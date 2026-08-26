@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>dev.cagents.Cagents</id>
+  <metadata_license>MIT</metadata_license>
+  <project_license>MIT</project_license>
+  <name>cagents</name>
+  <summary>Run coding agents in isolated workspaces</summary>
+  <developer id="dev.cagents">
+    <name>cagents contributors</name>
+  </developer>
+  <description>
+    <p>
+      cagents is a Wayland desktop application for organizing coding-agent
+      sessions, repositories, worktrees, terminals, and browser surfaces in
+      one workspace.
+    </p>
+  </description>
+  <launchable type="desktop-id">dev.cagents.Cagents.desktop</launchable>
+  <provides>
+    <binary>cagents</binary>
+  </provides>
+  <categories>
+    <category>Development</category>
+    <category>IDE</category>
+  </categories>
+  <content_rating type="oars-1.1"/>
+</component>

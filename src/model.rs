@@ -1,0 +1,651 @@
+use std::{
+    collections::BTreeMap,
+    ffi::{CStr, CString},
+    fmt,
+    mem::MaybeUninit,
+    path::{Path, PathBuf},
+    ptr,
+    str::FromStr,
+};
+
+use serde::{Deserialize, Serialize};
+use url::Url;
+use uuid::Uuid;
+
+macro_rules! id_type {
+    ($name:ident) => {
+        #[derive(
+            Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
+        )]
+        #[serde(transparent)]
+        pub struct $name(Uuid);
+
+        impl $name {
+            pub fn new() -> Self {
+                Self(Uuid::new_v4())
+            }
+
+            pub const fn from_uuid(id: Uuid) -> Self {
+                Self(id)
+            }
+
+            pub const fn as_uuid(self) -> Uuid {
+                self.0
+            }
+        }
+
+        impl Default for $name {
+            fn default() -> Self {
+                Self::new()
+            }
+        }
+
+        impl fmt::Display for $name {
+            fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                self.0.fmt(formatter)
+            }
+        }
+
+        impl FromStr for $name {
+            type Err = uuid::Error;
+
+            fn from_str(value: &str) -> Result<Self, Self::Err> {
+                Uuid::parse_str(value).map(Self)
+            }
+        }
+
+        impl From<Uuid> for $name {
+            fn from(value: Uuid) -> Self {
+                Self(value)
+            }
+        }
+
+        impl From<$name> for Uuid {
+            fn from(value: $name) -> Self {
+                value.0
+            }
+        }
+    };
+}
+
+id_type!(WorkspaceId);
+id_type!(CardId);
+id_type!(ProjectId);
+id_type!(WorktreeId);
+id_type!(TerminalId);
+id_type!(BrowserId);
+id_type!(OperationId);
+
+macro_rules! evidence_type {
+    ($name:ident) => {
+        #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+        #[serde(transparent)]
+        pub struct $name(String);
+
+        impl $name {
+            pub fn new(value: impl Into<String>) -> Self {
+                Self(value.into())
+            }
+
+            pub fn as_str(&self) -> &str {
+                &self.0
+            }
+
+            pub fn into_inner(self) -> String {
+                self.0
+            }
+        }
+
+        impl fmt::Display for $name {
+            fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                self.0.fmt(formatter)
+            }
+        }
+
+        impl From<String> for $name {
+            fn from(value: String) -> Self {
+                Self(value)
+            }
+        }
+
+        impl From<&str> for $name {
+            fn from(value: &str) -> Self {
+                Self(value.to_owned())
+            }
+        }
+    };
+}
+
+evidence_type!(BootId);
+evidence_type!(HostSessionId);
+evidence_type!(HostIncarnation);
+
+/// Durable card existence. Closing and closed cards remain durable so an
+/// interrupted close cannot resurrect a card.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Existence {
+    Open,
+    Closing { operation_id: OperationId },
+    Closed { tombstone: Tombstone },
+}
+
+impl Existence {
+    pub fn is_open(&self) -> bool {
+        matches!(self, Self::Open)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Tombstone {
+    pub operation_id: Option<OperationId>,
+    pub closed_at_unix_ms: i64,
+    pub reason: Option<String>,
+}
+
+/// Volatile viewport placement. This is deliberately not written to durable
+/// storage; column order, width, and focus are the persisted layout intent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Exposure {
+    Visible,
+    Prefetch,
+    Offscreen,
+}
+
+/// A typed runtime failure which is safe to present and persist in diagnostics.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RuntimeError {
+    pub code: String,
+    pub message: String,
+}
+
+/// Volatile resource state. It is orthogonal to existence and exposure: an
+/// open offscreen card can be hot, hibernated, hydrating, or failed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Residency {
+    Cold,
+    Hydrating {
+        epoch: u64,
+    },
+    Hot,
+    Evicting {
+        epoch: u64,
+    },
+    Hibernated,
+    Failed {
+        typed_error: RuntimeError,
+        retryable: bool,
+    },
+}
+
+impl Residency {
+    pub fn is_renderable(&self) -> bool {
+        matches!(self, Self::Hot)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CardState {
+    pub id: CardId,
+    pub generation: u64,
+    pub title: String,
+    pub width_fraction: f32,
+    pub existence: Existence,
+    pub exposure: Exposure,
+    pub residency: Residency,
+    pub kind: CardKind,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum CardKind {
+    Terminal(TerminalSession),
+    Browser(BrowserSession),
+    PullRequests(PullRequestView),
+    Repository(RepositoryView),
+}
+
+/// An argv-based launch recipe. `program` is never interpreted by a shell and
+/// every argument and environment entry remains a separate value.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LaunchRecipe {
+    pub program: String,
+    pub arguments: Vec<String>,
+    pub working_directory: PathBuf,
+    pub environment: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum LoginShellError {
+    #[error(
+        "no usable login shell was found in the effective user's passwd entry, SHELL, or /bin/sh"
+    )]
+    Unavailable,
+}
+
+impl LaunchRecipe {
+    pub fn shell(working_directory: PathBuf) -> Result<Self, LoginShellError> {
+        Ok(Self {
+            program: login_shell()?,
+            arguments: Vec::new(),
+            working_directory,
+            environment: BTreeMap::new(),
+        })
+    }
+}
+
+fn login_shell() -> Result<String, LoginShellError> {
+    choose_login_shell(
+        passwd_shell(),
+        std::env::var_os("SHELL").and_then(|shell| shell.into_string().ok()),
+        is_valid_shell,
+    )
+}
+
+fn choose_login_shell(
+    passwd: Option<String>,
+    environment: Option<String>,
+    is_valid: impl Fn(&str) -> bool,
+) -> Result<String, LoginShellError> {
+    if let Some(shell) = passwd.filter(|shell| is_valid(shell)) {
+        return Ok(shell);
+    }
+    if let Some(shell) = environment.filter(|shell| is_valid(shell)) {
+        return Ok(shell);
+    }
+    if is_valid("/bin/sh") {
+        return Ok("/bin/sh".to_owned());
+    }
+    Err(LoginShellError::Unavailable)
+}
+
+fn passwd_shell() -> Option<String> {
+    const INITIAL_BUFFER_SIZE: usize = 1_024;
+    const MAX_BUFFER_SIZE: usize = 1024 * 1024;
+
+    // SAFETY: sysconf and geteuid have no pointer arguments or preconditions.
+    let suggested = unsafe { libc::sysconf(libc::_SC_GETPW_R_SIZE_MAX) };
+    let size = usize::try_from(suggested)
+        .ok()
+        .filter(|size| *size > 0)
+        .unwrap_or(INITIAL_BUFFER_SIZE)
+        .clamp(INITIAL_BUFFER_SIZE, MAX_BUFFER_SIZE);
+    let mut buffer = vec![0_u8; size];
+
+    loop {
+        let mut entry = MaybeUninit::<libc::passwd>::zeroed();
+        let mut result = ptr::null_mut();
+        // SAFETY: entry and result are valid writable pointers, and buffer
+        // describes exactly `buffer.len()` writable bytes for the call.
+        let status = unsafe {
+            libc::getpwuid_r(
+                libc::geteuid(),
+                entry.as_mut_ptr(),
+                buffer.as_mut_ptr().cast(),
+                buffer.len(),
+                &mut result,
+            )
+        };
+        if status == libc::ERANGE && buffer.len() < MAX_BUFFER_SIZE {
+            buffer.resize(
+                buffer.len().saturating_mul(2).min(MAX_BUFFER_SIZE),
+                0,
+            );
+            continue;
+        }
+        if status != 0 || result.is_null() {
+            return None;
+        }
+
+        // SAFETY: a successful getpwuid_r initialized `result` and keeps every
+        // pointed-to string alive in `buffer` until this function returns.
+        let shell = unsafe { (*result).pw_shell };
+        if shell.is_null() {
+            return None;
+        }
+        // SAFETY: passwd string fields are NUL-terminated by getpwuid_r.
+        return unsafe { CStr::from_ptr(shell) }
+            .to_str()
+            .ok()
+            .map(str::to_owned);
+    }
+}
+
+fn is_valid_shell(candidate: &str) -> bool {
+    let path = Path::new(candidate);
+    if candidate.is_empty() || !path.is_absolute() {
+        return false;
+    }
+    fs_metadata_is_executable(path)
+}
+
+fn fs_metadata_is_executable(path: &Path) -> bool {
+    let Ok(metadata) = std::fs::metadata(path) else {
+        return false;
+    };
+    if !metadata.is_file() {
+        return false;
+    }
+    let Some(bytes) = path.to_str().map(str::as_bytes) else {
+        return false;
+    };
+    let Ok(path) = CString::new(bytes) else {
+        return false;
+    };
+    // SAFETY: path is a live NUL-terminated string. AT_EACCESS asks Linux to
+    // check execute permission using the process's effective credentials.
+    unsafe {
+        libc::faccessat(
+            libc::AT_FDCWD,
+            path.as_ptr(),
+            libc::X_OK,
+            libc::AT_EACCESS,
+        ) == 0
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TerminalExit {
+    pub code: Option<i32>,
+    pub signal: Option<i32>,
+    pub occurred_at_unix_ms: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HostSessionProof {
+    pub host_session_id: HostSessionId,
+    pub boot_id: BootId,
+    pub host_incarnation: HostIncarnation,
+}
+
+impl HostSessionProof {
+    pub fn is_complete(&self) -> bool {
+        !self.host_session_id.as_str().is_empty()
+            && !self.boot_id.as_str().is_empty()
+            && !self.host_incarnation.as_str().is_empty()
+    }
+}
+
+/// Durable terminal continuity evidence. A row marked `Live` is only attached
+/// as live after all three proof fields match the current host proof.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TerminalContinuity {
+    Live {
+        host_session_id: HostSessionId,
+        boot_id: BootId,
+        host_incarnation: HostIncarnation,
+    },
+    DetachedSameBoot {
+        host_session_id: HostSessionId,
+        boot_id: BootId,
+        host_incarnation: HostIncarnation,
+    },
+    RelaunchAvailable {
+        recipe: LaunchRecipe,
+        last_exit: Option<TerminalExit>,
+    },
+    Exited {
+        last_exit: TerminalExit,
+    },
+    Failed {
+        typed_error: RuntimeError,
+        retryable: bool,
+    },
+}
+
+impl TerminalContinuity {
+    pub fn live_proof(&self) -> Option<HostSessionProof> {
+        match self {
+            Self::Live {
+                host_session_id,
+                boot_id,
+                host_incarnation,
+            }
+            | Self::DetachedSameBoot {
+                host_session_id,
+                boot_id,
+                host_incarnation,
+            } => Some(HostSessionProof {
+                host_session_id: host_session_id.clone(),
+                boot_id: boot_id.clone(),
+                host_incarnation: host_incarnation.clone(),
+            }),
+            Self::RelaunchAvailable { .. } | Self::Exited { .. } | Self::Failed { .. } => None,
+        }
+    }
+
+    pub fn can_resume_live(&self, proof: &HostSessionProof) -> bool {
+        if !proof.is_complete() {
+            return false;
+        }
+        matches!(
+            self,
+            Self::Live {
+                host_session_id,
+                boot_id,
+                host_incarnation,
+            }
+            | Self::DetachedSameBoot {
+                host_session_id,
+                boot_id,
+                host_incarnation,
+            } if host_session_id == &proof.host_session_id
+                && boot_id == &proof.boot_id
+                && host_incarnation == &proof.host_incarnation
+        )
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TerminalSession {
+    pub id: TerminalId,
+    pub launch: LaunchRecipe,
+    pub transcript_path: Option<PathBuf>,
+    pub resume_hint: Option<String>,
+    pub continuity: TerminalContinuity,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TranscriptMetadata {
+    pub path: PathBuf,
+    pub byte_len: u64,
+    pub durable_offset: u64,
+    pub updated_at_unix_ms: i64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BrowserRestoreFidelity {
+    /// The in-memory live view is still attached. This value is never promised
+    /// after process restart and is downgraded before persistence.
+    ExactLive,
+    HistoryAndScroll,
+    UrlOnly,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct BrowserSession {
+    pub id: BrowserId,
+    pub current_url: Url,
+    pub history: Vec<Url>,
+    pub history_index: usize,
+    pub scroll_x: f64,
+    pub scroll_y: f64,
+    pub fidelity: BrowserRestoreFidelity,
+}
+
+impl BrowserSession {
+    /// Returns a descriptor that makes only restart-safe claims.
+    pub fn durable_descriptor(&self) -> Self {
+        let mut descriptor = self.clone();
+        if matches!(self.fidelity, BrowserRestoreFidelity::UrlOnly) {
+            descriptor.history = vec![descriptor.current_url.clone()];
+            descriptor.history_index = 0;
+            descriptor.scroll_x = 0.0;
+            descriptor.scroll_y = 0.0;
+            descriptor.fidelity = BrowserRestoreFidelity::UrlOnly;
+            return descriptor;
+        }
+
+        if descriptor.history.is_empty() {
+            descriptor.history.push(descriptor.current_url.clone());
+            descriptor.history_index = 0;
+        } else if descriptor.history_index >= descriptor.history.len() {
+            descriptor.history_index = descriptor.history.len() - 1;
+        }
+        descriptor.fidelity = BrowserRestoreFidelity::HistoryAndScroll;
+        descriptor
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PullRequestView {
+    pub repository: PathBuf,
+    pub selected_number: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RepositoryView {
+    pub project: ProjectId,
+    pub repository: PathBuf,
+    pub worktree: PathBuf,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProjectState {
+    pub id: ProjectId,
+    pub generation: u64,
+    pub name: String,
+    pub repository: PathBuf,
+    pub existence: Existence,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorktreeState {
+    pub id: WorktreeId,
+    pub project_id: ProjectId,
+    pub generation: u64,
+    pub path: PathBuf,
+    pub branch: Option<String>,
+    pub existence: Existence,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct WorkspaceState {
+    pub schema_version: u32,
+    pub id: WorkspaceId,
+    pub generation: u64,
+    pub existence: Existence,
+    pub cards: Vec<CardState>,
+    pub focused: Option<CardId>,
+}
+
+impl Default for WorkspaceState {
+    fn default() -> Self {
+        Self {
+            schema_version: 1,
+            id: WorkspaceId::new(),
+            generation: 0,
+            existence: Existence::Open,
+            cards: Vec::new(),
+            focused: None,
+        }
+    }
+}
+
+impl WorkspaceState {
+    pub fn focused_index(&self) -> Option<usize> {
+        let focused = self.focused?;
+        self.cards
+            .iter()
+            .position(|card| card.id == focused && card.existence.is_open())
+    }
+
+    pub fn normalize_focus(&mut self) {
+        if self.focused_index().is_none() {
+            self.focused = self
+                .cards
+                .iter()
+                .find(|card| card.existence.is_open())
+                .map(|card| card.id);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn passwd_shell_wins_when_environment_is_absent_or_stale() {
+        let valid = |candidate: &str| candidate == "/bin/fish";
+
+        assert_eq!(
+            choose_login_shell(Some("/bin/fish".into()), None, valid).unwrap(),
+            "/bin/fish"
+        );
+        assert_eq!(
+            choose_login_shell(
+                Some("/bin/fish".into()),
+                Some("/stale/environment-shell".into()),
+                valid,
+            )
+            .unwrap(),
+            "/bin/fish"
+        );
+    }
+
+    #[test]
+    fn shell_selection_falls_back_in_documented_order() {
+        let valid = |candidate: &str| matches!(candidate, "/bin/zsh" | "/bin/sh");
+        assert_eq!(
+            choose_login_shell(
+                Some("relative".into()),
+                Some("/bin/zsh".into()),
+                valid,
+            )
+            .unwrap(),
+            "/bin/zsh"
+        );
+        assert_eq!(
+            choose_login_shell(Some("relative".into()), None, valid).unwrap(),
+            "/bin/sh"
+        );
+        assert_eq!(
+            choose_login_shell(Some("relative".into()), None, |_| false),
+            Err(LoginShellError::Unavailable)
+        );
+    }
+
+    #[test]
+    fn valid_shell_must_be_absolute_regular_and_executable() {
+        let directory = tempfile::tempdir().unwrap();
+        let executable = directory.path().join("shell");
+        std::fs::write(&executable, b"#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+        assert!(is_valid_shell(executable.to_str().unwrap()));
+        assert!(!is_valid_shell("shell"));
+
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(!is_valid_shell(executable.to_str().unwrap()));
+        assert!(!is_valid_shell(directory.path().to_str().unwrap()));
+    }
+
+    #[test]
+    fn explicit_launch_recipe_round_trip_is_unchanged() {
+        let recipe = LaunchRecipe {
+            program: "/usr/bin/env".into(),
+            arguments: vec!["printf".into(), "%s".into(), "unchanged".into()],
+            working_directory: PathBuf::from("/tmp/worktree"),
+            environment: BTreeMap::from([("EXPLICIT".into(), "yes".into())]),
+        };
+
+        let encoded = serde_json::to_vec(&recipe).unwrap();
+        assert_eq!(serde_json::from_slice::<LaunchRecipe>(&encoded).unwrap(), recipe);
+    }
+}

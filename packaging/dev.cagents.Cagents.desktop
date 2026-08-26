@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=cagents
+GenericName=Coding Agent Workspace
+Comment=Run coding agents in isolated workspaces
+Exec=cagents ui
+Icon=dev.cagents.Cagents
+Terminal=false
+Categories=Development;IDE;
+Keywords=AI;Agent;Coding;Development;Git;
+StartupNotify=false

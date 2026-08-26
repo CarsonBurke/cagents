@@ -1,0 +1,53 @@
+[package]
+name = "cagents"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.93"
+license = "MIT"
+publish = false
+
+[dependencies]
+anyhow = "1.0"
+arc-swap = "1.7"
+async-channel = "2.5"
+bitflags = { version = "2.9", features = ["serde"] }
+clap = { version = "4.5", features = ["derive"] }
+crossbeam-channel = "0.5"
+dpi = "=0.1.2"
+directories = "6.0"
+euclid = "=0.22.11"
+image = { version = "0.25", default-features = false, features = ["png"] }
+iced_accessibility = { git = "https://github.com/pop-os/libcosmic.git", rev = "caec74c2559924443f12fc6faf97a5bcefe6271d" }
+keyboard-types = { version = "=0.8.3", features = ["serde"] }
+libcosmic = { git = "https://github.com/pop-os/libcosmic.git", rev = "caec74c2559924443f12fc6faf97a5bcefe6271d", default-features = false, features = ["a11y", "multi-window", "surface-message", "tokio", "wayland", "wgpu", "winit", "xdg-portal"] }
+libc = "0.2.189"
+libghostty-vt = { version = "0.2.1", features = ["tracing"] }
+portable-pty = "0.9"
+# Binary IPC codec. The terminal snapshot protocol is a per-frame, per-cell
+# binary payload; a self-describing text format costs ~24x more bytes and one
+# heap allocation per character cell on both sides. postcard is already in the
+# resolved dependency graph, needs no additional crates, and its externally
+# tagged enum encoding is why the wire enums below carry no `serde(tag)`.
+postcard = { version = "1.1", default-features = false, features = ["use-std"] }
+rusqlite = { version = "0.37", features = ["bundled"] }
+raw-window-handle = "=0.6.2"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+servo = { version = "=0.1.3", git = "https://github.com/servo/servo.git", rev = "5c14ac9428d8d95c2f6c2f0300fe248d3929f282", default-features = false, features = ["baked-in-resources", "clipboard", "js_jit"] }
+thiserror = "2.0"
+tempfile = "3.21"
+tokio = { version = "1.47", features = ["fs", "process", "rt-multi-thread", "sync", "time"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+toml = "1.1.4"
+url = { version = "2.5", features = ["serde"] }
+uuid = { version = "1.18", features = ["serde", "v4"] }
+wayland-client = { version = "=0.31.15", features = ["system"] }
+wayland-protocols = { version = "=0.32.13", features = ["client"] }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+
+[profile.dev.package."*"]
+opt-level = 2

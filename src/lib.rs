@@ -1,0 +1,17 @@
+pub mod app;
+pub mod browser;
+pub mod control;
+pub mod github;
+pub mod host;
+pub mod lifecycle;
+pub mod model;
+pub mod performance;
+pub mod persistence;
+pub mod repository;
+pub mod session;
+pub mod settings;
+pub mod sidebar;
+pub mod terminal;
+pub use terminal::ipc as terminal_ipc;
+pub mod workspace;
+pub mod workspace_widget;

@@ -1,0 +1,173 @@
+#!/bin/sh
+set -eu
+
+PROGRAM=cagents-uninstall
+
+usage() {
+    cat <<'EOF'
+Usage: cagents-uninstall [--prefix PATH] [--purge] [--help]
+
+Remove cagents program files installed by install.sh. User configuration,
+data, and caches are preserved unless --purge is supplied.
+
+Options:
+  --prefix PATH  Installation root (default: $XDG_DATA_HOME/cagents-install)
+  --purge        Also remove cagents user configuration, data, and caches
+  --help         Show this help
+EOF
+}
+
+fail() {
+    printf '%s: %s\n' "$PROGRAM" "$*" >&2
+    exit 1
+}
+
+if [ "$(id -u)" -eq 0 ]; then
+    fail 'refusing to run as root'
+fi
+
+: "${HOME:?HOME is not set}"
+case $HOME in
+    /*) ;;
+    *) fail 'HOME must be an absolute path' ;;
+esac
+DATA_HOME=${XDG_DATA_HOME:-"$HOME/.local/share"}
+case $DATA_HOME in
+    /*) ;;
+    *) fail 'XDG_DATA_HOME must be an absolute path' ;;
+esac
+PREFIX=$DATA_HOME/cagents-install
+PURGE=0
+
+while [ "$#" -gt 0 ]; do
+    case $1 in
+        --prefix)
+            [ "$#" -ge 2 ] || fail '--prefix requires a path'
+            PREFIX=$2
+            shift 2
+            ;;
+        --purge)
+            PURGE=1
+            shift
+            ;;
+        --help|-h)
+            usage
+            exit 0
+            ;;
+        *)
+            fail "unknown option: $1"
+            ;;
+    esac
+done
+
+case $PREFIX in
+    /*) ;;
+    *) fail '--prefix must be an absolute path' ;;
+esac
+while [ "$PREFIX" != / ] && [ "${PREFIX%/}" != "$PREFIX" ]; do
+    PREFIX=${PREFIX%/}
+done
+[ "$PREFIX" != / ] || fail 'refusing to use / as the installation root'
+
+remove_owned_link() {
+    link=$1
+    if [ -L "$link" ]; then
+        target=$(readlink "$link") || fail "cannot inspect $link"
+        case $target in
+            "$PREFIX/current"/*) rm -f "$link" ;;
+        esac
+    fi
+}
+
+read_daemon_status() {
+    daemon_cli=$1
+    if daemon_output=$("$daemon_cli" --json daemon status 2>/dev/null); then
+        case $daemon_output in
+            *'
+'*) DAEMON_STATUS=unknown ;;
+            '{"ok":true,"command":"daemon.status","data":{"running":true,"socket":"'*'"}}')
+                DAEMON_STATUS=running
+                ;;
+            '{"ok":true,"command":"daemon.status","data":{"running":false,"socket":"'*'"}}')
+                DAEMON_STATUS=stopped
+                ;;
+            *) DAEMON_STATUS=unknown ;;
+        esac
+    else
+        DAEMON_STATUS=unknown
+    fi
+}
+
+stop_daemon_and_wait() {
+    daemon_cli=$1
+    read_daemon_status "$daemon_cli"
+    case $DAEMON_STATUS in
+        stopped) return 0 ;;
+        running) ;;
+        *) fail 'cannot verify daemon status; cagents was not removed' ;;
+    esac
+
+    "$daemon_cli" daemon stop >/dev/null 2>&1 \
+        || fail 'daemon did not accept the stop request; cagents was not removed'
+
+    daemon_wait=30
+    while [ "$daemon_wait" -gt 0 ]; do
+        read_daemon_status "$daemon_cli"
+        [ "$DAEMON_STATUS" != stopped ] || return 0
+        daemon_wait=$((daemon_wait - 1))
+        [ "$daemon_wait" -eq 0 ] || sleep 1
+    done
+    fail 'could not verify that the daemon stopped; cagents was not removed'
+}
+
+if [ -e "$PREFIX/.cagents-install-root" ]; then
+    [ -f "$PREFIX/.cagents-install-root" ] && [ ! -L "$PREFIX/.cagents-install-root" ] \
+        || fail "unsafe installation marker at $PREFIX"
+    [ "$(cat "$PREFIX/.cagents-install-root")" = 'cagents install root' ] \
+        || fail "unrecognized installation marker at $PREFIX"
+
+    if [ -L "$PREFIX/current" ]; then
+        stop_daemon_and_wait "$PREFIX/current/bin/cagents"
+    elif [ -e "$PREFIX/current" ]; then
+        fail "refusing to remove non-symlink $PREFIX/current"
+    fi
+
+    remove_owned_link "$HOME/.local/bin/cagents"
+    remove_owned_link "$DATA_HOME/applications/dev.cagents.Cagents.desktop"
+    remove_owned_link "$DATA_HOME/icons/hicolor/scalable/apps/dev.cagents.Cagents.svg"
+    remove_owned_link "$DATA_HOME/icons/hicolor/128x128/apps/dev.cagents.Cagents.png"
+    remove_owned_link "$DATA_HOME/metainfo/dev.cagents.Cagents.metainfo.xml"
+
+    rm -f "$PREFIX/current"
+    rm -rf "$PREFIX/versions"
+    rm -f "$PREFIX/.cagents-install-root"
+    rmdir "$PREFIX" 2>/dev/null || :
+    if command -v gtk-update-icon-cache >/dev/null 2>&1; then
+        gtk-update-icon-cache --force --ignore-theme-index "$DATA_HOME/icons/hicolor" >/dev/null 2>&1 || :
+    fi
+    if command -v update-desktop-database >/dev/null 2>&1; then
+        update-desktop-database "$DATA_HOME/applications" >/dev/null 2>&1 || :
+    fi
+else
+    printf '%s: no install.sh installation found at %s\n' "$PROGRAM" "$PREFIX" >&2
+fi
+
+if [ "$PURGE" -eq 1 ]; then
+    CONFIG_HOME=${XDG_CONFIG_HOME:-"$HOME/.config"}
+    CACHE_HOME=${XDG_CACHE_HOME:-"$HOME/.cache"}
+    case $CONFIG_HOME in
+        /*) ;;
+        *) fail 'XDG_CONFIG_HOME must be an absolute path' ;;
+    esac
+    case $CACHE_HOME in
+        /*) ;;
+        *) fail 'XDG_CACHE_HOME must be an absolute path' ;;
+    esac
+    rm -rf "$CONFIG_HOME/cagents" "$DATA_HOME/cagents" "$CACHE_HOME/cagents"
+fi
+
+if [ "$PURGE" -eq 1 ]; then
+    printf 'cagents has been uninstalled and its user data removed.\n'
+else
+    printf 'cagents has been uninstalled; user data was preserved.\n'
+fi

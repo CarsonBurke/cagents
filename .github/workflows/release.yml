@@ -1,0 +1,202 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    name: Build and publish Linux release
+    runs-on: ubuntu-22.04
+    timeout-minutes: 120
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+      - name: Check out the tagged source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Install Rust 1.93
+        run: |
+          set -euo pipefail
+          rustup toolchain install 1.93.0 --profile minimal
+          rustup default 1.93.0
+          rustc --version
+          cargo --version
+
+      - name: Require the tag to match Cargo.toml
+        run: |
+          set -euo pipefail
+          version="$(cargo metadata --locked --no-deps --format-version 1 \
+            | jq -r '.packages[] | select(.name == "cagents") | .version')"
+          if [[ -z "$version" || "$version" == *$'\n'* ]]; then
+            echo "Could not determine one cagents package version" >&2
+            exit 1
+          fi
+          if [[ "$GITHUB_REF_NAME" != "v${version}" ]]; then
+            echo "Release tag $GITHUB_REF_NAME does not match Cargo.toml version $version (expected v${version})" >&2
+            exit 1
+          fi
+          printf 'VERSION=%s\n' "$version" >> "$GITHUB_ENV"
+
+      - name: Install native build and packaging dependencies
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends \
+            appstream \
+            build-essential \
+            clang \
+            cmake \
+            curl \
+            desktop-file-utils \
+            dpkg-dev \
+            git \
+            libclang-dev \
+            libdbus-1-dev \
+            libegl1-mesa-dev \
+            libfontconfig1-dev \
+            libfreetype6-dev \
+            libgbm-dev \
+            libgl1-mesa-dev \
+            libssl-dev \
+            libudev-dev \
+            libwayland-dev \
+            libxkbcommon-dev \
+            ninja-build \
+            pkg-config \
+            python3 \
+            xz-utils
+
+      - name: Install Zig 0.15.2
+        env:
+          ZIG_SHA256: 02aa270f183da276e5b5920b1dac44a63f1a49e55050ebde3aecc9eb82f93239
+          ZIG_URL: https://ziglang.org/download/0.15.2/zig-x86_64-linux-0.15.2.tar.xz
+        run: |
+          set -euo pipefail
+          archive="$RUNNER_TEMP/zig-0.15.2.tar.xz"
+          curl --proto '=https' --tlsv1.2 --fail --location "$ZIG_URL" --output "$archive"
+          printf '%s  %s\n' "$ZIG_SHA256" "$archive" | sha256sum --check --strict
+          tar -xJf "$archive" -C "$RUNNER_TEMP"
+          printf '%s\n' "$RUNNER_TEMP/zig-x86_64-linux-0.15.2" >> "$GITHUB_PATH"
+
+      - name: Check the locked source
+        run: |
+          set -euo pipefail
+          zig version
+          cargo check --locked --all-targets
+          cargo test --locked --all-targets
+
+      - name: Build Linux packages
+        run: ./scripts/package-linux.sh
+
+      - name: Stamp the installer and regenerate checksums
+        run: |
+          set -euo pipefail
+          sed -i \
+            "s|^DEFAULT_REPOSITORY='<OWNER>/<REPO>'$|DEFAULT_REPOSITORY='${GITHUB_REPOSITORY}'|" \
+            dist/install.sh
+          grep -Fqx "DEFAULT_REPOSITORY='${GITHUB_REPOSITORY}'" dist/install.sh
+          (
+            cd dist
+            rm -f SHA256SUMS
+            sha256sum \
+              "cagents-${VERSION}-x86_64-unknown-linux-gnu.tar.gz" \
+              "cagents_${VERSION}_amd64.deb" \
+              install.sh > SHA256SUMS
+          )
+
+      - name: Validate packaged desktop metadata
+        run: |
+          set -euo pipefail
+          staging="$(mktemp -d)"
+          trap 'rm -rf "$staging"' EXIT
+          tar -xzf "dist/cagents-${VERSION}-x86_64-unknown-linux-gnu.tar.gz" -C "$staging"
+          root="$staging/cagents-${VERSION}"
+          desktop-file-validate \
+            "$root/share/applications/dev.cagents.Cagents.desktop"
+          appstreamcli validate --no-net --override=url-homepage-missing=info \
+            "$root/share/metainfo/dev.cagents.Cagents.metainfo.xml"
+          dpkg-deb --info "dist/cagents_${VERSION}_amd64.deb" >/dev/null
+
+      - name: Stage and publish the GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          release_marker='<!-- cagents-release-workflow -->'
+          assets=(
+            "dist/cagents-${VERSION}-x86_64-unknown-linux-gnu.tar.gz"
+            "dist/cagents_${VERSION}_amd64.deb"
+            dist/SHA256SUMS
+            dist/install.sh
+          )
+
+          if release_state="$(
+            gh release view "$GITHUB_REF_NAME" \
+              --repo "$GITHUB_REPOSITORY" \
+              --json isDraft,body \
+              --jq "[.isDraft, (.body | contains(\"${release_marker}\"))] | @tsv" \
+              2>/dev/null
+          )"; then
+            read -r is_draft workflow_owned <<<"$release_state"
+            if [[ "$is_draft" != true || "$workflow_owned" != true ]]; then
+              echo "Refusing to modify a release that is not a workflow-owned draft" >&2
+              exit 1
+            fi
+          else
+            gh release create "$GITHUB_REF_NAME" \
+              --repo "$GITHUB_REPOSITORY" \
+              --verify-tag \
+              --draft \
+              --title "cagents ${GITHUB_REF_NAME}" \
+              --notes "$release_marker" \
+              --generate-notes
+          fi
+
+          gh release upload "$GITHUB_REF_NAME" "${assets[@]}" \
+            --repo "$GITHUB_REPOSITORY" \
+            --clobber
+
+          expected_assets="$(
+            printf '%s\n' "${assets[@]##*/}" | LC_ALL=C sort
+          )"
+          actual_assets="$(
+            gh release view "$GITHUB_REF_NAME" \
+              --repo "$GITHUB_REPOSITORY" \
+              --json assets \
+              --jq '.assets[].name' |
+              LC_ALL=C sort
+          )"
+          if [[ "$actual_assets" != "$expected_assets" ]]; then
+            echo "Refusing to publish: release assets do not match the expected set" >&2
+            printf 'Expected:\n%s\nActual:\n%s\n' "$expected_assets" "$actual_assets" >&2
+            exit 1
+          fi
+
+          if [[ "$(
+            gh release view "$GITHUB_REF_NAME" \
+              --repo "$GITHUB_REPOSITORY" \
+              --json isDraft \
+              --jq '.isDraft'
+          )" != true ]]; then
+            echo "Refusing to publish: release is no longer a draft" >&2
+            exit 1
+          fi
+
+          gh release edit "$GITHUB_REF_NAME" \
+            --repo "$GITHUB_REPOSITORY" \
+            --draft=false
