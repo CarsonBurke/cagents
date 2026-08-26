@@ -19,8 +19,14 @@ use crate::{
 };
 
 /// Version 3 replaced the JSON payload codec with postcard and made terminal
-/// snapshots row-delta capable. Both are breaking changes with no negotiation
-/// path, which is why the version is checked before anything else is decoded.
+/// snapshots row-delta capable.
+///
+/// Both are breaking changes with no negotiation path. Because the codec itself
+/// changed, a frame from a version-2 peer cannot be decoded at all: it fails as
+/// `FrameError::InvalidPayload`, not as a version mismatch. The `version` field
+/// therefore only diagnoses skew between versions that share a codec, and every
+/// reader must treat an undecodable frame as a possible version skew rather than
+/// as a corrupt peer.
 pub const PROTOCOL_VERSION: u16 = 3;
 /// Postcard encodes an 80x24 grid in roughly 20 KiB and a typical single-row
 /// delta in a few hundred bytes, but a full repaint of a very large grid after

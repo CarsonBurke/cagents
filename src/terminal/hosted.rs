@@ -998,9 +998,28 @@ fn serve_connection(
                 }
                 continue;
             }
-            Err(_) => return ConnectionEnd::Retry,
+            Err(error) => {
+                // The codec changed with the protocol version, so a frame from
+                // a daemon of another version is undecodable rather than merely
+                // unexpected. Without this the client retries forever against a
+                // mismatched daemon with nothing in the log to explain it.
+                tracing::warn!(
+                    %error,
+                    expected_version = PROTOCOL_VERSION,
+                    "could not decode a daemon frame; the daemon may speak another protocol version"
+                );
+                return ConnectionEnd::Retry;
+            }
         };
-        if envelope.version != PROTOCOL_VERSION || envelope.request_id != Some(connect_id) {
+        if envelope.version != PROTOCOL_VERSION {
+            tracing::warn!(
+                actual = envelope.version,
+                expected = PROTOCOL_VERSION,
+                "the daemon speaks an unsupported protocol version"
+            );
+            return ConnectionEnd::Retry;
+        }
+        if envelope.request_id != Some(connect_id) {
             return ConnectionEnd::Retry;
         }
         match envelope.message {
