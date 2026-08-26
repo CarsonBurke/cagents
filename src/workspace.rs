@@ -131,7 +131,7 @@ pub struct WorkspaceConfig {
 impl Default for WorkspaceConfig {
     fn default() -> Self {
         Self {
-            gap: 12.0,
+            gap: 8.0,
             leading_padding: 12.0,
             trailing_padding: 12.0,
             overscan: 360.0,

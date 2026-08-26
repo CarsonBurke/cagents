@@ -58,6 +58,16 @@ impl LifecycleManager {
         }
     }
 
+    /// Updates policy without disturbing card epochs or residency. The next
+    /// reconcile applies tighter limits and revised offscreen grace.
+    pub fn update_budget(&mut self, budget: LifecycleBudget) {
+        assert!(
+            budget.max_hot_cards > 0,
+            "at least one card must be renderable"
+        );
+        self.budget = budget;
+    }
+
     pub fn register(
         &mut self,
         card: CardId,

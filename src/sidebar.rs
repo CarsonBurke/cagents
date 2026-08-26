@@ -7,14 +7,11 @@
 //!
 //! `view` runs on every terminal wake rather than on every interaction, so it
 //! derives nothing that an entity already determines: folded filter keys,
-//! widget identities, and accessible names are built once per entity, and the
-//! project list is virtualized so only rows inside the visible scroll band are
-//! turned into widgets.
+//! widget identities, and accessible names are built once per entity.
 
 use std::{
     borrow::Cow,
     collections::BTreeSet,
-    ops::Range,
     path::{Path, PathBuf},
 };
 
@@ -34,29 +31,15 @@ use crate::{
     },
 };
 
-const EXPANDED_WIDTH: f32 = 320.0;
-const COMPACT_WIDTH: f32 = 64.0;
+const EXPANDED_WIDTH_MIN: f32 = 240.0;
+const EXPANDED_WIDTH_MAX: f32 = 360.0;
+const COMPACT_WIDTH: f32 = 56.0;
 const COMPACT_BREAKPOINT: f32 = 1_200.0;
 const PROJECT_HEADER_HEIGHT: f32 = 48.0;
-const WORKTREE_ROW_HEIGHT: f32 = 52.0;
-const PULL_REQUEST_ROW_HEIGHT: f32 = 52.0;
+const WORKTREE_ROW_HEIGHT: f32 = 48.0;
+const PULL_REQUEST_ROW_HEIGHT: f32 = 48.0;
 const ICON_CONTROL_SIZE: f32 = 32.0;
 const ROW_ICON_WIDTH: f32 = 24.0;
-/// COSMIC's caption and caption-heading presets both use a 17px line height.
-/// The virtualized list needs every height up front, without laying text out.
-const CAPTION_LINE_HEIGHT: f32 = 17.0;
-/// `divider::horizontal::light()` is a one-pixel rule.
-const SECTION_DIVIDER_HEIGHT: f32 = 1.0;
-/// Rows this far outside the viewport stay mounted, so a scroll gesture never
-/// outruns widget construction. Matches the workspace strip's overscan.
-const ROW_OVERSCAN: f32 = 360.0;
-/// Band height assumed before the list has reported its own. The scrollable
-/// publishes its real viewport on the first redraw; until then a generous
-/// guess mounts a screenful of rows instead of leaving a gap.
-const INITIAL_BAND_HEIGHT: u32 = 2_160;
-/// Project controls the compact rail always shows: open, toggle, new worktree,
-/// create pull request.
-const COMPACT_PROJECT_CONTROLS: usize = 4;
 
 /// The responsive density selected by the application from its available
 /// width. Compact mode retains every command as a named, focusable icon.
@@ -502,24 +485,14 @@ struct PullRequestChrome {
     metadata: Box<str>,
 }
 
-/// Scroll geometry of the project list, in whole content pixels. Sub-pixel
-/// precision cannot change which rows fall inside the mounted band, and
-/// integer pixels keep sidebar actions and state comparable.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct SidebarViewport {
-    /// Distance from the top of the content to the top of the visible band.
-    pub offset: u32,
-    /// Height of the visible band.
-    pub height: u32,
-}
-
-impl Default for SidebarViewport {
-    fn default() -> Self {
-        Self {
-            offset: 0,
-            height: INITIAL_BAND_HEIGHT,
-        }
-    }
+enum SidebarSelection {
+    Project(ProjectId),
+    Worktree {
+        project_id: ProjectId,
+        worktree_id: WorktreeId,
+    },
+    PullRequest { project_id: ProjectId, number: u64 },
 }
 
 /// Persistent interaction state owned by the application.
@@ -529,7 +502,7 @@ pub struct SidebarState {
     filter: SidebarFilter,
     expanded_projects: BTreeSet<ProjectId>,
     expanded_pull_requests: BTreeSet<ProjectId>,
-    viewport: SidebarViewport,
+    selection: Option<SidebarSelection>,
 }
 
 impl SidebarState {
@@ -553,14 +526,33 @@ impl SidebarState {
             SidebarAction::TogglePullRequests(project_id) => {
                 toggle_membership(&mut self.expanded_pull_requests, *project_id);
             }
-            SidebarAction::Scrolled(viewport) => self.viewport = *viewport,
+            SidebarAction::OpenRepository { project_id, .. } => {
+                self.selection = Some(SidebarSelection::Project(*project_id));
+            }
+            SidebarAction::OpenWorktree {
+                project_id,
+                worktree_id,
+                ..
+            } => {
+                self.selection = Some(SidebarSelection::Worktree {
+                    project_id: *project_id,
+                    worktree_id: *worktree_id,
+                });
+            }
+            SidebarAction::OpenPullRequest {
+                project_id, number, ..
+            } => {
+                self.selection = Some(SidebarSelection::PullRequest {
+                    project_id: *project_id,
+                    number: *number,
+                });
+            }
             SidebarAction::OpenRepositoryPicker
-            | SidebarAction::OpenRepository { .. }
-            | SidebarAction::OpenWorktree { .. }
             | SidebarAction::NewWorktree { .. }
-            | SidebarAction::OpenPullRequest { .. }
             | SidebarAction::Refresh
-            | SidebarAction::CreatePullRequest { .. } => {}
+            | SidebarAction::CreatePullRequest { .. }
+            | SidebarAction::OpenSettings
+            | SidebarAction::OpenShortcuts => {}
         }
     }
 }
@@ -573,9 +565,6 @@ pub enum SidebarAction {
     SetFilter(SidebarFilter),
     ToggleProject(ProjectId),
     TogglePullRequests(ProjectId),
-    /// Reports the project list's scroll geometry so the view can mount only
-    /// the rows inside the visible band.
-    Scrolled(SidebarViewport),
     OpenRepositoryPicker,
     OpenRepository {
         project_id: ProjectId,
@@ -601,10 +590,25 @@ pub enum SidebarAction {
         project_id: ProjectId,
         repository: PathBuf,
     },
+    OpenSettings,
+    OpenShortcuts,
 }
 
 pub fn search_focus_id() -> Id {
     stable_id("search")
+}
+
+/// Returns the rendered pane width. Persisted expanded widths are constrained
+/// to the workbench range even when an older settings file contains a broader
+/// backend-valid value.
+pub fn effective_width(mode: SidebarMode, persisted_width: f32) -> f32 {
+    if mode == SidebarMode::Compact {
+        COMPACT_WIDTH
+    } else if persisted_width.is_finite() {
+        persisted_width.clamp(EXPANDED_WIDTH_MIN, EXPANDED_WIDTH_MAX)
+    } else {
+        280.0
+    }
 }
 
 /// The sidebar's single public rendering entry point.
@@ -612,102 +616,220 @@ pub fn view<'a>(
     model: &'a SidebarModel,
     state: &'a SidebarState,
     mode: SidebarMode,
+    persisted_width: f32,
 ) -> Element<'a, SidebarAction> {
     let spacing = cosmic::theme::spacing();
     let compact = mode == SidebarMode::Compact;
-    let width = if compact {
-        Length::Fixed(COMPACT_WIDTH)
-    } else {
-        Length::Fixed(EXPANDED_WIDTH)
-    };
-    let refresh_enabled =
-        !model.projects.is_empty() && !matches!(&model.data_state, SidebarDataState::Loading);
-    let mut content = widget::column::with_capacity(4)
+    let width = effective_width(mode, persisted_width);
+    let loading = matches!(&model.data_state, SidebarDataState::Loading);
+    let refresh_enabled = !model.projects.is_empty() && !loading;
+    let mut content = widget::column::with_capacity(7)
         .push(
-            widget::container(header(compact, model.projects.len(), refresh_enabled))
-                .class(theme::Container::Secondary)
-                .padding([0, spacing.space_xxs]),
+            widget::container(header(
+                compact,
+                model.projects.len(),
+                refresh_enabled,
+                loading,
+            ))
+            .padding([0, spacing.space_xxs]),
         )
-        .push(search(state, compact));
+        .push(widget::divider::horizontal::light());
+
+    if !model.projects.is_empty() {
+        content = content
+            .push(widget::container(search(state, compact)).padding([
+                spacing.space_xxxs,
+                spacing.space_xxs,
+            ]))
+            .push(widget::container(filters(state.filter, compact)).padding([
+                0,
+                spacing.space_xxs,
+            ]));
+    }
+
     content = content
         .push(
-            widget::container(filters(state.filter, compact))
-                .class(theme::Container::Secondary)
-                .padding(spacing.space_xxxs),
+            widget::container(body(model, state, compact))
+                .padding([spacing.space_xxxs, spacing.space_xxs])
+                .height(Length::Fill),
         )
-        .push(body(model, state, compact))
-        .spacing(spacing.space_xxs)
-        .padding(if compact {
-            spacing.space_xxs
-        } else {
-            spacing.space_xs
-        })
+        .push(widget::divider::horizontal::light())
+        .push(footer(model, state, compact))
+        .spacing(0)
         .width(Length::Fill)
         .height(Length::Fill);
 
-    widget::container(content)
-        .class(theme::Container::Background)
-        .width(width)
-        .height(Length::Fill)
-        .into()
+    widget::container(
+        widget::row::with_children(vec![
+            widget::container(content)
+                .class(theme::Container::Background)
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .into(),
+            widget::divider::vertical::default().into(),
+        ])
+        .spacing(0),
+    )
+    .class(theme::Container::Background)
+    .width(Length::Fixed(width))
+    .height(Length::Fill)
+    .into()
 }
 
 fn header(
     compact: bool,
     project_count: usize,
     refresh_enabled: bool,
+    loading: bool,
 ) -> Element<'static, SidebarAction> {
     let spacing = cosmic::theme::spacing();
     if compact {
-        let content: Element<'static, SidebarAction> = if refresh_enabled {
-            icon_action(
-                "view-refresh-symbolic",
-                format!("Refresh {project_count} projects"),
-                SidebarAction::Refresh,
-                stable_id("refresh"),
-            )
-        } else {
-            widget::icon::from_name("folder-symbolic").size(16).into()
-        };
-        return widget::container(content)
-            .center_x(Length::Fill)
-            .height(Length::Fixed(PROJECT_HEADER_HEIGHT))
-            .into();
+        return widget::container(icon_action(
+            "document-open-symbolic",
+            "Open repository",
+            SidebarAction::OpenRepositoryPicker,
+            stable_id("open-repository"),
+        ))
+        .center_x(Length::Fill)
+        .height(Length::Fixed(PROJECT_HEADER_HEIGHT))
+        .into();
     }
-    let mut children = vec![
-        widget::column::with_children(vec![
-            widget::text::heading("Projects").into(),
-            widget::text::caption(format!("{project_count} repositories")).into(),
-        ])
-        .spacing(0)
-        .into(),
+    let mut children: Vec<Element<'static, SidebarAction>> = vec![
+        widget::text::caption_heading("Projects").into(),
+        widget::text::caption(project_count.to_string()).into(),
         cosmic::iced::widget::Space::new()
             .width(Length::Fill)
             .into(),
     ];
-    if refresh_enabled {
+    if loading {
+        children.push(
+            widget::progress_bar::circular::Circular::new()
+                .size(16.0)
+                .into(),
+        );
+    } else if refresh_enabled {
         children.push(icon_action(
             "view-refresh-symbolic",
-            "Refresh projects",
+            format!("Refresh {project_count} projects"),
             SidebarAction::Refresh,
             stable_id("refresh"),
         ));
     }
+    children.push(icon_action(
+        "document-open-symbolic",
+        "Open repository",
+        SidebarAction::OpenRepositoryPicker,
+        stable_id("open-repository"),
+    ));
     widget::row::with_children(children)
         .align_y(Alignment::Center)
-        .spacing(spacing.space_xxs)
+        .spacing(spacing.space_xxxs)
         .height(Length::Fixed(PROJECT_HEADER_HEIGHT))
         .width(Length::Fill)
         .into()
 }
 
-fn search<'a>(state: &'a SidebarState, compact: bool) -> Element<'a, SidebarAction> {
-    let width = if compact {
-        let spacing = cosmic::theme::spacing();
-        Length::Fixed(COMPACT_WIDTH - 2.0 * f32::from(spacing.space_xxs))
-    } else {
-        Length::Fill
-    };
+fn footer<'a>(
+    model: &'a SidebarModel,
+    state: &'a SidebarState,
+    compact: bool,
+) -> Element<'a, SidebarAction> {
+    let spacing = cosmic::theme::spacing();
+    if compact {
+        let selected_project_id = state.selection.map(|selection| match selection {
+            SidebarSelection::Project(project_id)
+            | SidebarSelection::Worktree { project_id, .. }
+            | SidebarSelection::PullRequest { project_id, .. } => project_id,
+        });
+        let mut children: Vec<Element<'a, SidebarAction>> = Vec::with_capacity(4);
+        if let Some(project) = selected_project_id
+            .and_then(|project_id| model.projects.iter().find(|project| project.id == project_id))
+        {
+            children.extend([
+                icon_action(
+                    "list-add-symbolic",
+                    &*project.chrome.new_worktree_name,
+                    SidebarAction::NewWorktree {
+                        project_id: project.id,
+                        repository: project.repository.clone(),
+                    },
+                    project.chrome.new_worktree_id.clone(),
+                ),
+                icon_action(
+                    "document-new-symbolic",
+                    &*project.chrome.create_pull_request_name,
+                    SidebarAction::CreatePullRequest {
+                        project_id: project.id,
+                        repository: project.repository.clone(),
+                    },
+                    project.chrome.create_pull_request_id.clone(),
+                ),
+            ]);
+        }
+        children.extend([
+            icon_action(
+                "input-keyboard-symbolic",
+                "Keyboard shortcuts",
+                SidebarAction::OpenShortcuts,
+                stable_id("shortcuts"),
+            ),
+            icon_action(
+                "emblem-system-symbolic",
+                "Settings",
+                SidebarAction::OpenSettings,
+                stable_id("settings"),
+            ),
+        ]);
+        return widget::column::with_children(children)
+            .align_x(Alignment::Center)
+            .spacing(spacing.space_xxxs)
+            .padding(spacing.space_xxxs)
+            .width(Length::Fill)
+            .into();
+    }
+    widget::column::with_children(vec![
+        button::custom(
+            widget::row::with_children(vec![
+                widget::icon::from_name("input-keyboard-symbolic")
+                    .size(16)
+                    .into(),
+                widget::text::body("Keyboard shortcuts").into(),
+            ])
+            .align_y(Alignment::Center)
+            .spacing(spacing.space_xxs),
+        )
+        .class(theme::Button::MenuItem)
+        .id(stable_id("shortcuts"))
+        .name("Keyboard shortcuts")
+        .height(Length::Fixed(40.0))
+        .width(Length::Fill)
+        .on_press(SidebarAction::OpenShortcuts)
+        .into(),
+        button::custom(
+            widget::row::with_children(vec![
+                widget::icon::from_name("emblem-system-symbolic")
+                    .size(16)
+                    .into(),
+                widget::text::body("Settings").into(),
+            ])
+            .align_y(Alignment::Center)
+            .spacing(spacing.space_xxs),
+        )
+        .class(theme::Button::MenuItem)
+        .id(stable_id("settings"))
+        .name("Settings")
+        .height(Length::Fixed(40.0))
+        .width(Length::Fill)
+        .on_press(SidebarAction::OpenSettings)
+        .into(),
+    ])
+    .padding(spacing.space_xxxs)
+    .width(Length::Fill)
+    .into()
+}
+
+fn search<'a>(state: &'a SidebarState, _compact: bool) -> Element<'a, SidebarAction> {
+    let width = Length::Fill;
     let input = widget::text_input::search_input("Search projects", &state.query)
         .on_input(SidebarAction::SearchChanged)
         .width(width);
@@ -784,16 +906,18 @@ fn body<'a>(
     compact: bool,
 ) -> Element<'a, SidebarAction> {
     match &model.data_state {
+        SidebarDataState::Loading if !model.projects.is_empty() => {
+            project_list(model, state, compact)
+        }
         SidebarDataState::Loading => loading(compact),
         SidebarDataState::Error(message) => error(message, compact),
         SidebarDataState::Ready => project_list(model, state, compact),
     }
 }
 
-/// The scrollable project list. The scrollable reports its own viewport on
-/// every redraw whose geometry changed, and that sample selects the mounted
-/// band; `responsive` is avoided here because it does not forward child
-/// accessibility nodes, and every row in this list is a named a11y target.
+/// The scrollable project list. `responsive` is avoided here because it does
+/// not forward child accessibility nodes, and every row in this list is a
+/// named a11y target.
 fn project_list<'a>(
     model: &'a SidebarModel,
     state: &'a SidebarState,
@@ -804,35 +928,26 @@ fn project_list<'a>(
         return empty(state, compact);
     }
 
-    let metrics = Metrics::new();
-    let sections = section_layouts(&projects, state, compact, metrics);
-    let total_height = sections
-        .last()
-        .map_or(0.0, |section| section.start + section.height);
-    let viewport = state.viewport.height as f32;
-    // The scrollable clamps its own offset the same way once the filtered list
-    // shrinks, so both agree without waiting for the next scroll sample.
-    let offset = (state.viewport.offset as f32).min((total_height - viewport).max(0.0));
-    let band = Band {
-        top: offset - ROW_OVERSCAN,
-        bottom: offset + viewport + ROW_OVERSCAN,
-    };
-
+    // A search reveals matches wherever they live, so every section it kept
+    // opens regardless of the persisted collapse state.
+    let searching = !state.query.trim().is_empty();
     let mut column = widget::column::with_capacity(projects.len() * 2).spacing(0);
-    for (index, (project, section)) in projects.iter().zip(&sections).enumerate() {
+    for (index, project) in projects.iter().enumerate() {
         if index > 0 {
             column = column.push(widget::divider::horizontal::light());
         }
-        column = column.push(project_view(project, *section, compact, band));
+        let project_id = project.project.id;
+        column = column.push(project_view(
+            project,
+            searching || state.expanded_projects.contains(&project_id),
+            searching || state.expanded_pull_requests.contains(&project_id),
+            compact,
+            state.selection,
+        ));
     }
 
     widget::scrollable(column)
-        .on_scroll(|viewport| {
-            SidebarAction::Scrolled(SidebarViewport {
-                offset: viewport.absolute_offset().y.max(0.0) as u32,
-                height: viewport.bounds().height.max(0.0) as u32,
-            })
-        })
+        .class(cosmic::style::iced::Scrollable::Minimal)
         .width(Length::Fill)
         .height(Length::Fill)
         .into()
@@ -847,7 +962,7 @@ fn loading(compact: bool) -> Element<'static, SidebarAction> {
         widget::text::caption(if compact {
             "Loading"
         } else {
-            "Loading repositories…"
+            "Loading projects…"
         })
         .into(),
     ])
@@ -941,6 +1056,18 @@ fn empty(state: &SidebarState, compact: bool) -> Element<'static, SidebarAction>
         );
     }
     let spacing = cosmic::theme::spacing();
+    let action_button: Element<'static, SidebarAction> =
+        if state.query.trim().is_empty() && state.filter == SidebarFilter::All {
+            button::suggested(action_label)
+                .id(stable_id("empty.action"))
+                .on_press(action)
+                .into()
+        } else {
+            button::standard(action_label)
+                .id(stable_id("empty.action"))
+                .on_press(action)
+                .into()
+        };
     widget::container(
         widget::column::with_children(vec![
             widget::icon::from_name(icon_name).size(20).into(),
@@ -948,10 +1075,7 @@ fn empty(state: &SidebarState, compact: bool) -> Element<'static, SidebarAction>
             widget::text::caption(detail)
                 .wrapping(cosmic::iced::widget::text::Wrapping::Word)
                 .into(),
-            button::standard(action_label)
-                .id(stable_id("empty.action"))
-                .on_press(action)
-                .into(),
+            action_button,
         ])
         .spacing(spacing.space_xxs),
     )
@@ -962,22 +1086,26 @@ fn empty(state: &SidebarState, compact: bool) -> Element<'static, SidebarAction>
 
 fn project_view<'a>(
     project: &FilteredProject<'a>,
-    section: SectionLayout,
+    expanded: bool,
+    pull_requests_expanded: bool,
     compact: bool,
-    band: Band,
+    selection: Option<SidebarSelection>,
 ) -> Element<'a, SidebarAction> {
     let entity = project.project;
     let chrome = &entity.chrome;
     let project_id = entity.id;
     if compact {
-        return compact_project(project, section, band);
+        return compact_project(project, selection);
     }
 
     let spacing = cosmic::theme::spacing();
     let worktree_count = project.worktrees.len();
     let pull_request_count = project.pull_requests.len();
-    let mut column = widget::column::with_capacity(6).spacing(spacing.space_xxxs);
-    let toggle_icon = if section.expanded {
+    // Header, the worktree caption, every worktree row, and the pull-request
+    // group: the exact child count when the section is open.
+    let mut column =
+        widget::column::with_capacity(worktree_count + 3).spacing(spacing.space_xxxs);
+    let toggle_icon = if expanded {
         "go-down-symbolic"
     } else {
         "go-next-symbolic"
@@ -1015,6 +1143,7 @@ fn project_view<'a>(
     .class(theme::Button::MenuItem)
     .id(chrome.open_id.clone())
     .name(&*chrome.open_name)
+    .selected(selection == Some(SidebarSelection::Project(project_id)))
     .padding([0, spacing.space_xxxs])
     .height(Length::Fixed(PROJECT_HEADER_HEIGHT))
     .width(Length::Fill)
@@ -1032,7 +1161,7 @@ fn project_view<'a>(
         widget::row::with_children(vec![
             icon_action(
                 toggle_icon,
-                if section.expanded {
+                if expanded {
                     &*chrome.collapse_name
                 } else {
                     &*chrome.expand_name
@@ -1063,11 +1192,11 @@ fn project_view<'a>(
         .align_y(Alignment::Center)
         .spacing(spacing.space_xxxs),
     )
-    .class(theme::Container::Secondary)
+    .class(theme::Container::Background)
     .height(Length::Fixed(PROJECT_HEADER_HEIGHT));
     column = column.push(header);
 
-    if section.expanded {
+    if expanded {
         let has_worktrees = worktree_count > 0;
         let has_pull_requests = pull_request_count > 0;
         if has_worktrees {
@@ -1078,28 +1207,20 @@ fn project_view<'a>(
                 .padding([spacing.space_xxxs, spacing.space_s]),
             );
         }
-        let mounted = section.worktrees.mounted(band);
-        if mounted.start > 0 {
-            column = column.push(spacer(section.worktrees.span(mounted.start)));
-        }
-        for index in mounted.clone() {
+        for &worktree in &project.worktrees {
             column = column.push(
-                widget::container(worktree_view(project_id, project.worktrees[index], false))
+                widget::container(worktree_view(project_id, worktree, false, selection))
                     .padding([0, 0, 0, spacing.space_s]),
             );
-        }
-        if worktree_count > mounted.end {
-            column = column.push(spacer(section.worktrees.span(worktree_count - mounted.end)));
         }
         if has_pull_requests {
             column = column.push(
                 widget::container(pull_request_group(
                     entity,
                     &project.pull_requests,
-                    section.pull_requests_expanded,
+                    pull_requests_expanded,
                     false,
-                    section.pull_requests,
-                    band,
+                    selection,
                 ))
                 .padding([spacing.space_xxxs, 0, 0, spacing.space_s]),
             );
@@ -1119,83 +1240,31 @@ fn project_view<'a>(
 
 fn compact_project<'a>(
     project: &FilteredProject<'a>,
-    section: SectionLayout,
-    band: Band,
+    selection: Option<SidebarSelection>,
 ) -> Element<'a, SidebarAction> {
     let entity = project.project;
     let chrome = &entity.chrome;
-    let project_id = entity.id;
-    let spacing = cosmic::theme::spacing();
-    let mut column = widget::column::with_capacity(5)
-        .spacing(spacing.space_xxxs)
-        .align_x(Alignment::Center)
-        .push(icon_action(
-            "folder-symbolic",
-            &*chrome.compact_open_name,
-            SidebarAction::OpenRepository {
-                project_id,
-                repository: entity.repository.clone(),
-            },
-            chrome.open_id.clone(),
-        ))
-        .push(icon_action(
-            if section.expanded {
-                "go-up-symbolic"
-            } else {
-                "go-down-symbolic"
-            },
-            if section.expanded {
-                &*chrome.collapse_name
-            } else {
-                &*chrome.expand_name
-            },
-            SidebarAction::ToggleProject(project_id),
-            chrome.toggle_id.clone(),
-        ))
-        .push(icon_action(
-            "list-add-symbolic",
-            &*chrome.new_worktree_name,
-            SidebarAction::NewWorktree {
-                project_id,
-                repository: entity.repository.clone(),
-            },
-            chrome.new_worktree_id.clone(),
-        ))
-        .push(icon_action(
-            "document-new-symbolic",
-            &*chrome.create_pull_request_name,
-            SidebarAction::CreatePullRequest {
-                project_id,
-                repository: entity.repository.clone(),
-            },
-            chrome.create_pull_request_id.clone(),
-        ));
-    if section.expanded {
-        let worktree_count = project.worktrees.len();
-        let mounted = section.worktrees.mounted(band);
-        if mounted.start > 0 {
-            column = column.push(spacer(section.worktrees.span(mounted.start)));
-        }
-        for index in mounted.clone() {
-            column = column.push(worktree_view(project_id, project.worktrees[index], true));
-        }
-        if worktree_count > mounted.end {
-            column = column.push(spacer(section.worktrees.span(worktree_count - mounted.end)));
-        }
-        if !project.pull_requests.is_empty() {
-            column = column.push(pull_request_group(
-                entity,
-                &project.pull_requests,
-                true,
-                true,
-                section.pull_requests,
-                band,
-            ));
-        }
-    }
-    widget::container(column)
-        .class(theme::Container::Secondary)
-        .padding(spacing.space_xxxs)
+    let selected = matches!(
+        selection,
+        Some(SidebarSelection::Project(project_id))
+            | Some(SidebarSelection::Worktree { project_id, .. })
+            | Some(SidebarSelection::PullRequest { project_id, .. })
+            if project_id == entity.id
+    );
+    let action = button::icon(icon::from_name("folder-symbolic").size(16))
+        .id(chrome.open_id.clone())
+        .name(&*chrome.compact_open_name)
+        .tooltip(&*chrome.compact_open_name)
+        .width(ICON_CONTROL_SIZE)
+        .height(ICON_CONTROL_SIZE)
+        .selected(selected)
+        .on_press(SidebarAction::OpenRepository {
+            project_id: entity.id,
+            repository: entity.repository.clone(),
+        });
+    widget::container(action)
+        .center_x(Length::Fill)
+        .padding(cosmic::theme::spacing().space_xxxs)
         .width(Length::Fill)
         .into()
 }
@@ -1204,6 +1273,7 @@ fn worktree_view<'a>(
     project_id: ProjectId,
     worktree: &'a SidebarWorktree,
     compact: bool,
+    selection: Option<SidebarSelection>,
 ) -> Element<'a, SidebarAction> {
     let chrome = &worktree.chrome;
     if compact {
@@ -1266,6 +1336,13 @@ fn worktree_view<'a>(
     let action = button::custom(row)
         .class(theme::Button::MenuItem)
         .id(chrome.open_id.clone())
+        .selected(
+            selection
+                == Some(SidebarSelection::Worktree {
+                    project_id,
+                    worktree_id: worktree.id,
+                }),
+        )
         .name(&*chrome.accessible_name)
         .padding([0, spacing.space_xxs])
         .height(Length::Fixed(WORKTREE_ROW_HEIGHT))
@@ -1288,8 +1365,7 @@ fn pull_request_group<'a>(
     pull_requests: &[&'a SidebarPullRequest],
     expanded: bool,
     compact: bool,
-    block: RowBlock,
-    band: Band,
+    selection: Option<SidebarSelection>,
 ) -> Element<'a, SidebarAction> {
     let chrome = &project.chrome;
     let spacing = cosmic::theme::spacing();
@@ -1320,15 +1396,9 @@ fn pull_request_group<'a>(
         );
     }
     if expanded {
-        let mounted = block.mounted(band);
-        if mounted.start > 0 {
-            column = column.push(spacer(block.span(mounted.start)));
-        }
-        for index in mounted.clone() {
-            column = column.push(pull_request_view(project.id, pull_requests[index], compact));
-        }
-        if pull_requests.len() > mounted.end {
-            column = column.push(spacer(block.span(pull_requests.len() - mounted.end)));
+        for &pull_request in pull_requests {
+            column =
+                column.push(pull_request_view(project.id, pull_request, compact, selection));
         }
     }
     column.into()
@@ -1338,6 +1408,7 @@ fn pull_request_view<'a>(
     project_id: ProjectId,
     pull_request: &'a SidebarPullRequest,
     compact: bool,
+    selection: Option<SidebarSelection>,
 ) -> Element<'a, SidebarAction> {
     let chrome = &pull_request.chrome;
     let action = SidebarAction::OpenPullRequest {
@@ -1396,6 +1467,13 @@ fn pull_request_view<'a>(
         .class(theme::Button::MenuItem)
         .id(chrome.open_id.clone())
         .name(&*chrome.accessible_name)
+        .selected(
+            selection
+                == Some(SidebarSelection::PullRequest {
+                    project_id,
+                    number: pull_request.number,
+                }),
+        )
         .padding([0, spacing.space_xxs])
         .height(Length::Fixed(PULL_REQUEST_ROW_HEIGHT))
         .width(Length::Fill)
@@ -1422,15 +1500,6 @@ fn icon_action<'a>(
         .width(ICON_CONTROL_SIZE)
         .height(ICON_CONTROL_SIZE)
         .on_press(action)
-        .into()
-}
-
-/// Stands in for rows outside the mounted band, holding the exact height they
-/// would have occupied so the scrollbar and scroll offset are unaffected.
-fn spacer<'a>(height: f32) -> Element<'a, SidebarAction> {
-    widget::Space::new()
-        .width(Length::Fill)
-        .height(Length::Fixed(height))
         .into()
 }
 
@@ -1526,258 +1595,6 @@ fn check_description(status: CheckStatus) -> &'static str {
         CheckStatus::Pending => "pending",
         CheckStatus::Failing => "failing",
         CheckStatus::Unknown => "unknown",
-    }
-}
-
-/// Vertical span of scroll-content pixels whose rows are mounted as widgets.
-#[derive(Debug, Clone, Copy)]
-struct Band {
-    top: f32,
-    bottom: f32,
-}
-
-/// A run of equally sized rows laid out consecutively inside one column.
-#[derive(Debug, Clone, Copy)]
-struct RowBlock {
-    start: f32,
-    height: f32,
-    pitch: f32,
-    count: usize,
-}
-
-impl RowBlock {
-    fn empty(start: f32, height: f32, gap: f32) -> Self {
-        Self {
-            start,
-            height,
-            pitch: height + gap,
-            count: 0,
-        }
-    }
-
-    /// The contiguous rows intersecting `band`. Rows are uniform, so the range
-    /// is closed-form rather than a scan.
-    fn mounted(self, band: Band) -> Range<usize> {
-        if self.count == 0 || self.pitch <= 0.0 {
-            return 0..0;
-        }
-        let first = ((band.top - self.start - self.height) / self.pitch)
-            .ceil()
-            .max(0.0) as usize;
-        let last = ((band.bottom - self.start) / self.pitch).floor();
-        if last < 0.0 || first >= self.count {
-            return 0..0;
-        }
-        let last = (last as usize).min(self.count - 1);
-        if first > last {
-            return 0..0;
-        }
-        first..last + 1
-    }
-
-    /// Height of `count` consecutive rows including the gaps between them,
-    /// which is exactly what a spacer must reserve to replace them.
-    fn span(self, count: usize) -> f32 {
-        match count {
-            0 => 0.0,
-            count => count as f32 * self.height + (count - 1) as f32 * (self.pitch - self.height),
-        }
-    }
-}
-
-/// Fixed heights the virtualized list needs. Every value must match the widgets
-/// `project_view` builds, or the scroll extent would drift from the content.
-#[derive(Debug, Clone, Copy)]
-struct Metrics {
-    gap: f32,
-    section_caption: f32,
-    empty_caption: f32,
-    pull_request_padding: f32,
-    compact_padding: f32,
-}
-
-impl Metrics {
-    fn new() -> Self {
-        let spacing = cosmic::theme::spacing();
-        let gap = f32::from(spacing.space_xxxs);
-        Self {
-            gap,
-            section_caption: CAPTION_LINE_HEIGHT + 2.0 * gap,
-            empty_caption: CAPTION_LINE_HEIGHT + 2.0 * f32::from(spacing.space_xxs),
-            pull_request_padding: gap,
-            compact_padding: gap,
-        }
-    }
-}
-
-/// Where one project's section sits in the scroll content, and where its
-/// virtualized row runs begin.
-#[derive(Debug, Clone, Copy)]
-struct SectionLayout {
-    start: f32,
-    height: f32,
-    expanded: bool,
-    pull_requests_expanded: bool,
-    worktrees: RowBlock,
-    pull_requests: RowBlock,
-}
-
-/// Accumulates one column's vertical layout so the view and the virtualization
-/// agree on every row's position.
-struct ColumnCursor {
-    y: f32,
-    gap: f32,
-    children: usize,
-}
-
-impl ColumnCursor {
-    fn new(y: f32, gap: f32) -> Self {
-        Self {
-            y,
-            gap,
-            children: 0,
-        }
-    }
-
-    /// Reserves one child of `height` and returns its top edge.
-    fn push(&mut self, height: f32) -> f32 {
-        if self.children > 0 {
-            self.y += self.gap;
-        }
-        self.children += 1;
-        let top = self.y;
-        self.y += height;
-        top
-    }
-
-    /// Reserves `count` consecutive children of `height`.
-    fn push_rows(&mut self, count: usize, height: f32) -> RowBlock {
-        let mut block = RowBlock::empty(self.y, height, self.gap);
-        if count == 0 {
-            return block;
-        }
-        block.start = self.push(height);
-        block.count = count;
-        self.y += (count - 1) as f32 * block.pitch;
-        self.children += count - 1;
-        block
-    }
-}
-
-fn section_layouts(
-    projects: &[FilteredProject<'_>],
-    state: &SidebarState,
-    compact: bool,
-    metrics: Metrics,
-) -> Vec<SectionLayout> {
-    let searching = !state.query.trim().is_empty();
-    let mut sections = Vec::with_capacity(projects.len());
-    let mut start = 0.0;
-    for (index, project) in projects.iter().enumerate() {
-        if index > 0 {
-            start += SECTION_DIVIDER_HEIGHT;
-        }
-        let section = if compact {
-            compact_section(project, state, searching, start, metrics)
-        } else {
-            expanded_section(project, state, searching, start, metrics)
-        };
-        start = section.start + section.height;
-        sections.push(section);
-    }
-    sections
-}
-
-fn expanded_section(
-    project: &FilteredProject<'_>,
-    state: &SidebarState,
-    searching: bool,
-    start: f32,
-    metrics: Metrics,
-) -> SectionLayout {
-    let project_id = project.project.id;
-    let expanded = searching || state.expanded_projects.contains(&project_id);
-    let pull_requests_expanded = searching || state.expanded_pull_requests.contains(&project_id);
-    let worktree_count = project.worktrees.len();
-    let pull_request_count = project.pull_requests.len();
-
-    let mut cursor = ColumnCursor::new(start, metrics.gap);
-    cursor.push(PROJECT_HEADER_HEIGHT);
-    let mut worktrees = RowBlock::empty(cursor.y, WORKTREE_ROW_HEIGHT, metrics.gap);
-    let mut pull_requests = RowBlock::empty(cursor.y, PULL_REQUEST_ROW_HEIGHT, metrics.gap);
-    if expanded {
-        if worktree_count > 0 {
-            cursor.push(metrics.section_caption);
-        }
-        worktrees = cursor.push_rows(worktree_count, WORKTREE_ROW_HEIGHT);
-        if pull_request_count > 0 {
-            let rows = if pull_requests_expanded {
-                pull_request_count
-            } else {
-                0
-            };
-            let group =
-                ICON_CONTROL_SIZE + rows as f32 * (metrics.gap + PULL_REQUEST_ROW_HEIGHT);
-            let top = cursor.push(metrics.pull_request_padding + group);
-            pull_requests = RowBlock {
-                start: top + metrics.pull_request_padding + ICON_CONTROL_SIZE + metrics.gap,
-                height: PULL_REQUEST_ROW_HEIGHT,
-                pitch: PULL_REQUEST_ROW_HEIGHT + metrics.gap,
-                count: rows,
-            };
-        }
-        if worktree_count == 0 && pull_request_count == 0 {
-            cursor.push(metrics.empty_caption);
-        }
-    }
-
-    SectionLayout {
-        start,
-        height: cursor.y - start,
-        expanded,
-        pull_requests_expanded,
-        worktrees,
-        pull_requests,
-    }
-}
-
-fn compact_section(
-    project: &FilteredProject<'_>,
-    state: &SidebarState,
-    searching: bool,
-    start: f32,
-    metrics: Metrics,
-) -> SectionLayout {
-    let expanded = searching || state.expanded_projects.contains(&project.project.id);
-    let mut cursor = ColumnCursor::new(start + metrics.compact_padding, metrics.gap);
-    for _ in 0..COMPACT_PROJECT_CONTROLS {
-        cursor.push(ICON_CONTROL_SIZE);
-    }
-    let mut worktrees = RowBlock::empty(cursor.y, ICON_CONTROL_SIZE, metrics.gap);
-    let mut pull_requests = RowBlock::empty(cursor.y, ICON_CONTROL_SIZE, metrics.gap);
-    if expanded {
-        worktrees = cursor.push_rows(project.worktrees.len(), ICON_CONTROL_SIZE);
-        let count = project.pull_requests.len();
-        if count > 0 {
-            let group = count as f32 * ICON_CONTROL_SIZE + (count - 1) as f32 * metrics.gap;
-            let top = cursor.push(group);
-            pull_requests = RowBlock {
-                start: top,
-                height: ICON_CONTROL_SIZE,
-                pitch: ICON_CONTROL_SIZE + metrics.gap,
-                count,
-            };
-        }
-    }
-
-    SectionLayout {
-        start,
-        height: cursor.y - start + metrics.compact_padding,
-        expanded,
-        // The compact rail has no pull-request disclosure of its own.
-        pull_requests_expanded: true,
-        worktrees,
-        pull_requests,
     }
 }
 
@@ -2045,5 +1862,55 @@ mod tests {
             CheckStatus::Failing
         );
         assert_eq!(CheckStatus::from_checks(&[]), CheckStatus::Unknown);
+    }
+
+    #[test]
+    fn sidebar_width_uses_compact_rail_and_clamped_persisted_expansion() {
+        assert_eq!(effective_width(SidebarMode::Compact, 320.0), 56.0);
+        assert_eq!(effective_width(SidebarMode::Expanded, 280.0), 280.0);
+        assert_eq!(effective_width(SidebarMode::Expanded, 120.0), 240.0);
+        assert_eq!(effective_width(SidebarMode::Expanded, 480.0), 360.0);
+        assert_eq!(effective_width(SidebarMode::Expanded, f32::NAN), 280.0);
+    }
+
+    #[test]
+    fn opening_entities_updates_only_the_selected_navigation_identity() {
+        let project = project_id(1);
+        let worktree = worktree(2, "main", false);
+        let mut state = SidebarState::default();
+        state.apply(&SidebarAction::OpenRepository {
+            project_id: project,
+            repository: "/repo/cagents".into(),
+        });
+        assert_eq!(
+            state.selection,
+            Some(SidebarSelection::Project(project))
+        );
+
+        state.apply(&SidebarAction::OpenWorktree {
+            project_id: project,
+            worktree_id: worktree.id,
+            path: worktree.path.clone(),
+        });
+        assert_eq!(
+            state.selection,
+            Some(SidebarSelection::Worktree {
+                project_id: project,
+                worktree_id: worktree.id,
+            })
+        );
+
+        state.apply(&SidebarAction::OpenPullRequest {
+            project_id: project,
+            number: 42,
+            url: Url::parse("https://github.com/example/cagents/pull/42").unwrap(),
+        });
+        assert_eq!(
+            state.selection,
+            Some(SidebarSelection::PullRequest {
+                project_id: project,
+                number: 42,
+            })
+        );
     }
 }

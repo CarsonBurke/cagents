@@ -48,6 +48,117 @@ pub enum GlobalShortcut {
     FocusAdjacent(FocusDirection),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ShortcutKey {
+    Latin(char),
+    ArrowLeft,
+    ArrowRight,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ShortcutChord {
+    modifiers: keyboard::Modifiers,
+    key: ShortcutKey,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ShortcutDescriptor {
+    pub action: GlobalShortcut,
+    pub label: &'static str,
+    pub keys: &'static str,
+    pub spoken_keys: &'static str,
+    pub repeatable: bool,
+    chords: &'static [ShortcutChord],
+}
+
+const CTRL_T: &[ShortcutChord] = &[ShortcutChord {
+    modifiers: keyboard::Modifiers::CTRL,
+    key: ShortcutKey::Latin('t'),
+}];
+const CTRL_W: &[ShortcutChord] = &[ShortcutChord {
+    modifiers: keyboard::Modifiers::CTRL,
+    key: ShortcutKey::Latin('w'),
+}];
+const CTRL_F: &[ShortcutChord] = &[ShortcutChord {
+    modifiers: keyboard::Modifiers::CTRL,
+    key: ShortcutKey::Latin('f'),
+}];
+const PREVIOUS_COLUMN: &[ShortcutChord] = &[
+    ShortcutChord {
+        modifiers: keyboard::Modifiers::ALT,
+        key: ShortcutKey::Latin('q'),
+    },
+    ShortcutChord {
+        modifiers: keyboard::Modifiers::ALT,
+        key: ShortcutKey::ArrowLeft,
+    },
+];
+const NEXT_COLUMN: &[ShortcutChord] = &[
+    ShortcutChord {
+        modifiers: keyboard::Modifiers::ALT,
+        key: ShortcutKey::Latin('w'),
+    },
+    ShortcutChord {
+        modifiers: keyboard::Modifiers::ALT,
+        key: ShortcutKey::ArrowRight,
+    },
+];
+
+pub const GLOBAL_SHORTCUT_DESCRIPTORS: &[ShortcutDescriptor] = &[
+    ShortcutDescriptor {
+        action: GlobalShortcut::NewTerminal,
+        label: "New terminal",
+        keys: "Ctrl+T",
+        spoken_keys: "Control plus T",
+        repeatable: false,
+        chords: CTRL_T,
+    },
+    ShortcutDescriptor {
+        action: GlobalShortcut::CloseFocusedCard,
+        label: "Close focused column",
+        keys: "Ctrl+W",
+        spoken_keys: "Control plus W",
+        repeatable: false,
+        chords: CTRL_W,
+    },
+    ShortcutDescriptor {
+        action: GlobalShortcut::FocusProjectSearch,
+        label: "Search projects",
+        keys: "Ctrl+F",
+        spoken_keys: "Control plus F",
+        repeatable: false,
+        chords: CTRL_F,
+    },
+    ShortcutDescriptor {
+        action: GlobalShortcut::FocusAdjacent(FocusDirection::Left),
+        label: "Previous column",
+        keys: "Alt+Q / Alt+Left",
+        spoken_keys: "Alt plus Q or Alt plus Left Arrow",
+        repeatable: true,
+        chords: PREVIOUS_COLUMN,
+    },
+    ShortcutDescriptor {
+        action: GlobalShortcut::FocusAdjacent(FocusDirection::Right),
+        label: "Next column",
+        keys: "Alt+W / Alt+Right",
+        spoken_keys: "Alt plus W or Alt plus Right Arrow",
+        repeatable: true,
+        chords: NEXT_COLUMN,
+    },
+];
+
+pub fn shortcut_descriptor(action: GlobalShortcut) -> &'static ShortcutDescriptor {
+    GLOBAL_SHORTCUT_DESCRIPTORS
+        .iter()
+        .find(|descriptor| descriptor.action == action)
+        .expect("every dispatched global shortcut has a descriptor")
+}
+
+pub fn shortcut_tooltip(action: GlobalShortcut) -> String {
+    let descriptor = shortcut_descriptor(action);
+    format!("{} — {}", descriptor.label, descriptor.keys)
+}
+
 #[derive(Debug, Default)]
 pub struct FrameClock {
     last: Option<Instant>,
@@ -169,11 +280,8 @@ pub fn global_shortcut(event: &keyboard::Event) -> Option<GlobalShortcut> {
     else {
         return None;
     };
-    let normalized = modifiers.difference(keyboard::Modifiers::CAPS_LOCK);
-    if *repeat && normalized == keyboard::Modifiers::CTRL {
-        return None;
-    }
-    global_shortcut_chord(key, *physical_key, *modifiers)
+    let descriptor = global_shortcut_descriptor(key, *physical_key, *modifiers)?;
+    (!*repeat || descriptor.repeatable).then_some(descriptor.action)
 }
 
 pub(crate) fn is_global_shortcut_chord(
@@ -189,31 +297,37 @@ fn global_shortcut_chord(
     physical_key: keyboard::key::Physical,
     modifiers: keyboard::Modifiers,
 ) -> Option<GlobalShortcut> {
+    global_shortcut_descriptor(key, physical_key, modifiers).map(|descriptor| descriptor.action)
+}
+
+fn global_shortcut_descriptor(
+    key: &keyboard::Key,
+    physical_key: keyboard::key::Physical,
+    modifiers: keyboard::Modifiers,
+) -> Option<&'static ShortcutDescriptor> {
     let modifiers = modifiers.difference(keyboard::Modifiers::CAPS_LOCK);
-    if modifiers == keyboard::Modifiers::CTRL {
-        return match latin_key(key, physical_key) {
-            Some('t') => Some(GlobalShortcut::NewTerminal),
-            Some('w') => Some(GlobalShortcut::CloseFocusedCard),
-            Some('f') => Some(GlobalShortcut::FocusProjectSearch),
-            _ => None,
-        };
-    }
-    if modifiers != keyboard::Modifiers::ALT {
-        return None;
-    }
-    match key.as_ref() {
-        keyboard::Key::Named(keyboard::key::Named::ArrowLeft) => {
-            Some(GlobalShortcut::FocusAdjacent(FocusDirection::Left))
-        }
-        keyboard::Key::Named(keyboard::key::Named::ArrowRight) => {
-            Some(GlobalShortcut::FocusAdjacent(FocusDirection::Right))
-        }
-        _ => match latin_key(key, physical_key) {
-            Some('q') => Some(GlobalShortcut::FocusAdjacent(FocusDirection::Left)),
-            Some('w') => Some(GlobalShortcut::FocusAdjacent(FocusDirection::Right)),
-            _ => None,
-        },
-    }
+    GLOBAL_SHORTCUT_DESCRIPTORS.iter().find(|descriptor| {
+        descriptor.chords.iter().any(|chord| {
+            chord.modifiers == modifiers
+                && match chord.key {
+                    ShortcutKey::Latin(expected) => {
+                        latin_key(key, physical_key) == Some(expected)
+                    }
+                    ShortcutKey::ArrowLeft => {
+                        matches!(
+                            key.as_ref(),
+                            keyboard::Key::Named(keyboard::key::Named::ArrowLeft)
+                        )
+                    }
+                    ShortcutKey::ArrowRight => {
+                        matches!(
+                            key.as_ref(),
+                            keyboard::Key::Named(keyboard::key::Named::ArrowRight)
+                        )
+                    }
+                }
+        })
+    })
 }
 
 fn latin_key(key: &keyboard::Key, physical_key: keyboard::key::Physical) -> Option<char> {
@@ -273,10 +387,11 @@ where
         let on_viewport_for_scroll = on_viewport.clone();
         let scrollable = cosmic::widget::scrollable::horizontal(strip)
             .id(scroll_id.clone())
+            .class(cosmic::style::iced::Scrollable::Minimal)
             .width(Length::Fill)
             .height(Length::Fill)
-            // Native COSMIC dimensions retain a practical pointer target; the
-            // scrollable omits its rail automatically when there is no overflow.
+            // Minimal native chrome auto-hides the rail when idle and omits it
+            // entirely when the strip does not overflow.
             .on_scroll(move |viewport| {
                 on_viewport_for_scroll(WorkspaceViewportEvent::Scrolled(ViewportSample {
                     offset: viewport.absolute_offset().x,
@@ -1576,6 +1691,48 @@ mod tests {
             workspace.focus_adjacent(direction).unwrap();
         }
         assert_eq!(workspace.focused(), Some(cards[0]));
+    }
+
+    #[test]
+    fn every_shortcut_descriptor_is_the_dispatchers_single_source_of_truth() {
+        use keyboard::key::{Code, Named, Physical};
+
+        for descriptor in GLOBAL_SHORTCUT_DESCRIPTORS {
+            assert!(!descriptor.label.is_empty());
+            assert!(!descriptor.keys.is_empty());
+            assert!(!descriptor.spoken_keys.is_empty());
+            for chord in descriptor.chords {
+                let (key, physical) = match chord.key {
+                    ShortcutKey::Latin(character) => {
+                        let code = match character {
+                            't' => Code::KeyT,
+                            'w' => Code::KeyW,
+                            'f' => Code::KeyF,
+                            'q' => Code::KeyQ,
+                            other => panic!("unexpected descriptor key {other}"),
+                        };
+                        (keyboard::Key::Character(character.to_string().into()), Physical::Code(code))
+                    }
+                    ShortcutKey::ArrowLeft => (
+                        keyboard::Key::Named(Named::ArrowLeft),
+                        Physical::Code(Code::ArrowLeft),
+                    ),
+                    ShortcutKey::ArrowRight => (
+                        keyboard::Key::Named(Named::ArrowRight),
+                        Physical::Code(Code::ArrowRight),
+                    ),
+                };
+                assert_eq!(
+                    global_shortcut_chord(&key, physical, chord.modifiers),
+                    Some(descriptor.action),
+                    "{} must dispatch from its displayed descriptor",
+                    descriptor.keys
+                );
+            }
+        }
+        assert!(GLOBAL_SHORTCUT_DESCRIPTORS.iter().all(|descriptor| {
+            !descriptor.keys.contains("Alt+A") && !descriptor.spoken_keys.contains("Alt plus A")
+        }));
     }
 
     #[test]
