@@ -21,6 +21,18 @@ const PERSIST_DEBOUNCE: Duration = Duration::from_millis(250);
 const PERSIST_RETRY_INITIAL: Duration = Duration::from_millis(100);
 const PERSIST_RETRY_MAX: Duration = Duration::from_secs(2);
 
+/// How long the final flush at shutdown keeps retrying before abandoning what
+/// it could not write.
+///
+/// One attempt can spend a whole busy timeout blocked on another cagents
+/// instance's write lock — 5s by default, and `MAX_BUSY_TIMEOUT` allows 10s —
+/// so a budget anywhere near that ceiling would buy exactly one attempt, which
+/// is the single-attempt loss this bound exists to rule out. 15s outlasts even
+/// the largest configurable timeout with room for a retry, and at the default
+/// it is worth several. It is also the cap on how long exit can wait: quitting
+/// cannot turn into a hang on a database that will never accept the write.
+const SHUTDOWN_FLUSH_BUDGET: Duration = Duration::from_secs(15);
+
 #[derive(Debug, Error)]
 pub enum SessionError {
     #[error("cagents data directory is unavailable")]
@@ -105,25 +117,27 @@ impl SessionRuntime {
             .flatten();
         let projects = store.list_projects()?;
         let worktrees = store.list_worktrees()?;
-        let persisted_generation = restored.as_ref().map_or(0, |state| state.generation);
-        let card_generations = restored
-            .as_ref()
-            .map(|state| {
-                state
-                    .cards
-                    .iter()
-                    .map(|card| (card.id, card.generation))
-                    .collect()
-            })
-            .unwrap_or_default();
-        let project_generations = projects
-            .iter()
-            .map(|project| (project.id, project.generation))
-            .collect();
-        let worktree_generations = worktrees
-            .iter()
-            .map(|worktree| (worktree.id, worktree.generation))
-            .collect();
+        let writes = PendingWrites::restored(
+            restored.as_ref().map_or(0, |state| state.generation),
+            restored
+                .as_ref()
+                .map(|state| {
+                    state
+                        .cards
+                        .iter()
+                        .map(|card| (card.id, card.generation))
+                        .collect()
+                })
+                .unwrap_or_default(),
+            projects
+                .iter()
+                .map(|project| (project.id, project.generation))
+                .collect(),
+            worktrees
+                .iter()
+                .map(|worktree| (worktree.id, worktree.generation))
+                .collect(),
+        );
 
         let queue = Arc::new((Mutex::new(QueueState::default()), Condvar::new()));
         let last_error = Arc::new(Mutex::new(None));
@@ -134,12 +148,10 @@ impl SessionRuntime {
             .spawn(move || {
                 persistence_loop(
                     store,
-                    persisted_generation,
-                    card_generations,
-                    project_generations,
-                    worktree_generations,
+                    writes,
                     worker_queue,
                     worker_error,
+                    SHUTDOWN_FLUSH_BUDGET,
                 )
             })
             .map_err(SessionError::Worker)?;
@@ -250,19 +262,132 @@ impl Drop for SessionRuntime {
     }
 }
 
+/// Everything the writer lane still owes storage, plus the storage generations
+/// the next attempt has to write against.
+///
+/// Keeping them in one place is what lets the shutdown path retry the very same
+/// flush the steady-state path runs, rather than a one-shot imitation of it.
+#[derive(Debug)]
+struct PendingWrites {
+    workspace: Option<Arc<WorkspaceState>>,
+    projects: HashMap<ProjectId, ProjectState>,
+    worktrees: HashMap<WorktreeId, WorktreeState>,
+    terminal_replacements: HashMap<CardId, TerminalIdentityReplacement>,
+    workspace_generation: u64,
+    card_generations: BTreeMap<CardId, u64>,
+    project_generations: HashMap<ProjectId, u64>,
+    worktree_generations: HashMap<WorktreeId, u64>,
+}
+
+impl PendingWrites {
+    /// A lane that owes storage nothing yet and writes against the generations
+    /// the session was restored at.
+    fn restored(
+        workspace_generation: u64,
+        card_generations: BTreeMap<CardId, u64>,
+        project_generations: HashMap<ProjectId, u64>,
+        worktree_generations: HashMap<WorktreeId, u64>,
+    ) -> Self {
+        Self {
+            workspace: None,
+            projects: HashMap::new(),
+            worktrees: HashMap::new(),
+            terminal_replacements: HashMap::new(),
+            workspace_generation,
+            card_generations,
+            project_generations,
+            worktree_generations,
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.workspace.is_none()
+            && self.projects.is_empty()
+            && self.worktrees.is_empty()
+            && self.terminal_replacements.is_empty()
+    }
+
+    /// Applies everything still pending, leaving whatever failed queued for a
+    /// later attempt. Returns one message per failed write.
+    fn flush(&mut self, store: &StateStore) -> Vec<String> {
+        let mut errors = Vec::new();
+        let replacement_cards = self
+            .terminal_replacements
+            .keys()
+            .copied()
+            .collect::<Vec<_>>();
+        for card_id in replacement_cards {
+            let replacement = &self.terminal_replacements[&card_id];
+            match store.replace_terminal_identity(
+                replacement.card_id,
+                replacement.expected_terminal_id,
+                &replacement.replacement,
+            ) {
+                Ok(()) => {
+                    self.terminal_replacements.remove(&card_id);
+                }
+                Err(error) => errors.push(error.to_string()),
+            }
+        }
+
+        // A snapshot still names the pre-replacement terminal identity until
+        // every queued replacement has landed, so it waits for them.
+        if self.terminal_replacements.is_empty()
+            && let Some(snapshot) = self.workspace.as_deref()
+        {
+            match store.save_workspace(
+                snapshot,
+                SnapshotBase {
+                    workspace: self.workspace_generation,
+                    cards: &self.card_generations,
+                },
+            ) {
+                Ok(commit) => {
+                    self.workspace_generation = commit.generation;
+                    self.card_generations = commit.card_generations;
+                    self.workspace = None;
+                }
+                Err(error) => errors.push(error.to_string()),
+            }
+        }
+
+        let project_ids = self.projects.keys().copied().collect::<Vec<_>>();
+        for id in project_ids {
+            let mut project = self.projects[&id].clone();
+            project.generation = self.project_generations.get(&id).copied().unwrap_or(0);
+            match store.save_project(&project) {
+                Ok(generation) => {
+                    self.project_generations.insert(id, generation);
+                    self.projects.remove(&id);
+                }
+                Err(error) => errors.push(error.to_string()),
+            }
+        }
+
+        let worktree_ids = self.worktrees.keys().copied().collect::<Vec<_>>();
+        for id in worktree_ids {
+            let mut worktree = self.worktrees[&id].clone();
+            worktree.generation = self.worktree_generations.get(&id).copied().unwrap_or(0);
+            match store.save_worktree(&worktree) {
+                Ok(generation) => {
+                    self.worktree_generations.insert(id, generation);
+                    self.worktrees.remove(&id);
+                }
+                Err(error) => errors.push(error.to_string()),
+            }
+        }
+
+        errors
+    }
+}
+
 fn persistence_loop(
     store: StateStore,
-    mut persisted_generation: u64,
-    mut card_generations: BTreeMap<CardId, u64>,
-    mut project_generations: HashMap<ProjectId, u64>,
-    mut worktree_generations: HashMap<WorktreeId, u64>,
+    mut writes: PendingWrites,
     queue: Arc<(Mutex<QueueState>, Condvar)>,
     last_error: Arc<Mutex<Option<String>>>,
+    shutdown_flush_budget: Duration,
 ) {
-    let mut pending: Option<Arc<WorkspaceState>> = None;
-    let mut pending_projects = HashMap::<ProjectId, ProjectState>::new();
-    let mut pending_worktrees = HashMap::<WorktreeId, WorktreeState>::new();
-    let mut pending_terminal_replacements = HashMap::<CardId, TerminalIdentityReplacement>::new();
     let mut due: Option<Instant> = None;
     let mut retry_delay = PERSIST_RETRY_INITIAL;
 
@@ -303,12 +428,12 @@ fn persistence_loop(
             || !state.worktrees.is_empty()
             || !state.terminal_replacements.is_empty();
         if let Some(latest) = state.latest.take() {
-            pending = Some(latest);
+            writes.workspace = Some(latest);
         }
-        pending_projects.extend(std::mem::take(&mut state.projects));
-        pending_worktrees.extend(std::mem::take(&mut state.worktrees));
+        writes.projects.extend(std::mem::take(&mut state.projects));
+        writes.worktrees.extend(std::mem::take(&mut state.worktrees));
         for replacement in std::mem::take(&mut state.terminal_replacements).into_values() {
-            merge_terminal_replacement(&mut pending_terminal_replacements, replacement);
+            merge_terminal_replacement(&mut writes.terminal_replacements, replacement);
         }
         if received_changes {
             due = Some(Instant::now() + PERSIST_DEBOUNCE);
@@ -318,92 +443,38 @@ fn persistence_loop(
         drop(state);
 
         if should_persist {
-            let mut batch_errors = Vec::new();
-            let replacement_cards = pending_terminal_replacements
-                .keys()
-                .copied()
-                .collect::<Vec<_>>();
-            for card_id in replacement_cards {
-                let replacement = &pending_terminal_replacements[&card_id];
-                match store.replace_terminal_identity(
-                    replacement.card_id,
-                    replacement.expected_terminal_id,
-                    &replacement.replacement,
-                ) {
-                    Ok(()) => {
-                        pending_terminal_replacements.remove(&card_id);
-                    }
-                    Err(error) => batch_errors.push(error.to_string()),
-                }
-            }
-
-            if pending_terminal_replacements.is_empty()
-                && let Some(snapshot) = pending.as_deref()
-            {
-                match store.save_workspace(
-                    snapshot,
-                    SnapshotBase {
-                        workspace: persisted_generation,
-                        cards: &card_generations,
-                    },
-                ) {
-                    Ok(commit) => {
-                        persisted_generation = commit.generation;
-                        card_generations = commit.card_generations;
-                        pending = None;
-                    }
-                    Err(error) => batch_errors.push(error.to_string()),
-                }
-            }
-
-            let project_ids = pending_projects.keys().copied().collect::<Vec<_>>();
-            for id in project_ids {
-                let mut project = pending_projects[&id].clone();
-                project.generation = project_generations.get(&id).copied().unwrap_or(0);
-                match store.save_project(&project) {
-                    Ok(generation) => {
-                        project_generations.insert(id, generation);
-                        pending_projects.remove(&id);
-                    }
-                    Err(error) => batch_errors.push(error.to_string()),
-                }
-            }
-
-            let worktree_ids = pending_worktrees.keys().copied().collect::<Vec<_>>();
-            for id in worktree_ids {
-                let mut worktree = pending_worktrees[&id].clone();
-                worktree.generation = worktree_generations.get(&id).copied().unwrap_or(0);
-                match store.save_worktree(&worktree) {
-                    Ok(generation) => {
-                        worktree_generations.insert(id, generation);
-                        pending_worktrees.remove(&id);
-                    }
-                    Err(error) => batch_errors.push(error.to_string()),
-                }
-            }
-
-            let has_pending = pending.is_some()
-                || !pending_projects.is_empty()
-                || !pending_worktrees.is_empty()
-                || !pending_terminal_replacements.is_empty();
-            if let Ok(mut error) = last_error.lock() {
-                *error = (!batch_errors.is_empty()).then(|| batch_errors.join("; "));
-            }
-            if has_pending {
-                due = Some(Instant::now() + retry_delay);
-                retry_delay = retry_delay.saturating_mul(2).min(PERSIST_RETRY_MAX);
-            } else {
+            record_flush_errors(&last_error, writes.flush(&store));
+            if writes.is_empty() {
                 due = None;
                 retry_delay = PERSIST_RETRY_INITIAL;
+            } else {
+                due = Some(Instant::now() + retry_delay);
+                retry_delay = retry_delay.saturating_mul(2).min(PERSIST_RETRY_MAX);
             }
         }
 
         if shutdown {
-            let has_pending = pending.is_some()
-                || !pending_projects.is_empty()
-                || !pending_worktrees.is_empty()
-                || !pending_terminal_replacements.is_empty();
-            if !has_pending
+            // The steady-state lane retries a failed batch until it lands, so
+            // the last flush of the session has to as well: the single attempt
+            // this once made discarded the user's final snapshot the first time
+            // storage was momentarily unwritable.
+            let deadline = Instant::now() + shutdown_flush_budget;
+            while !writes.is_empty() {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    break;
+                }
+                // A failing batch is usually blocked behind a lock another
+                // process holds, so retrying instantly would only burn the
+                // budget; the steady-state backoff already paces that wait.
+                thread::sleep(retry_delay.min(remaining));
+                record_flush_errors(&last_error, writes.flush(&store));
+                retry_delay = retry_delay.saturating_mul(2).min(PERSIST_RETRY_MAX);
+            }
+            // `clean_shutdown` asserts that storage holds everything this
+            // session produced, so only a complete flush earns it; otherwise
+            // the next open must recover rather than trust the database.
+            if writes.is_empty()
                 && let Err(error) = store.shutdown()
                 && let Ok(mut message) = last_error.lock()
             {
@@ -411,6 +482,12 @@ fn persistence_loop(
             }
             return;
         }
+    }
+}
+
+fn record_flush_errors(last_error: &Mutex<Option<String>>, errors: Vec<String>) {
+    if let Ok(mut slot) = last_error.lock() {
+        *slot = (!errors.is_empty()).then(|| errors.join("; "));
     }
 }
 
@@ -665,12 +742,10 @@ mod tests {
         let worker = thread::spawn(move || {
             persistence_loop(
                 store,
-                0,
-                BTreeMap::new(),
-                HashMap::new(),
-                HashMap::new(),
+                PendingWrites::restored(0, BTreeMap::new(), HashMap::new(), HashMap::new()),
                 worker_queue,
                 worker_error,
+                SHUTDOWN_FLUSH_BUDGET,
             );
         });
 
@@ -729,12 +804,12 @@ mod tests {
 
         persistence_loop(
             store,
-            0,
-            BTreeMap::new(),
-            HashMap::new(),
-            HashMap::new(),
+            PendingWrites::restored(0, BTreeMap::new(), HashMap::new(), HashMap::new()),
             queue,
             Arc::clone(&last_error),
+            // The blocker never lets go, so the budget only decides how long
+            // this test waits for the flush to give up.
+            Duration::from_millis(200),
         );
         assert!(last_error.lock().unwrap().is_some());
         blocker.execute_batch("ROLLBACK").unwrap();
@@ -742,5 +817,64 @@ mod tests {
 
         let reopened = StateStore::open(&path, BootId::new("boot-shutdown")).unwrap();
         assert!(reopened.recovery_report().dirty_shutdown);
+    }
+
+    #[test]
+    fn retried_shutdown_flush_persists_the_snapshot_and_records_a_clean_shutdown() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("retried-shutdown.sqlite3");
+        let boot = BootId::new("boot-shutdown-retry");
+        StateStore::open(&path, boot.clone())
+            .unwrap()
+            .shutdown()
+            .unwrap();
+        let store = StateStore::open_with_options(
+            &path,
+            boot.clone(),
+            crate::persistence::StoreOptions {
+                busy_timeout: Duration::from_millis(10),
+            },
+        )
+        .unwrap();
+        let blocker = Connection::open(&path).unwrap();
+        blocker.execute_batch("BEGIN IMMEDIATE").unwrap();
+        // Released only after the first attempt has already failed, so nothing
+        // is persisted unless the shutdown flush retries.
+        let release = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(50));
+            blocker.execute_batch("ROLLBACK").unwrap();
+        });
+
+        let snapshot = Arc::new(workspace());
+        let queue = Arc::new((
+            Mutex::new(QueueState {
+                latest: Some(Arc::clone(&snapshot)),
+                shutdown: true,
+                ..QueueState::default()
+            }),
+            Condvar::new(),
+        ));
+        let last_error = Arc::new(Mutex::new(None));
+
+        persistence_loop(
+            store,
+            PendingWrites::restored(0, BTreeMap::new(), HashMap::new(), HashMap::new()),
+            queue,
+            Arc::clone(&last_error),
+            SHUTDOWN_FLUSH_BUDGET,
+        );
+        release.join().unwrap();
+        assert!(last_error.lock().unwrap().is_none());
+
+        let reopened = StateStore::open(&path, boot).unwrap();
+        assert!(
+            !reopened.recovery_report().dirty_shutdown,
+            "a shutdown flush that eventually succeeded must still record a \
+             clean shutdown"
+        );
+        assert!(
+            reopened.load_workspace(snapshot.id, None).unwrap().is_some(),
+            "the final snapshot must survive a shutdown flush that failed once"
+        );
     }
 }
