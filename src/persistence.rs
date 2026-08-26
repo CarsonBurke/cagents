@@ -689,12 +689,7 @@ impl StateStore {
         // keep the "content_hash always describes the stored content" invariant
         // total. Without this, a later snapshot carrying the previous transcript
         // path could be skipped and silently leave the newer path in place.
-        transaction.execute(
-            "UPDATE cards SET content_hash = NULL WHERE card_id = (
-                SELECT card_id FROM terminal_recipes WHERE terminal_id = ?1
-             )",
-            [&id],
-        )?;
+        transaction.execute(INVALIDATE_CARD_HASH_BY_TERMINAL, [&id])?;
         transaction.commit()?;
         Ok(next)
     }
@@ -1304,6 +1299,13 @@ fn reconcile_startup(connection: &mut Connection, boot_id: &BootId) -> Result<Re
                      WHERE terminal_id = ?3",
                     params![to_json(&downgraded)?, now_unix_ms(), terminal_id],
                 )?;
+                // The downgrade rewrote a value the owning card's fingerprint
+                // covers, so the fingerprint must stop describing the row. Left
+                // alone, a reattach that rebuilds the pre-crash `Live`
+                // continuity fingerprints identically, the snapshot lane skips
+                // the write as unchanged, and the downgraded value nobody
+                // agrees with stays in storage permanently.
+                transaction.execute(INVALIDATE_CARD_HASH_BY_TERMINAL, [&terminal_id])?;
                 terminals_downgraded += 1;
             }
         }
@@ -1377,6 +1379,16 @@ const UPSERT_CARD: &str = "INSERT INTO cards (
 const TOMBSTONE_CARD: &str = "UPDATE cards
      SET generation = ?1, existence_json = ?2, content_hash = NULL, updated_at_unix_ms = ?3
      WHERE card_id = ?4";
+
+/// Clearing `cards.content_hash` is how a write that bypasses the snapshot lane
+/// keeps the fingerprint's contract: it must never describe anything other than
+/// the row it sits on. A cleared fingerprint matches no computed one, so the
+/// next snapshot takes the full write path instead of skipping it.
+const INVALIDATE_CARD_HASH: &str = "UPDATE cards SET content_hash = NULL WHERE card_id = ?1";
+
+/// The same clear, for writers that reach a card through the terminal it owns.
+const INVALIDATE_CARD_HASH_BY_TERMINAL: &str = "UPDATE cards SET content_hash = NULL
+     WHERE card_id = (SELECT card_id FROM terminal_recipes WHERE terminal_id = ?1)";
 
 const UPSERT_TERMINAL_RECIPE: &str = "INSERT INTO terminal_recipes (
         terminal_id, card_id, generation, recipe_json, continuity_json, resume_hint,
@@ -2000,10 +2012,7 @@ fn replace_terminal_identity_transaction(
     // Clearing it forces the next snapshot to take the full write path, which
     // is what makes `ensure_payload_identity` still reject a snapshot that is
     // carrying the superseded terminal identity.
-    transaction.execute(
-        "UPDATE cards SET content_hash = NULL WHERE card_id = ?1",
-        [card_id.to_string()],
-    )?;
+    transaction.execute(INVALIDATE_CARD_HASH, [card_id.to_string()])?;
     Ok(())
 }
 
@@ -2639,6 +2648,18 @@ mod tests {
             .unwrap()
     }
 
+    fn stored_continuity_json(store: &StateStore, terminal_id: TerminalId) -> String {
+        let inner = store.lock_inner().unwrap();
+        inner
+            .connection
+            .query_row(
+                "SELECT continuity_json FROM terminal_recipes WHERE terminal_id = ?1",
+                [terminal_id.to_string()],
+                |row| row.get(0),
+            )
+            .unwrap()
+    }
+
     #[test]
     fn store_creates_new_storage_with_private_modes() {
         let root = tempdir().unwrap();
@@ -3083,6 +3104,69 @@ mod tests {
             terminal.continuity,
             TerminalContinuity::Live { .. }
         ));
+    }
+
+    #[test]
+    fn recovery_downgrade_cannot_be_masked_by_an_unchanged_card_fingerprint() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("state.sqlite3");
+        let boot_id = boot("boot-a");
+        let workspace = workspace_with_terminal(&boot_id);
+        let workspace_id = workspace.id;
+        let card_id = workspace.cards[0].id;
+        {
+            // Dropped without `shutdown`, so the next open sees a dirty
+            // shutdown and downgrades the stored `Live` continuity.
+            let store = StateStore::open(&path, boot_id.clone()).unwrap();
+            SaveLane::default().save(&store, &workspace).unwrap();
+        }
+
+        let store = StateStore::open(&path, boot_id.clone()).unwrap();
+        assert!(store.recovery_report().dirty_shutdown);
+        assert_eq!(store.recovery_report().terminals_downgraded, 1);
+        assert_eq!(
+            stored_card_row(&store, card_id).2,
+            None,
+            "the recovery pass rewrote continuity, so the card fingerprint must \
+             no longer claim to describe the stored row"
+        );
+
+        // The app reattaches to the same host session, so the restored card
+        // carries exactly the `Live` triple the pre-crash snapshot did and
+        // fingerprints identically to what storage was last written with.
+        let proof = HostSessionProof {
+            host_session_id: HostSessionId::new("session-a"),
+            boot_id: boot_id.clone(),
+            host_incarnation: HostIncarnation::new("incarnation-a"),
+        };
+        let reattached = store
+            .load_workspace(workspace_id, Some(&proof))
+            .unwrap()
+            .unwrap();
+        let CardKind::Terminal(terminal) = &reattached.cards[0].kind else {
+            panic!("terminal card expected");
+        };
+        assert!(matches!(
+            terminal.continuity,
+            TerminalContinuity::Live { .. }
+        ));
+
+        let mut lane = SaveLane {
+            workspace: reattached.generation,
+            cards: reattached
+                .cards
+                .iter()
+                .map(|card| (card.id, card.generation))
+                .collect(),
+        };
+        lane.save(&store, &reattached).unwrap();
+
+        assert_eq!(
+            stored_continuity_json(&store, terminal.id),
+            to_json(&terminal.continuity).unwrap(),
+            "the snapshot must not be skipped over the downgraded continuity \
+             the recovery pass left behind"
+        );
     }
 
     #[test]
