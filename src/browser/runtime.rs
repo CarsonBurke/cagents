@@ -1676,6 +1676,56 @@ mod tests {
         assert_eq!(resize_request(&requested, degenerate), None);
     }
 
+    /// `retire` never runs on the panic path, so the registry keeps pointing at
+    /// the engine that unwound. The next card must notice that channel is dead
+    /// and start a fresh engine rather than register onto a corpse and hang.
+    ///
+    /// This is the only test that touches the process-wide registry; it is also
+    /// the only test that calls `register`.
+    #[test]
+    fn a_card_registered_after_an_engine_panic_starts_a_fresh_engine() {
+        // Exactly the state an unwound engine leaves behind: the registry's
+        // sender is live, but the receiver went with the thread.
+        let (dead_sender, dead_receiver) = crossbeam_channel::unbounded();
+        drop(dead_receiver);
+        let dead_generation = ENGINE_GENERATIONS.fetch_add(1, Ordering::Relaxed);
+        *lock_registry() = Some((dead_generation, dead_sender));
+
+        let events = EventBus::new();
+        let (teardown, teardown_done) = crossbeam_channel::bounded(0);
+        register(Registration {
+            mailbox: CommandMailbox::new(),
+            events: events.clone(),
+            restore: restore_state(),
+            visible: true,
+            fallback_factory: None,
+            teardown,
+        })
+        .expect("a dead registry entry must be replaced, not reported as failure");
+
+        // A replacement engine really ran this card: with no Wayland factory it
+        // fails initialization and is released, which is what disconnects the
+        // barrier. A timeout here would mean the card registered onto the dead
+        // channel and nothing ever serviced it.
+        assert!(matches!(
+            teardown_done.recv_timeout(Duration::from_secs(10)),
+            Err(crossbeam_channel::RecvTimeoutError::Disconnected)
+        ));
+        let queued = std::iter::from_fn(|| events.try_recv().ok()).collect::<Vec<_>>();
+        assert!(
+            queued
+                .iter()
+                .any(|event| matches!(event, BrowserEvent::Crashed { .. })),
+            "expected the card's failure to be reported, got {queued:?}"
+        );
+        assert!(
+            lock_registry()
+                .as_ref()
+                .is_none_or(|(live, _)| *live != dead_generation),
+            "the dead generation must not survive in the registry"
+        );
+    }
+
     #[test]
     fn lazy_history_traversal_has_stable_bounds() {
         let urls = ["one", "two", "three"]
