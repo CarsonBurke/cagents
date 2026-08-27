@@ -177,22 +177,6 @@ where
         .map(map)
 }
 
-pub fn active_animation_frames<Message, F>(
-    workspace: &Workspace,
-    app_window: window::Id,
-    map: F,
-) -> Subscription<Message>
-where
-    Message: Send + 'static,
-    F: Fn(Instant) -> Message + Send + Clone + 'static,
-{
-    if workspace.camera().is_animating() {
-        animation_frames(app_window, map)
-    } else {
-        Subscription::none()
-    }
-}
-
 pub fn scroll_to<Message: 'static>(id: widget::Id, offset: f32) -> Task<Message> {
     widget::scrollable::scroll_to(
         id,
