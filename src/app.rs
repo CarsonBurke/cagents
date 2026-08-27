@@ -2838,12 +2838,18 @@ impl Cagents {
             widget::column::with_children(rows).spacing(0).into()
         });
 
+        // A dialog is modal for the pointer only: libcosmic's `popover` captures
+        // mouse and touch events but forwards keyboard events to the content
+        // beneath it. The workspace surfaces are hidden while an inspector is
+        // open, so a card that still claimed model focus would receive typing
+        // the user is aiming at the dialog and write it into an invisible shell.
+        let card_focused = focused && self.inspector.is_none();
         let content: Element<'a, Message> = match self.cards.get(&id) {
             Some(CardRuntime::Terminal(handle)) => TerminalWidget::new(handle.clone())
                 .font_size(self.settings.terminal_font_size)
                 .font_family(&self.settings.terminal_font_family)
                 .scale_factor(self.window_scale_factor)
-                .model_focused(focused)
+                .model_focused(card_focused)
                 .on_focus(Message::FocusCard(id))
                 .on_command_error(move |error| Message::TerminalError {
                     card: id,
@@ -2851,7 +2857,7 @@ impl Cagents {
                 })
                 .into(),
             Some(CardRuntime::Browser(browser)) => BrowserWidget::new(&browser.handle)
-                .model_focused(focused)
+                .model_focused(card_focused)
                 .on_focus(Message::FocusCard(id))
                 .scale_factor(self.window_scale_factor)
                 .virtual_offset(self.workspace.camera().offset())
@@ -3080,7 +3086,13 @@ impl Cagents {
         }
     }
 
-    fn open_inspector(&mut self, inspector: Inspector) {
+    /// Opens `inspector` and moves keyboard focus into it.
+    ///
+    /// The dialog is a modal popover, and the modal captures pointer events
+    /// only, so focus would otherwise stay on the control that opened it -
+    /// where Enter re-fires that control, reopening the dialog and rebuilding
+    /// the draft over whatever the user had typed.
+    fn open_inspector(&mut self, inspector: Inspector) -> Task<Message> {
         let now = Instant::now();
         let from = self.inspector_transition.map_or_else(
             || if self.inspector.is_some() { 1.0 } else { 0.0 },
@@ -3096,6 +3108,7 @@ impl Cagents {
             self.set_workspace_surfaces_visible(false);
         }
         self.frame_clock.reset();
+        iced::widget::operation::focus(settings_close_id()).map(cosmic::Action::App)
     }
 
     fn close_inspector(&mut self) {
@@ -3655,8 +3668,7 @@ impl Application for Cagents {
                         self.settings_category = SettingsCategory::General;
                         self.settings_draft = SettingsDraft::from_settings(&self.settings);
                         self.settings_feedback = None;
-                        self.open_inspector(Inspector::Settings);
-                        Task::none()
+                        self.open_inspector(Inspector::Settings)
                     }
                     // The handle clamps to its own rendered bounds, and the
                     // settings file accepts a narrower range, so the width is
@@ -5056,6 +5068,11 @@ fn settings_category_controls<'a>(
     }
 }
 
+/// The dialog's first focusable control, focused when the dialog opens.
+fn settings_close_id() -> widget::Id {
+    widget::Id::new("dialog.settings.close")
+}
+
 fn settings_dialog<'a>(
     category: SettingsCategory,
     draft: &'a SettingsDraft,
@@ -5136,7 +5153,7 @@ fn settings_dialog<'a>(
         .width(Length::Fill)
         .into(),
         widget::button::icon(widget::icon::from_name("window-close-symbolic"))
-            .id(widget::Id::new("dialog.settings.close"))
+            .id(settings_close_id())
             .name("Close settings")
             .on_press(Message::CloseInspector)
             .into(),
