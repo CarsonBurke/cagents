@@ -292,6 +292,56 @@ mod tests {
     }
 
     #[test]
+    fn the_sweep_delay_is_the_earliest_grace_still_held_by_a_hot_offscreen_card() {
+        let now = Instant::now();
+        let grace = Duration::from_secs(30);
+        let oldest = CardId::new();
+        let newest = CardId::new();
+        let visible = CardId::new();
+        let hibernated = CardId::new();
+        let mut manager = LifecycleManager::new(LifecycleBudget {
+            max_hot_cards: 6,
+            offscreen_grace: grace,
+        });
+        manager.register(oldest, Exposure::Offscreen, Residency::Hot, now);
+        manager.register(
+            newest,
+            Exposure::Offscreen,
+            Residency::Hot,
+            now + Duration::from_secs(20),
+        );
+        // Neither of these owns a grace: one is on screen, the other has
+        // already been evicted.
+        manager.register(visible, Exposure::Visible, Residency::Hot, now);
+        manager.register(hibernated, Exposure::Offscreen, Residency::Hibernated, now);
+
+        // The earliest expiry wins, so no card waits past its own grace for a
+        // deadline belonging to a card that went offscreen later.
+        assert_eq!(
+            manager.next_offscreen_sweep_delay(now + Duration::from_secs(25)),
+            Some(Duration::from_secs(5))
+        );
+
+        // After the sweep that evicts the oldest, the wakeup moves to the card
+        // that still holds a grace - the property that lets a sweep re-arm
+        // itself instead of leaving a hot card un-swept.
+        let swept = now + grace;
+        let actions = manager.reconcile(&HashSet::from([visible]), &HashSet::new(), swept);
+        let epoch = actions
+            .iter()
+            .find_map(|action| match action {
+                LifecycleAction::Hibernate { card, epoch } if *card == oldest => Some(*epoch),
+                _ => None,
+            })
+            .expect("the oldest card's grace has expired");
+        assert!(manager.hibernation_finished(oldest, epoch));
+        assert_eq!(
+            manager.next_offscreen_sweep_delay(swept),
+            Some(Duration::from_secs(20))
+        );
+    }
+
+    #[test]
     fn hidden_hot_card_is_evicted_after_grace() {
         let now = Instant::now();
         let visible = CardId::new();

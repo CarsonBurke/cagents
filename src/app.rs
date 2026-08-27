@@ -376,11 +376,20 @@ fn rollback_failed_hibernation(
     Some(residency)
 }
 
-fn lifecycle_sweep_timer(delay: Duration) -> Task<Message> {
+fn lifecycle_sweep_timer(delay: Duration, generation: u64) -> Task<Message> {
     cosmic::task::future(async move {
         tokio::time::sleep(delay).await;
-        Message::LifecycleSweepElapsed
+        Message::LifecycleSweepElapsed(generation)
     })
+}
+
+/// Whether a wakeup at `requested` needs a timer of its own, given the wakeup
+/// already pending.
+///
+/// A pending timer already fires no later than `requested` and re-arms itself
+/// for whatever remains, so only an earlier deadline needs a new timer.
+fn sweep_needs_rearming(pending: Option<Instant>, requested: Instant) -> bool {
+    pending.is_none_or(|deadline| requested < deadline)
 }
 
 fn card_control_id(id: CardId, control: &str) -> widget::Id {
@@ -912,8 +921,9 @@ pub enum Message {
     Wheel(WheelDelta),
     Frame(Instant),
     LifecycleSweep,
-    /// The debounced sweep timer fired; sweeps only if the deadline has passed.
-    LifecycleSweepElapsed,
+    /// A sweep timer fired, carrying the generation it was armed for; a
+    /// generation that has since been superseded is discarded.
+    LifecycleSweepElapsed(u64),
     InitializeBrowserFactory,
     BrowserFactoryReady(Result<BrowserFactoryBinding, String>),
     WindowScaleFactorChanged(f32),
@@ -1082,9 +1092,12 @@ pub struct Cagents {
     lifecycle: LifecycleManager,
     // A sweep is a full lifecycle reconcile plus a view rebuild, and scrolling
     // requests one per visibility transition, so requests are debounced onto a
-    // single in-flight timer.
+    // single in-flight timer. `lifecycle_sweep_deadline` is `Some` exactly when
+    // a timer of the current generation is pending; timer futures cannot be
+    // cancelled, so superseding one means bumping the generation and letting
+    // the stale delivery be dropped.
     lifecycle_sweep_deadline: Option<Instant>,
-    lifecycle_sweep_armed: bool,
+    lifecycle_sweep_generation: u64,
     terminal_wake_tx: async_channel::Sender<TerminalWakeup>,
     terminal_wake_rx: async_channel::Receiver<TerminalWakeup>,
     session: Option<SessionRuntime>,
@@ -1996,29 +2009,41 @@ impl Cagents {
         Task::batch(tasks)
     }
 
-    /// Debounces delayed sweeps onto one in-flight timer.
+    /// Arms a timer for `deadline`, superseding any timer already pending.
+    fn arm_lifecycle_sweep(&mut self, deadline: Instant) -> Task<Message> {
+        self.lifecycle_sweep_deadline = Some(deadline);
+        self.lifecycle_sweep_generation = self.lifecycle_sweep_generation.wrapping_add(1);
+        lifecycle_sweep_timer(
+            deadline.saturating_duration_since(Instant::now()),
+            self.lifecycle_sweep_generation,
+        )
+    }
+
+    /// Brings the debounced sweep forward to `now + delay`, if that is sooner
+    /// than the wakeup already pending.
     ///
-    /// The deadline only ever moves later, so a burst of requests collapses to
-    /// a single reconcile roughly `delay` after the last request.
+    /// Callers report when one card's grace expires, so the sweep has to run at
+    /// the earliest such time: a deadline that only ever moved later would let
+    /// a steady stream of newly offscreen cards postpone the oldest card's
+    /// eviction indefinitely. Sweeping early costs nothing, because whatever a
+    /// sweep leaves un-evicted re-arms itself from the manager.
     fn request_lifecycle_sweep(&mut self, delay: Duration) -> Task<Message> {
         let Some(requested) = Instant::now().checked_add(delay) else {
             // A configured delay this large can never elapse anyway.
             return Task::none();
         };
-        let deadline = self.lifecycle_sweep_deadline.get_or_insert(requested);
-        if requested > *deadline {
-            *deadline = requested;
+        if sweep_needs_rearming(self.lifecycle_sweep_deadline, requested) {
+            self.arm_lifecycle_sweep(requested)
+        } else {
+            Task::none()
         }
-        let sleep = deadline.saturating_duration_since(Instant::now());
-        if self.lifecycle_sweep_armed {
-            return Task::none();
-        }
-        self.lifecycle_sweep_armed = true;
-        lifecycle_sweep_timer(sleep)
     }
 
-    fn lifecycle_sweep_elapsed(&mut self) -> Task<Message> {
-        self.lifecycle_sweep_armed = false;
+    fn lifecycle_sweep_elapsed(&mut self, generation: u64) -> Task<Message> {
+        if generation != self.lifecycle_sweep_generation {
+            // Superseded by a later arming, whose own delivery is still to come.
+            return Task::none();
+        }
         let Some(deadline) = self.lifecycle_sweep_deadline else {
             return Task::none();
         };
@@ -2026,11 +2051,14 @@ impl Cagents {
         if !remaining.is_zero() {
             // Later requests pushed the deadline out; wait for the remainder
             // rather than sweeping early.
-            self.lifecycle_sweep_armed = true;
-            return lifecycle_sweep_timer(remaining);
+            return self.arm_lifecycle_sweep(deadline);
         }
         self.lifecycle_sweep_deadline = None;
-        self.lifecycle_sweep()
+        let sweep = self.lifecycle_sweep();
+        // That reconcile made the manager's exposure current, so the next
+        // wakeup can be placed exactly when the earliest card still holding
+        // its grace exhausts it.
+        Task::batch([sweep, self.reschedule_offscreen_lifecycle_sweep()])
     }
 
     fn lifecycle_sweep(&mut self) -> Task<Message> {
@@ -3014,13 +3042,28 @@ impl Cagents {
         });
     }
 
+    /// Re-derives the pending sweep from the manager's own view of the grace,
+    /// so the wakeup lands exactly when the earliest hot offscreen card
+    /// exhausts it.
+    ///
+    /// The pending deadline is kept as a ceiling rather than discarded: a card
+    /// the workspace has already moved offscreen is not counted until a
+    /// reconcile records its exposure, and dropping that wakeup would leave the
+    /// card hot until some unrelated event happened to arm another sweep.
     fn reschedule_offscreen_lifecycle_sweep(&mut self) -> Task<Message> {
-        self.lifecycle_sweep_deadline = None;
-        self.lifecycle_sweep_armed = false;
-        let Some(delay) = self.lifecycle.next_offscreen_sweep_delay(Instant::now()) else {
+        let now = Instant::now();
+        let derived = self
+            .lifecycle
+            .next_offscreen_sweep_delay(now)
+            .and_then(|delay| now.checked_add(delay));
+        let Some(derived) = derived else {
             return Task::none();
         };
-        self.request_lifecycle_sweep(delay)
+        if sweep_needs_rearming(self.lifecycle_sweep_deadline, derived) {
+            self.arm_lifecycle_sweep(derived)
+        } else {
+            Task::none()
+        }
     }
 
     fn apply_setting_input(&mut self, field: SettingsField, value: String) -> Task<Message> {
@@ -3053,10 +3096,13 @@ impl Cagents {
                 }
                 match field {
                     SettingsField::MaxHotCards => cosmic::task::message(Message::LifecycleSweep),
-                    SettingsField::HibernationDelayMs => Task::batch([
-                        cosmic::task::message(Message::LifecycleSweep),
-                        self.reschedule_offscreen_lifecycle_sweep(),
-                    ]),
+                    SettingsField::HibernationDelayMs => {
+                        // Reconciled here rather than through a queued
+                        // `LifecycleSweep`, so the manager's exposure is
+                        // current before the new grace is re-derived from it.
+                        let sweep = self.lifecycle_sweep();
+                        Task::batch([sweep, self.reschedule_offscreen_lifecycle_sweep()])
+                    }
                     SettingsField::TerminalFontSize
                     | SettingsField::TerminalFontFamily
                     | SettingsField::TerminalScrollbackLines
@@ -3084,10 +3130,8 @@ impl Cagents {
             Ok(()) => SettingsFeedback::Saved,
             Err(error) => SettingsFeedback::Error(error),
         });
-        Task::batch([
-            cosmic::task::message(Message::LifecycleSweep),
-            self.reschedule_offscreen_lifecycle_sweep(),
-        ])
+        let sweep = self.lifecycle_sweep();
+        Task::batch([sweep, self.reschedule_offscreen_lifecycle_sweep()])
     }
 }
 
@@ -3175,7 +3219,7 @@ impl Application for Cagents {
             settings_feedback: None,
             status: status.map(TransientNotice::error),
             lifecycle_sweep_deadline: None,
-            lifecycle_sweep_armed: false,
+            lifecycle_sweep_generation: 0,
         };
         let mut tasks = vec![app.initialize_runtimes()];
         tasks.push(cosmic::task::message(Message::InitializeBrowserFactory));
@@ -3603,7 +3647,7 @@ impl Application for Cagents {
                 self.apply_viewport(update, true, false)
             }
             Message::LifecycleSweep => self.lifecycle_sweep(),
-            Message::LifecycleSweepElapsed => self.lifecycle_sweep_elapsed(),
+            Message::LifecycleSweepElapsed(generation) => self.lifecycle_sweep_elapsed(generation),
             Message::InitializeBrowserFactory => self.browser_factory_task(),
             Message::BrowserFactoryReady(result) => match result {
                 Ok(binding) => {
