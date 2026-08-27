@@ -3509,6 +3509,7 @@ impl Application for Cagents {
                     }
                     SidebarAction::SearchChanged(_)
                     | SidebarAction::SetFilter(_)
+                    | SidebarAction::ToggleControls
                     | SidebarAction::ToggleProject(_)
                     | SidebarAction::TogglePullRequests(_) => Task::none(),
                 }
@@ -3991,6 +3992,9 @@ impl Application for Cagents {
                 }
             }
             Message::FocusProjectSearch => {
+                if !self.sidebar_state.controls_expanded() {
+                    self.sidebar_state.apply(&SidebarAction::ToggleControls);
+                }
                 let id = sidebar::search_focus_id();
                 iced::widget::operation::focus(id.clone())
                     .chain(iced::widget::operation::select_all(id))
