@@ -70,7 +70,9 @@ const RESIZE_STEP: f32 = 16.0;
 const RESIZE_HANDLE_NAME: &str = "Resize sidebar";
 
 /// The responsive density selected by the application from its available
-/// width. Compact mode retains every command as a named, focusable icon.
+/// width. Compact mode is the `COMPACT_WIDTH` rail: it keeps every command it
+/// renders as a named, focusable icon, and applies no state it cannot render a
+/// control for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum SidebarMode {
     Compact,
@@ -641,6 +643,17 @@ pub enum SidebarAction {
     ResizeFinished,
 }
 
+/// Whether the pane would render the search input if its controls were open.
+///
+/// `view` only lays the controls block out for a project list that is not
+/// empty, and only at the expanded density, so those are the conditions under
+/// which [`search_focus_id`] names something on screen. A caller that focused
+/// it otherwise would blur whatever held focus and focus nothing, because
+/// `focus` unfocuses every widget whose id does not match.
+pub fn search_is_reachable(model: &SidebarModel, mode: SidebarMode) -> bool {
+    mode != SidebarMode::Compact && !model.projects.is_empty()
+}
+
 pub fn search_focus_id() -> Id {
     stable_id("search")
 }
@@ -686,7 +699,14 @@ pub fn view<'a>(
         widget::container(header(model, state, compact, loading)).padding([0, spacing.space_xxxs]),
     );
 
-    if !compact && !model.projects.is_empty() && state.controls_expanded {
+    // Each density is given the controls its width can hold, and
+    // `filtered_projects` applies exactly the state that has a control here:
+    // the rail fits the filter as an icon column but cannot fit a text input,
+    // so it offers the filter alone and its query is left unapplied.
+    if compact && !model.projects.is_empty() {
+        content = content
+            .push(widget::container(compact_filters(state.filter)).padding(spacing.space_xxxs));
+    } else if state.controls_expanded && search_is_reachable(model, mode) {
         content = content.push(
             widget::container(controls(state, refresh_enabled, loading))
                 .class(theme::Container::Secondary)
@@ -701,7 +721,7 @@ pub fn view<'a>(
                 .height(Length::Fill),
         )
         .push(widget::divider::horizontal::light())
-        .push(footer(compact))
+        .push(footer(model, state, compact))
         .spacing(0)
         .width(Length::Fill)
         .height(Length::Fill);
@@ -749,25 +769,33 @@ fn header<'a>(
         .into();
     }
 
-    let controls_selected =
-        state.controls_expanded || !state.query.is_empty() || state.filter != SidebarFilter::All;
-    let controls_button: Element<'a, SidebarAction> =
-        button::icon(icon::from_name("view-list-symbolic").size(ROW_ICON_SIZE))
-            .id(stable_id("toggle-controls"))
-            .name("Search and filter projects")
-            .tooltip("Search and filter projects")
-            .selected(controls_selected)
-            .width(ICON_CONTROL_SIZE)
-            .height(ICON_CONTROL_SIZE)
-            .on_press(SidebarAction::ToggleControls)
-            .into();
-    let mut children: Vec<Element<'a, SidebarAction>> = vec![
-        widget::text::caption_heading("Projects").into(),
+    let mut children: Vec<Element<'a, SidebarAction>> = Vec::with_capacity(6);
+    children.push(widget::text::caption_heading("Projects").into());
+    children.push(
         cosmic::iced::widget::Space::new()
             .width(Length::Fill)
             .into(),
-        controls_button,
-    ];
+    );
+    // `view` renders the controls only for a non-empty project list, so with
+    // no projects this would offer, and paint as selected, a control that
+    // opens nothing. The error state is empty too: `SidebarModel::error`
+    // clears the list.
+    if !model.projects.is_empty() {
+        let selected = state.controls_expanded
+            || !state.query.is_empty()
+            || state.filter != SidebarFilter::All;
+        children.push(
+            button::icon(icon::from_name("view-list-symbolic").size(ROW_ICON_SIZE))
+                .id(stable_id("toggle-controls"))
+                .name("Search and filter projects")
+                .tooltip("Search and filter projects")
+                .selected(selected)
+                .width(ICON_CONTROL_SIZE)
+                .height(ICON_CONTROL_SIZE)
+                .on_press(SidebarAction::ToggleControls)
+                .into(),
+        );
+    }
     if loading {
         children.push(
             widget::progress_bar::circular::Circular::new()
@@ -829,12 +857,13 @@ fn controls<'a>(
     loading: bool,
 ) -> Element<'a, SidebarAction> {
     let spacing = cosmic::theme::spacing();
-    let mut actions: Vec<Element<'a, SidebarAction>> = vec![
-        filters(state.filter),
+    let mut actions: Vec<Element<'a, SidebarAction>> = Vec::with_capacity(3);
+    actions.push(filters(state.filter));
+    actions.push(
         cosmic::iced::widget::Space::new()
             .width(Length::Fill)
             .into(),
-    ];
+    );
     if loading {
         actions.push(
             widget::progress_bar::circular::Circular::new()
@@ -850,7 +879,7 @@ fn controls<'a>(
         ));
     }
     widget::column::with_children(vec![
-        search(state, false),
+        search(state),
         widget::row::with_children(actions)
             .align_y(Alignment::Center)
             .spacing(spacing.space_xxxs)
@@ -861,7 +890,12 @@ fn controls<'a>(
     .into()
 }
 
-fn footer(compact: bool) -> Element<'static, SidebarAction> {
+fn footer<'a>(
+    model: &'a SidebarModel,
+    state: &SidebarState,
+    compact: bool,
+) -> Element<'a, SidebarAction> {
+    let spacing = cosmic::theme::spacing();
     let settings = icon_action(
         "emblem-system-symbolic",
         "Settings",
@@ -869,20 +903,48 @@ fn footer(compact: bool) -> Element<'static, SidebarAction> {
         stable_id("settings"),
     );
     if compact {
-        return widget::container(settings)
-            .center_x(Length::Fill)
-            .padding(cosmic::theme::spacing().space_xxxs)
+        // The rail renders no project header, and the window's header bar is
+        // no substitute: without these the two commands have no route at all
+        // below the breakpoint.
+        let mut children: Vec<Element<'a, SidebarAction>> = Vec::with_capacity(3);
+        if let Some(project) = selected_project(model, state) {
+            children.extend([
+                icon_action(
+                    "list-add-symbolic",
+                    &*project.chrome.new_worktree_name,
+                    SidebarAction::NewWorktree {
+                        project_id: project.id,
+                        repository: project.repository.clone(),
+                    },
+                    project.chrome.new_worktree_id.clone(),
+                ),
+                icon_action(
+                    "document-new-symbolic",
+                    &*project.chrome.create_pull_request_name,
+                    SidebarAction::CreatePullRequest {
+                        project_id: project.id,
+                        repository: project.repository.clone(),
+                    },
+                    project.chrome.create_pull_request_id.clone(),
+                ),
+            ]);
+        }
+        children.push(settings);
+        return widget::column::with_children(children)
+            .align_x(Alignment::Center)
+            .spacing(spacing.space_xxxs)
+            .padding(spacing.space_xxxs)
             .width(Length::Fill)
             .into();
     }
     widget::row::with_children(vec![settings])
         .align_y(Alignment::Center)
-        .padding(cosmic::theme::spacing().space_xxxs)
+        .padding(spacing.space_xxxs)
         .width(Length::Fill)
         .into()
 }
 
-fn search<'a>(state: &'a SidebarState, _compact: bool) -> Element<'a, SidebarAction> {
+fn search<'a>(state: &'a SidebarState) -> Element<'a, SidebarAction> {
     let width = Length::Fill;
     let input = widget::text_input::search_input("Search projects", &state.query)
         .on_input(SidebarAction::SearchChanged)
@@ -895,25 +957,36 @@ fn search<'a>(state: &'a SidebarState, _compact: bool) -> Element<'a, SidebarAct
     input.id(search_focus_id()).into()
 }
 
+/// The filter choices, in the order both densities present them: the rail
+/// renders the icon, the expanded row renders the label, and both name the
+/// control identically for assistive technologies.
+const FILTER_CHOICES: [(SidebarFilter, &str, &str, &str); 3] = [
+    (
+        SidebarFilter::All,
+        "view-list-symbolic",
+        "All",
+        "Show all projects",
+    ),
+    (
+        SidebarFilter::Attention,
+        "dialog-warning-symbolic",
+        "Attention",
+        "Show projects needing attention",
+    ),
+    (
+        SidebarFilter::PullRequests,
+        "vcs-merge-request-symbolic",
+        "PRs",
+        "Show projects with pull requests",
+    ),
+];
+
 fn filters(filter: SidebarFilter) -> Element<'static, SidebarAction> {
     let spacing = cosmic::theme::spacing();
-    let choices = [
-        (SidebarFilter::All, "All", "Show all projects"),
-        (
-            SidebarFilter::Attention,
-            "Attention",
-            "Show projects needing attention",
-        ),
-        (
-            SidebarFilter::PullRequests,
-            "PRs",
-            "Show projects with pull requests",
-        ),
-    ];
-    let mut row = widget::row::with_capacity(choices.len())
+    let mut row = widget::row::with_capacity(FILTER_CHOICES.len())
         .spacing(spacing.space_xxxs)
         .align_y(Alignment::Center);
-    for (value, visible_label, accessible_label) in choices {
+    for (value, _, visible_label, accessible_label) in FILTER_CHOICES {
         row = row.push(
             button::custom(widget::text::caption(visible_label))
                 .class(theme::Button::Text)
@@ -924,6 +997,30 @@ fn filters(filter: SidebarFilter) -> Element<'static, SidebarAction> {
         );
     }
     row.into()
+}
+
+/// The filter as an icon column, which is all the rail has room for. Without
+/// it a filter chosen while expanded would keep hiding projects with no
+/// control left to clear it.
+fn compact_filters(filter: SidebarFilter) -> Element<'static, SidebarAction> {
+    let spacing = cosmic::theme::spacing();
+    let mut column = widget::column::with_capacity(FILTER_CHOICES.len())
+        .spacing(spacing.space_xxxs)
+        .align_x(Alignment::Center)
+        .width(Length::Fill);
+    for (value, icon_name, _, accessible_label) in FILTER_CHOICES {
+        column = column.push(
+            button::icon(icon::from_name(icon_name).size(ROW_ICON_SIZE))
+                .id(filter_id(value))
+                .name(accessible_label)
+                .tooltip(accessible_label)
+                .width(ICON_CONTROL_SIZE)
+                .height(ICON_CONTROL_SIZE)
+                .selected(filter == value)
+                .on_press(SidebarAction::SetFilter(value)),
+        );
+    }
+    column.into()
 }
 
 fn body<'a>(
@@ -949,14 +1046,15 @@ fn project_list<'a>(
     state: &'a SidebarState,
     compact: bool,
 ) -> Element<'a, SidebarAction> {
-    let projects = filtered_projects(model, state);
+    let projects = filtered_projects(model, state, compact);
     if projects.is_empty() {
         return empty(state, compact);
     }
 
     // Search results are always revealed. Outside search, projects start open
-    // and the set stores only the user's explicit collapses.
-    let searching = !state.query.trim().is_empty();
+    // and the set stores only the user's explicit collapses. The rail renders
+    // no search input and applies no query, so nothing there is a result.
+    let searching = !compact && !state.query.trim().is_empty();
     let spacing = cosmic::theme::spacing();
     let mut column = widget::column::with_capacity(projects.len()).spacing(if compact {
         spacing.space_xxxs
@@ -1042,7 +1140,10 @@ fn error<'a>(message: &'a str, compact: bool) -> Element<'a, SidebarAction> {
 }
 
 fn empty(state: &SidebarState, compact: bool) -> Element<'static, SidebarAction> {
-    let (icon_name, title, detail, action_label, action) = if !state.query.trim().is_empty() {
+    // The rail neither renders the search input nor applies its query, so a
+    // query is never what emptied the list there.
+    let searching = !compact && !state.query.trim().is_empty();
+    let (icon_name, title, detail, action_label, action) = if searching {
         (
             "edit-find-symbolic",
             "No matches",
@@ -1085,7 +1186,7 @@ fn empty(state: &SidebarState, compact: bool) -> Element<'static, SidebarAction>
     }
     let spacing = cosmic::theme::spacing();
     let action_button: Element<'static, SidebarAction> =
-        if state.query.trim().is_empty() && state.filter == SidebarFilter::All {
+        if !searching && state.filter == SidebarFilter::All {
             button::suggested(action_label)
                 .id(stable_id("empty.action"))
                 .on_press(action)
@@ -1223,7 +1324,6 @@ fn project_view<'a>(
                     project_id,
                     worktree,
                     is_primary_worktree(&entity.repository, &worktree.path),
-                    false,
                     selection,
                 ))
                 .padding([0, 0, 0, spacing.space_l]),
@@ -1235,7 +1335,6 @@ fn project_view<'a>(
                     entity,
                     &project.pull_requests,
                     pull_requests_expanded,
-                    false,
                     selection,
                 ))
                 .padding([spacing.space_xxxs, 0, 0, spacing.space_l]),
@@ -1287,36 +1386,9 @@ fn worktree_view<'a>(
     project_id: ProjectId,
     worktree: &'a SidebarWorktree,
     primary: bool,
-    compact: bool,
     selection: Option<SidebarSelection>,
 ) -> Element<'a, SidebarAction> {
     let chrome = &worktree.chrome;
-    if compact {
-        let selected = matches!(
-            selection,
-            Some(SidebarSelection::Worktree {
-                project_id: selected_project,
-                worktree_id,
-            }) if selected_project == project_id && worktree_id == worktree.id
-        );
-        let action = button::icon(icon::from_name("vcs-branch-symbolic").size(ROW_ICON_SIZE))
-            .id(chrome.open_id.clone())
-            .name(&*chrome.accessible_name)
-            .tooltip(&*chrome.accessible_name)
-            .width(ICON_CONTROL_SIZE)
-            .height(ICON_CONTROL_SIZE)
-            .selected(selected)
-            .on_press(SidebarAction::OpenWorktree {
-                project_id,
-                worktree_id: worktree.id,
-                path: worktree.path.clone(),
-            });
-        return widget::container(action)
-            .center_x(Length::Fill)
-            .width(Length::Fill)
-            .into();
-    }
-
     let spacing = cosmic::theme::spacing();
     let mut row = widget::row::with_capacity(8)
         .align_y(Alignment::Center)
@@ -1383,15 +1455,13 @@ fn pull_request_group<'a>(
     project: &'a SidebarProject,
     pull_requests: &[&'a SidebarPullRequest],
     expanded: bool,
-    compact: bool,
     selection: Option<SidebarSelection>,
 ) -> Element<'a, SidebarAction> {
     let chrome = &project.chrome;
     let spacing = cosmic::theme::spacing();
-    let mut column =
-        widget::column::with_capacity(pull_requests.len() + 1).spacing(spacing.space_xxxs);
-    if !compact {
-        column = column.push(
+    let mut column = widget::column::with_capacity(pull_requests.len() + 1)
+        .spacing(spacing.space_xxxs)
+        .push(
             widget::row::with_children(vec![
                 icon_action(
                     if expanded {
@@ -1413,15 +1483,9 @@ fn pull_request_group<'a>(
             .align_y(Alignment::Center)
             .spacing(spacing.space_xxxs),
         );
-    }
     if expanded {
         for &pull_request in pull_requests {
-            column = column.push(pull_request_view(
-                project.id,
-                pull_request,
-                compact,
-                selection,
-            ));
+            column = column.push(pull_request_view(project.id, pull_request, selection));
         }
     }
     column.into()
@@ -1430,7 +1494,6 @@ fn pull_request_group<'a>(
 fn pull_request_view<'a>(
     project_id: ProjectId,
     pull_request: &'a SidebarPullRequest,
-    compact: bool,
     selection: Option<SidebarSelection>,
 ) -> Element<'a, SidebarAction> {
     let chrome = &pull_request.chrome;
@@ -1439,28 +1502,6 @@ fn pull_request_view<'a>(
         number: pull_request.number,
         url: pull_request.url.clone(),
     };
-    if compact {
-        let selected = matches!(
-            selection,
-            Some(SidebarSelection::PullRequest {
-                project_id: selected_project,
-                number,
-            }) if selected_project == project_id && number == pull_request.number
-        );
-        let action =
-            button::icon(icon::from_name("internet-web-browser-symbolic").size(ROW_ICON_SIZE))
-                .id(chrome.open_id.clone())
-                .name(&*chrome.accessible_name)
-                .tooltip(&*chrome.accessible_name)
-                .width(ICON_CONTROL_SIZE)
-                .height(ICON_CONTROL_SIZE)
-                .selected(selected)
-                .on_press(action);
-        return widget::container(action)
-            .center_x(Length::Fill)
-            .width(Length::Fill)
-            .into();
-    }
 
     let spacing = cosmic::theme::spacing();
     let check_label = check_description(pull_request.checks);
@@ -1580,6 +1621,9 @@ struct ResizeOrigin {
 struct ResizeHandleState {
     drag: Option<ResizeOrigin>,
     is_focused: bool,
+    /// Set while an arrow key repeats. A held key is one gesture, so the
+    /// width settles when it is released rather than on every repeat.
+    repeating: bool,
 }
 
 impl operation::Focusable for ResizeHandleState {
@@ -1722,14 +1766,33 @@ impl Widget<SidebarAction, Theme, Renderer> for ResizeHandle<'_> {
             // The release that ends a drag is delivered to whichever surface
             // owns the pointer, so a lost window ends the grab instead.
             Event::Window(window::Event::Unfocused) => {
-                if state.drag.take().is_some() {
+                let dragging = state.drag.take().is_some();
+                let repeating = std::mem::take(&mut state.repeating);
+                if dragging || repeating {
                     shell.publish(SidebarAction::ResizeFinished);
                 }
             }
-            // A keystroke is a whole gesture, so it also settles the width.
-            Event::Keyboard(keyboard::Event::KeyPressed { key, .. }) if state.is_focused => {
+            // A single keystroke is a whole gesture, so it settles the width
+            // at once. A held key is one gesture still under way: settling on
+            // every repeat would rewrite and fsync the settings file at the
+            // key-repeat rate, so a repeated gesture settles on release.
+            Event::Keyboard(keyboard::Event::KeyPressed { key, repeat, .. })
+                if state.is_focused =>
+            {
                 if let Some(step) = resize_step(key) {
                     shell.publish(self.resize(self.width + step));
+                    if *repeat {
+                        state.repeating = true;
+                    } else {
+                        shell.publish(SidebarAction::ResizeFinished);
+                    }
+                    shell.capture_event();
+                    return;
+                }
+            }
+            Event::Keyboard(keyboard::Event::KeyReleased { key, .. }) if state.repeating => {
+                if resize_step(key).is_some() {
+                    state.repeating = false;
                     shell.publish(SidebarAction::ResizeFinished);
                     shell.capture_event();
                     return;
@@ -1899,6 +1962,7 @@ enum BadgeTone {
 }
 
 fn badge<'a>(label: impl Into<Cow<'a, str>> + 'a, tone: BadgeTone) -> Element<'a, SidebarAction> {
+    let spacing = cosmic::theme::spacing();
     widget::container(
         widget::text::caption(label).wrapping(cosmic::iced::widget::text::Wrapping::None),
     )
@@ -1927,7 +1991,7 @@ fn badge<'a>(label: impl Into<Cow<'a, str>> + 'a, tone: BadgeTone) -> Element<'a
             snap: true,
         }
     }))
-    .padding([1, 4])
+    .padding([spacing.space_none, spacing.space_xxxs])
     .width(Length::Shrink)
     .into()
 }
@@ -1993,11 +2057,20 @@ struct FilteredProject<'a> {
     pull_requests: Vec<&'a SidebarPullRequest>,
 }
 
+/// The projects each density shows. `compact` is the density the caller
+/// renders, not a hint: the rail has no search input, so a query typed while
+/// expanded must not keep hiding projects once the window narrows. The filter
+/// has an icon control in both densities, so it always applies.
 fn filtered_projects<'a>(
     model: &'a SidebarModel,
     state: &SidebarState,
+    compact: bool,
 ) -> Vec<FilteredProject<'a>> {
-    let query = state.query.trim().to_ascii_lowercase();
+    let query = if compact {
+        String::new()
+    } else {
+        state.query.trim().to_ascii_lowercase()
+    };
     model
         .projects
         .iter()
@@ -2148,6 +2221,28 @@ mod tests {
         )
     }
 
+    /// The widget identities of the controls an element renders, in tree
+    /// order.
+    ///
+    /// An identity is what the module derives once per entity, and what
+    /// focus, tooltips and assistive technologies address a control by, so
+    /// the set of them is the set of controls a density offers. It is read
+    /// off the widget tree, which a test can build; accessible names cannot
+    /// be, because `widget::tooltip` reports no a11y nodes of its own and
+    /// every icon control in this module carries a tooltip.
+    fn control_ids(element: &Element<'_, SidebarAction>) -> Vec<String> {
+        fn collect(tree: &Tree, ids: &mut Vec<String>) {
+            ids.extend(tree.id.as_ref().map(ToString::to_string));
+            for child in &tree.children {
+                collect(child, ids);
+            }
+        }
+
+        let mut ids = Vec::new();
+        collect(&Tree::new(element), &mut ids);
+        ids
+    }
+
     #[test]
     fn local_state_transitions_are_idempotent_and_scoped() {
         let id = project_id(1);
@@ -2172,14 +2267,14 @@ mod tests {
         let model = SidebarModel::ready(SidebarMode::Expanded, vec![project()]);
         let mut state = SidebarState::default();
         state.apply(&SidebarAction::SearchChanged("FIX-SIDEBAR".into()));
-        let filtered = filtered_projects(&model, &state);
+        let filtered = filtered_projects(&model, &state, false);
         assert_eq!(filtered.len(), 1);
         assert_eq!(filtered[0].worktrees.len(), 1);
         assert_eq!(filtered[0].pull_requests.len(), 1);
 
         state.apply(&SidebarAction::SearchChanged(String::new()));
         state.apply(&SidebarAction::SetFilter(SidebarFilter::Attention));
-        let filtered = filtered_projects(&model, &state);
+        let filtered = filtered_projects(&model, &state, false);
         assert_eq!(filtered[0].worktrees.len(), 1);
         assert_eq!(
             filtered[0].worktrees[0].branch.as_deref(),
@@ -2193,7 +2288,7 @@ mod tests {
         let model = SidebarModel::ready(SidebarMode::Compact, vec![project()]);
         let mut state = SidebarState::default();
         state.apply(&SidebarAction::SetFilter(SidebarFilter::PullRequests));
-        let filtered = filtered_projects(&model, &state);
+        let filtered = filtered_projects(&model, &state, true);
         assert_eq!(filtered.len(), 1);
         assert!(filtered[0].worktrees.is_empty());
         assert_eq!(filtered[0].pull_requests[0].number, 42);
@@ -2206,24 +2301,153 @@ mod tests {
     }
 
     #[test]
-    fn compact_and_expanded_search_controls_share_the_real_focus_target() {
-        for compact in [true, false] {
-            let mut state = SidebarState::default();
-            let control = search(&state, compact);
-            assert_eq!(
-                control.as_widget().id().map(|id| id.to_string()),
-                Some(search_focus_id().to_string())
-            );
-            drop(control);
+    fn the_search_input_carries_the_focus_target_the_application_reveals() {
+        let mut state = SidebarState::default();
+        assert_eq!(
+            search(&state).as_widget().id().map(|id| id.to_string()),
+            Some(search_focus_id().to_string())
+        );
 
-            state.apply(&SidebarAction::SearchChanged("cagents".into()));
-            assert_eq!(state.query(), "cagents");
-            let control = search(&state, compact);
+        // A query adds the clear action, which must not cost the input the id
+        // the application focuses.
+        state.apply(&SidebarAction::SearchChanged("cagents".into()));
+        assert_eq!(
+            search(&state).as_widget().id().map(|id| id.to_string()),
+            Some(search_focus_id().to_string())
+        );
+    }
+
+    #[test]
+    fn the_search_is_reachable_exactly_when_the_pane_renders_its_input() {
+        // The application refuses to focus the input when this is false, so a
+        // pane that renders one anyway would leave the shortcut dead, and one
+        // that renders none while this is true would blur the focused widget
+        // and focus nothing.
+        let empty = SidebarModel::ready(SidebarMode::Expanded, Vec::new());
+        let populated = SidebarModel::ready(SidebarMode::Expanded, vec![project()]);
+        let mut state = SidebarState::default();
+        state.apply(&SidebarAction::ToggleControls);
+        assert!(state.controls_expanded());
+
+        for (model, mode) in [
+            (&empty, SidebarMode::Compact),
+            (&empty, SidebarMode::Expanded),
+            (&populated, SidebarMode::Compact),
+            (&populated, SidebarMode::Expanded),
+        ] {
+            let rendered = control_ids(&view(model, &state, mode, DEFAULT_EXPANDED_WIDTH))
+                .contains(&search_focus_id().to_string());
             assert_eq!(
-                control.as_widget().id().map(|id| id.to_string()),
-                Some(search_focus_id().to_string())
+                search_is_reachable(model, mode),
+                rendered,
+                "reachability disagrees with the pane at {mode:?} over {} projects",
+                model.projects.len()
             );
         }
+    }
+
+    #[test]
+    fn each_density_applies_only_the_state_it_gives_a_control() {
+        let model = SidebarModel::ready(SidebarMode::Compact, vec![project()]);
+        let chrome = &model.projects[0].chrome;
+        let mut state = SidebarState::default();
+        state.apply(&SidebarAction::OpenRepository {
+            project_id: project_id(1),
+            repository: "/repo/cagents".into(),
+        });
+        state.apply(&SidebarAction::SetFilter(SidebarFilter::Attention));
+        state.apply(&SidebarAction::SearchChanged(
+            "no project answers to this".into(),
+        ));
+
+        let rail = control_ids(&view(
+            &model,
+            &state,
+            SidebarMode::Compact,
+            DEFAULT_EXPANDED_WIDTH,
+        ));
+        for id in [
+            stable_id("open-repository"),
+            filter_id(SidebarFilter::All),
+            filter_id(SidebarFilter::Attention),
+            filter_id(SidebarFilter::PullRequests),
+            chrome.open_id.clone(),
+            chrome.new_worktree_id.clone(),
+            chrome.create_pull_request_id.clone(),
+            stable_id("settings"),
+        ] {
+            assert!(
+                rail.contains(&id.to_string()),
+                "the rail must render {id:?}: a filter it cannot clear hides projects, and the \
+                 window's header bar is no route to the commands it drops. It renders {rail:?}"
+            );
+        }
+
+        // The rail holds no text input, so it renders none and applies no
+        // query: the project it lists matches nothing in the query. The
+        // expanded pane renders the input, so there the query applies and the
+        // pane offers to clear it instead of listing the project.
+        assert!(!rail.contains(&search_focus_id().to_string()));
+        assert!(!rail.contains(&stable_id("toggle-controls").to_string()));
+        assert_eq!(filtered_projects(&model, &state, true).len(), 1);
+        assert!(filtered_projects(&model, &state, false).is_empty());
+
+        let pane = control_ids(&view(
+            &model,
+            &state,
+            SidebarMode::Expanded,
+            DEFAULT_EXPANDED_WIDTH,
+        ));
+        assert!(pane.contains(&stable_id("toggle-controls").to_string()));
+        assert!(pane.contains(&stable_id("empty.action").to_string()));
+        assert!(!pane.contains(&chrome.open_id.to_string()));
+        // The expanded search and filter live behind the toggle, which starts
+        // closed.
+        assert!(!pane.contains(&search_focus_id().to_string()));
+        assert!(!pane.contains(&filter_id(SidebarFilter::Attention).to_string()));
+
+        state.apply(&SidebarAction::ToggleControls);
+        let opened = control_ids(&view(
+            &model,
+            &state,
+            SidebarMode::Expanded,
+            DEFAULT_EXPANDED_WIDTH,
+        ));
+        assert!(opened.contains(&search_focus_id().to_string()));
+        assert!(opened.contains(&filter_id(SidebarFilter::Attention).to_string()));
+    }
+
+    #[test]
+    fn the_controls_toggle_is_offered_only_where_it_opens_something() {
+        let mut state = SidebarState::default();
+        state.apply(&SidebarAction::ToggleControls);
+        let toggle = stable_id("toggle-controls").to_string();
+        let offered = |model: &SidebarModel| {
+            control_ids(&view(
+                model,
+                &state,
+                SidebarMode::Expanded,
+                DEFAULT_EXPANDED_WIDTH,
+            ))
+            .contains(&toggle)
+        };
+
+        assert!(offered(&SidebarModel::ready(
+            SidebarMode::Expanded,
+            vec![project()]
+        )));
+        // The pane renders the controls only for a non-empty project list, and
+        // `SidebarModel::error` empties that list, so in either empty state the
+        // toggle would offer, and paint itself selected over, a panel that
+        // never opens.
+        assert!(!offered(&SidebarModel::ready(
+            SidebarMode::Expanded,
+            Vec::new()
+        )));
+        assert!(!offered(&SidebarModel::error(
+            SidebarMode::Expanded,
+            "disk on fire"
+        )));
     }
 
     #[test]
