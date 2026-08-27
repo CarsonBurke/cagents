@@ -699,6 +699,32 @@ enum SettingsFeedback {
     Error(String),
 }
 
+/// The shortcut rows exactly as typed.
+///
+/// A chord list edits as one comma-separated line, and reformatting it from the
+/// parsed list on every keystroke would delete a separator the moment the user
+/// typed it. The parsed form lives in `AppSettings`; this is only the text.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ShortcutDraft {
+    new_terminal: String,
+    close_focused_column: String,
+    search_projects: String,
+    previous_column: String,
+    next_column: String,
+}
+
+impl ShortcutDraft {
+    fn from_shortcuts(shortcuts: &KeyboardShortcuts) -> Self {
+        Self {
+            new_terminal: settings::format_chords(&shortcuts.new_terminal),
+            close_focused_column: settings::format_chords(&shortcuts.close_focused_column),
+            search_projects: settings::format_chords(&shortcuts.search_projects),
+            previous_column: settings::format_chords(&shortcuts.previous_column),
+            next_column: settings::format_chords(&shortcuts.next_column),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct SettingsDraft {
     schema_version: String,
@@ -711,7 +737,7 @@ struct SettingsDraft {
     default_column_fraction: String,
     link_open_destination: LinkOpenDestination,
     link_open_gesture: LinkOpenGesture,
-    keyboard_shortcuts: KeyboardShortcuts,
+    keyboard_shortcuts: ShortcutDraft,
 }
 
 impl SettingsDraft {
@@ -727,7 +753,7 @@ impl SettingsDraft {
             default_column_fraction: settings.default_column_fraction.to_string(),
             link_open_destination: settings.link_open_destination,
             link_open_gesture: settings.link_open_gesture,
-            keyboard_shortcuts: settings.keyboard_shortcuts.clone(),
+            keyboard_shortcuts: ShortcutDraft::from_shortcuts(&settings.keyboard_shortcuts),
         }
     }
 
@@ -857,23 +883,23 @@ fn settings_update(
             _ => Err("Choose a link-opening gesture.".to_owned()),
         },
         SettingsField::ShortcutNewTerminal => {
-            next.keyboard_shortcuts.new_terminal = value.to_owned();
+            next.keyboard_shortcuts.new_terminal = settings::parse_chords(value);
             Ok(())
         }
         SettingsField::ShortcutCloseFocusedColumn => {
-            next.keyboard_shortcuts.close_focused_column = value.to_owned();
+            next.keyboard_shortcuts.close_focused_column = settings::parse_chords(value);
             Ok(())
         }
         SettingsField::ShortcutSearchProjects => {
-            next.keyboard_shortcuts.search_projects = value.to_owned();
+            next.keyboard_shortcuts.search_projects = settings::parse_chords(value);
             Ok(())
         }
         SettingsField::ShortcutPreviousColumn => {
-            next.keyboard_shortcuts.previous_column = value.to_owned();
+            next.keyboard_shortcuts.previous_column = settings::parse_chords(value);
             Ok(())
         }
         SettingsField::ShortcutNextColumn => {
-            next.keyboard_shortcuts.next_column = value.to_owned();
+            next.keyboard_shortcuts.next_column = settings::parse_chords(value);
             Ok(())
         }
     };
@@ -1059,7 +1085,7 @@ impl CardChrome {
             close_name: format!(
                 "{}, {}",
                 card_close_name(type_label, title),
-                workspace_widget::shortcut_keys(
+                workspace_widget::shortcut_chords(
                     workspace_widget::GlobalShortcut::CloseFocusedCard,
                     shortcuts,
                 ),
@@ -2593,7 +2619,7 @@ impl Cagents {
                         Cow::Owned(format!(
                             "{}, {}",
                             card_close_name(labels.type_label, title),
-                            workspace_widget::shortcut_keys(
+                            workspace_widget::shortcut_chords(
                                 workspace_widget::GlobalShortcut::CloseFocusedCard,
                                 &self.settings.keyboard_shortcuts,
                             ),
@@ -4293,54 +4319,56 @@ impl Application for Cagents {
             workspace_widget::shortcut_descriptor(workspace_widget::GlobalShortcut::FocusAdjacent(
                 crate::workspace::FocusDirection::Right,
             ));
-        let navigator: Element<'_, Message> = widget::row::with_children(vec![
-            widget::button::icon(widget::icon::from_name("go-previous-symbolic"))
-                .id(widget::Id::new("command.previous-column"))
-                .name(format!(
-                    "{}, {}",
-                    previous.label,
-                    workspace_widget::shortcut_keys(
+        let navigator: Element<'_, Message> =
+            widget::row::with_children(vec![
+                widget::button::icon(widget::icon::from_name("go-previous-symbolic"))
+                    .id(widget::Id::new("command.previous-column"))
+                    .name(format!(
+                        "{}, {}",
+                        previous.label,
+                        workspace_widget::shortcut_chords(
+                            previous.action,
+                            &self.settings.keyboard_shortcuts,
+                        )
+                    ))
+                    .tooltip(workspace_widget::shortcut_tooltip(
                         previous.action,
                         &self.settings.keyboard_shortcuts,
-                    )
-                ))
-                .tooltip(workspace_widget::shortcut_tooltip(
-                    previous.action,
-                    &self.settings.keyboard_shortcuts,
-                ))
-                .width(ICON_CONTROL_SIZE)
-                .height(ICON_CONTROL_SIZE)
-                .on_press_maybe((current > 1).then_some(Message::FocusAdjacent(
-                    crate::workspace::FocusDirection::Left,
-                )))
-                .into(),
-            widget::container(widget::text::caption(format!("{current} / {total}")))
-                .center_x(Length::Fixed(APP_HEADER_HEIGHT))
-                .align_y(Alignment::Center)
-                .into(),
-            widget::button::icon(widget::icon::from_name("go-next-symbolic"))
-                .id(widget::Id::new("command.next-column"))
-                .name(format!(
-                    "{}, {}",
-                    next.label,
-                    workspace_widget::shortcut_keys(next.action, &self.settings.keyboard_shortcuts,)
-                ))
-                .tooltip(workspace_widget::shortcut_tooltip(
-                    next.action,
-                    &self.settings.keyboard_shortcuts,
-                ))
-                .width(ICON_CONTROL_SIZE)
-                .height(ICON_CONTROL_SIZE)
-                .on_press_maybe(
-                    (current > 0 && current < total).then_some(Message::FocusAdjacent(
-                        crate::workspace::FocusDirection::Right,
-                    )),
-                )
-                .into(),
-        ])
-        .align_y(Alignment::Center)
-        .spacing(0)
-        .into();
+                    ))
+                    .width(ICON_CONTROL_SIZE)
+                    .height(ICON_CONTROL_SIZE)
+                    .on_press_maybe((current > 1).then_some(Message::FocusAdjacent(
+                        crate::workspace::FocusDirection::Left,
+                    )))
+                    .into(),
+                widget::container(widget::text::caption(format!("{current} / {total}")))
+                    .center_x(Length::Fixed(APP_HEADER_HEIGHT))
+                    .align_y(Alignment::Center)
+                    .into(),
+                widget::button::icon(widget::icon::from_name("go-next-symbolic"))
+                    .id(widget::Id::new("command.next-column"))
+                    .name(format!(
+                        "{}, {}",
+                        next.label,
+                        workspace_widget::shortcut_chords(
+                            next.action,
+                            &self.settings.keyboard_shortcuts,
+                        )
+                    ))
+                    .tooltip(workspace_widget::shortcut_tooltip(
+                        next.action,
+                        &self.settings.keyboard_shortcuts,
+                    ))
+                    .width(ICON_CONTROL_SIZE)
+                    .height(ICON_CONTROL_SIZE)
+                    .on_press_maybe((current > 0 && current < total).then_some(
+                        Message::FocusAdjacent(crate::workspace::FocusDirection::Right),
+                    ))
+                    .into(),
+            ])
+            .align_y(Alignment::Center)
+            .spacing(0)
+            .into();
 
         let failed = self
             .cards
@@ -4406,7 +4434,7 @@ impl Application for Cagents {
                     .name(format!(
                         "{}, {}",
                         new_terminal.label,
-                        workspace_widget::shortcut_keys(
+                        workspace_widget::shortcut_chords(
                             new_terminal.action,
                             &self.settings.keyboard_shortcuts,
                         )
@@ -4444,7 +4472,7 @@ impl Application for Cagents {
                     .name(format!(
                         "{}, {}",
                         new_terminal.label,
-                        workspace_widget::shortcut_keys(
+                        workspace_widget::shortcut_chords(
                             new_terminal.action,
                             &self.settings.keyboard_shortcuts,
                         )
@@ -4883,7 +4911,7 @@ fn settings_category_controls<'a>(
         )],
         SettingsCategory::Keyboard => vec![settings_group(
             "Keyboard shortcuts",
-            "Use Ctrl, Alt, Shift, or Super plus A-Z, 0-9, Left, or Right. Every shortcut must be unique.",
+            "Each row takes one or more chords separated by commas. Use Ctrl, Alt, or Super, optionally with Shift, plus A-Z, 0-9, Left, or Right. Every chord in the table must be unique.",
             vec![
                 setting_input(
                     "New terminal",

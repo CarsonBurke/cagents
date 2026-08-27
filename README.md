@@ -200,11 +200,11 @@ link_open_destination = "integrated_browser"
 link_open_gesture = "control_click"
 
 [keyboard_shortcuts]
-new_terminal = "Ctrl+T"
-close_focused_column = "Ctrl+W"
-search_projects = "Ctrl+F"
-previous_column = "Alt+Q"
-next_column = "Alt+W"
+new_terminal = ["Ctrl+T"]
+close_focused_column = ["Ctrl+W"]
+search_projects = ["Ctrl+F"]
+previous_column = ["Alt+Q", "Alt+Left"]
+next_column = ["Alt+W", "Alt+Right"]
 ```
 
 | Key | Type | Default | Accepted values |
@@ -219,7 +219,7 @@ next_column = "Alt+W"
 | `default_column_fraction` | float | `0.72` | finite values from `0.25` through `1.0`, inclusive |
 | `link_open_destination` | string | `"integrated_browser"` | `"integrated_browser"` or `"system_default"` |
 | `link_open_gesture` | string | `"control_click"` | `"control_click"` or `"control_shift_click"` |
-| `keyboard_shortcuts.*` | string | shown above | a unique chord containing Ctrl, Alt, or Super and one A-Z, 0-9, Left, or Right key; Shift is optional |
+| `keyboard_shortcuts.*` | array of strings | shown above | one or more chords, each containing Ctrl, Alt, or Super and one A-Z, 0-9, Left, or Right key; Shift is optional. Every chord in the table must be distinct, and a bound chord is reserved rather than forwarded to the process inside a card |
 
 Version 1 TOML files are upgraded while loading. Sidebar widths accepted by
 version 1 are clamped to the current visible range; other values are preserved.

@@ -55,50 +55,91 @@ impl LinkOpenGesture {
     }
 }
 
+/// The chords bound to each action.
+///
+/// A list rather than a single chord because an action can be reachable by
+/// more than one gesture: column navigation answers to both a letter chord and
+/// the arrow keys, and binding one must not cost the other. Every chord in the
+/// table, across all actions, must be distinct, and a chord bound here is also
+/// reserved - the workspace consumes it instead of forwarding it to the
+/// process inside a card.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct KeyboardShortcuts {
-    pub new_terminal: String,
-    pub close_focused_column: String,
-    pub search_projects: String,
-    pub previous_column: String,
-    pub next_column: String,
+    pub new_terminal: Vec<String>,
+    pub close_focused_column: Vec<String>,
+    pub search_projects: Vec<String>,
+    pub previous_column: Vec<String>,
+    pub next_column: Vec<String>,
 }
 
 impl Default for KeyboardShortcuts {
     fn default() -> Self {
         Self {
-            new_terminal: "Ctrl+T".to_owned(),
-            close_focused_column: "Ctrl+W".to_owned(),
-            search_projects: "Ctrl+F".to_owned(),
-            previous_column: "Alt+Q".to_owned(),
-            next_column: "Alt+W".to_owned(),
+            new_terminal: vec!["Ctrl+T".to_owned()],
+            close_focused_column: vec!["Ctrl+W".to_owned()],
+            search_projects: vec!["Ctrl+F".to_owned()],
+            previous_column: vec!["Alt+Q".to_owned(), "Alt+Left".to_owned()],
+            next_column: vec!["Alt+W".to_owned(), "Alt+Right".to_owned()],
         }
     }
 }
 
+/// Separates chords in the one-line form the settings dialog edits.
+pub const CHORD_SEPARATOR: &str = ", ";
+
 impl KeyboardShortcuts {
+    /// Every action's chord list, in the order the dialog presents them.
+    fn actions(&self) -> [&Vec<String>; 5] {
+        [
+            &self.new_terminal,
+            &self.close_focused_column,
+            &self.search_projects,
+            &self.previous_column,
+            &self.next_column,
+        ]
+    }
+
     fn validate(&self) -> Result<(), SettingsError> {
-        let bindings = [
-            parse_shortcut(&self.new_terminal),
-            parse_shortcut(&self.close_focused_column),
-            parse_shortcut(&self.search_projects),
-            parse_shortcut(&self.previous_column),
-            parse_shortcut(&self.next_column),
-        ];
-        let mut parsed = Vec::with_capacity(bindings.len());
-        for binding in bindings {
-            parsed.push(binding.map_err(SettingsError::InvalidShortcut)?);
-        }
-        for (index, binding) in parsed.iter().enumerate() {
-            if parsed[..index].contains(binding) {
+        let mut parsed = Vec::new();
+        for chords in self.actions() {
+            if chords.is_empty() {
+                // An action with no chord would be silently unreachable, and
+                // its label would advertise a gesture that does nothing.
                 return Err(SettingsError::InvalidShortcut(
-                    "keyboard shortcuts must not conflict",
+                    "every keyboard shortcut needs at least one chord",
                 ));
+            }
+            for chord in chords {
+                let binding = parse_shortcut(chord).map_err(SettingsError::InvalidShortcut)?;
+                if parsed.contains(&binding) {
+                    return Err(SettingsError::InvalidShortcut(
+                        "keyboard shortcuts must not conflict",
+                    ));
+                }
+                parsed.push(binding);
             }
         }
         Ok(())
     }
+}
+
+/// Renders a chord list as the single line the settings dialog edits.
+pub fn format_chords(chords: &[String]) -> String {
+    chords.join(CHORD_SEPARATOR)
+}
+
+/// Reads back the line `format_chords` writes.
+///
+/// Empty entries are dropped rather than kept as blanks, so a trailing
+/// separator left mid-edit does not read as an unparsable chord; a line with no
+/// chord at all is rejected by [`KeyboardShortcuts::validate`].
+pub fn parse_chords(raw: &str) -> Vec<String> {
+    raw.split(',')
+        .map(str::trim)
+        .filter(|chord| !chord.is_empty())
+        .map(str::to_owned)
+        .collect()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -710,6 +751,8 @@ mod tests {
         assert!(parse_shortcut("Ctrl+Alt+Left").is_ok());
         assert!(parse_shortcut("Ctrl+NotAKey").is_err());
 
+        // Conflicts are detected across actions and across every chord in an
+        // action, not just the first.
         let mut conflicting = AppSettings::default();
         conflicting.keyboard_shortcuts.next_column =
             conflicting.keyboard_shortcuts.previous_column.clone();
@@ -717,6 +760,42 @@ mod tests {
             conflicting.validate(),
             Err(SettingsError::InvalidShortcut(message)) if message.contains("conflict")
         ));
+
+        let mut alternate_conflict = AppSettings::default();
+        alternate_conflict
+            .keyboard_shortcuts
+            .new_terminal
+            .push("Alt+Left".to_owned());
+        assert!(matches!(
+            alternate_conflict.validate(),
+            Err(SettingsError::InvalidShortcut(message)) if message.contains("conflict")
+        ));
+
+        // An action bound to nothing would be silently unreachable.
+        let mut unbound = AppSettings::default();
+        unbound.keyboard_shortcuts.search_projects.clear();
+        assert!(matches!(
+            unbound.validate(),
+            Err(SettingsError::InvalidShortcut(_))
+        ));
+
+        // Column navigation answers to a letter chord and an arrow, so binding
+        // one never costs the other.
+        let defaults = KeyboardShortcuts::default();
+        assert!(defaults.previous_column.iter().any(|c| c == "Alt+Left"));
+        assert!(defaults.next_column.iter().any(|c| c == "Alt+Right"));
+        assert!(AppSettings::default().validate().is_ok());
+    }
+
+    #[test]
+    fn a_chord_line_round_trips_through_the_dialog_representation() {
+        let chords = vec!["Alt+Q".to_owned(), "Alt+Left".to_owned()];
+        assert_eq!(format_chords(&chords), "Alt+Q, Alt+Left");
+        assert_eq!(parse_chords(&format_chords(&chords)), chords);
+
+        // Whitespace and the separator left behind mid-edit are not chords.
+        assert_eq!(parse_chords(" Ctrl+T ,, "), vec!["Ctrl+T".to_owned()]);
+        assert!(parse_chords("  ").is_empty());
     }
 
     #[test]

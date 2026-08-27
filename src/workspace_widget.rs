@@ -18,7 +18,7 @@ use cosmic::{Element, Renderer, Task, Theme};
 
 use crate::{
     model::CardId,
-    settings::{KeyboardShortcuts, ShortcutBinding, ShortcutKey, parse_shortcut},
+    settings::{CHORD_SEPARATOR, KeyboardShortcuts, ShortcutBinding, ShortcutKey, parse_shortcut},
     workspace::{
         FocusDirection, FocusHandoff, FocusTarget, ViewportProjection, WheelDelta, Workspace,
     },
@@ -93,7 +93,9 @@ pub fn shortcut_descriptor(action: GlobalShortcut) -> &'static ShortcutDescripto
         .expect("every dispatched global shortcut has a descriptor")
 }
 
-pub fn shortcut_keys(action: GlobalShortcut, shortcuts: &KeyboardShortcuts) -> &str {
+/// Every chord bound to `action`. Never empty: `KeyboardShortcuts::validate`
+/// rejects an action with no chord.
+pub fn shortcut_keys(action: GlobalShortcut, shortcuts: &KeyboardShortcuts) -> &[String] {
     match action {
         GlobalShortcut::NewTerminal => &shortcuts.new_terminal,
         GlobalShortcut::CloseFocusedCard => &shortcuts.close_focused_column,
@@ -103,12 +105,17 @@ pub fn shortcut_keys(action: GlobalShortcut, shortcuts: &KeyboardShortcuts) -> &
     }
 }
 
+/// The chords bound to `action`, as shown to the user.
+pub fn shortcut_chords(action: GlobalShortcut, shortcuts: &KeyboardShortcuts) -> String {
+    shortcut_keys(action, shortcuts).join(CHORD_SEPARATOR)
+}
+
 pub fn shortcut_tooltip(action: GlobalShortcut, shortcuts: &KeyboardShortcuts) -> String {
     let descriptor = shortcut_descriptor(action);
     format!(
         "{} — {}",
         descriptor.label,
-        shortcut_keys(action, shortcuts)
+        shortcut_chords(action, shortcuts)
     )
 }
 
@@ -256,8 +263,12 @@ fn global_shortcut_descriptor(
     shortcuts: &KeyboardShortcuts,
 ) -> Option<&'static ShortcutDescriptor> {
     GLOBAL_SHORTCUT_DESCRIPTORS.iter().find(|descriptor| {
-        parse_shortcut(shortcut_keys(descriptor.action, shortcuts))
-            .is_ok_and(|binding| shortcut_matches(binding, key, physical_key, modifiers))
+        shortcut_keys(descriptor.action, shortcuts)
+            .iter()
+            .any(|chord| {
+                parse_shortcut(chord)
+                    .is_ok_and(|binding| shortcut_matches(binding, key, physical_key, modifiers))
+            })
     })
 }
 
@@ -1481,6 +1492,24 @@ mod tests {
         }
     }
 
+    fn named_key_press(
+        named: keyboard::key::Named,
+        code: keyboard::key::Code,
+        modifiers: keyboard::Modifiers,
+        repeat: bool,
+    ) -> keyboard::Event {
+        let key = keyboard::Key::Named(named);
+        keyboard::Event::KeyPressed {
+            key: key.clone(),
+            modified_key: key,
+            physical_key: keyboard::key::Physical::Code(code),
+            location: keyboard::Location::Standard,
+            modifiers,
+            text: None,
+            repeat,
+        }
+    }
+
     #[test]
     fn global_shortcuts_match_configured_chords_and_repeat_presses() {
         use keyboard::key::Code;
@@ -1547,8 +1576,39 @@ mod tests {
             Some(GlobalShortcut::FocusAdjacent(FocusDirection::Right))
         );
 
+        // An action answers to every chord bound to it, not just the first:
+        // column navigation ships a letter chord *and* an arrow, and each must
+        // navigate and be reserved against the process inside a card.
+        for (named, code, direction) in [
+            (
+                keyboard::key::Named::ArrowLeft,
+                Code::ArrowLeft,
+                FocusDirection::Left,
+            ),
+            (
+                keyboard::key::Named::ArrowRight,
+                Code::ArrowRight,
+                FocusDirection::Right,
+            ),
+        ] {
+            for repeat in [false, true] {
+                let event = named_key_press(named, code, keyboard::Modifiers::ALT, repeat);
+                assert_eq!(
+                    global_shortcut(&event, &shortcuts),
+                    Some(GlobalShortcut::FocusAdjacent(direction)),
+                    "Alt+arrow must navigate on initial and repeated presses"
+                );
+                assert!(is_global_shortcut_chord(
+                    &keyboard::Key::Named(named),
+                    keyboard::key::Physical::Code(code),
+                    keyboard::Modifiers::ALT,
+                    &shortcuts,
+                ));
+            }
+        }
+
         let mut customized = shortcuts;
-        customized.new_terminal = "Ctrl+Shift+N".to_owned();
+        customized.new_terminal = vec!["Ctrl+Shift+N".to_owned()];
         assert_eq!(
             global_shortcut(
                 &key_press(
@@ -1561,7 +1621,7 @@ mod tests {
             ),
             Some(GlobalShortcut::NewTerminal)
         );
-        customized.new_terminal = "Ctrl+Shift+1".to_owned();
+        customized.new_terminal = vec!["Ctrl+Shift+1".to_owned()];
         assert_eq!(
             global_shortcut(
                 &key_press(
@@ -1861,8 +1921,16 @@ mod tests {
             assert!(!descriptor.label.is_empty());
             let keys = shortcut_keys(descriptor.action, &shortcuts);
             assert!(!keys.is_empty());
-            assert!(parse_shortcut(keys).is_ok());
-            assert!(bindings.insert(keys));
+            for chord in keys {
+                assert!(parse_shortcut(chord).is_ok());
+                // Distinct across every action, not merely within one, or a
+                // chord would dispatch to whichever descriptor came first.
+                assert!(bindings.insert(chord.clone()));
+            }
+            assert_eq!(
+                shortcut_chords(descriptor.action, &shortcuts),
+                keys.join(CHORD_SEPARATOR)
+            );
         }
     }
 
