@@ -1,10 +1,13 @@
 use std::{
-    collections::HashMap,
+    cell::RefCell,
+    collections::{HashMap, HashSet},
     marker::PhantomData,
+    ops::Range,
     sync::{Arc, LazyLock, Mutex},
 };
 
 use cosmic::iced::advanced::Renderer as _;
+use cosmic::iced::advanced::graphics::text::{self as graphics_text, cosmic_text, font_system};
 use cosmic::iced::advanced::text::Paragraph as _;
 use cosmic::{
     Element, Renderer, Theme,
@@ -20,8 +23,8 @@ use cosmic::{
 };
 
 use super::{
-    CellSnapshot, CursorShape, KeyAction, KeyInput, KeyModifiers, MouseAction,
-    MouseButton, MouseInput, RenderSnapshot, Rgb, TerminalKey, TerminalSendError, TerminalSize,
+    CellSnapshot, CursorShape, KeyAction, KeyInput, KeyModifiers, MouseAction, MouseButton,
+    MouseInput, RenderSnapshot, Rgb, RowSnapshot, TerminalKey, TerminalSendError, TerminalSize,
     TerminalSurface, Underline,
 };
 
@@ -31,22 +34,22 @@ const CONTENT_PADDING_Y: f32 = 4.0;
 /// Text metrics for one terminal grid at one scale factor.
 ///
 /// The grid pitch is snapped to whole physical pixels so that backgrounds, the
-/// cursor and mouse hit-testing all land on device pixels. A shaped text run,
-/// however, advances by the font's own fractional advance, so a run drawn as a
-/// single primitive drifts off its columns unless the two agree. `faces`
-/// reconciles them per face: it carries the font size at which that face's
-/// advance is closest to the pitch, and the longest run for which the residual
-/// difference still cannot reach half a physical pixel.
+/// cursor and mouse hit-testing all land on device pixels. A face's own advance
+/// is fractional and need not match that pitch, so `faces` carries, per face,
+/// the font size at which its advance comes closest to it. Drawing a face at
+/// that size is what makes a whole run of cells land on the grid: see
+/// [`shape_segment`].
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct CellMetrics {
     pub width: f32,
     pub height: f32,
-    faces: [FaceMetrics; FACE_COUNT],
+    faces: [f32; FACE_COUNT],
+    /// The family these advances were measured from, carried so that shaping
+    /// cannot draw with a family the grid pitch was not measured for.
+    family: &'static str,
 }
 
-
-/// The two style bits that select a font face, and therefore the only ones a
-/// shaped text run may not span.
+/// The two style bits that select a font face.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Face {
     bold: bool,
@@ -59,26 +62,12 @@ impl Face {
     }
 }
 
-/// How one face must be drawn to stay on the grid.
-#[derive(Clone, Copy, Debug, PartialEq)]
-struct FaceMetrics {
-    /// Size at which this face's advance is closest to the grid pitch.
-    font_size: f32,
-    /// Longest run this face may cover with one shaped primitive.
-    max_run: u16,
-}
-
-
 const FACE_COUNT: usize = 4;
 
 /// Cell height as a multiple of the font size. Terminals pick a fixed ratio
 /// rather than the font's own line height so that a font fallback for one row
 /// cannot change the grid pitch. 1.286 keeps the historical 18px box at 14pt.
 const LINE_HEIGHT_RATIO: f32 = 1.286;
-
-/// The drift a coalesced run is allowed to accumulate, in physical pixels.
-/// Half a pixel is the point at which a glyph would snap to the wrong column.
-const MAX_RUN_DRIFT_PX: f32 = 0.5;
 
 pub const DEFAULT_FONT_SIZE: f32 = 14.0;
 
@@ -88,15 +77,21 @@ pub const DEFAULT_FONT_SIZE: f32 = 14.0;
 const ADVANCE_SAMPLE: &str = "MMMMMMMMMMMMMMMM";
 
 impl CellMetrics {
-    /// Returns the metrics for `font_size` at `scale_factor`, measuring at most
-    /// once per distinct pair for the lifetime of the process.
+    /// Returns the metrics for `font_size` and `family` at `scale_factor`,
+    /// measuring at most once per distinct triple for the lifetime of the
+    /// process.
     ///
-    /// Measuring is four shaping calls and the installed faces cannot change at
+    /// Measuring is a shaping call and the installed faces cannot change at
     /// runtime, so the result is a pure function of its inputs. Memoising it
     /// lets `layout` and `draw` run per frame without paying for text layout.
-    pub fn resolve(font_size: f32, scale_factor: f32) -> Self {
-        static MEASURED: LazyLock<Mutex<HashMap<(u32, u32), CellMetrics>>> =
-            LazyLock::new(|| Mutex::new(HashMap::new()));
+    ///
+    /// An empty `family` selects the system monospace default.
+    pub fn resolve(font_size: f32, scale_factor: f32, family: &str) -> Self {
+        /// Keyed by the font size and scale factor in their raw bit patterns,
+        /// which are exact for the equality this cache needs, and the family
+        /// name interned for the lifetime of the process.
+        type MeasuredMetrics = Mutex<HashMap<(u32, u32, &'static str), CellMetrics>>;
+        static MEASURED: LazyLock<MeasuredMetrics> = LazyLock::new(|| Mutex::new(HashMap::new()));
 
         let font_size = if font_size.is_finite() {
             font_size.clamp(1.0, 400.0)
@@ -108,21 +103,22 @@ impl CellMetrics {
         } else {
             1.0
         };
-        let key = (font_size.to_bits(), scale_factor.to_bits());
+        let family = intern_family(family);
+        let key = (font_size.to_bits(), scale_factor.to_bits(), family);
         let mut measured = MEASURED
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         *measured
             .entry(key)
-            .or_insert_with(|| Self::measure(font_size, scale_factor))
+            .or_insert_with(|| Self::measure(font_size, scale_factor, family))
     }
 
-    fn measure(font_size: f32, scale_factor: f32) -> Self {
+    fn measure(font_size: f32, scale_factor: f32, family: &'static str) -> Self {
         let plain = Face {
             bold: false,
             italic: false,
         };
-        let base = advance(font_size, plain).unwrap_or((font_size * 0.6).max(1.0));
+        let base = advance(font_size, family, plain).unwrap_or((font_size * 0.6).max(1.0));
         let width = (base * scale_factor).round().max(1.0) / scale_factor;
         let height = (font_size * LINE_HEIGHT_RATIO * scale_factor)
             .round()
@@ -134,71 +130,45 @@ impl CellMetrics {
                 bold: index & 1 != 0,
                 italic: index & 2 != 0,
             };
-            // Scaling the size by pitch/advance lands the face on the pitch
-            // when its advance is linear in the size, which is the normal case.
-            // The re-measurement below is what makes the result correct when it
-            // is not, rather than assuming it: a face that refuses to land on
-            // the pitch gets a short `max_run` and is drawn in more pieces.
-            let Some(face_base) = advance(font_size, key) else {
-                return FaceMetrics {
-                    font_size,
-                    max_run: 1,
-                };
+            // Scaling the size by pitch/advance makes this face advance by
+            // exactly one cell, provided its advance is linear in the size -
+            // the normal case for a monospace face. A face whose advance cannot
+            // be measured keeps the requested size.
+            let Some(face_base) = advance(font_size, family, key) else {
+                return font_size;
             };
-            let adjusted = (font_size * width / face_base).clamp(1.0, 400.0);
-            let actual = advance(adjusted, key).unwrap_or(face_base);
-            FaceMetrics {
-                font_size: adjusted,
-                max_run: run_ceiling((actual - width).abs() * scale_factor),
-            }
+            (font_size * width / face_base).clamp(1.0, 400.0)
         });
 
         Self {
             width,
             height,
             faces,
+            family,
         }
     }
 
-    fn face(&self, key: Face) -> FaceMetrics {
+    /// The font size at which `key` advances by exactly one cell.
+    fn face_size(&self, key: Face) -> f32 {
         self.faces[key.index()]
     }
 }
 
 impl Default for CellMetrics {
     fn default() -> Self {
-        Self::resolve(DEFAULT_FONT_SIZE, 1.0)
-    }
-}
-
-/// The longest run whose accumulated drift stays under half a physical pixel.
-///
-/// The first cell of a run is anchored exactly, so `n` cells accumulate
-/// `(n - 1) * drift`.
-fn run_ceiling(drift_px: f32) -> u16 {
-    if !drift_px.is_finite() {
-        return 1;
-    }
-    if drift_px <= f32::EPSILON {
-        return u16::MAX;
-    }
-    let cells = (MAX_RUN_DRIFT_PX / drift_px).floor();
-    if cells >= f32::from(u16::MAX) {
-        u16::MAX
-    } else {
-        (cells as u16).saturating_add(1).max(1)
+        Self::resolve(DEFAULT_FONT_SIZE, 1.0, "")
     }
 }
 
 /// The shaped horizontal advance of one monospace cell, or `None` when no face
 /// resolved and the measurement cannot be trusted.
-fn advance(font_size: f32, key: Face) -> Option<f32> {
+fn advance(font_size: f32, family: &'static str, key: Face) -> Option<f32> {
     let paragraph = <Renderer as text::Renderer>::Paragraph::with_text(text::Text {
         content: ADVANCE_SAMPLE,
         bounds: Size::new(f32::INFINITY, f32::INFINITY),
         size: Pixels(font_size),
         line_height: text::LineHeight::Relative(1.0),
-        font: font(key),
+        font: font(family, key),
         align_x: text::Alignment::Left,
         align_y: cosmic::iced::alignment::Vertical::Top,
         shaping: text::Shaping::Basic,
@@ -209,8 +179,13 @@ fn advance(font_size: f32, key: Face) -> Option<f32> {
     (measured.is_finite() && measured >= 1.0).then_some(measured)
 }
 
-fn font(key: Face) -> Font {
+fn font(family: &'static str, key: Face) -> Font {
     Font {
+        family: if family.is_empty() {
+            Font::MONOSPACE.family
+        } else {
+            cosmic::iced::font::Family::Name(family)
+        },
         weight: if key.bold {
             cosmic::iced::font::Weight::Bold
         } else {
@@ -223,6 +198,33 @@ fn font(key: Face) -> Font {
         },
         ..Font::MONOSPACE
     }
+}
+
+/// Interns a family name for the lifetime of the process, mapping an empty name
+/// to the system monospace default.
+///
+/// iced names a family with a `&'static str`, but ours comes from a settings
+/// file at runtime and `view` rebuilds the widget on every frame: leaking there
+/// would leak per frame. Each distinct name is therefore leaked exactly once,
+/// so repeated frames - and an edit back to a name already seen - allocate
+/// nothing. The set of families a user types is bounded in practice.
+fn intern_family(family: &str) -> &'static str {
+    static INTERNED: LazyLock<Mutex<HashSet<&'static str>>> =
+        LazyLock::new(|| Mutex::new(HashSet::new()));
+
+    let family = family.trim();
+    if family.is_empty() {
+        return "";
+    }
+    let mut interned = INTERNED
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some(&existing) = interned.get(family) {
+        return existing;
+    }
+    let leaked: &'static str = String::from(family).leak();
+    interned.insert(leaked);
+    leaked
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -240,7 +242,7 @@ struct TerminalGeometry {
 }
 
 impl TerminalGeometry {
-    fn new(bounds: Rectangle, font_size: f32, scale_factor: f32) -> Self {
+    fn new(bounds: Rectangle, font_size: f32, scale_factor: f32, family: &str) -> Self {
         let scale_factor = if scale_factor.is_finite() && scale_factor > 0.0 {
             scale_factor
         } else {
@@ -248,7 +250,7 @@ impl TerminalGeometry {
         };
         // `resolve` already snapped the pitch to whole physical pixels at this
         // scale, so these conversions are exact rather than a second rounding.
-        let metrics = CellMetrics::resolve(font_size, scale_factor);
+        let metrics = CellMetrics::resolve(font_size, scale_factor, family);
         let cell_width_px = (metrics.width * scale_factor).round().max(1.0) as u32;
         let cell_height_px = (metrics.height * scale_factor).round().max(1.0) as u32;
         let cell_width = cell_width_px as f32 / scale_factor;
@@ -344,11 +346,13 @@ impl TerminalGeometry {
         self.run_bounds(column, 1, row)
     }
 
+    /// The draw position for a shaped buffer whose first cell is `cell_bounds`.
+    ///
+    /// A raw `cosmic_text` buffer is drawn from its top-left corner, and its
+    /// line box is exactly one cell high, so the cell's own corner is the
+    /// anchor. Ascenders stay inside the row rather than clipping above it.
     fn text_origin(self, cell_bounds: Rectangle) -> Point {
-        // `Vertical::Center` interprets the draw position as the vertical
-        // anchor, not the top-left corner. Anchoring at the cell top lets
-        // glyph ascenders escape above row zero and be clipped.
-        Point::new(cell_bounds.x, cell_bounds.y + cell_bounds.height / 2.0)
+        Point::new(cell_bounds.x, cell_bounds.y)
     }
 }
 
@@ -360,6 +364,120 @@ struct WidgetState {
     pressed_buttons: u8,
     modifiers: KeyModifiers,
     last_cursor: Option<Point>,
+    /// Shaped text, reused across frames. Mutated through `&self` because
+    /// `draw` is the only place that knows which rows are actually visible.
+    shaped: RefCell<ShapeCache>,
+}
+
+/// The inputs that invalidate every shaped buffer at once.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct ShapeParams {
+    font_size: u32,
+    scale_factor: u32,
+    family: &'static str,
+    columns: u16,
+    fonts: graphics_text::Version,
+}
+
+/// One row's shaped segments, keyed by the row it was shaped from.
+///
+/// The daemon reuses the `Arc` of every row a repaint leaves unchanged, so
+/// pointer identity is an exact content key: holding the `Arc` keeps the
+/// address from being recycled under a stale entry.
+#[derive(Default)]
+struct ShapedRow {
+    source: Option<Arc<RowSnapshot>>,
+    segments: Vec<ShapedSegment>,
+}
+
+struct ShapedSegment {
+    column: u16,
+    /// Held here so the `Weak` handed to the renderer stays live for the frame.
+    buffer: Arc<cosmic_text::Buffer>,
+}
+
+#[derive(Default)]
+struct ShapeCache {
+    params: Option<ShapeParams>,
+    rows: Vec<ShapedRow>,
+    /// Scratch reused while shaping, so a cache miss allocates nothing extra.
+    content: String,
+    spans: Vec<(Range<usize>, cosmic_text::Attrs<'static>)>,
+}
+
+impl ShapeCache {
+    /// Brings the cache up to date for the visible rows and returns nothing to
+    /// draw for rows that shape to no glyphs.
+    ///
+    /// Rows the daemon left untouched keep their buffers, so a terminal that is
+    /// not changing shapes nothing and never takes the font system lock. The
+    /// lock is taken once for the whole frame, and only when something is
+    /// actually stale.
+    fn refresh(
+        &mut self,
+        geometry: &TerminalGeometry,
+        font_size: f32,
+        rows: &[Arc<RowSnapshot>],
+        column_limit: usize,
+    ) {
+        let params = ShapeParams {
+            font_size: font_size.to_bits(),
+            scale_factor: geometry.scale_factor.to_bits(),
+            family: geometry.metrics.family,
+            columns: u16::try_from(column_limit).unwrap_or(u16::MAX),
+            fonts: font_system()
+                .read()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .version(),
+        };
+        if self.params != Some(params) {
+            self.params = Some(params);
+            self.rows.clear();
+        }
+        self.rows.resize_with(rows.len(), ShapedRow::default);
+
+        let stale = rows.iter().zip(self.rows.iter()).any(|(row, cached)| {
+            cached
+                .source
+                .as_ref()
+                .is_none_or(|source| !Arc::ptr_eq(source, row))
+        });
+        if !stale {
+            return;
+        }
+
+        let mut font_system = font_system()
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let font_system = font_system.raw();
+        for (row, cached) in rows.iter().zip(self.rows.iter_mut()) {
+            if cached
+                .source
+                .as_ref()
+                .is_some_and(|source| Arc::ptr_eq(source, row))
+            {
+                continue;
+            }
+            cached.segments.clear();
+            let cells = &row.cells[..row.cells.len().min(column_limit)];
+            for segment in segments(cells) {
+                let range = usize::from(segment.start)..usize::from(segment.start + segment.len);
+                let buffer = shape_segment(
+                    font_system,
+                    &geometry.metrics,
+                    &cells[range],
+                    &mut self.content,
+                    &mut self.spans,
+                    segment.single,
+                );
+                cached.segments.push(ShapedSegment {
+                    column: segment.start,
+                    buffer: Arc::new(buffer),
+                });
+            }
+            cached.source = Some(Arc::clone(row));
+        }
+    }
 }
 
 type ErrorMapper<Message> = dyn Fn(TerminalSendError) -> Message + Send + Sync + 'static;
@@ -373,6 +491,7 @@ pub struct TerminalWidget<Message> {
     handle: TerminalSurface,
     snapshot: Arc<RenderSnapshot>,
     font_size: f32,
+    font_family: &'static str,
     scale_factor: f32,
     model_focused: bool,
     on_focus: Option<Message>,
@@ -386,6 +505,7 @@ impl<Message> std::fmt::Debug for TerminalWidget<Message> {
             .debug_struct("TerminalWidget")
             .field("generation", &self.snapshot.generation)
             .field("font_size", &self.font_size)
+            .field("font_family", &self.font_family)
             .finish_non_exhaustive()
     }
 }
@@ -398,6 +518,7 @@ impl<Message> TerminalWidget<Message> {
             handle,
             snapshot,
             font_size: DEFAULT_FONT_SIZE,
+            font_family: "",
             scale_factor: 1.0,
             model_focused: false,
             on_focus: None,
@@ -408,8 +529,8 @@ impl<Message> TerminalWidget<Message> {
 
     /// Sets the terminal font size.
     ///
-    /// This is the only knob: the cell box is measured from the renderer's real
-    /// monospace advance at this size, so the grid, the PTY's reported pixel
+    /// The cell box is measured from the renderer's real advance for the
+    /// configured family at this size, so the grid, the PTY's reported pixel
     /// size, and the drawn glyphs cannot disagree.
     pub fn font_size(mut self, font_size: f32) -> Self {
         self.font_size = if font_size.is_finite() {
@@ -417,6 +538,17 @@ impl<Message> TerminalWidget<Message> {
         } else {
             DEFAULT_FONT_SIZE
         };
+        self
+    }
+
+    /// Sets the font family the grid is measured and drawn with. An empty or
+    /// whitespace-only name selects the system monospace default.
+    ///
+    /// A family whose glyph coverage the shell prompt needs - powerline
+    /// separators, for one - has to be named here: the generic monospace family
+    /// resolves to whatever the system prefers, which need not cover them.
+    pub fn font_family(mut self, family: &str) -> Self {
+        self.font_family = intern_family(family);
         self
     }
 
@@ -550,7 +682,8 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for TerminalWidget<Message
         _viewport: &Rectangle,
     ) {
         let bounds = layout.bounds();
-        let geometry = TerminalGeometry::new(bounds, self.font_size, self.scale_factor);
+        let geometry =
+            TerminalGeometry::new(bounds, self.font_size, self.scale_factor, self.font_family);
         let state = tree.state.downcast_mut::<WidgetState>();
         self.synchronize_size(state, geometry, shell);
         self.synchronize_focus(state, shell);
@@ -661,7 +794,7 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for TerminalWidget<Message
 
     fn draw(
         &self,
-        _tree: &Tree,
+        tree: &Tree,
         renderer: &mut Renderer,
         _theme: &Theme,
         _style: &renderer::Style,
@@ -675,7 +808,8 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for TerminalWidget<Message
         }
 
         let bounds = layout.bounds();
-        let geometry = TerminalGeometry::new(bounds, self.font_size, self.scale_factor);
+        let geometry =
+            TerminalGeometry::new(bounds, self.font_size, self.scale_factor, self.font_family);
         let Some(widget_clip) = bounds.intersection(viewport) else {
             self.handle.acknowledge_redraw(self.snapshot.generation);
             return;
@@ -697,8 +831,8 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for TerminalWidget<Message
             renderer.with_layer(content_clip, |renderer| {
                 let row_limit = usize::from(self.snapshot.rows.min(geometry.rows));
                 let column_limit = usize::from(self.snapshot.columns.min(geometry.columns));
-                let mut run_content = String::new();
-                for (row_index, row) in self.snapshot.lines.iter().take(row_limit).enumerate() {
+                let rows = &self.snapshot.lines[..self.snapshot.lines.len().min(row_limit)];
+                for (row_index, row) in rows.iter().enumerate() {
                     let cells = &row.cells[..row.cells.len().min(column_limit)];
                     draw_row(
                         renderer,
@@ -706,10 +840,36 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for TerminalWidget<Message
                         row_index as u16,
                         cells,
                         self.snapshot.background,
-                        content_clip,
-                        &mut run_content,
                     );
                 }
+
+                // Glyphs. One shaped buffer per segment, reused for as long as
+                // the daemon leaves the row alone, so a still terminal reshapes
+                // nothing and a scrolling one reshapes only the rows that moved.
+                let state = tree.state.downcast_ref::<WidgetState>();
+                let mut shaped = state.shaped.borrow_mut();
+                shaped.refresh(&geometry, self.font_size, rows, column_limit);
+                let default_foreground = color(self.snapshot.foreground);
+                for (row_index, cached) in shaped.rows.iter().enumerate() {
+                    let Ok(row) = u16::try_from(row_index) else {
+                        break;
+                    };
+                    for segment in &cached.segments {
+                        let Some(bounds) = geometry.cell_bounds(segment.column, row) else {
+                            continue;
+                        };
+                        text::Renderer::fill_raw(
+                            renderer,
+                            graphics_text::Raw {
+                                buffer: Arc::downgrade(&segment.buffer),
+                                position: geometry.text_origin(bounds),
+                                color: default_foreground,
+                                clip_bounds: content_clip,
+                            },
+                        );
+                    }
+                }
+                drop(shaped);
 
                 if let Some((cursor, cell_bounds)) = self
                     .snapshot
@@ -793,38 +953,25 @@ fn color(value: Rgb) -> Color {
     Color::from_rgb8(value.red, value.green, value.blue)
 }
 
-/// Draws one grid row using as few renderer primitives as the row's styling
-/// allows.
+/// Draws one grid row's quads: backgrounds and decorations.
 ///
-/// A cell-at-a-time loop cost one background quad plus one shaped text
-/// primitive plus up to three decoration quads *per column*: for a 200-column
-/// grid that is tens of thousands of primitives and ten thousand string
-/// allocations every frame. Terminal rows are overwhelmingly uniform, so each
-/// of the three passes below emits one primitive per maximal run of cells that
-/// share the attribute it draws.
+/// A cell-at-a-time loop cost one background quad plus up to three decoration
+/// quads *per column*: for a 200-column grid that is tens of thousands of
+/// primitives every frame. Terminal rows are overwhelmingly uniform, so each
+/// pass coalesces every maximal run of cells sharing the attribute it draws.
+/// Quads are positioned individually, so a run needs no length cap.
 ///
-/// Text runs carry the extra requirement that every cell advance by exactly one
-/// cell width, because only the run's first cell is positioned explicitly.
-/// Two things enforce that: the run must be single-width ASCII, since a wide or
-/// multi-scalar cluster is shaped by whatever fallback face covers it and its
-/// advance is not ours to predict; and the run is capped at the face's
-/// `max_run`, beyond which the residual difference between the shaped advance
-/// and the pixel-snapped grid pitch could reach half a physical pixel. Cells
-/// that fail the first requirement are drawn individually, which is exactly the
-/// per-cell behaviour that preceded coalescing.
-#[allow(clippy::too_many_arguments)]
+/// Glyphs are drawn separately, from shaped buffers cached across frames: see
+/// [`ShapeCache::refresh`].
 fn draw_row(
     renderer: &mut Renderer,
     geometry: &TerminalGeometry,
     row: u16,
     cells: &[CellSnapshot],
     default_background: Rgb,
-    clip: Rectangle,
-    content: &mut String,
 ) {
-    // Pass 1: backgrounds. Cells matching the terminal default are already
-    // covered by the widget-wide fill, so only runs that differ are drawn.
-    // Quads are positioned individually, so these runs need no length cap.
+    // Backgrounds. Cells matching the terminal default are already covered by
+    // the widget-wide fill, so only runs that differ are drawn.
     for run in runs(cells, |cell| (resolved(cell).1, cell.selected)) {
         let (background, selected) = run.key;
         if background == default_background && !selected {
@@ -844,83 +991,8 @@ fn draw_row(
         );
     }
 
-    // Pass 2: glyphs. Keyed on only what the shaped text actually depends on —
-    // colour and face — so an underline or blink change does not split a run
-    // that would render identically. `None` marks a cell that must not join a
-    // run at all: empty, invisible, or not single-width ASCII.
-    for run in runs(cells, |cell| {
-        (!cell.text.is_empty() && !cell.style.invisible && cell.text.is_narrow_ascii()).then(|| {
-            (
-                resolved(cell).0,
-                Face {
-                    bold: cell.style.bold,
-                    italic: cell.style.italic,
-                },
-            )
-        })
-    }) {
-        let Some((foreground, face_key)) = run.key else {
-            // Not coalescable: draw each cell on its own so that the font's own
-            // advance, not our cell pitch, positions the cluster.
-            for offset in 0..run.len {
-                let cell = &cells[usize::from(run.start + offset)];
-                if cell.text.is_empty() || cell.style.invisible {
-                    continue;
-                }
-                let Some(bounds) = geometry.run_bounds(run.start + offset, 1, row) else {
-                    continue;
-                };
-                content.clear();
-                content.push_str(cell.text.as_str());
-                let (foreground, _) = resolved(cell);
-                let face_key = Face {
-                    bold: cell.style.bold,
-                    italic: cell.style.italic,
-                };
-                fill_run(
-                    renderer,
-                    geometry,
-                    bounds,
-                    content.clone(),
-                    geometry.metrics.face(face_key).font_size,
-                    face_key,
-                    foreground,
-                    // A wide or multi-scalar cluster needs script detection and
-                    // font fallback; `Basic` would drop it to a tofu box.
-                    text::Shaping::Advanced,
-                    clip,
-                );
-            }
-            continue;
-        };
-        let face = geometry.metrics.face(face_key);
-        for chunk in run.chunks(face.max_run) {
-            let Some(bounds) = geometry.run_bounds(chunk.start, chunk.len, row) else {
-                continue;
-            };
-            content.clear();
-            for offset in 0..chunk.len {
-                content.push_str(cells[usize::from(chunk.start + offset)].text.as_str());
-            }
-            fill_run(
-                renderer,
-                geometry,
-                bounds,
-                content.clone(),
-                face.font_size,
-                face_key,
-                foreground,
-                // The run is single-width ASCII by construction, so skipping
-                // script detection and fallback selection is safe and avoids
-                // redoing both for every run on every frame.
-                text::Shaping::Basic,
-                clip,
-            );
-        }
-    }
-
-    // Pass 3: decorations. Keyed on colour plus only the line-drawing bits, so
-    // a bold/italic change inside an underlined span does not split the rule.
+    // Decorations. Keyed on colour plus only the line-drawing bits, so a
+    // bold/italic change inside an underlined span does not split the rule.
     for run in runs(cells, |cell| {
         let (foreground, _) = resolved(cell);
         (
@@ -948,6 +1020,152 @@ fn draw_row(
     }
 }
 
+/// A span of columns drawn by one shaped buffer.
+///
+/// `single` marks a segment that must be shaped on its own because its advance
+/// is not predictable: see [`segments`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Segment {
+    start: u16,
+    len: u16,
+    single: bool,
+}
+
+/// Splits a row into the segments that can each be drawn as one shaped buffer.
+///
+/// `set_monospace_width` rounds every glyph's advance to a whole number of
+/// cells, so a run of cells lands on its columns exactly - but only if each
+/// cell contributes its own width and nothing else. That holds for a single
+/// printable ASCII scalar, which is what `is_narrow_ascii` tests, and cannot be
+/// assumed otherwise: a wide cluster consumes two columns and the grid stores
+/// its second column as a separate cell whose content this layer cannot
+/// distinguish from a blank. Such a cell is therefore given a segment of its
+/// own, positioned explicitly, exactly as every cell used to be.
+///
+/// Blank and invisible cells draw nothing and so end a segment.
+fn segments(cells: &[CellSnapshot]) -> impl Iterator<Item = Segment> {
+    let mut column = 0usize;
+    std::iter::from_fn(move || {
+        loop {
+            let cell = cells.get(column)?;
+            let start = u16::try_from(column).ok()?;
+            if cell.style.invisible || cell.text.is_empty() {
+                column += 1;
+                continue;
+            }
+            if !cell.text.is_narrow_ascii() {
+                column += 1;
+                return Some(Segment {
+                    start,
+                    len: 1,
+                    single: true,
+                });
+            }
+            let mut len = 0u16;
+            while let Some(cell) = cells.get(column) {
+                if cell.style.invisible || !cell.text.is_narrow_ascii() {
+                    break;
+                }
+                column += 1;
+                len += 1;
+            }
+            return Some(Segment {
+                start,
+                len,
+                single: false,
+            });
+        }
+    })
+}
+
+/// Shapes one segment into a buffer whose glyphs land on the grid.
+///
+/// Each span carries its own [`cosmic_text::Metrics`], holding the font size at
+/// which that face advances by exactly one cell. cosmic-text multiplies a
+/// glyph's em advance by its span's font size, so every cell in the run
+/// advances by exactly the pitch and the Nth glyph starts exactly N pitches
+/// along. The pitch is a whole number of physical pixels, so once the renderer
+/// applies the scale factor every origin is an integer device pixel.
+///
+/// This is deliberately not `set_monospace_width`, which would do the same job
+/// in the shaper: that path reads `Font::monospace_em_width`, which is `None`
+/// unless cosmic-text is built with `monospace_fallback` *and* the resolved face
+/// sets `post.isFixedPitch`. Noto Sans Mono does not, so it would be silently
+/// inert on exactly the systems where the generic monospace family resolves to
+/// it. Deriving the size from our own measurement depends on no font metadata.
+///
+/// Hinting must stay disabled: it rounds advances to whole *logical* pixels,
+/// which on a fractional scale factor reintroduces per-cell drift.
+fn shape_segment(
+    font_system: &mut cosmic_text::FontSystem,
+    metrics: &CellMetrics,
+    cells: &[CellSnapshot],
+    content: &mut String,
+    spans: &mut Vec<(Range<usize>, cosmic_text::Attrs<'static>)>,
+    advanced: bool,
+) -> cosmic_text::Buffer {
+    let line_height = metrics.height.max(1.0);
+    content.clear();
+    spans.clear();
+    for cell in cells {
+        let start = content.len();
+        // An invisible cell inside a segment still owes its column an advance.
+        if cell.style.invisible {
+            content.push(' ');
+        } else {
+            content.push_str(cell.text.as_str());
+        }
+        let key = Face {
+            bold: cell.style.bold,
+            italic: cell.style.italic,
+        };
+        let foreground = resolved(cell).0;
+        let attrs = graphics_text::to_attributes(font(metrics.family, key))
+            .metrics(cosmic_text::Metrics::new(
+                metrics.face_size(key),
+                line_height,
+            ))
+            .color(cosmic_text::Color::rgb(
+                foreground.red,
+                foreground.green,
+                foreground.blue,
+            ));
+        match spans.last_mut() {
+            Some((range, last)) if *last == attrs => range.end = content.len(),
+            _ => spans.push((start..content.len(), attrs)),
+        }
+    }
+
+    let plain = Face {
+        bold: false,
+        italic: false,
+    };
+    let mut buffer = cosmic_text::Buffer::new_empty(cosmic_text::Metrics::new(
+        metrics.face_size(plain),
+        line_height,
+    ));
+    buffer.set_wrap(cosmic_text::Wrap::None);
+    buffer.set_size(None, None);
+    buffer.set_hinting(cosmic_text::Hinting::Disabled);
+    let default_attrs = graphics_text::to_attributes(font(metrics.family, plain));
+    buffer.set_rich_text(
+        spans
+            .iter()
+            .map(|(range, attrs)| (&content[range.clone()], attrs.clone())),
+        &default_attrs,
+        // Script detection and font fallback are only skippable for plain
+        // ASCII; a wide or multi-scalar cluster needs both or renders as tofu.
+        if advanced {
+            cosmic_text::Shaping::Advanced
+        } else {
+            cosmic_text::Shaping::Basic
+        },
+        None,
+    );
+    buffer.shape_until_scroll(font_system, false);
+    buffer
+}
+
 /// The foreground/background pair a cell is actually drawn with, after applying
 /// the selection swap.
 fn resolved(cell: &CellSnapshot) -> (Rgb, Rgb) {
@@ -962,37 +1180,6 @@ struct Run<Key> {
     start: u16,
     len: u16,
     key: Key,
-}
-
-/// A span of columns, without the key that produced it.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct Span {
-    start: u16,
-    len: u16,
-}
-
-impl<Key> Run<Key> {
-    /// Splits this run into spans of at most `limit` cells.
-    ///
-    /// A single shaped primitive may only cover as many cells as the face's
-    /// advance stays on the grid for, so a long uniform run becomes a few
-    /// primitives rather than one that drifts.
-    fn chunks(&self, limit: u16) -> impl Iterator<Item = Span> {
-        let limit = limit.max(1);
-        let (start, len) = (self.start, self.len);
-        let mut drawn = 0u16;
-        std::iter::from_fn(move || {
-            if drawn >= len {
-                return None;
-            }
-            let span = Span {
-                start: start + drawn,
-                len: limit.min(len - drawn),
-            };
-            drawn += span.len;
-            Some(span)
-        })
-    }
 }
 
 /// Splits `cells` into maximal spans whose `key` is equal.
@@ -1018,41 +1205,6 @@ fn runs<Key: PartialEq, F: Fn(&CellSnapshot) -> Key>(
         start += len;
         Some(run)
     })
-}
-
-#[allow(clippy::too_many_arguments)]
-fn fill_run(
-    renderer: &mut Renderer,
-    geometry: &TerminalGeometry,
-    bounds: Rectangle,
-    content: String,
-    font_size: f32,
-    key: Face,
-    foreground: Rgb,
-    shaping: text::Shaping,
-    clip: Rectangle,
-) {
-    text::Renderer::fill_text(
-        renderer,
-        text::Text {
-            content,
-            bounds: bounds.size(),
-            size: Pixels(font_size),
-            // Centering one absolute line box gives every glyph the same
-            // baseline while retaining its font-provided left and right
-            // bearings.
-            line_height: text::LineHeight::Absolute(Pixels(geometry.cell_height)),
-            font: font(key),
-            align_x: text::Alignment::Left,
-            align_y: cosmic::iced::alignment::Vertical::Center,
-            shaping,
-            wrapping: text::Wrapping::None,
-            ellipsize: text::Ellipsize::None,
-        },
-        geometry.text_origin(bounds),
-        color(foreground),
-        clip,
-    );
 }
 
 /// Draws the rules for a span of cells that share a colour and decoration set.
@@ -1195,7 +1347,7 @@ mod tests {
             width: 311.3,
             height: 193.7,
         };
-        let geometry = TerminalGeometry::new(bounds, DEFAULT_FONT_SIZE, 1.25);
+        let geometry = TerminalGeometry::new(bounds, DEFAULT_FONT_SIZE, 1.25, "");
         let size = geometry.terminal_size();
 
         assert_eq!(size.columns, geometry.columns);
@@ -1219,6 +1371,7 @@ mod tests {
                 },
                 DEFAULT_FONT_SIZE,
                 1.25,
+                "",
             )
         };
         let baseline = geometry_at(0.0);
@@ -1259,7 +1412,7 @@ mod tests {
             width: 317.3,
             height: 401.2,
         };
-        let geometry = TerminalGeometry::new(bounds, DEFAULT_FONT_SIZE, 1.25);
+        let geometry = TerminalGeometry::new(bounds, DEFAULT_FONT_SIZE, 1.25, "");
         let last = geometry
             .cell_bounds(geometry.columns - 1, geometry.rows - 1)
             .unwrap();
@@ -1287,7 +1440,11 @@ mod tests {
     }
 
     #[test]
-    fn centered_text_anchor_stays_inside_first_grid_row() {
+    fn the_text_anchor_is_the_first_cell_corner_inside_the_grid() {
+        // A raw buffer is drawn from its top-left corner and its line box is
+        // exactly one cell high, so the anchor must be the cell corner. The old
+        // centre anchor belonged to iced's `Vertical::Center` text path; keeping
+        // it here would push every row half a cell down.
         let geometry = TerminalGeometry::new(
             Rectangle {
                 x: 20.0,
@@ -1297,13 +1454,16 @@ mod tests {
             },
             DEFAULT_FONT_SIZE,
             1.25,
+            "",
         );
         let first_cell = geometry.cell_bounds(0, 0).unwrap();
         let origin = geometry.text_origin(first_cell);
 
         assert_eq!(origin.x, first_cell.x);
-        assert_eq!(origin.y, first_cell.y + first_cell.height / 2.0);
-        assert!(origin.y > geometry.content_bounds.y);
+        assert_eq!(origin.y, first_cell.y);
+        assert!(origin.y >= geometry.content_bounds.y);
+        let bottom = geometry.content_bounds.y + geometry.content_bounds.height;
+        assert!(origin.y + geometry.cell_height <= bottom);
     }
 
     #[test]
@@ -1317,6 +1477,7 @@ mod tests {
             },
             DEFAULT_FONT_SIZE,
             1.5,
+            "",
         );
 
         assert!(
@@ -1368,32 +1529,6 @@ mod tests {
     }
 
     #[test]
-    fn a_wide_or_invisible_cell_is_excluded_from_text_runs() {
-        // Only single-width ASCII may share a shaped run, because the cell
-        // pitch is the only advance the run has.
-        let row = cells("ab\u{1f600}cd", |index, mut cell| {
-            cell.style.invisible = index == 0;
-            cell
-        });
-        let text = runs(&row, |cell| {
-            (!cell.text.is_empty() && !cell.style.invisible && cell.text.is_narrow_ascii())
-                .then(|| (cell.foreground, cell.style))
-        })
-        .collect::<Vec<_>>();
-
-        let coalescable = text
-            .iter()
-            .filter(|run| run.key.is_some())
-            .map(|run| (run.start, run.len))
-            .collect::<Vec<_>>();
-        assert_eq!(
-            coalescable,
-            vec![(1, 1), (3, 2)],
-            "the invisible cell and the emoji must each break the run"
-        );
-    }
-
-    #[test]
     fn a_run_spans_its_cells_and_stops_at_the_grid_edge() {
         let geometry = TerminalGeometry::new(
             Rectangle {
@@ -1404,6 +1539,7 @@ mod tests {
             },
             DEFAULT_FONT_SIZE,
             1.0,
+            "",
         );
         let single = geometry.run_bounds(3, 1, 0).unwrap();
         let five = geometry.run_bounds(3, 5, 0).unwrap();
@@ -1418,10 +1554,7 @@ mod tests {
         assert!(geometry.run_bounds(0, 0, 0).is_none());
     }
 
-    fn cells(
-        text: &str,
-        style: impl Fn(usize, CellSnapshot) -> CellSnapshot,
-    ) -> Vec<CellSnapshot> {
+    fn cells(text: &str, style: impl Fn(usize, CellSnapshot) -> CellSnapshot) -> Vec<CellSnapshot> {
         text.chars()
             .enumerate()
             .map(|(index, character)| {
@@ -1437,86 +1570,242 @@ mod tests {
     }
 
     #[test]
-    fn a_coalesced_run_never_drifts_off_its_columns() {
-        // The invariant the whole run-coalescing design rests on: drawing N
-        // cells as one shaped primitive must land the Nth glyph within half a
-        // physical pixel of the Nth column. Checked against the real text
-        // stack, at every face, for the scale factors a fractional display
-        // actually reports.
+    fn the_grid_pitch_is_a_whole_number_of_physical_pixels() {
+        // Backgrounds, the cursor and mouse hit-testing all derive from the
+        // pitch, so a fractional pitch would put them on half pixels at every
+        // scale factor a fractional display actually reports.
         for scale in [1.0f32, 1.25, 1.5, 2.0] {
-            let metrics = CellMetrics::resolve(DEFAULT_FONT_SIZE, scale);
+            let metrics = CellMetrics::resolve(DEFAULT_FONT_SIZE, scale, "");
+            let physical = metrics.width * scale;
             assert!(
-                (metrics.width * scale - (metrics.width * scale).round()).abs() <= 1e-3,
-                "the grid pitch must be a whole number of physical pixels"
+                (physical - physical.round()).abs() <= 1e-3,
+                "scale {scale}: pitch {physical}px is not a whole pixel"
             );
-            for bold in [false, true] {
-                for italic in [false, true] {
-                    let key = Face { bold, italic };
-                    let face = metrics.face(key);
-                    let shaped = advance(face.font_size, key)
-                        .expect("a monospace face must resolve in the test environment");
-                    let cells = u32::from(face.max_run);
-                    let drift =
-                        (shaped - metrics.width).abs() * scale * cells.saturating_sub(1) as f32;
-                    assert!(
-                        drift <= MAX_RUN_DRIFT_PX + 1e-3,
-                        "scale {scale} bold {bold} italic {italic}: {cells} cells drift {drift}px"
-                    );
-                }
+            let physical = metrics.height * scale;
+            assert!(
+                (physical - physical.round()).abs() <= 1e-3,
+                "scale {scale}: row height {physical}px is not a whole pixel"
+            );
+        }
+    }
+
+    /// Every installed monospace family, interned and deduplicated.
+    fn installed_monospace_families() -> Vec<&'static str> {
+        let guard = font_system()
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut names: Vec<&'static str> = guard
+            .db()
+            .faces()
+            .filter(|face| face.monospaced)
+            .filter_map(|face| face.families.first())
+            .map(|(name, _)| intern_family(name))
+            .collect();
+        drop(guard);
+        names.sort_unstable();
+        names.dedup();
+        names
+    }
+
+    #[test]
+    fn the_grid_pitch_follows_the_font_family() {
+        // `resolve` memoises on its inputs, so a family missing from that key
+        // would hand a newly chosen family the previous one's pitch and drift
+        // every glyph off its column.
+        let plain = Face {
+            bold: false,
+            italic: false,
+        };
+        for family in installed_monospace_families() {
+            let expected = advance(DEFAULT_FONT_SIZE, family, plain)
+                .unwrap_or((DEFAULT_FONT_SIZE * 0.6).max(1.0))
+                .round()
+                .max(1.0);
+            let metrics = CellMetrics::resolve(DEFAULT_FONT_SIZE, 1.0, family);
+
+            assert_eq!(
+                metrics.width, expected,
+                "{family} was memoised at another family's pitch"
+            );
+            assert_eq!(metrics.family, family);
+        }
+
+        // Families the system cannot resolve measure identically, so only the
+        // cache entries themselves can show that the key carries the family.
+        let alpha = CellMetrics::resolve(DEFAULT_FONT_SIZE, 1.0, "Cagents Test Alpha");
+        let beta = CellMetrics::resolve(DEFAULT_FONT_SIZE, 1.0, "Cagents Test Beta");
+        assert_eq!(alpha.family, "Cagents Test Alpha");
+        assert_eq!(beta.family, "Cagents Test Beta");
+        assert_eq!(
+            CellMetrics::resolve(DEFAULT_FONT_SIZE, 1.0, "   ").family,
+            "",
+            "a family that names nothing must fall back to the system monospace"
+        );
+    }
+
+    #[test]
+    fn a_family_name_is_interned_once_and_an_empty_name_is_the_system_monospace() {
+        let plain = Face {
+            bold: false,
+            italic: false,
+        };
+        let first = intern_family("Cagents Interned Family");
+        let second = intern_family(&format!("  {first}  "));
+
+        assert!(
+            first.as_ptr() == second.as_ptr(),
+            "a repeated family must reuse its allocation instead of leaking again"
+        );
+        assert_eq!(
+            font("", plain).family,
+            cosmic::iced::font::Family::Monospace
+        );
+        assert_eq!(
+            font(first, plain).family,
+            cosmic::iced::font::Family::Name(first)
+        );
+    }
+
+    /// Shapes `cells` through the real text stack and returns the glyph
+    /// positions along with the width the shaper reports for the whole run.
+    fn shaped_positions(
+        metrics: &CellMetrics,
+        cells: &[CellSnapshot],
+        single: bool,
+    ) -> (Vec<f32>, f32) {
+        let mut content = String::new();
+        let mut spans = Vec::new();
+        let mut guard = font_system()
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let buffer = shape_segment(
+            guard.raw(),
+            metrics,
+            cells,
+            &mut content,
+            &mut spans,
+            single,
+        );
+        drop(guard);
+        let mut positions = Vec::new();
+        let mut width = 0.0f32;
+        for run in buffer.layout_runs() {
+            positions.extend(run.glyphs.iter().map(|glyph| glyph.x));
+            width += run.line_w;
+        }
+        (positions, width)
+    }
+
+    #[test]
+    fn every_shaped_glyph_lands_on_its_own_column() {
+        // The invariant the whole design rests on, and the one a previous
+        // attempt at coalescing broke: drawing N cells as a single shaped
+        // primitive must put the Nth glyph exactly N pitches along. Measured
+        // from the real shaper at the scale factors a fractional display
+        // reports, not derived from an advance estimate.
+        for scale in [1.0f32, 1.25, 1.5, 2.0] {
+            let metrics = CellMetrics::resolve(DEFAULT_FONT_SIZE, scale, "");
+            let cells = cells("the quick brown fox 0123456789", |_, cell| cell);
+            let (positions, width) = shaped_positions(&metrics, &cells, false);
+
+            assert_eq!(
+                positions.len(),
+                cells.len(),
+                "scale {scale}: one glyph per cell"
+            );
+            for (column, x) in positions.iter().enumerate() {
+                let expected = metrics.width * column as f32;
+                assert!(
+                    (x - expected).abs() <= 1e-3,
+                    "scale {scale}: column {column} drew at {x}, expected {expected}"
+                );
             }
+            let expected = metrics.width * cells.len() as f32;
+            assert!(
+                (width - expected).abs() <= 1e-3,
+                "scale {scale}: run is {width} wide, expected {expected}"
+            );
         }
     }
 
     #[test]
-    fn matching_the_pitch_buys_runs_long_enough_to_be_worth_coalescing() {
-        // If the font-size adjustment failed, `max_run` would collapse to a
-        // handful of cells and coalescing would buy nothing. A terminal row is
-        // 80+ columns, so anything below that is a regression in the fix, not
-        // just in the optimisation.
-        let metrics = CellMetrics::resolve(DEFAULT_FONT_SIZE, 1.0);
-        let plain = metrics.face(Face {
-            bold: false,
-            italic: false,
+    fn a_style_change_inside_a_run_does_not_move_the_grid() {
+        // Bold and italic faces have their own advances, which is why the
+        // previous design had to split a run at every style change. The
+        // monospace snap removes that constraint, so spans must now be able to
+        // carry the style without moving a single column.
+        let metrics = CellMetrics::resolve(DEFAULT_FONT_SIZE, 1.0, "");
+        let cells = cells("mixed weight text", |index, mut cell| {
+            cell.style.bold = index % 3 == 0;
+            cell.style.italic = index % 4 == 0;
+            cell
         });
-        assert!(
-            plain.max_run >= 80,
-            "plain text must coalesce a whole row, got {}",
-            plain.max_run
-        );
+        let (positions, width) = shaped_positions(&metrics, &cells, false);
+
+        assert_eq!(positions.len(), cells.len());
+        for (column, x) in positions.iter().enumerate() {
+            let expected = metrics.width * column as f32;
+            assert!(
+                (x - expected).abs() <= 1e-3,
+                "column {column} drew at {x}, expected {expected}"
+            );
+        }
+        let expected = metrics.width * cells.len() as f32;
+        assert!((width - expected).abs() <= 1e-3);
     }
 
     #[test]
-    fn a_run_is_chunked_to_the_face_ceiling_without_gaps_or_overlap() {
-        let run = Run {
-            start: 3,
-            len: 10,
-            key: (),
-        };
+    fn segments_coalesce_ascii_and_isolate_everything_else() {
+        let plain = cells("hello world", |_, cell| cell);
         assert_eq!(
-            run.chunks(4).collect::<Vec<_>>(),
+            segments(&plain).collect::<Vec<_>>(),
+            vec![Segment {
+                start: 0,
+                len: 11,
+                single: false
+            }],
+            "a plain ASCII row is one segment, spaces included"
+        );
+
+        // A blank ends a segment and draws nothing; a wide cluster is isolated
+        // so that its two-column advance cannot displace the cells after it.
+        let mixed = cells("ab漢cd", |index, mut cell| {
+            if index == 1 {
+                cell.text = CellText::new("");
+            }
+            cell
+        });
+        assert_eq!(
+            segments(&mixed).collect::<Vec<_>>(),
             vec![
-                Span { start: 3, len: 4 },
-                Span { start: 7, len: 4 },
-                Span { start: 11, len: 2 },
+                Segment {
+                    start: 0,
+                    len: 1,
+                    single: false
+                },
+                Segment {
+                    start: 2,
+                    len: 1,
+                    single: true
+                },
+                Segment {
+                    start: 3,
+                    len: 2,
+                    single: false
+                },
             ]
         );
-        assert_eq!(
-            run.chunks(u16::MAX).collect::<Vec<_>>(),
-            vec![Span { start: 3, len: 10 }]
-        );
-        // A degenerate ceiling must still make progress, one cell at a time,
-        // rather than loop forever on a zero-length span.
-        assert_eq!(run.chunks(0).count(), 10);
-    }
 
-    #[test]
-    fn a_degenerate_advance_measurement_yields_a_single_cell_ceiling() {
-        assert_eq!(run_ceiling(f32::NAN), 1);
-        assert_eq!(run_ceiling(f32::INFINITY), 1);
-        assert_eq!(run_ceiling(0.0), u16::MAX);
-        // Half a pixel of error per cell allows the anchored first cell plus
-        // one more before the budget is spent.
-        assert_eq!(run_ceiling(MAX_RUN_DRIFT_PX), 2);
-        assert_eq!(run_ceiling(1.0), 1);
+        // An invisible cell draws nothing, so it ends a segment too.
+        let hidden = cells("abcd", |index, mut cell| {
+            cell.style.invisible = index == 2;
+            cell
+        });
+        assert_eq!(
+            segments(&hidden)
+                .map(|segment| (segment.start, segment.len))
+                .collect::<Vec<_>>(),
+            vec![(0, 2), (3, 1)]
+        );
     }
 }
