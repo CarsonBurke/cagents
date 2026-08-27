@@ -407,6 +407,70 @@ fn card_close_name(type_label: &str, title: &str) -> String {
     format!("Close {type_label} column {title}")
 }
 
+/// The longest reported title kept.
+///
+/// Titles are reported by the process inside a card - a shell's `OSC 0` or a
+/// page's `document.title` - and are stored durably, expanded into five
+/// accessibility strings, shown in the card header, the header bar and the
+/// compositor toplevel title. `Ellipsize` does not bound the work, because the
+/// shaper must lay the whole string out before it can decide where to cut, so
+/// an unbounded title stalls the UI thread every frame; being persisted, it
+/// would go on stalling it after a restart.
+const MAX_REPORTED_TITLE_CHARS: usize = 256;
+
+/// Normalises a title reported by the process inside a card, or `None` when
+/// nothing legible survives.
+///
+/// Formatting characters are dropped rather than escaped: none of the surfaces
+/// that show a title can render them meaningfully, and a bidi override in the
+/// window title - which is composed as `"{title} — cagents"` - would let one
+/// card impersonate another, or the application itself.
+fn normalize_reported_title(title: &str) -> Option<String> {
+    let mut normalized = String::new();
+    let mut kept = 0usize;
+    let mut pending_space = false;
+    for character in title.chars() {
+        if kept == MAX_REPORTED_TITLE_CHARS {
+            break;
+        }
+        if character.is_whitespace() {
+            // Tested before the control check, because a tab, newline or
+            // carriage return is both: they separate words and so collapse to
+            // one space rather than closing it up. The Unicode line and
+            // paragraph separators are whitespace too, so they land here.
+            // Interior runs collapse; leading whitespace is dropped.
+            pending_space = kept > 0;
+            continue;
+        }
+        if character.is_control() || is_title_formatting(character) {
+            continue;
+        }
+        if pending_space {
+            normalized.push(' ');
+            kept += 1;
+            pending_space = false;
+            if kept == MAX_REPORTED_TITLE_CHARS {
+                break;
+            }
+        }
+        normalized.push(character);
+        kept += 1;
+    }
+    (!normalized.is_empty()).then_some(normalized)
+}
+
+/// The bidi marks and embedding controls: characters that carry no glyph of
+/// their own but reorder the text around them. `char::is_control` covers C0 and
+/// C1 but not these, which sit in ordinary printable categories. The line and
+/// paragraph separators are not here because they are whitespace, and so are
+/// already collapsed into a space.
+fn is_title_formatting(character: char) -> bool {
+    matches!(
+        character,
+        '\u{200e}' | '\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}'
+    )
+}
+
 fn card_kind_labels(kind: Option<&CardKind>) -> CardLabels {
     match kind {
         Some(CardKind::Terminal(_)) => CardLabels {
@@ -478,11 +542,17 @@ fn display_path(path: &Path) -> Cow<'_, str> {
 /// rather than as substrings, so a title naming anything else - a running
 /// command, an edited file - always survives.
 fn title_abbreviates_path(title: &str, caption: &str) -> bool {
+    if title.is_empty() {
+        return false;
+    }
     let mut components = caption.split('/');
     let mut abbreviated = title.split('/');
     loop {
         match (abbreviated.next(), components.next()) {
-            (Some(short), Some(full)) if full.starts_with(short) => {}
+            // An empty abbreviation is not an abbreviation: `starts_with("")`
+            // holds for every component, which would make one blank component
+            // match a whole path.
+            (Some(short), Some(full)) if !short.is_empty() && full.starts_with(short) => {}
             (None, None) => return true,
             _ => return false,
         }
@@ -1673,21 +1743,20 @@ impl Cagents {
     /// the durable state changed.
     ///
     /// A shell that emits a bare `OSC 0` or a page with no `<title>` reports an
-    /// empty string. Storing it would blank the card header, the card's
-    /// accessible name and the window title all at once, so the card keeps the
-    /// name it already had.
+    /// empty string, and a title of nothing but formatting normalises to one.
+    /// Storing it would blank the card header, the card's accessible name and
+    /// the window title all at once, so the card keeps the name it already had.
     fn apply_reported_title(&mut self, id: CardId, title: String) -> bool {
-        let title = title.trim();
-        if title.is_empty() {
+        let Some(title) = normalize_reported_title(&title) else {
             return false;
-        }
-        let _ = self.workspace.rename_card(id, title.to_owned());
+        };
+        let _ = self.workspace.rename_card(id, title.clone());
         if self
             .card_state(id)
             .is_some_and(|state| state.title != title)
             && let Some(state) = self.card_state_mut(id)
         {
-            state.title = title.to_owned();
+            state.title = title;
             return true;
         }
         false
@@ -6077,6 +6146,58 @@ mod tests {
         assert!(!title_abbreviates_path("~/D/r", caption));
         assert!(!title_abbreviates_path("~/D/r/cagents/src", caption));
         assert!(!title_abbreviates_path("", caption));
+    }
+
+    #[test]
+    fn a_reported_title_is_bounded_and_stripped_of_formatting() {
+        // The card's process chooses this string, and it reaches the card
+        // header, five accessibility strings, the header bar, the compositor
+        // toplevel title and the state database.
+        assert_eq!(normalize_reported_title("  fish  "), Some("fish".into()));
+        assert_eq!(
+            normalize_reported_title("two\nlines\u{2028}and\tmore"),
+            Some("two lines and more".into())
+        );
+        // A bidi override could reorder the window title around the
+        // application name and make one card impersonate another.
+        assert_eq!(
+            normalize_reported_title("safe\u{202e}gnitiops"),
+            Some("safegnitiops".into())
+        );
+        assert_eq!(normalize_reported_title("\u{7}\u{1b}"), None);
+        assert_eq!(normalize_reported_title(""), None);
+        assert_eq!(normalize_reported_title("   \n\t "), None);
+
+        let flood = "A".repeat(20_000_000);
+        let normalized = normalize_reported_title(&flood).expect("letters survive");
+        assert_eq!(normalized.chars().count(), MAX_REPORTED_TITLE_CHARS);
+        // Truncation counts characters, so a multi-byte title cannot smuggle
+        // more than the bound past it either.
+        let wide = "→".repeat(1_000);
+        assert_eq!(
+            normalize_reported_title(&wide)
+                .expect("arrows survive")
+                .chars()
+                .count(),
+            MAX_REPORTED_TITLE_CHARS
+        );
+    }
+
+    #[test]
+    fn a_sweep_is_rearmed_only_for_an_earlier_wakeup() {
+        let now = Instant::now();
+        let soon = now + Duration::from_secs(5);
+        let later = now + Duration::from_secs(30);
+
+        // Nothing pending: the request is the only wakeup there is.
+        assert!(sweep_needs_rearming(None, later));
+        // An earlier grace must pull the wakeup in, or the card that owns it
+        // waits for a deadline belonging to a card that went offscreen later.
+        assert!(sweep_needs_rearming(Some(later), soon));
+        // A pending timer already covers a later request and re-arms itself for
+        // the remainder, so a second timer would only duplicate it.
+        assert!(!sweep_needs_rearming(Some(soon), later));
+        assert!(!sweep_needs_rearming(Some(soon), soon));
     }
 
     #[test]
