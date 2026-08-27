@@ -16,9 +16,12 @@ use cosmic::iced::{
 };
 use cosmic::{Element, Renderer, Task, Theme};
 
-use crate::model::CardId;
-use crate::workspace::{
-    FocusDirection, FocusHandoff, FocusTarget, ViewportProjection, WheelDelta, Workspace,
+use crate::{
+    model::CardId,
+    settings::{KeyboardShortcuts, ShortcutBinding, ShortcutKey, parse_shortcut},
+    workspace::{
+        FocusDirection, FocusHandoff, FocusTarget, ViewportProjection, WheelDelta, Workspace,
+    },
 };
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -49,101 +52,37 @@ pub enum GlobalShortcut {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ShortcutKey {
-    Latin(char),
-    ArrowLeft,
-    ArrowRight,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct ShortcutChord {
-    modifiers: keyboard::Modifiers,
-    key: ShortcutKey,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ShortcutDescriptor {
     pub action: GlobalShortcut,
     pub label: &'static str,
-    pub keys: &'static str,
-    pub spoken_keys: &'static str,
     pub repeatable: bool,
-    chords: &'static [ShortcutChord],
 }
-
-const CTRL_T: &[ShortcutChord] = &[ShortcutChord {
-    modifiers: keyboard::Modifiers::CTRL,
-    key: ShortcutKey::Latin('t'),
-}];
-const CTRL_W: &[ShortcutChord] = &[ShortcutChord {
-    modifiers: keyboard::Modifiers::CTRL,
-    key: ShortcutKey::Latin('w'),
-}];
-const CTRL_F: &[ShortcutChord] = &[ShortcutChord {
-    modifiers: keyboard::Modifiers::CTRL,
-    key: ShortcutKey::Latin('f'),
-}];
-const PREVIOUS_COLUMN: &[ShortcutChord] = &[
-    ShortcutChord {
-        modifiers: keyboard::Modifiers::ALT,
-        key: ShortcutKey::Latin('q'),
-    },
-    ShortcutChord {
-        modifiers: keyboard::Modifiers::ALT,
-        key: ShortcutKey::ArrowLeft,
-    },
-];
-const NEXT_COLUMN: &[ShortcutChord] = &[
-    ShortcutChord {
-        modifiers: keyboard::Modifiers::ALT,
-        key: ShortcutKey::Latin('w'),
-    },
-    ShortcutChord {
-        modifiers: keyboard::Modifiers::ALT,
-        key: ShortcutKey::ArrowRight,
-    },
-];
 
 pub const GLOBAL_SHORTCUT_DESCRIPTORS: &[ShortcutDescriptor] = &[
     ShortcutDescriptor {
         action: GlobalShortcut::NewTerminal,
         label: "New terminal",
-        keys: "Ctrl+T",
-        spoken_keys: "Control plus T",
         repeatable: false,
-        chords: CTRL_T,
     },
     ShortcutDescriptor {
         action: GlobalShortcut::CloseFocusedCard,
         label: "Close focused column",
-        keys: "Ctrl+W",
-        spoken_keys: "Control plus W",
         repeatable: false,
-        chords: CTRL_W,
     },
     ShortcutDescriptor {
         action: GlobalShortcut::FocusProjectSearch,
         label: "Search projects",
-        keys: "Ctrl+F",
-        spoken_keys: "Control plus F",
         repeatable: false,
-        chords: CTRL_F,
     },
     ShortcutDescriptor {
         action: GlobalShortcut::FocusAdjacent(FocusDirection::Left),
         label: "Previous column",
-        keys: "Alt+Q / Alt+Left",
-        spoken_keys: "Alt plus Q or Alt plus Left Arrow",
         repeatable: true,
-        chords: PREVIOUS_COLUMN,
     },
     ShortcutDescriptor {
         action: GlobalShortcut::FocusAdjacent(FocusDirection::Right),
         label: "Next column",
-        keys: "Alt+W / Alt+Right",
-        spoken_keys: "Alt plus W or Alt plus Right Arrow",
         repeatable: true,
-        chords: NEXT_COLUMN,
     },
 ];
 
@@ -154,9 +93,23 @@ pub fn shortcut_descriptor(action: GlobalShortcut) -> &'static ShortcutDescripto
         .expect("every dispatched global shortcut has a descriptor")
 }
 
-pub fn shortcut_tooltip(action: GlobalShortcut) -> String {
+pub fn shortcut_keys(action: GlobalShortcut, shortcuts: &KeyboardShortcuts) -> &str {
+    match action {
+        GlobalShortcut::NewTerminal => &shortcuts.new_terminal,
+        GlobalShortcut::CloseFocusedCard => &shortcuts.close_focused_column,
+        GlobalShortcut::FocusProjectSearch => &shortcuts.search_projects,
+        GlobalShortcut::FocusAdjacent(FocusDirection::Left) => &shortcuts.previous_column,
+        GlobalShortcut::FocusAdjacent(FocusDirection::Right) => &shortcuts.next_column,
+    }
+}
+
+pub fn shortcut_tooltip(action: GlobalShortcut, shortcuts: &KeyboardShortcuts) -> String {
     let descriptor = shortcut_descriptor(action);
-    format!("{} — {}", descriptor.label, descriptor.keys)
+    format!(
+        "{} — {}",
+        descriptor.label,
+        shortcut_keys(action, shortcuts)
+    )
 }
 
 #[derive(Debug, Default)]
@@ -269,7 +222,10 @@ where
     focus_handoff(handoff, toolbar_focus_id).chain(Task::done(after_focus))
 }
 
-pub fn global_shortcut(event: &keyboard::Event) -> Option<GlobalShortcut> {
+pub fn global_shortcut(
+    event: &keyboard::Event,
+    shortcuts: &KeyboardShortcuts,
+) -> Option<GlobalShortcut> {
     let keyboard::Event::KeyPressed {
         key,
         physical_key,
@@ -280,7 +236,7 @@ pub fn global_shortcut(event: &keyboard::Event) -> Option<GlobalShortcut> {
     else {
         return None;
     };
-    let descriptor = global_shortcut_descriptor(key, *physical_key, *modifiers)?;
+    let descriptor = global_shortcut_descriptor(key, *physical_key, *modifiers, shortcuts)?;
     (!*repeat || descriptor.repeatable).then_some(descriptor.action)
 }
 
@@ -288,54 +244,105 @@ pub(crate) fn is_global_shortcut_chord(
     key: &keyboard::Key,
     physical_key: keyboard::key::Physical,
     modifiers: keyboard::Modifiers,
+    shortcuts: &KeyboardShortcuts,
 ) -> bool {
-    global_shortcut_chord(key, physical_key, modifiers).is_some()
-}
-
-fn global_shortcut_chord(
-    key: &keyboard::Key,
-    physical_key: keyboard::key::Physical,
-    modifiers: keyboard::Modifiers,
-) -> Option<GlobalShortcut> {
-    global_shortcut_descriptor(key, physical_key, modifiers).map(|descriptor| descriptor.action)
+    global_shortcut_descriptor(key, physical_key, modifiers, shortcuts).is_some()
 }
 
 fn global_shortcut_descriptor(
     key: &keyboard::Key,
     physical_key: keyboard::key::Physical,
     modifiers: keyboard::Modifiers,
+    shortcuts: &KeyboardShortcuts,
 ) -> Option<&'static ShortcutDescriptor> {
-    let modifiers = modifiers.difference(keyboard::Modifiers::CAPS_LOCK);
     GLOBAL_SHORTCUT_DESCRIPTORS.iter().find(|descriptor| {
-        descriptor.chords.iter().any(|chord| {
-            chord.modifiers == modifiers
-                && match chord.key {
-                    ShortcutKey::Latin(expected) => {
-                        latin_key(key, physical_key) == Some(expected)
-                    }
-                    ShortcutKey::ArrowLeft => {
-                        matches!(
-                            key.as_ref(),
-                            keyboard::Key::Named(keyboard::key::Named::ArrowLeft)
-                        )
-                    }
-                    ShortcutKey::ArrowRight => {
-                        matches!(
-                            key.as_ref(),
-                            keyboard::Key::Named(keyboard::key::Named::ArrowRight)
-                        )
-                    }
-                }
-        })
+        parse_shortcut(shortcut_keys(descriptor.action, shortcuts))
+            .is_ok_and(|binding| shortcut_matches(binding, key, physical_key, modifiers))
     })
 }
 
+fn shortcut_matches(
+    binding: ShortcutBinding,
+    key: &keyboard::Key,
+    physical_key: keyboard::key::Physical,
+    modifiers: keyboard::Modifiers,
+) -> bool {
+    let modifiers = modifiers.difference(keyboard::Modifiers::CAPS_LOCK);
+    binding.control == modifiers.control()
+        && binding.alt == modifiers.alt()
+        && binding.shift == modifiers.shift()
+        && binding.logo == modifiers.logo()
+        && match binding.key {
+            ShortcutKey::Character(expected) if expected.is_ascii_digit() => {
+                physical_digit(physical_key) == Some(expected)
+            }
+            ShortcutKey::Character(expected) => latin_key(key, physical_key) == Some(expected),
+            ShortcutKey::ArrowLeft => matches!(
+                key.as_ref(),
+                keyboard::Key::Named(keyboard::key::Named::ArrowLeft)
+            ),
+            ShortcutKey::ArrowRight => matches!(
+                key.as_ref(),
+                keyboard::Key::Named(keyboard::key::Named::ArrowRight)
+            ),
+        }
+}
+
 fn latin_key(key: &keyboard::Key, physical_key: keyboard::key::Physical) -> Option<char> {
+    if let keyboard::Key::Character(value) = key.as_ref() {
+        let mut characters = value.chars();
+        if let (Some(character), None) = (characters.next(), characters.next())
+            && character.is_ascii_alphanumeric()
+        {
+            return Some(character.to_ascii_lowercase());
+        }
+    }
     key.to_latin(physical_key)
         .map(|key| key.to_ascii_lowercase())
 }
 
+fn physical_digit(physical_key: keyboard::key::Physical) -> Option<char> {
+    use keyboard::key::Code;
+
+    let keyboard::key::Physical::Code(code) = physical_key else {
+        return None;
+    };
+    match code {
+        Code::Digit0 => Some('0'),
+        Code::Digit1 => Some('1'),
+        Code::Digit2 => Some('2'),
+        Code::Digit3 => Some('3'),
+        Code::Digit4 => Some('4'),
+        Code::Digit5 => Some('5'),
+        Code::Digit6 => Some('6'),
+        Code::Digit7 => Some('7'),
+        Code::Digit8 => Some('8'),
+        Code::Digit9 => Some('9'),
+        _ => None,
+    }
+}
+
+/// The application's constructors for the events the strip reports.
+///
+/// Grouped rather than passed positionally because three bare closures of the
+/// same shape at a call site say nothing about which is which.
+pub struct Events<ViewportMessage, PanMessage, WheelMessage> {
+    /// Scroll offsets and width changes, which the owner applies to the
+    /// workspace so the next frame's projection matches what was drawn.
+    pub viewport: ViewportMessage,
+    /// Middle-drag panning of the strip.
+    pub pan: PanMessage,
+    /// Wheel and touchpad scrolling that the strip handles itself.
+    pub wheel: WheelMessage,
+}
+
 /// Renders the workspace strip.
+///
+/// `viewport_width` is the width the strip is laid out against. It is a
+/// parameter rather than something this function discovers through
+/// `widget::responsive` because that wrapper reports no accessibility nodes,
+/// which hid the whole workspace from screen readers; the owner already tracks
+/// the width through `Workspace::resize_viewport`.
 ///
 /// `container_id` supplies each card's stable container identity, which
 /// scroll-to-card operations address. It is a lookup rather than something this
@@ -344,70 +351,72 @@ fn latin_key(key: &keyboard::Key, physical_key: keyboard::key::Physical) -> Opti
 /// cached clone.
 pub fn view<'a, Message, BuildCard, ContainerId, ViewportMessage, PanMessage, WheelMessage>(
     workspace: &'a Workspace,
+    shortcuts: &'a KeyboardShortcuts,
+    viewport_width: f32,
     scroll_id: widget::Id,
     build_card: BuildCard,
     container_id: ContainerId,
-    on_viewport: ViewportMessage,
-    on_pan: PanMessage,
-    on_wheel: WheelMessage,
+    events: Events<ViewportMessage, PanMessage, WheelMessage>,
 ) -> Element<'a, Message>
 where
     Message: 'static,
     BuildCard: Fn(CardViewContext) -> Element<'a, Message> + 'a,
     ContainerId: Fn(CardId) -> widget::Id + 'a,
     ViewportMessage: Fn(WorkspaceViewportEvent) -> Message + Clone + 'a,
-    PanMessage: Fn(PanGesture) -> Message + Clone + 'a,
-    WheelMessage: Fn(WheelDelta) -> Message + Clone + 'a,
+    PanMessage: Fn(PanGesture) -> Message + 'a,
+    WheelMessage: Fn(WheelDelta) -> Message + 'a,
 {
-    widget::responsive(move |available| {
-        let projection = workspace.projection(available.width);
-        let strip = VirtualStrip::new(
-            &projection,
-            workspace.order().collect(),
-            projection
-                .mounted
-                .iter()
-                .filter_map(|mounted| {
-                    let card = workspace.card(mounted.id)?;
-                    let context = CardViewContext {
-                        id: card.id,
-                        focused: workspace.focused() == Some(card.id),
-                    };
-                    let content =
-                        cosmic::widget::id_container(build_card(context), container_id(card.id));
-                    Some(VirtualCard {
-                        id: card.id,
-                        x: mounted.start,
-                        width: mounted.width,
-                        content: CardSurface::new(content).into(),
-                    })
+    let Events {
+        viewport: on_viewport,
+        pan: on_pan,
+        wheel: on_wheel,
+    } = events;
+    let projection = workspace.projection(viewport_width);
+    let strip = VirtualStrip::new(
+        &projection,
+        workspace.order().collect(),
+        projection
+            .mounted
+            .iter()
+            .filter_map(|mounted| {
+                let card = workspace.card(mounted.id)?;
+                let context = CardViewContext {
+                    id: card.id,
+                    focused: workspace.focused() == Some(card.id),
+                };
+                let content =
+                    cosmic::widget::id_container(build_card(context), container_id(card.id));
+                Some(VirtualCard {
+                    id: card.id,
+                    x: mounted.start,
+                    width: mounted.width,
+                    content: CardSurface::new(content).into(),
                 })
-                .collect(),
-        );
-        let on_viewport_for_scroll = on_viewport.clone();
-        let scrollable = cosmic::widget::scrollable::horizontal(strip)
-            .id(scroll_id.clone())
-            .class(cosmic::style::iced::Scrollable::Minimal)
-            .width(Length::Fill)
-            .height(Length::Fill)
-            // Minimal native chrome auto-hides the rail when idle and omits it
-            // entirely when the strip does not overflow.
-            .on_scroll(move |viewport| {
-                on_viewport_for_scroll(WorkspaceViewportEvent::Scrolled(ViewportSample {
-                    offset: viewport.absolute_offset().x,
-                    width: viewport.bounds().width,
-                }))
-            });
+            })
+            .collect(),
+    );
+    let on_viewport_for_scroll = on_viewport.clone();
+    let scrollable = cosmic::widget::scrollable::horizontal(strip)
+        .id(scroll_id)
+        .class(cosmic::style::iced::Scrollable::Minimal)
+        .width(Length::Fill)
+        .height(Length::Fill)
+        // Minimal native chrome auto-hides the rail when idle and omits it
+        // entirely when the strip does not overflow.
+        .on_scroll(move |viewport| {
+            on_viewport_for_scroll(WorkspaceViewportEvent::Scrolled(ViewportSample {
+                offset: viewport.absolute_offset().x,
+                width: viewport.bounds().width,
+            }))
+        });
 
-        let on_viewport_for_resize = on_viewport.clone();
-        widget::sensor(PanSurface::new(
-            scrollable,
-            on_pan.clone(),
-            on_wheel.clone(),
-        ))
-        .on_resize(move |size| on_viewport_for_resize(WorkspaceViewportEvent::Resized(size.width)))
-        .into()
-    })
+    PanSurface::new(
+        scrollable,
+        shortcuts,
+        on_pan,
+        on_wheel,
+        move |size: Size| on_viewport(WorkspaceViewportEvent::Resized(size.width)),
+    )
     .into()
 }
 
@@ -948,20 +957,26 @@ impl<'a, Message: 'a> From<VirtualStrip<'a, Message>> for Element<'a, Message> {
 
 struct PanSurface<'a, Message> {
     content: Element<'a, Message>,
+    shortcuts: &'a KeyboardShortcuts,
     on_pan: Box<dyn Fn(PanGesture) -> Message + 'a>,
     on_wheel: Box<dyn Fn(WheelDelta) -> Message + 'a>,
+    on_resize: Box<dyn Fn(Size) -> Message + 'a>,
 }
 
 impl<'a, Message> PanSurface<'a, Message> {
     fn new(
         content: impl Into<Element<'a, Message>>,
+        shortcuts: &'a KeyboardShortcuts,
         on_pan: impl Fn(PanGesture) -> Message + 'a,
         on_wheel: impl Fn(WheelDelta) -> Message + 'a,
+        on_resize: impl Fn(Size) -> Message + 'a,
     ) -> Self {
         Self {
             content: content.into(),
+            shortcuts,
             on_pan: Box::new(on_pan),
             on_wheel: Box::new(on_wheel),
+            on_resize: Box::new(on_resize),
         }
     }
 
@@ -978,6 +993,13 @@ impl<'a, Message> PanSurface<'a, Message> {
 struct PanSurfaceState {
     dragging: bool,
     modifiers: keyboard::Modifiers,
+    /// Last reported bounds. Size reporting lives in this widget instead of a
+    /// `widget::sensor` wrapper because `sensor` reports no accessibility
+    /// nodes, and wrapping the strip in one hid every card from screen
+    /// readers. The whole size is retained, not just the width, to keep
+    /// `sensor`'s notification points: it published whenever its bounds
+    /// changed in either axis.
+    last_size: Option<Size>,
 }
 
 impl<Message> Widget<Message, Theme, Renderer> for PanSurface<'_, Message> {
@@ -1047,6 +1069,17 @@ impl<Message> Widget<Message, Theme, Renderer> for PanSurface<'_, Message> {
         let content_layout = Self::child_layout(layout);
         let state = tree.state.downcast_mut::<PanSurfaceState>();
 
+        // Reported on redraw rather than from `layout`, because layout runs
+        // during view building where publishing a message would fight the
+        // reflow it triggers.
+        if let Event::Window(window::Event::RedrawRequested(_)) = event {
+            let size = layout.bounds().size();
+            if state.last_size != Some(size) {
+                state.last_size = Some(size);
+                shell.publish((self.on_resize)(size));
+            }
+        }
+
         if let Event::Keyboard(keyboard::Event::ModifiersChanged(modifiers)) = event {
             state.modifiers = *modifiers;
         }
@@ -1065,7 +1098,7 @@ impl<Message> Widget<Message, Theme, Renderer> for PanSurface<'_, Message> {
                     modifiers,
                     ..
                 },
-            ) if is_global_shortcut_chord(key, *physical_key, *modifiers) => {
+            ) if is_global_shortcut_chord(key, *physical_key, *modifiers, self.shortcuts) => {
                 shell.capture_event();
                 return;
             }
@@ -1449,63 +1482,97 @@ mod tests {
     }
 
     #[test]
-    fn global_shortcuts_match_native_chords_and_repeat_presses() {
+    fn global_shortcuts_match_configured_chords_and_repeat_presses() {
         use keyboard::key::Code;
 
+        let shortcuts = KeyboardShortcuts::default();
         assert_eq!(
-            global_shortcut(&key_press(
-                "t",
-                Code::KeyT,
-                keyboard::Modifiers::CTRL,
-                false
-            )),
+            global_shortcut(
+                &key_press("t", Code::KeyT, keyboard::Modifiers::CTRL, false),
+                &shortcuts,
+            ),
             Some(GlobalShortcut::NewTerminal)
         );
         assert_eq!(
-            global_shortcut(&key_press(
-                "w",
-                Code::KeyW,
-                keyboard::Modifiers::CTRL,
-                false
-            )),
+            global_shortcut(
+                &key_press("w", Code::KeyW, keyboard::Modifiers::CTRL, false),
+                &shortcuts,
+            ),
             Some(GlobalShortcut::CloseFocusedCard)
         );
         assert_eq!(
-            global_shortcut(&key_press(
-                "F",
-                Code::KeyF,
-                keyboard::Modifiers::CTRL | keyboard::Modifiers::CAPS_LOCK,
-                false,
-            )),
+            global_shortcut(
+                &key_press(
+                    "F",
+                    Code::KeyF,
+                    keyboard::Modifiers::CTRL | keyboard::Modifiers::CAPS_LOCK,
+                    false,
+                ),
+                &shortcuts,
+            ),
             Some(GlobalShortcut::FocusProjectSearch)
         );
         for (character, code) in [("t", Code::KeyT), ("w", Code::KeyW), ("f", Code::KeyF)] {
             assert_eq!(
-                global_shortcut(&key_press(character, code, keyboard::Modifiers::CTRL, true,)),
+                global_shortcut(
+                    &key_press(character, code, keyboard::Modifiers::CTRL, true),
+                    &shortcuts,
+                ),
                 None,
                 "held Ctrl shortcuts must not repeat destructive/creation actions"
             );
         }
         for repeat in [false, true] {
             assert_eq!(
-                global_shortcut(&key_press(
-                    "A",
-                    Code::KeyA,
-                    keyboard::Modifiers::ALT,
-                    repeat,
-                )),
+                global_shortcut(
+                    &key_press("A", Code::KeyA, keyboard::Modifiers::ALT, repeat),
+                    &shortcuts,
+                ),
                 None,
                 "Alt+A must be forwarded on initial and repeated key presses"
             );
         }
         assert_eq!(
-            global_shortcut(&key_press("q", Code::KeyQ, keyboard::Modifiers::ALT, true)),
+            global_shortcut(
+                &key_press("q", Code::KeyQ, keyboard::Modifiers::ALT, true),
+                &shortcuts,
+            ),
             Some(GlobalShortcut::FocusAdjacent(FocusDirection::Left))
         );
-
         assert_eq!(
-            global_shortcut(&key_press("w", Code::KeyW, keyboard::Modifiers::ALT, true)),
+            global_shortcut(
+                &key_press("w", Code::KeyW, keyboard::Modifiers::ALT, true),
+                &shortcuts,
+            ),
             Some(GlobalShortcut::FocusAdjacent(FocusDirection::Right))
+        );
+
+        let mut customized = shortcuts;
+        customized.new_terminal = "Ctrl+Shift+N".to_owned();
+        assert_eq!(
+            global_shortcut(
+                &key_press(
+                    "n",
+                    Code::KeyN,
+                    keyboard::Modifiers::CTRL | keyboard::Modifiers::SHIFT,
+                    false,
+                ),
+                &customized,
+            ),
+            Some(GlobalShortcut::NewTerminal)
+        );
+        customized.new_terminal = "Ctrl+Shift+1".to_owned();
+        assert_eq!(
+            global_shortcut(
+                &key_press(
+                    "!",
+                    Code::Digit1,
+                    keyboard::Modifiers::CTRL | keyboard::Modifiers::SHIFT,
+                    false,
+                ),
+                &customized,
+            ),
+            Some(GlobalShortcut::NewTerminal)
         );
     }
 
@@ -1515,7 +1582,10 @@ mod tests {
         assert!(should_forward_to_raw_children(false));
     }
 
-    struct AccessibleProbe(u64);
+    struct AccessibleProbe {
+        node: u64,
+        expected_virtual_offset: Vector,
+    }
 
     impl Widget<(), Theme, Renderer> for AccessibleProbe {
         fn size(&self) -> Size<Length> {
@@ -1551,8 +1621,8 @@ mod tests {
         ) -> iced_accessibility::A11yTree {
             use iced_accessibility::accesskit::{Node, Role};
 
-            assert_eq!(layout.virtual_offset(), Vector::new(32.0, 0.0));
-            iced_accessibility::A11yTree::leaf(Node::new(Role::Button), self.0)
+            assert_eq!(layout.virtual_offset(), self.expected_virtual_offset);
+            iced_accessibility::A11yTree::leaf(Node::new(Role::Button), self.node)
         }
     }
 
@@ -1571,12 +1641,17 @@ mod tests {
                     id,
                     x: index as f32 * 100.0,
                     width: 100.0,
-                    content: CardSurface::new(Element::new(AccessibleProbe(index as u64 + 1)))
-                        .into(),
+                    content: CardSurface::new(Element::new(AccessibleProbe {
+                        node: index as u64 + 1,
+                        expected_virtual_offset: Vector::new(32.0, 0.0),
+                    }))
+                    .into(),
                 })
                 .collect(),
         };
-        let surface: Element<'_, ()> = Element::new(PanSurface::new(strip, |_| (), |_| ()));
+        let shortcuts = KeyboardShortcuts::default();
+        let surface: Element<'_, ()> =
+            Element::new(PanSurface::new(strip, &shortcuts, |_| (), |_| (), |_| ()));
         let tree = Tree::new(&surface);
         let card_node = || {
             layout::Node::with_children(
@@ -1601,47 +1676,135 @@ mod tests {
     }
 
     #[test]
-    fn only_global_chords_are_reserved_from_terminal_and_browser_children() {
+    fn composed_workspace_view_exposes_every_mounted_card_to_a_screen_reader() {
+        use iced_accessibility::A11yId;
+
+        const VIEWPORT_WIDTH: f32 = 700.0;
+        const HEIGHT: f32 = 480.0;
+
+        let mut workspace = Workspace::default();
+        workspace.resize_viewport(VIEWPORT_WIDTH);
+        let cards: Vec<CardId> = (0..8).map(|_| CardId::new()).collect();
+        for (index, id) in cards.iter().copied().enumerate() {
+            workspace
+                .add_card(
+                    WorkspaceCard::new(id, format!("Card {index}"), CardWidth::Fixed(320.0))
+                        .unwrap(),
+                    index,
+                    index == 0,
+                )
+                .unwrap();
+        }
+        let projection = workspace.projection(VIEWPORT_WIDTH);
+        let mounted: Vec<CardId> = projection.mounted_ids().collect();
+        assert!(mounted.len() < cards.len());
+
+        let probe_id = |id: CardId| {
+            cards
+                .iter()
+                .position(|card| *card == id)
+                .expect("probe for a card the workspace holds") as u64
+                + 1
+        };
+        let shortcuts = KeyboardShortcuts::default();
+        let composed: Element<'_, ()> = view(
+            &workspace,
+            &shortcuts,
+            VIEWPORT_WIDTH,
+            workspace_scroll_id(),
+            |context| {
+                Element::new(AccessibleProbe {
+                    node: probe_id(context.id),
+                    expected_virtual_offset: Vector::ZERO,
+                })
+            },
+            card_widget_id,
+            Events {
+                viewport: |_| (),
+                pan: |_| (),
+                wheel: |_| (),
+            },
+        );
+        let tree = Tree::new(&composed);
+
+        // The view nests pan surface > scrollable > strip > card surface > id
+        // container > card, and every one of those contributes a layout node.
+        let strip_node = layout::Node::with_children(
+            Size::new(projection.total_width, HEIGHT),
+            projection
+                .mounted
+                .iter()
+                .map(|card| {
+                    let size = Size::new(card.width, HEIGHT);
+                    layout::Node::with_children(
+                        size,
+                        vec![layout::Node::with_children(
+                            size,
+                            vec![layout::Node::new(size)],
+                        )],
+                    )
+                    .move_to(Point::new(card.start, 0.0))
+                })
+                .collect(),
+        );
+        let surface_size = Size::new(VIEWPORT_WIDTH, HEIGHT);
+        let surface_node = layout::Node::with_children(
+            surface_size,
+            vec![layout::Node::with_children(surface_size, vec![strip_node])],
+        );
+        let accessible = composed.as_widget().a11y_nodes(
+            Layout::new(&surface_node),
+            &tree,
+            mouse::Cursor::Unavailable,
+        );
+
+        assert!(
+            !accessible.root().is_empty(),
+            "the workspace must reach a screen reader through every wrapper the view builds"
+        );
+        for id in &mounted {
+            assert!(
+                accessible.contains(&A11yId::from(probe_id(*id))),
+                "mounted card {id} is missing from the accessibility tree"
+            );
+        }
+        assert_eq!(
+            cards
+                .iter()
+                .filter(|id| accessible.contains(&A11yId::from(probe_id(**id))))
+                .count(),
+            mounted.len(),
+            "the accessibility tree must expose the mounted cards and nothing else"
+        );
+    }
+
+    #[test]
+    fn only_configured_global_chords_are_reserved_from_card_children() {
         use keyboard::key::{Code, Physical};
 
-        assert!(is_global_shortcut_chord(
-            &keyboard::Key::Character("t".into()),
-            Physical::Code(Code::KeyT),
-            keyboard::Modifiers::CTRL,
-        ));
-        assert!(!is_global_shortcut_chord(
-            &keyboard::Key::Character("q".into()),
-            Physical::Code(Code::KeyQ),
-            keyboard::Modifiers::CTRL,
-        ));
-        assert!(is_global_shortcut_chord(
-            &keyboard::Key::Character("q".into()),
-            Physical::Code(Code::KeyQ),
-            keyboard::Modifiers::ALT,
-        ));
-        assert!(!is_global_shortcut_chord(
-            &keyboard::Key::Character("a".into()),
-            Physical::Code(Code::KeyA),
-            keyboard::Modifiers::ALT,
-        ));
-        assert!(is_global_shortcut_chord(
-            &keyboard::Key::Character("w".into()),
-            Physical::Code(Code::KeyW),
-            keyboard::Modifiers::ALT,
-        ));
-        assert!(!is_global_shortcut_chord(
-            &keyboard::Key::Character("x".into()),
-            Physical::Code(Code::KeyX),
-            keyboard::Modifiers::ALT,
-        ));
-        assert!(!is_global_shortcut_chord(
-            &keyboard::Key::Character("q".into()),
-            Physical::Code(Code::KeyQ),
+        let shortcuts = KeyboardShortcuts::default();
+        let reserved = |character, code, modifiers| {
+            is_global_shortcut_chord(
+                &keyboard::Key::Character(character),
+                Physical::Code(code),
+                modifiers,
+                &shortcuts,
+            )
+        };
+        assert!(reserved("t".into(), Code::KeyT, keyboard::Modifiers::CTRL));
+        assert!(!reserved("q".into(), Code::KeyQ, keyboard::Modifiers::CTRL));
+        assert!(reserved("q".into(), Code::KeyQ, keyboard::Modifiers::ALT));
+        assert!(!reserved("a".into(), Code::KeyA, keyboard::Modifiers::ALT));
+        assert!(reserved("w".into(), Code::KeyW, keyboard::Modifiers::ALT));
+        assert!(!reserved("x".into(), Code::KeyX, keyboard::Modifiers::ALT));
+        assert!(!reserved(
+            "q".into(),
+            Code::KeyQ,
             keyboard::Modifiers::ALT | keyboard::Modifiers::CTRL,
         ));
-        assert!(!is_global_shortcut_chord(
-            &keyboard::Key::Character("t".into()),
-            Physical::Code(Code::KeyT),
+        assert!(!reserved(
+            "t".into(),
+            Code::KeyT,
             keyboard::Modifiers::CTRL | keyboard::Modifiers::SHIFT,
         ));
     }
@@ -1664,13 +1827,12 @@ mod tests {
         }
         workspace.focus(cards[0]).unwrap();
 
+        let shortcuts = KeyboardShortcuts::default();
         for repeat in [false, true, true, true] {
-            let shortcut = global_shortcut(&key_press(
-                "w",
-                Code::KeyW,
-                keyboard::Modifiers::ALT,
-                repeat,
-            ));
+            let shortcut = global_shortcut(
+                &key_press("w", Code::KeyW, keyboard::Modifiers::ALT, repeat),
+                &shortcuts,
+            );
             let Some(GlobalShortcut::FocusAdjacent(direction)) = shortcut else {
                 panic!("Alt+W must remain a navigation shortcut on repeated key presses");
             };
@@ -1679,12 +1841,10 @@ mod tests {
         assert_eq!(workspace.focused(), Some(cards[3]));
 
         for repeat in [false, true, true, true] {
-            let shortcut = global_shortcut(&key_press(
-                "q",
-                Code::KeyQ,
-                keyboard::Modifiers::ALT,
-                repeat,
-            ));
+            let shortcut = global_shortcut(
+                &key_press("q", Code::KeyQ, keyboard::Modifiers::ALT, repeat),
+                &shortcuts,
+            );
             let Some(GlobalShortcut::FocusAdjacent(direction)) = shortcut else {
                 panic!("Alt+Q must remain a navigation shortcut on repeated key presses");
             };
@@ -1694,45 +1854,16 @@ mod tests {
     }
 
     #[test]
-    fn every_shortcut_descriptor_is_the_dispatchers_single_source_of_truth() {
-        use keyboard::key::{Code, Named, Physical};
-
+    fn every_shortcut_descriptor_has_a_unique_configurable_binding() {
+        let shortcuts = KeyboardShortcuts::default();
+        let mut bindings = HashSet::new();
         for descriptor in GLOBAL_SHORTCUT_DESCRIPTORS {
             assert!(!descriptor.label.is_empty());
-            assert!(!descriptor.keys.is_empty());
-            assert!(!descriptor.spoken_keys.is_empty());
-            for chord in descriptor.chords {
-                let (key, physical) = match chord.key {
-                    ShortcutKey::Latin(character) => {
-                        let code = match character {
-                            't' => Code::KeyT,
-                            'w' => Code::KeyW,
-                            'f' => Code::KeyF,
-                            'q' => Code::KeyQ,
-                            other => panic!("unexpected descriptor key {other}"),
-                        };
-                        (keyboard::Key::Character(character.to_string().into()), Physical::Code(code))
-                    }
-                    ShortcutKey::ArrowLeft => (
-                        keyboard::Key::Named(Named::ArrowLeft),
-                        Physical::Code(Code::ArrowLeft),
-                    ),
-                    ShortcutKey::ArrowRight => (
-                        keyboard::Key::Named(Named::ArrowRight),
-                        Physical::Code(Code::ArrowRight),
-                    ),
-                };
-                assert_eq!(
-                    global_shortcut_chord(&key, physical, chord.modifiers),
-                    Some(descriptor.action),
-                    "{} must dispatch from its displayed descriptor",
-                    descriptor.keys
-                );
-            }
+            let keys = shortcut_keys(descriptor.action, &shortcuts);
+            assert!(!keys.is_empty());
+            assert!(parse_shortcut(keys).is_ok());
+            assert!(bindings.insert(keys));
         }
-        assert!(GLOBAL_SHORTCUT_DESCRIPTORS.iter().all(|descriptor| {
-            !descriptor.keys.contains("Alt+A") && !descriptor.spoken_keys.contains("Alt plus A")
-        }));
     }
 
     #[test]
