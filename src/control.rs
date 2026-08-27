@@ -166,9 +166,7 @@ pub enum ControlError {
     },
     #[error("the wait timeout is too large for the monotonic clock")]
     InvalidTimeout,
-    #[error(
-        "daemon answered a full-snapshot request with an incremental one it could not resolve"
-    )]
+    #[error("daemon answered a full-snapshot request with an incremental one it could not resolve")]
     IncrementalSnapshot,
 }
 
@@ -947,8 +945,7 @@ fn execute_terminal(command: TerminalCommand) -> Result<CommandOutput, AppError>
             let cwd = absolute_working_directory(cwd)
                 .map_err(|error| AppError::new("working_directory", error))?;
             let recipe = if argv.is_empty() {
-                LaunchRecipe::shell(cwd)
-                    .map_err(|error| AppError::new("login_shell", error))?
+                LaunchRecipe::shell(cwd).map_err(|error| AppError::new("login_shell", error))?
             } else {
                 LaunchRecipe {
                     program: argv[0].clone(),

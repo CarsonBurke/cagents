@@ -431,7 +431,9 @@ fn persistence_loop(
             writes.workspace = Some(latest);
         }
         writes.projects.extend(std::mem::take(&mut state.projects));
-        writes.worktrees.extend(std::mem::take(&mut state.worktrees));
+        writes
+            .worktrees
+            .extend(std::mem::take(&mut state.worktrees));
         for replacement in std::mem::take(&mut state.terminal_replacements).into_values() {
             merge_terminal_replacement(&mut writes.terminal_replacements, replacement);
         }
@@ -873,7 +875,10 @@ mod tests {
              clean shutdown"
         );
         assert!(
-            reopened.load_workspace(snapshot.id, None).unwrap().is_some(),
+            reopened
+                .load_workspace(snapshot.id, None)
+                .unwrap()
+                .is_some(),
             "the final snapshot must survive a shutdown flush that failed once"
         );
     }

@@ -16,7 +16,9 @@ use wayland_client::{
     backend::{Backend, ObjectId},
     delegate_noop,
     globals::{GlobalListContents, registry_queue_init},
-    protocol::{wl_compositor, wl_region, wl_registry, wl_subcompositor, wl_subsurface, wl_surface},
+    protocol::{
+        wl_compositor, wl_region, wl_registry, wl_subcompositor, wl_subsurface, wl_surface,
+    },
 };
 use wayland_protocols::wp::viewporter::client::{wp_viewport, wp_viewporter};
 
@@ -620,7 +622,12 @@ impl FallbackSurface {
 mod tests {
     use super::*;
 
-    fn clipped(source_x: u32, source_y: u32, source_width: u32, source_height: u32) -> SurfacePlacement {
+    fn clipped(
+        source_x: u32,
+        source_y: u32,
+        source_width: u32,
+        source_height: u32,
+    ) -> SurfacePlacement {
         SurfacePlacement {
             logical_x: 10,
             logical_y: 20,
@@ -665,7 +672,9 @@ mod tests {
         let placement = clipped(0, 0, 480, 600);
         let buffer = (480, 600);
         let latched = placement_delta(placement, buffer, None, None, None);
-        assert!(latched.position.is_some() && latched.destination.is_some() && latched.source.is_some());
+        assert!(
+            latched.position.is_some() && latched.destination.is_some() && latched.source.is_some()
+        );
 
         let moved = SurfacePlacement {
             logical_x: placement.logical_x + 7,

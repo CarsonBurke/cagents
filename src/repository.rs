@@ -261,10 +261,7 @@ impl CancellationToken {
     fn register(&self, waker: mpsc::Sender<WaitEvent>) -> CancellationWaker<'_> {
         let id = self.0.next_waker.fetch_add(1, Ordering::Relaxed);
         lock_wakers(&self.0).push((id, waker));
-        CancellationWaker {
-            state: &self.0,
-            id,
-        }
+        CancellationWaker { state: &self.0, id }
     }
 }
 
@@ -1440,7 +1437,7 @@ pub struct RepositoryService<E = SystemProcessExecutor> {
 
 impl RepositoryService<SystemProcessExecutor> {
     pub fn system(git: impl Into<PathBuf>) -> Self {
-        Self::new(git, Arc::new(SystemProcessExecutor::default()))
+        Self::new(git, Arc::new(SystemProcessExecutor))
     }
 }
 
