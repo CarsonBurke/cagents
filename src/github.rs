@@ -508,7 +508,7 @@ pub struct GitHubService<E = SystemProcessExecutor> {
 
 impl GitHubService<SystemProcessExecutor> {
     pub fn system(gh: impl Into<PathBuf>) -> Self {
-        Self::new(gh, Arc::new(SystemProcessExecutor::default()))
+        Self::new(gh, Arc::new(SystemProcessExecutor))
     }
 }
 

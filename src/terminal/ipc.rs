@@ -479,7 +479,10 @@ impl TerminalSnapshot {
     /// Applying a delta clones the row pointer list and replaces the changed
     /// entries, so an unchanged row costs one atomic increment instead of a
     /// full row rebuild.
-    pub fn apply(self, current: Option<&RenderSnapshot>) -> Result<RenderSnapshot, SnapshotApplyError> {
+    pub fn apply(
+        self,
+        current: Option<&RenderSnapshot>,
+    ) -> Result<RenderSnapshot, SnapshotApplyError> {
         let Self {
             generation,
             columns,
@@ -891,8 +894,7 @@ impl FrameCodec {
         value: &T,
     ) -> Result<(), FrameError> {
         let payload_length = encode_frame(&mut self.buffer, self.maximum, value)?;
-        self.buffer[..LENGTH_PREFIX_BYTES]
-            .copy_from_slice(&(payload_length as u32).to_be_bytes());
+        self.buffer[..LENGTH_PREFIX_BYTES].copy_from_slice(&(payload_length as u32).to_be_bytes());
         writer.write_all(&self.buffer)?;
         writer.flush()?;
         Ok(())
@@ -1008,7 +1010,9 @@ impl Write for CappedSink<'_> {
             ));
         };
         if required > self.maximum {
-            self.failure = Some(CappedSinkFailure::TooLarge { attempted: required });
+            self.failure = Some(CappedSinkFailure::TooLarge {
+                attempted: required,
+            });
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "IPC frame exceeds its maximum length",
@@ -1132,7 +1136,10 @@ mod tests {
             },
         )
         .unwrap_err();
-        assert!(matches!(error, FrameError::InvalidLength { maximum: 64, .. }));
+        assert!(matches!(
+            error,
+            FrameError::InvalidLength { maximum: 64, .. }
+        ));
     }
 
     #[test]

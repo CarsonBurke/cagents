@@ -84,7 +84,8 @@ impl SurfacePlacement {
     /// physical Servo buffer while supporting fractional logical scaling, so the
     /// destination is the buffer divided by the scale factor.
     pub fn unclipped(buffer: PhysicalViewport, scale_factor: f32) -> Self {
-        let (logical_width, logical_height) = logical_extent(buffer.width, buffer.height, scale_factor);
+        let (logical_width, logical_height) =
+            logical_extent(buffer.width, buffer.height, scale_factor);
         Self {
             logical_x: 0,
             logical_y: 0,
@@ -354,7 +355,10 @@ mod tests {
     #[test]
     fn fractional_scale_maps_physical_buffer_to_logical_destination() {
         let placement = SurfacePlacement::unclipped(PhysicalViewport::new(150, 75), 1.5);
-        assert_eq!((placement.logical_width, placement.logical_height), (100, 50));
+        assert_eq!(
+            (placement.logical_width, placement.logical_height),
+            (100, 50)
+        );
         assert_eq!((placement.source_width, placement.source_height), (150, 75));
         assert_eq!((placement.source_x, placement.source_y), (0, 0));
     }

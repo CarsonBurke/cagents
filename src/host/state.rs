@@ -11,9 +11,7 @@ use crate::{
         HostSessionProof, TerminalContinuity, TerminalExit, TerminalId, TerminalSession,
         TranscriptMetadata,
     },
-    terminal::{
-        RenderSnapshot, TerminalConfig, TerminalEvent, TerminalHandle, TerminalSendError,
-    },
+    terminal::{RenderSnapshot, TerminalConfig, TerminalEvent, TerminalHandle, TerminalSendError},
     terminal_ipc::{
         PROTOCOL_VERSION, ProtocolError, ProtocolErrorCode, ServerEnvelope, ServerMessage,
         TerminalDescriptor, TerminalSnapshot, TerminalSpawnOptions, TerminalVisibility,
@@ -108,7 +106,8 @@ impl Subscriptions {
         let Some(terminals) = self.by_client.remove(&client_id) else {
             return;
         };
-        self.sent.retain(|(sent_client, _), _| *sent_client != client_id);
+        self.sent
+            .retain(|(sent_client, _), _| *sent_client != client_id);
         for terminal_id in terminals.keys() {
             if let Some(clients) = self.by_terminal.get_mut(terminal_id) {
                 clients.remove(&client_id);

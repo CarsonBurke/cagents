@@ -289,10 +289,7 @@ fn passwd_shell() -> Option<String> {
             )
         };
         if status == libc::ERANGE && buffer.len() < MAX_BUFFER_SIZE {
-            buffer.resize(
-                buffer.len().saturating_mul(2).min(MAX_BUFFER_SIZE),
-                0,
-            );
+            buffer.resize(buffer.len().saturating_mul(2).min(MAX_BUFFER_SIZE), 0);
             continue;
         }
         if status != 0 || result.is_null() {
@@ -336,14 +333,7 @@ fn fs_metadata_is_executable(path: &Path) -> bool {
     };
     // SAFETY: path is a live NUL-terminated string. AT_EACCESS asks Linux to
     // check execute permission using the process's effective credentials.
-    unsafe {
-        libc::faccessat(
-            libc::AT_FDCWD,
-            path.as_ptr(),
-            libc::X_OK,
-            libc::AT_EACCESS,
-        ) == 0
-    }
+    unsafe { libc::faccessat(libc::AT_FDCWD, path.as_ptr(), libc::X_OK, libc::AT_EACCESS) == 0 }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -603,12 +593,7 @@ mod tests {
     fn shell_selection_falls_back_in_documented_order() {
         let valid = |candidate: &str| matches!(candidate, "/bin/zsh" | "/bin/sh");
         assert_eq!(
-            choose_login_shell(
-                Some("relative".into()),
-                Some("/bin/zsh".into()),
-                valid,
-            )
-            .unwrap(),
+            choose_login_shell(Some("relative".into()), Some("/bin/zsh".into()), valid,).unwrap(),
             "/bin/zsh"
         );
         assert_eq!(
@@ -646,6 +631,9 @@ mod tests {
         };
 
         let encoded = serde_json::to_vec(&recipe).unwrap();
-        assert_eq!(serde_json::from_slice::<LaunchRecipe>(&encoded).unwrap(), recipe);
+        assert_eq!(
+            serde_json::from_slice::<LaunchRecipe>(&encoded).unwrap(),
+            recipe
+        );
     }
 }

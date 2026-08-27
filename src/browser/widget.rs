@@ -666,7 +666,10 @@ mod tests {
         assert_eq!(native.buffer, PhysicalViewport::new(800, 600));
         assert_eq!(native.placement.logical_x, 300);
         assert_eq!(native.placement.logical_y, 100);
-        assert_eq!((native.placement.source_x, native.placement.source_y), (400, 0));
+        assert_eq!(
+            (native.placement.source_x, native.placement.source_y),
+            (400, 0)
+        );
         assert_eq!(
             (
                 native.placement.source_width,

@@ -1338,8 +1338,7 @@ const SELECT_WORKSPACE_GENERATION: &str =
 const SELECT_WORKSPACE_EXISTENCE: &str =
     "SELECT existence_json FROM workspaces WHERE workspace_id = ?1";
 const SELECT_PROJECT_GENERATION: &str = "SELECT generation FROM projects WHERE project_id = ?1";
-const SELECT_PROJECT_EXISTENCE: &str =
-    "SELECT existence_json FROM projects WHERE project_id = ?1";
+const SELECT_PROJECT_EXISTENCE: &str = "SELECT existence_json FROM projects WHERE project_id = ?1";
 const SELECT_WORKTREE_GENERATION: &str = "SELECT generation FROM worktrees WHERE worktree_id = ?1";
 const SELECT_WORKTREE_EXISTENCE: &str =
     "SELECT existence_json FROM worktrees WHERE worktree_id = ?1";
@@ -1471,14 +1470,16 @@ fn save_workspace_transaction(
         })
         .map(|id| id.to_string());
 
-    transaction.prepare_cached(UPSERT_WORKSPACE)?.execute(params![
-        workspace_id,
-        u64_to_i64(next, "workspace generation")?,
-        i64::from(state.schema_version),
-        to_json(&state.existence)?,
-        focused,
-        timestamp,
-    ])?;
+    transaction
+        .prepare_cached(UPSERT_WORKSPACE)?
+        .execute(params![
+            workspace_id,
+            u64_to_i64(next, "workspace generation")?,
+            i64::from(state.schema_version),
+            to_json(&state.existence)?,
+            focused,
+            timestamp,
+        ])?;
 
     let existing = existing_cards(transaction, &workspace_id)?;
     let incoming_ids = state
@@ -1586,12 +1587,14 @@ fn save_workspace_transaction(
                 reason: Some("absent from a newer workspace snapshot".into()),
             },
         };
-        transaction.prepare_cached(TOMBSTONE_CARD)?.execute(params![
-            u64_to_i64(generation, "card generation")?,
-            to_json(&tombstone)?,
-            timestamp,
-            card_id.to_string(),
-        ])?;
+        transaction
+            .prepare_cached(TOMBSTONE_CARD)?
+            .execute(params![
+                u64_to_i64(generation, "card generation")?,
+                to_json(&tombstone)?,
+                timestamp,
+                card_id.to_string(),
+            ])?;
         card_generations.insert(*card_id, generation);
     }
 
@@ -1659,11 +1662,7 @@ impl<'card> CardWrite<'card> {
                 recipe_json: to_json(&terminal.launch)?,
                 continuity_json: to_json(&terminal.continuity)?,
                 resume_hint: terminal.resume_hint.as_deref(),
-                transcript_path_json: terminal
-                    .transcript_path
-                    .as_ref()
-                    .map(to_json)
-                    .transpose()?,
+                transcript_path_json: terminal.transcript_path.as_ref().map(to_json).transpose()?,
             },
             CardKind::Browser(browser) => {
                 let descriptor = browser.durable_descriptor();
@@ -1672,10 +1671,7 @@ impl<'card> CardWrite<'card> {
                     browser_id: descriptor.id.to_string(),
                     current_url: descriptor.current_url.as_str().to_owned(),
                     history_json: to_json(&descriptor.history)?,
-                    history_index: usize_to_i64(
-                        descriptor.history_index,
-                        "browser history index",
-                    )?,
+                    history_index: usize_to_i64(descriptor.history_index, "browser history index")?,
                     scroll_x: descriptor.scroll_x,
                     scroll_y: descriptor.scroll_y,
                     fidelity: match descriptor.fidelity {
@@ -1860,12 +1856,7 @@ fn save_card_payload(
             scroll_y,
             fidelity,
         } => {
-            ensure_payload_identity(
-                transaction,
-                &BROWSER_PAYLOAD_IDENTITY,
-                browser_id,
-                card_id,
-            )?;
+            ensure_payload_identity(transaction, &BROWSER_PAYLOAD_IDENTITY, browser_id, card_id)?;
             transaction
                 .prepare_cached(UPSERT_BROWSER_RESTORE)?
                 .execute(params![
