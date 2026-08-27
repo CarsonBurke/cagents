@@ -68,6 +68,21 @@ impl LifecycleManager {
         self.budget = budget;
     }
 
+    pub fn next_offscreen_sweep_delay(&self, now: Instant) -> Option<Duration> {
+        self.cards
+            .values()
+            .filter(|runtime| {
+                runtime.exposure == Exposure::Offscreen
+                    && matches!(runtime.residency, Residency::Hot)
+            })
+            .map(|runtime| {
+                self.budget
+                    .offscreen_grace
+                    .saturating_sub(now.saturating_duration_since(runtime.last_visible))
+            })
+            .min()
+    }
+
     pub fn register(
         &mut self,
         card: CardId,
@@ -253,6 +268,27 @@ mod tests {
         assert!(!manager.hydration_finished(id, epoch.wrapping_add(1), Ok(())));
         assert!(manager.hydration_finished(id, epoch, Ok(())));
         assert_eq!(manager.state(id).unwrap().1, &Residency::Hot);
+    }
+
+    #[test]
+    fn revised_grace_preserves_existing_offscreen_age() {
+        let now = Instant::now();
+        let id = CardId::new();
+        let mut manager = LifecycleManager::new(LifecycleBudget::default());
+        manager.register(id, Exposure::Offscreen, Residency::Hot, now);
+        manager.update_budget(LifecycleBudget {
+            max_hot_cards: 6,
+            offscreen_grace: Duration::from_secs(31),
+        });
+
+        assert_eq!(
+            manager.next_offscreen_sweep_delay(now + Duration::from_secs(29)),
+            Some(Duration::from_secs(2))
+        );
+        assert_eq!(
+            manager.next_offscreen_sweep_delay(now + Duration::from_secs(32)),
+            Some(Duration::ZERO)
+        );
     }
 
     #[test]
