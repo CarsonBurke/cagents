@@ -1055,10 +1055,44 @@ fn child_exit_event(exited: &mut bool, result: ChildExit) -> Option<TerminalEven
     })
 }
 
+/// Variables the daemon may have inherited from whatever terminal (or desktop
+/// session) launched it. Left in place, a child would believe it is talking to
+/// that emulator and emit control sequences libghostty-vt does not implement.
+const INHERITED_TERMINAL_MARKERS: &[&str] = &[
+    "TERM_PROGRAM",
+    "TERM_PROGRAM_VERSION",
+    "TERMINFO",
+    "KITTY_WINDOW_ID",
+    "KITTY_PID",
+    "KITTY_INSTALLATION_DIR",
+    "GHOSTTY_RESOURCES_DIR",
+    "GHOSTTY_BIN_DIR",
+    "VTE_VERSION",
+    "ALACRITTY_WINDOW_ID",
+    "ALACRITTY_SOCKET",
+    "ALACRITTY_LOG",
+    "WEZTERM_PANE",
+    "WEZTERM_UNIX_SOCKET",
+    "WEZTERM_EXECUTABLE",
+    "ITERM_SESSION_ID",
+    "KONSOLE_VERSION",
+    "COLORTERM",
+];
+
 fn command_from_recipe(recipe: &LaunchRecipe) -> CommandBuilder {
     let mut command = CommandBuilder::new(&recipe.program);
     command.args(&recipe.arguments);
     command.cwd(&recipe.working_directory);
+    for name in INHERITED_TERMINAL_MARKERS {
+        command.env_remove(name);
+    }
+    // `xterm-256color` rather than a cagents-specific entry: we ship no
+    // terminfo database, and a name the host lacks breaks every curses program.
+    command.env("TERM", "xterm-256color");
+    command.env("COLORTERM", "truecolor");
+    command.env("TERM_PROGRAM", "cagents");
+    command.env("TERM_PROGRAM_VERSION", env!("CARGO_PKG_VERSION"));
+    // Last, so an explicit per-session entry still wins over our defaults.
     for (name, value) in &recipe.environment {
         command.env(name, value);
     }
@@ -1293,6 +1327,8 @@ fn map_mouse_button(button: MouseButton) -> mouse::Button {
 #[cfg(test)]
 mod tests {
     use std::{
+        collections::BTreeMap,
+        ffi::OsStr,
         fs,
         os::unix::fs::{PermissionsExt, symlink},
         sync::atomic::{AtomicUsize, Ordering},
@@ -1495,5 +1531,51 @@ mod tests {
             })
         ));
         assert!(event_rx.try_recv().is_err());
+    }
+
+    fn env_recipe(environment: BTreeMap<String, String>) -> LaunchRecipe {
+        LaunchRecipe {
+            program: "/bin/sh".to_owned(),
+            arguments: Vec::new(),
+            working_directory: PathBuf::from("/"),
+            environment,
+        }
+    }
+
+    #[test]
+    fn child_environment_advertises_our_own_terminal_identity() {
+        let command = command_from_recipe(&env_recipe(BTreeMap::new()));
+
+        assert_eq!(command.get_env("TERM"), Some(OsStr::new("xterm-256color")));
+        assert_eq!(command.get_env("COLORTERM"), Some(OsStr::new("truecolor")));
+        assert_eq!(command.get_env("TERM_PROGRAM"), Some(OsStr::new("cagents")));
+        assert_eq!(
+            command.get_env("TERM_PROGRAM_VERSION"),
+            Some(OsStr::new(env!("CARGO_PKG_VERSION")))
+        );
+        for marker in INHERITED_TERMINAL_MARKERS.iter().filter(|name| {
+            !matches!(
+                **name,
+                "TERM_PROGRAM" | "TERM_PROGRAM_VERSION" | "COLORTERM"
+            )
+        }) {
+            assert_eq!(
+                command.get_env(marker),
+                None,
+                "{marker} leaked to the child"
+            );
+        }
+    }
+
+    #[test]
+    fn explicit_recipe_environment_overrides_terminal_defaults() {
+        let command = command_from_recipe(&env_recipe(BTreeMap::from([
+            ("TERM".to_owned(), "dumb".to_owned()),
+            ("KITTY_WINDOW_ID".to_owned(), "3".to_owned()),
+        ])));
+
+        assert_eq!(command.get_env("TERM"), Some(OsStr::new("dumb")));
+        assert_eq!(command.get_env("KITTY_WINDOW_ID"), Some(OsStr::new("3")));
+        assert_eq!(command.get_env("COLORTERM"), Some(OsStr::new("truecolor")));
     }
 }
