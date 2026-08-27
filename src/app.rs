@@ -3221,6 +3221,21 @@ impl Application for Cagents {
             lifecycle_sweep_deadline: None,
             lifecycle_sweep_generation: 0,
         };
+        // `view` lays the strip out against the width `Workspace` holds, which
+        // starts at zero, and `PanSurface` only publishes its real bounds once
+        // it has been mounted and redrawn. A strip projected against zero
+        // mounts nothing but its overscan band, so without a seed the frame in
+        // which the strip first appears - at startup, and again when the first
+        // card arrives - flashes empty and rebuilds every card's widget state.
+        // The pane and the strip split the window, so this is the right width
+        // until the surface reports its own.
+        let sidebar_width = sidebar::effective_width(
+            SidebarMode::for_width(app.window_width),
+            app.settings.sidebar_width,
+        );
+        let _ = app
+            .workspace
+            .resize_viewport((app.window_width - sidebar_width).max(0.0));
         let mut tasks = vec![app.initialize_runtimes()];
         tasks.push(cosmic::task::message(Message::InitializeBrowserFactory));
         if let Some(window_id) = app.core.main_window_id() {
