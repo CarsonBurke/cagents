@@ -15,9 +15,19 @@ use std::{
     path::{Path, PathBuf},
 };
 
+use cosmic::iced::advanced::Renderer as _;
 use cosmic::{
-    Element,
-    iced::{Alignment, Length, advanced::text::EllipsizeHeightLimit, id::Id},
+    Element, Renderer, Theme,
+    iced::{
+        Alignment, Border, Event, Length, Point, Rectangle, Shadow, Size,
+        advanced::{
+            Clipboard, Layout, Shell, Widget, layout, mouse, overlay, renderer,
+            text::EllipsizeHeightLimit,
+            widget::{Operation, Tree, operation, tree},
+        },
+        id::Id,
+        keyboard, window,
+    },
     theme,
     widget::{self, button, icon},
 };
@@ -31,8 +41,14 @@ use crate::{
     },
 };
 
-const EXPANDED_WIDTH_MIN: f32 = 240.0;
-const EXPANDED_WIDTH_MAX: f32 = 360.0;
+/// The rendered bounds of the expanded pane, and the only bounds it has:
+/// `crate::settings` validates persisted widths against these, so a width can
+/// no longer pass validation and then silently render clamped.
+pub const EXPANDED_WIDTH_MIN: f32 = 240.0;
+pub const EXPANDED_WIDTH_MAX: f32 = 360.0;
+/// Rendered when a persisted width is not a finite number. Mirrors
+/// `settings::AppSettings::default`, so a corrupt file looks like a fresh one.
+const DEFAULT_EXPANDED_WIDTH: f32 = 280.0;
 const COMPACT_WIDTH: f32 = 56.0;
 const COMPACT_BREAKPOINT: f32 = 1_200.0;
 const PROJECT_HEADER_HEIGHT: f32 = 48.0;
@@ -40,6 +56,17 @@ const WORKTREE_ROW_HEIGHT: f32 = 48.0;
 const PULL_REQUEST_ROW_HEIGHT: f32 = 48.0;
 const ICON_CONTROL_SIZE: f32 = 32.0;
 const ROW_ICON_WIDTH: f32 = 24.0;
+/// Icons that sit inside a row, beside its text.
+const ROW_ICON_SIZE: u16 = 16;
+/// Icons that stand alone as the illustration of a whole pane state.
+const STATUS_ICON_SIZE: u16 = 20;
+/// Pointer target of the resize handle. Wider than the rule it draws, because
+/// a one-pixel grab target cannot be hit; the extra pixels come out of the
+/// pane, so it stays as narrow as a comfortable target allows.
+const RESIZE_HANDLE_WIDTH: f32 = 4.0;
+/// One keyboard resize step, and the step assistive technologies report.
+const RESIZE_STEP: f32 = 16.0;
+const RESIZE_HANDLE_NAME: &str = "Resize sidebar";
 
 /// The responsive density selected by the application from its available
 /// width. Compact mode retains every command as a named, focusable icon.
@@ -228,6 +255,7 @@ pub struct SidebarWorktree {
 }
 
 impl SidebarWorktree {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         id: WorktreeId,
         path: PathBuf,
@@ -395,6 +423,7 @@ pub struct SidebarPullRequest {
 impl SidebarPullRequest {
     /// `project_id` is required because a pull-request number is only unique
     /// within its project, and the focus identity is built here.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         project_id: ProjectId,
         number: u64,
@@ -417,10 +446,8 @@ impl SidebarPullRequest {
             folded_author: author.as_deref().map(fold),
             number_text: number.to_string().into_boxed_str(),
             open_id: stable_id(format!("project.{project_id}.pr.{number}.open")),
-            accessible_name: format!(
-                "Open pull request {number}: {title}, checks {check_label}"
-            )
-            .into_boxed_str(),
+            accessible_name: format!("Open pull request {number}: {title}, checks {check_label}")
+                .into_boxed_str(),
             metadata: metadata.into_boxed_str(),
         };
 
@@ -492,7 +519,10 @@ enum SidebarSelection {
         project_id: ProjectId,
         worktree_id: WorktreeId,
     },
-    PullRequest { project_id: ProjectId, number: u64 },
+    PullRequest {
+        project_id: ProjectId,
+        number: u64,
+    },
 }
 
 /// Persistent interaction state owned by the application.
@@ -552,14 +582,16 @@ impl SidebarState {
             | SidebarAction::Refresh
             | SidebarAction::CreatePullRequest { .. }
             | SidebarAction::OpenSettings
-            | SidebarAction::OpenShortcuts => {}
+            | SidebarAction::Resize { .. }
+            | SidebarAction::ResizeFinished => {}
         }
     }
 }
 
 /// All sidebar intents. Payloads are self-contained so `app.rs` does not need
 /// to recover a path or URL from ephemeral row indexes.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// Not `Eq`: the resize request carries a width, and widths are measurements.
+#[derive(Debug, Clone, PartialEq)]
 pub enum SidebarAction {
     SearchChanged(String),
     SetFilter(SidebarFilter),
@@ -579,7 +611,7 @@ pub enum SidebarAction {
         project_id: ProjectId,
         repository: PathBuf,
     },
-    /// Opens the pull request in an application-owned embedded browser card.
+    /// Opens the pull request using the configured link destination.
     OpenPullRequest {
         project_id: ProjectId,
         number: u64,
@@ -591,11 +623,25 @@ pub enum SidebarAction {
         repository: PathBuf,
     },
     OpenSettings,
-    OpenShortcuts,
+    /// A width requested by the pane's resize handle, already clamped to the
+    /// rendered bounds. Published on every pointer move of a drag, so the
+    /// application should apply it and nothing more.
+    Resize {
+        width: f32,
+    },
+    /// The end of a resize gesture: the last `Resize` is the one worth
+    /// persisting. Keeping the write off the drag spares the settings file one
+    /// atomic rewrite per pointer sample.
+    ResizeFinished,
 }
 
 pub fn search_focus_id() -> Id {
     stable_id("search")
+}
+
+/// The focus target of the pane's resize handle.
+pub fn resize_handle_id() -> Id {
+    stable_id("resize-handle")
 }
 
 /// Returns the rendered pane width. Persisted expanded widths are constrained
@@ -604,10 +650,17 @@ pub fn search_focus_id() -> Id {
 pub fn effective_width(mode: SidebarMode, persisted_width: f32) -> f32 {
     if mode == SidebarMode::Compact {
         COMPACT_WIDTH
-    } else if persisted_width.is_finite() {
-        persisted_width.clamp(EXPANDED_WIDTH_MIN, EXPANDED_WIDTH_MAX)
     } else {
-        280.0
+        clamp_expanded_width(persisted_width)
+    }
+}
+
+/// Constrains a requested expanded width to the pane's rendered bounds.
+pub fn clamp_expanded_width(width: f32) -> f32 {
+    if width.is_finite() {
+        width.clamp(EXPANDED_WIDTH_MIN, EXPANDED_WIDTH_MAX)
+    } else {
+        DEFAULT_EXPANDED_WIDTH
     }
 }
 
@@ -637,14 +690,13 @@ pub fn view<'a>(
 
     if !model.projects.is_empty() {
         content = content
-            .push(widget::container(search(state, compact)).padding([
-                spacing.space_xxxs,
-                spacing.space_xxs,
-            ]))
-            .push(widget::container(filters(state.filter, compact)).padding([
-                0,
-                spacing.space_xxs,
-            ]));
+            .push(
+                widget::container(search(state, compact))
+                    .padding([spacing.space_xxxs, spacing.space_xxs]),
+            )
+            .push(
+                widget::container(filters(state.filter, compact)).padding([0, spacing.space_xxs]),
+            );
     }
 
     content = content
@@ -666,7 +718,14 @@ pub fn view<'a>(
                 .width(Length::Fill)
                 .height(Length::Fill)
                 .into(),
-            widget::divider::vertical::default().into(),
+            // The compact rail has one width, so its edge is a rule and
+            // nothing more: a drag there would silently retune a width the
+            // rail does not render.
+            if compact {
+                widget::divider::vertical::default().into()
+            } else {
+                resize_handle(width).into()
+            },
         ])
         .spacing(0),
     )
@@ -685,7 +744,7 @@ fn header(
     let spacing = cosmic::theme::spacing();
     if compact {
         return widget::container(icon_action(
-            "document-open-symbolic",
+            "folder-open-symbolic",
             "Open repository",
             SidebarAction::OpenRepositoryPicker,
             stable_id("open-repository"),
@@ -704,7 +763,7 @@ fn header(
     if loading {
         children.push(
             widget::progress_bar::circular::Circular::new()
-                .size(16.0)
+                .size(f32::from(ROW_ICON_SIZE))
                 .into(),
         );
     } else if refresh_enabled {
@@ -716,7 +775,7 @@ fn header(
         ));
     }
     children.push(icon_action(
-        "document-open-symbolic",
+        "folder-open-symbolic",
         "Open repository",
         SidebarAction::OpenRepositoryPicker,
         stable_id("open-repository"),
@@ -742,9 +801,12 @@ fn footer<'a>(
             | SidebarSelection::PullRequest { project_id, .. } => project_id,
         });
         let mut children: Vec<Element<'a, SidebarAction>> = Vec::with_capacity(4);
-        if let Some(project) = selected_project_id
-            .and_then(|project_id| model.projects.iter().find(|project| project.id == project_id))
-        {
+        if let Some(project) = selected_project_id.and_then(|project_id| {
+            model
+                .projects
+                .iter()
+                .find(|project| project.id == project_id)
+        }) {
             children.extend([
                 icon_action(
                     "list-add-symbolic",
@@ -766,20 +828,12 @@ fn footer<'a>(
                 ),
             ]);
         }
-        children.extend([
-            icon_action(
-                "input-keyboard-symbolic",
-                "Keyboard shortcuts",
-                SidebarAction::OpenShortcuts,
-                stable_id("shortcuts"),
-            ),
-            icon_action(
-                "emblem-system-symbolic",
-                "Settings",
-                SidebarAction::OpenSettings,
-                stable_id("settings"),
-            ),
-        ]);
+        children.push(icon_action(
+            "emblem-system-symbolic",
+            "Settings",
+            SidebarAction::OpenSettings,
+            stable_id("settings"),
+        ));
         return widget::column::with_children(children)
             .align_x(Alignment::Center)
             .spacing(spacing.space_xxxs)
@@ -787,42 +841,14 @@ fn footer<'a>(
             .width(Length::Fill)
             .into();
     }
-    widget::column::with_children(vec![
-        button::custom(
-            widget::row::with_children(vec![
-                widget::icon::from_name("input-keyboard-symbolic")
-                    .size(16)
-                    .into(),
-                widget::text::body("Keyboard shortcuts").into(),
-            ])
-            .align_y(Alignment::Center)
-            .spacing(spacing.space_xxs),
-        )
-        .class(theme::Button::MenuItem)
-        .id(stable_id("shortcuts"))
-        .name("Keyboard shortcuts")
-        .height(Length::Fixed(40.0))
-        .width(Length::Fill)
-        .on_press(SidebarAction::OpenShortcuts)
-        .into(),
-        button::custom(
-            widget::row::with_children(vec![
-                widget::icon::from_name("emblem-system-symbolic")
-                    .size(16)
-                    .into(),
-                widget::text::body("Settings").into(),
-            ])
-            .align_y(Alignment::Center)
-            .spacing(spacing.space_xxs),
-        )
-        .class(theme::Button::MenuItem)
-        .id(stable_id("settings"))
-        .name("Settings")
-        .height(Length::Fixed(40.0))
-        .width(Length::Fill)
-        .on_press(SidebarAction::OpenSettings)
-        .into(),
-    ])
+    widget::row::with_children(vec![icon_action(
+        "emblem-system-symbolic",
+        "Settings",
+        SidebarAction::OpenSettings,
+        stable_id("settings"),
+    )])
+    .align_y(Alignment::Center)
+    .spacing(spacing.space_xxxs)
     .padding(spacing.space_xxxs)
     .width(Length::Fill)
     .into()
@@ -870,7 +896,7 @@ fn filters(filter: SidebarFilter, compact: bool) -> Element<'static, SidebarActi
             .width(Length::Fill);
         for (value, icon_name, _, accessible_label) in choices {
             column = column.push(
-                button::icon(icon::from_name(icon_name).size(16))
+                button::icon(icon::from_name(icon_name).size(ROW_ICON_SIZE))
                     .id(filter_id(value))
                     .name(accessible_label)
                     .tooltip(accessible_label)
@@ -957,7 +983,7 @@ fn loading(compact: bool) -> Element<'static, SidebarAction> {
     let spacing = cosmic::theme::spacing();
     let content = widget::column::with_children(vec![
         widget::progress_bar::circular::Circular::new()
-            .size(20.0)
+            .size(f32::from(STATUS_ICON_SIZE))
             .into(),
         widget::text::caption(if compact {
             "Loading"
@@ -979,7 +1005,7 @@ fn error<'a>(message: &'a str, compact: bool) -> Element<'a, SidebarAction> {
     if compact {
         return widget::column::with_children(vec![
             widget::icon::from_name("dialog-warning-symbolic")
-                .size(20)
+                .size(STATUS_ICON_SIZE)
                 .into(),
             icon_action(
                 "view-refresh-symbolic",
@@ -995,7 +1021,7 @@ fn error<'a>(message: &'a str, compact: bool) -> Element<'a, SidebarAction> {
     widget::container(
         widget::column::with_children(vec![
             widget::icon::from_name("dialog-warning-symbolic")
-                .size(20)
+                .size(STATUS_ICON_SIZE)
                 .into(),
             widget::text::heading("Couldn’t load projects").into(),
             widget::text::caption(message)
@@ -1025,7 +1051,7 @@ fn empty(state: &SidebarState, compact: bool) -> Element<'static, SidebarAction>
     } else {
         match state.filter {
             SidebarFilter::All => (
-                "document-open-symbolic",
+                "folder-open-symbolic",
                 "No projects yet",
                 "Open a repository to add its worktrees.",
                 "Open repository",
@@ -1070,7 +1096,9 @@ fn empty(state: &SidebarState, compact: bool) -> Element<'static, SidebarAction>
         };
     widget::container(
         widget::column::with_children(vec![
-            widget::icon::from_name(icon_name).size(20).into(),
+            widget::icon::from_name(icon_name)
+                .size(STATUS_ICON_SIZE)
+                .into(),
             widget::text::heading(title).into(),
             widget::text::caption(detail)
                 .wrapping(cosmic::iced::widget::text::Wrapping::Word)
@@ -1095,7 +1123,25 @@ fn project_view<'a>(
     let chrome = &entity.chrome;
     let project_id = entity.id;
     if compact {
-        return compact_project(project, selection);
+        let spacing = cosmic::theme::spacing();
+        let mut column = widget::column::with_capacity(
+            1 + project.worktrees.len() + project.pull_requests.len(),
+        )
+        .spacing(spacing.space_xxxs)
+        .push(compact_project(project, selection));
+        for &worktree in &project.worktrees {
+            column = column.push(worktree_view(project_id, worktree, true, selection));
+        }
+        if !project.pull_requests.is_empty() {
+            column = column.push(pull_request_group(
+                entity,
+                &project.pull_requests,
+                true,
+                true,
+                selection,
+            ));
+        }
+        return widget::container(column).width(Length::Fill).into();
     }
 
     let spacing = cosmic::theme::spacing();
@@ -1103,8 +1149,7 @@ fn project_view<'a>(
     let pull_request_count = project.pull_requests.len();
     // Header, the worktree caption, every worktree row, and the pull-request
     // group: the exact child count when the section is open.
-    let mut column =
-        widget::column::with_capacity(worktree_count + 3).spacing(spacing.space_xxxs);
+    let mut column = widget::column::with_capacity(worktree_count + 3).spacing(spacing.space_xxxs);
     let toggle_icon = if expanded {
         "go-down-symbolic"
     } else {
@@ -1112,7 +1157,7 @@ fn project_view<'a>(
     };
     let project_identity = button::custom(
         widget::row::with_children(vec![
-            widget::container(widget::icon::from_name("folder-symbolic").size(16))
+            widget::container(widget::icon::from_name("folder-symbolic").size(ROW_ICON_SIZE))
                 .center_x(Length::Fixed(ROW_ICON_WIDTH))
                 .into(),
             widget::column::with_children(vec![
@@ -1208,10 +1253,11 @@ fn project_view<'a>(
             );
         }
         for &worktree in &project.worktrees {
-            column = column.push(
-                widget::container(worktree_view(project_id, worktree, false, selection))
-                    .padding([0, 0, 0, spacing.space_s]),
-            );
+            column =
+                column.push(
+                    widget::container(worktree_view(project_id, worktree, false, selection))
+                        .padding([0, 0, 0, spacing.space_s]),
+                );
         }
         if has_pull_requests {
             column = column.push(
@@ -1251,7 +1297,7 @@ fn compact_project<'a>(
             | Some(SidebarSelection::PullRequest { project_id, .. })
             if project_id == entity.id
     );
-    let action = button::icon(icon::from_name("folder-symbolic").size(16))
+    let action = button::icon(icon::from_name("folder-symbolic").size(ROW_ICON_SIZE))
         .id(chrome.open_id.clone())
         .name(&*chrome.compact_open_name)
         .tooltip(&*chrome.compact_open_name)
@@ -1277,16 +1323,29 @@ fn worktree_view<'a>(
 ) -> Element<'a, SidebarAction> {
     let chrome = &worktree.chrome;
     if compact {
-        return icon_action(
-            "vcs-branch-symbolic",
-            &*chrome.accessible_name,
-            SidebarAction::OpenWorktree {
+        let selected = matches!(
+            selection,
+            Some(SidebarSelection::Worktree {
+                project_id: selected_project,
+                worktree_id,
+            }) if selected_project == project_id && worktree_id == worktree.id
+        );
+        let action = button::icon(icon::from_name("vcs-branch-symbolic").size(ROW_ICON_SIZE))
+            .id(chrome.open_id.clone())
+            .name(&*chrome.accessible_name)
+            .tooltip(&*chrome.accessible_name)
+            .width(ICON_CONTROL_SIZE)
+            .height(ICON_CONTROL_SIZE)
+            .selected(selected)
+            .on_press(SidebarAction::OpenWorktree {
                 project_id,
                 worktree_id: worktree.id,
                 path: worktree.path.clone(),
-            },
-            chrome.open_id.clone(),
-        );
+            });
+        return widget::container(action)
+            .center_x(Length::Fill)
+            .width(Length::Fill)
+            .into();
     }
 
     let spacing = cosmic::theme::spacing();
@@ -1294,7 +1353,7 @@ fn worktree_view<'a>(
         .align_y(Alignment::Center)
         .spacing(spacing.space_xxxs)
         .push(
-            widget::container(widget::icon::from_name("vcs-branch-symbolic").size(16))
+            widget::container(widget::icon::from_name("vcs-branch-symbolic").size(ROW_ICON_SIZE))
                 .center_x(Length::Fixed(ROW_ICON_WIDTH)),
         )
         .push(
@@ -1397,8 +1456,12 @@ fn pull_request_group<'a>(
     }
     if expanded {
         for &pull_request in pull_requests {
-            column =
-                column.push(pull_request_view(project.id, pull_request, compact, selection));
+            column = column.push(pull_request_view(
+                project.id,
+                pull_request,
+                compact,
+                selection,
+            ));
         }
     }
     column.into()
@@ -1417,12 +1480,26 @@ fn pull_request_view<'a>(
         url: pull_request.url.clone(),
     };
     if compact {
-        return icon_action(
-            "internet-web-browser-symbolic",
-            &*chrome.accessible_name,
-            action,
-            chrome.open_id.clone(),
+        let selected = matches!(
+            selection,
+            Some(SidebarSelection::PullRequest {
+                project_id: selected_project,
+                number,
+            }) if selected_project == project_id && number == pull_request.number
         );
+        let action =
+            button::icon(icon::from_name("internet-web-browser-symbolic").size(ROW_ICON_SIZE))
+                .id(chrome.open_id.clone())
+                .name(&*chrome.accessible_name)
+                .tooltip(&*chrome.accessible_name)
+                .width(ICON_CONTROL_SIZE)
+                .height(ICON_CONTROL_SIZE)
+                .selected(selected)
+                .on_press(action);
+        return widget::container(action)
+            .center_x(Length::Fill)
+            .width(Length::Fill)
+            .into();
     }
 
     let spacing = cosmic::theme::spacing();
@@ -1443,9 +1520,11 @@ fn pull_request_view<'a>(
         detail = detail.push(badge("draft", BadgeTone::Neutral));
     }
     let row = widget::row::with_children(vec![
-        widget::container(widget::icon::from_name("vcs-merge-request-symbolic").size(16))
-            .center_x(Length::Fixed(ROW_ICON_WIDTH))
-            .into(),
+        widget::container(
+            widget::icon::from_name("vcs-merge-request-symbolic").size(ROW_ICON_SIZE),
+        )
+        .center_x(Length::Fixed(ROW_ICON_WIDTH))
+        .into(),
         widget::column::with_children(vec![
             widget::text::body(pull_request.title.as_str())
                 .wrapping(cosmic::iced::widget::text::Wrapping::None)
@@ -1493,7 +1572,7 @@ fn icon_action<'a>(
     id: Id,
 ) -> Element<'a, SidebarAction> {
     let label = label.into();
-    button::icon(icon::from_name(icon_name).size(16))
+    button::icon(icon::from_name(icon_name).size(ROW_ICON_SIZE))
         .id(id)
         .name(label.clone())
         .tooltip(label)
@@ -1501,6 +1580,353 @@ fn icon_action<'a>(
         .height(ICON_CONTROL_SIZE)
         .on_press(action)
         .into()
+}
+
+/// The rule between the pane and the workspace, doubling as the pane's resize
+/// handle.
+///
+/// A widget of its own rather than `widget::mouse_area`, because `mouse_area`
+/// reports pointer motion only while the pointer is inside its own bounds: a
+/// handle this narrow would lose the gesture on the first pixel of travel. A
+/// widget sees every event, so the grab survives the pointer leaving it.
+fn resize_handle(width: f32) -> ResizeHandle<'static> {
+    ResizeHandle {
+        content: widget::container(widget::divider::vertical::default())
+            .center_x(Length::Fixed(RESIZE_HANDLE_WIDTH))
+            .height(Length::Fill)
+            .into(),
+        width,
+        id: resize_handle_id(),
+    }
+}
+
+struct ResizeHandle<'a> {
+    content: Element<'a, SidebarAction>,
+    /// The width the pane renders at, and the origin every gesture measures
+    /// from. Owned by the application, so the handle stores nothing itself.
+    width: f32,
+    id: Id,
+}
+
+/// Where a drag began. The width is captured with the pointer so the pane
+/// tracks the pointer exactly instead of accumulating each frame's rounding.
+#[derive(Debug, Clone, Copy)]
+struct ResizeOrigin {
+    pointer_x: f32,
+    width: f32,
+}
+
+#[derive(Debug, Default)]
+struct ResizeHandleState {
+    drag: Option<ResizeOrigin>,
+    is_focused: bool,
+}
+
+impl operation::Focusable for ResizeHandleState {
+    fn is_focused(&self) -> bool {
+        self.is_focused
+    }
+
+    fn focus(&mut self) {
+        self.is_focused = true;
+    }
+
+    fn unfocus(&mut self) {
+        self.is_focused = false;
+    }
+}
+
+impl ResizeHandle<'_> {
+    fn child_layout<'layout>(layout: Layout<'layout>) -> Layout<'layout> {
+        layout
+            .children()
+            .next()
+            .expect("resize handle content layout")
+            .with_virtual_offset(layout.virtual_offset())
+    }
+
+    fn resize(&self, width: f32) -> SidebarAction {
+        SidebarAction::Resize {
+            width: clamp_expanded_width(width),
+        }
+    }
+}
+
+/// The width a drag requests: the pointer's travel added to the width the
+/// gesture began at. Measured from the origin rather than the previous frame,
+/// so a pointer returning to where it started restores the width it started
+/// with, whatever the clamp did in between.
+fn dragged_width(origin: ResizeOrigin, pointer_x: f32) -> f32 {
+    clamp_expanded_width(origin.width + pointer_x - origin.pointer_x)
+}
+
+impl Widget<SidebarAction, Theme, Renderer> for ResizeHandle<'_> {
+    fn tag(&self) -> tree::Tag {
+        tree::Tag::of::<ResizeHandleState>()
+    }
+
+    fn state(&self) -> tree::State {
+        tree::State::new(ResizeHandleState::default())
+    }
+
+    fn children(&self) -> Vec<Tree> {
+        vec![Tree::new(&self.content)]
+    }
+
+    fn diff(&mut self, tree: &mut Tree) {
+        tree.diff_children(std::slice::from_mut(&mut self.content));
+    }
+
+    fn size(&self) -> Size<Length> {
+        self.content.as_widget().size()
+    }
+
+    fn layout(
+        &mut self,
+        tree: &mut Tree,
+        renderer: &Renderer,
+        limits: &layout::Limits,
+    ) -> layout::Node {
+        let content = self
+            .content
+            .as_widget_mut()
+            .layout(&mut tree.children[0], renderer, limits)
+            .move_to(Point::ORIGIN);
+        layout::Node::with_children(content.size(), vec![content])
+    }
+
+    fn operate(
+        &mut self,
+        tree: &mut Tree,
+        layout: Layout<'_>,
+        renderer: &Renderer,
+        operation: &mut dyn Operation,
+    ) {
+        let bounds = layout.bounds();
+        operation.traverse(&mut |operation| {
+            self.content.as_widget_mut().operate(
+                &mut tree.children[0],
+                Self::child_layout(layout),
+                renderer,
+                operation,
+            );
+        });
+        let state = tree.state.downcast_mut::<ResizeHandleState>();
+        operation.focusable(Some(&self.id), bounds, state);
+    }
+
+    fn update(
+        &mut self,
+        tree: &mut Tree,
+        event: &Event,
+        layout: Layout<'_>,
+        cursor: mouse::Cursor,
+        renderer: &Renderer,
+        clipboard: &mut dyn Clipboard,
+        shell: &mut Shell<'_, SidebarAction>,
+        viewport: &Rectangle,
+    ) {
+        let bounds = layout.bounds();
+        let state = tree.state.downcast_mut::<ResizeHandleState>();
+        match event {
+            Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)) => {
+                // Focus follows the press, and is surrendered when the press
+                // lands elsewhere, exactly as libcosmic's buttons do: the
+                // arrow keys must never resize the pane from a text field.
+                state.is_focused = cursor.is_over(bounds);
+                if let Some(position) = cursor.position().filter(|_| state.is_focused) {
+                    state.drag = Some(ResizeOrigin {
+                        pointer_x: position.x,
+                        width: self.width,
+                    });
+                    shell.capture_event();
+                    return;
+                }
+            }
+            Event::Mouse(mouse::Event::CursorMoved { position }) => {
+                if let Some(origin) = state.drag {
+                    shell.publish(SidebarAction::Resize {
+                        width: dragged_width(origin, position.x),
+                    });
+                    shell.capture_event();
+                    return;
+                }
+            }
+            Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)) => {
+                if state.drag.take().is_some() {
+                    shell.publish(SidebarAction::ResizeFinished);
+                    shell.capture_event();
+                    return;
+                }
+            }
+            // The release that ends a drag is delivered to whichever surface
+            // owns the pointer, so a lost window ends the grab instead.
+            Event::Window(window::Event::Unfocused) => {
+                if state.drag.take().is_some() {
+                    shell.publish(SidebarAction::ResizeFinished);
+                }
+            }
+            // A keystroke is a whole gesture, so it also settles the width.
+            Event::Keyboard(keyboard::Event::KeyPressed { key, .. }) if state.is_focused => {
+                if let Some(step) = resize_step(key) {
+                    shell.publish(self.resize(self.width + step));
+                    shell.publish(SidebarAction::ResizeFinished);
+                    shell.capture_event();
+                    return;
+                }
+            }
+            Event::A11y(id, request) if *id == self.id => {
+                use iced_accessibility::accesskit::Action;
+                match request.action {
+                    Action::Focus => state.is_focused = true,
+                    Action::Blur => state.is_focused = false,
+                    Action::Increment => {
+                        shell.publish(self.resize(self.width + RESIZE_STEP));
+                        shell.publish(SidebarAction::ResizeFinished);
+                    }
+                    Action::Decrement => {
+                        shell.publish(self.resize(self.width - RESIZE_STEP));
+                        shell.publish(SidebarAction::ResizeFinished);
+                    }
+                    _ => {}
+                }
+                shell.capture_event();
+                return;
+            }
+            _ => {}
+        }
+        self.content.as_widget_mut().update(
+            &mut tree.children[0],
+            event,
+            Self::child_layout(layout),
+            cursor,
+            renderer,
+            clipboard,
+            shell,
+            viewport,
+        );
+    }
+
+    fn mouse_interaction(
+        &self,
+        tree: &Tree,
+        layout: Layout<'_>,
+        cursor: mouse::Cursor,
+        _viewport: &Rectangle,
+        _renderer: &Renderer,
+    ) -> mouse::Interaction {
+        let state = tree.state.downcast_ref::<ResizeHandleState>();
+        if state.drag.is_some() || cursor.is_over(layout.bounds()) {
+            mouse::Interaction::ResizingHorizontally
+        } else {
+            mouse::Interaction::default()
+        }
+    }
+
+    fn draw(
+        &self,
+        tree: &Tree,
+        renderer: &mut Renderer,
+        theme: &Theme,
+        style: &renderer::Style,
+        layout: Layout<'_>,
+        cursor: mouse::Cursor,
+        viewport: &Rectangle,
+    ) {
+        self.content.as_widget().draw(
+            &tree.children[0],
+            renderer,
+            theme,
+            style,
+            Self::child_layout(layout),
+            cursor,
+            viewport,
+        );
+        // The rule alone cannot show focus: it looks the same either way.
+        if tree.state.downcast_ref::<ResizeHandleState>().is_focused {
+            renderer.fill_quad(
+                renderer::Quad {
+                    bounds: layout.bounds(),
+                    border: Border::default(),
+                    shadow: Shadow::default(),
+                    snap: true,
+                },
+                cosmic::iced::Background::Color(theme.cosmic().accent.base.into()),
+            );
+        }
+    }
+
+    fn overlay<'a>(
+        &'a mut self,
+        tree: &'a mut Tree,
+        layout: Layout<'a>,
+        renderer: &Renderer,
+        viewport: &Rectangle,
+        translation: cosmic::iced::Vector,
+    ) -> Option<overlay::Element<'a, SidebarAction, Theme, Renderer>> {
+        self.content.as_widget_mut().overlay(
+            &mut tree.children[0],
+            Self::child_layout(layout),
+            renderer,
+            viewport,
+            translation,
+        )
+    }
+
+    fn a11y_nodes(
+        &self,
+        layout: Layout<'_>,
+        _state: &Tree,
+        _cursor: mouse::Cursor,
+    ) -> iced_accessibility::A11yTree {
+        use iced_accessibility::accesskit::{Action, Node, Rect, Role};
+
+        let Rectangle {
+            x,
+            y,
+            width,
+            height,
+        } = layout.bounds();
+        let mut node = Node::new(Role::Splitter);
+        node.add_action(Action::Focus);
+        node.add_action(Action::Increment);
+        node.add_action(Action::Decrement);
+        node.set_bounds(Rect::new(
+            f64::from(x),
+            f64::from(y),
+            f64::from(x + width),
+            f64::from(y + height),
+        ));
+        node.set_label(RESIZE_HANDLE_NAME);
+        node.set_numeric_value(f64::from(self.width));
+        node.set_min_numeric_value(f64::from(EXPANDED_WIDTH_MIN));
+        node.set_max_numeric_value(f64::from(EXPANDED_WIDTH_MAX));
+        node.set_numeric_value_step(f64::from(RESIZE_STEP));
+        iced_accessibility::A11yTree::leaf(node, self.id.clone())
+    }
+
+    fn id(&self) -> Option<Id> {
+        Some(self.id.clone())
+    }
+
+    fn set_id(&mut self, id: Id) {
+        self.id = id;
+    }
+}
+
+impl<'a> From<ResizeHandle<'a>> for Element<'a, SidebarAction> {
+    fn from(handle: ResizeHandle<'a>) -> Self {
+        Self::new(handle)
+    }
+}
+
+/// The width delta a key requests, or `None` for keys the handle ignores.
+fn resize_step(key: &keyboard::Key) -> Option<f32> {
+    match key {
+        keyboard::Key::Named(keyboard::key::Named::ArrowLeft) => Some(-RESIZE_STEP),
+        keyboard::Key::Named(keyboard::key::Named::ArrowRight) => Some(RESIZE_STEP),
+        _ => None,
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1866,11 +2292,151 @@ mod tests {
 
     #[test]
     fn sidebar_width_uses_compact_rail_and_clamped_persisted_expansion() {
-        assert_eq!(effective_width(SidebarMode::Compact, 320.0), 56.0);
-        assert_eq!(effective_width(SidebarMode::Expanded, 280.0), 280.0);
-        assert_eq!(effective_width(SidebarMode::Expanded, 120.0), 240.0);
-        assert_eq!(effective_width(SidebarMode::Expanded, 480.0), 360.0);
-        assert_eq!(effective_width(SidebarMode::Expanded, f32::NAN), 280.0);
+        assert_eq!(effective_width(SidebarMode::Compact, 320.0), COMPACT_WIDTH);
+        assert_eq!(
+            effective_width(SidebarMode::Expanded, DEFAULT_EXPANDED_WIDTH),
+            DEFAULT_EXPANDED_WIDTH
+        );
+        assert_eq!(
+            effective_width(SidebarMode::Expanded, EXPANDED_WIDTH_MIN - 120.0),
+            EXPANDED_WIDTH_MIN
+        );
+        assert_eq!(
+            effective_width(SidebarMode::Expanded, EXPANDED_WIDTH_MAX + 120.0),
+            EXPANDED_WIDTH_MAX
+        );
+        assert_eq!(
+            effective_width(SidebarMode::Expanded, f32::NAN),
+            DEFAULT_EXPANDED_WIDTH
+        );
+    }
+
+    #[test]
+    fn dragging_the_handle_tracks_the_pointer_within_the_rendered_bounds() {
+        let origin = ResizeOrigin {
+            pointer_x: 600.0,
+            width: DEFAULT_EXPANDED_WIDTH,
+        };
+
+        assert_eq!(dragged_width(origin, 640.0), DEFAULT_EXPANDED_WIDTH + 40.0);
+        assert_eq!(dragged_width(origin, 560.0), DEFAULT_EXPANDED_WIDTH - 40.0);
+        assert_eq!(dragged_width(origin, 4_000.0), EXPANDED_WIDTH_MAX);
+        assert_eq!(dragged_width(origin, 0.0), EXPANDED_WIDTH_MIN);
+        // A gesture that returns to its origin restores the width it began
+        // at, however far past the bounds it travelled first.
+        assert_eq!(dragged_width(origin, 600.0), DEFAULT_EXPANDED_WIDTH);
+    }
+
+    #[test]
+    fn the_resize_handle_answers_to_the_keyboard_in_whole_steps() {
+        let step = |named| resize_step(&keyboard::Key::Named(named));
+
+        assert_eq!(step(keyboard::key::Named::ArrowRight), Some(RESIZE_STEP));
+        assert_eq!(step(keyboard::key::Named::ArrowLeft), Some(-RESIZE_STEP));
+        assert_eq!(step(keyboard::key::Named::Enter), None);
+        assert_eq!(step(keyboard::key::Named::ArrowUp), None);
+    }
+
+    #[test]
+    fn the_resize_handle_is_a_named_focusable_splitter() {
+        use iced_accessibility::accesskit::{Action, Role};
+
+        let handle: Element<'_, SidebarAction> = resize_handle(DEFAULT_EXPANDED_WIDTH).into();
+        assert_eq!(
+            handle.as_widget().id().map(|id| id.to_string()),
+            Some(resize_handle_id().to_string()),
+            "a mouse-only resize is an accessibility regression: the handle must be a focus target"
+        );
+
+        let tree = Tree::new(&handle);
+        let bounds = Size::new(RESIZE_HANDLE_WIDTH, 480.0);
+        let node = layout::Node::with_children(bounds, vec![layout::Node::new(bounds)]);
+        let accessible = handle.as_widget().a11y_nodes(
+            Layout::new(&node),
+            &tree,
+            cosmic::iced::advanced::mouse::Cursor::Unavailable,
+        );
+
+        let root = accessible.root();
+        assert_eq!(root.len(), 1);
+        let node = root[0].node();
+        assert_eq!(node.role(), Role::Splitter);
+        assert_eq!(node.label(), Some(RESIZE_HANDLE_NAME));
+        assert_eq!(
+            node.numeric_value(),
+            Some(f64::from(DEFAULT_EXPANDED_WIDTH))
+        );
+        assert_eq!(
+            node.min_numeric_value(),
+            Some(f64::from(EXPANDED_WIDTH_MIN))
+        );
+        assert_eq!(
+            node.max_numeric_value(),
+            Some(f64::from(EXPANDED_WIDTH_MAX))
+        );
+        assert_eq!(node.numeric_value_step(), Some(f64::from(RESIZE_STEP)));
+        for action in [Action::Focus, Action::Increment, Action::Decrement] {
+            assert!(
+                node.supports_action(action),
+                "the handle must expose {action:?} to assistive technologies"
+            );
+        }
+    }
+
+    /// libcosmic labels a button from `name` alone; its visible text is not a
+    /// fallback, so an unnamed button reaches a screen reader as "button".
+    #[test]
+    fn every_pane_state_offers_its_action_under_an_accessible_name() {
+        /// The accessible names of the button nodes only: the surrounding
+        /// text contributes labels of its own, which are no substitute.
+        fn button_labels(element: &Element<'_, SidebarAction>, children: usize) -> Vec<String> {
+            let tree = Tree::new(element);
+            let leaf = || layout::Node::new(Size::new(120.0, 32.0));
+            // container > column > [icon, heading, caption, button > label]
+            let column = layout::Node::with_children(
+                Size::new(240.0, 320.0),
+                (0..children)
+                    .map(|_| layout::Node::with_children(Size::new(120.0, 32.0), vec![leaf()]))
+                    .collect(),
+            );
+            let root = layout::Node::with_children(Size::new(240.0, 320.0), vec![column]);
+            let accessible = element.as_widget().a11y_nodes(
+                Layout::new(&root),
+                &tree,
+                cosmic::iced::advanced::mouse::Cursor::Unavailable,
+            );
+            accessible
+                .root()
+                .iter()
+                .chain(accessible.children())
+                .filter(|node| node.node().role() == iced_accessibility::accesskit::Role::Button)
+                .filter_map(|node| node.node().label().map(str::to_owned))
+                .collect()
+        }
+
+        assert!(
+            button_labels(&error("disk on fire", false), 4)
+                .iter()
+                .any(|label| label == "Try again"),
+            "the error state's retry button must carry its own accessible name"
+        );
+
+        for (query, filter, expected) in [
+            (String::new(), SidebarFilter::All, "Open repository"),
+            (String::new(), SidebarFilter::Attention, "Show all"),
+            ("nothing".to_owned(), SidebarFilter::All, "Clear search"),
+        ] {
+            let mut state = SidebarState::default();
+            state.apply(&SidebarAction::SearchChanged(query));
+            state.apply(&SidebarAction::SetFilter(filter));
+            let empty = empty(&state, false);
+            assert!(
+                button_labels(&empty, 4)
+                    .iter()
+                    .any(|label| label == expected),
+                "the empty state's action must be named {expected:?}"
+            );
+        }
     }
 
     #[test]
@@ -1882,10 +2448,7 @@ mod tests {
             project_id: project,
             repository: "/repo/cagents".into(),
         });
-        assert_eq!(
-            state.selection,
-            Some(SidebarSelection::Project(project))
-        );
+        assert_eq!(state.selection, Some(SidebarSelection::Project(project)));
 
         state.apply(&SidebarAction::OpenWorktree {
             project_id: project,
