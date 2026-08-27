@@ -1058,15 +1058,33 @@ fn child_exit_event(exited: &mut bool, result: ChildExit) -> Option<TerminalEven
 /// Variables the daemon may have inherited from whatever terminal (or desktop
 /// session) launched it. Left in place, a child would believe it is talking to
 /// that emulator and emit control sequences libghostty-vt does not implement.
+///
+/// Two entries are worse than a wrong identity. `KITTY_LISTEN_ON` names a
+/// socket that fully controls the user's real kitty instance, so a child that
+/// inherited it could type into the user's other windows - the exact
+/// containment this scrub exists to establish. `LC_TERMINAL` and
+/// `LC_TERMINAL_VERSION` match sshd's default `AcceptEnv LC_*`, so they carry
+/// the wrong identity onto every host the child then reaches.
+///
+/// Grouped by the emulator that sets them, with the names any of them may set
+/// first and `COLORTERM` - which we go on to set ourselves - last.
 const INHERITED_TERMINAL_MARKERS: &[&str] = &[
     "TERM_PROGRAM",
     "TERM_PROGRAM_VERSION",
+    "TERM_SESSION_ID",
+    "TERMINAL_EMULATOR",
     "TERMINFO",
+    "TERMINFO_DIRS",
     "KITTY_WINDOW_ID",
     "KITTY_PID",
     "KITTY_INSTALLATION_DIR",
+    "KITTY_LISTEN_ON",
+    "KITTY_PUBLIC_KEY",
+    "KITTY_SHELL_INTEGRATION",
     "GHOSTTY_RESOURCES_DIR",
     "GHOSTTY_BIN_DIR",
+    "GHOSTTY_SHELL_FEATURES",
+    "GHOSTTY_SHELL_INTEGRATION_NO_SUDO",
     "VTE_VERSION",
     "ALACRITTY_WINDOW_ID",
     "ALACRITTY_SOCKET",
@@ -1074,8 +1092,17 @@ const INHERITED_TERMINAL_MARKERS: &[&str] = &[
     "WEZTERM_PANE",
     "WEZTERM_UNIX_SOCKET",
     "WEZTERM_EXECUTABLE",
+    "WEZTERM_EXECUTABLE_DIR",
+    "WEZTERM_CONFIG_DIR",
+    "WEZTERM_CONFIG_FILE",
     "ITERM_SESSION_ID",
+    "LC_TERMINAL",
+    "LC_TERMINAL_VERSION",
     "KONSOLE_VERSION",
+    "WT_SESSION",
+    "WT_PROFILE_ID",
+    "ZED_TERM",
+    "VSCODE_INJECTION",
     "COLORTERM",
 ];
 
@@ -1553,6 +1580,11 @@ mod tests {
             command.get_env("TERM_PROGRAM_VERSION"),
             Some(OsStr::new(env!("CARGO_PKG_VERSION")))
         );
+        // `KITTY_LISTEN_ON` by name as well as by list membership: it is a live
+        // control socket for the user's real kitty instance, not just a wrong
+        // identity, so dropping it from the list would be a containment hole
+        // rather than a cosmetic regression.
+        assert_eq!(command.get_env("KITTY_LISTEN_ON"), None);
         for marker in INHERITED_TERMINAL_MARKERS.iter().filter(|name| {
             !matches!(
                 **name,
