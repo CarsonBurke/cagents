@@ -65,7 +65,10 @@ const INLINE_CAPACITY: usize = 22;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum CellTextRepr {
-    Inline { length: u8, bytes: [u8; INLINE_CAPACITY] },
+    Inline {
+        length: u8,
+        bytes: [u8; INLINE_CAPACITY],
+    },
     Spilled(Box<str>),
 }
 
@@ -432,6 +435,32 @@ mod tests {
         assert_eq!(snapshot.lines[0].cells[0].text, "p");
         assert_eq!(snapshot.lines[0].cells[6].text, "r");
         assert_ne!(snapshot.lines[0].cells[6].foreground, snapshot.foreground);
+    }
+
+    #[test]
+    fn a_wide_cluster_is_never_stored_as_narrow_ascii() {
+        // The draw layer coalesces a run of cells into one shaped primitive
+        // only where every cell is narrow ASCII, because that is the only case
+        // in which each cell advances by exactly one column. A wide cluster
+        // consumes two columns, so it must fail that test or the cells after it
+        // would be drawn a column to the left.
+        let mut terminal = Terminal::new(TerminalOptions {
+            cols: 8,
+            rows: 1,
+            max_scrollback: 0,
+        })
+        .unwrap();
+        terminal.vt_write("a漢b".as_bytes());
+        let mut visual = VisualResources::new().unwrap();
+        let snapshot = visual.capture(&terminal, 1, true).unwrap().unwrap();
+        let cells = &snapshot.lines[0].cells;
+
+        assert!(cells[0].text.is_narrow_ascii(), "plain ASCII must coalesce");
+        assert_eq!(cells[1].text, "漢");
+        assert!(
+            !cells[1].text.is_narrow_ascii(),
+            "a wide cluster must be shaped on its own"
+        );
     }
 
     #[test]
