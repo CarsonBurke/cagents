@@ -645,7 +645,13 @@ mod tests {
     fn version_one_toml_is_upgraded_and_legacy_sidebar_widths_are_normalized() {
         let directory = tempfile::tempdir().unwrap();
         let path = path_in(&directory);
-        for (legacy_width, expected_width) in [(180.0, 240.0), (400.0, 360.0)] {
+        // Derived from the constants, not restated: the legacy window strictly
+        // contains the rendered range, so its extremes must land on the
+        // rendered extremes however either bound is later moved.
+        for (legacy_width, expected_width) in [
+            (LEGACY_SIDEBAR_WIDTH_MIN, EXPANDED_WIDTH_MIN),
+            (LEGACY_SIDEBAR_WIDTH_MAX, EXPANDED_WIDTH_MAX),
+        ] {
             fs::write(
                 &path,
                 format!(

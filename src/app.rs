@@ -2774,7 +2774,15 @@ impl Cagents {
                     .into(),
                     widget::text::caption(repository.to_string_lossy()).into(),
                     widget::button::standard("Search projects")
-                        .on_press(Message::FocusProjectSearch)
+                        // Disabled rather than dead: the pane does not always
+                        // give the search a control to focus.
+                        .on_press_maybe(
+                            sidebar::search_is_reachable(
+                                &self.sidebar_model,
+                                SidebarMode::for_width(self.window_width),
+                            )
+                            .then_some(Message::FocusProjectSearch),
+                        )
                         .into(),
                 ])
                 .align_x(Alignment::Center)
@@ -4051,6 +4059,17 @@ impl Application for Cagents {
                 }
             }
             Message::FocusProjectSearch => {
+                // `focus` unfocuses every widget whose id does not match, so
+                // aiming it at an id the pane is not rendering would blur
+                // whatever the user was typing into and focus nothing. Only
+                // the pane knows which densities and models give the search a
+                // control.
+                if !sidebar::search_is_reachable(
+                    &self.sidebar_model,
+                    SidebarMode::for_width(self.window_width),
+                ) {
+                    return Task::none();
+                }
                 if !self.sidebar_state.controls_expanded() {
                     self.sidebar_state.apply(&SidebarAction::ToggleControls);
                 }
