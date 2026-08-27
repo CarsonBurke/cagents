@@ -181,27 +181,48 @@ Program files installed by `install.sh` live separately under `${XDG_DATA_HOME:-
 
 ### Settings
 
-`settings.toml` uses the following flat version 1 schema. Every key is required;
-unknown keys, unsupported schema versions, malformed TOML, and values outside
-the documented ranges are rejected.
+`settings.toml` uses the version 2 schema below. The original runtime and layout
+keys remain required; newer preferences are optional when reading older files
+and use the documented defaults. Unknown keys, unsupported schema versions,
+malformed TOML, conflicting shortcuts, and values outside the documented ranges
+are rejected.
 
 ```toml
-schema_version = 1
+schema_version = 2
 max_hot_cards = 6
 hibernation_delay_ms = 30000
 terminal_font_size = 14.0
+terminal_font_family = ""
 sidebar_width = 280.0
 default_column_fraction = 0.72
+terminal_scrollback_lines = 10000
+link_open_destination = "integrated_browser"
+link_open_gesture = "control_click"
+
+[keyboard_shortcuts]
+new_terminal = "Ctrl+T"
+close_focused_column = "Ctrl+W"
+search_projects = "Ctrl+F"
+previous_column = "Alt+Q"
+next_column = "Alt+W"
 ```
 
 | Key | Type | Default | Accepted values |
 | --- | --- | --- | --- |
-| `schema_version` | integer | `1` | exactly `1` |
+| `schema_version` | integer | `2` | exactly `2` |
 | `max_hot_cards` | non-negative integer | `6` | `1` through `9223372036854775807` |
 | `hibernation_delay_ms` | non-negative integer | `30000` | `0` through `9223372036854775807` milliseconds |
 | `terminal_font_size` | float | `14.0` | finite values from `8.0` through `40.0`, inclusive |
-| `sidebar_width` | float | `280.0` | finite values from `180.0` through `480.0`, inclusive |
+| `terminal_font_family` | string | `""` | empty for system monospace, or a non-whitespace family name up to 128 bytes |
+| `terminal_scrollback_lines` | non-negative integer | `10000` | `0` through `1000000` lines for newly started terminals |
+| `sidebar_width` | float | `280.0` | finite values from `240.0` through `360.0`, inclusive |
 | `default_column_fraction` | float | `0.72` | finite values from `0.25` through `1.0`, inclusive |
+| `link_open_destination` | string | `"integrated_browser"` | `"integrated_browser"` or `"system_default"` |
+| `link_open_gesture` | string | `"control_click"` | `"control_click"` or `"control_shift_click"` |
+| `keyboard_shortcuts.*` | string | shown above | a unique chord containing Ctrl, Alt, or Super and one A-Z, 0-9, Left, or Right key; Shift is optional |
+
+Version 1 TOML files are upgraded while loading. Sidebar widths accepted by
+version 1 are clamped to the current visible range; other values are preserved.
 
 On first use after upgrading, cagents migrates a sibling `settings.json` only
 when `settings.toml` does not exist. It validates the JSON, writes and syncs the

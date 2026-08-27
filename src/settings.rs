@@ -9,10 +9,171 @@ use directories::ProjectDirs;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-pub const SETTINGS_SCHEMA_VERSION: u32 = 1;
+use crate::sidebar::{EXPANDED_WIDTH_MAX, EXPANDED_WIDTH_MIN};
+
+pub const SETTINGS_SCHEMA_VERSION: u32 = 2;
 const PRIVATE_DIRECTORY_MODE: u32 = 0o700;
 const PRIVATE_FILE_MODE: u32 = 0o600;
 const MAX_TOML_INTEGER: u64 = i64::MAX as u64;
+
+const MAX_TERMINAL_SCROLLBACK_LINES: usize = 1_000_000;
+const LEGACY_SETTINGS_SCHEMA_VERSION: u32 = 1;
+const LEGACY_SIDEBAR_WIDTH_MIN: f32 = 180.0;
+const LEGACY_SIDEBAR_WIDTH_MAX: f32 = 480.0;
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LinkOpenDestination {
+    #[default]
+    IntegratedBrowser,
+    SystemDefault,
+}
+
+impl LinkOpenDestination {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::IntegratedBrowser => "integrated_browser",
+            Self::SystemDefault => "system_default",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LinkOpenGesture {
+    #[default]
+    ControlClick,
+    ControlShiftClick,
+}
+
+impl LinkOpenGesture {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::ControlClick => "control_click",
+            Self::ControlShiftClick => "control_shift_click",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct KeyboardShortcuts {
+    pub new_terminal: String,
+    pub close_focused_column: String,
+    pub search_projects: String,
+    pub previous_column: String,
+    pub next_column: String,
+}
+
+impl Default for KeyboardShortcuts {
+    fn default() -> Self {
+        Self {
+            new_terminal: "Ctrl+T".to_owned(),
+            close_focused_column: "Ctrl+W".to_owned(),
+            search_projects: "Ctrl+F".to_owned(),
+            previous_column: "Alt+Q".to_owned(),
+            next_column: "Alt+W".to_owned(),
+        }
+    }
+}
+
+impl KeyboardShortcuts {
+    fn validate(&self) -> Result<(), SettingsError> {
+        let bindings = [
+            parse_shortcut(&self.new_terminal),
+            parse_shortcut(&self.close_focused_column),
+            parse_shortcut(&self.search_projects),
+            parse_shortcut(&self.previous_column),
+            parse_shortcut(&self.next_column),
+        ];
+        let mut parsed = Vec::with_capacity(bindings.len());
+        for binding in bindings {
+            parsed.push(binding.map_err(SettingsError::InvalidShortcut)?);
+        }
+        for (index, binding) in parsed.iter().enumerate() {
+            if parsed[..index].contains(binding) {
+                return Err(SettingsError::InvalidShortcut(
+                    "keyboard shortcuts must not conflict",
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ShortcutBinding {
+    pub control: bool,
+    pub alt: bool,
+    pub shift: bool,
+    pub logo: bool,
+    pub key: ShortcutKey,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ShortcutKey {
+    Character(char),
+    ArrowLeft,
+    ArrowRight,
+}
+
+pub(crate) fn parse_shortcut(raw: &str) -> Result<ShortcutBinding, &'static str> {
+    let mut control = false;
+    let mut alt = false;
+    let mut shift = false;
+    let mut logo = false;
+    let mut key = None;
+    for token in raw.trim().split('+').map(str::trim) {
+        if token.eq_ignore_ascii_case("ctrl") || token.eq_ignore_ascii_case("control") {
+            if std::mem::replace(&mut control, true) {
+                return Err("keyboard shortcut repeats a modifier");
+            }
+        } else if token.eq_ignore_ascii_case("alt") {
+            if std::mem::replace(&mut alt, true) {
+                return Err("keyboard shortcut repeats a modifier");
+            }
+        } else if token.eq_ignore_ascii_case("shift") {
+            if std::mem::replace(&mut shift, true) {
+                return Err("keyboard shortcut repeats a modifier");
+            }
+        } else if token.eq_ignore_ascii_case("super") || token.eq_ignore_ascii_case("meta") {
+            if std::mem::replace(&mut logo, true) {
+                return Err("keyboard shortcut repeats a modifier");
+            }
+        } else {
+            if key.is_some() {
+                return Err("keyboard shortcut must contain exactly one key");
+            }
+            key = if token.eq_ignore_ascii_case("left") {
+                Some(ShortcutKey::ArrowLeft)
+            } else if token.eq_ignore_ascii_case("right") {
+                Some(ShortcutKey::ArrowRight)
+            } else {
+                let mut characters = token.chars();
+                match (characters.next(), characters.next()) {
+                    (Some(character), None) if character.is_ascii_alphanumeric() => {
+                        Some(ShortcutKey::Character(character.to_ascii_lowercase()))
+                    }
+                    _ => return Err("keyboard shortcut key must be A-Z, 0-9, Left, or Right"),
+                }
+            };
+        }
+    }
+    if !(control || alt || logo) {
+        return Err("keyboard shortcut must include Ctrl, Alt, or Super");
+    }
+    Ok(ShortcutBinding {
+        control,
+        alt,
+        shift,
+        logo,
+        key: key.ok_or("keyboard shortcut must contain a key")?,
+    })
+}
+
+const fn default_terminal_scrollback_lines() -> usize {
+    10_000
+}
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -21,8 +182,19 @@ pub struct AppSettings {
     pub max_hot_cards: usize,
     pub hibernation_delay_ms: u64,
     pub terminal_font_size: f32,
+    /// The terminal font family, or empty for the system monospace default.
+    #[serde(default)]
+    pub terminal_font_family: String,
     pub sidebar_width: f32,
     pub default_column_fraction: f32,
+    #[serde(default = "default_terminal_scrollback_lines")]
+    pub terminal_scrollback_lines: usize,
+    #[serde(default)]
+    pub link_open_destination: LinkOpenDestination,
+    #[serde(default)]
+    pub link_open_gesture: LinkOpenGesture,
+    #[serde(default)]
+    pub keyboard_shortcuts: KeyboardShortcuts,
 }
 
 impl Default for AppSettings {
@@ -32,10 +204,33 @@ impl Default for AppSettings {
             max_hot_cards: 6,
             hibernation_delay_ms: 30_000,
             terminal_font_size: 14.0,
+            terminal_font_family: String::new(),
             sidebar_width: 280.0,
             default_column_fraction: 0.72,
+            terminal_scrollback_lines: 10_000,
+            link_open_destination: LinkOpenDestination::default(),
+            link_open_gesture: LinkOpenGesture::default(),
+            keyboard_shortcuts: KeyboardShortcuts::default(),
         }
     }
+}
+
+#[derive(Debug, Deserialize)]
+struct SettingsHeader {
+    schema_version: u32,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct V1TomlSettings {
+    schema_version: u32,
+    max_hot_cards: usize,
+    hibernation_delay_ms: u64,
+    terminal_font_size: f32,
+    #[serde(default)]
+    terminal_font_family: String,
+    sidebar_width: f32,
+    default_column_fraction: f32,
 }
 
 #[derive(Debug, Deserialize)]
@@ -45,6 +240,7 @@ struct LegacySettings {
     max_hot_cards: usize,
     hibernation_delay_ms: u64,
     terminal_font_size: f32,
+    terminal_font_family: String,
     sidebar_width: f32,
     default_column_fraction: f32,
 }
@@ -53,10 +249,11 @@ impl Default for LegacySettings {
     fn default() -> Self {
         let defaults = AppSettings::default();
         Self {
-            schema_version: defaults.schema_version,
+            schema_version: LEGACY_SETTINGS_SCHEMA_VERSION,
             max_hot_cards: defaults.max_hot_cards,
             hibernation_delay_ms: defaults.hibernation_delay_ms,
             terminal_font_size: defaults.terminal_font_size,
+            terminal_font_family: defaults.terminal_font_family,
             sidebar_width: defaults.sidebar_width,
             default_column_fraction: defaults.default_column_fraction,
         }
@@ -66,13 +263,39 @@ impl Default for LegacySettings {
 impl From<LegacySettings> for AppSettings {
     fn from(legacy: LegacySettings) -> Self {
         Self {
-            schema_version: legacy.schema_version,
+            schema_version: SETTINGS_SCHEMA_VERSION,
             max_hot_cards: legacy.max_hot_cards,
             hibernation_delay_ms: legacy.hibernation_delay_ms,
             terminal_font_size: legacy.terminal_font_size,
-            sidebar_width: legacy.sidebar_width,
+            terminal_font_family: legacy.terminal_font_family,
+            sidebar_width: normalize_legacy_sidebar_width(legacy.sidebar_width),
             default_column_fraction: legacy.default_column_fraction,
+            ..Self::default()
         }
+    }
+}
+
+impl From<V1TomlSettings> for AppSettings {
+    fn from(legacy: V1TomlSettings) -> Self {
+        debug_assert_eq!(legacy.schema_version, LEGACY_SETTINGS_SCHEMA_VERSION);
+        Self {
+            schema_version: SETTINGS_SCHEMA_VERSION,
+            max_hot_cards: legacy.max_hot_cards,
+            hibernation_delay_ms: legacy.hibernation_delay_ms,
+            terminal_font_size: legacy.terminal_font_size,
+            terminal_font_family: legacy.terminal_font_family,
+            sidebar_width: normalize_legacy_sidebar_width(legacy.sidebar_width),
+            default_column_fraction: legacy.default_column_fraction,
+            ..Self::default()
+        }
+    }
+}
+
+fn normalize_legacy_sidebar_width(width: f32) -> f32 {
+    if (LEGACY_SIDEBAR_WIDTH_MIN..=LEGACY_SIDEBAR_WIDTH_MAX).contains(&width) {
+        width.clamp(EXPANDED_WIDTH_MIN, EXPANDED_WIDTH_MAX)
+    } else {
+        width
     }
 }
 
@@ -98,16 +321,33 @@ impl AppSettings {
                 "terminal_font_size must be between 8 and 40",
             ));
         }
-        if !(180.0..=480.0).contains(&self.sidebar_width) {
+        if self.terminal_font_family.len() > 128 {
             return Err(SettingsError::Invalid(
-                "sidebar_width must be between 180 and 480",
+                "terminal_font_family must not exceed 128 bytes",
             ));
+        }
+        if !self.terminal_font_family.is_empty() && self.terminal_font_family.trim().is_empty() {
+            return Err(SettingsError::Invalid(
+                "terminal_font_family must be a family name or empty",
+            ));
+        }
+        if !(EXPANDED_WIDTH_MIN..=EXPANDED_WIDTH_MAX).contains(&self.sidebar_width) {
+            return Err(SettingsError::SidebarWidth {
+                min: EXPANDED_WIDTH_MIN,
+                max: EXPANDED_WIDTH_MAX,
+            });
         }
         if !(0.25..=1.0).contains(&self.default_column_fraction) {
             return Err(SettingsError::Invalid(
                 "default_column_fraction must be between 0.25 and 1.0",
             ));
         }
+        if self.terminal_scrollback_lines > MAX_TERMINAL_SCROLLBACK_LINES {
+            return Err(SettingsError::Invalid(
+                "terminal_scrollback_lines must be between 0 and 1000000",
+            ));
+        }
+        self.keyboard_shortcuts.validate()?;
         Ok(self)
     }
 }
@@ -126,10 +366,16 @@ pub enum SettingsError {
     TomlSerialize(#[from] toml::ser::Error),
     #[error("failed to decode legacy JSON settings: {0}")]
     LegacyJson(#[from] serde_json::Error),
-    #[error("settings use unsupported schema version {0}; expected 1")]
+    #[error("settings use unsupported schema version {0}; expected 2")]
     UnsupportedSchema(u32),
     #[error("invalid settings: {0}")]
     Invalid(&'static str),
+    #[error("invalid settings: {0}")]
+    InvalidShortcut(&'static str),
+    /// Quotes the sidebar's own bounds rather than repeating them, because a
+    /// width this accepted used to render clamped to a narrower range.
+    #[error("invalid settings: sidebar_width must be between {min} and {max}")]
+    SidebarWidth { min: f32, max: f32 },
 }
 
 pub fn default_path() -> Result<PathBuf, SettingsError> {
@@ -183,7 +429,14 @@ pub fn save(path: impl AsRef<Path>, settings: &AppSettings) -> Result<(), Settin
 
 fn load_toml(path: &Path) -> Result<AppSettings, SettingsError> {
     let bytes = read_private_file(path)?;
-    toml::from_str::<AppSettings>(std::str::from_utf8(&bytes)?)?.validate()
+    let document = std::str::from_utf8(&bytes)?;
+    match toml::from_str::<SettingsHeader>(document)?.schema_version {
+        LEGACY_SETTINGS_SCHEMA_VERSION => {
+            AppSettings::from(toml::from_str::<V1TomlSettings>(document)?).validate()
+        }
+        SETTINGS_SCHEMA_VERSION => toml::from_str::<AppSettings>(document)?.validate(),
+        version => Err(SettingsError::UnsupportedSchema(version)),
+    }
 }
 
 fn migrate_legacy(path: &Path) -> Result<AppSettings, SettingsError> {
@@ -192,8 +445,11 @@ fn migrate_legacy(path: &Path) -> Result<AppSettings, SettingsError> {
     match fs::symlink_metadata(&legacy_path) {
         Ok(_) => {
             let bytes = read_private_file(&legacy_path)?;
-            let settings = AppSettings::from(serde_json::from_slice::<LegacySettings>(&bytes)?)
-                .validate()?;
+            let legacy = serde_json::from_slice::<LegacySettings>(&bytes)?;
+            if legacy.schema_version != LEGACY_SETTINGS_SCHEMA_VERSION {
+                return Err(SettingsError::UnsupportedSchema(legacy.schema_version));
+            }
+            let settings = AppSettings::from(legacy).validate()?;
             save(path, &settings)?;
             let _ = fs::remove_file(legacy_path);
             Ok(settings)
@@ -264,7 +520,10 @@ fn reject_symlink_components(path: &Path) -> io::Result<()> {
     for ancestor in ancestors {
         match fs::symlink_metadata(ancestor) {
             Ok(metadata) if metadata.file_type().is_symlink() => {
-                return Err(unsafe_path_error(ancestor, "symbolic links are not allowed"));
+                return Err(unsafe_path_error(
+                    ancestor,
+                    "symbolic links are not allowed",
+                ));
             }
             Ok(_) => {}
             Err(error) if error.kind() == io::ErrorKind::NotFound => {}
@@ -353,6 +612,7 @@ mod tests {
             max_hot_cards: 9,
             hibernation_delay_ms: 1_234,
             terminal_font_size: 16.5,
+            terminal_font_family: "Fira Code".to_owned(),
             sidebar_width: 360.0,
             default_column_fraction: 0.55,
             ..AppSettings::default()
@@ -363,6 +623,163 @@ mod tests {
         assert_eq!(load(&path).unwrap(), settings);
         let decoded: AppSettings = toml::from_str(&fs::read_to_string(path).unwrap()).unwrap();
         assert_eq!(decoded, settings);
+    }
+
+    #[test]
+    fn a_file_written_before_the_font_family_key_existed_loads_with_the_default() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = path_in(&directory);
+        let document = toml::to_string(&AppSettings::default()).unwrap();
+        let without_family: String = document
+            .lines()
+            .filter(|line| !line.starts_with("terminal_font_family"))
+            .map(|line| format!("{line}\n"))
+            .collect();
+        assert!(!without_family.contains("terminal_font_family"));
+        fs::write(&path, without_family).unwrap();
+
+        assert_eq!(load(&path).unwrap(), AppSettings::default());
+    }
+
+    #[test]
+    fn version_one_toml_is_upgraded_and_legacy_sidebar_widths_are_normalized() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = path_in(&directory);
+        for (legacy_width, expected_width) in [(180.0, 240.0), (400.0, 360.0)] {
+            fs::write(
+                &path,
+                format!(
+                    "schema_version = 1\nmax_hot_cards = 6\nhibernation_delay_ms = 30000\nterminal_font_size = 14.0\nsidebar_width = {legacy_width}\ndefault_column_fraction = 0.72\n"
+                ),
+            )
+            .unwrap();
+
+            let loaded = load(&path).unwrap();
+            assert_eq!(loaded.schema_version, SETTINGS_SCHEMA_VERSION);
+            assert_eq!(loaded.sidebar_width, expected_width);
+            assert_eq!(loaded.keyboard_shortcuts, KeyboardShortcuts::default());
+        }
+    }
+
+    #[test]
+    fn rejects_a_font_family_that_names_nothing() {
+        let whitespace_only = AppSettings {
+            terminal_font_family: "   ".to_owned(),
+            ..AppSettings::default()
+        };
+        assert!(matches!(
+            whitespace_only.validate(),
+            Err(SettingsError::Invalid(_))
+        ));
+
+        let too_long = AppSettings {
+            terminal_font_family: "F".repeat(129),
+            ..AppSettings::default()
+        };
+        assert!(matches!(
+            too_long.validate(),
+            Err(SettingsError::Invalid(_))
+        ));
+
+        let named = AppSettings {
+            terminal_font_family: "Fira Code".to_owned(),
+            ..AppSettings::default()
+        };
+        assert!(named.validate().is_ok());
+    }
+
+    #[test]
+    fn keyboard_shortcuts_are_validated_as_unique_modified_chords() {
+        assert_eq!(
+            parse_shortcut("Ctrl+Shift+N").unwrap(),
+            ShortcutBinding {
+                control: true,
+                alt: false,
+                shift: true,
+                logo: false,
+                key: ShortcutKey::Character('n'),
+            }
+        );
+        assert!(parse_shortcut("T").is_err());
+        assert!(parse_shortcut("Ctrl+Alt+Left").is_ok());
+        assert!(parse_shortcut("Ctrl+NotAKey").is_err());
+
+        let mut conflicting = AppSettings::default();
+        conflicting.keyboard_shortcuts.next_column =
+            conflicting.keyboard_shortcuts.previous_column.clone();
+        assert!(matches!(
+            conflicting.validate(),
+            Err(SettingsError::InvalidShortcut(message)) if message.contains("conflict")
+        ));
+    }
+
+    #[test]
+    fn terminal_scrollback_is_bounded() {
+        let at_limit = AppSettings {
+            terminal_scrollback_lines: MAX_TERMINAL_SCROLLBACK_LINES,
+            ..AppSettings::default()
+        };
+        assert!(at_limit.validate().is_ok());
+        let above_limit = AppSettings {
+            terminal_scrollback_lines: MAX_TERMINAL_SCROLLBACK_LINES + 1,
+            ..AppSettings::default()
+        };
+        assert!(matches!(
+            above_limit.validate(),
+            Err(SettingsError::Invalid(_))
+        ));
+    }
+
+    #[test]
+    fn the_accepted_sidebar_width_is_exactly_the_width_the_pane_renders() {
+        use crate::sidebar::{SidebarMode, effective_width};
+
+        let with_width = |sidebar_width| AppSettings {
+            sidebar_width,
+            ..AppSettings::default()
+        };
+
+        // A width outside the pane's bounds used to validate and then render
+        // clamped, so the file said 200 while the sidebar showed 240.
+        for width in [
+            EXPANDED_WIDTH_MIN - 40.0,
+            EXPANDED_WIDTH_MIN - 0.5,
+            EXPANDED_WIDTH_MAX + 0.5,
+            f32::NAN,
+        ] {
+            assert!(
+                matches!(
+                    with_width(width).validate(),
+                    Err(SettingsError::SidebarWidth { .. })
+                ),
+                "a width of {width} cannot be persisted: the pane will not render it"
+            );
+        }
+
+        for width in [
+            EXPANDED_WIDTH_MIN,
+            AppSettings::default().sidebar_width,
+            EXPANDED_WIDTH_MAX,
+        ] {
+            let accepted = with_width(width)
+                .validate()
+                .expect("a width the pane renders must validate");
+            assert_eq!(
+                effective_width(SidebarMode::Expanded, accepted.sidebar_width),
+                width
+            );
+        }
+
+        let message = SettingsError::SidebarWidth {
+            min: EXPANDED_WIDTH_MIN,
+            max: EXPANDED_WIDTH_MAX,
+        }
+        .to_string();
+        assert!(
+            message.contains(&EXPANDED_WIDTH_MIN.to_string())
+                && message.contains(&EXPANDED_WIDTH_MAX.to_string()),
+            "the rejection must quote the bounds it enforces, not a copy of them: {message}"
+        );
     }
 
     #[test]
@@ -427,8 +844,10 @@ mod tests {
         fs::write(&path, format!("{valid}unknown = true\n")).unwrap();
         assert!(matches!(load(&path), Err(SettingsError::Toml(_))));
 
-        let mut future = AppSettings::default();
-        future.schema_version = SETTINGS_SCHEMA_VERSION + 1;
+        let future = AppSettings {
+            schema_version: SETTINGS_SCHEMA_VERSION + 1,
+            ..AppSettings::default()
+        };
         fs::write(&path, toml::to_string(&future).unwrap()).unwrap();
         assert!(matches!(
             load(&path),
@@ -438,13 +857,17 @@ mod tests {
         fs::write(&path, "schema_version = 1\n").unwrap();
         assert!(matches!(load(&path), Err(SettingsError::Toml(_))));
 
-        let mut invalid = AppSettings::default();
-        invalid.default_column_fraction = 0.1;
+        let invalid = AppSettings {
+            default_column_fraction: 0.1,
+            ..AppSettings::default()
+        };
         fs::write(&path, toml::to_string(&invalid).unwrap()).unwrap();
         assert!(matches!(load(&path), Err(SettingsError::Invalid(_))));
 
-        let mut too_large = AppSettings::default();
-        too_large.hibernation_delay_ms = MAX_TOML_INTEGER + 1;
+        let too_large = AppSettings {
+            hibernation_delay_ms: MAX_TOML_INTEGER + 1,
+            ..AppSettings::default()
+        };
         assert!(matches!(
             too_large.validate(),
             Err(SettingsError::Invalid(_))
