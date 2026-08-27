@@ -213,7 +213,7 @@ next_column = "Alt+W"
 | `max_hot_cards` | non-negative integer | `6` | `1` through `9223372036854775807` |
 | `hibernation_delay_ms` | non-negative integer | `30000` | `0` through `9223372036854775807` milliseconds |
 | `terminal_font_size` | float | `14.0` | finite values from `8.0` through `40.0`, inclusive |
-| `terminal_font_family` | string | `""` | empty for system monospace, or a non-whitespace family name up to 128 bytes |
+| `terminal_font_family` | string | `""` | empty for the system monospace font, or a non-whitespace family name up to 128 bytes. The family must be fixed-pitch; one whose glyph widths differ falls back to the system monospace font, because the grid is a single pitch |
 | `terminal_scrollback_lines` | non-negative integer | `10000` | `0` through `1000000` lines for newly started terminals |
 | `sidebar_width` | float | `280.0` | finite values from `240.0` through `360.0`, inclusive |
 | `default_column_fraction` | float | `0.72` | finite values from `0.25` through `1.0`, inclusive |

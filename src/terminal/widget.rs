@@ -57,8 +57,20 @@ struct Face {
 }
 
 impl Face {
+    const PLAIN: Self = Self {
+        bold: false,
+        italic: false,
+    };
+
     const fn index(self) -> usize {
         (self.bold as usize) | ((self.italic as usize) << 1)
+    }
+
+    const fn from_index(index: usize) -> Self {
+        Self {
+            bold: index & 1 != 0,
+            italic: index & 2 != 0,
+        }
     }
 }
 
@@ -71,10 +83,37 @@ const LINE_HEIGHT_RATIO: f32 = 1.286;
 
 pub const DEFAULT_FONT_SIZE: f32 = 14.0;
 
-/// The `ADVANCE_SAMPLE` string, repeated so that the per-glyph advance is the
-/// measured width divided by the sample length. That averages away the
-/// sub-pixel rounding a single glyph's bounds would carry.
+/// One glyph repeated, so that the per-glyph advance is the measured width
+/// divided by the sample length. That averages away the sub-pixel rounding a
+/// single glyph's bounds would carry.
 const ADVANCE_SAMPLE: &str = "MMMMMMMMMMMMMMMM";
+
+/// Samples whose per-glyph advance must match [`ADVANCE_SAMPLE`]'s for a face
+/// to count as fixed-pitch: the narrowest ASCII letter and the blank, the two
+/// glyphs a proportional face draws far narrower than `M`. Both are the same
+/// length as `ADVANCE_SAMPLE`, so all three measurements carry the same
+/// rounding.
+///
+/// The blank sample is bracketed by `M` rather than blank throughout so that a
+/// text stack which trimmed trailing whitespace could not report it as zero
+/// wide and condemn every family. Bracketing only dilutes a difference by
+/// 14/16, which stays far above [`PITCH_TOLERANCE`].
+const PITCH_SAMPLES: [&str; 2] = ["iiiiiiiiiiiiiiii", "M              M"];
+
+/// How far a [`PITCH_SAMPLES`] advance may sit from `ADVANCE_SAMPLE`'s before
+/// the face counts as proportional, as a fraction of the latter.
+///
+/// A fixed-pitch face makes the two equal - every installed monospace face
+/// measures bit-identically - so the entire budget is measurement noise, and
+/// the only noise on this path is a paragraph width `advance` then divides by
+/// the sample length. 2% of the pitch is well clear of that at any legible
+/// size and an order of magnitude below the roughly threefold `M`-to-`i`
+/// spread a proportional face shows.
+const PITCH_TOLERANCE: f32 = 0.02;
+
+/// The floor under [`PITCH_TOLERANCE`]: half a pixel of paragraph width spread
+/// over the sample's glyphs, the most rounding a measurement can carry.
+const PITCH_TOLERANCE_FLOOR: f32 = 0.5 / ADVANCE_SAMPLE.len() as f32;
 
 impl CellMetrics {
     /// Returns the metrics for `font_size` and `family` at `scale_factor`,
@@ -114,11 +153,27 @@ impl CellMetrics {
     }
 
     fn measure(font_size: f32, scale_factor: f32, family: &'static str) -> Self {
-        let plain = Face {
-            bold: false,
-            italic: false,
-        };
-        let base = advance(font_size, family, plain).unwrap_or((font_size * 0.6).max(1.0));
+        // Every face is measured up front: one face that is not fixed-pitch
+        // disqualifies the whole family, and the same measurement then sets
+        // that face's drawing size.
+        let bases: [Option<f32>; FACE_COUNT] = std::array::from_fn(|index| {
+            advance(ADVANCE_SAMPLE, font_size, family, Face::from_index(index))
+        });
+
+        // A family that is not fixed-pitch cannot hold the grid at all, so the
+        // system monospace default is the only thing left to draw with. It is
+        // never checked itself, which also bounds this recursion at one step.
+        if !family.is_empty()
+            && !bases.iter().enumerate().all(|(index, base)| {
+                base.is_none_or(|base| {
+                    is_fixed_pitch(font_size, family, Face::from_index(index), base)
+                })
+            })
+        {
+            return Self::measure(font_size, scale_factor, "");
+        }
+
+        let base = bases[Face::PLAIN.index()].unwrap_or((font_size * 0.6).max(1.0));
         let width = (base * scale_factor).round().max(1.0) / scale_factor;
         let height = (font_size * LINE_HEIGHT_RATIO * scale_factor)
             .round()
@@ -126,15 +181,11 @@ impl CellMetrics {
             / scale_factor;
 
         let faces = std::array::from_fn(|index| {
-            let key = Face {
-                bold: index & 1 != 0,
-                italic: index & 2 != 0,
-            };
             // Scaling the size by pitch/advance makes this face advance by
             // exactly one cell, provided its advance is linear in the size -
             // the normal case for a monospace face. A face whose advance cannot
             // be measured keeps the requested size.
-            let Some(face_base) = advance(font_size, family, key) else {
+            let Some(face_base) = bases[index] else {
                 return font_size;
             };
             (font_size * width / face_base).clamp(1.0, 400.0)
@@ -160,11 +211,17 @@ impl Default for CellMetrics {
     }
 }
 
-/// The shaped horizontal advance of one monospace cell, or `None` when no face
-/// resolved and the measurement cannot be trusted.
-fn advance(font_size: f32, family: &'static str, key: Face) -> Option<f32> {
+/// The shaped horizontal advance of one cell of `sample`, or `None` when no
+/// face resolved and the measurement cannot be trusted.
+fn advance(sample: &str, font_size: f32, family: &'static str, key: Face) -> Option<f32> {
+    let measured = measured_advance(sample, font_size, family, key);
+    (measured.is_finite() && measured >= 1.0).then_some(measured)
+}
+
+/// The mean advance of `sample`'s glyphs, whatever it measures.
+fn measured_advance(sample: &str, font_size: f32, family: &'static str, key: Face) -> f32 {
     let paragraph = <Renderer as text::Renderer>::Paragraph::with_text(text::Text {
-        content: ADVANCE_SAMPLE,
+        content: sample,
         bounds: Size::new(f32::INFINITY, f32::INFINITY),
         size: Pixels(font_size),
         line_height: text::LineHeight::Relative(1.0),
@@ -175,8 +232,31 @@ fn advance(font_size: f32, family: &'static str, key: Face) -> Option<f32> {
         wrapping: text::Wrapping::None,
         ellipsize: text::Ellipsize::None,
     });
-    let measured = paragraph.min_bounds().width / ADVANCE_SAMPLE.len() as f32;
-    (measured.is_finite() && measured >= 1.0).then_some(measured)
+    paragraph.min_bounds().width / sample.len() as f32
+}
+
+/// Whether `key` in `family` advances the narrow ASCII glyphs by `base` too,
+/// `base` being the advance the grid pitch is derived from.
+///
+/// [`CellMetrics::measure`] only makes `ADVANCE_SAMPLE`'s glyph advance exactly
+/// one cell, but [`shape_segment`] draws a coalesced run of arbitrary narrow
+/// ASCII as one buffer and needs *every* glyph in it to do so - a property only
+/// a fixed-pitch face has. Nothing else establishes it: `fontdb` matches no
+/// face for a name it does not know and cosmic-text then falls back to the
+/// first face of its globally sorted match list, so a proportional family, a
+/// mistyped monospace one, or a monospace one whose bold face is simply not
+/// installed all still measure a finite advance. The grid would then shear
+/// silently, glyphs drifting left of their columns while the backgrounds,
+/// selection, decorations and cursor stayed on the pitch.
+fn is_fixed_pitch(font_size: f32, family: &'static str, key: Face, base: f32) -> bool {
+    let tolerance = (base * PITCH_TOLERANCE).max(PITCH_TOLERANCE_FLOOR);
+    PITCH_SAMPLES.iter().all(|sample| {
+        let measured = measured_advance(sample, font_size, family, key);
+        // A measurement that is not finite is evidence of nothing, so the
+        // family keeps the benefit of the doubt, exactly as it does when
+        // `ADVANCE_SAMPLE` itself cannot be measured.
+        !measured.is_finite() || (measured - base).abs() <= tolerance
+    })
 }
 
 fn font(family: &'static str, key: Face) -> Font {
@@ -1136,18 +1216,14 @@ fn shape_segment(
         }
     }
 
-    let plain = Face {
-        bold: false,
-        italic: false,
-    };
     let mut buffer = cosmic_text::Buffer::new_empty(cosmic_text::Metrics::new(
-        metrics.face_size(plain),
+        metrics.face_size(Face::PLAIN),
         line_height,
     ));
     buffer.set_wrap(cosmic_text::Wrap::None);
     buffer.set_size(None, None);
     buffer.set_hinting(cosmic_text::Hinting::Disabled);
-    let default_attrs = graphics_text::to_attributes(font(metrics.family, plain));
+    let default_attrs = graphics_text::to_attributes(font(metrics.family, Face::PLAIN));
     buffer.set_rich_text(
         spans
             .iter()
@@ -1589,15 +1665,21 @@ mod tests {
         }
     }
 
-    /// Every installed monospace family, interned and deduplicated.
-    fn installed_monospace_families() -> Vec<&'static str> {
+    /// Every installed family whose faces `fontdb` flags as `monospaced` or
+    /// not, interned and deduplicated.
+    ///
+    /// The flag is the font's own metadata, which is exactly what the grid
+    /// cannot trust - `AR PL New Sung Mono` claims to be monospaced and draws
+    /// Latin proportionally - so this is a source of candidate names, nothing
+    /// more.
+    fn installed_families(monospaced: bool) -> Vec<&'static str> {
         let guard = font_system()
             .read()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let mut names: Vec<&'static str> = guard
             .db()
             .faces()
-            .filter(|face| face.monospaced)
+            .filter(|face| face.monospaced == monospaced)
             .filter_map(|face| face.families.first())
             .map(|(name, _)| intern_family(name))
             .collect();
@@ -1607,35 +1689,57 @@ mod tests {
         names
     }
 
+    /// Whether every face of `family` measures fixed-pitch, which is what
+    /// [`CellMetrics::measure`] accepts a family on.
+    fn family_is_fixed_pitch(font_size: f32, family: &'static str) -> bool {
+        (0..FACE_COUNT).all(|index| {
+            let key = Face::from_index(index);
+            advance(ADVANCE_SAMPLE, font_size, family, key)
+                .is_none_or(|base| is_fixed_pitch(font_size, family, key, base))
+        })
+    }
+
     #[test]
     fn the_grid_pitch_follows_the_font_family() {
         // `resolve` memoises on its inputs, so a family missing from that key
         // would hand a newly chosen family the previous one's pitch and drift
         // every glyph off its column.
-        let plain = Face {
-            bold: false,
-            italic: false,
-        };
-        for family in installed_monospace_families() {
-            let expected = advance(DEFAULT_FONT_SIZE, family, plain)
-                .unwrap_or((DEFAULT_FONT_SIZE * 0.6).max(1.0))
-                .round()
-                .max(1.0);
+        for family in installed_families(true) {
             let metrics = CellMetrics::resolve(DEFAULT_FONT_SIZE, 1.0, family);
+            let expected = advance(
+                ADVANCE_SAMPLE,
+                DEFAULT_FONT_SIZE,
+                metrics.family,
+                Face::PLAIN,
+            )
+            .unwrap_or((DEFAULT_FONT_SIZE * 0.6).max(1.0))
+            .round()
+            .max(1.0);
 
             assert_eq!(
                 metrics.width, expected,
                 "{family} was memoised at another family's pitch"
             );
-            assert_eq!(metrics.family, family);
+            assert_eq!(
+                metrics.family == family,
+                family_is_fixed_pitch(DEFAULT_FONT_SIZE, family),
+                "{family} must be drawn with exactly when every face of it \
+                 measures fixed-pitch"
+            );
         }
 
-        // Families the system cannot resolve measure identically, so only the
-        // cache entries themselves can show that the key carries the family.
-        let alpha = CellMetrics::resolve(DEFAULT_FONT_SIZE, 1.0, "Cagents Test Alpha");
-        let beta = CellMetrics::resolve(DEFAULT_FONT_SIZE, 1.0, "Cagents Test Beta");
-        assert_eq!(alpha.family, "Cagents Test Alpha");
-        assert_eq!(beta.family, "Cagents Test Beta");
+        // A name the system cannot resolve is served by an arbitrary face from
+        // cosmic-text's globally sorted match list, so the only thing that can
+        // be asserted of it is that same invariant.
+        for name in ["Cagents Test Alpha", "Cagents Test Beta"] {
+            let metrics = CellMetrics::resolve(DEFAULT_FONT_SIZE, 1.0, name);
+            assert_eq!(
+                metrics.family == name,
+                family_is_fixed_pitch(DEFAULT_FONT_SIZE, intern_family(name)),
+                "{name} names no installed family and must only be drawn with \
+                 if whatever answered for it holds the grid"
+            );
+        }
         assert_eq!(
             CellMetrics::resolve(DEFAULT_FONT_SIZE, 1.0, "   ").family,
             "",
@@ -1645,10 +1749,6 @@ mod tests {
 
     #[test]
     fn a_family_name_is_interned_once_and_an_empty_name_is_the_system_monospace() {
-        let plain = Face {
-            bold: false,
-            italic: false,
-        };
         let first = intern_family("Cagents Interned Family");
         let second = intern_family(&format!("  {first}  "));
 
@@ -1657,11 +1757,11 @@ mod tests {
             "a repeated family must reuse its allocation instead of leaking again"
         );
         assert_eq!(
-            font("", plain).family,
+            font("", Face::PLAIN).family,
             cosmic::iced::font::Family::Monospace
         );
         assert_eq!(
-            font(first, plain).family,
+            font(first, Face::PLAIN).family,
             cosmic::iced::font::Family::Name(first)
         );
     }
@@ -1696,6 +1796,26 @@ mod tests {
         (positions, width)
     }
 
+    /// Asserts that shaping `cells` as one buffer puts the Nth glyph exactly N
+    /// pitches along and leaves the run exactly as wide as its columns.
+    fn assert_columns(metrics: &CellMetrics, cells: &[CellSnapshot], case: &str) {
+        let (positions, width) = shaped_positions(metrics, cells, false);
+
+        assert_eq!(positions.len(), cells.len(), "{case}: one glyph per cell");
+        for (column, x) in positions.iter().enumerate() {
+            let expected = metrics.width * column as f32;
+            assert!(
+                (x - expected).abs() <= 1e-3,
+                "{case}: column {column} drew at {x}, expected {expected}"
+            );
+        }
+        let expected = metrics.width * cells.len() as f32;
+        assert!(
+            (width - expected).abs() <= 1e-3,
+            "{case}: run is {width} wide, expected {expected}"
+        );
+    }
+
     #[test]
     fn every_shaped_glyph_lands_on_its_own_column() {
         // The invariant the whole design rests on, and the one a previous
@@ -1703,29 +1823,85 @@ mod tests {
         // primitive must put the Nth glyph exactly N pitches along. Measured
         // from the real shaper at the scale factors a fractional display
         // reports, not derived from an advance estimate.
-        for scale in [1.0f32, 1.25, 1.5, 2.0] {
-            let metrics = CellMetrics::resolve(DEFAULT_FONT_SIZE, scale, "");
-            let cells = cells("the quick brown fox 0123456789", |_, cell| cell);
-            let (positions, width) = shaped_positions(&metrics, &cells, false);
-
-            assert_eq!(
-                positions.len(),
-                cells.len(),
-                "scale {scale}: one glyph per cell"
-            );
-            for (column, x) in positions.iter().enumerate() {
-                let expected = metrics.width * column as f32;
-                assert!(
-                    (x - expected).abs() <= 1e-3,
-                    "scale {scale}: column {column} drew at {x}, expected {expected}"
+        //
+        // The family is user-settable, which is the axis the invariant breaks
+        // along, so every installed monospace family is exercised as well as
+        // the default, and at more than one font size: the pitch is rounded to
+        // whole physical pixels, so each size divides a face's own advance
+        // differently.
+        let cells = cells("the quick brown fox 0123456789", |_, cell| cell);
+        let mut families = installed_families(true);
+        families.push("");
+        for family in families {
+            for (font_size, scale) in [
+                (DEFAULT_FONT_SIZE, 1.0f32),
+                (DEFAULT_FONT_SIZE, 1.25),
+                (DEFAULT_FONT_SIZE, 1.5),
+                (DEFAULT_FONT_SIZE, 2.0),
+                (11.0, 1.0),
+                (23.0, 1.25),
+            ] {
+                let metrics = CellMetrics::resolve(font_size, scale, family);
+                assert_columns(
+                    &metrics,
+                    &cells,
+                    &format!("{family:?} at {font_size}px, scale {scale}"),
                 );
             }
-            let expected = metrics.width * cells.len() as f32;
-            assert!(
-                (width - expected).abs() <= 1e-3,
-                "scale {scale}: run is {width} wide, expected {expected}"
-            );
         }
+    }
+
+    #[test]
+    fn a_family_that_is_not_fixed_pitch_falls_back_instead_of_shearing_the_grid() {
+        // The pitch comes from `M` alone, so a family whose other glyphs
+        // advance less puts the Nth glyph of a coalesced run left of column N
+        // while its background, selection, decorations and cursor stay on the
+        // pitch. Nothing downstream can catch that: cosmic-text answers an
+        // unknown or proportional family with an arbitrary installed face, so a
+        // finite advance is no evidence of a usable grid.
+        let Some(proportional) = installed_families(false)
+            .into_iter()
+            .find(|family| !family_is_fixed_pitch(DEFAULT_FONT_SIZE, family))
+        else {
+            // Nothing to exercise on a host with no proportional font.
+            return;
+        };
+        let cells = cells("the quick brown fox 0123456789", |_, cell| cell);
+
+        // The family really is hostile: measured as `measure` used to, with the
+        // pitch taken from `M` and no fixed-pitch check, its glyphs leave their
+        // columns by whole cells.
+        let width = advance(ADVANCE_SAMPLE, DEFAULT_FONT_SIZE, proportional, Face::PLAIN)
+            .expect("a resolvable family measures an advance")
+            .round()
+            .max(1.0);
+        let unchecked = CellMetrics {
+            width,
+            height: (DEFAULT_FONT_SIZE * LINE_HEIGHT_RATIO).round(),
+            faces: std::array::from_fn(|index| {
+                let key = Face::from_index(index);
+                advance(ADVANCE_SAMPLE, DEFAULT_FONT_SIZE, proportional, key)
+                    .map_or(DEFAULT_FONT_SIZE, |base| DEFAULT_FONT_SIZE * width / base)
+            }),
+            family: proportional,
+        };
+        let (sheared, _) = shaped_positions(&unchecked, &cells, false);
+        assert!(
+            sheared
+                .iter()
+                .enumerate()
+                .any(|(column, x)| (x - width * column as f32).abs() > width),
+            "{proportional} was chosen for shearing the grid but did not"
+        );
+
+        // So it must not be drawn with at all.
+        let metrics = CellMetrics::resolve(DEFAULT_FONT_SIZE, 1.0, proportional);
+        assert_eq!(
+            metrics,
+            CellMetrics::resolve(DEFAULT_FONT_SIZE, 1.0, ""),
+            "{proportional} must fall back to the system monospace whole"
+        );
+        assert_columns(&metrics, &cells, proportional);
     }
 
     #[test]
@@ -1740,18 +1916,8 @@ mod tests {
             cell.style.italic = index % 4 == 0;
             cell
         });
-        let (positions, width) = shaped_positions(&metrics, &cells, false);
 
-        assert_eq!(positions.len(), cells.len());
-        for (column, x) in positions.iter().enumerate() {
-            let expected = metrics.width * column as f32;
-            assert!(
-                (x - expected).abs() <= 1e-3,
-                "column {column} drew at {x}, expected {expected}"
-            );
-        }
-        let expected = metrics.width * cells.len() as f32;
-        assert!((width - expected).abs() <= 1e-3);
+        assert_columns(&metrics, &cells, "mixed styles");
     }
 
     #[test]
@@ -1807,5 +1973,137 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![(0, 2), (3, 1)]
         );
+    }
+
+    fn row(text: &str) -> Arc<RowSnapshot> {
+        Arc::new(RowSnapshot {
+            cells: cells(text, |_, cell| cell),
+        })
+    }
+
+    fn shape_cache_geometry(family: &str) -> TerminalGeometry {
+        TerminalGeometry::new(
+            Rectangle {
+                x: 0.0,
+                y: 0.0,
+                width: 900.0,
+                height: 400.0,
+            },
+            DEFAULT_FONT_SIZE,
+            1.0,
+            family,
+        )
+    }
+
+    /// The shaped buffer of every cached row.
+    fn shaped_buffers(cache: &ShapeCache) -> Vec<Arc<cosmic_text::Buffer>> {
+        cache
+            .rows
+            .iter()
+            .map(|cached| {
+                // A plain ASCII row coalesces into exactly one segment, so a
+                // reshape that failed to drop the previous one shows up here.
+                assert_eq!(
+                    cached.segments.len(),
+                    1,
+                    "a reshaped row must replace its segments, not append to them"
+                );
+                Arc::clone(&cached.segments[0].buffer)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_shaped_row_survives_exactly_as_long_as_its_snapshot_pointer() {
+        // The cache keys a row's buffers on the `Arc` the daemon handed out and
+        // holds it, so the address cannot be recycled under a stale entry.
+        // Comparing anything weaker - a length, or the cells themselves - would
+        // leave a live terminal drawing glyphs of text it no longer holds.
+        let geometry = shape_cache_geometry("");
+        let mut cache = ShapeCache::default();
+        let mut rows = vec![row("first row"), row("second row")];
+
+        cache.refresh(&geometry, DEFAULT_FONT_SIZE, &rows, 80);
+        let baseline = shaped_buffers(&cache);
+        assert_eq!(baseline.len(), rows.len(), "every row shapes");
+
+        // Nothing moved, so nothing reshapes and the font system is never
+        // touched again.
+        cache.refresh(&geometry, DEFAULT_FONT_SIZE, &rows, 80);
+        for (before, after) in baseline.iter().zip(&shaped_buffers(&cache)) {
+            assert!(
+                Arc::ptr_eq(before, after),
+                "an untouched row must keep its buffer"
+            );
+        }
+
+        // Equal content in a fresh allocation still reshapes: the daemon reuses
+        // the `Arc` of every row a repaint leaves alone, so a new pointer means
+        // the row was rewritten and pointer identity is the whole key.
+        rows[1] = row("second row");
+        cache.refresh(&geometry, DEFAULT_FONT_SIZE, &rows, 80);
+        let replaced = shaped_buffers(&cache);
+        assert!(
+            Arc::ptr_eq(&baseline[0], &replaced[0]),
+            "a row nobody touched must not reshape"
+        );
+        assert!(
+            !Arc::ptr_eq(&baseline[1], &replaced[1]),
+            "a replaced row must reshape even when its content is equal"
+        );
+
+        // And a row whose content actually changed, for the same reason.
+        rows[0] = row("FIRST ROW");
+        cache.refresh(&geometry, DEFAULT_FONT_SIZE, &rows, 80);
+        let rewritten = shaped_buffers(&cache);
+        assert!(!Arc::ptr_eq(&replaced[0], &rewritten[0]));
+        assert!(
+            Arc::ptr_eq(&replaced[1], &rewritten[1]),
+            "one rewritten row must not cost the others their buffers"
+        );
+    }
+
+    #[test]
+    fn a_shape_parameter_change_invalidates_every_cached_row() {
+        // The font size, the column limit and the family all change what a row
+        // shapes to and none of them is visible in a row's pointer, so they are
+        // compared separately and clear the cache whole.
+        let geometry = shape_cache_geometry("");
+        let rows = vec![row("first row"), row("second row")];
+        let invalidates = |geometry: &TerminalGeometry, font_size: f32, columns: usize| {
+            let mut cache = ShapeCache::default();
+            cache.refresh(&shape_cache_geometry(""), DEFAULT_FONT_SIZE, &rows, 80);
+            let before = shaped_buffers(&cache);
+            cache.refresh(geometry, font_size, &rows, columns);
+            before
+                .iter()
+                .zip(&shaped_buffers(&cache))
+                .all(|(before, after)| !Arc::ptr_eq(before, after))
+        };
+
+        assert!(
+            invalidates(&geometry, DEFAULT_FONT_SIZE + 2.0, 80),
+            "a font size change must reshape every row"
+        );
+        assert!(
+            invalidates(&geometry, DEFAULT_FONT_SIZE, 4),
+            "a column limit change must reshape every row"
+        );
+        assert!(
+            !invalidates(&geometry, DEFAULT_FONT_SIZE, 80),
+            "unchanged parameters must reshape nothing"
+        );
+
+        // A family only counts as a change when the host has one the metrics
+        // will actually keep.
+        if let Some(family) = installed_families(true)
+            .into_iter()
+            .find(|family| CellMetrics::resolve(DEFAULT_FONT_SIZE, 1.0, family).family == *family)
+        {
+            assert!(
+                invalidates(&shape_cache_geometry(family), DEFAULT_FONT_SIZE, 80),
+                "a family change must reshape every row"
+            );
+        }
     }
 }
