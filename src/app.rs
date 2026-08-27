@@ -1010,6 +1010,11 @@ pub enum Message {
         field: SettingsField,
         value: String,
     },
+    /// Records typing without adopting it; see [`setting_input_on_submit`].
+    SettingsDraftChanged {
+        field: SettingsField,
+        value: String,
+    },
     ResetSettings,
     DismissStatus,
 }
@@ -4113,6 +4118,11 @@ impl Application for Cagents {
                 Task::none()
             }
             Message::SettingsChanged { field, value } => self.apply_setting_input(field, value),
+            Message::SettingsDraftChanged { field, value } => {
+                self.settings_draft.set(field, value);
+                self.settings_feedback = None;
+                Task::none()
+            }
             Message::ResetSettings => self.reset_settings(),
             Message::DismissStatus => {
                 self.status = None;
@@ -4727,6 +4737,35 @@ fn setting_input<'a>(
     .into()
 }
 
+/// A row that edits its draft freely but only applies on Enter.
+///
+/// For a field whose every distinct value costs something permanent. Adopting
+/// a font family interns its name for the lifetime of the process and measures
+/// the grid for it - four shaping calls - so applying one per keystroke would
+/// leak a name and shape a grid for every prefix the user typed through.
+fn setting_input_on_submit<'a>(
+    label: &'static str,
+    detail: impl Into<Cow<'a, str>> + 'a,
+    value: &'a str,
+    field: SettingsField,
+) -> Element<'a, Message> {
+    let spacing = cosmic::theme::spacing();
+    widget::column::with_children(vec![
+        widget::text::caption_heading(label).into(),
+        widget::text_input(label, value)
+            .on_input(move |value| Message::SettingsDraftChanged { field, value })
+            .on_submit(move |value| Message::SettingsChanged { field, value })
+            .width(Length::Fill)
+            .into(),
+        widget::text::caption(detail)
+            .wrapping(cosmic::iced::widget::text::Wrapping::Word)
+            .into(),
+    ])
+    .spacing(spacing.space_xxxs)
+    .width(Length::Fill)
+    .into()
+}
+
 fn settings_choice<'a>(
     label: &'static str,
     detail: &'static str,
@@ -4855,9 +4894,9 @@ fn settings_category_controls<'a>(
                     &draft.terminal_font_size,
                     SettingsField::TerminalFontSize,
                 ),
-                setting_input(
+                setting_input_on_submit(
                     "Font family",
-                    "Leave empty for the system monospace font. Powerline prompts need a font that includes their glyphs.",
+                    "Leave empty for the system monospace font. Powerline prompts need a font that includes their glyphs. Must be fixed-pitch: a family whose glyphs differ in width would not line up on the grid, so it falls back to the system monospace font. Applies when you press Enter.",
                     &draft.terminal_font_family,
                     SettingsField::TerminalFontFamily,
                 ),
