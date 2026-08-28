@@ -97,16 +97,82 @@ pub struct WorkspaceCard {
     pub width: CardWidth,
 }
 
+/// The longest card name kept.
+///
+/// A card's name is chosen by the process inside it, through a shell's
+/// `OSC 0` or a page's `document.title`. It is stored durably, expanded into
+/// five accessibility strings, and shown in the card header, the header bar
+/// and the compositor toplevel title. `Ellipsize` does not bound the work,
+/// because the shaper must lay the whole string out before it can decide
+/// where to cut, so an unbounded name stalls the UI thread every frame; being
+/// persisted, it would go on stalling it after a restart.
+pub const MAX_CARD_NAME_CHARS: usize = 256;
+
+/// Normalises a card name, or `None` when nothing legible survives.
+///
+/// Every name reaches a card through [`WorkspaceCard::new`] or
+/// [`Workspace::rename_card`], both of which normalise here, so no ingress -
+/// a reported title, a directory name, a restored session - can carry an
+/// unbounded or reordering name into the model.
+///
+/// Formatting characters are dropped rather than escaped: none of the surfaces
+/// that show a name can render them meaningfully, and a bidi override in the
+/// window title - which is composed as `"{name} — cagents"` - would let one
+/// card impersonate another, or the application itself.
+pub fn normalize_card_name(name: &str) -> Option<String> {
+    let mut normalized = String::new();
+    let mut kept = 0usize;
+    let mut pending_space = false;
+    for character in name.chars() {
+        if kept == MAX_CARD_NAME_CHARS {
+            break;
+        }
+        if character.is_whitespace() {
+            // Tested before the control check, because a tab, newline or
+            // carriage return is both: they separate words and so collapse to
+            // one space rather than closing it up. The Unicode line and
+            // paragraph separators are whitespace too, so they land here.
+            // Interior runs collapse; leading whitespace is dropped.
+            pending_space = kept > 0;
+            continue;
+        }
+        if character.is_control() || is_name_formatting(character) {
+            continue;
+        }
+        if pending_space {
+            normalized.push(' ');
+            kept += 1;
+            pending_space = false;
+            if kept == MAX_CARD_NAME_CHARS {
+                break;
+            }
+        }
+        normalized.push(character);
+        kept += 1;
+    }
+    (!normalized.is_empty()).then_some(normalized)
+}
+
+/// The bidi marks and embedding controls: characters that carry no glyph of
+/// their own but reorder the text around them. `char::is_control` covers C0 and
+/// C1 but not these, which sit in ordinary printable categories. The line and
+/// paragraph separators are not here because they are whitespace, and so are
+/// already collapsed into a space.
+fn is_name_formatting(character: char) -> bool {
+    matches!(
+        character,
+        '\u{200e}' | '\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}'
+    )
+}
+
 impl WorkspaceCard {
     pub fn new(
         id: CardId,
         accessible_name: impl Into<String>,
         width: CardWidth,
     ) -> Result<Self, WorkspaceError> {
-        let accessible_name = accessible_name.into();
-        if accessible_name.trim().is_empty() {
-            return Err(WorkspaceError::EmptyAccessibleName);
-        }
+        let accessible_name = normalize_card_name(&accessible_name.into())
+            .ok_or(WorkspaceError::EmptyAccessibleName)?;
 
         Ok(Self {
             id,
@@ -714,10 +780,8 @@ impl Workspace {
         id: CardId,
         accessible_name: impl Into<String>,
     ) -> Result<(), WorkspaceError> {
-        let accessible_name = accessible_name.into();
-        if accessible_name.trim().is_empty() {
-            return Err(WorkspaceError::EmptyAccessibleName);
-        }
+        let accessible_name = normalize_card_name(&accessible_name.into())
+            .ok_or(WorkspaceError::EmptyAccessibleName)?;
         let index = self.index_of(id).ok_or(WorkspaceError::UnknownCard(id))?;
         self.cards[index].accessible_name = accessible_name;
         Ok(())
@@ -1243,6 +1307,71 @@ mod tests {
             workspace.add_card(card(width), index, index == 0).unwrap();
         }
         workspace
+    }
+
+    #[test]
+    fn a_card_name_is_bounded_and_stripped_of_formatting() {
+        // The card's process chooses this string, and it reaches the card
+        // header, five accessibility strings, the header bar, the compositor
+        // toplevel title and the state database.
+        assert_eq!(normalize_card_name("  fish  "), Some("fish".into()));
+        assert_eq!(
+            normalize_card_name("two\nlines\u{2028}and\tmore"),
+            Some("two lines and more".into())
+        );
+        // A bidi override could reorder the window title around the
+        // application name and make one card impersonate another.
+        assert_eq!(
+            normalize_card_name("safe\u{202e}gnitiops"),
+            Some("safegnitiops".into())
+        );
+        assert_eq!(normalize_card_name("\u{7}\u{1b}"), None);
+        assert_eq!(normalize_card_name(""), None);
+        assert_eq!(normalize_card_name("   \n\t "), None);
+
+        let flood = "A".repeat(20_000_000);
+        let normalized = normalize_card_name(&flood).expect("letters survive");
+        assert_eq!(normalized.chars().count(), MAX_CARD_NAME_CHARS);
+        // Truncation counts characters, so a multi-byte name cannot smuggle
+        // more than the bound past it either.
+        let wide = "→".repeat(1_000);
+        assert_eq!(
+            normalize_card_name(&wide)
+                .expect("arrows survive")
+                .chars()
+                .count(),
+            MAX_CARD_NAME_CHARS
+        );
+    }
+
+    #[test]
+    fn every_ingress_normalises_the_name_it_is_given() {
+        // Names arrive from a reported title, a directory name and a restored
+        // session. Normalising at both constructors is what makes the bound
+        // hold for all of them, including the ones a restart replays.
+        let hostile = format!("we\u{202e}b\n{}", "A".repeat(20_000_000));
+        let card = WorkspaceCard::new(CardId::new(), hostile.clone(), CardWidth::Fixed(320.0))
+            .expect("letters survive");
+        assert_eq!(card.accessible_name.chars().count(), MAX_CARD_NAME_CHARS);
+        assert!(!card.accessible_name.contains('\u{202e}'));
+
+        let mut workspace = Workspace::default();
+        workspace.resize_viewport(600.0);
+        let id = card.id;
+        workspace.add_card(card, 0, true).unwrap();
+        workspace.rename_card(id, hostile).unwrap();
+        let renamed = &workspace.cards()[0].accessible_name;
+        assert_eq!(renamed.chars().count(), MAX_CARD_NAME_CHARS);
+        assert!(!renamed.contains('\u{202e}'));
+
+        // A name of nothing legible is refused, so a card keeps the one it had
+        // rather than losing its header, its accessible name and the window
+        // title at once.
+        assert!(workspace.rename_card(id, "\u{202e}\u{7}").is_err());
+        assert_eq!(
+            workspace.cards()[0].accessible_name.chars().count(),
+            MAX_CARD_NAME_CHARS
+        );
     }
 
     #[test]
