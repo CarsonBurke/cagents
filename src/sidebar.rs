@@ -208,6 +208,10 @@ struct ProjectChrome {
     open_id: Id,
     toggle_id: Id,
     new_worktree_id: Id,
+    /// The header's command for the selected project is a second control, so
+    /// it needs a second identity: two widgets sharing one custom id leave the
+    /// state tree with a node the renderer cannot downcast.
+    header_new_worktree_id: Id,
     create_pull_request_id: Id,
     toggle_pull_requests_id: Id,
     open_name: Box<str>,
@@ -228,6 +232,7 @@ impl ProjectChrome {
             open_id: entity_id("project.open", id),
             toggle_id: entity_id("project.toggle", id),
             new_worktree_id: entity_id("project.new_worktree", id),
+            header_new_worktree_id: entity_id("header.new_worktree", id),
             create_pull_request_id: entity_id("project.create_pr", id),
             toggle_pull_requests_id: entity_id("project.toggle_prs", id),
             open_name: format!("Open project {name}").into_boxed_str(),
@@ -785,8 +790,9 @@ fn header<'a>(
     );
     // `view` renders the controls only for a non-empty project list, so with
     // no projects this would offer, and paint as selected, a control that
-    // opens nothing. The error state is empty too: `SidebarModel::error`
-    // clears the list.
+    // opens nothing. A failed refresh keeps the projects it already had - it
+    // replaces the body, not the list - so this stays rendered there, which is
+    // right: search and filter still describe what the pane is holding.
     if !model.projects.is_empty() {
         let selected = state.controls_expanded
             || !state.query.is_empty()
@@ -824,7 +830,7 @@ fn header<'a>(
                 project_id: project.id,
                 repository: project.repository.clone(),
             },
-            project.chrome.new_worktree_id.clone(),
+            project.chrome.header_new_worktree_id.clone(),
         ));
     } else {
         children.push(icon_action(
@@ -2274,6 +2280,79 @@ mod tests {
         let mut ids = Vec::new();
         collect(&Tree::new(element), &mut ids);
         ids
+    }
+
+    #[test]
+    fn no_two_controls_in_one_frame_share_an_identity() {
+        // Two widgets carrying the same custom id are not a cosmetic clash.
+        // The runtime keeps state for named widgets in a map keyed by that
+        // name, and drains it before every diff: with a name repeated, one node
+        // is handed nothing back, keeps the tag that says it is stateful, and
+        // the next focus traversal or draw panics on the downcast. The header's
+        // command for the selected project and that project's own row are the
+        // pair that collided, so selection is part of the cross product.
+        let populated = vec![project()];
+        let selections = [
+            None,
+            Some(SidebarSelection::Project(project_id(1))),
+            Some(SidebarSelection::Worktree {
+                project_id: project_id(1),
+                worktree_id: populated[0].worktrees[0].id,
+            }),
+            Some(SidebarSelection::PullRequest {
+                project_id: project_id(1),
+                number: 42,
+            }),
+        ];
+
+        for mode in [SidebarMode::Compact, SidebarMode::Expanded] {
+            // Every data state carries the projects it already had: a failed
+            // refresh replaces the body and keeps the list, which is the state
+            // the collision was found in.
+            for data_state in [
+                SidebarDataState::Ready,
+                SidebarDataState::Loading,
+                SidebarDataState::Error("git exited with status 128".to_owned()),
+            ] {
+                for projects in [Vec::new(), populated.clone()] {
+                    let model = SidebarModel {
+                        mode,
+                        data_state: data_state.clone(),
+                        projects,
+                    };
+                    for selection in &selections {
+                        for controls_expanded in [false, true] {
+                            let mut state = SidebarState {
+                                controls_expanded,
+                                selection: *selection,
+                                ..SidebarState::default()
+                            };
+                            state.apply(&SidebarAction::TogglePullRequests(project_id(1)));
+
+                            let element = view(&model, &state, mode, DEFAULT_EXPANDED_WIDTH, false);
+                            let mut seen = BTreeSet::new();
+                            for id in control_ids(&element) {
+                                // Only named identities share the runtime's
+                                // map; an unnamed widget gets a fresh unique
+                                // id per instance, which `Display` renders as
+                                // "Undefined" and which cannot collide.
+                                if id == "Undefined" {
+                                    continue;
+                                }
+                                assert!(
+                                    seen.insert(id.clone()),
+                                    "{id} is rendered twice at {mode:?} \
+                                     with {} project(s), {data_state:?}, \
+                                     selection {selection:?}, controls \
+                                     {controls_expanded}",
+                                    model.projects.len()
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 
     #[test]
