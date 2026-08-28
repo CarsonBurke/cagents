@@ -1613,8 +1613,20 @@ mod tests {
             command.get_env("TERM_PROGRAM_VERSION"),
             Some(OsStr::new(env!("CARGO_PKG_VERSION")))
         );
-        // The identity we set is what a child should see; that every inherited
-        // marker is gone is proved by the test below, which plants them first.
+        // The test below proves the scrub removes names; this one proves
+        // `command_from_recipe` still calls it. Only markers this host
+        // actually set can witness that, so the assertion is conditional
+        // rather than absent: on a host inside kitty or tmux it is real
+        // coverage of the call site, and on a bare host it costs nothing.
+        for name in INHERITED_TERMINAL_MARKERS {
+            if matches!(*name, "TERM_PROGRAM" | "TERM_PROGRAM_VERSION" | "COLORTERM") {
+                // Set again, deliberately, after the scrub.
+                continue;
+            }
+            if std::env::var_os(name).is_some() {
+                assert_eq!(command.get_env(name), None, "{name} reached the child");
+            }
+        }
     }
 
     #[test]
