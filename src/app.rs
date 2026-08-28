@@ -3565,6 +3565,19 @@ impl Application for Cagents {
                 task
             }
             Message::Sidebar(action) => {
+                // A control in the pane can still be activated while a dialog
+                // is up: the modal captures the pointer, and the focus
+                // operation the dialog issues on open cannot reach a pane
+                // widget to unfocus it, so a focused control keeps its focus
+                // and answers to Enter, and an assistive technology's own
+                // activation is not captured at all. Acting on one would
+                // replace the dialog the user is filling in with a fresh one,
+                // discarding what they had typed. Nothing is recorded either:
+                // the selection an open would set is a claim that a card
+                // exists, and refusing the open would make it a false one.
+                if self.modal_is_open() {
+                    return Task::none();
+                }
                 self.sidebar_state.apply(&action);
                 match action {
                     SidebarAction::OpenRepositoryPicker => {
