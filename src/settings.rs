@@ -112,6 +112,9 @@ impl KeyboardShortcuts {
             }
             for chord in chords {
                 let binding = parse_shortcut(chord).map_err(SettingsError::InvalidShortcut)?;
+                if let Some(message) = withheld_from_the_card(binding) {
+                    return Err(SettingsError::InvalidShortcut(message));
+                }
                 if parsed.contains(&binding) {
                     return Err(SettingsError::InvalidShortcut(
                         "keyboard shortcuts must not conflict",
@@ -121,6 +124,31 @@ impl KeyboardShortcuts {
             }
         }
         Ok(())
+    }
+}
+
+/// Why a chord must not be bound, or `None` when binding it is safe.
+///
+/// A bound chord is also a reserved one: the card widget captures it and never
+/// forwards it to the process inside the card. That is the point for `Ctrl+W`,
+/// but the control characters that carry a signal or end input are how a user
+/// stops a runaway program, and a card that swallows them offers no clue that
+/// it is doing so.
+fn withheld_from_the_card(binding: ShortcutBinding) -> Option<&'static str> {
+    if !binding.control || binding.alt || binding.shift || binding.logo {
+        // Only the bare `Ctrl` chord reaches a child as a control character.
+        // `Ctrl+Shift+C` is the conventional copy gesture and sends nothing,
+        // and adding Alt or Super makes it an escape sequence instead.
+        return None;
+    }
+    match binding.key {
+        ShortcutKey::Character('c') => Some("Ctrl+C interrupts the program in a card"),
+        ShortcutKey::Character('d') => Some("Ctrl+D ends input to the program in a card"),
+        ShortcutKey::Character('z') => Some("Ctrl+Z suspends the program in a card"),
+        ShortcutKey::Character('s') | ShortcutKey::Character('q') => {
+            Some("Ctrl+S and Ctrl+Q control the flow of output in a card")
+        }
+        _ => None,
     }
 }
 
@@ -785,6 +813,32 @@ mod tests {
         assert!(defaults.previous_column.iter().any(|c| c == "Alt+Left"));
         assert!(defaults.next_column.iter().any(|c| c == "Alt+Right"));
         assert!(AppSettings::default().validate().is_ok());
+    }
+
+    #[test]
+    fn a_chord_a_card_needs_for_safety_cannot_be_bound() {
+        // A bound chord is reserved, so the card never sees it: binding one of
+        // these would leave a runaway program with no way to be stopped.
+        for chord in ["Ctrl+C", "Ctrl+D", "Ctrl+Z", "Ctrl+S", "Ctrl+Q"] {
+            let mut settings = AppSettings::default();
+            settings.keyboard_shortcuts.new_terminal = vec![chord.to_owned()];
+            assert!(
+                matches!(
+                    settings.validate(),
+                    Err(SettingsError::InvalidShortcut(message)) if message.contains("card")
+                ),
+                "{chord} was accepted"
+            );
+        }
+
+        // The gesture only reaches the child as a control character when Ctrl
+        // is alone: the shifted and Alt forms send something else, or nothing,
+        // and stay bindable.
+        for chord in ["Ctrl+Shift+C", "Ctrl+Alt+D", "Super+Z"] {
+            let mut settings = AppSettings::default();
+            settings.keyboard_shortcuts.new_terminal = vec![chord.to_owned()];
+            assert!(settings.validate().is_ok(), "{chord} was refused");
+        }
     }
 
     #[test]
