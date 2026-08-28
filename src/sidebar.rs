@@ -2291,7 +2291,39 @@ mod tests {
         // the next focus traversal or draw panics on the downcast. The header's
         // command for the selected project and that project's own row are the
         // pair that collided, so selection is part of the cross product.
-        let populated = vec![project()];
+        // More than one of everything: a constant id minted inside a
+        // per-entity view renders once with a thin fixture and passes, so the
+        // pane carries two projects, and the first has two worktrees and two
+        // pull requests.
+        let mut crowded = project();
+        crowded.pull_requests.push(SidebarPullRequest::new(
+            project_id(1),
+            43,
+            "Rename the pane".into(),
+            Url::parse("https://github.com/example/cagents/pull/43").unwrap(),
+            "main".into(),
+            None,
+            true,
+            CheckStatus::Passing,
+        ));
+        let other = SidebarProject::new(
+            project_id(4),
+            RepositoryId(Uuid::from_u128(11)),
+            "Orca".into(),
+            "/repo/orca".into(),
+            vec![worktree(5, "main", false)],
+            vec![SidebarPullRequest::new(
+                project_id(4),
+                7,
+                "Trim the deps".into(),
+                Url::parse("https://github.com/example/orca/pull/7").unwrap(),
+                "main".into(),
+                Some("octocat".into()),
+                false,
+                CheckStatus::Passing,
+            )],
+        );
+        let populated = vec![crowded, other];
         let selections = [
             None,
             Some(SidebarSelection::Project(project_id(1))),
@@ -2328,6 +2360,7 @@ mod tests {
                                 ..SidebarState::default()
                             };
                             state.apply(&SidebarAction::TogglePullRequests(project_id(1)));
+                            state.apply(&SidebarAction::TogglePullRequests(project_id(4)));
 
                             let element = view(&model, &state, mode, DEFAULT_EXPANDED_WIDTH, false);
                             let mut seen = BTreeSet::new();
