@@ -2,6 +2,8 @@ use cosmic::app::Settings;
 use tracing_subscriber::EnvFilter;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let _application_lease = cagents::instance::ApplicationLease::acquire_for_ui()?;
+
     tracing_subscriber::fmt()
         .with_env_filter(
             EnvFilter::try_from_default_env()

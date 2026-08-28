@@ -1,10 +1,13 @@
 use std::{
     collections::BTreeMap,
     ffi::{OsStr, OsString},
-    io,
-    os::unix::{net::UnixStream, process::CommandExt},
+    io::{self, Read},
+    os::{
+        fd::AsRawFd,
+        unix::{net::UnixStream, process::CommandExt},
+    },
     path::{Path, PathBuf},
-    process::{Command, ExitCode, Stdio},
+    process::{ChildStdout, Command, ExitCode, Stdio},
     thread,
     time::{Duration, Instant},
 };
@@ -15,6 +18,7 @@ use serde_json::{Value, json};
 use thiserror::Error;
 
 use crate::{
+    instance::{UI_LAUNCH_ERROR_PREFIX, UI_LAUNCH_HANDSHAKE_ENV, UI_LAUNCH_READY},
     model::{HostSessionProof, LaunchRecipe, TerminalContinuity, TerminalId, TerminalSession},
     terminal::{
         self, TerminalSpawnOptions,
@@ -29,6 +33,8 @@ use crate::{
 const IO_TIMEOUT: Duration = Duration::from_secs(5);
 const SNAPSHOT_RETRY_INTERVAL: Duration = Duration::from_millis(25);
 const WAIT_POLL_INTERVAL: Duration = Duration::from_millis(100);
+const UI_LAUNCH_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
+const MAX_UI_LAUNCH_HANDSHAKE_BYTES: usize = 4096;
 const MAX_WAIT_SECONDS: f64 = 24.0 * 60.0 * 60.0;
 
 #[derive(Debug, Parser)]
@@ -855,18 +861,95 @@ fn launch_ui() -> Result<CommandOutput, AppError> {
         sibling_executable("cagents-ui").map_err(|error| AppError::new("launch", error))?;
     let mut command = Command::new(&executable);
     command
+        .env(UI_LAUNCH_HANDSHAKE_ENV, "1")
         .stdin(Stdio::null())
-        .stdout(Stdio::null())
+        .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .process_group(0);
-    command
+    let mut child = command
         .spawn()
         .map_err(|error| AppError::new("launch", error))?;
+    let launch_result = child
+        .stdout
+        .take()
+        .ok_or_else(|| io::Error::other("cagents-ui handshake pipe was not created"))
+        .and_then(|mut stdout| read_ui_launch_handshake(&mut stdout));
+    if let Err(error) = launch_result {
+        if child.try_wait().ok().flatten().is_none() {
+            let _ = child.kill();
+        }
+        let _ = child.wait();
+        return Err(AppError::new("launch", error));
+    }
     Ok(CommandOutput {
         command: "ui",
         data: json!({ "launched": true, "executable": executable }),
         human: "cagents-ui started".to_owned(),
     })
+}
+
+fn read_ui_launch_handshake(stdout: &mut ChildStdout) -> io::Result<()> {
+    let descriptor = stdout.as_raw_fd();
+    // SAFETY: fcntl receives a live descriptor and integer flags only.
+    let flags = unsafe { libc::fcntl(descriptor, libc::F_GETFL) };
+    if flags == -1
+        || unsafe { libc::fcntl(descriptor, libc::F_SETFL, flags | libc::O_NONBLOCK) } == -1
+    {
+        return Err(io::Error::last_os_error());
+    }
+
+    let deadline = Instant::now() + UI_LAUNCH_HANDSHAKE_TIMEOUT;
+    let mut response = Vec::new();
+    let mut buffer = [0_u8; 256];
+    loop {
+        match stdout.read(&mut buffer) {
+            Ok(0) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "cagents-ui exited before acknowledging startup",
+                ));
+            }
+            Ok(read) => {
+                response.extend_from_slice(&buffer[..read]);
+                if response.len() > MAX_UI_LAUNCH_HANDSHAKE_BYTES {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "cagents-ui startup response was too large",
+                    ));
+                }
+                if let Some(newline) = response.iter().position(|byte| *byte == b'\n') {
+                    response.truncate(newline);
+                    return parse_ui_launch_handshake(&response);
+                }
+            }
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                if Instant::now() >= deadline {
+                    return Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "cagents-ui did not acknowledge startup within 5 seconds",
+                    ));
+                }
+                thread::sleep(Duration::from_millis(10));
+            }
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+fn parse_ui_launch_handshake(response: &[u8]) -> io::Result<()> {
+    let response = std::str::from_utf8(response)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    if response == UI_LAUNCH_READY {
+        return Ok(());
+    }
+    if let Some(message) = response.strip_prefix(UI_LAUNCH_ERROR_PREFIX) {
+        return Err(io::Error::other(message.to_owned()));
+    }
+    Err(io::Error::new(
+        io::ErrorKind::InvalidData,
+        "cagents-ui returned an invalid startup response",
+    ))
 }
 
 fn execute_daemon(command: DaemonCommand) -> Result<CommandOutput, AppError> {
@@ -1380,5 +1463,19 @@ mod tests {
             ));
             server.join().unwrap();
         }
+    }
+    #[test]
+    fn ui_launch_handshake_surfaces_child_startup_errors() {
+        parse_ui_launch_handshake(UI_LAUNCH_READY.as_bytes()).unwrap();
+
+        let error = parse_ui_launch_handshake(
+            format!("{UI_LAUNCH_ERROR_PREFIX}upgrade the peer package").as_bytes(),
+        )
+        .unwrap_err();
+        assert_eq!(error.to_string(), "upgrade the peer package");
+        assert_eq!(
+            parse_ui_launch_handshake(b"unknown").unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
     }
 }

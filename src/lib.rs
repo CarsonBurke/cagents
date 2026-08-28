@@ -1,8 +1,11 @@
 pub mod app;
+#[cfg(feature = "integrated-browser")]
 pub mod browser;
+pub mod capability;
 pub mod control;
 pub mod github;
 pub mod host;
+pub mod instance;
 pub mod lifecycle;
 pub mod model;
 pub mod performance;

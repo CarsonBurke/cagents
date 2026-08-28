@@ -50,14 +50,60 @@ jobs:
           fi
           printf 'VERSION=%s\n' "$version" >> "$GITHUB_ENV"
 
-      - name: Test all targets in the release profile
+      - name: Test both feature configurations in the release profile
         run: |
           set -euo pipefail
           zig version
           cargo test --locked --release --all-targets
+          cargo test --locked --release --no-default-features --all-targets
 
-      - name: Build Linux packages
-        run: ./scripts/package-linux.sh
+      - name: Build full and browserless Linux packages
+        run: |
+          ./scripts/package-linux.sh --variant full
+          ./scripts/package-linux.sh --variant browserless
+
+      - name: Record full-to-browserless artifact deltas
+        run: |
+          set -euo pipefail
+          full_report="dist/cagents-${VERSION}-sizes.txt"
+          browserless_report="dist/cagents-browserless-${VERSION}-sizes.txt"
+          metric() {
+            value=$(sed -n "s/^$2=//p" "$1")
+            case "$value" in
+              ''|*[!0-9]*)
+                echo "Invalid $2 measurement in $1" >&2
+                exit 1
+                ;;
+            esac
+            printf '%s' "$value"
+          }
+          full_packages=$(metric "$full_report" resolved_package_ids)
+          browserless_packages=$(metric "$browserless_report" resolved_package_ids)
+          full_build=$(metric "$full_report" build_seconds)
+          browserless_build=$(metric "$browserless_report" build_seconds)
+          full_installed=$(metric "$full_report" installed_binary_bytes)
+          browserless_installed=$(metric "$browserless_report" installed_binary_bytes)
+          full_archive=$(metric "$full_report" portable_archive_bytes)
+          browserless_archive=$(metric "$browserless_report" portable_archive_bytes)
+          full_deb=$(metric "$full_report" debian_package_bytes)
+          browserless_deb=$(metric "$browserless_report" debian_package_bytes)
+          cat > "dist/cagents-${VERSION}-artifact-comparison.txt" <<EOF
+          full_resolved_package_ids=$full_packages
+          browserless_resolved_package_ids=$browserless_packages
+          resolved_package_id_reduction=$((full_packages - browserless_packages))
+          full_build_seconds=$full_build
+          browserless_build_seconds=$browserless_build
+          build_seconds_reduction=$((full_build - browserless_build))
+          full_installed_binary_bytes=$full_installed
+          browserless_installed_binary_bytes=$browserless_installed
+          installed_binary_byte_reduction=$((full_installed - browserless_installed))
+          full_portable_archive_bytes=$full_archive
+          browserless_portable_archive_bytes=$browserless_archive
+          portable_archive_byte_reduction=$((full_archive - browserless_archive))
+          full_debian_package_bytes=$full_deb
+          browserless_debian_package_bytes=$browserless_deb
+          debian_package_byte_reduction=$((full_deb - browserless_deb))
+          EOF
 
       - name: Stamp the installer and regenerate checksums
         run: |
@@ -72,6 +118,8 @@ jobs:
             sha256sum \
               "cagents-${VERSION}-x86_64-unknown-linux-gnu.tar.gz" \
               "cagents_${VERSION}_amd64.deb" \
+              "cagents-${VERSION}-sizes.txt" \
+              "cagents-${VERSION}-artifact-comparison.txt" \
               install.sh > SHA256SUMS
           )
 
@@ -87,6 +135,15 @@ jobs:
           appstreamcli validate --no-net --override=url-homepage-missing=info \
             "$root/share/metainfo/dev.cagents.Cagents.metainfo.xml"
           dpkg-deb --info "dist/cagents_${VERSION}_amd64.deb" >/dev/null
+          dpkg-deb --info "dist/cagents-browserless_${VERSION}_amd64.deb" >/dev/null
+          browserless_root="$staging/cagents-browserless-deb"
+          mkdir "$browserless_root"
+          dpkg-deb --extract \
+            "dist/cagents-browserless_${VERSION}_amd64.deb" "$browserless_root"
+          desktop-file-validate \
+            "$browserless_root/usr/share/applications/dev.cagents.Cagents.Browserless.desktop"
+          appstreamcli validate --no-net --override=url-homepage-missing=info \
+            "$browserless_root/usr/share/metainfo/dev.cagents.Cagents.Browserless.metainfo.xml"
 
       - name: Stage and publish the GitHub release
         env:
@@ -98,8 +155,14 @@ jobs:
           assets=(
             "dist/cagents-${VERSION}-x86_64-unknown-linux-gnu.tar.gz"
             "dist/cagents_${VERSION}_amd64.deb"
+            "dist/cagents-${VERSION}-sizes.txt"
+            "dist/cagents-${VERSION}-artifact-comparison.txt"
             dist/SHA256SUMS
             dist/install.sh
+            "dist/cagents-browserless-${VERSION}-x86_64-unknown-linux-gnu.tar.gz"
+            "dist/cagents-browserless_${VERSION}_amd64.deb"
+            "dist/cagents-browserless-${VERSION}-sizes.txt"
+            dist/SHA256SUMS-browserless
           )
 
           if release_state="$(

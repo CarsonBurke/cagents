@@ -30,19 +30,25 @@ sudo apt-get install --yes --no-install-recommends \
   build-essential clang cmake git libclang-dev libdbus-1-dev \
   libegl1-mesa-dev libfontconfig1-dev libfreetype6-dev libgbm-dev \
   libgl1-mesa-dev libssl-dev libudev-dev libwayland-dev \
-  libxkbcommon-dev ninja-build pkg-config python3 xz-utils
+  libxkbcommon-dev ninja-build pkg-config python3 xdg-utils xz-utils
 rustup toolchain install 1.93.0 --profile minimal
 rustup default 1.93.0
 ```
 
-Install Zig 0.15.2 from [ziglang.org](https://ziglang.org/download/) and ensure `zig` is on `PATH`. Build all three executables before running so the UI and CLI can find their sibling `cagentsd`:
+Install Zig 0.15.2 from [ziglang.org](https://ziglang.org/download/) and ensure `zig` is on `PATH`. The default feature set includes the integrated Servo browser. Build all three executables before running so the UI and CLI can find their sibling `cagentsd`:
 
 ```sh
 cargo build --locked --bins
 cargo run --locked --bin cagents-ui
 ```
 
-Running only one binary from an unrelated directory is not a supported layout; `cagents`, `cagents-ui`, and `cagentsd` must remain together.
+For the browserless configuration, this single command builds the same three executables while excluding the `integrated-browser` feature and Servo's engine graph:
+
+```sh
+cargo build --locked --release --no-default-features --bins
+```
+
+Browserless builds keep terminals, repositories, worktrees, GitHub pull-request flows, and persistence. New links use the desktop portal and fall back to the system `xdg-open` handler when a portal is unavailable; Debian packages install `xdg-utils`, and portable/source users must provide it for that fallback. A restored browser card retains its saved URL, history, scroll position, and fidelity, shows that the integrated browser is unavailable, and offers **Open in system browser**. Running only one binary from an unrelated directory is not a supported layout; `cagents`, `cagents-ui`, and `cagentsd` must remain together.
 
 ## Install a release
 
@@ -131,6 +137,18 @@ sudo apt install git "./cagents_${VERSION}_amd64.deb"
 
 The Debian package installs the three executables together under `/usr/libexec/cagents`, exposes `/usr/bin/cagents`, and installs the desktop entry, icon, and AppStream metadata system-wide.
 
+The separately named browserless package can be installed alongside the full package. It uses `/usr/libexec/cagents-browserless`, exposes `/usr/bin/cagents-browserless`, and installs separately identified desktop and AppStream metadata:
+
+```sh
+curl --proto '=https' --tlsv1.2 --fail --location --remote-name \
+  "https://github.com/${REPOSITORY}/releases/download/v${VERSION}/cagents-browserless_${VERSION}_amd64.deb"
+curl --proto '=https' --tlsv1.2 --fail --location --remote-name \
+  "https://github.com/${REPOSITORY}/releases/download/v${VERSION}/SHA256SUMS-browserless"
+sha256sum --ignore-missing --strict --check SHA256SUMS-browserless
+sudo apt install git "./cagents-browserless_${VERSION}_amd64.deb"
+cagents-browserless ui
+```
+
 ### Portable archive
 
 The archive is self-contained as a directory layout, not as a static executable. Keep its `bin` directory intact:
@@ -167,7 +185,7 @@ Run `cagents --help` or `cagents terminal --help` for the complete command set.
 
 ## Daemon and user data
 
-There is no service unit, login autostart, or system daemon. A UI or terminal command starts the per-user sibling `cagentsd` on demand. The daemon runs independently after the launching process exits so terminals can survive UI restarts. Stop it explicitly with `cagents daemon stop`; installers and package upgrades also stop an old daemon before switching executables.
+There is no service unit, login autostart, or system daemon. A UI or terminal command starts the per-user sibling `cagentsd` on demand. The daemon runs independently after the launching process exits so terminals can survive UI restarts. Full and browserless builds share the established protocol-3 daemon socket, preserving live terminals when upgrading or switching variants. A protocol change must deliberately retain or migrate that namespace. One shared application lease prevents concurrent UI processes from racing writes to their common session store. During the lease rollout, startup rejects both a UI left running from an older build and a Debian peer package that predates the lease marker; upgrade that peer before switching variants. Stop the shared daemon explicitly with either control command (`cagents daemon stop` or `cagents-browserless daemon stop`); installers and package upgrades stop the daemon owned by the package being changed while preserving a compatible peer package's daemon.
 
 cagents follows the XDG base-directory convention:
 
@@ -175,7 +193,7 @@ cagents follows the XDG base-directory convention:
 - Session database: `${XDG_DATA_HOME:-$HOME/.local/share}/cagents/sessions.sqlite3`
 - Terminal transcripts: `${XDG_DATA_HOME:-$HOME/.local/share}/cagents/transcripts/`
 - Cache, when present: `${XDG_CACHE_HOME:-$HOME/.cache}/cagents/`
-- Daemon socket and lock: `$XDG_RUNTIME_DIR/cagents/`
+- Daemon socket and lock: `$XDG_RUNTIME_DIR/cagents/` (shared by full and browserless protocol version 3 builds)
 
 Program files installed by `install.sh` live separately under `${XDG_DATA_HOME:-$HOME/.local/share}/cagents-install/`.
 
@@ -257,19 +275,35 @@ The downloaded installer offers the equivalent `--uninstall` and `--purge` optio
 Remove a Debian installation with:
 
 ```sh
-sudo apt remove cagents
+sudo apt remove cagents             # full package
+sudo apt remove cagents-browserless # browserless package
 ```
 
 APT removal and purge do not delete files in the user's XDG directories.
 
 ## Releases
 
-Once a canonical GitHub repository is configured, pushing a `v*` tag runs `.github/workflows/release.yml` on Ubuntu 22.04 with Rust 1.93 and Zig 0.15.2. The tag must exactly equal `v` plus the version in `Cargo.toml`; a mismatch fails before package publication. A successful release runs locked, all-target tests in the release profile, then calls `scripts/package-linux.sh` so its production binary build reuses the release-profile dependency artifacts. The workflow also validates the desktop and AppStream metadata, stamps the canonical repository into `dist/install.sh`, regenerates `SHA256SUMS`, and creates a non-draft GitHub release containing:
+Once a canonical GitHub repository is configured, pushing a `v*` tag runs `.github/workflows/release.yml` on Ubuntu 22.04 with Rust 1.93 and Zig 0.15.2. The tag must exactly equal `v` plus the version in `Cargo.toml`; a mismatch fails before package publication. A successful release runs locked, all-target tests for both feature configurations in the release profile, then packages the full and browserless builds while reusing their release-profile dependency artifacts. The workflow records resolved-package counts, build times, stripped installed sizes, and compressed sizes; validates both sets of desktop and AppStream metadata; stamps the canonical repository into `dist/install.sh`; regenerates checksums; and creates a non-draft GitHub release containing:
 
 - `cagents-${VERSION}-x86_64-unknown-linux-gnu.tar.gz`
 - `cagents_${VERSION}_amd64.deb`
+- `cagents-${VERSION}-sizes.txt`
+- `cagents-${VERSION}-artifact-comparison.txt`
 - `SHA256SUMS`
 - `install.sh`
+- `cagents-browserless-${VERSION}-x86_64-unknown-linux-gnu.tar.gz`
+- `cagents-browserless_${VERSION}_amd64.deb`
+- `cagents-browserless-${VERSION}-sizes.txt`
+- `SHA256SUMS-browserless`
+
+The package script keeps the existing full package as its default and writes browserless build outputs to a separate Cargo target directory. Run both variants to compare their generated measurement reports without either artifact overwriting the other:
+
+```sh
+./scripts/package-linux.sh --variant full
+./scripts/package-linux.sh --variant browserless
+cat dist/cagents-"${VERSION}"-sizes.txt \
+  dist/cagents-browserless-"${VERSION}"-sizes.txt
+```
 
 The workflow uses its least-privilege GitHub token for publication through the preinstalled `gh` CLI; it does not require a maintainer's personal `gh` login.
 

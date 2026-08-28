@@ -36,7 +36,11 @@ pub const MAX_FRAME_BYTES: usize = 8 * 1024 * 1024;
 pub const MAX_CLIENT_FRAME_BYTES: usize = 2 * 1024 * 1024;
 pub const MAX_INPUT_BYTES: usize = 1024 * 1024;
 pub const MAX_RESUME_TERMINALS: usize = 1024;
+/// Shared by build variants that speak protocol 3. Keep this legacy namespace
+/// while protocol 3 remains current so upgrades can resume existing terminals.
 pub const RUNTIME_SUBDIRECTORY: &str = "cagents";
+#[cfg(test)]
+const RUNTIME_NAMESPACE_PROTOCOL_VERSION: u16 = 3;
 pub const SOCKET_FILE_NAME: &str = "cagentsd.sock";
 
 /// Returns the current user's cagents daemon socket path.
@@ -1088,6 +1092,14 @@ mod tests {
             boot_id: BootId::new(boot),
             host_incarnation: HostIncarnation::new(incarnation),
         }
+    }
+
+    #[test]
+    fn runtime_namespace_version_matches_the_wire_protocol() {
+        assert_eq!(
+            RUNTIME_NAMESPACE_PROTOCOL_VERSION, PROTOCOL_VERSION,
+            "a protocol change must deliberately retain or migrate the daemon namespace"
+        );
     }
 
     #[test]
