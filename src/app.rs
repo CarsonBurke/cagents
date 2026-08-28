@@ -1160,6 +1160,9 @@ pub struct Cagents {
     browser_factory: Option<Arc<RawWaylandSubsurfaceFactory>>,
     browser_parent_lifetime: Option<Arc<ParentWindowLifetime>>,
     window_scale_factor: f32,
+    /// Starts at an estimate, because the pane density and the strip's viewport
+    /// are both derived from it and the surface does not report a width until
+    /// it has been mapped. `Message::WindowResized` replaces it.
     window_width: f32,
     core: Core,
     settings_path: Option<PathBuf>,
@@ -2101,13 +2104,16 @@ impl Cagents {
             // Superseded by a later arming, whose own delivery is still to come.
             return Task::none();
         }
+        // A matching generation carries the deadline it was armed with, because
+        // `arm_lifecycle_sweep` writes both together, so neither branch below
+        // is reachable through the normal path. They are guards, not flow: a
+        // sweep that ran without a deadline has nothing to do, and a timer that
+        // woke marginally early must wait out the grace rather than cut it.
         let Some(deadline) = self.lifecycle_sweep_deadline else {
             return Task::none();
         };
         let remaining = deadline.saturating_duration_since(Instant::now());
         if !remaining.is_zero() {
-            // Later requests pushed the deadline out; wait for the remainder
-            // rather than sweeping early.
             return self.arm_lifecycle_sweep(deadline);
         }
         self.lifecycle_sweep_deadline = None;
@@ -3317,8 +3323,11 @@ impl Application for Cagents {
         // mounts nothing but its overscan band, so without a seed the frame in
         // which the strip first appears - at startup, and again when the first
         // card arrives - flashes empty and rebuilds every card's widget state.
-        // The pane and the strip split the window, so this is the right width
-        // until the surface reports its own.
+        // The pane and the strip split the window, so subtracting the pane from
+        // the starting width is the closest estimate available before the
+        // surface reports its own, and `WindowResized` re-projects against the
+        // real one. Card widths are fractions re-derived per frame, so an
+        // estimate costs nothing but is enough to mount them.
         let sidebar_width = sidebar::effective_width(
             SidebarMode::for_width(app.window_width),
             app.settings.sidebar_width,
