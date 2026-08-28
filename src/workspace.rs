@@ -110,10 +110,14 @@ pub const MAX_CARD_NAME_CHARS: usize = 256;
 
 /// Normalises a card name, or `None` when nothing legible survives.
 ///
-/// Every name reaches a card through [`WorkspaceCard::new`] or
-/// [`Workspace::rename_card`], both of which normalise here, so no ingress -
-/// a reported title, a directory name, a restored session - can carry an
-/// unbounded or reordering name into the model.
+/// Two kinds of name exist and both normalise. [`WorkspaceCard::new`] and
+/// [`Workspace::rename_card`] normalise here, by construction, so the model
+/// cannot hold an unbounded or reordering `accessible_name`. The name the
+/// surfaces actually read is the durable `CardState::title`, which every
+/// writer normalises at its own call site: the four that name a new card, the
+/// reported-title path, and the restore path that re-admits titles stored by
+/// a build predating this function. A new writer of that field must call
+/// here too; nothing in the type system will remind it.
 ///
 /// Formatting characters are dropped rather than escaped: none of the surfaces
 /// that show a name can render them meaningfully, and a bidi override in the
