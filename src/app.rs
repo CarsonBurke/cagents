@@ -5007,33 +5007,38 @@ fn settings_category_controls<'a>(
         )],
         SettingsCategory::Keyboard => vec![settings_group(
             "Keyboard shortcuts",
-            "Each row takes one or more chords separated by commas. Use Ctrl, Alt, or Super, optionally with Shift, plus A-Z, 0-9, Left, or Right. Every chord in the table must be unique.",
+            "Each row takes one or more chords separated by commas, and applies when you press Enter. Use Ctrl, Alt, or Super, optionally with Shift, plus A-Z, 0-9, Left, or Right. Every chord in the table must be unique.",
             vec![
-                setting_input(
+                // Applied on submit, not per keystroke: a partly typed list
+                // parses on its way to the one the user means - "Alt+A" is a
+                // valid chord while "Alt+A, Alt+Left" is being typed - and
+                // adopting each prefix would rebind the action and rewrite the
+                // settings file at typing speed.
+                setting_input_on_submit(
                     "New terminal",
                     "Creates a terminal column.",
                     &draft.keyboard_shortcuts.new_terminal,
                     SettingsField::ShortcutNewTerminal,
                 ),
-                setting_input(
+                setting_input_on_submit(
                     "Close focused column",
                     "Closes the active workspace column.",
                     &draft.keyboard_shortcuts.close_focused_column,
                     SettingsField::ShortcutCloseFocusedColumn,
                 ),
-                setting_input(
+                setting_input_on_submit(
                     "Search projects",
                     "Moves keyboard focus to project search.",
                     &draft.keyboard_shortcuts.search_projects,
                     SettingsField::ShortcutSearchProjects,
                 ),
-                setting_input(
+                setting_input_on_submit(
                     "Previous column",
                     "Moves focus left and may repeat while held.",
                     &draft.keyboard_shortcuts.previous_column,
                     SettingsField::ShortcutPreviousColumn,
                 ),
-                setting_input(
+                setting_input_on_submit(
                     "Next column",
                     "Moves focus right and may repeat while held.",
                     &draft.keyboard_shortcuts.next_column,
