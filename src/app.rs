@@ -4055,18 +4055,23 @@ impl Application for Cagents {
                     return Task::none();
                 };
                 let request = CreatePullRequestRequest {
-                    repository: dialog.repository,
-                    base: dialog.base,
-                    head: dialog.head,
-                    title: dialog.title,
-                    body: dialog.body,
+                    repository: dialog.repository.clone(),
+                    base: dialog.base.clone(),
+                    head: dialog.head.clone(),
+                    title: dialog.title.clone(),
+                    body: dialog.body.clone(),
                     draft: dialog.draft,
                     labels: Vec::new(),
                     reviewers: Vec::new(),
                 };
                 if let Err(error) = request.validate() {
+                    // Kept, not discarded: the description is the longest thing
+                    // the user types anywhere in the application, and a rejected
+                    // title is no reason to take it away from them.
                     self.status = Some(TransientNotice::error(error.to_string()));
-                    return Task::none();
+                    self.pull_request_dialog = Some(dialog);
+                    return iced::widget::operation::focus(pull_request_dialog_focus_id())
+                        .map(cosmic::Action::App);
                 }
                 cosmic::task::future(async move {
                     let result = tokio::task::spawn_blocking(move || {
