@@ -1062,12 +1062,17 @@ fn child_exit_event(exited: &mut bool, result: ChildExit) -> Option<TerminalEven
 /// Some entries are worse than a wrong identity, because they name a live
 /// control channel into something of the user's that a card is not inside:
 /// `KITTY_LISTEN_ON` fully controls their real kitty instance, `TMUX` and
-/// `STY` and `ZELLIJ` reach every pane of their multiplexer session, and
-/// `NVIM` is an RPC socket that runs commands in their editor. A child that
-/// inherited any of them could act outside its own card - the exact
-/// containment this scrub exists to establish. `LC_TERMINAL` and
-/// `LC_TERMINAL_VERSION` match sshd's default `AcceptEnv LC_*`, so they carry
-/// the wrong identity onto every host the child then reaches.
+/// `STY` and `ZELLIJ` reach every pane of their multiplexer session, the
+/// `KONSOLE_DBUS_*` triple drives their real Konsole over the session bus, and
+/// `NVIM`, `VSCODE_IPC_HOOK_CLI` and `EMACS_SERVER_FILE` each run commands in
+/// their editor. A child that inherited any of them could act outside its own
+/// card - the exact containment this scrub exists to establish. `LC_TERMINAL`
+/// and `LC_TERMINAL_VERSION` match sshd's default `AcceptEnv LC_*`, so they
+/// carry the wrong identity onto every host the child then reaches.
+///
+/// Every emulator here contributes both halves where it has them, identity and
+/// channel, because a channel is only reachable once and an identity is only
+/// misleading once.
 ///
 /// Grouped by the emulator that sets them, with the names any of them may set
 /// first and `COLORTERM` - which we go on to set ourselves - last.
@@ -1102,10 +1107,18 @@ const INHERITED_TERMINAL_MARKERS: &[&str] = &[
     "LC_TERMINAL",
     "LC_TERMINAL_VERSION",
     "KONSOLE_VERSION",
+    "KONSOLE_DBUS_SERVICE",
+    "KONSOLE_DBUS_SESSION",
+    "KONSOLE_DBUS_WINDOW",
     "WT_SESSION",
     "WT_PROFILE_ID",
     "ZED_TERM",
     "VSCODE_INJECTION",
+    "VSCODE_IPC_HOOK_CLI",
+    "VSCODE_GIT_IPC_HANDLE",
+    "VSCODE_GIT_ASKPASS_NODE",
+    "VSCODE_GIT_ASKPASS_MAIN",
+    "EMACS_SERVER_FILE",
     "TMUX",
     "TMUX_PANE",
     "STY",
@@ -1117,13 +1130,22 @@ const INHERITED_TERMINAL_MARKERS: &[&str] = &[
     "COLORTERM",
 ];
 
+/// Drops every inherited marker from a command's environment.
+///
+/// Separate from [`command_from_recipe`] so a test can plant all of them and
+/// watch them go, rather than observing that a host which never set them does
+/// not have them.
+fn scrub_inherited_markers(command: &mut CommandBuilder) {
+    for name in INHERITED_TERMINAL_MARKERS {
+        command.env_remove(name);
+    }
+}
+
 fn command_from_recipe(recipe: &LaunchRecipe) -> CommandBuilder {
     let mut command = CommandBuilder::new(&recipe.program);
     command.args(&recipe.arguments);
     command.cwd(&recipe.working_directory);
-    for name in INHERITED_TERMINAL_MARKERS {
-        command.env_remove(name);
-    }
+    scrub_inherited_markers(&mut command);
     // `xterm-256color` rather than a cagents-specific entry: we ship no
     // terminfo database, and a name the host lacks breaks every curses program.
     command.env("TERM", "xterm-256color");
@@ -1591,40 +1613,48 @@ mod tests {
             command.get_env("TERM_PROGRAM_VERSION"),
             Some(OsStr::new(env!("CARGO_PKG_VERSION")))
         );
-        // Each control channel by name as well as by list membership: these
-        // reach the user's real kitty instance, multiplexer session and
-        // editor, so dropping one from the list would be a containment hole
-        // rather than a cosmetic regression.
-        //
-        // Membership is the load-bearing half. `CommandBuilder::new` seeds its
-        // map from `std::env::vars_os`, and spawning clears the child
-        // environment and applies only that map, so a name on the list cannot
-        // reach a child - while the absence assertion alone would also pass
-        // for a variable this test process never had.
+        // The identity we set is what a child should see; that every inherited
+        // marker is gone is proved by the test below, which plants them first.
+    }
+
+    #[test]
+    fn every_inherited_marker_is_dropped_from_the_child_environment() {
+        // Planted rather than inherited: `CommandBuilder::new` seeds its map
+        // from `std::env::vars_os`, so asserting absence on a fresh command
+        // would pass on any host that never set these - which is every host
+        // for most of the list, and so would pass with the scrub deleted.
+        let mut command = CommandBuilder::new("/bin/sh");
+        command.env_clear();
+        for name in INHERITED_TERMINAL_MARKERS {
+            command.env(name, "planted");
+        }
+
+        scrub_inherited_markers(&mut command);
+
+        for name in INHERITED_TERMINAL_MARKERS {
+            assert_eq!(command.get_env(name), None, "{name} survived the scrub");
+        }
+        // Each control channel named as well, so that shortening the list is a
+        // test failure and not merely a smaller loop: these reach the user's
+        // real kitty instance, multiplexer session, Konsole and editor.
         for channel in [
             "KITTY_LISTEN_ON",
             "TMUX",
+            "TMUX_PANE",
             "STY",
             "ZELLIJ",
+            "ZELLIJ_SESSION_NAME",
+            "ZELLIJ_PANE_ID",
+            "KONSOLE_DBUS_SERVICE",
+            "KONSOLE_DBUS_SESSION",
             "NVIM",
             "NVIM_LISTEN_ADDRESS",
+            "VSCODE_IPC_HOOK_CLI",
+            "EMACS_SERVER_FILE",
         ] {
             assert!(
                 INHERITED_TERMINAL_MARKERS.contains(&channel),
                 "{channel} is not scrubbed"
-            );
-            assert_eq!(command.get_env(channel), None);
-        }
-        for marker in INHERITED_TERMINAL_MARKERS.iter().filter(|name| {
-            !matches!(
-                **name,
-                "TERM_PROGRAM" | "TERM_PROGRAM_VERSION" | "COLORTERM"
-            )
-        }) {
-            assert_eq!(
-                command.get_env(marker),
-                None,
-                "{marker} leaked to the child"
             );
         }
     }
