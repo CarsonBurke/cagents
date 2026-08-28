@@ -18,7 +18,7 @@ use cosmic::{Element, Renderer, Task, Theme};
 
 use crate::{
     model::CardId,
-    settings::{CHORD_SEPARATOR, KeyboardShortcuts, ShortcutBinding, ShortcutKey, parse_shortcut},
+    settings::{KeyboardShortcuts, ShortcutBinding, ShortcutKey, format_chords, parse_shortcut},
     workspace::{
         FocusDirection, FocusHandoff, FocusTarget, ViewportProjection, WheelDelta, Workspace,
     },
@@ -105,9 +105,10 @@ pub fn shortcut_keys(action: GlobalShortcut, shortcuts: &KeyboardShortcuts) -> &
     }
 }
 
-/// The chords bound to `action`, as shown to the user.
+/// The chords bound to `action`, in the one-line form the settings dialog
+/// reads back.
 pub fn shortcut_chords(action: GlobalShortcut, shortcuts: &KeyboardShortcuts) -> String {
-    shortcut_keys(action, shortcuts).join(CHORD_SEPARATOR)
+    format_chords(shortcut_keys(action, shortcuts))
 }
 
 pub fn shortcut_tooltip(action: GlobalShortcut, shortcuts: &KeyboardShortcuts) -> String {
@@ -262,7 +263,8 @@ fn shortcut_matches(
     physical_key: keyboard::key::Physical,
     modifiers: keyboard::Modifiers,
 ) -> bool {
-    let modifiers = modifiers.difference(keyboard::Modifiers::CAPS_LOCK);
+    // Read flag by flag, so a lock modifier the user happens to be holding is
+    // simply not consulted.
     binding.control == modifiers.control()
         && binding.alt == modifiers.alt()
         && binding.shift == modifiers.shift()
@@ -1288,6 +1290,7 @@ impl<'a, Message: 'a> From<PanSurface<'a, Message>> for Element<'a, Message> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::settings::parse_chords;
     use crate::workspace::{CardWidth, WorkspaceCard};
 
     #[test]
@@ -1911,9 +1914,11 @@ mod tests {
                 // chord would dispatch to whichever descriptor came first.
                 assert!(bindings.insert(chord.clone()));
             }
+            // The one-line form the dialog shows has to read back as the same
+            // chords, or editing a two-chord action there would drop one.
             assert_eq!(
-                shortcut_chords(descriptor.action, &shortcuts),
-                keys.join(CHORD_SEPARATOR)
+                parse_chords(&shortcut_chords(descriptor.action, &shortcuts)),
+                *keys
             );
         }
     }
