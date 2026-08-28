@@ -153,15 +153,18 @@ pub fn normalize_card_name(name: &str) -> Option<String> {
     (!normalized.is_empty()).then_some(normalized)
 }
 
-/// The bidi marks and embedding controls: characters that carry no glyph of
-/// their own but reorder the text around them. `char::is_control` covers C0 and
-/// C1 but not these, which sit in ordinary printable categories. The line and
+/// Every Unicode bidi control: the three marks, the five embedding and
+/// override codes, and the four isolates. They carry no glyph of their own but
+/// reorder the text around them, and `char::is_control` covers C0 and C1 but
+/// not these, which sit in ordinary printable categories. The line and
 /// paragraph separators are not here because they are whitespace, and so are
-/// already collapsed into a space.
+/// already collapsed into a space. Other invisible format characters are kept
+/// deliberately: a zero-width joiner is load-bearing inside an emoji sequence,
+/// and unlike a bidi control it cannot make one name read as another.
 fn is_name_formatting(character: char) -> bool {
     matches!(
         character,
-        '\u{200e}' | '\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}'
+        '\u{061c}' | '\u{200e}' | '\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}'
     )
 }
 
