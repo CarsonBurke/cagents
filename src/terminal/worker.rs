@@ -1059,9 +1059,12 @@ fn child_exit_event(exited: &mut bool, result: ChildExit) -> Option<TerminalEven
 /// session) launched it. Left in place, a child would believe it is talking to
 /// that emulator and emit control sequences libghostty-vt does not implement.
 ///
-/// Two entries are worse than a wrong identity. `KITTY_LISTEN_ON` names a
-/// socket that fully controls the user's real kitty instance, so a child that
-/// inherited it could type into the user's other windows - the exact
+/// Some entries are worse than a wrong identity, because they name a live
+/// control channel into something of the user's that a card is not inside:
+/// `KITTY_LISTEN_ON` fully controls their real kitty instance, `TMUX` and
+/// `STY` and `ZELLIJ` reach every pane of their multiplexer session, and
+/// `NVIM` is an RPC socket that runs commands in their editor. A child that
+/// inherited any of them could act outside its own card - the exact
 /// containment this scrub exists to establish. `LC_TERMINAL` and
 /// `LC_TERMINAL_VERSION` match sshd's default `AcceptEnv LC_*`, so they carry
 /// the wrong identity onto every host the child then reaches.
@@ -1103,6 +1106,14 @@ const INHERITED_TERMINAL_MARKERS: &[&str] = &[
     "WT_PROFILE_ID",
     "ZED_TERM",
     "VSCODE_INJECTION",
+    "TMUX",
+    "TMUX_PANE",
+    "STY",
+    "ZELLIJ",
+    "ZELLIJ_SESSION_NAME",
+    "ZELLIJ_PANE_ID",
+    "NVIM",
+    "NVIM_LISTEN_ADDRESS",
     "COLORTERM",
 ];
 
@@ -1580,11 +1591,30 @@ mod tests {
             command.get_env("TERM_PROGRAM_VERSION"),
             Some(OsStr::new(env!("CARGO_PKG_VERSION")))
         );
-        // `KITTY_LISTEN_ON` by name as well as by list membership: it is a live
-        // control socket for the user's real kitty instance, not just a wrong
-        // identity, so dropping it from the list would be a containment hole
+        // Each control channel by name as well as by list membership: these
+        // reach the user's real kitty instance, multiplexer session and
+        // editor, so dropping one from the list would be a containment hole
         // rather than a cosmetic regression.
-        assert_eq!(command.get_env("KITTY_LISTEN_ON"), None);
+        //
+        // Membership is the load-bearing half. `CommandBuilder::new` seeds its
+        // map from `std::env::vars_os`, and spawning clears the child
+        // environment and applies only that map, so a name on the list cannot
+        // reach a child - while the absence assertion alone would also pass
+        // for a variable this test process never had.
+        for channel in [
+            "KITTY_LISTEN_ON",
+            "TMUX",
+            "STY",
+            "ZELLIJ",
+            "NVIM",
+            "NVIM_LISTEN_ADDRESS",
+        ] {
+            assert!(
+                INHERITED_TERMINAL_MARKERS.contains(&channel),
+                "{channel} is not scrubbed"
+            );
+            assert_eq!(command.get_env(channel), None);
+        }
         for marker in INHERITED_TERMINAL_MARKERS.iter().filter(|name| {
             !matches!(
                 **name,
