@@ -4597,6 +4597,7 @@ impl Application for Cagents {
             &self.sidebar_state,
             sidebar_mode,
             self.settings.sidebar_width,
+            self.modal_is_open(),
         )
         .map(Message::Sidebar);
 

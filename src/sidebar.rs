@@ -684,11 +684,18 @@ pub fn clamp_expanded_width(width: f32) -> f32 {
 }
 
 /// The sidebar's single public rendering entry point.
+///
+/// `modal_open` says a dialog is on screen. The dialog is an overlay, so a
+/// keystroke it does not consume still reaches this pane, and the pane still
+/// holds whatever focus it had when the dialog opened - libcosmic's modal
+/// popover declines to deliver a focus operation to the content beneath it, so
+/// that focus cannot be moved away while the dialog is up.
 pub fn view<'a>(
     model: &'a SidebarModel,
     state: &'a SidebarState,
     mode: SidebarMode,
     persisted_width: f32,
+    modal_open: bool,
 ) -> Element<'a, SidebarAction> {
     let spacing = cosmic::theme::spacing();
     let compact = mode == SidebarMode::Compact;
@@ -739,7 +746,7 @@ pub fn view<'a>(
             if compact {
                 widget::divider::vertical::default().into()
             } else {
-                resize_handle(width).into()
+                resize_handle(width, modal_open).into()
             },
         ])
         .spacing(0),
@@ -1590,13 +1597,14 @@ fn icon_action<'a>(
 /// reports pointer motion only while the pointer is inside its own bounds: a
 /// handle this narrow would lose the gesture on the first pixel of travel. A
 /// widget sees every event, so the grab survives the pointer leaving it.
-fn resize_handle(width: f32) -> ResizeHandle<'static> {
+fn resize_handle(width: f32, modal_open: bool) -> ResizeHandle<'static> {
     ResizeHandle {
         content: widget::container(widget::divider::vertical::default())
             .center_x(Length::Fixed(RESIZE_HANDLE_WIDTH))
             .height(Length::Fill)
             .into(),
         width,
+        modal_open,
         id: resize_handle_id(),
     }
 }
@@ -1606,6 +1614,8 @@ struct ResizeHandle<'a> {
     /// The width the pane renders at, and the origin every gesture measures
     /// from. Owned by the application, so the handle stores nothing itself.
     width: f32,
+    /// Set while a dialog is on screen, when the keyboard is not ours to read.
+    modal_open: bool,
     id: Id,
 }
 
@@ -1778,13 +1788,21 @@ impl Widget<SidebarAction, Theme, Renderer> for ResizeHandle<'_> {
             // key-repeat rate, so a repeated gesture settles on release.
             // An arrow carrying a modifier belongs to whoever reserved that
             // chord - `Alt+Left` and `Alt+Right` navigate columns by default -
-            // so only a bare arrow resizes the pane.
+            // so only a bare arrow resizes the pane. The four are read
+            // individually rather than as `is_empty`, which would also consult
+            // the lock flags this iced fork carries: a user holding caps lock
+            // would silently lose the gesture.
+            //
+            // A dialog on screen takes the keyboard even though this widget
+            // keeps the focus flag it had when the dialog opened: an arrow
+            // aimed at a dialog control must not quietly retune the pane and
+            // write the settings file behind it.
             Event::Keyboard(keyboard::Event::KeyPressed {
                 key,
                 modifiers,
                 repeat,
                 ..
-            }) if state.is_focused && modifiers.is_empty() => {
+            }) if state.is_focused && !self.modal_open && !chorded(*modifiers) => {
                 if let Some(step) = resize_step(key) {
                     shell.publish(self.resize(self.width + step));
                     if *repeat {
@@ -1956,6 +1974,15 @@ fn resize_step(key: &keyboard::Key) -> Option<f32> {
         keyboard::Key::Named(keyboard::key::Named::ArrowRight) => Some(RESIZE_STEP),
         _ => None,
     }
+}
+
+/// Whether a keystroke carries a modifier that could make it someone's chord.
+///
+/// The four are read individually because `Modifiers::is_empty` also consults
+/// the lock flags, which say what the keyboard is latched to rather than what
+/// the user is holding down.
+fn chorded(modifiers: keyboard::Modifiers) -> bool {
+    modifiers.control() || modifiers.alt() || modifiers.shift() || modifiers.logo()
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -2341,7 +2368,7 @@ mod tests {
             (&populated, SidebarMode::Compact),
             (&populated, SidebarMode::Expanded),
         ] {
-            let rendered = control_ids(&view(model, &state, mode, DEFAULT_EXPANDED_WIDTH))
+            let rendered = control_ids(&view(model, &state, mode, DEFAULT_EXPANDED_WIDTH, false))
                 .contains(&search_focus_id().to_string());
             assert_eq!(
                 search_is_reachable(model, mode),
@@ -2371,6 +2398,7 @@ mod tests {
             &state,
             SidebarMode::Compact,
             DEFAULT_EXPANDED_WIDTH,
+            false,
         ));
         for id in [
             stable_id("open-repository"),
@@ -2403,6 +2431,7 @@ mod tests {
             &state,
             SidebarMode::Expanded,
             DEFAULT_EXPANDED_WIDTH,
+            false,
         ));
         assert!(pane.contains(&stable_id("toggle-controls").to_string()));
         assert!(pane.contains(&stable_id("empty.action").to_string()));
@@ -2418,6 +2447,7 @@ mod tests {
             &state,
             SidebarMode::Expanded,
             DEFAULT_EXPANDED_WIDTH,
+            false,
         ));
         assert!(opened.contains(&search_focus_id().to_string()));
         assert!(opened.contains(&filter_id(SidebarFilter::Attention).to_string()));
@@ -2434,6 +2464,7 @@ mod tests {
                 &state,
                 SidebarMode::Expanded,
                 DEFAULT_EXPANDED_WIDTH,
+                false,
             ))
             .contains(&toggle)
         };
@@ -2546,7 +2577,8 @@ mod tests {
     fn the_resize_handle_is_a_named_focusable_splitter() {
         use iced_accessibility::accesskit::{Action, Role};
 
-        let handle: Element<'_, SidebarAction> = resize_handle(DEFAULT_EXPANDED_WIDTH).into();
+        let handle: Element<'_, SidebarAction> =
+            resize_handle(DEFAULT_EXPANDED_WIDTH, false).into();
         assert_eq!(
             handle.as_widget().id().map(|id| id.to_string()),
             Some(resize_handle_id().to_string()),
