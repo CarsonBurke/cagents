@@ -2795,12 +2795,11 @@ impl Cagents {
             widget::column::with_children(rows).spacing(0).into()
         });
 
-        // A dialog is modal for the pointer only: libcosmic's `popover` captures
-        // mouse and touch events but forwards keyboard events to the content
-        // beneath it. The workspace surfaces are hidden while an inspector is
-        // open, so a card that still claimed model focus would receive typing
-        // the user is aiming at the dialog and write it into an invisible shell.
-        let card_focused = focused && self.inspector.is_none();
+        // A card that kept model focus under an open dialog would take the
+        // typing aimed at the dialog and write it into a shell, which runs
+        // what it is given. The inspector additionally hides the workspace, so
+        // that shell would not even be on screen.
+        let card_focused = focused && !self.modal_is_open();
         let content: Element<'a, Message> = match self.cards.get(&id) {
             Some(CardRuntime::Terminal(handle)) => TerminalWidget::new(handle.clone())
                 .font_size(self.settings.terminal_font_size)
@@ -3041,6 +3040,19 @@ impl Cagents {
         if was_open {
             self.set_workspace_surfaces_visible(true);
         }
+    }
+
+    /// Whether a modal dialog is on screen.
+    ///
+    /// libcosmic renders every one of them inside a `popover` that is modal
+    /// for the pointer alone: it captures mouse and touch but forwards
+    /// keyboard events to the content beneath. Nothing under a dialog may
+    /// therefore act on a keystroke, because the user is aiming it at the
+    /// dialog - and a terminal acts by writing to a shell.
+    fn modal_is_open(&self) -> bool {
+        self.inspector.is_some()
+            || self.worktree_dialog.is_some()
+            || self.pull_request_dialog.is_some()
     }
 
     /// Opens `inspector` and moves keyboard focus into it.
@@ -3579,7 +3591,8 @@ impl Application for Cagents {
                             base: "main".into(),
                             destination: root.display().to_string(),
                         });
-                        Task::none()
+                        iced::widget::operation::focus(worktree_dialog_focus_id())
+                            .map(cosmic::Action::App)
                     }
                     SidebarAction::Refresh => {
                         let targets = repository_refresh_targets(&self.sidebar_model.projects);
@@ -3619,7 +3632,8 @@ impl Application for Cagents {
                             body: String::new(),
                             draft: false,
                         });
-                        Task::none()
+                        iced::widget::operation::focus(pull_request_dialog_focus_id())
+                            .map(cosmic::Action::App)
                     }
                     SidebarAction::OpenSettings => {
                         self.settings_category = SettingsCategory::General;
@@ -3945,7 +3959,8 @@ impl Application for Cagents {
                     Err(error) => {
                         self.status = Some(TransientNotice::error(error.to_string()));
                         self.worktree_dialog = Some(dialog);
-                        Task::none()
+                        iced::widget::operation::focus(worktree_dialog_focus_id())
+                            .map(cosmic::Action::App)
                     }
                 }
             }
@@ -4095,7 +4110,11 @@ impl Application for Cagents {
                         return cosmic::task::message(Message::CancelDialog);
                     }
                 }
-                if self.inspector.is_some() {
+                // A chord typed at a dialog is not the workspace's to act on:
+                // Ctrl+W must not close the card behind the dialog. The
+                // reserved chords stay reserved, so it does not reach the text
+                // field as "delete word" either.
+                if self.modal_is_open() {
                     return Task::none();
                 }
                 match workspace_widget::global_shortcut(&event, &self.settings.keyboard_shortcuts) {
@@ -4223,7 +4242,7 @@ impl Application for Cagents {
                         widget::column::with_children(vec![
                             widget::text::caption("Branch").into(),
                             widget::text_input("Branch", &dialog.branch)
-                                .id(widget::Id::new("dialog.worktree.branch"))
+                                .id(worktree_dialog_focus_id())
                                 .on_input(Message::WorktreeBranchChanged)
                                 .into(),
                         ])
@@ -4290,7 +4309,7 @@ impl Application for Cagents {
                     widget::column::with_children(vec![
                         widget::text::caption("Title").into(),
                         widget::text_input("Title", &dialog.title)
-                            .id(widget::Id::new("dialog.pull-request.title"))
+                            .id(pull_request_dialog_focus_id())
                             .on_input(Message::PullRequestTitleChanged)
                             .into(),
                     ])
@@ -5025,9 +5044,19 @@ fn settings_category_controls<'a>(
     }
 }
 
-/// The dialog's first focusable control, focused when the dialog opens.
+/// The settings dialog's first focusable control, focused when it opens.
 fn settings_close_id() -> widget::Id {
     widget::Id::new("dialog.settings.close")
+}
+
+/// The worktree dialog's first field, focused when it opens.
+fn worktree_dialog_focus_id() -> widget::Id {
+    widget::Id::new("dialog.worktree.branch")
+}
+
+/// The pull-request dialog's first field, focused when it opens.
+fn pull_request_dialog_focus_id() -> widget::Id {
+    widget::Id::new("dialog.pull-request.title")
 }
 
 fn settings_dialog<'a>(
