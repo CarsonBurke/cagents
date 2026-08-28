@@ -961,8 +961,9 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for TerminalWidget<Message
                             .map(|bounds| (cursor, bounds))
                     })
                 {
+                    // Two physical pixels, never wider than the cell it
+                    // outlines.
                     let stroke = (2.0 / geometry.scale_factor)
-                        .max(1.0 / geometry.scale_factor)
                         .min(cell_bounds.width)
                         .min(cell_bounds.height);
                     let cursor_bounds = match cursor.shape {
@@ -1122,7 +1123,9 @@ struct Segment {
 /// distinguish from a blank. Such a cell is therefore given a segment of its
 /// own, positioned explicitly, exactly as every cell used to be.
 ///
-/// Blank and invisible cells draw nothing and so end a segment.
+/// Invisible and empty cells draw nothing, so they are skipped and end the run
+/// they interrupt. A blank is an ordinary narrow-ASCII space and stays inside
+/// its run, which is what keeps a line of text one shaped buffer.
 fn segments(cells: &[CellSnapshot]) -> impl Iterator<Item = Segment> {
     let mut column = 0usize;
     std::iter::from_fn(move || {
@@ -1189,7 +1192,9 @@ fn shape_segment(
     spans.clear();
     for cell in cells {
         let start = content.len();
-        // An invisible cell inside a segment still owes its column an advance.
+        // `segments` skips invisible cells, so a segment should not contain
+        // one. Kept as a guard rather than an assertion: if that ever changes,
+        // the cell owes its column an advance and must not render its text.
         if cell.style.invisible {
             content.push(' ');
         } else {
