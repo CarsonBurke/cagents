@@ -3325,9 +3325,11 @@ impl Application for Cagents {
         // card arrives - flashes empty and rebuilds every card's widget state.
         // The pane and the strip split the window, so subtracting the pane from
         // the starting width is the closest estimate available before the
-        // surface reports its own, and `WindowResized` re-projects against the
-        // real one. Card widths are fractions re-derived per frame, so an
-        // estimate costs nothing but is enough to mount them.
+        // surface reports its own. The strip then replaces the estimate itself,
+        // from its own measured bounds, through `WorkspaceViewportEvent`; the
+        // window's own resize only re-derives the pane density. Card widths are
+        // fractions re-derived per frame, so an estimate costs nothing but is
+        // enough to mount them.
         let sidebar_width = sidebar::effective_width(
             SidebarMode::for_width(app.window_width),
             app.settings.sidebar_width,
@@ -4125,9 +4127,9 @@ impl Application for Cagents {
                     }
                 }
                 // A chord typed at a dialog is not the workspace's to act on:
-                // Ctrl+W must not close the card behind the dialog. The
-                // reserved chords stay reserved, so it does not reach the text
-                // field as "delete word" either.
+                // Ctrl+W must not close the card behind the dialog. The dialog
+                // is an overlay, so it has already seen the keystroke by the
+                // time this runs, and what it does with one is its own affair.
                 if self.modal_is_open() {
                     return Task::none();
                 }
