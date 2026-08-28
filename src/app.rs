@@ -1,15 +1,17 @@
 use std::{
-    any::Any,
     borrow::Cow,
     collections::{HashMap, HashSet},
     path::{Path, PathBuf},
     pin::Pin,
-    sync::{
-        Arc, LazyLock,
-        atomic::{AtomicBool, Ordering},
-    },
+    sync::{Arc, LazyLock},
     thread::JoinHandle,
     time::{Duration, Instant},
+};
+
+#[cfg(feature = "integrated-browser")]
+use std::{
+    any::Any,
+    sync::atomic::{AtomicBool, Ordering},
 };
 
 use cosmic::{
@@ -25,21 +27,15 @@ use cosmic::{
 use url::Url;
 
 use crate::{
-    browser::{
-        BrowserEvent, BrowserHandle, BrowserLifecycle, BrowserRestoreState, BrowserWidget,
-        DelegateRequest, DelegateRequestId, InputMethodState, PhysicalViewport,
-        RawWaylandSubsurfaceFactory, WaylandSubsurfaceFactory,
-    },
     github::{
         CreatePullRequestRequest, GitHubRepoKey, GitHubService, ListPullRequestsRequest,
         PullRequest, PullRequestCheck, PullRequestCreationOutcome, PullRequestStateFilter,
     },
     lifecycle::{LifecycleAction, LifecycleBudget, LifecycleManager},
     model::{
-        BrowserId, BrowserRestoreFidelity, BrowserSession, CardId, CardKind, CardState, Existence,
-        Exposure, HostSessionProof, LaunchRecipe, ProjectId, ProjectState, RepositoryView,
-        Residency, RuntimeError, TerminalContinuity, TerminalExit, TerminalId, TerminalSession,
-        WorkspaceState, WorktreeState,
+        CardId, CardKind, CardState, Existence, Exposure, HostSessionProof, LaunchRecipe,
+        ProjectId, ProjectState, RepositoryView, Residency, RuntimeError, TerminalContinuity,
+        TerminalExit, TerminalId, TerminalSession, WorkspaceState, WorktreeState,
     },
     repository::{
         BaseRevision, CancellationToken, CreateWorktreeRequest, RepositoryId, RepositoryInfo,
@@ -60,6 +56,19 @@ use crate::{
         WorkspaceCard, WorkspaceConfig, normalize_card_name,
     },
     workspace_widget::{self, FrameClock, PanGesture, WorkspaceViewportEvent},
+};
+
+#[cfg(not(feature = "integrated-browser"))]
+use crate::capability::{BrowserRestoreAction, browser_restore_action};
+
+#[cfg(feature = "integrated-browser")]
+use crate::{
+    browser::{
+        BrowserEvent, BrowserHandle, BrowserLifecycle, BrowserRestoreState, BrowserWidget,
+        DelegateRequest, DelegateRequestId, InputMethodState, PhysicalViewport,
+        RawWaylandSubsurfaceFactory, WaylandSubsurfaceFactory,
+    },
+    model::{BrowserId, BrowserRestoreFidelity, BrowserSession},
 };
 
 const APPLICATION_ICON_PNG: &[u8] = include_bytes!("../packaging/dev.cagents.Cagents.png");
@@ -85,14 +94,17 @@ fn application_window_icon() -> window::Icon {
     .expect("embedded application icon dimensions must match its RGBA pixels")
 }
 
+#[cfg(any(feature = "integrated-browser", test))]
 const INITIAL_HYDRATION_EPOCH: u64 = 1;
 
+#[cfg(feature = "integrated-browser")]
 #[derive(Debug)]
 struct ParentWindowLifetime {
     window_id: window::Id,
     active: AtomicBool,
 }
 
+#[cfg(feature = "integrated-browser")]
 impl ParentWindowLifetime {
     fn new(window_id: window::Id) -> Self {
         Self {
@@ -106,6 +118,7 @@ impl ParentWindowLifetime {
     }
 }
 
+#[cfg(feature = "integrated-browser")]
 #[derive(Debug, Clone)]
 pub struct BrowserFactoryBinding {
     factory: Arc<RawWaylandSubsurfaceFactory>,
@@ -124,6 +137,7 @@ const APP_HEADER_HEIGHT: f32 = 48.0;
 const NOTICE_ROW_HEIGHT: f32 = 36.0;
 const CARD_HEADER_HEIGHT: f32 = 40.0;
 const BROWSER_TOOLBAR_HEIGHT: f32 = 36.0;
+#[cfg(feature = "integrated-browser")]
 const BROWSER_PROGRESS_HEIGHT: f32 = 2.0;
 const FOCUS_RAIL_HEIGHT: f32 = 3.0;
 const ICON_CONTROL_SIZE: f32 = 32.0;
@@ -329,6 +343,7 @@ fn terminal_start_visibility(state: Option<&CardState>) -> Option<bool> {
         .map(|state| state.exposure == Exposure::Visible)
 }
 
+#[cfg(feature = "integrated-browser")]
 fn can_register_deferred_browser(
     state: &CardState,
     lifecycle_registered: bool,
@@ -970,35 +985,48 @@ pub enum Message {
     /// A sweep timer fired, carrying the generation it was armed for; a
     /// generation that has since been superseded is discarded.
     LifecycleSweepElapsed(u64),
+    #[cfg(feature = "integrated-browser")]
     InitializeBrowserFactory,
+    #[cfg(feature = "integrated-browser")]
     BrowserFactoryReady(Result<BrowserFactoryBinding, String>),
     WindowScaleFactorChanged(f32),
     WindowResized(f32),
     OpenBrowser(Url),
     ExternalLinkOpened(Result<(), String>),
     NewBrowser,
+    #[cfg(not(feature = "integrated-browser"))]
+    ExternalUrlOpened(Result<(), String>),
+    #[cfg(feature = "integrated-browser")]
     BrowserBack(CardId),
+    #[cfg(feature = "integrated-browser")]
     BrowserForward(CardId),
+    #[cfg(feature = "integrated-browser")]
     BrowserReload(CardId),
     RetryCard(CardId),
+    #[cfg(feature = "integrated-browser")]
     BrowserAddressChanged {
         card: CardId,
         value: String,
     },
+    #[cfg(feature = "integrated-browser")]
     BrowserNavigate(CardId),
+    #[cfg(feature = "integrated-browser")]
     BrowserEvent {
         card: CardId,
         event: BrowserEvent,
     },
+    #[cfg(feature = "integrated-browser")]
     BrowserError {
         card: CardId,
         message: String,
     },
+    #[cfg(feature = "integrated-browser")]
     ClipboardRead {
         card: CardId,
         request: DelegateRequestId,
         value: Option<String>,
     },
+    #[cfg(feature = "integrated-browser")]
     FilePickerResult {
         card: CardId,
         request: DelegateRequestId,
@@ -1039,6 +1067,7 @@ pub enum Message {
     DismissStatus,
 }
 
+#[cfg(feature = "integrated-browser")]
 struct BrowserRuntime {
     handle: BrowserHandle,
     ime: Option<InputMethodState>,
@@ -1051,6 +1080,7 @@ enum CardRuntime {
     Loading,
     Failed(String),
     Terminal(TerminalSurface),
+    #[cfg(feature = "integrated-browser")]
     Browser(BrowserRuntime),
     Repository(RepositoryView),
     PullRequests(PathBuf),
@@ -1073,8 +1103,11 @@ struct CardChrome {
     focus_id: widget::Id,
     container_id: widget::Id,
     close_id: widget::Id,
+    #[cfg(feature = "integrated-browser")]
     browser_back_id: widget::Id,
+    #[cfg(feature = "integrated-browser")]
     browser_forward_id: widget::Id,
+    #[cfg(feature = "integrated-browser")]
     browser_reload_id: widget::Id,
     browser_address_id: widget::Id,
     type_label: &'static str,
@@ -1098,8 +1131,11 @@ impl CardChrome {
             focus_id: workspace_widget::card_focus_id(id),
             container_id: workspace_widget::card_widget_id(id),
             close_id: card_control_id(id, "close"),
+            #[cfg(feature = "integrated-browser")]
             browser_back_id: card_control_id(id, "browser.back"),
+            #[cfg(feature = "integrated-browser")]
             browser_forward_id: card_control_id(id, "browser.forward"),
+            #[cfg(feature = "integrated-browser")]
             browser_reload_id: card_control_id(id, "browser.reload"),
             browser_address_id: card_control_id(id, "browser.address"),
             type_label,
@@ -1155,9 +1191,12 @@ pub struct Cagents {
     settings: AppSettings,
     // These owners are declared before `core`: application Drop empties and
     // joins them explicitly, and field drop order is the final backstop.
+    #[cfg(feature = "integrated-browser")]
     browser_teardowns: Vec<JoinHandle<()>>,
     terminal_teardowns: Vec<JoinHandle<()>>,
+    #[cfg(feature = "integrated-browser")]
     browser_factory: Option<Arc<RawWaylandSubsurfaceFactory>>,
+    #[cfg(feature = "integrated-browser")]
     browser_parent_lifetime: Option<Arc<ParentWindowLifetime>>,
     window_scale_factor: f32,
     /// Starts at an estimate, because the pane density and the strip's viewport
@@ -1259,6 +1298,7 @@ impl Cagents {
         })
     }
 
+    #[cfg(feature = "integrated-browser")]
     fn browser_factory_task(&self) -> Task<Message> {
         let Some(window_id) = self.core.main_window_id() else {
             return cosmic::task::message(Message::BrowserFactoryReady(Err(
@@ -1295,6 +1335,7 @@ impl Cagents {
         .map(cosmic::Action::App)
     }
 
+    #[cfg(feature = "integrated-browser")]
     fn register_deferred_browsers(&mut self) {
         let pending = self
             .durable
@@ -1348,6 +1389,7 @@ impl Cagents {
             }
             let terminal_residency =
                 restored_terminal_residency(&card.kind, card.exposure, &card.residency);
+            #[cfg(feature = "integrated-browser")]
             let runtime_residency =
                 restored_runtime_residency(&card.kind, card.exposure, &card.residency);
             match card.kind {
@@ -1375,11 +1417,26 @@ impl Cagents {
                         self.cards.insert(card.id, CardRuntime::Loading);
                     }
                 }
+                #[cfg(feature = "integrated-browser")]
                 CardKind::Browser(_) => {
                     if let Some(state) = self.card_state_mut(card.id) {
                         state.residency = runtime_residency;
                     }
                     self.cards.insert(card.id, CardRuntime::Loading);
+                }
+                #[cfg(not(feature = "integrated-browser"))]
+                CardKind::Browser(session) => {
+                    debug_assert!(matches!(
+                        browser_restore_action(&session),
+                        BrowserRestoreAction::OfferExternal(_)
+                    ));
+                    self.cards.insert(
+                        card.id,
+                        CardRuntime::Failed(
+                            "This cagents build does not include the integrated browser. Open the saved URL in your system browser."
+                                .into(),
+                        ),
+                    );
                 }
                 CardKind::Repository(view) => {
                     self.cards.insert(card.id, CardRuntime::Repository(view));
@@ -1391,9 +1448,9 @@ impl Cagents {
             }
         }
 
-        // Admit restored terminals first. Restored browsers remain unregistered
-        // and hibernated until the rendering factory is ready; the resulting
-        // lifecycle sweep admits them under the same hot-card budget.
+        // Restored integrated browsers wait for the rendering factory. A
+        // browserless build leaves their durable descriptors untouched and
+        // renders an explicit external-open path instead.
         self.reconcile_lifecycle(&initially_visible, &initially_prefetch)
     }
 
@@ -1605,6 +1662,7 @@ impl Cagents {
         }
     }
 
+    #[cfg(feature = "integrated-browser")]
     fn add_browser(&mut self, url: Url) -> Task<Message> {
         let card_id = CardId::new();
         let session = BrowserSession {
@@ -1678,6 +1736,42 @@ impl Cagents {
             });
         self.persist();
         self.apply_viewport(update, true, false)
+    }
+
+    #[cfg(not(feature = "integrated-browser"))]
+    fn add_browser(&mut self, url: Url) -> Task<Message> {
+        Self::open_external_url(url)
+    }
+
+    #[cfg(not(feature = "integrated-browser"))]
+    fn open_external_url(url: Url) -> Task<Message> {
+        cosmic::task::future(async move {
+            let portal_result = async {
+                let request = ashpd::desktop::open_uri::OpenFileRequest::default()
+                    .send_uri(&url)
+                    .await
+                    .map_err(|error| error.to_string())?;
+                request.response().map_err(|error| error.to_string())
+            }
+            .await;
+            let result = match portal_result {
+                Ok(()) => Ok(()),
+                Err(portal_error) => match tokio::process::Command::new("xdg-open")
+                    .arg(url.as_str())
+                    .status()
+                    .await
+                {
+                    Ok(status) if status.success() => Ok(()),
+                    Ok(status) => Err(format!(
+                        "desktop portal failed ({portal_error}); xdg-open exited with {status}"
+                    )),
+                    Err(fallback_error) => Err(format!(
+                        "desktop portal failed ({portal_error}); xdg-open failed: {fallback_error}"
+                    )),
+                },
+            };
+            Message::ExternalUrlOpened(result)
+        })
     }
 
     fn persist(&self) {
@@ -1844,6 +1938,7 @@ impl Cagents {
             Some(CardRuntime::Terminal(handle)) => {
                 self.begin_terminal_teardown(handle);
             }
+            #[cfg(feature = "integrated-browser")]
             Some(CardRuntime::Browser(browser)) => {
                 let _ = browser.handle.set_visible(false);
                 self.begin_browser_teardown(browser.handle);
@@ -1871,6 +1966,10 @@ impl Cagents {
         else {
             return Task::none();
         };
+        #[cfg(not(feature = "integrated-browser"))]
+        if let CardKind::Browser(session) = &state.kind {
+            return Self::open_external_url(session.current_url.clone());
+        }
         let terminal_replacement = if let CardKind::Terminal(session) = &mut state.kind {
             let expected_terminal_id = session.id;
             let replacement = fresh_terminal_relaunch(session);
@@ -1905,6 +2004,7 @@ impl Cagents {
                     state.exposure == Exposure::Visible && surfaces_visible,
                 )
             }
+            #[cfg(feature = "integrated-browser")]
             CardKind::Browser(session) => {
                 self.cards.insert(card, CardRuntime::Loading);
                 let Some(factory) = self.browser_factory.clone() else {
@@ -1925,6 +2025,10 @@ impl Cagents {
                     }
                 }
                 Task::none()
+            }
+            #[cfg(not(feature = "integrated-browser"))]
+            CardKind::Browser(_) => {
+                unreachable!("browserless retries return before mutating durable state")
             }
             CardKind::Repository(view) => {
                 self.cards.insert(card, CardRuntime::Repository(view));
@@ -1966,6 +2070,7 @@ impl Cagents {
         }
     }
 
+    #[cfg(feature = "integrated-browser")]
     fn begin_browser_teardown(&mut self, mut handle: BrowserHandle) {
         let mut index = 0;
         while index < self.browser_teardowns.len() {
@@ -2034,6 +2139,7 @@ impl Cagents {
                         let _ = handle.hide();
                     }
                 }
+                #[cfg(feature = "integrated-browser")]
                 Some(CardRuntime::Browser(browser)) => {
                     let _ = browser
                         .handle
@@ -2183,7 +2289,11 @@ impl Cagents {
                         ));
                         continue;
                     }
+                    #[cfg(feature = "integrated-browser")]
                     let mut deferred_browser_started = false;
+                    #[cfg(not(feature = "integrated-browser"))]
+                    let deferred_browser_started = false;
+                    #[cfg(feature = "integrated-browser")]
                     let deferred_browser = self
                         .durable
                         .cards
@@ -2197,6 +2307,7 @@ impl Cagents {
                             }
                             _ => None,
                         });
+                    #[cfg(feature = "integrated-browser")]
                     if let Some(session) = deferred_browser {
                         let Some(factory) = self.browser_factory.clone() else {
                             tasks.push(cosmic::task::message(Message::InitializeBrowserFactory));
@@ -2229,6 +2340,7 @@ impl Cagents {
                                     .restore(visible.contains(&card) && surfaces_visible)
                                     .map_err(|error| error.to_string()),
                             ),
+                            #[cfg(feature = "integrated-browser")]
                             Some(CardRuntime::Browser(browser)) => {
                                 match browser.handle.restore().and_then(|()| {
                                     browser
@@ -2266,6 +2378,7 @@ impl Cagents {
                         Some(CardRuntime::Terminal(handle)) => {
                             handle.hibernate().map_err(|error| error.to_string())
                         }
+                        #[cfg(feature = "integrated-browser")]
                         Some(CardRuntime::Browser(browser)) => browser
                             .handle
                             .hibernate()
@@ -2378,6 +2491,7 @@ impl Cagents {
         }
     }
 
+    #[cfg(feature = "integrated-browser")]
     fn handle_browser_event(&mut self, id: CardId, event: BrowserEvent) -> Task<Message> {
         let mut tasks = Vec::new();
         let mut durable_changed = false;
@@ -2544,6 +2658,7 @@ impl Cagents {
         // `sync_chrome` keeps an entry for every durable card; a miss can
         // only be a card that is not durable, which renders degenerate chrome.
         let chrome = self.card_chrome.get(&id);
+        #[cfg(feature = "integrated-browser")]
         let browser_runtime = match self.cards.get(&id) {
             Some(CardRuntime::Browser(browser)) => Some(browser),
             _ => None,
@@ -2625,11 +2740,13 @@ impl Cagents {
         let runtime_status = match self.cards.get(&id) {
             Some(CardRuntime::Loading) | None => Some((labels.starting, true)),
             Some(CardRuntime::Failed(_)) => Some(("Unavailable", false)),
+            #[cfg(feature = "integrated-browser")]
             Some(CardRuntime::Browser(browser))
                 if browser.lifecycle == BrowserLifecycle::Restoring =>
             {
                 Some(("Restoring…", true))
             }
+            #[cfg(feature = "integrated-browser")]
             Some(CardRuntime::Browser(browser)) if browser.load_state.is_some() => {
                 Some(("Loading…", true))
             }
@@ -2710,6 +2827,7 @@ impl Cagents {
             .spacing(0)
             .height(Length::Fixed(CARD_HEADER_HEIGHT));
 
+        #[cfg(feature = "integrated-browser")]
         let browser_toolbar: Option<Element<'a, Message>> = browser_session.map(|session| {
             let address = browser_runtime
                 .map(|browser| browser.address.as_str())
@@ -2806,6 +2924,42 @@ impl Cagents {
         // what it is given. The inspector additionally hides the workspace, so
         // that shell would not even be on screen.
         let card_focused = focused && !self.modal_is_open();
+        #[cfg(not(feature = "integrated-browser"))]
+        let browser_toolbar: Option<Element<'a, Message>> = browser_session.map(|session| {
+            let address = widget::text_input("Saved URL", session.current_url.as_str())
+                .id(chrome.map_or_else(
+                    || card_control_id(id, "browser.address"),
+                    |chrome| chrome.browser_address_id.clone(),
+                ))
+                .width(Length::Fill);
+            let toolbar = widget::container(
+                widget::row::with_children(vec![
+                    address.into(),
+                    widget::button::suggested("Open in system browser")
+                        .on_press(Message::RetryCard(id))
+                        .into(),
+                ])
+                .align_y(Alignment::Center)
+                .spacing(spacing.space_xxxs)
+                .width(Length::Fill),
+            )
+            .height(Length::Fixed(BROWSER_TOOLBAR_HEIGHT))
+            .padding([0, spacing.space_xxs])
+            .class(cosmic::theme::Container::Background);
+            widget::column::with_children(vec![
+                widget::divider::horizontal::light().into(),
+                toolbar.into(),
+            ])
+            .spacing(0)
+            .into()
+        });
+
+        let retry_label = if cfg!(not(feature = "integrated-browser")) && browser_session.is_some()
+        {
+            "Open in system browser"
+        } else {
+            "Retry"
+        };
         let content: Element<'a, Message> = match self.cards.get(&id) {
             Some(CardRuntime::Terminal(handle)) => TerminalWidget::new(handle.clone())
                 .font_size(self.settings.terminal_font_size)
@@ -2818,6 +2972,7 @@ impl Cagents {
                     message: error.to_string(),
                 })
                 .into(),
+            #[cfg(feature = "integrated-browser")]
             Some(CardRuntime::Browser(browser)) => BrowserWidget::new(&browser.handle)
                 .model_focused(card_focused)
                 .on_focus(Message::FocusCard(id))
@@ -2876,9 +3031,9 @@ impl Cagents {
                             .width(Length::Fill)
                             .into(),
                         widget::row::with_children(vec![
-                            widget::button::suggested("Retry")
+                            widget::button::suggested(retry_label)
                                 .id(card_control_id(id, "retry"))
-                                .name(format!("Retry {}", labels.type_label))
+                                .name(format!("{retry_label} {}", labels.type_label))
                                 .on_press(Message::RetryCard(id))
                                 .into(),
                             widget::button::standard("Close")
@@ -3020,6 +3175,7 @@ impl Cagents {
                     surface.hide()
                 }
                 .map_err(|error| error.to_string()),
+                #[cfg(feature = "integrated-browser")]
                 CardRuntime::Browser(browser) => browser
                     .handle
                     .set_visible(visible)
@@ -3230,7 +3386,10 @@ impl Application for Cagents {
     type Flags = ();
     type Message = Message;
 
+    #[cfg(feature = "integrated-browser")]
     const APP_ID: &'static str = "dev.cagents.Cagents";
+    #[cfg(not(feature = "integrated-browser"))]
+    const APP_ID: &'static str = "dev.cagents.Cagents.Browserless";
 
     fn init(core: Core, (): ()) -> (Self, Task<Message>) {
         let (
@@ -3287,9 +3446,12 @@ impl Application for Cagents {
             terminal_wake_rx,
             session,
             settings,
+            #[cfg(feature = "integrated-browser")]
             browser_teardowns: Vec::new(),
             terminal_teardowns: Vec::new(),
+            #[cfg(feature = "integrated-browser")]
             browser_factory: None,
+            #[cfg(feature = "integrated-browser")]
             browser_parent_lifetime: None,
             window_scale_factor,
             window_width: 1_600.0,
@@ -3332,6 +3494,7 @@ impl Application for Cagents {
             .workspace
             .resize_viewport((app.window_width - sidebar_width).max(0.0));
         let mut tasks = vec![app.initialize_runtimes()];
+        #[cfg(feature = "integrated-browser")]
         tasks.push(cosmic::task::message(Message::InitializeBrowserFactory));
         if let Some(window_id) = app.core.main_window_id() {
             tasks.push(
@@ -3440,9 +3603,21 @@ impl Application for Cagents {
                 self.drain_terminal(card, generation);
                 Task::none()
             }
-            Message::TerminalError { card: _, message }
-            | Message::BrowserError { card: _, message } => {
+            Message::TerminalError { card: _, message } => {
                 self.status = Some(TransientNotice::error(message));
+                Task::none()
+            }
+            #[cfg(feature = "integrated-browser")]
+            Message::BrowserError { card: _, message } => {
+                self.status = Some(TransientNotice::error(message));
+                Task::none()
+            }
+            #[cfg(not(feature = "integrated-browser"))]
+            Message::ExternalUrlOpened(result) => {
+                self.status = Some(match result {
+                    Ok(()) => TransientNotice::success("Opened in the system browser"),
+                    Err(error) => TransientNotice::error(error),
+                });
                 Task::none()
             }
             Message::OpenRepository => {
@@ -3707,6 +3882,7 @@ impl Application for Cagents {
                         CardRuntime::Terminal(handle) => {
                             self.begin_terminal_teardown(handle);
                         }
+                        #[cfg(feature = "integrated-browser")]
                         CardRuntime::Browser(browser) => {
                             self.begin_browser_teardown(browser.handle);
                         }
@@ -3772,7 +3948,9 @@ impl Application for Cagents {
             }
             Message::LifecycleSweep => self.lifecycle_sweep(),
             Message::LifecycleSweepElapsed(generation) => self.lifecycle_sweep_elapsed(generation),
+            #[cfg(feature = "integrated-browser")]
             Message::InitializeBrowserFactory => self.browser_factory_task(),
+            #[cfg(feature = "integrated-browser")]
             Message::BrowserFactoryReady(result) => match result {
                 Ok(binding) => {
                     self.browser_parent_lifetime = Some(binding.parent_lifetime);
@@ -3802,6 +3980,7 @@ impl Application for Cagents {
             Message::WindowScaleFactorChanged(scale_factor) => {
                 if scale_factor.is_finite() && scale_factor > 0.0 {
                     self.window_scale_factor = scale_factor;
+                    #[cfg(feature = "integrated-browser")]
                     for runtime in self.cards.values() {
                         if let CardRuntime::Browser(browser) = runtime {
                             let _ = browser.handle.set_scale_factor(scale_factor);
@@ -3834,15 +4013,18 @@ impl Application for Cagents {
                     Url::parse("https://github.com/").expect("default browser URL is valid"),
                 )
             }
+            #[cfg(feature = "integrated-browser")]
             Message::BrowserBack(card) => {
                 browser_command(&self.cards, card, |handle| handle.back(), &mut self.status)
             }
+            #[cfg(feature = "integrated-browser")]
             Message::BrowserForward(card) => browser_command(
                 &self.cards,
                 card,
                 |handle| handle.forward(),
                 &mut self.status,
             ),
+            #[cfg(feature = "integrated-browser")]
             Message::BrowserReload(card) => browser_command(
                 &self.cards,
                 card,
@@ -3850,12 +4032,14 @@ impl Application for Cagents {
                 &mut self.status,
             ),
             Message::RetryCard(card) => self.retry_card(card),
+            #[cfg(feature = "integrated-browser")]
             Message::BrowserAddressChanged { card, value } => {
                 if let Some(CardRuntime::Browser(browser)) = self.cards.get_mut(&card) {
                     browser.address = value;
                 }
                 Task::none()
             }
+            #[cfg(feature = "integrated-browser")]
             Message::BrowserNavigate(card) => {
                 let address = match self.cards.get(&card) {
                     Some(CardRuntime::Browser(browser)) => browser.address.trim().to_owned(),
@@ -3878,7 +4062,9 @@ impl Application for Cagents {
                     }
                 }
             }
+            #[cfg(feature = "integrated-browser")]
             Message::BrowserEvent { card, event } => self.handle_browser_event(card, event),
+            #[cfg(feature = "integrated-browser")]
             Message::ClipboardRead {
                 card,
                 request,
@@ -3892,6 +4078,7 @@ impl Application for Cagents {
                 }
                 Task::none()
             }
+            #[cfg(feature = "integrated-browser")]
             Message::FilePickerResult {
                 card,
                 request,
@@ -4241,6 +4428,7 @@ impl Application for Cagents {
         {
             subscriptions.push(workspace_widget::animation_frames(window, Message::Frame));
         }
+        #[cfg(feature = "integrated-browser")]
         for (&card, runtime) in &self.cards {
             if let CardRuntime::Browser(browser) = runtime {
                 subscriptions.push(
@@ -4470,6 +4658,7 @@ impl Application for Cagents {
             .values()
             .filter(|runtime| match runtime {
                 CardRuntime::Loading => true,
+                #[cfg(feature = "integrated-browser")]
                 CardRuntime::Browser(browser) => {
                     browser.lifecycle == BrowserLifecycle::Restoring || browser.load_state.is_some()
                 }
@@ -4778,6 +4967,7 @@ impl Drop for Cagents {
         // 3. drop the raw-handle factory/Wayland host;
         // 4. deactivate/drop the parent lifetime guard;
         // 5. only then may Rust drop `core` and its parent window.
+        #[cfg(feature = "integrated-browser")]
         for runtime in std::mem::take(&mut self.cards).into_values() {
             if let CardRuntime::Browser(mut browser) = runtime {
                 browser.handle.shutdown();
@@ -4786,10 +4976,13 @@ impl Drop for Cagents {
         for teardown in self.terminal_teardowns.drain(..) {
             let _ = teardown.join();
         }
+        #[cfg(feature = "integrated-browser")]
         for teardown in self.browser_teardowns.drain(..) {
             let _ = teardown.join();
         }
+        #[cfg(feature = "integrated-browser")]
         self.browser_factory.take();
+        #[cfg(feature = "integrated-browser")]
         if let Some(parent_lifetime) = self.browser_parent_lifetime.take() {
             parent_lifetime.deactivate();
         }
@@ -5234,6 +5427,7 @@ fn settings_dialog<'a>(
         .into()
 }
 
+#[cfg(feature = "integrated-browser")]
 fn spawn_browser(
     session: &BrowserSession,
     visible: bool,
@@ -5306,6 +5500,7 @@ fn repository_card<'a>(view: &'a RepositoryView) -> Element<'a, Message> {
     .into()
 }
 
+#[cfg(feature = "integrated-browser")]
 fn browser_command(
     cards: &HashMap<CardId, CardRuntime>,
     card: CardId,
@@ -5893,6 +6088,7 @@ mod tests {
         ));
     }
 
+    #[cfg(feature = "integrated-browser")]
     #[test]
     fn restored_nonvisible_browser_waits_for_visible_lifecycle_hydration() {
         let url = Url::parse("about:blank").unwrap();
