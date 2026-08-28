@@ -17,6 +17,8 @@ jobs:
     name: Build and publish Linux release
     runs-on: ubuntu-22.04
     timeout-minutes: 120
+    env:
+      CARGO_TARGET_DIR: ${{ github.workspace }}/target
     defaults:
       run:
         shell: bash
@@ -28,13 +30,10 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
-      - name: Install Rust 1.93
-        run: |
-          set -euo pipefail
-          rustup toolchain install 1.93.0 --profile minimal
-          rustup default 1.93.0
-          rustc --version
-          cargo --version
+      - name: Set up the Linux build environment
+        uses: ./.github/actions/setup-linux-build
+        with:
+          packaging: "true"
 
       - name: Require the tag to match Cargo.toml
         run: |
@@ -51,53 +50,11 @@ jobs:
           fi
           printf 'VERSION=%s\n' "$version" >> "$GITHUB_ENV"
 
-      - name: Install native build and packaging dependencies
-        run: |
-          set -euo pipefail
-          sudo apt-get update
-          sudo apt-get install --yes --no-install-recommends \
-            appstream \
-            build-essential \
-            clang \
-            cmake \
-            curl \
-            desktop-file-utils \
-            dpkg-dev \
-            git \
-            libclang-dev \
-            libdbus-1-dev \
-            libegl1-mesa-dev \
-            libfontconfig1-dev \
-            libfreetype6-dev \
-            libgbm-dev \
-            libgl1-mesa-dev \
-            libssl-dev \
-            libudev-dev \
-            libwayland-dev \
-            libxkbcommon-dev \
-            ninja-build \
-            pkg-config \
-            python3 \
-            xz-utils
-
-      - name: Install Zig 0.15.2
-        env:
-          ZIG_SHA256: 02aa270f183da276e5b5920b1dac44a63f1a49e55050ebde3aecc9eb82f93239
-          ZIG_URL: https://ziglang.org/download/0.15.2/zig-x86_64-linux-0.15.2.tar.xz
-        run: |
-          set -euo pipefail
-          archive="$RUNNER_TEMP/zig-0.15.2.tar.xz"
-          curl --proto '=https' --tlsv1.2 --fail --location "$ZIG_URL" --output "$archive"
-          printf '%s  %s\n' "$ZIG_SHA256" "$archive" | sha256sum --check --strict
-          tar -xJf "$archive" -C "$RUNNER_TEMP"
-          printf '%s\n' "$RUNNER_TEMP/zig-x86_64-linux-0.15.2" >> "$GITHUB_PATH"
-
-      - name: Check the locked source
+      - name: Test all targets in the release profile
         run: |
           set -euo pipefail
           zig version
-          cargo check --locked --all-targets
-          cargo test --locked --all-targets
+          cargo test --locked --release --all-targets
 
       - name: Build Linux packages
         run: ./scripts/package-linux.sh
