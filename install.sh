@@ -421,6 +421,7 @@ if ! awk -v top="$TOP_LEVEL" '
             path == top "/bin/cagents" ||
             path == top "/bin/cagents-ui" ||
             path == top "/bin/cagentsd" ||
+            path == top "/bin/.cagents-ui-lease-v1" ||
             path == top "/bin/cagents-uninstall" ||
             path == top "/share/" ||
             path == top "/share/applications/" ||
@@ -443,6 +444,7 @@ if ! awk -v top="$TOP_LEVEL" '
     $0 == top "/bin/cagents" { required[1] = 1 }
     $0 == top "/bin/cagents-ui" { required[2] = 1 }
     $0 == top "/bin/cagentsd" { required[3] = 1 }
+    $0 == top "/bin/.cagents-ui-lease-v1" { required[10] = 1 }
     $0 == top "/bin/cagents-uninstall" { required[4] = 1 }
     $0 == top "/share/applications/dev.cagents.Cagents.desktop" { required[5] = 1 }
     $0 == top "/share/icons/hicolor/scalable/apps/dev.cagents.Cagents.svg" { required[6] = 1 }
@@ -450,7 +452,7 @@ if ! awk -v top="$TOP_LEVEL" '
     $0 == top "/share/metainfo/dev.cagents.Cagents.metainfo.xml" { required[7] = 1 }
     $0 == top "/share/doc/cagents/LICENSE" { required[8] = 1 }
     END {
-        for (i = 1; i <= 9; i++) if (!required[i]) exit 1
+        for (i = 1; i <= 10; i++) if (!required[i]) exit 1
     }
 ' "$ARCHIVE_LIST"; then
     fail 'archive has an unexpected or incomplete entry structure'
