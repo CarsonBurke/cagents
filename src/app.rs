@@ -3061,27 +3061,21 @@ impl Cagents {
             || self.pull_request_dialog.is_some()
     }
 
-    /// Opens `inspector` and moves keyboard focus into it.
+    /// Opens `inspector` from closed, and moves keyboard focus into it.
     ///
     /// The dialog is a modal popover, and the modal captures pointer events
     /// only, so focus would otherwise stay on the control that opened it -
-    /// where Enter re-fires that control, reopening the dialog and rebuilding
-    /// the draft over whatever the user had typed.
+    /// where Enter re-fires that control. That control cannot be reached
+    /// while the dialog is up, because `update` refuses a pane command for
+    /// as long as one is open, so this only ever runs from closed.
     fn open_inspector(&mut self, inspector: Inspector) -> Task<Message> {
-        let now = Instant::now();
-        let from = self.inspector_transition.map_or_else(
-            || if self.inspector.is_some() { 1.0 } else { 0.0 },
-            |transition| transition.progress(now),
-        );
-        let was_closed = self.inspector.replace(inspector).is_none();
+        self.inspector = Some(inspector);
         self.inspector_transition = Some(InspectorTransition {
-            started_at: now,
-            from,
+            started_at: Instant::now(),
+            from: 0.0,
             to: 1.0,
         });
-        if was_closed {
-            self.set_workspace_surfaces_visible(false);
-        }
+        self.set_workspace_surfaces_visible(false);
         self.frame_clock.reset();
         iced::widget::operation::focus(settings_close_id()).map(cosmic::Action::App)
     }
