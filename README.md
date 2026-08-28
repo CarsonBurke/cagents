@@ -264,7 +264,7 @@ APT removal and purge do not delete files in the user's XDG directories.
 
 ## Releases
 
-Once a canonical GitHub repository is configured, pushing a `v*` tag runs `.github/workflows/release.yml` on Ubuntu 22.04 with Rust 1.93 and Zig 0.15.2. The tag must exactly equal `v` plus the version in `Cargo.toml`; a mismatch fails before package publication. A successful run tests and checks the locked source, validates the desktop and AppStream metadata, calls `scripts/package-linux.sh`, stamps the canonical repository into `dist/install.sh`, regenerates `SHA256SUMS`, and creates a non-draft GitHub release containing:
+Once a canonical GitHub repository is configured, pushing a `v*` tag runs `.github/workflows/release.yml` on Ubuntu 22.04 with Rust 1.93 and Zig 0.15.2. The tag must exactly equal `v` plus the version in `Cargo.toml`; a mismatch fails before package publication. A successful release runs locked, all-target tests in the release profile, then calls `scripts/package-linux.sh` so its production binary build reuses the release-profile dependency artifacts. The workflow also validates the desktop and AppStream metadata, stamps the canonical repository into `dist/install.sh`, regenerates `SHA256SUMS`, and creates a non-draft GitHub release containing:
 
 - `cagents-${VERSION}-x86_64-unknown-linux-gnu.tar.gz`
 - `cagents_${VERSION}_amd64.deb`
