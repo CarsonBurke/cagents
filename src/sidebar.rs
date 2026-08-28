@@ -1776,9 +1776,15 @@ impl Widget<SidebarAction, Theme, Renderer> for ResizeHandle<'_> {
             // at once. A held key is one gesture still under way: settling on
             // every repeat would rewrite and fsync the settings file at the
             // key-repeat rate, so a repeated gesture settles on release.
-            Event::Keyboard(keyboard::Event::KeyPressed { key, repeat, .. })
-                if state.is_focused =>
-            {
+            // An arrow carrying a modifier belongs to whoever reserved that
+            // chord - `Alt+Left` and `Alt+Right` navigate columns by default -
+            // so only a bare arrow resizes the pane.
+            Event::Keyboard(keyboard::Event::KeyPressed {
+                key,
+                modifiers,
+                repeat,
+                ..
+            }) if state.is_focused && modifiers.is_empty() => {
                 if let Some(step) = resize_step(key) {
                     shell.publish(self.resize(self.width + step));
                     if *repeat {
