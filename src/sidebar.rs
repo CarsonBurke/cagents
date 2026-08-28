@@ -1833,11 +1833,15 @@ impl Widget<SidebarAction, Theme, Renderer> for ResizeHandle<'_> {
                 match request.action {
                     Action::Focus => state.is_focused = true,
                     Action::Blur => state.is_focused = false,
-                    Action::Increment => {
+                    // A dialog is not ours to resize behind, whoever asks:
+                    // the keyboard path stands down for one, and an
+                    // assistive technology reaches this widget by another
+                    // road rather than with another right.
+                    Action::Increment if !self.modal_open => {
                         shell.publish(self.resize(self.width + RESIZE_STEP));
                         shell.publish(SidebarAction::ResizeFinished);
                     }
-                    Action::Decrement => {
+                    Action::Decrement if !self.modal_open => {
                         shell.publish(self.resize(self.width - RESIZE_STEP));
                         shell.publish(SidebarAction::ResizeFinished);
                     }
