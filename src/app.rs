@@ -3327,7 +3327,7 @@ impl Application for Cagents {
         // the starting width is the closest estimate available before the
         // surface reports its own. The strip then replaces the estimate itself,
         // from its own measured bounds, through `WorkspaceViewportEvent`; the
-        // window's own resize only re-derives the pane density. Card widths are
+        // window's own resize only re-derives the densities. Card widths are
         // fractions re-derived per frame, so an estimate costs nothing but is
         // enough to mount them.
         let sidebar_width = sidebar::effective_width(

@@ -114,7 +114,7 @@ pub const MAX_CARD_NAME_CHARS: usize = 256;
 /// [`Workspace::rename_card`] normalise here, by construction, so the model
 /// cannot hold an unbounded or reordering `accessible_name`. The name the
 /// surfaces actually read is the durable `CardState::title`, which every
-/// writer normalises at its own call site: the four that name a new card, the
+/// writer normalises at its own call site: the three that name a new card, the
 /// reported-title path, and the restore path that re-admits titles stored by
 /// a build predating this function. A new writer of that field must call
 /// here too; nothing in the type system will remind it.
@@ -164,7 +164,7 @@ pub fn normalize_card_name(name: &str) -> Option<String> {
 /// paragraph separators are not here because they are whitespace, and so are
 /// already collapsed into a space. Other invisible format characters are kept
 /// deliberately: a zero-width joiner is load-bearing inside an emoji sequence,
-/// and unlike a bidi control it cannot make one name read as another.
+/// and unlike a bidi control none of them can reorder the text around them.
 fn is_name_formatting(character: char) -> bool {
     matches!(
         character,
