@@ -13,8 +13,9 @@
 - Use `scripts/run-development --browserless` for ordinary UI, session, sidebar, settings, and terminal work.
 - Use `scripts/run-development` when the changed behavior requires the embedded browser.
 - Do not use a direct `cargo run` as the normal UI workflow. The runner builds the three sibling executables together and selects the isolated development application ID, state, and daemon.
+- The runner uses the `dev-runtime` profile so UI dependencies remain optimized. Keep ordinary `dev` checks unoptimized; do not restore a wildcard `opt-level` under `[profile.dev.package."*"]`.
 - Add `--debug --log-file /tmp/cagents-ui.log` when diagnosing UI behavior.
-- Add `--fresh-daemon` after changing daemon, terminal-host, IPC/protocol, or process-lifecycle code. It terminates terminals hosted by the old development daemon.
+- Add `--fresh-daemon` after changing daemon, terminal-host, IPC/protocol, or process-lifecycle code. It validates and signals the old development daemon before rebuilding, so it remains safe across protocol changes; this terminates terminals hosted by that daemon.
 - Do not run browserless and integrated development sessions concurrently; they share development state.
 
 ## Preserve cross-feature behavior

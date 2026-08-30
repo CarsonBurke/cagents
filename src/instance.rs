@@ -10,9 +10,14 @@ use std::{
     process,
 };
 
+use directories::ProjectDirs;
 use thiserror::Error;
 
-const APPLICATION_LOCK_FILE: &str = "cagents-ui.lock";
+const APPLICATION_LOCK_FILE: &str = if IS_DEVELOPMENT {
+    "cagents-development-ui.lock"
+} else {
+    "cagents-ui.lock"
+};
 const PRIVATE_FILE_MODE: u32 = 0o600;
 const LEASE_CAPABLE_PROCESS_NAME: &str = "cagents-ui-v2";
 const LEGACY_PROCESS_NAME: &str = "cagents-ui";
@@ -43,18 +48,20 @@ pub enum ApplicationLeaseError {
     Io(#[from] io::Error),
 }
 
-/// Exclusive process lease protecting the session store shared by all variants.
+/// Exclusive process lease protecting this instance's durable session store.
 pub struct ApplicationLease {
     _lock: File,
 }
 
 impl ApplicationLease {
     pub fn acquire() -> Result<Self, ApplicationLeaseError> {
-        let peer_directory = Path::new(PEER_PACKAGE_DIRECTORY);
-        if peer_ui_predates_lease(peer_directory) {
-            return Err(ApplicationLeaseError::IncompatiblePeerPackage {
-                path: peer_directory.join("cagents-ui"),
-            });
+        if !IS_DEVELOPMENT {
+            let peer_directory = Path::new(PEER_PACKAGE_DIRECTORY);
+            if peer_ui_predates_lease(peer_directory) {
+                return Err(ApplicationLeaseError::IncompatiblePeerPackage {
+                    path: peer_directory.join("cagents-ui"),
+                });
+            }
         }
         mark_lease_capable_process()?;
         let runtime_directory = env::var_os("XDG_RUNTIME_DIR")
@@ -62,7 +69,7 @@ impl ApplicationLease {
             .filter(|path| path.is_absolute())
             .ok_or(ApplicationLeaseError::MissingRuntimeDirectory)?;
         let lease = Self::acquire_in(&runtime_directory)?;
-        if legacy_ui_process_running(Path::new("/proc"))? {
+        if !IS_DEVELOPMENT && legacy_ui_process_running(Path::new("/proc"))? {
             return Err(ApplicationLeaseError::AlreadyRunning);
         }
         Ok(lease)
@@ -156,13 +163,10 @@ fn legacy_ui_process_running(proc_root: &Path) -> io::Result<bool> {
     }
     Ok(false)
 }
-
 fn current_uid() -> u32 {
     // SAFETY: geteuid has no preconditions and no failure state.
     unsafe { libc::geteuid() }
 }
-
-use directories::ProjectDirs;
 
 // Source-tree debug builds are development instances by default. The explicit
 // feature keeps the same isolation available to optimized development builds.
@@ -260,41 +264,54 @@ mod tests {
         assert!(!peer_ui_predates_lease(peer.path()));
     }
 
+    #[cfg(any(debug_assertions, feature = "development"))]
     #[test]
-    fn instance_namespaces_are_internally_consistent() {
-        if IS_DEVELOPMENT {
-            assert_eq!(
-                (
-                    NAME,
-                    APPLICATION_ID,
-                    APPLICATION_NAME,
-                    STORAGE_NAME,
-                    RUNTIME_SUBDIRECTORY
-                ),
-                (
-                    "development",
-                    "dev.cagents.Cagents.Development",
-                    "cagents (Development)",
-                    "cagents-development",
-                    "cagents-development"
-                )
-            );
+    fn debug_and_explicit_development_builds_use_development_namespaces() {
+        assert_eq!(
+            (
+                NAME,
+                APPLICATION_ID,
+                APPLICATION_NAME,
+                STORAGE_NAME,
+                RUNTIME_SUBDIRECTORY,
+                APPLICATION_LOCK_FILE,
+            ),
+            (
+                "development",
+                "dev.cagents.Cagents.Development",
+                "cagents (Development)",
+                "cagents-development",
+                "cagents-development",
+                "cagents-development-ui.lock",
+            )
+        );
+    }
+
+    #[cfg(not(any(debug_assertions, feature = "development")))]
+    #[test]
+    fn optimized_builds_without_development_feature_use_production_namespaces() {
+        let application_id = if cfg!(feature = "integrated-browser") {
+            "dev.cagents.Cagents"
         } else {
-            let application_id = if cfg!(feature = "integrated-browser") {
-                "dev.cagents.Cagents"
-            } else {
-                "dev.cagents.Cagents.Browserless"
-            };
-            assert_eq!(
-                (
-                    NAME,
-                    APPLICATION_ID,
-                    APPLICATION_NAME,
-                    STORAGE_NAME,
-                    RUNTIME_SUBDIRECTORY
-                ),
-                ("production", application_id, "cagents", "cagents", "cagents")
-            );
-        }
+            "dev.cagents.Cagents.Browserless"
+        };
+        assert_eq!(
+            (
+                NAME,
+                APPLICATION_ID,
+                APPLICATION_NAME,
+                STORAGE_NAME,
+                RUNTIME_SUBDIRECTORY,
+                APPLICATION_LOCK_FILE,
+            ),
+            (
+                "production",
+                application_id,
+                "cagents",
+                "cagents",
+                "cagents",
+                "cagents-ui.lock",
+            )
+        );
     }
 }

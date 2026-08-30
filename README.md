@@ -43,7 +43,7 @@ Use the development instance for source-tree work. Start with the browserless la
 # Fast type-check: 518 Linux packages; no Servo/WebRender/SpiderMonkey.
 cargo check --locked --no-default-features --bins
 
-# Full integration boundary: 980 Linux packages.
+# Full integration boundary: 977 Linux packages.
 cargo check --locked --bins
 ```
 
@@ -54,6 +54,7 @@ cargo build --locked --release --no-default-features --bins
 ```
 
 Browserless builds keep terminals, repositories, worktrees, GitHub pull-request flows, and persistence. New links use the desktop portal and fall back to the system `xdg-open` handler when a portal is unavailable; Debian packages install `xdg-utils`, and portable/source users must provide it for that fallback. A restored browser card retains its saved URL, history, scroll position, and fidelity, shows that the integrated browser is unavailable, and offers **Open in system browser**. Running only one binary from an unrelated directory is not a supported layout; `cagents`, `cagents-ui`, and `cagentsd` must remain together.
+
 Launch the native UI through the development runner:
 
 ```sh
@@ -71,9 +72,9 @@ scripts/run-development --debug --fresh-daemon
 scripts/run-development --browserless --debug --log-file /tmp/cagents-ui.log
 ```
 
-`--log-file` captures UI tracing and panic output in a stable artifact while Cargo diagnostics remain in the invoking terminal. Fresh-daemon mode stops the isolated daemon and therefore terminates its hosted development terminals. `scripts/run-development` is POSIX shell; the repository contains no Python development tooling. Python remains a native build prerequisite for the full Servo dependency graph.
+`--log-file` captures UI tracing and panic output in a stable artifact while Cargo diagnostics remain in the invoking terminal. Fresh-daemon mode validates the isolated daemon's lock owner and process before signaling it, so protocol changes cannot strand an older daemon; stopping it terminates its hosted development terminals. `scripts/run-development` is POSIX shell; the repository contains no Python development tooling. Python remains a native build prerequisite for the full Servo dependency graph.
 
-The runner builds the three sibling executables in one Cargo pass and executes the selected UI directly. The development instance has its own application ID, configuration, session database, transcripts, and `$XDG_RUNTIME_DIR/cagents-development/` daemon, so it can run beside the installed production instance. `cagents`, `cagents-ui`, and `cagentsd` must remain together.
+The runner builds the three sibling executables in one Cargo pass and executes the selected UI through Cargo, so configured target directories and target triples are honored. Its `dev-runtime` profile keeps dependencies optimized for usable UI performance while the ordinary `dev` profile stays cheap for checks. The development instance has its own application ID, configuration, session database, transcripts, application lease, and `$XDG_RUNTIME_DIR/cagents-development/` daemon, so it can run beside the installed production instance. `cagents`, `cagents-ui`, and `cagentsd` must remain together.
 
 ## Install a release
 
@@ -210,10 +211,11 @@ Run `cagents --help` or `cagents terminal --help` for the complete command set.
 
 ## Daemon and user data
 
-There is no service unit, login autostart, or system daemon. A UI or terminal command starts the per-user sibling `cagentsd` on demand. The daemon runs independently after the launching process exits so terminals can survive UI restarts. Full and browserless builds share the established protocol-3 daemon socket, preserving live terminals when upgrading or switching variants. A protocol change must deliberately retain or migrate that namespace. One shared application lease prevents concurrent UI processes from racing writes to their common session store. During the lease rollout, startup rejects both a UI left running from an older build and a Debian peer package that predates the lease marker; upgrade that peer before switching variants. Stop the shared daemon explicitly with either control command (`cagents daemon stop` or `cagents-browserless daemon stop`); installers and package upgrades stop the daemon owned by the package being changed while preserving a compatible peer package's daemon.
-The standard production installation starts its per-user daemon immediately and registers it for graphical-login autostart. While that daemon is running, cagents exposes a system-tray item that opens the UI and can stop the daemon. The daemon remains independent of the UI so terminals survive window and UI-process restarts. `cagents daemon stop` stops it for the current login; starting the UI or a terminal command starts it again on demand.
+There is no system daemon or service unit. The standard production installation starts its per-user sibling `cagentsd` immediately and registers it for graphical-login autostart. While that daemon is running, cagents exposes a system-tray item that opens the UI and can stop the daemon. The daemon remains independent of the UI so terminals survive window and UI-process restarts.
 
-Cargo debug builds and builds with the explicit `development` feature use a separate daemon and do not register a tray item or autostart entry. This keeps source-tree development isolated while the installed production cagents remains available as the workflow manager. Release builds without that feature are production builds.
+Full and browserless production builds share the established protocol-3 daemon socket and session store. A protocol change must deliberately retain or migrate that namespace. One shared application lease prevents their UI processes from racing writes, and startup rejects an older running UI or Debian peer package that predates the lease marker. Upgrade that peer before switching variants. Stop the shared daemon explicitly with either control command (`cagents daemon stop` or `cagents-browserless daemon stop`); installers and package upgrades stop the daemon owned by the package being changed while preserving a compatible peer package's daemon.
+
+Cargo debug builds and builds with the explicit `development` feature use a separate daemon, session store, application lease, and runtime namespace. They do not register a tray item or autostart entry, so source-tree development can run beside the installed production application. Release builds without that feature are production builds.
 
 cagents follows the XDG base-directory convention. Production paths are:
 
