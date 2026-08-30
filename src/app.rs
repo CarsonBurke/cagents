@@ -48,6 +48,7 @@ use crate::{
         RepositoryService, StatusSnapshot, ValidatedBranchName, WorktreeCreationOutcome,
         WorktreeRecord,
     },
+    repository_widget::{self, RepositoryAction, RepositoryRuntime},
     session::SessionRuntime,
     settings::{self, AppSettings, KeyboardShortcuts, LinkOpenDestination, LinkOpenGesture},
     sidebar::{
@@ -737,6 +738,26 @@ fn is_escape_press(event: &keyboard::Event) -> bool {
     )
 }
 
+fn is_save_press(event: &keyboard::Event) -> bool {
+    matches!(
+        event,
+        keyboard::Event::KeyPressed {
+            key: keyboard::Key::Character(key),
+            modifiers,
+            repeat: false,
+            ..
+        } if key.eq_ignore_ascii_case("s")
+            && modifiers.control()
+            && !modifiers.alt()
+            && !modifiers.shift()
+            && !modifiers.logo()
+    )
+}
+
+fn repository_task(task: iced::Task<RepositoryAction>) -> Task<Message> {
+    task.map(Message::Repository).map(cosmic::Action::App)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SettingsField {
     MaxHotCards,
@@ -1001,10 +1022,15 @@ pub enum Message {
         open_cards: bool,
         result: Result<Box<LoadedRepository>, String>,
     },
+    Repository(RepositoryAction),
     Sidebar(SidebarAction),
     FocusCard(CardId),
     CloseCard(CardId),
     CommitClose(CardId),
+    SaveAndCloseRepository(CardId),
+    OverwriteAndCloseRepository(CardId),
+    DiscardAndCloseRepository(CardId),
+    CancelRepositoryClose,
     Viewport(WorkspaceViewportEvent),
     Pan(PanGesture),
     Wheel(WheelDelta),
@@ -1190,7 +1216,7 @@ enum CardRuntime {
     Terminal(TerminalSurface),
     #[cfg(feature = "integrated-browser")]
     Browser(BrowserRuntime),
-    Repository(RepositoryView),
+    Repository(Box<RepositoryRuntime>),
     PullRequests(PathBuf),
 }
 
@@ -1322,6 +1348,7 @@ pub struct Cagents {
     github_repositories: HashMap<ProjectId, GitHubRepoKey>,
     worktree_dialog: Option<WorktreeDialog>,
     pull_request_dialog: Option<PullRequestDialog>,
+    dirty_repository_close: Option<CardId>,
     frame_clock: FrameClock,
     inspector: Option<Inspector>,
     inspector_transition: Option<InspectorTransition>,
@@ -1519,6 +1546,7 @@ impl Cagents {
     }
 
     fn initialize_runtimes(&mut self) -> Task<Message> {
+        let mut repository_tasks = Vec::new();
         let initially_visible = self
             .durable
             .cards
@@ -1597,7 +1625,10 @@ impl Cagents {
                     );
                 }
                 CardKind::Repository(view) => {
-                    self.cards.insert(card.id, CardRuntime::Repository(view));
+                    let mut runtime = RepositoryRuntime::new(view);
+                    repository_tasks.push(repository_task(runtime.initial_load(card.id)));
+                    self.cards
+                        .insert(card.id, CardRuntime::Repository(Box::new(runtime)));
                 }
                 CardKind::PullRequests(view) => {
                     self.cards
@@ -1609,7 +1640,10 @@ impl Cagents {
         // Restored integrated browsers wait for the rendering factory. A
         // browserless build leaves their durable descriptors untouched and
         // renders an explicit external-open path instead.
-        self.reconcile_lifecycle(&initially_visible, &initially_prefetch)
+        Task::batch([
+            self.reconcile_lifecycle(&initially_visible, &initially_prefetch),
+            Task::batch(repository_tasks),
+        ])
     }
 
     fn start_terminal(
@@ -1764,7 +1798,10 @@ impl Cagents {
         let durable = Arc::make_mut(&mut self.durable);
         durable.cards.push(card);
         durable.focused = Some(card_id);
-        self.cards.insert(card_id, CardRuntime::Repository(view));
+        let mut runtime = RepositoryRuntime::new(view);
+        let load = repository_task(runtime.initial_load(card_id));
+        self.cards
+            .insert(card_id, CardRuntime::Repository(Box::new(runtime)));
         let index = self.workspace.cards().len();
         let update = self
             .workspace
@@ -1783,7 +1820,7 @@ impl Cagents {
                 ViewportUpdate::unchanged()
             });
         self.persist();
-        self.apply_viewport(update, true, false)
+        Task::batch([self.apply_viewport(update, true, false), load])
     }
     fn open_link(&mut self, url: Url) -> Task<Message> {
         self.show_workspace_for_action();
@@ -2154,8 +2191,11 @@ impl Cagents {
                 unreachable!("browserless retries return before mutating durable state")
             }
             CardKind::Repository(view) => {
-                self.cards.insert(card, CardRuntime::Repository(view));
-                Task::none()
+                let mut runtime = RepositoryRuntime::new(view);
+                let task = repository_task(runtime.initial_load(card));
+                self.cards
+                    .insert(card, CardRuntime::Repository(Box::new(runtime)));
+                task
             }
             CardKind::PullRequests(view) => {
                 self.cards
@@ -3115,7 +3155,9 @@ impl Cagents {
                     message: error.to_string(),
                 })
                 .into(),
-            Some(CardRuntime::Repository(view)) => repository_card(view),
+            Some(CardRuntime::Repository(runtime)) => {
+                repository_widget::view(id, runtime).map(Message::Repository)
+            }
             Some(CardRuntime::PullRequests(repository)) => widget::container(
                 widget::container(
                     widget::column::with_children(vec![
@@ -3362,6 +3404,7 @@ impl Cagents {
         self.inspector.is_some()
             || self.worktree_dialog.is_some()
             || self.pull_request_dialog.is_some()
+            || self.dirty_repository_close.is_some()
     }
 
     fn context_inspector_is_overlay(&self) -> bool {
@@ -3772,6 +3815,7 @@ impl Application for Cagents {
             github_repositories: HashMap::new(),
             worktree_dialog: None,
             pull_request_dialog: None,
+            dirty_repository_close: None,
             frame_clock: FrameClock::default(),
             inspector: None,
             inspector_transition: None,
@@ -3861,7 +3905,9 @@ impl Application for Cagents {
                     .focused()
                     .and_then(|id| self.cards.get(&id))
                     .and_then(|runtime| match runtime {
-                        CardRuntime::Repository(view) => Some(view.worktree.clone()),
+                        CardRuntime::Repository(runtime) => {
+                            Some(runtime.descriptor.worktree.clone())
+                        }
                         _ => None,
                     })
                     .unwrap_or_else(|| {
@@ -4058,6 +4104,36 @@ impl Application for Cagents {
                 }
                 task
             }
+            Message::Repository(RepositoryAction::NewTerminal { card }) => {
+                self.show_workspace_for_action();
+                match self.cards.get(&card) {
+                    Some(CardRuntime::Repository(runtime)) => {
+                        self.add_terminal(runtime.descriptor.worktree.clone())
+                    }
+                    _ => Task::none(),
+                }
+            }
+            Message::Repository(action) => {
+                let card = action.card();
+                let save_finished = matches!(action, RepositoryAction::SaveFinished { .. });
+                let (task, saved_for_close) = match self.cards.get_mut(&card) {
+                    Some(CardRuntime::Repository(runtime)) => {
+                        let task = repository_task(runtime.update(action));
+                        let saved_for_close = save_finished
+                            && self.dirty_repository_close == Some(card)
+                            && !runtime.is_dirty()
+                            && runtime.save_error().is_none();
+                        (task, saved_for_close)
+                    }
+                    _ => (Task::none(), false),
+                };
+                if saved_for_close {
+                    self.dirty_repository_close = None;
+                    Task::batch([task, cosmic::task::message(Message::CloseCard(card))])
+                } else {
+                    task
+                }
+            }
             Message::Sidebar(action) => {
                 // A control in the pane can still be activated while a dialog
                 // is up: the modal captures the pointer, and the focus
@@ -4189,6 +4265,11 @@ impl Application for Cagents {
                     Task::none()
                 }
             },
+            Message::CloseCard(id) if matches!(self.cards.get(&id), Some(CardRuntime::Repository(runtime)) if runtime.is_dirty()) =>
+            {
+                self.dirty_repository_close = Some(id);
+                Task::none()
+            }
             Message::CloseCard(id) => match self.workspace.request_close(id) {
                 Ok(handoff) => workspace_widget::focus_handoff_then(
                     handoff,
@@ -4201,6 +4282,29 @@ impl Application for Cagents {
                     Task::none()
                 }
             },
+            Message::SaveAndCloseRepository(id) => match self.cards.get_mut(&id) {
+                Some(CardRuntime::Repository(runtime)) => {
+                    repository_task(runtime.request_save(id, false))
+                }
+                _ => Task::none(),
+            },
+            Message::OverwriteAndCloseRepository(id) => match self.cards.get_mut(&id) {
+                Some(CardRuntime::Repository(runtime)) => {
+                    repository_task(runtime.request_save(id, true))
+                }
+                _ => Task::none(),
+            },
+            Message::DiscardAndCloseRepository(id) => {
+                if let Some(CardRuntime::Repository(runtime)) = self.cards.get_mut(&id) {
+                    runtime.abandon_unsaved_changes();
+                }
+                self.dirty_repository_close = None;
+                cosmic::task::message(Message::CloseCard(id))
+            }
+            Message::CancelRepositoryClose => {
+                self.dirty_repository_close = None;
+                Task::none()
+            }
             Message::CommitClose(id) => {
                 if let Some(runtime) = self.cards.remove(&id) {
                     match runtime {
@@ -4634,6 +4738,9 @@ impl Application for Cagents {
                     self.keyboard_modifiers = *modifiers;
                 }
                 if is_escape_press(&event) {
+                    if self.dirty_repository_close.is_some() {
+                        return cosmic::task::message(Message::CancelRepositoryClose);
+                    }
                     if self.inspector.is_some() {
                         return cosmic::task::message(Message::CloseInspector);
                     }
@@ -4652,6 +4759,15 @@ impl Application for Cagents {
                 // time this runs, and what it does with one is its own affair.
                 if self.workspace_inputs_blocked() {
                     return Task::none();
+                }
+                if is_save_press(&event)
+                    && let Some(card) = self.workspace.focused()
+                    && matches!(self.cards.get(&card), Some(CardRuntime::Repository(_)))
+                {
+                    return cosmic::task::message(Message::Repository(RepositoryAction::Save {
+                        card,
+                        overwrite: false,
+                    }));
                 }
                 match workspace_widget::global_shortcut(&event, &self.settings.keyboard_shortcuts) {
                     Some(workspace_widget::GlobalShortcut::NewTerminal) => {
@@ -4775,6 +4891,67 @@ impl Application for Cagents {
 
     fn dialog(&self) -> Option<Element<'_, Message>> {
         let spacing = cosmic::theme::spacing();
+        if let Some(card) = self.dirty_repository_close {
+            let runtime = match self.cards.get(&card) {
+                Some(CardRuntime::Repository(runtime)) => runtime,
+                _ => return None,
+            };
+            let title = self
+                .card_state(card)
+                .map_or("Repository".into(), |state| state.title.clone());
+            let mut rows: Vec<Element<'_, Message>> = vec![
+                widget::text::title3(format!("Save changes to {title}?"))
+                    .into(),
+                widget::text::body(
+                    "This editor has unsaved changes. Save them before closing, discard them, or keep the repository open.",
+                )
+                .wrapping(cosmic::iced::widget::text::Wrapping::Word)
+                .into(),
+            ];
+            if let Some(error) = runtime.save_error() {
+                rows.push(
+                    widget::text::body(error.to_owned())
+                        .wrapping(cosmic::iced::widget::text::Wrapping::Word)
+                        .into(),
+                );
+            }
+            let save_message = runtime
+                .can_save()
+                .then_some(if runtime.has_save_conflict() {
+                    Message::OverwriteAndCloseRepository(card)
+                } else {
+                    Message::SaveAndCloseRepository(card)
+                });
+            rows.push(
+                widget::row::with_children(vec![
+                    widget::button::standard("Cancel")
+                        .on_press(Message::CancelRepositoryClose)
+                        .into(),
+                    widget::button::destructive("Discard")
+                        .on_press_maybe(
+                            (!runtime.is_saving())
+                                .then_some(Message::DiscardAndCloseRepository(card)),
+                        )
+                        .into(),
+                    widget::button::suggested(if runtime.has_save_conflict() {
+                        "Overwrite and close"
+                    } else {
+                        "Save and close"
+                    })
+                    .on_press_maybe(save_message)
+                    .into(),
+                ])
+                .spacing(spacing.space_xxs)
+                .into(),
+            );
+            return Some(
+                widget::container(widget::column::with_children(rows).spacing(spacing.space_xs))
+                    .class(cosmic::theme::Container::Dialog(false))
+                    .padding(spacing.space_m)
+                    .max_width(560)
+                    .into(),
+            );
+        }
         if let Some(dialog) = self.worktree_dialog.as_ref() {
             return Some(
                 widget::container(
@@ -5902,48 +6079,6 @@ fn spawn_browser(
             load_state: None,
         })
         .map_err(|error| error.to_string())
-}
-
-fn repository_card<'a>(view: &'a RepositoryView) -> Element<'a, Message> {
-    let spacing = cosmic::theme::spacing();
-    let name = view
-        .worktree
-        .file_name()
-        .map(|name| name.to_string_lossy().into_owned())
-        .filter(|name| !name.is_empty())
-        .unwrap_or_else(|| "Repository".into());
-    widget::container(
-        widget::column::with_children(vec![
-            widget::row::with_children(vec![
-                widget::icon::from_name("folder-symbolic").size(20).into(),
-                widget::text::title3(name).into(),
-            ])
-            .align_y(Alignment::Center)
-            .spacing(spacing.space_xxs)
-            .into(),
-            widget::text::body(view.worktree.display().to_string())
-                .wrapping(cosmic::iced::widget::text::Wrapping::Word)
-                .into(),
-            widget::text::caption(format!("Git directory: {}", view.repository.display()))
-                .wrapping(cosmic::iced::widget::text::Wrapping::Word)
-                .into(),
-            widget::row::with_children(vec![
-                widget::button::suggested("New terminal here")
-                    .leading_icon(widget::icon::from_name("utilities-terminal-symbolic").size(16))
-                    .on_press(Message::NewTerminal)
-                    .into(),
-            ])
-            .spacing(spacing.space_xxs)
-            .into(),
-        ])
-        .align_x(Alignment::Start)
-        .spacing(spacing.space_s)
-        .max_width(CONTENT_MAX_WIDTH),
-    )
-    .padding(spacing.space_m)
-    .width(Length::Fill)
-    .height(Length::Fill)
-    .into()
 }
 
 #[cfg(feature = "integrated-browser")]
