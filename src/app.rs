@@ -2742,6 +2742,31 @@ impl Cagents {
         .into();
 
         let mut header_children = vec![title_region];
+        let runtime_status = match self.cards.get(&id) {
+            Some(CardRuntime::Loading) | None => Some((labels.starting, true)),
+            Some(CardRuntime::Failed(_)) => Some(("Unavailable", false)),
+            #[cfg(feature = "integrated-browser")]
+            Some(CardRuntime::Browser(browser))
+                if browser.lifecycle == BrowserLifecycle::Restoring =>
+            {
+                Some(("Restoring…", true))
+            }
+            #[cfg(feature = "integrated-browser")]
+            Some(CardRuntime::Browser(browser)) if browser.load_state.is_some() => {
+                Some(("Loading…", true))
+            }
+            _ => None,
+        };
+        if let Some((label, busy)) = runtime_status {
+            if busy {
+                header_children.push(
+                    widget::progress_bar::circular::Circular::new()
+                        .size(16.0)
+                        .into(),
+                );
+            }
+            header_children.push(widget::text::caption(label).into());
+        }
 
         header_children.push(
             widget::button::icon(widget::icon::from_name("window-close-symbolic"))
