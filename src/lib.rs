@@ -8,6 +8,7 @@ pub mod github;
 pub mod host;
 pub mod instance;
 pub mod lifecycle;
+pub mod location;
 pub mod model;
 pub mod performance;
 pub mod persistence;

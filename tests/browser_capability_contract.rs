@@ -1,5 +1,6 @@
 use cagents::{
     capability::{BrowserCapability, BrowserRestoreAction, browser_restore_action},
+    location::SanitizedLocation,
     model::{BrowserId, BrowserRestoreFidelity, BrowserSession},
 };
 use url::Url;
@@ -21,6 +22,34 @@ fn persisted_browser() -> BrowserSession {
         scroll_y: 912.5,
         fidelity: BrowserRestoreFidelity::HistoryAndScroll,
     }
+}
+
+#[test]
+fn persisted_browser_keeps_navigation_authority_but_presents_a_sanitized_location() {
+    let raw = "https://alice:password@example.test:8443/private%20path?oauth=secret#token";
+    let url = Url::parse(raw).unwrap();
+    let session = BrowserSession {
+        id: BrowserId::new(),
+        current_url: url.clone(),
+        history: vec![url.clone()],
+        history_index: 0,
+        scroll_x: 0.0,
+        scroll_y: 0.0,
+        fidelity: BrowserRestoreFidelity::HistoryAndScroll,
+    };
+
+    assert_eq!(session.current_url.as_str(), raw);
+    assert_eq!(session.history, vec![url]);
+    assert_eq!(
+        SanitizedLocation::from(&session.current_url).as_str(),
+        "https://example.test:8443/private%20path"
+    );
+
+    #[cfg(not(feature = "integrated-browser"))]
+    assert!(matches!(
+        browser_restore_action(&session),
+        BrowserRestoreAction::OfferExternal(full) if full.as_str() == raw
+    ));
 }
 
 #[test]

@@ -3,6 +3,8 @@ use std::{ops::Range, path::PathBuf};
 use serde::{Deserialize, Serialize};
 use url::Url;
 
+use crate::location::SanitizedLocation;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum BrowserLifecycle {
@@ -339,7 +341,7 @@ pub enum BrowserError {
     #[error("browser thread has stopped")]
     ThreadStopped,
     #[error("invalid URL: {0}")]
-    InvalidUrl(String),
+    InvalidUrl(SanitizedLocation),
     #[error("GPU interop unavailable: {0}")]
     Interop(String),
     #[error("Wayland subsurface fallback unavailable: {0}")]
@@ -351,6 +353,21 @@ pub enum BrowserError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn invalid_url_errors_can_only_format_a_sanitized_location() {
+        let url =
+            Url::parse("https://alice:password@example.test/private?oauth=secret#access-token")
+                .unwrap();
+        let error = BrowserError::InvalidUrl(SanitizedLocation::from(&url)).to_string();
+
+        assert_eq!(error, "invalid URL: https://example.test/private");
+        assert!(!error.contains("alice"));
+        assert!(!error.contains("password"));
+        assert!(!error.contains("oauth"));
+        assert!(!error.contains("secret"));
+        assert!(!error.contains("access-token"));
+    }
 
     #[test]
     fn fractional_scale_maps_physical_buffer_to_logical_destination() {
