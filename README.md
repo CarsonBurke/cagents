@@ -35,16 +35,16 @@ rustup toolchain install 1.93.0 --profile minimal
 rustup default 1.93.0
 ```
 
-Install Zig 0.15.2 from [ziglang.org](https://ziglang.org/download/) and ensure `zig` is on `PATH`. The default feature set includes the integrated Servo browser. Production is the default build profile.
+Install Zig 0.15.2 from [ziglang.org](https://ziglang.org/download/) and ensure `zig` is on `PATH`. The default feature set includes the integrated Servo browser. Ordinary debug builds automatically use the isolated development instance; optimized builds are production unless the Cargo `development` feature is explicitly enabled.
 
-Use the isolated development instance for source-tree work. Start with the browserless lane unless the change touches the embedded browser:
+Use the development instance for source-tree work. Start with the browserless lane unless the change touches the embedded browser:
 
 ```sh
 # Fast type-check: 518 Linux packages; no Servo/WebRender/SpiderMonkey.
-cargo check --locked --no-default-features --features development --bins
+cargo check --locked --no-default-features --bins
 
 # Full integration boundary: 980 Linux packages.
-cargo check --locked --features development --bins
+cargo check --locked --bins
 ```
 
 For the browserless configuration, this single command builds the same three executables while excluding the `integrated-browser` feature and Servo's engine graph:
@@ -213,7 +213,7 @@ Run `cagents --help` or `cagents terminal --help` for the complete command set.
 There is no service unit, login autostart, or system daemon. A UI or terminal command starts the per-user sibling `cagentsd` on demand. The daemon runs independently after the launching process exits so terminals can survive UI restarts. Full and browserless builds share the established protocol-3 daemon socket, preserving live terminals when upgrading or switching variants. A protocol change must deliberately retain or migrate that namespace. One shared application lease prevents concurrent UI processes from racing writes to their common session store. During the lease rollout, startup rejects both a UI left running from an older build and a Debian peer package that predates the lease marker; upgrade that peer before switching variants. Stop the shared daemon explicitly with either control command (`cagents daemon stop` or `cagents-browserless daemon stop`); installers and package upgrades stop the daemon owned by the package being changed while preserving a compatible peer package's daemon.
 The standard production installation starts its per-user daemon immediately and registers it for graphical-login autostart. While that daemon is running, cagents exposes a system-tray item that opens the UI and can stop the daemon. The daemon remains independent of the UI so terminals survive window and UI-process restarts. `cagents daemon stop` stops it for the current login; starting the UI or a terminal command starts it again on demand.
 
-The explicitly selected Cargo `development` feature uses a separate daemon and does not register a tray item or autostart entry. This keeps source-tree UI development isolated while the installed production cagents remains available as the workflow manager.
+Cargo debug builds and builds with the explicit `development` feature use a separate daemon and do not register a tray item or autostart entry. This keeps source-tree development isolated while the installed production cagents remains available as the workflow manager. Release builds without that feature are production builds.
 
 cagents follows the XDG base-directory convention. Production paths are:
 
