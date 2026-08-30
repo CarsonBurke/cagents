@@ -4,7 +4,7 @@ use std::{
     fs::{self, DirBuilder, File, OpenOptions},
     io::{self, Read, Seek, SeekFrom, Write},
     os::{
-        fd::AsRawFd,
+        fd::{AsRawFd, FromRawFd},
         unix::{
             fs::{DirBuilderExt, FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt},
             net::{UnixListener, UnixStream},
@@ -17,7 +17,7 @@ use std::{
     },
 };
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::{
@@ -178,8 +178,8 @@ pub(crate) enum PlatformError {
     UnsafeSocketPath { path: PathBuf },
     #[error("failed to prepare cagents daemon runtime: {0}")]
     Io(#[from] io::Error),
-    #[error("failed to serialize cagents daemon lock metadata: {0}")]
-    Serialize(#[from] serde_json::Error),
+    #[error("failed to process cagents daemon lock metadata: {0}")]
+    LockMetadata(#[from] serde_json::Error),
 }
 
 #[derive(Clone, Debug)]
@@ -275,6 +275,134 @@ fn write_lock_metadata(lock: &mut File, proof: &HostSessionProof) -> Result<(), 
     lock.write_all(b"\n")?;
     lock.sync_data()?;
     Ok(())
+}
+
+#[derive(Deserialize)]
+struct StoredLockMetadata {
+    pid: u32,
+}
+
+/// Sends SIGTERM to the daemon identified by the current instance's lock.
+///
+/// The pidfd is opened before `/proc` validation, so PID reuse cannot redirect
+/// the signal after the lock owner has been authenticated.
+pub(crate) fn terminate_daemon_from_lock() -> Result<bool, PlatformError> {
+    let paths = RuntimePaths::discover()?;
+    let mut lock = match OpenOptions::new()
+        .read(true)
+        .custom_flags(O_NOFOLLOW)
+        .open(&paths.lock)
+    {
+        Ok(lock) => lock,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            recover_stale_socket(&paths.socket)?;
+            return Ok(false);
+        }
+        Err(error) => return Err(error.into()),
+    };
+    let Some(pidfd) = daemon_pidfd_from_lock(&mut lock, &paths)? else {
+        return Ok(false);
+    };
+    // SAFETY: pidfd is a live pidfd for the validated lock owner, SIGTERM is a
+    // valid signal, and a null siginfo pointer with flags zero is supported.
+    let result = unsafe {
+        libc::syscall(
+            libc::SYS_pidfd_send_signal,
+            pidfd.as_raw_fd(),
+            SIGTERM,
+            std::ptr::null::<libc::siginfo_t>(),
+            0,
+        )
+    };
+    if result == -1 {
+        let error = io::Error::last_os_error();
+        if error.raw_os_error() != Some(libc::ESRCH) {
+            return Err(error.into());
+        }
+    }
+    Ok(true)
+}
+
+fn daemon_pidfd_from_lock(
+    lock: &mut File,
+    paths: &RuntimePaths,
+) -> Result<Option<File>, PlatformError> {
+    validate_lock_file(&paths.lock, &lock.metadata()?, current_uid())?;
+    // Check ownership before trusting metadata: a crashed writer can leave a
+    // truncated lock file, but an unheld flock proves no daemon can be using it.
+    // SAFETY: lock owns a live descriptor and flock takes scalar values.
+    if unsafe { flock(lock.as_raw_fd(), LOCK_EX | LOCK_NB) } == 0 {
+        let recovery = recover_stale_socket(&paths.socket);
+        // SAFETY: this descriptor owns the lock acquired above.
+        let _ = unsafe { flock(lock.as_raw_fd(), LOCK_UN) };
+        recovery?;
+        return Ok(None);
+    }
+    let lock_error = io::Error::last_os_error();
+    if lock_error.kind() != io::ErrorKind::WouldBlock {
+        return Err(lock_error.into());
+    }
+    lock.seek(SeekFrom::Start(0))?;
+    let stored: StoredLockMetadata = serde_json::from_reader(&mut *lock)?;
+    open_daemon_pidfd_or_recover(lock, paths, stored.pid)
+}
+
+fn open_daemon_pidfd_or_recover(
+    lock: &File,
+    paths: &RuntimePaths,
+    pid: u32,
+) -> Result<Option<File>, PlatformError> {
+    match open_validated_pidfd(lock, pid, Path::new("/proc")) {
+        Ok(pidfd) => Ok(Some(pidfd)),
+        Err(validation_error) => {
+            // A dead daemon can leave both metadata files behind. Only remove
+            // its socket after taking the same exclusive lock a live daemon
+            // must hold; otherwise preserve the validation failure.
+            // SAFETY: lock owns a live descriptor and flock takes scalar values.
+            if unsafe { flock(lock.as_raw_fd(), LOCK_EX | LOCK_NB) } != 0 {
+                return Err(validation_error.into());
+            }
+            recover_stale_socket(&paths.socket)?;
+            // SAFETY: this descriptor still owns the lock acquired above.
+            let _ = unsafe { flock(lock.as_raw_fd(), LOCK_UN) };
+            Ok(None)
+        }
+    }
+}
+
+fn open_validated_pidfd(lock: &File, pid: u32, proc_root: &Path) -> io::Result<File> {
+    let pid = i32::try_from(pid)
+        .ok()
+        .filter(|pid| *pid > 1)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "invalid daemon PID"))?;
+    // SAFETY: pidfd_open takes scalar arguments and returns a new owned file
+    // descriptor or -1 without writing through any pointer.
+    let descriptor = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) };
+    if descriptor == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: a successful pidfd_open returns a fresh descriptor owned here.
+    let pidfd = unsafe { File::from_raw_fd(descriptor as c_int) };
+
+    let process_path = proc_root.join(pid.to_string());
+    validate_owner(
+        &process_path,
+        &fs::symlink_metadata(&process_path)?,
+        current_uid(),
+    )
+    .map_err(io::Error::other)?;
+    let expected = lock.metadata()?;
+    let owns_lock = fs::read_dir(process_path.join("fd"))?
+        .filter_map(Result::ok)
+        .filter_map(|entry| fs::metadata(entry.path()).ok())
+        .any(|metadata| metadata.dev() == expected.dev() && metadata.ino() == expected.ino());
+    if !owns_lock {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "daemon PID does not own the validated lock file",
+        ));
+    }
+    Ok(pidfd)
 }
 
 fn prepare_runtime_directory(path: &Path) -> Result<(), PlatformError> {
@@ -527,6 +655,46 @@ mod tests {
         assert_eq!(mode(&paths.directory), PRIVATE_DIRECTORY_MODE);
         assert_eq!(mode(&paths.lock), PRIVATE_FILE_MODE);
         drop(lease);
+    }
+
+    #[test]
+    fn validated_pidfd_pins_the_process_that_owns_the_lock() {
+        let root = tempdir().unwrap();
+        let lock = File::create(root.path().join("lock")).unwrap();
+
+        let pidfd = open_validated_pidfd(&lock, std::process::id(), Path::new("/proc")).unwrap();
+
+        assert!(pidfd.metadata().is_ok());
+    }
+
+    #[test]
+    fn dead_daemon_lock_recovers_its_stale_socket() {
+        let root = tempdir().unwrap();
+        let paths = paths(root.path().to_path_buf());
+        let listener = UnixListener::bind(&paths.socket).unwrap();
+        drop(listener);
+        let lock = File::create(&paths.lock).unwrap();
+
+        let pidfd = open_daemon_pidfd_or_recover(&lock, &paths, u32::MAX).unwrap();
+
+        assert!(pidfd.is_none());
+        assert!(!paths.socket.exists());
+    }
+
+    #[test]
+    fn unheld_corrupt_lock_recovers_without_parsing_metadata() {
+        let root = tempdir().unwrap();
+        let paths = paths(root.path().to_path_buf());
+        let listener = UnixListener::bind(&paths.socket).unwrap();
+        drop(listener);
+        fs::write(&paths.lock, b"truncated").unwrap();
+        fs::set_permissions(&paths.lock, fs::Permissions::from_mode(PRIVATE_FILE_MODE)).unwrap();
+        let mut lock = File::open(&paths.lock).unwrap();
+
+        let pidfd = daemon_pidfd_from_lock(&mut lock, &paths).unwrap();
+
+        assert!(pidfd.is_none());
+        assert!(!paths.socket.exists());
     }
 
     #[test]

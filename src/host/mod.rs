@@ -3,6 +3,8 @@ mod delivery;
 mod platform;
 mod state;
 
+pub(crate) use platform::terminate_daemon_from_lock;
+
 use std::{
     fs, io,
     net::Shutdown,

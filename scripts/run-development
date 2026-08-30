@@ -76,46 +76,19 @@ esac
 PATH=${zig_executable%/*}:$PATH
 export PATH
 
-stop_development_daemon() {
-    runtime=${XDG_RUNTIME_DIR:?XDG_RUNTIME_DIR must be set}/cagents-development
-    socket=$runtime/cagentsd.sock
-    lock=$runtime/cagentsd.lock
-    if [ ! -e "$socket" ]; then
-        return
+run_cli() {
+    if [ "$browserless" = true ]; then
+        cargo run --quiet --locked --profile dev-runtime --no-default-features \
+            --features development --bin cagents -- "$@"
+    else
+        cargo run --quiet --locked --profile dev-runtime --features development \
+            --bin cagents -- "$@"
     fi
-    if [ ! -f "$lock" ] || [ -L "$lock" ]; then
-        printf '%s\n' "development daemon lock is not a regular file: $lock" >&2
-        exit 1
-    fi
-    if [ "$(stat -c %u "$lock")" != "$(id -u)" ]; then
-        printf '%s\n' "development daemon lock is not owned by the current user: $lock" >&2
-        exit 1
-    fi
+}
 
-    metadata=$(cat "$lock")
-    pid=$(printf '%s\n' "$metadata" | sed -n 's/^{"pid":\([0-9][0-9]*\),"proof":.*/\1/p')
-    if [ -z "$pid" ] || [ "$pid" -le 1 ] || [ ! -d "/proc/$pid" ]; then
-        printf '%s\n' "development daemon lock has invalid process metadata: $lock" >&2
-        exit 1
-    fi
-    if [ "$(stat -c %u "/proc/$pid")" != "$(id -u)" ]; then
-        printf '%s\n' "development daemon process is not owned by the current user: $pid" >&2
-        exit 1
-    fi
-
-    owns_lock=false
-    for descriptor in "/proc/$pid/fd/"*; do
-        if [ "$descriptor" -ef "$lock" ]; then
-            owns_lock=true
-            break
-        fi
-    done
-    if [ "$owns_lock" != true ]; then
-        printf '%s\n' "development daemon process does not own its lock: $pid" >&2
-        exit 1
-    fi
-
-    kill -TERM "$pid"
+if [ "$fresh_daemon" = true ]; then
+    run_cli daemon stop-for-rebuild >/dev/null
+    socket=${XDG_RUNTIME_DIR:?XDG_RUNTIME_DIR must be set}/cagents-development/cagentsd.sock
     remaining=100
     while [ -e "$socket" ]; do
         if [ "$remaining" -eq 0 ]; then
@@ -125,10 +98,6 @@ stop_development_daemon() {
         remaining=$((remaining - 1))
         sleep 0.05
     done
-}
-
-if [ "$fresh_daemon" = true ]; then
-    stop_development_daemon
 fi
 
 if [ "$browserless" = true ]; then

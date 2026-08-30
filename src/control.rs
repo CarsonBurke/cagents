@@ -76,6 +76,9 @@ pub enum DaemonCommand {
     Status,
     /// Stop the daemon and its hosted resources.
     Stop,
+    /// Stop any development daemon without relying on its wire protocol.
+    #[command(hide = true)]
+    StopForRebuild,
 }
 
 #[derive(Debug, Subcommand)]
@@ -1004,6 +1007,19 @@ fn execute_daemon(command: DaemonCommand) -> Result<CommandOutput, AppError> {
                 command: "daemon.stop",
                 data: json!({ "instance": instance::NAME, "stopped": true }),
                 human: format!("{} daemon stopping", instance::NAME),
+            })
+        }
+        DaemonCommand::StopForRebuild => {
+            let stopped = crate::host::terminate_daemon_from_lock()
+                .map_err(|error| AppError::new("daemon_process", error))?;
+            Ok(CommandOutput {
+                command: "daemon.stop_for_rebuild",
+                data: json!({ "instance": instance::NAME, "stopped": stopped }),
+                human: if stopped {
+                    format!("{} daemon stopping", instance::NAME)
+                } else {
+                    format!("{} daemon stopped", instance::NAME)
+                },
             })
         }
     }
