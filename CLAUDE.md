@@ -1,5 +1,10 @@
 # Repository workflow
 
+## Deliver changes through pull requests
+
+- Start each change from current `main` on a dedicated branch.
+- Push the branch and open a pull request targeting `main`; do not commit new work directly to `main`.
+
 ## Choose the cheapest correct build lane
 
 - Start with the browserless lane unless the change touches the embedded browser, Servo integration, browser capability gating, or default feature behavior.
@@ -7,6 +12,7 @@
 - Integrated-browser check: `cargo check --locked --features development --bins`
 - The production default includes `integrated-browser`. Do not change that default to make local development faster.
 - Before finishing a Cargo feature or dependency change, run both checks. Browserless builds must not resolve or compile Servo, WebRender, or SpiderMonkey.
+- Do not run independent cold Cargo builds concurrently. They contend for the shared build directory and memory; lower `CARGO_BUILD_JOBS` when the host is already under memory pressure.
 
 ## Run the application through the development runner
 
@@ -15,7 +21,7 @@
 - Do not use a direct `cargo run` as the normal UI workflow. The runner builds the three sibling executables together and selects the isolated development application ID, state, and daemon.
 - The runner uses the `dev-runtime` profile so UI dependencies remain optimized. Keep ordinary `dev` checks unoptimized; do not restore a wildcard `opt-level` under `[profile.dev.package."*"]`.
 - Add `--debug --log-file /tmp/cagents-ui.log` when diagnosing UI behavior.
-- Add `--fresh-daemon` after changing daemon, terminal-host, IPC/protocol, or process-lifecycle code. It validates and signals the old development daemon before rebuilding, so it remains safe across protocol changes; this terminates terminals hosted by that daemon.
+- Add `--fresh-daemon` after changing daemon, terminal-host, IPC/protocol, or process-lifecycle code. It uses the daemon lock and a Linux pidfd rather than the wire protocol, so it remains safe across protocol changes; this terminates terminals hosted by that daemon.
 - Do not run browserless and integrated development sessions concurrently; they share development state.
 
 ## Preserve cross-feature behavior
