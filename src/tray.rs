@@ -1,4 +1,4 @@
-#[cfg(not(feature = "development"))]
+#[cfg(not(any(debug_assertions, feature = "development")))]
 mod production {
     use std::{
         os::unix::process::CommandExt,
@@ -175,13 +175,13 @@ mod production {
     }
 }
 
-#[cfg(not(feature = "development"))]
+#[cfg(not(any(debug_assertions, feature = "development")))]
 pub use production::{TrayGuard, start};
 
-#[cfg(feature = "development")]
+#[cfg(any(debug_assertions, feature = "development"))]
 pub struct TrayGuard;
 
-#[cfg(feature = "development")]
+#[cfg(any(debug_assertions, feature = "development"))]
 pub fn start() -> TrayGuard {
     TrayGuard
 }
