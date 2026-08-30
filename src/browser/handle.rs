@@ -555,12 +555,9 @@ impl BrowserHandle {
     /// thread used to be. A defensive engine-thread check replaces the old
     /// refusal to join our own thread.
     ///
-    /// This cannot block forever, orderly shutdown or not: an engine thread
-    /// that unwinds drops its `Card` values, and with them the teardown
-    /// senders, so the wait ends with a disconnect either way. The disconnect
-    /// alone therefore says nothing about *why* the card is gone - a panicking
-    /// engine reports itself on the event bus as [`BrowserEvent::Crashed`], and
-    /// every later command through this handle fails with
+    /// The disconnect says nothing about *why* the card is gone - a panicking
+    /// engine reports itself on the event bus as [`BrowserEvent::Crashed`],
+    /// and every later command through this handle fails with
     /// [`BrowserError::ThreadStopped`].
     pub fn shutdown(&mut self) {
         self.request_shutdown();
@@ -570,6 +567,8 @@ impl BrowserHandle {
         if runtime::on_engine_thread() {
             return;
         }
+        // Disconnection is the ordinary end of this wait: the engine drops
+        // the sender only after this card's browser resources are gone.
         let _ = teardown.recv();
     }
 }

@@ -6,10 +6,10 @@ use std::{
     time::{Duration, Instant},
 };
 
-use directories::ProjectDirs;
 use thiserror::Error;
 
 use crate::{
+    instance,
     model::{
         BootId, CardId, ProjectId, ProjectState, TerminalId, TerminalSession, WorkspaceState,
         WorktreeId, WorktreeState,
@@ -96,8 +96,8 @@ pub struct SessionRuntime {
 
 impl SessionRuntime {
     pub fn open_default() -> Result<(Self, Option<WorkspaceState>), SessionError> {
-        let project_dirs = ProjectDirs::from("dev", "cagents", "cagents")
-            .ok_or(SessionError::DataDirectoryUnavailable)?;
+        let project_dirs =
+            instance::project_dirs().ok_or(SessionError::DataDirectoryUnavailable)?;
         let database_path = project_dirs.data_dir().join("sessions.sqlite3");
         Self::open(database_path, current_boot_id()?)
     }

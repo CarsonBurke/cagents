@@ -90,6 +90,11 @@ case $DATA_HOME in
     /*) ;;
     *) fail 'XDG_DATA_HOME must be an absolute path' ;;
 esac
+CONFIG_HOME=${XDG_CONFIG_HOME:-"$HOME/.config"}
+case $CONFIG_HOME in
+    /*) ;;
+    *) fail 'XDG_CONFIG_HOME must be an absolute path' ;;
+esac
 
 if [ -z "$PREFIX" ]; then
     PREFIX=$DATA_HOME/cagents-install
@@ -101,6 +106,10 @@ esac
 while [ "$PREFIX" != / ] && [ "${PREFIX%/}" != "$PREFIX" ]; do
     PREFIX=${PREFIX%/}
 done
+case $PREFIX in
+    *'
+'*) fail '--prefix must not contain a newline' ;;
+esac
 [ "$PREFIX" != / ] || fail 'refusing to use / as the installation root'
 
 remove_owned_link() {
@@ -119,10 +128,10 @@ read_daemon_status() {
         case $daemon_output in
             *'
 '*) DAEMON_STATUS=unknown ;;
-            '{"ok":true,"command":"daemon.status","data":{"running":true,"socket":"'*'"}}')
+            '{"ok":true,"command":"daemon.status","data":{'*'"running":true'*)
                 DAEMON_STATUS=running
                 ;;
-            '{"ok":true,"command":"daemon.status","data":{"running":false,"socket":"'*'"}}')
+            '{"ok":true,"command":"daemon.status","data":{'*'"running":false'*)
                 DAEMON_STATUS=stopped
                 ;;
             *) DAEMON_STATUS=unknown ;;
@@ -172,6 +181,7 @@ uninstall_cagents() {
         remove_owned_link "$DATA_HOME/icons/hicolor/scalable/apps/dev.cagents.Cagents.svg"
         remove_owned_link "$DATA_HOME/icons/hicolor/128x128/apps/dev.cagents.Cagents.png"
         remove_owned_link "$DATA_HOME/metainfo/dev.cagents.Cagents.metainfo.xml"
+        remove_owned_link "$CONFIG_HOME/autostart/dev.cagents.Cagents.Daemon.desktop"
 
         rm -f "$PREFIX/current"
         rm -rf "$PREFIX/versions"
@@ -182,12 +192,7 @@ uninstall_cagents() {
     fi
 
     if [ "$PURGE" -eq 1 ]; then
-        CONFIG_HOME=${XDG_CONFIG_HOME:-"$HOME/.config"}
         CACHE_HOME=${XDG_CACHE_HOME:-"$HOME/.cache"}
-        case $CONFIG_HOME in
-            /*) ;;
-            *) fail 'XDG_CONFIG_HOME must be an absolute path' ;;
-        esac
         case $CACHE_HOME in
             /*) ;;
             *) fail 'XDG_CACHE_HOME must be an absolute path' ;;
@@ -245,6 +250,7 @@ need_command() {
 
 need_command awk
 need_command mktemp
+need_command sed
 need_command tar
 need_command readlink
 
@@ -279,21 +285,27 @@ TRANSACTION_COMMITTED=0
 HAD_CURRENT=0
 PREVIOUS_CURRENT_TARGET=
 ROLLBACK_OK=1
+DAEMON_STOPPED_FOR_SWITCH=0
+OLD_DAEMON_WAS_RUNNING=0
+DAEMON_STARTED=0
 BIN_LINK=$HOME/.local/bin/cagents
 DESKTOP_LINK=$DATA_HOME/applications/dev.cagents.Cagents.desktop
 ICON_LINK=$DATA_HOME/icons/hicolor/scalable/apps/dev.cagents.Cagents.svg
 RASTER_ICON_LINK=$DATA_HOME/icons/hicolor/128x128/apps/dev.cagents.Cagents.png
 METAINFO_LINK=$DATA_HOME/metainfo/dev.cagents.Cagents.metainfo.xml
+AUTOSTART_LINK=$CONFIG_HOME/autostart/dev.cagents.Cagents.Daemon.desktop
 BIN_TARGET=$PREFIX/current/bin/cagents
 DESKTOP_TARGET=$PREFIX/current/share/applications/dev.cagents.Cagents.desktop
 ICON_TARGET=$PREFIX/current/share/icons/hicolor/scalable/apps/dev.cagents.Cagents.svg
 RASTER_ICON_TARGET=$PREFIX/current/share/icons/hicolor/128x128/apps/dev.cagents.Cagents.png
 METAINFO_TARGET=$PREFIX/current/share/metainfo/dev.cagents.Cagents.metainfo.xml
+AUTOSTART_TARGET=$PREFIX/current/share/autostart/dev.cagents.Cagents.Daemon.desktop
 BIN_LINK_CREATED=0
 DESKTOP_LINK_CREATED=0
 ICON_LINK_CREATED=0
 RASTER_ICON_LINK_CREATED=0
 METAINFO_LINK_CREATED=0
+AUTOSTART_LINK_CREATED=0
 cleanup() {
     cleanup_status=$?
     rm -rf "$DOWNLOAD_DIR" || :
@@ -322,6 +334,14 @@ cleanup() {
             rm -f "$PREFIX/current" || ROLLBACK_OK=0
         fi
     fi
+    if [ "$TRANSACTION_COMMITTED" -eq 0 ] \
+        && [ "$DAEMON_STOPPED_FOR_SWITCH" -eq 1 ] \
+        && [ "$OLD_DAEMON_WAS_RUNNING" -eq 1 ] \
+        && [ "$ROLLBACK_OK" -eq 1 ]; then
+        "$PREFIX/current/bin/cagents" daemon start >/dev/null 2>&1 \
+            || printf '%s: restored the previous version but could not restart its daemon\n' \
+                "$PROGRAM" >&2
+    fi
 
     if [ "$TRANSACTION_COMMITTED" -eq 0 ] \
         && [ "$BIN_LINK_CREATED" -eq 1 ] && [ -L "$BIN_LINK" ] \
@@ -347,6 +367,11 @@ cleanup() {
         && [ "$METAINFO_LINK_CREATED" -eq 1 ] && [ -L "$METAINFO_LINK" ] \
         && [ "$(readlink "$METAINFO_LINK" 2>/dev/null || :)" = "$METAINFO_TARGET" ]; then
         rm -f "$METAINFO_LINK" || :
+    fi
+    if [ "$TRANSACTION_COMMITTED" -eq 0 ] \
+        && [ "$AUTOSTART_LINK_CREATED" -eq 1 ] && [ -L "$AUTOSTART_LINK" ] \
+        && [ "$(readlink "$AUTOSTART_LINK" 2>/dev/null || :)" = "$AUTOSTART_TARGET" ]; then
+        rm -f "$AUTOSTART_LINK" || :
     fi
 
     if [ "$TRANSACTION_COMMITTED" -eq 0 ] \
@@ -426,6 +451,8 @@ if ! awk -v top="$TOP_LEVEL" '
             path == top "/share/" ||
             path == top "/share/applications/" ||
             path == top "/share/applications/dev.cagents.Cagents.desktop" ||
+            path == top "/share/autostart/" ||
+            path == top "/share/autostart/dev.cagents.Cagents.Daemon.desktop" ||
             path == top "/share/icons/" ||
             path == top "/share/icons/hicolor/" ||
             path == top "/share/icons/hicolor/scalable/" ||
@@ -450,6 +477,7 @@ if ! awk -v top="$TOP_LEVEL" '
     $0 == top "/share/icons/hicolor/scalable/apps/dev.cagents.Cagents.svg" { required[6] = 1 }
     $0 == top "/share/icons/hicolor/128x128/apps/dev.cagents.Cagents.png" { required[9] = 1 }
     $0 == top "/share/metainfo/dev.cagents.Cagents.metainfo.xml" { required[7] = 1 }
+    $0 == top "/share/autostart/dev.cagents.Cagents.Daemon.desktop" { required[10] = 1 }
     $0 == top "/share/doc/cagents/LICENSE" { required[8] = 1 }
     END {
         for (i = 1; i <= 10; i++) if (!required[i]) exit 1
@@ -511,21 +539,46 @@ prepare_link_parent() {
     [ -d "$link_directory" ] || fail "link parent is not a directory: $link_directory"
 }
 
+desktop_exec_escape() {
+    printf '%s' "$1" | sed \
+        -e 's/\\/\\\\/g' \
+        -e 's/"/\\"/g' \
+        -e 's/`/\\`/g' \
+        -e 's/\$/\\$/g' \
+        -e 's/%/%%/g'
+}
+
 check_link_destination "$BIN_LINK" "$BIN_TARGET"
 check_link_destination "$DESKTOP_LINK" "$DESKTOP_TARGET"
 check_link_destination "$ICON_LINK" "$ICON_TARGET"
 check_link_destination "$RASTER_ICON_LINK" "$RASTER_ICON_TARGET"
 check_link_destination "$METAINFO_LINK" "$METAINFO_TARGET"
+check_link_destination "$AUTOSTART_LINK" "$AUTOSTART_TARGET"
 prepare_link_parent "$BIN_LINK"
 prepare_link_parent "$DESKTOP_LINK"
 prepare_link_parent "$ICON_LINK"
 prepare_link_parent "$RASTER_ICON_LINK"
 prepare_link_parent "$METAINFO_LINK"
+prepare_link_parent "$AUTOSTART_LINK"
 
 INSTALL_STAGE=$PREFIX/.staging.$$
 (umask 077 && mkdir "$INSTALL_STAGE") || fail 'could not create installation staging directory'
 tar --no-same-owner --no-same-permissions -xzf "$ARCHIVE_PATH" -C "$INSTALL_STAGE" \
     || fail 'archive extraction failed'
+AUTOSTART_EXEC=$(desktop_exec_escape "$BIN_TARGET")
+{
+    printf '%s\n' \
+        '[Desktop Entry]' \
+        'Type=Application' \
+        'Name=cagents daemon' \
+        'Comment=Keep cagents sessions available in the system tray'
+    printf 'Exec="%s" daemon start\n' "$AUTOSTART_EXEC"
+    printf '%s\n' \
+        'Terminal=false' \
+        'NoDisplay=true' \
+        'X-GNOME-Autostart-enabled=true'
+} > "$INSTALL_STAGE/$TOP_LEVEL/share/autostart/dev.cagents.Cagents.Daemon.desktop" \
+    || fail 'could not prepare the daemon autostart entry'
 chmod 0755 "$INSTALL_STAGE/$TOP_LEVEL" "$INSTALL_STAGE/$TOP_LEVEL/bin"
 chmod 0755 \
     "$INSTALL_STAGE/$TOP_LEVEL/bin/cagents" \
@@ -554,6 +607,7 @@ ensure_link() {
         icon) ICON_LINK_CREATED=1 ;;
         raster_icon) RASTER_ICON_LINK_CREATED=1 ;;
         metainfo) METAINFO_LINK_CREATED=1 ;;
+        autostart) AUTOSTART_LINK_CREATED=1 ;;
         *) fail 'internal error: unknown link kind' ;;
     esac
     ln -s "$link_target" "$link_path" || fail "cannot create link $link_path"
@@ -564,9 +618,13 @@ ensure_link "$DESKTOP_TARGET" "$DESKTOP_LINK" desktop
 ensure_link "$ICON_TARGET" "$ICON_LINK" icon
 ensure_link "$RASTER_ICON_TARGET" "$RASTER_ICON_LINK" raster_icon
 ensure_link "$METAINFO_TARGET" "$METAINFO_LINK" metainfo
+ensure_link "$AUTOSTART_TARGET" "$AUTOSTART_LINK" autostart
 
 if [ "$HAD_CURRENT" -eq 1 ]; then
+    read_daemon_status "$PREFIX/current/bin/cagents"
+    [ "$DAEMON_STATUS" != running ] || OLD_DAEMON_WAS_RUNNING=1
     stop_daemon_and_wait "$PREFIX/current/bin/cagents"
+    DAEMON_STOPPED_FOR_SWITCH=1
 fi
 CURRENT_TEMP=$PREFIX/.current.$$
 rm -f "$CURRENT_TEMP"
@@ -574,6 +632,12 @@ ln -s "versions/$VERSION" "$CURRENT_TEMP"
 CURRENT_SWITCHED=1
 mv -Tf "$CURRENT_TEMP" "$PREFIX/current"
 TRANSACTION_COMMITTED=1
+if "$PREFIX/current/bin/cagents" daemon start >/dev/null; then
+    DAEMON_STARTED=1
+else
+    printf '%s: installed cagents, but its production daemon could not start now; login autostart remains enabled\n' \
+        "$PROGRAM" >&2
+fi
 if command -v gtk-update-icon-cache >/dev/null 2>&1; then
     gtk-update-icon-cache --force --ignore-theme-index "$DATA_HOME/icons/hicolor" >/dev/null 2>&1 || :
 fi
@@ -582,5 +646,9 @@ if command -v update-desktop-database >/dev/null 2>&1; then
 fi
 
 
-printf 'Installed cagents %s.\n' "$VERSION"
+if [ "$DAEMON_STARTED" -eq 1 ]; then
+    printf 'Installed cagents %s; the production daemon is running and will start at login.\n' "$VERSION"
+else
+    printf 'Installed cagents %s; the production daemon will start at graphical login.\n' "$VERSION"
+fi
 printf 'Ensure %s is on PATH, then run: cagents ui\n' "$HOME/.local/bin"

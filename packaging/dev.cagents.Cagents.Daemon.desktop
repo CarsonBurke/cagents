@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=cagents daemon
+Comment=Keep cagents sessions available in the system tray
+Exec=cagents daemon start
+TryExec=cagents
+Terminal=false
+NoDisplay=true
+X-GNOME-Autostart-enabled=true

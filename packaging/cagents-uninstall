@@ -36,6 +36,11 @@ case $DATA_HOME in
     /*) ;;
     *) fail 'XDG_DATA_HOME must be an absolute path' ;;
 esac
+CONFIG_HOME=${XDG_CONFIG_HOME:-"$HOME/.config"}
+case $CONFIG_HOME in
+    /*) ;;
+    *) fail 'XDG_CONFIG_HOME must be an absolute path' ;;
+esac
 PREFIX=$DATA_HOME/cagents-install
 PURGE=0
 
@@ -85,10 +90,10 @@ read_daemon_status() {
         case $daemon_output in
             *'
 '*) DAEMON_STATUS=unknown ;;
-            '{"ok":true,"command":"daemon.status","data":{"running":true,"socket":"'*'"}}')
+            '{"ok":true,"command":"daemon.status","data":{'*'"running":true'*)
                 DAEMON_STATUS=running
                 ;;
-            '{"ok":true,"command":"daemon.status","data":{"running":false,"socket":"'*'"}}')
+            '{"ok":true,"command":"daemon.status","data":{'*'"running":false'*)
                 DAEMON_STATUS=stopped
                 ;;
             *) DAEMON_STATUS=unknown ;;
@@ -137,6 +142,7 @@ if [ -e "$PREFIX/.cagents-install-root" ]; then
     remove_owned_link "$DATA_HOME/icons/hicolor/scalable/apps/dev.cagents.Cagents.svg"
     remove_owned_link "$DATA_HOME/icons/hicolor/128x128/apps/dev.cagents.Cagents.png"
     remove_owned_link "$DATA_HOME/metainfo/dev.cagents.Cagents.metainfo.xml"
+    remove_owned_link "$CONFIG_HOME/autostart/dev.cagents.Cagents.Daemon.desktop"
 
     rm -f "$PREFIX/current"
     rm -rf "$PREFIX/versions"
@@ -153,12 +159,7 @@ else
 fi
 
 if [ "$PURGE" -eq 1 ]; then
-    CONFIG_HOME=${XDG_CONFIG_HOME:-"$HOME/.config"}
     CACHE_HOME=${XDG_CACHE_HOME:-"$HOME/.cache"}
-    case $CONFIG_HOME in
-        /*) ;;
-        *) fail 'XDG_CONFIG_HOME must be an absolute path' ;;
-    esac
     case $CACHE_HOME in
         /*) ;;
         *) fail 'XDG_CACHE_HOME must be an absolute path' ;;

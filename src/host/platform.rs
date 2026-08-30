@@ -21,8 +21,9 @@ use serde::Serialize;
 use thiserror::Error;
 
 use crate::{
+    instance,
     model::{BootId, HostSessionProof},
-    terminal_ipc::{RUNTIME_SUBDIRECTORY, SOCKET_FILE_NAME},
+    terminal_ipc::SOCKET_FILE_NAME,
 };
 
 const PRIVATE_DIRECTORY_MODE: u32 = 0o700;
@@ -194,7 +195,7 @@ impl RuntimePaths {
             .map(PathBuf::from)
             .filter(|path| path.is_absolute())
             .ok_or(PlatformError::MissingRuntimeDirectory)?;
-        let directory = base.join(RUNTIME_SUBDIRECTORY);
+        let directory = base.join(instance::RUNTIME_SUBDIRECTORY);
         Ok(Self {
             socket: directory.join(SOCKET_FILE_NAME),
             lock: directory.join("cagentsd.lock"),

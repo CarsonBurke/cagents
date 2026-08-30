@@ -5,11 +5,13 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use directories::ProjectDirs;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::sidebar::{EXPANDED_WIDTH_MAX, EXPANDED_WIDTH_MIN};
+use crate::{
+    design, instance,
+    sidebar::{EXPANDED_WIDTH_MAX, EXPANDED_WIDTH_MIN},
+};
 
 pub const SETTINGS_SCHEMA_VERSION: u32 = 2;
 const PRIVATE_DIRECTORY_MODE: u32 = 0o700;
@@ -274,7 +276,7 @@ impl Default for AppSettings {
             hibernation_delay_ms: 30_000,
             terminal_font_size: 14.0,
             terminal_font_family: String::new(),
-            sidebar_width: 280.0,
+            sidebar_width: design::NAVIGATION_DEFAULT_WIDTH,
             default_column_fraction: 0.72,
             terminal_scrollback_lines: 10_000,
             link_open_destination: LinkOpenDestination::default(),
@@ -448,7 +450,7 @@ pub enum SettingsError {
 }
 
 pub fn default_path() -> Result<PathBuf, SettingsError> {
-    ProjectDirs::from("dev", "cagents", "cagents")
+    instance::project_dirs()
         .map(|dirs| dirs.config_dir().join("settings.toml"))
         .ok_or(SettingsError::DirectoryUnavailable)
 }

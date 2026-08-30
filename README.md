@@ -35,11 +35,16 @@ rustup toolchain install 1.93.0 --profile minimal
 rustup default 1.93.0
 ```
 
-Install Zig 0.15.2 from [ziglang.org](https://ziglang.org/download/) and ensure `zig` is on `PATH`. The default feature set includes the integrated Servo browser. Build all three executables before running so the UI and CLI can find their sibling `cagentsd`:
+Install Zig 0.15.2 from [ziglang.org](https://ziglang.org/download/) and ensure `zig` is on `PATH`. The default feature set includes the integrated Servo browser. Production is the default build profile.
+
+Use the isolated development instance for source-tree work. Start with the browserless lane unless the change touches the embedded browser:
 
 ```sh
-cargo build --locked --bins
-cargo run --locked --bin cagents-ui
+# Fast type-check: 518 Linux packages; no Servo/WebRender/SpiderMonkey.
+cargo check --locked --no-default-features --features development --bins
+
+# Full integration boundary: 980 Linux packages.
+cargo check --locked --features development --bins
 ```
 
 For the browserless configuration, this single command builds the same three executables while excluding the `integrated-browser` feature and Servo's engine graph:
@@ -49,6 +54,26 @@ cargo build --locked --release --no-default-features --bins
 ```
 
 Browserless builds keep terminals, repositories, worktrees, GitHub pull-request flows, and persistence. New links use the desktop portal and fall back to the system `xdg-open` handler when a portal is unavailable; Debian packages install `xdg-utils`, and portable/source users must provide it for that fallback. A restored browser card retains its saved URL, history, scroll position, and fidelity, shows that the integrated browser is unavailable, and offers **Open in system browser**. Running only one binary from an unrelated directory is not a supported layout; `cagents`, `cagents-ui`, and `cagentsd` must remain together.
+Launch the native UI through the development runner:
+
+```sh
+scripts/run-development --browserless
+scripts/run-development
+```
+
+The browserless UI preserves saved browser descriptors and opens their URLs through the system browser instead of compiling Servo. The default build retains the integrated browser.
+
+For UI diagnosis, add `--debug`. It enables Rust backtraces and `cagents=debug,cagentsd=debug,warn` tracing; an explicit `RUST_LOG` or `RUST_BACKTRACE` value takes precedence. Use `--fresh-daemon` after changing daemon, terminal-host, or protocol code so the UI cannot reconnect to an older development daemon:
+
+```sh
+scripts/run-development --browserless --debug
+scripts/run-development --debug --fresh-daemon
+scripts/run-development --browserless --debug --log-file /tmp/cagents-ui.log
+```
+
+`--log-file` captures UI tracing and panic output in a stable artifact while Cargo diagnostics remain in the invoking terminal. Fresh-daemon mode stops the isolated daemon and therefore terminates its hosted development terminals. `scripts/run-development` is POSIX shell; the repository contains no Python development tooling. Python remains a native build prerequisite for the full Servo dependency graph.
+
+The runner builds the three sibling executables in one Cargo pass and executes the selected UI directly. The development instance has its own application ID, configuration, session database, transcripts, and `$XDG_RUNTIME_DIR/cagents-development/` daemon, so it can run beside the installed production instance. `cagents`, `cagents-ui`, and `cagentsd` must remain together.
 
 ## Install a release
 
@@ -186,14 +211,19 @@ Run `cagents --help` or `cagents terminal --help` for the complete command set.
 ## Daemon and user data
 
 There is no service unit, login autostart, or system daemon. A UI or terminal command starts the per-user sibling `cagentsd` on demand. The daemon runs independently after the launching process exits so terminals can survive UI restarts. Full and browserless builds share the established protocol-3 daemon socket, preserving live terminals when upgrading or switching variants. A protocol change must deliberately retain or migrate that namespace. One shared application lease prevents concurrent UI processes from racing writes to their common session store. During the lease rollout, startup rejects both a UI left running from an older build and a Debian peer package that predates the lease marker; upgrade that peer before switching variants. Stop the shared daemon explicitly with either control command (`cagents daemon stop` or `cagents-browserless daemon stop`); installers and package upgrades stop the daemon owned by the package being changed while preserving a compatible peer package's daemon.
+The standard production installation starts its per-user daemon immediately and registers it for graphical-login autostart. While that daemon is running, cagents exposes a system-tray item that opens the UI and can stop the daemon. The daemon remains independent of the UI so terminals survive window and UI-process restarts. `cagents daemon stop` stops it for the current login; starting the UI or a terminal command starts it again on demand.
 
-cagents follows the XDG base-directory convention:
+The explicitly selected Cargo `development` feature uses a separate daemon and does not register a tray item or autostart entry. This keeps source-tree UI development isolated while the installed production cagents remains available as the workflow manager.
+
+cagents follows the XDG base-directory convention. Production paths are:
 
 - Settings: `${XDG_CONFIG_HOME:-$HOME/.config}/cagents/settings.toml`
 - Session database: `${XDG_DATA_HOME:-$HOME/.local/share}/cagents/sessions.sqlite3`
 - Terminal transcripts: `${XDG_DATA_HOME:-$HOME/.local/share}/cagents/transcripts/`
 - Cache, when present: `${XDG_CACHE_HOME:-$HOME/.cache}/cagents/`
 - Daemon socket and lock: `$XDG_RUNTIME_DIR/cagents/` (shared by full and browserless protocol version 3 builds)
+
+Development substitutes `cagents-development` for the final `cagents` directory component.
 
 Program files installed by `install.sh` live separately under `${XDG_DATA_HOME:-$HOME/.local/share}/cagents-install/`.
 

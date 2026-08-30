@@ -1,0 +1,99 @@
+#!/bin/sh
+set -eu
+
+root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+cd "$root"
+
+target_dir=${CARGO_TARGET_DIR:-${CARGO_BUILD_TARGET_DIR:-$root/target}}
+case "$target_dir" in
+    /*) ;;
+    *) target_dir="$root/$target_dir" ;;
+esac
+
+browserless=false
+debug=false
+fresh_daemon=false
+log_file=
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        --browserless) browserless=true ;;
+        --debug) debug=true ;;
+        --fresh-daemon) fresh_daemon=true ;;
+        --log-file)
+            if [ "$#" -lt 2 ]; then
+                printf '%s\n' "--log-file requires a path" >&2
+                exit 2
+            fi
+            shift
+            log_file=$1
+            ;;
+        --help)
+            cat <<'USAGE'
+Usage: scripts/run-development [OPTIONS] [-- UI_ARGUMENTS...]
+
+Options:
+  --browserless    Build without Servo and open saved browser URLs externally
+  --debug          Enable cagents debug logs and Rust backtraces
+  --fresh-daemon   Stop the existing development daemon before rebuilding
+  --log-file PATH  Write UI tracing output to PATH
+  --help           Show this help
+USAGE
+            exit 0
+            ;;
+        --)
+            shift
+            break
+            ;;
+        *)
+            printf '%s\n' "unknown option: $1" >&2
+            exit 2
+            ;;
+    esac
+    shift
+done
+
+if [ "$debug" = true ]; then
+    export RUST_BACKTRACE=${RUST_BACKTRACE:-1}
+    export RUST_LOG=${RUST_LOG:-cagents=debug,cagentsd=debug,warn}
+fi
+
+if [ "$fresh_daemon" = true ]; then
+    cli="$target_dir/debug/cagents"
+    if [ ! -x "$cli" ]; then
+        printf '%s\n' "build once before using --fresh-daemon: $cli is missing" >&2
+        exit 1
+    fi
+    status=$("$cli" --json daemon status)
+    case "$status" in
+        *'"instance":"development"'*'"running":false'*) ;;
+        *'"instance":"development"'*'"running":true'*)
+            "$cli" daemon stop
+            socket=${XDG_RUNTIME_DIR:?XDG_RUNTIME_DIR must be set}/cagents-development/cagentsd.sock
+            remaining=100
+            while [ -e "$socket" ]; do
+                if [ "$remaining" -eq 0 ]; then
+                    printf '%s\n' "development daemon did not stop within 5 seconds" >&2
+                    exit 1
+                fi
+                remaining=$((remaining - 1))
+                sleep 0.05
+            done
+            ;;
+        *)
+            printf '%s\n' "unexpected development daemon status: $status" >&2
+            exit 1
+            ;;
+    esac
+fi
+
+if [ "$browserless" = true ]; then
+    cargo build --locked --no-default-features --features development --bins
+else
+    cargo build --locked --features development --bins
+fi
+
+if [ -n "$log_file" ]; then
+    printf '%s\n' "writing UI diagnostics to $log_file"
+    exec "$target_dir/debug/cagents-ui" "$@" >"$log_file" 2>&1
+fi
+exec "$target_dir/debug/cagents-ui" "$@"

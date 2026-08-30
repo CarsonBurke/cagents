@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use thiserror::Error;
 
 use crate::{
+    instance,
     model::{
         HostSessionProof, LaunchRecipe, TerminalContinuity, TerminalId, TerminalSession,
         TranscriptMetadata,
@@ -36,9 +37,8 @@ pub const MAX_FRAME_BYTES: usize = 8 * 1024 * 1024;
 pub const MAX_CLIENT_FRAME_BYTES: usize = 2 * 1024 * 1024;
 pub const MAX_INPUT_BYTES: usize = 1024 * 1024;
 pub const MAX_RESUME_TERMINALS: usize = 1024;
-/// Shared by build variants that speak protocol 3. Keep this legacy namespace
-/// while protocol 3 remains current so upgrades can resume existing terminals.
-pub const RUNTIME_SUBDIRECTORY: &str = "cagents";
+/// Production full and browserless builds retain this namespace while protocol
+/// version 3 remains current so upgrades can resume existing terminals.
 #[cfg(test)]
 const RUNTIME_NAMESPACE_PROTOCOL_VERSION: u16 = 3;
 pub const SOCKET_FILE_NAME: &str = "cagentsd.sock";
@@ -54,7 +54,9 @@ pub fn daemon_socket_path() -> io::Result<PathBuf> {
                 "XDG_RUNTIME_DIR is not set to an absolute path",
             )
         })?;
-    Ok(runtime.join(RUNTIME_SUBDIRECTORY).join(SOCKET_FILE_NAME))
+    Ok(runtime
+        .join(instance::RUNTIME_SUBDIRECTORY)
+        .join(SOCKET_FILE_NAME))
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

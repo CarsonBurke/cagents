@@ -118,13 +118,18 @@ pub fn run() -> Result<(), HostError> {
     let listener = UnixListener::bind(&paths.socket)?;
     fs::set_permissions(&paths.socket, fs::Permissions::from_mode(0o600))?;
     listener.set_nonblocking(true)?;
+    let _tray = crate::tray::start();
 
     let host: SharedHost = Arc::new(Mutex::new(HostState::new(proof)));
     let next_client_id = AtomicU64::new(1);
     let client_capacity = ClientCapacity::new(MAX_ACTIVE_CLIENTS);
     let mut clients = Vec::new();
     let mut runtime_error = None;
-    tracing::info!(socket = %paths.socket.display(), "cagents daemon is ready");
+    tracing::info!(
+        instance = crate::instance::NAME,
+        socket = %paths.socket.display(),
+        "cagents daemon is ready"
+    );
 
     loop {
         reap_finished(&mut clients);

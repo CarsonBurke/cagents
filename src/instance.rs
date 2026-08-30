@@ -162,6 +162,48 @@ fn current_uid() -> u32 {
     unsafe { libc::geteuid() }
 }
 
+use directories::ProjectDirs;
+
+// Source-tree debug builds are development instances by default. The explicit
+// feature keeps the same isolation available to optimized development builds.
+const IS_DEVELOPMENT: bool = cfg!(any(debug_assertions, feature = "development"));
+
+pub const NAME: &str = if IS_DEVELOPMENT {
+    "development"
+} else {
+    "production"
+};
+
+pub const APPLICATION_ID: &str = if IS_DEVELOPMENT {
+    "dev.cagents.Cagents.Development"
+} else if cfg!(feature = "integrated-browser") {
+    "dev.cagents.Cagents"
+} else {
+    "dev.cagents.Cagents.Browserless"
+};
+
+pub const APPLICATION_NAME: &str = if IS_DEVELOPMENT {
+    "cagents (Development)"
+} else {
+    "cagents"
+};
+
+pub const STORAGE_NAME: &str = if IS_DEVELOPMENT {
+    "cagents-development"
+} else {
+    "cagents"
+};
+
+pub const RUNTIME_SUBDIRECTORY: &str = if IS_DEVELOPMENT {
+    "cagents-development"
+} else {
+    "cagents"
+};
+
+pub fn project_dirs() -> Option<ProjectDirs> {
+    ProjectDirs::from("dev", "cagents", STORAGE_NAME)
+}
+
 #[cfg(test)]
 mod tests {
     use std::os::unix::fs::symlink;
@@ -216,5 +258,43 @@ mod tests {
 
         File::create(peer.path().join(LEASE_MARKER_FILE)).unwrap();
         assert!(!peer_ui_predates_lease(peer.path()));
+    }
+
+    #[test]
+    fn instance_namespaces_are_internally_consistent() {
+        if IS_DEVELOPMENT {
+            assert_eq!(
+                (
+                    NAME,
+                    APPLICATION_ID,
+                    APPLICATION_NAME,
+                    STORAGE_NAME,
+                    RUNTIME_SUBDIRECTORY
+                ),
+                (
+                    "development",
+                    "dev.cagents.Cagents.Development",
+                    "cagents (Development)",
+                    "cagents-development",
+                    "cagents-development"
+                )
+            );
+        } else {
+            let application_id = if cfg!(feature = "integrated-browser") {
+                "dev.cagents.Cagents"
+            } else {
+                "dev.cagents.Cagents.Browserless"
+            };
+            assert_eq!(
+                (
+                    NAME,
+                    APPLICATION_ID,
+                    APPLICATION_NAME,
+                    STORAGE_NAME,
+                    RUNTIME_SUBDIRECTORY
+                ),
+                ("production", application_id, "cagents", "cagents", "cagents")
+            );
+        }
     }
 }

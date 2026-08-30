@@ -34,6 +34,7 @@ use cosmic::{
 use url::Url;
 
 use crate::{
+    design::{self, NavigationLayout},
     github::{PullRequest, PullRequestCheck},
     model::{ProjectId, ProjectState, WorktreeId},
     repository::{
@@ -44,18 +45,17 @@ use crate::{
 /// The rendered bounds of the expanded pane, and the only bounds it has:
 /// `crate::settings` validates persisted widths against these, so a width can
 /// no longer pass validation and then silently render clamped.
-pub const EXPANDED_WIDTH_MIN: f32 = 240.0;
-pub const EXPANDED_WIDTH_MAX: f32 = 400.0;
+pub const EXPANDED_WIDTH_MIN: f32 = design::NAVIGATION_MIN_WIDTH;
+pub const EXPANDED_WIDTH_MAX: f32 = design::NAVIGATION_MAX_WIDTH;
 /// Rendered when a persisted width is not a finite number. Mirrors
 /// `settings::AppSettings::default`, so a corrupt file looks like a fresh one.
-const DEFAULT_EXPANDED_WIDTH: f32 = 280.0;
-const COMPACT_WIDTH: f32 = 52.0;
-const COMPACT_BREAKPOINT: f32 = 1_200.0;
-const HEADER_HEIGHT: f32 = 44.0;
-const PROJECT_HEADER_HEIGHT: f32 = 36.0;
-const WORKTREE_ROW_HEIGHT: f32 = 40.0;
-const PULL_REQUEST_ROW_HEIGHT: f32 = 44.0;
-const ICON_CONTROL_SIZE: f32 = 30.0;
+const DEFAULT_EXPANDED_WIDTH: f32 = design::NAVIGATION_DEFAULT_WIDTH;
+const COMPACT_WIDTH: f32 = design::NAVIGATION_RAIL_WIDTH;
+const HEADER_HEIGHT: f32 = design::HEADER_HEIGHT;
+const PROJECT_HEADER_HEIGHT: f32 = design::ROW_HEIGHT;
+const WORKTREE_ROW_HEIGHT: f32 = design::ROW_HEIGHT;
+const PULL_REQUEST_ROW_HEIGHT: f32 = design::ROW_HEIGHT + (2.0 * design::GRID_UNIT);
+const ICON_CONTROL_SIZE: f32 = design::PRIMARY_CONTROL_SIZE;
 const ROW_ICON_WIDTH: f32 = 20.0;
 /// Icons that sit inside a row, beside its text.
 const ROW_ICON_SIZE: u16 = 16;
@@ -83,10 +83,9 @@ pub enum SidebarMode {
 impl SidebarMode {
     /// Selects the compact rail for narrow application windows.
     pub fn for_width(window_width: f32) -> Self {
-        if window_width < COMPACT_BREAKPOINT {
-            Self::Compact
-        } else {
-            Self::Expanded
+        match design::ShellLayout::for_width(window_width).navigation {
+            NavigationLayout::Rail => Self::Compact,
+            NavigationLayout::Expanded => Self::Expanded,
         }
     }
 }
@@ -707,8 +706,10 @@ pub fn view<'a>(
     let width = effective_width(mode, persisted_width);
     let loading = matches!(&model.data_state, SidebarDataState::Loading);
     let refresh_enabled = !model.projects.is_empty() && !loading;
+    let header_loading = loading && !model.projects.is_empty();
     let mut content = widget::column::with_capacity(5).push(
-        widget::container(header(model, state, compact, loading)).padding([0, spacing.space_xxxs]),
+        widget::container(header(model, state, compact, header_loading))
+            .padding([0, spacing.space_xxxs]),
     );
 
     // Each density is given the controls its width can hold, and
@@ -720,7 +721,7 @@ pub fn view<'a>(
             .push(widget::container(compact_filters(state.filter)).padding(spacing.space_xxxs));
     } else if state.controls_expanded && search_is_reachable(model, mode) {
         content = content.push(
-            widget::container(controls(state, refresh_enabled, loading))
+            widget::container(controls(state, refresh_enabled))
                 .class(theme::Container::Secondary)
                 .padding(spacing.space_xxs),
         );
@@ -832,13 +833,6 @@ fn header<'a>(
             },
             project.chrome.header_new_worktree_id.clone(),
         ));
-    } else {
-        children.push(icon_action(
-            "list-add-symbolic",
-            "Open a repository and create a worktree",
-            SidebarAction::OpenRepositoryPicker,
-            stable_id("new-worktree"),
-        ));
     }
 
     widget::row::with_children(children)
@@ -864,11 +858,7 @@ fn selected_project<'a>(
         .find(|project| project.id == project_id)
 }
 
-fn controls<'a>(
-    state: &'a SidebarState,
-    refresh_enabled: bool,
-    loading: bool,
-) -> Element<'a, SidebarAction> {
+fn controls<'a>(state: &'a SidebarState, refresh_enabled: bool) -> Element<'a, SidebarAction> {
     let spacing = cosmic::theme::spacing();
     let mut actions: Vec<Element<'a, SidebarAction>> = Vec::with_capacity(3);
     actions.push(filters(state.filter));
@@ -877,13 +867,7 @@ fn controls<'a>(
             .width(Length::Fill)
             .into(),
     );
-    if loading {
-        actions.push(
-            widget::progress_bar::circular::Circular::new()
-                .size(f32::from(ROW_ICON_SIZE))
-                .into(),
-        );
-    } else if refresh_enabled {
+    if refresh_enabled {
         actions.push(icon_action(
             "view-refresh-symbolic",
             "Refresh projects",
@@ -1108,27 +1092,32 @@ fn loading(compact: bool) -> Element<'static, SidebarAction> {
     .align_x(Alignment::Center)
     .spacing(spacing.space_xxs);
     widget::container(content)
-        .center_x(Length::Fill)
-        .padding(spacing.space_xxs)
+        .center(Length::Fill)
+        .padding(spacing.space_xs)
         .width(Length::Fill)
+        .height(Length::Fill)
         .into()
 }
 fn error<'a>(message: &'a str, compact: bool) -> Element<'a, SidebarAction> {
     let spacing = cosmic::theme::spacing();
     if compact {
-        return widget::column::with_children(vec![
-            widget::icon::from_name("dialog-warning-symbolic")
-                .size(STATUS_ICON_SIZE)
-                .into(),
-            icon_action(
-                "view-refresh-symbolic",
-                format!("Couldn't load projects. {message}. Try again"),
-                SidebarAction::Refresh,
-                stable_id("error.retry"),
-            ),
-        ])
-        .spacing(spacing.space_xxs)
-        .align_x(Alignment::Center)
+        return widget::container(
+            widget::column::with_children(vec![
+                widget::icon::from_name("dialog-warning-symbolic")
+                    .size(STATUS_ICON_SIZE)
+                    .into(),
+                icon_action(
+                    "view-refresh-symbolic",
+                    format!("Couldn't load projects. {message}. Try again"),
+                    SidebarAction::Refresh,
+                    stable_id("error.retry"),
+                ),
+            ])
+            .spacing(spacing.space_xxs)
+            .align_x(Alignment::Center),
+        )
+        .center(Length::Fill)
+        .height(Length::Fill)
         .into();
     }
     widget::container(
@@ -1145,10 +1134,13 @@ fn error<'a>(message: &'a str, compact: bool) -> Element<'a, SidebarAction> {
                 .on_press(SidebarAction::Refresh)
                 .into(),
         ])
+        .align_x(Alignment::Center)
         .spacing(spacing.space_xxs),
     )
-    .padding(spacing.space_xs)
+    .center(Length::Fill)
+    .padding(spacing.space_s)
     .width(Length::Fill)
+    .height(Length::Fill)
     .into()
 }
 
@@ -2601,6 +2593,42 @@ mod tests {
             SidebarMode::Expanded,
             "disk on fire"
         )));
+    }
+
+    #[test]
+    fn new_worktree_requires_a_selected_project() {
+        let empty = SidebarModel::ready(SidebarMode::Expanded, Vec::new());
+        let state = SidebarState::default();
+        let empty_ids = control_ids(&view(
+            &empty,
+            &state,
+            SidebarMode::Expanded,
+            DEFAULT_EXPANDED_WIDTH,
+            false,
+        ));
+        assert!(!empty_ids.contains(&stable_id("new-worktree").to_string()));
+
+        let populated = SidebarModel::ready(SidebarMode::Expanded, vec![project()]);
+        let mut selected = SidebarState::default();
+        selected.apply(&SidebarAction::OpenRepository {
+            project_id: project_id(1),
+            repository: "/repo/cagents".into(),
+        });
+        let populated_ids = control_ids(&view(
+            &populated,
+            &selected,
+            SidebarMode::Expanded,
+            DEFAULT_EXPANDED_WIDTH,
+            false,
+        ));
+        assert!(
+            populated_ids.contains(
+                &populated.projects[0]
+                    .chrome
+                    .header_new_worktree_id
+                    .to_string()
+            )
+        );
     }
 
     #[test]

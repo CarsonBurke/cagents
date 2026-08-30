@@ -89,6 +89,23 @@ if [ "${CAGENTS_SKIP_BUILD:-0}" != 1 ]; then
             --bin cagents-ui \
             --bin cagentsd
     else
+        command -v zig >/dev/null 2>&1 || fail 'required command not found: zig'
+        # Build scripts run outside the repository and cannot rely on a mise shim
+        # rediscovering mise.toml from their working directory. Resolve the real Zig
+        # executable while this script still has the project context, then put that
+        # directory ahead of any version-manager shim.
+        ZIG_ENV=$(zig env) || fail 'could not inspect the Zig installation'
+        ZIG_EXECUTABLE=$(printf '%s\n' "$ZIG_ENV" | sed -n \
+            -e 's/^[[:space:]]*"zig_exe":[[:space:]]*"\([^"]*\)",\{0,1\}[[:space:]]*$/\1/p' \
+            -e 's/^[[:space:]]*\.zig_exe[[:space:]]*=[[:space:]]*"\([^"]*\)",\{0,1\}[[:space:]]*$/\1/p')
+        case $ZIG_EXECUTABLE in
+            /*) ;;
+            *) fail 'zig env did not report an absolute zig_exe' ;;
+        esac
+        [ -x "$ZIG_EXECUTABLE" ] || fail "zig executable is not runnable: $ZIG_EXECUTABLE"
+        PATH=${ZIG_EXECUTABLE%/*}:$PATH
+        export PATH
+
         cargo build \
             --manifest-path "$ROOT_DIR/Cargo.toml" \
             --locked \
@@ -139,6 +156,7 @@ SHARE_DIR=$PACKAGE_ROOT/share
 install -d -m 0755 \
     "$BIN_DIR" \
     "$SHARE_DIR/applications" \
+    "$SHARE_DIR/autostart" \
     "$SHARE_DIR/icons/hicolor/scalable/apps" \
     "$SHARE_DIR/icons/hicolor/128x128/apps" \
     "$SHARE_DIR/metainfo" \
@@ -159,6 +177,11 @@ sed \
     -e "s/^Icon=dev\\.cagents\\.Cagents\$/Icon=$DESKTOP_ID/" \
     "$ROOT_DIR/packaging/dev.cagents.Cagents.desktop" \
     > "$SHARE_DIR/applications/$DESKTOP_ID.desktop"
+sed \
+    -e "s/^Exec=cagents /Exec=$COMMAND_NAME /" \
+    -e "s/^TryExec=cagents\$/TryExec=$COMMAND_NAME/" \
+    "$ROOT_DIR/packaging/dev.cagents.Cagents.Daemon.desktop" \
+    > "$SHARE_DIR/autostart/$DESKTOP_ID.Daemon.desktop"
 install -m 0644 "$ROOT_DIR/packaging/dev.cagents.Cagents.svg" "$SHARE_DIR/icons/hicolor/scalable/apps/$DESKTOP_ID.svg"
 install -m 0644 "$ROOT_DIR/packaging/dev.cagents.Cagents.png" "$SHARE_DIR/icons/hicolor/128x128/apps/$DESKTOP_ID.png"
 sed \
@@ -189,6 +212,7 @@ gzip -n -9 -c "$PORTABLE_TAR" > "$DIST_DIR/$ARCHIVE_NAME"
 DEB_ROOT=$WORK_DIR/deb
 install -d -m 0755 \
     "$DEB_ROOT/DEBIAN" \
+    "$DEB_ROOT/etc/xdg/autostart" \
     "$DEB_ROOT/usr/bin" \
     "$DEB_ROOT/usr/libexec/$PACKAGE_NAME" \
     "$DEB_ROOT/usr/share/applications" \
@@ -202,6 +226,12 @@ install -m 0755 "$BIN_DIR/cagentsd" "$DEB_ROOT/usr/libexec/$PACKAGE_NAME/cagents
 install -m 0644 "$BIN_DIR/.cagents-ui-lease-v1" "$DEB_ROOT/usr/libexec/$PACKAGE_NAME/.cagents-ui-lease-v1"
 ln -s "../libexec/$PACKAGE_NAME/cagents" "$DEB_ROOT/usr/bin/$COMMAND_NAME"
 install -m 0644 "$SHARE_DIR/applications/$DESKTOP_ID.desktop" "$DEB_ROOT/usr/share/applications/$DESKTOP_ID.desktop"
+sed \
+    -e "s|^Exec=.*|Exec=/usr/bin/$COMMAND_NAME daemon start|" \
+    -e "s|^TryExec=.*|TryExec=/usr/bin/$COMMAND_NAME|" \
+    "$SHARE_DIR/autostart/$DESKTOP_ID.Daemon.desktop" \
+    > "$DEB_ROOT/etc/xdg/autostart/$DESKTOP_ID.Daemon.desktop"
+chmod 0644 "$DEB_ROOT/etc/xdg/autostart/$DESKTOP_ID.Daemon.desktop"
 install -m 0644 "$SHARE_DIR/icons/hicolor/scalable/apps/$DESKTOP_ID.svg" "$DEB_ROOT/usr/share/icons/hicolor/scalable/apps/$DESKTOP_ID.svg"
 install -m 0644 "$SHARE_DIR/icons/hicolor/128x128/apps/$DESKTOP_ID.png" "$DEB_ROOT/usr/share/icons/hicolor/128x128/apps/$DESKTOP_ID.png"
 install -m 0644 "$SHARE_DIR/metainfo/$DESKTOP_ID.metainfo.xml" "$DEB_ROOT/usr/share/metainfo/$DESKTOP_ID.metainfo.xml"

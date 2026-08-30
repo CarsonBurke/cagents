@@ -10,6 +10,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .unwrap_or_else(|_| EnvFilter::new("cagents=info,warn")),
         )
         .init();
+    cagents::terminal::ensure_daemon_ready()?;
 
     let settings = Settings::default()
         .size(cosmic::iced::Size::new(1440.0, 900.0))

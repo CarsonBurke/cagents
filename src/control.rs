@@ -18,7 +18,7 @@ use serde_json::{Value, json};
 use thiserror::Error;
 
 use crate::{
-    instance::{UI_LAUNCH_ERROR_PREFIX, UI_LAUNCH_HANDSHAKE_ENV, UI_LAUNCH_READY},
+    instance::{self, UI_LAUNCH_ERROR_PREFIX, UI_LAUNCH_HANDSHAKE_ENV, UI_LAUNCH_READY},
     model::{HostSessionProof, LaunchRecipe, TerminalContinuity, TerminalId, TerminalSession},
     terminal::{
         self, TerminalSpawnOptions,
@@ -959,8 +959,8 @@ fn execute_daemon(command: DaemonCommand) -> Result<CommandOutput, AppError> {
                 .map_err(|error| AppError::new("daemon_start", error))?;
             Ok(CommandOutput {
                 command: "daemon.start",
-                data: json!({ "running": true, "socket": socket }),
-                human: format!("daemon running ({})", socket.display()),
+                data: json!({ "instance": instance::NAME, "running": true, "socket": socket }),
+                human: format!("{} daemon running ({})", instance::NAME, socket.display()),
             })
         }
         DaemonCommand::Status => {
@@ -980,11 +980,15 @@ fn execute_daemon(command: DaemonCommand) -> Result<CommandOutput, AppError> {
             };
             Ok(CommandOutput {
                 command: "daemon.status",
-                data: json!({ "running": running, "socket": socket }),
+                data: json!({
+                    "instance": instance::NAME,
+                    "running": running,
+                    "socket": socket
+                }),
                 human: if running {
-                    format!("daemon running ({})", socket.display())
+                    format!("{} daemon running ({})", instance::NAME, socket.display())
                 } else {
-                    "daemon stopped".to_owned()
+                    format!("{} daemon stopped", instance::NAME)
                 },
             })
         }
@@ -998,8 +1002,8 @@ fn execute_daemon(command: DaemonCommand) -> Result<CommandOutput, AppError> {
                 .map_err(|error| AppError::new("protocol", error))?;
             Ok(CommandOutput {
                 command: "daemon.stop",
-                data: json!({ "stopped": true }),
-                human: "daemon stopping".to_owned(),
+                data: json!({ "instance": instance::NAME, "stopped": true }),
+                human: format!("{} daemon stopping", instance::NAME),
             })
         }
     }
