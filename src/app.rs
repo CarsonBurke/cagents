@@ -1227,6 +1227,33 @@ pub struct Cagents {
     status: Option<TransientNotice>,
 }
 
+async fn open_system_url(url: Url) -> Result<(), String> {
+    let portal_result = async {
+        let request = ashpd::desktop::open_uri::OpenFileRequest::default()
+            .send_uri(&url)
+            .await
+            .map_err(|error| error.to_string())?;
+        request.response().map_err(|error| error.to_string())
+    }
+    .await;
+    match portal_result {
+        Ok(()) => Ok(()),
+        Err(portal_error) => match tokio::process::Command::new("xdg-open")
+            .arg(url.as_str())
+            .status()
+            .await
+        {
+            Ok(status) if status.success() => Ok(()),
+            Ok(status) => Err(format!(
+                "desktop portal failed ({portal_error}); xdg-open exited with {status}"
+            )),
+            Err(fallback_error) => Err(format!(
+                "desktop portal failed ({portal_error}); xdg-open failed: {fallback_error}"
+            )),
+        },
+    }
+}
+
 impl Cagents {
     fn bootstrap() -> BootstrapResult {
         let (settings, settings_path, settings_write_blocked, mut status) =
@@ -1638,16 +1665,7 @@ impl Cagents {
         match self.settings.link_open_destination {
             LinkOpenDestination::IntegratedBrowser => self.add_browser(url),
             LinkOpenDestination::SystemDefault => cosmic::task::future(async move {
-                let result = async {
-                    let request = ashpd::desktop::open_uri::OpenFileRequest::default()
-                        .send_uri(&url)
-                        .await
-                        .map_err(|error| error.to_string())?;
-                    request.response().map_err(|error| error.to_string())?;
-                    Ok(())
-                }
-                .await;
-                Message::ExternalLinkOpened(result)
+                Message::ExternalLinkOpened(open_system_url(url).await)
             }),
         }
     }
@@ -1751,33 +1769,7 @@ impl Cagents {
 
     #[cfg(not(feature = "integrated-browser"))]
     fn open_external_url(url: Url) -> Task<Message> {
-        cosmic::task::future(async move {
-            let portal_result = async {
-                let request = ashpd::desktop::open_uri::OpenFileRequest::default()
-                    .send_uri(&url)
-                    .await
-                    .map_err(|error| error.to_string())?;
-                request.response().map_err(|error| error.to_string())
-            }
-            .await;
-            let result = match portal_result {
-                Ok(()) => Ok(()),
-                Err(portal_error) => match tokio::process::Command::new("xdg-open")
-                    .arg(url.as_str())
-                    .status()
-                    .await
-                {
-                    Ok(status) if status.success() => Ok(()),
-                    Ok(status) => Err(format!(
-                        "desktop portal failed ({portal_error}); xdg-open exited with {status}"
-                    )),
-                    Err(fallback_error) => Err(format!(
-                        "desktop portal failed ({portal_error}); xdg-open failed: {fallback_error}"
-                    )),
-                },
-            };
-            Message::ExternalUrlOpened(result)
-        })
+        cosmic::task::future(async move { Message::ExternalUrlOpened(open_system_url(url).await) })
     }
 
     fn persist(&self) {
