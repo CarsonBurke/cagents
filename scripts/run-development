@@ -4,7 +4,6 @@ set -eu
 root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 cd "$root"
 
-
 browserless=false
 debug=false
 fresh_daemon=false
@@ -51,6 +50,31 @@ if [ "$debug" = true ]; then
     export RUST_BACKTRACE=${RUST_BACKTRACE:-1}
     export RUST_LOG=${RUST_LOG:-cagents=debug,cagentsd=debug,warn}
 fi
+
+command -v zig >/dev/null 2>&1 || {
+    printf '%s\n' 'required command not found: zig' >&2
+    exit 1
+}
+zig_env=$(zig env) || {
+    printf '%s\n' 'could not inspect the Zig installation' >&2
+    exit 1
+}
+zig_executable=$(printf '%s\n' "$zig_env" | sed -n \
+    -e 's/^[[:space:]]*"zig_exe":[[:space:]]*"\([^"]*\)",\{0,1\}[[:space:]]*$/\1/p' \
+    -e 's/^[[:space:]]*\.zig_exe[[:space:]]*=[[:space:]]*"\([^"]*\)",\{0,1\}[[:space:]]*$/\1/p')
+case $zig_executable in
+    /*) ;;
+    *)
+        printf '%s\n' 'zig env did not report an absolute zig_exe' >&2
+        exit 1
+        ;;
+esac
+[ -x "$zig_executable" ] || {
+    printf '%s\n' "zig executable is not runnable: $zig_executable" >&2
+    exit 1
+}
+PATH=${zig_executable%/*}:$PATH
+export PATH
 
 stop_development_daemon() {
     runtime=${XDG_RUNTIME_DIR:?XDG_RUNTIME_DIR must be set}/cagents-development
