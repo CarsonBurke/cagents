@@ -13,13 +13,14 @@ use crate::{
     sidebar::{EXPANDED_WIDTH_MAX, EXPANDED_WIDTH_MIN},
 };
 
-pub const SETTINGS_SCHEMA_VERSION: u32 = 2;
+pub const SETTINGS_SCHEMA_VERSION: u32 = 3;
 const PRIVATE_DIRECTORY_MODE: u32 = 0o700;
 const PRIVATE_FILE_MODE: u32 = 0o600;
 const MAX_TOML_INTEGER: u64 = i64::MAX as u64;
 
 const MAX_TERMINAL_SCROLLBACK_LINES: usize = 1_000_000;
 const LEGACY_SETTINGS_SCHEMA_VERSION: u32 = 1;
+const PREVIOUS_SETTINGS_SCHEMA_VERSION: u32 = 2;
 const LEGACY_SIDEBAR_WIDTH_MIN: f32 = 180.0;
 const LEGACY_SIDEBAR_WIDTH_MAX: f32 = 480.0;
 
@@ -257,6 +258,7 @@ pub struct AppSettings {
     #[serde(default)]
     pub terminal_font_family: String,
     pub sidebar_width: f32,
+    pub inspector_width: f32,
     pub default_column_fraction: f32,
     #[serde(default = "default_terminal_scrollback_lines")]
     pub terminal_scrollback_lines: usize,
@@ -277,6 +279,7 @@ impl Default for AppSettings {
             terminal_font_size: 14.0,
             terminal_font_family: String::new(),
             sidebar_width: design::NAVIGATION_DEFAULT_WIDTH,
+            inspector_width: design::INSPECTOR_DEFAULT_WIDTH,
             default_column_fraction: 0.72,
             terminal_scrollback_lines: 10_000,
             link_open_destination: LinkOpenDestination::default(),
@@ -302,6 +305,30 @@ struct V1TomlSettings {
     terminal_font_family: String,
     sidebar_width: f32,
     default_column_fraction: f32,
+}
+
+/// The complete version-2 shape. Keeping the previous schema explicit makes
+/// the inspector-width addition a real versioned migration instead of
+/// silently changing the meaning of an existing schema number.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct V2TomlSettings {
+    schema_version: u32,
+    max_hot_cards: usize,
+    hibernation_delay_ms: u64,
+    terminal_font_size: f32,
+    #[serde(default)]
+    terminal_font_family: String,
+    sidebar_width: f32,
+    default_column_fraction: f32,
+    #[serde(default = "default_terminal_scrollback_lines")]
+    terminal_scrollback_lines: usize,
+    #[serde(default)]
+    link_open_destination: LinkOpenDestination,
+    #[serde(default)]
+    link_open_gesture: LinkOpenGesture,
+    #[serde(default)]
+    keyboard_shortcuts: KeyboardShortcuts,
 }
 
 #[derive(Debug, Deserialize)]
@@ -362,6 +389,26 @@ impl From<V1TomlSettings> for AppSettings {
     }
 }
 
+impl From<V2TomlSettings> for AppSettings {
+    fn from(previous: V2TomlSettings) -> Self {
+        debug_assert_eq!(previous.schema_version, PREVIOUS_SETTINGS_SCHEMA_VERSION);
+        Self {
+            schema_version: SETTINGS_SCHEMA_VERSION,
+            max_hot_cards: previous.max_hot_cards,
+            hibernation_delay_ms: previous.hibernation_delay_ms,
+            terminal_font_size: previous.terminal_font_size,
+            terminal_font_family: previous.terminal_font_family,
+            sidebar_width: previous.sidebar_width,
+            inspector_width: design::INSPECTOR_DEFAULT_WIDTH,
+            default_column_fraction: previous.default_column_fraction,
+            terminal_scrollback_lines: previous.terminal_scrollback_lines,
+            link_open_destination: previous.link_open_destination,
+            link_open_gesture: previous.link_open_gesture,
+            keyboard_shortcuts: previous.keyboard_shortcuts,
+        }
+    }
+}
+
 fn normalize_legacy_sidebar_width(width: f32) -> f32 {
     if (LEGACY_SIDEBAR_WIDTH_MIN..=LEGACY_SIDEBAR_WIDTH_MAX).contains(&width) {
         width.clamp(EXPANDED_WIDTH_MIN, EXPANDED_WIDTH_MAX)
@@ -408,6 +455,13 @@ impl AppSettings {
                 max: EXPANDED_WIDTH_MAX,
             });
         }
+        if !(design::INSPECTOR_MIN_WIDTH..=design::INSPECTOR_MAX_WIDTH)
+            .contains(&self.inspector_width)
+        {
+            return Err(SettingsError::Invalid(
+                "inspector_width must be between 320 and 420",
+            ));
+        }
         if !(0.25..=1.0).contains(&self.default_column_fraction) {
             return Err(SettingsError::Invalid(
                 "default_column_fraction must be between 0.25 and 1.0",
@@ -437,7 +491,7 @@ pub enum SettingsError {
     TomlSerialize(#[from] toml::ser::Error),
     #[error("failed to decode legacy JSON settings: {0}")]
     LegacyJson(#[from] serde_json::Error),
-    #[error("settings use unsupported schema version {0}; expected 2")]
+    #[error("settings use unsupported schema version {0}; expected 3")]
     UnsupportedSchema(u32),
     #[error("invalid settings: {0}")]
     Invalid(&'static str),
@@ -504,6 +558,9 @@ fn load_toml(path: &Path) -> Result<AppSettings, SettingsError> {
     match toml::from_str::<SettingsHeader>(document)?.schema_version {
         LEGACY_SETTINGS_SCHEMA_VERSION => {
             AppSettings::from(toml::from_str::<V1TomlSettings>(document)?).validate()
+        }
+        PREVIOUS_SETTINGS_SCHEMA_VERSION => {
+            AppSettings::from(toml::from_str::<V2TomlSettings>(document)?).validate()
         }
         SETTINGS_SCHEMA_VERSION => toml::from_str::<AppSettings>(document)?.validate(),
         version => Err(SettingsError::UnsupportedSchema(version)),
@@ -685,6 +742,7 @@ mod tests {
             terminal_font_size: 16.5,
             terminal_font_family: "Fira Code".to_owned(),
             sidebar_width: 360.0,
+            inspector_width: 404.0,
             default_column_fraction: 0.55,
             ..AppSettings::default()
         };
@@ -736,6 +794,36 @@ mod tests {
             assert_eq!(loaded.sidebar_width, expected_width);
             assert_eq!(loaded.keyboard_shortcuts, KeyboardShortcuts::default());
         }
+    }
+
+    #[test]
+    fn version_two_toml_adds_the_default_inspector_width() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = path_in(&directory);
+        let previous = AppSettings {
+            sidebar_width: 376.0,
+            terminal_font_size: 15.0,
+            ..AppSettings::default()
+        };
+        let document = toml::to_string(&previous).unwrap();
+        let document = document
+            .lines()
+            .filter(|line| !line.starts_with("inspector_width"))
+            .map(|line| {
+                if line.starts_with("schema_version") {
+                    format!("schema_version = {PREVIOUS_SETTINGS_SCHEMA_VERSION}\n")
+                } else {
+                    format!("{line}\n")
+                }
+            })
+            .collect::<String>();
+        fs::write(&path, document).unwrap();
+
+        let migrated = load(&path).unwrap();
+        assert_eq!(migrated.schema_version, SETTINGS_SCHEMA_VERSION);
+        assert_eq!(migrated.sidebar_width, previous.sidebar_width);
+        assert_eq!(migrated.terminal_font_size, previous.terminal_font_size);
+        assert_eq!(migrated.inspector_width, design::INSPECTOR_DEFAULT_WIDTH);
     }
 
     #[test]
@@ -921,6 +1009,40 @@ mod tests {
                 && message.contains(&EXPANDED_WIDTH_MAX.to_string()),
             "the rejection must quote the bounds it enforces, not a copy of them: {message}"
         );
+    }
+
+    #[test]
+    fn inspector_width_round_trips_only_within_rendered_bounds() {
+        for width in [
+            design::INSPECTOR_MIN_WIDTH,
+            design::INSPECTOR_DEFAULT_WIDTH,
+            design::INSPECTOR_MAX_WIDTH,
+        ] {
+            let settings = AppSettings {
+                inspector_width: width,
+                ..AppSettings::default()
+            }
+            .validate()
+            .unwrap();
+            let directory = tempfile::tempdir().unwrap();
+            let path = path_in(&directory);
+            save(&path, &settings).unwrap();
+            assert_eq!(load(&path).unwrap().inspector_width, width);
+        }
+        for width in [
+            design::INSPECTOR_MIN_WIDTH - 1.0,
+            design::INSPECTOR_MAX_WIDTH + 1.0,
+            f32::NAN,
+        ] {
+            assert!(
+                AppSettings {
+                    inspector_width: width,
+                    ..AppSettings::default()
+                }
+                .validate()
+                .is_err()
+            );
+        }
     }
 
     #[test]

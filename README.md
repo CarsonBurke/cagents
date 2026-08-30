@@ -231,19 +231,20 @@ Program files installed by `install.sh` live separately under `${XDG_DATA_HOME:-
 
 ### Settings
 
-`settings.toml` uses the version 2 schema below. The original runtime and layout
+`settings.toml` uses the version 3 schema below. The original runtime and layout
 keys remain required; newer preferences are optional when reading older files
 and use the documented defaults. Unknown keys, unsupported schema versions,
 malformed TOML, conflicting shortcuts, and values outside the documented ranges
 are rejected.
 
 ```toml
-schema_version = 2
+schema_version = 3
 max_hot_cards = 6
 hibernation_delay_ms = 30000
 terminal_font_size = 14.0
 terminal_font_family = ""
 sidebar_width = 280.0
+inspector_width = 360.0
 default_column_fraction = 0.72
 terminal_scrollback_lines = 10000
 link_open_destination = "integrated_browser"
@@ -259,20 +260,22 @@ next_column = ["Alt+W", "Alt+Right"]
 
 | Key | Type | Default | Accepted values |
 | --- | --- | --- | --- |
-| `schema_version` | integer | `2` | exactly `2` |
+| `schema_version` | integer | `3` | exactly `3` |
 | `max_hot_cards` | non-negative integer | `6` | `1` through `9223372036854775807` |
 | `hibernation_delay_ms` | non-negative integer | `30000` | `0` through `9223372036854775807` milliseconds |
 | `terminal_font_size` | float | `14.0` | finite values from `8.0` through `40.0`, inclusive |
 | `terminal_font_family` | string | `""` | empty for the system monospace font, or a non-whitespace family name up to 128 bytes. The family must be fixed-pitch; one whose glyph widths differ falls back to the system monospace font, because the grid is a single pitch |
 | `terminal_scrollback_lines` | non-negative integer | `10000` | `0` through `1000000` lines for newly started terminals |
 | `sidebar_width` | float | `280.0` | finite values from `240.0` through `400.0`, inclusive |
+| `inspector_width` | float | `360.0` | finite values from `320.0` through `420.0`, inclusive |
 | `default_column_fraction` | float | `0.72` | finite values from `0.25` through `1.0`, inclusive |
 | `link_open_destination` | string | `"integrated_browser"` | `"integrated_browser"` or `"system_default"` |
 | `link_open_gesture` | string | `"control_click"` | `"control_click"` or `"control_shift_click"` |
 | `keyboard_shortcuts.*` | array of strings | shown above | one or more chords, each containing Ctrl, Alt, or Super and one A-Z, 0-9, Left, or Right key; Shift is optional. Every chord in the table must be distinct, and a bound chord is reserved rather than forwarded to the process inside a card |
 
-Version 1 TOML files are upgraded while loading. Sidebar widths accepted by
-version 1 are clamped to the current visible range; other values are preserved.
+Version 1 and 2 TOML files are upgraded while loading. Sidebar widths accepted
+by version 1 are clamped to the current visible range; other values are
+preserved. Version 2 files receive the default inspector width.
 
 On first use after upgrading, cagents migrates a sibling `settings.json` only
 when `settings.toml` does not exist. It validates the JSON, writes and syncs the

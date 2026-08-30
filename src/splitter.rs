@@ -1,0 +1,539 @@
+//! Reusable, accessible pane splitter.
+//!
+//! The widget owns only transient gesture state. Pane width and persistence
+//! remain with the caller, so the same splitter can resize either edge without
+//! duplicating event handling or performing I/O from the view.
+
+use cosmic::iced::advanced::Renderer as _;
+use cosmic::{
+    Element, Renderer, Theme,
+    iced::{
+        Border, Event, Length, Point, Rectangle, Shadow, Size,
+        advanced::{
+            Clipboard, Layout, Shell, Widget, layout, mouse, overlay, renderer,
+            widget::{Operation, Tree, operation, tree},
+        },
+        id::Id,
+        keyboard, window,
+    },
+    widget,
+};
+
+pub const WIDTH: f32 = 4.0;
+pub const KEYBOARD_STEP: f32 = 16.0;
+
+/// The pane edge occupied by the splitter.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Edge {
+    /// The splitter is after the pane; moving right grows the pane.
+    Trailing,
+    /// The splitter is before the pane; moving left grows the pane.
+    Leading,
+}
+
+pub struct Splitter<'a, Message> {
+    content: Element<'a, Message>,
+    width: f32,
+    min: f32,
+    max: f32,
+    edge: Edge,
+    modal_open: bool,
+    id: Id,
+    label: &'a str,
+    on_resize: Box<dyn Fn(f32) -> Message + 'a>,
+    on_finish: Box<dyn Fn() -> Message + 'a>,
+}
+
+impl<'a, Message: 'a> Splitter<'a, Message> {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        id: Id,
+        label: &'a str,
+        width: f32,
+        min: f32,
+        max: f32,
+        edge: Edge,
+        modal_open: bool,
+        on_resize: impl Fn(f32) -> Message + 'a,
+        on_finish: impl Fn() -> Message + 'a,
+    ) -> Self {
+        debug_assert!(min.is_finite() && max.is_finite() && min <= max);
+        Self {
+            content: widget::container(widget::divider::vertical::default())
+                .center_x(Length::Fixed(WIDTH))
+                .height(Length::Fill)
+                .into(),
+            width: clamp(width, min, max),
+            min,
+            max,
+            edge,
+            modal_open,
+            id,
+            label,
+            on_resize: Box::new(on_resize),
+            on_finish: Box::new(on_finish),
+        }
+    }
+
+    fn child_layout<'layout>(layout: Layout<'layout>) -> Layout<'layout> {
+        layout
+            .children()
+            .next()
+            .expect("splitter content layout")
+            .with_virtual_offset(layout.virtual_offset())
+    }
+
+    fn resize(&self, width: f32) -> Message {
+        (self.on_resize)(clamp(width, self.min, self.max))
+    }
+
+    fn pointer_delta(self_edge: Edge, start: f32, current: f32) -> f32 {
+        match self_edge {
+            Edge::Trailing => current - start,
+            Edge::Leading => start - current,
+        }
+    }
+
+    fn keyboard_delta(&self, key: &keyboard::Key) -> Option<f32> {
+        let physical = match key {
+            keyboard::Key::Named(keyboard::key::Named::ArrowLeft) => -KEYBOARD_STEP,
+            keyboard::Key::Named(keyboard::key::Named::ArrowRight) => KEYBOARD_STEP,
+            _ => return None,
+        };
+        Some(match self.edge {
+            Edge::Trailing => physical,
+            Edge::Leading => -physical,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ResizeOrigin {
+    pointer_x: f32,
+    width: f32,
+}
+
+#[derive(Debug, Default)]
+struct SplitterState {
+    drag: Option<ResizeOrigin>,
+    is_focused: bool,
+    repeating: bool,
+}
+
+impl SplitterState {
+    fn begin_drag(&mut self, pointer_x: f32, width: f32) {
+        self.drag = Some(ResizeOrigin { pointer_x, width });
+    }
+
+    fn dragged_width(&self, edge: Edge, pointer_x: f32) -> Option<f32> {
+        self.drag.map(|origin| {
+            origin.width + Splitter::<()>::pointer_delta(edge, origin.pointer_x, pointer_x)
+        })
+    }
+
+    fn finish_drag(&mut self) -> bool {
+        self.drag.take().is_some()
+    }
+}
+
+impl operation::Focusable for SplitterState {
+    fn is_focused(&self) -> bool {
+        self.is_focused
+    }
+
+    fn focus(&mut self) {
+        self.is_focused = true;
+    }
+
+    fn unfocus(&mut self) {
+        self.is_focused = false;
+    }
+}
+
+fn clamp(width: f32, min: f32, max: f32) -> f32 {
+    if width.is_finite() {
+        width.clamp(min, max)
+    } else {
+        min
+    }
+}
+
+fn chorded(modifiers: keyboard::Modifiers) -> bool {
+    modifiers.control() || modifiers.alt() || modifiers.shift() || modifiers.logo()
+}
+
+impl<'view, Message: 'view> Widget<Message, Theme, Renderer> for Splitter<'view, Message> {
+    fn tag(&self) -> tree::Tag {
+        tree::Tag::of::<SplitterState>()
+    }
+
+    fn state(&self) -> tree::State {
+        tree::State::new(SplitterState::default())
+    }
+
+    fn children(&self) -> Vec<Tree> {
+        vec![Tree::new(&self.content)]
+    }
+
+    fn diff(&mut self, tree: &mut Tree) {
+        tree.diff_children(std::slice::from_mut(&mut self.content));
+    }
+
+    fn size(&self) -> Size<Length> {
+        self.content.as_widget().size()
+    }
+
+    fn layout(
+        &mut self,
+        tree: &mut Tree,
+        renderer: &Renderer,
+        limits: &layout::Limits,
+    ) -> layout::Node {
+        let content = self
+            .content
+            .as_widget_mut()
+            .layout(&mut tree.children[0], renderer, limits)
+            .move_to(Point::ORIGIN);
+        layout::Node::with_children(content.size(), vec![content])
+    }
+
+    fn operate(
+        &mut self,
+        tree: &mut Tree,
+        layout: Layout<'_>,
+        renderer: &Renderer,
+        operation: &mut dyn Operation,
+    ) {
+        let bounds = layout.bounds();
+        operation.traverse(&mut |operation| {
+            self.content.as_widget_mut().operate(
+                &mut tree.children[0],
+                Self::child_layout(layout),
+                renderer,
+                operation,
+            );
+        });
+        operation.focusable(
+            Some(&self.id),
+            bounds,
+            tree.state.downcast_mut::<SplitterState>(),
+        );
+    }
+
+    fn update(
+        &mut self,
+        tree: &mut Tree,
+        event: &Event,
+        layout: Layout<'_>,
+        cursor: mouse::Cursor,
+        renderer: &Renderer,
+        clipboard: &mut dyn Clipboard,
+        shell: &mut Shell<'_, Message>,
+        viewport: &Rectangle,
+    ) {
+        let bounds = layout.bounds();
+        let state = tree.state.downcast_mut::<SplitterState>();
+        match event {
+            Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)) => {
+                state.is_focused = cursor.is_over(bounds);
+                if let Some(position) = cursor.position().filter(|_| state.is_focused) {
+                    state.begin_drag(position.x, self.width);
+                    shell.capture_event();
+                    return;
+                }
+            }
+            Event::Mouse(mouse::Event::CursorMoved { position }) => {
+                if let Some(width) = state.dragged_width(self.edge, position.x) {
+                    shell.publish(self.resize(width));
+                    shell.capture_event();
+                    return;
+                }
+            }
+            Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)) => {
+                if state.finish_drag() {
+                    shell.publish((self.on_finish)());
+                    shell.capture_event();
+                    return;
+                }
+            }
+            Event::Window(window::Event::Unfocused) => {
+                let dragging = state.finish_drag();
+                let repeating = std::mem::take(&mut state.repeating);
+                if dragging || repeating {
+                    shell.publish((self.on_finish)());
+                }
+            }
+            Event::Keyboard(keyboard::Event::KeyPressed {
+                key,
+                modifiers,
+                repeat,
+                ..
+            }) if state.is_focused && !self.modal_open && !chorded(*modifiers) => {
+                if let Some(delta) = self.keyboard_delta(key) {
+                    shell.publish(self.resize(self.width + delta));
+                    if *repeat {
+                        state.repeating = true;
+                    } else {
+                        shell.publish((self.on_finish)());
+                    }
+                    shell.capture_event();
+                    return;
+                }
+            }
+            Event::Keyboard(keyboard::Event::KeyReleased { key, .. }) if state.repeating => {
+                if self.keyboard_delta(key).is_some() {
+                    state.repeating = false;
+                    shell.publish((self.on_finish)());
+                    shell.capture_event();
+                    return;
+                }
+            }
+            Event::A11y(id, request) if *id == self.id => {
+                use iced_accessibility::accesskit::Action;
+                match request.action {
+                    Action::Focus => state.is_focused = true,
+                    Action::Blur => state.is_focused = false,
+                    Action::Increment if !self.modal_open => {
+                        shell.publish(self.resize(self.width + KEYBOARD_STEP));
+                        shell.publish((self.on_finish)());
+                    }
+                    Action::Decrement if !self.modal_open => {
+                        shell.publish(self.resize(self.width - KEYBOARD_STEP));
+                        shell.publish((self.on_finish)());
+                    }
+                    _ => {}
+                }
+                shell.capture_event();
+                return;
+            }
+            _ => {}
+        }
+        self.content.as_widget_mut().update(
+            &mut tree.children[0],
+            event,
+            Self::child_layout(layout),
+            cursor,
+            renderer,
+            clipboard,
+            shell,
+            viewport,
+        );
+    }
+
+    fn mouse_interaction(
+        &self,
+        tree: &Tree,
+        layout: Layout<'_>,
+        cursor: mouse::Cursor,
+        _viewport: &Rectangle,
+        _renderer: &Renderer,
+    ) -> mouse::Interaction {
+        if tree.state.downcast_ref::<SplitterState>().drag.is_some()
+            || cursor.is_over(layout.bounds())
+        {
+            mouse::Interaction::ResizingHorizontally
+        } else {
+            mouse::Interaction::default()
+        }
+    }
+
+    fn draw(
+        &self,
+        tree: &Tree,
+        renderer: &mut Renderer,
+        theme: &Theme,
+        style: &renderer::Style,
+        layout: Layout<'_>,
+        cursor: mouse::Cursor,
+        viewport: &Rectangle,
+    ) {
+        self.content.as_widget().draw(
+            &tree.children[0],
+            renderer,
+            theme,
+            style,
+            Self::child_layout(layout),
+            cursor,
+            viewport,
+        );
+        if tree.state.downcast_ref::<SplitterState>().is_focused {
+            renderer.fill_quad(
+                renderer::Quad {
+                    bounds: layout.bounds(),
+                    border: Border::default(),
+                    shadow: Shadow::default(),
+                    snap: true,
+                },
+                cosmic::iced::Background::Color(theme.cosmic().accent.base.into()),
+            );
+        }
+    }
+
+    fn overlay<'a>(
+        &'a mut self,
+        tree: &'a mut Tree,
+        layout: Layout<'a>,
+        renderer: &Renderer,
+        viewport: &Rectangle,
+        translation: cosmic::iced::Vector,
+    ) -> Option<overlay::Element<'a, Message, Theme, Renderer>> {
+        self.content.as_widget_mut().overlay(
+            &mut tree.children[0],
+            Self::child_layout(layout),
+            renderer,
+            viewport,
+            translation,
+        )
+    }
+
+    fn a11y_nodes(
+        &self,
+        layout: Layout<'_>,
+        _state: &Tree,
+        _cursor: mouse::Cursor,
+    ) -> iced_accessibility::A11yTree {
+        use iced_accessibility::accesskit::{Action, Node, Rect, Role};
+
+        let Rectangle {
+            x,
+            y,
+            width,
+            height,
+        } = layout.bounds();
+        let mut node = Node::new(Role::Splitter);
+        node.add_action(Action::Focus);
+        node.add_action(Action::Increment);
+        node.add_action(Action::Decrement);
+        node.set_bounds(Rect::new(
+            f64::from(x),
+            f64::from(y),
+            f64::from(x + width),
+            f64::from(y + height),
+        ));
+        node.set_label(self.label);
+        node.set_numeric_value(f64::from(self.width));
+        node.set_min_numeric_value(f64::from(self.min));
+        node.set_max_numeric_value(f64::from(self.max));
+        node.set_numeric_value_step(f64::from(KEYBOARD_STEP));
+        iced_accessibility::A11yTree::leaf(node, self.id.clone())
+    }
+
+    fn id(&self) -> Option<Id> {
+        Some(self.id.clone())
+    }
+
+    fn set_id(&mut self, id: Id) {
+        self.id = id;
+    }
+}
+
+impl<'a, Message: 'a> From<Splitter<'a, Message>> for Element<'a, Message> {
+    fn from(splitter: Splitter<'a, Message>) -> Self {
+        Self::new(splitter)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use cosmic::iced::advanced::{Layout, layout, mouse, widget::Tree};
+    use iced_accessibility::accesskit::{Action, Role};
+
+    #[derive(Debug, Clone, PartialEq)]
+    enum Message {
+        Resize(f32),
+        Finished,
+    }
+
+    fn element(edge: Edge) -> Element<'static, Message> {
+        Splitter::new(
+            Id::new("test.splitter"),
+            "Resize test pane",
+            360.0,
+            320.0,
+            420.0,
+            edge,
+            false,
+            Message::Resize,
+            || Message::Finished,
+        )
+        .into()
+    }
+
+    #[test]
+    fn pointer_travel_grows_the_pane_from_either_edge() {
+        assert_eq!(
+            Splitter::<Message>::pointer_delta(Edge::Trailing, 600.0, 640.0),
+            40.0
+        );
+        assert_eq!(
+            Splitter::<Message>::pointer_delta(Edge::Leading, 600.0, 560.0),
+            40.0
+        );
+    }
+
+    #[test]
+    fn pointer_drag_tracks_one_origin_and_finishes_once() {
+        let mut state = SplitterState::default();
+        state.begin_drag(600.0, 360.0);
+        assert_eq!(state.dragged_width(Edge::Leading, 560.0), Some(400.0));
+        assert_eq!(state.dragged_width(Edge::Leading, 640.0), Some(320.0));
+        assert_eq!(state.dragged_width(Edge::Leading, 600.0), Some(360.0));
+        assert!(state.finish_drag());
+        assert!(!state.finish_drag());
+        assert_eq!(state.dragged_width(Edge::Leading, 560.0), None);
+    }
+
+    #[test]
+    fn keyboard_direction_tracks_the_physical_splitter_edge() {
+        let trailing = Splitter::new(
+            Id::new("trailing"),
+            "trailing",
+            360.0,
+            320.0,
+            420.0,
+            Edge::Trailing,
+            false,
+            Message::Resize,
+            || Message::Finished,
+        );
+        let leading = Splitter::new(
+            Id::new("leading"),
+            "leading",
+            360.0,
+            320.0,
+            420.0,
+            Edge::Leading,
+            false,
+            Message::Resize,
+            || Message::Finished,
+        );
+        let right = keyboard::Key::Named(keyboard::key::Named::ArrowRight);
+        assert_eq!(trailing.keyboard_delta(&right), Some(KEYBOARD_STEP));
+        assert_eq!(leading.keyboard_delta(&right), Some(-KEYBOARD_STEP));
+    }
+
+    #[test]
+    fn splitter_exposes_focus_and_numeric_accessibility_actions() {
+        let element = element(Edge::Leading);
+        assert_eq!(
+            element.as_widget().id().map(|id| id.to_string()),
+            Some("test.splitter".into())
+        );
+        let tree = Tree::new(&element);
+        let bounds = Size::new(WIDTH, 480.0);
+        let node = layout::Node::with_children(bounds, vec![layout::Node::new(bounds)]);
+        let accessible =
+            element
+                .as_widget()
+                .a11y_nodes(Layout::new(&node), &tree, mouse::Cursor::Unavailable);
+        let node = accessible.root()[0].node();
+        assert_eq!(node.role(), Role::Splitter);
+        assert_eq!(node.label(), Some("Resize test pane"));
+        assert_eq!(node.numeric_value(), Some(360.0));
+        assert_eq!(node.min_numeric_value(), Some(320.0));
+        assert_eq!(node.max_numeric_value(), Some(420.0));
+        assert!(node.supports_action(Action::Increment));
+        assert!(node.supports_action(Action::Decrement));
+    }
+}
