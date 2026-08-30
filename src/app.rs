@@ -1,8 +1,10 @@
 use std::{
     borrow::Cow,
     collections::{HashMap, HashSet},
+    ffi::OsStr,
     path::{Path, PathBuf},
     pin::Pin,
+    process::Stdio,
     sync::{Arc, LazyLock},
     thread::JoinHandle,
     time::{Duration, Instant},
@@ -1319,19 +1321,33 @@ async fn open_system_url(url: Url) -> Result<(), String> {
     .await;
     match portal_result {
         Ok(()) => Ok(()),
-        Err(portal_error) => match tokio::process::Command::new("xdg-open")
-            .arg(url.as_str())
-            .status()
-            .await
-        {
-            Ok(status) if status.success() => Ok(()),
-            Ok(status) => Err(format!(
-                "desktop portal failed ({portal_error}); xdg-open exited with {status}"
-            )),
-            Err(fallback_error) => Err(format!(
-                "desktop portal failed ({portal_error}); xdg-open failed: {fallback_error}"
-            )),
-        },
+        // Portal diagnostics are also intentionally omitted: they are an
+        // external error boundary and may include the URI supplied above.
+        Err(_) => open_system_url_with_opener(&url, "xdg-open").await,
+    }
+}
+
+async fn open_system_url_with_opener(url: &Url, opener: impl AsRef<OsStr>) -> Result<(), String> {
+    let presented = SanitizedLocation::from(url);
+    let result = tokio::process::Command::new(opener)
+        .arg(url.as_str())
+        .stdin(Stdio::null())
+        // An opener can echo its argument in diagnostics. The authoritative
+        // URL may contain credentials, query data, or a fragment, so neither
+        // child stream may inherit cagents' presentation or logging streams.
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .await;
+
+    match result {
+        Ok(status) if status.success() => Ok(()),
+        Ok(status) => Err(format!(
+            "desktop portal could not open {presented}; system opener exited with {status}"
+        )),
+        Err(error) => Err(format!(
+            "desktop portal could not open {presented}; system opener could not be started: {error}"
+        )),
     }
 }
 
@@ -5793,6 +5809,60 @@ mod tests {
             assert!(!presented.contains("oauth"));
             assert!(!presented.contains("secret"));
             assert!(!presented.contains("token"));
+        }
+    }
+
+    #[test]
+    fn system_opener_failure_redaction_contract() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempfile::tempdir().unwrap();
+        let opener = directory.path().join("fake-opener");
+        std::fs::write(
+            &opener,
+            concat!(
+                "#!/bin/sh\n",
+                "readlink /proc/$$/fd/1 > \"${0}.stdout-target\"\n",
+                "readlink /proc/$$/fd/2 > \"${0}.stderr-target\"\n",
+                "printf '%s\\n' \"$1\" >&2\n",
+                "exit 42\n",
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&opener, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+        let raw =
+            "https://alice:password@example.test:8443/private%20path?oauth=secret#access-token";
+        let url = Url::parse(raw).unwrap();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let error = runtime
+            .block_on(open_system_url_with_opener(&url, &opener))
+            .unwrap_err();
+
+        assert_eq!(
+            std::fs::read_to_string(opener.with_extension("stdout-target")).unwrap(),
+            "/dev/null\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(opener.with_extension("stderr-target")).unwrap(),
+            "/dev/null\n"
+        );
+        assert!(error.contains("https://example.test:8443/private%20path"));
+        assert!(error.contains("system opener exited"));
+        assert!(error.contains("42"));
+        for sensitive in [
+            "alice",
+            "password",
+            "oauth",
+            "secret",
+            "access-token",
+            "?",
+            "#",
+        ] {
+            assert!(!error.contains(sensitive), "leaked {sensitive:?}: {error}");
         }
     }
 
