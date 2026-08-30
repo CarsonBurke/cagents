@@ -163,6 +163,7 @@ fn legacy_ui_process_running(proc_root: &Path) -> io::Result<bool> {
     }
     Ok(false)
 }
+
 fn current_uid() -> u32 {
     // SAFETY: geteuid has no preconditions and no failure state.
     unsafe { libc::geteuid() }
