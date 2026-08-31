@@ -878,9 +878,18 @@ fn next_dirty_close_control(
     current: DirtyCloseControl,
     backwards: bool,
     saving: bool,
+    discardable: bool,
 ) -> DirtyCloseControl {
     if saving {
         return DirtyCloseControl::Cancel;
+    }
+    if !discardable {
+        return match current {
+            DirtyCloseControl::Cancel => DirtyCloseControl::Save,
+            DirtyCloseControl::Save => DirtyCloseControl::Cancel,
+            DirtyCloseControl::Discard if backwards => DirtyCloseControl::Cancel,
+            DirtyCloseControl::Discard => DirtyCloseControl::Save,
+        };
     }
     match (current, backwards) {
         (DirtyCloseControl::Cancel, false) | (DirtyCloseControl::Save, true) => {
@@ -3890,6 +3899,21 @@ impl Cagents {
         let Some(mut close) = self.dirty_repository_close.take() else {
             return Task::none();
         };
+        // Every close resolution is revalidated at this boundary. In
+        // particular, discarding an editor buffer cannot clear an unresolved
+        // post-persist durability warning, and no stale control message may
+        // skip the current repository and reach card teardown or app exit.
+        if matches!(self.cards.get(&close.card), Some(CardRuntime::Repository(runtime)) if runtime.blocks_navigation())
+        {
+            let card = close.card;
+            close.focused = DirtyCloseControl::Cancel;
+            self.dirty_repository_close = Some(close);
+            return iced::widget::operation::focus(dirty_close_control_id(
+                card,
+                DirtyCloseControl::Cancel,
+            ))
+            .map(cosmic::Action::App);
+        }
         if let Some(card) = close.next_unresolved(|card| {
             matches!(self.cards.get(&card), Some(CardRuntime::Repository(runtime)) if runtime.blocks_navigation())
         }) {
@@ -3961,7 +3985,11 @@ impl Cagents {
         if saving {
             return Task::none();
         }
-        close.focused = next_dirty_close_control(close.focused, backwards, saving);
+        let discardable = matches!(
+            self.cards.get(&close.card),
+            Some(CardRuntime::Repository(runtime)) if runtime.can_abandon_unsaved_changes()
+        );
+        close.focused = next_dirty_close_control(close.focused, backwards, saving, discardable);
         iced::widget::operation::focus(dirty_close_control_id(close.card, close.focused))
             .map(cosmic::Action::App)
     }
@@ -4552,18 +4580,14 @@ impl Application for Cagents {
                 let card = action.card();
                 let save_finished = matches!(action, RepositoryAction::SaveFinished { .. });
                 let closing_card = self.dirty_repository_close.as_ref().map(|close| close.card);
-                let (task, saved_for_close) = match self.cards.get_mut(&card) {
+                let task = match self.cards.get_mut(&card) {
                     Some(CardRuntime::Repository(runtime)) => {
                         let task = repository_task(runtime.update(action));
-                        let saved_for_close = save_finished
-                            && closing_card == Some(card)
-                            && !runtime.blocks_navigation()
-                            && runtime.save_error().is_none();
-                        (task, saved_for_close)
+                        task
                     }
-                    _ => (Task::none(), false),
+                    _ => Task::none(),
                 };
-                if saved_for_close {
+                if save_finished && closing_card == Some(card) {
                     Task::batch([task, self.advance_dirty_close()])
                 } else {
                     task
@@ -4759,11 +4783,11 @@ impl Application for Cagents {
                 {
                     return Task::none();
                 }
-                if let Some(CardRuntime::Repository(runtime)) = self.cards.get_mut(&id)
-                    && !runtime.is_saving()
-                {
-                    runtime.abandon_unsaved_changes();
-                } else {
+                let discarded = match self.cards.get_mut(&id) {
+                    Some(CardRuntime::Repository(runtime)) => runtime.abandon_unsaved_changes(),
+                    _ => false,
+                };
+                if !discarded {
                     return Task::none();
                 }
                 self.advance_dirty_close()
@@ -5390,11 +5414,17 @@ impl Application for Cagents {
                 .card_state(card)
                 .map_or("Repository".into(), |state| state.title.clone());
             let mut rows: Vec<Element<'_, Message>> = vec![
-                widget::text::title3(format!("Save changes to {title}?"))
-                    .into(),
-                widget::text::body(
-                    "This editor has unsaved changes. Save them before closing, discard them, or keep the repository open.",
-                )
+                widget::text::title3(if runtime.has_durability_warning() {
+                    format!("Confirm the save to {title} before closing")
+                } else {
+                    format!("Save changes to {title}?")
+                })
+                .into(),
+                widget::text::body(if runtime.has_durability_warning() {
+                    "The file was replaced on disk, but its durability is still unconfirmed. Retry the save, or cancel and reload from disk before closing; discarding editor changes cannot resolve this warning."
+                } else {
+                    "This editor has unsaved changes. Save them before closing, discard them, or keep the repository open."
+                })
                 .wrapping(cosmic::iced::widget::text::Wrapping::Word)
                 .into(),
             ];
@@ -5412,32 +5442,38 @@ impl Application for Cagents {
                 } else {
                     Message::SaveAndCloseRepository(card)
                 });
-            rows.push(
-                widget::row::with_children(vec![
-                    widget::button::standard("Cancel")
-                        .id(dirty_close_control_id(card, DirtyCloseControl::Cancel))
-                        .on_press_maybe(
-                            (!runtime.is_saving()).then_some(Message::CancelRepositoryClose),
-                        )
-                        .into(),
+            let mut controls: Vec<Element<'_, Message>> = vec![
+                widget::button::standard("Cancel")
+                    .id(dirty_close_control_id(card, DirtyCloseControl::Cancel))
+                    .on_press_maybe(
+                        (!runtime.is_saving()).then_some(Message::CancelRepositoryClose),
+                    )
+                    .into(),
+            ];
+            if runtime.can_abandon_unsaved_changes() {
+                controls.push(
                     widget::button::destructive("Discard")
                         .id(dirty_close_control_id(card, DirtyCloseControl::Discard))
-                        .on_press_maybe(
-                            (!runtime.is_saving())
-                                .then_some(Message::DiscardAndCloseRepository(card)),
-                        )
+                        .on_press(Message::DiscardAndCloseRepository(card))
                         .into(),
-                    widget::button::suggested(if runtime.has_save_conflict() {
-                        "Overwrite and close"
-                    } else {
-                        "Save and close"
-                    })
-                    .id(dirty_close_control_id(card, DirtyCloseControl::Save))
-                    .on_press_maybe(save_message)
-                    .into(),
-                ])
-                .spacing(spacing.space_xxs)
+                );
+            }
+            controls.push(
+                widget::button::suggested(if runtime.has_save_conflict() {
+                    "Overwrite and close"
+                } else if runtime.has_durability_warning() {
+                    "Retry save and close"
+                } else {
+                    "Save and close"
+                })
+                .id(dirty_close_control_id(card, DirtyCloseControl::Save))
+                .on_press_maybe(save_message)
                 .into(),
+            );
+            rows.push(
+                widget::row::with_children(controls)
+                    .spacing(spacing.space_xxs)
+                    .into(),
             );
             return Some(
                 widget::container(widget::column::with_children(rows).spacing(spacing.space_xs))
@@ -6911,6 +6947,142 @@ mod tests {
     }
 
     #[test]
+    fn window_close_rejects_discard_for_post_persist_edit_back_fence() {
+        let mut app = context_inspector_test_app(true);
+        let card = app.workspace.focused().unwrap();
+        let window = window::Id::unique();
+        let runtime = RepositoryRuntime::post_persist_warning_fixture(card);
+        assert!(runtime.is_dirty(), "the buffer has edited back from B to A");
+        assert!(runtime.has_durability_warning());
+        assert!(!runtime.can_abandon_unsaved_changes());
+        app.cards
+            .insert(card, CardRuntime::Repository(Box::new(runtime)));
+
+        let _ = app.update(Message::WindowCloseRequested(window));
+        let _ = app.update(Message::DiscardAndCloseRepository(card));
+
+        assert!(app.dirty_repository_close.as_ref().is_some_and(
+            |close| close.card == card && close.intent == DirtyCloseIntent::Application(window)
+        ));
+        assert!(app.workspace.order().any(|candidate| candidate == card));
+        assert!(matches!(
+            app.cards.get(&card),
+            Some(CardRuntime::Repository(runtime))
+                if runtime.blocks_navigation()
+                    && runtime.has_durability_warning()
+                    && !runtime.can_abandon_unsaved_changes()
+        ));
+    }
+
+    #[test]
+    fn card_close_rejects_discard_for_post_persist_edit_back_fence() {
+        let mut app = context_inspector_test_app(true);
+        let card = app.workspace.focused().unwrap();
+        let runtime = RepositoryRuntime::post_persist_warning_fixture(card);
+        app.cards
+            .insert(card, CardRuntime::Repository(Box::new(runtime)));
+
+        let _ = app.update(Message::CloseCard(card));
+        let _ = app.update(Message::DiscardAndCloseRepository(card));
+
+        assert!(app.dirty_repository_close.as_ref().is_some_and(
+            |close| close.card == card && close.intent == DirtyCloseIntent::Card(card)
+        ));
+        assert!(app.workspace.order().any(|candidate| candidate == card));
+        assert!(matches!(
+            app.cards.get(&card),
+            Some(CardRuntime::Repository(runtime))
+                if runtime.blocks_navigation() && runtime.has_durability_warning()
+        ));
+    }
+
+    #[test]
+    fn card_close_still_discards_ordinary_editor_dirtiness() {
+        let mut app = context_inspector_test_app(true);
+        let card = app.workspace.focused().unwrap();
+        let runtime = RepositoryRuntime::dirty_fixture(card);
+        assert!(runtime.can_abandon_unsaved_changes());
+        app.cards
+            .insert(card, CardRuntime::Repository(Box::new(runtime)));
+
+        let _ = app.update(Message::CloseCard(card));
+        let close = app.update(Message::DiscardAndCloseRepository(card));
+
+        assert!(app.dirty_repository_close.is_none());
+        assert!(matches!(
+            app.cards.get(&card),
+            Some(CardRuntime::Repository(runtime)) if !runtime.blocks_navigation()
+        ));
+        assert!(matches!(
+            task_app_message(close),
+            Message::CloseCard(candidate) if candidate == card
+        ));
+    }
+
+    #[test]
+    fn application_close_advances_only_after_current_durability_fence_resolves() {
+        let mut app = context_inspector_test_app(true);
+        let first = app.workspace.focused().unwrap();
+        let second_state = terminal_card_state();
+        let second = second_state.id;
+        Arc::make_mut(&mut app.durable)
+            .cards
+            .push(second_state.clone());
+        app.workspace
+            .add_card(
+                WorkspaceCard::new(
+                    second,
+                    second_state.title,
+                    CardWidth::Fraction(second_state.width_fraction),
+                )
+                .unwrap(),
+                1,
+                false,
+            )
+            .unwrap();
+        app.cards.insert(
+            first,
+            CardRuntime::Repository(Box::new(RepositoryRuntime::post_persist_warning_fixture(
+                first,
+            ))),
+        );
+        app.cards.insert(
+            second,
+            CardRuntime::Repository(Box::new(RepositoryRuntime::dirty_fixture(second))),
+        );
+        let window = window::Id::unique();
+
+        let _ = app.update(Message::WindowCloseRequested(window));
+        let _ = app.update(Message::DiscardAndCloseRepository(first));
+        assert!(app.dirty_repository_close.as_ref().is_some_and(
+            |close| close.card == first && close.remaining == VecDeque::from([second])
+        ));
+
+        let _ = app.update(Message::SaveAndCloseRepository(first));
+        let CardRuntime::Repository(runtime) = app.cards.get(&first).unwrap() else {
+            panic!("first repository remains installed during close resolution");
+        };
+        let completion = runtime.durable_active_save_completion();
+        let _ = app.update(Message::Repository(completion));
+
+        assert!(
+            app.dirty_repository_close
+                .as_ref()
+                .is_some_and(|close| close.card == second
+                    && close.remaining.is_empty()
+                    && close.intent == DirtyCloseIntent::Application(window))
+        );
+        assert!(matches!(
+            app.cards.get(&first),
+            Some(CardRuntime::Repository(runtime)) if !runtime.blocks_navigation()
+        ));
+        assert!(matches!(
+            app.cards.get(&second),
+            Some(CardRuntime::Repository(runtime)) if runtime.blocks_navigation()
+        ));
+    }
+
+    #[test]
     fn card_close_stays_fenced_after_post_persist_failure_until_retry_succeeds() {
         let mut app = context_inspector_test_app(true);
         let card = app.workspace.focused().unwrap();
@@ -7082,18 +7254,30 @@ mod tests {
             dirty_close_control_id(card, DirtyCloseControl::Save)
         );
         let mut focus = DirtyCloseControl::Cancel;
-        focus = next_dirty_close_control(focus, false, false);
+        focus = next_dirty_close_control(focus, false, false, true);
         assert_eq!(focus, DirtyCloseControl::Discard);
-        focus = next_dirty_close_control(focus, false, false);
+        focus = next_dirty_close_control(focus, false, false, true);
         assert_eq!(focus, DirtyCloseControl::Save);
-        focus = next_dirty_close_control(focus, false, false);
+        focus = next_dirty_close_control(focus, false, false, true);
         assert_eq!(focus, DirtyCloseControl::Cancel);
         assert_eq!(
-            next_dirty_close_control(DirtyCloseControl::Save, true, false),
+            next_dirty_close_control(DirtyCloseControl::Save, true, false, true),
             DirtyCloseControl::Discard
         );
         assert_eq!(
-            next_dirty_close_control(DirtyCloseControl::Save, false, true),
+            next_dirty_close_control(DirtyCloseControl::Save, false, true, true),
+            DirtyCloseControl::Cancel
+        );
+        assert_eq!(
+            next_dirty_close_control(DirtyCloseControl::Cancel, false, false, false),
+            DirtyCloseControl::Save
+        );
+        assert_eq!(
+            next_dirty_close_control(DirtyCloseControl::Cancel, true, false, false),
+            DirtyCloseControl::Save
+        );
+        assert_eq!(
+            next_dirty_close_control(DirtyCloseControl::Save, false, false, false),
             DirtyCloseControl::Cancel
         );
     }

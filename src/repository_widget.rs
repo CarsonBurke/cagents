@@ -584,6 +584,19 @@ impl RepositoryRuntime {
     }
 
     #[cfg(test)]
+    pub(crate) fn dirty_fixture(card: CardId) -> Self {
+        let (mut runtime, _) = Self::post_persist_failure_fixture(card);
+        let DocumentState::Editable(document) = &mut runtime.document else {
+            unreachable!("post-persist fixture has an editable document");
+        };
+        document.content = text_editor::Content::with_text("unsaved\n");
+        document.dirty = true;
+        document.revision = 1;
+        document.active_save = None;
+        runtime
+    }
+
+    #[cfg(test)]
     pub(crate) fn durable_active_save_completion(&self) -> RepositoryAction {
         let DocumentState::Editable(document) = &self.document else {
             panic!("test fixture requires an editable document");
@@ -653,6 +666,25 @@ impl RepositoryRuntime {
         self.is_dirty()
             || self.is_saving()
             || matches!(&self.document, DocumentState::Editable(document) if document.durability_warning.is_some())
+    }
+
+    /// Whether abandoning the editor buffer is sufficient to release every
+    /// repository navigation fence.
+    ///
+    /// A post-persist durability warning describes unresolved disk state, not
+    /// merely unsaved editor contents. Discarding the buffer cannot resolve it.
+    pub fn can_abandon_unsaved_changes(&self) -> bool {
+        matches!(
+            &self.document,
+            DocumentState::Editable(document)
+                if document.dirty
+                    && document.active_save.is_none()
+                    && document.durability_warning.is_none()
+        )
+    }
+
+    pub fn has_durability_warning(&self) -> bool {
+        matches!(&self.document, DocumentState::Editable(document) if document.durability_warning.is_some())
     }
 
     pub fn inspector_context(&self) -> RepositoryInspectorContext {
@@ -771,6 +803,9 @@ impl RepositoryRuntime {
             dirty: self.is_dirty(),
             saving: self.is_saving(),
             can_save: self.can_save(),
+            // Discarding the local buffer is still a valid editor action when
+            // a durability warning remains; it just cannot authorize closing
+            // or navigation, because that disk-state fence stays installed.
             can_discard: self.is_dirty() && !self.is_saving(),
             can_reload: conflict
                 || matches!(&self.document, DocumentState::Editable(document) if document.durability_warning.is_some())
@@ -802,10 +837,15 @@ impl RepositoryRuntime {
         }
     }
 
-    pub fn abandon_unsaved_changes(&mut self) {
-        if let DocumentState::Editable(document) = &mut self.document {
-            document.discard_edits();
+    pub fn abandon_unsaved_changes(&mut self) -> bool {
+        if !self.can_abandon_unsaved_changes() {
+            return false;
         }
+        let DocumentState::Editable(document) = &mut self.document else {
+            unreachable!("discard eligibility requires an editable document");
+        };
+        document.discard_edits();
+        true
     }
 
     pub fn save_error(&self) -> Option<&str> {
