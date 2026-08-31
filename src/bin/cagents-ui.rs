@@ -13,6 +13,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     cagents::terminal::ensure_daemon_ready()?;
 
     let settings = Settings::default()
+        .exit_on_close(false)
         .size(cosmic::iced::Size::new(1440.0, 900.0))
         .size_limits(
             cosmic::iced::Limits::NONE

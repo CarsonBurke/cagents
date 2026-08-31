@@ -41,6 +41,7 @@ arc-swap = "1.7"
 async-channel = "2.5"
 ashpd = { version = "0.12.3", default-features = false, features = ["tokio", "wayland"] }
 bitflags = { version = "2.9", features = ["serde"] }
+blake3 = "1.8"
 clap = { version = "4.5", features = ["derive"] }
 crossbeam-channel = "0.5"
 dpi = { version = "=0.1.2", optional = true }
@@ -49,7 +50,8 @@ euclid = { version = "=0.22.11", optional = true }
 image = { version = "0.25", default-features = false, features = ["png"] }
 iced_accessibility = { git = "https://github.com/pop-os/libcosmic.git", rev = "caec74c2559924443f12fc6faf97a5bcefe6271d" }
 keyboard-types = { version = "=0.8.3", features = ["serde"], optional = true }
-libcosmic = { git = "https://github.com/pop-os/libcosmic.git", rev = "caec74c2559924443f12fc6faf97a5bcefe6271d", default-features = false, features = ["a11y", "multi-window", "surface-message", "tokio", "wayland", "wgpu", "winit", "xdg-portal"] }
+libcosmic = { git = "https://github.com/pop-os/libcosmic.git", rev = "caec74c2559924443f12fc6faf97a5bcefe6271d", default-features = false, features = ["a11y", "markdown", "multi-window", "surface-message", "tokio", "wayland", "wgpu", "winit", "xdg-portal"] }
+imara-diff = "0.2.0"
 ksni = "0.3.6"
 libc = "0.2.189"
 libghostty-vt = { version = "0.2.1", default-features = false, features = ["tracing"] }
