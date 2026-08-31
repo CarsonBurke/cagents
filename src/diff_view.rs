@@ -1,6 +1,7 @@
 //! Immutable native diff models computed away from the application update thread.
 
 use std::{
+    collections::HashMap,
     ffi::OsString,
     fs,
     path::{Path, PathBuf},
@@ -232,6 +233,8 @@ pub fn build_diff(before: &str, after: &str) -> DiffModel {
     let mut split_change_starts = Vec::new();
     let mut old_cursor = 0usize;
     let mut new_cursor = 0usize;
+    let mut before_endings = HashMap::<&str, u8>::new();
+    let mut after_endings = HashMap::<&str, u8>::new();
 
     for hunk in hunks {
         append_context(
@@ -251,19 +254,37 @@ pub fn build_diff(before: &str, after: &str) -> DiffModel {
         let old_end = hunk.before.end as usize;
         let new_start = hunk.after.start as usize;
         let new_end = hunk.after.end as usize;
-        for (offset, text) in before_lines[old_start..old_end].iter().enumerate() {
+        before_endings.clear();
+        after_endings.clear();
+        for line in &before_lines[old_start..old_end] {
+            *before_endings.entry(&line.text).or_default() |= line.ending.bit();
+        }
+        for line in &after_lines[new_start..new_end] {
+            *after_endings.entry(&line.text).or_default() |= line.ending.bit();
+        }
+        for (offset, line) in before_lines[old_start..old_end].iter().enumerate() {
+            let ending_changed = line.ending_differs(&after_endings);
             inline_rows.push(InlineDiffRow {
                 old_line: Some((old_start + offset + 1) as u32),
                 new_line: None,
-                text: text.clone(),
+                text: if ending_changed {
+                    line.changed_text()
+                } else {
+                    line.text.clone()
+                },
                 kind: DiffRowKind::Deletion,
             });
         }
-        for (offset, text) in after_lines[new_start..new_end].iter().enumerate() {
+        for (offset, line) in after_lines[new_start..new_end].iter().enumerate() {
+            let ending_changed = line.ending_differs(&before_endings);
             inline_rows.push(InlineDiffRow {
                 old_line: None,
                 new_line: Some((new_start + offset + 1) as u32),
-                text: text.clone(),
+                text: if ending_changed {
+                    line.changed_text()
+                } else {
+                    line.text.clone()
+                },
                 kind: DiffRowKind::Addition,
             });
         }
@@ -276,11 +297,27 @@ pub fn build_diff(before: &str, after: &str) -> DiffModel {
             let new_text = after_lines
                 .get(new_start + offset)
                 .filter(|_| new_start + offset < new_end);
+            let old_ending_changed =
+                old_text.is_some_and(|line| line.ending_differs(&after_endings));
+            let new_ending_changed =
+                new_text.is_some_and(|line| line.ending_differs(&before_endings));
             split_rows.push(SplitDiffRow {
                 old_line: old_text.map(|_| (old_start + offset + 1) as u32),
                 new_line: new_text.map(|_| (new_start + offset + 1) as u32),
-                old_text: old_text.cloned(),
-                new_text: new_text.cloned(),
+                old_text: old_text.map(|line| {
+                    if old_ending_changed {
+                        line.changed_text()
+                    } else {
+                        line.text.clone()
+                    }
+                }),
+                new_text: new_text.map(|line| {
+                    if new_ending_changed {
+                        line.changed_text()
+                    } else {
+                        line.text.clone()
+                    }
+                }),
                 kind: match (old_text, new_text) {
                     (Some(_), Some(_)) => DiffRowKind::Modification,
                     (Some(_), None) => DiffRowKind::Deletion,
@@ -315,8 +352,8 @@ pub fn build_diff(before: &str, after: &str) -> DiffModel {
 
 #[allow(clippy::too_many_arguments)]
 fn append_context(
-    before: &[String],
-    after: &[String],
+    before: &[DisplayLine],
+    after: &[DisplayLine],
     old_cursor: &mut usize,
     old_end: usize,
     new_cursor: &mut usize,
@@ -328,7 +365,7 @@ fn append_context(
     while *old_cursor < old_end && *new_cursor < new_end {
         let old_line = *old_cursor + 1;
         let new_line = *new_cursor + 1;
-        let text = before[*old_cursor].clone();
+        let text = before[*old_cursor].text.clone();
         inline.push(InlineDiffRow {
             old_line: Some(old_line as u32),
             new_line: Some(new_line as u32),
@@ -339,7 +376,7 @@ fn append_context(
             old_line: Some(old_line as u32),
             new_line: Some(new_line as u32),
             old_text: Some(text),
-            new_text: Some(after[*new_cursor].clone()),
+            new_text: Some(after[*new_cursor].text.clone()),
             kind: DiffRowKind::Context,
         });
         *old_cursor += 1;
@@ -347,11 +384,63 @@ fn append_context(
     }
 }
 
-fn display_line(line: &str) -> String {
-    line.strip_suffix('\n')
-        .and_then(|line| line.strip_suffix('\r').or(Some(line)))
-        .unwrap_or(line)
-        .to_owned()
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LineEnding {
+    Lf,
+    CrLf,
+    None,
+}
+
+impl LineEnding {
+    const fn bit(self) -> u8 {
+        match self {
+            Self::Lf => 1,
+            Self::CrLf => 2,
+            Self::None => 4,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DisplayLine {
+    text: String,
+    ending: LineEnding,
+}
+
+impl DisplayLine {
+    fn ending_differs(&self, other: &HashMap<&str, u8>) -> bool {
+        other
+            .get(self.text.as_str())
+            .is_some_and(|endings| endings & !self.ending.bit() != 0)
+    }
+
+    fn changed_text(&self) -> String {
+        let ending = match self.ending {
+            LineEnding::Lf => "[LF]",
+            LineEnding::CrLf => "[CRLF]",
+            LineEnding::None => "[no newline]",
+        };
+        format!("{} {ending}", self.text)
+    }
+}
+
+fn display_line(line: &str) -> DisplayLine {
+    if let Some(text) = line.strip_suffix("\r\n") {
+        DisplayLine {
+            text: text.into(),
+            ending: LineEnding::CrLf,
+        }
+    } else if let Some(text) = line.strip_suffix('\n') {
+        DisplayLine {
+            text: text.into(),
+            ending: LineEnding::Lf,
+        }
+    } else {
+        DisplayLine {
+            text: line.into(),
+            ending: LineEnding::None,
+        }
+    }
 }
 
 enum SideContent {
@@ -651,6 +740,48 @@ mod tests {
         assert_eq!(model.split_rows[1].kind, DiffRowKind::Modification);
         assert_eq!(model.split_rows[1].old_line, Some(2));
         assert_eq!(model.split_rows[1].new_line, Some(2));
+    }
+
+    #[test]
+    fn line_ending_only_changes_have_distinct_visible_rows() {
+        let crlf_to_lf = build_diff("same\r\n", "same\n");
+        assert_eq!(crlf_to_lf.inline_rows[0].text, "same [CRLF]");
+        assert_eq!(crlf_to_lf.inline_rows[1].text, "same [LF]");
+        assert_eq!(
+            crlf_to_lf.split_rows[0].old_text.as_deref(),
+            Some("same [CRLF]")
+        );
+        assert_eq!(
+            crlf_to_lf.split_rows[0].new_text.as_deref(),
+            Some("same [LF]")
+        );
+
+        let missing_newline = build_diff("same\n", "same");
+        assert_eq!(missing_newline.inline_rows[0].text, "same [LF]");
+        assert_eq!(missing_newline.inline_rows[1].text, "same [no newline]");
+
+        let mixed = build_diff("same\r\nold\n", "same\nnew\n");
+        assert!(
+            mixed
+                .inline_rows
+                .iter()
+                .any(|row| row.text == "same [CRLF]")
+        );
+        assert!(mixed.inline_rows.iter().any(|row| row.text == "same [LF]"));
+
+        let shifted = build_diff("same\r\n", "added\nsame\n");
+        assert!(
+            shifted
+                .inline_rows
+                .iter()
+                .any(|row| row.text == "same [CRLF]")
+        );
+        assert!(
+            shifted
+                .inline_rows
+                .iter()
+                .any(|row| row.text == "same [LF]")
+        );
     }
 
     #[test]

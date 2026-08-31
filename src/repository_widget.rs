@@ -55,6 +55,19 @@ impl RepositoryFile {
     }
 }
 
+fn status_with_unstaged_change(status: Option<&str>, already_unstaged: bool) -> String {
+    if already_unstaged {
+        return status.unwrap_or(" M").into();
+    }
+    match status {
+        None => " M".into(),
+        Some(status) => {
+            let staged = status.chars().next().filter(char::is_ascii).unwrap_or(' ');
+            format!("{staged}M")
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AsyncIdentity {
     pub card: CardId,
@@ -86,6 +99,7 @@ pub enum RepositoryAction {
     DiffLoaded {
         identity: AsyncIdentity,
         basis: DiffBasis,
+        request: u64,
         content: DiffContent,
     },
     EditorAction {
@@ -360,7 +374,7 @@ enum DocumentState {
 }
 
 enum DiffState {
-    Loading,
+    Loading { request: u64 },
     Ready(DiffContent),
 }
 
@@ -433,6 +447,7 @@ pub struct RepositoryRuntime {
     file_viewport: ListViewport,
     diff_viewport: ListViewport,
     next_save_ticket: u64,
+    next_diff_request: u64,
 }
 
 /// Owned, renderer-free projection of the active repository source surface.
@@ -489,6 +504,7 @@ impl RepositoryRuntime {
             selected: None,
             document: DocumentState::None,
             diffs: BTreeMap::new(),
+            next_diff_request: 0,
             source_surface: SourceSurface::Editor,
             markdown_mode: MarkdownMode::Edit,
             diff_mode: DiffMode::Inline,
@@ -737,7 +753,7 @@ impl RepositoryRuntime {
         let (diff_state, diff_error, diff_additions, diff_deletions, diff_change) = if diff {
             match self.diffs.get(&self.diff_basis) {
                 None => (Some("No changes"), None, Some(0), Some(0), None),
-                Some(DiffState::Loading) => (Some("Loading"), None, None, None, None),
+                Some(DiffState::Loading { .. }) => (Some("Loading"), None, None, None, None),
                 Some(DiffState::Ready(DiffContent::Text(model))) => {
                     let changes = model.change_starts(self.diff_mode).len();
                     (
@@ -826,7 +842,7 @@ impl RepositoryRuntime {
             DocumentState::Failed { .. } => RepositoryRuntimeStatus::Unavailable,
             _ if self.source_surface == SourceSurface::Diff => {
                 match self.diffs.get(&self.diff_basis) {
-                    Some(DiffState::Loading) => RepositoryRuntimeStatus::Loading,
+                    Some(DiffState::Loading { .. }) => RepositoryRuntimeStatus::Loading,
                     Some(DiffState::Ready(DiffContent::Error(_))) => {
                         RepositoryRuntimeStatus::Unavailable
                     }
@@ -967,12 +983,19 @@ impl RepositoryRuntime {
             RepositoryAction::DiffLoaded {
                 identity,
                 basis,
+                request,
                 content,
             } => {
-                if self.accepts_selected(&identity) {
+                let current_request = matches!(
+                    self.diffs.get(&basis),
+                    Some(DiffState::Loading { request: active }) if *active == request
+                );
+                if self.accepts_selected(&identity) && current_request {
                     self.diffs.insert(basis, DiffState::Ready(content));
-                    self.diff_change = 0;
-                    self.diff_viewport = ListViewport::default();
+                    if basis == self.diff_basis {
+                        self.diff_change = 0;
+                        self.diff_viewport = ListViewport::default();
+                    }
                 }
                 Task::none()
             }
@@ -1055,13 +1078,13 @@ impl RepositoryRuntime {
                     let Some(selected) = self.selected.as_mut() else {
                         return Task::none();
                     };
+                    selected.status = Some(status_with_unstaged_change(
+                        selected.status.as_deref(),
+                        selected.unstaged,
+                    ));
                     selected.unstaged = true;
-                    self.diffs.insert(DiffBasis::Unstaged, DiffState::Loading);
-                    diff_task(
-                        identity,
-                        DiffBasis::Unstaged,
-                        selected.previous_path(DiffBasis::Unstaged),
-                    )
+                    let previous_path = selected.previous_path(DiffBasis::Unstaged);
+                    self.request_diff(identity, DiffBasis::Unstaged, previous_path)
                 } else {
                     Task::none()
                 }
@@ -1219,8 +1242,7 @@ impl RepositoryRuntime {
                 }
                 let previous_path = selected.previous_path(self.diff_basis);
                 let identity = self.current_identity(card, selected.path.clone());
-                self.diffs.insert(self.diff_basis, DiffState::Loading);
-                diff_task(identity, self.diff_basis, previous_path)
+                self.request_diff(identity, self.diff_basis, previous_path)
             }
             RepositoryAction::FileViewport { offset, height, .. } => {
                 self.file_viewport = ListViewport { offset, height };
@@ -1250,6 +1272,18 @@ impl RepositoryRuntime {
         }
     }
 
+    fn request_diff(
+        &mut self,
+        identity: AsyncIdentity,
+        basis: DiffBasis,
+        old_path: Option<PathBuf>,
+    ) -> Task<RepositoryAction> {
+        self.next_diff_request = self.next_diff_request.wrapping_add(1).max(1);
+        let request = self.next_diff_request;
+        self.diffs.insert(basis, DiffState::Loading { request });
+        diff_task(identity, basis, request, old_path)
+    }
+
     fn open_file(&mut self, card: CardId, path: PathBuf) -> Task<RepositoryAction> {
         let Some(file) = self.file(&path).cloned() else {
             return Task::none();
@@ -1258,11 +1292,6 @@ impl RepositoryRuntime {
         self.document = DocumentState::Loading(path.clone());
         self.diffs.clear();
         self.diff_viewport = ListViewport::default();
-        for basis in [DiffBasis::Staged, DiffBasis::Unstaged] {
-            if file.has_basis(basis) {
-                self.diffs.insert(basis, DiffState::Loading);
-            }
-        }
         self.diff_basis = if file.unstaged {
             DiffBasis::Unstaged
         } else {
@@ -1279,11 +1308,7 @@ impl RepositoryRuntime {
         let mut tasks = vec![file_task];
         for basis in [DiffBasis::Staged, DiffBasis::Unstaged] {
             if file.has_basis(basis) {
-                tasks.push(diff_task(
-                    identity.clone(),
-                    basis,
-                    file.previous_path(basis),
-                ));
+                tasks.push(self.request_diff(identity.clone(), basis, file.previous_path(basis)));
             }
         }
         Task::batch(tasks)
@@ -1400,6 +1425,7 @@ fn file_task(identity: AsyncIdentity) -> Task<RepositoryAction> {
 fn diff_task(
     identity: AsyncIdentity,
     basis: DiffBasis,
+    request: u64,
     old_path: Option<PathBuf>,
 ) -> Task<RepositoryAction> {
     let worktree = identity.worktree.clone();
@@ -1413,6 +1439,7 @@ fn diff_task(
         RepositoryAction::DiffLoaded {
             identity,
             basis,
+            request,
             content,
         }
     })
@@ -1960,7 +1987,7 @@ fn diff_surface(card: CardId, runtime: &RepositoryRuntime) -> Element<'_, Reposi
             "No local changes",
             "This file has no changes for the selected basis.",
         ),
-        Some(DiffState::Loading) => loading(format!(
+        Some(DiffState::Loading { .. }) => loading(format!(
             "Computing {} diff for {}…",
             runtime.diff_basis.label().to_lowercase(),
             runtime
@@ -2965,7 +2992,7 @@ mod tests {
         assert!(!document.conflict);
         assert!(matches!(
             runtime.diffs.get(&DiffBasis::Unstaged),
-            Some(DiffState::Loading)
+            Some(DiffState::Loading { .. })
         ));
     }
 
@@ -3067,7 +3094,9 @@ mod tests {
         assert_eq!(context.diff_deletions, Some(2));
         assert_eq!(context.diff_change, Some((1, 2)));
 
-        runtime.diffs.insert(DiffBasis::Staged, DiffState::Loading);
+        runtime
+            .diffs
+            .insert(DiffBasis::Staged, DiffState::Loading { request: 1 });
         assert_eq!(
             runtime.inspector_runtime_status(),
             RepositoryRuntimeStatus::Loading
@@ -3173,11 +3202,104 @@ mod tests {
                     .as_ref()
                     .is_some_and(RepositoryFile::changed)
             );
+            assert_eq!(
+                runtime
+                    .selected
+                    .as_ref()
+                    .and_then(|selected| selected.status.as_deref()),
+                Some(if tracked { " M" } else { "??" })
+            );
             assert!(matches!(
                 runtime.diffs.get(&DiffBasis::Unstaged),
-                Some(DiffState::Loading)
+                Some(DiffState::Loading { .. })
             ));
         }
+    }
+
+    #[test]
+    fn successful_save_marks_a_staged_file_as_staged_and_unstaged() {
+        assert_eq!(status_with_unstaged_change(Some("M "), false), "MM");
+        assert_eq!(status_with_unstaged_change(None, false), " M");
+        for status in ["??", "UU", "D?", "AA", " R", " T"] {
+            assert_eq!(status_with_unstaged_change(Some(status), true), status);
+        }
+    }
+
+    #[test]
+    fn diff_completions_are_fenced_per_basis_and_preserve_the_active_viewport() {
+        let view = RepositoryView {
+            project: ProjectId::new(),
+            repository: PathBuf::from("/repo/.git"),
+            worktree: PathBuf::from("/repo"),
+        };
+        let mut runtime = RepositoryRuntime::new(view);
+        let card = CardId::new();
+        let path = PathBuf::from("notes.txt");
+        runtime.generation = 1;
+        runtime.selected = Some(RepositoryFile {
+            path: path.clone(),
+            staged_old_path: None,
+            unstaged_old_path: None,
+            staged: true,
+            unstaged: true,
+            status: Some("MM".into()),
+        });
+        runtime.diff_basis = DiffBasis::Unstaged;
+        runtime.diff_change = 2;
+        runtime.diff_viewport = ListViewport {
+            offset: 600.0,
+            height: 300.0,
+        };
+        runtime
+            .diffs
+            .insert(DiffBasis::Staged, DiffState::Loading { request: 3 });
+        runtime
+            .diffs
+            .insert(DiffBasis::Unstaged, DiffState::Loading { request: 2 });
+        let identity = AsyncIdentity {
+            card,
+            worktree: PathBuf::from("/repo"),
+            path,
+            generation: 1,
+        };
+        let content = |additions| {
+            DiffContent::Text(DiffModel {
+                inline_rows: Vec::new(),
+                split_rows: Vec::new(),
+                inline_change_starts: Vec::new(),
+                split_change_starts: Vec::new(),
+                additions,
+                deletions: 0,
+            })
+        };
+
+        let _ = runtime.update(RepositoryAction::DiffLoaded {
+            identity: identity.clone(),
+            basis: DiffBasis::Staged,
+            request: 3,
+            content: content(3),
+        });
+        assert_eq!(runtime.diff_change, 2);
+        assert_eq!(runtime.diff_viewport.offset, 600.0);
+
+        let _ = runtime.update(RepositoryAction::DiffLoaded {
+            identity: identity.clone(),
+            basis: DiffBasis::Unstaged,
+            request: 2,
+            content: content(2),
+        });
+        assert_eq!(runtime.diff_change, 0);
+        assert_eq!(runtime.diff_viewport.offset, 0.0);
+        let _ = runtime.update(RepositoryAction::DiffLoaded {
+            identity,
+            basis: DiffBasis::Unstaged,
+            request: 1,
+            content: content(1),
+        });
+        assert!(matches!(
+            runtime.diffs.get(&DiffBasis::Unstaged),
+            Some(DiffState::Ready(DiffContent::Text(model))) if model.additions == 2
+        ));
     }
 
     #[test]
