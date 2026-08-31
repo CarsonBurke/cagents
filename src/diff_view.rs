@@ -1,41 +1,17 @@
 //! Immutable native diff models computed away from the application update thread.
 
-use std::{
-    collections::HashMap,
-    ffi::OsString,
-    fs,
-    path::{Path, PathBuf},
-    process::Command,
-};
+use std::{collections::HashMap, path::Path};
 
 use imara_diff::{Algorithm, Diff, InternedInput};
 
-use crate::editor::{FileIoError, validate_repo_path};
-
-/// A text diff larger than this on either side becomes an explicit read-only state.
-pub const MAX_TEXT_DIFF_BYTES_PER_SIDE: u64 = 16 * 1024 * 1024;
+use crate::repository::{
+    CancellationToken, DiffBasis, DiffContent, DiffRequest, RepoPath, RepositoryService,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DiffMode {
     Inline,
     Split,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub enum DiffBasis {
-    /// Changes already recorded in the index: `HEAD` to index.
-    Staged,
-    /// Changes not yet staged: index to working tree.
-    Unstaged,
-}
-
-impl DiffBasis {
-    pub const fn label(self) -> &'static str {
-        match self {
-            Self::Staged => "Staged",
-            Self::Unstaged => "Unstaged",
-        }
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -93,122 +69,107 @@ impl DiffModel {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum DiffSide {
-    Head,
-    Index,
-    WorkingTree,
-}
-
+/// What the diff surface draws for one path and one comparison basis.
+///
+/// Built on a worker thread: reading both sides and turning them into rows are
+/// each unbounded in the size of the file, and neither belongs on the update
+/// thread.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum DiffContent {
-    Text(DiffModel),
-    Binary {
-        side: DiffSide,
+pub enum RenderedDiff {
+    /// Line rows, with the labels of the two sides they were computed from.
+    ///
+    /// The labels are the service's own, so the chrome names the comparison
+    /// being shown — `Index`/`Working tree`, `HEAD`/`Index`,
+    /// `main (a1b2c3d4)`/`HEAD`, or a pair of commit ids — instead of one
+    /// wording for every basis.
+    Text {
+        model: DiffModel,
+        old_label: String,
+        new_label: String,
     },
-    InvalidUtf8 {
-        side: DiffSide,
-    },
-    Symlink {
-        target: PathBuf,
-    },
-    Oversize {
-        side: DiffSide,
-        bytes: u64,
-        limit: u64,
-    },
-    NotRegularFile,
+    /// This comparison has no text rows. The service's account of the sides is
+    /// kept verbatim, so the surface reports what they are — absent, binary,
+    /// not UTF-8, oversize, a symlink, a submodule, unreadable, or the three
+    /// stages of a conflict — rather than an empty or invented diff.
+    NoText(DiffContent),
+    /// The comparison could not be read at all.
     Error(String),
 }
 
+impl RenderedDiff {
+    /// Turns one comparison into rows, or into the fact that it has none.
+    ///
+    /// An added or deleted path still diffs:
+    /// [`Absent`](crate::repository::DiffSide::Absent) reads as an empty side.
+    /// An unmerged path never does — it has three index stages and no single
+    /// old side — so it is passed through instead of being flattened into a
+    /// two-sided diff.
+    pub fn from_content(content: DiffContent) -> Self {
+        match content {
+            DiffContent::Comparison {
+                old,
+                new,
+                old_label,
+                new_label,
+            } => {
+                if !old.is_diffable() || !new.is_diffable() {
+                    return Self::NoText(DiffContent::Comparison {
+                        old,
+                        new,
+                        old_label,
+                        new_label,
+                    });
+                }
+                Self::Text {
+                    model: build_diff(
+                        old.text().unwrap_or_default(),
+                        new.text().unwrap_or_default(),
+                    ),
+                    old_label,
+                    new_label,
+                }
+            }
+            unmerged @ DiffContent::Unmerged { .. } => Self::NoText(unmerged),
+        }
+    }
+}
+
+/// Reads one path's comparison through [`RepositoryService::diff`] and renders
+/// it.
+///
+/// `previous_path` is a rename or copy source: the old side reads it instead of
+/// `relative_path`, so a renamed file compares against its own former content
+/// rather than against nothing.
 pub fn load_repository_diff(
     worktree: &Path,
     relative_path: &Path,
-    basis: DiffBasis,
+    basis: &DiffBasis,
     previous_path: Option<&Path>,
-) -> DiffContent {
-    if let Err(error) = validate_repo_path(relative_path) {
-        return DiffContent::Error(error.to_string());
+) -> RenderedDiff {
+    // `RepoPath` *is* the path validation: it rejects an absolute path, `.`,
+    // `..`, an empty component and an interior NUL, which is what makes the
+    // pathspec safe to hand to Git.
+    let path = match RepoPath::parse(relative_path) {
+        Ok(path) => path,
+        Err(error) => return RenderedDiff::Error(error.to_string()),
+    };
+    let old_path = match previous_path.map(RepoPath::parse).transpose() {
+        Ok(old_path) => old_path,
+        Err(error) => return RenderedDiff::Error(error.to_string()),
+    };
+    let request = DiffRequest {
+        worktree: worktree.to_path_buf(),
+        basis: basis.clone(),
+        path,
+        old_path,
+    };
+    // Fenced by the request counter in `RepositoryRuntime`, not by
+    // cancellation: a superseded result is rejected on arrival rather than
+    // aborted in flight, so this call owns a token nobody else can cancel.
+    match RepositoryService::system("git").diff(&request, &CancellationToken::new()) {
+        Ok(content) => RenderedDiff::from_content(content),
+        Err(error) => RenderedDiff::Error(error.to_string()),
     }
-    if let Some(previous_path) = previous_path
-        && let Err(error) = validate_repo_path(previous_path)
-    {
-        return DiffContent::Error(error.to_string());
-    }
-    let before_path = previous_path.unwrap_or(relative_path);
-    let before = match basis {
-        DiffBasis::Staged => read_head_side(worktree, before_path),
-        DiffBasis::Unstaged => read_index_side(worktree, before_path),
-    };
-    let before = match before {
-        Ok(SideContent::Text(text)) => text,
-        Ok(SideContent::Binary) => {
-            return DiffContent::Binary {
-                side: match basis {
-                    DiffBasis::Staged => DiffSide::Head,
-                    DiffBasis::Unstaged => DiffSide::Index,
-                },
-            };
-        }
-        Ok(SideContent::InvalidUtf8) => {
-            return DiffContent::InvalidUtf8 {
-                side: match basis {
-                    DiffBasis::Staged => DiffSide::Head,
-                    DiffBasis::Unstaged => DiffSide::Index,
-                },
-            };
-        }
-        Ok(SideContent::Oversize(bytes)) => {
-            return DiffContent::Oversize {
-                side: match basis {
-                    DiffBasis::Staged => DiffSide::Head,
-                    DiffBasis::Unstaged => DiffSide::Index,
-                },
-                bytes,
-                limit: MAX_TEXT_DIFF_BYTES_PER_SIDE,
-            };
-        }
-        Ok(SideContent::Symlink(target)) => return DiffContent::Symlink { target },
-        Ok(SideContent::NotRegularFile) => String::new(),
-        Err(error) => return DiffContent::Error(error.to_string()),
-    };
-    let after = match basis {
-        DiffBasis::Staged => read_index_side(worktree, relative_path),
-        DiffBasis::Unstaged => read_worktree_side(worktree, relative_path),
-    };
-    let after = match after {
-        Ok(SideContent::Text(text)) => text,
-        Ok(SideContent::Binary) => {
-            return DiffContent::Binary {
-                side: match basis {
-                    DiffBasis::Staged => DiffSide::Index,
-                    DiffBasis::Unstaged => DiffSide::WorkingTree,
-                },
-            };
-        }
-        Ok(SideContent::InvalidUtf8) => {
-            return DiffContent::InvalidUtf8 {
-                side: match basis {
-                    DiffBasis::Staged => DiffSide::Index,
-                    DiffBasis::Unstaged => DiffSide::WorkingTree,
-                },
-            };
-        }
-        Ok(SideContent::Symlink(target)) => return DiffContent::Symlink { target },
-        Ok(SideContent::Oversize(bytes)) => {
-            return DiffContent::Oversize {
-                side: match basis {
-                    DiffBasis::Staged => DiffSide::Index,
-                    DiffBasis::Unstaged => DiffSide::WorkingTree,
-                },
-                bytes,
-                limit: MAX_TEXT_DIFF_BYTES_PER_SIDE,
-            };
-        }
-        Ok(SideContent::NotRegularFile) => return DiffContent::NotRegularFile,
-        Err(error) => return DiffContent::Error(error.to_string()),
-    };
-    DiffContent::Text(build_diff(&before, &after))
 }
 
 pub fn build_diff(before: &str, after: &str) -> DiffModel {
@@ -443,257 +404,14 @@ fn display_line(line: &str) -> DisplayLine {
     }
 }
 
-enum SideContent {
-    Text(String),
-    Binary,
-    InvalidUtf8,
-    Symlink(PathBuf),
-    Oversize(u64),
-    NotRegularFile,
-}
-
-fn read_worktree_side(worktree: &Path, relative_path: &Path) -> Result<SideContent, FileIoError> {
-    let root = fs::canonicalize(worktree)
-        .map_err(|error| FileIoError::InvalidRepositoryRoot(error.to_string()))?;
-    let path = root.join(relative_path);
-    let parent = path.parent().ok_or(FileIoError::InvalidRepositoryPath)?;
-    let canonical_parent = match fs::canonicalize(parent) {
-        Ok(parent) => parent,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            // A deletion can remove the file's entire directory hierarchy.
-            // The validated relative path cannot escape `root`, and no read is
-            // attempted when an ancestor is absent, so the worktree side is
-            // the same empty side as a missing leaf file.
-            return Ok(SideContent::Text(String::new()));
-        }
-        Err(error) => return Err(FileIoError::Io(error.to_string())),
-    };
-    if !canonical_parent.starts_with(&root) {
-        return Err(FileIoError::OutsideWorktree);
-    }
-    let metadata = match fs::symlink_metadata(&path) {
-        Ok(metadata) => metadata,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return Ok(SideContent::Text(String::new()));
-        }
-        Err(error) => return Err(FileIoError::Io(error.to_string())),
-    };
-    if metadata.file_type().is_symlink() {
-        return fs::read_link(path)
-            .map(SideContent::Symlink)
-            .map_err(|error| FileIoError::Io(error.to_string()));
-    }
-    if !metadata.is_file() {
-        return Ok(SideContent::NotRegularFile);
-    }
-    if metadata.len() > MAX_TEXT_DIFF_BYTES_PER_SIDE {
-        return Ok(SideContent::Oversize(metadata.len()));
-    }
-    let bytes = fs::read(path).map_err(|error| FileIoError::Io(error.to_string()))?;
-    classify_bytes(bytes)
-}
-
-fn read_head_side(worktree: &Path, relative_path: &Path) -> Result<SideContent, FileIoError> {
-    let head = git(
-        worktree,
-        [
-            OsString::from("rev-parse"),
-            OsString::from("--verify"),
-            OsString::from("HEAD"),
-        ],
-    )?;
-    if !head.status.success() {
-        return Ok(SideContent::Text(String::new()));
-    }
-    let listing = git(
-        worktree,
-        [
-            OsString::from("ls-tree"),
-            OsString::from("-z"),
-            OsString::from("--full-tree"),
-            OsString::from("HEAD"),
-            OsString::from("--"),
-            relative_path.as_os_str().to_owned(),
-        ],
-    )?;
-    if !listing.status.success() {
-        return Err(FileIoError::Io(format!(
-            "Git could not inspect the previous file: {}",
-            String::from_utf8_lossy(&listing.stderr).trim()
-        )));
-    }
-    let Some((mode, object)) = parse_tree_entry(&listing.stdout)? else {
-        return Ok(SideContent::Text(String::new()));
-    };
-    read_git_blob(worktree, mode, object, DiffSide::Head)
-}
-
-fn read_index_side(worktree: &Path, relative_path: &Path) -> Result<SideContent, FileIoError> {
-    let listing = git(
-        worktree,
-        [
-            OsString::from("ls-files"),
-            OsString::from("--stage"),
-            OsString::from("-z"),
-            OsString::from("--"),
-            relative_path.as_os_str().to_owned(),
-        ],
-    )?;
-    if !listing.status.success() {
-        return Err(FileIoError::Io(format!(
-            "Git could not inspect the indexed file: {}",
-            String::from_utf8_lossy(&listing.stderr).trim()
-        )));
-    }
-    let Some((mode, object)) = parse_tree_entry(&listing.stdout)? else {
-        return Ok(SideContent::Text(String::new()));
-    };
-    read_git_blob(worktree, mode, object, DiffSide::Index)
-}
-
-fn read_git_blob(
-    worktree: &Path,
-    mode: &[u8],
-    object: OsString,
-    side: DiffSide,
-) -> Result<SideContent, FileIoError> {
-    if !matches!(mode, b"100644" | b"100755" | b"120000") {
-        return Ok(SideContent::NotRegularFile);
-    }
-    let size = git(
-        worktree,
-        [
-            OsString::from("cat-file"),
-            OsString::from("-s"),
-            object.clone(),
-        ],
-    )?;
-    if !size.status.success() {
-        return Err(FileIoError::Io(format!(
-            "Git could not inspect the {side:?} file size: {}",
-            String::from_utf8_lossy(&size.stderr).trim()
-        )));
-    }
-    let bytes = std::str::from_utf8(&size.stdout)
-        .ok()
-        .and_then(|size| size.trim().parse::<u64>().ok())
-        .ok_or_else(|| FileIoError::Io("Git returned an invalid blob size".into()))?;
-    if bytes > MAX_TEXT_DIFF_BYTES_PER_SIDE {
-        return Ok(SideContent::Oversize(bytes));
-    }
-    let output = git(
-        worktree,
-        [OsString::from("cat-file"), OsString::from("blob"), object],
-    )?;
-    if !output.status.success() {
-        return Err(FileIoError::Io(format!(
-            "Git could not read the {side:?} file: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        )));
-    }
-    if mode == b"120000" {
-        return Ok(SideContent::Symlink(bytes_to_path(&output.stdout)));
-    }
-    classify_bytes(output.stdout)
-}
-
-fn parse_tree_entry(output: &[u8]) -> Result<Option<(&[u8], OsString)>, FileIoError> {
-    if output.is_empty() {
-        return Ok(None);
-    }
-    if !output.ends_with(&[0]) || output[..output.len() - 1].contains(&0) {
-        return Err(FileIoError::Io(
-            "Git returned a malformed tree entry".into(),
-        ));
-    }
-    let record = &output[..output.len() - 1];
-    let separator = record
-        .iter()
-        .position(|byte| *byte == b'\t')
-        .ok_or_else(|| FileIoError::Io("Git returned a malformed tree entry".into()))?;
-    let header = &record[..separator];
-    let mut fields = header.split(|byte| *byte == b' ');
-    let mode = fields
-        .next()
-        .filter(|field| !field.is_empty())
-        .ok_or_else(|| FileIoError::Io("Git returned a malformed tree mode".into()))?;
-    let second = fields
-        .next()
-        .filter(|field| !field.is_empty())
-        .ok_or_else(|| FileIoError::Io("Git returned a malformed tree type".into()))?;
-    let object = if matches!(second, b"blob" | b"tree" | b"commit") {
-        fields
-            .next()
-            .filter(|field| !field.is_empty())
-            .ok_or_else(|| FileIoError::Io("Git returned a malformed tree object".into()))?
-    } else {
-        second
-    };
-    let trailing = fields.next();
-    if trailing.is_some_and(|stage| stage != b"0") || fields.next().is_some() {
-        return Err(FileIoError::Io(
-            "Git returned a malformed tree entry".into(),
-        ));
-    }
-    Ok(Some((mode, bytes_to_os_string(object))))
-}
-
-fn git<const N: usize>(
-    worktree: &Path,
-    arguments: [OsString; N],
-) -> Result<std::process::Output, FileIoError> {
-    Command::new("git")
-        .arg("--literal-pathspecs")
-        .arg("-C")
-        .arg(worktree)
-        .args(arguments)
-        .env("GIT_TERMINAL_PROMPT", "0")
-        .env("GIT_PAGER", "cat")
-        .env("GIT_OPTIONAL_LOCKS", "0")
-        .env_remove("GIT_DIR")
-        .env_remove("GIT_WORK_TREE")
-        .env_remove("GIT_INDEX_FILE")
-        .env_remove("GIT_COMMON_DIR")
-        .output()
-        .map_err(|error| FileIoError::Io(error.to_string()))
-}
-
-fn bytes_to_path(bytes: &[u8]) -> PathBuf {
-    PathBuf::from(bytes_to_os_string(bytes))
-}
-
-fn bytes_to_os_string(bytes: &[u8]) -> OsString {
-    #[cfg(unix)]
-    {
-        use std::os::unix::ffi::OsStringExt;
-        OsString::from_vec(bytes.to_vec())
-    }
-    #[cfg(not(unix))]
-    {
-        OsString::from(String::from_utf8_lossy(bytes).into_owned())
-    }
-}
-
-fn classify_bytes(bytes: Vec<u8>) -> Result<SideContent, FileIoError> {
-    if bytes.len() as u64 > MAX_TEXT_DIFF_BYTES_PER_SIDE {
-        return Ok(SideContent::Oversize(bytes.len() as u64));
-    }
-    if bytes.contains(&0) {
-        return Ok(SideContent::Binary);
-    }
-    match String::from_utf8(bytes) {
-        Ok(text) => Ok(SideContent::Text(text)),
-        Err(_) => Ok(SideContent::InvalidUtf8),
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    use std::process::Command;
+    use std::{fs, path::PathBuf, process::Command};
 
     use tempfile::tempdir;
 
     use super::*;
+    use crate::repository::{DiffSide, Oid, ValidatedRefName};
 
     #[test]
     fn line_model_has_correct_numbers_and_kinds() {
@@ -793,44 +511,293 @@ mod tests {
         assert_eq!(model.split_rows[2].new_line, Some(2));
     }
 
+    /// Only a side that is text — or absent, which is an empty side — becomes
+    /// rows. Every other side the service can report is passed through as the
+    /// fact it is, so the surface never draws an empty diff over a file it
+    /// could not read.
+    #[test]
+    fn only_text_and_absent_sides_become_rows() {
+        let comparison = |old: DiffSide, new: DiffSide| {
+            RenderedDiff::from_content(DiffContent::Comparison {
+                old,
+                new,
+                old_label: "old".into(),
+                new_label: "new".into(),
+            })
+        };
+        let text = |text: &str| DiffSide::Text {
+            text: text.into(),
+            bytes: text.len() as u64,
+        };
+
+        assert!(matches!(
+            comparison(text("a\n"), text("b\n")),
+            RenderedDiff::Text { .. }
+        ));
+        assert!(matches!(
+            comparison(DiffSide::Absent, text("a\n")),
+            RenderedDiff::Text { .. }
+        ));
+        assert!(matches!(
+            comparison(text("a\n"), DiffSide::Absent),
+            RenderedDiff::Text { .. }
+        ));
+        assert!(matches!(
+            comparison(DiffSide::Absent, DiffSide::Absent),
+            RenderedDiff::Text { .. }
+        ));
+
+        for opaque in [
+            DiffSide::Binary { bytes: 3 },
+            DiffSide::InvalidUtf8 { bytes: 1 },
+            DiffSide::Oversize { bytes: u64::MAX },
+            DiffSide::Submodule {
+                oid: Some(fixture_oid()),
+            },
+            DiffSide::Submodule { oid: None },
+            DiffSide::Symlink {
+                target: PathBuf::from("elsewhere"),
+            },
+            DiffSide::NotRegularFile,
+            DiffSide::Unreadable {
+                reason: "permission denied".into(),
+            },
+        ] {
+            assert!(
+                matches!(
+                    comparison(opaque.clone(), text("a\n")),
+                    RenderedDiff::NoText(_)
+                ),
+                "{opaque:?} must not be diffed as text on the old side"
+            );
+            assert!(
+                matches!(
+                    comparison(text("a\n"), opaque.clone()),
+                    RenderedDiff::NoText(_)
+                ),
+                "{opaque:?} must not be diffed as text on the new side"
+            );
+        }
+
+        assert!(matches!(
+            RenderedDiff::from_content(DiffContent::Unmerged {
+                base: text("base\n"),
+                ours: text("ours\n"),
+                theirs: text("theirs\n"),
+                worktree: text("merged\n"),
+            }),
+            RenderedDiff::NoText(DiffContent::Unmerged { .. })
+        ));
+    }
+
+    /// A path that could name something outside the worktree is refused before
+    /// any Git process starts, on either side of a rename.
+    #[test]
+    fn an_escaping_path_is_refused_on_either_side() {
+        let root = tempdir().unwrap();
+        for (path, previous) in [
+            (Path::new("../escape.txt"), None),
+            (Path::new("/etc/passwd"), None),
+            (Path::new(""), None),
+            (Path::new("ok.txt"), Some(Path::new("../escape.txt"))),
+            (Path::new("ok.txt"), Some(Path::new("nested/../escape.txt"))),
+        ] {
+            let content =
+                load_repository_diff(root.path(), path, &DiffBasis::IndexToWorktree, previous);
+            assert!(
+                matches!(content, RenderedDiff::Error(_)),
+                "{path:?} with previous {previous:?} must be refused, got {content:?}"
+            );
+        }
+    }
+
     #[test]
     fn real_git_fixture_reads_head_and_worktree_without_shell_or_lossy_text() {
-        let root = tempdir().unwrap();
-        run_git(root.path(), ["init", "-q"]);
-        run_git(root.path(), ["config", "user.name", "Fixture"]);
-        run_git(
-            root.path(),
-            ["config", "user.email", "fixture@example.invalid"],
-        );
+        let root = git_fixture();
         fs::write(root.path().join("sample.txt"), "one\ntwo\n").unwrap();
         run_git(root.path(), ["add", "sample.txt"]);
         run_git(root.path(), ["commit", "-qm", "initial"]);
         fs::write(root.path().join("sample.txt"), "one\nsecond\nthree\n").unwrap();
 
-        let DiffContent::Text(model) = load_repository_diff(
+        let RenderedDiff::Text {
+            model,
+            old_label,
+            new_label,
+        } = load_repository_diff(
             root.path(),
             Path::new("sample.txt"),
-            DiffBasis::Unstaged,
+            &DiffBasis::IndexToWorktree,
             None,
-        ) else {
+        )
+        else {
             panic!("fixture should produce a text diff");
         };
         assert_eq!((model.additions, model.deletions), (2, 1));
         assert_eq!(model.inline_rows[1].old_line, Some(2));
         assert_eq!(model.inline_rows[2].new_line, Some(2));
+        assert_eq!(
+            (old_label.as_str(), new_label.as_str()),
+            ("Index", "Working tree")
+        );
+    }
+
+    /// Every one of the service's four bases reaches the loader and reads the
+    /// pair of trees it names.
+    ///
+    /// `other.txt` is the load-bearing assertion for the branch basis: it
+    /// exists only on the base branch's tip, so a comparison against that tip
+    /// would report it deleted. Against the *merge base* it is absent on both
+    /// sides, which is what a branch review must show.
+    #[test]
+    fn every_basis_reads_the_pair_of_trees_it_names() {
+        let root = git_fixture();
+        fs::write(root.path().join("base.txt"), "one\n").unwrap();
+        run_git(root.path(), ["add", "base.txt"]);
+        run_git(root.path(), ["commit", "-qm", "base"]);
+        run_git(root.path(), ["checkout", "-q", "-b", "feature"]);
+        fs::write(root.path().join("base.txt"), "one\ntwo\n").unwrap();
+        run_git(root.path(), ["commit", "-qam", "feature"]);
+        run_git(root.path(), ["checkout", "-q", "main"]);
+        fs::write(root.path().join("other.txt"), "main only\n").unwrap();
+        run_git(root.path(), ["add", "other.txt"]);
+        run_git(root.path(), ["commit", "-qm", "main only"]);
+        run_git(root.path(), ["checkout", "-q", "feature"]);
+        // A staged and an unstaged change on top, so all four bases have
+        // something distinct to report for the same path.
+        fs::write(root.path().join("base.txt"), "one\ntwo\nstaged\n").unwrap();
+        run_git(root.path(), ["add", "base.txt"]);
+        fs::write(root.path().join("base.txt"), "one\ntwo\nstaged\nworking\n").unwrap();
+
+        let head = revision(root.path(), "HEAD");
+        let parent = revision(root.path(), "HEAD^");
+
+        let unstaged = text_diff(root.path(), "base.txt", &DiffBasis::IndexToWorktree, None);
+        assert_eq!(unstaged.0.additions, 1);
+        assert_eq!(unstaged.0.deletions, 0);
+        assert_eq!(
+            (unstaged.1.as_str(), unstaged.2.as_str()),
+            ("Index", "Working tree")
+        );
+
+        let staged = text_diff(root.path(), "base.txt", &DiffBasis::HeadToIndex, None);
+        assert_eq!((staged.0.additions, staged.0.deletions), (1, 0));
+        assert_eq!((staged.1.as_str(), staged.2.as_str()), ("HEAD", "Index"));
+
+        let branch = DiffBasis::MergeBaseToHead {
+            base_ref: ValidatedRefName::parse("refs/heads/main").unwrap(),
+        };
+        let merge_base = merge_base(root.path(), "main", "HEAD");
+        let compared = text_diff(root.path(), "base.txt", &branch, None);
+        // The merge base has `one`; HEAD has `one` and `two`. The staged and
+        // working changes are deliberately absent: a committed comparison
+        // never reads the index or the worktree.
+        assert_eq!((compared.0.additions, compared.0.deletions), (1, 0));
+        assert_eq!(compared.0.inline_rows[1].text, "two");
+        assert_eq!(
+            (compared.1.as_str(), compared.2.as_str()),
+            (format!("main ({})", merge_base.short()).as_str(), "HEAD")
+        );
+        let untouched = text_diff(root.path(), "other.txt", &branch, None);
+        assert!(
+            untouched.0.is_empty(),
+            "a file only the base branch tip has must be absent on both sides of a merge-base comparison, got {:?}",
+            untouched.0
+        );
+
+        let commit = DiffBasis::CommitToParent {
+            oid: head.clone(),
+            parent: Some(parent.clone()),
+        };
+        let committed = text_diff(root.path(), "base.txt", &commit, None);
+        assert_eq!((committed.0.additions, committed.0.deletions), (1, 0));
+        assert_eq!(committed.0.inline_rows[1].text, "two");
+        assert_eq!(
+            (committed.1.as_str(), committed.2.as_str()),
+            (parent.short(), head.short())
+        );
+    }
+
+    /// A root commit has no parent, so it compares against the empty tree and
+    /// every one of its lines is an addition.
+    #[test]
+    fn a_root_commit_diffs_against_the_empty_tree() {
+        let root = git_fixture();
+        fs::write(root.path().join("first.txt"), "one\ntwo\n").unwrap();
+        run_git(root.path(), ["add", "first.txt"]);
+        run_git(root.path(), ["commit", "-qm", "root"]);
+        let first = revision(root.path(), "HEAD");
+
+        let (model, old_label, new_label) = text_diff(
+            root.path(),
+            "first.txt",
+            &DiffBasis::CommitToParent {
+                oid: first.clone(),
+                parent: None,
+            },
+            None,
+        );
+        assert_eq!((model.additions, model.deletions), (2, 0));
+        assert_eq!(model.inline_rows[0].old_line, None);
+        assert_eq!(model.inline_rows[0].new_line, Some(1));
+        assert_eq!(
+            (old_label.as_str(), new_label.as_str()),
+            ("root commit", first.short())
+        );
+    }
+
+    /// A conflicted path has no stage 0. Reading that absence as an empty old
+    /// side would claim the file was added, so the three conflict stages are
+    /// reported instead of a two-sided diff.
+    #[test]
+    fn a_conflicted_path_renders_as_its_three_stages() {
+        let root = git_fixture();
+        fs::write(root.path().join("conflict.txt"), "base\n").unwrap();
+        run_git(root.path(), ["add", "conflict.txt"]);
+        run_git(root.path(), ["commit", "-qm", "base"]);
+        run_git(root.path(), ["checkout", "-q", "-b", "other"]);
+        fs::write(root.path().join("conflict.txt"), "theirs\n").unwrap();
+        run_git(root.path(), ["commit", "-qam", "theirs"]);
+        run_git(root.path(), ["checkout", "-q", "main"]);
+        fs::write(root.path().join("conflict.txt"), "ours\n").unwrap();
+        run_git(root.path(), ["commit", "-qam", "ours"]);
+        let merge = Command::new("git")
+            .arg("-C")
+            .arg(root.path())
+            .args(["merge", "other"])
+            .output()
+            .unwrap();
+        assert!(!merge.status.success(), "the merge must conflict");
+
+        let content = load_repository_diff(
+            root.path(),
+            Path::new("conflict.txt"),
+            &DiffBasis::IndexToWorktree,
+            None,
+        );
+        let RenderedDiff::NoText(DiffContent::Unmerged {
+            base,
+            ours,
+            theirs,
+            worktree,
+        }) = &content
+        else {
+            panic!("a conflicted path must render as unmerged, got {content:?}");
+        };
+        assert_eq!(base.text(), Some("base\n"));
+        assert_eq!(ours.text(), Some("ours\n"));
+        assert_eq!(theirs.text(), Some("theirs\n"));
+        // The worktree holds Git's conflict markers, which is neither side.
+        assert!(
+            worktree.text().is_some_and(|text| text.contains("<<<<<<<")),
+            "the worktree stage should hold the conflict markers, got {worktree:?}"
+        );
     }
 
     #[test]
     fn head_lookup_handles_added_renamed_and_prior_symlink_paths() {
         use std::os::unix::fs::symlink;
 
-        let root = tempdir().unwrap();
-        run_git(root.path(), ["init", "-q"]);
-        run_git(root.path(), ["config", "user.name", "Fixture"]);
-        run_git(
-            root.path(),
-            ["config", "user.email", "fixture@example.invalid"],
-        );
+        let root = git_fixture();
         fs::write(root.path().join("original.txt"), "same\n").unwrap();
         symlink("destination", root.path().join("link")).unwrap();
         run_git(root.path(), ["add", "original.txt", "link"]);
@@ -838,32 +805,66 @@ mod tests {
 
         fs::write(root.path().join("added.txt"), "added\n").unwrap();
         run_git(root.path(), ["add", "added.txt"]);
-        let DiffContent::Text(added) =
-            load_repository_diff(root.path(), Path::new("added.txt"), DiffBasis::Staged, None)
-        else {
-            panic!("a staged addition should compare against an empty previous side");
-        };
+        let (added, ..) = text_diff(root.path(), "added.txt", &DiffBasis::HeadToIndex, None);
         assert_eq!((added.additions, added.deletions), (1, 0));
 
         run_git(root.path(), ["mv", "original.txt", "renamed.txt"]);
-        let DiffContent::Text(renamed) = load_repository_diff(
+        let (renamed, ..) = text_diff(
             root.path(),
-            Path::new("renamed.txt"),
-            DiffBasis::Staged,
+            "renamed.txt",
+            &DiffBasis::HeadToIndex,
             Some(Path::new("original.txt")),
-        ) else {
-            panic!("a rename should compare against its original HEAD path");
-        };
-        assert!(renamed.is_empty());
+        );
+        assert!(
+            renamed.is_empty(),
+            "a rename should compare against its original HEAD path"
+        );
 
         fs::remove_file(root.path().join("link")).unwrap();
         fs::write(root.path().join("link"), "ordinary file\n").unwrap();
+        let content = load_repository_diff(
+            root.path(),
+            Path::new("link"),
+            &DiffBasis::IndexToWorktree,
+            None,
+        );
+        let RenderedDiff::NoText(DiffContent::Comparison { old, new, .. }) = &content else {
+            panic!("a symlink replaced by a file has no text diff, got {content:?}");
+        };
         assert_eq!(
-            load_repository_diff(root.path(), Path::new("link"), DiffBasis::Unstaged, None,),
-            DiffContent::Symlink {
+            old,
+            &DiffSide::Symlink {
                 target: PathBuf::from("destination")
             }
         );
+        assert!(matches!(new, DiffSide::Text { .. }));
+    }
+
+    /// A rename is read from its source on the old side for a committed
+    /// comparison too, not only for the index bases.
+    #[test]
+    fn a_committed_rename_reads_the_old_path_on_the_old_side() {
+        let root = git_fixture();
+        fs::write(root.path().join("old.txt"), "same\n").unwrap();
+        run_git(root.path(), ["add", "old.txt"]);
+        run_git(root.path(), ["commit", "-qm", "initial"]);
+        run_git(root.path(), ["mv", "old.txt", "new.txt"]);
+        run_git(root.path(), ["commit", "-qm", "rename"]);
+        let basis = DiffBasis::CommitToParent {
+            oid: revision(root.path(), "HEAD"),
+            parent: Some(revision(root.path(), "HEAD^")),
+        };
+
+        let (renamed, ..) = text_diff(root.path(), "new.txt", &basis, Some(Path::new("old.txt")));
+        assert!(
+            renamed.is_empty(),
+            "the old side must read old.txt, got {renamed:?}"
+        );
+
+        // Without the source, the old side is absent and the whole file reads
+        // as added — which is exactly why the source has to be carried.
+        let (without_source, ..) = text_diff(root.path(), "new.txt", &basis, None);
+        assert_eq!((without_source.additions, without_source.deletions), (1, 0));
     }
 
     #[test]
@@ -874,23 +875,37 @@ mod tests {
         fs::write(root.path().join("binary"), b"a\0b").unwrap();
         fs::write(root.path().join("invalid"), [0xff]).unwrap();
         symlink("binary", root.path().join("link")).unwrap();
+
         assert_eq!(
-            load_repository_diff(root.path(), Path::new("binary"), DiffBasis::Unstaged, None,),
-            DiffContent::Binary {
-                side: DiffSide::WorkingTree
-            }
+            working_side(root.path(), "binary"),
+            DiffSide::Binary { bytes: 3 }
         );
         assert_eq!(
-            load_repository_diff(root.path(), Path::new("invalid"), DiffBasis::Unstaged, None,),
-            DiffContent::InvalidUtf8 {
-                side: DiffSide::WorkingTree
-            }
+            working_side(root.path(), "invalid"),
+            DiffSide::InvalidUtf8 { bytes: 1 }
         );
         assert_eq!(
-            load_repository_diff(root.path(), Path::new("link"), DiffBasis::Unstaged, None,),
-            DiffContent::Symlink {
+            working_side(root.path(), "link"),
+            DiffSide::Symlink {
                 target: PathBuf::from("binary")
             }
+        );
+    }
+
+    /// A tracked file replaced by a directory is reported as what the worktree
+    /// now holds, never read as though it were still a file.
+    #[test]
+    fn a_tracked_path_replaced_by_a_directory_is_not_a_regular_file() {
+        let root = git_fixture();
+        fs::write(root.path().join("swapped"), "content\n").unwrap();
+        run_git(root.path(), ["add", "swapped"]);
+        run_git(root.path(), ["commit", "-qm", "initial"]);
+        fs::remove_file(root.path().join("swapped")).unwrap();
+        fs::create_dir(root.path().join("swapped")).unwrap();
+
+        assert_eq!(
+            working_side(root.path(), "swapped"),
+            DiffSide::NotRegularFile
         );
     }
 
@@ -904,22 +919,13 @@ mod tests {
         run_git(root.path(), ["add", "opposite.txt"]);
         fs::write(root.path().join("opposite.txt"), "head\n").unwrap();
 
-        let DiffContent::Text(staged) = load_repository_diff(
+        let (staged, ..) = text_diff(root.path(), "opposite.txt", &DiffBasis::HeadToIndex, None);
+        let (unstaged, ..) = text_diff(
             root.path(),
-            Path::new("opposite.txt"),
-            DiffBasis::Staged,
+            "opposite.txt",
+            &DiffBasis::IndexToWorktree,
             None,
-        ) else {
-            panic!("staged basis should be text");
-        };
-        let DiffContent::Text(unstaged) = load_repository_diff(
-            root.path(),
-            Path::new("opposite.txt"),
-            DiffBasis::Unstaged,
-            None,
-        ) else {
-            panic!("unstaged basis should be text");
-        };
+        );
         assert_eq!((staged.additions, staged.deletions), (1, 1));
         assert_eq!((unstaged.additions, unstaged.deletions), (1, 1));
         assert_eq!(staged.inline_rows[0].text, "head");
@@ -938,22 +944,13 @@ mod tests {
         run_git(root.path(), ["add", "deleted.txt"]);
         fs::remove_file(root.path().join("deleted.txt")).unwrap();
 
-        let DiffContent::Text(staged) = load_repository_diff(
+        let (staged, ..) = text_diff(root.path(), "deleted.txt", &DiffBasis::HeadToIndex, None);
+        let (unstaged, ..) = text_diff(
             root.path(),
-            Path::new("deleted.txt"),
-            DiffBasis::Staged,
+            "deleted.txt",
+            &DiffBasis::IndexToWorktree,
             None,
-        ) else {
-            panic!("staged basis should be text");
-        };
-        let DiffContent::Text(unstaged) = load_repository_diff(
-            root.path(),
-            Path::new("deleted.txt"),
-            DiffBasis::Unstaged,
-            None,
-        ) else {
-            panic!("unstaged deletion should be text");
-        };
+        );
         assert_eq!((staged.additions, staged.deletions), (1, 1));
         assert_eq!((unstaged.additions, unstaged.deletions), (0, 1));
         assert_eq!(unstaged.inline_rows[0].text, "indexed");
@@ -968,14 +965,12 @@ mod tests {
         run_git(root.path(), ["commit", "-qm", "initial"]);
         fs::remove_dir_all(root.path().join("nested")).unwrap();
 
-        let DiffContent::Text(unstaged) = load_repository_diff(
+        let (unstaged, ..) = text_diff(
             root.path(),
-            Path::new("nested/deleted.txt"),
-            DiffBasis::Unstaged,
+            "nested/deleted.txt",
+            &DiffBasis::IndexToWorktree,
             None,
-        ) else {
-            panic!("a missing worktree ancestor should produce a deletion diff");
-        };
+        );
         assert_eq!((unstaged.additions, unstaged.deletions), (0, 1));
         assert_eq!(unstaged.inline_rows[0].text, "indexed");
     }
@@ -988,14 +983,12 @@ mod tests {
         run_git(root.path(), ["commit", "-qm", "initial"]);
         fs::rename(root.path().join("old.txt"), root.path().join("new.txt")).unwrap();
 
-        let DiffContent::Text(renamed) = load_repository_diff(
+        let (renamed, ..) = text_diff(
             root.path(),
-            Path::new("new.txt"),
-            DiffBasis::Unstaged,
+            "new.txt",
+            &DiffBasis::IndexToWorktree,
             Some(Path::new("old.txt")),
-        ) else {
-            panic!("unstaged rename should compare indexed source to working destination");
-        };
+        );
         assert!(renamed.is_empty());
     }
 
@@ -1007,29 +1000,91 @@ mod tests {
         run_git(root.path(), ["commit", "-qm", "initial"]);
         run_git(root.path(), ["rm", "--cached", "-q", "replacement.txt"]);
 
-        let DiffContent::Text(staged) = load_repository_diff(
+        let (staged, ..) = text_diff(
             root.path(),
-            Path::new("replacement.txt"),
-            DiffBasis::Staged,
+            "replacement.txt",
+            &DiffBasis::HeadToIndex,
             None,
-        ) else {
-            panic!("staged deletion should be text");
-        };
-        let DiffContent::Text(unstaged) = load_repository_diff(
+        );
+        let (unstaged, ..) = text_diff(
             root.path(),
-            Path::new("replacement.txt"),
-            DiffBasis::Unstaged,
+            "replacement.txt",
+            &DiffBasis::IndexToWorktree,
             None,
-        ) else {
-            panic!("untracked replacement should be text");
-        };
+        );
         assert_eq!((staged.additions, staged.deletions), (0, 1));
         assert_eq!((unstaged.additions, unstaged.deletions), (1, 0));
     }
 
+    /// The rows of a comparison that must be text, with both side labels.
+    fn text_diff(
+        worktree: &Path,
+        path: &str,
+        basis: &DiffBasis,
+        previous_path: Option<&Path>,
+    ) -> (DiffModel, String, String) {
+        let content = load_repository_diff(worktree, Path::new(path), basis, previous_path);
+        let RenderedDiff::Text {
+            model,
+            old_label,
+            new_label,
+        } = content
+        else {
+            panic!("{path} on {basis:?} should produce a text diff, got {content:?}");
+        };
+        (model, old_label, new_label)
+    }
+
+    /// The working-tree side of an untracked or replaced path, which the
+    /// unstaged basis reports as its new side.
+    fn working_side(worktree: &Path, path: &str) -> DiffSide {
+        let content =
+            load_repository_diff(worktree, Path::new(path), &DiffBasis::IndexToWorktree, None);
+        let RenderedDiff::NoText(DiffContent::Comparison { new, .. }) = content else {
+            panic!("{path} should have no text diff, got {content:?}");
+        };
+        new
+    }
+
+    fn revision(root: &Path, revision: &str) -> Oid {
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(root)
+            .args(["rev-parse", "--verify", revision])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git rev-parse {revision} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        Oid::parse_object(String::from_utf8(output.stdout).unwrap().trim()).unwrap()
+    }
+
+    fn merge_base(root: &Path, left: &str, right: &str) -> Oid {
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(root)
+            .args(["merge-base", left, right])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git merge-base {left} {right} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        Oid::parse_object(String::from_utf8(output.stdout).unwrap().trim()).unwrap()
+    }
+
+    fn fixture_oid() -> Oid {
+        Oid::parse_object(format!("{}1", "0".repeat(39))).unwrap()
+    }
+
     fn git_fixture() -> tempfile::TempDir {
         let root = tempdir().unwrap();
-        run_git(root.path(), ["init", "-q"]);
+        // An explicit initial branch: `main` is named by the branch-comparison
+        // tests, and Git's default depends on the host's configuration.
+        run_git(root.path(), ["init", "-q", "-b", "main"]);
         run_git(root.path(), ["config", "user.name", "Fixture"]);
         run_git(
             root.path(),
@@ -1039,12 +1094,16 @@ mod tests {
     }
 
     fn run_git<const N: usize>(root: &Path, args: [&str; N]) {
-        let status = Command::new("git")
+        let output = Command::new("git")
             .arg("-C")
             .arg(root)
             .args(args)
-            .status()
+            .output()
             .unwrap();
-        assert!(status.success());
+        assert!(
+            output.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 }

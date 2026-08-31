@@ -4408,7 +4408,7 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         let old_path = request.old_path.as_ref().unwrap_or(&request.path);
         match &request.basis {
             DiffBasis::IndexToWorktree => {
-                let stages = self.index_entries(worktree, &request.path, cancellation)?;
+                let stages = self.index_entries(worktree, old_path, cancellation)?;
                 let worktree_side = read_worktree_side(worktree, &request.path);
                 let stage = |number: u8| stages.iter().find(|entry| entry.stage == number);
                 if stage(0).is_none() && (1..=3).any(|number| stage(number).is_some()) {

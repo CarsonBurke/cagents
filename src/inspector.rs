@@ -21,6 +21,10 @@ use url::Url;
 use crate::{
     design::{self, InspectorLayout},
     location::SanitizedLocation,
+    lsp::{
+        LocationKind, LspCompletionItem, LspCompletionKind, LspCoordinates, LspDiagnostic,
+        LspLocation, LspPosition, LspSeverity, LspStatus, LspTarget,
+    },
     model::{
         BrowserRestoreFidelity, CardId, CardKind, CardState, ProjectId, Residency,
         TerminalContinuity,
@@ -304,12 +308,57 @@ pub enum InspectorAction {
     },
     FocusProjectSearch,
     CloseCard(CardId),
+    /// Move the caret of `card`'s open document. Self-contained: a language
+    /// server replaces a document's diagnostics without being asked, so a row
+    /// that carried a position in a list the application holds could resolve
+    /// against a list that had already been replaced.
+    JumpToLspDiagnostic {
+        card: CardId,
+        at: LspPosition,
+    },
+    /// Open a file of `card`'s own worktree and move its caret. `coordinates`
+    /// says whether `at` is already in editor-native scalars, or is still in
+    /// protocol code units and must be converted once the file is loaded.
+    JumpToLspLocation {
+        card: CardId,
+        path: PathBuf,
+        at: LspPosition,
+        coordinates: LspCoordinates,
+    },
+    /// Apply `card`'s completion candidate. Applying a candidate needs the
+    /// whole item, which the application holds, so this addresses it by
+    /// position; `label` is the fingerprint the application compares against
+    /// the item it finds before touching the buffer.
+    ApplyLspCompletion {
+        card: CardId,
+        index: usize,
+        label: String,
+    },
+    RequestLspHover(CardId),
+    GoToLspDefinition(CardId),
+    FindLspReferences(CardId),
+    RestartLanguageServer(CardId),
+    DismissLspResults(CardId),
+    /// A link inside rendered hover Markdown. The application parses it, as it
+    /// already does for a Markdown document's links, because a hover link is
+    /// not guaranteed to be an absolute URL.
+    OpenLspHoverLink(String),
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// One labelled line of an inspector section.
+///
+/// A fact is inert unless it carries an `action`: the language-server sections
+/// need rows the reader can press, and only a footer [`Action`] could carry a
+/// message before. Every fact built by [`model_for_card`] leaves `action`
+/// unset and renders exactly as it did.
+#[derive(Debug, Clone, PartialEq)]
 pub struct Fact {
     pub label: Cow<'static, str>,
     pub value: String,
+    /// Rendered as Markdown instead of plain selectable text.
+    pub markdown: bool,
+    /// Pressing the fact's row emits this message.
+    pub action: Option<InspectorAction>,
 }
 
 impl Fact {
@@ -317,11 +366,23 @@ impl Fact {
         Self {
             label: label.into(),
             value: value.into(),
+            markdown: false,
+            action: None,
         }
+    }
+
+    fn markdown(mut self) -> Self {
+        self.markdown = true;
+        self
+    }
+
+    fn activated(mut self, action: InspectorAction) -> Self {
+        self.action = Some(action);
+        self
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Section {
     pub title: Cow<'static, str>,
     pub facts: Vec<Fact>,
@@ -556,7 +617,12 @@ pub fn model_for_card(
                         InspectorAction::BackToRepositoryFiles(card.id),
                     ));
                 }
-                if source.selected_changed && source.surface == "Editor" && !source.saving {
+                // Not gated on a local change: two of the card's four bases
+                // compare against committed trees, which is exactly how a file
+                // the branch changed and the worktree left alone gets a diff.
+                // The card's own Edit/Diff control refuses no such file, and
+                // the inspector describes that card rather than overruling it.
+                if source.surface == "Editor" && !source.saving {
                     actions.push(Action::new(
                         format!("{}.diff", card.id),
                         "Show diff",
@@ -749,6 +815,382 @@ pub fn model_for_card(
         icon,
         sections,
         actions,
+    }
+}
+
+/// The LSP half of a repository card's inspector, owned by the application
+/// because results arrive on the manager's event channel rather than from
+/// widget state.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct LspInspectorContext {
+    pub status: Option<LspStatus>,
+    pub diagnostics: Vec<LspDiagnostic>,
+    pub hover: Option<String>,
+    pub locations: Option<(LocationKind, Vec<LspLocation>)>,
+    pub completions: Vec<LspCompletionItem>,
+    pub notice: Option<String>,
+}
+
+/// Hover Markdown is arbitrary server text, so its block count and its nesting
+/// are bounded for the same reason the result lists are.
+const MARKDOWN_BLOCK_LIMIT: usize = 48;
+const MARKDOWN_NESTING_LIMIT: usize = 8;
+
+/// A language server may report thousands of diagnostics or references for one
+/// file. The inspector is a narrow column, so each list renders a bounded
+/// prefix and states the remainder instead of growing the widget tree with the
+/// server's answer.
+const LSP_ROW_LIMIT: usize = 24;
+
+/// Appends the language-server sections to a repository card's model.
+/// Additive so `model_for_card`'s existing four-argument signature, and its
+/// single call site in `app.rs`, stay untouched in this batch.
+pub fn with_lsp(
+    mut model: InspectorModel,
+    card: CardId,
+    lsp: &LspInspectorContext,
+) -> InspectorModel {
+    model.sections.extend(language_server_section(
+        lsp.status.as_ref(),
+        lsp.notice.as_deref(),
+    ));
+    model
+        .sections
+        .extend(diagnostics_section(card, &lsp.diagnostics));
+    model
+        .sections
+        .extend(lsp.hover.as_deref().map(hover_section));
+    model.sections.extend(
+        lsp.locations
+            .as_ref()
+            .map(|(kind, locations)| locations_section(card, *kind, locations)),
+    );
+    model
+        .sections
+        .extend(completions_section(card, &lsp.completions));
+
+    // Closing the card stays the last thing the footer offers.
+    let close = model
+        .actions
+        .iter()
+        .position(|action| matches!(action.message, InspectorAction::CloseCard(_)))
+        .unwrap_or(model.actions.len());
+    model.actions.splice(close..close, lsp_actions(card, lsp));
+    model
+}
+
+fn language_server_section(status: Option<&LspStatus>, notice: Option<&str>) -> Option<Section> {
+    if status.is_none() && notice.is_none() {
+        return None;
+    }
+    let mut facts = Vec::new();
+    if let Some(status) = status {
+        facts.push(Fact::new("Status", lsp_status_label(status)));
+        match status {
+            // Not configuring a server for a file type is a statement about the
+            // settings, not a failure of anything.
+            LspStatus::Disabled => facts.push(Fact::new(
+                "Detail",
+                "No language server is configured for this file type.",
+            )),
+            LspStatus::Unavailable { reason } => facts.push(Fact::new("Reason", reason)),
+            LspStatus::Failed {
+                reason,
+                stderr_tail,
+            } => {
+                facts.push(Fact::new("Reason", reason));
+                // The tail is the only evidence of why the session died, so it
+                // is presented rather than swallowed.
+                facts.push(Fact::new(
+                    "Server output",
+                    if stderr_tail.is_empty() {
+                        "The server wrote nothing to standard error.".to_owned()
+                    } else {
+                        stderr_tail.join("\n")
+                    },
+                ));
+            }
+            LspStatus::Starting | LspStatus::Ready => {}
+        }
+    }
+    if let Some(notice) = notice {
+        facts.push(Fact::new("Notice", notice));
+    }
+    Some(Section::new("Language server", facts))
+}
+
+fn diagnostics_section(card: CardId, diagnostics: &[LspDiagnostic]) -> Option<Section> {
+    if diagnostics.is_empty() {
+        return None;
+    }
+    let mut ordered: Vec<&LspDiagnostic> = diagnostics.iter().collect();
+    // Servers publish in their own order; a reader wants file order.
+    ordered.sort_by_key(|diagnostic| diagnostic.range.start);
+    let withheld = ordered.len().saturating_sub(LSP_ROW_LIMIT);
+    let mut facts: Vec<Fact> = ordered
+        .into_iter()
+        .take(LSP_ROW_LIMIT)
+        .map(|diagnostic| {
+            Fact::new(diagnostic_label(diagnostic), diagnostic.message.as_str()).activated(
+                InspectorAction::JumpToLspDiagnostic {
+                    card,
+                    at: diagnostic.range.start,
+                },
+            )
+        })
+        .collect();
+    if withheld > 0 {
+        facts.push(withheld_fact(withheld, "diagnostic", "diagnostics"));
+    }
+    Some(Section::new("Diagnostics", facts))
+}
+
+fn hover_section(hover: &str) -> Section {
+    Section::new(
+        "Hover",
+        vec![if hover.trim().is_empty() {
+            Fact::new("Symbol", "The server returned no description.")
+        } else {
+            Fact::new("Symbol", hover).markdown()
+        }],
+    )
+}
+
+fn locations_section(card: CardId, kind: LocationKind, locations: &[LspLocation]) -> Section {
+    let mut facts = Vec::new();
+    if locations.is_empty() {
+        facts.push(Fact::new("Result", "The server reported no locations."));
+    }
+    let withheld = locations.len().saturating_sub(LSP_ROW_LIMIT);
+    facts.extend(
+        locations
+            .iter()
+            .take(LSP_ROW_LIMIT)
+            .map(|location| location_fact(card, location)),
+    );
+    if withheld > 0 {
+        facts.push(withheld_fact(withheld, "location", "locations"));
+    }
+    Section::new(
+        match kind {
+            LocationKind::Definition => "Definition",
+            LocationKind::References => "References",
+        },
+        facts,
+    )
+}
+
+fn completions_section(card: CardId, completions: &[LspCompletionItem]) -> Option<Section> {
+    if completions.is_empty() {
+        return None;
+    }
+    let mut ordered: Vec<(usize, &LspCompletionItem)> = completions.iter().enumerate().collect();
+    // The preselected candidate is the one the editor would accept by default,
+    // so it leads; the rest keep the server's ranking.
+    ordered.sort_by_key(|(_, item)| !item.preselect);
+    let withheld = ordered.len().saturating_sub(LSP_ROW_LIMIT);
+    let mut facts: Vec<Fact> = ordered
+        .into_iter()
+        .take(LSP_ROW_LIMIT)
+        .map(|(index, item)| {
+            Fact::new(completion_label(item), completion_value(item)).activated(
+                InspectorAction::ApplyLspCompletion {
+                    card,
+                    index,
+                    label: item.label.clone(),
+                },
+            )
+        })
+        .collect();
+    if withheld > 0 {
+        facts.push(withheld_fact(withheld, "candidate", "candidates"));
+    }
+    Some(Section::new("Completions", facts))
+}
+
+fn lsp_actions(card: CardId, lsp: &LspInspectorContext) -> Vec<Action> {
+    let mut actions = Vec::new();
+    if let Some(status) = &lsp.status {
+        if status.can_restart() {
+            actions.push(Action::new(
+                format!("{card}.lsp-restart"),
+                "Restart language server",
+                "view-refresh-symbolic",
+                InspectorAction::RestartLanguageServer(card),
+            ));
+        }
+        if status.is_ready() {
+            actions.push(Action::new(
+                format!("{card}.lsp-hover"),
+                "Describe symbol",
+                "dialog-information-symbolic",
+                InspectorAction::RequestLspHover(card),
+            ));
+            actions.push(Action::new(
+                format!("{card}.lsp-definition"),
+                "Go to definition",
+                "go-next-symbolic",
+                InspectorAction::GoToLspDefinition(card),
+            ));
+            actions.push(Action::new(
+                format!("{card}.lsp-references"),
+                "Find references",
+                "edit-find-symbolic",
+                InspectorAction::FindLspReferences(card),
+            ));
+        }
+    }
+    if lsp.hover.is_some()
+        || lsp.locations.is_some()
+        || !lsp.completions.is_empty()
+        || lsp.notice.is_some()
+    {
+        actions.push(Action::new(
+            format!("{card}.lsp-dismiss"),
+            "Dismiss results",
+            "window-close-symbolic",
+            InspectorAction::DismissLspResults(card),
+        ));
+    }
+    actions
+}
+
+fn lsp_status_label(status: &LspStatus) -> &'static str {
+    match status {
+        LspStatus::Disabled => "Not configured",
+        LspStatus::Unavailable { .. } => "Unavailable",
+        LspStatus::Starting => "Starting",
+        LspStatus::Ready => "Ready",
+        LspStatus::Failed { .. } => "Failed",
+    }
+}
+
+fn severity_label(severity: LspSeverity) -> &'static str {
+    match severity {
+        LspSeverity::Error => "Error",
+        LspSeverity::Warning => "Warning",
+        LspSeverity::Information => "Information",
+        LspSeverity::Hint => "Hint",
+    }
+}
+
+fn withheld_fact(withheld: usize, singular: &str, plural: &str) -> Fact {
+    Fact::new("Withheld", withheld_label(withheld, singular, plural))
+}
+
+fn withheld_label(withheld: usize, singular: &str, plural: &str) -> String {
+    if withheld == 1 {
+        format!("1 further {singular} is not shown.")
+    } else {
+        format!("{withheld} further {plural} are not shown.")
+    }
+}
+
+fn diagnostic_label(diagnostic: &LspDiagnostic) -> String {
+    let origin = match (&diagnostic.source, &diagnostic.code) {
+        (Some(source), Some(code)) => format!(" · {source} {code}"),
+        (Some(text), None) | (None, Some(text)) => format!(" · {text}"),
+        (None, None) => String::new(),
+    };
+    format!(
+        "{} · line {}{origin}",
+        severity_label(diagnostic.severity),
+        diagnostic.range.start.line.saturating_add(1)
+    )
+}
+
+fn location_fact(card: CardId, location: &LspLocation) -> Fact {
+    let line = location.range.start.line.saturating_add(1);
+    match (&location.target, location.coordinates) {
+        (LspTarget::Workspace { path }, LspCoordinates::Scalar) => Fact::new(
+            format!(
+                "Open · line {line}, column {}",
+                location.range.start.character.saturating_add(1)
+            ),
+            path.display().to_string(),
+        )
+        .activated(InspectorAction::JumpToLspLocation {
+            card,
+            path: path.clone(),
+            at: location.range.start,
+            coordinates: LspCoordinates::Scalar,
+        }),
+        // Only `character` is still in protocol code units; a line counts the
+        // same either way. The row therefore offers the line it does know and
+        // says that the column is settled when the file is loaded, rather than
+        // claiming a caret this editor cannot yet place.
+        (LspTarget::Workspace { path }, LspCoordinates::Utf16) => Fact::new(
+            format!("Open · line {line} · column resolved on open"),
+            path.display().to_string(),
+        )
+        .activated(InspectorAction::JumpToLspLocation {
+            card,
+            path: path.clone(),
+            at: location.range.start,
+            coordinates: LspCoordinates::Utf16,
+        }),
+        (LspTarget::External { path }, _) => Fact::new(
+            "Outside this worktree",
+            format!(
+                "{}: this card opens files from its own worktree only.",
+                path.display()
+            ),
+        ),
+        (LspTarget::Uri { uri }, _) => Fact::new(
+            "Not a file",
+            format!("{uri}: this card cannot open a location that is not a file."),
+        ),
+    }
+}
+
+fn completion_label(item: &LspCompletionItem) -> String {
+    let mut label = item
+        .kind
+        .map_or("Candidate", completion_kind_label)
+        .to_owned();
+    if item.preselect {
+        label.push_str(" · preselected");
+    }
+    if item.deprecated {
+        label.push_str(" · deprecated");
+    }
+    label
+}
+
+fn completion_value(item: &LspCompletionItem) -> String {
+    match &item.detail {
+        Some(detail) => format!("{}\n{detail}", item.label),
+        None => item.label.clone(),
+    }
+}
+
+fn completion_kind_label(kind: LspCompletionKind) -> &'static str {
+    match kind {
+        LspCompletionKind::Text => "Text",
+        LspCompletionKind::Method => "Method",
+        LspCompletionKind::Function => "Function",
+        LspCompletionKind::Constructor => "Constructor",
+        LspCompletionKind::Field => "Field",
+        LspCompletionKind::Variable => "Variable",
+        LspCompletionKind::Class => "Class",
+        LspCompletionKind::Interface => "Interface",
+        LspCompletionKind::Module => "Module",
+        LspCompletionKind::Property => "Property",
+        LspCompletionKind::Unit => "Unit",
+        LspCompletionKind::Value => "Value",
+        LspCompletionKind::Enum => "Enum",
+        LspCompletionKind::Keyword => "Keyword",
+        LspCompletionKind::Snippet => "Snippet",
+        LspCompletionKind::Color => "Color",
+        LspCompletionKind::File => "File",
+        LspCompletionKind::Reference => "Reference",
+        LspCompletionKind::Folder => "Folder",
+        LspCompletionKind::EnumMember => "Enum member",
+        LspCompletionKind::Constant => "Constant",
+        LspCompletionKind::Struct => "Struct",
+        LspCompletionKind::Event => "Event",
+        LspCompletionKind::Operator => "Operator",
+        LspCompletionKind::TypeParameter => "Type parameter",
     }
 }
 
@@ -950,6 +1392,288 @@ impl SegmentedActions {
     }
 }
 
+/// One fact's row.
+///
+/// An actionless fact keeps the caption-over-selectable-text shape the
+/// inspector has always drawn. A fact that carries a message becomes a
+/// pressable text row, the same control the sidebar uses for its own rows,
+/// because the editor offers no gutter or overlay to host a language server's
+/// results.
+fn fact_element(
+    fact: Fact,
+    spacing: cosmic::cosmic_theme::Spacing,
+) -> Element<'static, InspectorAction> {
+    match fact.action {
+        Some(action) => {
+            let name = format!("{}: {}", fact.label, fact.value);
+            widget::button::custom(
+                widget::column::with_children(vec![
+                    widget::text::caption(fact.label).into(),
+                    fact_body(fact.value, fact.markdown, false),
+                ])
+                .spacing(0)
+                .width(Length::Fill),
+            )
+            .class(theme::Button::Text)
+            .name(name)
+            .padding([0, spacing.space_xxxs])
+            .width(Length::Fill)
+            .on_press(action)
+            .into()
+        }
+        None => widget::column::with_children(vec![
+            widget::text::caption(fact.label).into(),
+            fact_body(fact.value, fact.markdown, true),
+        ])
+        .spacing(0)
+        .width(Length::Fill)
+        .into(),
+    }
+}
+
+fn fact_body(value: String, markdown: bool, selectable: bool) -> Element<'static, InspectorAction> {
+    if markdown {
+        markdown_body(&value)
+    } else if selectable {
+        widget::selectable_text(value)
+            .wrapping(cosmic::iced::widget::text::Wrapping::Word)
+            .width(Length::Fill)
+            .into()
+    } else {
+        // Selectable text inside a button consumes the press that would
+        // activate the row.
+        widget::text::body(value)
+            .wrapping(cosmic::iced::widget::text::Wrapping::Word)
+            .width(Length::Fill)
+            .into()
+    }
+}
+
+/// Renders Markdown into owned widgets.
+///
+/// `markdown::view` returns an element borrowed from the items it renders, and
+/// this module's model is consumed by value, so the crate's own item viewer
+/// cannot be reused here. The parsing and all inline styling still come from
+/// it: `markdown::Text::spans` yields owned, already-styled spans.
+/// Parsing happens on every render: `LspInspectorContext` carries the hover as
+/// the Markdown source the manager delivered, and the whole inspector model is
+/// rebuilt per frame anyway. `repository_widget` caches its parse because a
+/// document's Markdown lives in durable widget state; a hover answer does not.
+fn markdown_body(source: &str) -> Element<'static, InspectorAction> {
+    let settings = widget::markdown::Settings::with_text_size(
+        14.0,
+        widget::markdown::Style::from(cosmic::iced::Theme::Dark),
+    );
+    let items: Vec<widget::markdown::Item> = widget::markdown::parse(source).collect();
+    markdown_items(&items, &settings, 0)
+}
+
+fn markdown_items(
+    items: &[widget::markdown::Item],
+    settings: &widget::markdown::Settings,
+    depth: usize,
+) -> Element<'static, InspectorAction> {
+    // A server's Markdown chooses its own block count and nesting, and both
+    // become the size and the depth of this widget tree.
+    if depth >= MARKDOWN_NESTING_LIMIT {
+        return widget::text::caption("Markdown nested deeper than this is not shown.").into();
+    }
+    let blocks = bounded_indexed(items, "Markdown block", "Markdown blocks", |index, item| {
+        markdown_item(item, settings, index, depth)
+    });
+    widget::column::with_children(blocks)
+        .spacing(settings.spacing.0)
+        .width(Length::Fill)
+        .into()
+}
+
+/// A prefix of `items` rendered by `render`, with a stated remainder when the
+/// server sent more than the inspector will draw. Every fan-out inside a
+/// Markdown block is a count the server chose, so each one is bounded.
+fn bounded<T>(
+    items: &[T],
+    singular: &str,
+    plural: &str,
+    render: impl Fn(&T) -> Element<'static, InspectorAction>,
+) -> Vec<Element<'static, InspectorAction>> {
+    bounded_indexed(items, singular, plural, |_, item| render(item))
+}
+
+fn bounded_indexed<T>(
+    items: &[T],
+    singular: &str,
+    plural: &str,
+    render: impl Fn(usize, &T) -> Element<'static, InspectorAction>,
+) -> Vec<Element<'static, InspectorAction>> {
+    let withheld = items.len().saturating_sub(MARKDOWN_BLOCK_LIMIT);
+    let mut rendered: Vec<Element<'static, InspectorAction>> = items
+        .iter()
+        .take(MARKDOWN_BLOCK_LIMIT)
+        .enumerate()
+        .map(|(index, item)| render(index, item))
+        .collect();
+    if withheld > 0 {
+        rendered.push(markdown_withheld(withheld, singular, plural));
+    }
+    rendered
+}
+
+fn markdown_withheld(
+    withheld: usize,
+    singular: &str,
+    plural: &str,
+) -> Element<'static, InspectorAction> {
+    widget::text::caption(withheld_label(withheld, singular, plural)).into()
+}
+
+fn markdown_item(
+    item: &widget::markdown::Item,
+    settings: &widget::markdown::Settings,
+    index: usize,
+    depth: usize,
+) -> Element<'static, InspectorAction> {
+    use widget::markdown::{Bullet, HeadingLevel, Item};
+
+    match item {
+        Item::Heading(level, text) => widget::container(markdown_text(
+            text,
+            settings,
+            match level {
+                HeadingLevel::H1 => settings.h1_size,
+                HeadingLevel::H2 => settings.h2_size,
+                HeadingLevel::H3 => settings.h3_size,
+                HeadingLevel::H4 => settings.h4_size,
+                HeadingLevel::H5 => settings.h5_size,
+                HeadingLevel::H6 => settings.h6_size,
+            },
+            None,
+        ))
+        .padding(cosmic::iced::padding::top(if index > 0 {
+            settings.text_size.0 / 2.0
+        } else {
+            0.0
+        }))
+        .into(),
+        Item::Paragraph(text) => markdown_text(text, settings, settings.text_size, None),
+        Item::CodeBlock { lines, .. } => widget::container(
+            widget::column::with_children(bounded(lines, "line", "lines", |line| {
+                markdown_text(
+                    line,
+                    settings,
+                    settings.code_size,
+                    Some(settings.style.code_block_font),
+                )
+            }))
+            .width(Length::Fill),
+        )
+        .class(theme::Container::Secondary)
+        .padding(settings.code_size.0 / 2.0)
+        .width(Length::Fill)
+        .into(),
+        Item::List { start, bullets } => widget::column::with_children(bounded_indexed(
+            bullets,
+            "item",
+            "items",
+            |offset, bullet| {
+                let (Bullet::Point { items } | Bullet::Task { items, .. }) = bullet;
+                let marker = match (start, bullet) {
+                    (Some(first), _) => {
+                        format!(
+                            "{}.",
+                            first.saturating_add(u64::try_from(offset).unwrap_or(0))
+                        )
+                    }
+                    (None, Bullet::Task { done: true, .. }) => "☑".to_owned(),
+                    (None, Bullet::Task { done: false, .. }) => "☐".to_owned(),
+                    (None, Bullet::Point { .. }) => "•".to_owned(),
+                };
+                widget::row::with_children(vec![
+                    widget::text::body(marker).size(settings.text_size).into(),
+                    markdown_items(items, settings, depth + 1),
+                ])
+                .spacing(settings.spacing.0 / 2.0)
+                .into()
+            },
+        ))
+        .spacing(settings.spacing.0 / 2.0)
+        .width(Length::Fill)
+        .into(),
+        // The inspector performs no I/O, so an image is named rather than
+        // fetched.
+        Item::Image { url, title, alt } => widget::column::with_children(vec![
+            markdown_text(alt, settings, settings.text_size, None),
+            widget::text::caption(if title.is_empty() {
+                format!("Image: {url}")
+            } else {
+                format!("Image: {title} ({url})")
+            })
+            .into(),
+        ])
+        .spacing(0)
+        .width(Length::Fill)
+        .into(),
+        Item::Quote(quote) => widget::row::with_children(vec![
+            widget::divider::vertical::light().into(),
+            markdown_items(quote, settings, depth + 1),
+        ])
+        .spacing(settings.spacing.0 / 2.0)
+        .into(),
+        Item::Rule => widget::divider::horizontal::light().into(),
+        Item::Table { columns, rows } => {
+            let width = columns.len().min(MARKDOWN_BLOCK_LIMIT);
+            let mut table = vec![
+                widget::row::with_children(
+                    columns
+                        .iter()
+                        .take(width)
+                        .map(|column| markdown_items(&column.header, settings, depth + 1))
+                        .collect::<Vec<_>>(),
+                )
+                .spacing(settings.spacing.0)
+                .into(),
+            ];
+            // A row the parser could not pad holds fewer cells than the
+            // header; rendering it as it stands would spread those cells over
+            // the whole width and misalign every column beside the gap.
+            table.extend(bounded(rows, "row", "rows", |row| {
+                widget::row::with_children(
+                    (0..width)
+                        .map(|column| {
+                            row.cells.get(column).map_or_else(
+                                || widget::text::body("").width(Length::Fill).into(),
+                                |cells| markdown_items(cells, settings, depth + 1),
+                            )
+                        })
+                        .collect::<Vec<_>>(),
+                )
+                .spacing(settings.spacing.0)
+                .into()
+            }));
+            widget::column::with_children(table)
+                .spacing(settings.spacing.0 / 2.0)
+                .width(Length::Fill)
+                .into()
+        }
+    }
+}
+
+fn markdown_text(
+    text: &widget::markdown::Text,
+    settings: &widget::markdown::Settings,
+    size: cosmic::iced::Pixels,
+    font: Option<cosmic::font::Font>,
+) -> Element<'static, InspectorAction> {
+    let mut rich = cosmic::iced::widget::rich_text(text.spans(settings.style))
+        .size(size)
+        .wrapping(cosmic::iced::widget::text::Wrapping::Word)
+        .width(Length::Fill)
+        .on_link_click(InspectorAction::OpenLspHoverLink);
+    if let Some(font) = font {
+        rich = rich.font(font);
+    }
+    rich.into()
+}
+
 pub fn view(model: InspectorModel, width: f32) -> Element<'static, InspectorAction> {
     let spacing = cosmic::theme::spacing();
     let heading = widget::row::with_children(vec![
@@ -979,18 +1703,7 @@ pub fn view(model: InspectorModel, width: f32) -> Element<'static, InspectorActi
         let facts = section
             .facts
             .into_iter()
-            .map(|fact| {
-                widget::column::with_children(vec![
-                    widget::text::caption(fact.label).into(),
-                    widget::selectable_text(fact.value)
-                        .wrapping(cosmic::iced::widget::text::Wrapping::Word)
-                        .width(Length::Fill)
-                        .into(),
-                ])
-                .spacing(0)
-                .width(Length::Fill)
-                .into()
-            })
+            .map(|fact| fact_element(fact, spacing))
             .collect();
         sections.push(InspectorSection::new(section.title, facts).view());
     }
@@ -1028,6 +1741,7 @@ pub fn view(model: InspectorModel, width: f32) -> Element<'static, InspectorActi
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::lsp::{LspCompletionEdit, LspPosition, LspRange};
     use crate::model::{
         BrowserId, BrowserRestoreFidelity, BrowserSession, Existence, Exposure, LaunchRecipe,
         ProjectId, RepositoryView, TerminalId, TerminalSession, WorktreeId,
@@ -1233,35 +1947,7 @@ mod tests {
     #[test]
     fn repository_model_uses_runtime_source_facts_and_recovery_actions() {
         let card = repository_card();
-        let source = RepositoryInspectorContext {
-            file_list: "Ready",
-            file_count: Some(3),
-            file_error: None,
-            selected_path: Some(PathBuf::from("README.md")),
-            selected_status: Some("MM".into()),
-            selected_changed: true,
-            has_staged: true,
-            has_unstaged: true,
-            surface: "Diff",
-            document: "Save conflict",
-            document_error: Some("changed on disk".into()),
-            conflict: true,
-            markdown_mode: None,
-            diff_basis: Some("Staged"),
-            diff_mode: Some("Split"),
-            diff_state: Some("Unavailable"),
-            diff_error: Some("diff failed".into()),
-            diff_additions: Some(3),
-            diff_deletions: Some(2),
-            diff_change: Some((1, 2)),
-            dirty: true,
-            saving: false,
-            can_save: true,
-            can_discard: true,
-            can_reload: true,
-            can_retry_diff: true,
-            can_back: false,
-        };
+        let source = source_context();
         let model = model_for_card(&card, RuntimeStatus::Attention, &[], Some(&source));
         let facts = &model
             .sections
@@ -1400,5 +2086,844 @@ mod tests {
             accessible.root()[0].node().label(),
             Some("Foreground splitter")
         );
+    }
+
+    fn source_context() -> RepositoryInspectorContext {
+        RepositoryInspectorContext {
+            file_list: "Ready",
+            file_count: Some(3),
+            file_error: None,
+            selected_path: Some(PathBuf::from("README.md")),
+            selected_status: Some("MM".into()),
+            selected_changed: true,
+            has_staged: true,
+            has_unstaged: true,
+            surface: "Diff",
+            document: "Save conflict",
+            document_error: Some("changed on disk".into()),
+            conflict: true,
+            markdown_mode: None,
+            diff_basis: Some("Staged"),
+            diff_mode: Some("Split"),
+            diff_state: Some("Unavailable"),
+            diff_error: Some("diff failed".into()),
+            diff_additions: Some(3),
+            diff_deletions: Some(2),
+            diff_change: Some((1, 2)),
+            dirty: true,
+            saving: false,
+            can_save: true,
+            can_discard: true,
+            can_reload: true,
+            can_retry_diff: true,
+            can_back: false,
+        }
+    }
+
+    fn diagnostic(line: u32, severity: LspSeverity, message: &str) -> LspDiagnostic {
+        LspDiagnostic {
+            range: LspRange::new(LspPosition::new(line, 0), LspPosition::new(line, 4)),
+            severity,
+            message: message.to_owned(),
+            source: None,
+            code: None,
+        }
+    }
+
+    fn location(target: LspTarget, coordinates: LspCoordinates) -> LspLocation {
+        LspLocation {
+            target,
+            range: LspRange::new(LspPosition::new(7, 2), LspPosition::new(7, 9)),
+            coordinates,
+        }
+    }
+
+    fn completion(label: &str, preselect: bool, deprecated: bool) -> LspCompletionItem {
+        LspCompletionItem {
+            label: label.to_owned(),
+            kind: Some(LspCompletionKind::Function),
+            detail: Some(format!("fn {label}()")),
+            documentation: None,
+            sort_text: None,
+            filter_text: None,
+            preselect,
+            deprecated,
+            edit: LspCompletionEdit {
+                range: LspRange::default(),
+                replace_range: None,
+                new_text: label.to_owned(),
+                snippet: None,
+            },
+            additional_edits: Vec::new(),
+        }
+    }
+
+    fn lsp_model(card: &CardState, lsp: &LspInspectorContext) -> InspectorModel {
+        let source = source_context();
+        with_lsp(
+            model_for_card(card, RuntimeStatus::Ready, &[], Some(&source)),
+            card.id,
+            lsp,
+        )
+    }
+
+    fn section<'a>(model: &'a InspectorModel, title: &str) -> &'a Section {
+        model
+            .sections
+            .iter()
+            .find(|section| section.title == title)
+            .unwrap_or_else(|| panic!("no {title:?} section in {:?}", model.sections))
+    }
+
+    /// Two of the card's four diff bases compare against committed trees, so a
+    /// file the branch changed and the worktree left alone still has a diff to
+    /// read. The inspector must not withhold what the card itself offers.
+    #[test]
+    fn an_unchanged_file_is_still_offered_a_diff() {
+        let card = repository_card();
+        let source = RepositoryInspectorContext {
+            selected_status: Some("  ".into()),
+            selected_changed: false,
+            has_staged: false,
+            has_unstaged: false,
+            surface: "Editor",
+            ..source_context()
+        };
+        let model = model_for_card(&card, RuntimeStatus::Ready, &[], Some(&source));
+
+        assert!(
+            model.actions.iter().any(|action| action.message
+                == InspectorAction::ShowRepositoryDiff(card.id)
+                && action.label == "Show diff"),
+            "an unchanged file was refused the diff its card offers: {:?}",
+            model.actions
+        );
+
+        // A save in flight is a different refusal and stays in force: the
+        // diff would describe text the write has not finished replacing.
+        let saving = RepositoryInspectorContext {
+            saving: true,
+            ..source
+        };
+        let model = model_for_card(&card, RuntimeStatus::Ready, &[], Some(&saving));
+
+        assert!(
+            !model
+                .actions
+                .iter()
+                .any(|action| action.message == InspectorAction::ShowRepositoryDiff(card.id)),
+            "a diff was offered while the file was being written: {:?}",
+            model.actions
+        );
+    }
+
+    #[test]
+    fn a_quiet_language_server_context_adds_nothing() {
+        let card = repository_card();
+        let source = source_context();
+        let plain = model_for_card(&card, RuntimeStatus::Ready, &[], Some(&source));
+        let decorated = with_lsp(plain.clone(), card.id, &LspInspectorContext::default());
+
+        assert_eq!(plain, decorated);
+    }
+
+    #[test]
+    fn every_fact_a_card_builds_for_itself_stays_inert() {
+        let source = source_context();
+        for model in [
+            model_for_card(&terminal_card(), RuntimeStatus::Ready, &[], None),
+            model_for_card(
+                &browser_card("https://example.test"),
+                RuntimeStatus::Ready,
+                &[],
+                None,
+            ),
+            model_for_card(
+                &repository_card(),
+                RuntimeStatus::Attention,
+                &[],
+                Some(&source),
+            ),
+        ] {
+            for section in &model.sections {
+                for fact in &section.facts {
+                    assert_eq!(
+                        fact.action, None,
+                        "{}/{} gained an action",
+                        section.title, fact.label
+                    );
+                    assert!(
+                        !fact.markdown,
+                        "{}/{} became Markdown",
+                        section.title, fact.label
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn an_actionless_fact_still_renders_the_inert_text_shape() {
+        let spacing = cosmic::theme::spacing();
+        let rendered = Tree::new(&fact_element(Fact::new("Label", "value"), spacing));
+        let historical: Element<'static, InspectorAction> = widget::column::with_children(vec![
+            widget::text::caption("Label").into(),
+            widget::selectable_text("value")
+                .wrapping(cosmic::iced::widget::text::Wrapping::Word)
+                .width(Length::Fill)
+                .into(),
+        ])
+        .spacing(0)
+        .width(Length::Fill)
+        .into();
+
+        assert_eq!(tree_shape(&rendered), tree_shape(&Tree::new(&historical)));
+
+        let activated = Tree::new(&fact_element(
+            Fact::new("Label", "value").activated(InspectorAction::CloseCard(CardId::new())),
+            spacing,
+        ));
+        assert_ne!(
+            tree_shape(&activated),
+            tree_shape(&Tree::new(&historical)),
+            "an activatable fact must not render as inert text"
+        );
+        let pressable: Element<'static, InspectorAction> =
+            widget::button::custom(widget::text::body("value"))
+                .on_press(InspectorAction::CloseCard(CardId::new()))
+                .into();
+        assert_eq!(
+            activated.tag,
+            Tree::new(&pressable).tag,
+            "an activatable fact must render as a pressable control"
+        );
+    }
+
+    #[test]
+    fn an_activatable_fact_carries_exactly_its_own_action() {
+        let card = repository_card();
+        let lsp = LspInspectorContext {
+            diagnostics: vec![
+                diagnostic(0, LspSeverity::Error, "first"),
+                diagnostic(1, LspSeverity::Warning, "second"),
+            ],
+            ..LspInspectorContext::default()
+        };
+        let model = lsp_model(&card, &lsp);
+        let facts = &section(&model, "Diagnostics").facts;
+
+        assert_eq!(
+            facts[0].action,
+            Some(InspectorAction::JumpToLspDiagnostic {
+                card: card.id,
+                at: LspPosition::new(0, 0)
+            })
+        );
+        assert_eq!(
+            facts[1].action,
+            Some(InspectorAction::JumpToLspDiagnostic {
+                card: card.id,
+                at: LspPosition::new(1, 0)
+            })
+        );
+    }
+
+    #[test]
+    fn a_disabled_server_offers_no_restart_while_a_failed_one_does() {
+        let card = repository_card();
+        let disabled = lsp_model(
+            &card,
+            &LspInspectorContext {
+                status: Some(LspStatus::Disabled),
+                ..LspInspectorContext::default()
+            },
+        );
+        assert!(
+            !disabled
+                .actions
+                .iter()
+                .any(|action| action.message == InspectorAction::RestartLanguageServer(card.id)),
+            "a file type with no configured server offered Restart"
+        );
+        let facts = &section(&disabled, "Language server").facts;
+        assert_eq!(facts[0].value, "Not configured");
+        assert!(
+            facts
+                .iter()
+                .any(|fact| fact.value.contains("No language server is configured")),
+            "Disabled must read as a plain statement: {facts:?}"
+        );
+
+        let failed = lsp_model(
+            &card,
+            &LspInspectorContext {
+                status: Some(LspStatus::Failed {
+                    reason: "exited".into(),
+                    stderr_tail: Vec::new(),
+                }),
+                ..LspInspectorContext::default()
+            },
+        );
+        assert!(
+            failed
+                .actions
+                .iter()
+                .any(|action| action.message == InspectorAction::RestartLanguageServer(card.id)),
+            "a failed server hid Restart"
+        );
+    }
+
+    #[test]
+    fn a_failed_server_presents_its_stderr_tail_as_evidence() {
+        let card = repository_card();
+        let model = lsp_model(
+            &card,
+            &LspInspectorContext {
+                status: Some(LspStatus::Failed {
+                    reason: "initialize failed".into(),
+                    stderr_tail: vec!["thread panicked".into(), "at src/main.rs:1".into()],
+                }),
+                ..LspInspectorContext::default()
+            },
+        );
+        let facts = &section(&model, "Language server").facts;
+
+        assert!(
+            facts.iter().any(|fact| fact.value == "initialize failed"),
+            "the failure reason was swallowed: {facts:?}"
+        );
+        let tail = facts
+            .iter()
+            .find(|fact| fact.label == "Server output")
+            .unwrap_or_else(|| panic!("no server output in {facts:?}"));
+        assert!(tail.value.contains("thread panicked"), "{}", tail.value);
+        assert!(tail.value.contains("at src/main.rs:1"), "{}", tail.value);
+    }
+
+    #[test]
+    fn a_ready_server_offers_the_request_actions_and_a_starting_one_does_not() {
+        let card = repository_card();
+        let ready = lsp_model(
+            &card,
+            &LspInspectorContext {
+                status: Some(LspStatus::Ready),
+                ..LspInspectorContext::default()
+            },
+        );
+        for expected in [
+            InspectorAction::RequestLspHover(card.id),
+            InspectorAction::GoToLspDefinition(card.id),
+            InspectorAction::FindLspReferences(card.id),
+        ] {
+            assert!(
+                ready
+                    .actions
+                    .iter()
+                    .any(|action| action.message == expected),
+                "a ready server hid {expected:?}"
+            );
+        }
+        assert_eq!(
+            ready.actions.last().map(|action| &action.message),
+            Some(&InspectorAction::CloseCard(card.id)),
+            "closing the card must stay the last footer action"
+        );
+
+        let starting = lsp_model(
+            &card,
+            &LspInspectorContext {
+                status: Some(LspStatus::Starting),
+                ..LspInspectorContext::default()
+            },
+        );
+        assert!(
+            !starting
+                .actions
+                .iter()
+                .any(|action| action.message == InspectorAction::RequestLspHover(card.id)),
+            "a server still initialising offered a request"
+        );
+    }
+
+    #[test]
+    fn a_long_diagnostic_list_is_bounded_and_says_what_it_withheld() {
+        let card = repository_card();
+        let total = LSP_ROW_LIMIT + 5;
+        let lsp = LspInspectorContext {
+            diagnostics: (0..total)
+                .map(|line| {
+                    diagnostic(
+                        u32::try_from(line).unwrap(),
+                        LspSeverity::Error,
+                        &format!("problem {line}"),
+                    )
+                })
+                .collect(),
+            ..LspInspectorContext::default()
+        };
+        let model = lsp_model(&card, &lsp);
+        let facts = &section(&model, "Diagnostics").facts;
+
+        assert_eq!(
+            facts.iter().filter(|fact| fact.action.is_some()).count(),
+            LSP_ROW_LIMIT,
+            "the rendered rows are not bounded"
+        );
+        let withheld = facts.last().unwrap();
+        assert_eq!(withheld.action, None);
+        assert_eq!(withheld.value, "5 further diagnostics are not shown.");
+    }
+
+    #[test]
+    fn diagnostics_read_in_file_order_and_carry_their_own_position() {
+        let card = repository_card();
+        let lsp = LspInspectorContext {
+            diagnostics: vec![
+                diagnostic(9, LspSeverity::Warning, "later"),
+                diagnostic(2, LspSeverity::Error, "earlier"),
+            ],
+            ..LspInspectorContext::default()
+        };
+        let model = lsp_model(&card, &lsp);
+        let facts = &section(&model, "Diagnostics").facts;
+
+        assert_eq!(facts[0].value, "earlier");
+        assert_eq!(
+            facts[0].action,
+            Some(InspectorAction::JumpToLspDiagnostic {
+                card: card.id,
+                at: LspPosition::new(2, 0)
+            }),
+            "a row must carry the position it displays, not a place in a list \
+             the server can replace before the press arrives"
+        );
+        assert_eq!(facts[1].value, "later");
+        assert_eq!(
+            facts[1].action,
+            Some(InspectorAction::JumpToLspDiagnostic {
+                card: card.id,
+                at: LspPosition::new(9, 0)
+            })
+        );
+        assert!(
+            facts[0].label.starts_with("Error · line 3"),
+            "{:?}",
+            facts[0]
+        );
+    }
+
+    #[test]
+    fn a_location_outside_the_worktree_states_a_reason_instead_of_a_jump() {
+        let card = repository_card();
+        let lsp = LspInspectorContext {
+            locations: Some((
+                LocationKind::Definition,
+                vec![location(
+                    LspTarget::External {
+                        path: PathBuf::from("/usr/lib/std.rs"),
+                    },
+                    LspCoordinates::Scalar,
+                )],
+            )),
+            ..LspInspectorContext::default()
+        };
+        let model = lsp_model(&card, &lsp);
+        let facts = &section(&model, "Definition").facts;
+
+        assert_eq!(facts[0].action, None, "an unopenable file offered a jump");
+        assert!(facts[0].value.contains("/usr/lib/std.rs"), "{:?}", facts[0]);
+        assert!(facts[0].value.contains("worktree"), "{:?}", facts[0]);
+    }
+
+    #[test]
+    fn an_unconverted_location_offers_its_line_without_claiming_a_column() {
+        let card = repository_card();
+        let lsp = LspInspectorContext {
+            locations: Some((
+                LocationKind::References,
+                vec![
+                    location(
+                        LspTarget::Workspace {
+                            path: PathBuf::from("/repo/src/lib.rs"),
+                        },
+                        LspCoordinates::Utf16,
+                    ),
+                    location(
+                        LspTarget::Workspace {
+                            path: PathBuf::from("/repo/src/main.rs"),
+                        },
+                        LspCoordinates::Scalar,
+                    ),
+                    location(
+                        LspTarget::Uri {
+                            uri: "jdt://contents".into(),
+                        },
+                        LspCoordinates::Scalar,
+                    ),
+                ],
+            )),
+            ..LspInspectorContext::default()
+        };
+        let model = lsp_model(&card, &lsp);
+        let facts = &section(&model, "References").facts;
+
+        assert_eq!(
+            facts[0].action,
+            Some(InspectorAction::JumpToLspLocation {
+                card: card.id,
+                path: PathBuf::from("/repo/src/lib.rs"),
+                at: LspPosition::new(7, 2),
+                coordinates: LspCoordinates::Utf16
+            }),
+            "an unconverted location must still open its file, and must say so"
+        );
+        assert!(
+            facts[0].label.contains("column resolved on open"),
+            "an unconverted row must say when its column is settled: {:?}",
+            facts[0]
+        );
+        assert!(
+            !facts[0].label.contains("column 3"),
+            "an unconverted row must not claim a column this editor cannot place: {:?}",
+            facts[0]
+        );
+        assert!(
+            facts[0].label.contains("line 8"),
+            "a line counts the same in either coordinate space: {:?}",
+            facts[0]
+        );
+        assert_eq!(
+            facts[1].action,
+            Some(InspectorAction::JumpToLspLocation {
+                card: card.id,
+                path: PathBuf::from("/repo/src/main.rs"),
+                at: LspPosition::new(7, 2),
+                coordinates: LspCoordinates::Scalar
+            }),
+            "a converted workspace location must stay pressable"
+        );
+        assert!(
+            facts[1].label.contains("column 3"),
+            "a converted row must name the column it can honour: {:?}",
+            facts[1]
+        );
+        assert_eq!(facts[2].action, None, "a non-file URI offered a jump");
+    }
+
+    #[test]
+    fn hover_renders_as_markdown_rather_than_flat_text() {
+        let card = repository_card();
+        let lsp = LspInspectorContext {
+            hover: Some("# Signature\n\n`fn open()` **opens**".into()),
+            ..LspInspectorContext::default()
+        };
+        let model = lsp_model(&card, &lsp);
+        let fact = section(&model, "Hover").facts[0].clone();
+
+        assert!(fact.markdown, "hover was not marked as Markdown: {fact:?}");
+        assert_eq!(fact.action, None);
+
+        let rendered = Tree::new(&fact_element(fact.clone(), cosmic::theme::spacing()));
+        let markdown = Tree::new(&markdown_body(&fact.value));
+        assert_eq!(
+            tree_shape(&rendered.children[1]),
+            tree_shape(&markdown),
+            "the hover body did not render through the Markdown renderer"
+        );
+        assert_eq!(
+            markdown.children.len(),
+            2,
+            "the Markdown was not split into its heading and paragraph"
+        );
+        let flat: Element<'static, InspectorAction> = widget::selectable_text(fact.value.clone())
+            .wrapping(cosmic::iced::widget::text::Wrapping::Word)
+            .width(Length::Fill)
+            .into();
+        assert_ne!(
+            rendered.children[1].tag,
+            Tree::new(&flat).tag,
+            "the hover body rendered as flat text"
+        );
+    }
+
+    #[test]
+    fn completions_lead_with_the_preselected_candidate_and_mark_the_deprecated_one() {
+        let card = repository_card();
+        let lsp = LspInspectorContext {
+            completions: vec![
+                completion("legacy", false, true),
+                completion("preferred", true, false),
+            ],
+            ..LspInspectorContext::default()
+        };
+        let model = lsp_model(&card, &lsp);
+        let facts = &section(&model, "Completions").facts;
+
+        assert!(facts[0].value.starts_with("preferred"), "{:?}", facts[0]);
+        assert_eq!(
+            facts[0].action,
+            Some(InspectorAction::ApplyLspCompletion {
+                card: card.id,
+                index: 1,
+                label: "preferred".to_owned()
+            }),
+            "the message must address the application's own unsorted list, and \
+             fingerprint the item it expects to find there"
+        );
+        assert!(facts[0].label.contains("preselected"), "{:?}", facts[0]);
+        assert!(facts[0].label.contains("Function"), "{:?}", facts[0]);
+        assert!(facts[0].value.contains("fn preferred()"), "{:?}", facts[0]);
+        assert!(facts[1].label.contains("deprecated"), "{:?}", facts[1]);
+    }
+
+    #[test]
+    fn location_and_completion_lists_are_bounded_like_diagnostics() {
+        let card = repository_card();
+        let extra = 3;
+        let lsp = LspInspectorContext {
+            locations: Some((
+                LocationKind::References,
+                (0..LSP_ROW_LIMIT + extra)
+                    .map(|index| {
+                        location(
+                            LspTarget::Workspace {
+                                path: PathBuf::from(format!("/repo/src/{index}.rs")),
+                            },
+                            LspCoordinates::Scalar,
+                        )
+                    })
+                    .collect(),
+            )),
+            completions: (0..LSP_ROW_LIMIT + extra)
+                .map(|index| completion(&format!("candidate{index}"), false, false))
+                .collect(),
+            ..LspInspectorContext::default()
+        };
+        let model = lsp_model(&card, &lsp);
+
+        for (title, noun) in [("References", "locations"), ("Completions", "candidates")] {
+            let facts = &section(&model, title).facts;
+            assert_eq!(
+                facts.iter().filter(|fact| fact.action.is_some()).count(),
+                LSP_ROW_LIMIT,
+                "{title} is not bounded"
+            );
+            assert_eq!(
+                facts.last().unwrap().value,
+                format!("{extra} further {noun} are not shown.")
+            );
+        }
+    }
+
+    #[test]
+    fn a_notice_reads_as_a_plain_statement_and_can_be_dismissed() {
+        let card = repository_card();
+        let model = lsp_model(
+            &card,
+            &LspInspectorContext {
+                notice: Some("hover request cancelled".into()),
+                ..LspInspectorContext::default()
+            },
+        );
+        let facts = &section(&model, "Language server").facts;
+
+        assert_eq!(facts[0].label, "Notice");
+        assert_eq!(facts[0].value, "hover request cancelled");
+        assert_eq!(facts[0].action, None);
+        assert!(
+            model
+                .actions
+                .iter()
+                .any(|action| action.message == InspectorAction::DismissLspResults(card.id)),
+            "results the reader can see must be dismissable"
+        );
+    }
+
+    /// The editor offers no gutter or overlay, so every language-server result
+    /// is rendered by this module. This drives the real `view` over one of each
+    /// kind of result, including Markdown containing every block the parser can
+    /// produce, and builds the widget tree the shell would build.
+    #[test]
+    fn every_language_server_result_builds_its_widget_tree() {
+        let card = repository_card();
+        let lsp = LspInspectorContext {
+            status: Some(LspStatus::Failed {
+                reason: "server exited".into(),
+                stderr_tail: vec!["panicked".into()],
+            }),
+            diagnostics: vec![LspDiagnostic {
+                source: Some("rustc".into()),
+                code: Some("E0308".into()),
+                ..diagnostic(3, LspSeverity::Error, "mismatched types")
+            }],
+            hover: Some(
+                concat!(
+                    "# Heading\n\n",
+                    "A paragraph with `code`, **bold**, and [a link](https://example.test).\n\n",
+                    "```rust\nfn main() {}\n```\n\n",
+                    "- point\n- [x] task\n\n1. first\n2. second\n\n",
+                    "> quoted\n\n---\n\n",
+                    "| a | b |\n| - | - |\n| 1 | 2 |\n\n",
+                    "![alt](https://example.test/image.png \"title\")\n"
+                )
+                .into(),
+            ),
+            locations: Some((
+                LocationKind::References,
+                vec![
+                    location(
+                        LspTarget::Workspace {
+                            path: PathBuf::from("/repo/src/lib.rs"),
+                        },
+                        LspCoordinates::Scalar,
+                    ),
+                    location(
+                        LspTarget::Workspace {
+                            path: PathBuf::from("/repo/src/main.rs"),
+                        },
+                        LspCoordinates::Utf16,
+                    ),
+                    location(
+                        LspTarget::External {
+                            path: PathBuf::from("/usr/lib/std.rs"),
+                        },
+                        LspCoordinates::Scalar,
+                    ),
+                    location(
+                        LspTarget::Uri {
+                            uri: "jdt://contents".into(),
+                        },
+                        LspCoordinates::Scalar,
+                    ),
+                ],
+            )),
+            completions: vec![
+                completion("open", true, false),
+                completion("legacy", false, true),
+            ],
+            notice: Some("references were truncated by the server".into()),
+        };
+        let model = lsp_model(&card, &lsp);
+        let sections = model.sections.len();
+        let rows: usize = model
+            .sections
+            .iter()
+            .map(|section| section.facts.len())
+            .sum();
+
+        let element = view(model, design::INSPECTOR_MIN_WIDTH);
+        let tree = Tree::new(&element);
+
+        assert!(sections >= 7, "expected every result to have a section");
+        assert!(rows >= 12, "expected every result to have a row");
+        assert!(
+            !tree.children.is_empty(),
+            "the inspector rendered no widget tree"
+        );
+    }
+
+    fn tree_depth(tree: &Tree) -> usize {
+        1 + tree.children.iter().map(tree_depth).max().unwrap_or(0)
+    }
+
+    /// A widget tree folded into its per-node state tags, so a test can pin the
+    /// shape a fact renders as rather than only the kind of its root.
+    #[derive(Debug, PartialEq)]
+    struct TreeShape(cosmic::iced::advanced::widget::tree::Tag, Vec<TreeShape>);
+
+    fn tree_shape(tree: &Tree) -> TreeShape {
+        TreeShape(tree.tag, tree.children.iter().map(tree_shape).collect())
+    }
+
+    #[test]
+    fn a_long_markdown_hover_is_bounded_and_says_what_it_withheld() {
+        let extra = 4;
+        let source = (0..MARKDOWN_BLOCK_LIMIT + extra)
+            .map(|index| format!("paragraph {index}\n\n"))
+            .collect::<String>();
+        let tree = Tree::new(&markdown_body(&source));
+
+        assert_eq!(
+            tree.children.len(),
+            MARKDOWN_BLOCK_LIMIT + 1,
+            "the rendered blocks are not bounded"
+        );
+        assert_eq!(
+            withheld_label(extra, "Markdown block", "Markdown blocks"),
+            "4 further Markdown blocks are not shown."
+        );
+        assert_eq!(
+            withheld_label(1, "Markdown block", "Markdown blocks"),
+            "1 further Markdown block is not shown.",
+            "the boundary case must still read as English"
+        );
+    }
+
+    #[test]
+    fn deeply_nested_markdown_stops_at_a_stated_depth() {
+        let source = format!("{}quoted\n", "> ".repeat(40));
+        let bounded = tree_depth(&Tree::new(&markdown_body(&source)));
+        let shallow = tree_depth(&Tree::new(&markdown_body("> quoted\n")));
+
+        assert!(
+            bounded <= shallow + 3 * MARKDOWN_NESTING_LIMIT,
+            "nesting grew the widget tree to depth {bounded}"
+        );
+    }
+
+    /// A code block, a list and a table are each one Markdown item, so the
+    /// per-item block bound says nothing about the rows inside them.
+    #[test]
+    fn the_rows_inside_one_markdown_block_are_bounded_too() {
+        let over = MARKDOWN_BLOCK_LIMIT + 2;
+
+        let code = format!(
+            "```\n{}```\n",
+            (0..over)
+                .map(|line| format!("line {line}\n"))
+                .collect::<String>()
+        );
+        let rendered = Tree::new(&markdown_body(&code));
+        assert_eq!(
+            rendered.children[0].children.len(),
+            MARKDOWN_BLOCK_LIMIT + 1,
+            "a code block's lines are not bounded"
+        );
+
+        let list = (0..over)
+            .map(|item| format!("- item {item}\n"))
+            .collect::<String>();
+        let rendered = Tree::new(&markdown_body(&list));
+        assert_eq!(
+            rendered.children[0].children.len(),
+            MARKDOWN_BLOCK_LIMIT + 1,
+            "a list's items are not bounded"
+        );
+
+        let columns = MARKDOWN_BLOCK_LIMIT + 2;
+        let row = format!("|{}|\n", vec!["x"; columns].join("|"));
+        let table = format!(
+            "|{}|\n|{}|\n{}",
+            (0..columns)
+                .map(|column| format!("h{column}"))
+                .collect::<Vec<_>>()
+                .join("|"),
+            vec!["-"; columns].join("|"),
+            row.repeat(over)
+        );
+        let rendered = Tree::new(&markdown_body(&table));
+        let table = &rendered.children[0];
+        assert_eq!(
+            table.children.len(),
+            MARKDOWN_BLOCK_LIMIT + 2,
+            "a table's rows are not bounded"
+        );
+        for row in &table.children[..=MARKDOWN_BLOCK_LIMIT] {
+            assert_eq!(
+                row.children.len(),
+                MARKDOWN_BLOCK_LIMIT,
+                "a table's columns are not bounded, or a row is not padded to its header"
+            );
+        }
     }
 }

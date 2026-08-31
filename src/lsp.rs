@@ -3252,6 +3252,16 @@ impl LspManager {
         self.generation
     }
 
+    /// The server list this manager was built with.
+    ///
+    /// A manager's server set is fixed at construction and a shutdown is
+    /// one-way, so this is what a caller compares against to decide whether the
+    /// configured list still describes the process it is talking to.
+    #[must_use]
+    pub fn servers(&self) -> &[LanguageServerSettings] {
+        &self.servers
+    }
+
     /// `None` when no configured server claims the extension.
     #[must_use]
     pub fn language_for(&self, path: &Path) -> Option<LspLanguage> {
@@ -3467,6 +3477,31 @@ impl LspManager {
         self.sessions
             .get(&reference.session)
             .map_or(LspStatus::Disabled, SessionHandle::status)
+    }
+
+    /// Converts a protocol UTF-16 position into the editor-native scalar
+    /// position, against `doc`'s current snapshot.
+    ///
+    /// An [`LspLocation`] whose target file was not open at this boundary when
+    /// the answer arrived carries [`LspCoordinates::Utf16`], and its column
+    /// cannot be placed until that file is open. This is what places it once
+    /// it is, using the same conversion every other position goes through, so
+    /// a column landing inside a surrogate pair is refused here exactly as it
+    /// is refused there rather than rounded to a caret the server never named.
+    pub fn scalar_position(
+        &self,
+        doc: LspDocumentId,
+        at: LspPosition,
+    ) -> Result<LspPosition, LspError> {
+        let reference = self
+            .documents
+            .get(&doc)
+            .ok_or(LspError::UnknownDocument(doc.0))?;
+        let snapshot = self
+            .snapshots
+            .latest(&reference.uri)
+            .ok_or(LspError::UnknownDocument(doc.0))?;
+        snapshot.from_utf16(lsp_types::Position::new(at.line, at.character))
     }
 
     /// Replaces the session backing `doc` with a fresh process and re-opens
