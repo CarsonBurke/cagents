@@ -394,12 +394,13 @@ where
     );
     let on_viewport_for_scroll = on_viewport.clone();
     let scrollable = cosmic::widget::scrollable::horizontal(strip)
+        .direction(widget::scrollable::Direction::Horizontal(
+            widget::scrollable::Scrollbar::hidden(),
+        ))
         .id(scroll_id)
         .class(cosmic::style::iced::Scrollable::Minimal)
         .width(Length::Fill)
         .height(Length::Fill)
-        // Minimal native chrome auto-hides the rail when idle and omits it
-        // entirely when the strip does not overflow.
         .on_scroll(move |viewport| {
             on_viewport_for_scroll(WorkspaceViewportEvent::Scrolled(ViewportSample {
                 offset: viewport.absolute_offset().x,

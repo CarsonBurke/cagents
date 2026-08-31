@@ -1150,6 +1150,8 @@ fn user_workspace_message_blocked_while_modal(message: &Message) -> bool {
         | Message::OpenRepository
         | Message::Sidebar(_)
         | Message::FocusCard(_)
+        | Message::ResizeCard { .. }
+        | Message::ResizeCardFinished(_)
         | Message::CloseCard(_)
         | Message::Pan(PanGesture::Begin { .. } | PanGesture::Update { .. })
         | Message::Wheel(_)
@@ -1541,6 +1543,11 @@ pub enum Message {
     Repository(RepositoryAction),
     Sidebar(SidebarAction),
     FocusCard(CardId),
+    ResizeCard {
+        card: CardId,
+        width: f32,
+    },
+    ResizeCardFinished(CardId),
     CloseCard(CardId),
     WindowCloseRequested(window::Id),
     CommitClose(CardId),
@@ -1791,6 +1798,7 @@ struct CardChrome {
     focus_id: widget::Id,
     container_id: widget::Id,
     close_id: widget::Id,
+    resize_id: widget::Id,
     #[cfg(feature = "integrated-browser")]
     browser_back_id: widget::Id,
     #[cfg(feature = "integrated-browser")]
@@ -1803,6 +1811,7 @@ struct CardChrome {
     focused_name: String,
     caption: String,
     unfocused_name: String,
+    resize_name: String,
     close_name: String,
     close_tooltip: String,
 }
@@ -1819,6 +1828,7 @@ impl CardChrome {
             focus_id: workspace_widget::card_focus_id(id),
             container_id: workspace_widget::card_widget_id(id),
             close_id: card_control_id(id, "close"),
+            resize_id: card_control_id(id, "resize"),
             #[cfg(feature = "integrated-browser")]
             browser_back_id: card_control_id(id, "browser.back"),
             #[cfg(feature = "integrated-browser")]
@@ -1831,6 +1841,7 @@ impl CardChrome {
             caption: caption.to_owned(),
             focused_name: card_accessible_name(type_label, title, caption, true),
             unfocused_name: card_accessible_name(type_label, title, caption, false),
+            resize_name: format!("Resize {type_label} column {title}"),
             close_name: format!(
                 "{}, {}",
                 card_close_name(type_label, title),
@@ -2014,7 +2025,11 @@ impl Cagents {
     fn rebuild_workspace(state: &WorkspaceState) -> Workspace {
         let mut workspace = Workspace::new(WorkspaceConfig::default()).unwrap_or_default();
         for card in state.cards.iter().filter(|card| card.existence.is_open()) {
-            let width = CardWidth::Fraction(card.width_fraction.clamp(0.25, 1.0));
+            let width = if card.width_fraction.is_finite() && card.width_fraction > 0.0 {
+                CardWidth::Fraction(card.width_fraction.min(1.0))
+            } else {
+                CardWidth::Fraction(0.7)
+            };
             let index = workspace.cards().len();
             let _ = workspace.add_card(
                 WorkspaceCard::new(card.id, card.title.clone(), width).unwrap_or_else(|_| {
@@ -3832,7 +3847,7 @@ impl Cagents {
             rows.push(widget::divider::horizontal::default().into());
         }
         rows.push(content);
-        widget::container(
+        let surface: Element<'a, Message> = widget::container(
             widget::column::with_children(rows)
                 .spacing(0)
                 .height(Length::Fill),
@@ -3840,7 +3855,46 @@ impl Cagents {
         .class(cosmic::theme::Container::Background)
         .width(Length::Fill)
         .height(Length::Fill)
-        .into()
+        .into();
+        let edge: Element<'a, Message> =
+            if card.is_some_and(|state| matches!(&state.kind, CardKind::Terminal(_))) {
+                let limits = self.workspace.fractional_width_limits();
+                let width = self
+                    .workspace
+                    .geometry()
+                    .card(id)
+                    .map_or(limits.minimum, |card| card.width());
+                let maximum = limits.maximum;
+                let minimum = limits.minimum;
+                Splitter::new(
+                    chrome.map_or_else(
+                        || card_control_id(id, "resize"),
+                        |chrome| chrome.resize_id.clone(),
+                    ),
+                    chrome.map_or_else(
+                        || card.map_or("Resize terminal column", |state| state.title.as_str()),
+                        |chrome| chrome.resize_name.as_str(),
+                    ),
+                    width,
+                    minimum,
+                    maximum,
+                    SplitterEdge::Trailing,
+                    self.modal_is_open(),
+                    move |width| Message::ResizeCard { card: id, width },
+                    move || Message::ResizeCardFinished(id),
+                )
+                .into()
+            } else {
+                widget::container(widget::divider::vertical::default())
+                    .center_x(Length::Fixed(crate::splitter::WIDTH))
+                    .height(Length::Fill)
+                    .into()
+            };
+        widget::row::with_children(vec![surface, edge])
+            .spacing(0)
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .into()
     }
 
     fn synchronize_sidebar_selection(&mut self) {
@@ -5105,6 +5159,50 @@ impl Application for Cagents {
                     Task::none()
                 }
             },
+            Message::ResizeCard { card, width } => {
+                if !self
+                    .card_state(card)
+                    .is_some_and(|state| matches!(&state.kind, CardKind::Terminal(_)))
+                {
+                    return Task::none();
+                }
+                let viewport = self.workspace.viewport_width();
+                if viewport <= f32::EPSILON {
+                    return Task::none();
+                }
+                let limits = self.workspace.fractional_width_limits();
+                let maximum = limits.maximum;
+                let minimum = limits.minimum;
+                let width = width.clamp(minimum, maximum);
+                let fraction = width / viewport;
+                if self.workspace.focused() != Some(card)
+                    && let Err(error) = self.workspace.focus(card)
+                {
+                    self.status = Some(TransientNotice::error(error.to_string()));
+                    return Task::none();
+                }
+                match self
+                    .workspace
+                    .set_card_width(card, CardWidth::Fraction(fraction))
+                {
+                    Ok(update) => {
+                        if let Some(state) = self.card_state_mut(card) {
+                            state.width_fraction = fraction;
+                        }
+                        self.apply_viewport(update, true, false)
+                    }
+                    Err(error) => {
+                        self.status = Some(TransientNotice::error(error.to_string()));
+                        Task::none()
+                    }
+                }
+            }
+            Message::ResizeCardFinished(card) => {
+                if self.card_state(card).is_some() {
+                    self.persist();
+                }
+                Task::none()
+            }
             Message::CloseCard(_) if self.dirty_repository_close.is_some() => Task::none(),
             Message::CloseCard(id) if matches!(self.cards.get(&id), Some(CardRuntime::Repository(runtime)) if runtime.blocks_navigation()) => {
                 self.begin_dirty_close(DirtyCloseIntent::Card(id), VecDeque::from([id]))
@@ -7338,6 +7436,7 @@ mod tests {
             &KeyboardShortcuts::default(),
         );
         assert_eq!(chrome.caption, caption);
+        assert_eq!(chrome.resize_name, "Resize Browser column Example");
         assert_eq!(
             chrome.accessible_name(true),
             "Browser column Example, https://example.test/private%20path, focused"
@@ -7831,6 +7930,8 @@ mod tests {
             Message::NewTerminal,
             Message::NewBrowser,
             Message::FocusCard(card),
+            Message::ResizeCard { card, width: 640.0 },
+            Message::ResizeCardFinished(card),
             Message::FocusAdjacent(crate::workspace::FocusDirection::Right),
             Message::Repository(RepositoryAction::NewTerminal { card }),
             Message::ToggleContextInspector,
@@ -8421,6 +8522,49 @@ mod tests {
             settings_feedback: None,
             status: None,
         }
+    }
+
+    #[test]
+    fn restored_terminal_preserves_a_minimum_width_fraction_on_wide_viewports() {
+        let mut card = terminal_card_state();
+        card.width_fraction = 0.125;
+        let card_id = card.id;
+        let durable = WorkspaceState {
+            cards: vec![card],
+            focused: Some(card_id),
+            ..WorkspaceState::default()
+        };
+
+        let mut workspace = Cagents::rebuild_workspace(&durable);
+        workspace.resize_viewport(3_840.0);
+
+        assert_eq!(
+            workspace.card(card_id).unwrap().width,
+            CardWidth::Fraction(0.125)
+        );
+        assert_eq!(workspace.geometry().card(card_id).unwrap().width(), 480.0);
+    }
+    #[test]
+
+    fn terminal_resize_updates_rendered_and_durable_width_within_bounds() {
+        let mut app = context_inspector_test_app(true);
+        let card = app.workspace.focused().unwrap();
+        app.workspace.resize_viewport(1_000.0);
+
+        let _ = app.update(Message::ResizeCard { card, width: 640.0 });
+        assert_eq!(app.workspace.geometry().card(card).unwrap().width(), 640.0);
+        assert_eq!(app.card_state(card).unwrap().width_fraction, 0.64);
+
+        let _ = app.update(Message::ResizeCard { card, width: 10.0 });
+        assert_eq!(app.workspace.geometry().card(card).unwrap().width(), 480.0);
+        assert_eq!(app.card_state(card).unwrap().width_fraction, 0.48);
+
+        let _ = app.update(Message::ResizeCard {
+            card,
+            width: 5_000.0,
+        });
+        assert_eq!(app.workspace.geometry().card(card).unwrap().width(), 976.0);
+        assert_eq!(app.card_state(card).unwrap().width_fraction, 0.976);
     }
 
     fn task_app_message(task: Task<Message>) -> Message {

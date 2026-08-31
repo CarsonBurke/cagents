@@ -204,7 +204,7 @@ pub struct WorkspaceConfig {
 impl Default for WorkspaceConfig {
     fn default() -> Self {
         Self {
-            gap: 8.0,
+            gap: 0.0,
             leading_padding: 12.0,
             trailing_padding: 12.0,
             overscan: 360.0,
@@ -719,6 +719,21 @@ impl Workspace {
 
     pub fn viewport_width(&self) -> f32 {
         self.viewport_width
+    }
+    pub fn fractional_width_limits(&self) -> WidthLimits {
+        let available = self.viewport_width
+            - self.config.leading_padding
+            - self.config.gap
+            - self.config.reveal_margin;
+        let maximum = if available > 0.0 {
+            available.min(self.config.width_limits.maximum)
+        } else {
+            self.config.width_limits.minimum
+        };
+        WidthLimits {
+            minimum: self.config.width_limits.minimum.min(maximum),
+            maximum,
+        }
     }
 
     pub fn visibility(&self, id: CardId) -> Option<VisibilityClass> {
@@ -1395,7 +1410,7 @@ mod tests {
                     let workspace = workspace_with_widths(&[a, b, c], 800.0);
                     let cards = workspace.geometry().cards();
                     assert_eq!(cards.len(), 3);
-                    assert!(cards.windows(2).all(|pair| pair[0].end < pair[1].start));
+                    assert!(cards.windows(2).all(|pair| pair[0].end <= pair[1].start));
                     assert_eq!(cards[1].start, cards[0].end + workspace.config.gap);
                     assert_eq!(cards[2].start, cards[1].end + workspace.config.gap);
                     assert_eq!(
@@ -1432,7 +1447,7 @@ mod tests {
     }
 
     #[test]
-    fn fractional_columns_reserve_the_gap_and_next_column_peek_at_every_width() {
+    fn fractional_columns_reserve_the_neighbor_peek_at_every_width() {
         for viewport in [320.0, 800.0, 1_920.0] {
             let workspace = workspace_with_widths(&[CardWidth::Fraction(1.0); 3], viewport);
             let cards = workspace.geometry().cards();
