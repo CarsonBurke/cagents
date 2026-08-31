@@ -48,7 +48,7 @@ use crate::{
         RepositoryService, StatusSnapshot, ValidatedBranchName, WorktreeCreationOutcome,
         WorktreeRecord,
     },
-    repository_widget::{self, RepositoryAction, RepositoryRuntime},
+    repository_widget::{self, RepositoryAction, RepositoryRuntime, RepositoryRuntimeStatus},
     session::SessionRuntime,
     settings::{self, AppSettings, KeyboardShortcuts, LinkOpenDestination, LinkOpenGesture},
     sidebar::{
@@ -778,6 +778,34 @@ fn repository_action_allowed_while_modal(action: &RepositoryAction) -> bool {
     )
 }
 
+fn user_workspace_message_blocked_while_modal(message: &Message) -> bool {
+    match message {
+        Message::NewTerminal
+        | Message::OpenRepository
+        | Message::Sidebar(_)
+        | Message::FocusCard(_)
+        | Message::CloseCard(_)
+        | Message::Pan(PanGesture::Begin { .. } | PanGesture::Update { .. })
+        | Message::Wheel(_)
+        | Message::OpenBrowser(_)
+        | Message::NewBrowser
+        | Message::RetryCard(_)
+        | Message::FocusAdjacent(_)
+        | Message::FocusProjectSearch
+        | Message::ToggleContextInspector
+        | Message::ContextInspector(_)
+        | Message::DismissStatus => true,
+        Message::Repository(action) => !repository_action_allowed_while_modal(action),
+        #[cfg(feature = "integrated-browser")]
+        Message::BrowserBack(_)
+        | Message::BrowserForward(_)
+        | Message::BrowserReload(_)
+        | Message::BrowserAddressChanged { .. }
+        | Message::BrowserNavigate(_) => true,
+        _ => false,
+    }
+}
+
 fn focused_save_in_flight(
     focused: Option<CardId>,
     mut is_saving: impl FnMut(CardId) -> bool,
@@ -785,13 +813,64 @@ fn focused_save_in_flight(
     focused.is_some_and(&mut is_saving)
 }
 
+fn resolve_restore_card(
+    preferred: Option<CardId>,
+    current: Option<CardId>,
+    mut exists: impl FnMut(CardId) -> bool,
+) -> Option<CardId> {
+    preferred.filter(|card| exists(*card)).or(current)
+}
+
 fn workspace_navigation_blocked_during_save(message: &Message) -> bool {
     matches!(
         message,
-        Message::FocusCard(_)
+        Message::NewTerminal
+            | Message::NewBrowser
+            | Message::OpenBrowser(_)
+            | Message::FocusCard(_)
             | Message::FocusAdjacent(_)
             | Message::Wheel(_)
             | Message::Pan(PanGesture::Begin { .. } | PanGesture::Update { .. })
+            | Message::ToggleContextInspector
+            | Message::Repository(RepositoryAction::NewTerminal { .. })
+            | Message::Repository(RepositoryAction::MarkdownLink { .. })
+            | Message::Sidebar(
+                SidebarAction::OpenRepositoryPicker
+                    | SidebarAction::OpenRepository { .. }
+                    | SidebarAction::OpenWorktree { .. }
+                    | SidebarAction::OpenPullRequest { .. }
+                    | SidebarAction::NewWorktree { .. }
+                    | SidebarAction::CreatePullRequest { .. }
+                    | SidebarAction::OpenSettings
+            )
+    ) || matches!(
+        message,
+        Message::ContextInspector(action) if context_inspector_action_navigates(action)
+    )
+}
+
+fn context_inspector_action_navigates(action: &InspectorAction) -> bool {
+    matches!(
+        action,
+        InspectorAction::NewTerminalAt(_)
+            | InspectorAction::Retry(_)
+            | InspectorAction::ReloadBrowser(_)
+            | InspectorAction::OpenBrowser(_)
+            | InspectorAction::CreatePullRequest { .. }
+            | InspectorAction::FocusProjectSearch
+    )
+}
+
+fn completion_navigates(message: &Message) -> bool {
+    matches!(
+        message,
+        Message::RepositoryLoaded {
+            open_cards: true,
+            result: Ok(_),
+        } | Message::WorktreeCreated {
+            result: Ok(WorktreeCreationOutcome::Created { .. }),
+            ..
+        } | Message::PullRequestCreated(Ok(PullRequestCreationOutcome::Created { .. }))
     )
 }
 
@@ -1204,7 +1283,7 @@ struct DirtyRepositoryClose {
     remaining: VecDeque<CardId>,
     intent: DirtyCloseIntent,
     focused: DirtyCloseControl,
-    restore_focus: widget::Id,
+    restore_card: Option<CardId>,
 }
 
 impl DirtyRepositoryClose {
@@ -1446,6 +1525,7 @@ pub struct Cagents {
     worktree_dialog: Option<WorktreeDialog>,
     pull_request_dialog: Option<PullRequestDialog>,
     dirty_repository_close: Option<DirtyRepositoryClose>,
+    deferred_navigation: VecDeque<Message>,
     frame_clock: FrameClock,
     inspector: Option<Inspector>,
     inspector_transition: Option<InspectorTransition>,
@@ -2214,6 +2294,10 @@ impl Cagents {
     }
 
     fn retry_card(&mut self, card: CardId) -> Task<Message> {
+        if matches!(self.cards.get(&card), Some(CardRuntime::Repository(runtime)) if runtime.blocks_navigation())
+        {
+            return Task::none();
+        }
         let Some(mut state) = self
             .durable
             .cards
@@ -3538,7 +3622,11 @@ impl Cagents {
         // focus operation makes every breakpoint entry deterministic, even if
         // a focused docked inspector child disappears during the re-layout.
         self.context_inspector_restore_focus = Some(context_inspector_toggle_id());
-        iced::widget::operation::focus(inspector::close_focus_id()).map(cosmic::Action::App)
+        if self.modal_is_open() || self.focused_repository_is_saving() {
+            Task::none()
+        } else {
+            iced::widget::operation::focus(inspector::close_focus_id()).map(cosmic::Action::App)
+        }
     }
 
     fn sync_context_overlay_state(&mut self) -> Task<Message> {
@@ -3594,9 +3682,14 @@ impl Cagents {
             Some(CardRuntime::Browser(browser)) if browser.load_state.is_some() => {
                 InspectorRuntimeStatus::Loading
             }
-            Some(CardRuntime::Terminal(_))
-            | Some(CardRuntime::Repository(_))
-            | Some(CardRuntime::PullRequests(_)) => InspectorRuntimeStatus::Ready,
+            Some(CardRuntime::Terminal(_)) | Some(CardRuntime::PullRequests(_)) => {
+                InspectorRuntimeStatus::Ready
+            }
+            Some(CardRuntime::Repository(runtime)) => match runtime.inspector_runtime_status() {
+                RepositoryRuntimeStatus::Loading => InspectorRuntimeStatus::Loading,
+                RepositoryRuntimeStatus::Ready => InspectorRuntimeStatus::Ready,
+                RepositoryRuntimeStatus::Unavailable => InspectorRuntimeStatus::Attention,
+            },
             #[cfg(feature = "integrated-browser")]
             Some(CardRuntime::Browser(_)) => InspectorRuntimeStatus::Ready,
         }
@@ -3624,44 +3717,122 @@ impl Cagents {
                 } else {
                     Task::none()
                 };
-                let command = match command {
-                    InspectorAction::NewTerminalAt(path) => self.add_terminal(path),
-                    InspectorAction::Retry(card) => cosmic::task::message(Message::RetryCard(card)),
-                    InspectorAction::ReloadBrowser(card) => {
-                        #[cfg(feature = "integrated-browser")]
-                        {
-                            cosmic::task::message(Message::BrowserReload(card))
-                        }
-                        #[cfg(not(feature = "integrated-browser"))]
-                        {
+                let command =
+                    match command {
+                        InspectorAction::NewTerminalAt(path) => self.add_terminal(path),
+                        InspectorAction::Retry(card) => {
                             cosmic::task::message(Message::RetryCard(card))
                         }
-                    }
-                    InspectorAction::OpenBrowser(url) => {
-                        cosmic::task::message(Message::OpenBrowser(url))
-                    }
-                    InspectorAction::RefreshRepositories => {
-                        cosmic::task::message(Message::Sidebar(SidebarAction::Refresh))
-                    }
-                    InspectorAction::CreatePullRequest {
-                        project_id,
-                        repository,
-                    } => {
-                        cosmic::task::message(Message::Sidebar(SidebarAction::CreatePullRequest {
+                        InspectorAction::ReloadBrowser(card) => {
+                            #[cfg(feature = "integrated-browser")]
+                            {
+                                cosmic::task::message(Message::BrowserReload(card))
+                            }
+                            #[cfg(not(feature = "integrated-browser"))]
+                            {
+                                cosmic::task::message(Message::RetryCard(card))
+                            }
+                        }
+                        InspectorAction::OpenBrowser(url) => {
+                            cosmic::task::message(Message::OpenBrowser(url))
+                        }
+                        InspectorAction::RefreshRepository(card) => cosmic::task::message(
+                            Message::Repository(RepositoryAction::RefreshFiles { card }),
+                        ),
+                        InspectorAction::BackToRepositoryFiles(card) => cosmic::task::message(
+                            Message::Repository(RepositoryAction::BackToFiles { card }),
+                        ),
+                        InspectorAction::SaveRepositoryFile(card) => {
+                            cosmic::task::message(Message::Repository(RepositoryAction::Save {
+                                card,
+                                overwrite: false,
+                            }))
+                        }
+                        InspectorAction::OverwriteRepositoryFile(card) => {
+                            cosmic::task::message(Message::Repository(RepositoryAction::Save {
+                                card,
+                                overwrite: true,
+                            }))
+                        }
+                        InspectorAction::ReloadRepositoryFile(card) => {
+                            cosmic::task::message(Message::Repository(RepositoryAction::Reload {
+                                card,
+                            }))
+                        }
+                        InspectorAction::DiscardRepositoryEdits(card) => cosmic::task::message(
+                            Message::Repository(RepositoryAction::DiscardEdits { card }),
+                        ),
+                        InspectorAction::ShowRepositoryEditor(card) => {
+                            cosmic::task::message(Message::Repository(
+                                RepositoryAction::ApplySourceSurface { card, diff: false },
+                            ))
+                        }
+                        InspectorAction::ShowRepositoryDiff(card) => {
+                            cosmic::task::message(Message::Repository(
+                                RepositoryAction::ApplySourceSurface { card, diff: true },
+                            ))
+                        }
+                        InspectorAction::ShowMarkdownEdit(card) => cosmic::task::message(
+                            Message::Repository(RepositoryAction::ApplyMarkdownMode {
+                                card,
+                                preview: false,
+                            }),
+                        ),
+                        InspectorAction::ShowMarkdownPreview(card) => cosmic::task::message(
+                            Message::Repository(RepositoryAction::ApplyMarkdownMode {
+                                card,
+                                preview: true,
+                            }),
+                        ),
+                        InspectorAction::ShowStagedDiff(card) => {
+                            cosmic::task::message(Message::Repository(
+                                RepositoryAction::ApplyDiffBasis { card, staged: true },
+                            ))
+                        }
+                        InspectorAction::ShowUnstagedDiff(card) => cosmic::task::message(
+                            Message::Repository(RepositoryAction::ApplyDiffBasis {
+                                card,
+                                staged: false,
+                            }),
+                        ),
+                        InspectorAction::ShowInlineDiff(card) => {
+                            cosmic::task::message(Message::Repository(
+                                RepositoryAction::ApplyDiffMode { card, split: false },
+                            ))
+                        }
+                        InspectorAction::ShowSplitDiff(card) => {
+                            cosmic::task::message(Message::Repository(
+                                RepositoryAction::ApplyDiffMode { card, split: true },
+                            ))
+                        }
+                        InspectorAction::RetryRepositoryDiff(card) => cosmic::task::message(
+                            Message::Repository(RepositoryAction::RetryDiff { card }),
+                        ),
+                        InspectorAction::PreviousRepositoryChange(card) => cosmic::task::message(
+                            Message::Repository(RepositoryAction::PreviousChange { card }),
+                        ),
+                        InspectorAction::NextRepositoryChange(card) => cosmic::task::message(
+                            Message::Repository(RepositoryAction::NextChange { card }),
+                        ),
+                        InspectorAction::CreatePullRequest {
                             project_id,
                             repository,
-                        }))
-                    }
-                    InspectorAction::FocusProjectSearch => {
-                        cosmic::task::message(Message::FocusProjectSearch)
-                    }
-                    InspectorAction::CloseCard(card) => {
-                        cosmic::task::message(Message::CloseCard(card))
-                    }
-                    InspectorAction::Close
-                    | InspectorAction::Resize { .. }
-                    | InspectorAction::ResizeFinished => unreachable!("handled above"),
-                };
+                        } => cosmic::task::message(Message::Sidebar(
+                            SidebarAction::CreatePullRequest {
+                                project_id,
+                                repository,
+                            },
+                        )),
+                        InspectorAction::FocusProjectSearch => {
+                            cosmic::task::message(Message::FocusProjectSearch)
+                        }
+                        InspectorAction::CloseCard(card) => {
+                            cosmic::task::message(Message::CloseCard(card))
+                        }
+                        InspectorAction::Close
+                        | InspectorAction::Resize { .. }
+                        | InspectorAction::ResizeFinished => unreachable!("handled above"),
+                    };
                 Task::batch([close_overlay, command])
             }
         }
@@ -3671,6 +3842,20 @@ impl Cagents {
         focused_save_in_flight(
             self.workspace.focused(),
             |card| matches!(self.cards.get(&card), Some(CardRuntime::Repository(runtime)) if runtime.is_saving()),
+        )
+    }
+
+    fn release_deferred_navigation_if_unblocked(&mut self) -> Task<Message> {
+        let repository_blocks = self.workspace.focused().is_some_and(|card| {
+            matches!(self.cards.get(&card), Some(CardRuntime::Repository(runtime)) if runtime.blocks_navigation())
+        });
+        if self.modal_is_open() || repository_blocks {
+            return Task::none();
+        }
+        Task::batch(
+            self.deferred_navigation
+                .drain(..)
+                .map(cosmic::task::message),
         )
     }
 
@@ -3685,17 +3870,17 @@ impl Cagents {
                 DirtyCloseIntent::Application(_) => iced::exit().map(cosmic::Action::App),
             };
         };
-        let restore_focus = self
-            .workspace
-            .focused()
-            .map(workspace_widget::card_focus_id)
-            .unwrap_or_else(|| widget::Id::new(TOOLBAR_FOCUS_ID));
+        // Keep a stable workspace fallback even when another modal is
+        // currently underneath. That modal may finish its own close animation
+        // while dirty-close is topmost; Cancel re-checks the live modal tree
+        // and uses this only when none remains.
+        let restore_card = self.workspace.focused();
         self.dirty_repository_close = Some(DirtyRepositoryClose {
             card,
             remaining: cards,
             intent,
             focused: DirtyCloseControl::Cancel,
-            restore_focus,
+            restore_card,
         });
         iced::widget::operation::focus(dirty_close_control_id(card, DirtyCloseControl::Cancel))
             .map(cosmic::Action::App)
@@ -3722,10 +3907,47 @@ impl Cagents {
     }
 
     fn cancel_dirty_close(&mut self) -> Task<Message> {
+        if self.dirty_repository_close.as_ref().is_some_and(|close| {
+            matches!(self.cards.get(&close.card), Some(CardRuntime::Repository(runtime)) if runtime.is_saving())
+        }) {
+            return Task::none();
+        }
         let Some(close) = self.dirty_repository_close.take() else {
             return Task::none();
         };
-        iced::widget::operation::focus(close.restore_focus).map(cosmic::Action::App)
+        let restore_focus = self.nested_modal_focus_target().unwrap_or_else(|| {
+            resolve_restore_card(close.restore_card, self.workspace.focused(), |card| {
+                self.workspace.order().any(|candidate| candidate == card)
+            })
+            .map(workspace_widget::card_focus_id)
+            .unwrap_or_else(|| widget::Id::new(TOOLBAR_FOCUS_ID))
+        });
+        iced::widget::operation::focus(restore_focus).map(cosmic::Action::App)
+    }
+
+    fn nested_modal_focus_target(&self) -> Option<widget::Id> {
+        if self.worktree_dialog.is_some() {
+            Some(worktree_dialog_focus_id())
+        } else if self.inspector.is_some() {
+            Some(settings_close_id())
+        } else if self.pull_request_dialog.is_some() {
+            Some(pull_request_dialog_focus_id())
+        } else if self.context_inspector_is_overlay() {
+            Some(inspector::close_focus_id())
+        } else {
+            None
+        }
+    }
+
+    fn focus_context_overlay_if_exposed(&self) -> Task<Message> {
+        if self.context_inspector_is_overlay()
+            && !self.modal_is_open()
+            && !self.focused_repository_is_saving()
+        {
+            iced::widget::operation::focus(inspector::close_focus_id()).map(cosmic::Action::App)
+        } else {
+            Task::none()
+        }
     }
 
     fn cycle_dirty_close_focus(&mut self, backwards: bool) -> Task<Message> {
@@ -3736,6 +3958,9 @@ impl Cagents {
             self.cards.get(&close.card),
             Some(CardRuntime::Repository(runtime)) if runtime.is_saving()
         );
+        if saving {
+            return Task::none();
+        }
         close.focused = next_dirty_close_control(close.focused, backwards, saving);
         iced::widget::operation::focus(dirty_close_control_id(close.card, close.focused))
             .map(cosmic::Action::App)
@@ -3775,9 +4000,9 @@ impl Cagents {
         }
     }
 
-    fn advance_inspector_transition(&mut self, now: Instant) {
+    fn advance_inspector_transition(&mut self, now: Instant) -> Task<Message> {
         let Some(transition) = self.inspector_transition else {
-            return;
+            return Task::none();
         };
         if transition.is_complete(now) {
             if transition.to == 0.0 {
@@ -3787,6 +4012,7 @@ impl Cagents {
             }
             self.inspector_transition = None;
         }
+        self.focus_context_overlay_if_exposed()
     }
 
     fn save_settings_now(&mut self) -> Result<(), String> {
@@ -3997,6 +4223,7 @@ impl Application for Cagents {
             worktree_dialog: None,
             pull_request_dialog: None,
             dirty_repository_close: None,
+            deferred_navigation: VecDeque::new(),
             frame_clock: FrameClock::default(),
             inspector: None,
             inspector_transition: None,
@@ -4078,8 +4305,17 @@ impl Application for Cagents {
     }
 
     fn update(&mut self, message: Message) -> Task<Message> {
+        if self.modal_is_open() && user_workspace_message_blocked_while_modal(&message) {
+            return Task::none();
+        }
         if self.focused_repository_is_saving() && workspace_navigation_blocked_during_save(&message)
         {
+            return Task::none();
+        }
+        if (self.focused_repository_is_saving() || self.modal_is_open())
+            && completion_navigates(&message)
+        {
+            self.deferred_navigation.push_back(message);
             return Task::none();
         }
         let task = match message {
@@ -4296,6 +4532,17 @@ impl Application for Cagents {
                         self.add_terminal(runtime.descriptor.worktree.clone())
                     }
                     _ => Task::none(),
+                }
+            }
+            Message::Repository(RepositoryAction::MarkdownLink { uri, .. }) => {
+                match Url::parse(&uri) {
+                    Ok(url) => self.open_link(url),
+                    Err(_) => {
+                        self.status = Some(TransientNotice::error(
+                            "could not open Markdown link: invalid absolute URL",
+                        ));
+                        Task::none()
+                    }
                 }
             }
             Message::Repository(action) => {
@@ -4585,15 +4832,16 @@ impl Application for Cagents {
                 self.apply_viewport(update, true, false)
             }
             Message::Frame(frame) => {
-                self.advance_inspector_transition(frame);
+                let inspector_task = self.advance_inspector_transition(frame);
                 let Some(elapsed) = self.frame_clock.elapsed(frame) else {
-                    return Task::none();
+                    let deferred = self.release_deferred_navigation_if_unblocked();
+                    return Task::batch([inspector_task, deferred]);
                 };
                 if self.focused_repository_is_saving() {
-                    return Task::none();
+                    return inspector_task;
                 }
                 let update = self.workspace.tick(elapsed);
-                self.apply_viewport(update, true, false)
+                Task::batch([inspector_task, self.apply_viewport(update, true, false)])
             }
             Message::LifecycleSweep => self.lifecycle_sweep(),
             Message::LifecycleSweepElapsed(generation) => self.lifecycle_sweep_elapsed(generation),
@@ -4641,6 +4889,9 @@ impl Application for Cagents {
             Message::WindowResized(width) => {
                 if width.is_finite() && width > 0.0 {
                     self.window_width = width;
+                }
+                if self.focused_repository_is_saving() && self.context_inspector_is_overlay() {
+                    self.context_inspector_open = false;
                 }
                 self.sync_context_overlay_state()
             }
@@ -4790,7 +5041,7 @@ impl Application for Cagents {
                     Ok(request) => {
                         let project_id = dialog.project_id;
                         let repository = dialog.repository;
-                        cosmic::task::future(async move {
+                        let submit = cosmic::task::future(async move {
                             let result = tokio::task::spawn_blocking(move || {
                                 let _ = std::fs::create_dir_all(&request.managed_root);
                                 RepositoryService::system("git")
@@ -4804,7 +5055,8 @@ impl Application for Cagents {
                                 repository,
                                 result,
                             }
-                        })
+                        });
+                        Task::batch([submit, self.focus_context_overlay_if_exposed()])
                     }
                     Err(error) => {
                         self.status = Some(TransientNotice::error(error.to_string()));
@@ -4914,7 +5166,7 @@ impl Application for Cagents {
                     return iced::widget::operation::focus(pull_request_dialog_focus_id())
                         .map(cosmic::Action::App);
                 }
-                cosmic::task::future(async move {
+                let submit = cosmic::task::future(async move {
                     let result = tokio::task::spawn_blocking(move || {
                         GitHubService::system("gh")
                             .create(&request, &CancellationToken::default())
@@ -4924,7 +5176,8 @@ impl Application for Cagents {
                     .map_err(|error| format!("pull request creator join failed: {error}"))
                     .and_then(|result| result);
                     Message::PullRequestCreated(result)
-                })
+                });
+                Task::batch([submit, self.focus_context_overlay_if_exposed()])
             }
             Message::PullRequestCreated(result) => match result {
                 Ok(PullRequestCreationOutcome::Created { url, .. }) => {
@@ -4951,7 +5204,7 @@ impl Application for Cagents {
             Message::CancelDialog => {
                 self.worktree_dialog = None;
                 self.pull_request_dialog = None;
-                Task::none()
+                self.focus_context_overlay_if_exposed()
             }
             Message::KeyEvent(event) => {
                 if let keyboard::Event::ModifiersChanged(modifiers) = &event {
@@ -4959,6 +5212,11 @@ impl Application for Cagents {
                 }
                 if is_escape_press(&event) {
                     if self.dirty_repository_close.is_some() {
+                        if self.dirty_repository_close.as_ref().is_some_and(|close| {
+                            matches!(self.cards.get(&close.card), Some(CardRuntime::Repository(runtime)) if runtime.is_saving())
+                        }) {
+                            return Task::none();
+                        }
                         return cosmic::task::message(Message::CancelRepositoryClose);
                     }
                     if self.inspector.is_some() {
@@ -5043,9 +5301,11 @@ impl Application for Cagents {
                     .chain(iced::widget::operation::select_all(id))
                     .map(cosmic::Action::App)
             }
+            Message::ToggleContextInspector if self.modal_is_open() => Task::none(),
             Message::ToggleContextInspector => {
                 self.set_context_inspector_open(!self.context_inspector_open)
             }
+            Message::ContextInspector(_) if self.modal_is_open() => Task::none(),
             Message::ContextInspector(action) => self.handle_context_inspector_action(action),
             Message::CloseInspector => {
                 self.close_inspector();
@@ -5070,7 +5330,8 @@ impl Application for Cagents {
         self.synchronize_sidebar_selection();
         // `view` cannot rebuild the chrome cache itself, so refresh it here.
         let chrome = self.sync_chrome();
-        Task::batch([task, chrome])
+        let deferred = self.release_deferred_navigation_if_unblocked();
+        Task::batch([task, chrome, deferred])
     }
 
     fn subscription(&self) -> Subscription<Message> {
@@ -5155,7 +5416,9 @@ impl Application for Cagents {
                 widget::row::with_children(vec![
                     widget::button::standard("Cancel")
                         .id(dirty_close_control_id(card, DirtyCloseControl::Cancel))
-                        .on_press(Message::CancelRepositoryClose)
+                        .on_press_maybe(
+                            (!runtime.is_saving()).then_some(Message::CancelRepositoryClose),
+                        )
                         .into(),
                     widget::button::destructive("Discard")
                         .id(dirty_close_control_id(card, DirtyCloseControl::Discard))
@@ -5715,10 +5978,15 @@ impl Application for Cagents {
             .flatten()
             .and_then(|card| {
                 self.card_state(card).map(|state| {
+                    let repository = match self.cards.get(&card) {
+                        Some(CardRuntime::Repository(runtime)) => Some(runtime.inspector_context()),
+                        _ => None,
+                    };
                     inspector::model_for_card(
                         state,
                         self.inspector_runtime_status(card),
                         &self.sidebar_model.projects,
+                        repository.as_ref(),
                     )
                 })
             });
@@ -6617,21 +6885,29 @@ mod tests {
         let second = CardId::new();
         let third = CardId::new();
         let window = window::Id::unique();
-        let restore_focus = workspace_widget::card_focus_id(origin);
         let mut close = DirtyRepositoryClose {
             card: first,
             remaining: VecDeque::from([second, third]),
             intent: DirtyCloseIntent::Application(window),
             focused: DirtyCloseControl::Save,
-            restore_focus: restore_focus.clone(),
+            restore_card: Some(origin),
         };
         assert_eq!(close.next_unresolved(|card| card == second), Some(second));
         assert_eq!(close.focused, DirtyCloseControl::Cancel);
-        assert_eq!(close.restore_focus, restore_focus);
+        assert_eq!(close.restore_card, Some(origin));
         assert_eq!(close.next_unresolved(|card| card == third), Some(third));
-        assert_eq!(close.restore_focus, workspace_widget::card_focus_id(origin));
+        assert_eq!(close.restore_card, Some(origin));
         assert_eq!(close.next_unresolved(|_| true), None);
         assert_eq!(close.intent, DirtyCloseIntent::Application(window));
+        let replacement = CardId::new();
+        assert_eq!(
+            resolve_restore_card(Some(origin), Some(replacement), |card| card == origin),
+            Some(origin)
+        );
+        assert_eq!(
+            resolve_restore_card(Some(origin), Some(replacement), |_| false),
+            Some(replacement)
+        );
     }
 
     #[test]
@@ -6642,11 +6918,15 @@ mod tests {
         assert!(!focused_save_in_flight(Some(focused), |_| false));
 
         let messages = [
+            Message::NewTerminal,
+            Message::NewBrowser,
             Message::FocusCard(CardId::new()),
             Message::FocusAdjacent(crate::workspace::FocusDirection::Right),
             Message::Pan(PanGesture::Begin { pointer_x: 10.0 }),
             Message::Pan(PanGesture::Update { pointer_x: 20.0 }),
             Message::Wheel(WheelDelta::Pixels { x: 1.0, y: 0.0 }),
+            Message::ToggleContextInspector,
+            Message::Repository(RepositoryAction::NewTerminal { card: focused }),
         ];
         assert!(
             messages
@@ -6656,6 +6936,18 @@ mod tests {
         assert!(!workspace_navigation_blocked_during_save(&Message::Pan(
             PanGesture::End
         )));
+
+        let repository = GitHubRepoKey::new("github.com", None, "owner", "repo").unwrap();
+        let key = crate::github::PullRequestKey::new(repository, 45).unwrap();
+        assert!(completion_navigates(&Message::PullRequestCreated(Ok(
+            PullRequestCreationOutcome::Created {
+                key,
+                url: Url::parse("https://github.com/owner/repo/pull/45").unwrap(),
+                pull_request: None,
+                normalization_warning: None,
+            }
+        ))));
+        assert!(!completion_navigates(&Message::ExternalLinkOpened(Ok(()))));
     }
 
     #[test]
@@ -6708,6 +7000,102 @@ mod tests {
                 result: Err(crate::editor::FileIoError::Io("fixture".into())),
             }
         ));
+        for message in [
+            Message::NewTerminal,
+            Message::NewBrowser,
+            Message::FocusCard(card),
+            Message::FocusAdjacent(crate::workspace::FocusDirection::Right),
+            Message::Repository(RepositoryAction::NewTerminal { card }),
+            Message::ToggleContextInspector,
+        ] {
+            assert!(user_workspace_message_blocked_while_modal(&message));
+        }
+        assert!(!user_workspace_message_blocked_while_modal(
+            &Message::Repository(RepositoryAction::FileLoaded {
+                identity: repository_widget::AsyncIdentity {
+                    card,
+                    worktree: PathBuf::from("/repo"),
+                    path: PathBuf::from("file.txt"),
+                    generation: 1,
+                },
+                result: Err(crate::editor::FileIoError::Io("fixture".into())),
+            })
+        ));
+    }
+
+    #[test]
+    fn first_frame_after_immediate_settings_close_releases_deferred_navigation() {
+        let mut app = context_inspector_test_app(false);
+        let repository = GitHubRepoKey::new("github.com", None, "owner", "repo").unwrap();
+        let key = crate::github::PullRequestKey::new(repository, 45).unwrap();
+        app.deferred_navigation
+            .push_back(Message::PullRequestCreated(Ok(
+                PullRequestCreationOutcome::Created {
+                    key,
+                    url: Url::parse("https://github.com/owner/repo/pull/45").unwrap(),
+                    pull_request: None,
+                    normalization_warning: None,
+                },
+            )));
+        app.inspector = Some(Inspector::Settings);
+        app.inspector_transition = Some(InspectorTransition {
+            started_at: Instant::now() - DIALOG_TRANSITION_DURATION,
+            from: 0.05,
+            to: 0.0,
+        });
+        app.frame_clock.reset();
+
+        let _released = app.update(Message::Frame(Instant::now()));
+
+        assert!(app.inspector.is_none());
+        assert!(app.inspector_transition.is_none());
+        assert!(app.deferred_navigation.is_empty());
+    }
+
+    #[test]
+    fn dirty_close_restores_the_actual_underlying_modal_focus_target() {
+        let mut app = context_inspector_test_app(true);
+        let project = ProjectId::new();
+        app.worktree_dialog = Some(WorktreeDialog {
+            project_id: project,
+            repository: PathBuf::from("/repo"),
+            branch: String::new(),
+            base: "main".into(),
+            destination: "/worktrees".into(),
+        });
+        assert_eq!(
+            app.nested_modal_focus_target().unwrap().to_string(),
+            worktree_dialog_focus_id().to_string()
+        );
+
+        app.worktree_dialog = None;
+        app.inspector = Some(Inspector::Settings);
+        assert_eq!(
+            app.nested_modal_focus_target().unwrap().to_string(),
+            settings_close_id().to_string()
+        );
+
+        app.inspector = None;
+        app.pull_request_dialog = Some(PullRequestDialog {
+            repository: GitHubRepoKey::new("github.com", None, "owner", "repo").unwrap(),
+            base: "main".into(),
+            head: "topic".into(),
+            title: String::new(),
+            body: String::new(),
+            draft: false,
+        });
+        assert_eq!(
+            app.nested_modal_focus_target().unwrap().to_string(),
+            pull_request_dialog_focus_id().to_string()
+        );
+
+        app.pull_request_dialog = None;
+        app.window_width = design::WIDE_BREAKPOINT - 1.0;
+        assert!(app.context_inspector_is_overlay());
+        assert_eq!(
+            app.nested_modal_focus_target().unwrap().to_string(),
+            inspector::close_focus_id().to_string()
+        );
     }
 
     #[test]
@@ -7192,6 +7580,8 @@ mod tests {
             github_repositories: HashMap::new(),
             worktree_dialog: None,
             pull_request_dialog: None,
+            dirty_repository_close: None,
+            deferred_navigation: VecDeque::new(),
             frame_clock: FrameClock::default(),
             inspector: None,
             inspector_transition: None,

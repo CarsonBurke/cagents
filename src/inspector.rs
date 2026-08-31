@@ -25,6 +25,7 @@ use crate::{
         BrowserRestoreFidelity, CardId, CardKind, CardState, ProjectId, Residency,
         TerminalContinuity,
     },
+    repository_widget::RepositoryInspectorContext,
     sidebar::{SidebarProject, SidebarWorktree},
 };
 
@@ -243,6 +244,7 @@ pub enum RuntimeStatus {
     Ready,
     Restoring,
     Loading,
+    Attention,
     Unavailable,
 }
 
@@ -253,6 +255,7 @@ impl RuntimeStatus {
             Self::Ready => "Ready",
             Self::Restoring => "Restoring",
             Self::Loading => "Loading",
+            Self::Attention => "Needs attention",
             Self::Unavailable => "Unavailable",
         }
     }
@@ -269,7 +272,23 @@ pub enum InspectorAction {
     Retry(CardId),
     ReloadBrowser(CardId),
     OpenBrowser(Url),
-    RefreshRepositories,
+    RefreshRepository(CardId),
+    BackToRepositoryFiles(CardId),
+    SaveRepositoryFile(CardId),
+    OverwriteRepositoryFile(CardId),
+    ReloadRepositoryFile(CardId),
+    DiscardRepositoryEdits(CardId),
+    ShowRepositoryEditor(CardId),
+    ShowRepositoryDiff(CardId),
+    ShowMarkdownEdit(CardId),
+    ShowMarkdownPreview(CardId),
+    ShowStagedDiff(CardId),
+    ShowUnstagedDiff(CardId),
+    ShowInlineDiff(CardId),
+    ShowSplitDiff(CardId),
+    RetryRepositoryDiff(CardId),
+    PreviousRepositoryChange(CardId),
+    NextRepositoryChange(CardId),
     CreatePullRequest {
         project_id: ProjectId,
         repository: PathBuf,
@@ -353,6 +372,7 @@ pub fn model_for_card(
     card: &CardState,
     runtime: RuntimeStatus,
     projects: &[SidebarProject],
+    repository_runtime: Option<&RepositoryInspectorContext>,
 ) -> InspectorModel {
     let (kind, icon) = match &card.kind {
         CardKind::Terminal(_) => ("Terminal", "utilities-terminal-symbolic"),
@@ -467,10 +487,188 @@ pub fn model_for_card(
             );
             actions.push(Action::new(
                 format!("{}.refresh", card.id),
-                "Refresh",
+                "Refresh files",
                 "view-refresh-symbolic",
-                InspectorAction::RefreshRepositories,
+                InspectorAction::RefreshRepository(card.id),
             ));
+            if let Some(source) = repository_runtime {
+                let mut facts = vec![
+                    Fact::new("Surface", source.surface),
+                    Fact::new("Files", source.file_list),
+                ];
+                if let Some(count) = source.file_count {
+                    facts.push(Fact::new("File count", count.to_string()));
+                }
+                if let Some(error) = &source.file_error {
+                    facts.push(Fact::new("File-list error", error));
+                }
+                if let Some(path) = &source.selected_path {
+                    facts.push(Fact::new("Selected file", path.display().to_string()));
+                    facts.push(Fact::new(
+                        "File status",
+                        source.selected_status.as_deref().unwrap_or("Clean"),
+                    ));
+                    facts.push(Fact::new("Document", source.document));
+                }
+                if let Some(error) = &source.document_error {
+                    facts.push(Fact::new("Document error", error));
+                }
+                if let Some(mode) = source.markdown_mode {
+                    facts.push(Fact::new("Markdown", mode));
+                }
+                if let Some(basis) = source.diff_basis {
+                    facts.push(Fact::new("Diff basis", basis));
+                }
+                if let Some(mode) = source.diff_mode {
+                    facts.push(Fact::new("Diff layout", mode));
+                }
+                if let Some(state) = source.diff_state {
+                    facts.push(Fact::new("Diff", state));
+                }
+                if let Some(error) = &source.diff_error {
+                    facts.push(Fact::new("Diff error", error));
+                }
+                if let (Some(additions), Some(deletions)) =
+                    (source.diff_additions, source.diff_deletions)
+                {
+                    facts.push(Fact::new("Changes", format!("+{additions}  −{deletions}")));
+                }
+                if let Some((current, total)) = source.diff_change {
+                    facts.push(Fact::new("Change", format!("{current} of {total}")));
+                }
+                sections.push(Section::new("Source", facts));
+                if source.can_back {
+                    actions.push(Action::new(
+                        format!("{}.files", card.id),
+                        "Back to files",
+                        "go-previous-symbolic",
+                        InspectorAction::BackToRepositoryFiles(card.id),
+                    ));
+                }
+                if source.selected_changed && source.surface == "Editor" && !source.saving {
+                    actions.push(Action::new(
+                        format!("{}.diff", card.id),
+                        "Show diff",
+                        "text-x-generic-symbolic",
+                        InspectorAction::ShowRepositoryDiff(card.id),
+                    ));
+                } else if source.surface == "Diff" {
+                    actions.push(Action::new(
+                        format!("{}.editor", card.id),
+                        "Show editor",
+                        "document-edit-symbolic",
+                        InspectorAction::ShowRepositoryEditor(card.id),
+                    ));
+                }
+                match source.markdown_mode {
+                    Some("Edit") => actions.push(Action::new(
+                        format!("{}.markdown-preview", card.id),
+                        "Preview Markdown",
+                        "document-preview-symbolic",
+                        InspectorAction::ShowMarkdownPreview(card.id),
+                    )),
+                    Some("Preview") => actions.push(Action::new(
+                        format!("{}.markdown-edit", card.id),
+                        "Edit Markdown",
+                        "document-edit-symbolic",
+                        InspectorAction::ShowMarkdownEdit(card.id),
+                    )),
+                    _ => {}
+                }
+                if source.surface == "Diff" {
+                    let opposite_basis = match source.diff_basis {
+                        Some("Staged") if source.has_unstaged => Some((
+                            "Show unstaged diff",
+                            InspectorAction::ShowUnstagedDiff(card.id),
+                        )),
+                        Some("Unstaged") if source.has_staged => {
+                            Some(("Show staged diff", InspectorAction::ShowStagedDiff(card.id)))
+                        }
+                        _ => None,
+                    };
+                    if let Some((label, message)) = opposite_basis {
+                        actions.push(Action::new(
+                            format!("{}.diff-basis", card.id),
+                            label,
+                            "vcs-diff-symbolic",
+                            message,
+                        ));
+                    }
+                    actions.push(Action::new(
+                        format!("{}.diff-layout", card.id),
+                        if source.diff_mode == Some("Split") {
+                            "Show inline diff"
+                        } else {
+                            "Show split diff"
+                        },
+                        "view-split-left-right-symbolic",
+                        if source.diff_mode == Some("Split") {
+                            InspectorAction::ShowInlineDiff(card.id)
+                        } else {
+                            InspectorAction::ShowSplitDiff(card.id)
+                        },
+                    ));
+                    if source.diff_change.is_some() {
+                        actions.push(Action::new(
+                            format!("{}.previous-change", card.id),
+                            "Previous change",
+                            "go-up-symbolic",
+                            InspectorAction::PreviousRepositoryChange(card.id),
+                        ));
+                        actions.push(Action::new(
+                            format!("{}.next-change", card.id),
+                            "Next change",
+                            "go-down-symbolic",
+                            InspectorAction::NextRepositoryChange(card.id),
+                        ));
+                    }
+                    if source.can_retry_diff {
+                        actions.push(Action::new(
+                            format!("{}.retry-diff", card.id),
+                            "Retry diff",
+                            "view-refresh-symbolic",
+                            InspectorAction::RetryRepositoryDiff(card.id),
+                        ));
+                    }
+                }
+                if source.can_discard {
+                    actions.push(Action::new(
+                        format!("{}.discard", card.id),
+                        "Discard changes",
+                        "edit-undo-symbolic",
+                        InspectorAction::DiscardRepositoryEdits(card.id),
+                    ));
+                }
+                if source.can_reload && !source.saving {
+                    actions.push(Action::new(
+                        format!("{}.reload", card.id),
+                        "Reload from disk",
+                        "view-refresh-symbolic",
+                        InspectorAction::ReloadRepositoryFile(card.id),
+                    ));
+                }
+                if source.conflict && !source.saving {
+                    actions.push(
+                        Action::new(
+                            format!("{}.overwrite", card.id),
+                            "Overwrite file",
+                            "document-save-symbolic",
+                            InspectorAction::OverwriteRepositoryFile(card.id),
+                        )
+                        .primary(),
+                    );
+                } else if source.can_save {
+                    actions.push(
+                        Action::new(
+                            format!("{}.save", card.id),
+                            "Save file",
+                            "document-save-symbolic",
+                            InspectorAction::SaveRepositoryFile(card.id),
+                        )
+                        .primary(),
+                    );
+                }
+            }
             if let Some(project) = projects.iter().find(|project| project.id == view.project) {
                 actions.push(Action::new(
                     format!("{}.pull-request", card.id),
@@ -817,7 +1015,7 @@ mod tests {
     use super::*;
     use crate::model::{
         BrowserId, BrowserRestoreFidelity, BrowserSession, Existence, Exposure, LaunchRecipe,
-        TerminalId, TerminalSession,
+        ProjectId, RepositoryView, TerminalId, TerminalSession,
     };
     use crate::splitter::{Edge as SplitterEdge, Splitter};
     use cosmic::iced::{
@@ -876,6 +1074,23 @@ mod tests {
         }
     }
 
+    fn repository_card() -> CardState {
+        CardState {
+            id: CardId::new(),
+            generation: 1,
+            title: "Repository".into(),
+            width_fraction: 0.7,
+            kind: CardKind::Repository(RepositoryView {
+                project: ProjectId::new(),
+                repository: PathBuf::from("/repo/.git"),
+                worktree: PathBuf::from("/repo"),
+            }),
+            existence: Existence::Open,
+            exposure: Exposure::Visible,
+            residency: Residency::Hot,
+        }
+    }
+
     #[test]
     fn browser_fact_uses_the_typed_sanitized_location_projection() {
         let model = model_for_card(
@@ -884,6 +1099,7 @@ mod tests {
             ),
             RuntimeStatus::Ready,
             &[],
+            None,
         );
         let presented = &model
             .sections
@@ -906,9 +1122,93 @@ mod tests {
     }
 
     #[test]
+    fn repository_model_uses_runtime_source_facts_and_recovery_actions() {
+        let card = repository_card();
+        let source = RepositoryInspectorContext {
+            file_list: "Ready",
+            file_count: Some(3),
+            file_error: None,
+            selected_path: Some(PathBuf::from("README.md")),
+            selected_status: Some("MM".into()),
+            selected_changed: true,
+            has_staged: true,
+            has_unstaged: true,
+            surface: "Diff",
+            document: "Save conflict",
+            document_error: Some("changed on disk".into()),
+            conflict: true,
+            markdown_mode: None,
+            diff_basis: Some("Staged"),
+            diff_mode: Some("Split"),
+            diff_state: Some("Unavailable"),
+            diff_error: Some("diff failed".into()),
+            diff_additions: Some(3),
+            diff_deletions: Some(2),
+            diff_change: Some((1, 2)),
+            dirty: true,
+            saving: false,
+            can_save: true,
+            can_discard: true,
+            can_reload: true,
+            can_retry_diff: true,
+            can_back: false,
+        };
+        let model = model_for_card(&card, RuntimeStatus::Attention, &[], Some(&source));
+        let facts = &model
+            .sections
+            .iter()
+            .find(|section| section.title == "Source")
+            .unwrap()
+            .facts;
+        assert!(
+            facts
+                .iter()
+                .any(|fact| fact.label == "Selected file" && fact.value == "README.md")
+        );
+        assert!(
+            facts
+                .iter()
+                .any(|fact| fact.label == "Document" && fact.value == "Save conflict")
+        );
+        assert!(
+            facts
+                .iter()
+                .any(|fact| fact.label == "Changes" && fact.value == "+3  −2")
+        );
+        assert!(model.actions.iter().any(|action| matches!(
+            action.message,
+            InspectorAction::OverwriteRepositoryFile(id) if id == card.id
+        )));
+        assert!(model.actions.iter().any(|action| matches!(
+            action.message,
+            InspectorAction::ReloadRepositoryFile(id) if id == card.id
+        )));
+        assert!(model.actions.iter().any(|action| matches!(
+            action.message,
+            InspectorAction::ShowUnstagedDiff(id) if id == card.id
+        )));
+        assert!(model.actions.iter().any(|action| matches!(
+            action.message,
+            InspectorAction::RetryRepositoryDiff(id) if id == card.id
+        )));
+        assert!(
+            !model
+                .actions
+                .iter()
+                .any(|action| matches!(action.message, InspectorAction::Retry(_)))
+        );
+        assert!(
+            !model
+                .actions
+                .iter()
+                .any(|action| matches!(action.message, InspectorAction::SaveRepositoryFile(_)))
+        );
+    }
+
+    #[test]
     fn terminal_model_exposes_identity_context_and_real_actions() {
         let card = terminal_card();
-        let model = model_for_card(&card, RuntimeStatus::Ready, &[]);
+        let model = model_for_card(&card, RuntimeStatus::Ready, &[], None);
         assert_eq!(model.card_id, card.id);
         assert_eq!(model.kind, "Terminal");
         assert!(
@@ -929,7 +1229,7 @@ mod tests {
     #[test]
     fn unavailable_runtime_adds_retry_without_replacing_context() {
         let card = terminal_card();
-        let model = model_for_card(&card, RuntimeStatus::Unavailable, &[]);
+        let model = model_for_card(&card, RuntimeStatus::Unavailable, &[], None);
         assert!(
             model.actions.iter().any(
                 |action| matches!(action.message, InspectorAction::Retry(id) if id == card.id)
