@@ -19,8 +19,8 @@ use crate::{
         load_repository_diff,
     },
     editor::{
-        FileContent, FileIoError, ReadOnlyReason, SaveOutcome, load_file, save_file,
-        validate_repo_path,
+        FileContent, FileIoError, ReadOnlyReason, SaveDurability, SaveOutcome, load_file,
+        save_file, validate_repo_path,
     },
     model::{CardId, RepositoryView},
 };
@@ -278,6 +278,7 @@ struct EditorDocument {
     active_save: Option<SaveTicket>,
     conflict: bool,
     error: Option<String>,
+    durability_warning: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -307,6 +308,7 @@ impl EditorDocument {
             active_save: None,
             conflict: false,
             error: None,
+            durability_warning: None,
         }
     }
 
@@ -523,6 +525,105 @@ impl RepositoryRuntime {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn post_persist_failure_fixture(card: CardId) -> (Self, RepositoryAction) {
+        let path = PathBuf::from("notes.txt");
+        let descriptor = RepositoryView {
+            project: crate::model::ProjectId::new(),
+            repository: PathBuf::from("/repo/.git"),
+            worktree: PathBuf::from("/repo"),
+        };
+        let mut runtime = Self::new(descriptor);
+        runtime.generation = 1;
+        runtime.files = FileListState::Ready(vec![RepositoryFile {
+            path: path.clone(),
+            staged_old_path: None,
+            unstaged_old_path: None,
+            staged: false,
+            unstaged: true,
+            status: Some(" M".into()),
+        }]);
+        runtime.selected = runtime.file(&path).cloned();
+        let identity = AsyncIdentity {
+            card,
+            worktree: PathBuf::from("/repo"),
+            path: path.clone(),
+            generation: 1,
+        };
+        let mut document = EditorDocument::new(path, "A\n".into(), blake3::hash(b"A\n"), false);
+        document.content = text_editor::Content::with_text("A\n");
+        document.dirty = false;
+        document.revision = 2;
+        document.active_save = Some(SaveTicket {
+            id: 1,
+            identity: identity.clone(),
+            revision: 1,
+            snapshot: "B\n".into(),
+        });
+        runtime.document = DocumentState::Editable(document);
+        let completion = RepositoryAction::SaveFinished {
+            identity,
+            ticket: 1,
+            revision: 1,
+            saved_text: "B\n".into(),
+            result: Ok(SaveOutcome::Saved {
+                content_hash: blake3::hash(b"B\n"),
+                durability: SaveDurability::Unconfirmed {
+                    error: "injected parent sync failure".into(),
+                },
+            }),
+        };
+        (runtime, completion)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn post_persist_warning_fixture(card: CardId) -> Self {
+        let (mut runtime, completion) = Self::post_persist_failure_fixture(card);
+        let _ = runtime.update(completion);
+        runtime
+    }
+
+    #[cfg(test)]
+    pub(crate) fn durable_active_save_completion(&self) -> RepositoryAction {
+        let DocumentState::Editable(document) = &self.document else {
+            panic!("test fixture requires an editable document");
+        };
+        let ticket = document
+            .active_save
+            .as_ref()
+            .expect("test fixture requires an active save");
+        RepositoryAction::SaveFinished {
+            identity: ticket.identity.clone(),
+            ticket: ticket.id,
+            revision: ticket.revision,
+            saved_text: ticket.snapshot.clone(),
+            result: Ok(SaveOutcome::Saved {
+                content_hash: blake3::hash(ticket.snapshot.as_bytes()),
+                durability: SaveDurability::Durable,
+            }),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn failed_active_save_completion(&self) -> RepositoryAction {
+        let DocumentState::Editable(document) = &self.document else {
+            panic!("test fixture requires an editable document");
+        };
+        let ticket = document
+            .active_save
+            .as_ref()
+            .expect("test fixture requires an active save");
+        RepositoryAction::SaveFinished {
+            identity: ticket.identity.clone(),
+            ticket: ticket.id,
+            revision: ticket.revision,
+            saved_text: ticket.snapshot.clone(),
+            result: Err(FileIoError::Io(
+                "injected retry failure before persist".into(),
+            )),
+        }
+    }
+
     pub fn initial_load(&mut self, card: CardId) -> Task<RepositoryAction> {
         self.files = FileListState::Loading;
         self.file_viewport = ListViewport::default();
@@ -541,7 +642,7 @@ impl RepositoryRuntime {
     }
 
     pub fn can_save(&self) -> bool {
-        matches!(&self.document, DocumentState::Editable(document) if document.dirty && document.active_save.is_none())
+        matches!(&self.document, DocumentState::Editable(document) if (document.dirty || document.durability_warning.is_some()) && document.active_save.is_none())
     }
 
     pub fn is_saving(&self) -> bool {
@@ -549,7 +650,9 @@ impl RepositoryRuntime {
     }
 
     pub fn blocks_navigation(&self) -> bool {
-        self.is_dirty() || self.is_saving()
+        self.is_dirty()
+            || self.is_saving()
+            || matches!(&self.document, DocumentState::Editable(document) if document.durability_warning.is_some())
     }
 
     pub fn inspector_context(&self) -> RepositoryInspectorContext {
@@ -565,6 +668,9 @@ impl RepositoryRuntime {
             DocumentState::Loading(_) => "Loading",
             DocumentState::Editable(_) if self.is_saving() => "Saving",
             DocumentState::Editable(document) if document.conflict => "Save conflict",
+            DocumentState::Editable(document) if document.durability_warning.is_some() => {
+                "Durability warning"
+            }
             DocumentState::Editable(document) if document.error.is_some() => "Save failed",
             DocumentState::Editable(_) if self.is_dirty() => "Unsaved changes",
             DocumentState::Editable(_) => "Editable",
@@ -572,7 +678,13 @@ impl RepositoryRuntime {
             DocumentState::Failed { .. } => "Unavailable",
         };
         let (document_error, conflict) = match &self.document {
-            DocumentState::Editable(document) => (document.error.clone(), document.conflict),
+            DocumentState::Editable(document) => (
+                document
+                    .error
+                    .clone()
+                    .or_else(|| document.durability_warning.clone()),
+                document.conflict,
+            ),
             DocumentState::Failed { message, .. } => (Some(message.clone()), false),
             _ => (None, false),
         };
@@ -660,7 +772,9 @@ impl RepositoryRuntime {
             saving: self.is_saving(),
             can_save: self.can_save(),
             can_discard: self.is_dirty() && !self.is_saving(),
-            can_reload: conflict || matches!(&self.document, DocumentState::Failed { .. }),
+            can_reload: conflict
+                || matches!(&self.document, DocumentState::Editable(document) if document.durability_warning.is_some())
+                || matches!(&self.document, DocumentState::Failed { .. }),
             can_retry_diff,
             can_back: selected && !self.blocks_navigation(),
         }
@@ -696,7 +810,10 @@ impl RepositoryRuntime {
 
     pub fn save_error(&self) -> Option<&str> {
         match &self.document {
-            DocumentState::Editable(document) => document.error.as_deref(),
+            DocumentState::Editable(document) => document
+                .error
+                .as_deref()
+                .or(document.durability_warning.as_deref()),
             _ => None,
         }
     }
@@ -708,7 +825,8 @@ impl RepositoryRuntime {
     pub fn request_save(&mut self, card: CardId, overwrite: bool) -> Task<RepositoryAction> {
         let (path, text, disk_hash, revision) = match &self.document {
             DocumentState::Editable(document)
-                if document.dirty && document.active_save.is_none() =>
+                if (document.dirty || document.durability_warning.is_some())
+                    && document.active_save.is_none() =>
             {
                 (
                     document.path.clone(),
@@ -860,12 +978,21 @@ impl RepositoryRuntime {
                 if let DocumentState::Editable(document) = &mut self.document {
                     document.active_save = None;
                     match result {
-                        Ok(SaveOutcome::Saved { content_hash }) => {
+                        Ok(SaveOutcome::Saved {
+                            content_hash,
+                            durability,
+                        }) => {
                             document.saved_text = saved_text;
                             document.disk_hash = content_hash;
                             document.dirty = document.content.text() != document.saved_text;
                             document.conflict = false;
                             document.error = None;
+                            document.durability_warning = match durability {
+                                SaveDurability::Durable => None,
+                                SaveDurability::Unconfirmed { error } => Some(format!(
+                                    "The file was replaced on disk, but its durability could not be confirmed: {error}. Reload from disk or retry the save before leaving."
+                                )),
+                            };
                             saved = true;
                         }
                         Ok(SaveOutcome::Conflict { .. }) => {
@@ -873,7 +1000,15 @@ impl RepositoryRuntime {
                             document.error =
                                 Some("The file changed on disk after it was opened.".into());
                         }
-                        Err(error) => document.error = Some(error.to_string()),
+                        Err(error) => {
+                            let error = error.to_string();
+                            document.error = Some(
+                                document
+                                    .durability_warning
+                                    .as_ref()
+                                    .map_or(error.clone(), |warning| format!("{error} {warning}")),
+                            );
+                        }
                     }
                 }
                 if saved {
@@ -1703,20 +1838,35 @@ fn editable_document_view<'a>(
         );
         rows.push(widget::divider::horizontal::light().into());
     }
-    if let Some(error) = &document.error {
+    if let Some(error) = document
+        .error
+        .as_ref()
+        .or(document.durability_warning.as_ref())
+    {
         let mut actions: Vec<Element<'a, RepositoryAction>> =
             vec![widget::text::body(error).width(Length::Fill).into()];
-        if document.conflict {
+        if document.conflict || document.durability_warning.is_some() {
             actions.push(
                 widget::button::standard("Reload")
                     .on_press(RepositoryAction::Reload { card })
                     .into(),
             );
+        }
+        if document.conflict {
             actions.push(
                 widget::button::destructive("Overwrite")
                     .on_press(RepositoryAction::Save {
                         card,
                         overwrite: true,
+                    })
+                    .into(),
+            );
+        } else if document.durability_warning.is_some() {
+            actions.push(
+                widget::button::suggested("Retry save")
+                    .on_press(RepositoryAction::Save {
+                        card,
+                        overwrite: false,
                     })
                     .into(),
             );
@@ -2313,6 +2463,7 @@ mod tests {
             saved_text: "submitted\n".into(),
             result: Ok(SaveOutcome::Saved {
                 content_hash: blake3::hash(b"submitted\n"),
+                durability: SaveDurability::Durable,
             }),
         });
 
@@ -2323,6 +2474,147 @@ mod tests {
         assert_eq!(document.content.text(), "typed later\n");
         assert!(document.dirty);
         assert!(document.active_save.is_none());
+    }
+
+    #[test]
+    fn post_persist_failure_uses_submitted_snapshot_as_baseline_and_fences_edit_back() {
+        let card = CardId::new();
+        let runtime = RepositoryRuntime::post_persist_warning_fixture(card);
+
+        let DocumentState::Editable(document) = &runtime.document else {
+            panic!("document should remain editable");
+        };
+        assert_eq!(document.saved_text, "B\n");
+        assert_eq!(document.disk_hash, blake3::hash(b"B\n"));
+        assert_eq!(document.content.text(), "A\n");
+        assert_eq!(document.revision, 2);
+        assert!(document.dirty);
+        assert!(document.active_save.is_none());
+        assert!(
+            document
+                .durability_warning
+                .as_deref()
+                .is_some_and(|warning| {
+                    warning.contains("replaced on disk")
+                        && warning.contains("Reload from disk or retry")
+                })
+        );
+        assert!(runtime.blocks_navigation());
+        assert!(runtime.can_save());
+        assert!(runtime.inspector_context().can_reload);
+    }
+
+    #[test]
+    fn pre_persist_failure_keeps_original_baseline_and_unsaved_buffer_dirty() {
+        let card = CardId::new();
+        let (mut runtime, _) = RepositoryRuntime::post_persist_failure_fixture(card);
+        let DocumentState::Editable(document) = &mut runtime.document else {
+            panic!("document should remain editable");
+        };
+        document.content = text_editor::Content::with_text("B\n");
+        document.dirty = true;
+        document.revision = 1;
+        let ticket = document.active_save.clone().expect("save is in flight");
+
+        let _ = runtime.update(RepositoryAction::SaveFinished {
+            identity: ticket.identity,
+            ticket: ticket.id,
+            revision: ticket.revision,
+            saved_text: ticket.snapshot,
+            result: Err(FileIoError::Io("injected failure before persist".into())),
+        });
+
+        let DocumentState::Editable(document) = &runtime.document else {
+            panic!("document should remain editable");
+        };
+        assert_eq!(document.saved_text, "A\n");
+        assert_eq!(document.disk_hash, blake3::hash(b"A\n"));
+        assert_eq!(document.content.text(), "B\n");
+        assert!(document.dirty);
+        assert!(document.durability_warning.is_none());
+        assert!(
+            document
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("failure before persist"))
+        );
+        assert!(runtime.blocks_navigation());
+    }
+
+    #[test]
+    fn failed_retry_keeps_post_persist_warning_visible_and_navigation_fenced() {
+        let card = CardId::new();
+        let mut runtime = RepositoryRuntime::post_persist_warning_fixture(card);
+        let _retry = runtime.request_save(card, false);
+        let DocumentState::Editable(document) = &runtime.document else {
+            panic!("document should remain editable");
+        };
+        let ticket = document.active_save.clone().expect("retry is in flight");
+
+        let _ = runtime.update(RepositoryAction::SaveFinished {
+            identity: ticket.identity,
+            ticket: ticket.id,
+            revision: ticket.revision,
+            saved_text: ticket.snapshot,
+            result: Err(FileIoError::Io(
+                "injected retry failure before persist".into(),
+            )),
+        });
+
+        let message = runtime.save_error().expect("combined warning is visible");
+        assert!(message.contains("retry failure before persist"));
+        assert!(message.contains("replaced on disk"));
+        assert!(message.contains("Reload from disk or retry"));
+        assert!(runtime.blocks_navigation());
+        assert!(runtime.can_save());
+        let context = runtime.inspector_context();
+        assert_eq!(context.document, "Durability warning");
+        assert!(
+            context
+                .document_error
+                .as_deref()
+                .is_some_and(|message| message.contains("retry failure before persist")
+                    && message.contains("replaced on disk"))
+        );
+        assert!(context.can_reload);
+        assert!(context.can_save);
+    }
+
+    #[test]
+    fn reload_and_overwrite_resolve_post_persist_durability_warning_explicitly() {
+        let card = CardId::new();
+        let mut reloaded = RepositoryRuntime::post_persist_warning_fixture(card);
+        let _reload = reloaded.update(RepositoryAction::Reload { card });
+        let identity = reloaded.current_identity(card, PathBuf::from("notes.txt"));
+        let _ = reloaded.update(RepositoryAction::FileLoaded {
+            identity,
+            result: Ok(FileContent::Editable {
+                text: "B\n".into(),
+                content_hash: blake3::hash(b"B\n"),
+                markdown: false,
+            }),
+        });
+        assert!(!reloaded.blocks_navigation());
+        assert!(reloaded.save_error().is_none());
+
+        let mut overwritten = RepositoryRuntime::post_persist_warning_fixture(card);
+        let _overwrite = overwritten.request_save(card, true);
+        let DocumentState::Editable(document) = &overwritten.document else {
+            panic!("document should remain editable");
+        };
+        let ticket = document.active_save.clone().expect("overwrite started");
+        let _ = overwritten.update(RepositoryAction::SaveFinished {
+            identity: ticket.identity,
+            ticket: ticket.id,
+            revision: ticket.revision,
+            saved_text: ticket.snapshot,
+            result: Ok(SaveOutcome::Saved {
+                content_hash: blake3::hash(b"A\n"),
+                durability: SaveDurability::Durable,
+            }),
+        });
+        assert!(!overwritten.blocks_navigation());
+        assert!(overwritten.save_error().is_none());
     }
 
     #[test]
@@ -2374,6 +2666,7 @@ mod tests {
             saved_text: "obsolete\n".into(),
             result: Ok(SaveOutcome::Saved {
                 content_hash: blake3::hash(b"obsolete\n"),
+                durability: SaveDurability::Durable,
             }),
         });
 
@@ -2618,6 +2911,7 @@ mod tests {
             saved_text: "after\n".into(),
             result: Ok(SaveOutcome::Saved {
                 content_hash: blake3::hash(b"after\n"),
+                durability: SaveDurability::Durable,
             }),
         });
 
@@ -2829,6 +3123,7 @@ mod tests {
                 saved_text: "after\n".into(),
                 result: Ok(SaveOutcome::Saved {
                     content_hash: blake3::hash(b"after\n"),
+                    durability: SaveDurability::Durable,
                 }),
             });
 

@@ -6911,6 +6911,126 @@ mod tests {
     }
 
     #[test]
+    fn card_close_stays_fenced_after_post_persist_failure_until_retry_succeeds() {
+        let mut app = context_inspector_test_app(true);
+        let card = app.workspace.focused().unwrap();
+        let (runtime, failure) = RepositoryRuntime::post_persist_failure_fixture(card);
+        app.cards
+            .insert(card, CardRuntime::Repository(Box::new(runtime)));
+        app.dirty_repository_close = Some(DirtyRepositoryClose {
+            card,
+            remaining: VecDeque::new(),
+            intent: DirtyCloseIntent::Card(card),
+            focused: DirtyCloseControl::Save,
+            restore_card: Some(card),
+        });
+
+        let _ = app.update(Message::Repository(failure));
+
+        assert!(app.dirty_repository_close.is_some());
+        let CardRuntime::Repository(runtime) = app.cards.get(&card).unwrap() else {
+            panic!("repository runtime should remain installed");
+        };
+        assert!(runtime.blocks_navigation());
+        assert!(
+            runtime
+                .save_error()
+                .is_some_and(|warning| warning.contains("replaced on disk"))
+        );
+
+        let _ = app.update(Message::SaveAndCloseRepository(card));
+        let CardRuntime::Repository(runtime) = app.cards.get(&card).unwrap() else {
+            panic!("repository runtime should remain installed");
+        };
+        let retry_failure = runtime.failed_active_save_completion();
+        let _ = app.update(Message::Repository(retry_failure));
+
+        assert!(app.dirty_repository_close.is_some());
+        let CardRuntime::Repository(runtime) = app.cards.get(&card).unwrap() else {
+            panic!("repository runtime should remain installed");
+        };
+        let message = runtime.save_error().expect("close dialog shows the error");
+        assert!(message.contains("retry failure before persist"));
+        assert!(message.contains("replaced on disk"));
+        assert!(runtime.blocks_navigation());
+        let context = runtime.inspector_context();
+        assert!(context.can_reload);
+        assert!(context.can_save);
+
+        let _ = app.update(Message::SaveAndCloseRepository(card));
+        let CardRuntime::Repository(runtime) = app.cards.get(&card).unwrap() else {
+            panic!("repository runtime should remain installed");
+        };
+        let completion = runtime.durable_active_save_completion();
+        let _close = app.update(Message::Repository(completion));
+
+        assert!(app.dirty_repository_close.is_none());
+        let CardRuntime::Repository(runtime) = app.cards.get(&card).unwrap() else {
+            panic!("repository runtime should remain until close is committed");
+        };
+        assert!(!runtime.blocks_navigation());
+        assert!(runtime.save_error().is_none());
+    }
+
+    #[test]
+    fn window_close_stays_fenced_after_post_persist_failure_until_retry_succeeds() {
+        let mut app = context_inspector_test_app(true);
+        let card = app.workspace.focused().unwrap();
+        let window = window::Id::unique();
+        let (runtime, failure) = RepositoryRuntime::post_persist_failure_fixture(card);
+        app.cards
+            .insert(card, CardRuntime::Repository(Box::new(runtime)));
+        app.dirty_repository_close = Some(DirtyRepositoryClose {
+            card,
+            remaining: VecDeque::new(),
+            intent: DirtyCloseIntent::Application(window),
+            focused: DirtyCloseControl::Save,
+            restore_card: Some(card),
+        });
+
+        let _ = app.update(Message::Repository(failure));
+
+        assert!(app.dirty_repository_close.is_some());
+        assert!(matches!(
+            app.cards.get(&card),
+            Some(CardRuntime::Repository(runtime)) if runtime.blocks_navigation()
+        ));
+
+        let _ = app.update(Message::SaveAndCloseRepository(card));
+        let CardRuntime::Repository(runtime) = app.cards.get(&card).unwrap() else {
+            panic!("repository runtime should remain installed");
+        };
+        let retry_failure = runtime.failed_active_save_completion();
+        let _ = app.update(Message::Repository(retry_failure));
+
+        assert!(app.dirty_repository_close.is_some());
+        let CardRuntime::Repository(runtime) = app.cards.get(&card).unwrap() else {
+            panic!("repository runtime should remain installed");
+        };
+        let message = runtime.save_error().expect("close dialog shows the error");
+        assert!(message.contains("retry failure before persist"));
+        assert!(message.contains("replaced on disk"));
+        assert!(runtime.blocks_navigation());
+        let context = runtime.inspector_context();
+        assert!(context.can_reload);
+        assert!(context.can_save);
+
+        let _ = app.update(Message::SaveAndCloseRepository(card));
+        let CardRuntime::Repository(runtime) = app.cards.get(&card).unwrap() else {
+            panic!("repository runtime should remain installed");
+        };
+        let completion = runtime.durable_active_save_completion();
+        let _exit = app.update(Message::Repository(completion));
+
+        assert!(app.dirty_repository_close.is_none());
+        assert!(matches!(
+            app.cards.get(&card),
+            Some(CardRuntime::Repository(runtime)) if !runtime.blocks_navigation()
+                && runtime.save_error().is_none()
+        ));
+    }
+
+    #[test]
     fn active_save_fences_direct_adjacent_pan_and_wheel_navigation() {
         let focused = CardId::new();
         assert!(focused_save_in_flight(Some(focused), |card| card == focused));

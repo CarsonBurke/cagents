@@ -44,8 +44,23 @@ pub enum FileIoError {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SaveOutcome {
-    Saved { content_hash: blake3::Hash },
-    Conflict { disk_hash: blake3::Hash },
+    Saved {
+        content_hash: blake3::Hash,
+        durability: SaveDurability,
+    },
+    Conflict {
+        disk_hash: blake3::Hash,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SaveDurability {
+    /// The replacement and its parent-directory entry were synced.
+    Durable,
+    /// The destination was replaced, but syncing its parent directory failed.
+    /// The new bytes are the live disk baseline even though crash durability is
+    /// not guaranteed.
+    Unconfirmed { error: String },
 }
 
 pub fn validate_repo_path(path: &Path) -> Result<(), FileIoError> {
@@ -113,6 +128,24 @@ pub fn save_file(
     expected_disk_hash: blake3::Hash,
     overwrite: bool,
 ) -> Result<SaveOutcome, FileIoError> {
+    save_file_with_atomic_replace(
+        worktree,
+        relative_path,
+        text,
+        expected_disk_hash,
+        overwrite,
+        atomic_replace,
+    )
+}
+
+fn save_file_with_atomic_replace(
+    worktree: &Path,
+    relative_path: &Path,
+    text: &str,
+    expected_disk_hash: blake3::Hash,
+    overwrite: bool,
+    replace: impl FnOnce(&Path, &[u8], Permissions) -> Result<SaveDurability, FileIoError>,
+) -> Result<SaveOutcome, FileIoError> {
     let path = checked_path(worktree, relative_path)?;
     let metadata = fs::symlink_metadata(&path).map_err(io_error)?;
     if metadata.file_type().is_symlink() || !metadata.is_file() {
@@ -127,9 +160,10 @@ pub fn save_file(
         return Ok(SaveOutcome::Conflict { disk_hash });
     }
 
-    atomic_replace(&path, text.as_bytes(), metadata.permissions())?;
+    let durability = replace(&path, text.as_bytes(), metadata.permissions())?;
     Ok(SaveOutcome::Saved {
         content_hash: blake3::hash(text.as_bytes()),
+        durability,
     })
 }
 
@@ -146,7 +180,27 @@ fn checked_path(worktree: &Path, relative_path: &Path) -> Result<PathBuf, FileIo
     Ok(path)
 }
 
-fn atomic_replace(path: &Path, bytes: &[u8], permissions: Permissions) -> Result<(), FileIoError> {
+fn atomic_replace(
+    path: &Path,
+    bytes: &[u8],
+    permissions: Permissions,
+) -> Result<SaveDurability, FileIoError> {
+    atomic_replace_with_hooks(
+        path,
+        bytes,
+        permissions,
+        || Ok(()),
+        |parent| File::open(parent).and_then(|directory| directory.sync_all()),
+    )
+}
+
+fn atomic_replace_with_hooks(
+    path: &Path,
+    bytes: &[u8],
+    permissions: Permissions,
+    before_persist: impl FnOnce() -> io::Result<()>,
+    sync_parent: impl FnOnce(&Path) -> io::Result<()>,
+) -> Result<SaveDurability, FileIoError> {
     let parent = path.parent().ok_or(FileIoError::InvalidRepositoryPath)?;
     let mut temporary = tempfile::NamedTempFile::new_in(parent).map_err(io_error)?;
     temporary
@@ -156,12 +210,20 @@ fn atomic_replace(path: &Path, bytes: &[u8], permissions: Permissions) -> Result
     temporary.write_all(bytes).map_err(io_error)?;
     temporary.flush().map_err(io_error)?;
     temporary.as_file().sync_all().map_err(io_error)?;
+    before_persist().map_err(io_error)?;
     temporary
         .persist(path)
         .map_err(|error| io_error(error.error))?;
-    File::open(parent)
-        .and_then(|directory| directory.sync_all())
-        .map_err(io_error)
+    // `persist` has replaced the destination. From this point onward, an I/O
+    // failure must be reported as a successful replacement with unconfirmed
+    // durability; returning `Err` would falsely tell callers the old baseline
+    // is still on disk.
+    Ok(match sync_parent(parent) {
+        Ok(()) => SaveDurability::Durable,
+        Err(error) => SaveDurability::Unconfirmed {
+            error: error.to_string(),
+        },
+    })
 }
 
 fn io_error(error: io::Error) -> FileIoError {
@@ -223,12 +285,85 @@ mod tests {
 
         let outcome =
             save_file(root.path(), Path::new("notes.md"), "mine\n", expected, true).unwrap();
-        assert!(matches!(outcome, SaveOutcome::Saved { .. }));
+        assert!(matches!(
+            outcome,
+            SaveOutcome::Saved {
+                durability: SaveDurability::Durable,
+                ..
+            }
+        ));
         assert_eq!(fs::read_to_string(&path).unwrap(), "mine\n");
         assert_eq!(
             fs::metadata(&path).unwrap().permissions().mode() & 0o777,
             0o640
         );
+    }
+
+    #[test]
+    fn failure_before_persist_leaves_destination_unchanged_and_returns_error() {
+        let root = tempdir().unwrap();
+        let path = root.path().join("notes.txt");
+        fs::write(&path, "before\n").unwrap();
+        let expected = blake3::hash(b"before\n");
+
+        let result = save_file_with_atomic_replace(
+            root.path(),
+            Path::new("notes.txt"),
+            "after\n",
+            expected,
+            false,
+            |path, bytes, permissions| {
+                atomic_replace_with_hooks(
+                    path,
+                    bytes,
+                    permissions,
+                    || Err(io::Error::other("injected failure before persist")),
+                    |_| panic!("parent sync must not run when persist was not attempted"),
+                )
+            },
+        );
+
+        assert!(matches!(
+            result,
+            Err(FileIoError::Io(error)) if error.contains("injected failure before persist")
+        ));
+        assert_eq!(fs::read_to_string(path).unwrap(), "before\n");
+    }
+
+    #[test]
+    fn parent_sync_failure_reports_replaced_but_unconfirmed_destination() {
+        let root = tempdir().unwrap();
+        let path = root.path().join("notes.txt");
+        fs::write(&path, "before\n").unwrap();
+        let expected = blake3::hash(b"before\n");
+
+        let result = save_file_with_atomic_replace(
+            root.path(),
+            Path::new("notes.txt"),
+            "after\n",
+            expected,
+            false,
+            |path, bytes, permissions| {
+                atomic_replace_with_hooks(
+                    path,
+                    bytes,
+                    permissions,
+                    || Ok(()),
+                    |_| Err(io::Error::other("injected parent sync failure")),
+                )
+            },
+        )
+        .unwrap();
+
+        assert!(matches!(
+            result,
+            SaveOutcome::Saved {
+                content_hash,
+                durability: SaveDurability::Unconfirmed { error },
+            } if content_hash == blake3::hash(b"after\n")
+                && error.contains("injected parent sync failure")
+        ));
+        assert_eq!(fs::read_to_string(path).unwrap(), "after\n");
     }
 
     #[test]
