@@ -617,7 +617,7 @@ pub enum SidebarAction {
     Refresh,
     CreatePullRequest {
         project_id: ProjectId,
-        repository: PathBuf,
+        worktree: Option<PathBuf>,
     },
     OpenSettings,
     /// A width requested by the pane's resize handle, already clamped to the
@@ -905,7 +905,7 @@ fn footer<'a>(
                     &*project.chrome.create_pull_request_name,
                     SidebarAction::CreatePullRequest {
                         project_id: project.id,
-                        repository: project.repository.clone(),
+                        worktree: None,
                     },
                     project.chrome.create_pull_request_id.clone(),
                 ),
@@ -1295,7 +1295,7 @@ fn project_view<'a>(
             &*chrome.create_pull_request_name,
             SidebarAction::CreatePullRequest {
                 project_id,
-                repository: entity.repository.clone(),
+                worktree: None,
             },
             chrome.create_pull_request_id.clone(),
         ),

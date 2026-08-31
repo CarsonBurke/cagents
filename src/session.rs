@@ -3,7 +3,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{Arc, Condvar, Mutex},
     thread,
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use thiserror::Error;
@@ -20,6 +20,7 @@ use crate::{
 const PERSIST_DEBOUNCE: Duration = Duration::from_millis(250);
 const PERSIST_RETRY_INITIAL: Duration = Duration::from_millis(100);
 const PERSIST_RETRY_MAX: Duration = Duration::from_secs(2);
+const PERSIST_MAX_AUTOMATIC_ATTEMPTS: u32 = 4;
 
 /// How long the final flush at shutdown keeps retrying before abandoning what
 /// it could not write.
@@ -32,6 +33,123 @@ const PERSIST_RETRY_MAX: Duration = Duration::from_secs(2);
 /// it is worth several. It is also the cap on how long exit can wait: quitting
 /// cannot turn into a hang on a database that will never accept the write.
 const SHUTDOWN_FLUSH_BUDGET: Duration = Duration::from_secs(15);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SaveFailureCategory {
+    Busy,
+    ReadOnly,
+    DiskFull,
+    PermissionDenied,
+    StorageUnavailable,
+    Corrupt,
+    Conflict,
+    Serialization,
+    InvalidData,
+    Io,
+    Database,
+}
+
+impl SaveFailureCategory {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Busy => "database busy or locked",
+            Self::ReadOnly => "database is read-only",
+            Self::DiskFull => "storage is full",
+            Self::PermissionDenied => "permission denied",
+            Self::StorageUnavailable => "storage path is unavailable",
+            Self::Corrupt => "database is corrupt",
+            Self::Conflict => "saved state changed unexpectedly",
+            Self::Serialization => "state could not be encoded",
+            Self::InvalidData => "saved state is invalid",
+            Self::Io => "storage I/O failed",
+            Self::Database => "database operation failed",
+        }
+    }
+
+    pub fn guidance(self) -> &'static str {
+        match self {
+            Self::Busy => "Close other processes using the database, then retry.",
+            Self::ReadOnly | Self::PermissionDenied => {
+                "Restore write permission for the database and its directory, then retry."
+            }
+            Self::DiskFull => "Free disk space, then retry.",
+            Self::StorageUnavailable => {
+                "Restore the database directory or mounted storage, then retry."
+            }
+            Self::Corrupt => "Back up the database and restart cagents before making more changes.",
+            Self::Conflict => "Restart cagents so it can reload the current saved state.",
+            Self::Serialization | Self::InvalidData => {
+                "Restart cagents; if this repeats, report the failure category and database path."
+            }
+            Self::Io | Self::Database => {
+                "Check the database directory and system storage, then retry."
+            }
+        }
+    }
+
+    fn selection_rank(self) -> u8 {
+        match self {
+            Self::DiskFull => 0,
+            Self::ReadOnly => 1,
+            Self::PermissionDenied => 2,
+            Self::StorageUnavailable => 3,
+            Self::Corrupt => 4,
+            Self::Busy => 5,
+            Self::Conflict => 6,
+            Self::Serialization => 7,
+            Self::InvalidData => 8,
+            Self::Io => 9,
+            Self::Database => 10,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SessionSaveHealth {
+    Healthy,
+    Retrying {
+        category: SaveFailureCategory,
+        first_failed_at_unix_ms: i64,
+        attempts: u32,
+    },
+    Recovered {
+        recovered_at_unix_ms: i64,
+    },
+    RetryExhausted {
+        category: SaveFailureCategory,
+        first_failed_at_unix_ms: i64,
+        attempts: u32,
+    },
+    WriterUnavailable,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionSaveHealthEvent {
+    pub revision: u64,
+    pub health: SessionSaveHealth,
+    pub last_successful_flush_at_unix_ms: Option<i64>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct PersistenceConfig {
+    debounce: Duration,
+    retry_initial: Duration,
+    retry_max: Duration,
+    max_automatic_attempts: u32,
+    shutdown_flush_budget: Duration,
+}
+
+impl Default for PersistenceConfig {
+    fn default() -> Self {
+        Self {
+            debounce: PERSIST_DEBOUNCE,
+            retry_initial: PERSIST_RETRY_INITIAL,
+            retry_max: PERSIST_RETRY_MAX,
+            max_automatic_attempts: PERSIST_MAX_AUTOMATIC_ATTEMPTS,
+            shutdown_flush_budget: SHUTDOWN_FLUSH_BUDGET,
+        }
+    }
+}
 
 #[derive(Debug, Error)]
 pub enum SessionError {
@@ -81,6 +199,7 @@ struct QueueState {
     projects: HashMap<ProjectId, ProjectState>,
     worktrees: HashMap<WorktreeId, WorktreeState>,
     terminal_replacements: HashMap<CardId, TerminalIdentityReplacement>,
+    retry_requested: bool,
     shutdown: bool,
 }
 
@@ -88,6 +207,7 @@ struct QueueState {
 pub struct SessionRuntime {
     queue: Arc<(Mutex<QueueState>, Condvar)>,
     last_error: Arc<Mutex<Option<String>>>,
+    health: async_channel::Receiver<SessionSaveHealthEvent>,
     worker: Option<thread::JoinHandle<()>>,
     database_path: PathBuf,
     restored_projects: Vec<ProjectState>,
@@ -95,11 +215,14 @@ pub struct SessionRuntime {
 }
 
 impl SessionRuntime {
-    pub fn open_default() -> Result<(Self, Option<WorkspaceState>), SessionError> {
+    pub fn default_database_path() -> Result<PathBuf, SessionError> {
         let project_dirs =
             instance::project_dirs().ok_or(SessionError::DataDirectoryUnavailable)?;
-        let database_path = project_dirs.data_dir().join("sessions.sqlite3");
-        Self::open(database_path, current_boot_id()?)
+        Ok(project_dirs.data_dir().join("sessions.sqlite3"))
+    }
+
+    pub fn open_default() -> Result<(Self, Option<WorkspaceState>), SessionError> {
+        Self::open(Self::default_database_path()?, current_boot_id()?)
     }
 
     pub fn open(
@@ -141,18 +264,21 @@ impl SessionRuntime {
 
         let queue = Arc::new((Mutex::new(QueueState::default()), Condvar::new()));
         let last_error = Arc::new(Mutex::new(None));
+        let (health_tx, health_rx) = async_channel::unbounded();
+        let health = HealthPublisher::new(health_tx);
         let worker_queue = Arc::clone(&queue);
         let worker_error = Arc::clone(&last_error);
         let worker = thread::Builder::new()
             .name("cagents-session-writer".into())
             .spawn(move || {
-                persistence_loop(
+                run_persistence_worker(
                     store,
                     writes,
                     worker_queue,
                     worker_error,
-                    SHUTDOWN_FLUSH_BUDGET,
-                )
+                    health,
+                    PersistenceConfig::default(),
+                );
             })
             .map_err(SessionError::Worker)?;
 
@@ -160,6 +286,7 @@ impl SessionRuntime {
             Self {
                 queue,
                 last_error,
+                health: health_rx,
                 worker: Some(worker),
                 database_path,
                 restored_projects: projects,
@@ -240,6 +367,24 @@ impl SessionRuntime {
         self.last_error.lock().ok().and_then(|error| error.clone())
     }
 
+    pub fn health_receiver(&self) -> async_channel::Receiver<SessionSaveHealthEvent> {
+        self.health.clone()
+    }
+
+    /// Requests one new bounded retry cycle without waiting for storage.
+    pub fn retry_save(&self) -> bool {
+        let (lock, changed) = &*self.queue;
+        let Ok(mut queue) = lock.lock() else {
+            return false;
+        };
+        if queue.shutdown {
+            return false;
+        }
+        queue.retry_requested = true;
+        changed.notify_one();
+        true
+    }
+
     pub fn database_path(&self) -> &Path {
         &self.database_path
     }
@@ -279,6 +424,54 @@ struct PendingWrites {
     worktree_generations: HashMap<WorktreeId, u64>,
 }
 
+trait SessionStore {
+    fn replace_terminal_identity(
+        &self,
+        card_id: CardId,
+        expected_terminal_id: TerminalId,
+        replacement: &TerminalSession,
+    ) -> Result<(), StoreError>;
+    fn save_workspace(
+        &self,
+        state: &WorkspaceState,
+        base: SnapshotBase<'_>,
+    ) -> Result<crate::persistence::WorkspaceCommit, StoreError>;
+    fn save_project(&self, project: &ProjectState) -> Result<u64, StoreError>;
+    fn save_worktree(&self, worktree: &WorktreeState) -> Result<u64, StoreError>;
+    fn shutdown(&self) -> Result<(), StoreError>;
+}
+
+impl SessionStore for StateStore {
+    fn replace_terminal_identity(
+        &self,
+        card_id: CardId,
+        expected_terminal_id: TerminalId,
+        replacement: &TerminalSession,
+    ) -> Result<(), StoreError> {
+        Self::replace_terminal_identity(self, card_id, expected_terminal_id, replacement)
+    }
+
+    fn save_workspace(
+        &self,
+        state: &WorkspaceState,
+        base: SnapshotBase<'_>,
+    ) -> Result<crate::persistence::WorkspaceCommit, StoreError> {
+        Self::save_workspace(self, state, base)
+    }
+
+    fn save_project(&self, project: &ProjectState) -> Result<u64, StoreError> {
+        Self::save_project(self, project)
+    }
+
+    fn save_worktree(&self, worktree: &WorktreeState) -> Result<u64, StoreError> {
+        Self::save_worktree(self, worktree)
+    }
+
+    fn shutdown(&self) -> Result<(), StoreError> {
+        Self::shutdown(self)
+    }
+}
+
 impl PendingWrites {
     /// A lane that owes storage nothing yet and writes against the generations
     /// the session was restored at.
@@ -309,7 +502,7 @@ impl PendingWrites {
 
     /// Applies everything still pending, leaving whatever failed queued for a
     /// later attempt. Returns one message per failed write.
-    fn flush(&mut self, store: &StateStore) -> Vec<String> {
+    fn flush(&mut self, store: &impl SessionStore) -> Vec<StoreError> {
         let mut errors = Vec::new();
         let replacement_cards = self
             .terminal_replacements
@@ -326,7 +519,7 @@ impl PendingWrites {
                 Ok(()) => {
                     self.terminal_replacements.remove(&card_id);
                 }
-                Err(error) => errors.push(error.to_string()),
+                Err(error) => errors.push(error),
             }
         }
 
@@ -347,7 +540,7 @@ impl PendingWrites {
                     self.card_generations = commit.card_generations;
                     self.workspace = None;
                 }
-                Err(error) => errors.push(error.to_string()),
+                Err(error) => errors.push(error),
             }
         }
 
@@ -360,7 +553,7 @@ impl PendingWrites {
                     self.project_generations.insert(id, generation);
                     self.projects.remove(&id);
                 }
-                Err(error) => errors.push(error.to_string()),
+                Err(error) => errors.push(error),
             }
         }
 
@@ -373,7 +566,7 @@ impl PendingWrites {
                     self.worktree_generations.insert(id, generation);
                     self.worktrees.remove(&id);
                 }
-                Err(error) => errors.push(error.to_string()),
+                Err(error) => errors.push(error),
             }
         }
 
@@ -381,26 +574,175 @@ impl PendingWrites {
     }
 }
 
+#[derive(Debug)]
+struct FailureIncident {
+    category: SaveFailureCategory,
+    first_failed_at_unix_ms: i64,
+    attempts: u32,
+}
+
+struct HealthPublisher {
+    sender: async_channel::Sender<SessionSaveHealthEvent>,
+    revision: u64,
+    last_successful_flush_at_unix_ms: Option<i64>,
+    incident: Option<FailureIncident>,
+}
+
+impl HealthPublisher {
+    fn new(sender: async_channel::Sender<SessionSaveHealthEvent>) -> Self {
+        let mut publisher = Self {
+            sender,
+            revision: 0,
+            last_successful_flush_at_unix_ms: None,
+            incident: None,
+        };
+        publisher.publish(SessionSaveHealth::Healthy);
+        publisher
+    }
+
+    fn publish(&mut self, health: SessionSaveHealth) {
+        self.revision = self.revision.saturating_add(1);
+        let _ = self.sender.try_send(SessionSaveHealthEvent {
+            revision: self.revision,
+            health,
+            last_successful_flush_at_unix_ms: self.last_successful_flush_at_unix_ms,
+        });
+    }
+
+    fn failed(&mut self, errors: &[StoreError], exhausted: bool) {
+        let category = errors
+            .iter()
+            .map(save_failure_category)
+            .min_by_key(|category| category.selection_rank())
+            .unwrap_or(SaveFailureCategory::Database);
+        let incident = self.incident.get_or_insert_with(|| FailureIncident {
+            category,
+            first_failed_at_unix_ms: unix_millis(),
+            attempts: 0,
+        });
+        incident.category = category;
+        incident.attempts = incident.attempts.saturating_add(1);
+        let health = if exhausted {
+            SessionSaveHealth::RetryExhausted {
+                category: incident.category,
+                first_failed_at_unix_ms: incident.first_failed_at_unix_ms,
+                attempts: incident.attempts,
+            }
+        } else {
+            SessionSaveHealth::Retrying {
+                category: incident.category,
+                first_failed_at_unix_ms: incident.first_failed_at_unix_ms,
+                attempts: incident.attempts,
+            }
+        };
+        self.publish(health);
+    }
+
+    fn flushed(&mut self) {
+        let at = unix_millis();
+        self.last_successful_flush_at_unix_ms = Some(at);
+        if self.incident.take().is_some() {
+            self.publish(SessionSaveHealth::Recovered {
+                recovered_at_unix_ms: at,
+            });
+        }
+    }
+}
+
+fn save_failure_category(error: &StoreError) -> SaveFailureCategory {
+    use rusqlite::ErrorCode;
+
+    match error {
+        StoreError::Sqlite(rusqlite::Error::SqliteFailure(error, _)) => match error.code {
+            ErrorCode::DatabaseBusy | ErrorCode::DatabaseLocked => SaveFailureCategory::Busy,
+            ErrorCode::ReadOnly => SaveFailureCategory::ReadOnly,
+            ErrorCode::DiskFull => SaveFailureCategory::DiskFull,
+            ErrorCode::PermissionDenied | ErrorCode::AuthorizationForStatementDenied => {
+                SaveFailureCategory::PermissionDenied
+            }
+            ErrorCode::CannotOpen | ErrorCode::NotFound => SaveFailureCategory::StorageUnavailable,
+            ErrorCode::DatabaseCorrupt | ErrorCode::NotADatabase => SaveFailureCategory::Corrupt,
+            ErrorCode::SystemIoFailure => SaveFailureCategory::Io,
+            _ => SaveFailureCategory::Database,
+        },
+        StoreError::Sqlite(_) => SaveFailureCategory::Database,
+        StoreError::Serialization(_) => SaveFailureCategory::Serialization,
+        StoreError::Io(error) if error.raw_os_error() == Some(libc::ENOSPC) => {
+            SaveFailureCategory::DiskFull
+        }
+        StoreError::Io(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
+            SaveFailureCategory::PermissionDenied
+        }
+        StoreError::Io(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            SaveFailureCategory::StorageUnavailable
+        }
+        StoreError::Io(_) => SaveFailureCategory::Io,
+        StoreError::StaleGeneration { .. } => SaveFailureCategory::Conflict,
+        StoreError::UnsupportedSchema { .. } | StoreError::InvalidState(_) => {
+            SaveFailureCategory::InvalidData
+        }
+        StoreError::InvalidUuid { .. }
+        | StoreError::InvalidBusyTimeout { .. }
+        | StoreError::MutexPoisoned
+        | StoreError::Closed => SaveFailureCategory::Database,
+    }
+}
+
+fn unix_millis() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .try_into()
+        .unwrap_or(i64::MAX)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WriterExit {
+    Shutdown,
+    Unavailable,
+}
+
+fn run_persistence_worker(
+    store: impl SessionStore,
+    writes: PendingWrites,
+    queue: Arc<(Mutex<QueueState>, Condvar)>,
+    last_error: Arc<Mutex<Option<String>>>,
+    mut health: HealthPublisher,
+    config: PersistenceConfig,
+) {
+    let exit = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        persistence_loop(store, writes, queue, last_error, &mut health, config)
+    }));
+    if !matches!(exit, Ok(WriterExit::Shutdown)) {
+        health.publish(SessionSaveHealth::WriterUnavailable);
+    }
+}
+
 fn persistence_loop(
-    store: StateStore,
+    store: impl SessionStore,
     mut writes: PendingWrites,
     queue: Arc<(Mutex<QueueState>, Condvar)>,
     last_error: Arc<Mutex<Option<String>>>,
-    shutdown_flush_budget: Duration,
-) {
+    health: &mut HealthPublisher,
+    config: PersistenceConfig,
+) -> WriterExit {
     let mut due: Option<Instant> = None;
-    let mut retry_delay = PERSIST_RETRY_INITIAL;
+    let mut retry_delay = config.retry_initial;
+    let mut attempts_this_cycle = 0_u32;
+    let mut retry_exhausted = false;
 
     loop {
         let (lock, changed) = &*queue;
         let mut state = match lock.lock() {
             Ok(state) => state,
-            Err(_) => return,
+            Err(_) => return WriterExit::Unavailable,
         };
         while state.latest.is_none()
             && state.projects.is_empty()
             && state.worktrees.is_empty()
             && state.terminal_replacements.is_empty()
+            && !state.retry_requested
             && !state.shutdown
         {
             state = if let Some(deadline) = due {
@@ -413,12 +755,12 @@ fn persistence_loop(
                         }
                         continue;
                     }
-                    Err(_) => return,
+                    Err(_) => return WriterExit::Unavailable,
                 }
             } else {
                 match changed.wait(state) {
                     Ok(next) => next,
-                    Err(_) => return,
+                    Err(_) => return WriterExit::Unavailable,
                 }
             };
         }
@@ -437,21 +779,41 @@ fn persistence_loop(
         for replacement in std::mem::take(&mut state.terminal_replacements).into_values() {
             merge_terminal_replacement(&mut writes.terminal_replacements, replacement);
         }
-        if received_changes {
-            due = Some(Instant::now() + PERSIST_DEBOUNCE);
+        let retry_requested = std::mem::take(&mut state.retry_requested);
+        if retry_requested && !writes.is_empty() {
+            retry_exhausted = false;
+            attempts_this_cycle = 0;
+            retry_delay = config.retry_initial;
+            due = Some(Instant::now());
+        } else {
+            due = schedule_flush_after_changes(
+                due,
+                received_changes,
+                retry_exhausted,
+                attempts_this_cycle,
+                Instant::now(),
+                config.debounce,
+            );
         }
         let shutdown = state.shutdown;
         let should_persist = shutdown || due.is_some_and(|deadline| Instant::now() >= deadline);
         drop(state);
 
         if should_persist {
-            record_flush_errors(&last_error, writes.flush(&store));
+            let errors = writes.flush(&store);
+            record_flush_errors(&last_error, &errors);
             if writes.is_empty() {
+                health.flushed();
                 due = None;
-                retry_delay = PERSIST_RETRY_INITIAL;
+                retry_delay = config.retry_initial;
+                attempts_this_cycle = 0;
+                retry_exhausted = false;
             } else {
-                due = Some(Instant::now() + retry_delay);
-                retry_delay = retry_delay.saturating_mul(2).min(PERSIST_RETRY_MAX);
+                attempts_this_cycle = attempts_this_cycle.saturating_add(1);
+                retry_exhausted = attempts_this_cycle >= config.max_automatic_attempts;
+                health.failed(&errors, retry_exhausted);
+                due = (!retry_exhausted).then(|| Instant::now() + retry_delay);
+                retry_delay = retry_delay.saturating_mul(2).min(config.retry_max);
             }
         }
 
@@ -460,7 +822,7 @@ fn persistence_loop(
             // the last flush of the session has to as well: the single attempt
             // this once made discarded the user's final snapshot the first time
             // storage was momentarily unwritable.
-            let deadline = Instant::now() + shutdown_flush_budget;
+            let deadline = Instant::now() + config.shutdown_flush_budget;
             while !writes.is_empty() {
                 let remaining = deadline.saturating_duration_since(Instant::now());
                 if remaining.is_zero() {
@@ -470,8 +832,14 @@ fn persistence_loop(
                 // process holds, so retrying instantly would only burn the
                 // budget; the steady-state backoff already paces that wait.
                 thread::sleep(retry_delay.min(remaining));
-                record_flush_errors(&last_error, writes.flush(&store));
-                retry_delay = retry_delay.saturating_mul(2).min(PERSIST_RETRY_MAX);
+                let errors = writes.flush(&store);
+                record_flush_errors(&last_error, &errors);
+                if writes.is_empty() {
+                    health.flushed();
+                } else {
+                    health.failed(&errors, false);
+                }
+                retry_delay = retry_delay.saturating_mul(2).min(config.retry_max);
             }
             // `clean_shutdown` asserts that storage holds everything this
             // session produced, so only a complete flush earns it; otherwise
@@ -482,14 +850,38 @@ fn persistence_loop(
             {
                 *message = Some(error.to_string());
             }
-            return;
+            return WriterExit::Shutdown;
         }
     }
 }
 
-fn record_flush_errors(last_error: &Mutex<Option<String>>, errors: Vec<String>) {
+fn schedule_flush_after_changes(
+    current_due: Option<Instant>,
+    received_changes: bool,
+    retry_exhausted: bool,
+    attempts_this_cycle: u32,
+    now: Instant,
+    debounce: Duration,
+) -> Option<Instant> {
+    if received_changes && !retry_exhausted && attempts_this_cycle == 0 {
+        // Preserve the trailing debounce for ordinary changes. Once a flush
+        // has failed, keep its retry deadline stable instead of letting a
+        // stream of new snapshots postpone recovery forever.
+        Some(now + debounce)
+    } else {
+        current_due
+    }
+}
+
+fn record_flush_errors(last_error: &Mutex<Option<String>>, errors: &[StoreError]) {
     if let Ok(mut slot) = last_error.lock() {
-        *slot = (!errors.is_empty()).then(|| errors.join("; "));
+        *slot = (!errors.is_empty()).then(|| {
+            errors
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join("; ")
+        });
     }
 }
 
@@ -501,7 +893,7 @@ pub fn current_boot_id() -> Result<BootId, SessionError> {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::{BTreeMap, HashSet};
+    use std::collections::{BTreeMap, HashSet, VecDeque};
 
     use rusqlite::Connection;
 
@@ -513,6 +905,92 @@ mod tests {
     };
 
     use super::*;
+
+    #[derive(Debug)]
+    enum FakeWrite {
+        Succeed,
+        Fail,
+        Panic,
+    }
+
+    struct FakeStore {
+        writes: Mutex<VecDeque<FakeWrite>>,
+    }
+
+    impl FakeStore {
+        fn new(writes: impl IntoIterator<Item = FakeWrite>) -> Self {
+            Self {
+                writes: Mutex::new(writes.into_iter().collect()),
+            }
+        }
+
+        fn write(&self) -> Result<(), StoreError> {
+            match self
+                .writes
+                .lock()
+                .unwrap()
+                .pop_front()
+                .unwrap_or(FakeWrite::Succeed)
+            {
+                FakeWrite::Succeed => Ok(()),
+                FakeWrite::Fail => Err(StoreError::Io(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "TOKEN=secret terminal output must never reach health",
+                ))),
+                FakeWrite::Panic => panic!("injected writer panic"),
+            }
+        }
+    }
+
+    impl SessionStore for FakeStore {
+        fn replace_terminal_identity(
+            &self,
+            _card_id: CardId,
+            _expected_terminal_id: TerminalId,
+            _replacement: &TerminalSession,
+        ) -> Result<(), StoreError> {
+            self.write()
+        }
+
+        fn save_workspace(
+            &self,
+            _state: &WorkspaceState,
+            _base: SnapshotBase<'_>,
+        ) -> Result<crate::persistence::WorkspaceCommit, StoreError> {
+            self.write()?;
+            Ok(crate::persistence::WorkspaceCommit::default())
+        }
+
+        fn save_project(&self, _project: &ProjectState) -> Result<u64, StoreError> {
+            self.write().map(|()| 1)
+        }
+
+        fn save_worktree(&self, _worktree: &WorktreeState) -> Result<u64, StoreError> {
+            self.write().map(|()| 1)
+        }
+
+        fn shutdown(&self) -> Result<(), StoreError> {
+            Ok(())
+        }
+    }
+
+    fn fast_persistence_config(max_automatic_attempts: u32) -> PersistenceConfig {
+        PersistenceConfig {
+            debounce: Duration::ZERO,
+            retry_initial: Duration::from_millis(1),
+            retry_max: Duration::from_millis(1),
+            max_automatic_attempts,
+            shutdown_flush_budget: Duration::from_millis(20),
+        }
+    }
+
+    fn next_health(
+        receiver: &async_channel::Receiver<SessionSaveHealthEvent>,
+    ) -> SessionSaveHealthEvent {
+        receiver
+            .recv_blocking()
+            .expect("health publisher must remain connected")
+    }
 
     fn workspace() -> WorkspaceState {
         let launch = LaunchRecipe {
@@ -547,6 +1025,217 @@ mod tests {
                 }),
             }],
         }
+    }
+
+    #[test]
+    fn new_changes_trail_debounce_without_postponing_an_active_retry() {
+        let now = Instant::now();
+        let old_debounce = now + Duration::from_millis(10);
+        let new_debounce = now + Duration::from_millis(250);
+        assert_eq!(
+            schedule_flush_after_changes(
+                Some(old_debounce),
+                true,
+                false,
+                0,
+                now,
+                Duration::from_millis(250),
+            ),
+            Some(new_debounce)
+        );
+
+        let retry_due = now + Duration::from_millis(100);
+        assert_eq!(
+            schedule_flush_after_changes(
+                Some(retry_due),
+                true,
+                false,
+                1,
+                now,
+                Duration::from_millis(250),
+            ),
+            Some(retry_due)
+        );
+    }
+
+    #[test]
+    fn health_category_tracks_the_current_batch_deterministically() {
+        let (health_tx, health_rx) = async_channel::unbounded();
+        let mut publisher = HealthPublisher::new(health_tx);
+        assert!(matches!(
+            next_health(&health_rx).health,
+            SessionSaveHealth::Healthy
+        ));
+
+        publisher.failed(
+            &[StoreError::Io(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "secret details",
+            ))],
+            false,
+        );
+        let first = next_health(&health_rx);
+        let SessionSaveHealth::Retrying {
+            first_failed_at_unix_ms,
+            ..
+        } = first.health
+        else {
+            panic!("first failure must be retrying");
+        };
+
+        publisher.failed(
+            &[
+                StoreError::StaleGeneration {
+                    entity: "workspace id".to_owned(),
+                    expected: 1,
+                    actual: 2,
+                },
+                StoreError::Io(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "different secret details",
+                )),
+            ],
+            true,
+        );
+        assert_eq!(
+            next_health(&health_rx).health,
+            SessionSaveHealth::RetryExhausted {
+                category: SaveFailureCategory::PermissionDenied,
+                first_failed_at_unix_ms,
+                attempts: 2,
+            }
+        );
+
+        publisher.failed(
+            &[StoreError::StaleGeneration {
+                entity: "workspace id".to_owned(),
+                expected: 1,
+                actual: 2,
+            }],
+            true,
+        );
+        assert_eq!(
+            next_health(&health_rx).health,
+            SessionSaveHealth::RetryExhausted {
+                category: SaveFailureCategory::Conflict,
+                first_failed_at_unix_ms,
+                attempts: 3,
+            }
+        );
+    }
+
+    #[test]
+    fn health_contract_reports_failure_exhaustion_retry_and_recovery() {
+        let queue = Arc::new((
+            Mutex::new(QueueState {
+                latest: Some(Arc::new(workspace())),
+                ..QueueState::default()
+            }),
+            Condvar::new(),
+        ));
+        let last_error = Arc::new(Mutex::new(None));
+        let (health_tx, health_rx) = async_channel::unbounded();
+        let health = HealthPublisher::new(health_tx);
+        let worker_queue = Arc::clone(&queue);
+        let worker_error = Arc::clone(&last_error);
+        let worker = thread::spawn(move || {
+            run_persistence_worker(
+                FakeStore::new([FakeWrite::Fail, FakeWrite::Fail, FakeWrite::Succeed]),
+                PendingWrites::restored(0, BTreeMap::new(), HashMap::new(), HashMap::new()),
+                worker_queue,
+                worker_error,
+                health,
+                fast_persistence_config(2),
+            );
+        });
+
+        assert!(matches!(
+            next_health(&health_rx).health,
+            SessionSaveHealth::Healthy
+        ));
+        let retrying = next_health(&health_rx);
+        let SessionSaveHealth::Retrying {
+            category,
+            first_failed_at_unix_ms,
+            attempts,
+        } = retrying.health
+        else {
+            panic!("first failed flush must enter retrying health");
+        };
+        assert_eq!(category, SaveFailureCategory::PermissionDenied);
+        assert_eq!(attempts, 1);
+        assert_eq!(retrying.last_successful_flush_at_unix_ms, None);
+
+        let exhausted = next_health(&health_rx);
+        assert_eq!(
+            exhausted.health,
+            SessionSaveHealth::RetryExhausted {
+                category,
+                first_failed_at_unix_ms,
+                attempts: 2,
+            }
+        );
+        assert!(!format!("{exhausted:?}").contains("TOKEN=secret"));
+        assert!(
+            last_error
+                .lock()
+                .unwrap()
+                .as_deref()
+                .is_some_and(|error| { error.contains("TOKEN=secret") })
+        );
+
+        let (lock, changed) = &*queue;
+        lock.lock().unwrap().retry_requested = true;
+        changed.notify_one();
+        let recovered = next_health(&health_rx);
+        let SessionSaveHealth::Recovered {
+            recovered_at_unix_ms,
+        } = recovered.health
+        else {
+            panic!("successful manual retry must report recovery");
+        };
+        assert_eq!(
+            recovered.last_successful_flush_at_unix_ms,
+            Some(recovered_at_unix_ms)
+        );
+        assert!(last_error.lock().unwrap().is_none());
+
+        lock.lock().unwrap().shutdown = true;
+        changed.notify_one();
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn injected_writer_panic_reports_unavailable() {
+        let queue = Arc::new((
+            Mutex::new(QueueState {
+                latest: Some(Arc::new(workspace())),
+                ..QueueState::default()
+            }),
+            Condvar::new(),
+        ));
+        let (health_tx, health_rx) = async_channel::unbounded();
+        let health = HealthPublisher::new(health_tx);
+        let worker = thread::spawn(move || {
+            run_persistence_worker(
+                FakeStore::new([FakeWrite::Panic]),
+                PendingWrites::restored(0, BTreeMap::new(), HashMap::new(), HashMap::new()),
+                queue,
+                Arc::new(Mutex::new(None)),
+                health,
+                fast_persistence_config(2),
+            );
+        });
+
+        assert!(matches!(
+            next_health(&health_rx).health,
+            SessionSaveHealth::Healthy
+        ));
+        assert!(matches!(
+            next_health(&health_rx).health,
+            SessionSaveHealth::WriterUnavailable
+        ));
+        worker.join().unwrap();
     }
 
     #[test]
@@ -742,12 +1431,15 @@ mod tests {
         let worker_queue = Arc::clone(&queue);
         let worker_error = Arc::clone(&last_error);
         let worker = thread::spawn(move || {
+            let (health_tx, _health_rx) = async_channel::unbounded();
+            let mut health = HealthPublisher::new(health_tx);
             persistence_loop(
                 store,
                 PendingWrites::restored(0, BTreeMap::new(), HashMap::new(), HashMap::new()),
                 worker_queue,
                 worker_error,
-                SHUTDOWN_FLUSH_BUDGET,
+                &mut health,
+                PersistenceConfig::default(),
             );
         });
 
@@ -803,15 +1495,21 @@ mod tests {
             Condvar::new(),
         ));
         let last_error = Arc::new(Mutex::new(None));
+        let (health_tx, _health_rx) = async_channel::unbounded();
+        let mut health = HealthPublisher::new(health_tx);
 
         persistence_loop(
             store,
             PendingWrites::restored(0, BTreeMap::new(), HashMap::new(), HashMap::new()),
             queue,
             Arc::clone(&last_error),
-            // The blocker never lets go, so the budget only decides how long
-            // this test waits for the flush to give up.
-            Duration::from_millis(200),
+            &mut health,
+            PersistenceConfig {
+                // The blocker never lets go, so the budget only decides how long
+                // this test waits for the flush to give up.
+                shutdown_flush_budget: Duration::from_millis(200),
+                ..PersistenceConfig::default()
+            },
         );
         assert!(last_error.lock().unwrap().is_some());
         blocker.execute_batch("ROLLBACK").unwrap();
@@ -857,13 +1555,16 @@ mod tests {
             Condvar::new(),
         ));
         let last_error = Arc::new(Mutex::new(None));
+        let (health_tx, _health_rx) = async_channel::unbounded();
+        let mut health = HealthPublisher::new(health_tx);
 
         persistence_loop(
             store,
             PendingWrites::restored(0, BTreeMap::new(), HashMap::new(), HashMap::new()),
             queue,
             Arc::clone(&last_error),
-            SHUTDOWN_FLUSH_BUDGET,
+            &mut health,
+            PersistenceConfig::default(),
         );
         release.join().unwrap();
         assert!(last_error.lock().unwrap().is_none());

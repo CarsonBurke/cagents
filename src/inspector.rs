@@ -245,6 +245,8 @@ pub enum RuntimeStatus {
     Restoring,
     Loading,
     Attention,
+    Suspending,
+    Suspended,
     Unavailable,
 }
 
@@ -256,8 +258,15 @@ impl RuntimeStatus {
             Self::Restoring => "Restoring",
             Self::Loading => "Loading",
             Self::Attention => "Needs attention",
+            Self::Suspending => "Suspending",
+            Self::Suspended => "Suspended",
             Self::Unavailable => "Unavailable",
         }
+    }
+
+    #[cfg(feature = "integrated-browser")]
+    const fn has_live_runtime(self) -> bool {
+        matches!(self, Self::Ready | Self::Loading)
     }
 }
 
@@ -291,7 +300,7 @@ pub enum InspectorAction {
     NextRepositoryChange(CardId),
     CreatePullRequest {
         project_id: ProjectId,
-        repository: PathBuf,
+        worktree: PathBuf,
     },
     FocusProjectSearch,
     CloseCard(CardId),
@@ -442,15 +451,17 @@ pub fn model_for_card(
                 ],
             ));
             #[cfg(feature = "integrated-browser")]
-            actions.push(
-                Action::new(
-                    format!("{}.reload", card.id),
-                    "Reload",
-                    "view-refresh-symbolic",
-                    InspectorAction::ReloadBrowser(card.id),
-                )
-                .primary(),
-            );
+            if runtime.has_live_runtime() {
+                actions.push(
+                    Action::new(
+                        format!("{}.reload", card.id),
+                        "Reload",
+                        "view-refresh-symbolic",
+                        InspectorAction::ReloadBrowser(card.id),
+                    )
+                    .primary(),
+                );
+            }
             #[cfg(not(feature = "integrated-browser"))]
             actions.push(
                 Action::new(
@@ -676,7 +687,7 @@ pub fn model_for_card(
                     "vcs-merge-request-symbolic",
                     InspectorAction::CreatePullRequest {
                         project_id: project.id,
-                        repository: project.repository.clone(),
+                        worktree: view.worktree.clone(),
                     },
                 ));
             }
@@ -804,8 +815,12 @@ fn repository_section(project: &SidebarProject, worktree: &SidebarWorktree) -> S
                 "Clean".into()
             } else {
                 format!(
-                    "{total} changes ({} staged, {} unstaged, {} untracked)",
-                    dirty.staged, dirty.unstaged, dirty.untracked
+                    "{total} changes ({} staged, {} unstaged, {} untracked, {} conflicted, {} submodule)",
+                    dirty.staged,
+                    dirty.unstaged,
+                    dirty.untracked,
+                    dirty.conflicted,
+                    dirty.submodule
                 )
             }
         },
@@ -1015,7 +1030,7 @@ mod tests {
     use super::*;
     use crate::model::{
         BrowserId, BrowserRestoreFidelity, BrowserSession, Existence, Exposure, LaunchRecipe,
-        ProjectId, RepositoryView, TerminalId, TerminalSession,
+        ProjectId, RepositoryView, TerminalId, TerminalSession, WorktreeId,
     };
     use crate::splitter::{Edge as SplitterEdge, Splitter};
     use cosmic::iced::{
@@ -1119,6 +1134,100 @@ mod tests {
                 "inspector fact leaked {sensitive:?}: {presented}"
             );
         }
+    }
+
+    #[cfg(feature = "integrated-browser")]
+    #[test]
+    fn reload_is_available_only_while_the_browser_is_materialized() {
+        let card = browser_card("https://example.test");
+        for status in [
+            RuntimeStatus::Starting,
+            RuntimeStatus::Restoring,
+            RuntimeStatus::Suspending,
+            RuntimeStatus::Suspended,
+            RuntimeStatus::Unavailable,
+        ] {
+            let model = model_for_card(&card, status, &[], None);
+            assert!(
+                !model
+                    .actions
+                    .iter()
+                    .any(|action| matches!(action.message, InspectorAction::ReloadBrowser(_))),
+                "{status:?} exposed Reload"
+            );
+        }
+        for status in [RuntimeStatus::Ready, RuntimeStatus::Loading] {
+            let model = model_for_card(&card, status, &[], None);
+            assert!(
+                model
+                    .actions
+                    .iter()
+                    .any(|action| matches!(action.message, InspectorAction::ReloadBrowser(_))),
+                "{status:?} hid Reload"
+            );
+        }
+    }
+
+    #[test]
+    fn repository_context_targets_its_worktree_and_names_every_change_kind() {
+        let project_id = ProjectId::new();
+        let repository = PathBuf::from("/repo");
+        let worktree_path = PathBuf::from("/repo/worktrees/feature");
+        let worktree = SidebarWorktree::new(
+            WorktreeId::new(),
+            worktree_path.clone(),
+            Some("feature".into()),
+            false,
+            false,
+            Some(crate::repository::DirtyState {
+                staged: 1,
+                unstaged: 2,
+                untracked: 3,
+                conflicted: 4,
+                submodule: 5,
+            }),
+            Some(0),
+            Some(0),
+        );
+        let project = SidebarProject::new(
+            project_id,
+            crate::repository::RepositoryId::new(),
+            "repo".into(),
+            repository.clone(),
+            vec![worktree],
+            Vec::new(),
+        );
+        let card = CardState {
+            id: CardId::new(),
+            generation: 1,
+            title: "feature".into(),
+            width_fraction: 0.7,
+            existence: Existence::Open,
+            exposure: Exposure::Visible,
+            residency: Residency::Hot,
+            kind: CardKind::Repository(RepositoryView {
+                project: project_id,
+                repository,
+                worktree: worktree_path.clone(),
+            }),
+        };
+
+        let model = model_for_card(&card, RuntimeStatus::Ready, &[project], None);
+        assert!(model.actions.iter().any(|action| matches!(
+            &action.message,
+            InspectorAction::CreatePullRequest { project_id: action_project, worktree }
+                if *action_project == project_id && worktree == &worktree_path
+        )));
+        let changes = model
+            .sections
+            .iter()
+            .find(|section| section.title == "Worktree context")
+            .and_then(|section| section.facts.iter().find(|fact| fact.label == "Changes"))
+            .map(|fact| fact.value.as_str());
+        assert_eq!(
+            changes,
+            Some("15 changes (1 staged, 2 unstaged, 3 untracked, 4 conflicted, 5 submodule)")
+        );
     }
 
     #[test]
