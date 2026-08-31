@@ -51,7 +51,7 @@ euclid = { version = "=0.22.11", optional = true }
 image = { version = "0.25", default-features = false, features = ["png"] }
 iced_accessibility = { git = "https://github.com/pop-os/libcosmic.git", rev = "caec74c2559924443f12fc6faf97a5bcefe6271d" }
 keyboard-types = { version = "=0.8.3", features = ["serde"], optional = true }
-libcosmic = { git = "https://github.com/pop-os/libcosmic.git", rev = "caec74c2559924443f12fc6faf97a5bcefe6271d", default-features = false, features = ["a11y", "markdown", "multi-window", "surface-message", "tokio", "wayland", "wgpu", "winit", "xdg-portal"] }
+libcosmic = { git = "https://github.com/pop-os/libcosmic.git", rev = "caec74c2559924443f12fc6faf97a5bcefe6271d", default-features = false, features = ["a11y", "highlighter", "markdown", "multi-window", "surface-message", "tokio", "wayland", "wgpu", "winit", "xdg-portal"] }
 imara-diff = "0.2.0"
 ksni = "0.3.6"
 libc = "0.2.189"

@@ -10,7 +10,7 @@ use std::{
 
 use cosmic::{
     Element,
-    iced::{self, Alignment, Font, Length, Task},
+    iced::{self, Alignment, Font, Length, Task, highlighter},
     widget::{self, markdown, segmented_button, text_editor},
 };
 
@@ -1151,7 +1151,15 @@ impl RepositoryRuntime {
     /// first the way the file list does.
     #[cfg(test)]
     pub(crate) fn lsp_selection_fixture(card: CardId) -> (Self, AsyncIdentity) {
-        let path = PathBuf::from("notes.txt");
+        Self::selection_fixture(card, "notes.txt")
+    }
+
+    /// The same fixture under a chosen file name, so a test can vary the one
+    /// thing a selection tells the highlighter: the extension it was opened
+    /// under.
+    #[cfg(test)]
+    pub(crate) fn selection_fixture(card: CardId, name: &str) -> (Self, AsyncIdentity) {
+        let path = PathBuf::from(name);
         let descriptor = RepositoryView {
             project: crate::model::ProjectId::new(),
             repository: PathBuf::from("/repo/.git"),
@@ -1159,7 +1167,7 @@ impl RepositoryRuntime {
         };
         let mut runtime = Self::new(descriptor);
         runtime.files = FileListState::Ready(
-            ["notes.txt", "other.txt"]
+            [name, "other.txt"]
                 .into_iter()
                 .map(|path| RepositoryFile {
                     path: PathBuf::from(path),
@@ -1187,7 +1195,13 @@ impl RepositoryRuntime {
     /// `text`, with the resulting intents still queued.
     #[cfg(test)]
     pub(crate) fn lsp_open_fixture(card: CardId, text: &str) -> (Self, AsyncIdentity) {
-        let (mut runtime, identity) = Self::lsp_selection_fixture(card);
+        Self::open_fixture(card, "notes.txt", text)
+    }
+
+    /// The same, under a chosen file name.
+    #[cfg(test)]
+    pub(crate) fn open_fixture(card: CardId, name: &str, text: &str) -> (Self, AsyncIdentity) {
+        let (mut runtime, identity) = Self::selection_fixture(card, name);
         drop(runtime.update(RepositoryAction::FileLoaded {
             identity: identity.clone(),
             result: Ok(FileContent::Editable {
@@ -1297,6 +1311,34 @@ impl RepositoryRuntime {
             selection: None,
         });
         true
+    }
+
+    /// The focus target of the editable buffer while that buffer is the
+    /// surface actually on screen, and `None` while it is not.
+    ///
+    /// A card showing the diff, a Markdown preview, or a file that never
+    /// became editable builds no editor, so there is nothing there to focus
+    /// and a focus operation aimed at it would be delivered to no widget.
+    #[must_use]
+    pub fn editor_focus_target(&self, card: CardId) -> Option<widget::Id> {
+        let DocumentState::Editable(document) = &self.document else {
+            return None;
+        };
+        let editing = self.source_surface == SourceSurface::Editor
+            && !(document.markdown && self.markdown_mode == MarkdownMode::Preview);
+        editing.then(|| editor_focus_id(card))
+    }
+
+    /// Gives the keyboard to the editable buffer.
+    ///
+    /// Moving the caret is not enough on its own to *show* a jump: an
+    /// unfocused [`text_editor`] draws no caret at all, so a jump into a
+    /// buffer the user has not clicked into lands invisibly. Callers that
+    /// move the caret programmatically chain this after it.
+    #[must_use]
+    pub fn focus_editor<Message: 'static>(&self, card: CardId) -> Task<Message> {
+        self.editor_focus_target(card)
+            .map_or_else(Task::none, iced::widget::operation::focus)
     }
 
     /// Applies a completion's edits to the open buffer.
@@ -2759,8 +2801,47 @@ pub fn view(card: CardId, runtime: &RepositoryRuntime) -> Element<'_, Repository
         .into()
 }
 
+/// The focus target of the card's editable buffer.
+///
+/// Derived from the card rather than minted, so it is the same id on every
+/// rebuild of the view — a focus operation is delivered on the frame *after*
+/// the one that asked for it, and an id that changed in between would address
+/// nothing — and so two repository cards never contend for one focus target.
 pub fn editor_focus_id(card: CardId) -> widget::Id {
     widget::Id::new(format!("repository.{card}.editor"))
+}
+
+/// The grammar and colour scheme the editable buffer is highlighted with.
+///
+/// `token` is what the highlighter resolves a grammar from; it matches a
+/// syntax by name as well as by extension, so a file that has no extension is
+/// still recognised by its own name (`Makefile`, `Dockerfile`) instead of
+/// falling back to plain text. Extensions are lowercased because a grammar
+/// lists its extensions in one case and `README.MD` is still Markdown; a bare
+/// name is passed through as written because that is what a name match
+/// compares against. An unrecognised token is not an error: the highlighter
+/// resolves plain text for it.
+///
+/// The scheme follows the application's own light/dark state rather than being
+/// pinned. Every one of these palettes picks its foregrounds for a background
+/// of its own kind, and reading a dark scheme off a light surface is what
+/// turns highlighted text into unreadable text.
+fn highlighter_settings(path: &Path, dark: bool) -> highlighter::Settings {
+    let token = match path.extension() {
+        Some(extension) => extension.to_string_lossy().to_lowercase(),
+        None => path
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_default(),
+    };
+    highlighter::Settings {
+        theme: if dark {
+            highlighter::Theme::Base16Ocean
+        } else {
+            highlighter::Theme::InspiredGitHub
+        },
+        token,
+    }
 }
 
 pub fn focus_restore_id(card: CardId) -> widget::Id {
@@ -3028,14 +3109,22 @@ fn editable_document_view<'a>(
             .into()
         } else {
             iced::widget::mouse_area(
-                text_editor::text_editor(&document.content)
-                    // libcosmic's context-menu wrapper owns a second widget
-                    // tree whose child can retain the preceding stateless
-                    // placeholder during an async file-load transition. The
-                    // native editor itself provides the required focus and
-                    // editing state without that wrapper.
-                    .context_menu(false)
+                // Iced's own editor rather than libcosmic's wrapper around it.
+                // The wrapper exists to add a context menu, and it pins its
+                // inner editor to `highlighter::PlainText`, so it is incapable
+                // of syntax highlighting. Its second widget tree is also what
+                // could retain the preceding stateless placeholder during an
+                // async file-load transition. With the context menu declined
+                // the wrapper was already a pass-through to exactly this
+                // widget, which is where the focus and editing state live.
+                iced::widget::text_editor::TextEditor::new(&document.content)
+                    // Before `highlight_with`: `id` is only offered by the
+                    // not-yet-highlighted builder.
                     .id(editor_focus_id(card))
+                    .highlight_with::<highlighter::Highlighter>(
+                        highlighter_settings(&document.path, cosmic::theme::is_dark()),
+                        |highlight, _theme| highlight.to_format(),
+                    )
                     .font(Font::MONOSPACE)
                     .padding(spacing.space_xs)
                     .height(Length::Fill)
@@ -3461,6 +3550,8 @@ fn information_state<'a>(
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
+
     use crate::lsp::{LspRange, LspSnippet, LspSnippetStop};
     use crate::model::ProjectId;
     use crate::repository::Oid;
@@ -6052,5 +6143,305 @@ mod tests {
             .status()
             .unwrap();
         assert!(status.success());
+    }
+
+    /// A buffer whose tokens are exactly the ones the smoke run found
+    /// indistinguishable: a comment, a keyword, a string, and a macro call.
+    const HIGHLIGHTABLE: &str = "// what main does\nfn main() {\n    let hello = \"world\";\n    println!(\"{hello}\");\n}\n";
+
+    /// A headless `cosmic::Renderer`. With no graphics device it falls back to
+    /// `tiny-skia`, which needs neither a device nor a surface and which can
+    /// hand back the pixels it drew.
+    ///
+    /// One per render: the renderer accumulates the layers it is drawn into.
+    fn headless_renderer() -> cosmic::Renderer {
+        use cosmic::iced::Pixels;
+        use cosmic::iced::advanced::renderer::Headless;
+
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("executor")
+            .block_on(cosmic::Renderer::new(
+                Font::MONOSPACE,
+                Pixels(14.0),
+                Some("tiny-skia"),
+            ))
+            .expect("a headless renderer")
+    }
+
+    /// The RGBA pixels the card's own `view` rasterises, at `size` logical
+    /// pixels on the dark COSMIC palette.
+    fn rendered_card(card: CardId, runtime: &RepositoryRuntime, size: (u32, u32)) -> Vec<u8> {
+        use cosmic::iced::advanced::renderer::{Headless, Style};
+        use cosmic::iced::advanced::{Layout, layout, mouse, widget::Tree};
+        use cosmic::iced::{Color, Rectangle, Size};
+
+        let (width, height) = size;
+        let mut renderer = headless_renderer();
+        let mut element = view(card, runtime);
+        let mut tree = Tree::new(element.as_widget());
+        let viewport = Rectangle::with_size(Size::new(width as f32, height as f32));
+        let node = element.as_widget_mut().layout(
+            &mut tree,
+            &renderer,
+            &layout::Limits::new(Size::ZERO, viewport.size()),
+        );
+        element.as_widget().draw(
+            &tree,
+            &mut renderer,
+            &cosmic::Theme::dark(),
+            &Style::default(),
+            Layout::new(&node),
+            mouse::Cursor::Unavailable,
+            &viewport,
+        );
+        renderer.screenshot(Size::new(width, height), 1.0, Color::BLACK)
+    }
+
+    /// The colour families a render puts on screen, as (brightest channel,
+    /// dimmest channel) pairs.
+    ///
+    /// Counting *distinct colours* would count anti-aliasing: a single
+    /// coloured glyph fades into the background over a dozen shades. Which
+    /// channel leads is what survives that fade, so this counts token colours
+    /// rather than blend steps. Achromatic pixels — the background, the
+    /// chrome's greys, and unhighlighted text — are excluded outright, and a
+    /// family needs a real population to count so a stray fringe pixel cannot
+    /// invent one.
+    fn colour_families(pixels: &[u8]) -> BTreeSet<(usize, usize)> {
+        const MIN_CHROMA: u8 = 32;
+        const MIN_PIXELS: usize = 16;
+
+        let mut counts: BTreeMap<(usize, usize), usize> = BTreeMap::new();
+        for pixel in pixels.chunks_exact(4) {
+            let rgb = [pixel[0], pixel[1], pixel[2]];
+            let high = rgb.iter().copied().max().expect("three channels");
+            let low = rgb.iter().copied().min().expect("three channels");
+            if high - low < MIN_CHROMA {
+                continue;
+            }
+            let brightest = rgb
+                .iter()
+                .enumerate()
+                .max_by_key(|&(_, v)| v)
+                .expect("max")
+                .0;
+            let dimmest = rgb
+                .iter()
+                .enumerate()
+                .min_by_key(|&(_, v)| v)
+                .expect("min")
+                .0;
+            *counts.entry((brightest, dimmest)).or_default() += 1;
+        }
+        counts
+            .into_iter()
+            .filter(|&(_, count)| count >= MIN_PIXELS)
+            .map(|(family, _)| family)
+            .collect()
+    }
+
+    /// GitHub issue #1 asks for editable *syntax-highlighted* buffers, and the
+    /// editor that first landed drew every token in one colour. This renders
+    /// the same bytes twice, changing nothing but the name they were opened
+    /// under, and reads the pixels back.
+    #[test]
+    fn the_editable_buffer_is_highlighted_by_the_grammar_its_name_names() {
+        let card = CardId::new();
+        let render = |name: &str| {
+            let (runtime, _) = RepositoryRuntime::open_fixture(card, name, HIGHLIGHTABLE);
+            rendered_card(card, &runtime, (520, 200))
+        };
+        // `.txt` is plain text to every grammar set, so this is the same card
+        // with the highlighting switched off by the only input that chooses it.
+        let rust = render("main.rs");
+        let plain = render("main.txt");
+
+        assert_eq!(rust.len(), plain.len(), "both renders are one size");
+        assert!(
+            rust.iter().any(|&channel| channel != 0),
+            "the harness drew nothing at all, so every comparison below would pass vacuously"
+        );
+
+        // Not a comparison of the two frames byte for byte: the header prints
+        // the file name, so they differ on a row that has nothing to do with
+        // highlighting, and such a check would pass with the highlighter
+        // deleted. Colour is what separates them. Every one of this card's own
+        // greys and its single chromatic accent is drawn identically in both,
+        // so a colour family the Rust render has and the plain-text one lacks
+        // can only have come from a grammar.
+        let highlighted = colour_families(&rust);
+        let unhighlighted = colour_families(&plain);
+        assert!(
+            unhighlighted.is_subset(&highlighted),
+            "the plain render has a colour the highlighted one lacks, so these two renders differ \
+             in more than the grammar and the comparison below proves nothing: {unhighlighted:?} \
+             against {highlighted:?}"
+        );
+        assert!(
+            highlighted.len() >= unhighlighted.len() + 2,
+            "a keyword, a string and a comment must not all read the same: the highlighted render \
+             put {} colour families on screen against the plain render's {} — {highlighted:?} \
+             against {unhighlighted:?}",
+            highlighted.len(),
+            unhighlighted.len()
+        );
+    }
+
+    /// Both inputs the highlighter takes, checked where they are decided.
+    #[test]
+    fn the_grammar_follows_the_file_name_and_the_scheme_follows_the_palette() {
+        use cosmic::iced::advanced::text::Highlighter as _;
+
+        /// Whether a token resolves to a grammar that actually colours
+        /// `line`, rather than to the plain-text fallback that colours nothing.
+        fn colours(token: &str, line: &str) -> bool {
+            let settings = highlighter::Settings {
+                theme: highlighter::Theme::Base16Ocean,
+                token: token.to_owned(),
+            };
+            highlighter::Highlighter::new(&settings)
+                .highlight_line(line)
+                .any(|(_, highlight)| highlight.color().is_some())
+        }
+
+        for (path, token, line) in [
+            ("src/main.rs", "rs", "fn main() {}"),
+            // A grammar lists its extensions in one case, and `README.MD` is
+            // still Markdown.
+            ("README.MD", "md", "# heading"),
+            // No extension to read, so the name is the token — and it is
+            // passed through as written, because that is what a grammar's own
+            // name is matched against.
+            ("Makefile", "Makefile", "all: build"),
+            ("deploy/Dockerfile", "Dockerfile", "FROM scratch"),
+        ] {
+            let settings = highlighter_settings(Path::new(path), true);
+            assert_eq!(
+                settings.token, token,
+                "{path} must be highlighted as {token}"
+            );
+            assert!(
+                colours(&settings.token, line),
+                "{token:?} resolves to no grammar, so {path} would render as flat plain text"
+            );
+        }
+
+        assert!(
+            !colours("no-such-grammar", "fn main() {}"),
+            "an unrecognised token must fall back to plain text rather than colour arbitrarily; \
+             without that the check above cannot tell a grammar from the fallback"
+        );
+
+        // A scheme picks its foregrounds for a background of its own kind, so
+        // reading a dark one off a light surface is what makes highlighted
+        // text illegible.
+        assert!(
+            highlighter_settings(Path::new("main.rs"), true)
+                .theme
+                .is_dark(),
+            "a dark application must highlight with a dark scheme"
+        );
+        assert!(
+            !highlighter_settings(Path::new("main.rs"), false)
+                .theme
+                .is_dark(),
+            "a light application must highlight with a light scheme"
+        );
+    }
+
+    /// Moving the caret is not enough to *show* a jump: an unfocused
+    /// `text_editor` draws no caret at all, which is what made
+    /// jump-to-location look like it did nothing. The affordance the
+    /// application chains after a caret move has to name a target that the
+    /// view really carries, on the frame after the one that asked for it.
+    #[test]
+    fn the_editable_buffer_offers_a_stable_focus_target_the_view_really_carries() {
+        use cosmic::iced::Size;
+        use cosmic::iced::advanced::widget::Operation as _;
+        use cosmic::iced::advanced::widget::operation::{self, Outcome};
+        use cosmic::iced::advanced::{Layout, layout, widget::Tree};
+
+        let card = CardId::new();
+        let expected = editor_focus_id(card).to_string();
+        assert_eq!(
+            editor_focus_id(card).to_string(),
+            expected,
+            "the id must be derived from the card rather than minted: a focus operation is \
+             delivered on a later frame than the one that asked for it, and an id that changed in \
+             between would address nothing"
+        );
+        assert_ne!(
+            editor_focus_id(CardId::new()).to_string(),
+            expected,
+            "two repository cards must not contend for one focus target"
+        );
+
+        let (mut runtime, _) = RepositoryRuntime::open_fixture(card, "main.rs", HIGHLIGHTABLE);
+        assert_eq!(
+            runtime.editor_focus_target(card).map(|id| id.to_string()),
+            Some(expected.clone()),
+            "an open editable buffer is exactly the surface a jump lands in"
+        );
+
+        // The id is only worth having if the widget tree answers to it, so ask
+        // the real `view` to focus it and then ask it back what is focused.
+        let landed = {
+            let renderer = headless_renderer();
+            let mut element = view(card, &runtime);
+            let mut tree = Tree::new(element.as_widget());
+            let node = element.as_widget_mut().layout(
+                &mut tree,
+                &renderer,
+                &layout::Limits::new(Size::ZERO, Size::new(520.0, 200.0)),
+            );
+            let mut focus = operation::focusable::focus::<()>(editor_focus_id(card));
+            element
+                .as_widget_mut()
+                .operate(&mut tree, Layout::new(&node), &renderer, &mut focus);
+            // `Widget::operate` only takes an `Operation<()>`; `black_box` is
+            // how iced runs an operation that reports an outcome through one.
+            let mut focused = operation::focusable::find_focused();
+            let mut probe = operation::black_box::<_, ()>(&mut focused);
+            element
+                .as_widget_mut()
+                .operate(&mut tree, Layout::new(&node), &renderer, &mut probe);
+            drop(probe);
+            match focused.finish() {
+                Outcome::Some(id) => Some(id.to_string()),
+                Outcome::None | Outcome::Chain(_) => None,
+            }
+        };
+        assert_eq!(
+            landed,
+            Some(expected.clone()),
+            "the focus operation reached no focusable widget under that id: the editor the view \
+             builds does not carry it"
+        );
+
+        // A surface that builds no editor has nothing to focus, and a focus
+        // operation aimed at it would be delivered to no widget at all.
+        if let DocumentState::Editable(document) = &mut runtime.document {
+            document.markdown = true;
+        }
+        runtime.markdown_mode = MarkdownMode::Preview;
+        assert!(
+            runtime.editor_focus_target(card).is_none(),
+            "a Markdown preview renders the buffer, it does not edit it"
+        );
+
+        runtime.markdown_mode = MarkdownMode::Edit;
+        drop(runtime.update(RepositoryAction::ApplySourceSurface { card, diff: true }));
+        assert!(
+            runtime.editor_focus_target(card).is_none(),
+            "the diff surface replaces the editor rather than sitting beside it"
+        );
+
+        drop(runtime.update(RepositoryAction::BackToFiles { card }));
+        assert!(
+            runtime.editor_focus_target(card).is_none(),
+            "the file list has no buffer for a caret to be in"
+        );
     }
 }
