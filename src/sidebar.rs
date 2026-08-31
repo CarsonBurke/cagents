@@ -1813,7 +1813,10 @@ fn filter_id(filter: SidebarFilter) -> Id {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{github::RemoteValue, repository::WorktreeLock};
+    use crate::{
+        github::RemoteValue,
+        repository::{ChangeArea, ChangeKind, ChangedPath, RepoPath, WorktreeLock},
+    };
     use cosmic::iced::{
         Size,
         advanced::{Layout, layout, widget::Tree},
@@ -1842,6 +1845,23 @@ mod tests {
                 dirty: DirtyState {
                     unstaged: if dirty { 1 } else { 0 },
                     ..DirtyState::default()
+                },
+                // `dirty` counts what `entries` lists, so a fixture that
+                // claimed a modified file without naming one would describe a
+                // snapshot the parser cannot produce.
+                entries: if dirty {
+                    vec![ChangedPath {
+                        path: RepoPath::parse("src/lib.rs").unwrap(),
+                        old_path: None,
+                        area: ChangeArea::Unstaged,
+                        kind: ChangeKind::Modified,
+                        conflict: None,
+                        submodule: false,
+                        added_lines: None,
+                        removed_lines: None,
+                    }]
+                } else {
+                    Vec::new()
                 },
             }),
         )

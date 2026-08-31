@@ -1,4 +1,5 @@
 use std::{
+    collections::{HashMap, HashSet},
     fs::{self, DirBuilder, File, OpenOptions},
     io::{self, Read, Write},
     os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt},
@@ -266,6 +267,17 @@ pub struct AppSettings {
     pub link_open_destination: LinkOpenDestination,
     #[serde(default)]
     pub link_open_gesture: LinkOpenGesture,
+    /// External language servers, in declaration order. The first server whose
+    /// language claims a file extension handles that file. An empty list
+    /// disables LSP entirely.
+    ///
+    /// Declared after every scalar because it serialises as an array of
+    /// tables, and TOML admits no scalar key after the first table. Declared
+    /// before `keyboard_shortcuts` because an empty list serialises as the
+    /// value `language_servers = []`, which after a `[keyboard_shortcuts]`
+    /// header would read as a key inside that table.
+    #[serde(default = "default_language_servers")]
+    pub language_servers: Vec<LanguageServerSettings>,
     #[serde(default)]
     pub keyboard_shortcuts: KeyboardShortcuts,
 }
@@ -284,9 +296,120 @@ impl Default for AppSettings {
             terminal_scrollback_lines: 10_000,
             link_open_destination: LinkOpenDestination::default(),
             link_open_gesture: LinkOpenGesture::default(),
+            language_servers: default_language_servers(),
             keyboard_shortcuts: KeyboardShortcuts::default(),
         }
     }
+}
+
+/// One language a server handles, and the file extensions that select it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LanguageServerLanguage {
+    /// LSP `languageId` sent in `textDocument/didOpen`.
+    pub language_id: String,
+    /// Lowercase file extensions without a leading dot.
+    pub extensions: Vec<String>,
+}
+
+/// One external language server.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LanguageServerSettings {
+    /// Stable unique identifier, also used as the session key prefix.
+    pub id: String,
+    pub languages: Vec<LanguageServerLanguage>,
+    /// argv; never a shell command line. `command[0]` is the executable.
+    pub command: Vec<String>,
+    /// Relative marker names that identify a project root.
+    #[serde(default)]
+    pub root_markers: Vec<String>,
+}
+
+/// The built-in language-server list. A `language_servers` key in the settings
+/// file replaces this list wholesale rather than merging with it.
+pub fn default_language_servers() -> Vec<LanguageServerSettings> {
+    fn server(
+        id: &str,
+        command: &[&str],
+        languages: &[(&str, &[&str])],
+        root_markers: &[&str],
+    ) -> LanguageServerSettings {
+        LanguageServerSettings {
+            id: id.to_owned(),
+            languages: languages
+                .iter()
+                .map(|(language_id, extensions)| LanguageServerLanguage {
+                    language_id: (*language_id).to_owned(),
+                    extensions: extensions.iter().map(|value| (*value).to_owned()).collect(),
+                })
+                .collect(),
+            command: command.iter().map(|value| (*value).to_owned()).collect(),
+            root_markers: root_markers
+                .iter()
+                .map(|value| (*value).to_owned())
+                .collect(),
+        }
+    }
+
+    vec![
+        server(
+            "rust-analyzer",
+            &["rust-analyzer"],
+            &[("rust", &["rs"])],
+            &["Cargo.toml", "rust-project.json", ".git"],
+        ),
+        server(
+            "pyright",
+            &["pyright-langserver", "--stdio"],
+            &[("python", &["py"])],
+            &[
+                "pyproject.toml",
+                "setup.py",
+                "setup.cfg",
+                "requirements.txt",
+                ".git",
+            ],
+        ),
+        server(
+            "typescript-language-server",
+            &["typescript-language-server", "--stdio"],
+            &[
+                ("javascript", &["js", "mjs", "cjs"]),
+                ("javascriptreact", &["jsx"]),
+                ("typescript", &["ts", "mts", "cts"]),
+                ("typescriptreact", &["tsx"]),
+            ],
+            &["tsconfig.json", "jsconfig.json", "package.json", ".git"],
+        ),
+        server(
+            "gopls",
+            &["gopls"],
+            &[("go", &["go"])],
+            &["go.work", "go.mod", ".git"],
+        ),
+        server(
+            "clangd",
+            &["clangd"],
+            &[
+                ("c", &["c", "h"]),
+                ("cpp", &["cc", "cpp", "cxx", "hh", "hpp", "hxx"]),
+            ],
+            &["compile_commands.json", "compile_flags.txt", ".git"],
+        ),
+        server(
+            "lua-language-server",
+            &["lua-language-server"],
+            &[("lua", &["lua"])],
+            &[".luarc.json", ".luarc.jsonc", ".git"],
+        ),
+        server(
+            "bash-language-server",
+            &["bash-language-server", "start"],
+            &[("shellscript", &["sh", "bash"])],
+            &[".git"],
+        ),
+    ]
 }
 
 #[derive(Debug, Deserialize)]
@@ -404,6 +527,10 @@ impl From<V2TomlSettings> for AppSettings {
             terminal_scrollback_lines: previous.terminal_scrollback_lines,
             link_open_destination: previous.link_open_destination,
             link_open_gesture: previous.link_open_gesture,
+            // A version-2 file predates language servers, so it can hold no
+            // preference to carry: migration adopts the built-in list, which
+            // is what a file that omits the key gets as well.
+            language_servers: default_language_servers(),
             keyboard_shortcuts: previous.keyboard_shortcuts,
         }
     }
@@ -473,8 +600,112 @@ impl AppSettings {
             ));
         }
         self.keyboard_shortcuts.validate()?;
+        validate_language_servers(&self.language_servers)?;
         Ok(self)
     }
+}
+
+/// Validates the flattened language-server mapping. An empty list is valid and
+/// disables LSP. Nothing here touches the filesystem, resolves an executable,
+/// or invokes a shell.
+fn validate_language_servers(servers: &[LanguageServerSettings]) -> Result<(), SettingsError> {
+    let mut identifiers: HashSet<&str> = HashSet::new();
+    let mut extension_owners: HashMap<&str, &str> = HashMap::new();
+
+    for server in servers {
+        let id = server.id.as_str();
+        if id.is_empty() {
+            return Err(SettingsError::LanguageServer(
+                "language_servers entry has an empty id".to_owned(),
+            ));
+        }
+        if !identifiers.insert(id) {
+            return Err(SettingsError::LanguageServer(format!(
+                "language server id {id} is declared more than once"
+            )));
+        }
+        if server.command.is_empty() {
+            return Err(SettingsError::LanguageServer(format!(
+                "language server {id} must declare a non-empty command"
+            )));
+        }
+        if server.command[0].is_empty() {
+            return Err(SettingsError::LanguageServer(format!(
+                "language server {id} must name an executable in command[0]"
+            )));
+        }
+        if server.languages.is_empty() {
+            return Err(SettingsError::LanguageServer(format!(
+                "language server {id} must declare at least one language"
+            )));
+        }
+        for marker in &server.root_markers {
+            if !is_relative_marker(marker) {
+                return Err(SettingsError::LanguageServer(format!(
+                    "language server {id} root marker {marker:?} must be a relative path without empty, . or .. components"
+                )));
+            }
+        }
+        for language in &server.languages {
+            let language_id = language.language_id.as_str();
+            if language_id.is_empty() {
+                return Err(SettingsError::LanguageServer(format!(
+                    "language server {id} has a language with an empty language_id"
+                )));
+            }
+            if language.extensions.is_empty() {
+                return Err(SettingsError::LanguageServer(format!(
+                    "language server {id} language {language_id} must declare at least one extension"
+                )));
+            }
+            for extension in &language.extensions {
+                if extension.is_empty() {
+                    return Err(SettingsError::LanguageServer(format!(
+                        "language server {id} language {language_id} has an empty extension"
+                    )));
+                }
+                if extension.starts_with('.') {
+                    return Err(SettingsError::LanguageServer(format!(
+                        "language server {id} extension {extension} must not start with a dot"
+                    )));
+                }
+                // `is_uppercase` is the Unicode `Uppercase` property, which
+                // excludes titlecase characters such as U+01C5. Comparing the
+                // scalar-wise lowercase mapping is the exact test and, unlike
+                // `str::to_lowercase`, allocates nothing.
+                if !extension
+                    .chars()
+                    .flat_map(char::to_lowercase)
+                    .eq(extension.chars())
+                {
+                    return Err(SettingsError::LanguageServer(format!(
+                        "language server {id} extension {extension} must be lowercase"
+                    )));
+                }
+                // Repeating an extension under one server is redundant but
+                // unambiguous: the first declaration wins. Two servers claiming
+                // it is genuinely ambiguous and is rejected.
+                if let Some(owner) = extension_owners.insert(extension.as_str(), id)
+                    && owner != id
+                {
+                    return Err(SettingsError::LanguageServer(format!(
+                        "extension {extension} is claimed by both {owner} and {id}"
+                    )));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// A root marker names a relative path below the project root. Splitting on the
+/// separator rejects an empty marker, an absolute path, a trailing or doubled
+/// separator, and any `.` or `..` segment, so discovery can never be pointed
+/// out of the worktree.
+fn is_relative_marker(marker: &str) -> bool {
+    marker
+        .split('/')
+        .all(|segment| !segment.is_empty() && segment != "." && segment != "..")
 }
 
 #[derive(Debug, Error)]
@@ -501,6 +732,8 @@ pub enum SettingsError {
     /// width this accepted used to render clamped to a narrower range.
     #[error("invalid settings: sidebar_width must be between {min} and {max}")]
     SidebarWidth { min: f32, max: f32 },
+    #[error("invalid settings: {0}")]
+    LanguageServer(String),
 }
 
 pub fn default_path() -> Result<PathBuf, SettingsError> {
@@ -796,8 +1029,12 @@ mod tests {
         }
     }
 
+    /// Derives the version-2 document from today's shape rather than pasting a
+    /// literal, so a key added to version 3 later cannot pass this test by
+    /// simply not appearing in it: the writer has to strip the key here, which
+    /// is where the migration decision gets stated.
     #[test]
-    fn version_two_toml_adds_the_default_inspector_width() {
+    fn version_two_toml_adds_every_key_it_predates() {
         let directory = tempfile::tempdir().unwrap();
         let path = path_in(&directory);
         let previous = AppSettings {
@@ -806,9 +1043,21 @@ mod tests {
             ..AppSettings::default()
         };
         let document = toml::to_string(&previous).unwrap();
+        // `language_servers` serialises as an array of tables with nested
+        // `[[language_servers.languages]]` tables of its own, so removing it
+        // means dropping every line under any header rooted at that key rather
+        // than a single scalar line.
+        let mut inside_language_servers = false;
         let document = document
             .lines()
-            .filter(|line| !line.starts_with("inspector_width"))
+            .filter(|line| {
+                if let Some(header) = line.strip_prefix("[[").or(line.strip_prefix('[')) {
+                    inside_language_servers = header
+                        .strip_prefix("language_servers")
+                        .is_some_and(|rest| rest.starts_with(']') || rest.starts_with('.'));
+                }
+                !inside_language_servers && !line.starts_with("inspector_width")
+            })
             .map(|line| {
                 if line.starts_with("schema_version") {
                     format!("schema_version = {PREVIOUS_SETTINGS_SCHEMA_VERSION}\n")
@@ -817,6 +1066,7 @@ mod tests {
                 }
             })
             .collect::<String>();
+        assert!(!document.contains("language_servers"), "{document}");
         fs::write(&path, document).unwrap();
 
         let migrated = load(&path).unwrap();
@@ -824,6 +1074,7 @@ mod tests {
         assert_eq!(migrated.sidebar_width, previous.sidebar_width);
         assert_eq!(migrated.terminal_font_size, previous.terminal_font_size);
         assert_eq!(migrated.inspector_width, design::INSPECTOR_DEFAULT_WIDTH);
+        assert_eq!(migrated.language_servers, default_language_servers());
     }
 
     #[test]
