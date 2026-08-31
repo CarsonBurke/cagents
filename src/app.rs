@@ -4367,14 +4367,15 @@ impl Cagents {
     /// traffic, and it must happen after *every* repository action, because an
     /// `Open` that is never drained leaves a document the server has not been
     /// told about while the application shows results for it.
-    fn drain_lsp_intents(&mut self, card: CardId) {
+    fn drain_lsp_intents(&mut self, card: CardId) -> Task<Message> {
         let intents = match self.cards.get_mut(&card) {
             Some(CardRuntime::Repository(runtime)) => runtime.take_lsp_intents(),
             _ => Vec::new(),
         };
         if intents.is_empty() {
-            return;
+            return Task::none();
         }
+        let mut tasks = Vec::new();
         for intent in intents {
             match intent {
                 LspIntent::Open {
@@ -4382,7 +4383,13 @@ impl Cagents {
                     worktree,
                     version,
                     text,
-                } => self.open_lsp_document(card, &absolute_path, &worktree, version, &text),
+                } => tasks.push(self.open_lsp_document(
+                    card,
+                    &absolute_path,
+                    &worktree,
+                    version,
+                    &text,
+                )),
                 LspIntent::Change { version, text } => {
                     let Some(doc) = self.lsp_document(card) else {
                         continue;
@@ -4406,6 +4413,7 @@ impl Cagents {
                 LspIntent::Close => self.close_lsp_document(card),
             }
         }
+        Task::batch(tasks)
     }
 
     /// Retires everything a closed card held at the language-server boundary.
@@ -4433,7 +4441,7 @@ impl Cagents {
         worktree: &Path,
         version: i32,
         text: &str,
-    ) {
+    ) -> Task<Message> {
         // A previous buffer's document is closed first even without a `Close`
         // intent, because the two are one transition for the user: opening a
         // second file over the first leaves the server holding a document for
@@ -4449,7 +4457,7 @@ impl Cagents {
             let state = self.lsp_contexts.entry(card).or_default();
             state.context.status = Some(LspStatus::Disabled);
             self.lsp_pending_jumps.remove(&card);
-            return;
+            return Task::none();
         };
         let doc = LspDocumentId(self.next_lsp_document);
         self.next_lsp_document += 1;
@@ -4461,7 +4469,7 @@ impl Cagents {
         let state = self.lsp_contexts.entry(card).or_default();
         state.document = Some(doc);
         state.context.status = Some(status);
-        self.flush_pending_lsp_jump(card, path);
+        self.flush_pending_lsp_jump(card, path)
     }
 
     fn close_lsp_document(&mut self, card: CardId) {
@@ -4482,17 +4490,17 @@ impl Cagents {
     }
 
     /// Applies a parked jump now that `path` is the card's open buffer.
-    fn flush_pending_lsp_jump(&mut self, card: CardId, path: &Path) {
+    fn flush_pending_lsp_jump(&mut self, card: CardId, path: &Path) -> Task<Message> {
         // Taken on *any* open, not only a matching one. A jump is answered by
         // the open it asked for or by nothing: leaving it parked would let the
         // caret be yanked minutes later, when the user opens that file
         // themselves, to a position from an answer they have forgotten asking
         // for and against text that has since changed.
         let Some(jump) = self.lsp_pending_jumps.remove(&card) else {
-            return;
+            return Task::none();
         };
         if jump.path != path {
-            return;
+            return Task::none();
         }
         let at = match jump.coordinates {
             LspCoordinates::Scalar => jump.at,
@@ -4501,7 +4509,7 @@ impl Cagents {
             // manager can place it against the text it actually indexes.
             LspCoordinates::Utf16 => {
                 let Some(doc) = self.lsp_document(card) else {
-                    return;
+                    return Task::none();
                 };
                 match self.lsp.scalar_position(doc, jump.at) {
                     Ok(at) => at,
@@ -4509,25 +4517,33 @@ impl Cagents {
                         self.status = Some(TransientNotice::warning(format!(
                             "opened the file, but could not place the caret: {error}"
                         )));
-                        return;
+                        return Task::none();
                     }
                 }
             }
         };
-        self.move_lsp_caret(card, at);
+        self.move_lsp_caret(card, at)
     }
 
-    fn move_lsp_caret(&mut self, card: CardId, at: LspPosition) {
-        let moved = match self.cards.get_mut(&card) {
-            Some(CardRuntime::Repository(runtime)) => runtime.move_cursor_to(at),
-            _ => false,
+    /// Places the caret and gives the editor the keyboard.
+    ///
+    /// Moving the caret alone is invisible: an unfocused `text_editor` draws
+    /// no caret at all, so a jump into a result would answer the user with a
+    /// frame that looks exactly like the one they clicked in.
+    fn move_lsp_caret(&mut self, card: CardId, at: LspPosition) -> Task<Message> {
+        let focus = match self.cards.get_mut(&card) {
+            Some(CardRuntime::Repository(runtime)) => runtime
+                .move_cursor_to(at)
+                .then(|| runtime.focus_editor(card)),
+            _ => None,
         };
-        if !moved {
+        focus.unwrap_or_else(|| {
             self.status = Some(TransientNotice::warning(format!(
                 "line {} is not in this file any more",
                 at.line.saturating_add(1)
             )));
-        }
+            Task::none()
+        })
     }
 
     /// Routes one language-server event onto the card whose document it names.
@@ -4626,8 +4642,7 @@ impl Cagents {
                     ));
                     return Task::none();
                 }
-                self.move_lsp_caret(card, at);
-                Task::none()
+                self.move_lsp_caret(card, at)
             }
             InspectorAction::JumpToLspLocation {
                 card,
@@ -4703,16 +4718,13 @@ impl Cagents {
             // rather than trusted, because placing protocol code units as
             // scalars silently lands the caret in the wrong column.
             return match coordinates {
-                LspCoordinates::Scalar => {
-                    self.move_lsp_caret(card, at);
-                    Task::none()
-                }
+                LspCoordinates::Scalar => self.move_lsp_caret(card, at),
                 LspCoordinates::Utf16 => {
                     let Some(doc) = self.lsp_document(card) else {
                         return Task::none();
                     };
                     match self.lsp.scalar_position(doc, at) {
-                        Ok(at) => self.move_lsp_caret(card, at),
+                        Ok(at) => return self.move_lsp_caret(card, at),
                         Err(error) => {
                             self.status = Some(TransientNotice::warning(format!(
                                 "could not place the caret: {error}"
@@ -4802,8 +4814,7 @@ impl Cagents {
         if let Some(state) = self.lsp_contexts.get_mut(&card) {
             state.context.completions.clear();
         }
-        self.drain_lsp_intents(card);
-        Task::none()
+        self.drain_lsp_intents(card)
     }
 
     fn request_lsp(&mut self, card: CardId, kind: LspRequestKind) -> Task<Message> {
@@ -5641,9 +5652,9 @@ impl Cagents {
     /// one-way, so a changed list is a new manager. Every open buffer is
     /// re-announced to the replacement: leaving them would show the user files
     /// that look checked and are not.
-    fn synchronize_language_servers(&mut self) {
+    fn synchronize_language_servers(&mut self) -> Task<Message> {
         if self.lsp.servers() == self.settings.language_servers.as_slice() {
-            return;
+            return Task::none();
         }
         // `shutdown` alone moves the sessions into the outgoing manager's own
         // retiring list and kills nothing, and dropping that manager drops
@@ -5657,13 +5668,15 @@ impl Cagents {
         self.lsp_documents.clear();
         self.lsp_pending_jumps.clear();
         let cards: Vec<CardId> = self.cards.keys().copied().collect();
+        let mut tasks = Vec::with_capacity(cards.len());
         for card in cards {
             if let Some(CardRuntime::Repository(runtime)) = self.cards.get_mut(&card) {
                 runtime.set_lsp_document(None);
                 runtime.resync_lsp();
             }
-            self.drain_lsp_intents(card);
+            tasks.push(self.drain_lsp_intents(card));
         }
+        Task::batch(tasks)
     }
 
     fn reset_settings(&mut self) -> Task<Message> {
@@ -5673,14 +5686,14 @@ impl Cagents {
         self.synchronize_lifecycle_budget();
         // Reset restores the built-in server list, which is a different set of
         // processes whenever the user had configured their own.
-        self.synchronize_language_servers();
+        let resync = self.synchronize_language_servers();
         self.settings_write_blocked = false;
         self.settings_feedback = Some(match self.save_settings_now() {
             Ok(()) => SettingsFeedback::Saved,
             Err(error) => SettingsFeedback::Error(error),
         });
         let sweep = self.lifecycle_sweep();
-        Task::batch([sweep, self.reschedule_offscreen_lifecycle_sweep()])
+        Task::batch([resync, sweep, self.reschedule_offscreen_lifecycle_sweep()])
     }
 }
 
@@ -6126,8 +6139,7 @@ impl Application for Cagents {
                 // runtime and has so far reached nothing. Draining here rather
                 // than at the individual actions is what makes that true of all
                 // of them, including the ones a later action adds.
-                self.drain_lsp_intents(card);
-                let mut tasks = vec![task];
+                let mut tasks = vec![task, self.drain_lsp_intents(card)];
                 if files_loaded {
                     tasks.push(self.flush_pending_panel_open(card));
                 }
@@ -8935,6 +8947,195 @@ mod tests {
         ));
     }
 
+    /// A headless `cosmic::Renderer`. With no graphics device it falls back
+    /// to tiny-skia, which needs neither a device nor a surface.
+    fn headless_renderer() -> cosmic::Renderer {
+        use cosmic::iced::advanced::renderer::Headless;
+        use cosmic::iced::{Font, Pixels};
+
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("executor")
+            .block_on(cosmic::Renderer::new(
+                Font::default(),
+                Pixels(14.0),
+                Some("tiny-skia"),
+            ))
+            .expect("a headless renderer")
+    }
+
+    /// Presents one frame against a carried-over widget tree, exactly the way
+    /// `iced_runtime::UserInterface::build` does: the previous frame's named
+    /// widget states are lifted into the thread-local map that reconciliation
+    /// restores them from, then the tree is reconciled, laid out and drawn.
+    ///
+    /// Reproduced here rather than driven through `UserInterface` because that
+    /// type keeps its reconciled tree private, and the tree is what these
+    /// tests are about.
+    fn present(
+        app: &Cagents,
+        renderer: &mut cosmic::Renderer,
+        tree: &mut cosmic::iced::advanced::widget::Tree,
+    ) {
+        use cosmic::iced::advanced::widget::tree::NAMED;
+        use cosmic::iced::advanced::{Layout, layout, mouse, renderer::Style};
+        use cosmic::iced::{Rectangle, Size};
+
+        let bounds = Size::new(1600.0, 1200.0);
+        let mut element: cosmic::Element<'_, Message> = cosmic::Application::view(app);
+        NAMED.with(|named| {
+            *named.borrow_mut() = tree.take_all_named();
+        });
+        tree.diff(element.as_widget_mut());
+        let node = element.as_widget_mut().layout(
+            tree,
+            renderer,
+            &layout::Limits::new(Size::ZERO, bounds),
+        );
+        NAMED.with(|named| named.borrow_mut().clear());
+        element.as_widget().draw(
+            tree,
+            renderer,
+            &cosmic::theme::active(),
+            &Style::default(),
+            Layout::new(&node),
+            mouse::Cursor::Unavailable,
+            &Rectangle::with_size(bounds),
+        );
+    }
+
+    /// Every named node in a tree, in the order a parent draws its children.
+    fn named_nodes(tree: &cosmic::iced::advanced::widget::Tree) -> Vec<String> {
+        fn walk(tree: &cosmic::iced::advanced::widget::Tree, into: &mut Vec<String>) {
+            if let Some(id) = tree.id.as_ref() {
+                let rendered = format!("{id:?}");
+                // `Id`'s debug carries a per-process counter that differs
+                // between two builds of the same frame; the name does not.
+                if let Some(name) = rendered
+                    .split_once("Custom(")
+                    .and_then(|(_, rest)| rest.split_once('"'))
+                    .and_then(|(_, rest)| rest.split_once('"'))
+                    .map(|(name, _)| name.to_owned())
+                {
+                    into.push(name);
+                }
+            }
+            for child in &tree.children {
+                walk(child, into);
+            }
+        }
+
+        let mut found = Vec::new();
+        walk(tree, &mut found);
+        found
+    }
+
+    /// A reconciled tree must describe the frame it was reconciled against.
+    ///
+    /// Naming a widget - `widget::Id::new(some_string)` - opts it into
+    /// libcosmic's named-state mechanism: every build lifts such a node's
+    /// state out of the tree into a thread-local map and puts it back only for
+    /// the names the new frame still asks for. Surviving children are then
+    /// claimed by name *in place* and never repositioned, so a list whose
+    /// membership changes leaves the departed nodes stranded at their old
+    /// indices with their state gone. Whichever widget now occupies such a
+    /// slot is then laid out and drawn against a stranger's state - and a
+    /// button drawn against emptied state aborts the process from inside
+    /// `draw`, where nothing can catch it.
+    ///
+    /// Comparing against a tree built fresh for the same frame is the whole
+    /// invariant: same names, same order.
+    fn assert_frame_is_faithful(app: &Cagents, tree: &cosmic::iced::advanced::widget::Tree) {
+        let mut fresh: cosmic::Element<'_, Message> = cosmic::Application::view(app);
+        let expected = named_nodes(&cosmic::iced::advanced::widget::Tree::new(
+            fresh.as_widget_mut(),
+        ));
+        assert_eq!(
+            named_nodes(tree),
+            expected,
+            "the reconciled tree does not describe the frame it was reconciled against"
+        );
+    }
+
+    /// A repository card whose durable state and runtime both say repository,
+    /// with an unsaved buffer and a language server reporting on it - the
+    /// state a user is in while editing a file.
+    fn editing_repository_app() -> (Cagents, CardId) {
+        let mut app = context_inspector_test_app(true);
+        let card = app.workspace.focused().expect("a focused card");
+        {
+            let durable = Arc::make_mut(&mut app.durable);
+            let state = durable
+                .cards
+                .iter_mut()
+                .find(|state| state.id == card)
+                .expect("the focused card is durable");
+            state.kind = CardKind::Repository(RepositoryView {
+                project: ProjectId::new(),
+                repository: PathBuf::from("/repo/.git"),
+                worktree: PathBuf::from("/repo"),
+            });
+        }
+        app.cards.insert(
+            card,
+            CardRuntime::Repository(Box::new(RepositoryRuntime::dirty_fixture(card))),
+        );
+        let state = lsp_state(&mut app, card);
+        state.document = Some(LspDocumentId(1));
+        state.context.status = Some(crate::lsp::LspStatus::Ready);
+        state.context.diagnostics = vec![diagnostic("first"), diagnostic("second")];
+        state.diagnostics_version = Some(0);
+        app.lsp_documents.insert(LspDocumentId(1), card);
+        (app, card)
+    }
+
+    /// Discarding retires the Discard and Save commands and offers Back to
+    /// files in their place. Before this was fixed that repaint aborted the
+    /// process: the contextual inspector's commands were named, so the two
+    /// departing buttons stranded their emptied nodes for the surviving
+    /// buttons to draw against.
+    #[test]
+    fn discarding_an_edit_repaints_the_window() {
+        use cosmic::iced::advanced::widget::Tree;
+
+        let (mut app, card) = editing_repository_app();
+        let mut renderer = headless_renderer();
+        let mut tree = Tree::empty();
+
+        present(&app, &mut renderer, &mut tree);
+        assert_frame_is_faithful(&app, &tree);
+
+        let _ = app.update(Message::Repository(RepositoryAction::DiscardEdits { card }));
+        present(&app, &mut renderer, &mut tree);
+        assert_frame_is_faithful(&app, &tree);
+    }
+
+    /// The same reconciliation, over the transitions that move a repository
+    /// card between its surfaces. Each one changes which commands the
+    /// inspector offers, which is the condition that strands a named node.
+    #[test]
+    fn moving_between_repository_surfaces_repaints_the_window() {
+        use cosmic::iced::advanced::widget::Tree;
+
+        let (mut app, card) = editing_repository_app();
+        let mut renderer = headless_renderer();
+        let mut tree = Tree::empty();
+        present(&app, &mut renderer, &mut tree);
+
+        for action in [
+            RepositoryAction::ApplySourceSurface { card, diff: true },
+            RepositoryAction::ApplySourceSurface { card, diff: false },
+            RepositoryAction::BackToFiles { card },
+            RepositoryAction::DiscardEdits { card },
+            RepositoryAction::RefreshFiles { card },
+        ] {
+            let _ = app.update(Message::Repository(action));
+            present(&app, &mut renderer, &mut tree);
+            assert_frame_is_faithful(&app, &tree);
+        }
+    }
+
     #[test]
     fn card_close_still_discards_ordinary_editor_dirtiness() {
         let mut app = context_inspector_test_app(true);
@@ -10147,6 +10348,83 @@ mod tests {
         assert_eq!(parked.at, LspPosition::new(4, 2));
         assert_eq!(parked.coordinates, LspCoordinates::Utf16);
         assert_eq!(notice(&app), None);
+    }
+
+    /// A jump that moves the caret must also hand the editor the keyboard.
+    ///
+    /// An unfocused `text_editor` draws no caret at all, so without this the
+    /// application answers a click on a result with a frame indistinguishable
+    /// from the one the user clicked in - measured live before this was wired:
+    /// frame differencing over the caret's blink found a 2px column with the
+    /// editor focused and zero pixel delta after a jump.
+    #[test]
+    fn a_jump_gives_the_editor_the_keyboard() {
+        use cosmic::iced::advanced::widget::{Tree, operation};
+
+        let (mut app, card) = editing_repository_app();
+        // The focus arrives as a widget operation, not a message, so it is
+        // read the way the runtime reads one: run it over the tree the frame
+        // actually built, then ask that tree who holds focus.
+        fn focused(app: &Cagents, task: Task<Message>) -> Option<widget::Id> {
+            use cosmic::iced::advanced::layout;
+            use cosmic::iced::advanced::widget::{Operation, operation};
+            use cosmic::iced::{Size, advanced::Layout};
+
+            let renderer = headless_renderer();
+            let mut element: cosmic::Element<'_, Message> = cosmic::Application::view(app);
+            let mut tree = Tree::new(element.as_widget_mut());
+            let node = element.as_widget_mut().layout(
+                &mut tree,
+                &renderer,
+                &layout::Limits::new(Size::ZERO, Size::new(1600.0, 1200.0)),
+            );
+
+            let mut stream =
+                cosmic::iced::runtime::task::into_stream(task).expect("the jump produced a task");
+            let executor = tokio::runtime::Builder::new_current_thread()
+                .build()
+                .expect("executor");
+            while let Some(action) = executor.block_on(stream.next()) {
+                let cosmic::iced::runtime::Action::Widget(mut operation) = action else {
+                    continue;
+                };
+                element.as_widget_mut().operate(
+                    &mut tree,
+                    Layout::new(&node),
+                    &renderer,
+                    &mut operation,
+                );
+            }
+
+            // `find_focused` reports an `Id`; `operate` takes an operation
+            // over `()`, so the answer comes back through a cell.
+            let found: Arc<std::sync::Mutex<Option<widget::Id>>> = Default::default();
+            let sink = Arc::clone(&found);
+            let mut probe = operation::map(operation::focusable::find_focused(), move |id| {
+                *sink.lock().expect("the probe is not shared across a panic") = Some(id);
+            });
+            element
+                .as_widget_mut()
+                .operate(&mut tree, Layout::new(&node), &renderer, &mut probe);
+            let _ = probe.finish();
+            let answer = found.lock().expect("the probe survived").clone();
+            answer
+        }
+
+        // Into the buffer that is already open, which is the one jump that
+        // needs no running server to place its caret.
+        lsp_state(&mut app, card).path = Some(PathBuf::from("/repo/notes.txt"));
+        let task = app.update_lsp(InspectorAction::JumpToLspLocation {
+            card,
+            path: PathBuf::from("/repo/notes.txt"),
+            at: LspPosition::new(0, 0),
+            coordinates: LspCoordinates::Scalar,
+        });
+        assert_eq!(
+            focused(&app, task),
+            Some(repository_widget::editor_focus_id(card)),
+            "the jump left the editor unfocused, so its caret is invisible"
+        );
     }
 
     /// A definition can resolve into a file the card has no row for - a
