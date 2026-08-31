@@ -399,7 +399,6 @@ impl Section {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Action {
-    pub id: String,
     pub label: Cow<'static, str>,
     pub icon: &'static str,
     pub message: InspectorAction,
@@ -408,13 +407,11 @@ pub struct Action {
 
 impl Action {
     fn new(
-        id: impl Into<String>,
         label: impl Into<Cow<'static, str>>,
         icon: &'static str,
         message: InspectorAction,
     ) -> Self {
         Self {
-            id: id.into(),
             label: label.into(),
             icon,
             message,
@@ -485,7 +482,6 @@ pub fn model_for_card(
             ));
             actions.push(
                 Action::new(
-                    format!("{}.terminal", card.id),
                     "New terminal here",
                     "utilities-terminal-symbolic",
                     InspectorAction::NewTerminalAt(session.launch.working_directory.clone()),
@@ -515,7 +511,6 @@ pub fn model_for_card(
             if runtime.has_live_runtime() {
                 actions.push(
                     Action::new(
-                        format!("{}.reload", card.id),
                         "Reload",
                         "view-refresh-symbolic",
                         InspectorAction::ReloadBrowser(card.id),
@@ -526,7 +521,6 @@ pub fn model_for_card(
             #[cfg(not(feature = "integrated-browser"))]
             actions.push(
                 Action::new(
-                    format!("{}.external", card.id),
                     "Open in system browser",
                     "internet-web-browser-symbolic",
                     InspectorAction::Retry(card.id),
@@ -534,7 +528,6 @@ pub fn model_for_card(
                 .primary(),
             );
             actions.push(Action::new(
-                format!("{}.browser-copy", card.id),
                 "Open copy",
                 "list-add-symbolic",
                 InspectorAction::OpenBrowser(session.current_url.clone()),
@@ -550,7 +543,6 @@ pub fn model_for_card(
             ));
             actions.push(
                 Action::new(
-                    format!("{}.terminal", card.id),
                     "New terminal here",
                     "utilities-terminal-symbolic",
                     InspectorAction::NewTerminalAt(view.worktree.clone()),
@@ -558,7 +550,6 @@ pub fn model_for_card(
                 .primary(),
             );
             actions.push(Action::new(
-                format!("{}.refresh", card.id),
                 "Refresh files",
                 "view-refresh-symbolic",
                 InspectorAction::RefreshRepository(card.id),
@@ -611,7 +602,6 @@ pub fn model_for_card(
                 sections.push(Section::new("Source", facts));
                 if source.can_back {
                     actions.push(Action::new(
-                        format!("{}.files", card.id),
                         "Back to files",
                         "go-previous-symbolic",
                         InspectorAction::BackToRepositoryFiles(card.id),
@@ -624,14 +614,12 @@ pub fn model_for_card(
                 // the inspector describes that card rather than overruling it.
                 if source.surface == "Editor" && !source.saving {
                     actions.push(Action::new(
-                        format!("{}.diff", card.id),
                         "Show diff",
                         "text-x-generic-symbolic",
                         InspectorAction::ShowRepositoryDiff(card.id),
                     ));
                 } else if source.surface == "Diff" {
                     actions.push(Action::new(
-                        format!("{}.editor", card.id),
                         "Show editor",
                         "document-edit-symbolic",
                         InspectorAction::ShowRepositoryEditor(card.id),
@@ -639,13 +627,11 @@ pub fn model_for_card(
                 }
                 match source.markdown_mode {
                     Some("Edit") => actions.push(Action::new(
-                        format!("{}.markdown-preview", card.id),
                         "Preview Markdown",
                         "document-preview-symbolic",
                         InspectorAction::ShowMarkdownPreview(card.id),
                     )),
                     Some("Preview") => actions.push(Action::new(
-                        format!("{}.markdown-edit", card.id),
                         "Edit Markdown",
                         "document-edit-symbolic",
                         InspectorAction::ShowMarkdownEdit(card.id),
@@ -664,15 +650,9 @@ pub fn model_for_card(
                         _ => None,
                     };
                     if let Some((label, message)) = opposite_basis {
-                        actions.push(Action::new(
-                            format!("{}.diff-basis", card.id),
-                            label,
-                            "vcs-diff-symbolic",
-                            message,
-                        ));
+                        actions.push(Action::new(label, "vcs-diff-symbolic", message));
                     }
                     actions.push(Action::new(
-                        format!("{}.diff-layout", card.id),
                         if source.diff_mode == Some("Split") {
                             "Show inline diff"
                         } else {
@@ -687,13 +667,11 @@ pub fn model_for_card(
                     ));
                     if source.diff_change.is_some() {
                         actions.push(Action::new(
-                            format!("{}.previous-change", card.id),
                             "Previous change",
                             "go-up-symbolic",
                             InspectorAction::PreviousRepositoryChange(card.id),
                         ));
                         actions.push(Action::new(
-                            format!("{}.next-change", card.id),
                             "Next change",
                             "go-down-symbolic",
                             InspectorAction::NextRepositoryChange(card.id),
@@ -701,7 +679,6 @@ pub fn model_for_card(
                     }
                     if source.can_retry_diff {
                         actions.push(Action::new(
-                            format!("{}.retry-diff", card.id),
                             "Retry diff",
                             "view-refresh-symbolic",
                             InspectorAction::RetryRepositoryDiff(card.id),
@@ -710,7 +687,6 @@ pub fn model_for_card(
                 }
                 if source.can_discard {
                     actions.push(Action::new(
-                        format!("{}.discard", card.id),
                         "Discard changes",
                         "edit-undo-symbolic",
                         InspectorAction::DiscardRepositoryEdits(card.id),
@@ -718,7 +694,6 @@ pub fn model_for_card(
                 }
                 if source.can_reload && !source.saving {
                     actions.push(Action::new(
-                        format!("{}.reload", card.id),
                         "Reload from disk",
                         "view-refresh-symbolic",
                         InspectorAction::ReloadRepositoryFile(card.id),
@@ -727,7 +702,6 @@ pub fn model_for_card(
                 if source.conflict && !source.saving {
                     actions.push(
                         Action::new(
-                            format!("{}.overwrite", card.id),
                             "Overwrite file",
                             "document-save-symbolic",
                             InspectorAction::OverwriteRepositoryFile(card.id),
@@ -737,7 +711,6 @@ pub fn model_for_card(
                 } else if source.can_save {
                     actions.push(
                         Action::new(
-                            format!("{}.save", card.id),
                             "Save file",
                             "document-save-symbolic",
                             InspectorAction::SaveRepositoryFile(card.id),
@@ -748,7 +721,6 @@ pub fn model_for_card(
             }
             if let Some(project) = projects.iter().find(|project| project.id == view.project) {
                 actions.push(Action::new(
-                    format!("{}.pull-request", card.id),
                     "Create PR",
                     "vcs-merge-request-symbolic",
                     InspectorAction::CreatePullRequest {
@@ -772,7 +744,6 @@ pub fn model_for_card(
             ));
             actions.push(
                 Action::new(
-                    format!("{}.search", card.id),
                     "Search projects",
                     "system-search-symbolic",
                     InspectorAction::FocusProjectSearch,
@@ -793,7 +764,6 @@ pub fn model_for_card(
         actions.insert(
             0,
             Action::new(
-                format!("{}.retry", card.id),
                 "Retry",
                 "view-refresh-symbolic",
                 InspectorAction::Retry(card.id),
@@ -802,7 +772,6 @@ pub fn model_for_card(
         );
     }
     actions.push(Action::new(
-        format!("{}.close", card.id),
         "Close card",
         "window-close-symbolic",
         InspectorAction::CloseCard(card.id),
@@ -1013,7 +982,6 @@ fn lsp_actions(card: CardId, lsp: &LspInspectorContext) -> Vec<Action> {
     if let Some(status) = &lsp.status {
         if status.can_restart() {
             actions.push(Action::new(
-                format!("{card}.lsp-restart"),
                 "Restart language server",
                 "view-refresh-symbolic",
                 InspectorAction::RestartLanguageServer(card),
@@ -1021,19 +989,16 @@ fn lsp_actions(card: CardId, lsp: &LspInspectorContext) -> Vec<Action> {
         }
         if status.is_ready() {
             actions.push(Action::new(
-                format!("{card}.lsp-hover"),
                 "Describe symbol",
                 "dialog-information-symbolic",
                 InspectorAction::RequestLspHover(card),
             ));
             actions.push(Action::new(
-                format!("{card}.lsp-definition"),
                 "Go to definition",
                 "go-next-symbolic",
                 InspectorAction::GoToLspDefinition(card),
             ));
             actions.push(Action::new(
-                format!("{card}.lsp-references"),
                 "Find references",
                 "edit-find-symbolic",
                 InspectorAction::FindLspReferences(card),
@@ -1046,7 +1011,6 @@ fn lsp_actions(card: CardId, lsp: &LspInspectorContext) -> Vec<Action> {
         || lsp.notice.is_some()
     {
         actions.push(Action::new(
-            format!("{card}.lsp-dismiss"),
             "Dismiss results",
             "window-close-symbolic",
             InspectorAction::DismissLspResults(card),
@@ -1371,11 +1335,19 @@ impl SegmentedActions {
             .actions
             .into_iter()
             .map(|action| -> Element<'static, InspectorAction> {
+                // Deliberately unidentified. A `widget::Id::new(string)` makes
+                // the node *named*, and `UserInterface::build` empties every
+                // named node's state into a thread-local map, restoring it
+                // only for the names the next frame still asks for. Children
+                // are then claimed by name in place and never repositioned, so
+                // an action that goes away leaves its emptied node behind at
+                // its old index for whichever button now occupies that slot to
+                // draw against - and drawing a button against stateless state
+                // aborts the process. This list's membership changes with
+                // every editor and diff transition, nothing focuses these
+                // buttons by id, and their accessible names come from their
+                // labels, so the identity buys nothing and costs a crash.
                 let mut button = widget::button::standard(action.label)
-                    .id(widget::Id::new(format!(
-                        "context-inspector.action.{}",
-                        action.id
-                    )))
                     .leading_icon(widget::icon::from_name(action.icon).size(16))
                     .width(Length::Fill)
                     .on_press(action.message);
