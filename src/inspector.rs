@@ -20,6 +20,7 @@ use url::Url;
 
 use crate::{
     design::{self, InspectorLayout},
+    location::SanitizedLocation,
     model::{
         BrowserRestoreFidelity, CardId, CardKind, CardState, ProjectId, Residency,
         TerminalContinuity,
@@ -28,6 +29,10 @@ use crate::{
 };
 
 pub const RESIZE_HANDLE_NAME: &str = "Resize context inspector";
+
+pub fn close_focus_id() -> widget::Id {
+    widget::Id::new("context-inspector.close")
+}
 
 /// A modal layer that keeps its background painted while exposing and
 /// operating only the foreground subtree. Unlike an ordinary stack or
@@ -399,11 +404,12 @@ pub fn model_for_card(
             );
         }
         CardKind::Browser(session) => {
+            let presented_location = SanitizedLocation::from(&session.current_url);
             sections.push(Section::new(
                 "Browser",
                 vec![
                     Fact::new("Browser ID", session.id.to_string()),
-                    Fact::new("URL", session.current_url.as_str()),
+                    Fact::new("URL", presented_location.into_inner()),
                     Fact::new(
                         "History",
                         format!(
@@ -743,7 +749,7 @@ pub fn view(model: InspectorModel, width: f32) -> Element<'static, InspectorActi
         .width(Length::Fill)
         .into(),
         widget::button::icon(widget::icon::from_name("window-close-symbolic"))
-            .id(widget::Id::new("context-inspector.close"))
+            .id(close_focus_id())
             .name("Collapse context inspector")
             .tooltip("Collapse context inspector")
             .on_press(InspectorAction::Close)
@@ -809,7 +815,10 @@ pub fn view(model: InspectorModel, width: f32) -> Element<'static, InspectorActi
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{Existence, Exposure, LaunchRecipe, TerminalId, TerminalSession};
+    use crate::model::{
+        BrowserId, BrowserRestoreFidelity, BrowserSession, Existence, Exposure, LaunchRecipe,
+        TerminalId, TerminalSession,
+    };
     use crate::splitter::{Edge as SplitterEdge, Splitter};
     use cosmic::iced::{
         advanced::{Layout, layout, mouse, widget::Tree},
@@ -842,6 +851,57 @@ mod tests {
                     last_exit: None,
                 },
             }),
+        }
+    }
+
+    fn browser_card(raw: &str) -> CardState {
+        let url = Url::parse(raw).unwrap();
+        CardState {
+            id: CardId::new(),
+            generation: 1,
+            title: "Browser".into(),
+            width_fraction: 0.7,
+            kind: CardKind::Browser(BrowserSession {
+                id: BrowserId::new(),
+                current_url: url.clone(),
+                history: vec![url],
+                history_index: 0,
+                scroll_x: 0.0,
+                scroll_y: 0.0,
+                fidelity: BrowserRestoreFidelity::HistoryAndScroll,
+            }),
+            existence: Existence::Open,
+            exposure: Exposure::Visible,
+            residency: Residency::Hot,
+        }
+    }
+
+    #[test]
+    fn browser_fact_uses_the_typed_sanitized_location_projection() {
+        let model = model_for_card(
+            &browser_card(
+                "https://alice:password@EXAMPLE.test:443/private%20path?oauth=secret#token",
+            ),
+            RuntimeStatus::Ready,
+            &[],
+        );
+        let presented = &model
+            .sections
+            .iter()
+            .find(|section| section.title == "Browser")
+            .unwrap()
+            .facts
+            .iter()
+            .find(|fact| fact.label == "URL")
+            .unwrap()
+            .value;
+
+        assert_eq!(presented, "https://example.test/private%20path");
+        for sensitive in ["alice", "password", "oauth", "secret", "token", "?", "#"] {
+            assert!(
+                !presented.contains(sensitive),
+                "inspector fact leaked {sensitive:?}: {presented}"
+            );
         }
     }
 

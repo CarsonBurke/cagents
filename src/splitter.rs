@@ -117,7 +117,7 @@ struct ResizeOrigin {
 struct SplitterState {
     drag: Option<ResizeOrigin>,
     is_focused: bool,
-    repeating: bool,
+    keyboard_gesture: bool,
 }
 
 impl SplitterState {
@@ -133,6 +133,17 @@ impl SplitterState {
 
     fn finish_drag(&mut self) -> bool {
         self.drag.take().is_some()
+    }
+
+    fn keyboard_resize(&mut self, delta: Option<f32>) -> Option<f32> {
+        if delta.is_some() {
+            self.keyboard_gesture = true;
+        }
+        delta
+    }
+
+    fn finish_keyboard_gesture(&mut self, resize_key: bool) -> bool {
+        resize_key && std::mem::take(&mut self.keyboard_gesture)
     }
 }
 
@@ -258,31 +269,25 @@ impl<'view, Message: 'view> Widget<Message, Theme, Renderer> for Splitter<'view,
             }
             Event::Window(window::Event::Unfocused) => {
                 let dragging = state.finish_drag();
-                let repeating = std::mem::take(&mut state.repeating);
-                if dragging || repeating {
+                let keyboard_gesture = state.finish_keyboard_gesture(true);
+                if dragging || keyboard_gesture {
                     shell.publish((self.on_finish)());
                 }
             }
             Event::Keyboard(keyboard::Event::KeyPressed {
                 key,
                 modifiers,
-                repeat,
+                repeat: _,
                 ..
             }) if state.is_focused && !self.modal_open && !chorded(*modifiers) => {
-                if let Some(delta) = self.keyboard_delta(key) {
+                if let Some(delta) = state.keyboard_resize(self.keyboard_delta(key)) {
                     shell.publish(self.resize(self.width + delta));
-                    if *repeat {
-                        state.repeating = true;
-                    } else {
-                        shell.publish((self.on_finish)());
-                    }
                     shell.capture_event();
                     return;
                 }
             }
-            Event::Keyboard(keyboard::Event::KeyReleased { key, .. }) if state.repeating => {
-                if self.keyboard_delta(key).is_some() {
-                    state.repeating = false;
+            Event::Keyboard(keyboard::Event::KeyReleased { key, .. }) if state.keyboard_gesture => {
+                if state.finish_keyboard_gesture(self.keyboard_delta(key).is_some()) {
                     shell.publish((self.on_finish)());
                     shell.capture_event();
                     return;
@@ -436,7 +441,10 @@ impl<'a, Message: 'a> From<Splitter<'a, Message>> for Element<'a, Message> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use cosmic::iced::advanced::{Layout, layout, mouse, widget::Tree};
+    use cosmic::iced::{
+        Font, Pixels,
+        advanced::{Layout, clipboard, layout, mouse, renderer::Headless, widget::Tree},
+    };
     use iced_accessibility::accesskit::{Action, Role};
 
     #[derive(Debug, Clone, PartialEq)]
@@ -458,6 +466,88 @@ mod tests {
             || Message::Finished,
         )
         .into()
+    }
+
+    fn headless_renderer() -> Renderer {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(<Renderer as Headless>::new(
+                Font::DEFAULT,
+                Pixels::from(16),
+                Some("tiny-skia"),
+            ))
+            .expect("create a headless splitter renderer")
+    }
+
+    fn arrow_event(repeat: Option<bool>) -> Event {
+        let key = keyboard::Key::Named(keyboard::key::Named::ArrowRight);
+        let physical_key = keyboard::key::Physical::Code(keyboard::key::Code::ArrowRight);
+        let event = match repeat {
+            Some(repeat) => keyboard::Event::KeyPressed {
+                key: key.clone(),
+                modified_key: key,
+                physical_key,
+                location: keyboard::Location::Standard,
+                modifiers: keyboard::Modifiers::empty(),
+                text: None,
+                repeat,
+            },
+            None => keyboard::Event::KeyReleased {
+                key: key.clone(),
+                modified_key: key,
+                physical_key,
+                location: keyboard::Location::Standard,
+                modifiers: keyboard::Modifiers::empty(),
+            },
+        };
+        Event::Keyboard(event)
+    }
+
+    fn dispatch_event(
+        width: f32,
+        event: &Event,
+        cursor: mouse::Cursor,
+        tree: &mut Tree,
+        renderer: &Renderer,
+    ) -> Vec<Message> {
+        let size = Size::new(WIDTH, 480.0);
+        let mut clipboard = clipboard::Null;
+        let mut messages = Vec::new();
+        let mut shell = Shell::new(&mut messages);
+        let viewport = Rectangle::with_size(size);
+
+        // Rebuild the widget with the width the application accepted from the
+        // preceding event while preserving its real tree state across repeats.
+        let mut element: Element<'static, Message> = Splitter::new(
+            Id::new("test.splitter"),
+            "Resize test pane",
+            width,
+            320.0,
+            420.0,
+            Edge::Trailing,
+            false,
+            Message::Resize,
+            || Message::Finished,
+        )
+        .into();
+        element.as_widget_mut().diff(tree);
+        let node =
+            element
+                .as_widget_mut()
+                .layout(tree, renderer, &layout::Limits::new(Size::ZERO, size));
+        element.as_widget_mut().update(
+            tree,
+            event,
+            Layout::new(&node),
+            cursor,
+            renderer,
+            &mut clipboard,
+            &mut shell,
+            &viewport,
+        );
+        messages
     }
 
     #[test]
@@ -511,6 +601,122 @@ mod tests {
         let right = keyboard::Key::Named(keyboard::key::Named::ArrowRight);
         assert_eq!(trailing.keyboard_delta(&right), Some(KEYBOARD_STEP));
         assert_eq!(leading.keyboard_delta(&right), Some(-KEYBOARD_STEP));
+    }
+
+    #[test]
+    fn single_and_repeated_keyboard_gestures_publish_each_resize_and_finish_once_at_release() {
+        let renderer = headless_renderer();
+        for repeats in [0, 3] {
+            let initial = element(Edge::Trailing);
+            let mut tree = Tree::new(&initial);
+            tree.state.downcast_mut::<SplitterState>().is_focused = true;
+            let mut width = 360.0;
+            let mut resize_publications = 0;
+            let mut finish_publications = 0;
+
+            for event in std::iter::once(arrow_event(Some(false)))
+                .chain((0..repeats).map(|_| arrow_event(Some(true))))
+            {
+                let messages = dispatch_event(
+                    width,
+                    &event,
+                    mouse::Cursor::Unavailable,
+                    &mut tree,
+                    &renderer,
+                );
+                assert_eq!(messages.len(), 1, "every press must publish one resize");
+                match messages[0] {
+                    Message::Resize(next) => {
+                        width = next;
+                        resize_publications += 1;
+                    }
+                    Message::Finished => panic!("keyboard resize finished before key release"),
+                }
+            }
+
+            for message in dispatch_event(
+                width,
+                &arrow_event(None),
+                mouse::Cursor::Unavailable,
+                &mut tree,
+                &renderer,
+            ) {
+                match message {
+                    Message::Resize(_) => panic!("key release published an extra resize"),
+                    Message::Finished => finish_publications += 1,
+                }
+            }
+            finish_publications += dispatch_event(
+                width,
+                &arrow_event(None),
+                mouse::Cursor::Unavailable,
+                &mut tree,
+                &renderer,
+            )
+            .into_iter()
+            .filter(|message| matches!(message, Message::Finished))
+            .count();
+
+            assert_eq!(resize_publications, repeats + 1);
+            assert_eq!(finish_publications, 1);
+            assert_eq!(
+                width,
+                (360.0 + KEYBOARD_STEP * (repeats + 1) as f32).min(420.0)
+            );
+        }
+    }
+
+    #[test]
+    fn pointer_drag_widget_events_publish_live_resizes_and_one_finish() {
+        let renderer = headless_renderer();
+        let initial = element(Edge::Trailing);
+        let mut tree = Tree::new(&initial);
+        let mut width = 360.0;
+        let start = Point::new(2.0, 120.0);
+
+        assert!(
+            dispatch_event(
+                width,
+                &Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)),
+                mouse::Cursor::Available(start),
+                &mut tree,
+                &renderer,
+            )
+            .is_empty()
+        );
+
+        let moved = dispatch_event(
+            width,
+            &Event::Mouse(mouse::Event::CursorMoved {
+                position: Point::new(50.0, 120.0),
+            }),
+            mouse::Cursor::Available(Point::new(50.0, 120.0)),
+            &mut tree,
+            &renderer,
+        );
+        assert_eq!(moved, vec![Message::Resize(408.0)]);
+        width = 408.0;
+
+        assert_eq!(
+            dispatch_event(
+                width,
+                &Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)),
+                mouse::Cursor::Available(Point::new(50.0, 120.0)),
+                &mut tree,
+                &renderer,
+            ),
+            vec![Message::Finished]
+        );
+        assert!(
+            dispatch_event(
+                width,
+                &Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)),
+                mouse::Cursor::Available(Point::new(50.0, 120.0)),
+                &mut tree,
+                &renderer,
+            )
+            .is_empty()
+        );
     }
 
     #[test]

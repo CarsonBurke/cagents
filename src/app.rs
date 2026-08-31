@@ -691,6 +691,21 @@ struct InspectorTransition {
     to: f32,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ContextOverlayChange {
+    Entered,
+    Exited,
+    Unchanged,
+}
+
+const fn context_overlay_change(was_overlay: bool, is_overlay: bool) -> ContextOverlayChange {
+    match (was_overlay, is_overlay) {
+        (false, true) => ContextOverlayChange::Entered,
+        (true, false) => ContextOverlayChange::Exited,
+        _ => ContextOverlayChange::Unchanged,
+    }
+}
+
 impl InspectorTransition {
     fn duration(self) -> Duration {
         DIALOG_TRANSITION_DURATION.mul_f32((self.to - self.from).abs())
@@ -1311,6 +1326,10 @@ pub struct Cagents {
     inspector: Option<Inspector>,
     inspector_transition: Option<InspectorTransition>,
     context_inspector_open: bool,
+    /// The overlay state whose focus and native-surface transition has already
+    /// been applied. The rendered mount also depends on workspace focus, so it
+    /// cannot be derived solely from inspector-open and window-resize events.
+    context_inspector_overlay_active: bool,
     context_inspector_restore_focus: Option<widget::Id>,
     settings_category: SettingsCategory,
     keyboard_modifiers: keyboard::Modifiers,
@@ -2215,7 +2234,7 @@ impl Cagents {
         synchronize_scroll: bool,
         additional_durable_change: bool,
     ) -> Task<Message> {
-        self.sync_context_overlay_headerbar();
+        let context_overlay_task = self.sync_context_overlay_state();
         let focused = self.workspace.focused();
         let viewport_durable_changed =
             durable_viewport_update_pending(&self.durable, focused, &update.transitions)
@@ -2264,9 +2283,12 @@ impl Cagents {
         if synchronize_scroll && update.offset_changed {
             tasks.push(self.synchronize_workspace_scroll());
         }
-        if let Some(card) = self.workspace.take_widget_focus_request() {
+        if let Some(card) = self.workspace.take_widget_focus_request()
+            && !self.context_inspector_overlay_active
+        {
             tasks.push(workspace_widget::focus_card(card).map(cosmic::Action::App));
         }
+        tasks.push(context_overlay_task);
         if reconcile_now {
             tasks.push(cosmic::task::message(Message::LifecycleSweep));
         }
@@ -3370,26 +3392,52 @@ impl Cagents {
             headerbar_should_render(self.window_headerbar_enabled, overlay_open);
     }
 
-    fn set_context_inspector_open(&mut self, open: bool) -> Task<Message> {
-        if self.context_inspector_open == open {
-            return Task::none();
-        }
-        let was_overlay = self.context_inspector_is_overlay();
-        self.context_inspector_open = open;
+    fn enter_context_overlay(&mut self) -> Task<Message> {
+        // The header toggle belongs to the docked tree we are leaving and is
+        // guaranteed to return when the modal closes. Recording it before the
+        // focus operation makes every breakpoint entry deterministic, even if
+        // a focused docked inspector child disappears during the re-layout.
+        self.context_inspector_restore_focus = Some(context_inspector_toggle_id());
+        iced::widget::operation::focus(inspector::close_focus_id()).map(cosmic::Action::App)
+    }
+
+    fn sync_context_overlay_state(&mut self) -> Task<Message> {
+        let was_overlay = self.context_inspector_overlay_active;
         let is_overlay = self.context_inspector_is_overlay();
+        self.context_inspector_overlay_active = is_overlay;
         self.sync_context_overlay_headerbar();
         if was_overlay != is_overlay {
             let visible = self.workspace_surfaces_visible();
             self.set_workspace_surfaces_visible(visible);
         }
-        if is_overlay {
-            iced::widget::operation::focus(widget::Id::new("context-inspector.close"))
-                .map(cosmic::Action::App)
-        } else if !open && let Some(id) = self.context_inspector_restore_focus.take() {
-            iced::widget::operation::focus(id).map(cosmic::Action::App)
-        } else {
-            Task::none()
+        match context_overlay_change(was_overlay, is_overlay) {
+            ContextOverlayChange::Entered => self.enter_context_overlay(),
+            ContextOverlayChange::Exited
+                if !self.context_inspector_open || self.workspace.focused().is_none() =>
+            {
+                self.context_inspector_restore_focus
+                    .take()
+                    .map_or_else(Task::none, |id| {
+                        iced::widget::operation::focus(id).map(cosmic::Action::App)
+                    })
+            }
+            ContextOverlayChange::Exited => {
+                // A width change kept the inspector mounted and focused as a
+                // docked pane. A later docked close must not restore a target
+                // from the preceding modal interval.
+                self.context_inspector_restore_focus = None;
+                Task::none()
+            }
+            ContextOverlayChange::Unchanged => Task::none(),
         }
+    }
+
+    fn set_context_inspector_open(&mut self, open: bool) -> Task<Message> {
+        if self.context_inspector_open == open {
+            return Task::none();
+        }
+        self.context_inspector_open = open;
+        self.sync_context_overlay_state()
     }
 
     fn inspector_runtime_status(&self, card: CardId) -> InspectorRuntimeStatus {
@@ -3728,7 +3776,11 @@ impl Application for Cagents {
             inspector: None,
             inspector_transition: None,
             context_inspector_open: true,
-            context_inspector_restore_focus: None,
+            context_inspector_overlay_active: false,
+            // The initial estimate is wide, but the first compositor resize
+            // can immediately mount the default-open inspector as a modal.
+            // Keep a valid post-close target ready for that narrow startup.
+            context_inspector_restore_focus: Some(context_inspector_toggle_id()),
             settings_category: SettingsCategory::General,
             keyboard_modifiers: keyboard::Modifiers::empty(),
             settings_draft,
@@ -4263,22 +4315,10 @@ impl Application for Cagents {
                 Task::none()
             }
             Message::WindowResized(width) => {
-                let was_overlay = self.context_inspector_is_overlay();
                 if width.is_finite() && width > 0.0 {
                     self.window_width = width;
                 }
-                let is_overlay = self.context_inspector_is_overlay();
-                self.sync_context_overlay_headerbar();
-                if was_overlay != is_overlay {
-                    let visible = self.workspace_surfaces_visible();
-                    self.set_workspace_surfaces_visible(visible);
-                }
-                if !was_overlay && is_overlay {
-                    iced::widget::operation::focus(widget::Id::new("context-inspector.close"))
-                        .map(cosmic::Action::App)
-                } else {
-                    Task::none()
-                }
+                self.sync_context_overlay_state()
             }
             Message::OpenBrowser(url) => {
                 self.show_workspace_for_action();
@@ -4663,9 +4703,6 @@ impl Application for Cagents {
                     .map(cosmic::Action::App)
             }
             Message::ToggleContextInspector => {
-                if !self.context_inspector_open {
-                    self.context_inspector_restore_focus = Some(context_inspector_toggle_id());
-                }
                 self.set_context_inspector_open(!self.context_inspector_open)
             }
             Message::ContextInspector(action) => self.handle_context_inspector_action(action),
@@ -6057,6 +6094,7 @@ fn unix_millis() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use cosmic::iced::futures::StreamExt;
 
     fn browser_kind(raw: &str) -> CardKind {
         let url = Url::parse(raw).unwrap();
@@ -6216,6 +6254,173 @@ mod tests {
         assert!(!headerbar_should_render(true, true));
         assert!(!headerbar_should_render(false, false));
         assert!(!headerbar_should_render(false, true));
+    }
+
+    #[test]
+    fn context_overlay_update_captures_traps_and_restores_focus_across_startup_and_escape() {
+        assert_eq!(
+            context_inspector_toggle_id().to_string(),
+            "command.toggle-context-inspector"
+        );
+        assert_eq!(
+            inspector::close_focus_id().to_string(),
+            "context-inspector.close"
+        );
+        assert_ne!(
+            context_inspector_toggle_id().to_string(),
+            inspector::close_focus_id().to_string()
+        );
+        assert_eq!(
+            context_overlay_change(false, true),
+            ContextOverlayChange::Entered
+        );
+        assert_eq!(
+            context_overlay_change(true, false),
+            ContextOverlayChange::Exited
+        );
+        assert_eq!(
+            context_overlay_change(false, false),
+            ContextOverlayChange::Unchanged
+        );
+        assert_eq!(
+            context_overlay_change(true, true),
+            ContextOverlayChange::Unchanged
+        );
+
+        let mut app = context_inspector_test_app(true);
+        assert!(!app.context_inspector_is_overlay());
+        assert_eq!(
+            app.context_inspector_restore_focus
+                .as_ref()
+                .map(ToString::to_string),
+            Some(context_inspector_toggle_id().to_string())
+        );
+
+        // The compositor's first narrow size is the real startup transition.
+        app.context_inspector_restore_focus = None;
+        let _focus_close = app.update(Message::WindowResized(design::WIDE_BREAKPOINT - 1.0));
+        assert!(app.context_inspector_is_overlay());
+        assert!(app.context_inspector_overlay_active);
+        assert!(app.workspace_inputs_blocked());
+        assert_eq!(
+            app.context_inspector_restore_focus
+                .as_ref()
+                .map(ToString::to_string),
+            Some(context_inspector_toggle_id().to_string())
+        );
+        assert_eq!(
+            app.core.window.show_headerbar,
+            headerbar_should_render(app.window_headerbar_enabled, true)
+        );
+
+        let escape = keyboard::Event::KeyPressed {
+            key: keyboard::Key::Named(keyboard::key::Named::Escape),
+            modified_key: keyboard::Key::Named(keyboard::key::Named::Escape),
+            physical_key: keyboard::key::Physical::Code(keyboard::key::Code::Escape),
+            location: keyboard::Location::Standard,
+            modifiers: keyboard::Modifiers::empty(),
+            text: None,
+            repeat: false,
+        };
+        let close = task_app_message(app.update(Message::KeyEvent(escape)));
+        assert!(matches!(
+            close,
+            Message::ContextInspector(InspectorAction::Close)
+        ));
+        let _restore_focus = app.update(close);
+        assert!(!app.context_inspector_open);
+        assert!(!app.context_inspector_overlay_active);
+        assert!(!app.workspace_inputs_blocked());
+        assert!(app.context_inspector_restore_focus.is_none());
+        assert_eq!(
+            app.core.window.show_headerbar,
+            headerbar_should_render(app.window_headerbar_enabled, false)
+        );
+
+        // Re-entering from a live docked inspector captures afresh instead of
+        // depending on the startup value consumed by the first Escape.
+        let _wide = app.update(Message::WindowResized(design::WIDE_BREAKPOINT));
+        let _open_docked = app.update(Message::ToggleContextInspector);
+        assert!(!app.context_inspector_is_overlay());
+        app.context_inspector_restore_focus = None;
+        let _focus_close = app.update(Message::WindowResized(design::WIDE_BREAKPOINT - 1.0));
+        assert!(app.context_inspector_is_overlay());
+        assert_eq!(
+            app.context_inspector_restore_focus
+                .as_ref()
+                .map(ToString::to_string),
+            Some(context_inspector_toggle_id().to_string())
+        );
+
+        // A real first-card update can create the overlay without any resize:
+        // narrow startup begins empty, then the focused context arrives.
+        let mut startup = context_inspector_test_app(false);
+        let _narrow = startup.update(Message::WindowResized(design::WIDE_BREAKPOINT - 1.0));
+        assert!(!startup.context_inspector_is_overlay());
+        assert!(!startup.context_inspector_overlay_active);
+        assert_eq!(
+            startup
+                .context_inspector_restore_focus
+                .as_ref()
+                .map(ToString::to_string),
+            Some(context_inspector_toggle_id().to_string())
+        );
+        let _focus_close = startup.add_repository_card(
+            ProjectId::new(),
+            PathBuf::from("/repo"),
+            PathBuf::from("/repo/worktree"),
+        );
+        assert!(startup.workspace.focused().is_some());
+        assert!(startup.context_inspector_is_overlay());
+        assert!(startup.context_inspector_overlay_active);
+        assert!(startup.workspace_inputs_blocked());
+
+        let close = task_app_message(startup.update(Message::KeyEvent(
+            keyboard::Event::KeyPressed {
+                key: keyboard::Key::Named(keyboard::key::Named::Escape),
+                modified_key: keyboard::Key::Named(keyboard::key::Named::Escape),
+                physical_key: keyboard::key::Physical::Code(keyboard::key::Code::Escape),
+                location: keyboard::Location::Standard,
+                modifiers: keyboard::Modifiers::empty(),
+                text: None,
+                repeat: false,
+            },
+        )));
+        let _restore_focus = startup.update(close);
+        assert!(!startup.context_inspector_open);
+        assert!(!startup.context_inspector_overlay_active);
+        assert!(startup.context_inspector_restore_focus.is_none());
+
+        // Losing the final context is another real overlay exit: it restores
+        // the header target even though the open preference itself stays on.
+        let _focus_close = startup.update(Message::ToggleContextInspector);
+        assert!(startup.context_inspector_overlay_active);
+        let final_card = startup.workspace.focused().unwrap();
+        startup.workspace.request_close(final_card).unwrap();
+        let _restore_focus = startup.update(Message::CommitClose(final_card));
+        assert!(startup.workspace.focused().is_none());
+        assert!(!startup.context_inspector_is_overlay());
+        assert!(!startup.context_inspector_overlay_active);
+        assert!(startup.context_inspector_restore_focus.is_none());
+    }
+
+    #[test]
+    fn context_inspector_resize_persists_only_when_the_gesture_finishes() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("settings.toml");
+        let mut app = context_inspector_test_app(true);
+        app.settings_path = Some(path.clone());
+        app.settings_write_blocked = false;
+
+        let _live_resize = app.update(Message::ContextInspector(InspectorAction::Resize {
+            width: 384.0,
+        }));
+        assert_eq!(app.settings.inspector_width, 384.0);
+        assert!(!path.exists(), "live key repeats must not persist settings");
+
+        let _finished = app.update(Message::ContextInspector(InspectorAction::ResizeFinished));
+        let saved = std::fs::read_to_string(path).unwrap();
+        assert!(saved.contains("inspector_width = 384.0"));
     }
 
     #[test]
@@ -6457,6 +6662,82 @@ mod tests {
                     last_exit: None,
                 },
             }),
+        }
+    }
+
+    fn context_inspector_test_app(with_focused_card: bool) -> Cagents {
+        let card = with_focused_card.then(terminal_card_state);
+        let card_id = card.as_ref().map(|card| card.id);
+        let durable = Arc::new(WorkspaceState {
+            cards: card.into_iter().collect(),
+            focused: card_id,
+            ..WorkspaceState::default()
+        });
+        let workspace = Cagents::rebuild_workspace(&durable);
+        let settings = AppSettings::default();
+        let (terminal_wake_tx, terminal_wake_rx) = async_channel::unbounded();
+        let core = Core::default();
+        let window_headerbar_enabled = core.window.show_headerbar;
+
+        Cagents {
+            workspace,
+            durable,
+            cards: card_id
+                .map(|card_id| HashMap::from([(card_id, CardRuntime::Loading)]))
+                .unwrap_or_default(),
+            card_chrome: HashMap::new(),
+            lifecycle: LifecycleManager::new(LifecycleBudget {
+                max_hot_cards: settings.max_hot_cards,
+                offscreen_grace: Duration::from_millis(settings.hibernation_delay_ms),
+            }),
+            lifecycle_sweep_deadline: None,
+            lifecycle_sweep_generation: 0,
+            terminal_wake_tx,
+            terminal_wake_rx,
+            session: None,
+            settings_draft: SettingsDraft::from_settings(&settings),
+            settings,
+            #[cfg(feature = "integrated-browser")]
+            browser_teardowns: Vec::new(),
+            terminal_teardowns: Vec::new(),
+            #[cfg(feature = "integrated-browser")]
+            browser_factory: None,
+            #[cfg(feature = "integrated-browser")]
+            browser_parent_lifetime: None,
+            window_scale_factor: 1.0,
+            window_width: 1_600.0,
+            window_headerbar_enabled,
+            core,
+            settings_path: None,
+            settings_write_blocked: true,
+            sidebar_model: SidebarModel::ready(SidebarMode::Expanded, Vec::new()),
+            sidebar_state: SidebarState::default(),
+            github_repositories: HashMap::new(),
+            worktree_dialog: None,
+            pull_request_dialog: None,
+            frame_clock: FrameClock::default(),
+            inspector: None,
+            inspector_transition: None,
+            context_inspector_open: true,
+            context_inspector_overlay_active: false,
+            context_inspector_restore_focus: Some(context_inspector_toggle_id()),
+            settings_category: SettingsCategory::General,
+            keyboard_modifiers: keyboard::Modifiers::empty(),
+            settings_feedback: None,
+            status: None,
+        }
+    }
+
+    fn task_app_message(task: Task<Message>) -> Message {
+        let mut stream = iced::runtime::task::into_stream(task).expect("task has an output");
+        let action = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap()
+            .block_on(stream.next())
+            .expect("task produced an action");
+        match action {
+            iced::runtime::Action::Output(cosmic::Action::App(message)) => message,
+            _ => panic!("task did not produce an application message"),
         }
     }
 
