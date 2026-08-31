@@ -20,6 +20,23 @@ pub enum DiffMode {
     Split,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum DiffBasis {
+    /// Changes already recorded in the index: `HEAD` to index.
+    Staged,
+    /// Changes not yet staged: index to working tree.
+    Unstaged,
+}
+
+impl DiffBasis {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Staged => "Staged",
+            Self::Unstaged => "Unstaged",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DiffRowKind {
     Context,
@@ -77,7 +94,8 @@ impl DiffModel {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DiffSide {
-    Previous,
+    Head,
+    Index,
     WorkingTree,
 }
 
@@ -102,13 +120,10 @@ pub enum DiffContent {
     Error(String),
 }
 
-pub fn load_worktree_diff(worktree: &Path, relative_path: &Path, tracked: bool) -> DiffContent {
-    load_worktree_diff_from(worktree, relative_path, tracked.then_some(relative_path))
-}
-
-pub fn load_worktree_diff_from(
+pub fn load_repository_diff(
     worktree: &Path,
     relative_path: &Path,
+    basis: DiffBasis,
     previous_path: Option<&Path>,
 ) -> DiffContent {
     if let Err(error) = validate_repo_path(relative_path) {
@@ -119,55 +134,78 @@ pub fn load_worktree_diff_from(
     {
         return DiffContent::Error(error.to_string());
     }
-    let after = match read_worktree_side(worktree, relative_path) {
+    let before_path = previous_path.unwrap_or(relative_path);
+    let before = match basis {
+        DiffBasis::Staged => read_head_side(worktree, before_path),
+        DiffBasis::Unstaged => read_index_side(worktree, before_path),
+    };
+    let before = match before {
         Ok(SideContent::Text(text)) => text,
         Ok(SideContent::Binary) => {
             return DiffContent::Binary {
-                side: DiffSide::WorkingTree,
+                side: match basis {
+                    DiffBasis::Staged => DiffSide::Head,
+                    DiffBasis::Unstaged => DiffSide::Index,
+                },
             };
         }
         Ok(SideContent::InvalidUtf8) => {
             return DiffContent::InvalidUtf8 {
-                side: DiffSide::WorkingTree,
+                side: match basis {
+                    DiffBasis::Staged => DiffSide::Head,
+                    DiffBasis::Unstaged => DiffSide::Index,
+                },
+            };
+        }
+        Ok(SideContent::Oversize(bytes)) => {
+            return DiffContent::Oversize {
+                side: match basis {
+                    DiffBasis::Staged => DiffSide::Head,
+                    DiffBasis::Unstaged => DiffSide::Index,
+                },
+                bytes,
+                limit: MAX_TEXT_DIFF_BYTES_PER_SIDE,
+            };
+        }
+        Ok(SideContent::Symlink(target)) => return DiffContent::Symlink { target },
+        Ok(SideContent::NotRegularFile) => String::new(),
+        Err(error) => return DiffContent::Error(error.to_string()),
+    };
+    let after = match basis {
+        DiffBasis::Staged => read_index_side(worktree, relative_path),
+        DiffBasis::Unstaged => read_worktree_side(worktree, relative_path),
+    };
+    let after = match after {
+        Ok(SideContent::Text(text)) => text,
+        Ok(SideContent::Binary) => {
+            return DiffContent::Binary {
+                side: match basis {
+                    DiffBasis::Staged => DiffSide::Index,
+                    DiffBasis::Unstaged => DiffSide::WorkingTree,
+                },
+            };
+        }
+        Ok(SideContent::InvalidUtf8) => {
+            return DiffContent::InvalidUtf8 {
+                side: match basis {
+                    DiffBasis::Staged => DiffSide::Index,
+                    DiffBasis::Unstaged => DiffSide::WorkingTree,
+                },
             };
         }
         Ok(SideContent::Symlink(target)) => return DiffContent::Symlink { target },
         Ok(SideContent::Oversize(bytes)) => {
             return DiffContent::Oversize {
-                side: DiffSide::WorkingTree,
+                side: match basis {
+                    DiffBasis::Staged => DiffSide::Index,
+                    DiffBasis::Unstaged => DiffSide::WorkingTree,
+                },
                 bytes,
                 limit: MAX_TEXT_DIFF_BYTES_PER_SIDE,
             };
         }
         Ok(SideContent::NotRegularFile) => return DiffContent::NotRegularFile,
         Err(error) => return DiffContent::Error(error.to_string()),
-    };
-    let before = if let Some(previous_path) = previous_path {
-        match read_head_side(worktree, previous_path) {
-            Ok(SideContent::Text(text)) => text,
-            Ok(SideContent::Binary) => {
-                return DiffContent::Binary {
-                    side: DiffSide::Previous,
-                };
-            }
-            Ok(SideContent::InvalidUtf8) => {
-                return DiffContent::InvalidUtf8 {
-                    side: DiffSide::Previous,
-                };
-            }
-            Ok(SideContent::Oversize(bytes)) => {
-                return DiffContent::Oversize {
-                    side: DiffSide::Previous,
-                    bytes,
-                    limit: MAX_TEXT_DIFF_BYTES_PER_SIDE,
-                };
-            }
-            Ok(SideContent::Symlink(target)) => return DiffContent::Symlink { target },
-            Ok(SideContent::NotRegularFile) => String::new(),
-            Err(error) => return DiffContent::Error(error.to_string()),
-        }
-    } else {
-        String::new()
     };
     DiffContent::Text(build_diff(&before, &after))
 }
@@ -330,13 +368,27 @@ fn read_worktree_side(worktree: &Path, relative_path: &Path) -> Result<SideConte
         .map_err(|error| FileIoError::InvalidRepositoryRoot(error.to_string()))?;
     let path = root.join(relative_path);
     let parent = path.parent().ok_or(FileIoError::InvalidRepositoryPath)?;
-    let canonical_parent =
-        fs::canonicalize(parent).map_err(|error| FileIoError::Io(error.to_string()))?;
+    let canonical_parent = match fs::canonicalize(parent) {
+        Ok(parent) => parent,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            // A deletion can remove the file's entire directory hierarchy.
+            // The validated relative path cannot escape `root`, and no read is
+            // attempted when an ancestor is absent, so the worktree side is
+            // the same empty side as a missing leaf file.
+            return Ok(SideContent::Text(String::new()));
+        }
+        Err(error) => return Err(FileIoError::Io(error.to_string())),
+    };
     if !canonical_parent.starts_with(&root) {
         return Err(FileIoError::OutsideWorktree);
     }
-    let metadata =
-        fs::symlink_metadata(&path).map_err(|error| FileIoError::Io(error.to_string()))?;
+    let metadata = match fs::symlink_metadata(&path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(SideContent::Text(String::new()));
+        }
+        Err(error) => return Err(FileIoError::Io(error.to_string())),
+    };
     if metadata.file_type().is_symlink() {
         return fs::read_link(path)
             .map(SideContent::Symlink)
@@ -384,6 +436,38 @@ fn read_head_side(worktree: &Path, relative_path: &Path) -> Result<SideContent, 
     let Some((mode, object)) = parse_tree_entry(&listing.stdout)? else {
         return Ok(SideContent::Text(String::new()));
     };
+    read_git_blob(worktree, mode, object, DiffSide::Head)
+}
+
+fn read_index_side(worktree: &Path, relative_path: &Path) -> Result<SideContent, FileIoError> {
+    let listing = git(
+        worktree,
+        [
+            OsString::from("ls-files"),
+            OsString::from("--stage"),
+            OsString::from("-z"),
+            OsString::from("--"),
+            relative_path.as_os_str().to_owned(),
+        ],
+    )?;
+    if !listing.status.success() {
+        return Err(FileIoError::Io(format!(
+            "Git could not inspect the indexed file: {}",
+            String::from_utf8_lossy(&listing.stderr).trim()
+        )));
+    }
+    let Some((mode, object)) = parse_tree_entry(&listing.stdout)? else {
+        return Ok(SideContent::Text(String::new()));
+    };
+    read_git_blob(worktree, mode, object, DiffSide::Index)
+}
+
+fn read_git_blob(
+    worktree: &Path,
+    mode: &[u8],
+    object: OsString,
+    side: DiffSide,
+) -> Result<SideContent, FileIoError> {
     if !matches!(mode, b"100644" | b"100755" | b"120000") {
         return Ok(SideContent::NotRegularFile);
     }
@@ -397,7 +481,7 @@ fn read_head_side(worktree: &Path, relative_path: &Path) -> Result<SideContent, 
     )?;
     if !size.status.success() {
         return Err(FileIoError::Io(format!(
-            "Git could not inspect the previous file size: {}",
+            "Git could not inspect the {side:?} file size: {}",
             String::from_utf8_lossy(&size.stderr).trim()
         )));
     }
@@ -414,7 +498,7 @@ fn read_head_side(worktree: &Path, relative_path: &Path) -> Result<SideContent, 
     )?;
     if !output.status.success() {
         return Err(FileIoError::Io(format!(
-            "Git could not read the previous file: {}",
+            "Git could not read the {side:?} file: {}",
             String::from_utf8_lossy(&output.stderr).trim()
         )));
     }
@@ -444,15 +528,20 @@ fn parse_tree_entry(output: &[u8]) -> Result<Option<(&[u8], OsString)>, FileIoEr
         .next()
         .filter(|field| !field.is_empty())
         .ok_or_else(|| FileIoError::Io("Git returned a malformed tree mode".into()))?;
-    let _kind = fields
+    let second = fields
         .next()
         .filter(|field| !field.is_empty())
         .ok_or_else(|| FileIoError::Io("Git returned a malformed tree type".into()))?;
-    let object = fields
-        .next()
-        .filter(|field| !field.is_empty())
-        .ok_or_else(|| FileIoError::Io("Git returned a malformed tree object".into()))?;
-    if fields.next().is_some() {
+    let object = if matches!(second, b"blob" | b"tree" | b"commit") {
+        fields
+            .next()
+            .filter(|field| !field.is_empty())
+            .ok_or_else(|| FileIoError::Io("Git returned a malformed tree object".into()))?
+    } else {
+        second
+    };
+    let trailing = fields.next();
+    if trailing.is_some_and(|stage| stage != b"0") || fields.next().is_some() {
         return Err(FileIoError::Io(
             "Git returned a malformed tree entry".into(),
         ));
@@ -587,9 +676,12 @@ mod tests {
         run_git(root.path(), ["commit", "-qm", "initial"]);
         fs::write(root.path().join("sample.txt"), "one\nsecond\nthree\n").unwrap();
 
-        let DiffContent::Text(model) =
-            load_worktree_diff(root.path(), Path::new("sample.txt"), true)
-        else {
+        let DiffContent::Text(model) = load_repository_diff(
+            root.path(),
+            Path::new("sample.txt"),
+            DiffBasis::Unstaged,
+            None,
+        ) else {
             panic!("fixture should produce a text diff");
         };
         assert_eq!((model.additions, model.deletions), (2, 1));
@@ -616,16 +708,17 @@ mod tests {
         fs::write(root.path().join("added.txt"), "added\n").unwrap();
         run_git(root.path(), ["add", "added.txt"]);
         let DiffContent::Text(added) =
-            load_worktree_diff(root.path(), Path::new("added.txt"), true)
+            load_repository_diff(root.path(), Path::new("added.txt"), DiffBasis::Staged, None)
         else {
             panic!("a staged addition should compare against an empty previous side");
         };
         assert_eq!((added.additions, added.deletions), (1, 0));
 
         run_git(root.path(), ["mv", "original.txt", "renamed.txt"]);
-        let DiffContent::Text(renamed) = load_worktree_diff_from(
+        let DiffContent::Text(renamed) = load_repository_diff(
             root.path(),
             Path::new("renamed.txt"),
+            DiffBasis::Staged,
             Some(Path::new("original.txt")),
         ) else {
             panic!("a rename should compare against its original HEAD path");
@@ -635,7 +728,7 @@ mod tests {
         fs::remove_file(root.path().join("link")).unwrap();
         fs::write(root.path().join("link"), "ordinary file\n").unwrap();
         assert_eq!(
-            load_worktree_diff(root.path(), Path::new("link"), true),
+            load_repository_diff(root.path(), Path::new("link"), DiffBasis::Unstaged, None,),
             DiffContent::Symlink {
                 target: PathBuf::from("destination")
             }
@@ -646,28 +739,172 @@ mod tests {
     fn diff_inputs_have_typed_binary_invalid_utf8_and_symlink_states() {
         use std::os::unix::fs::symlink;
 
-        let root = tempdir().unwrap();
+        let root = git_fixture();
         fs::write(root.path().join("binary"), b"a\0b").unwrap();
         fs::write(root.path().join("invalid"), [0xff]).unwrap();
         symlink("binary", root.path().join("link")).unwrap();
         assert_eq!(
-            load_worktree_diff(root.path(), Path::new("binary"), false),
+            load_repository_diff(root.path(), Path::new("binary"), DiffBasis::Unstaged, None,),
             DiffContent::Binary {
                 side: DiffSide::WorkingTree
             }
         );
         assert_eq!(
-            load_worktree_diff(root.path(), Path::new("invalid"), false),
+            load_repository_diff(root.path(), Path::new("invalid"), DiffBasis::Unstaged, None,),
             DiffContent::InvalidUtf8 {
                 side: DiffSide::WorkingTree
             }
         );
         assert_eq!(
-            load_worktree_diff(root.path(), Path::new("link"), false),
+            load_repository_diff(root.path(), Path::new("link"), DiffBasis::Unstaged, None,),
             DiffContent::Symlink {
                 target: PathBuf::from("binary")
             }
         );
+    }
+
+    #[test]
+    fn staged_and_unstaged_bases_preserve_opposing_changes() {
+        let root = git_fixture();
+        fs::write(root.path().join("opposite.txt"), "head\n").unwrap();
+        run_git(root.path(), ["add", "opposite.txt"]);
+        run_git(root.path(), ["commit", "-qm", "initial"]);
+        fs::write(root.path().join("opposite.txt"), "staged\n").unwrap();
+        run_git(root.path(), ["add", "opposite.txt"]);
+        fs::write(root.path().join("opposite.txt"), "head\n").unwrap();
+
+        let DiffContent::Text(staged) = load_repository_diff(
+            root.path(),
+            Path::new("opposite.txt"),
+            DiffBasis::Staged,
+            None,
+        ) else {
+            panic!("staged basis should be text");
+        };
+        let DiffContent::Text(unstaged) = load_repository_diff(
+            root.path(),
+            Path::new("opposite.txt"),
+            DiffBasis::Unstaged,
+            None,
+        ) else {
+            panic!("unstaged basis should be text");
+        };
+        assert_eq!((staged.additions, staged.deletions), (1, 1));
+        assert_eq!((unstaged.additions, unstaged.deletions), (1, 1));
+        assert_eq!(staged.inline_rows[0].text, "head");
+        assert_eq!(staged.inline_rows[1].text, "staged");
+        assert_eq!(unstaged.inline_rows[0].text, "staged");
+        assert_eq!(unstaged.inline_rows[1].text, "head");
+    }
+
+    #[test]
+    fn staged_change_plus_unstaged_deletion_has_two_independent_diffs() {
+        let root = git_fixture();
+        fs::write(root.path().join("deleted.txt"), "head\n").unwrap();
+        run_git(root.path(), ["add", "deleted.txt"]);
+        run_git(root.path(), ["commit", "-qm", "initial"]);
+        fs::write(root.path().join("deleted.txt"), "indexed\n").unwrap();
+        run_git(root.path(), ["add", "deleted.txt"]);
+        fs::remove_file(root.path().join("deleted.txt")).unwrap();
+
+        let DiffContent::Text(staged) = load_repository_diff(
+            root.path(),
+            Path::new("deleted.txt"),
+            DiffBasis::Staged,
+            None,
+        ) else {
+            panic!("staged basis should be text");
+        };
+        let DiffContent::Text(unstaged) = load_repository_diff(
+            root.path(),
+            Path::new("deleted.txt"),
+            DiffBasis::Unstaged,
+            None,
+        ) else {
+            panic!("unstaged deletion should be text");
+        };
+        assert_eq!((staged.additions, staged.deletions), (1, 1));
+        assert_eq!((unstaged.additions, unstaged.deletions), (0, 1));
+        assert_eq!(unstaged.inline_rows[0].text, "indexed");
+    }
+
+    #[test]
+    fn unstaged_deletion_with_missing_parent_has_an_empty_worktree_side() {
+        let root = git_fixture();
+        fs::create_dir(root.path().join("nested")).unwrap();
+        fs::write(root.path().join("nested/deleted.txt"), "indexed\n").unwrap();
+        run_git(root.path(), ["add", "nested/deleted.txt"]);
+        run_git(root.path(), ["commit", "-qm", "initial"]);
+        fs::remove_dir_all(root.path().join("nested")).unwrap();
+
+        let DiffContent::Text(unstaged) = load_repository_diff(
+            root.path(),
+            Path::new("nested/deleted.txt"),
+            DiffBasis::Unstaged,
+            None,
+        ) else {
+            panic!("a missing worktree ancestor should produce a deletion diff");
+        };
+        assert_eq!((unstaged.additions, unstaged.deletions), (0, 1));
+        assert_eq!(unstaged.inline_rows[0].text, "indexed");
+    }
+
+    #[test]
+    fn unstaged_rename_reads_the_old_index_path() {
+        let root = git_fixture();
+        fs::write(root.path().join("old.txt"), "same\n").unwrap();
+        run_git(root.path(), ["add", "old.txt"]);
+        run_git(root.path(), ["commit", "-qm", "initial"]);
+        fs::rename(root.path().join("old.txt"), root.path().join("new.txt")).unwrap();
+
+        let DiffContent::Text(renamed) = load_repository_diff(
+            root.path(),
+            Path::new("new.txt"),
+            DiffBasis::Unstaged,
+            Some(Path::new("old.txt")),
+        ) else {
+            panic!("unstaged rename should compare indexed source to working destination");
+        };
+        assert!(renamed.is_empty());
+    }
+
+    #[test]
+    fn staged_deletion_with_untracked_replacement_has_two_bases() {
+        let root = git_fixture();
+        fs::write(root.path().join("replacement.txt"), "content\n").unwrap();
+        run_git(root.path(), ["add", "replacement.txt"]);
+        run_git(root.path(), ["commit", "-qm", "initial"]);
+        run_git(root.path(), ["rm", "--cached", "-q", "replacement.txt"]);
+
+        let DiffContent::Text(staged) = load_repository_diff(
+            root.path(),
+            Path::new("replacement.txt"),
+            DiffBasis::Staged,
+            None,
+        ) else {
+            panic!("staged deletion should be text");
+        };
+        let DiffContent::Text(unstaged) = load_repository_diff(
+            root.path(),
+            Path::new("replacement.txt"),
+            DiffBasis::Unstaged,
+            None,
+        ) else {
+            panic!("untracked replacement should be text");
+        };
+        assert_eq!((staged.additions, staged.deletions), (0, 1));
+        assert_eq!((unstaged.additions, unstaged.deletions), (1, 0));
+    }
+
+    fn git_fixture() -> tempfile::TempDir {
+        let root = tempdir().unwrap();
+        run_git(root.path(), ["init", "-q"]);
+        run_git(root.path(), ["config", "user.name", "Fixture"]);
+        run_git(
+            root.path(),
+            ["config", "user.email", "fixture@example.invalid"],
+        );
+        root
     }
 
     fn run_git<const N: usize>(root: &Path, args: [&str; N]) {

@@ -15,8 +15,8 @@ use cosmic::{
 
 use crate::{
     diff_view::{
-        DiffContent, DiffMode, DiffModel, DiffRowKind, InlineDiffRow, SplitDiffRow,
-        load_worktree_diff_from,
+        DiffBasis, DiffContent, DiffMode, DiffModel, DiffRowKind, InlineDiffRow, SplitDiffRow,
+        load_repository_diff,
     },
     editor::{
         FileContent, FileIoError, ReadOnlyReason, SaveOutcome, load_file, save_file,
@@ -28,10 +28,31 @@ use crate::{
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RepositoryFile {
     pub path: PathBuf,
-    pub old_path: Option<PathBuf>,
-    pub tracked: bool,
-    pub changed: bool,
+    pub staged_old_path: Option<PathBuf>,
+    pub unstaged_old_path: Option<PathBuf>,
+    pub staged: bool,
+    pub unstaged: bool,
     pub status: Option<String>,
+}
+
+impl RepositoryFile {
+    fn changed(&self) -> bool {
+        self.staged || self.unstaged
+    }
+
+    fn has_basis(&self, basis: DiffBasis) -> bool {
+        match basis {
+            DiffBasis::Staged => self.staged,
+            DiffBasis::Unstaged => self.unstaged,
+        }
+    }
+
+    fn previous_path(&self, basis: DiffBasis) -> Option<PathBuf> {
+        match basis {
+            DiffBasis::Staged => self.staged_old_path.clone(),
+            DiffBasis::Unstaged => self.unstaged_old_path.clone(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -64,6 +85,7 @@ pub enum RepositoryAction {
     },
     DiffLoaded {
         identity: AsyncIdentity,
+        basis: DiffBasis,
         content: DiffContent,
     },
     EditorAction {
@@ -76,6 +98,8 @@ pub enum RepositoryAction {
     },
     SaveFinished {
         identity: AsyncIdentity,
+        ticket: u64,
+        revision: u64,
         saved_text: String,
         result: Result<SaveOutcome, FileIoError>,
     },
@@ -112,6 +136,24 @@ pub enum RepositoryAction {
         card: CardId,
         split: bool,
     },
+    SelectDiffBasis {
+        card: CardId,
+        entity: segmented_button::Entity,
+    },
+    ApplyDiffBasis {
+        card: CardId,
+        staged: bool,
+    },
+    FileViewport {
+        card: CardId,
+        offset: f32,
+        height: f32,
+    },
+    DiffViewport {
+        card: CardId,
+        offset: f32,
+        height: f32,
+    },
     PreviousChange {
         card: CardId,
     },
@@ -141,6 +183,10 @@ impl RepositoryAction {
             | Self::ApplyMarkdownMode { card, .. }
             | Self::SelectDiffMode { card, .. }
             | Self::ApplyDiffMode { card, .. }
+            | Self::SelectDiffBasis { card, .. }
+            | Self::ApplyDiffBasis { card, .. }
+            | Self::FileViewport { card, .. }
+            | Self::DiffViewport { card, .. }
             | Self::PreviousChange { card }
             | Self::NextChange { card }
             | Self::MarkdownLink { card, .. } => *card,
@@ -224,9 +270,18 @@ struct EditorDocument {
     markdown: bool,
     markdown_items: Vec<markdown::Item>,
     dirty: bool,
-    saving: bool,
+    revision: u64,
+    active_save: Option<SaveTicket>,
     conflict: bool,
     error: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SaveTicket {
+    id: u64,
+    identity: AsyncIdentity,
+    revision: u64,
+    snapshot: String,
 }
 
 impl EditorDocument {
@@ -244,7 +299,8 @@ impl EditorDocument {
             markdown,
             markdown_items,
             dirty: false,
-            saving: false,
+            revision: 0,
+            active_save: None,
             conflict: false,
             error: None,
         }
@@ -254,6 +310,7 @@ impl EditorDocument {
         let is_edit = action.is_edit();
         self.content.perform(action);
         if is_edit {
+            self.revision = self.revision.wrapping_add(1).max(1);
             let text = self.content.text();
             self.dirty = text != self.saved_text;
             if self.markdown {
@@ -270,7 +327,7 @@ impl EditorDocument {
             self.markdown_items = markdown::parse(&self.saved_text).collect();
         }
         self.dirty = false;
-        self.saving = false;
+        debug_assert!(self.active_save.is_none());
         self.conflict = false;
         self.error = None;
     }
@@ -297,9 +354,53 @@ enum DocumentState {
 }
 
 enum DiffState {
-    None,
-    Loading(PathBuf),
+    Loading,
     Ready(DiffContent),
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct ListViewport {
+    offset: f32,
+    height: f32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct VisibleRows {
+    start: usize,
+    end: usize,
+    top_space: f32,
+    bottom_space: f32,
+}
+
+const FILE_ROW_HEIGHT: f32 = 36.0;
+const DIFF_ROW_HEIGHT: f32 = 30.0;
+const VISIBLE_ROW_OVERSCAN: usize = 6;
+const INITIAL_VIEWPORT_HEIGHT: f32 = 900.0;
+
+fn visible_rows(total: usize, viewport: ListViewport, row_height: f32) -> VisibleRows {
+    let height = if viewport.height.is_finite() && viewport.height > 0.0 {
+        viewport.height
+    } else {
+        INITIAL_VIEWPORT_HEIGHT
+    };
+    let offset = if viewport.offset.is_finite() {
+        viewport.offset.max(0.0)
+    } else {
+        0.0
+    };
+    let first = (offset / row_height).floor() as usize;
+    let visible = (height / row_height).ceil() as usize + 1;
+    let start = first.saturating_sub(VISIBLE_ROW_OVERSCAN).min(total);
+    let end = first
+        .saturating_add(visible)
+        .saturating_add(VISIBLE_ROW_OVERSCAN)
+        .min(total);
+    VisibleRows {
+        start,
+        end,
+        top_space: start as f32 * row_height,
+        bottom_space: total.saturating_sub(end) as f32 * row_height,
+    }
 }
 
 pub struct RepositoryRuntime {
@@ -308,15 +409,20 @@ pub struct RepositoryRuntime {
     files: FileListState,
     selected: Option<RepositoryFile>,
     document: DocumentState,
-    diff: DiffState,
+    diffs: BTreeMap<DiffBasis, DiffState>,
     source_surface: SourceSurface,
     markdown_mode: MarkdownMode,
     diff_mode: DiffMode,
+    diff_basis: DiffBasis,
     source_control: TwoChoiceControl<SourceSurface>,
     markdown_control: TwoChoiceControl<MarkdownMode>,
     diff_control: TwoChoiceControl<DiffMode>,
+    diff_basis_control: TwoChoiceControl<DiffBasis>,
     diff_change: usize,
     diff_scroll_id: widget::Id,
+    file_viewport: ListViewport,
+    diff_viewport: ListViewport,
+    next_save_ticket: u64,
 }
 
 impl RepositoryRuntime {
@@ -328,10 +434,11 @@ impl RepositoryRuntime {
             files: FileListState::Loading,
             selected: None,
             document: DocumentState::None,
-            diff: DiffState::None,
+            diffs: BTreeMap::new(),
             source_surface: SourceSurface::Editor,
             markdown_mode: MarkdownMode::Edit,
             diff_mode: DiffMode::Inline,
+            diff_basis: DiffBasis::Unstaged,
             source_control: TwoChoiceControl::new(
                 "Edit",
                 SourceSurface::Editor,
@@ -350,13 +457,23 @@ impl RepositoryRuntime {
                 "Split",
                 DiffMode::Split,
             ),
+            diff_basis_control: TwoChoiceControl::new(
+                "Staged",
+                DiffBasis::Staged,
+                "Unstaged",
+                DiffBasis::Unstaged,
+            ),
             diff_change: 0,
             diff_scroll_id: widget::Id::new(format!("repository.diff.{identity}")),
+            file_viewport: ListViewport::default(),
+            diff_viewport: ListViewport::default(),
+            next_save_ticket: 0,
         }
     }
 
     pub fn initial_load(&mut self, card: CardId) -> Task<RepositoryAction> {
         self.files = FileListState::Loading;
+        self.file_viewport = ListViewport::default();
         let identity = self.next_identity(card, PathBuf::from("."));
         files_task(identity)
     }
@@ -366,17 +483,20 @@ impl RepositoryRuntime {
     }
 
     pub fn can_save(&self) -> bool {
-        matches!(&self.document, DocumentState::Editable(document) if document.dirty && !document.saving)
+        matches!(&self.document, DocumentState::Editable(document) if document.dirty && document.active_save.is_none())
     }
 
     pub fn is_saving(&self) -> bool {
-        matches!(&self.document, DocumentState::Editable(document) if document.saving)
+        matches!(&self.document, DocumentState::Editable(document) if document.active_save.is_some())
+    }
+
+    pub fn blocks_navigation(&self) -> bool {
+        self.is_dirty() || self.is_saving()
     }
 
     pub fn abandon_unsaved_changes(&mut self) {
         if let DocumentState::Editable(document) = &mut self.document {
-            document.dirty = false;
-            document.saving = false;
+            document.discard_edits();
         }
     }
 
@@ -392,19 +512,31 @@ impl RepositoryRuntime {
     }
 
     pub fn request_save(&mut self, card: CardId, overwrite: bool) -> Task<RepositoryAction> {
-        let (path, text, disk_hash) = match &mut self.document {
-            DocumentState::Editable(document) if document.dirty && !document.saving => {
-                document.saving = true;
-                document.error = None;
+        let (path, text, disk_hash, revision) = match &self.document {
+            DocumentState::Editable(document)
+                if document.dirty && document.active_save.is_none() =>
+            {
                 (
                     document.path.clone(),
                     document.content.text(),
                     document.disk_hash,
+                    document.revision,
                 )
             }
             _ => return Task::none(),
         };
         let identity = self.current_identity(card, path);
+        self.next_save_ticket = self.next_save_ticket.wrapping_add(1).max(1);
+        let ticket = SaveTicket {
+            id: self.next_save_ticket,
+            identity: identity.clone(),
+            revision,
+            snapshot: text.clone(),
+        };
+        if let DocumentState::Editable(document) = &mut self.document {
+            document.active_save = Some(ticket.clone());
+            document.error = None;
+        }
         let worktree = identity.worktree.clone();
         let relative_path = identity.path.clone();
         let saved_text = text.clone();
@@ -417,6 +549,8 @@ impl RepositoryRuntime {
             .and_then(|result| result);
             RepositoryAction::SaveFinished {
                 identity,
+                ticket: ticket.id,
+                revision,
                 saved_text,
                 result,
             }
@@ -434,7 +568,12 @@ impl RepositoryRuntime {
                 self.files = result.map_or_else(FileListState::Failed, FileListState::Ready);
                 Task::none()
             }
-            RepositoryAction::OpenFile { card, path } => self.open_file(card, path),
+            RepositoryAction::OpenFile { card, path } => {
+                if self.blocks_navigation() {
+                    return Task::none();
+                }
+                self.open_file(card, path)
+            }
             RepositoryAction::FileLoaded { identity, result } => {
                 if !self.accepts_selected(&identity) {
                     return Task::none();
@@ -461,10 +600,15 @@ impl RepositoryRuntime {
                 };
                 Task::none()
             }
-            RepositoryAction::DiffLoaded { identity, content } => {
+            RepositoryAction::DiffLoaded {
+                identity,
+                basis,
+                content,
+            } => {
                 if self.accepts_selected(&identity) {
-                    self.diff = DiffState::Ready(content);
+                    self.diffs.insert(basis, DiffState::Ready(content));
                     self.diff_change = 0;
+                    self.diff_viewport = ListViewport::default();
                 }
                 Task::none()
             }
@@ -477,15 +621,38 @@ impl RepositoryRuntime {
             RepositoryAction::Save { card, overwrite } => self.request_save(card, overwrite),
             RepositoryAction::SaveFinished {
                 identity,
+                ticket,
+                revision,
                 saved_text,
                 result,
             } => {
-                if !self.accepts_selected(&identity) {
+                let active_matches = matches!(
+                    &self.document,
+                    DocumentState::Editable(document)
+                        if document.active_save.as_ref().is_some_and(|active| {
+                            active.id == ticket
+                                && active.identity == identity
+                                && active.revision == revision
+                                && active.snapshot == saved_text
+                        })
+                );
+                if !active_matches {
+                    if let DocumentState::Editable(document) = &mut self.document
+                        && document.active_save.is_some()
+                    {
+                        document.active_save = None;
+                        document.dirty = true;
+                        document.conflict = true;
+                        document.error = Some(
+                            "The save result did not match the active document snapshot; the disk state is unknown. Reload or overwrite before leaving."
+                                .into(),
+                        );
+                    }
                     return Task::none();
                 }
                 let mut saved = false;
                 if let DocumentState::Editable(document) = &mut self.document {
-                    document.saving = false;
+                    document.active_save = None;
                     match result {
                         Ok(SaveOutcome::Saved { content_hash }) => {
                             document.saved_text = saved_text;
@@ -507,32 +674,42 @@ impl RepositoryRuntime {
                     let Some(selected) = self.selected.as_mut() else {
                         return Task::none();
                     };
-                    selected.changed = true;
-                    self.diff = DiffState::Loading(identity.path.clone());
-                    diff_task(identity, selected.tracked, selected.old_path.clone())
+                    selected.unstaged = true;
+                    self.diffs.insert(DiffBasis::Unstaged, DiffState::Loading);
+                    diff_task(
+                        identity,
+                        DiffBasis::Unstaged,
+                        selected.previous_path(DiffBasis::Unstaged),
+                    )
                 } else {
                     Task::none()
                 }
             }
             RepositoryAction::Reload { card } => {
+                if self.is_saving() {
+                    return Task::none();
+                }
                 let Some(path) = self.selected.as_ref().map(|file| file.path.clone()) else {
                     return Task::none();
                 };
                 self.open_file(card, path)
             }
             RepositoryAction::DiscardEdits { .. } => {
+                if self.is_saving() {
+                    return Task::none();
+                }
                 if let DocumentState::Editable(document) = &mut self.document {
                     document.discard_edits();
                 }
                 Task::none()
             }
             RepositoryAction::BackToFiles { card } => {
-                if self.is_dirty() {
+                if self.blocks_navigation() {
                     return Task::none();
                 }
                 self.selected = None;
                 self.document = DocumentState::None;
-                self.diff = DiffState::None;
+                self.diffs.clear();
                 self.source_surface = SourceSurface::Editor;
                 self.source_control.activate_value(SourceSurface::Editor);
                 self.initial_load(card)
@@ -540,7 +717,7 @@ impl RepositoryRuntime {
             RepositoryAction::SelectSource { card, entity } => {
                 if let Some(surface) = self.source_control.activate(entity)
                     && (surface == SourceSurface::Editor
-                        || self.selected.as_ref().is_some_and(|file| file.changed))
+                        || self.selected.as_ref().is_some_and(RepositoryFile::changed))
                 {
                     return cosmic::task::message(RepositoryAction::ApplySourceSurface {
                         card,
@@ -590,13 +767,50 @@ impl RepositoryRuntime {
                     DiffMode::Inline
                 };
                 self.diff_change = 0;
+                self.diff_viewport = ListViewport::default();
+                self.realize_current_change();
                 self.scroll_to_change()
+            }
+            RepositoryAction::SelectDiffBasis { card, entity } => {
+                if let Some(basis) = self.diff_basis_control.activate(entity)
+                    && self
+                        .selected
+                        .as_ref()
+                        .is_some_and(|file| file.has_basis(basis))
+                {
+                    return cosmic::task::message(RepositoryAction::ApplyDiffBasis {
+                        card,
+                        staged: basis == DiffBasis::Staged,
+                    });
+                }
+                self.diff_basis_control.activate_value(self.diff_basis);
+                Task::none()
+            }
+            RepositoryAction::ApplyDiffBasis { staged, .. } => {
+                self.diff_basis = if staged {
+                    DiffBasis::Staged
+                } else {
+                    DiffBasis::Unstaged
+                };
+                self.diff_change = 0;
+                self.diff_viewport = ListViewport::default();
+                self.realize_current_change();
+                self.scroll_to_change()
+            }
+            RepositoryAction::FileViewport { offset, height, .. } => {
+                self.file_viewport = ListViewport { offset, height };
+                Task::none()
+            }
+            RepositoryAction::DiffViewport { offset, height, .. } => {
+                self.diff_viewport = ListViewport { offset, height };
+                Task::none()
             }
             RepositoryAction::PreviousChange { .. } => {
                 let changes = self.change_count();
                 if changes != 0 {
                     self.diff_change = (self.diff_change + changes - 1) % changes;
                 }
+                self.realize_current_change();
                 self.scroll_to_change()
             }
             RepositoryAction::NextChange { .. } => {
@@ -604,6 +818,7 @@ impl RepositoryRuntime {
                 if changes != 0 {
                     self.diff_change = (self.diff_change + 1) % changes;
                 }
+                self.realize_current_change();
                 self.scroll_to_change()
             }
             RepositoryAction::MarkdownLink { .. } => Task::none(),
@@ -616,11 +831,19 @@ impl RepositoryRuntime {
         };
         self.selected = Some(file.clone());
         self.document = DocumentState::Loading(path.clone());
-        self.diff = if file.changed {
-            DiffState::Loading(path.clone())
+        self.diffs.clear();
+        self.diff_viewport = ListViewport::default();
+        for basis in [DiffBasis::Staged, DiffBasis::Unstaged] {
+            if file.has_basis(basis) {
+                self.diffs.insert(basis, DiffState::Loading);
+            }
+        }
+        self.diff_basis = if file.unstaged {
+            DiffBasis::Unstaged
         } else {
-            DiffState::None
+            DiffBasis::Staged
         };
+        self.diff_basis_control.activate_value(self.diff_basis);
         self.source_surface = SourceSurface::Editor;
         self.source_control.activate_value(SourceSurface::Editor);
         self.markdown_mode = MarkdownMode::Edit;
@@ -628,11 +851,17 @@ impl RepositoryRuntime {
         self.diff_change = 0;
         let identity = self.next_identity(card, path);
         let file_task = file_task(identity.clone());
-        if file.changed {
-            Task::batch([file_task, diff_task(identity, file.tracked, file.old_path)])
-        } else {
-            file_task
+        let mut tasks = vec![file_task];
+        for basis in [DiffBasis::Staged, DiffBasis::Unstaged] {
+            if file.has_basis(basis) {
+                tasks.push(diff_task(
+                    identity.clone(),
+                    basis,
+                    file.previous_path(basis),
+                ));
+            }
         }
+        Task::batch(tasks)
     }
 
     fn file(&self, path: &Path) -> Option<&RepositoryFile> {
@@ -674,8 +903,8 @@ impl RepositoryRuntime {
     }
 
     fn diff_model(&self) -> Option<&DiffModel> {
-        match &self.diff {
-            DiffState::Ready(DiffContent::Text(model)) => Some(model),
+        match self.diffs.get(&self.diff_basis) {
+            Some(DiffState::Ready(DiffContent::Text(model))) => Some(model),
             _ => None,
         }
     }
@@ -683,6 +912,16 @@ impl RepositoryRuntime {
     fn change_count(&self) -> usize {
         self.diff_model()
             .map_or(0, |model| model.change_starts(self.diff_mode).len())
+    }
+
+    fn realize_current_change(&mut self) {
+        let row = self
+            .diff_model()
+            .and_then(|model| model.change_starts(self.diff_mode).get(self.diff_change))
+            .copied();
+        if let Some(row) = row {
+            self.diff_viewport.offset = row as f32 * DIFF_ROW_HEIGHT;
+        }
     }
 
     fn scroll_to_change(&self) -> Task<RepositoryAction> {
@@ -730,21 +969,22 @@ fn file_task(identity: AsyncIdentity) -> Task<RepositoryAction> {
 
 fn diff_task(
     identity: AsyncIdentity,
-    tracked: bool,
+    basis: DiffBasis,
     old_path: Option<PathBuf>,
 ) -> Task<RepositoryAction> {
     let worktree = identity.worktree.clone();
     let path = identity.path.clone();
     cosmic::task::future(async move {
         let content = tokio::task::spawn_blocking(move || {
-            let previous_path = old_path
-                .as_deref()
-                .or_else(|| tracked.then_some(path.as_path()));
-            load_worktree_diff_from(&worktree, &path, previous_path)
+            load_repository_diff(&worktree, &path, basis, old_path.as_deref())
         })
         .await
         .unwrap_or_else(|error| DiffContent::Error(format!("diff worker failed: {error}")));
-        RepositoryAction::DiffLoaded { identity, content }
+        RepositoryAction::DiffLoaded {
+            identity,
+            basis,
+            content,
+        }
     })
 }
 
@@ -775,22 +1015,33 @@ fn assemble_repository_files(
         files.entry(path).or_insert(false);
     }
     for status in statuses.values() {
-        if status.code.as_bytes().contains(&b'R')
-            && let Some(old_path) = &status.old_path
+        for old_path in [
+            status.staged_old_path.as_ref(),
+            status.unstaged_old_path.as_ref(),
+        ]
+        .into_iter()
+        .flatten()
         {
             files.remove(old_path);
         }
     }
+    for path in statuses.keys() {
+        files.entry(path.clone()).or_insert(false);
+    }
     Ok(files
         .into_iter()
-        .map(|(path, tracked)| {
+        .map(|(path, _tracked)| {
             let status = statuses.get(&path);
+            let (staged, unstaged) = status.map_or((false, false), |status| {
+                (status.staged.is_some(), status.unstaged.is_some())
+            });
             RepositoryFile {
-                changed: status.is_some(),
-                old_path: status.and_then(|status| status.old_path.clone()),
+                staged_old_path: status.and_then(|status| status.staged_old_path.clone()),
+                unstaged_old_path: status.and_then(|status| status.unstaged_old_path.clone()),
                 path,
-                tracked,
-                status: status.map(|status| status.code.clone()),
+                staged,
+                unstaged,
+                status: status.map(ParsedStatus::display_code),
             }
         })
         .collect())
@@ -838,8 +1089,68 @@ fn parse_paths(output: &[u8], format: &str) -> Result<Vec<PathBuf>, String> {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ParsedStatus {
-    code: String,
-    old_path: Option<PathBuf>,
+    staged: Option<u8>,
+    unstaged: Option<u8>,
+    staged_old_path: Option<PathBuf>,
+    unstaged_old_path: Option<PathBuf>,
+}
+
+impl ParsedStatus {
+    fn display_code(&self) -> String {
+        match (self.staged, self.unstaged) {
+            (None, Some(b'?')) => "??".into(),
+            (staged, unstaged) => {
+                String::from_utf8(vec![staged.unwrap_or(b' '), unstaged.unwrap_or(b' ')])
+                    .expect("porcelain status codes are ASCII")
+            }
+        }
+    }
+
+    fn merge(&mut self, other: Self) -> Result<(), String> {
+        merge_status_fact(&mut self.staged, other.staged, "staged")?;
+        merge_status_fact(&mut self.unstaged, other.unstaged, "unstaged")?;
+        merge_status_path(
+            &mut self.staged_old_path,
+            other.staged_old_path,
+            "staged rename",
+        )?;
+        merge_status_path(
+            &mut self.unstaged_old_path,
+            other.unstaged_old_path,
+            "unstaged rename",
+        )
+    }
+}
+
+fn merge_status_fact(
+    target: &mut Option<u8>,
+    incoming: Option<u8>,
+    basis: &str,
+) -> Result<(), String> {
+    if let Some(incoming) = incoming {
+        if target.is_some_and(|existing| existing != incoming) {
+            return Err(format!("conflicting {basis} status records"));
+        }
+        *target = Some(incoming);
+    }
+    Ok(())
+}
+
+fn merge_status_path(
+    target: &mut Option<PathBuf>,
+    incoming: Option<PathBuf>,
+    basis: &str,
+) -> Result<(), String> {
+    if let Some(incoming) = incoming {
+        if target
+            .as_ref()
+            .is_some_and(|existing| existing != &incoming)
+        {
+            return Err(format!("conflicting {basis} source paths"));
+        }
+        *target = Some(incoming);
+    }
+    Ok(())
 }
 
 fn parse_status_paths(output: &[u8]) -> Result<HashMap<PathBuf, ParsedStatus>, String> {
@@ -850,14 +1161,14 @@ fn parse_status_paths(output: &[u8]) -> Result<HashMap<PathBuf, ParsedStatus>, S
         .split(|byte| *byte == 0)
         .filter(|field| !field.is_empty())
         .collect::<Vec<_>>();
-    let mut statuses = HashMap::new();
+    let mut statuses: HashMap<PathBuf, ParsedStatus> = HashMap::new();
     let mut index = 0;
     while index < fields.len() {
         let field = fields[index];
         if field.len() < 4 || field[2] != b' ' {
             return Err(format!("malformed git status record {index}"));
         }
-        let status = String::from_utf8_lossy(&field[..2]).into_owned();
+        let code = &field[..2];
         let path = bytes_to_path(&field[3..]);
         validate_repo_path(&path).map_err(|error| error.to_string())?;
         let mut old_path = None;
@@ -870,13 +1181,28 @@ fn parse_status_paths(output: &[u8]) -> Result<HashMap<PathBuf, ParsedStatus>, S
             validate_repo_path(&source).map_err(|error| error.to_string())?;
             old_path = Some(source);
         }
-        statuses.insert(
-            path,
-            ParsedStatus {
-                code: status,
-                old_path,
+        let untracked = code == b"??";
+        let parsed = ParsedStatus {
+            staged: (!untracked && code[0] != b' ').then_some(code[0]),
+            unstaged: if untracked {
+                Some(b'?')
+            } else {
+                (code[1] != b' ').then_some(code[1])
             },
-        );
+            staged_old_path: matches!(code[0], b'R' | b'C')
+                .then(|| old_path.clone())
+                .flatten(),
+            unstaged_old_path: if matches!(code[1], b'R' | b'C') {
+                old_path
+            } else {
+                None
+            },
+        };
+        if let Some(existing) = statuses.get_mut(&path) {
+            existing.merge(parsed)?;
+        } else {
+            statuses.insert(path, parsed);
+        }
         index += 1;
     }
     Ok(statuses)
@@ -895,17 +1221,27 @@ fn bytes_to_path(bytes: &[u8]) -> PathBuf {
 }
 
 pub fn view(card: CardId, runtime: &RepositoryRuntime) -> Element<'_, RepositoryAction> {
-    let spacing = cosmic::theme::spacing();
-    let body = if runtime.selected.is_some() {
-        selected_file_view(card, runtime)
+    let (surface_key, body) = if runtime.selected.is_some() {
+        (1_u8, selected_file_view(card, runtime))
     } else {
-        file_list_view(card, runtime)
+        (0, file_list_view(card, runtime))
     };
-    widget::column::with_children(vec![body])
-        .spacing(spacing.space_xxs)
+    // The file list and selected-file editor are both columns but have
+    // unrelated stateful descendants. Key the surface so the reconciler does
+    // not reuse a list row's stateless tree as editor state when a fast file
+    // load skips the intermediate loading frame.
+    iced::widget::keyed_column([(surface_key, body)])
         .width(Length::Fill)
         .height(Length::Fill)
         .into()
+}
+
+pub fn editor_focus_id(card: CardId) -> widget::Id {
+    widget::Id::new(format!("repository.{card}.editor"))
+}
+
+pub fn focus_restore_id(card: CardId) -> widget::Id {
+    widget::Id::new(format!("repository.{card}.back"))
 }
 
 fn file_list_view(card: CardId, runtime: &RepositoryRuntime) -> Element<'_, RepositoryAction> {
@@ -946,10 +1282,15 @@ fn file_list_view(card: CardId, runtime: &RepositoryRuntime) -> Element<'_, Repo
             "This worktree has no tracked or untracked regular-file paths.",
         ),
         FileListState::Ready(files) => {
-            let rows = files.iter().map(|file| {
+            let visible = visible_rows(files.len(), runtime.file_viewport, FILE_ROW_HEIGHT);
+            let mut rows = Vec::with_capacity(visible.end - visible.start + 2);
+            if visible.top_space > 0.0 {
+                rows.push(iced::widget::Space::new().height(visible.top_space).into());
+            }
+            rows.extend(files[visible.start..visible.end].iter().map(|file| {
                 let label = file.path.to_string_lossy();
                 let mut children: Vec<Element<'_, RepositoryAction>> = vec![
-                    widget::icon::from_name(if file.changed {
+                    widget::icon::from_name(if file.changed() {
                         "document-edit-symbolic"
                     } else {
                         "text-x-generic-symbolic"
@@ -968,13 +1309,26 @@ fn file_list_view(card: CardId, runtime: &RepositoryRuntime) -> Element<'_, Repo
                 )
                 .class(cosmic::theme::Button::Text)
                 .width(Length::Fill)
+                .height(Length::Fixed(FILE_ROW_HEIGHT))
                 .on_press(RepositoryAction::OpenFile {
                     card,
                     path: file.path.clone(),
                 })
                 .into()
-            });
-            widget::scrollable(widget::column(rows).spacing(spacing.space_xxxs))
+            }));
+            if visible.bottom_space > 0.0 {
+                rows.push(
+                    iced::widget::Space::new()
+                        .height(visible.bottom_space)
+                        .into(),
+                );
+            }
+            widget::scrollable(widget::column::with_children(rows))
+                .on_scroll(move |viewport| RepositoryAction::FileViewport {
+                    card,
+                    offset: viewport.absolute_offset().y,
+                    height: viewport.bounds().height,
+                })
                 .height(Length::Fill)
                 .width(Length::Fill)
                 .into()
@@ -994,14 +1348,17 @@ fn selected_file_view(card: CardId, runtime: &RepositoryRuntime) -> Element<'_, 
     let selected = runtime.selected.as_ref().expect("selected file exists");
     let mut controls: Vec<Element<'_, RepositoryAction>> = vec![
         widget::button::icon(widget::icon::from_name("go-previous-symbolic"))
+            .id(focus_restore_id(card))
             .name("Back to repository files")
-            .on_press_maybe((!runtime.is_dirty()).then_some(RepositoryAction::BackToFiles { card }))
+            .on_press_maybe(
+                (!runtime.blocks_navigation()).then_some(RepositoryAction::BackToFiles { card }),
+            )
             .into(),
         widget::text::heading(selected.path.to_string_lossy())
             .width(Length::Fill)
             .into(),
     ];
-    if selected.changed {
+    if selected.changed() {
         controls.push(
             widget::segmented_control::horizontal(&runtime.source_control.model)
                 .on_activate(move |entity| RepositoryAction::SelectSource { card, entity })
@@ -1047,23 +1404,30 @@ fn selected_file_view(card: CardId, runtime: &RepositoryRuntime) -> Element<'_, 
 }
 
 fn editor_surface(card: CardId, runtime: &RepositoryRuntime) -> Element<'_, RepositoryAction> {
-    match &runtime.document {
-        DocumentState::None => information_state(
-            "No file selected",
-            "Choose a file from the repository list.",
+    let (state_key, content) = match &runtime.document {
+        DocumentState::None => (
+            0_u8,
+            information_state(
+                "No file selected",
+                "Choose a file from the repository list.",
+            ),
         ),
-        DocumentState::Loading(path) => loading(format!("Loading {}…", path.display())),
-        DocumentState::Failed { path, message } => {
-            information_state(format!("Could not open {}", path.display()), message)
-        }
-        DocumentState::ReadOnly { path, reason } => read_only_state(path, reason),
-        // `MouseArea` supplies a stateful tree boundary. Without it, Iced can
-        // reconcile the preceding stateless loading view into the editor and
-        // leave the native text editor with an incompatible child state.
-        DocumentState::Editable(document) => {
-            iced::widget::mouse_area(editable_document_view(card, runtime, document)).into()
-        }
-    }
+        DocumentState::Loading(path) => (1, loading(format!("Loading {}…", path.display()))),
+        DocumentState::Failed { path, message } => (
+            2,
+            information_state(format!("Could not open {}", path.display()), message),
+        ),
+        DocumentState::ReadOnly { path, reason } => (3, read_only_state(path, reason)),
+        // The key forces Iced to build a fresh subtree when an asynchronous
+        // load replaces a stateless placeholder with the stateful editor.
+        // A generic wrapper is insufficient because its own identity can be
+        // retained while its child still carries the placeholder's state.
+        DocumentState::Editable(document) => (4, editable_document_view(card, runtime, document)),
+    };
+    iced::widget::keyed_column([(state_key, content)])
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .into()
 }
 
 fn editable_document_view<'a>(
@@ -1125,6 +1489,13 @@ fn editable_document_view<'a>(
         } else {
             iced::widget::mouse_area(
                 text_editor::text_editor(&document.content)
+                    // libcosmic's context-menu wrapper owns a second widget
+                    // tree whose child can retain the preceding stateless
+                    // placeholder during an async file-load transition. The
+                    // native editor itself provides the required focus and
+                    // editing state without that wrapper.
+                    .context_menu(false)
+                    .id(editor_focus_id(card))
                     .font(Font::MONOSPACE)
                     .padding(spacing.space_xs)
                     .height(Length::Fill)
@@ -1139,13 +1510,20 @@ fn editable_document_view<'a>(
 }
 
 fn diff_surface(card: CardId, runtime: &RepositoryRuntime) -> Element<'_, RepositoryAction> {
-    match &runtime.diff {
-        DiffState::None => information_state(
+    match runtime.diffs.get(&runtime.diff_basis) {
+        None => information_state(
             "No local changes",
-            "This file matches its checked-in version.",
+            "This file has no changes for the selected basis.",
         ),
-        DiffState::Loading(path) => loading(format!("Computing diff for {}…", path.display())),
-        DiffState::Ready(content) => match content {
+        Some(DiffState::Loading) => loading(format!(
+            "Computing {} diff for {}…",
+            runtime.diff_basis.label().to_lowercase(),
+            runtime
+                .selected
+                .as_ref()
+                .map_or_else(String::new, |file| file.path.display().to_string())
+        )),
+        Some(DiffState::Ready(content)) => match content {
             DiffContent::Text(model) => diff_model_view(card, runtime, model),
             DiffContent::Binary { side } => information_state(
                 "Binary diff unavailable",
@@ -1181,6 +1559,9 @@ fn diff_model_view<'a>(
     let change_count = model.change_starts(runtime.diff_mode).len();
     let toolbar = widget::container(
         widget::row::with_children(vec![
+            widget::segmented_control::horizontal(&runtime.diff_basis_control.model)
+                .on_activate(move |entity| RepositoryAction::SelectDiffBasis { card, entity })
+                .into(),
             widget::segmented_control::horizontal(&runtime.diff_control.model)
                 .on_activate(move |entity| RepositoryAction::SelectDiffMode { card, entity })
                 .into(),
@@ -1219,12 +1600,38 @@ fn diff_model_view<'a>(
             "The working file and checked-in file have identical text.",
         )
     } else {
-        let children: Vec<Element<'a, RepositoryAction>> = match runtime.diff_mode {
-            DiffMode::Inline => model.inline_rows.iter().map(inline_diff_row).collect(),
-            DiffMode::Split => model.split_rows.iter().map(split_diff_row).collect(),
+        let total = model.row_count(runtime.diff_mode);
+        let visible = visible_rows(total, runtime.diff_viewport, DIFF_ROW_HEIGHT);
+        let mut children = Vec::with_capacity(visible.end - visible.start + 2);
+        if visible.top_space > 0.0 {
+            children.push(iced::widget::Space::new().height(visible.top_space).into());
+        }
+        match runtime.diff_mode {
+            DiffMode::Inline => children.extend(
+                model.inline_rows[visible.start..visible.end]
+                    .iter()
+                    .map(inline_diff_row),
+            ),
+            DiffMode::Split => children.extend(
+                model.split_rows[visible.start..visible.end]
+                    .iter()
+                    .map(split_diff_row),
+            ),
         };
+        if visible.bottom_space > 0.0 {
+            children.push(
+                iced::widget::Space::new()
+                    .height(visible.bottom_space)
+                    .into(),
+            );
+        }
         widget::scrollable(widget::column::with_children(children).spacing(0))
             .id(runtime.diff_scroll_id.clone())
+            .on_scroll(move |viewport| RepositoryAction::DiffViewport {
+                card,
+                offset: viewport.absolute_offset().y,
+                height: viewport.bounds().height,
+            })
             .height(Length::Fill)
             .width(Length::Fill)
             .into()
@@ -1323,6 +1730,7 @@ fn diff_container<'a>(
             }
         }))
         .padding([3, 8])
+        .height(Length::Fixed(DIFF_ROW_HEIGHT))
         .width(Length::Fill)
         .into()
 }
@@ -1408,25 +1816,25 @@ mod tests {
         assert_eq!(
             parsed
                 .get(Path::new("src/main.rs"))
-                .map(|status| status.code.as_str()),
-            Some(" M")
+                .map(ParsedStatus::display_code),
+            Some(" M".into())
         );
         assert_eq!(
             parsed
                 .get(Path::new("renamed.md"))
-                .map(|status| status.code.as_str()),
-            Some("R ")
+                .map(ParsedStatus::display_code),
+            Some("R ".into())
         );
         assert_eq!(
             parsed
                 .get(Path::new("new.txt"))
-                .map(|status| status.code.as_str()),
-            Some("??")
+                .map(ParsedStatus::display_code),
+            Some("??".into())
         );
         assert_eq!(
             parsed
                 .get(Path::new("renamed.md"))
-                .and_then(|status| status.old_path.as_deref()),
+                .and_then(|status| status.staged_old_path.as_deref()),
             Some(Path::new("old.md"))
         );
         assert!(!parsed.contains_key(Path::new("old.md")));
@@ -1437,6 +1845,36 @@ mod tests {
         assert!(parse_paths(b"src/main.rs", "fixture").is_err());
         assert!(parse_paths(b"../outside\0", "fixture").is_err());
         assert!(parse_status_paths(b"R  renamed\0").is_err());
+    }
+
+    #[test]
+    fn merges_staged_deletion_and_untracked_replacement_for_one_path() {
+        let parsed = parse_status_paths(b"D  replacement.txt\0?? replacement.txt\0").unwrap();
+        let status = parsed.get(Path::new("replacement.txt")).unwrap();
+        assert_eq!(status.staged, Some(b'D'));
+        assert_eq!(status.unstaged, Some(b'?'));
+        assert_eq!(status.display_code(), "D?");
+
+        let root = tempdir().unwrap();
+        run_git(root.path(), ["init", "-q"]);
+        run_git(root.path(), ["config", "user.name", "Fixture"]);
+        run_git(
+            root.path(),
+            ["config", "user.email", "fixture@example.invalid"],
+        );
+        std::fs::write(root.path().join("replacement.txt"), "same path\n").unwrap();
+        run_git(root.path(), ["add", "replacement.txt"]);
+        run_git(root.path(), ["commit", "-qm", "initial"]);
+        run_git(root.path(), ["rm", "--cached", "-q", "replacement.txt"]);
+        let files = load_repository_files(root.path()).unwrap();
+        let replacements = files
+            .iter()
+            .filter(|file| file.path == Path::new("replacement.txt"))
+            .collect::<Vec<_>>();
+        assert_eq!(replacements.len(), 1);
+        assert!(replacements[0].staged);
+        assert!(replacements[0].unstaged);
+        assert_eq!(replacements[0].status.as_deref(), Some("D?"));
     }
 
     #[test]
@@ -1451,9 +1889,10 @@ mod tests {
             files,
             vec![RepositoryFile {
                 path: PathBuf::from("renamed.md"),
-                old_path: Some(PathBuf::from("old-name.md")),
-                tracked: false,
-                changed: true,
+                staged_old_path: None,
+                unstaged_old_path: Some(PathBuf::from("old-name.md")),
+                staged: false,
+                unstaged: true,
                 status: Some(" R".into()),
             }]
         );
@@ -1482,27 +1921,71 @@ mod tests {
             vec![
                 RepositoryFile {
                     path: PathBuf::from("new.txt"),
-                    old_path: None,
-                    tracked: false,
-                    changed: true,
+                    staged_old_path: None,
+                    unstaged_old_path: None,
+                    staged: false,
+                    unstaged: true,
                     status: Some("??".into())
                 },
                 RepositoryFile {
                     path: PathBuf::from("renamed.md"),
-                    old_path: Some(PathBuf::from("old-name.md")),
-                    tracked: true,
-                    changed: true,
+                    staged_old_path: Some(PathBuf::from("old-name.md")),
+                    unstaged_old_path: None,
+                    staged: true,
+                    unstaged: false,
                     status: Some("R ".into())
                 },
                 RepositoryFile {
                     path: PathBuf::from("tracked.md"),
-                    old_path: None,
-                    tracked: true,
-                    changed: true,
+                    staged_old_path: None,
+                    unstaged_old_path: None,
+                    staged: false,
+                    unstaged: true,
                     status: Some(" M".into())
                 },
             ]
         );
+    }
+
+    #[test]
+    fn real_git_fixture_keeps_status_only_and_staged_plus_unstaged_deletions() {
+        let root = tempdir().unwrap();
+        run_git(root.path(), ["init", "-q"]);
+        run_git(root.path(), ["config", "user.name", "Fixture"]);
+        run_git(
+            root.path(),
+            ["config", "user.email", "fixture@example.invalid"],
+        );
+        for path in ["staged-delete", "unstaged-delete", "both-delete"] {
+            std::fs::write(root.path().join(path), "head\n").unwrap();
+        }
+        run_git(root.path(), ["add", "."]);
+        run_git(root.path(), ["commit", "-qm", "initial"]);
+        run_git(root.path(), ["rm", "-q", "staged-delete"]);
+        std::fs::remove_file(root.path().join("unstaged-delete")).unwrap();
+        std::fs::write(root.path().join("both-delete"), "indexed\n").unwrap();
+        run_git(root.path(), ["add", "both-delete"]);
+        std::fs::remove_file(root.path().join("both-delete")).unwrap();
+
+        let files = load_repository_files(root.path()).unwrap();
+        let staged = files
+            .iter()
+            .find(|file| file.path == Path::new("staged-delete"))
+            .expect("a staged deletion absent from the index must remain listed");
+        assert_eq!((staged.staged, staged.unstaged), (true, false));
+        assert_eq!(staged.status.as_deref(), Some("D "));
+        let unstaged = files
+            .iter()
+            .find(|file| file.path == Path::new("unstaged-delete"))
+            .unwrap();
+        assert_eq!((unstaged.staged, unstaged.unstaged), (false, true));
+        assert_eq!(unstaged.status.as_deref(), Some(" D"));
+        let both = files
+            .iter()
+            .find(|file| file.path == Path::new("both-delete"))
+            .unwrap();
+        assert_eq!((both.staged, both.unstaged), (true, true));
+        assert_eq!(both.status.as_deref(), Some("MD"));
     }
 
     #[test]
@@ -1520,10 +2003,9 @@ mod tests {
         assert!(document.dirty);
         assert!(!document.markdown_items.is_empty());
         assert!(document.markdown_items.len() >= original_items);
-        document.saving = true;
         document.discard_edits();
         assert!(!document.dirty);
-        assert!(!document.saving);
+        assert!(document.active_save.is_none());
         assert_eq!(document.content.text(), "# Title\n");
     }
 
@@ -1540,9 +2022,10 @@ mod tests {
         runtime.generation = 1;
         runtime.selected = Some(RepositoryFile {
             path: path.clone(),
-            old_path: None,
-            tracked: true,
-            changed: true,
+            staged_old_path: None,
+            unstaged_old_path: None,
+            staged: false,
+            unstaged: true,
             status: Some(" M".into()),
         });
         let mut document = EditorDocument::new(
@@ -1551,19 +2034,27 @@ mod tests {
             blake3::hash(b"before\n"),
             false,
         );
-        document.saved_text = "submitted\n".into();
         document.content = text_editor::Content::with_text("typed later\n");
         document.dirty = true;
-        document.saving = true;
+        document.revision = 2;
+        let identity = AsyncIdentity {
+            card,
+            worktree: PathBuf::from("/repo"),
+            path: path.clone(),
+            generation: 1,
+        };
+        document.active_save = Some(SaveTicket {
+            id: 7,
+            identity: identity.clone(),
+            revision: 1,
+            snapshot: "submitted\n".into(),
+        });
         runtime.document = DocumentState::Editable(document);
 
         let _ = runtime.update(RepositoryAction::SaveFinished {
-            identity: AsyncIdentity {
-                card,
-                worktree: PathBuf::from("/repo"),
-                path,
-                generation: 1,
-            },
+            identity,
+            ticket: 7,
+            revision: 1,
             saved_text: "submitted\n".into(),
             result: Ok(SaveOutcome::Saved {
                 content_hash: blake3::hash(b"submitted\n"),
@@ -1576,12 +2067,178 @@ mod tests {
         assert_eq!(document.saved_text, "submitted\n");
         assert_eq!(document.content.text(), "typed later\n");
         assert!(document.dirty);
-        assert!(!document.saving);
+        assert!(document.active_save.is_none());
+    }
+
+    #[test]
+    fn obsolete_save_completion_cannot_change_document_or_release_navigation_fence() {
+        let view = RepositoryView {
+            project: ProjectId::new(),
+            repository: PathBuf::from("/repo/.git"),
+            worktree: PathBuf::from("/repo"),
+        };
+        let mut runtime = RepositoryRuntime::new(view);
+        let card = CardId::new();
+        let path = PathBuf::from("notes.txt");
+        runtime.generation = 1;
+        runtime.selected = Some(RepositoryFile {
+            path: path.clone(),
+            staged_old_path: None,
+            unstaged_old_path: None,
+            staged: false,
+            unstaged: true,
+            status: Some(" M".into()),
+        });
+        let mut document = EditorDocument::new(
+            path.clone(),
+            "disk\n".into(),
+            blake3::hash(b"disk\n"),
+            false,
+        );
+        document.content = text_editor::Content::with_text("newest\n");
+        document.dirty = true;
+        document.revision = 3;
+        let identity = AsyncIdentity {
+            card,
+            worktree: PathBuf::from("/repo"),
+            path: path.clone(),
+            generation: 1,
+        };
+        document.active_save = Some(SaveTicket {
+            id: 8,
+            identity: identity.clone(),
+            revision: 3,
+            snapshot: "newest\n".into(),
+        });
+        runtime.document = DocumentState::Editable(document);
+
+        let _ = runtime.update(RepositoryAction::SaveFinished {
+            identity,
+            ticket: 7,
+            revision: 2,
+            saved_text: "obsolete\n".into(),
+            result: Ok(SaveOutcome::Saved {
+                content_hash: blake3::hash(b"obsolete\n"),
+            }),
+        });
+
+        let DocumentState::Editable(document) = &runtime.document else {
+            panic!("document should remain editable");
+        };
+        assert_eq!(document.saved_text, "disk\n");
+        assert_eq!(document.content.text(), "newest\n");
+        assert!(document.active_save.is_none());
+        assert!(document.conflict);
+        assert!(
+            document
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("disk state is unknown"))
+        );
+        assert!(runtime.blocks_navigation());
+    }
+
+    #[test]
+    fn save_in_flight_blocks_navigation_even_when_text_temporarily_matches_old_disk() {
+        let mut document = EditorDocument::new(
+            PathBuf::from("notes.txt"),
+            "disk\n".into(),
+            blake3::hash(b"disk\n"),
+            false,
+        );
+        document.revision = 2;
+        document.active_save = Some(SaveTicket {
+            id: 1,
+            identity: AsyncIdentity {
+                card: CardId::new(),
+                worktree: PathBuf::from("/repo"),
+                path: PathBuf::from("notes.txt"),
+                generation: 1,
+            },
+            revision: 1,
+            snapshot: "submitted\n".into(),
+        });
+        document.dirty = false;
+        let view = RepositoryView {
+            project: ProjectId::new(),
+            repository: PathBuf::from("/repo/.git"),
+            worktree: PathBuf::from("/repo"),
+        };
+        let mut runtime = RepositoryRuntime::new(view);
+        runtime.document = DocumentState::Editable(document);
+        assert!(!runtime.is_dirty());
+        assert!(runtime.blocks_navigation());
+    }
+
+    #[test]
+    fn active_save_rejects_open_reload_and_discard_transitions() {
+        let view = RepositoryView {
+            project: ProjectId::new(),
+            repository: PathBuf::from("/repo/.git"),
+            worktree: PathBuf::from("/repo"),
+        };
+        let mut runtime = RepositoryRuntime::new(view);
+        let card = CardId::new();
+        let path = PathBuf::from("notes.txt");
+        runtime.generation = 4;
+        runtime.selected = Some(RepositoryFile {
+            path: path.clone(),
+            staged_old_path: None,
+            unstaged_old_path: None,
+            staged: false,
+            unstaged: true,
+            status: Some(" M".into()),
+        });
+        let identity = AsyncIdentity {
+            card,
+            worktree: PathBuf::from("/repo"),
+            path: path.clone(),
+            generation: 4,
+        };
+        let mut document = EditorDocument::new(
+            path.clone(),
+            "disk\n".into(),
+            blake3::hash(b"disk\n"),
+            false,
+        );
+        document.content = text_editor::Content::with_text("submitted\n");
+        document.dirty = true;
+        document.revision = 1;
+        document.active_save = Some(SaveTicket {
+            id: 9,
+            identity,
+            revision: 1,
+            snapshot: "submitted\n".into(),
+        });
+        runtime.document = DocumentState::Editable(document);
+
+        for action in [
+            RepositoryAction::DiscardEdits { card },
+            RepositoryAction::Reload { card },
+            RepositoryAction::OpenFile {
+                card,
+                path: PathBuf::from("other.txt"),
+            },
+        ] {
+            let _ = runtime.update(action);
+        }
+
+        assert_eq!(runtime.generation, 4);
+        assert_eq!(runtime.selected.as_ref().unwrap().path, path);
+        let DocumentState::Editable(document) = &runtime.document else {
+            panic!("the active save document must remain installed");
+        };
+        assert_eq!(document.content.text(), "submitted\n");
+        assert_eq!(
+            document.active_save.as_ref().map(|ticket| ticket.id),
+            Some(9)
+        );
+        assert!(runtime.blocks_navigation());
     }
 
     #[test]
     fn successful_save_prepares_a_fresh_diff_for_clean_and_untracked_files() {
-        for (tracked, changed) in [(true, false), (false, true)] {
+        for tracked in [true, false] {
             let view = RepositoryView {
                 project: ProjectId::new(),
                 repository: PathBuf::from("/repo/.git"),
@@ -1593,9 +2250,10 @@ mod tests {
             runtime.generation = 1;
             runtime.selected = Some(RepositoryFile {
                 path: path.clone(),
-                old_path: None,
-                tracked,
-                changed,
+                staged_old_path: None,
+                unstaged_old_path: None,
+                staged: false,
+                unstaged: !tracked,
                 status: (!tracked).then(|| "??".into()),
             });
             let mut document = EditorDocument::new(
@@ -1606,24 +2264,41 @@ mod tests {
             );
             document.content = text_editor::Content::with_text("after\n");
             document.dirty = true;
-            document.saving = true;
+            document.revision = 1;
+            let identity = AsyncIdentity {
+                card,
+                worktree: PathBuf::from("/repo"),
+                path: path.clone(),
+                generation: 1,
+            };
+            document.active_save = Some(SaveTicket {
+                id: 1,
+                identity: identity.clone(),
+                revision: 1,
+                snapshot: "after\n".into(),
+            });
             runtime.document = DocumentState::Editable(document);
 
             let _ = runtime.update(RepositoryAction::SaveFinished {
-                identity: AsyncIdentity {
-                    card,
-                    worktree: PathBuf::from("/repo"),
-                    path: path.clone(),
-                    generation: 1,
-                },
+                identity,
+                ticket: 1,
+                revision: 1,
                 saved_text: "after\n".into(),
                 result: Ok(SaveOutcome::Saved {
                     content_hash: blake3::hash(b"after\n"),
                 }),
             });
 
-            assert!(runtime.selected.as_ref().is_some_and(|file| file.changed));
-            assert!(matches!(runtime.diff, DiffState::Loading(ref loaded) if loaded == &path));
+            assert!(
+                runtime
+                    .selected
+                    .as_ref()
+                    .is_some_and(RepositoryFile::changed)
+            );
+            assert!(matches!(
+                runtime.diffs.get(&DiffBasis::Unstaged),
+                Some(DiffState::Loading)
+            ));
         }
     }
 
@@ -1638,9 +2313,10 @@ mod tests {
         runtime.generation = 9;
         runtime.selected = Some(RepositoryFile {
             path: PathBuf::from("current.rs"),
-            old_path: None,
-            tracked: true,
-            changed: true,
+            staged_old_path: None,
+            unstaged_old_path: None,
+            staged: false,
+            unstaged: true,
             status: Some(" M".into()),
         });
         runtime.document = DocumentState::Loading(PathBuf::from("current.rs"));
@@ -1689,6 +2365,161 @@ mod tests {
         let _ = runtime.update(RepositoryAction::ApplyDiffMode { card, split: true });
         assert_eq!(runtime.markdown_mode, MarkdownMode::Preview);
         assert_eq!(runtime.diff_mode, DiffMode::Split);
+    }
+
+    #[test]
+    fn visible_row_projection_bounds_widgets_for_large_file_and_diff_fixtures() {
+        let top = visible_rows(
+            100_000,
+            ListViewport {
+                offset: 0.0,
+                height: 720.0,
+            },
+            FILE_ROW_HEIGHT,
+        );
+        let middle = visible_rows(
+            1_000_000,
+            ListViewport {
+                offset: 12_345_678.0,
+                height: 900.0,
+            },
+            DIFF_ROW_HEIGHT,
+        );
+        assert!(top.end - top.start <= 34);
+        assert!(middle.end - middle.start <= 43);
+        assert_eq!(
+            top.top_space + (top.end - top.start) as f32 * FILE_ROW_HEIGHT + top.bottom_space,
+            100_000.0 * FILE_ROW_HEIGHT
+        );
+        assert_eq!(
+            middle.top_space
+                + (middle.end - middle.start) as f32 * DIFF_ROW_HEIGHT
+                + middle.bottom_space,
+            1_000_000.0 * DIFF_ROW_HEIGHT
+        );
+    }
+
+    #[test]
+    fn actual_widget_trees_stay_bounded_at_top_middle_and_end_of_100k_rows() {
+        fn tree_size(tree: &iced::advanced::widget::Tree) -> usize {
+            1 + tree.children.iter().map(tree_size).sum::<usize>()
+        }
+
+        let view = RepositoryView {
+            project: ProjectId::new(),
+            repository: PathBuf::from("/repo/.git"),
+            worktree: PathBuf::from("/repo"),
+        };
+        let mut runtime = RepositoryRuntime::new(view);
+        runtime.files = FileListState::Ready(
+            (0..100_000)
+                .map(|index| RepositoryFile {
+                    path: PathBuf::from(format!("file-{index:06}.txt")),
+                    staged_old_path: None,
+                    unstaged_old_path: None,
+                    staged: false,
+                    unstaged: false,
+                    status: None,
+                })
+                .collect(),
+        );
+        let card = CardId::new();
+        for offset in [
+            0.0,
+            50_000.0 * FILE_ROW_HEIGHT,
+            100_000.0 * FILE_ROW_HEIGHT - 720.0,
+        ] {
+            runtime.file_viewport = ListViewport {
+                offset,
+                height: 720.0,
+            };
+            let element = file_list_view(card, &runtime);
+            let tree = iced::advanced::widget::Tree::new(&element);
+            assert!(tree_size(&tree) < 1_000, "file widget tree was eager");
+        }
+
+        let inline = InlineDiffRow {
+            old_line: Some(1),
+            new_line: Some(1),
+            text: "line".into(),
+            kind: DiffRowKind::Context,
+        };
+        let split = SplitDiffRow {
+            old_line: Some(1),
+            new_line: Some(1),
+            old_text: Some("line".into()),
+            new_text: Some("line".into()),
+            kind: DiffRowKind::Context,
+        };
+        runtime.selected = Some(RepositoryFile {
+            path: PathBuf::from("large.txt"),
+            staged_old_path: None,
+            unstaged_old_path: None,
+            staged: false,
+            unstaged: true,
+            status: Some(" M".into()),
+        });
+        runtime.diffs.insert(
+            DiffBasis::Unstaged,
+            DiffState::Ready(DiffContent::Text(DiffModel {
+                inline_rows: vec![inline; 100_000],
+                split_rows: vec![split; 100_000],
+                inline_change_starts: vec![0, 50_000, 99_999],
+                split_change_starts: vec![0, 50_000, 99_999],
+                additions: 1,
+                deletions: 1,
+            })),
+        );
+        for offset in [
+            0.0,
+            50_000.0 * DIFF_ROW_HEIGHT,
+            100_000.0 * DIFF_ROW_HEIGHT - 720.0,
+        ] {
+            runtime.diff_viewport = ListViewport {
+                offset,
+                height: 720.0,
+            };
+            let element = diff_surface(card, &runtime);
+            let tree = iced::advanced::widget::Tree::new(&element);
+            assert!(tree_size(&tree) < 1_500, "diff widget tree was eager");
+        }
+    }
+
+    #[test]
+    fn change_navigation_realizes_far_rows_before_programmatic_scroll() {
+        let view = RepositoryView {
+            project: ProjectId::new(),
+            repository: PathBuf::from("/repo/.git"),
+            worktree: PathBuf::from("/repo"),
+        };
+        let mut runtime = RepositoryRuntime::new(view);
+        runtime.diff_viewport.height = 720.0;
+        runtime.diffs.insert(
+            DiffBasis::Unstaged,
+            DiffState::Ready(DiffContent::Text(DiffModel {
+                inline_rows: vec![
+                    InlineDiffRow {
+                        old_line: Some(1),
+                        new_line: Some(1),
+                        text: "line".into(),
+                        kind: DiffRowKind::Context,
+                    };
+                    100_000
+                ],
+                split_rows: Vec::new(),
+                inline_change_starts: vec![0, 50_000, 99_999],
+                split_change_starts: Vec::new(),
+                additions: 1,
+                deletions: 1,
+            })),
+        );
+        let card = CardId::new();
+        let _ = runtime.update(RepositoryAction::NextChange { card });
+        let middle = visible_rows(100_000, runtime.diff_viewport, DIFF_ROW_HEIGHT);
+        assert!(middle.start <= 50_000 && middle.end > 50_000);
+        let _ = runtime.update(RepositoryAction::NextChange { card });
+        let end = visible_rows(100_000, runtime.diff_viewport, DIFF_ROW_HEIGHT);
+        assert!(end.start <= 99_999 && end.end > 99_999);
     }
 
     fn run_git<const N: usize>(root: &Path, args: [&str; N]) {

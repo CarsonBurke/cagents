@@ -1,6 +1,6 @@
 use std::{
     borrow::Cow,
-    collections::{HashMap, HashSet},
+    collections::{HashMap, HashSet, VecDeque},
     ffi::OsStr,
     path::{Path, PathBuf},
     pin::Pin,
@@ -754,6 +754,68 @@ fn is_save_press(event: &keyboard::Event) -> bool {
     )
 }
 
+fn is_tab_press(event: &keyboard::Event) -> Option<bool> {
+    match event {
+        keyboard::Event::KeyPressed {
+            key: keyboard::Key::Named(keyboard::key::Named::Tab),
+            modifiers,
+            repeat: false,
+            ..
+        } if !modifiers.control() && !modifiers.alt() && !modifiers.logo() => {
+            Some(modifiers.shift())
+        }
+        _ => None,
+    }
+}
+
+fn repository_action_allowed_while_modal(action: &RepositoryAction) -> bool {
+    matches!(
+        action,
+        RepositoryAction::FilesLoaded { .. }
+            | RepositoryAction::FileLoaded { .. }
+            | RepositoryAction::DiffLoaded { .. }
+            | RepositoryAction::SaveFinished { .. }
+    )
+}
+
+fn focused_save_in_flight(
+    focused: Option<CardId>,
+    mut is_saving: impl FnMut(CardId) -> bool,
+) -> bool {
+    focused.is_some_and(&mut is_saving)
+}
+
+fn workspace_navigation_blocked_during_save(message: &Message) -> bool {
+    matches!(
+        message,
+        Message::FocusCard(_)
+            | Message::FocusAdjacent(_)
+            | Message::Wheel(_)
+            | Message::Pan(PanGesture::Begin { .. } | PanGesture::Update { .. })
+    )
+}
+
+fn next_dirty_close_control(
+    current: DirtyCloseControl,
+    backwards: bool,
+    saving: bool,
+) -> DirtyCloseControl {
+    if saving {
+        return DirtyCloseControl::Cancel;
+    }
+    match (current, backwards) {
+        (DirtyCloseControl::Cancel, false) | (DirtyCloseControl::Save, true) => {
+            DirtyCloseControl::Discard
+        }
+        (DirtyCloseControl::Discard, false) | (DirtyCloseControl::Cancel, true) => {
+            DirtyCloseControl::Save
+        }
+        (DirtyCloseControl::Save, false) | (DirtyCloseControl::Discard, true) => {
+            DirtyCloseControl::Cancel
+        }
+    }
+}
+
 fn repository_task(task: iced::Task<RepositoryAction>) -> Task<Message> {
     task.map(Message::Repository).map(cosmic::Action::App)
 }
@@ -1026,6 +1088,7 @@ pub enum Message {
     Sidebar(SidebarAction),
     FocusCard(CardId),
     CloseCard(CardId),
+    WindowCloseRequested(window::Id),
     CommitClose(CardId),
     SaveAndCloseRepository(CardId),
     OverwriteAndCloseRepository(CardId),
@@ -1121,6 +1184,40 @@ pub enum Message {
     },
     ResetSettings,
     DismissStatus,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DirtyCloseIntent {
+    Card(CardId),
+    Application(window::Id),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DirtyCloseControl {
+    Cancel,
+    Discard,
+    Save,
+}
+
+struct DirtyRepositoryClose {
+    card: CardId,
+    remaining: VecDeque<CardId>,
+    intent: DirtyCloseIntent,
+    focused: DirtyCloseControl,
+    restore_focus: widget::Id,
+}
+
+impl DirtyRepositoryClose {
+    fn next_unresolved(&mut self, mut unresolved: impl FnMut(CardId) -> bool) -> Option<CardId> {
+        while let Some(card) = self.remaining.pop_front() {
+            if unresolved(card) {
+                self.card = card;
+                self.focused = DirtyCloseControl::Cancel;
+                return Some(card);
+            }
+        }
+        None
+    }
 }
 
 #[cfg(feature = "integrated-browser")]
@@ -1348,7 +1445,7 @@ pub struct Cagents {
     github_repositories: HashMap<ProjectId, GitHubRepoKey>,
     worktree_dialog: Option<WorktreeDialog>,
     pull_request_dialog: Option<PullRequestDialog>,
-    dirty_repository_close: Option<CardId>,
+    dirty_repository_close: Option<DirtyRepositoryClose>,
     frame_clock: FrameClock,
     inspector: Option<Inspector>,
     inspector_transition: Option<InspectorTransition>,
@@ -3570,6 +3667,80 @@ impl Cagents {
         }
     }
 
+    fn focused_repository_is_saving(&self) -> bool {
+        focused_save_in_flight(
+            self.workspace.focused(),
+            |card| matches!(self.cards.get(&card), Some(CardRuntime::Repository(runtime)) if runtime.is_saving()),
+        )
+    }
+
+    fn begin_dirty_close(
+        &mut self,
+        intent: DirtyCloseIntent,
+        mut cards: VecDeque<CardId>,
+    ) -> Task<Message> {
+        let Some(card) = cards.pop_front() else {
+            return match intent {
+                DirtyCloseIntent::Card(card) => cosmic::task::message(Message::CloseCard(card)),
+                DirtyCloseIntent::Application(_) => iced::exit().map(cosmic::Action::App),
+            };
+        };
+        let restore_focus = self
+            .workspace
+            .focused()
+            .map(workspace_widget::card_focus_id)
+            .unwrap_or_else(|| widget::Id::new(TOOLBAR_FOCUS_ID));
+        self.dirty_repository_close = Some(DirtyRepositoryClose {
+            card,
+            remaining: cards,
+            intent,
+            focused: DirtyCloseControl::Cancel,
+            restore_focus,
+        });
+        iced::widget::operation::focus(dirty_close_control_id(card, DirtyCloseControl::Cancel))
+            .map(cosmic::Action::App)
+    }
+
+    fn advance_dirty_close(&mut self) -> Task<Message> {
+        let Some(mut close) = self.dirty_repository_close.take() else {
+            return Task::none();
+        };
+        if let Some(card) = close.next_unresolved(|card| {
+            matches!(self.cards.get(&card), Some(CardRuntime::Repository(runtime)) if runtime.blocks_navigation())
+        }) {
+            self.dirty_repository_close = Some(close);
+            return iced::widget::operation::focus(dirty_close_control_id(
+                card,
+                DirtyCloseControl::Cancel,
+            ))
+            .map(cosmic::Action::App);
+        }
+        match close.intent {
+            DirtyCloseIntent::Card(card) => cosmic::task::message(Message::CloseCard(card)),
+            DirtyCloseIntent::Application(_) => iced::exit().map(cosmic::Action::App),
+        }
+    }
+
+    fn cancel_dirty_close(&mut self) -> Task<Message> {
+        let Some(close) = self.dirty_repository_close.take() else {
+            return Task::none();
+        };
+        iced::widget::operation::focus(close.restore_focus).map(cosmic::Action::App)
+    }
+
+    fn cycle_dirty_close_focus(&mut self, backwards: bool) -> Task<Message> {
+        let Some(close) = self.dirty_repository_close.as_mut() else {
+            return Task::none();
+        };
+        let saving = matches!(
+            self.cards.get(&close.card),
+            Some(CardRuntime::Repository(runtime)) if runtime.is_saving()
+        );
+        close.focused = next_dirty_close_control(close.focused, backwards, saving);
+        iced::widget::operation::focus(dirty_close_control_id(close.card, close.focused))
+            .map(cosmic::Action::App)
+    }
+
     /// Opens `inspector` from closed, and moves keyboard focus into it.
     ///
     /// The dialog is a modal popover, and the modal captures pointer events
@@ -3742,6 +3913,16 @@ impl Application for Cagents {
 
     const APP_ID: &'static str = instance::APPLICATION_ID;
 
+    fn on_app_exit(&mut self) -> Option<Message> {
+        self.core
+            .main_window_id()
+            .map(Message::WindowCloseRequested)
+    }
+
+    fn on_close_requested(&self, id: window::Id) -> Option<Message> {
+        Some(Message::WindowCloseRequested(id))
+    }
+
     fn init(core: Core, (): ()) -> (Self, Task<Message>) {
         let (
             durable,
@@ -3897,6 +4078,10 @@ impl Application for Cagents {
     }
 
     fn update(&mut self, message: Message) -> Task<Message> {
+        if self.focused_repository_is_saving() && workspace_navigation_blocked_during_save(&message)
+        {
+            return Task::none();
+        }
         let task = match message {
             Message::NewTerminal => {
                 self.show_workspace_for_action();
@@ -4114,22 +4299,25 @@ impl Application for Cagents {
                 }
             }
             Message::Repository(action) => {
+                if self.modal_is_open() && !repository_action_allowed_while_modal(&action) {
+                    return Task::none();
+                }
                 let card = action.card();
                 let save_finished = matches!(action, RepositoryAction::SaveFinished { .. });
+                let closing_card = self.dirty_repository_close.as_ref().map(|close| close.card);
                 let (task, saved_for_close) = match self.cards.get_mut(&card) {
                     Some(CardRuntime::Repository(runtime)) => {
                         let task = repository_task(runtime.update(action));
                         let saved_for_close = save_finished
-                            && self.dirty_repository_close == Some(card)
-                            && !runtime.is_dirty()
+                            && closing_card == Some(card)
+                            && !runtime.blocks_navigation()
                             && runtime.save_error().is_none();
                         (task, saved_for_close)
                     }
                     _ => (Task::none(), false),
                 };
                 if saved_for_close {
-                    self.dirty_repository_close = None;
-                    Task::batch([task, cosmic::task::message(Message::CloseCard(card))])
+                    Task::batch([task, self.advance_dirty_close()])
                 } else {
                     task
                 }
@@ -4265,10 +4453,22 @@ impl Application for Cagents {
                     Task::none()
                 }
             },
-            Message::CloseCard(id) if matches!(self.cards.get(&id), Some(CardRuntime::Repository(runtime)) if runtime.is_dirty()) =>
-            {
-                self.dirty_repository_close = Some(id);
-                Task::none()
+            Message::CloseCard(_) if self.dirty_repository_close.is_some() => Task::none(),
+            Message::CloseCard(id) if matches!(self.cards.get(&id), Some(CardRuntime::Repository(runtime)) if runtime.blocks_navigation()) => {
+                self.begin_dirty_close(DirtyCloseIntent::Card(id), VecDeque::from([id]))
+            }
+            Message::WindowCloseRequested(window) => {
+                if self.dirty_repository_close.is_some() {
+                    return Task::none();
+                }
+                let dirty = self
+                    .workspace
+                    .order()
+                    .filter(|card| {
+                        matches!(self.cards.get(card), Some(CardRuntime::Repository(runtime)) if runtime.blocks_navigation())
+                    })
+                    .collect::<VecDeque<_>>();
+                self.begin_dirty_close(DirtyCloseIntent::Application(window), dirty)
             }
             Message::CloseCard(id) => match self.workspace.request_close(id) {
                 Ok(handoff) => workspace_widget::focus_handoff_then(
@@ -4283,28 +4483,45 @@ impl Application for Cagents {
                 }
             },
             Message::SaveAndCloseRepository(id) => match self.cards.get_mut(&id) {
-                Some(CardRuntime::Repository(runtime)) => {
+                Some(CardRuntime::Repository(runtime))
+                    if self
+                        .dirty_repository_close
+                        .as_ref()
+                        .is_some_and(|close| close.card == id) =>
+                {
                     repository_task(runtime.request_save(id, false))
                 }
                 _ => Task::none(),
             },
             Message::OverwriteAndCloseRepository(id) => match self.cards.get_mut(&id) {
-                Some(CardRuntime::Repository(runtime)) => {
+                Some(CardRuntime::Repository(runtime))
+                    if self
+                        .dirty_repository_close
+                        .as_ref()
+                        .is_some_and(|close| close.card == id) =>
+                {
                     repository_task(runtime.request_save(id, true))
                 }
                 _ => Task::none(),
             },
             Message::DiscardAndCloseRepository(id) => {
-                if let Some(CardRuntime::Repository(runtime)) = self.cards.get_mut(&id) {
-                    runtime.abandon_unsaved_changes();
+                if self
+                    .dirty_repository_close
+                    .as_ref()
+                    .is_none_or(|close| close.card != id)
+                {
+                    return Task::none();
                 }
-                self.dirty_repository_close = None;
-                cosmic::task::message(Message::CloseCard(id))
+                if let Some(CardRuntime::Repository(runtime)) = self.cards.get_mut(&id)
+                    && !runtime.is_saving()
+                {
+                    runtime.abandon_unsaved_changes();
+                } else {
+                    return Task::none();
+                }
+                self.advance_dirty_close()
             }
-            Message::CancelRepositoryClose => {
-                self.dirty_repository_close = None;
-                Task::none()
-            }
+            Message::CancelRepositoryClose => self.cancel_dirty_close(),
             Message::CommitClose(id) => {
                 if let Some(runtime) = self.cards.remove(&id) {
                     match runtime {
@@ -4372,6 +4589,9 @@ impl Application for Cagents {
                 let Some(elapsed) = self.frame_clock.elapsed(frame) else {
                     return Task::none();
                 };
+                if self.focused_repository_is_saving() {
+                    return Task::none();
+                }
                 let update = self.workspace.tick(elapsed);
                 self.apply_viewport(update, true, false)
             }
@@ -4753,6 +4973,11 @@ impl Application for Cagents {
                         ));
                     }
                 }
+                if let Some(backwards) = is_tab_press(&event)
+                    && self.dirty_repository_close.is_some()
+                {
+                    return self.cycle_dirty_close_focus(backwards);
+                }
                 // A chord typed at a dialog is not the workspace's to act on:
                 // Ctrl+W must not close the card behind the dialog. The dialog
                 // is an overlay, so it has already seen the keystroke by the
@@ -4858,13 +5083,16 @@ impl Application for Cagents {
                 card: wake.card,
                 generation: wake.generation,
             }),
-            event::listen_with(|event, _status, _window| match event {
+            event::listen_with(|event, _status, event_window| match event {
                 iced::Event::Keyboard(event) => Some(Message::KeyEvent(event)),
                 iced::Event::Window(window::Event::Rescaled(scale_factor)) => {
                     Some(Message::WindowScaleFactorChanged(scale_factor))
                 }
                 iced::Event::Window(window::Event::Resized(size)) => {
                     Some(Message::WindowResized(size.width))
+                }
+                iced::Event::Window(window::Event::CloseRequested) => {
+                    Some(Message::WindowCloseRequested(event_window))
                 }
                 _ => None,
             }),
@@ -4891,7 +5119,8 @@ impl Application for Cagents {
 
     fn dialog(&self) -> Option<Element<'_, Message>> {
         let spacing = cosmic::theme::spacing();
-        if let Some(card) = self.dirty_repository_close {
+        if let Some(close) = self.dirty_repository_close.as_ref() {
+            let card = close.card;
             let runtime = match self.cards.get(&card) {
                 Some(CardRuntime::Repository(runtime)) => runtime,
                 _ => return None,
@@ -4925,9 +5154,11 @@ impl Application for Cagents {
             rows.push(
                 widget::row::with_children(vec![
                     widget::button::standard("Cancel")
+                        .id(dirty_close_control_id(card, DirtyCloseControl::Cancel))
                         .on_press(Message::CancelRepositoryClose)
                         .into(),
                     widget::button::destructive("Discard")
+                        .id(dirty_close_control_id(card, DirtyCloseControl::Discard))
                         .on_press_maybe(
                             (!runtime.is_saving())
                                 .then_some(Message::DiscardAndCloseRepository(card)),
@@ -4938,6 +5169,7 @@ impl Application for Cagents {
                     } else {
                         "Save and close"
                     })
+                    .id(dirty_close_control_id(card, DirtyCloseControl::Save))
                     .on_press_maybe(save_message)
                     .into(),
                 ])
@@ -4946,6 +5178,7 @@ impl Application for Cagents {
             );
             return Some(
                 widget::container(widget::column::with_children(rows).spacing(spacing.space_xs))
+                    .id(widget::Id::new(format!("dialog.dirty-close.{card}")))
                     .class(cosmic::theme::Container::Dialog(false))
                     .padding(spacing.space_m)
                     .max_width(560)
@@ -5883,6 +6116,15 @@ fn context_inspector_toggle_id() -> widget::Id {
     widget::Id::new("command.toggle-context-inspector")
 }
 
+fn dirty_close_control_id(card: CardId, control: DirtyCloseControl) -> widget::Id {
+    let control = match control {
+        DirtyCloseControl::Cancel => "cancel",
+        DirtyCloseControl::Discard => "discard",
+        DirtyCloseControl::Save => "save",
+    };
+    widget::Id::new(format!("dialog.dirty-close.{card}.{control}"))
+}
+
 /// The worktree dialog's first field, focused when it opens.
 fn worktree_dialog_focus_id() -> widget::Id {
     widget::Id::new("dialog.worktree.branch")
@@ -6368,6 +6610,106 @@ mod tests {
         assert_eq!(malformed.submit(), Err(()));
         assert_eq!(malformed.as_str(), SanitizedLocation::INVALID);
     }
+    #[test]
+    fn application_close_sequence_visits_every_unresolved_repository_card() {
+        let origin = CardId::new();
+        let first = CardId::new();
+        let second = CardId::new();
+        let third = CardId::new();
+        let window = window::Id::unique();
+        let restore_focus = workspace_widget::card_focus_id(origin);
+        let mut close = DirtyRepositoryClose {
+            card: first,
+            remaining: VecDeque::from([second, third]),
+            intent: DirtyCloseIntent::Application(window),
+            focused: DirtyCloseControl::Save,
+            restore_focus: restore_focus.clone(),
+        };
+        assert_eq!(close.next_unresolved(|card| card == second), Some(second));
+        assert_eq!(close.focused, DirtyCloseControl::Cancel);
+        assert_eq!(close.restore_focus, restore_focus);
+        assert_eq!(close.next_unresolved(|card| card == third), Some(third));
+        assert_eq!(close.restore_focus, workspace_widget::card_focus_id(origin));
+        assert_eq!(close.next_unresolved(|_| true), None);
+        assert_eq!(close.intent, DirtyCloseIntent::Application(window));
+    }
+
+    #[test]
+    fn active_save_fences_direct_adjacent_pan_and_wheel_navigation() {
+        let focused = CardId::new();
+        assert!(focused_save_in_flight(Some(focused), |card| card == focused));
+        assert!(!focused_save_in_flight(None, |_| true));
+        assert!(!focused_save_in_flight(Some(focused), |_| false));
+
+        let messages = [
+            Message::FocusCard(CardId::new()),
+            Message::FocusAdjacent(crate::workspace::FocusDirection::Right),
+            Message::Pan(PanGesture::Begin { pointer_x: 10.0 }),
+            Message::Pan(PanGesture::Update { pointer_x: 20.0 }),
+            Message::Wheel(WheelDelta::Pixels { x: 1.0, y: 0.0 }),
+        ];
+        assert!(
+            messages
+                .iter()
+                .all(workspace_navigation_blocked_during_save)
+        );
+        assert!(!workspace_navigation_blocked_during_save(&Message::Pan(
+            PanGesture::End
+        )));
+    }
+
+    #[test]
+    fn dirty_dialog_focus_is_stable_trapped_and_save_aware() {
+        let card = CardId::new();
+        assert_eq!(
+            dirty_close_control_id(card, DirtyCloseControl::Cancel),
+            dirty_close_control_id(card, DirtyCloseControl::Cancel)
+        );
+        assert_ne!(
+            dirty_close_control_id(card, DirtyCloseControl::Cancel),
+            dirty_close_control_id(card, DirtyCloseControl::Save)
+        );
+        let mut focus = DirtyCloseControl::Cancel;
+        focus = next_dirty_close_control(focus, false, false);
+        assert_eq!(focus, DirtyCloseControl::Discard);
+        focus = next_dirty_close_control(focus, false, false);
+        assert_eq!(focus, DirtyCloseControl::Save);
+        focus = next_dirty_close_control(focus, false, false);
+        assert_eq!(focus, DirtyCloseControl::Cancel);
+        assert_eq!(
+            next_dirty_close_control(DirtyCloseControl::Save, true, false),
+            DirtyCloseControl::Discard
+        );
+        assert_eq!(
+            next_dirty_close_control(DirtyCloseControl::Save, false, true),
+            DirtyCloseControl::Cancel
+        );
+    }
+
+    #[test]
+    fn modal_rejects_editor_input_but_accepts_async_repository_completions() {
+        let card = CardId::new();
+        let editor = RepositoryAction::EditorAction {
+            card,
+            action: cosmic::widget::text_editor::Action::Edit(
+                cosmic::widget::text_editor::Edit::Paste(Arc::new("blocked".into())),
+            ),
+        };
+        assert!(!repository_action_allowed_while_modal(&editor));
+        let identity = repository_widget::AsyncIdentity {
+            card,
+            worktree: PathBuf::from("/repo"),
+            path: PathBuf::from("file.txt"),
+            generation: 1,
+        };
+        assert!(repository_action_allowed_while_modal(
+            &RepositoryAction::FileLoaded {
+                identity,
+                result: Err(crate::editor::FileIoError::Io("fixture".into())),
+            }
+        ));
+    }
+
     #[test]
     fn column_navigator_appears_only_when_movement_is_possible() {
         assert!(!should_show_card_navigator(0));
