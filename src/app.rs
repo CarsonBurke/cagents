@@ -38,22 +38,28 @@ use crate::{
     instance,
     lifecycle::{LifecycleAction, LifecycleBudget, LifecycleManager},
     location::SanitizedLocation,
+    lsp::{LspCoordinates, LspDocumentId, LspError, LspEvent, LspManager, LspPosition, LspStatus},
     model::{
         CardId, CardKind, CardState, Existence, Exposure, HostSessionProof, LaunchRecipe,
         ProjectId, ProjectState, RepositoryView, Residency, RuntimeError, TerminalContinuity,
         TerminalExit, TerminalId, TerminalSession, WorkspaceState, WorktreeState,
     },
     repository::{
-        BaseRevision, CancellationToken, CreateWorktreeRequest, RepositoryId, RepositoryInfo,
-        RepositoryService, StatusSnapshot, ValidatedBranchName, WorktreeCreationOutcome,
-        WorktreeRecord,
+        BaseRevision, CancellationToken, ChangeArea, CommitOutcome, CommitRequest, CommitSummary,
+        CreateWorktreeRequest, DiffBasis, HistoryRequest, HistoryRevision, MutationOutcome,
+        PushOutcome, PushRequest, RepoPath, RepositoryId, RepositoryInfo, RepositoryService,
+        RepositorySnapshot, StageRequest, StatusSnapshot, UnstageRequest, ValidatedBranchName,
+        WorktreeCreationOutcome, WorktreeRecord,
     },
-    repository_widget::{self, RepositoryAction, RepositoryRuntime, RepositoryRuntimeStatus},
+    repository_widget::{
+        self, LspIntent, RepositoryAction, RepositoryRuntime, RepositoryRuntimeStatus,
+    },
     session::{SessionRuntime, SessionSaveHealth, SessionSaveHealthEvent},
     settings::{self, AppSettings, KeyboardShortcuts, LinkOpenDestination, LinkOpenGesture},
     sidebar::{
-        self, SidebarAction, SidebarDataState, SidebarMode, SidebarModel, SidebarProject,
-        SidebarPullRequest, SidebarState, SidebarWorktree,
+        self, ActiveWorktreeKey, MutationKind, PanelSection, SidebarAction, SidebarDataState,
+        SidebarFocus, SidebarMode, SidebarModel, SidebarProject, SidebarPullRequest, SidebarState,
+        SidebarWorktree, SourceControlModel,
     },
     splitter::{Edge as SplitterEdge, Splitter},
     terminal::{
@@ -541,6 +547,37 @@ impl std::hash::Hash for SessionHealthSource {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
         std::hash::Hash::hash(&"cagents-session-save-health", state);
     }
+}
+
+/// Keyed by the manager's generation, so replacing the manager - which is how
+/// a settings change takes effect, because a shutdown is one-way - rebuilds the
+/// subscription onto the new channel instead of leaving it reading a queue
+/// nobody writes to.
+#[derive(Clone)]
+struct LspEventSource(async_channel::Receiver<LspEvent>, u64);
+
+impl PartialEq for LspEventSource {
+    fn eq(&self, other: &Self) -> bool {
+        self.1 == other.1
+    }
+}
+
+impl Eq for LspEventSource {}
+
+impl std::hash::Hash for LspEventSource {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        std::hash::Hash::hash(&"cagents-language-server-events", state);
+        std::hash::Hash::hash(&self.1, state);
+    }
+}
+
+fn lsp_event_stream(
+    source: &LspEventSource,
+) -> Pin<Box<dyn cosmic::iced::futures::Stream<Item = LspEvent> + Send + 'static>> {
+    Box::pin(cosmic::iced::futures::stream::unfold(
+        source.0.clone(),
+        |receiver| async move { receiver.recv().await.ok().map(|event| (event, receiver)) },
+    ))
 }
 
 fn terminal_wake_stream(
@@ -1144,11 +1181,93 @@ fn repository_action_allowed_while_modal(action: &RepositoryAction) -> bool {
     )
 }
 
+/// The discard confirmation's own two answers.
+///
+/// The dialog is mounted by [`Cagents::dialog`] rather than by
+/// `sidebar::view`, so it is the one surface whose commands must survive the
+/// modal guard - refusing them would strand the dialog with no way out. It
+/// is exactly two variants, and neither can destroy anything the dialog did
+/// not already count and show.
+fn answers_discard_confirmation(action: &SidebarAction) -> bool {
+    matches!(
+        action,
+        SidebarAction::ConfirmDiscard { .. } | SidebarAction::CancelDiscard
+    )
+}
+
+/// What one worktree mutation is reported as, or `None` when it did all of
+/// what it was asked.
+///
+/// A partial application is a failure with a known good half, and an unknown
+/// outcome is not a success: both are said out loud, because the alternative
+/// is a panel that refreshes and silently shows fewer paths staged than the
+/// user selected.
+fn mutation_report(
+    label: &str,
+    outcome: Result<MutationOutcome, crate::repository::RepositoryError>,
+) -> Option<String> {
+    match outcome {
+        Ok(MutationOutcome::Applied { .. }) => None,
+        Ok(MutationOutcome::PartiallyApplied { paths, failures }) => Some(format!(
+            "{label} applied to {} path(s); {}",
+            paths.len(),
+            join_failures(&failures)
+        )),
+        Ok(MutationOutcome::NotApplied { failure }) => Some(format!("{label} failed: {failure}")),
+        Ok(MutationOutcome::OutcomeUnknown { failure }) => Some(format!(
+            "{label} may or may not have run: {failure}. Refresh to see what Git holds."
+        )),
+        Err(error) => Some(format!("{label} could not run: {error}")),
+    }
+}
+
+/// The commit report, and whether a commit was actually created. Only a
+/// created commit may clear the message input.
+fn commit_report(
+    outcome: Result<CommitOutcome, crate::repository::RepositoryError>,
+) -> (Option<String>, bool) {
+    match outcome {
+        Ok(CommitOutcome::Created { warnings, .. }) if warnings.is_empty() => (None, true),
+        Ok(CommitOutcome::Created { warnings, .. }) => (
+            Some(format!("Commit created, but {}", join_failures(&warnings))),
+            true,
+        ),
+        Ok(CommitOutcome::NotCreated { failure }) => {
+            (Some(format!("Commit failed: {failure}")), false)
+        }
+        Ok(CommitOutcome::OutcomeUnknown { failure }) => (
+            Some(format!(
+                "Commit may or may not have been created: {failure}. Refresh to see what Git holds."
+            )),
+            false,
+        ),
+        Err(error) => (Some(format!("Commit could not run: {error}")), false),
+    }
+}
+
+fn push_report(outcome: Result<PushOutcome, crate::repository::RepositoryError>) -> Option<String> {
+    match outcome {
+        Ok(PushOutcome::Pushed { .. }) => None,
+        Ok(PushOutcome::NotPushed { failure }) => Some(format!("Push failed: {failure}")),
+        Ok(PushOutcome::OutcomeUnknown { failure }) => Some(format!(
+            "Push may or may not have reached the remote: {failure}. Refresh to see what Git holds."
+        )),
+        Err(error) => Some(format!("Push could not run: {error}")),
+    }
+}
+
+fn join_failures(failures: &[crate::repository::MutationFailure]) -> String {
+    failures
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
 fn user_workspace_message_blocked_while_modal(message: &Message) -> bool {
     match message {
         Message::NewTerminal
         | Message::OpenRepository
-        | Message::Sidebar(_)
         | Message::FocusCard(_)
         | Message::ResizeCard { .. }
         | Message::ResizeCardFinished(_)
@@ -1164,6 +1283,7 @@ fn user_workspace_message_blocked_while_modal(message: &Message) -> bool {
         | Message::ContextInspector(_)
         | Message::DismissStatus => true,
         Message::Repository(action) => !repository_action_allowed_while_modal(action),
+        Message::Sidebar(action) => !answers_discard_confirmation(action),
         #[cfg(feature = "integrated-browser")]
         Message::BrowserBack(_)
         | Message::BrowserForward(_)
@@ -1521,6 +1641,35 @@ fn settings_update(
 
 #[derive(Debug, Clone)]
 pub enum Message {
+    /// A worktree snapshot for the source-control panel.
+    ///
+    /// `key` is the binding the request was made against. The panel rebinds
+    /// whenever the focused card names a different worktree, so a result whose
+    /// key is no longer the bound one is a read of a tree nobody is looking at
+    /// and is dropped rather than rendered.
+    SourceControlLoaded {
+        key: ActiveWorktreeKey,
+        result: Result<Box<RepositorySnapshot>, String>,
+    },
+    /// One page of the bound worktree's history.
+    SourceControlHistory {
+        key: ActiveWorktreeKey,
+        page: u32,
+        result: Result<Vec<CommitSummary>, String>,
+    },
+    /// A finished stage, unstage, discard, commit, or push.
+    ///
+    /// `report` is `None` when the mutation did everything it was asked to do.
+    /// Every outcome triggers a re-snapshot rather than an optimistic edit:
+    /// the only authority on what the index holds is Git.
+    SourceControlMutated {
+        key: ActiveWorktreeKey,
+        kind: MutationKind,
+        report: Option<String>,
+        /// A commit that succeeded clears the message input; one that did not
+        /// must keep it, because the text is the user's work.
+        committed: bool,
+    },
     NewTerminal,
     TerminalStarted {
         card: CardId,
@@ -1645,6 +1794,8 @@ pub enum Message {
     },
     ResetSettings,
     SessionSaveHealthChanged(SessionSaveHealthEvent),
+    Lsp(LspEvent),
+    LanguageServersReaped,
     RetrySessionSave,
     AcknowledgeSessionRecovery,
     DismissStatus,
@@ -1661,6 +1812,18 @@ enum DirtyCloseControl {
     Cancel,
     Discard,
     Save,
+}
+
+/// A source-control row's navigation, held until the repository card it is
+/// aimed at has a file list to resolve the path against.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PendingPanelOpen {
+    card: CardId,
+    /// Worktree-relative, exactly as the card's own file list names paths.
+    path: PathBuf,
+    /// `None` opens the editor; `Some` opens the diff on that side. The card
+    /// has no third basis, so a conflict is shown against the working tree.
+    diff_staged: Option<bool>,
 }
 
 struct DirtyRepositoryClose {
@@ -1870,12 +2033,109 @@ impl CardChrome {
     }
 }
 
+/// Which position-addressed request the inspector asked for.
+#[derive(Debug, Clone, Copy)]
+enum LspRequestKind {
+    Hover,
+    Definition,
+    References,
+}
+
+/// A caret jump waiting for its target file to be the card's open buffer.
+#[derive(Debug, Clone)]
+struct PendingLspJump {
+    path: PathBuf,
+    at: LspPosition,
+    coordinates: LspCoordinates,
+}
+
+/// One card's language-server results, with the buffer version each describes.
+///
+/// A server answers the text it was given. Keeping the version beside the
+/// answer is what lets a stale one be refused instead of applied to text that
+/// has since moved: a caret jump to a line that no longer exists, or a
+/// completion whose edit range describes characters the user has already
+/// replaced, are both silent corruptions, and neither is recoverable by
+/// looking at the answer alone.
+#[derive(Debug, Default)]
+struct LspInspectorState {
+    context: inspector::LspInspectorContext,
+    /// The document, once opened. `None` while no file is open, or when no
+    /// configured server claims this file's extension.
+    document: Option<LspDocumentId>,
+    /// Absolute path of the card's open buffer, recorded even when no server
+    /// claims it. A jump target arrives absolute while the card's file list is
+    /// worktree-relative, so this is the only side both can be compared on.
+    path: Option<PathBuf>,
+    /// The version the diagnostics were computed for, as the manager stamped
+    /// them. Compared against [`LspManager::document_version`] and never
+    /// against a count of this side's own: the manager re-opens a document on
+    /// a restart, a crash-respawn, or a second card opening the same file, and
+    /// none of those are edits this side made.
+    diagnostics_version: Option<i32>,
+    /// A failure the user has not dismissed. Outranks `progress`, because an
+    /// indexing report arriving a second later must not erase the one message
+    /// saying their hover and completions were thrown away.
+    failure: Option<String>,
+    /// The server's current progress report, if it is still working.
+    progress: Option<String>,
+}
+
+impl LspInspectorState {
+    /// Drops every answer that describes text the buffer no longer holds.
+    ///
+    /// Diagnostics are kept and re-dated instead of dropped: the server
+    /// replaces them wholesale on its own schedule, and blanking them on each
+    /// keystroke would make the list flicker empty while the user typed. They
+    /// are refused at the point of use by version rather than erased here.
+    fn invalidate_answers(&mut self) {
+        self.context.hover = None;
+        self.context.locations = None;
+        self.context.completions.clear();
+    }
+
+    /// Recomputes the single notice the surface renders from the two
+    /// independent things that can want it.
+    fn refresh_notice(&mut self) {
+        self.context.notice = self.failure.clone().or_else(|| self.progress.clone());
+    }
+}
+
+/// Whether a published diagnostics list still describes the buffer on screen.
+///
+/// `published` is the version the manager stamped the list with; `document` is
+/// the version its snapshot holds now. Both must be known and equal: an
+/// unknown document has no diagnostics worth jumping into, and an unstamped
+/// list is one this side never received.
+const fn diagnostics_are_current(published: Option<i32>, document: Option<i32>) -> bool {
+    match (published, document) {
+        (Some(published), Some(document)) => published == document,
+        _ => false,
+    }
+}
+
 pub struct Cagents {
     workspace: Workspace,
     durable: Arc<WorkspaceState>,
     cards: HashMap<CardId, CardRuntime>,
     card_chrome: HashMap<CardId, CardChrome>,
     lifecycle: LifecycleManager,
+    /// The shared language-server client. One manager serves every card; a
+    /// session is per project root, not per card, so two cards in one worktree
+    /// share the server rather than starting a second copy of it.
+    lsp: LspManager,
+    /// Which card owns each open LSP document, so an event that names only a
+    /// document reaches the surface that asked for it.
+    lsp_documents: HashMap<LspDocumentId, CardId>,
+    /// Results the inspector renders. Owned here rather than by the widget
+    /// because they arrive on the manager's channel, not from widget state.
+    lsp_contexts: HashMap<CardId, LspInspectorState>,
+    /// A jump whose target file is not the card's open buffer, held until that
+    /// file is open. A location's column is only placeable against the text it
+    /// indexes, and for a `Utf16` location the text is not even loaded yet, so
+    /// the jump waits for the open rather than landing on the wrong column.
+    lsp_pending_jumps: HashMap<CardId, PendingLspJump>,
+    next_lsp_document: u64,
     // A sweep is a full lifecycle reconcile plus a view rebuild, and scrolling
     // requests one per visibility transition, so requests are debounced onto a
     // single in-flight timer. `lifecycle_sweep_deadline` is `Some` exactly when
@@ -1915,6 +2175,16 @@ pub struct Cagents {
     worktree_dialog: Option<WorktreeDialog>,
     pull_request_dialog: Option<PullRequestDialog>,
     dirty_repository_close: Option<DirtyRepositoryClose>,
+    /// A source-control navigation waiting for its repository card to finish
+    /// listing files.
+    ///
+    /// The card opens a path by looking it up in the list it already holds, so
+    /// a sidebar row pressed before that list has landed - or against a card
+    /// whose list predates the change - would open nothing at all. The
+    /// navigation is therefore always paired with a refresh of that card's
+    /// list and performed when the list arrives. One slot: the last press is
+    /// the one the user is waiting on.
+    pending_panel_open: Option<PendingPanelOpen>,
     deferred_navigation: VecDeque<Message>,
     frame_clock: FrameClock,
     inspector: Option<Inspector>,
@@ -2675,6 +2945,7 @@ impl Cagents {
         }
     }
     fn fail_runtime(&mut self, card: CardId, message: String) {
+        self.retire_lsp_card(card);
         match self.cards.remove(&card) {
             Some(CardRuntime::Terminal(handle)) => {
                 self.begin_terminal_teardown(handle);
@@ -3969,6 +4240,743 @@ impl Cagents {
         }
     }
 
+    /// The focused card, reduced to what binding the source-control panel
+    /// needs. A card that names no worktree directory - a browser, a
+    /// pull-request list - is [`SidebarFocus::None`], which leaves the panel
+    /// where it is rather than tearing it down.
+    fn sidebar_focus(&self) -> SidebarFocus {
+        let Some(card) = self.workspace.focused().and_then(|id| self.card_state(id)) else {
+            return SidebarFocus::None;
+        };
+        match &card.kind {
+            CardKind::Repository(view) => SidebarFocus::Repository {
+                worktree: view.worktree.clone(),
+            },
+            CardKind::Terminal(session) => SidebarFocus::Terminal {
+                working_directory: session.launch.working_directory.clone(),
+            },
+            CardKind::Browser(_) | CardKind::PullRequests(_) => SidebarFocus::None,
+        }
+    }
+
+    /// Rebinds the source-control panel to whatever worktree is now focused,
+    /// and loads a snapshot when that is a different worktree.
+    ///
+    /// Runs at the tail of every update, beside the selection sync, because
+    /// focus changes for reasons that are not sidebar actions: a card closing,
+    /// a session restoring, a project list arriving. Rebinding drops the
+    /// previous worktree's model outright, so a stale row can never be pressed.
+    fn rebind_source_control(&mut self) -> Task<Message> {
+        let focus = self.sidebar_focus();
+        if !self
+            .sidebar_state
+            .sync_active_worktree(&self.sidebar_model, &focus)
+        {
+            return self.load_pending_history();
+        }
+        let Some(key) = self.sidebar_state.active_worktree().cloned() else {
+            self.sidebar_model.source_control = None;
+            return Task::none();
+        };
+        self.sidebar_model.source_control = Some(SourceControlModel::loading(key.clone()));
+        Self::source_control_snapshot_task(key)
+    }
+
+    /// Asks for the first page of history once, and only once the `History`
+    /// section is showing: a page is a `git log` walk, and a section nobody
+    /// opened is not worth one.
+    fn load_pending_history(&mut self) -> Task<Message> {
+        if !self.sidebar_state.section_expanded(PanelSection::History) {
+            return Task::none();
+        }
+        let Some(source) = self.sidebar_model.source_control.as_mut() else {
+            return Task::none();
+        };
+        if !source.wants_history() || source.history_requested() {
+            return Task::none();
+        }
+        source.mark_history_requested();
+        Self::source_control_history_task(source.key.clone(), 0)
+    }
+
+    /// The open repository card showing this worktree, if one is open.
+    fn repository_card_for(&self, worktree: &Path) -> Option<CardId> {
+        self.durable
+            .cards
+            .iter()
+            .find(|card| {
+                card.existence.is_open()
+                    && matches!(&card.kind, CardKind::Repository(view) if view.worktree == worktree)
+            })
+            .map(|card| card.id)
+    }
+
+    /// Routes one panel row to the worktree's repository card.
+    ///
+    /// The card is opened if the worktree has none. Either way the navigation
+    /// is parked in [`Self::pending_panel_open`] and performed when that card's
+    /// file list lands, because the card resolves a path against the list it
+    /// holds and the sidebar's rows come from a snapshot the list may predate.
+    fn route_panel_open(
+        &mut self,
+        key: &ActiveWorktreeKey,
+        path: &RepoPath,
+        diff_staged: Option<bool>,
+    ) -> Task<Message> {
+        self.show_workspace_for_action();
+        let path = path.as_path().to_path_buf();
+        match self.repository_card_for(&key.canonical_path) {
+            Some(card) => {
+                self.pending_panel_open = Some(PendingPanelOpen {
+                    card,
+                    path,
+                    diff_staged,
+                });
+                cosmic::task::message(Message::Repository(RepositoryAction::RefreshFiles { card }))
+            }
+            None => {
+                // `add_repository_card` runs the card's own initial load, so
+                // the parked navigation is answered by that list rather than by
+                // a second one requested here.
+                let task = self.add_repository_card(
+                    key.project_id,
+                    key.canonical_path.clone(),
+                    key.canonical_path.clone(),
+                );
+                if let Some(card) = self.repository_card_for(&key.canonical_path) {
+                    self.pending_panel_open = Some(PendingPanelOpen {
+                        card,
+                        path,
+                        diff_staged,
+                    });
+                }
+                task
+            }
+        }
+    }
+
+    /// Performs a parked navigation now that `card` has listed its files.
+    ///
+    /// The three actions are chained rather than batched: the card decides
+    /// whether it may show a diff from the selection the open just made, so
+    /// they must arrive in this order.
+    /// Hands the card's buffer lifecycle to the language-server manager.
+    ///
+    /// The widget records what happened to the buffer; nothing in it can talk
+    /// to a process. Draining here is what turns those records into protocol
+    /// traffic, and it must happen after *every* repository action, because an
+    /// `Open` that is never drained leaves a document the server has not been
+    /// told about while the application shows results for it.
+    fn drain_lsp_intents(&mut self, card: CardId) -> Task<Message> {
+        let intents = match self.cards.get_mut(&card) {
+            Some(CardRuntime::Repository(runtime)) => runtime.take_lsp_intents(),
+            _ => Vec::new(),
+        };
+        if intents.is_empty() {
+            return Task::none();
+        }
+        let mut tasks = Vec::new();
+        for intent in intents {
+            match intent {
+                LspIntent::Open {
+                    absolute_path,
+                    worktree,
+                    version,
+                    text,
+                } => tasks.push(self.open_lsp_document(
+                    card,
+                    &absolute_path,
+                    &worktree,
+                    version,
+                    &text,
+                )),
+                LspIntent::Change { version, text } => {
+                    let Some(doc) = self.lsp_document(card) else {
+                        continue;
+                    };
+                    // The widget cannot report *where* the text differs, so the
+                    // manager is given an empty edit slice and sends the whole
+                    // document. Every answer computed against the old text is
+                    // dropped in the same breath: a completion range or a hover
+                    // span that predates a keystroke describes characters the
+                    // buffer no longer has.
+                    self.lsp.change(doc, version, &[], &text);
+                    if let Some(state) = self.lsp_contexts.get_mut(&card) {
+                        state.invalidate_answers();
+                    }
+                }
+                LspIntent::Save { text } => {
+                    if let Some(doc) = self.lsp_document(card) {
+                        self.lsp.save(doc, &text);
+                    }
+                }
+                LspIntent::Close => self.close_lsp_document(card),
+            }
+        }
+        Task::batch(tasks)
+    }
+
+    /// Retires everything a closed card held at the language-server boundary.
+    ///
+    /// Dropping the runtime alone leaves the server holding a document for a
+    /// file nobody can see - still analysing it, still publishing diagnostics
+    /// for it - and leaves this side's three maps growing for the life of the
+    /// session. A card is closed far more often than a file is, so this is the
+    /// path that decides whether a long session accumulates dead documents.
+    fn retire_lsp_card(&mut self, card: CardId) {
+        self.close_lsp_document(card);
+        self.lsp_contexts.remove(&card);
+        self.lsp_pending_jumps.remove(&card);
+    }
+
+    fn lsp_document(&self, card: CardId) -> Option<LspDocumentId> {
+        self.lsp_contexts.get(&card)?.document
+    }
+
+    /// Opens `path` at the LSP boundary and answers any jump parked on it.
+    fn open_lsp_document(
+        &mut self,
+        card: CardId,
+        path: &Path,
+        worktree: &Path,
+        version: i32,
+        text: &str,
+    ) -> Task<Message> {
+        // A previous buffer's document is closed first even without a `Close`
+        // intent, because the two are one transition for the user: opening a
+        // second file over the first leaves the server holding a document for
+        // text nobody is editing, and its diagnostics would keep arriving for
+        // a card that has moved on.
+        self.close_lsp_document(card);
+        let state = self.lsp_contexts.entry(card).or_default();
+        state.path = Some(path.to_path_buf());
+        let Some(language) = self.lsp.language_for(path) else {
+            // No configured server claims this extension. That is a supported
+            // configuration, not a failure, so the surface says the file has
+            // no server rather than reporting one that is broken.
+            let state = self.lsp_contexts.entry(card).or_default();
+            state.context.status = Some(LspStatus::Disabled);
+            self.lsp_pending_jumps.remove(&card);
+            return Task::none();
+        };
+        let doc = LspDocumentId(self.next_lsp_document);
+        self.next_lsp_document += 1;
+        let status = self.lsp.open(doc, path, worktree, language, version, text);
+        if let Some(CardRuntime::Repository(runtime)) = self.cards.get_mut(&card) {
+            runtime.set_lsp_document(Some(doc));
+        }
+        self.lsp_documents.insert(doc, card);
+        let state = self.lsp_contexts.entry(card).or_default();
+        state.document = Some(doc);
+        state.context.status = Some(status);
+        self.flush_pending_lsp_jump(card, path)
+    }
+
+    fn close_lsp_document(&mut self, card: CardId) {
+        if let Some(state) = self.lsp_contexts.get_mut(&card)
+            && let Some(doc) = state.document.take()
+        {
+            self.lsp.close(doc);
+            self.lsp_documents.remove(&doc);
+        }
+        if let Some(CardRuntime::Repository(runtime)) = self.cards.get_mut(&card) {
+            runtime.set_lsp_document(None);
+        }
+        if let Some(state) = self.lsp_contexts.get_mut(&card) {
+            state.context = inspector::LspInspectorContext::default();
+            state.diagnostics_version = None;
+            state.path = None;
+        }
+    }
+
+    /// Applies a parked jump now that `path` is the card's open buffer.
+    fn flush_pending_lsp_jump(&mut self, card: CardId, path: &Path) -> Task<Message> {
+        // Taken on *any* open, not only a matching one. A jump is answered by
+        // the open it asked for or by nothing: leaving it parked would let the
+        // caret be yanked minutes later, when the user opens that file
+        // themselves, to a position from an answer they have forgotten asking
+        // for and against text that has since changed.
+        let Some(jump) = self.lsp_pending_jumps.remove(&card) else {
+            return Task::none();
+        };
+        if jump.path != path {
+            return Task::none();
+        }
+        let at = match jump.coordinates {
+            LspCoordinates::Scalar => jump.at,
+            // The column arrived in protocol code units because the file was
+            // not open when the server answered. It is open now, so the
+            // manager can place it against the text it actually indexes.
+            LspCoordinates::Utf16 => {
+                let Some(doc) = self.lsp_document(card) else {
+                    return Task::none();
+                };
+                match self.lsp.scalar_position(doc, jump.at) {
+                    Ok(at) => at,
+                    Err(error) => {
+                        self.status = Some(TransientNotice::warning(format!(
+                            "opened the file, but could not place the caret: {error}"
+                        )));
+                        return Task::none();
+                    }
+                }
+            }
+        };
+        self.move_lsp_caret(card, at)
+    }
+
+    /// Places the caret and gives the editor the keyboard.
+    ///
+    /// Moving the caret alone is invisible: an unfocused `text_editor` draws
+    /// no caret at all, so a jump into a result would answer the user with a
+    /// frame that looks exactly like the one they clicked in.
+    fn move_lsp_caret(&mut self, card: CardId, at: LspPosition) -> Task<Message> {
+        let focus = match self.cards.get_mut(&card) {
+            Some(CardRuntime::Repository(runtime)) => runtime
+                .move_cursor_to(at)
+                .then(|| runtime.focus_editor(card)),
+            _ => None,
+        };
+        focus.unwrap_or_else(|| {
+            self.status = Some(TransientNotice::warning(format!(
+                "line {} is not in this file any more",
+                at.line.saturating_add(1)
+            )));
+            Task::none()
+        })
+    }
+
+    /// Routes one language-server event onto the card whose document it names.
+    fn apply_lsp_event(&mut self, event: LspEvent) {
+        let doc = match &event {
+            LspEvent::Diagnostics { doc, .. }
+            | LspEvent::Completion { doc, .. }
+            | LspEvent::Hover { doc, .. }
+            | LspEvent::Locations { doc, .. }
+            | LspEvent::Status { doc, .. }
+            | LspEvent::Progress { doc, .. }
+            | LspEvent::RequestFailed { doc, .. }
+            | LspEvent::DocumentDesynced { doc, .. } => *doc,
+        };
+        // An event for a document that has since been closed has no surface to
+        // land on, and diagnostics arrive on every recheck, so this is a map
+        // rather than a scan of the open cards.
+        let Some(&card) = self.lsp_documents.get(&doc) else {
+            return;
+        };
+        let Some(state) = self.lsp_contexts.get_mut(&card) else {
+            return;
+        };
+        match event {
+            LspEvent::Diagnostics { version, items, .. } => {
+                state.context.diagnostics = items;
+                state.diagnostics_version = Some(version);
+            }
+            LspEvent::Completion { items, .. } => state.context.completions = items,
+            LspEvent::Hover { markdown, .. } => state.context.hover = markdown,
+            LspEvent::Locations { kind, items, .. } => {
+                state.context.locations = Some((kind, items));
+            }
+            LspEvent::Status { status, .. } => state.context.status = Some(status),
+            LspEvent::Progress { progress, .. } => {
+                // Progress is transient by definition, so it is shown in the
+                // notice slot the surface already has and cleared on `done`
+                // rather than accumulating a log nobody dismisses.
+                state.progress = (!progress.done).then(|| {
+                    let detail = progress
+                        .title
+                        .or(progress.message)
+                        .unwrap_or_else(|| progress.token.clone());
+                    match progress.percentage {
+                        Some(percent) => format!("{detail} ({percent}%)"),
+                        None => detail,
+                    }
+                });
+                state.refresh_notice();
+            }
+            LspEvent::RequestFailed { error, .. } => {
+                // A superseded request is the ordinary result of typing while
+                // one is in flight, and reporting it would put a warning on
+                // screen for every keystroke.
+                if !matches!(error, LspError::Cancelled) {
+                    state.failure = Some(error.to_string());
+                    state.refresh_notice();
+                }
+            }
+            LspEvent::DocumentDesynced { error, .. } => {
+                // The buffer is intact and the manager has already resent it;
+                // what is gone is every answer computed against the text the
+                // two sides disagreed about.
+                state.invalidate_answers();
+                state.failure = Some(format!(
+                    "resynchronised with the language server after {error}"
+                ));
+                state.refresh_notice();
+            }
+        }
+    }
+
+    /// The LSP results to render beside `card`, if it is showing any.
+    fn lsp_context(&self, card: CardId) -> Option<&inspector::LspInspectorContext> {
+        self.lsp_contexts.get(&card).map(|state| &state.context)
+    }
+
+    /// Handles the inspector's language-server actions.
+    fn update_lsp(&mut self, action: InspectorAction) -> Task<Message> {
+        match action {
+            InspectorAction::JumpToLspDiagnostic { card, at } => {
+                let Some(state) = self.lsp_contexts.get(&card) else {
+                    return Task::none();
+                };
+                // Diagnostics are unsolicited and replace each other wholesale,
+                // so the list on screen can describe text the buffer has moved
+                // past. Jumping into it would land the caret on a line the
+                // diagnostic never named.
+                let published = state.diagnostics_version;
+                let current = state
+                    .document
+                    .and_then(|doc| self.lsp.document_version(doc));
+                if !diagnostics_are_current(published, current) {
+                    self.status = Some(TransientNotice::warning(
+                        "these diagnostics describe an earlier version of the file",
+                    ));
+                    return Task::none();
+                }
+                self.move_lsp_caret(card, at)
+            }
+            InspectorAction::JumpToLspLocation {
+                card,
+                path,
+                at,
+                coordinates,
+            } => self.jump_to_lsp_location(card, path, at, coordinates),
+            InspectorAction::ApplyLspCompletion { card, index, label } => {
+                self.apply_lsp_completion(card, index, &label)
+            }
+            InspectorAction::RequestLspHover(card) => self.request_lsp(card, LspRequestKind::Hover),
+            InspectorAction::GoToLspDefinition(card) => {
+                self.request_lsp(card, LspRequestKind::Definition)
+            }
+            InspectorAction::FindLspReferences(card) => {
+                self.request_lsp(card, LspRequestKind::References)
+            }
+            InspectorAction::RestartLanguageServer(card) => {
+                let Some(doc) = self.lsp_document(card) else {
+                    return Task::none();
+                };
+                self.lsp.restart(doc);
+                if let Some(state) = self.lsp_contexts.get_mut(&card) {
+                    // The replacement process republishes from scratch. Keeping
+                    // the dead session's diagnostics on screen would show the
+                    // user results from a server that no longer exists.
+                    state.invalidate_answers();
+                    state.context.diagnostics.clear();
+                    state.diagnostics_version = None;
+                    state.failure = None;
+                    state.progress = None;
+                    state.refresh_notice();
+                    state.context.status = Some(self.lsp.status(doc));
+                }
+                Task::none()
+            }
+            InspectorAction::DismissLspResults(card) => {
+                if let Some(state) = self.lsp_contexts.get_mut(&card) {
+                    state.invalidate_answers();
+                    state.failure = None;
+                    state.refresh_notice();
+                }
+                Task::none()
+            }
+            InspectorAction::OpenLspHoverLink(uri) => match Url::parse(&uri) {
+                Ok(url) => self.open_link(url),
+                Err(_) => {
+                    self.status = Some(TransientNotice::error(
+                        "could not open hover link: invalid absolute URL",
+                    ));
+                    Task::none()
+                }
+            },
+            other => unreachable!("{other:?} is not a language-server action"),
+        }
+    }
+
+    fn jump_to_lsp_location(
+        &mut self,
+        card: CardId,
+        path: PathBuf,
+        at: LspPosition,
+        coordinates: LspCoordinates,
+    ) -> Task<Message> {
+        let open_path = self
+            .lsp_contexts
+            .get(&card)
+            .and_then(|state| state.path.clone());
+        if open_path.as_deref() == Some(path.as_path()) {
+            // Already the open buffer, so the column is placeable now. A
+            // `Utf16` location for the open file cannot occur - the manager
+            // converts against every document it holds - but it is refused
+            // rather than trusted, because placing protocol code units as
+            // scalars silently lands the caret in the wrong column.
+            return match coordinates {
+                LspCoordinates::Scalar => self.move_lsp_caret(card, at),
+                LspCoordinates::Utf16 => {
+                    let Some(doc) = self.lsp_document(card) else {
+                        return Task::none();
+                    };
+                    match self.lsp.scalar_position(doc, at) {
+                        Ok(at) => return self.move_lsp_caret(card, at),
+                        Err(error) => {
+                            self.status = Some(TransientNotice::warning(format!(
+                                "could not place the caret: {error}"
+                            )));
+                        }
+                    }
+                    Task::none()
+                }
+            };
+        }
+        // The card's file list is worktree-relative and a location is absolute.
+        // A target outside the worktree has no row to open, and the inspector
+        // already renders those as inert, so this is a refusal rather than a
+        // guess at which repository the path belongs to.
+        let worktree = match self.cards.get(&card) {
+            Some(CardRuntime::Repository(runtime)) => runtime.descriptor.worktree.clone(),
+            _ => return Task::none(),
+        };
+        let Ok(relative) = path.strip_prefix(&worktree) else {
+            self.status = Some(TransientNotice::warning(
+                "that definition is outside this worktree",
+            ));
+            return Task::none();
+        };
+        let relative = relative.to_path_buf();
+        // `OpenFile` answers a path the card has no row for by doing nothing,
+        // so parking on that open would wait for something that never happens
+        // and leave the user with no answer at all. A generated or ignored
+        // source inside the worktree is the ordinary way to reach this.
+        let openable = match self.cards.get(&card) {
+            Some(CardRuntime::Repository(runtime)) => runtime.can_open_file(&relative),
+            _ => false,
+        };
+        if !openable {
+            self.status = Some(TransientNotice::warning(format!(
+                "{} is not in this worktree's file list",
+                relative.display()
+            )));
+            return Task::none();
+        }
+        self.lsp_pending_jumps.insert(
+            card,
+            PendingLspJump {
+                path,
+                at,
+                coordinates,
+            },
+        );
+        cosmic::task::message(Message::Repository(RepositoryAction::OpenFile {
+            card,
+            path: relative,
+        }))
+    }
+
+    fn apply_lsp_completion(&mut self, card: CardId, index: usize, label: &str) -> Task<Message> {
+        let Some(state) = self.lsp_contexts.get(&card) else {
+            return Task::none();
+        };
+        let Some(item) = state.context.completions.get(index) else {
+            return Task::none();
+        };
+        // The list is addressed by position, and a fresh completion response
+        // replaces it wholesale. The label is the fingerprint that catches a
+        // list which changed under the press: applying the wrong candidate
+        // writes text the user never chose.
+        if item.label != label {
+            self.status = Some(TransientNotice::warning(
+                "the completion list changed; nothing was applied",
+            ));
+            return Task::none();
+        }
+        let item = item.clone();
+        let applied = match self.cards.get_mut(&card) {
+            Some(CardRuntime::Repository(runtime)) => runtime.apply_completion(&item),
+            _ => false,
+        };
+        if !applied {
+            self.status = Some(TransientNotice::warning(format!(
+                "`{}` could not be applied to this buffer",
+                item.label
+            )));
+            return Task::none();
+        }
+        // Applying one candidate makes the rest describe text that no longer
+        // exists, and the edit itself produces a `Change` intent that must
+        // reach the server before the next request is answered against it.
+        if let Some(state) = self.lsp_contexts.get_mut(&card) {
+            state.context.completions.clear();
+        }
+        self.drain_lsp_intents(card)
+    }
+
+    fn request_lsp(&mut self, card: CardId, kind: LspRequestKind) -> Task<Message> {
+        let Some(doc) = self.lsp_document(card) else {
+            return Task::none();
+        };
+        let at = match self.cards.get(&card) {
+            Some(CardRuntime::Repository(runtime)) => runtime.cursor_position(),
+            _ => None,
+        };
+        let Some(at) = at else {
+            return Task::none();
+        };
+        match kind {
+            LspRequestKind::Hover => self.lsp.request_hover(doc, at),
+            LspRequestKind::Definition => self.lsp.request_definition(doc, at),
+            LspRequestKind::References => self.lsp.request_references(doc, at),
+        };
+        Task::none()
+    }
+
+    fn flush_pending_panel_open(&mut self, card: CardId) -> Task<Message> {
+        if self.pending_panel_open.as_ref().map(|open| open.card) != Some(card) {
+            return Task::none();
+        }
+        let open = self
+            .pending_panel_open
+            .take()
+            .expect("the pending open was just matched");
+        let mut task = cosmic::task::message(Message::Repository(RepositoryAction::OpenFile {
+            card,
+            path: open.path,
+        }));
+        if let Some(staged) = open.diff_staged {
+            // A staged row is what the index holds against HEAD; an unstaged
+            // one is what the worktree holds against the index. The panel
+            // reports which list the row came from, and these are the two
+            // bases those lists are computed from.
+            let basis = if staged {
+                DiffBasis::HeadToIndex
+            } else {
+                DiffBasis::IndexToWorktree
+            };
+            task = task
+                .chain(cosmic::task::message(Message::Repository(
+                    RepositoryAction::ApplySourceSurface { card, diff: true },
+                )))
+                .chain(cosmic::task::message(Message::Repository(
+                    RepositoryAction::ApplyDiffBasis { card, basis },
+                )));
+        }
+        task
+    }
+
+    /// True when this result still describes the worktree the panel is bound
+    /// to. A snapshot for a worktree the panel left is a read of a tree nobody
+    /// is looking at.
+    fn source_control_is_bound(&self, key: &ActiveWorktreeKey) -> bool {
+        self.sidebar_model
+            .source_control
+            .as_ref()
+            .is_some_and(|source| source.key == *key)
+    }
+
+    /// Reloads the bound worktree, keeping whatever mutation is in flight
+    /// visible so a refresh cannot make a running command look finished.
+    fn reload_source_control(&mut self, key: &ActiveWorktreeKey) -> Task<Message> {
+        if !self.source_control_is_bound(key) {
+            return Task::none();
+        }
+        if let Some(source) = self.sidebar_model.source_control.as_mut() {
+            source.set_reloading(true);
+        }
+        Self::source_control_snapshot_task(key.clone())
+    }
+
+    fn source_control_snapshot_task(key: ActiveWorktreeKey) -> Task<Message> {
+        let worktree = key.canonical_path.clone();
+        cosmic::task::future(async move {
+            let result = tokio::task::spawn_blocking(move || {
+                RepositoryService::system("git")
+                    .snapshot(&worktree, &CancellationToken::default())
+                    .map_err(|error| error.to_string())
+            })
+            .await
+            .map_err(|error| format!("source-control reader join failed: {error}"))
+            .and_then(|result| result)
+            .map(Box::new);
+            Message::SourceControlLoaded { key, result }
+        })
+    }
+
+    fn source_control_history_task(key: ActiveWorktreeKey, page: u32) -> Task<Message> {
+        let request = HistoryRequest {
+            worktree: key.canonical_path.clone(),
+            revision: HistoryRevision::Head,
+            page,
+            path: None,
+        };
+        cosmic::task::future(async move {
+            let result = tokio::task::spawn_blocking(move || {
+                RepositoryService::system("git")
+                    .history(&request, &CancellationToken::default())
+                    .map_err(|error| error.to_string())
+            })
+            .await
+            .map_err(|error| format!("history reader join failed: {error}"))
+            .and_then(|result| result);
+            Message::SourceControlHistory { key, page, result }
+        })
+    }
+
+    /// Starts one mutation against the bound worktree.
+    ///
+    /// Refused outright when the panel has moved on or a command is already
+    /// running: two `git add` runs against one index corrupt each other's
+    /// `index.lock`, and the panel's own controls stand down while one is in
+    /// flight, so this is the guard for a press that raced the frame.
+    fn begin_mutation(&mut self, key: &ActiveWorktreeKey, kind: MutationKind) -> bool {
+        if !self.source_control_is_bound(key) {
+            return false;
+        }
+        let Some(source) = self.sidebar_model.source_control.as_mut() else {
+            return false;
+        };
+        if source.busy() {
+            return false;
+        }
+        source.set_error(None);
+        source.set_mutation(Some(kind));
+        true
+    }
+
+    /// The task one finished mutation turns into: report what Git did, then
+    /// re-read the worktree, because the index is the only authority on what
+    /// the mutation left behind.
+    fn mutation_task(
+        key: ActiveWorktreeKey,
+        kind: MutationKind,
+        run: impl FnOnce(&RepositoryService, &CancellationToken) -> (Option<String>, bool)
+        + Send
+        + 'static,
+    ) -> Task<Message> {
+        cosmic::task::future(async move {
+            let joined = tokio::task::spawn_blocking(move || {
+                let service = RepositoryService::system("git");
+                run(&service, &CancellationToken::default())
+            })
+            .await;
+            let (report, committed) = match joined {
+                Ok(outcome) => outcome,
+                Err(error) => (Some(format!("Git worker failed: {error}")), false),
+            };
+            Message::SourceControlMutated {
+                key,
+                kind,
+                report,
+                committed,
+            }
+        })
+    }
+
     fn set_workspace_surfaces_visible(&mut self, workspace_visible: bool) {
         let visible_cards = self
             .durable
@@ -4029,6 +5037,12 @@ impl Cagents {
             || self.worktree_dialog.is_some()
             || self.pull_request_dialog.is_some()
             || self.dirty_repository_close.is_some()
+            // Mounted by `dialog` from the sidebar's own state, so nothing
+            // beneath it can learn about it any other way. Leaving it out is
+            // how the one dialog that is on screen *because* it is about to
+            // destroy work becomes the one dialog the pane keeps its commands
+            // live behind.
+            || self.sidebar_state.pending_discard().is_some()
     }
 
     fn context_inspector_is_overlay(&self) -> bool {
@@ -4157,6 +5171,27 @@ impl Cagents {
                 }
                 Task::none()
             }
+            // A request's answer is rendered by this very panel, so dismissing
+            // an overlay inspector on the way to asking for it would show the
+            // user nothing at all. These five stay put; the four below move the
+            // caret, edit the buffer, or leave the application, and for those
+            // an overlay covering the workspace is in the way.
+            action @ (InspectorAction::RequestLspHover(_)
+            | InspectorAction::GoToLspDefinition(_)
+            | InspectorAction::FindLspReferences(_)
+            | InspectorAction::RestartLanguageServer(_)
+            | InspectorAction::DismissLspResults(_)) => self.update_lsp(action),
+            action @ (InspectorAction::JumpToLspDiagnostic { .. }
+            | InspectorAction::JumpToLspLocation { .. }
+            | InspectorAction::ApplyLspCompletion { .. }
+            | InspectorAction::OpenLspHoverLink(_)) => {
+                let close_overlay = if self.context_inspector_is_overlay() {
+                    self.set_context_inspector_open(false)
+                } else {
+                    Task::none()
+                };
+                Task::batch([close_overlay, self.update_lsp(action)])
+            }
             command => {
                 let close_overlay = if self.context_inspector_is_overlay() {
                     self.set_context_inspector_open(false)
@@ -4230,15 +5265,16 @@ impl Cagents {
                                 preview: true,
                             }),
                         ),
-                        InspectorAction::ShowStagedDiff(card) => {
-                            cosmic::task::message(Message::Repository(
-                                RepositoryAction::ApplyDiffBasis { card, staged: true },
-                            ))
-                        }
+                        InspectorAction::ShowStagedDiff(card) => cosmic::task::message(
+                            Message::Repository(RepositoryAction::ApplyDiffBasis {
+                                card,
+                                basis: DiffBasis::HeadToIndex,
+                            }),
+                        ),
                         InspectorAction::ShowUnstagedDiff(card) => cosmic::task::message(
                             Message::Repository(RepositoryAction::ApplyDiffBasis {
                                 card,
-                                staged: false,
+                                basis: DiffBasis::IndexToWorktree,
                             }),
                         ),
                         InspectorAction::ShowInlineDiff(card) => {
@@ -4277,7 +5313,18 @@ impl Cagents {
                         }
                         InspectorAction::Close
                         | InspectorAction::Resize { .. }
-                        | InspectorAction::ResizeFinished => unreachable!("handled above"),
+                        | InspectorAction::ResizeFinished
+                        | InspectorAction::JumpToLspDiagnostic { .. }
+                        | InspectorAction::JumpToLspLocation { .. }
+                        | InspectorAction::ApplyLspCompletion { .. }
+                        | InspectorAction::RequestLspHover(_)
+                        | InspectorAction::GoToLspDefinition(_)
+                        | InspectorAction::FindLspReferences(_)
+                        | InspectorAction::RestartLanguageServer(_)
+                        | InspectorAction::DismissLspResults(_)
+                        | InspectorAction::OpenLspHoverLink(_) => {
+                            unreachable!("handled above")
+                        }
                     };
                 Task::batch([close_overlay, command])
             }
@@ -4305,6 +5352,22 @@ impl Cagents {
         )
     }
 
+    /// Exits once the language servers have actually been reaped.
+    ///
+    /// `shutdown` only *asks*: the processes are stopped by session tasks on
+    /// the tokio runtime, and `iced::exit()` takes that runtime away. Waiting
+    /// off the update thread and exiting on the answer is what keeps a
+    /// `rust-analyzer` - and the proc-macro server it owns - from outliving the
+    /// application that spawned it. The wait is bounded by the module's own
+    /// reap timeout, so a server that refuses to die cannot hold the exit.
+    fn exit_after_language_servers(&mut self) -> Task<Message> {
+        let reaped = self.lsp.begin_shutdown();
+        cosmic::task::future(async move {
+            reaped.await;
+            Message::LanguageServersReaped
+        })
+    }
+
     fn begin_dirty_close(
         &mut self,
         intent: DirtyCloseIntent,
@@ -4313,7 +5376,7 @@ impl Cagents {
         let Some(card) = cards.pop_front() else {
             return match intent {
                 DirtyCloseIntent::Card(card) => cosmic::task::message(Message::CloseCard(card)),
-                DirtyCloseIntent::Application(_) => iced::exit().map(cosmic::Action::App),
+                DirtyCloseIntent::Application(_) => self.exit_after_language_servers(),
             };
         };
         // Keep a stable workspace fallback even when another modal is
@@ -4363,7 +5426,7 @@ impl Cagents {
         }
         match close.intent {
             DirtyCloseIntent::Card(card) => cosmic::task::message(Message::CloseCard(card)),
-            DirtyCloseIntent::Application(_) => iced::exit().map(cosmic::Action::App),
+            DirtyCloseIntent::Application(_) => self.exit_after_language_servers(),
         }
     }
 
@@ -4582,18 +5645,55 @@ impl Cagents {
         }
     }
 
+    /// Rebuilds the language-server manager when the configured list no longer
+    /// describes the processes it is running.
+    ///
+    /// A manager's server set is fixed at construction and its shutdown is
+    /// one-way, so a changed list is a new manager. Every open buffer is
+    /// re-announced to the replacement: leaving them would show the user files
+    /// that look checked and are not.
+    fn synchronize_language_servers(&mut self) -> Task<Message> {
+        if self.lsp.servers() == self.settings.language_servers.as_slice() {
+            return Task::none();
+        }
+        // `shutdown` alone moves the sessions into the outgoing manager's own
+        // retiring list and kills nothing, and dropping that manager drops
+        // them unreaped - after which no exit path can reach them, because
+        // every exit path addresses the manager that replaced it.
+        // `begin_shutdown` spawns the reap on the runtime the sessions run on,
+        // so it survives the returned future being dropped here.
+        drop(self.lsp.begin_shutdown());
+        self.lsp = LspManager::new(self.settings.language_servers.clone());
+        self.lsp_contexts.clear();
+        self.lsp_documents.clear();
+        self.lsp_pending_jumps.clear();
+        let cards: Vec<CardId> = self.cards.keys().copied().collect();
+        let mut tasks = Vec::with_capacity(cards.len());
+        for card in cards {
+            if let Some(CardRuntime::Repository(runtime)) = self.cards.get_mut(&card) {
+                runtime.set_lsp_document(None);
+                runtime.resync_lsp();
+            }
+            tasks.push(self.drain_lsp_intents(card));
+        }
+        Task::batch(tasks)
+    }
+
     fn reset_settings(&mut self) -> Task<Message> {
         self.settings = AppSettings::default();
         self.settings_draft = SettingsDraft::from_settings(&self.settings);
         self.card_chrome.clear();
         self.synchronize_lifecycle_budget();
+        // Reset restores the built-in server list, which is a different set of
+        // processes whenever the user had configured their own.
+        let resync = self.synchronize_language_servers();
         self.settings_write_blocked = false;
         self.settings_feedback = Some(match self.save_settings_now() {
             Ok(()) => SettingsFeedback::Saved,
             Err(error) => SettingsFeedback::Error(error),
         });
         let sweep = self.lifecycle_sweep();
-        Task::batch([sweep, self.reschedule_offscreen_lifecycle_sweep()])
+        Task::batch([resync, sweep, self.reschedule_offscreen_lifecycle_sweep()])
     }
 }
 
@@ -4667,6 +5767,11 @@ impl Application for Cagents {
                 max_hot_cards: settings.max_hot_cards,
                 offscreen_grace: Duration::from_millis(settings.hibernation_delay_ms),
             }),
+            lsp: LspManager::new(settings.language_servers.clone()),
+            lsp_documents: HashMap::new(),
+            lsp_contexts: HashMap::new(),
+            lsp_pending_jumps: HashMap::new(),
+            next_lsp_document: 0,
             terminal_wake_tx,
             terminal_wake_rx,
             session,
@@ -4690,6 +5795,7 @@ impl Application for Cagents {
             worktree_dialog: None,
             pull_request_dialog: None,
             dirty_repository_close: None,
+            pending_panel_open: None,
             deferred_navigation: VecDeque::new(),
             frame_clock: FrameClock::default(),
             inspector: None,
@@ -5018,19 +6124,29 @@ impl Application for Cagents {
                 }
                 let card = action.card();
                 let save_finished = matches!(action, RepositoryAction::SaveFinished { .. });
+                // A parked source-control navigation is answered by the very
+                // file list it is waiting on, and only after the card has taken
+                // that list.
+                let files_loaded = matches!(action, RepositoryAction::FilesLoaded { .. });
                 let closing_card = self.dirty_repository_close.as_ref().map(|close| close.card);
                 let task = match self.cards.get_mut(&card) {
                     Some(CardRuntime::Repository(runtime)) => {
-                        let task = repository_task(runtime.update(action));
-                        task
+                        repository_task(runtime.update(action))
                     }
                     _ => Task::none(),
                 };
-                if save_finished && closing_card == Some(card) {
-                    Task::batch([task, self.advance_dirty_close()])
-                } else {
-                    task
+                // Every buffer transition the action caused is recorded on the
+                // runtime and has so far reached nothing. Draining here rather
+                // than at the individual actions is what makes that true of all
+                // of them, including the ones a later action adds.
+                let mut tasks = vec![task, self.drain_lsp_intents(card)];
+                if files_loaded {
+                    tasks.push(self.flush_pending_panel_open(card));
                 }
+                if save_finished && closing_card == Some(card) {
+                    tasks.push(self.advance_dirty_close());
+                }
+                Task::batch(tasks)
             }
             Message::Sidebar(action) => {
                 // A control in the pane can still be activated while a dialog
@@ -5043,7 +6159,13 @@ impl Application for Cagents {
                 // discarding what they had typed. Nothing is recorded either:
                 // the selection an open would set is a claim that a card
                 // exists, and refusing the open would make it a false one.
-                if self.modal_is_open() {
+                //
+                // The one exception is the discard confirmation's own answer.
+                // That dialog is itself a modal, and its Cancel and Discard are
+                // `SidebarAction`s that arrive right here, so refusing
+                // everything while it is up would strand it with no way out - a
+                // worse fault than the one this guard exists for.
+                if self.modal_is_open() && !answers_discard_confirmation(&action) {
                     return Task::none();
                 }
                 self.sidebar_state.apply(&action);
@@ -5144,6 +6266,120 @@ impl Application for Cagents {
                             Err(error) => SettingsFeedback::Error(error),
                         });
                         Task::none()
+                    }
+                    // Expanding `History` is the only thing that asks for the
+                    // first page; the tail of `update` sees the new toggle and
+                    // issues the walk.
+                    SidebarAction::ToggleSection { .. }
+                    | SidebarAction::ToggleSourceControlPanel { .. }
+                    | SidebarAction::FilesQueryChanged { .. }
+                    | SidebarAction::ToggleDirectory { .. }
+                    | SidebarAction::CommitMessageChanged { .. }
+                    | SidebarAction::PublishRemoteChanged { .. }
+                    | SidebarAction::PublishBranchChanged { .. }
+                    | SidebarAction::CancelPublish
+                    // `apply` already cleared the pending discard, and the
+                    // dialog it was driving is gone with it.
+                    | SidebarAction::CancelDiscard
+                    // Raising the confirmation is the whole of this intent:
+                    // `apply` recorded the unconfirmed request and `dialog`
+                    // mounts it.
+                    | SidebarAction::RequestDiscard { .. } => Task::none(),
+                    SidebarAction::RefreshWorktree { key } => self.reload_source_control(&key),
+                    SidebarAction::OpenFile { key, path } => {
+                        self.route_panel_open(&key, &path, None)
+                    }
+                    SidebarAction::OpenChange { key, path, area } => {
+                        // The card has two diff bases. A conflict has no staged
+                        // side to show, so it is opened against the working
+                        // tree like any other unstaged change.
+                        let staged = area == ChangeArea::Staged;
+                        self.route_panel_open(&key, &path, Some(staged))
+                    }
+                    SidebarAction::Stage { key, selection } => {
+                        if !self.begin_mutation(&key, MutationKind::Stage) {
+                            return Task::none();
+                        }
+                        let request = StageRequest {
+                            worktree: key.canonical_path.clone(),
+                            selection,
+                        };
+                        Self::mutation_task(key, MutationKind::Stage, move |service, cancel| {
+                            (
+                                mutation_report("Stage", service.stage(&request, cancel)),
+                                false,
+                            )
+                        })
+                    }
+                    SidebarAction::Unstage { key, selection } => {
+                        if !self.begin_mutation(&key, MutationKind::Unstage) {
+                            return Task::none();
+                        }
+                        let request = UnstageRequest {
+                            worktree: key.canonical_path.clone(),
+                            selection,
+                        };
+                        Self::mutation_task(key, MutationKind::Unstage, move |service, cancel| {
+                            (
+                                mutation_report("Unstage", service.unstage(&request, cancel)),
+                                false,
+                            )
+                        })
+                    }
+                    // The only arm that destroys work, and the only one the
+                    // dialog can raise: `RequestDiscard` builds the request
+                    // with `confirmed: false`, the dialog rebuilds it with
+                    // `confirmed: true`, and the service refuses an
+                    // unconfirmed one outright.
+                    SidebarAction::ConfirmDiscard { key, request } => {
+                        if !self.begin_mutation(&key, MutationKind::Discard) {
+                            return Task::none();
+                        }
+                        Self::mutation_task(key, MutationKind::Discard, move |service, cancel| {
+                            (
+                                mutation_report("Discard", service.discard(&request, cancel)),
+                                false,
+                            )
+                        })
+                    }
+                    SidebarAction::Commit { key, message } => {
+                        if !self.begin_mutation(&key, MutationKind::Commit) {
+                            return Task::none();
+                        }
+                        let request = CommitRequest {
+                            worktree: key.canonical_path.clone(),
+                            message,
+                        };
+                        Self::mutation_task(key, MutationKind::Commit, move |service, cancel| {
+                            commit_report(service.commit(&request, cancel))
+                        })
+                    }
+                    SidebarAction::Push {
+                        key,
+                        branch,
+                        target,
+                    } => {
+                        if !self.begin_mutation(&key, MutationKind::Push) {
+                            return Task::none();
+                        }
+                        let request = PushRequest {
+                            worktree: key.canonical_path.clone(),
+                            branch,
+                            target,
+                        };
+                        Self::mutation_task(key, MutationKind::Push, move |service, cancel| {
+                            (push_report(service.push(&request, cancel)), false)
+                        })
+                    }
+                    SidebarAction::OpenPublish { .. } => Task::none(),
+                    SidebarAction::LoadMoreHistory { key, page } => {
+                        if !self.source_control_is_bound(&key) {
+                            return Task::none();
+                        }
+                        if let Some(source) = self.sidebar_model.source_control.as_mut() {
+                            source.mark_history_requested();
+                        }
+                        Self::source_control_history_task(key, page)
                     }
                     SidebarAction::SearchChanged(_)
                     | SidebarAction::SetFilter(_)
@@ -5273,6 +6509,7 @@ impl Application for Cagents {
             }
             Message::CancelRepositoryClose => self.cancel_dirty_close(),
             Message::CommitClose(id) => {
+                self.retire_lsp_card(id);
                 if let Some(runtime) = self.cards.remove(&id) {
                     match runtime {
                         CardRuntime::Terminal(handle) => {
@@ -5825,6 +7062,11 @@ impl Application for Cagents {
                 Task::none()
             }
             Message::ResetSettings => self.reset_settings(),
+            Message::Lsp(event) => {
+                self.apply_lsp_event(event);
+                Task::none()
+            }
+            Message::LanguageServersReaped => iced::exit().map(cosmic::Action::App),
             Message::SessionSaveHealthChanged(event) => {
                 if let Some(health) = &mut self.save_health {
                     health.apply(event);
@@ -5847,12 +7089,77 @@ impl Application for Cagents {
                 self.status = None;
                 Task::none()
             }
+            Message::SourceControlLoaded { key, result } => {
+                if !self.source_control_is_bound(&key) {
+                    return Task::none();
+                }
+                let mut next = match result {
+                    Ok(snapshot) => SourceControlModel::ready(key, &snapshot),
+                    Err(error) => SourceControlModel::failed(key, error),
+                };
+                // The reload replaces the rows and nothing else: an in-flight
+                // mutation, its last failure, and the history already walked
+                // belong to the binding, not to the page of Git output.
+                if let Some(previous) = self.sidebar_model.source_control.as_ref() {
+                    previous.carry_mutation_into(&mut next);
+                }
+                self.sidebar_model.source_control = Some(next);
+                Task::none()
+            }
+            Message::SourceControlHistory { key, page, result } => {
+                if !self.source_control_is_bound(&key) {
+                    return Task::none();
+                }
+                match result {
+                    Ok(commits) => {
+                        if let Some(source) = self.sidebar_model.source_control.as_mut() {
+                            // A page that arrives out of order would append the
+                            // same commits twice, so only the page the walk is
+                            // waiting for is taken.
+                            if source.next_history_page == page {
+                                source.append_history(&commits);
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        if let Some(source) = self.sidebar_model.source_control.as_mut() {
+                            source.set_error(Some(format!("Could not read history: {error}")));
+                        }
+                    }
+                }
+                Task::none()
+            }
+            Message::SourceControlMutated {
+                key,
+                kind,
+                report,
+                committed,
+            } => {
+                if !self.source_control_is_bound(&key) {
+                    return Task::none();
+                }
+                if committed {
+                    self.sidebar_state.clear_commit_message();
+                }
+                if let Some(source) = self.sidebar_model.source_control.as_mut() {
+                    source.set_mutation(None);
+                    source.set_error(report.clone());
+                }
+                if let Some(report) = report {
+                    self.status = Some(TransientNotice::error(report));
+                }
+                let _ = kind;
+                // Whatever Git did, the index is the authority on the result,
+                // so the panel re-reads rather than guessing.
+                self.reload_source_control(&key)
+            }
         };
         self.synchronize_sidebar_selection();
+        let binding = self.rebind_source_control();
         // `view` cannot rebuild the chrome cache itself, so refresh it here.
         let chrome = self.sync_chrome();
         let deferred = self.release_deferred_navigation_if_unblocked();
-        Task::batch([task, chrome, deferred])
+        Task::batch([task, binding, chrome, deferred])
     }
 
     fn subscription(&self) -> Subscription<Message> {
@@ -5888,6 +7195,13 @@ impl Application for Cagents {
                 .map(Message::SessionSaveHealthChanged),
             );
         }
+        subscriptions.push(
+            Subscription::run_with(
+                LspEventSource(self.lsp.events(), self.lsp.generation()),
+                lsp_event_stream,
+            )
+            .map(Message::Lsp),
+        );
         if let Some(window) = self.core.main_window_id()
             && (self.workspace.camera().is_animating() || self.inspector_transition.is_some())
         {
@@ -5910,6 +7224,11 @@ impl Application for Cagents {
 
     fn dialog(&self) -> Option<Element<'_, Message>> {
         let spacing = cosmic::theme::spacing();
+        // First, because a discard is the one dialog on screen precisely
+        // because it is about to destroy work that exists nowhere else.
+        if let Some(pending) = self.sidebar_state.pending_discard() {
+            return Some(sidebar::discard_confirmation_dialog(pending).map(Message::Sidebar));
+        }
         if let Some(close) = self.dirty_repository_close.as_ref() {
             let card = close.card;
             let runtime = match self.cards.get(&card) {
@@ -6482,12 +7801,16 @@ impl Application for Cagents {
                         Some(CardRuntime::Repository(runtime)) => Some(runtime.inspector_context()),
                         _ => None,
                     };
-                    inspector::model_for_card(
+                    let model = inspector::model_for_card(
                         state,
                         self.inspector_runtime_status(card),
                         &self.sidebar_model.projects,
                         repository.as_ref(),
-                    )
+                    );
+                    match self.lsp_context(card) {
+                        Some(lsp) => inspector::with_lsp(model, card, lsp),
+                        None => model,
+                    }
                 })
             });
         if let Some(model) = context_model {
@@ -6568,6 +7891,12 @@ impl Drop for Cagents {
         if let Some(session) = &mut self.session {
             session.shutdown();
         }
+        // Reached without the exit path having run - a panic, or a close this
+        // application did not drive - so nothing has awaited the reap and the
+        // runtime is going away regardless. `shutdown` alone would leave every
+        // server merely asked to stop, with nobody left to insist.
+        self.lsp.shutdown();
+        self.lsp.kill_retired_now();
 
         // Exact Wayland parent invariant:
         // 1. request and join every browser still owned by a card;
@@ -7135,7 +8464,7 @@ fn load_repository(path: &Path, project_id: Option<ProjectId>) -> Result<LoadedR
                     &ListPullRequestsRequest {
                         repository: repository.clone(),
                         state: PullRequestStateFilter::Open,
-                        limit: 50,
+                        limit: sidebar::PULL_REQUEST_LIST_LIMIT,
                     },
                     &cancellation,
                 )
@@ -7616,6 +8945,282 @@ mod tests {
             Some(CardRuntime::Repository(runtime))
                 if runtime.blocks_navigation() && runtime.has_durability_warning()
         ));
+    }
+
+    /// A headless `cosmic::Renderer`. With no graphics device it falls back
+    /// to tiny-skia, which needs neither a device nor a surface.
+    fn headless_renderer() -> cosmic::Renderer {
+        use cosmic::iced::advanced::renderer::Headless;
+        use cosmic::iced::{Font, Pixels};
+
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("executor")
+            .block_on(cosmic::Renderer::new(
+                Font::default(),
+                Pixels(14.0),
+                Some("tiny-skia"),
+            ))
+            .expect("a headless renderer")
+    }
+
+    /// The frame the runtime actually builds: libcosmic composes the header,
+    /// the application's own view and any dialog into a single element, and
+    /// reconciles all of it against one tree.
+    ///
+    /// Driving `Application::view` alone would miss the dialog entirely, and
+    /// driving `Application::dialog` alone would miss that a dialog *joins and
+    /// leaves* the popover that holds it - a membership change in the widest
+    /// list there is. libcosmic itself flags the hazard where it composes them
+    /// ("we have to use a popover even without a dialog to keep the tree from
+    /// changing"), and only stops the popover node from coming and going: the
+    /// popup beneath it still does.
+    fn frame(app: &Cagents) -> cosmic::Element<'_, cosmic::Action<Message>> {
+        cosmic::ApplicationExt::view_main(app)
+    }
+
+    /// Presents one frame against a carried-over widget tree, exactly the way
+    /// `iced_runtime::UserInterface::build` does: the previous frame's named
+    /// widget states are lifted into the thread-local map that reconciliation
+    /// restores them from, then the tree is reconciled, laid out and drawn.
+    ///
+    /// Reproduced here rather than driven through `UserInterface` because that
+    /// type keeps its reconciled tree private, and the tree is what these
+    /// tests are about.
+    fn present(
+        app: &Cagents,
+        renderer: &mut cosmic::Renderer,
+        tree: &mut cosmic::iced::advanced::widget::Tree,
+    ) {
+        use cosmic::iced::advanced::widget::tree::NAMED;
+        use cosmic::iced::advanced::{Layout, layout, mouse, renderer::Style};
+        use cosmic::iced::{Rectangle, Size};
+
+        let bounds = Size::new(1600.0, 1200.0);
+        let mut element = frame(app);
+        NAMED.with(|named| {
+            *named.borrow_mut() = tree.take_all_named();
+        });
+        tree.diff(element.as_widget_mut());
+        let node = element.as_widget_mut().layout(
+            tree,
+            renderer,
+            &layout::Limits::new(Size::ZERO, bounds),
+        );
+        NAMED.with(|named| named.borrow_mut().clear());
+        element.as_widget().draw(
+            tree,
+            renderer,
+            &cosmic::theme::active(),
+            &Style::default(),
+            Layout::new(&node),
+            mouse::Cursor::Unavailable,
+            &Rectangle::with_size(bounds),
+        );
+    }
+
+    /// The name a node was given, if it was given one.
+    fn node_name(tree: &cosmic::iced::advanced::widget::Tree) -> Option<String> {
+        let rendered = format!("{:?}", tree.id.as_ref()?);
+        // `Id`'s debug carries a per-process counter that differs between two
+        // builds of the same frame; the name does not.
+        rendered
+            .split_once("Custom(")
+            .and_then(|(_, rest)| rest.split_once('"'))
+            .and_then(|(_, rest)| rest.split_once('"'))
+            .map(|(name, _)| name.to_owned())
+    }
+
+    /// A reconciled tree must describe the frame it was reconciled against.
+    ///
+    /// Naming a widget - `widget::Id::new(some_string)` - opts it into
+    /// libcosmic's named-state mechanism: every build lifts such a node's
+    /// state out of the tree into a thread-local map and puts it back only for
+    /// the names the new frame still asks for. Surviving children are then
+    /// claimed by name *in place* and never repositioned, so a list whose
+    /// membership changes leaves the departed nodes stranded at their old
+    /// indices with their state gone. Whichever widget now occupies such a
+    /// slot is then laid out and drawn against a stranger's state - and a
+    /// button drawn against emptied state aborts the process from inside
+    /// `draw`, where nothing can catch it.
+    ///
+    /// Comparing against a tree built fresh for the same frame is the whole
+    /// invariant. Both halves of it matter, and each catches a failure the
+    /// other cannot see: the names must match, because a stranded node is a
+    /// name in the wrong place; and the shape must match, because a list that
+    /// lost an *unnamed* widget keeps its state at the wrong index without
+    /// renaming anything, and every container zips its children against their
+    /// trees - so the tail of that row is silently not laid out, not drawn and
+    /// not clickable for the frame.
+    fn assert_tree_is_faithful(
+        reconciled: &cosmic::iced::advanced::widget::Tree,
+        fresh: &cosmic::iced::advanced::widget::Tree,
+    ) {
+        fn walk(
+            reconciled: &cosmic::iced::advanced::widget::Tree,
+            fresh: &cosmic::iced::advanced::widget::Tree,
+            path: &mut Vec<usize>,
+        ) {
+            assert_eq!(
+                node_name(reconciled),
+                node_name(fresh),
+                "at {path:?}: the reconciled tree names a different widget than the frame it was reconciled against"
+            );
+            assert_eq!(
+                reconciled.children.len(),
+                fresh.children.len(),
+                "at {path:?} ({:?}): the reconciled tree holds a different number of children than the frame it was reconciled against, so its parent zips widgets against strangers' state",
+                node_name(fresh)
+            );
+            for (index, (reconciled, fresh)) in reconciled
+                .children
+                .iter()
+                .zip(fresh.children.iter())
+                .enumerate()
+            {
+                path.push(index);
+                walk(reconciled, fresh, path);
+                path.pop();
+            }
+        }
+
+        walk(reconciled, fresh, &mut Vec::new());
+    }
+
+    fn assert_frame_is_faithful(app: &Cagents, tree: &cosmic::iced::advanced::widget::Tree) {
+        let mut fresh = frame(app);
+        assert_tree_is_faithful(
+            tree,
+            &cosmic::iced::advanced::widget::Tree::new(fresh.as_widget_mut()),
+        );
+    }
+
+    /// A repository card whose durable state and runtime both say repository,
+    /// with an unsaved buffer and a language server reporting on it - the
+    /// state a user is in while editing a file.
+    fn editing_repository_app() -> (Cagents, CardId) {
+        let mut app = context_inspector_test_app(true);
+        let card = app.workspace.focused().expect("a focused card");
+        {
+            let durable = Arc::make_mut(&mut app.durable);
+            let state = durable
+                .cards
+                .iter_mut()
+                .find(|state| state.id == card)
+                .expect("the focused card is durable");
+            state.kind = CardKind::Repository(RepositoryView {
+                project: ProjectId::new(),
+                repository: PathBuf::from("/repo/.git"),
+                worktree: PathBuf::from("/repo"),
+            });
+        }
+        app.cards.insert(
+            card,
+            CardRuntime::Repository(Box::new(RepositoryRuntime::dirty_fixture(card))),
+        );
+        let state = lsp_state(&mut app, card);
+        state.document = Some(LspDocumentId(1));
+        state.context.status = Some(crate::lsp::LspStatus::Ready);
+        state.context.diagnostics = vec![diagnostic("first"), diagnostic("second")];
+        state.diagnostics_version = Some(0);
+        app.lsp_documents.insert(LspDocumentId(1), card);
+        (app, card)
+    }
+
+    /// Discarding retires the Discard and Save commands and offers Back to
+    /// files in their place. Before this was fixed that repaint aborted the
+    /// process: the contextual inspector's commands were named, so the two
+    /// departing buttons stranded their emptied nodes for the surviving
+    /// buttons to draw against.
+    #[test]
+    fn discarding_an_edit_repaints_the_window() {
+        use cosmic::iced::advanced::widget::Tree;
+
+        let (mut app, card) = editing_repository_app();
+        let mut renderer = headless_renderer();
+        let mut tree = Tree::empty();
+
+        present(&app, &mut renderer, &mut tree);
+        assert_frame_is_faithful(&app, &tree);
+
+        let _ = app.update(Message::Repository(RepositoryAction::DiscardEdits { card }));
+        present(&app, &mut renderer, &mut tree);
+        assert_frame_is_faithful(&app, &tree);
+    }
+
+    /// The same reconciliation, over the transitions that move a repository
+    /// card between its surfaces. Each one changes which commands the
+    /// inspector offers, which is the condition that strands a named node.
+    #[test]
+    fn moving_between_repository_surfaces_repaints_the_window() {
+        use cosmic::iced::advanced::widget::Tree;
+
+        let (mut app, card) = editing_repository_app();
+        let mut renderer = headless_renderer();
+        let mut tree = Tree::empty();
+        present(&app, &mut renderer, &mut tree);
+
+        for action in [
+            RepositoryAction::ApplySourceSurface { card, diff: true },
+            RepositoryAction::ApplySourceSurface { card, diff: false },
+            RepositoryAction::BackToFiles { card },
+            RepositoryAction::DiscardEdits { card },
+            RepositoryAction::RefreshFiles { card },
+        ] {
+            let _ = app.update(Message::Repository(action));
+            present(&app, &mut renderer, &mut tree);
+            assert_frame_is_faithful(&app, &tree);
+        }
+    }
+
+    /// The dirty-close dialog's controls are named too, and the row they sit
+    /// in changes membership: Discard leaves while a save is in flight and
+    /// comes back when the save fails, which is exactly the transition a user
+    /// walks through by answering "Save and close" to a file the disk then
+    /// refuses.
+    ///
+    /// The dialog itself joins and leaves the popover libcosmic composes the
+    /// frame from, so opening one is a membership change in the outermost list
+    /// there is - which is why this starts from a frame with no dialog on it.
+    #[test]
+    fn a_failed_save_repaints_the_dirty_close_dialog() {
+        use cosmic::iced::advanced::widget::Tree;
+
+        let (mut app, card) = editing_repository_app();
+        let mut renderer = headless_renderer();
+        let mut tree = Tree::empty();
+
+        present(&app, &mut renderer, &mut tree);
+        assert_frame_is_faithful(&app, &tree);
+
+        let _ = app.update(Message::CloseCard(card));
+        assert!(
+            app.dirty_repository_close.is_some(),
+            "closing a card with an unsaved buffer asks before destroying it"
+        );
+        present(&app, &mut renderer, &mut tree);
+        assert_frame_is_faithful(&app, &tree);
+
+        // The save starts: Discard leaves, because there is nothing coherent
+        // to abandon while a write is in flight.
+        let _ = app.update(Message::SaveAndCloseRepository(card));
+        present(&app, &mut renderer, &mut tree);
+        assert_frame_is_faithful(&app, &tree);
+
+        // The save fails: the buffer is dirty again and Discard comes back,
+        // in the middle of the row rather than at its end.
+        let Some(CardRuntime::Repository(runtime)) = app.cards.get(&card) else {
+            panic!("the card is a repository");
+        };
+        let failed = runtime.failed_active_save_completion();
+        let _ = app.update(Message::Repository(failed));
+        assert!(
+            app.dirty_repository_close.is_some(),
+            "a failed save leaves the dialog up"
+        );
+        present(&app, &mut renderer, &mut tree);
+        assert_frame_is_faithful(&app, &tree);
     }
 
     #[test]
@@ -8458,6 +10063,661 @@ mod tests {
         }
     }
 
+    fn diagnostic(message: &str) -> crate::lsp::LspDiagnostic {
+        crate::lsp::LspDiagnostic {
+            range: crate::lsp::LspRange::new(LspPosition::new(0, 0), LspPosition::new(0, 1)),
+            severity: crate::lsp::LspSeverity::Error,
+            message: message.into(),
+            source: None,
+            code: None,
+        }
+    }
+
+    fn completion_item(label: &str) -> crate::lsp::LspCompletionItem {
+        crate::lsp::LspCompletionItem {
+            label: label.into(),
+            kind: None,
+            detail: None,
+            documentation: None,
+            sort_text: None,
+            filter_text: None,
+            preselect: false,
+            deprecated: false,
+            edit: crate::lsp::LspCompletionEdit {
+                range: crate::lsp::LspRange::new(LspPosition::new(0, 0), LspPosition::new(0, 0)),
+                replace_range: None,
+                new_text: label.into(),
+                snippet: None,
+            },
+            additional_edits: Vec::new(),
+        }
+    }
+
+    fn lsp_test_app() -> Cagents {
+        let mut app = context_inspector_test_app(false);
+        // No configured server, so nothing in these tests can spawn a process
+        // or depend on one being installed on the machine running them.
+        app.settings.language_servers = Vec::new();
+        app.lsp = LspManager::new(Vec::new());
+        app
+    }
+
+    fn repository_card(app: &mut Cagents, worktree: &str) -> CardId {
+        let card = CardId::new();
+        app.cards.insert(
+            card,
+            CardRuntime::Repository(Box::new(
+                repository_widget::RepositoryRuntime::file_list_fixture(
+                    RepositoryView {
+                        project: ProjectId::new(),
+                        repository: PathBuf::from(worktree),
+                        worktree: PathBuf::from(worktree),
+                    },
+                    &["src/main.rs", "src/other.rs"],
+                ),
+            )),
+        );
+        card
+    }
+
+    fn lsp_state(app: &mut Cagents, card: CardId) -> &mut LspInspectorState {
+        app.lsp_contexts.entry(card).or_default()
+    }
+
+    fn notice(app: &Cagents) -> Option<&str> {
+        app.status.as_ref().map(|notice| notice.message.as_str())
+    }
+
+    /// A card is closed far more often than a file is. Leaving its document
+    /// open would keep a server analysing and publishing for a file nobody can
+    /// see, and would grow all three maps for the life of the session.
+    #[test]
+    fn closing_a_card_retires_everything_it_held_at_the_lsp_boundary() {
+        let mut app = lsp_test_app();
+        let card = repository_card(&mut app, "/repo");
+        let state = lsp_state(&mut app, card);
+        state.document = Some(LspDocumentId(1));
+        state.path = Some(PathBuf::from("/repo/a.rs"));
+        app.lsp_documents.insert(LspDocumentId(1), card);
+        app.lsp_pending_jumps.insert(
+            card,
+            PendingLspJump {
+                path: PathBuf::from("/repo/b.rs"),
+                at: LspPosition::new(0, 0),
+                coordinates: LspCoordinates::Scalar,
+            },
+        );
+
+        let _ = app.update(Message::CommitClose(card));
+
+        assert!(!app.cards.contains_key(&card));
+        assert!(!app.lsp_contexts.contains_key(&card));
+        assert!(!app.lsp_documents.contains_key(&LspDocumentId(1)));
+        assert!(!app.lsp_pending_jumps.contains_key(&card));
+    }
+
+    /// Diagnostics are unsolicited and replace each other wholesale, so a list
+    /// on screen can outlive the text it describes. Jumping into a stale one
+    /// puts the caret on a line the server never named.
+    /// The two versions are equal only when both are known. An application
+    /// that kept a count of its own would satisfy this predicate while the
+    /// manager had silently moved on - a restart, a crash-respawn, or a second
+    /// card opening the same file all bump the manager's version without any
+    /// edit having been made.
+    #[test]
+    fn diagnostics_are_current_only_when_both_versions_are_known_and_equal() {
+        assert!(diagnostics_are_current(Some(4), Some(4)));
+        assert!(!diagnostics_are_current(Some(4), Some(5)));
+        assert!(!diagnostics_are_current(Some(5), Some(4)));
+        // No document: nothing published for it can still describe it.
+        assert!(!diagnostics_are_current(Some(4), None));
+        // Nothing published: there is no list to jump into.
+        assert!(!diagnostics_are_current(None, Some(4)));
+        assert!(!diagnostics_are_current(None, None));
+    }
+
+    /// The jump arm must consult that predicate rather than jumping blind.
+    #[test]
+    fn a_jump_into_stale_diagnostics_is_refused() {
+        let mut app = lsp_test_app();
+        let card = repository_card(&mut app, "/repo");
+        // A published list, and a document the manager does not hold, which is
+        // exactly the shape the predicate refuses.
+        lsp_state(&mut app, card).document = Some(LspDocumentId(1));
+        lsp_state(&mut app, card).diagnostics_version = Some(6);
+
+        let _ = app.update_lsp(InspectorAction::JumpToLspDiagnostic {
+            card,
+            at: LspPosition::new(3, 0),
+        });
+        assert_eq!(
+            notice(&app),
+            Some("these diagnostics describe an earlier version of the file")
+        );
+    }
+
+    /// The completion list is addressed by position and a fresh response
+    /// replaces it wholesale, so the label is the fingerprint that catches a
+    /// list which changed under the press.
+    #[test]
+    fn a_completion_whose_label_moved_is_not_applied() {
+        let mut app = lsp_test_app();
+        let card = repository_card(&mut app, "/repo");
+        lsp_state(&mut app, card).context.completions = vec![completion_item("alpha")];
+
+        let _ = app.update_lsp(InspectorAction::ApplyLspCompletion {
+            card,
+            index: 0,
+            label: "beta".into(),
+        });
+        assert_eq!(
+            notice(&app),
+            Some("the completion list changed; nothing was applied")
+        );
+        // Refused, not consumed: the list the user is looking at is still there.
+        assert_eq!(app.lsp_contexts[&card].context.completions.len(), 1);
+
+        // A matching fingerprint gets as far as the buffer, which is a
+        // different outcome from the refusal above.
+        app.status = None;
+        let _ = app.update_lsp(InspectorAction::ApplyLspCompletion {
+            card,
+            index: 0,
+            label: "alpha".into(),
+        });
+        assert_eq!(
+            notice(&app),
+            Some("`alpha` could not be applied to this buffer")
+        );
+    }
+
+    /// An index past the end of a list that shrank must not panic, and must not
+    /// silently apply the last candidate either.
+    #[test]
+    fn a_completion_index_past_the_end_applies_nothing() {
+        let mut app = lsp_test_app();
+        let card = repository_card(&mut app, "/repo");
+        lsp_state(&mut app, card).context.completions = vec![completion_item("alpha")];
+
+        let _ = app.update_lsp(InspectorAction::ApplyLspCompletion {
+            card,
+            index: 4,
+            label: "alpha".into(),
+        });
+        assert_eq!(notice(&app), None);
+        assert_eq!(app.lsp_contexts[&card].context.completions.len(), 1);
+    }
+
+    /// Two cards can hold two documents at once, and diagnostics arrive
+    /// unsolicited for either. Routing them by anything but the document id
+    /// puts one file's errors on another file's card.
+    #[test]
+    fn diagnostics_land_on_the_card_that_owns_the_document() {
+        let mut app = lsp_test_app();
+        let first = repository_card(&mut app, "/repo/first");
+        let second = repository_card(&mut app, "/repo/second");
+        lsp_state(&mut app, first).document = Some(LspDocumentId(1));
+        lsp_state(&mut app, second).document = Some(LspDocumentId(2));
+        app.lsp_documents.insert(LspDocumentId(1), first);
+        app.lsp_documents.insert(LspDocumentId(2), second);
+
+        app.apply_lsp_event(LspEvent::Diagnostics {
+            doc: LspDocumentId(2),
+            version: 1,
+            items: vec![diagnostic("undefined name")],
+        });
+
+        assert_eq!(app.lsp_contexts[&second].context.diagnostics.len(), 1);
+        assert_eq!(app.lsp_contexts[&second].diagnostics_version, Some(1));
+        assert!(app.lsp_contexts[&first].context.diagnostics.is_empty());
+        assert_eq!(app.lsp_contexts[&first].diagnostics_version, None);
+    }
+
+    /// An event for a document nobody holds any more has no surface to land on.
+    #[test]
+    fn an_event_for_a_closed_document_is_dropped() {
+        let mut app = lsp_test_app();
+        let card = repository_card(&mut app, "/repo");
+        lsp_state(&mut app, card).document = Some(LspDocumentId(1));
+        app.lsp_documents.insert(LspDocumentId(1), card);
+
+        app.apply_lsp_event(LspEvent::Diagnostics {
+            doc: LspDocumentId(9),
+            version: 1,
+            items: vec![diagnostic("undefined name")],
+        });
+
+        assert!(app.lsp_contexts[&card].context.diagnostics.is_empty());
+    }
+
+    /// A desync means the two sides disagreed about the text every answer was
+    /// computed against. The buffer survives; the answers cannot.
+    #[test]
+    fn a_desync_drops_the_answers_and_keeps_the_diagnostics() {
+        let mut app = lsp_test_app();
+        let card = repository_card(&mut app, "/repo");
+        app.lsp_documents.insert(LspDocumentId(1), card);
+        let state = lsp_state(&mut app, card);
+        state.document = Some(LspDocumentId(1));
+        state.context.hover = Some("hover".into());
+        state.context.completions = vec![completion_item("alpha")];
+        state.context.locations = Some((crate::lsp::LocationKind::Definition, Vec::new()));
+        state.context.diagnostics = vec![diagnostic("undefined name")];
+
+        app.apply_lsp_event(LspEvent::DocumentDesynced {
+            doc: LspDocumentId(1),
+            version: 12,
+            error: LspError::NoServer,
+        });
+
+        let state = &app.lsp_contexts[&card];
+        assert!(state.context.hover.is_none());
+        assert!(state.context.completions.is_empty());
+        assert!(state.context.locations.is_none());
+        // Diagnostics are the server's own standing answer, replaced on its
+        // schedule, and are refused by version at the point of use instead.
+        assert_eq!(state.context.diagnostics.len(), 1);
+        assert!(state.context.notice.is_some());
+    }
+
+    /// A superseded request is the ordinary result of typing while one is in
+    /// flight. Reporting it would put a notice on screen for every keystroke.
+    #[test]
+    fn a_cancelled_request_is_not_reported() {
+        let mut app = lsp_test_app();
+        let card = repository_card(&mut app, "/repo");
+        lsp_state(&mut app, card).document = Some(LspDocumentId(1));
+        app.lsp_documents.insert(LspDocumentId(1), card);
+
+        app.apply_lsp_event(LspEvent::RequestFailed {
+            request: crate::lsp::LspRequestId(1),
+            doc: LspDocumentId(1),
+            error: LspError::Cancelled,
+        });
+        assert!(app.lsp_contexts[&card].context.notice.is_none());
+
+        app.apply_lsp_event(LspEvent::RequestFailed {
+            request: crate::lsp::LspRequestId(2),
+            doc: LspDocumentId(1),
+            error: LspError::NoServer,
+        });
+        assert!(app.lsp_contexts[&card].context.notice.is_some());
+    }
+
+    /// Progress is transient by definition, so it occupies the notice slot and
+    /// is cleared on `done` rather than accumulating a log nobody dismisses.
+    #[test]
+    fn progress_occupies_the_notice_slot_until_it_is_done() {
+        let mut app = lsp_test_app();
+        let card = repository_card(&mut app, "/repo");
+        lsp_state(&mut app, card).document = Some(LspDocumentId(1));
+        app.lsp_documents.insert(LspDocumentId(1), card);
+
+        app.apply_lsp_event(LspEvent::Progress {
+            doc: LspDocumentId(1),
+            progress: crate::lsp::LspProgress {
+                token: "indexing".into(),
+                title: Some("Indexing".into()),
+                message: None,
+                percentage: Some(40),
+                done: false,
+            },
+        });
+        assert_eq!(
+            app.lsp_contexts[&card].context.notice.as_deref(),
+            Some("Indexing (40%)")
+        );
+
+        app.apply_lsp_event(LspEvent::Progress {
+            doc: LspDocumentId(1),
+            progress: crate::lsp::LspProgress {
+                token: "indexing".into(),
+                title: Some("Indexing".into()),
+                message: None,
+                percentage: Some(100),
+                done: true,
+            },
+        });
+        assert!(app.lsp_contexts[&card].context.notice.is_none());
+    }
+
+    /// A location arrives absolute and the card's file list is
+    /// worktree-relative. A target the worktree does not contain has no row to
+    /// open, and must not be guessed at.
+    #[test]
+    fn a_jump_outside_the_worktree_opens_nothing() {
+        let mut app = lsp_test_app();
+        let card = repository_card(&mut app, "/repo");
+
+        let _ = app.update_lsp(InspectorAction::JumpToLspLocation {
+            card,
+            path: PathBuf::from("/elsewhere/other.rs"),
+            at: LspPosition::new(1, 0),
+            coordinates: LspCoordinates::Scalar,
+        });
+
+        assert_eq!(
+            notice(&app),
+            Some("that definition is outside this worktree")
+        );
+        assert!(!app.lsp_pending_jumps.contains_key(&card));
+    }
+
+    /// A jump into a file the card is not showing parks until that file is the
+    /// open buffer: a column is only placeable against the text it indexes.
+    #[test]
+    fn a_jump_into_another_file_parks_until_it_is_open() {
+        let mut app = lsp_test_app();
+        let card = repository_card(&mut app, "/repo");
+
+        let task = app.update_lsp(InspectorAction::JumpToLspLocation {
+            card,
+            path: PathBuf::from("/repo/src/other.rs"),
+            at: LspPosition::new(4, 2),
+            coordinates: LspCoordinates::Utf16,
+        });
+
+        // Parking without asking the card to open the file is a jump that never
+        // lands: that open is the only thing that releases it, and the file
+        // list it addresses is keyed on the worktree-relative path.
+        assert!(matches!(
+            task_app_message(task),
+            Message::Repository(RepositoryAction::OpenFile { card: at, ref path })
+                if at == card && path == Path::new("src/other.rs")
+        ));
+        let parked = app
+            .lsp_pending_jumps
+            .get(&card)
+            .expect("the jump is parked on the open");
+        // Parked absolute, because that is the side the *next* open reports and
+        // the only side the two can be compared on.
+        assert_eq!(parked.path, PathBuf::from("/repo/src/other.rs"));
+        assert_eq!(parked.at, LspPosition::new(4, 2));
+        assert_eq!(parked.coordinates, LspCoordinates::Utf16);
+        assert_eq!(notice(&app), None);
+    }
+
+    /// Who holds the keyboard once a task's widget operations have run.
+    ///
+    /// Focus arrives as a widget operation rather than a message, so it is
+    /// read the way the runtime reads one: run the task's operations over the
+    /// tree the frame actually built, then ask that tree who holds focus.
+    fn focused(app: &Cagents, task: Task<Message>) -> Option<widget::Id> {
+        use cosmic::iced::advanced::layout;
+        use cosmic::iced::advanced::widget::Tree;
+        use cosmic::iced::advanced::widget::{Operation, operation};
+        use cosmic::iced::{Size, advanced::Layout};
+
+        let renderer = headless_renderer();
+        let mut element: cosmic::Element<'_, Message> = cosmic::Application::view(app);
+        let mut tree = Tree::new(element.as_widget_mut());
+        let node = element.as_widget_mut().layout(
+            &mut tree,
+            &renderer,
+            &layout::Limits::new(Size::ZERO, Size::new(1600.0, 1200.0)),
+        );
+
+        // An empty task is not an error here: it is precisely the answer a
+        // jump that forgot to focus gives, and the assertion that reads this
+        // says so far better than an unwrap would.
+        if let Some(mut stream) = cosmic::iced::runtime::task::into_stream(task) {
+            let executor = tokio::runtime::Builder::new_current_thread()
+                .build()
+                .expect("executor");
+            while let Some(action) = executor.block_on(stream.next()) {
+                let cosmic::iced::runtime::Action::Widget(mut operation) = action else {
+                    continue;
+                };
+                element.as_widget_mut().operate(
+                    &mut tree,
+                    Layout::new(&node),
+                    &renderer,
+                    &mut operation,
+                );
+            }
+        }
+
+        // `find_focused` reports an `Id`; `operate` takes an operation over
+        // `()`, so the answer comes back through a cell.
+        let found: Arc<std::sync::Mutex<Option<widget::Id>>> = Default::default();
+        let sink = Arc::clone(&found);
+        let mut probe = operation::map(operation::focusable::find_focused(), move |id| {
+            *sink.lock().expect("the probe is not shared across a panic") = Some(id);
+        });
+        element
+            .as_widget_mut()
+            .operate(&mut tree, Layout::new(&node), &renderer, &mut probe);
+        let _ = probe.finish();
+        let answer = found.lock().expect("the probe survived").clone();
+        answer
+    }
+
+    /// A jump that moves the caret must also hand the editor the keyboard.
+    ///
+    /// An unfocused `text_editor` draws no caret at all, so without this the
+    /// application answers a click on a result with a frame indistinguishable
+    /// from the one the user clicked in - measured live before this was wired:
+    /// frame differencing over the caret's blink found a 2px column with the
+    /// editor focused and zero pixel delta after a jump.
+    #[test]
+    fn a_jump_gives_the_editor_the_keyboard() {
+        let (mut app, card) = editing_repository_app();
+
+        // Into the buffer that is already open, which is the one jump that
+        // needs no running server to place its caret.
+        lsp_state(&mut app, card).path = Some(PathBuf::from("/repo/notes.txt"));
+        let task = app.update_lsp(InspectorAction::JumpToLspLocation {
+            card,
+            path: PathBuf::from("/repo/notes.txt"),
+            at: LspPosition::new(0, 0),
+            coordinates: LspCoordinates::Scalar,
+        });
+        assert_eq!(
+            focused(&app, task),
+            Some(repository_widget::editor_focus_id(card)),
+            "the jump left the editor unfocused, so its caret is invisible"
+        );
+    }
+
+    /// The same, for the jump that has to open a file first.
+    ///
+    /// Go to definition and Find references usually land in a *different*
+    /// file, so the caret cannot be placed when the answer arrives: the jump
+    /// is parked, the file is opened, and the open answers it. That second
+    /// path reaches the caret through `flush_pending_lsp_jump` rather than
+    /// directly, and has to hand over the keyboard just the same - a caret
+    /// placed in a buffer nobody focused is a caret nobody can see.
+    #[test]
+    fn a_jump_that_opens_a_file_gives_the_editor_the_keyboard_too() {
+        let (mut app, card) = editing_repository_app();
+
+        // Parked the way `jump_to_lsp_location` parks one, on the path the
+        // card is about to open.
+        let path = PathBuf::from("/repo/notes.txt");
+        lsp_state(&mut app, card).path = Some(path.clone());
+        app.lsp_pending_jumps.insert(
+            card,
+            PendingLspJump {
+                path: path.clone(),
+                at: LspPosition::new(0, 0),
+                coordinates: LspCoordinates::Scalar,
+            },
+        );
+
+        let task = app.flush_pending_lsp_jump(card, &path);
+
+        assert!(
+            !app.lsp_pending_jumps.contains_key(&card),
+            "the open answered the jump, so it must not stay parked"
+        );
+        assert_eq!(
+            focused(&app, task),
+            Some(repository_widget::editor_focus_id(card)),
+            "the jump placed its caret in a buffer it never focused, so the caret is invisible"
+        );
+    }
+
+    /// A definition can resolve into a file the card has no row for - a
+    /// generated or ignored source inside the worktree. `OpenFile` answers
+    /// those by doing nothing, so parking on that open would wait forever and
+    /// leave the user with no answer at all.
+    #[test]
+    fn a_jump_into_a_file_the_card_cannot_open_says_so() {
+        let mut app = lsp_test_app();
+        let card = repository_card(&mut app, "/repo");
+
+        let _ = app.update_lsp(InspectorAction::JumpToLspLocation {
+            card,
+            path: PathBuf::from("/repo/target/generated.rs"),
+            at: LspPosition::new(1, 0),
+            coordinates: LspCoordinates::Scalar,
+        });
+
+        assert_eq!(
+            notice(&app),
+            Some("target/generated.rs is not in this worktree's file list")
+        );
+        assert!(!app.lsp_pending_jumps.contains_key(&card));
+    }
+
+    /// A jump is answered by the open it asked for or by nothing. Surviving an
+    /// unrelated open would let the caret be yanked minutes later, when the
+    /// user opens that file themselves, against text that has since changed.
+    #[test]
+    fn a_parked_jump_does_not_survive_a_different_file_opening() {
+        let mut app = lsp_test_app();
+        let card = repository_card(&mut app, "/repo");
+        app.lsp_pending_jumps.insert(
+            card,
+            PendingLspJump {
+                path: PathBuf::from("/repo/src/other.rs"),
+                at: LspPosition::new(4, 2),
+                coordinates: LspCoordinates::Scalar,
+            },
+        );
+
+        // The flush is driven directly because these fixtures configure no
+        // server, so `open_lsp_document` short-circuits into the disabled
+        // status before reaching it - the half that
+        // `a_file_with_no_server_reports_disabled_and_clears_a_parked_jump`
+        // already covers.
+        let _ = app.flush_pending_lsp_jump(card, Path::new("/repo/src/main.rs"));
+
+        assert!(!app.lsp_pending_jumps.contains_key(&card));
+    }
+
+    /// The notice slot has two independent producers. An indexing report
+    /// arriving a second later must not erase the one message telling the user
+    /// their hover, locations and completions were thrown away.
+    #[test]
+    fn progress_does_not_erase_a_failure_the_user_has_not_read() {
+        let mut app = lsp_test_app();
+        let card = repository_card(&mut app, "/repo");
+        lsp_state(&mut app, card).document = Some(LspDocumentId(1));
+        app.lsp_documents.insert(LspDocumentId(1), card);
+
+        app.apply_lsp_event(LspEvent::DocumentDesynced {
+            doc: LspDocumentId(1),
+            version: 3,
+            error: LspError::NoServer,
+        });
+        let failure = app.lsp_contexts[&card]
+            .context
+            .notice
+            .clone()
+            .expect("the desync is reported");
+
+        for done in [false, true] {
+            app.apply_lsp_event(LspEvent::Progress {
+                doc: LspDocumentId(1),
+                progress: crate::lsp::LspProgress {
+                    token: "indexing".into(),
+                    title: Some("Indexing".into()),
+                    message: None,
+                    percentage: None,
+                    done,
+                },
+            });
+            assert_eq!(
+                app.lsp_contexts[&card].context.notice.as_deref(),
+                Some(failure.as_str()),
+                "progress with done={done} replaced the failure"
+            );
+        }
+
+        // Dismissing is the user saying they have read it; only then may
+        // progress have the slot.
+        let _ = app.update_lsp(InspectorAction::DismissLspResults(card));
+        app.apply_lsp_event(LspEvent::Progress {
+            doc: LspDocumentId(1),
+            progress: crate::lsp::LspProgress {
+                token: "indexing".into(),
+                title: Some("Indexing".into()),
+                message: None,
+                percentage: Some(10),
+                done: false,
+            },
+        });
+        assert_eq!(
+            app.lsp_contexts[&card].context.notice.as_deref(),
+            Some("Indexing (10%)")
+        );
+    }
+
+    /// Opening a file no configured server claims is a supported configuration,
+    /// not a failure, and it must not leave an earlier file's jump parked.
+    #[test]
+    fn a_file_with_no_server_reports_disabled_and_clears_a_parked_jump() {
+        let mut app = lsp_test_app();
+        let card = repository_card(&mut app, "/repo");
+        app.lsp_pending_jumps.insert(
+            card,
+            PendingLspJump {
+                path: PathBuf::from("/repo/gone.rs"),
+                at: LspPosition::new(1, 0),
+                coordinates: LspCoordinates::Scalar,
+            },
+        );
+
+        let _ = app.open_lsp_document(
+            card,
+            Path::new("/repo/notes.unknownext"),
+            Path::new("/repo"),
+            1,
+            "text\n",
+        );
+
+        let state = &app.lsp_contexts[&card];
+        assert_eq!(state.context.status, Some(LspStatus::Disabled));
+        assert!(state.document.is_none());
+        // Recorded even with no server: the file *is* open, and a later jump
+        // compares against this path to decide whether it must open anything.
+        assert_eq!(
+            state.path.as_deref(),
+            Some(Path::new("/repo/notes.unknownext"))
+        );
+        assert!(!app.lsp_pending_jumps.contains_key(&card));
+    }
+
+    /// Closing the buffer must retract the document from the routing map, or a
+    /// later document reusing the card would receive the dead one's events.
+    #[test]
+    fn closing_a_document_retracts_it_from_the_routing_map() {
+        let mut app = lsp_test_app();
+        let card = repository_card(&mut app, "/repo");
+        lsp_state(&mut app, card).document = Some(LspDocumentId(1));
+        lsp_state(&mut app, card).path = Some(PathBuf::from("/repo/a.rs"));
+        app.lsp_documents.insert(LspDocumentId(1), card);
+
+        app.close_lsp_document(card);
+
+        assert!(app.lsp_documents.is_empty());
+        let state = &app.lsp_contexts[&card];
+        assert!(state.document.is_none());
+        assert!(state.path.is_none());
+        assert_eq!(state.diagnostics_version, None);
+    }
+
     fn context_inspector_test_app(with_focused_card: bool) -> Cagents {
         let card = with_focused_card.then(terminal_card_state);
         let card_id = card.as_ref().map(|card| card.id);
@@ -8483,6 +10743,11 @@ mod tests {
                 max_hot_cards: settings.max_hot_cards,
                 offscreen_grace: Duration::from_millis(settings.hibernation_delay_ms),
             }),
+            lsp: LspManager::new(settings.language_servers.clone()),
+            lsp_documents: HashMap::new(),
+            lsp_contexts: HashMap::new(),
+            lsp_pending_jumps: HashMap::new(),
+            next_lsp_document: 0,
             lifecycle_sweep_deadline: None,
             lifecycle_sweep_generation: 0,
             terminal_wake_tx,
@@ -8510,6 +10775,7 @@ mod tests {
             worktree_dialog: None,
             pull_request_dialog: None,
             dirty_repository_close: None,
+            pending_panel_open: None,
             deferred_navigation: VecDeque::new(),
             frame_clock: FrameClock::default(),
             inspector: None,
@@ -9135,5 +11401,173 @@ mod tests {
             assert_eq!(display_path(&home), home.to_string_lossy());
             assert_eq!(display_path(&home.join("src/x")), "~/src/x");
         }
+    }
+
+    fn discard_key() -> ActiveWorktreeKey {
+        ActiveWorktreeKey {
+            project_id: ProjectId::default(),
+            worktree_id: crate::model::WorktreeId::new(),
+            canonical_path: PathBuf::from("/repo/main"),
+        }
+    }
+
+    fn discard_request(confirmed: bool) -> crate::repository::DiscardRequest {
+        crate::repository::DiscardRequest {
+            worktree: PathBuf::from("/repo/main"),
+            tracked: Vec::new(),
+            untracked: vec![RepoPath::parse("notes.txt").expect("a repository path")],
+            confirmed,
+        }
+    }
+
+    #[test]
+    fn only_the_discard_confirmations_own_answers_survive_the_modal_guard() {
+        // `Message::Sidebar` is refused while any dialog is up, because the
+        // pane keeps its focus behind the overlay and an accessibility Click
+        // is not captured at all. The discard confirmation is mounted by
+        // `dialog` rather than by `sidebar::view`, so its Cancel and Discard
+        // arrive down this same route: refusing them would strand the dialog
+        // with no way out.
+        for action in [
+            SidebarAction::ConfirmDiscard {
+                key: discard_key(),
+                request: discard_request(true),
+            },
+            SidebarAction::CancelDiscard,
+        ] {
+            assert!(
+                answers_discard_confirmation(&action),
+                "{action:?} is one of the dialog's own two answers"
+            );
+            assert!(
+                !user_workspace_message_blocked_while_modal(&Message::Sidebar(action.clone())),
+                "{action:?} must also survive the deferred-navigation queue, which drops every \
+                 message it decides a modal blocks"
+            );
+        }
+
+        for action in [
+            SidebarAction::RequestDiscard {
+                key: discard_key(),
+                request: discard_request(false),
+            },
+            SidebarAction::Stage {
+                key: discard_key(),
+                selection: Vec::new(),
+            },
+            SidebarAction::Commit {
+                key: discard_key(),
+                message: "wip".into(),
+            },
+            SidebarAction::Refresh,
+        ] {
+            assert!(
+                !answers_discard_confirmation(&action),
+                "{action:?} is a pane command and must stand down behind a dialog"
+            );
+            assert!(user_workspace_message_blocked_while_modal(
+                &Message::Sidebar(action)
+            ));
+        }
+    }
+
+    #[test]
+    fn a_pending_discard_reads_as_a_modal_and_mounts_its_own_confirmation() {
+        let mut app = context_inspector_test_app(false);
+        assert!(!app.modal_is_open());
+        assert!(app.dialog().is_none());
+
+        app.sidebar_state.apply(&SidebarAction::RequestDiscard {
+            key: discard_key(),
+            request: discard_request(false),
+        });
+        assert!(
+            app.modal_is_open(),
+            "the one dialog that is on screen because it is about to destroy work must not be \
+             the one dialog the pane keeps its commands live behind"
+        );
+        assert!(
+            app.dialog().is_some(),
+            "a pending discard is mounted by `dialog`; nothing else mounts it"
+        );
+
+        app.sidebar_state.apply(&SidebarAction::CancelDiscard);
+        assert!(!app.modal_is_open());
+        assert!(app.dialog().is_none());
+    }
+
+    #[test]
+    fn a_mutation_that_did_not_do_all_of_what_it_was_asked_says_so() {
+        let path = RepoPath::parse("src/app.rs").expect("a repository path");
+        assert_eq!(
+            mutation_report(
+                "Stage",
+                Ok(MutationOutcome::Applied {
+                    paths: vec![path.clone()]
+                })
+            ),
+            None,
+            "a mutation that did everything asked reports nothing: the refreshed rows are the \
+             report"
+        );
+
+        let partial = mutation_report(
+            "Stage",
+            Ok(MutationOutcome::PartiallyApplied {
+                paths: vec![path.clone()],
+                failures: vec![crate::repository::MutationFailure::Rejected {
+                    reason: "pathspec did not match".into(),
+                }],
+            }),
+        )
+        .expect("a partial application is a failure with a known good half");
+        assert!(partial.contains("1 path"), "{partial}");
+        assert!(partial.contains("pathspec did not match"), "{partial}");
+
+        let unknown = mutation_report(
+            "Stage",
+            Ok(MutationOutcome::OutcomeUnknown {
+                failure: crate::repository::MutationFailure::Rejected {
+                    reason: "git was killed".into(),
+                },
+            }),
+        )
+        .expect("an unknown outcome is not a success");
+        assert!(unknown.contains("may or may not"), "{unknown}");
+    }
+
+    #[test]
+    fn only_a_created_commit_clears_the_message_the_user_typed() {
+        let oid = crate::repository::Oid::parse("ab".repeat(20)).expect("a valid object id");
+        assert_eq!(
+            commit_report(Ok(CommitOutcome::Created {
+                oid: oid.clone(),
+                warnings: Vec::new()
+            })),
+            (None, true)
+        );
+
+        let (report, committed) = commit_report(Ok(CommitOutcome::Created {
+            oid,
+            warnings: vec![crate::repository::MutationFailure::Rejected {
+                reason: "post-commit hook failed".into(),
+            }],
+        }));
+        assert!(committed, "the commit exists; the hook ran after it");
+        assert!(
+            report.expect("a failing hook is reported").contains("hook"),
+            "a warning that is not shown is a commit the user thinks was clean"
+        );
+
+        let (report, committed) = commit_report(Ok(CommitOutcome::NotCreated {
+            failure: crate::repository::MutationFailure::Rejected {
+                reason: "there are no staged changes to commit".into(),
+            },
+        }));
+        assert!(
+            !committed,
+            "a commit that was not created must keep the message: the text is the user's work"
+        );
+        assert!(report.is_some());
     }
 }

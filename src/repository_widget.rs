@@ -3,26 +3,32 @@
 use std::{
     collections::{BTreeMap, HashMap},
     ffi::OsString,
+    ops::Range,
     path::{Path, PathBuf},
     process::Command,
 };
 
 use cosmic::{
     Element,
-    iced::{self, Alignment, Font, Length, Task},
+    iced::{self, Alignment, Font, Length, Task, highlighter},
     widget::{self, markdown, segmented_button, text_editor},
 };
 
 use crate::{
     diff_view::{
-        DiffBasis, DiffContent, DiffMode, DiffModel, DiffRowKind, InlineDiffRow, SplitDiffRow,
+        DiffMode, DiffModel, DiffRowKind, InlineDiffRow, RenderedDiff, SplitDiffRow,
         load_repository_diff,
     },
     editor::{
         FileContent, FileIoError, ReadOnlyReason, SaveDurability, SaveOutcome, load_file,
         save_file, validate_repo_path,
     },
+    lsp::{LspCompletionEdit, LspCompletionItem, LspDocumentId, LspPosition},
     model::{CardId, RepositoryView},
+    repository::{
+        CancellationToken, DiffBasis, DiffContent, DiffSide, HistoryRequest, HistoryRevision,
+        MAX_DIFF_SIDE_BYTES, RepositoryService, RepositorySnapshot, ValidatedRefName,
+    },
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -40,17 +46,30 @@ impl RepositoryFile {
         self.staged || self.unstaged
     }
 
-    fn has_basis(&self, basis: DiffBasis) -> bool {
+    /// Whether this comparison has anything to show for this file.
+    ///
+    /// Only the two working bases are answerable from a file's status: a
+    /// committed comparison reads two trees and can differ for a file with no
+    /// local change at all, so it is always offered.
+    fn has_basis(&self, basis: &DiffBasis) -> bool {
         match basis {
-            DiffBasis::Staged => self.staged,
-            DiffBasis::Unstaged => self.unstaged,
+            DiffBasis::HeadToIndex => self.staged,
+            DiffBasis::IndexToWorktree => self.unstaged,
+            DiffBasis::MergeBaseToHead { .. } | DiffBasis::CommitToParent { .. } => true,
         }
     }
 
-    fn previous_path(&self, basis: DiffBasis) -> Option<PathBuf> {
+    /// The rename source the old side of this comparison must read.
+    ///
+    /// `git status` reports a rename source per area, which is where both
+    /// working bases get theirs. A committed comparison's rename detection
+    /// belongs to the range that produced the file list, and the card's list
+    /// comes from the working tree, so nothing is invented here.
+    fn previous_path(&self, basis: &DiffBasis) -> Option<PathBuf> {
         match basis {
-            DiffBasis::Staged => self.staged_old_path.clone(),
-            DiffBasis::Unstaged => self.unstaged_old_path.clone(),
+            DiffBasis::HeadToIndex => self.staged_old_path.clone(),
+            DiffBasis::IndexToWorktree => self.unstaged_old_path.clone(),
+            DiffBasis::MergeBaseToHead { .. } | DiffBasis::CommitToParent { .. } => None,
         }
     }
 }
@@ -68,12 +87,188 @@ fn status_with_unstaged_change(status: Option<&str>, already_unstaged: bool) -> 
     }
 }
 
+/// One choice in the card's comparison-basis control.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BasisChoice {
+    /// `HEAD` to index.
+    Staged,
+    /// Index to working tree.
+    Unstaged,
+    /// A comparison against committed history.
+    Committed(CommittedChoice),
+}
+
+/// A comparison the card cannot name without asking Git: a merge base's
+/// default ref comes from the remote's symbolic `HEAD`, and a commit's parent
+/// comes from the commit itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CommittedChoice {
+    /// Merge base of the default base ref with `HEAD`.
+    Branch,
+    /// `HEAD`'s own commit against its first parent.
+    LastCommit,
+}
+
+impl CommittedChoice {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Branch => "Branch",
+            Self::LastCommit => "Commit",
+        }
+    }
+}
+
+/// What resolving a committed comparison found.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ResolvedBasis {
+    /// A comparison ready to be read.
+    Ready(DiffBasis),
+    /// A branch comparison has no default base, because this repository has no
+    /// `refs/remotes/<remote>/HEAD` to read one from. The refs that could
+    /// serve as one are offered; a name is never guessed.
+    NeedsBase { candidates: Vec<ValidatedRefName> },
+    /// An unborn branch has no commit to compare against anything.
+    NoCommit,
+}
+
+/// Where an outstanding committed-comparison resolution got to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum BasisResolution {
+    Resolving(CommittedChoice),
+    /// The user must choose the base ref, because nothing resolved one.
+    NeedsBase(Vec<ValidatedRefName>),
+    Unavailable(String),
+}
+
+/// The comparison a basis names, for the diff surface's own chrome.
+///
+/// A committed comparison names its ref or its commit: the whole point of a
+/// fourth basis is that a user looking at one commit's diff must not see the
+/// same heading as a user looking at unstaged work.
+fn basis_label(basis: &DiffBasis) -> String {
+    match basis {
+        DiffBasis::IndexToWorktree => "Unstaged changes".into(),
+        DiffBasis::HeadToIndex => "Staged changes".into(),
+        DiffBasis::MergeBaseToHead { base_ref } => {
+            format!("Branch vs {}", base_ref.short_name())
+        }
+        DiffBasis::CommitToParent {
+            oid,
+            parent: Some(_),
+        } => format!("Commit {}", oid.short()),
+        DiffBasis::CommitToParent { oid, parent: None } => {
+            format!("Root commit {}", oid.short())
+        }
+    }
+}
+
+/// The basis in one static word, for the inspector projection, which holds
+/// `&'static str` and so cannot carry a ref name or a commit id.
+fn basis_choice_label(basis: &DiffBasis) -> &'static str {
+    match basis_choice(basis) {
+        BasisChoice::Staged => "Staged",
+        BasisChoice::Unstaged => "Unstaged",
+        BasisChoice::Committed(choice) => choice.label(),
+    }
+}
+
+/// Which control choice a basis was made from, so the widget can never show a
+/// choice the runtime has not made.
+fn basis_choice(basis: &DiffBasis) -> BasisChoice {
+    match basis {
+        DiffBasis::HeadToIndex => BasisChoice::Staged,
+        DiffBasis::IndexToWorktree => BasisChoice::Unstaged,
+        DiffBasis::MergeBaseToHead { .. } => BasisChoice::Committed(CommittedChoice::Branch),
+        DiffBasis::CommitToParent { .. } => BasisChoice::Committed(CommittedChoice::LastCommit),
+    }
+}
+
+/// What one side of a comparison is, in one word, for the inspector.
+fn side_kind(side: &DiffSide) -> &'static str {
+    match side {
+        DiffSide::Absent => "Absent",
+        DiffSide::Text { .. } => "Text",
+        DiffSide::Binary { .. } => "Binary",
+        DiffSide::InvalidUtf8 { .. } => "Invalid UTF-8",
+        DiffSide::Oversize { .. } => "Too large",
+        DiffSide::Submodule { .. } => "Submodule",
+        DiffSide::Symlink { .. } => "Symlink",
+        DiffSide::NotRegularFile => "Not a regular file",
+        DiffSide::Unreadable { .. } => "Unreadable",
+    }
+}
+
+/// The one-word state a comparison with no text rows reports.
+fn no_text_kind(content: &DiffContent) -> &'static str {
+    match content {
+        DiffContent::Unmerged { .. } => "Conflicted",
+        // At least one side is undiffable, or there would be rows; the first
+        // such side is the one the reader has to be told about.
+        DiffContent::Comparison { old, new, .. } => [old, new]
+            .into_iter()
+            .find(|side| !side.is_diffable())
+            .map_or("Unavailable", side_kind),
+    }
+}
+
+/// What one side of a comparison holds, in the diff surface's own words.
+fn side_detail(side: &DiffSide) -> String {
+    match side {
+        DiffSide::Absent => "not present".into(),
+        DiffSide::Text { bytes, .. } => format!("{bytes} bytes of text"),
+        DiffSide::Binary { bytes } => format!("binary, {bytes} bytes"),
+        DiffSide::InvalidUtf8 { bytes } => format!("not valid UTF-8, {bytes} bytes"),
+        DiffSide::Oversize { bytes } => {
+            format!("{bytes} bytes, over the {MAX_DIFF_SIDE_BYTES}-byte limit for one side")
+        }
+        DiffSide::Submodule { oid: Some(oid) } => {
+            format!("a submodule recorded at {}", oid.short())
+        }
+        DiffSide::Submodule { oid: None } => "a submodule with no recorded commit".into(),
+        DiffSide::Symlink { target } => format!("a symlink to {}", target.display()),
+        DiffSide::NotRegularFile => "not a regular file".into(),
+        DiffSide::Unreadable { reason } => format!("unreadable: {reason}"),
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AsyncIdentity {
     pub card: CardId,
     pub worktree: PathBuf,
     pub path: PathBuf,
     pub generation: u64,
+}
+
+/// One thing the language server must be told about the open document.
+///
+/// The runtime records these; the application drains them with
+/// [`RepositoryRuntime::take_lsp_intents`] and performs them, because the
+/// runtime owns no [`crate::lsp::LspManager`] and does no I/O.
+#[derive(Debug, Clone, PartialEq)]
+pub enum LspIntent {
+    /// The buffer became the card's open document. `absolute_path` is
+    /// resolvable on disk; [`AsyncIdentity::path`] is worktree-relative and a
+    /// document URI cannot be built from it alone.
+    Open {
+        absolute_path: PathBuf,
+        worktree: PathBuf,
+        version: i32,
+        text: String,
+    },
+    /// The buffer changed. `text` is the whole document, because
+    /// [`text_editor::Action`] and [`text_editor::Edit`] carry no ranges: the
+    /// widget reports *what* was pressed, never *where* the resulting text
+    /// differs. Incremental synchronisation is therefore unavailable by
+    /// construction, not by omission, and the application must call
+    /// [`crate::lsp::LspManager::change`] with an empty edit slice so the
+    /// manager sends the full document rather than trying to reconcile edits
+    /// it was never given.
+    Change { version: i32, text: String },
+    /// The buffer reached disk. `text` is what was written.
+    Save { text: String },
+    /// The buffer is gone: another file was opened over it, or the card
+    /// returned to its file list.
+    Close,
 }
 
 #[derive(Debug, Clone)]
@@ -100,7 +295,7 @@ pub enum RepositoryAction {
         identity: AsyncIdentity,
         basis: DiffBasis,
         request: u64,
-        content: DiffContent,
+        content: RenderedDiff,
     },
     EditorAction {
         card: CardId,
@@ -154,9 +349,16 @@ pub enum RepositoryAction {
         card: CardId,
         entity: segmented_button::Entity,
     },
+    /// Installs a fully-formed comparison, however it was chosen: the basis
+    /// control, the base-ref picker, or any other producer of one.
     ApplyDiffBasis {
         card: CardId,
-        staged: bool,
+        basis: DiffBasis,
+    },
+    DiffBasisResolved {
+        identity: AsyncIdentity,
+        choice: CommittedChoice,
+        result: Result<ResolvedBasis, String>,
     },
     RetryDiff {
         card: CardId,
@@ -211,6 +413,7 @@ impl RepositoryAction {
             Self::FilesLoaded { identity, .. }
             | Self::FileLoaded { identity, .. }
             | Self::DiffLoaded { identity, .. }
+            | Self::DiffBasisResolved { identity, .. }
             | Self::SaveFinished { identity, .. } => identity.card,
         }
     }
@@ -228,55 +431,64 @@ enum MarkdownMode {
     Preview,
 }
 
-struct TwoChoiceControl<T> {
+/// A segmented control over a fixed set of values.
+///
+/// The values are the control's state: activation resolves an entity to one of
+/// them and applying a value activates the entity carrying it, so the widget
+/// can never show a choice the runtime has not made. Generalised from a
+/// two-choice control because the comparison basis has four.
+struct ChoiceControl<T> {
     model: segmented_button::SingleSelectModel,
-    first: segmented_button::Entity,
-    second: segmented_button::Entity,
-    first_value: T,
-    second_value: T,
+    choices: Vec<(segmented_button::Entity, T)>,
 }
 
-impl<T: Copy> TwoChoiceControl<T> {
-    fn new(
-        first_label: &'static str,
-        first_value: T,
-        second_label: &'static str,
-        second_value: T,
-    ) -> Self {
-        let mut model = segmented_button::Model::builder()
-            .insert(|builder| builder.text(first_label).activate())
-            .insert(|builder| builder.text(second_label))
-            .build();
-        Self {
-            first: model.entity_at(0).expect("first segmented choice exists"),
-            second: model.entity_at(1).expect("second segmented choice exists"),
-            model,
-            first_value,
-            second_value,
+impl<T: Copy + PartialEq> ChoiceControl<T> {
+    fn new(choices: &[(&'static str, T)]) -> Self {
+        debug_assert!(!choices.is_empty(), "a control needs at least one choice");
+        let mut builder = segmented_button::Model::builder();
+        for (index, (label, _)) in choices.iter().enumerate() {
+            builder = builder.insert(|item| {
+                let item = item.text(*label);
+                if index == 0 { item.activate() } else { item }
+            });
         }
+        let mut model = builder.build();
+        let choices = choices
+            .iter()
+            .zip(0u16..)
+            .map(|((_, value), index)| {
+                (
+                    model
+                        .entity_at(index)
+                        .expect("every inserted choice has an entity"),
+                    *value,
+                )
+            })
+            .collect();
+        Self { model, choices }
     }
 
     fn activate(&mut self, entity: segmented_button::Entity) -> Option<T> {
-        let value = if entity == self.first {
-            self.first_value
-        } else if entity == self.second {
-            self.second_value
-        } else {
-            return None;
-        };
+        let value = self
+            .choices
+            .iter()
+            .find(|(candidate, _)| *candidate == entity)
+            .map(|(_, value)| *value)?;
         self.model.activate(entity);
         Some(value)
     }
 
-    fn activate_value(&mut self, value: T)
-    where
-        T: PartialEq,
-    {
-        self.model.activate(if value == self.first_value {
-            self.first
-        } else {
-            self.second
-        });
+    fn activate_value(&mut self, value: T) {
+        if let Some(entity) = self.entity_of(value) {
+            self.model.activate(entity);
+        }
+    }
+
+    fn entity_of(&self, value: T) -> Option<segmented_button::Entity> {
+        self.choices
+            .iter()
+            .find(|(_, candidate)| *candidate == value)
+            .map(|(entity, _)| *entity)
     }
 }
 
@@ -289,6 +501,16 @@ struct EditorDocument {
     markdown_items: Vec<markdown::Item>,
     dirty: bool,
     revision: u64,
+    /// Version of this buffer as the language server counts it: monotonic and
+    /// starting at the `1` sent with `textDocument/didOpen`.
+    ///
+    /// Deliberately not [`EditorDocument::revision`], which is a `u64` that
+    /// *wraps* — a wrapped version would silently rewind the server's idea of
+    /// the document, while [`crate::lsp::LspManager::change`] takes an `i32`
+    /// and reports exhaustion as [`crate::lsp::LspError::VersionExhausted`].
+    /// This one saturates instead, and a saturated document simply stops
+    /// reporting changes.
+    lsp_version: i32,
     active_save: Option<SaveTicket>,
     conflict: bool,
     error: Option<String>,
@@ -319,6 +541,7 @@ impl EditorDocument {
             markdown_items,
             dirty: false,
             revision: 0,
+            lsp_version: 1,
             active_save: None,
             conflict: false,
             error: None,
@@ -351,6 +574,217 @@ impl EditorDocument {
         self.conflict = false;
         self.error = None;
     }
+
+    /// Advances the version the language server will be told about, or reports
+    /// `None` once the `i32` version space is spent.
+    ///
+    /// Exhaustion is not a wrap: a document that has been through two billion
+    /// edits stops being synchronised rather than being resynchronised
+    /// backwards, which a server would reject as a stale version.
+    fn bump_lsp_version(&mut self) -> Option<i32> {
+        if self.lsp_version == i32::MAX {
+            return None;
+        }
+        self.lsp_version += 1;
+        Some(self.lsp_version)
+    }
+
+    /// Installs a whole new buffer text and brings the derived editor state
+    /// with it.
+    ///
+    /// Used where the result is computed as text rather than as editor
+    /// actions — applying a completion — which the widget's `Content` has no
+    /// other way to express.
+    fn replace_text(&mut self, text: &str) {
+        self.content = text_editor::Content::with_text(text);
+        if self.markdown {
+            self.markdown_items = markdown::parse(text).collect();
+        }
+        self.dirty = text != self.saved_text;
+        self.revision = self.revision.wrapping_add(1).max(1);
+        self.conflict = false;
+        self.error = None;
+    }
+}
+
+// Caret coordinates.
+//
+// The two sides of the editor boundary count a column differently and neither
+// says so in its types. `text_editor::Position::column` is a **byte** index
+// into the line: libcosmic re-exports iced's type, and `iced_graphics`'
+// editor builds it straight from a `cosmic_text::Cursor::index`, which is a
+// byte offset. [`LspPosition::character`] counts **Unicode scalar values**.
+// On any line that is pure ASCII the two agree, which is exactly why getting
+// this wrong survives casual testing and then misplaces every diagnostic in a
+// file with an accent or an emoji in it.
+
+/// Converts a byte column inside `line` into the scalar count the protocol
+/// uses.
+///
+/// A byte index that does not land on a character boundary is rounded down to
+/// the boundary before it rather than slicing: a caret can only sit between
+/// scalars, and panicking would throw away a position the editor considers
+/// perfectly valid.
+fn scalar_column(line: &str, byte_column: usize) -> u32 {
+    let mut boundary = byte_column.min(line.len());
+    while !line.is_char_boundary(boundary) {
+        boundary -= 1;
+    }
+    u32::try_from(line[..boundary].chars().count()).unwrap_or(u32::MAX)
+}
+
+/// Converts a scalar count into the byte column the caret uses.
+///
+/// A count past the end of the line clamps to its end, which is what the
+/// protocol asks a client to do with an out-of-range character.
+fn byte_column(line: &str, character: u32) -> usize {
+    let character = usize::try_from(character).unwrap_or(usize::MAX);
+    line.char_indices()
+        .nth(character)
+        .map_or(line.len(), |(at, _)| at)
+}
+
+/// Byte range of the given zero-based line inside `text`, excluding its
+/// terminator.
+///
+/// Deliberately identical to `Snapshot::line_span` in [`crate::lsp`]: lines
+/// break on `\n` alone and a `\r` immediately before one is its partner, not
+/// content. Every [`LspPosition`] crossing this boundary was produced in that
+/// numbering, so anything else here would address the wrong line.
+fn line_span(text: &str, line: u32) -> Option<Range<usize>> {
+    let line = usize::try_from(line).unwrap_or(usize::MAX);
+    let mut start = 0;
+    let mut index = 0;
+    loop {
+        let end = text[start..].find('\n').map_or(text.len(), |at| start + at);
+        if index == line {
+            let content_end = if end > start && text.as_bytes()[end - 1] == b'\r' {
+                end - 1
+            } else {
+                end
+            };
+            return Some(start..content_end);
+        }
+        if end == text.len() {
+            return None;
+        }
+        start = end + 1;
+        index += 1;
+    }
+}
+
+/// Byte offset of a protocol position inside `text`, or `None` when it names a
+/// line the buffer does not have.
+fn byte_offset(text: &str, at: LspPosition) -> Option<usize> {
+    let span = line_span(text, at.line)?;
+    Some(span.start + byte_column(&text[span.clone()], at.character))
+}
+
+/// Protocol position of a byte offset into `text`.
+fn position_for_offset(text: &str, offset: usize) -> LspPosition {
+    let offset = char_boundary(text, offset);
+    let line = u32::try_from(text[..offset].matches('\n').count()).unwrap_or(u32::MAX);
+    // Clamped to the line's *content*, not merely to the offset: [`line_span`]
+    // drops a `\r` that the editor treats as a terminator of its own and will
+    // happily park a caret after. A column that counted such a `\r` would name
+    // a character the protocol's line does not have, and
+    // `Snapshot::to_utf16` refuses that outright — silently failing every
+    // hover, completion and definition made from that caret.
+    let span = line_span(text, line).unwrap_or(0..offset);
+    let content = &text[span.start..offset.min(span.end)];
+    LspPosition::new(line, scalar_column(content, content.len()))
+}
+
+/// Largest character boundary of `text` at or before `offset`, clamped to its
+/// length.
+fn char_boundary(text: &str, offset: usize) -> usize {
+    let mut offset = offset.min(text.len());
+    while !text.is_char_boundary(offset) {
+        offset -= 1;
+    }
+    offset
+}
+
+// Editor lines against protocol lines.
+//
+// These two do not agree, and no amount of column arithmetic hides it:
+// `cosmic_text`'s `LineIter` breaks a buffer on a bare `\r` and on `\n\r` as
+// well as on `\n`, while [`crate::lsp`] counts `\n` alone. A file carrying a
+// stray carriage return therefore has two different line numberings at once.
+// Byte offsets into [`text_editor::Content::text`] are the one space both
+// sides provably share, so every conversion below goes through an offset
+// rather than passing a line index off as if it meant the same thing on both
+// sides of the boundary.
+
+/// What [`text_editor::Content::text`] writes after this line: nothing after
+/// the last one, and a newline for an unterminated line in the middle.
+fn line_terminator(line: &text_editor::Line<'_>, last: bool) -> &'static str {
+    if last {
+        ""
+    } else if line.ending == text_editor::LineEnding::None {
+        text_editor::LineEnding::default().as_str()
+    } else {
+        line.ending.as_str()
+    }
+}
+
+/// Byte offset, into the text the buffer would produce, of a caret expressed
+/// in the editor's own line and byte column.
+fn caret_offset(
+    content: &text_editor::Content<cosmic::Renderer>,
+    caret: text_editor::Position,
+) -> Option<usize> {
+    let lines = content.line_count();
+    let mut offset = 0;
+    for index in 0..lines {
+        let line = content.line(index)?;
+        if index == caret.line {
+            return Some(offset + char_boundary(&line.text, caret.column));
+        }
+        offset += line.text.len() + line_terminator(&line, index + 1 == lines).len();
+    }
+    None
+}
+
+/// The editor-native caret for a byte offset into the buffer's text.
+///
+/// An offset past the end lands at the end of the last line, because a caret
+/// has to be somewhere.
+fn caret_for_offset(
+    content: &text_editor::Content<cosmic::Renderer>,
+    offset: usize,
+) -> text_editor::Position {
+    let lines = content.line_count();
+    let mut start = 0;
+    let mut caret = text_editor::Position { line: 0, column: 0 };
+    for index in 0..lines {
+        let Some(line) = content.line(index) else {
+            break;
+        };
+        let end = start + line.text.len();
+        caret = text_editor::Position {
+            line: index,
+            column: char_boundary(&line.text, offset.saturating_sub(start)),
+        };
+        if offset <= end {
+            break;
+        }
+        start = end + line_terminator(&line, index + 1 == lines).len();
+    }
+    caret
+}
+
+/// Byte range one completion edit replaces, or `None` when it cannot be
+/// addressed against `text` at all.
+///
+/// [`LspCompletionEdit::replace_range`] is deliberately ignored: choosing the
+/// wider replace range over the insert range is a user preference nothing in
+/// this application exposes yet, and guessing it would silently eat the
+/// identifier the caret sits inside.
+fn completion_span(text: &str, edit: &LspCompletionEdit) -> Option<Range<usize>> {
+    let start = byte_offset(text, edit.range.start)?;
+    let end = byte_offset(text, edit.range.end)?;
+    (start <= end).then_some(start..end)
 }
 
 enum FileListState {
@@ -375,7 +809,7 @@ enum DocumentState {
 
 enum DiffState {
     Loading { request: u64 },
-    Ready(DiffContent),
+    Ready(RenderedDiff),
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -396,6 +830,15 @@ const FILE_ROW_HEIGHT: f32 = 36.0;
 const DIFF_ROW_HEIGHT: f32 = 30.0;
 const VISIBLE_ROW_OVERSCAN: usize = 6;
 const INITIAL_VIEWPORT_HEIGHT: f32 = 900.0;
+/// How many committed comparisons one open file keeps.
+///
+/// The two working bases are always retained: there are only ever two of them
+/// and a save recomputes them. A committed basis is named by a ref or a commit
+/// id, so its keyspace is open - stepping through history would otherwise
+/// retain one whole diff model per commit visited for as long as the file
+/// stays open, and a side is allowed to be megabytes. Four keeps stepping back
+/// instant and the ceiling bounded.
+const MAX_RETAINED_COMMITTED_DIFFS: usize = 4;
 
 fn visible_rows(total: usize, viewport: ListViewport, row_height: f32) -> VisibleRows {
     let height = if viewport.height.is_finite() && viewport.height > 0.0 {
@@ -433,21 +876,42 @@ pub struct RepositoryRuntime {
     files: FileListState,
     selected: Option<RepositoryFile>,
     document: DocumentState,
-    diffs: BTreeMap<DiffBasis, DiffState>,
+    /// One entry per comparison this selection has been asked for.
+    ///
+    /// A list rather than a map: at most four bases are live at once, and
+    /// [`DiffBasis`] is deliberately neither `Ord` nor `Hash` — it owns a ref
+    /// name and an object id.
+    diffs: Vec<(DiffBasis, DiffState)>,
     source_surface: SourceSurface,
     markdown_mode: MarkdownMode,
     diff_mode: DiffMode,
     diff_basis: DiffBasis,
-    source_control: TwoChoiceControl<SourceSurface>,
-    markdown_control: TwoChoiceControl<MarkdownMode>,
-    diff_control: TwoChoiceControl<DiffMode>,
-    diff_basis_control: TwoChoiceControl<DiffBasis>,
+    /// The committed comparison being resolved, or the reason one could not
+    /// be, while that is the whole story of the diff surface.
+    basis_resolution: Option<BasisResolution>,
+    source_control: ChoiceControl<SourceSurface>,
+    markdown_control: ChoiceControl<MarkdownMode>,
+    diff_control: ChoiceControl<DiffMode>,
+    diff_basis_control: ChoiceControl<BasisChoice>,
     diff_change: usize,
     diff_scroll_id: widget::Id,
     file_viewport: ListViewport,
     diff_viewport: ListViewport,
     next_save_ticket: u64,
     next_diff_request: u64,
+    /// Identity the application gave the open buffer at the LSP boundary, or
+    /// `None` while nothing is open there. Stored rather than derived: only
+    /// the application, which owns the manager, can mint one.
+    lsp_document: Option<LspDocumentId>,
+    /// Protocol notifications this buffer has earned but nobody has performed
+    /// yet, oldest first.
+    ///
+    /// An outbox rather than direct calls, because a widget that reached a
+    /// language server would have to own one, and because the ordering of
+    /// `didOpen`/`didChange`/`didClose` is exactly what a server cannot
+    /// tolerate being wrong. Every buffer mutation appends here, so a mutation
+    /// that forgets is a desynchronised server rather than a silent nothing.
+    lsp_intents: Vec<LspIntent>,
 }
 
 /// Owned, renderer-free projection of the active repository source surface.
@@ -503,41 +967,44 @@ impl RepositoryRuntime {
             files: FileListState::Loading,
             selected: None,
             document: DocumentState::None,
-            diffs: BTreeMap::new(),
+            diffs: Vec::new(),
             next_diff_request: 0,
             source_surface: SourceSurface::Editor,
             markdown_mode: MarkdownMode::Edit,
             diff_mode: DiffMode::Inline,
-            diff_basis: DiffBasis::Unstaged,
-            source_control: TwoChoiceControl::new(
-                "Edit",
-                SourceSurface::Editor,
-                "Diff",
-                SourceSurface::Diff,
-            ),
-            markdown_control: TwoChoiceControl::new(
-                "Edit",
-                MarkdownMode::Edit,
-                "Preview",
-                MarkdownMode::Preview,
-            ),
-            diff_control: TwoChoiceControl::new(
-                "Inline",
-                DiffMode::Inline,
-                "Split",
-                DiffMode::Split,
-            ),
-            diff_basis_control: TwoChoiceControl::new(
-                "Staged",
-                DiffBasis::Staged,
-                "Unstaged",
-                DiffBasis::Unstaged,
-            ),
+            diff_basis: DiffBasis::IndexToWorktree,
+            basis_resolution: None,
+            source_control: ChoiceControl::new(&[
+                ("Edit", SourceSurface::Editor),
+                ("Diff", SourceSurface::Diff),
+            ]),
+            markdown_control: ChoiceControl::new(&[
+                ("Edit", MarkdownMode::Edit),
+                ("Preview", MarkdownMode::Preview),
+            ]),
+            diff_control: ChoiceControl::new(&[
+                ("Inline", DiffMode::Inline),
+                ("Split", DiffMode::Split),
+            ]),
+            diff_basis_control: ChoiceControl::new(&[
+                ("Staged", BasisChoice::Staged),
+                ("Unstaged", BasisChoice::Unstaged),
+                (
+                    CommittedChoice::Branch.label(),
+                    BasisChoice::Committed(CommittedChoice::Branch),
+                ),
+                (
+                    CommittedChoice::LastCommit.label(),
+                    BasisChoice::Committed(CommittedChoice::LastCommit),
+                ),
+            ]),
             diff_change: 0,
             diff_scroll_id: widget::Id::new(format!("repository.diff.{identity}")),
             file_viewport: ListViewport::default(),
             diff_viewport: ListViewport::default(),
             next_save_ticket: 0,
+            lsp_document: None,
+            lsp_intents: Vec::new(),
         }
     }
 
@@ -599,6 +1066,30 @@ impl RepositoryRuntime {
         runtime
     }
 
+    /// A runtime whose file list is `Ready` with exactly `paths` and nothing
+    /// else: no selection, no open document, no save in flight.
+    ///
+    /// For callers that need [`Self::can_open_file`] to answer truthfully
+    /// without also inheriting a fixture's document state.
+    #[cfg(test)]
+    pub(crate) fn file_list_fixture(descriptor: RepositoryView, paths: &[&str]) -> Self {
+        let mut runtime = Self::new(descriptor);
+        runtime.files = FileListState::Ready(
+            paths
+                .iter()
+                .map(|path| RepositoryFile {
+                    path: PathBuf::from(path),
+                    staged_old_path: None,
+                    unstaged_old_path: None,
+                    staged: false,
+                    unstaged: true,
+                    status: Some(" M".into()),
+                })
+                .collect(),
+        );
+        runtime
+    }
+
     #[cfg(test)]
     pub(crate) fn dirty_fixture(card: CardId) -> Self {
         let (mut runtime, _) = Self::post_persist_failure_fixture(card);
@@ -653,6 +1144,97 @@ impl RepositoryRuntime {
         }
     }
 
+    /// A card whose file list is loaded and whose `notes.txt` selection is
+    /// still in flight, plus the identity that selection's load will carry.
+    ///
+    /// `other.txt` is listed too, so a test can open a second file over the
+    /// first the way the file list does.
+    #[cfg(test)]
+    pub(crate) fn lsp_selection_fixture(card: CardId) -> (Self, AsyncIdentity) {
+        Self::selection_fixture(card, "notes.txt")
+    }
+
+    /// The same fixture under a chosen file name, so a test can vary the one
+    /// thing a selection tells the highlighter: the extension it was opened
+    /// under.
+    #[cfg(test)]
+    pub(crate) fn selection_fixture(card: CardId, name: &str) -> (Self, AsyncIdentity) {
+        let path = PathBuf::from(name);
+        let descriptor = RepositoryView {
+            project: crate::model::ProjectId::new(),
+            repository: PathBuf::from("/repo/.git"),
+            worktree: PathBuf::from("/repo"),
+        };
+        let mut runtime = Self::new(descriptor);
+        runtime.files = FileListState::Ready(
+            [name, "other.txt"]
+                .into_iter()
+                .map(|path| RepositoryFile {
+                    path: PathBuf::from(path),
+                    staged_old_path: None,
+                    unstaged_old_path: None,
+                    staged: false,
+                    unstaged: true,
+                    status: Some(" M".into()),
+                })
+                .collect(),
+        );
+        // Drives the real selection path so the generation, the selection and
+        // the loading document agree the way they do in the application.
+        drop(runtime.open_file(card, path.clone()));
+        let identity = AsyncIdentity {
+            card,
+            worktree: PathBuf::from("/repo"),
+            path,
+            generation: runtime.generation,
+        };
+        (runtime, identity)
+    }
+
+    /// The same card once `notes.txt` has loaded as an editable buffer holding
+    /// `text`, with the resulting intents still queued.
+    #[cfg(test)]
+    pub(crate) fn lsp_open_fixture(card: CardId, text: &str) -> (Self, AsyncIdentity) {
+        Self::open_fixture(card, "notes.txt", text)
+    }
+
+    /// The same, under a chosen file name.
+    #[cfg(test)]
+    pub(crate) fn open_fixture(card: CardId, name: &str, text: &str) -> (Self, AsyncIdentity) {
+        let (mut runtime, identity) = Self::selection_fixture(card, name);
+        drop(runtime.update(RepositoryAction::FileLoaded {
+            identity: identity.clone(),
+            result: Ok(FileContent::Editable {
+                text: text.into(),
+                content_hash: blake3::hash(text.as_bytes()),
+                markdown: false,
+            }),
+        }));
+        (runtime, identity)
+    }
+
+    /// Completion that reports the in-flight save found the file changed
+    /// underneath it.
+    #[cfg(test)]
+    pub(crate) fn conflicted_active_save_completion(&self) -> RepositoryAction {
+        let DocumentState::Editable(document) = &self.document else {
+            panic!("test fixture requires an editable document");
+        };
+        let ticket = document
+            .active_save
+            .as_ref()
+            .expect("test fixture requires an active save");
+        RepositoryAction::SaveFinished {
+            identity: ticket.identity.clone(),
+            ticket: ticket.id,
+            revision: ticket.revision,
+            saved_text: ticket.snapshot.clone(),
+            result: Ok(SaveOutcome::Conflict {
+                disk_hash: blake3::hash(b"changed underneath the editor"),
+            }),
+        }
+    }
+
     pub fn initial_load(&mut self, card: CardId) -> Task<RepositoryAction> {
         self.files = FileListState::Loading;
         self.file_viewport = ListViewport::default();
@@ -664,6 +1246,267 @@ impl RepositoryRuntime {
             generation: self.file_list_generation,
         };
         files_task(identity)
+    }
+
+    /// Removes and returns every protocol notification the open buffer has
+    /// earned since the last drain, oldest first.
+    ///
+    /// The application performs them in order against its
+    /// [`crate::lsp::LspManager`]. Draining is destructive because a
+    /// notification performed twice is worse than one performed late.
+    pub fn take_lsp_intents(&mut self) -> Vec<LspIntent> {
+        std::mem::take(&mut self.lsp_intents)
+    }
+
+    /// Identity of the open buffer at the LSP boundary, if the application
+    /// gave it one.
+    #[must_use]
+    pub fn lsp_document(&self) -> Option<LspDocumentId> {
+        self.lsp_document
+    }
+
+    /// Records the identity the application minted for the open buffer, or
+    /// clears it once the buffer has been closed at the boundary.
+    pub fn set_lsp_document(&mut self, doc: Option<LspDocumentId>) {
+        self.lsp_document = doc;
+    }
+
+    /// The caret as the protocol counts it: Unicode scalars, not bytes, and
+    /// lines as [`crate::lsp`] breaks them rather than as the editor does.
+    ///
+    /// `None` when no editable buffer is open, which is also every case where
+    /// a hover or completion request would have nothing to ask about.
+    #[must_use]
+    pub fn cursor_position(&self) -> Option<LspPosition> {
+        let DocumentState::Editable(document) = &self.document else {
+            return None;
+        };
+        let offset = caret_offset(&document.content, document.content.cursor().position)?;
+        Some(position_for_offset(&document.content.text(), offset))
+    }
+
+    /// Moves the caret to a protocol position, for jump-to-location.
+    ///
+    /// Reports whether the position named a line this buffer has; a character
+    /// past the end of that line clamps to its end. The caller is responsible
+    /// for only passing [`crate::lsp::LspCoordinates::Scalar`] positions: a
+    /// location whose target file was not open at the LSP boundary still
+    /// carries UTF-16 code units, and this runtime has no way to tell the two
+    /// apart from an [`LspPosition`] alone.
+    pub fn move_cursor_to(&mut self, at: LspPosition) -> bool {
+        let DocumentState::Editable(document) = &mut self.document else {
+            return false;
+        };
+        let Some(offset) = byte_offset(&document.content.text(), at) else {
+            return false;
+        };
+        let position = caret_for_offset(&document.content, offset);
+        // `move_to` leaves an existing selection installed, which would turn a
+        // jump into a selection stretching from wherever the user last was.
+        document
+            .content
+            .perform(text_editor::Action::ClearSelection);
+        document.content.move_to(text_editor::Cursor {
+            position,
+            selection: None,
+        });
+        true
+    }
+
+    /// The focus target of the editable buffer while that buffer is the
+    /// surface actually on screen, and `None` while it is not.
+    ///
+    /// A card showing the diff, a Markdown preview, or a file that never
+    /// became editable builds no editor, so there is nothing there to focus
+    /// and a focus operation aimed at it would be delivered to no widget.
+    #[must_use]
+    pub fn editor_focus_target(&self, card: CardId) -> Option<widget::Id> {
+        let DocumentState::Editable(document) = &self.document else {
+            return None;
+        };
+        let editing = self.source_surface == SourceSurface::Editor
+            && !(document.markdown && self.markdown_mode == MarkdownMode::Preview);
+        editing.then(|| editor_focus_id(card))
+    }
+
+    /// Gives the keyboard to the editable buffer.
+    ///
+    /// Moving the caret is not enough on its own to *show* a jump: an
+    /// unfocused [`text_editor`] draws no caret at all, so a jump into a
+    /// buffer the user has not clicked into lands invisibly. Callers that
+    /// move the caret programmatically chain this after it.
+    #[must_use]
+    pub fn focus_editor<Message: 'static>(&self, card: CardId) -> Task<Message> {
+        self.editor_focus_target(card)
+            .map_or_else(Task::none, iced::widget::operation::focus)
+    }
+
+    /// Applies a completion's edits to the open buffer.
+    ///
+    /// Reports whether it was applied. A completion is refused rather than
+    /// half-applied when any of its edits cannot be addressed against the
+    /// current buffer or when two of them overlap, because a partially applied
+    /// completion is a corrupted file the user did not ask for.
+    ///
+    /// A snippet is inserted as its literal
+    /// [`crate::lsp::LspSnippet::text`] — equal to
+    /// [`LspCompletionEdit::new_text`], so the text is right — and its tab
+    /// stops are not entered. `text_editor` has no multi-caret or placeholder
+    /// concept to enter them with; a following pass that adds one can consume
+    /// [`crate::lsp::LspSnippet::stops`], which is why they are carried this
+    /// far rather than dropped at the protocol boundary.
+    ///
+    /// Unlike an [`crate::lsp::LspLocation`], a completion edit carries no
+    /// [`crate::lsp::LspCoordinates`] to check: the manager converts every
+    /// completion range against the snapshot of *this* document, so scalar
+    /// coordinates are the only kind that can arrive here. There is
+    /// consequently nothing to refuse on that ground, and pretending to check
+    /// would only suggest the field exists.
+    pub fn apply_completion(&mut self, item: &LspCompletionItem) -> bool {
+        let DocumentState::Editable(document) = &mut self.document else {
+            return false;
+        };
+        let text = document.content.text();
+        // Every range is resolved against the buffer as it stands *now*,
+        // before anything is applied, and the edits are then applied
+        // last-first. Resolving as we go would let an earlier insertion shift
+        // a later edit's range out from under it — which is how "add the `use`
+        // line and complete the call" quietly writes the call into the middle
+        // of the import.
+        let mut edits = Vec::with_capacity(1 + item.additional_edits.len());
+        for edit in std::iter::once(&item.edit).chain(&item.additional_edits) {
+            let Some(span) = completion_span(&text, edit) else {
+                return false;
+            };
+            edits.push((span, edit.new_text.as_str()));
+        }
+        let primary = edits[0].0.clone();
+        edits.sort_by(|left, right| left.0.start.cmp(&right.0.start));
+        if edits.windows(2).any(|pair| pair[0].0.end > pair[1].0.start) {
+            // Overlapping edits have no defined joint meaning; applying them
+            // in either order would invent one.
+            return false;
+        }
+
+        let mut updated = text;
+        for (span, new_text) in edits.iter().rev() {
+            updated.replace_range(span.clone(), new_text);
+        }
+        // The caret belongs after the text the user chose. Edits that sit
+        // before the primary one displace it by however much they inserted
+        // less however much they removed; none of them can reach past
+        // `primary.start`, having just been proven disjoint, so this cannot
+        // underflow.
+        let (inserted, removed) = edits
+            .iter()
+            .filter(|(span, _)| span.start < primary.start)
+            .fold((0, 0), |(inserted, removed), (span, new_text)| {
+                (inserted + new_text.len(), removed + (span.end - span.start))
+            });
+        let caret = primary.start + item.edit.new_text.len() + inserted - removed;
+
+        // One version for the whole application: the server is told about a
+        // completion as the single document transition the user performed, not
+        // as one transition per edit it happened to decompose into.
+        let version = document.bump_lsp_version();
+        document.replace_text(&updated);
+        // Resolved against the rebuilt buffer, so the caret lands where the
+        // editor now believes that offset to be.
+        let position = caret_for_offset(&document.content, caret);
+        document
+            .content
+            .perform(text_editor::Action::ClearSelection);
+        document.content.move_to(text_editor::Cursor {
+            position,
+            selection: None,
+        });
+        if let Some(version) = version {
+            self.lsp_intents.push(LspIntent::Change {
+                version,
+                text: updated,
+            });
+        }
+        true
+    }
+
+    /// Records that the open buffer became the card's LSP document, and does
+    /// nothing at all when what loaded was read-only or unreadable.
+    ///
+    /// The path comes from the buffer rather than from the caller, so the
+    /// intent cannot name a file other than the one that was opened. It is
+    /// worktree-relative, as every [`AsyncIdentity`] carries it, and is joined
+    /// here because a document URI cannot be built from a relative path.
+    fn push_lsp_open(&mut self, worktree: &Path) {
+        let DocumentState::Editable(document) = &self.document else {
+            return;
+        };
+        self.lsp_intents.push(LspIntent::Open {
+            absolute_path: worktree.join(&document.path),
+            worktree: worktree.to_path_buf(),
+            version: document.lsp_version,
+            text: document.content.text(),
+        });
+    }
+
+    /// Whether `path` names a row this card's file list can open.
+    ///
+    /// A location can resolve into a file the card has no row for - a
+    /// gitignored or generated source a build script produced - or arrive
+    /// while the list is still loading, and [`Self::update`]'s `OpenFile`
+    /// answers both by doing nothing. A caller about to park work on that open
+    /// has to know that before it waits for something that will never happen.
+    #[must_use]
+    pub fn can_open_file(&self, path: &Path) -> bool {
+        self.file(path).is_some()
+    }
+
+    /// Re-announces the open buffer to a replaced language-server manager.
+    ///
+    /// A manager's server set is fixed at construction, so a changed
+    /// configuration is a new manager holding no documents. Without this the
+    /// buffer stays open on screen while the servers it is checked against know
+    /// nothing about it, and no diagnostic arrives until the next keystroke.
+    pub fn resync_lsp(&mut self) {
+        let worktree = self.descriptor.worktree.clone();
+        self.push_lsp_open(&worktree);
+    }
+
+    /// Records that the open buffer's text changed, whatever changed it.
+    ///
+    /// Silent once the version space is spent: the buffer keeps working and
+    /// the server keeps its last coherent version rather than being rewound.
+    fn push_lsp_change(&mut self) {
+        let DocumentState::Editable(document) = &mut self.document else {
+            return;
+        };
+        let Some(version) = document.bump_lsp_version() else {
+            return;
+        };
+        let text = document.content.text();
+        self.lsp_intents.push(LspIntent::Change { version, text });
+    }
+
+    /// Records that the open buffer reached disk.
+    fn push_lsp_save(&mut self) {
+        let DocumentState::Editable(document) = &self.document else {
+            return;
+        };
+        self.lsp_intents.push(LspIntent::Save {
+            text: document.saved_text.clone(),
+        });
+    }
+
+    /// Records that the open buffer is about to stop existing.
+    ///
+    /// Conditioned on there being an editable buffer rather than on
+    /// [`RepositoryRuntime::lsp_document`], which is only set once the
+    /// application has drained the matching [`LspIntent::Open`]: gating on it
+    /// would drop the close of a document opened and abandoned between two
+    /// drains, and leak that session.
+    fn push_lsp_close(&mut self) {
+        if matches!(&self.document, DocumentState::Editable(_)) {
+            self.lsp_intents.push(LspIntent::Close);
+        }
     }
 
     pub fn is_dirty(&self) -> bool {
@@ -750,11 +1593,23 @@ impl RepositoryRuntime {
             matches!(&self.document, DocumentState::Editable(document) if document.markdown)
                 .then_some(markdown_mode)
                 .flatten();
-        let (diff_state, diff_error, diff_additions, diff_deletions, diff_change) = if diff {
-            match self.diffs.get(&self.diff_basis) {
+        let (diff_state, diff_error, diff_additions, diff_deletions, diff_change) = if !diff {
+            (None, None, None, None, None)
+        } else if let Some(resolution) = &self.basis_resolution {
+            // An unresolved comparison is the whole story of the surface, so
+            // no stale diff is reported behind it.
+            match resolution {
+                BasisResolution::Resolving(_) => (Some("Loading"), None, None, None, None),
+                BasisResolution::NeedsBase(_) => (Some("Choose a base"), None, None, None, None),
+                BasisResolution::Unavailable(message) => {
+                    (Some("Unavailable"), Some(message.clone()), None, None, None)
+                }
+            }
+        } else {
+            match self.diff_state(&self.diff_basis) {
                 None => (Some("No changes"), None, Some(0), Some(0), None),
                 Some(DiffState::Loading { .. }) => (Some("Loading"), None, None, None, None),
-                Some(DiffState::Ready(DiffContent::Text(model))) => {
+                Some(DiffState::Ready(RenderedDiff::Text { model, .. })) => {
                     let changes = model.change_starts(self.diff_mode).len();
                     (
                         Some(if changes == 0 { "No changes" } else { "Ready" }),
@@ -764,28 +1619,18 @@ impl RepositoryRuntime {
                         (changes != 0).then_some((self.diff_change + 1, changes)),
                     )
                 }
-                Some(DiffState::Ready(DiffContent::Error(error))) => {
+                Some(DiffState::Ready(RenderedDiff::Error(error))) => {
                     (Some("Unavailable"), Some(error.clone()), None, None, None)
                 }
-                Some(DiffState::Ready(content)) => (
-                    Some(match content {
-                        DiffContent::Binary { .. } => "Binary",
-                        DiffContent::InvalidUtf8 { .. } => "Invalid UTF-8",
-                        DiffContent::Symlink { .. } => "Symlink",
-                        DiffContent::Oversize { .. } => "Too large",
-                        DiffContent::NotRegularFile => "Not a regular file",
-                        DiffContent::Text(_) | DiffContent::Error(_) => unreachable!(),
-                    }),
-                    None,
-                    None,
-                    None,
-                    None,
-                ),
+                Some(DiffState::Ready(RenderedDiff::NoText(content))) => {
+                    (Some(no_text_kind(content)), None, None, None, None)
+                }
             }
-        } else {
-            (None, None, None, None, None)
         };
-        let can_retry_diff = diff_error.is_some();
+        // A retry re-reads the comparison. A basis that never resolved has no
+        // comparison to re-read, and its own surface offers the base choice,
+        // so the retry control stays unarmed for it.
+        let can_retry_diff = diff_error.is_some() && self.basis_resolution.is_none();
         RepositoryInspectorContext {
             file_list,
             file_count,
@@ -806,7 +1651,7 @@ impl RepositoryRuntime {
             document_error,
             conflict,
             markdown_mode,
-            diff_basis: diff.then_some(self.diff_basis.label()),
+            diff_basis: diff.then(|| basis_choice_label(&self.diff_basis)),
             diff_mode: diff.then_some(match self.diff_mode {
                 DiffMode::Inline => "Inline",
                 DiffMode::Split => "Split",
@@ -840,15 +1685,19 @@ impl RepositoryRuntime {
         match &self.document {
             DocumentState::Loading(_) => RepositoryRuntimeStatus::Loading,
             DocumentState::Failed { .. } => RepositoryRuntimeStatus::Unavailable,
-            _ if self.source_surface == SourceSurface::Diff => {
-                match self.diffs.get(&self.diff_basis) {
+            _ if self.source_surface == SourceSurface::Diff => match &self.basis_resolution {
+                Some(BasisResolution::Resolving(_)) => RepositoryRuntimeStatus::Loading,
+                Some(BasisResolution::NeedsBase(_) | BasisResolution::Unavailable(_)) => {
+                    RepositoryRuntimeStatus::Unavailable
+                }
+                None => match self.diff_state(&self.diff_basis) {
                     Some(DiffState::Loading { .. }) => RepositoryRuntimeStatus::Loading,
-                    Some(DiffState::Ready(DiffContent::Error(_))) => {
+                    Some(DiffState::Ready(RenderedDiff::Error(_))) => {
                         RepositoryRuntimeStatus::Unavailable
                     }
                     _ => RepositoryRuntimeStatus::Ready,
-                }
-            }
+                },
+            },
             _ => RepositoryRuntimeStatus::Ready,
         }
     }
@@ -861,6 +1710,9 @@ impl RepositoryRuntime {
             unreachable!("discard eligibility requires an editable document");
         };
         document.discard_edits();
+        // Reached from the application's dirty-close dialog, which throws the
+        // buffer away without the editor ever seeing an action for it.
+        self.push_lsp_change();
         true
     }
 
@@ -978,6 +1830,10 @@ impl RepositoryRuntime {
                         message: error.to_string(),
                     },
                 };
+                // A read-only or unreadable file is not a document a language
+                // server can serve, and `push_lsp_open` reports nothing for
+                // either of them.
+                self.push_lsp_open(&identity.worktree);
                 Task::none()
             }
             RepositoryAction::DiffLoaded {
@@ -986,13 +1842,19 @@ impl RepositoryRuntime {
                 request,
                 content,
             } => {
+                // Three independent fences: the generation and path in the
+                // identity, the per-basis slot the result is keyed by, and the
+                // request counter within that slot. A result for a basis the
+                // user has left lands in its own slot and is displayed by
+                // nothing; a superseded result for the same basis is dropped.
                 let current_request = matches!(
-                    self.diffs.get(&basis),
+                    self.diff_state(&basis),
                     Some(DiffState::Loading { request: active }) if *active == request
                 );
                 if self.accepts_selected(&identity) && current_request {
-                    self.diffs.insert(basis, DiffState::Ready(content));
-                    if basis == self.diff_basis {
+                    let current = basis == self.diff_basis;
+                    self.set_diff_state(basis, DiffState::Ready(content));
+                    if current {
                         self.diff_change = 0;
                         self.diff_viewport = ListViewport::default();
                     }
@@ -1000,8 +1862,15 @@ impl RepositoryRuntime {
                 Task::none()
             }
             RepositoryAction::EditorAction { action, .. } => {
+                let is_edit = action.is_edit();
                 if let DocumentState::Editable(document) = &mut self.document {
                     document.apply(action);
+                }
+                // A caret movement is not a document change. Bumping the
+                // version for one would leave every request the user makes
+                // next quoting a version the server has never been sent.
+                if is_edit {
+                    self.push_lsp_change();
                 }
                 Task::none()
             }
@@ -1075,6 +1944,10 @@ impl RepositoryRuntime {
                     }
                 }
                 if saved {
+                    // Only here: not when the write was submitted, not on a
+                    // conflict, and not on a failure — in none of those does
+                    // the file on disk match this buffer.
+                    self.push_lsp_save();
                     let Some(selected) = self.selected.as_mut() else {
                         return Task::none();
                     };
@@ -1083,8 +1956,8 @@ impl RepositoryRuntime {
                         selected.unstaged,
                     ));
                     selected.unstaged = true;
-                    let previous_path = selected.previous_path(DiffBasis::Unstaged);
-                    self.request_diff(identity, DiffBasis::Unstaged, previous_path)
+                    let previous_path = selected.previous_path(&DiffBasis::IndexToWorktree);
+                    self.request_diff(identity, DiffBasis::IndexToWorktree, previous_path)
                 } else {
                     Task::none()
                 }
@@ -1104,6 +1977,10 @@ impl RepositoryRuntime {
                 }
                 if let DocumentState::Editable(document) = &mut self.document {
                     document.discard_edits();
+                    // `discard_edits` rebuilds the buffer without going
+                    // through an editor action, so nothing else here would
+                    // notice that the server's copy just became wrong.
+                    self.push_lsp_change();
                 }
                 Task::none()
             }
@@ -1111,9 +1988,11 @@ impl RepositoryRuntime {
                 if self.blocks_navigation() {
                     return Task::none();
                 }
+                self.push_lsp_close();
                 self.selected = None;
                 self.document = DocumentState::None;
                 self.diffs.clear();
+                self.basis_resolution = None;
                 self.source_surface = SourceSurface::Editor;
                 self.source_control.activate_value(SourceSurface::Editor);
                 self.initial_load(card)
@@ -1123,9 +2002,12 @@ impl RepositoryRuntime {
                     self.source_control.activate_value(self.source_surface);
                     return Task::none();
                 }
+                // Any selected file has a diff surface. It used to take a
+                // local change, which made the two committed comparisons
+                // unreachable for exactly the files a branch review is about:
+                // ones changed by the branch and clean in the worktree.
                 if let Some(surface) = self.source_control.activate(entity)
-                    && (surface == SourceSurface::Editor
-                        || self.selected.as_ref().is_some_and(RepositoryFile::changed))
+                    && (surface == SourceSurface::Editor || self.selected.is_some())
                 {
                     return cosmic::task::message(RepositoryAction::ApplySourceSurface {
                         card,
@@ -1140,10 +2022,7 @@ impl RepositoryRuntime {
                 } else {
                     SourceSurface::Editor
                 };
-                if self.is_saving()
-                    || (surface == SourceSurface::Diff
-                        && !self.selected.as_ref().is_some_and(RepositoryFile::changed))
-                {
+                if self.is_saving() || (surface == SourceSurface::Diff && self.selected.is_none()) {
                     self.source_control.activate_value(self.source_surface);
                     return Task::none();
                 }
@@ -1198,51 +2077,108 @@ impl RepositoryRuntime {
                 self.scroll_to_change()
             }
             RepositoryAction::SelectDiffBasis { card, entity } => {
-                if let Some(basis) = self.diff_basis_control.activate(entity)
-                    && self
-                        .selected
-                        .as_ref()
-                        .is_some_and(|file| file.has_basis(basis))
-                {
-                    return cosmic::task::message(RepositoryAction::ApplyDiffBasis {
-                        card,
-                        staged: basis == DiffBasis::Staged,
-                    });
+                let Some(choice) = self.diff_basis_control.activate(entity) else {
+                    return Task::none();
+                };
+                match choice {
+                    BasisChoice::Staged => self.choose_basis(card, DiffBasis::HeadToIndex),
+                    BasisChoice::Unstaged => self.choose_basis(card, DiffBasis::IndexToWorktree),
+                    // Neither committed comparison can be named without Git:
+                    // one needs the remote's default branch, the other needs
+                    // HEAD's parent.
+                    BasisChoice::Committed(choice) => {
+                        let Some(selected) = self.selected.as_ref() else {
+                            self.diff_basis_control
+                                .activate_value(basis_choice(&self.diff_basis));
+                            return Task::none();
+                        };
+                        let identity = self.current_identity(card, selected.path.clone());
+                        self.basis_resolution = Some(BasisResolution::Resolving(choice));
+                        basis_task(identity, choice)
+                    }
                 }
-                self.diff_basis_control.activate_value(self.diff_basis);
+            }
+            RepositoryAction::DiffBasisResolved {
+                identity,
+                choice,
+                result,
+            } => {
+                // A resolution nobody is waiting for must not install a basis:
+                // the selection, or the choice, has moved on since it started.
+                if !self.accepts_selected(&identity)
+                    || self.basis_resolution != Some(BasisResolution::Resolving(choice))
+                {
+                    return Task::none();
+                }
+                match result {
+                    Ok(ResolvedBasis::Ready(basis)) => {
+                        self.basis_resolution = None;
+                        return cosmic::task::message(RepositoryAction::ApplyDiffBasis {
+                            card: identity.card,
+                            basis,
+                        });
+                    }
+                    Ok(ResolvedBasis::NeedsBase { candidates }) => {
+                        self.basis_resolution = Some(BasisResolution::NeedsBase(candidates));
+                    }
+                    Ok(ResolvedBasis::NoCommit) => {
+                        self.basis_resolution = Some(BasisResolution::Unavailable(
+                            "This branch has no commits yet, so there is nothing to compare."
+                                .into(),
+                        ));
+                    }
+                    Err(error) => {
+                        self.basis_resolution = Some(BasisResolution::Unavailable(error));
+                    }
+                }
                 Task::none()
             }
-            RepositoryAction::ApplyDiffBasis { staged, .. } => {
-                let basis = if staged {
-                    DiffBasis::Staged
-                } else {
-                    DiffBasis::Unstaged
-                };
+            RepositoryAction::ApplyDiffBasis { card, basis } => {
                 if !self
                     .selected
                     .as_ref()
-                    .is_some_and(|file| file.has_basis(basis))
+                    .is_some_and(|file| file.has_basis(&basis))
                 {
-                    self.diff_basis_control.activate_value(self.diff_basis);
+                    self.diff_basis_control
+                        .activate_value(basis_choice(&self.diff_basis));
                     return Task::none();
                 }
+                self.basis_resolution = None;
+                self.diff_basis_control.activate_value(basis_choice(&basis));
                 self.diff_basis = basis;
-                self.diff_basis_control.activate_value(basis);
                 self.diff_change = 0;
                 self.diff_viewport = ListViewport::default();
+                // Both working bases are read when the file is opened. A
+                // committed comparison is only named once it has been
+                // resolved, so choosing it is also what starts reading it —
+                // and the request counter makes that a new request, which
+                // supersedes any diff still in flight for the same slot.
+                let load = if self.diff_state(&self.diff_basis).is_some() {
+                    Task::none()
+                } else {
+                    let Some(selected) = self.selected.as_ref() else {
+                        return Task::none();
+                    };
+                    let path = selected.path.clone();
+                    let previous_path = selected.previous_path(&self.diff_basis);
+                    let identity = self.current_identity(card, path);
+                    let basis = self.diff_basis.clone();
+                    self.request_diff(identity, basis, previous_path)
+                };
                 self.realize_current_change();
-                self.scroll_to_change()
+                Task::batch([load, self.scroll_to_change()])
             }
             RepositoryAction::RetryDiff { card } => {
                 let Some(selected) = self.selected.as_ref() else {
                     return Task::none();
                 };
-                if !selected.has_basis(self.diff_basis) {
+                if !selected.has_basis(&self.diff_basis) {
                     return Task::none();
                 }
-                let previous_path = selected.previous_path(self.diff_basis);
+                let previous_path = selected.previous_path(&self.diff_basis);
                 let identity = self.current_identity(card, selected.path.clone());
-                self.request_diff(identity, self.diff_basis, previous_path)
+                let basis = self.diff_basis.clone();
+                self.request_diff(identity, basis, previous_path)
             }
             RepositoryAction::FileViewport { offset, height, .. } => {
                 self.file_viewport = ListViewport { offset, height };
@@ -1272,6 +2208,73 @@ impl RepositoryRuntime {
         }
     }
 
+    /// Sends the basis control's choice through the one action that installs
+    /// a basis, or puts the control back when the file has nothing to show for
+    /// it.
+    fn choose_basis(&mut self, card: CardId, basis: DiffBasis) -> Task<RepositoryAction> {
+        if !self
+            .selected
+            .as_ref()
+            .is_some_and(|file| file.has_basis(&basis))
+        {
+            self.diff_basis_control
+                .activate_value(basis_choice(&self.diff_basis));
+            return Task::none();
+        }
+        cosmic::task::message(RepositoryAction::ApplyDiffBasis { card, basis })
+    }
+
+    /// The state of one comparison, or `None` when it has never been asked for.
+    fn diff_state(&self, basis: &DiffBasis) -> Option<&DiffState> {
+        self.diffs
+            .iter()
+            .find(|(candidate, _)| candidate == basis)
+            .map(|(_, state)| state)
+    }
+
+    fn set_diff_state(&mut self, basis: DiffBasis, state: DiffState) {
+        match self
+            .diffs
+            .iter_mut()
+            .find(|(candidate, _)| *candidate == basis)
+        {
+            Some(entry) => entry.1 = state,
+            None => {
+                self.diffs.push((basis, state));
+                self.prune_committed_diffs();
+            }
+        }
+    }
+
+    /// Drops the committed comparisons added longest ago, beyond the cap.
+    ///
+    /// Never the one on screen, and never a working basis. Dropping a slot
+    /// that is still `Loading` is safe: [`RepositoryAction::DiffLoaded`]
+    /// requires its slot to still hold its own request, so the abandoned
+    /// result lands nowhere.
+    fn prune_committed_diffs(&mut self) {
+        let committed =
+            |basis: &DiffBasis| matches!(basis_choice(basis), BasisChoice::Committed(_));
+        let mut excess = self
+            .diffs
+            .iter()
+            .filter(|(basis, _)| committed(basis))
+            .count()
+            .saturating_sub(MAX_RETAINED_COMMITTED_DIFFS);
+        if excess == 0 {
+            return;
+        }
+        let current = self.diff_basis.clone();
+        // `retain` visits in insertion order, so the oldest go first.
+        self.diffs.retain(|(basis, _)| {
+            if excess == 0 || *basis == current || !committed(basis) {
+                return true;
+            }
+            excess -= 1;
+            false
+        });
+    }
+
     fn request_diff(
         &mut self,
         identity: AsyncIdentity,
@@ -1280,7 +2283,7 @@ impl RepositoryRuntime {
     ) -> Task<RepositoryAction> {
         self.next_diff_request = self.next_diff_request.wrapping_add(1).max(1);
         let request = self.next_diff_request;
-        self.diffs.insert(basis, DiffState::Loading { request });
+        self.set_diff_state(basis.clone(), DiffState::Loading { request });
         diff_task(identity, basis, request, old_path)
     }
 
@@ -1288,16 +2291,23 @@ impl RepositoryRuntime {
         let Some(file) = self.file(&path).cloned() else {
             return Task::none();
         };
+        // Whatever was open is about to be replaced — including by a reload of
+        // this very path, which is a different document however identical its
+        // name. Emitted before the replacement, while the old buffer still
+        // exists to be closed.
+        self.push_lsp_close();
         self.selected = Some(file.clone());
         self.document = DocumentState::Loading(path.clone());
         self.diffs.clear();
+        self.basis_resolution = None;
         self.diff_viewport = ListViewport::default();
         self.diff_basis = if file.unstaged {
-            DiffBasis::Unstaged
+            DiffBasis::IndexToWorktree
         } else {
-            DiffBasis::Staged
+            DiffBasis::HeadToIndex
         };
-        self.diff_basis_control.activate_value(self.diff_basis);
+        self.diff_basis_control
+            .activate_value(basis_choice(&self.diff_basis));
         self.source_surface = SourceSurface::Editor;
         self.source_control.activate_value(SourceSurface::Editor);
         self.markdown_mode = MarkdownMode::Edit;
@@ -1306,9 +2316,13 @@ impl RepositoryRuntime {
         let identity = self.next_identity(card, path);
         let file_task = file_task(identity.clone());
         let mut tasks = vec![file_task];
-        for basis in [DiffBasis::Staged, DiffBasis::Unstaged] {
-            if file.has_basis(basis) {
-                tasks.push(self.request_diff(identity.clone(), basis, file.previous_path(basis)));
+        // Only the working bases are read up front: a committed comparison
+        // cannot even be named yet, and reading one nobody asked for would
+        // spend a `git log` or a ref walk per file opened.
+        for basis in [DiffBasis::HeadToIndex, DiffBasis::IndexToWorktree] {
+            if file.has_basis(&basis) {
+                let previous_path = file.previous_path(&basis);
+                tasks.push(self.request_diff(identity.clone(), basis, previous_path));
             }
         }
         Task::batch(tasks)
@@ -1358,8 +2372,8 @@ impl RepositoryRuntime {
     }
 
     fn diff_model(&self) -> Option<&DiffModel> {
-        match self.diffs.get(&self.diff_basis) {
-            Some(DiffState::Ready(DiffContent::Text(model))) => Some(model),
+        match self.diff_state(&self.diff_basis) {
+            Some(DiffState::Ready(RenderedDiff::Text { model, .. })) => Some(model),
             _ => None,
         }
     }
@@ -1430,12 +2444,13 @@ fn diff_task(
 ) -> Task<RepositoryAction> {
     let worktree = identity.worktree.clone();
     let path = identity.path.clone();
+    let requested = basis.clone();
     cosmic::task::future(async move {
         let content = tokio::task::spawn_blocking(move || {
-            load_repository_diff(&worktree, &path, basis, old_path.as_deref())
+            load_repository_diff(&worktree, &path, &requested, old_path.as_deref())
         })
         .await
-        .unwrap_or_else(|error| DiffContent::Error(format!("diff worker failed: {error}")));
+        .unwrap_or_else(|error| RenderedDiff::Error(format!("diff worker failed: {error}")));
         RepositoryAction::DiffLoaded {
             identity,
             basis,
@@ -1443,6 +2458,99 @@ fn diff_task(
             content,
         }
     })
+}
+
+fn basis_task(identity: AsyncIdentity, choice: CommittedChoice) -> Task<RepositoryAction> {
+    let worktree = identity.worktree.clone();
+    cosmic::task::future(async move {
+        let result = tokio::task::spawn_blocking(move || resolve_basis(&worktree, choice))
+            .await
+            .unwrap_or_else(|error| Err(format!("basis worker failed: {error}")));
+        RepositoryAction::DiffBasisResolved {
+            identity,
+            choice,
+            result,
+        }
+    })
+}
+
+/// Names the comparison a committed choice stands for.
+///
+/// Both halves come from Git rather than from a guess: the branch base is the
+/// remote's own symbolic `HEAD`, and the commit's parent is the commit's own
+/// first parent — `None` for a root commit, which the service compares against
+/// the empty tree.
+fn resolve_basis(worktree: &Path, choice: CommittedChoice) -> Result<ResolvedBasis, String> {
+    let service = RepositoryService::system("git");
+    let cancellation = CancellationToken::new();
+    match choice {
+        CommittedChoice::Branch => {
+            // A merge base is taken against `HEAD`, so an unborn branch has
+            // nothing to compare here either. Without this the base ref
+            // resolves, `MergeBaseToHead` is installed, and the comparison
+            // dies in Git with "Not a valid object name HEAD".
+            if service
+                .resolve_head(worktree, &cancellation)
+                .map_err(|error| error.to_string())?
+                .is_none()
+            {
+                return Ok(ResolvedBasis::NoCommit);
+            }
+            let snapshot = service
+                .snapshot(worktree, &cancellation)
+                .map_err(|error| error.to_string())?;
+            Ok(match snapshot.default_branch_base() {
+                Some(base_ref) => ResolvedBasis::Ready(DiffBasis::MergeBaseToHead {
+                    base_ref: base_ref.clone(),
+                }),
+                None => ResolvedBasis::NeedsBase {
+                    candidates: base_candidates(&snapshot),
+                },
+            })
+        }
+        CommittedChoice::LastCommit => {
+            let page = service
+                .history(
+                    &HistoryRequest {
+                        worktree: worktree.to_path_buf(),
+                        revision: HistoryRevision::Head,
+                        page: 0,
+                        path: None,
+                    },
+                    &cancellation,
+                )
+                .map_err(|error| error.to_string())?;
+            // History is newest first, so `HEAD`'s own commit is the first
+            // entry and its first parent is what it was written against.
+            Ok(match page.first() {
+                Some(head) => ResolvedBasis::Ready(DiffBasis::CommitToParent {
+                    oid: head.oid.clone(),
+                    parent: head.parents.first().cloned(),
+                }),
+                None => ResolvedBasis::NoCommit,
+            })
+        }
+    }
+}
+
+/// The refs a branch comparison could take its merge base from, offered when
+/// no default resolves.
+///
+/// Remote-tracking branches first, because a review base is normally one, and
+/// the checked-out branch is left out: its merge base with `HEAD` is `HEAD`.
+fn base_candidates(snapshot: &RepositorySnapshot) -> Vec<ValidatedRefName> {
+    snapshot
+        .remote_refs
+        .iter()
+        .map(|record| record.name.clone())
+        .chain(
+            snapshot
+                .local_refs
+                .iter()
+                .filter(|record| !record.head)
+                .map(|record| record.name.clone()),
+        )
+        .collect()
 }
 
 pub fn load_repository_files(worktree: &Path) -> Result<Vec<RepositoryFile>, String> {
@@ -1693,8 +2801,53 @@ pub fn view(card: CardId, runtime: &RepositoryRuntime) -> Element<'_, Repository
         .into()
 }
 
+/// The focus target of the card's editable buffer.
+///
+/// Derived from the card rather than minted, so it is the same id on every
+/// rebuild of the view — a focus operation is delivered on the frame *after*
+/// the one that asked for it, and an id that changed in between would address
+/// nothing — and so two repository cards never contend for one focus target.
 pub fn editor_focus_id(card: CardId) -> widget::Id {
     widget::Id::new(format!("repository.{card}.editor"))
+}
+
+/// The grammar and colour scheme the editable buffer is highlighted with.
+///
+/// `token` is what the highlighter resolves a grammar from; it matches a
+/// syntax by name as well as by extension, so a file that has no extension is
+/// still recognised by its own name (`Makefile`, `Dockerfile`) instead of
+/// falling back to plain text. Extensions are lowercased so the token a file
+/// resolves under is decided here rather than by whichever casing a grammar
+/// happens to list, and a bare name is passed through as written because that
+/// is what a name match compares against. An unrecognised token is not an
+/// error: the highlighter resolves plain text for it.
+///
+/// An extension wins over a name, so a name that carries an unknown extension
+/// - `Dockerfile.dev`, `Makefile.am` - resolves to plain text rather than to
+/// the grammar its stem names. Recovering those would mean resolving the
+/// grammar here instead of naming it, which is syntect's job and not worth a
+/// direct dependency on it for the case.
+///
+/// The scheme follows the application's own light/dark state rather than being
+/// pinned. Every one of these palettes picks its foregrounds for a background
+/// of its own kind, and reading a dark scheme off a light surface is what
+/// turns highlighted text into unreadable text.
+fn highlighter_settings(path: &Path, dark: bool) -> highlighter::Settings {
+    let token = match path.extension() {
+        Some(extension) => extension.to_string_lossy().to_lowercase(),
+        None => path
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_default(),
+    };
+    highlighter::Settings {
+        theme: if dark {
+            highlighter::Theme::Base16Ocean
+        } else {
+            highlighter::Theme::InspiredGitHub
+        },
+        token,
+    }
 }
 
 pub fn focus_restore_id(card: CardId) -> widget::Id {
@@ -1815,13 +2968,15 @@ fn selected_file_view(card: CardId, runtime: &RepositoryRuntime) -> Element<'_, 
             .width(Length::Fill)
             .into(),
     ];
-    if selected.changed() {
-        controls.push(
-            widget::segmented_control::horizontal(&runtime.source_control.model)
-                .on_activate(move |entity| RepositoryAction::SelectSource { card, entity })
-                .into(),
-        );
-    }
+    // Drawn for any selected file, not only a locally changed one. The two
+    // committed comparisons exist precisely for files the branch changed and
+    // the worktree has not, and gating this control on a local change is what
+    // would leave them unreachable there.
+    controls.push(
+        widget::segmented_control::horizontal(&runtime.source_control.model)
+            .on_activate(move |entity| RepositoryAction::SelectSource { card, entity })
+            .into(),
+    );
     if runtime.is_dirty() {
         controls.push(widget::text::caption("Unsaved").into());
         controls.push(
@@ -1960,14 +3115,22 @@ fn editable_document_view<'a>(
             .into()
         } else {
             iced::widget::mouse_area(
-                text_editor::text_editor(&document.content)
-                    // libcosmic's context-menu wrapper owns a second widget
-                    // tree whose child can retain the preceding stateless
-                    // placeholder during an async file-load transition. The
-                    // native editor itself provides the required focus and
-                    // editing state without that wrapper.
-                    .context_menu(false)
+                // Iced's own editor rather than libcosmic's wrapper around it.
+                // The wrapper exists to add a context menu, and it pins its
+                // inner editor to `highlighter::PlainText`, so it is incapable
+                // of syntax highlighting. Its second widget tree is also what
+                // could retain the preceding stateless placeholder during an
+                // async file-load transition. With the context menu declined
+                // the wrapper was already a pass-through to exactly this
+                // widget, which is where the focus and editing state live.
+                iced::widget::text_editor::TextEditor::new(&document.content)
+                    // Before `highlight_with`: `id` is only offered by the
+                    // not-yet-highlighted builder.
                     .id(editor_focus_id(card))
+                    .highlight_with::<highlighter::Highlighter>(
+                        highlighter_settings(&document.path, cosmic::theme::is_dark()),
+                        |highlight, _theme| highlight.to_format(),
+                    )
                     .font(Font::MONOSPACE)
                     .padding(spacing.space_xs)
                     .height(Length::Fill)
@@ -1982,61 +3145,184 @@ fn editable_document_view<'a>(
 }
 
 fn diff_surface(card: CardId, runtime: &RepositoryRuntime) -> Element<'_, RepositoryAction> {
-    match runtime.diffs.get(&runtime.diff_basis) {
-        None => information_state(
-            "No local changes",
-            "This file has no changes for the selected basis.",
-        ),
-        Some(DiffState::Loading { .. }) => loading(format!(
-            "Computing {} diff for {}…",
-            runtime.diff_basis.label().to_lowercase(),
-            runtime
-                .selected
-                .as_ref()
-                .map_or_else(String::new, |file| file.path.display().to_string())
-        )),
-        Some(DiffState::Ready(content)) => match content {
-            DiffContent::Text(model) => diff_model_view(card, runtime, model),
-            DiffContent::Binary { side } => information_state(
-                "Binary diff unavailable",
-                format!("The {side:?} side contains binary data."),
+    let spacing = cosmic::theme::spacing();
+    // The basis control belongs above every state, not only above a text diff.
+    // An unresolved committed comparison replaces the body, and if the only
+    // way to leave that basis were drawn inside the body, the user would be
+    // stranded in it — with the diff they were reading still cached behind,
+    // and `basis_resolution` surviving an Edit/Diff round trip.
+    let header = widget::container(
+        widget::row::with_children(vec![
+            widget::segmented_control::horizontal(&runtime.diff_basis_control.model)
+                .on_activate(move |entity| RepositoryAction::SelectDiffBasis { card, entity })
+                .into(),
+            // Which comparison this is: a commit diff and unstaged work must
+            // not read the same.
+            widget::text::caption(basis_label(&runtime.diff_basis)).into(),
+            iced::widget::Space::new().width(Length::Fill).into(),
+            widget::button::suggested("Open in editor")
+                .on_press(RepositoryAction::ApplySourceSurface { card, diff: false })
+                .into(),
+        ])
+        .align_y(Alignment::Center)
+        .spacing(spacing.space_xxs),
+    )
+    .padding([spacing.space_xxs, spacing.space_s]);
+    let body = match &runtime.basis_resolution {
+        Some(BasisResolution::Resolving(choice)) => {
+            loading(format!("Resolving the {} comparison…", choice.label()))
+        }
+        Some(BasisResolution::NeedsBase(candidates)) => base_choice_view(card, candidates),
+        Some(BasisResolution::Unavailable(message)) => {
+            information_state("Comparison unavailable", message.clone())
+        }
+        None => match runtime.diff_state(&runtime.diff_basis) {
+            None => information_state(
+                "Nothing to compare",
+                "This file has nothing to show for the selected comparison.",
             ),
-            DiffContent::InvalidUtf8 { side } => information_state(
-                "Text diff unavailable",
-                format!("The {side:?} side is not valid UTF-8."),
-            ),
-            DiffContent::Symlink { target } => information_state(
-                "Symlink diff is read-only",
-                format!("Target: {}", target.display()),
-            ),
-            DiffContent::Oversize { side, bytes, limit } => information_state(
-                "Diff is too large",
-                format!("The {side:?} side is {bytes} bytes; the safe limit is {limit} bytes."),
-            ),
-            DiffContent::NotRegularFile => information_state(
-                "Diff unavailable",
-                "The selected path is not a regular file.",
-            ),
-            DiffContent::Error(error) => information_state("Could not compute diff", error),
+            Some(DiffState::Loading { .. }) => loading(format!(
+                "Computing the diff for {} ({})…",
+                runtime
+                    .selected
+                    .as_ref()
+                    .map_or_else(String::new, |file| file.path.display().to_string()),
+                basis_label(&runtime.diff_basis),
+            )),
+            Some(DiffState::Ready(RenderedDiff::Text {
+                model,
+                old_label,
+                new_label,
+            })) => diff_model_view(card, runtime, model, old_label, new_label),
+            Some(DiffState::Ready(RenderedDiff::NoText(content))) => no_text_view(content),
+            Some(DiffState::Ready(RenderedDiff::Error(error))) => {
+                information_state("Could not compute diff", error.clone())
+            }
         },
+    };
+    widget::column::with_children(vec![header.into(), body])
+        .height(Length::Fill)
+        .into()
+}
+
+/// A comparison with no text rows, reported as the fact it is.
+///
+/// A conflicted path is drawn as its stages, never as a two-sided diff: it has
+/// no single old side, and pretending otherwise would claim the file had been
+/// added.
+fn no_text_view(content: &DiffContent) -> Element<'static, RepositoryAction> {
+    match content {
+        DiffContent::Comparison {
+            old,
+            new,
+            old_label,
+            new_label,
+        } => information_state(
+            format!("No text diff between {old_label} and {new_label}"),
+            [(old_label, old), (new_label, new)]
+                .into_iter()
+                .filter(|(_, side)| !side.is_diffable())
+                .map(|(label, side)| format!("{label}: {}", side_detail(side)))
+                .collect::<Vec<_>>()
+                .join("\n"),
+        ),
+        DiffContent::Unmerged {
+            base,
+            ours,
+            theirs,
+            worktree,
+        } => information_state(
+            "This path is conflicted",
+            [
+                ("Common ancestor", base),
+                ("Ours", ours),
+                ("Theirs", theirs),
+                ("Working tree", worktree),
+            ]
+            .into_iter()
+            .map(|(label, side)| format!("{label}: {}", side_detail(side)))
+            .collect::<Vec<_>>()
+            .join("\n"),
+        ),
     }
+}
+
+/// The base-ref picker a branch comparison falls back to.
+///
+/// Reached exactly when this repository has no `refs/remotes/<remote>/HEAD`,
+/// which is what a remote added by hand rather than by cloning never gets. A
+/// name is never guessed: the refs that could serve are offered instead.
+fn base_choice_view(
+    card: CardId,
+    candidates: &[ValidatedRefName],
+) -> Element<'static, RepositoryAction> {
+    let spacing = cosmic::theme::spacing();
+    let mut rows: Vec<Element<'static, RepositoryAction>> = vec![
+        widget::text::title3("Choose a branch comparison base").into(),
+        widget::text::body(
+            "This repository has no remote HEAD to take a default base from, so there is no branch to compare against yet.",
+        )
+        .wrapping(iced::widget::text::Wrapping::Word)
+        .into(),
+    ];
+    if candidates.is_empty() {
+        rows.push(
+            widget::text::body(
+                "It also has no other ref to offer. Fetch a remote, or point refs/remotes/<remote>/HEAD at its default branch.",
+            )
+            .wrapping(iced::widget::text::Wrapping::Word)
+            .into(),
+        );
+    } else {
+        let labels: Vec<String> = candidates
+            .iter()
+            .map(|base_ref| base_ref.short_name().to_owned())
+            .collect();
+        let refs = candidates.to_vec();
+        rows.push(
+            widget::dropdown(labels, None, move |index| {
+                // The dropdown reports an index into the very list it was given.
+                RepositoryAction::ApplyDiffBasis {
+                    card,
+                    basis: DiffBasis::MergeBaseToHead {
+                        base_ref: refs[index].clone(),
+                    },
+                }
+            })
+            .into(),
+        );
+    }
+    widget::container(
+        widget::container(
+            widget::column::with_children(rows)
+                .align_x(Alignment::Center)
+                .spacing(spacing.space_xs),
+        )
+        .class(cosmic::theme::Container::Card)
+        .padding(spacing.space_m)
+        .max_width(620),
+    )
+    .center(Length::Fill)
+    .into()
 }
 
 fn diff_model_view<'a>(
     card: CardId,
     runtime: &'a RepositoryRuntime,
     model: &'a DiffModel,
+    old_label: &'a str,
+    new_label: &'a str,
 ) -> Element<'a, RepositoryAction> {
     let spacing = cosmic::theme::spacing();
     let change_count = model.change_starts(runtime.diff_mode).len();
     let toolbar = widget::container(
         widget::row::with_children(vec![
-            widget::segmented_control::horizontal(&runtime.diff_basis_control.model)
-                .on_activate(move |entity| RepositoryAction::SelectDiffBasis { card, entity })
-                .into(),
             widget::segmented_control::horizontal(&runtime.diff_control.model)
                 .on_activate(move |entity| RepositoryAction::SelectDiffMode { card, entity })
                 .into(),
+            // Which two sides this comparison is between. Which comparison it
+            // is, the surface header above already says.
+            widget::text::caption(format!("{old_label} → {new_label}")).into(),
             widget::text::caption(format!("+{}  −{}", model.additions, model.deletions)).into(),
             iced::widget::Space::new().width(Length::Fill).into(),
             widget::button::standard("Previous change")
@@ -2055,12 +3341,6 @@ fn diff_model_view<'a>(
                     (change_count != 0).then_some(RepositoryAction::NextChange { card }),
                 )
                 .into(),
-            widget::button::suggested("Open in editor")
-                .on_press(RepositoryAction::SelectSource {
-                    card,
-                    entity: runtime.source_control.first,
-                })
-                .into(),
         ])
         .align_y(Alignment::Center)
         .spacing(spacing.space_xxs),
@@ -2069,7 +3349,7 @@ fn diff_model_view<'a>(
     let rows: Element<'a, RepositoryAction> = if model.is_empty() {
         information_state(
             "No content changes",
-            "The working file and checked-in file have identical text.",
+            format!("{old_label} and {new_label} hold identical text."),
         )
     } else {
         let total = model.row_count(runtime.diff_mode);
@@ -2276,7 +3556,11 @@ fn information_state<'a>(
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
+
+    use crate::lsp::{LspRange, LspSnippet, LspSnippetStop};
     use crate::model::ProjectId;
+    use crate::repository::Oid;
     use tempfile::tempdir;
 
     use super::*;
@@ -2826,8 +4110,14 @@ mod tests {
             snapshot: "submitted\n".into(),
         });
         runtime.document = DocumentState::Editable(document);
-        let diff = runtime.source_control.second;
-        let preview = runtime.markdown_control.second;
+        let diff = runtime
+            .source_control
+            .entity_of(SourceSurface::Diff)
+            .expect("the diff choice exists");
+        let preview = runtime
+            .markdown_control
+            .entity_of(MarkdownMode::Preview)
+            .expect("the preview choice exists");
 
         for action in [
             RepositoryAction::DiscardEdits { card },
@@ -2929,7 +4219,7 @@ mod tests {
                 .as_ref()
                 .is_some_and(|selected| !selected.staged && selected.unstaged)
         );
-        assert_eq!(runtime.diff_basis, DiffBasis::Unstaged);
+        assert_eq!(runtime.diff_basis, DiffBasis::IndexToWorktree);
     }
 
     #[test]
@@ -2991,7 +4281,7 @@ mod tests {
         assert!(document.active_save.is_none());
         assert!(!document.conflict);
         assert!(matches!(
-            runtime.diffs.get(&DiffBasis::Unstaged),
+            runtime.diff_state(&DiffBasis::IndexToWorktree),
             Some(DiffState::Loading { .. })
         ));
     }
@@ -3066,11 +4356,11 @@ mod tests {
         document.error = Some("changed on disk".into());
         runtime.document = DocumentState::Editable(document);
         runtime.source_surface = SourceSurface::Diff;
-        runtime.diff_basis = DiffBasis::Staged;
+        runtime.diff_basis = DiffBasis::HeadToIndex;
         runtime.diff_mode = DiffMode::Split;
-        runtime.diffs.insert(
-            DiffBasis::Staged,
-            DiffState::Ready(DiffContent::Text(DiffModel {
+        runtime.set_diff_state(
+            DiffBasis::HeadToIndex,
+            DiffState::Ready(staged_text_diff(DiffModel {
                 inline_rows: Vec::new(),
                 split_rows: Vec::new(),
                 inline_change_starts: vec![0, 2],
@@ -3094,16 +4384,14 @@ mod tests {
         assert_eq!(context.diff_deletions, Some(2));
         assert_eq!(context.diff_change, Some((1, 2)));
 
-        runtime
-            .diffs
-            .insert(DiffBasis::Staged, DiffState::Loading { request: 1 });
+        runtime.set_diff_state(DiffBasis::HeadToIndex, DiffState::Loading { request: 1 });
         assert_eq!(
             runtime.inspector_runtime_status(),
             RepositoryRuntimeStatus::Loading
         );
-        runtime.diffs.insert(
-            DiffBasis::Staged,
-            DiffState::Ready(DiffContent::Error("diff failed".into())),
+        runtime.set_diff_state(
+            DiffBasis::HeadToIndex,
+            DiffState::Ready(RenderedDiff::Error("diff failed".into())),
         );
         assert_eq!(
             runtime.inspector_runtime_status(),
@@ -3136,10 +4424,13 @@ mod tests {
             unstaged: true,
             status: Some(" M".into()),
         });
-        runtime.diff_basis = DiffBasis::Unstaged;
+        runtime.diff_basis = DiffBasis::IndexToWorktree;
         let card = CardId::new();
-        let _ = runtime.update(RepositoryAction::ApplyDiffBasis { card, staged: true });
-        assert_eq!(runtime.diff_basis, DiffBasis::Unstaged);
+        let _ = runtime.update(RepositoryAction::ApplyDiffBasis {
+            card,
+            basis: DiffBasis::HeadToIndex,
+        });
+        assert_eq!(runtime.diff_basis, DiffBasis::IndexToWorktree);
     }
 
     #[test]
@@ -3210,7 +4501,7 @@ mod tests {
                 Some(if tracked { " M" } else { "??" })
             );
             assert!(matches!(
-                runtime.diffs.get(&DiffBasis::Unstaged),
+                runtime.diff_state(&DiffBasis::IndexToWorktree),
                 Some(DiffState::Loading { .. })
             ));
         }
@@ -3244,61 +4535,50 @@ mod tests {
             unstaged: true,
             status: Some("MM".into()),
         });
-        runtime.diff_basis = DiffBasis::Unstaged;
+        runtime.diff_basis = DiffBasis::IndexToWorktree;
         runtime.diff_change = 2;
         runtime.diff_viewport = ListViewport {
             offset: 600.0,
             height: 300.0,
         };
-        runtime
-            .diffs
-            .insert(DiffBasis::Staged, DiffState::Loading { request: 3 });
-        runtime
-            .diffs
-            .insert(DiffBasis::Unstaged, DiffState::Loading { request: 2 });
+        runtime.set_diff_state(DiffBasis::HeadToIndex, DiffState::Loading { request: 3 });
+        runtime.set_diff_state(
+            DiffBasis::IndexToWorktree,
+            DiffState::Loading { request: 2 },
+        );
         let identity = AsyncIdentity {
             card,
             worktree: PathBuf::from("/repo"),
             path,
             generation: 1,
         };
-        let content = |additions| {
-            DiffContent::Text(DiffModel {
-                inline_rows: Vec::new(),
-                split_rows: Vec::new(),
-                inline_change_starts: Vec::new(),
-                split_change_starts: Vec::new(),
-                additions,
-                deletions: 0,
-            })
-        };
 
         let _ = runtime.update(RepositoryAction::DiffLoaded {
             identity: identity.clone(),
-            basis: DiffBasis::Staged,
+            basis: DiffBasis::HeadToIndex,
             request: 3,
-            content: content(3),
+            content: staged_text_diff(model_with(3)),
         });
         assert_eq!(runtime.diff_change, 2);
         assert_eq!(runtime.diff_viewport.offset, 600.0);
 
         let _ = runtime.update(RepositoryAction::DiffLoaded {
             identity: identity.clone(),
-            basis: DiffBasis::Unstaged,
+            basis: DiffBasis::IndexToWorktree,
             request: 2,
-            content: content(2),
+            content: staged_text_diff(model_with(2)),
         });
         assert_eq!(runtime.diff_change, 0);
         assert_eq!(runtime.diff_viewport.offset, 0.0);
         let _ = runtime.update(RepositoryAction::DiffLoaded {
             identity,
-            basis: DiffBasis::Unstaged,
+            basis: DiffBasis::IndexToWorktree,
             request: 1,
-            content: content(1),
+            content: staged_text_diff(model_with(1)),
         });
         assert!(matches!(
-            runtime.diffs.get(&DiffBasis::Unstaged),
-            Some(DiffState::Ready(DiffContent::Text(model))) if model.additions == 2
+            runtime.diff_state(&DiffBasis::IndexToWorktree),
+            Some(DiffState::Ready(RenderedDiff::Text { model, .. })) if model.additions == 2
         ));
     }
 
@@ -3348,8 +4628,14 @@ mod tests {
         };
         let mut runtime = RepositoryRuntime::new(view);
         let card = CardId::new();
-        let preview = runtime.markdown_control.second;
-        let split = runtime.diff_control.second;
+        let preview = runtime
+            .markdown_control
+            .entity_of(MarkdownMode::Preview)
+            .expect("the preview choice exists");
+        let split = runtime
+            .diff_control
+            .entity_of(DiffMode::Split)
+            .expect("the split choice exists");
         let _ = runtime.update(RepositoryAction::SelectMarkdown {
             card,
             entity: preview,
@@ -3401,10 +4687,6 @@ mod tests {
 
     #[test]
     fn actual_widget_trees_stay_bounded_at_top_middle_and_end_of_100k_rows() {
-        fn tree_size(tree: &iced::advanced::widget::Tree) -> usize {
-            1 + tree.children.iter().map(tree_size).sum::<usize>()
-        }
-
         let view = RepositoryView {
             project: ProjectId::new(),
             repository: PathBuf::from("/repo/.git"),
@@ -3434,8 +4716,7 @@ mod tests {
                 height: 720.0,
             };
             let element = file_list_view(card, &runtime);
-            let tree = iced::advanced::widget::Tree::new(&element);
-            assert!(tree_size(&tree) < 1_000, "file widget tree was eager");
+            assert!(widget_nodes(&element) < 1_000, "file widget tree was eager");
         }
 
         let inline = InlineDiffRow {
@@ -3459,9 +4740,9 @@ mod tests {
             unstaged: true,
             status: Some(" M".into()),
         });
-        runtime.diffs.insert(
-            DiffBasis::Unstaged,
-            DiffState::Ready(DiffContent::Text(DiffModel {
+        runtime.set_diff_state(
+            DiffBasis::IndexToWorktree,
+            DiffState::Ready(staged_text_diff(DiffModel {
                 inline_rows: vec![inline; 100_000],
                 split_rows: vec![split; 100_000],
                 inline_change_starts: vec![0, 50_000, 99_999],
@@ -3480,8 +4761,7 @@ mod tests {
                 height: 720.0,
             };
             let element = diff_surface(card, &runtime);
-            let tree = iced::advanced::widget::Tree::new(&element);
-            assert!(tree_size(&tree) < 1_500, "diff widget tree was eager");
+            assert!(widget_nodes(&element) < 1_500, "diff widget tree was eager");
         }
     }
 
@@ -3494,9 +4774,9 @@ mod tests {
         };
         let mut runtime = RepositoryRuntime::new(view);
         runtime.diff_viewport.height = 720.0;
-        runtime.diffs.insert(
-            DiffBasis::Unstaged,
-            DiffState::Ready(DiffContent::Text(DiffModel {
+        runtime.set_diff_state(
+            DiffBasis::IndexToWorktree,
+            DiffState::Ready(staged_text_diff(DiffModel {
                 inline_rows: vec![
                     InlineDiffRow {
                         old_line: Some(1),
@@ -3522,6 +4802,1345 @@ mod tests {
         assert!(end.start <= 99_999 && end.end > 99_999);
     }
 
+    fn completion_edit(range: LspRange, new_text: &str) -> LspCompletionEdit {
+        LspCompletionEdit {
+            range,
+            replace_range: None,
+            new_text: new_text.into(),
+            snippet: None,
+        }
+    }
+
+    fn completion_item(
+        edit: LspCompletionEdit,
+        additional_edits: Vec<LspCompletionEdit>,
+    ) -> LspCompletionItem {
+        LspCompletionItem {
+            label: "println!".into(),
+            kind: None,
+            detail: None,
+            documentation: None,
+            sort_text: None,
+            filter_text: None,
+            preselect: false,
+            deprecated: false,
+            edit,
+            additional_edits,
+        }
+    }
+
+    fn buffer_text(runtime: &RepositoryRuntime) -> String {
+        match &runtime.document {
+            DocumentState::Editable(document) => document.content.text(),
+            _ => panic!("test expects an editable buffer"),
+        }
+    }
+
+    fn lsp_version(runtime: &RepositoryRuntime) -> i32 {
+        match &runtime.document {
+            DocumentState::Editable(document) => document.lsp_version,
+            _ => panic!("test expects an editable buffer"),
+        }
+    }
+
+    /// Normalises the caret without touching the buffer, and proves in passing
+    /// that a motion is not a document change.
+    fn move_to_start(runtime: &mut RepositoryRuntime, card: CardId) {
+        drop(runtime.update(RepositoryAction::EditorAction {
+            card,
+            action: text_editor::Action::Move(text_editor::Motion::DocumentStart),
+        }));
+        assert_eq!(
+            runtime.take_lsp_intents(),
+            Vec::new(),
+            "moving the caret changes no text, so the server must hear nothing"
+        );
+    }
+
+    #[test]
+    fn loading_an_editable_file_opens_it_at_the_first_version() {
+        let card = CardId::new();
+        let (mut runtime, _) = RepositoryRuntime::lsp_open_fixture(card, "fn main() {}\n");
+        assert_eq!(
+            runtime.take_lsp_intents(),
+            vec![LspIntent::Open {
+                // Absolute: `AsyncIdentity::path` is worktree-relative and no
+                // document URI can be built from it alone.
+                absolute_path: PathBuf::from("/repo/notes.txt"),
+                worktree: PathBuf::from("/repo"),
+                version: 1,
+                text: "fn main() {}\n".into(),
+            }]
+        );
+        assert_eq!(
+            runtime.take_lsp_intents(),
+            Vec::new(),
+            "draining is destructive; a notification performed twice is worse than one performed late"
+        );
+    }
+
+    #[test]
+    fn a_read_only_or_unreadable_file_is_never_opened_at_the_boundary() {
+        let card = CardId::new();
+        for result in [
+            Ok(FileContent::ReadOnly(ReadOnlyReason::Binary)),
+            Err(FileIoError::Io("injected read failure".into())),
+        ] {
+            let (mut runtime, identity) = RepositoryRuntime::lsp_selection_fixture(card);
+            drop(runtime.update(RepositoryAction::FileLoaded { identity, result }));
+            assert_eq!(
+                runtime.take_lsp_intents(),
+                Vec::new(),
+                "only an editable buffer is a document a language server can serve"
+            );
+        }
+    }
+
+    #[test]
+    fn an_edit_reports_the_whole_document_at_the_next_version() {
+        let card = CardId::new();
+        let (mut runtime, _) = RepositoryRuntime::lsp_open_fixture(card, "fn main() {}\n");
+        drop(runtime.take_lsp_intents());
+        move_to_start(&mut runtime, card);
+
+        drop(runtime.update(RepositoryAction::EditorAction {
+            card,
+            action: text_editor::Action::Edit(text_editor::Edit::Insert('x')),
+        }));
+        assert_eq!(
+            runtime.take_lsp_intents(),
+            vec![LspIntent::Change {
+                version: 2,
+                text: "xfn main() {}\n".into(),
+            }]
+        );
+    }
+
+    #[test]
+    fn an_exhausted_version_stops_reporting_changes_rather_than_rewinding() {
+        let card = CardId::new();
+        let (mut runtime, _) = RepositoryRuntime::lsp_open_fixture(card, "fn main() {}\n");
+        drop(runtime.take_lsp_intents());
+        move_to_start(&mut runtime, card);
+        let DocumentState::Editable(document) = &mut runtime.document else {
+            unreachable!("the fixture opened an editable buffer");
+        };
+        document.lsp_version = i32::MAX;
+
+        drop(runtime.update(RepositoryAction::EditorAction {
+            card,
+            action: text_editor::Action::Edit(text_editor::Edit::Insert('x')),
+        }));
+        assert_eq!(
+            runtime.take_lsp_intents(),
+            Vec::new(),
+            "the version space is spent; a wrapped version would rewind the server"
+        );
+        assert_eq!(
+            buffer_text(&runtime),
+            "xfn main() {}\n",
+            "the buffer stays authoritative even when it can no longer be reported"
+        );
+        assert_eq!(lsp_version(&runtime), i32::MAX, "saturated, never wrapped");
+    }
+
+    #[test]
+    fn submitting_a_save_and_hitting_a_conflict_both_tell_the_server_nothing() {
+        let card = CardId::new();
+        let (mut runtime, _) = RepositoryRuntime::lsp_open_fixture(card, "fn main() {}\n");
+        drop(runtime.take_lsp_intents());
+        move_to_start(&mut runtime, card);
+        drop(runtime.update(RepositoryAction::EditorAction {
+            card,
+            action: text_editor::Action::Edit(text_editor::Edit::Insert('x')),
+        }));
+        drop(runtime.take_lsp_intents());
+
+        drop(runtime.request_save(card, false));
+        assert_eq!(
+            runtime.take_lsp_intents(),
+            Vec::new(),
+            "a submitted save has not reached disk, so `didSave` would be a lie"
+        );
+
+        let conflicted = runtime.conflicted_active_save_completion();
+        drop(runtime.update(conflicted));
+        assert!(runtime.has_save_conflict());
+        assert_eq!(
+            runtime.take_lsp_intents(),
+            Vec::new(),
+            "a conflict left the file on disk as it was"
+        );
+    }
+
+    #[test]
+    fn a_completed_save_reports_what_reached_disk() {
+        let card = CardId::new();
+        let (mut runtime, _) = RepositoryRuntime::lsp_open_fixture(card, "fn main() {}\n");
+        drop(runtime.take_lsp_intents());
+        move_to_start(&mut runtime, card);
+        drop(runtime.update(RepositoryAction::EditorAction {
+            card,
+            action: text_editor::Action::Edit(text_editor::Edit::Insert('x')),
+        }));
+        drop(runtime.take_lsp_intents());
+        drop(runtime.request_save(card, false));
+
+        let completion = runtime.durable_active_save_completion();
+        drop(runtime.update(completion));
+        assert_eq!(
+            runtime.take_lsp_intents(),
+            vec![LspIntent::Save {
+                text: "xfn main() {}\n".into(),
+            }]
+        );
+    }
+
+    #[test]
+    fn discarding_edits_resynchronises_the_server_with_the_saved_text() {
+        let card = CardId::new();
+        let (mut runtime, _) = RepositoryRuntime::lsp_open_fixture(card, "fn main() {}\n");
+        drop(runtime.take_lsp_intents());
+        move_to_start(&mut runtime, card);
+        drop(runtime.update(RepositoryAction::EditorAction {
+            card,
+            action: text_editor::Action::Edit(text_editor::Edit::Insert('x')),
+        }));
+        drop(runtime.take_lsp_intents());
+
+        drop(runtime.update(RepositoryAction::DiscardEdits { card }));
+        assert_eq!(
+            runtime.take_lsp_intents(),
+            vec![LspIntent::Change {
+                version: 3,
+                text: "fn main() {}\n".into(),
+            }],
+            "discarding rebuilds the buffer without going through an editor action"
+        );
+    }
+
+    #[test]
+    fn abandoning_unsaved_changes_resynchronises_the_server() {
+        let card = CardId::new();
+        let (mut runtime, _) = RepositoryRuntime::lsp_open_fixture(card, "fn main() {}\n");
+        drop(runtime.take_lsp_intents());
+        move_to_start(&mut runtime, card);
+        drop(runtime.update(RepositoryAction::EditorAction {
+            card,
+            action: text_editor::Action::Edit(text_editor::Edit::Insert('x')),
+        }));
+        drop(runtime.take_lsp_intents());
+
+        assert!(runtime.abandon_unsaved_changes());
+        assert_eq!(
+            runtime.take_lsp_intents(),
+            vec![LspIntent::Change {
+                version: 3,
+                text: "fn main() {}\n".into(),
+            }],
+            "the dirty-close dialog discards the buffer behind the editor's back"
+        );
+    }
+
+    #[test]
+    fn reloading_closes_the_document_before_opening_it_again() {
+        let card = CardId::new();
+        let (mut runtime, _) = RepositoryRuntime::lsp_open_fixture(card, "fn main() {}\n");
+        drop(runtime.take_lsp_intents());
+
+        drop(runtime.update(RepositoryAction::Reload { card }));
+        assert_eq!(
+            runtime.take_lsp_intents(),
+            vec![LspIntent::Close],
+            "the reloaded buffer is a different document, however identical its path"
+        );
+
+        let identity = AsyncIdentity {
+            card,
+            worktree: PathBuf::from("/repo"),
+            path: PathBuf::from("notes.txt"),
+            generation: runtime.generation,
+        };
+        drop(runtime.update(RepositoryAction::FileLoaded {
+            identity,
+            result: Ok(FileContent::Editable {
+                text: "fn main() {}\n".into(),
+                content_hash: blake3::hash(b"fn main() {}\n"),
+                markdown: false,
+            }),
+        }));
+        assert_eq!(
+            runtime.take_lsp_intents(),
+            vec![LspIntent::Open {
+                absolute_path: PathBuf::from("/repo/notes.txt"),
+                worktree: PathBuf::from("/repo"),
+                version: 1,
+                text: "fn main() {}\n".into(),
+            }]
+        );
+    }
+
+    #[test]
+    fn opening_another_file_closes_the_one_it_replaces() {
+        let card = CardId::new();
+        let (mut runtime, _) = RepositoryRuntime::lsp_open_fixture(card, "fn main() {}\n");
+        drop(runtime.take_lsp_intents());
+
+        drop(runtime.update(RepositoryAction::OpenFile {
+            card,
+            path: PathBuf::from("other.txt"),
+        }));
+        assert_eq!(runtime.take_lsp_intents(), vec![LspIntent::Close]);
+    }
+
+    #[test]
+    fn returning_to_the_file_list_closes_the_document() {
+        let card = CardId::new();
+        let (mut runtime, _) = RepositoryRuntime::lsp_open_fixture(card, "fn main() {}\n");
+        drop(runtime.take_lsp_intents());
+
+        drop(runtime.update(RepositoryAction::BackToFiles { card }));
+        assert_eq!(runtime.take_lsp_intents(), vec![LspIntent::Close]);
+        assert!(runtime.cursor_position().is_none());
+    }
+
+    #[test]
+    fn the_document_identity_is_stored_for_the_application_that_minted_it() {
+        let card = CardId::new();
+        let (mut runtime, _) = RepositoryRuntime::lsp_open_fixture(card, "fn main() {}\n");
+        assert_eq!(runtime.lsp_document(), None);
+        runtime.set_lsp_document(Some(LspDocumentId(7)));
+        assert_eq!(runtime.lsp_document(), Some(LspDocumentId(7)));
+        runtime.set_lsp_document(None);
+        assert_eq!(runtime.lsp_document(), None);
+    }
+
+    #[test]
+    fn caret_columns_convert_between_bytes_and_scalars() {
+        // Thirteen scalars in seventeen bytes: the accent and the arrow are
+        // the whole point.
+        let line = "héllo → wörld";
+        assert_eq!(line.len(), 17);
+        assert_eq!(scalar_column(line, line.len()), 13);
+        assert_eq!(byte_column(line, 13), 17);
+        assert_eq!(scalar_column(line, 7), 6, "the arrow starts at byte seven");
+        assert_eq!(byte_column(line, 6), 7);
+        assert_eq!(
+            scalar_column(line, 8),
+            6,
+            "a byte index inside the arrow rounds down instead of panicking"
+        );
+        assert_eq!(scalar_column(line, 9), 6);
+        assert_eq!(
+            byte_column(line, 99),
+            17,
+            "a character past the end clamps to the end of the line"
+        );
+        assert_eq!(scalar_column(line, 99), 13);
+    }
+
+    #[test]
+    fn the_caret_round_trips_through_protocol_coordinates_on_a_non_ascii_line() {
+        let card = CardId::new();
+        let (mut runtime, _) = RepositoryRuntime::lsp_open_fixture(card, "héllo → wörld\nplain\n");
+        drop(runtime.take_lsp_intents());
+
+        for at in [
+            LspPosition::new(0, 0),
+            LspPosition::new(0, 6),
+            LspPosition::new(0, 9),
+            LspPosition::new(0, 13),
+            LspPosition::new(1, 5),
+        ] {
+            assert!(runtime.move_cursor_to(at), "line {} exists", at.line);
+            assert_eq!(
+                runtime.cursor_position(),
+                Some(at),
+                "a caret placed at {at:?} must be reported there, not at its byte offset"
+            );
+        }
+        assert_eq!(
+            runtime.take_lsp_intents(),
+            Vec::new(),
+            "jumping the caret changes no text"
+        );
+        assert!(
+            !runtime.move_cursor_to(LspPosition::new(9, 0)),
+            "a line the buffer does not have is refused rather than clamped"
+        );
+    }
+
+    #[test]
+    fn the_caret_round_trips_across_windows_line_endings() {
+        let card = CardId::new();
+        let (mut runtime, _) =
+            RepositoryRuntime::lsp_open_fixture(card, "let a = 1;\r\nlet b = 2;\r\n");
+        drop(runtime.take_lsp_intents());
+
+        for at in [LspPosition::new(0, 10), LspPosition::new(1, 4)] {
+            assert!(runtime.move_cursor_to(at));
+            assert_eq!(
+                runtime.cursor_position(),
+                Some(at),
+                "a `\\r\\n` is one terminator and belongs to neither line's content"
+            );
+        }
+    }
+
+    #[test]
+    fn a_bare_carriage_return_is_a_line_break_to_the_editor_and_not_to_the_protocol() {
+        // The editor's `LineIter` breaks on a lone `\r`; `crate::lsp` counts
+        // `\n` alone. This buffer therefore has three lines to the editor and
+        // two to the protocol, and a caret that survives the trip proves the
+        // conversion goes through byte offsets rather than through a line
+        // index that means different things on each side.
+        let card = CardId::new();
+        let (mut runtime, _) = RepositoryRuntime::lsp_open_fixture(card, "old\rmac\n");
+        drop(runtime.take_lsp_intents());
+
+        let inside_the_second_editor_line = LspPosition::new(0, 5);
+        assert!(runtime.move_cursor_to(inside_the_second_editor_line));
+        assert_eq!(
+            runtime.cursor_position(),
+            Some(inside_the_second_editor_line)
+        );
+        assert!(
+            !runtime.move_cursor_to(LspPosition::new(2, 0)),
+            "the protocol sees two lines here, whatever the editor does"
+        );
+    }
+
+    #[test]
+    fn a_caret_after_a_stripped_carriage_return_reports_a_position_the_protocol_can_hold() {
+        // `crate::lsp` drops a `\r` sitting immediately before a line's
+        // terminating `\n`, or at the end of the buffer, from that line's
+        // content — while the editor treats the same `\r` as a terminator of
+        // its own and will park a caret after it. A column that counted the
+        // `\r` would name a character the protocol's line does not have, which
+        // `Snapshot::to_utf16` refuses with `PositionOutOfRange`: every hover,
+        // completion and definition asked from that caret would silently fail.
+        assert_eq!(
+            position_for_offset("a\r", 2),
+            LspPosition::new(0, 1),
+            "the buffer's trailing bare `\\r` is not a character of line zero"
+        );
+        assert_eq!(
+            position_for_offset("x\n\r\ny", 3),
+            LspPosition::new(1, 0),
+            "the editor reads `\\n\\r` as one terminator, the protocol reads `\\r\\n`; \
+             either way line one is empty"
+        );
+
+        let card = CardId::new();
+        let (mut runtime, _) = RepositoryRuntime::lsp_open_fixture(card, "a\r");
+        drop(runtime.take_lsp_intents());
+        // The end of this buffer is a place `move_cursor_to` cannot name, so
+        // the caret is driven there the way a keypress would.
+        drop(runtime.update(RepositoryAction::EditorAction {
+            card,
+            action: text_editor::Action::Move(text_editor::Motion::DocumentEnd),
+        }));
+        assert_eq!(runtime.cursor_position(), Some(LspPosition::new(0, 1)));
+        assert_eq!(runtime.take_lsp_intents(), Vec::new());
+    }
+
+    #[test]
+    fn every_reported_position_lands_inside_its_own_protocol_line() {
+        // Exhaustive over the shapes that pull the editor's line numbering
+        // apart from the protocol's: every terminator the editor recognises, a
+        // multi-byte scalar, and an unterminated final line, in every order up
+        // to four pieces.
+        let atoms = ["", "a", "\n", "\r", "\r\n", "\n\r", "é"];
+        let mut texts = vec![String::new()];
+        for _ in 0..4 {
+            texts = texts
+                .iter()
+                .flat_map(|text| atoms.iter().map(move |atom| format!("{text}{atom}")))
+                .collect();
+        }
+
+        for text in &texts {
+            for offset in (0..=text.len()).filter(|at| text.is_char_boundary(*at)) {
+                let at = position_for_offset(text, offset);
+                let span =
+                    line_span(text, at.line).expect("the line was counted out of this very text");
+                let scalars = text[span].chars().count();
+                assert!(
+                    usize::try_from(at.character).unwrap() <= scalars,
+                    "{text:?} offset {offset} reported {at:?}, but that line holds \
+                     {scalars} scalars — `Snapshot::to_utf16` would refuse it"
+                );
+                let addressed =
+                    byte_offset(text, at).expect("a reported position addresses a real line");
+                assert_eq!(
+                    position_for_offset(text, addressed),
+                    at,
+                    "{text:?} offset {offset} must survive a second conversion unchanged"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_completion_applies_every_edit_and_reports_one_version() {
+        let card = CardId::new();
+        let (mut runtime, _) = RepositoryRuntime::lsp_open_fixture(
+            card,
+            "use std::fmt;\n\nfn main() {\n    prin\n}\n",
+        );
+        drop(runtime.take_lsp_intents());
+
+        let item = completion_item(
+            completion_edit(
+                LspRange::new(LspPosition::new(3, 4), LspPosition::new(3, 8)),
+                "println!()",
+            ),
+            vec![completion_edit(
+                LspRange::new(LspPosition::new(1, 0), LspPosition::new(1, 0)),
+                "use std::io;\n",
+            )],
+        );
+        assert!(runtime.apply_completion(&item));
+
+        let expected = "use std::fmt;\nuse std::io;\n\nfn main() {\n    println!()\n}\n";
+        assert_eq!(buffer_text(&runtime), expected);
+        assert_eq!(
+            runtime.take_lsp_intents(),
+            vec![LspIntent::Change {
+                version: 2,
+                text: expected.into(),
+            }],
+            "one completion is one document transition, not one per edit"
+        );
+        assert_eq!(lsp_version(&runtime), 2);
+        assert_eq!(
+            runtime.cursor_position(),
+            Some(LspPosition::new(4, 14)),
+            "the caret follows the text the user chose, past the edit inserted above it"
+        );
+        assert!(runtime.is_dirty());
+    }
+
+    #[test]
+    fn a_completion_whose_edits_overlap_is_refused_rather_than_half_applied() {
+        let card = CardId::new();
+        let (mut runtime, _) = RepositoryRuntime::lsp_open_fixture(card, "let value = 1;\n");
+        drop(runtime.take_lsp_intents());
+
+        let overlapping = completion_item(
+            completion_edit(
+                LspRange::new(LspPosition::new(0, 4), LspPosition::new(0, 9)),
+                "other",
+            ),
+            vec![completion_edit(
+                LspRange::new(LspPosition::new(0, 6), LspPosition::new(0, 11)),
+                "clash",
+            )],
+        );
+        assert!(!runtime.apply_completion(&overlapping));
+
+        let unaddressable = completion_item(
+            completion_edit(
+                LspRange::new(LspPosition::new(40, 0), LspPosition::new(40, 1)),
+                "nowhere",
+            ),
+            Vec::new(),
+        );
+        assert!(!runtime.apply_completion(&unaddressable));
+
+        assert_eq!(buffer_text(&runtime), "let value = 1;\n");
+        assert_eq!(lsp_version(&runtime), 1);
+        assert_eq!(
+            runtime.take_lsp_intents(),
+            Vec::new(),
+            "a refused completion is not a document change"
+        );
+        assert!(!runtime.is_dirty());
+    }
+
+    #[test]
+    fn a_snippet_completion_inserts_its_literal_text() {
+        let card = CardId::new();
+        let (mut runtime, _) = RepositoryRuntime::lsp_open_fixture(card, "    prin\n");
+        drop(runtime.take_lsp_intents());
+
+        let mut edit = completion_edit(
+            LspRange::new(LspPosition::new(0, 4), LspPosition::new(0, 8)),
+            "println!()",
+        );
+        edit.snippet = Some(LspSnippet {
+            text: "println!()".into(),
+            stops: vec![LspSnippetStop {
+                index: 1,
+                range: 9..9,
+            }],
+        });
+        assert!(runtime.apply_completion(&completion_item(edit, Vec::new())));
+        assert_eq!(
+            buffer_text(&runtime),
+            "    println!()\n",
+            "tab stops are carried but not entered in this pass"
+        );
+    }
+
+    #[test]
+    fn nothing_is_reported_for_a_card_with_no_editable_buffer() {
+        let card = CardId::new();
+        let (mut runtime, _) = RepositoryRuntime::lsp_selection_fixture(card);
+        assert_eq!(runtime.cursor_position(), None);
+        assert!(!runtime.move_cursor_to(LspPosition::new(0, 0)));
+        assert!(!runtime.apply_completion(&completion_item(
+            completion_edit(LspRange::default(), "x"),
+            Vec::new()
+        )));
+        assert_eq!(runtime.take_lsp_intents(), Vec::new());
+    }
+
+    /// A basis switch is a new request. The diff still in flight for the basis
+    /// the user left must not be able to answer for the one they moved to, and
+    /// a request the counter has already superseded must not answer at all.
+    #[test]
+    fn a_diff_for_a_superseded_basis_cannot_answer_for_the_current_one() {
+        let card = CardId::new();
+        let (mut runtime, identity) = diff_runtime(card);
+        let commit = DiffBasis::CommitToParent {
+            oid: fixture_oid(1),
+            parent: Some(fixture_oid(2)),
+        };
+
+        // The unstaged diff is in flight when the user switches to the commit
+        // comparison, which starts a request of its own.
+        runtime.diff_basis = DiffBasis::IndexToWorktree;
+        runtime.set_diff_state(
+            DiffBasis::IndexToWorktree,
+            DiffState::Loading { request: 1 },
+        );
+        runtime.next_diff_request = 1;
+        let _ = runtime.update(RepositoryAction::ApplyDiffBasis {
+            card,
+            basis: commit.clone(),
+        });
+        assert_eq!(runtime.diff_basis, commit);
+        assert!(matches!(
+            runtime.diff_state(&commit),
+            Some(DiffState::Loading { request: 2 })
+        ));
+
+        // The unstaged answer lands now. It may reach its own slot, and must
+        // not be shown as the commit comparison, nor reset the viewport and
+        // change cursor the user is holding in it.
+        runtime.diff_viewport = ListViewport {
+            offset: 480.0,
+            height: 300.0,
+        };
+        runtime.diff_change = 3;
+        let _ = runtime.update(RepositoryAction::DiffLoaded {
+            identity: identity.clone(),
+            basis: DiffBasis::IndexToWorktree,
+            request: 1,
+            content: staged_text_diff(model_with(9)),
+        });
+        assert!(
+            matches!(
+                runtime.diff_state(&commit),
+                Some(DiffState::Loading { request: 2 })
+            ),
+            "the superseded basis answered for the current one"
+        );
+        assert!(runtime.diff_model().is_none());
+        assert_eq!(runtime.diff_viewport.offset, 480.0);
+        assert_eq!(runtime.diff_change, 3);
+        assert!(matches!(
+            runtime.diff_state(&DiffBasis::IndexToWorktree),
+            Some(DiffState::Ready(RenderedDiff::Text { model, .. })) if model.additions == 9
+        ));
+
+        // A superseded request for the *current* basis is dropped outright.
+        let _ = runtime.update(RepositoryAction::DiffLoaded {
+            identity,
+            basis: commit.clone(),
+            request: 1,
+            content: staged_text_diff(model_with(7)),
+        });
+        assert!(matches!(
+            runtime.diff_state(&commit),
+            Some(DiffState::Loading { request: 2 })
+        ));
+    }
+
+    /// A resolution nobody is waiting for cannot install a basis: the
+    /// selection, or the choice, has moved on since it started.
+    #[test]
+    fn a_stale_basis_resolution_cannot_install_a_basis() {
+        let card = CardId::new();
+        let (mut runtime, identity) = diff_runtime(card);
+        runtime.diff_basis = DiffBasis::IndexToWorktree;
+
+        // Nothing outstanding at all.
+        let _ = runtime.update(RepositoryAction::DiffBasisResolved {
+            identity: identity.clone(),
+            choice: CommittedChoice::Branch,
+            result: Ok(ResolvedBasis::Ready(DiffBasis::HeadToIndex)),
+        });
+        assert_eq!(runtime.diff_basis, DiffBasis::IndexToWorktree);
+        assert!(runtime.basis_resolution.is_none());
+
+        // Outstanding, but for the other committed choice.
+        runtime.basis_resolution = Some(BasisResolution::Resolving(CommittedChoice::LastCommit));
+        let _ = runtime.update(RepositoryAction::DiffBasisResolved {
+            identity: identity.clone(),
+            choice: CommittedChoice::Branch,
+            result: Ok(ResolvedBasis::Ready(DiffBasis::HeadToIndex)),
+        });
+        assert_eq!(
+            runtime.basis_resolution,
+            Some(BasisResolution::Resolving(CommittedChoice::LastCommit))
+        );
+
+        // Outstanding for this choice, but from a selection the card has left.
+        runtime.basis_resolution = Some(BasisResolution::Resolving(CommittedChoice::Branch));
+        let _ = runtime.update(RepositoryAction::DiffBasisResolved {
+            identity: AsyncIdentity {
+                generation: 99,
+                ..identity.clone()
+            },
+            choice: CommittedChoice::Branch,
+            result: Ok(ResolvedBasis::Ready(DiffBasis::HeadToIndex)),
+        });
+        assert_eq!(
+            runtime.basis_resolution,
+            Some(BasisResolution::Resolving(CommittedChoice::Branch))
+        );
+
+        // The one that is waited for is accepted, and clears the wait.
+        let _ = runtime.update(RepositoryAction::DiffBasisResolved {
+            identity,
+            choice: CommittedChoice::Branch,
+            result: Ok(ResolvedBasis::Ready(DiffBasis::HeadToIndex)),
+        });
+        assert!(runtime.basis_resolution.is_none());
+    }
+
+    /// The branch comparison's default base is the remote's own symbolic
+    /// `HEAD`. Without one, nothing is guessed: the refs that could serve as a
+    /// base are offered instead.
+    #[test]
+    fn a_branch_basis_reports_a_missing_default_base_and_offers_the_refs() {
+        let root = tempdir().unwrap();
+        git_fixture(root.path());
+        std::fs::write(root.path().join("file.txt"), "one\n").unwrap();
+        run_git(root.path(), ["add", "file.txt"]);
+        run_git(root.path(), ["commit", "-qm", "base"]);
+        run_git(root.path(), ["branch", "release"]);
+
+        let resolved = resolve_basis(root.path(), CommittedChoice::Branch).unwrap();
+        let ResolvedBasis::NeedsBase { candidates } = &resolved else {
+            panic!("a repository with no remote HEAD has no default base, got {resolved:?}");
+        };
+        assert_eq!(
+            candidates
+                .iter()
+                .map(ValidatedRefName::as_str)
+                .collect::<Vec<_>>(),
+            vec!["refs/heads/release"],
+            "the checked-out branch is not a base for itself"
+        );
+
+        // A symbolic remote HEAD is the default base, and is used verbatim.
+        run_git(
+            root.path(),
+            ["update-ref", "refs/remotes/origin/main", "HEAD"],
+        );
+        run_git(
+            root.path(),
+            [
+                "symbolic-ref",
+                "refs/remotes/origin/HEAD",
+                "refs/remotes/origin/main",
+            ],
+        );
+        assert_eq!(
+            resolve_basis(root.path(), CommittedChoice::Branch).unwrap(),
+            ResolvedBasis::Ready(DiffBasis::MergeBaseToHead {
+                base_ref: ValidatedRefName::parse("refs/remotes/origin/main").unwrap(),
+            })
+        );
+    }
+
+    /// The commit comparison is `HEAD` against its own first parent. A root
+    /// commit has none, which the service compares against the empty tree, and
+    /// an unborn branch has no commit at all.
+    #[test]
+    fn the_commit_basis_resolves_head_against_its_own_parent() {
+        let root = tempdir().unwrap();
+        git_fixture(root.path());
+        assert_eq!(
+            resolve_basis(root.path(), CommittedChoice::LastCommit).unwrap(),
+            ResolvedBasis::NoCommit
+        );
+
+        std::fs::write(root.path().join("file.txt"), "one\n").unwrap();
+        run_git(root.path(), ["add", "file.txt"]);
+        run_git(root.path(), ["commit", "-qm", "root"]);
+        let first = head_oid(root.path());
+        assert_eq!(
+            resolve_basis(root.path(), CommittedChoice::LastCommit).unwrap(),
+            ResolvedBasis::Ready(DiffBasis::CommitToParent {
+                oid: first.clone(),
+                parent: None,
+            })
+        );
+
+        std::fs::write(root.path().join("file.txt"), "one\ntwo\n").unwrap();
+        run_git(root.path(), ["commit", "-qam", "second"]);
+        assert_eq!(
+            resolve_basis(root.path(), CommittedChoice::LastCommit).unwrap(),
+            ResolvedBasis::Ready(DiffBasis::CommitToParent {
+                oid: head_oid(root.path()),
+                parent: Some(first),
+            })
+        );
+    }
+
+    /// With no default base the card says so and offers the choice; picking one
+    /// installs that comparison and clears the outstanding resolution.
+    #[test]
+    fn an_unresolvable_branch_base_offers_the_choice_instead_of_guessing() {
+        let card = CardId::new();
+        let (mut runtime, identity) = diff_runtime(card);
+        runtime.diff_basis = DiffBasis::IndexToWorktree;
+        let candidate = ValidatedRefName::parse("refs/remotes/origin/main").unwrap();
+        runtime.basis_resolution = Some(BasisResolution::Resolving(CommittedChoice::Branch));
+
+        let _ = runtime.update(RepositoryAction::DiffBasisResolved {
+            identity,
+            choice: CommittedChoice::Branch,
+            result: Ok(ResolvedBasis::NeedsBase {
+                candidates: vec![candidate.clone()],
+            }),
+        });
+        assert_eq!(
+            runtime.basis_resolution,
+            Some(BasisResolution::NeedsBase(vec![candidate.clone()]))
+        );
+        let context = runtime.inspector_context();
+        assert_eq!(context.diff_state, Some("Choose a base"));
+        assert_eq!(
+            runtime.diff_basis,
+            DiffBasis::IndexToWorktree,
+            "no base may be guessed"
+        );
+        assert!(!context.can_retry_diff);
+        let _ = diff_surface(card, &runtime);
+
+        // The same surface with nothing to offer still says what is wrong.
+        runtime.basis_resolution = Some(BasisResolution::NeedsBase(Vec::new()));
+        let _ = diff_surface(card, &runtime);
+        assert_eq!(
+            runtime.inspector_context().diff_state,
+            Some("Choose a base")
+        );
+
+        runtime.basis_resolution = Some(BasisResolution::NeedsBase(vec![candidate.clone()]));
+        let basis = DiffBasis::MergeBaseToHead {
+            base_ref: candidate,
+        };
+        let _ = runtime.update(RepositoryAction::ApplyDiffBasis {
+            card,
+            basis: basis.clone(),
+        });
+        assert_eq!(runtime.diff_basis, basis);
+        assert!(runtime.basis_resolution.is_none());
+        assert!(matches!(
+            runtime.diff_state(&basis),
+            Some(DiffState::Loading { .. })
+        ));
+    }
+
+    /// A committed comparison does not depend on local status: a file with no
+    /// staged half can still be compared against committed history, and
+    /// choosing that comparison is what starts reading it.
+    #[test]
+    fn a_committed_basis_is_offered_for_a_file_with_no_staged_half() {
+        let card = CardId::new();
+        let (mut runtime, _) = diff_runtime(card);
+        let selected = runtime
+            .selected
+            .as_mut()
+            .expect("the fixture selects a file");
+        selected.staged = false;
+        runtime.diff_basis = DiffBasis::IndexToWorktree;
+        let branch = DiffBasis::MergeBaseToHead {
+            base_ref: ValidatedRefName::parse("refs/heads/main").unwrap(),
+        };
+
+        let _ = runtime.update(RepositoryAction::ApplyDiffBasis {
+            card,
+            basis: DiffBasis::HeadToIndex,
+        });
+        assert_eq!(
+            runtime.diff_basis,
+            DiffBasis::IndexToWorktree,
+            "a file with no staged half has no staged comparison"
+        );
+
+        let _ = runtime.update(RepositoryAction::ApplyDiffBasis {
+            card,
+            basis: branch.clone(),
+        });
+        assert_eq!(runtime.diff_basis, branch);
+        assert!(matches!(
+            runtime.diff_state(&branch),
+            Some(DiffState::Loading { .. })
+        ));
+    }
+
+    /// A file with no local change at all still has a diff surface, and still
+    /// reaches the committed comparisons — which is the only way to review a
+    /// file the branch changed and the worktree has not.
+    #[test]
+    fn a_file_with_no_local_change_still_reaches_a_committed_comparison() {
+        let card = CardId::new();
+        let (mut runtime, _) = diff_runtime(card);
+        let selected = runtime
+            .selected
+            .as_mut()
+            .expect("the fixture selects a file");
+        selected.staged = false;
+        selected.unstaged = false;
+        selected.status = None;
+        runtime.source_surface = SourceSurface::Editor;
+        runtime.diff_basis = DiffBasis::HeadToIndex;
+
+        let _ = runtime.update(RepositoryAction::ApplySourceSurface { card, diff: true });
+        assert_eq!(runtime.source_surface, SourceSurface::Diff);
+        // Neither working comparison has anything to show, and nothing was
+        // invented to fill the surface.
+        assert!(runtime.diff_state(&DiffBasis::HeadToIndex).is_none());
+        assert_eq!(runtime.inspector_context().diff_state, Some("No changes"));
+        let _ = diff_surface(card, &runtime);
+
+        let commit = DiffBasis::CommitToParent {
+            oid: fixture_oid(4),
+            parent: Some(fixture_oid(5)),
+        };
+        let _ = runtime.update(RepositoryAction::ApplyDiffBasis {
+            card,
+            basis: commit.clone(),
+        });
+        assert_eq!(runtime.diff_basis, commit);
+        assert!(matches!(
+            runtime.diff_state(&commit),
+            Some(DiffState::Loading { .. })
+        ));
+
+        // With no file selected there is no diff surface to open.
+        runtime.selected = None;
+        runtime.source_surface = SourceSurface::Editor;
+        let _ = runtime.update(RepositoryAction::ApplySourceSurface { card, diff: true });
+        assert_eq!(runtime.source_surface, SourceSurface::Editor);
+    }
+
+    /// Widening the update path was not enough: the only affordance that emits
+    /// it is the card's Edit/Diff control, and while that was gated on a local
+    /// change the two committed comparisons stayed unreachable for exactly the
+    /// files they exist for.
+    #[test]
+    fn the_diff_affordance_survives_a_file_with_no_local_change() {
+        fn probe(card: CardId, runtime: &RepositoryRuntime) -> Element<'_, RepositoryAction> {
+            widget::segmented_control::horizontal(&runtime.source_control.model)
+                .on_activate(move |entity| RepositoryAction::SelectSource { card, entity })
+                .into()
+        }
+
+        let card = CardId::new();
+        let (mut runtime, _) = diff_runtime(card);
+        let expected = {
+            let changed = selected_file_view(card, &runtime);
+            assert!(holds_widget_like(&changed, &probe(card, &runtime)));
+            widget_nodes(&changed)
+        };
+
+        let selected = runtime
+            .selected
+            .as_mut()
+            .expect("the fixture selects a file");
+        selected.staged = false;
+        selected.unstaged = false;
+        selected.status = None;
+
+        let unchanged = selected_file_view(card, &runtime);
+        assert!(
+            holds_widget_like(&unchanged, &probe(card, &runtime)),
+            "the Edit/Diff control vanished for a file with no local change"
+        );
+        assert_eq!(widget_nodes(&unchanged), expected);
+    }
+
+    /// A committed comparison that does not resolve replaces the body of the
+    /// diff surface. The control that chose it must survive that, or the user
+    /// is stranded in a basis with their own diff still cached behind it.
+    #[test]
+    fn an_unresolved_comparison_still_offers_the_way_back() {
+        let card = CardId::new();
+        let (mut runtime, _) = diff_runtime(card);
+        runtime.set_diff_state(
+            DiffBasis::IndexToWorktree,
+            DiffState::Ready(staged_text_diff(model_with(1))),
+        );
+        let control = widget::segmented_control::horizontal(&runtime.diff_basis_control.model)
+            .on_activate(move |entity| RepositoryAction::SelectDiffBasis { card, entity })
+            .into();
+        assert!(holds_widget_like(&diff_surface(card, &runtime), &control));
+
+        for resolution in [
+            BasisResolution::Resolving(CommittedChoice::Branch),
+            // No candidates at all, so even the ref selector offers nothing.
+            BasisResolution::NeedsBase(Vec::new()),
+            BasisResolution::Unavailable("This branch has no commits yet".into()),
+        ] {
+            runtime.basis_resolution = Some(resolution.clone());
+            assert!(
+                holds_widget_like(&diff_surface(card, &runtime), &control),
+                "{resolution:?} stranded the user with no way to change basis"
+            );
+            // The diff the user was reading is still cached, and the basis
+            // never moved - so changing basis back is a real escape.
+            assert_eq!(runtime.diff_basis, DiffBasis::IndexToWorktree);
+            assert!(matches!(
+                runtime.diff_state(&DiffBasis::IndexToWorktree),
+                Some(DiffState::Ready(RenderedDiff::Text { .. }))
+            ));
+        }
+    }
+
+    /// A committed basis is named by a commit id, so the per-basis diff cache
+    /// has an open keyspace where the two working bases were a closed one.
+    /// Stepping through history must not retain one diff model per commit
+    /// visited, and the eviction must never take the comparison on screen, a
+    /// working basis, or resurrect an abandoned slot.
+    #[test]
+    fn stepping_through_commits_does_not_retain_a_diff_per_commit() {
+        let card = CardId::new();
+        let (mut runtime, identity) = diff_runtime(card);
+        // The two working bases, as opening the file would have read them.
+        for basis in [DiffBasis::HeadToIndex, DiffBasis::IndexToWorktree] {
+            runtime.set_diff_state(basis, DiffState::Ready(staged_text_diff(model_with(1))));
+        }
+        let commit = |step: u8| DiffBasis::CommitToParent {
+            oid: fixture_oid(step * 2),
+            parent: Some(fixture_oid(step * 2 + 1)),
+        };
+
+        const STEPS: u8 = 12;
+        for step in 0..STEPS {
+            let basis = commit(step);
+            let _ = runtime.update(RepositoryAction::ApplyDiffBasis {
+                card,
+                basis: basis.clone(),
+            });
+            assert_eq!(runtime.diff_basis, basis, "step {step} was not applied");
+            assert!(
+                runtime
+                    .diffs
+                    .iter()
+                    .filter(|(basis, _)| matches!(basis_choice(basis), BasisChoice::Committed(_)))
+                    .count()
+                    <= MAX_RETAINED_COMMITTED_DIFFS,
+                "the cache exceeded its cap at step {step}"
+            );
+        }
+
+        // Neither working basis was evicted to make room.
+        assert!(runtime.diff_state(&DiffBasis::HeadToIndex).is_some());
+        assert!(runtime.diff_state(&DiffBasis::IndexToWorktree).is_some());
+        // The comparison on screen survived, and so did the ones just before
+        // it, which is what makes stepping back instant.
+        let kept = usize::from(STEPS) - MAX_RETAINED_COMMITTED_DIFFS;
+        for step in 0..STEPS {
+            let present = runtime.diff_state(&commit(step)).is_some();
+            assert_eq!(
+                present,
+                usize::from(step) >= kept,
+                "step {step} retention is wrong"
+            );
+        }
+
+        // The evicted slots were still in flight. Their answers land nowhere
+        // and do not recreate the slot the user has moved away from.
+        let _ = runtime.update(RepositoryAction::DiffLoaded {
+            identity,
+            basis: commit(0),
+            request: 1,
+            content: staged_text_diff(model_with(9)),
+        });
+        assert!(runtime.diff_state(&commit(0)).is_none());
+        assert_eq!(runtime.diff_basis, commit(STEPS - 1));
+    }
+
+    /// A commit diff and unstaged work must not read the same. The heading
+    /// names the comparison, and the inspector has its own static word for it.
+    #[test]
+    fn every_basis_names_itself_in_the_chrome() {
+        let commit = DiffBasis::CommitToParent {
+            oid: fixture_oid(1),
+            parent: Some(fixture_oid(2)),
+        };
+        let root_commit = DiffBasis::CommitToParent {
+            oid: fixture_oid(1),
+            parent: None,
+        };
+        let branch = DiffBasis::MergeBaseToHead {
+            base_ref: ValidatedRefName::parse("refs/remotes/origin/main").unwrap(),
+        };
+        let labels = [
+            &DiffBasis::IndexToWorktree,
+            &DiffBasis::HeadToIndex,
+            &branch,
+            &commit,
+            &root_commit,
+        ]
+        .map(basis_label);
+        assert_eq!(
+            labels,
+            [
+                "Unstaged changes".to_owned(),
+                "Staged changes".to_owned(),
+                "Branch vs origin/main".to_owned(),
+                format!("Commit {}", fixture_oid(1).short()),
+                format!("Root commit {}", fixture_oid(1).short()),
+            ]
+        );
+        let mut distinct = labels.to_vec();
+        distinct.sort();
+        distinct.dedup();
+        assert_eq!(distinct.len(), labels.len(), "two bases share their chrome");
+
+        assert_eq!(basis_choice_label(&DiffBasis::IndexToWorktree), "Unstaged");
+        assert_eq!(basis_choice_label(&DiffBasis::HeadToIndex), "Staged");
+        assert_eq!(basis_choice_label(&branch), "Branch");
+        assert_eq!(basis_choice_label(&commit), "Commit");
+        assert_eq!(basis_choice_label(&root_commit), "Commit");
+    }
+
+    /// A comparison with no text rows reports what it actually is, including
+    /// the states #45's loader could not produce. A conflicted path reports as
+    /// conflicted and has no two-sided model at all.
+    #[test]
+    fn a_comparison_without_rows_reports_what_it_is() {
+        let card = CardId::new();
+        let (mut runtime, _) = diff_runtime(card);
+        runtime.diff_basis = DiffBasis::IndexToWorktree;
+        let text = || DiffSide::Text {
+            text: "a\n".into(),
+            bytes: 2,
+        };
+
+        runtime.set_diff_state(
+            DiffBasis::IndexToWorktree,
+            DiffState::Ready(RenderedDiff::NoText(DiffContent::Unmerged {
+                base: text(),
+                ours: text(),
+                theirs: text(),
+                worktree: DiffSide::Absent,
+            })),
+        );
+        assert_eq!(runtime.inspector_context().diff_state, Some("Conflicted"));
+        assert!(
+            runtime.diff_model().is_none(),
+            "a conflict has no two-sided model"
+        );
+        let _ = diff_surface(card, &runtime);
+
+        for (new, expected) in [
+            (DiffSide::Binary { bytes: 3 }, "Binary"),
+            (DiffSide::InvalidUtf8 { bytes: 1 }, "Invalid UTF-8"),
+            (DiffSide::Oversize { bytes: 1 << 30 }, "Too large"),
+            (DiffSide::NotRegularFile, "Not a regular file"),
+            (DiffSide::Submodule { oid: None }, "Submodule"),
+            (
+                DiffSide::Submodule {
+                    oid: Some(fixture_oid(3)),
+                },
+                "Submodule",
+            ),
+            (
+                DiffSide::Unreadable {
+                    reason: "permission denied".into(),
+                },
+                "Unreadable",
+            ),
+            (
+                DiffSide::Symlink {
+                    target: PathBuf::from("elsewhere"),
+                },
+                "Symlink",
+            ),
+        ] {
+            runtime.set_diff_state(
+                DiffBasis::IndexToWorktree,
+                DiffState::Ready(RenderedDiff::NoText(DiffContent::Comparison {
+                    old: text(),
+                    new,
+                    old_label: "Index".into(),
+                    new_label: "Working tree".into(),
+                })),
+            );
+            assert_eq!(runtime.inspector_context().diff_state, Some(expected));
+            assert!(runtime.diff_model().is_none());
+            // The surface renders the fact instead of panicking on a state
+            // #45's reduced content type had no variant for.
+            let _ = diff_surface(card, &runtime);
+        }
+    }
+
+    /// A runtime with one selected file that has both working halves and the
+    /// diff surface showing, which is what every basis fence needs to be
+    /// observable.
+    fn diff_runtime(card: CardId) -> (RepositoryRuntime, AsyncIdentity) {
+        let mut runtime = RepositoryRuntime::new(RepositoryView {
+            project: ProjectId::new(),
+            repository: PathBuf::from("/repo/.git"),
+            worktree: PathBuf::from("/repo"),
+        });
+        let path = PathBuf::from("notes.txt");
+        let file = RepositoryFile {
+            path: path.clone(),
+            staged_old_path: None,
+            unstaged_old_path: None,
+            staged: true,
+            unstaged: true,
+            status: Some("MM".into()),
+        };
+        runtime.generation = 1;
+        runtime.files = FileListState::Ready(vec![file.clone()]);
+        runtime.selected = Some(file);
+        runtime.source_surface = SourceSurface::Diff;
+        let identity = AsyncIdentity {
+            card,
+            worktree: PathBuf::from("/repo"),
+            path,
+            generation: 1,
+        };
+        (runtime, identity)
+    }
+
+    /// A ready text diff carrying the labels the staged basis produces.
+    fn staged_text_diff(model: DiffModel) -> RenderedDiff {
+        RenderedDiff::Text {
+            model,
+            old_label: "HEAD".into(),
+            new_label: "Index".into(),
+        }
+    }
+
+    fn model_with(additions: u32) -> DiffModel {
+        DiffModel {
+            inline_rows: Vec::new(),
+            split_rows: Vec::new(),
+            inline_change_starts: Vec::new(),
+            split_change_starts: Vec::new(),
+            additions,
+            deletions: 0,
+        }
+    }
+
+    /// Every node in the widget tree an element actually builds.
+    fn widget_nodes(element: &Element<'_, RepositoryAction>) -> usize {
+        fn count(tree: &iced::advanced::widget::Tree) -> usize {
+            1 + tree.children.iter().map(count).sum::<usize>()
+        }
+        count(&iced::advanced::widget::Tree::new(element))
+    }
+
+    /// Whether the tree `element` builds holds a widget of the same kind as
+    /// `probe`.
+    ///
+    /// Comparing state tags is the only way to ask "is this control on screen"
+    /// from outside the widget library, whose state types are private.
+    fn holds_widget_like(
+        element: &Element<'_, RepositoryAction>,
+        probe: &Element<'_, RepositoryAction>,
+    ) -> bool {
+        fn find(
+            tree: &iced::advanced::widget::Tree,
+            tag: iced::advanced::widget::tree::Tag,
+        ) -> bool {
+            tree.tag == tag || tree.children.iter().any(|child| find(child, tag))
+        }
+        find(
+            &iced::advanced::widget::Tree::new(element),
+            iced::advanced::widget::Tree::new(probe).tag,
+        )
+    }
+
+    fn fixture_oid(seed: u8) -> Oid {
+        Oid::parse_object(format!("{}{seed:02x}", "ab".repeat(19))).expect("a valid object id")
+    }
+
+    fn head_oid(root: &Path) -> Oid {
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(root)
+            .args(["rev-parse", "--verify", "HEAD"])
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "git rev-parse HEAD failed");
+        Oid::parse_object(String::from_utf8(output.stdout).unwrap().trim()).unwrap()
+    }
+
+    /// An unborn branch has no `HEAD` for a merge base to be taken against —
+    /// even when the remote's own `HEAD` names a base ref perfectly well, which
+    /// is what makes this different from the commit basis's own empty case.
+    #[test]
+    fn an_unborn_branch_reports_no_commit_for_the_branch_basis_too() {
+        let origin = tempdir().unwrap();
+        git_fixture(origin.path());
+        std::fs::write(origin.path().join("seed.txt"), "seed\n").unwrap();
+        run_git(origin.path(), ["add", "seed.txt"]);
+        run_git(origin.path(), ["commit", "-qm", "seed"]);
+
+        let fetched = tempdir().unwrap();
+        git_fixture(fetched.path());
+        run_git(
+            fetched.path(),
+            [
+                "remote",
+                "add",
+                "origin",
+                origin.path().to_str().expect("a UTF-8 fixture path"),
+            ],
+        );
+        run_git(fetched.path(), ["fetch", "-q", "origin"]);
+        run_git(fetched.path(), ["remote", "set-head", "origin", "-a"]);
+
+        // The base ref resolves: this repository really does know what the
+        // remote's default branch is.
+        let snapshot = RepositoryService::system("git")
+            .snapshot(fetched.path(), &CancellationToken::new())
+            .expect("snapshot");
+        assert!(snapshot.default_branch_base().is_some());
+        // Nothing has been committed here, so there is no HEAD to compare that
+        // base with, and both committed choices must say so rather than
+        // installing a comparison that dies in Git.
+        assert_eq!(
+            resolve_basis(fetched.path(), CommittedChoice::Branch),
+            Ok(ResolvedBasis::NoCommit)
+        );
+        assert_eq!(
+            resolve_basis(fetched.path(), CommittedChoice::LastCommit),
+            Ok(ResolvedBasis::NoCommit)
+        );
+    }
+
+    /// An empty repository on a named initial branch, because the branch tests
+    /// name `main` and Git's default depends on the host's configuration.
+    fn git_fixture(root: &Path) {
+        run_git(root, ["init", "-q", "-b", "main"]);
+        run_git(root, ["config", "user.name", "Fixture"]);
+        run_git(root, ["config", "user.email", "fixture@example.invalid"]);
+    }
+
     fn run_git<const N: usize>(root: &Path, args: [&str; N]) {
         let status = Command::new("git")
             .arg("-C")
@@ -3530,5 +6149,319 @@ mod tests {
             .status()
             .unwrap();
         assert!(status.success());
+    }
+
+    /// A buffer whose tokens are exactly the ones the smoke run found
+    /// indistinguishable: a comment, a keyword, a string, and a macro call.
+    const HIGHLIGHTABLE: &str = "// what main does\nfn main() {\n    let hello = \"world\";\n    println!(\"{hello}\");\n}\n";
+
+    /// A headless `cosmic::Renderer`. With no graphics device it falls back to
+    /// `tiny-skia`, which needs neither a device nor a surface and which can
+    /// hand back the pixels it drew.
+    ///
+    /// One per render: the renderer accumulates the layers it is drawn into.
+    fn headless_renderer() -> cosmic::Renderer {
+        use cosmic::iced::Pixels;
+        use cosmic::iced::advanced::renderer::Headless;
+
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("executor")
+            .block_on(cosmic::Renderer::new(
+                Font::MONOSPACE,
+                Pixels(14.0),
+                Some("tiny-skia"),
+            ))
+            .expect("a headless renderer")
+    }
+
+    /// The RGBA pixels the card's own `view` rasterises, at `size` logical
+    /// pixels on the dark COSMIC palette.
+    fn rendered_card(card: CardId, runtime: &RepositoryRuntime, size: (u32, u32)) -> Vec<u8> {
+        use cosmic::iced::advanced::renderer::{Headless, Style};
+        use cosmic::iced::advanced::{Layout, layout, mouse, widget::Tree};
+        use cosmic::iced::{Color, Rectangle, Size};
+
+        let (width, height) = size;
+        let mut renderer = headless_renderer();
+        let mut element = view(card, runtime);
+        let mut tree = Tree::new(element.as_widget());
+        let viewport = Rectangle::with_size(Size::new(width as f32, height as f32));
+        let node = element.as_widget_mut().layout(
+            &mut tree,
+            &renderer,
+            &layout::Limits::new(Size::ZERO, viewport.size()),
+        );
+        element.as_widget().draw(
+            &tree,
+            &mut renderer,
+            &cosmic::Theme::dark(),
+            &Style::default(),
+            Layout::new(&node),
+            mouse::Cursor::Unavailable,
+            &viewport,
+        );
+        renderer.screenshot(Size::new(width, height), 1.0, Color::BLACK)
+    }
+
+    /// The colour families a render puts on screen, as (brightest channel,
+    /// dimmest channel) pairs.
+    ///
+    /// Counting *distinct colours* would count anti-aliasing: a single
+    /// coloured glyph fades into the background over a dozen shades. Which
+    /// channel leads is what survives that fade, so this counts token colours
+    /// rather than blend steps. Achromatic pixels — the background, the
+    /// chrome's greys, and unhighlighted text — are excluded outright, and a
+    /// family needs a real population to count so a stray fringe pixel cannot
+    /// invent one.
+    fn colour_families(pixels: &[u8]) -> BTreeSet<(usize, usize)> {
+        const MIN_CHROMA: u8 = 32;
+        const MIN_PIXELS: usize = 16;
+
+        let mut counts: BTreeMap<(usize, usize), usize> = BTreeMap::new();
+        for pixel in pixels.chunks_exact(4) {
+            let rgb = [pixel[0], pixel[1], pixel[2]];
+            let high = rgb.iter().copied().max().expect("three channels");
+            let low = rgb.iter().copied().min().expect("three channels");
+            if high - low < MIN_CHROMA {
+                continue;
+            }
+            let brightest = rgb
+                .iter()
+                .enumerate()
+                .max_by_key(|&(_, v)| v)
+                .expect("max")
+                .0;
+            let dimmest = rgb
+                .iter()
+                .enumerate()
+                .min_by_key(|&(_, v)| v)
+                .expect("min")
+                .0;
+            *counts.entry((brightest, dimmest)).or_default() += 1;
+        }
+        counts
+            .into_iter()
+            .filter(|&(_, count)| count >= MIN_PIXELS)
+            .map(|(family, _)| family)
+            .collect()
+    }
+
+    /// GitHub issue #1 asks for editable *syntax-highlighted* buffers, and the
+    /// editor that first landed drew every token in one colour. This renders
+    /// the same bytes twice, changing nothing but the name they were opened
+    /// under, and reads the pixels back.
+    #[test]
+    fn the_editable_buffer_is_highlighted_by_the_grammar_its_name_names() {
+        let card = CardId::new();
+        let render = |name: &str| {
+            let (runtime, _) = RepositoryRuntime::open_fixture(card, name, HIGHLIGHTABLE);
+            rendered_card(card, &runtime, (520, 200))
+        };
+        // `.txt` is plain text to every grammar set, so this is the same card
+        // with the highlighting switched off by the only input that chooses it.
+        let rust = render("main.rs");
+        let plain = render("main.txt");
+
+        assert_eq!(rust.len(), plain.len(), "both renders are one size");
+        assert!(
+            rust.iter().any(|&channel| channel != 0),
+            "the harness drew nothing at all, so every comparison below would pass vacuously"
+        );
+
+        // Not a comparison of the two frames byte for byte: the header prints
+        // the file name, so they differ on a row that has nothing to do with
+        // highlighting, and such a check would pass with the highlighter
+        // deleted. Colour is what separates them. Every one of this card's own
+        // greys and its single chromatic accent is drawn identically in both,
+        // so a colour family the Rust render has and the plain-text one lacks
+        // can only have come from a grammar.
+        let highlighted = colour_families(&rust);
+        let unhighlighted = colour_families(&plain);
+        assert!(
+            unhighlighted.is_subset(&highlighted),
+            "the plain render has a colour the highlighted one lacks, so these two renders differ \
+             in more than the grammar and the comparison below proves nothing: {unhighlighted:?} \
+             against {highlighted:?}"
+        );
+        assert!(
+            highlighted.len() >= unhighlighted.len() + 2,
+            "a keyword, a string and a comment must not all read the same: the highlighted render \
+             put {} colour families on screen against the plain render's {} — {highlighted:?} \
+             against {unhighlighted:?}",
+            highlighted.len(),
+            unhighlighted.len()
+        );
+    }
+
+    /// Both inputs the highlighter takes, checked where they are decided.
+    #[test]
+    fn the_grammar_follows_the_file_name_and_the_scheme_follows_the_palette() {
+        use cosmic::iced::advanced::text::Highlighter as _;
+
+        /// Whether a token resolves to a grammar that actually colours
+        /// `line`, rather than to the plain-text fallback that colours nothing.
+        fn colours(token: &str, line: &str) -> bool {
+            let settings = highlighter::Settings {
+                theme: highlighter::Theme::Base16Ocean,
+                token: token.to_owned(),
+            };
+            highlighter::Highlighter::new(&settings)
+                .highlight_line(line)
+                .any(|(_, highlight)| highlight.color().is_some())
+        }
+
+        for (path, token, line) in [
+            ("src/main.rs", "rs", "fn main() {}"),
+            // A grammar lists its extensions in one case, and `README.MD` is
+            // still Markdown.
+            ("README.MD", "md", "# heading"),
+            // No extension to read, so the name is the token — and it is
+            // passed through as written, because that is what a grammar's own
+            // name is matched against.
+            ("Makefile", "Makefile", "all: build"),
+            ("deploy/Dockerfile", "Dockerfile", "FROM scratch"),
+        ] {
+            let settings = highlighter_settings(Path::new(path), true);
+            assert_eq!(
+                settings.token, token,
+                "{path} must be highlighted as {token}"
+            );
+            assert!(
+                colours(&settings.token, line),
+                "{token:?} resolves to no grammar, so {path} would render as flat plain text"
+            );
+        }
+
+        assert!(
+            !colours("no-such-grammar", "fn main() {}"),
+            "an unrecognised token must fall back to plain text rather than colour arbitrarily; \
+             without that the check above cannot tell a grammar from the fallback"
+        );
+
+        // An extension wins over a name, so a name carrying an unknown
+        // extension resolves to plain text. Pinned rather than fixed: naming
+        // the grammar is all this decides, and choosing between two candidate
+        // grammars is syntect's job.
+        for path in ["Dockerfile.dev", "Makefile.am"] {
+            let settings = highlighter_settings(Path::new(path), true);
+            assert!(
+                !colours(&settings.token, "FROM scratch"),
+                "{path} resolves as {:?}; if that now colours, the extension no longer wins and \
+                 the documented gap is gone",
+                settings.token
+            );
+        }
+
+        // A scheme picks its foregrounds for a background of its own kind, so
+        // reading a dark one off a light surface is what makes highlighted
+        // text illegible.
+        assert!(
+            highlighter_settings(Path::new("main.rs"), true)
+                .theme
+                .is_dark(),
+            "a dark application must highlight with a dark scheme"
+        );
+        assert!(
+            !highlighter_settings(Path::new("main.rs"), false)
+                .theme
+                .is_dark(),
+            "a light application must highlight with a light scheme"
+        );
+    }
+
+    /// Moving the caret is not enough to *show* a jump: an unfocused
+    /// `text_editor` draws no caret at all, which is what made
+    /// jump-to-location look like it did nothing. The affordance the
+    /// application chains after a caret move has to name a target that the
+    /// view really carries, on the frame after the one that asked for it.
+    #[test]
+    fn the_editable_buffer_offers_a_stable_focus_target_the_view_really_carries() {
+        use cosmic::iced::Size;
+        use cosmic::iced::advanced::widget::Operation as _;
+        use cosmic::iced::advanced::widget::operation::{self, Outcome};
+        use cosmic::iced::advanced::{Layout, layout, widget::Tree};
+
+        let card = CardId::new();
+        let expected = editor_focus_id(card).to_string();
+        assert_eq!(
+            editor_focus_id(card).to_string(),
+            expected,
+            "the id must be derived from the card rather than minted: a focus operation is \
+             delivered on a later frame than the one that asked for it, and an id that changed in \
+             between would address nothing"
+        );
+        assert_ne!(
+            editor_focus_id(CardId::new()).to_string(),
+            expected,
+            "two repository cards must not contend for one focus target"
+        );
+
+        let (mut runtime, _) = RepositoryRuntime::open_fixture(card, "main.rs", HIGHLIGHTABLE);
+        assert_eq!(
+            runtime.editor_focus_target(card).map(|id| id.to_string()),
+            Some(expected.clone()),
+            "an open editable buffer is exactly the surface a jump lands in"
+        );
+
+        // The id is only worth having if the widget tree answers to it, so ask
+        // the real `view` to focus it and then ask it back what is focused.
+        let landed = {
+            let renderer = headless_renderer();
+            let mut element = view(card, &runtime);
+            let mut tree = Tree::new(element.as_widget());
+            let node = element.as_widget_mut().layout(
+                &mut tree,
+                &renderer,
+                &layout::Limits::new(Size::ZERO, Size::new(520.0, 200.0)),
+            );
+            let mut focus = operation::focusable::focus::<()>(editor_focus_id(card));
+            element
+                .as_widget_mut()
+                .operate(&mut tree, Layout::new(&node), &renderer, &mut focus);
+            // `Widget::operate` only takes an `Operation<()>`; `black_box` is
+            // how iced runs an operation that reports an outcome through one.
+            let mut focused = operation::focusable::find_focused();
+            let mut probe = operation::black_box::<_, ()>(&mut focused);
+            element
+                .as_widget_mut()
+                .operate(&mut tree, Layout::new(&node), &renderer, &mut probe);
+            drop(probe);
+            match focused.finish() {
+                Outcome::Some(id) => Some(id.to_string()),
+                Outcome::None | Outcome::Chain(_) => None,
+            }
+        };
+        assert_eq!(
+            landed,
+            Some(expected.clone()),
+            "the focus operation reached no focusable widget under that id: the editor the view \
+             builds does not carry it"
+        );
+
+        // A surface that builds no editor has nothing to focus, and a focus
+        // operation aimed at it would be delivered to no widget at all.
+        if let DocumentState::Editable(document) = &mut runtime.document {
+            document.markdown = true;
+        }
+        runtime.markdown_mode = MarkdownMode::Preview;
+        assert!(
+            runtime.editor_focus_target(card).is_none(),
+            "a Markdown preview renders the buffer, it does not edit it"
+        );
+
+        runtime.markdown_mode = MarkdownMode::Edit;
+        drop(runtime.update(RepositoryAction::ApplySourceSurface { card, diff: true }));
+        assert!(
+            runtime.editor_focus_target(card).is_none(),
+            "the diff surface replaces the editor rather than sitting beside it"
+        );
+
+        drop(runtime.update(RepositoryAction::BackToFiles { card }));
+        assert!(
+            runtime.editor_focus_target(card).is_none(),
+            "the file list has no buffer for a caret to be in"
+        );
     }
 }
