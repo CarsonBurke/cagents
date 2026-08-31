@@ -10437,37 +10437,30 @@ mod tests {
         assert_eq!(notice(&app), None);
     }
 
-    /// A jump that moves the caret must also hand the editor the keyboard.
+    /// Who holds the keyboard once a task's widget operations have run.
     ///
-    /// An unfocused `text_editor` draws no caret at all, so without this the
-    /// application answers a click on a result with a frame indistinguishable
-    /// from the one the user clicked in - measured live before this was wired:
-    /// frame differencing over the caret's blink found a 2px column with the
-    /// editor focused and zero pixel delta after a jump.
-    #[test]
-    fn a_jump_gives_the_editor_the_keyboard() {
+    /// Focus arrives as a widget operation rather than a message, so it is
+    /// read the way the runtime reads one: run the task's operations over the
+    /// tree the frame actually built, then ask that tree who holds focus.
+    fn focused(app: &Cagents, task: Task<Message>) -> Option<widget::Id> {
+        use cosmic::iced::advanced::layout;
         use cosmic::iced::advanced::widget::Tree;
+        use cosmic::iced::advanced::widget::{Operation, operation};
+        use cosmic::iced::{Size, advanced::Layout};
 
-        let (mut app, card) = editing_repository_app();
-        // The focus arrives as a widget operation, not a message, so it is
-        // read the way the runtime reads one: run it over the tree the frame
-        // actually built, then ask that tree who holds focus.
-        fn focused(app: &Cagents, task: Task<Message>) -> Option<widget::Id> {
-            use cosmic::iced::advanced::layout;
-            use cosmic::iced::advanced::widget::{Operation, operation};
-            use cosmic::iced::{Size, advanced::Layout};
+        let renderer = headless_renderer();
+        let mut element: cosmic::Element<'_, Message> = cosmic::Application::view(app);
+        let mut tree = Tree::new(element.as_widget_mut());
+        let node = element.as_widget_mut().layout(
+            &mut tree,
+            &renderer,
+            &layout::Limits::new(Size::ZERO, Size::new(1600.0, 1200.0)),
+        );
 
-            let renderer = headless_renderer();
-            let mut element: cosmic::Element<'_, Message> = cosmic::Application::view(app);
-            let mut tree = Tree::new(element.as_widget_mut());
-            let node = element.as_widget_mut().layout(
-                &mut tree,
-                &renderer,
-                &layout::Limits::new(Size::ZERO, Size::new(1600.0, 1200.0)),
-            );
-
-            let mut stream =
-                cosmic::iced::runtime::task::into_stream(task).expect("the jump produced a task");
+        // An empty task is not an error here: it is precisely the answer a
+        // jump that forgot to focus gives, and the assertion that reads this
+        // says so far better than an unwrap would.
+        if let Some(mut stream) = cosmic::iced::runtime::task::into_stream(task) {
             let executor = tokio::runtime::Builder::new_current_thread()
                 .build()
                 .expect("executor");
@@ -10482,21 +10475,33 @@ mod tests {
                     &mut operation,
                 );
             }
-
-            // `find_focused` reports an `Id`; `operate` takes an operation
-            // over `()`, so the answer comes back through a cell.
-            let found: Arc<std::sync::Mutex<Option<widget::Id>>> = Default::default();
-            let sink = Arc::clone(&found);
-            let mut probe = operation::map(operation::focusable::find_focused(), move |id| {
-                *sink.lock().expect("the probe is not shared across a panic") = Some(id);
-            });
-            element
-                .as_widget_mut()
-                .operate(&mut tree, Layout::new(&node), &renderer, &mut probe);
-            let _ = probe.finish();
-            let answer = found.lock().expect("the probe survived").clone();
-            answer
         }
+
+        // `find_focused` reports an `Id`; `operate` takes an operation over
+        // `()`, so the answer comes back through a cell.
+        let found: Arc<std::sync::Mutex<Option<widget::Id>>> = Default::default();
+        let sink = Arc::clone(&found);
+        let mut probe = operation::map(operation::focusable::find_focused(), move |id| {
+            *sink.lock().expect("the probe is not shared across a panic") = Some(id);
+        });
+        element
+            .as_widget_mut()
+            .operate(&mut tree, Layout::new(&node), &renderer, &mut probe);
+        let _ = probe.finish();
+        let answer = found.lock().expect("the probe survived").clone();
+        answer
+    }
+
+    /// A jump that moves the caret must also hand the editor the keyboard.
+    ///
+    /// An unfocused `text_editor` draws no caret at all, so without this the
+    /// application answers a click on a result with a frame indistinguishable
+    /// from the one the user clicked in - measured live before this was wired:
+    /// frame differencing over the caret's blink found a 2px column with the
+    /// editor focused and zero pixel delta after a jump.
+    #[test]
+    fn a_jump_gives_the_editor_the_keyboard() {
+        let (mut app, card) = editing_repository_app();
 
         // Into the buffer that is already open, which is the one jump that
         // needs no running server to place its caret.
@@ -10511,6 +10516,44 @@ mod tests {
             focused(&app, task),
             Some(repository_widget::editor_focus_id(card)),
             "the jump left the editor unfocused, so its caret is invisible"
+        );
+    }
+
+    /// The same, for the jump that has to open a file first.
+    ///
+    /// Go to definition and Find references usually land in a *different*
+    /// file, so the caret cannot be placed when the answer arrives: the jump
+    /// is parked, the file is opened, and the open answers it. That second
+    /// path reaches the caret through `flush_pending_lsp_jump` rather than
+    /// directly, and has to hand over the keyboard just the same - a caret
+    /// placed in a buffer nobody focused is a caret nobody can see.
+    #[test]
+    fn a_jump_that_opens_a_file_gives_the_editor_the_keyboard_too() {
+        let (mut app, card) = editing_repository_app();
+
+        // Parked the way `jump_to_lsp_location` parks one, on the path the
+        // card is about to open.
+        let path = PathBuf::from("/repo/notes.txt");
+        lsp_state(&mut app, card).path = Some(path.clone());
+        app.lsp_pending_jumps.insert(
+            card,
+            PendingLspJump {
+                path: path.clone(),
+                at: LspPosition::new(0, 0),
+                coordinates: LspCoordinates::Scalar,
+            },
+        );
+
+        let task = app.flush_pending_lsp_jump(card, &path);
+
+        assert!(
+            !app.lsp_pending_jumps.contains_key(&card),
+            "the open answered the jump, so it must not stay parked"
+        );
+        assert_eq!(
+            focused(&app, task),
+            Some(repository_widget::editor_focus_id(card)),
+            "the jump placed its caret in a buffer it never focused, so the caret is invisible"
         );
     }
 
