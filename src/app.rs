@@ -1,8 +1,10 @@
 use std::{
     borrow::Cow,
     collections::{HashMap, HashSet},
+    ffi::OsStr,
     path::{Path, PathBuf},
     pin::Pin,
+    process::Stdio,
     sync::{Arc, LazyLock},
     thread::JoinHandle,
     time::{Duration, Instant},
@@ -34,6 +36,7 @@ use crate::{
     },
     instance,
     lifecycle::{LifecycleAction, LifecycleBudget, LifecycleManager},
+    location::SanitizedLocation,
     model::{
         CardId, CardKind, CardState, Existence, Exposure, HostSessionProof, LaunchRecipe,
         ProjectId, ProjectState, RepositoryView, Residency, RuntimeError, TerminalContinuity,
@@ -823,7 +826,9 @@ fn card_kind_labels(kind: Option<&CardKind>) -> CardLabels {
 fn card_kind_caption(kind: &CardKind) -> Cow<'_, str> {
     match kind {
         CardKind::Terminal(session) => display_path(&session.launch.working_directory),
-        CardKind::Browser(session) => Cow::Borrowed(session.current_url.as_str()),
+        CardKind::Browser(session) => {
+            Cow::Owned(SanitizedLocation::from(&session.current_url).into_inner())
+        }
         CardKind::PullRequests(view) => display_path(&view.repository),
         CardKind::Repository(view) => display_path(&view.worktree),
     }
@@ -1421,11 +1426,89 @@ pub enum Message {
 }
 
 #[cfg(feature = "integrated-browser")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum BrowserAddress {
+    Location {
+        authoritative: Url,
+        presented: SanitizedLocation,
+    },
+    UserInput(String),
+    Invalid(SanitizedLocation),
+}
+
+#[cfg(feature = "integrated-browser")]
+impl BrowserAddress {
+    fn location(url: &Url) -> Self {
+        Self::Location {
+            authoritative: url.clone(),
+            presented: SanitizedLocation::from(url),
+        }
+    }
+
+    fn user_input(value: String) -> Self {
+        Self::UserInput(value)
+    }
+
+    fn as_str(&self) -> &str {
+        match self {
+            Self::Location { presented, .. } => presented.as_str(),
+            Self::UserInput(value) => value,
+            Self::Invalid(presented) => presented.as_str(),
+        }
+    }
+
+    /// Resolves the value to navigate without deriving authority from its
+    /// redacted presentation. A restored or reported location therefore keeps
+    /// its complete URL when the user submits the unchanged address, while a
+    /// submitted draft is immediately replaced by its safe presentation.
+    fn submit(&mut self) -> Result<Url, ()> {
+        let result = match self {
+            Self::Location { authoritative, .. } => Ok(authoritative.clone()),
+            Self::UserInput(value) => {
+                let value = value.trim();
+                Url::parse(value).or_else(|error| {
+                    if has_explicit_url_scheme(value) {
+                        Err(error)
+                    } else {
+                        Url::parse(&format!("https://{value}"))
+                    }
+                })
+            }
+            Self::Invalid(_) => return Err(()),
+        };
+
+        match result {
+            Ok(url) => {
+                *self = Self::location(&url);
+                Ok(url)
+            }
+            Err(_) => {
+                *self = Self::Invalid(SanitizedLocation::invalid());
+                Err(())
+            }
+        }
+    }
+}
+
+#[cfg(feature = "integrated-browser")]
+fn has_explicit_url_scheme(value: &str) -> bool {
+    value.split_once(':').is_some_and(|(scheme, _)| {
+        let mut chars = scheme.chars();
+        chars
+            .next()
+            .is_some_and(|first| first.is_ascii_alphabetic())
+            && chars.all(|character| {
+                character.is_ascii_alphanumeric() || matches!(character, '+' | '-' | '.')
+            })
+    })
+}
+
+#[cfg(feature = "integrated-browser")]
 struct BrowserRuntime {
     handle: BrowserHandle,
     ime: Option<InputMethodState>,
     lifecycle: BrowserLifecycle,
-    address: String,
+    address: BrowserAddress,
     load_state: Option<String>,
 }
 
@@ -1586,19 +1669,33 @@ async fn open_system_url(url: Url) -> Result<(), String> {
     .await;
     match portal_result {
         Ok(()) => Ok(()),
-        Err(portal_error) => match tokio::process::Command::new("xdg-open")
-            .arg(url.as_str())
-            .status()
-            .await
-        {
-            Ok(status) if status.success() => Ok(()),
-            Ok(status) => Err(format!(
-                "desktop portal failed ({portal_error}); xdg-open exited with {status}"
-            )),
-            Err(fallback_error) => Err(format!(
-                "desktop portal failed ({portal_error}); xdg-open failed: {fallback_error}"
-            )),
-        },
+        // Portal diagnostics are also intentionally omitted: they are an
+        // external error boundary and may include the URI supplied above.
+        Err(_) => open_system_url_with_opener(&url, "xdg-open").await,
+    }
+}
+
+async fn open_system_url_with_opener(url: &Url, opener: impl AsRef<OsStr>) -> Result<(), String> {
+    let presented = SanitizedLocation::from(url);
+    let result = tokio::process::Command::new(opener)
+        .arg(url.as_str())
+        .stdin(Stdio::null())
+        // An opener can echo its argument in diagnostics. The authoritative
+        // URL may contain credentials, query data, or a fragment, so neither
+        // child stream may inherit cagents' presentation or logging streams.
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .await;
+
+    match result {
+        Ok(status) if status.success() => Ok(()),
+        Ok(status) => Err(format!(
+            "desktop portal could not open {presented}; system opener exited with {status}"
+        )),
+        Err(error) => Err(format!(
+            "desktop portal could not open {presented}; system opener could not be started: {error}"
+        )),
     }
 }
 
@@ -2854,7 +2951,7 @@ impl Cagents {
         match event {
             BrowserEvent::UrlChanged(url) => {
                 if let Some(CardRuntime::Browser(browser)) = self.cards.get_mut(&id) {
-                    browser.address = url.as_str().to_owned();
+                    browser.address = BrowserAddress::location(&url);
                 }
                 if let Some(card) = self.card_state_mut(id)
                     && let CardKind::Browser(session) = &mut card.kind
@@ -3187,7 +3284,8 @@ impl Cagents {
         let browser_toolbar: Option<Element<'a, Message>> = browser_session.map(|session| {
             let address = browser_runtime
                 .map(|browser| browser.address.as_str())
-                .unwrap_or_else(|| session.current_url.as_str());
+                .or_else(|| chrome.map(|chrome| chrome.caption.as_str()))
+                .unwrap_or(SanitizedLocation::INVALID);
             let active = browser_runtime.is_some();
             let can_go_back = active && session.history_index > 0;
             let can_go_forward =
@@ -3281,8 +3379,11 @@ impl Cagents {
         // that shell would not even be on screen.
         let card_focused = focused && !self.modal_is_open();
         #[cfg(not(feature = "integrated-browser"))]
-        let browser_toolbar: Option<Element<'a, Message>> = browser_session.map(|session| {
-            let address = widget::text_input("Saved URL", session.current_url.as_str())
+        let browser_toolbar: Option<Element<'a, Message>> = browser_session.map(|_| {
+            let address = chrome
+                .map(|chrome| chrome.caption.as_str())
+                .unwrap_or(SanitizedLocation::INVALID);
+            let address = widget::text_input("Saved URL", address)
                 .id(chrome.map_or_else(
                     || card_control_id(id, "browser.address"),
                     |chrome| chrome.browser_address_id.clone(),
@@ -4405,18 +4506,16 @@ impl Application for Cagents {
             #[cfg(feature = "integrated-browser")]
             Message::BrowserAddressChanged { card, value } => {
                 if let Some(CardRuntime::Browser(browser)) = self.cards.get_mut(&card) {
-                    browser.address = value;
+                    browser.address = BrowserAddress::user_input(value);
                 }
                 Task::none()
             }
             #[cfg(feature = "integrated-browser")]
             Message::BrowserNavigate(card) => {
-                let address = match self.cards.get(&card) {
-                    Some(CardRuntime::Browser(browser)) => browser.address.trim().to_owned(),
+                let url = match self.cards.get_mut(&card) {
+                    Some(CardRuntime::Browser(browser)) => browser.address.submit(),
                     _ => return Task::none(),
                 };
-                let url =
-                    Url::parse(&address).or_else(|_| Url::parse(&format!("https://{address}")));
                 match url {
                     Ok(url) => browser_command(
                         &self.cards,
@@ -4424,10 +4523,8 @@ impl Application for Cagents {
                         |handle| handle.navigate(url),
                         &mut self.status,
                     ),
-                    Err(error) => {
-                        self.status = Some(TransientNotice::error(format!(
-                            "invalid browser URL: {error}"
-                        )));
+                    Err(_) => {
+                        self.status = Some(TransientNotice::error("invalid browser location"));
                         Task::none()
                     }
                 }
@@ -5823,7 +5920,7 @@ fn spawn_browser(
             } else {
                 BrowserLifecycle::Hibernated
             },
-            address: session.current_url.as_str().to_owned(),
+            address: BrowserAddress::location(&session.current_url),
             load_state: None,
         })
         .map_err(|error| error.to_string())
@@ -6009,6 +6106,19 @@ fn unix_millis() -> i64 {
 mod tests {
     use super::*;
 
+    fn browser_kind(raw: &str) -> CardKind {
+        let url = Url::parse(raw).unwrap();
+        CardKind::Browser(crate::model::BrowserSession {
+            id: crate::model::BrowserId::new(),
+            current_url: url.clone(),
+            history: vec![url],
+            history_index: 0,
+            scroll_x: 0.0,
+            scroll_y: 0.0,
+            fidelity: crate::model::BrowserRestoreFidelity::HistoryAndScroll,
+        })
+    }
+
     fn health_event(
         revision: u64,
         health: SessionSaveHealth,
@@ -6125,6 +6235,122 @@ mod tests {
             working_directory: working_directory.into(),
             environment: Default::default(),
         }
+    }
+
+    #[test]
+    fn browser_chrome_uses_one_sanitized_location_for_visible_and_accessible_text() {
+        let kind = browser_kind(
+            "https://alice:password@EXAMPLE.test:443/private%20path?oauth=secret#token",
+        );
+        let caption = card_kind_caption(&kind);
+        assert_eq!(caption, "https://example.test/private%20path");
+
+        let chrome = CardChrome::new(
+            CardId::new(),
+            "Browser",
+            "Example",
+            &caption,
+            &KeyboardShortcuts::default(),
+        );
+        assert_eq!(chrome.caption, caption);
+        assert_eq!(
+            chrome.accessible_name(true),
+            "Browser column Example, https://example.test/private%20path, focused"
+        );
+        for presented in [chrome.caption.as_str(), chrome.accessible_name(true)] {
+            assert!(!presented.contains("alice"));
+            assert!(!presented.contains("password"));
+            assert!(!presented.contains("oauth"));
+            assert!(!presented.contains("secret"));
+            assert!(!presented.contains("token"));
+        }
+    }
+
+    #[test]
+    fn system_opener_failure_redaction_contract() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempfile::tempdir().unwrap();
+        let opener = directory.path().join("fake-opener");
+        std::fs::write(
+            &opener,
+            concat!(
+                "#!/bin/sh\n",
+                "readlink /proc/$$/fd/1 > \"${0}.stdout-target\"\n",
+                "readlink /proc/$$/fd/2 > \"${0}.stderr-target\"\n",
+                "printf '%s\\n' \"$1\" >&2\n",
+                "exit 42\n",
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&opener, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+        let raw =
+            "https://alice:password@example.test:8443/private%20path?oauth=secret#access-token";
+        let url = Url::parse(raw).unwrap();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let error = runtime
+            .block_on(open_system_url_with_opener(&url, &opener))
+            .unwrap_err();
+
+        assert_eq!(
+            std::fs::read_to_string(opener.with_extension("stdout-target")).unwrap(),
+            "/dev/null\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(opener.with_extension("stderr-target")).unwrap(),
+            "/dev/null\n"
+        );
+        assert!(error.contains("https://example.test:8443/private%20path"));
+        assert!(error.contains("system opener exited"));
+        assert!(error.contains("42"));
+        for sensitive in [
+            "alice",
+            "password",
+            "oauth",
+            "secret",
+            "access-token",
+            "?",
+            "#",
+        ] {
+            assert!(!error.contains(sensitive), "leaked {sensitive:?}: {error}");
+        }
+    }
+
+    #[cfg(feature = "integrated-browser")]
+    #[test]
+    fn unchanged_sanitized_address_submits_the_authoritative_location() {
+        let url =
+            Url::parse("https://alice:password@example.test:8443/path?api_key=hunter2#fragment")
+                .unwrap();
+        let mut address = BrowserAddress::location(&url);
+        assert_eq!(address.as_str(), "https://example.test:8443/path");
+        assert_eq!(address.submit(), Ok(url.clone()));
+        assert_eq!(address.as_str(), "https://example.test:8443/path");
+    }
+
+    #[cfg(feature = "integrated-browser")]
+    #[test]
+    fn submitted_user_input_keeps_navigation_authority_but_redacts_presentation() {
+        let url =
+            Url::parse("https://alice:password@example.test:8443/path?api_key=hunter2#fragment")
+                .unwrap();
+        let mut typed = BrowserAddress::user_input(url.as_str().to_owned());
+        assert_eq!(typed.as_str(), url.as_str());
+        assert_eq!(typed.submit(), Ok(url));
+        assert_eq!(typed.as_str(), "https://example.test:8443/path");
+        for sensitive in ["alice", "password", "api_key", "hunter2", "fragment"] {
+            assert!(!typed.as_str().contains(sensitive));
+        }
+
+        let mut malformed = BrowserAddress::user_input(
+            "https://alice:password@example .test/path?token=secret".into(),
+        );
+        assert_eq!(malformed.submit(), Err(()));
+        assert_eq!(malformed.as_str(), SanitizedLocation::INVALID);
     }
     #[test]
     fn column_navigator_appears_only_when_movement_is_possible() {
