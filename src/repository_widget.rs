@@ -2816,11 +2816,17 @@ pub fn editor_focus_id(card: CardId) -> widget::Id {
 /// `token` is what the highlighter resolves a grammar from; it matches a
 /// syntax by name as well as by extension, so a file that has no extension is
 /// still recognised by its own name (`Makefile`, `Dockerfile`) instead of
-/// falling back to plain text. Extensions are lowercased because a grammar
-/// lists its extensions in one case and `README.MD` is still Markdown; a bare
-/// name is passed through as written because that is what a name match
-/// compares against. An unrecognised token is not an error: the highlighter
-/// resolves plain text for it.
+/// falling back to plain text. Extensions are lowercased so the token a file
+/// resolves under is decided here rather than by whichever casing a grammar
+/// happens to list, and a bare name is passed through as written because that
+/// is what a name match compares against. An unrecognised token is not an
+/// error: the highlighter resolves plain text for it.
+///
+/// An extension wins over a name, so a name that carries an unknown extension
+/// - `Dockerfile.dev`, `Makefile.am` - resolves to plain text rather than to
+/// the grammar its stem names. Recovering those would mean resolving the
+/// grammar here instead of naming it, which is syntect's job and not worth a
+/// direct dependency on it for the case.
 ///
 /// The scheme follows the application's own light/dark state rather than being
 /// pinned. Every one of these palettes picks its foregrounds for a background
@@ -6333,6 +6339,20 @@ mod tests {
             "an unrecognised token must fall back to plain text rather than colour arbitrarily; \
              without that the check above cannot tell a grammar from the fallback"
         );
+
+        // An extension wins over a name, so a name carrying an unknown
+        // extension resolves to plain text. Pinned rather than fixed: naming
+        // the grammar is all this decides, and choosing between two candidate
+        // grammars is syntect's job.
+        for path in ["Dockerfile.dev", "Makefile.am"] {
+            let settings = highlighter_settings(Path::new(path), true);
+            assert!(
+                !colours(&settings.token, "FROM scratch"),
+                "{path} resolves as {:?}; if that now colours, the extension no longer wins and \
+                 the documented gap is gone",
+                settings.token
+            );
+        }
 
         // A scheme picks its foregrounds for a background of its own kind, so
         // reading a dark one off a light surface is what makes highlighted

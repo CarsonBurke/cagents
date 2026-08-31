@@ -8965,6 +8965,21 @@ mod tests {
             .expect("a headless renderer")
     }
 
+    /// The frame the runtime actually builds: libcosmic composes the header,
+    /// the application's own view and any dialog into a single element, and
+    /// reconciles all of it against one tree.
+    ///
+    /// Driving `Application::view` alone would miss the dialog entirely, and
+    /// driving `Application::dialog` alone would miss that a dialog *joins and
+    /// leaves* the popover that holds it - a membership change in the widest
+    /// list there is. libcosmic itself flags the hazard where it composes them
+    /// ("we have to use a popover even without a dialog to keep the tree from
+    /// changing"), and only stops the popover node from coming and going: the
+    /// popup beneath it still does.
+    fn frame(app: &Cagents) -> cosmic::Element<'_, cosmic::Action<Message>> {
+        cosmic::ApplicationExt::view_main(app)
+    }
+
     /// Presents one frame against a carried-over widget tree, exactly the way
     /// `iced_runtime::UserInterface::build` does: the previous frame's named
     /// widget states are lifted into the thread-local map that reconciliation
@@ -8983,7 +8998,7 @@ mod tests {
         use cosmic::iced::{Rectangle, Size};
 
         let bounds = Size::new(1600.0, 1200.0);
-        let mut element: cosmic::Element<'_, Message> = cosmic::Application::view(app);
+        let mut element = frame(app);
         NAMED.with(|named| {
             *named.borrow_mut() = tree.take_all_named();
         });
@@ -9005,30 +9020,16 @@ mod tests {
         );
     }
 
-    /// Every named node in a tree, in the order a parent draws its children.
-    fn named_nodes(tree: &cosmic::iced::advanced::widget::Tree) -> Vec<String> {
-        fn walk(tree: &cosmic::iced::advanced::widget::Tree, into: &mut Vec<String>) {
-            if let Some(id) = tree.id.as_ref() {
-                let rendered = format!("{id:?}");
-                // `Id`'s debug carries a per-process counter that differs
-                // between two builds of the same frame; the name does not.
-                if let Some(name) = rendered
-                    .split_once("Custom(")
-                    .and_then(|(_, rest)| rest.split_once('"'))
-                    .and_then(|(_, rest)| rest.split_once('"'))
-                    .map(|(name, _)| name.to_owned())
-                {
-                    into.push(name);
-                }
-            }
-            for child in &tree.children {
-                walk(child, into);
-            }
-        }
-
-        let mut found = Vec::new();
-        walk(tree, &mut found);
-        found
+    /// The name a node was given, if it was given one.
+    fn node_name(tree: &cosmic::iced::advanced::widget::Tree) -> Option<String> {
+        let rendered = format!("{:?}", tree.id.as_ref()?);
+        // `Id`'s debug carries a per-process counter that differs between two
+        // builds of the same frame; the name does not.
+        rendered
+            .split_once("Custom(")
+            .and_then(|(_, rest)| rest.split_once('"'))
+            .and_then(|(_, rest)| rest.split_once('"'))
+            .map(|(name, _)| name.to_owned())
     }
 
     /// A reconciled tree must describe the frame it was reconciled against.
@@ -9045,16 +9046,53 @@ mod tests {
     /// `draw`, where nothing can catch it.
     ///
     /// Comparing against a tree built fresh for the same frame is the whole
-    /// invariant: same names, same order.
+    /// invariant. Both halves of it matter, and each catches a failure the
+    /// other cannot see: the names must match, because a stranded node is a
+    /// name in the wrong place; and the shape must match, because a list that
+    /// lost an *unnamed* widget keeps its state at the wrong index without
+    /// renaming anything, and every container zips its children against their
+    /// trees - so the tail of that row is silently not laid out, not drawn and
+    /// not clickable for the frame.
+    fn assert_tree_is_faithful(
+        reconciled: &cosmic::iced::advanced::widget::Tree,
+        fresh: &cosmic::iced::advanced::widget::Tree,
+    ) {
+        fn walk(
+            reconciled: &cosmic::iced::advanced::widget::Tree,
+            fresh: &cosmic::iced::advanced::widget::Tree,
+            path: &mut Vec<usize>,
+        ) {
+            assert_eq!(
+                node_name(reconciled),
+                node_name(fresh),
+                "at {path:?}: the reconciled tree names a different widget than the frame it was reconciled against"
+            );
+            assert_eq!(
+                reconciled.children.len(),
+                fresh.children.len(),
+                "at {path:?} ({:?}): the reconciled tree holds a different number of children than the frame it was reconciled against, so its parent zips widgets against strangers' state",
+                node_name(fresh)
+            );
+            for (index, (reconciled, fresh)) in reconciled
+                .children
+                .iter()
+                .zip(fresh.children.iter())
+                .enumerate()
+            {
+                path.push(index);
+                walk(reconciled, fresh, path);
+                path.pop();
+            }
+        }
+
+        walk(reconciled, fresh, &mut Vec::new());
+    }
+
     fn assert_frame_is_faithful(app: &Cagents, tree: &cosmic::iced::advanced::widget::Tree) {
-        let mut fresh: cosmic::Element<'_, Message> = cosmic::Application::view(app);
-        let expected = named_nodes(&cosmic::iced::advanced::widget::Tree::new(
-            fresh.as_widget_mut(),
-        ));
-        assert_eq!(
-            named_nodes(tree),
-            expected,
-            "the reconciled tree does not describe the frame it was reconciled against"
+        let mut fresh = frame(app);
+        assert_tree_is_faithful(
+            tree,
+            &cosmic::iced::advanced::widget::Tree::new(fresh.as_widget_mut()),
         );
     }
 
@@ -9134,6 +9172,55 @@ mod tests {
             present(&app, &mut renderer, &mut tree);
             assert_frame_is_faithful(&app, &tree);
         }
+    }
+
+    /// The dirty-close dialog's controls are named too, and the row they sit
+    /// in changes membership: Discard leaves while a save is in flight and
+    /// comes back when the save fails, which is exactly the transition a user
+    /// walks through by answering "Save and close" to a file the disk then
+    /// refuses.
+    ///
+    /// The dialog itself joins and leaves the popover libcosmic composes the
+    /// frame from, so opening one is a membership change in the outermost list
+    /// there is - which is why this starts from a frame with no dialog on it.
+    #[test]
+    fn a_failed_save_repaints_the_dirty_close_dialog() {
+        use cosmic::iced::advanced::widget::Tree;
+
+        let (mut app, card) = editing_repository_app();
+        let mut renderer = headless_renderer();
+        let mut tree = Tree::empty();
+
+        present(&app, &mut renderer, &mut tree);
+        assert_frame_is_faithful(&app, &tree);
+
+        let _ = app.update(Message::CloseCard(card));
+        assert!(
+            app.dirty_repository_close.is_some(),
+            "closing a card with an unsaved buffer asks before destroying it"
+        );
+        present(&app, &mut renderer, &mut tree);
+        assert_frame_is_faithful(&app, &tree);
+
+        // The save starts: Discard leaves, because there is nothing coherent
+        // to abandon while a write is in flight.
+        let _ = app.update(Message::SaveAndCloseRepository(card));
+        present(&app, &mut renderer, &mut tree);
+        assert_frame_is_faithful(&app, &tree);
+
+        // The save fails: the buffer is dirty again and Discard comes back,
+        // in the middle of the row rather than at its end.
+        let Some(CardRuntime::Repository(runtime)) = app.cards.get(&card) else {
+            panic!("the card is a repository");
+        };
+        let failed = runtime.failed_active_save_completion();
+        let _ = app.update(Message::Repository(failed));
+        assert!(
+            app.dirty_repository_close.is_some(),
+            "a failed save leaves the dialog up"
+        );
+        present(&app, &mut renderer, &mut tree);
+        assert_frame_is_faithful(&app, &tree);
     }
 
     #[test]
@@ -10359,7 +10446,7 @@ mod tests {
     /// editor focused and zero pixel delta after a jump.
     #[test]
     fn a_jump_gives_the_editor_the_keyboard() {
-        use cosmic::iced::advanced::widget::{Tree, operation};
+        use cosmic::iced::advanced::widget::Tree;
 
         let (mut app, card) = editing_repository_app();
         // The focus arrives as a widget operation, not a message, so it is
@@ -10471,7 +10558,7 @@ mod tests {
         // status before reaching it - the half that
         // `a_file_with_no_server_reports_disabled_and_clears_a_parked_jump`
         // already covers.
-        app.flush_pending_lsp_jump(card, Path::new("/repo/src/main.rs"));
+        let _ = app.flush_pending_lsp_jump(card, Path::new("/repo/src/main.rs"));
 
         assert!(!app.lsp_pending_jumps.contains_key(&card));
     }
@@ -10549,7 +10636,7 @@ mod tests {
             },
         );
 
-        app.open_lsp_document(
+        let _ = app.open_lsp_document(
             card,
             Path::new("/repo/notes.unknownext"),
             Path::new("/repo"),
