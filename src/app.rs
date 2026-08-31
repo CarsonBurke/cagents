@@ -955,6 +955,28 @@ fn update_workspace_viewport(
     }
 }
 
+fn pull_request_head(
+    projects: &[SidebarProject],
+    project_id: ProjectId,
+    worktree: Option<&Path>,
+) -> String {
+    projects
+        .iter()
+        .find(|project| project.id == project_id)
+        .and_then(|project| match worktree {
+            Some(path) => project
+                .worktrees
+                .iter()
+                .find(|worktree| worktree.path == path)
+                .and_then(|worktree| worktree.branch.clone()),
+            None => project
+                .worktrees
+                .iter()
+                .find_map(|worktree| worktree.branch.clone()),
+        })
+        .unwrap_or_default()
+}
+
 #[derive(Debug, Clone)]
 pub struct LoadedRepository {
     project: ProjectState,
@@ -3803,20 +3825,23 @@ impl Cagents {
             Some(CardRuntime::Loading) | None => InspectorRuntimeStatus::Starting,
             Some(CardRuntime::Failed(_)) => InspectorRuntimeStatus::Unavailable,
             #[cfg(feature = "integrated-browser")]
-            Some(CardRuntime::Browser(browser))
-                if browser.lifecycle == BrowserLifecycle::Restoring =>
-            {
-                InspectorRuntimeStatus::Restoring
-            }
-            #[cfg(feature = "integrated-browser")]
-            Some(CardRuntime::Browser(browser)) if browser.load_state.is_some() => {
-                InspectorRuntimeStatus::Loading
-            }
+            Some(CardRuntime::Browser(browser)) => match browser.lifecycle {
+                BrowserLifecycle::Restoring => InspectorRuntimeStatus::Restoring,
+                BrowserLifecycle::Hibernating => InspectorRuntimeStatus::Suspending,
+                BrowserLifecycle::Hibernated => InspectorRuntimeStatus::Suspended,
+                BrowserLifecycle::Closed => InspectorRuntimeStatus::Unavailable,
+                BrowserLifecycle::Visible | BrowserLifecycle::OffscreenHot
+                    if browser.load_state.is_some() =>
+                {
+                    InspectorRuntimeStatus::Loading
+                }
+                BrowserLifecycle::Visible | BrowserLifecycle::OffscreenHot => {
+                    InspectorRuntimeStatus::Ready
+                }
+            },
             Some(CardRuntime::Terminal(_))
             | Some(CardRuntime::Repository(_))
             | Some(CardRuntime::PullRequests(_)) => InspectorRuntimeStatus::Ready,
-            #[cfg(feature = "integrated-browser")]
-            Some(CardRuntime::Browser(_)) => InspectorRuntimeStatus::Ready,
         }
     }
 
@@ -3863,11 +3888,11 @@ impl Cagents {
                     }
                     InspectorAction::CreatePullRequest {
                         project_id,
-                        repository,
+                        worktree,
                     } => {
                         cosmic::task::message(Message::Sidebar(SidebarAction::CreatePullRequest {
                             project_id,
-                            repository,
+                            worktree: Some(worktree),
                         }))
                     }
                     InspectorAction::FocusProjectSearch => {
@@ -4482,7 +4507,10 @@ impl Application for Cagents {
                             Self::repository_load_task(repository, Some(id), false)
                         }))
                     }
-                    SidebarAction::CreatePullRequest { project_id, .. } => {
+                    SidebarAction::CreatePullRequest {
+                        project_id,
+                        worktree,
+                    } => {
                         let Some(repository) = self.github_repositories.get(&project_id).cloned()
                         else {
                             self.status = Some(TransientNotice::warning(
@@ -4490,18 +4518,11 @@ impl Application for Cagents {
                             ));
                             return Task::none();
                         };
-                        let head = self
-                            .sidebar_model
-                            .projects
-                            .iter()
-                            .find(|project| project.id == project_id)
-                            .and_then(|project| {
-                                project
-                                    .worktrees
-                                    .iter()
-                                    .find_map(|worktree| worktree.branch.clone())
-                            })
-                            .unwrap_or_default();
+                        let head = pull_request_head(
+                            &self.sidebar_model.projects,
+                            project_id,
+                            worktree.as_deref(),
+                        );
                         self.pull_request_dialog = Some(PullRequestDialog {
                             repository,
                             base: "main".into(),
@@ -6454,17 +6475,52 @@ mod tests {
         })
     }
 
-    fn browser_kind(raw: &str) -> CardKind {
-        let url = Url::parse(raw).unwrap();
-        CardKind::Browser(crate::model::BrowserSession {
-            id: crate::model::BrowserId::new(),
-            current_url: url.clone(),
-            history: vec![url],
-            history_index: 0,
-            scroll_x: 0.0,
-            scroll_y: 0.0,
-            fidelity: crate::model::BrowserRestoreFidelity::HistoryAndScroll,
-        })
+    #[test]
+    fn pull_request_head_prefers_the_context_worktree() {
+        let project_id = ProjectId::new();
+        let selected = PathBuf::from("/repo/selected");
+        let project = SidebarProject::new(
+            project_id,
+            RepositoryId::new(),
+            "repo".into(),
+            PathBuf::from("/repo"),
+            vec![
+                SidebarWorktree::new(
+                    crate::model::WorktreeId::new(),
+                    PathBuf::from("/repo/first"),
+                    Some("first".into()),
+                    false,
+                    false,
+                    None,
+                    None,
+                    None,
+                ),
+                SidebarWorktree::new(
+                    crate::model::WorktreeId::new(),
+                    selected.clone(),
+                    Some("selected".into()),
+                    false,
+                    false,
+                    None,
+                    None,
+                    None,
+                ),
+            ],
+            Vec::new(),
+        );
+
+        assert_eq!(
+            pull_request_head(&[project.clone()], project_id, None),
+            "first"
+        );
+        assert_eq!(
+            pull_request_head(&[project.clone()], project_id, Some(&selected)),
+            "selected"
+        );
+        assert_eq!(
+            pull_request_head(&[project], project_id, Some(Path::new("/repo/missing"))),
+            ""
+        );
     }
 
     fn health_event(
@@ -7162,6 +7218,7 @@ mod tests {
             terminal_wake_tx,
             terminal_wake_rx,
             session: None,
+            save_health: None,
             settings_draft: SettingsDraft::from_settings(&settings),
             settings,
             #[cfg(feature = "integrated-browser")]
