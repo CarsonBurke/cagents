@@ -2067,12 +2067,18 @@ struct LspInspectorState {
     /// claims it. A jump target arrives absolute while the card's file list is
     /// worktree-relative, so this is the only side both can be compared on.
     path: Option<PathBuf>,
-    /// The newest version handed to the server for this document.
-    version: i32,
-    /// The version the diagnostics were computed for. Diagnostics arrive
-    /// unsolicited on every recheck, so this is the only way to know whether
-    /// the positions they carry still describe the buffer on screen.
+    /// The version the diagnostics were computed for, as the manager stamped
+    /// them. Compared against [`LspManager::document_version`] and never
+    /// against a count of this side's own: the manager re-opens a document on
+    /// a restart, a crash-respawn, or a second card opening the same file, and
+    /// none of those are edits this side made.
     diagnostics_version: Option<i32>,
+    /// A failure the user has not dismissed. Outranks `progress`, because an
+    /// indexing report arriving a second later must not erase the one message
+    /// saying their hover and completions were thrown away.
+    failure: Option<String>,
+    /// The server's current progress report, if it is still working.
+    progress: Option<String>,
 }
 
 impl LspInspectorState {
@@ -2086,6 +2092,25 @@ impl LspInspectorState {
         self.context.hover = None;
         self.context.locations = None;
         self.context.completions.clear();
+    }
+
+    /// Recomputes the single notice the surface renders from the two
+    /// independent things that can want it.
+    fn refresh_notice(&mut self) {
+        self.context.notice = self.failure.clone().or_else(|| self.progress.clone());
+    }
+}
+
+/// Whether a published diagnostics list still describes the buffer on screen.
+///
+/// `published` is the version the manager stamped the list with; `document` is
+/// the version its snapshot holds now. Both must be known and equal: an
+/// unknown document has no diagnostics worth jumping into, and an unstamped
+/// list is one this side never received.
+const fn diagnostics_are_current(published: Option<i32>, document: Option<i32>) -> bool {
+    match (published, document) {
+        (Some(published), Some(document)) => published == document,
+        _ => false,
     }
 }
 
@@ -4370,7 +4395,6 @@ impl Cagents {
                     // buffer no longer has.
                     self.lsp.change(doc, version, &[], &text);
                     if let Some(state) = self.lsp_contexts.get_mut(&card) {
-                        state.version = version;
                         state.invalidate_answers();
                     }
                 }
@@ -4417,7 +4441,6 @@ impl Cagents {
         // a card that has moved on.
         self.close_lsp_document(card);
         let state = self.lsp_contexts.entry(card).or_default();
-        state.version = version;
         state.path = Some(path.to_path_buf());
         let Some(language) = self.lsp.language_for(path) else {
             // No configured server claims this extension. That is a supported
@@ -4460,16 +4483,17 @@ impl Cagents {
 
     /// Applies a parked jump now that `path` is the card's open buffer.
     fn flush_pending_lsp_jump(&mut self, card: CardId, path: &Path) {
-        let Some(jump) = self.lsp_pending_jumps.get(&card) else {
+        // Taken on *any* open, not only a matching one. A jump is answered by
+        // the open it asked for or by nothing: leaving it parked would let the
+        // caret be yanked minutes later, when the user opens that file
+        // themselves, to a position from an answer they have forgotten asking
+        // for and against text that has since changed.
+        let Some(jump) = self.lsp_pending_jumps.remove(&card) else {
             return;
         };
         if jump.path != path {
             return;
         }
-        let jump = self
-            .lsp_pending_jumps
-            .remove(&card)
-            .expect("presence just checked");
         let at = match jump.coordinates {
             LspCoordinates::Scalar => jump.at,
             // The column arrived in protocol code units because the file was
@@ -4542,7 +4566,7 @@ impl Cagents {
                 // Progress is transient by definition, so it is shown in the
                 // notice slot the surface already has and cleared on `done`
                 // rather than accumulating a log nobody dismisses.
-                state.context.notice = (!progress.done).then(|| {
+                state.progress = (!progress.done).then(|| {
                     let detail = progress
                         .title
                         .or(progress.message)
@@ -4552,24 +4576,26 @@ impl Cagents {
                         None => detail,
                     }
                 });
+                state.refresh_notice();
             }
             LspEvent::RequestFailed { error, .. } => {
                 // A superseded request is the ordinary result of typing while
                 // one is in flight, and reporting it would put a warning on
                 // screen for every keystroke.
                 if !matches!(error, LspError::Cancelled) {
-                    state.context.notice = Some(error.to_string());
+                    state.failure = Some(error.to_string());
+                    state.refresh_notice();
                 }
             }
-            LspEvent::DocumentDesynced { version, error, .. } => {
+            LspEvent::DocumentDesynced { error, .. } => {
                 // The buffer is intact and the manager has already resent it;
                 // what is gone is every answer computed against the text the
                 // two sides disagreed about.
-                state.version = version;
                 state.invalidate_answers();
-                state.context.notice = Some(format!(
+                state.failure = Some(format!(
                     "resynchronised with the language server after {error}"
                 ));
+                state.refresh_notice();
             }
         }
     }
@@ -4590,7 +4616,11 @@ impl Cagents {
                 // so the list on screen can describe text the buffer has moved
                 // past. Jumping into it would land the caret on a line the
                 // diagnostic never named.
-                if state.diagnostics_version != Some(state.version) {
+                let published = state.diagnostics_version;
+                let current = state
+                    .document
+                    .and_then(|doc| self.lsp.document_version(doc));
+                if !diagnostics_are_current(published, current) {
                     self.status = Some(TransientNotice::warning(
                         "these diagnostics describe an earlier version of the file",
                     ));
@@ -4627,7 +4657,9 @@ impl Cagents {
                     state.invalidate_answers();
                     state.context.diagnostics.clear();
                     state.diagnostics_version = None;
-                    state.context.notice = None;
+                    state.failure = None;
+                    state.progress = None;
+                    state.refresh_notice();
                     state.context.status = Some(self.lsp.status(doc));
                 }
                 Task::none()
@@ -4635,7 +4667,8 @@ impl Cagents {
             InspectorAction::DismissLspResults(card) => {
                 if let Some(state) = self.lsp_contexts.get_mut(&card) {
                     state.invalidate_answers();
-                    state.context.notice = None;
+                    state.failure = None;
+                    state.refresh_notice();
                 }
                 Task::none()
             }
@@ -4705,6 +4738,21 @@ impl Cagents {
             return Task::none();
         };
         let relative = relative.to_path_buf();
+        // `OpenFile` answers a path the card has no row for by doing nothing,
+        // so parking on that open would wait for something that never happens
+        // and leave the user with no answer at all. A generated or ignored
+        // source inside the worktree is the ordinary way to reach this.
+        let openable = match self.cards.get(&card) {
+            Some(CardRuntime::Repository(runtime)) => runtime.can_open_file(&relative),
+            _ => false,
+        };
+        if !openable {
+            self.status = Some(TransientNotice::warning(format!(
+                "{} is not in this worktree's file list",
+                relative.display()
+            )));
+            return Task::none();
+        }
         self.lsp_pending_jumps.insert(
             card,
             PendingLspJump {
@@ -5597,7 +5645,13 @@ impl Cagents {
         if self.lsp.servers() == self.settings.language_servers.as_slice() {
             return;
         }
-        self.lsp.shutdown();
+        // `shutdown` alone moves the sessions into the outgoing manager's own
+        // retiring list and kills nothing, and dropping that manager drops
+        // them unreaped - after which no exit path can reach them, because
+        // every exit path addresses the manager that replaced it.
+        // `begin_shutdown` spawns the reap on the runtime the sessions run on,
+        // so it survives the returned future being dropped here.
+        drop(self.lsp.begin_shutdown());
         self.lsp = LspManager::new(self.settings.language_servers.clone());
         self.lsp_contexts.clear();
         self.lsp_documents.clear();
@@ -9764,13 +9818,16 @@ mod tests {
         let card = CardId::new();
         app.cards.insert(
             card,
-            CardRuntime::Repository(Box::new(repository_widget::RepositoryRuntime::new(
-                RepositoryView {
-                    project: ProjectId::new(),
-                    repository: PathBuf::from(worktree),
-                    worktree: PathBuf::from(worktree),
-                },
-            ))),
+            CardRuntime::Repository(Box::new(
+                repository_widget::RepositoryRuntime::file_list_fixture(
+                    RepositoryView {
+                        project: ProjectId::new(),
+                        repository: PathBuf::from(worktree),
+                        worktree: PathBuf::from(worktree),
+                    },
+                    &["src/main.rs", "src/other.rs"],
+                ),
+            )),
         );
         card
     }
@@ -9814,13 +9871,32 @@ mod tests {
     /// Diagnostics are unsolicited and replace each other wholesale, so a list
     /// on screen can outlive the text it describes. Jumping into a stale one
     /// puts the caret on a line the server never named.
+    /// The two versions are equal only when both are known. An application
+    /// that kept a count of its own would satisfy this predicate while the
+    /// manager had silently moved on - a restart, a crash-respawn, or a second
+    /// card opening the same file all bump the manager's version without any
+    /// edit having been made.
+    #[test]
+    fn diagnostics_are_current_only_when_both_versions_are_known_and_equal() {
+        assert!(diagnostics_are_current(Some(4), Some(4)));
+        assert!(!diagnostics_are_current(Some(4), Some(5)));
+        assert!(!diagnostics_are_current(Some(5), Some(4)));
+        // No document: nothing published for it can still describe it.
+        assert!(!diagnostics_are_current(Some(4), None));
+        // Nothing published: there is no list to jump into.
+        assert!(!diagnostics_are_current(None, Some(4)));
+        assert!(!diagnostics_are_current(None, None));
+    }
+
+    /// The jump arm must consult that predicate rather than jumping blind.
     #[test]
     fn a_jump_into_stale_diagnostics_is_refused() {
         let mut app = lsp_test_app();
         let card = repository_card(&mut app, "/repo");
-        let state = lsp_state(&mut app, card);
-        state.version = 7;
-        state.diagnostics_version = Some(6);
+        // A published list, and a document the manager does not hold, which is
+        // exactly the shape the predicate refuses.
+        lsp_state(&mut app, card).document = Some(LspDocumentId(1));
+        lsp_state(&mut app, card).diagnostics_version = Some(6);
 
         let _ = app.update_lsp(InspectorAction::JumpToLspDiagnostic {
             card,
@@ -9830,18 +9906,6 @@ mod tests {
             notice(&app),
             Some("these diagnostics describe an earlier version of the file")
         );
-
-        // The same jump against a current list is *attempted*: it reaches the
-        // buffer and fails there, on this card with no open file, which is a
-        // different refusal from the one above. Without the version guard the
-        // stale case would produce this second message too.
-        app.status = None;
-        lsp_state(&mut app, card).diagnostics_version = Some(7);
-        let _ = app.update_lsp(InspectorAction::JumpToLspDiagnostic {
-            card,
-            at: LspPosition::new(3, 0),
-        });
-        assert_eq!(notice(&app), Some("line 4 is not in this file any more"));
     }
 
     /// The completion list is addressed by position and a fresh response
@@ -9959,7 +10023,6 @@ mod tests {
         });
 
         let state = &app.lsp_contexts[&card];
-        assert_eq!(state.version, 12);
         assert!(state.context.hover.is_none());
         assert!(state.context.completions.is_empty());
         assert!(state.context.locations.is_none());
@@ -10059,13 +10122,21 @@ mod tests {
         let mut app = lsp_test_app();
         let card = repository_card(&mut app, "/repo");
 
-        let _ = app.update_lsp(InspectorAction::JumpToLspLocation {
+        let task = app.update_lsp(InspectorAction::JumpToLspLocation {
             card,
             path: PathBuf::from("/repo/src/other.rs"),
             at: LspPosition::new(4, 2),
             coordinates: LspCoordinates::Utf16,
         });
 
+        // Parking without asking the card to open the file is a jump that never
+        // lands: that open is the only thing that releases it, and the file
+        // list it addresses is keyed on the worktree-relative path.
+        assert!(matches!(
+            task_app_message(task),
+            Message::Repository(RepositoryAction::OpenFile { card: at, ref path })
+                if at == card && path == Path::new("src/other.rs")
+        ));
         let parked = app
             .lsp_pending_jumps
             .get(&card)
@@ -10076,6 +10147,113 @@ mod tests {
         assert_eq!(parked.at, LspPosition::new(4, 2));
         assert_eq!(parked.coordinates, LspCoordinates::Utf16);
         assert_eq!(notice(&app), None);
+    }
+
+    /// A definition can resolve into a file the card has no row for - a
+    /// generated or ignored source inside the worktree. `OpenFile` answers
+    /// those by doing nothing, so parking on that open would wait forever and
+    /// leave the user with no answer at all.
+    #[test]
+    fn a_jump_into_a_file_the_card_cannot_open_says_so() {
+        let mut app = lsp_test_app();
+        let card = repository_card(&mut app, "/repo");
+
+        let _ = app.update_lsp(InspectorAction::JumpToLspLocation {
+            card,
+            path: PathBuf::from("/repo/target/generated.rs"),
+            at: LspPosition::new(1, 0),
+            coordinates: LspCoordinates::Scalar,
+        });
+
+        assert_eq!(
+            notice(&app),
+            Some("target/generated.rs is not in this worktree's file list")
+        );
+        assert!(!app.lsp_pending_jumps.contains_key(&card));
+    }
+
+    /// A jump is answered by the open it asked for or by nothing. Surviving an
+    /// unrelated open would let the caret be yanked minutes later, when the
+    /// user opens that file themselves, against text that has since changed.
+    #[test]
+    fn a_parked_jump_does_not_survive_a_different_file_opening() {
+        let mut app = lsp_test_app();
+        let card = repository_card(&mut app, "/repo");
+        app.lsp_pending_jumps.insert(
+            card,
+            PendingLspJump {
+                path: PathBuf::from("/repo/src/other.rs"),
+                at: LspPosition::new(4, 2),
+                coordinates: LspCoordinates::Scalar,
+            },
+        );
+
+        // The flush is driven directly because these fixtures configure no
+        // server, so `open_lsp_document` short-circuits into the disabled
+        // status before reaching it - the half that
+        // `a_file_with_no_server_reports_disabled_and_clears_a_parked_jump`
+        // already covers.
+        app.flush_pending_lsp_jump(card, Path::new("/repo/src/main.rs"));
+
+        assert!(!app.lsp_pending_jumps.contains_key(&card));
+    }
+
+    /// The notice slot has two independent producers. An indexing report
+    /// arriving a second later must not erase the one message telling the user
+    /// their hover, locations and completions were thrown away.
+    #[test]
+    fn progress_does_not_erase_a_failure_the_user_has_not_read() {
+        let mut app = lsp_test_app();
+        let card = repository_card(&mut app, "/repo");
+        lsp_state(&mut app, card).document = Some(LspDocumentId(1));
+        app.lsp_documents.insert(LspDocumentId(1), card);
+
+        app.apply_lsp_event(LspEvent::DocumentDesynced {
+            doc: LspDocumentId(1),
+            version: 3,
+            error: LspError::NoServer,
+        });
+        let failure = app.lsp_contexts[&card]
+            .context
+            .notice
+            .clone()
+            .expect("the desync is reported");
+
+        for done in [false, true] {
+            app.apply_lsp_event(LspEvent::Progress {
+                doc: LspDocumentId(1),
+                progress: crate::lsp::LspProgress {
+                    token: "indexing".into(),
+                    title: Some("Indexing".into()),
+                    message: None,
+                    percentage: None,
+                    done,
+                },
+            });
+            assert_eq!(
+                app.lsp_contexts[&card].context.notice.as_deref(),
+                Some(failure.as_str()),
+                "progress with done={done} replaced the failure"
+            );
+        }
+
+        // Dismissing is the user saying they have read it; only then may
+        // progress have the slot.
+        let _ = app.update_lsp(InspectorAction::DismissLspResults(card));
+        app.apply_lsp_event(LspEvent::Progress {
+            doc: LspDocumentId(1),
+            progress: crate::lsp::LspProgress {
+                token: "indexing".into(),
+                title: Some("Indexing".into()),
+                message: None,
+                percentage: Some(10),
+                done: false,
+            },
+        });
+        assert_eq!(
+            app.lsp_contexts[&card].context.notice.as_deref(),
+            Some("Indexing (10%)")
+        );
     }
 
     /// Opening a file no configured server claims is a supported configuration,

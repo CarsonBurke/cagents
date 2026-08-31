@@ -1066,6 +1066,30 @@ impl RepositoryRuntime {
         runtime
     }
 
+    /// A runtime whose file list is `Ready` with exactly `paths` and nothing
+    /// else: no selection, no open document, no save in flight.
+    ///
+    /// For callers that need [`Self::can_open_file`] to answer truthfully
+    /// without also inheriting a fixture's document state.
+    #[cfg(test)]
+    pub(crate) fn file_list_fixture(descriptor: RepositoryView, paths: &[&str]) -> Self {
+        let mut runtime = Self::new(descriptor);
+        runtime.files = FileListState::Ready(
+            paths
+                .iter()
+                .map(|path| RepositoryFile {
+                    path: PathBuf::from(path),
+                    staged_old_path: None,
+                    unstaged_old_path: None,
+                    staged: false,
+                    unstaged: true,
+                    status: Some(" M".into()),
+                })
+                .collect(),
+        );
+        runtime
+    }
+
     #[cfg(test)]
     pub(crate) fn dirty_fixture(card: CardId) -> Self {
         let (mut runtime, _) = Self::post_persist_failure_fixture(card);
@@ -1380,6 +1404,18 @@ impl RepositoryRuntime {
             version: document.lsp_version,
             text: document.content.text(),
         });
+    }
+
+    /// Whether `path` names a row this card's file list can open.
+    ///
+    /// A location can resolve into a file the card has no row for - a
+    /// gitignored or generated source a build script produced - or arrive
+    /// while the list is still loading, and [`Self::update`]'s `OpenFile`
+    /// answers both by doing nothing. A caller about to park work on that open
+    /// has to know that before it waits for something that will never happen.
+    #[must_use]
+    pub fn can_open_file(&self, path: &Path) -> bool {
+        self.file(path).is_some()
     }
 
     /// Re-announces the open buffer to a replaced language-server manager.

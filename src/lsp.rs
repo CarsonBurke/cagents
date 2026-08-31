@@ -3479,6 +3479,20 @@ impl LspManager {
             .map_or(LspStatus::Disabled, SessionHandle::status)
     }
 
+    /// Version of `doc`'s current snapshot: the version every result this
+    /// manager publishes for it is stamped with.
+    ///
+    /// A caller must read this rather than counting versions of its own. The
+    /// manager bumps a document's version whenever it re-opens it - a restart,
+    /// a crashed session respawning, a second document registering the same
+    /// URI - and none of those are edits the caller made, so a private counter
+    /// falls silently behind and starts rejecting live results as stale.
+    #[must_use]
+    pub fn document_version(&self, doc: LspDocumentId) -> Option<i32> {
+        let reference = self.documents.get(&doc)?;
+        Some(self.snapshots.latest(&reference.uri)?.version)
+    }
+
     /// Converts a protocol UTF-16 position into the editor-native scalar
     /// position, against `doc`'s current snapshot.
     ///
