@@ -15,19 +15,9 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use cosmic::iced::advanced::Renderer as _;
 use cosmic::{
-    Element, Renderer, Theme,
-    iced::{
-        Alignment, Border, Event, Length, Point, Rectangle, Shadow, Size,
-        advanced::{
-            Clipboard, Layout, Shell, Widget, layout, mouse, overlay, renderer,
-            text::EllipsizeHeightLimit,
-            widget::{Operation, Tree, operation, tree},
-        },
-        id::Id,
-        keyboard, window,
-    },
+    Element,
+    iced::{Alignment, Length, advanced::text::EllipsizeHeightLimit, id::Id},
     theme,
     widget::{self, button, icon},
 };
@@ -40,6 +30,7 @@ use crate::{
     repository::{
         DirtyState, RepositoryId, RepositoryInfo, StatusSnapshot, TrackingState, WorktreeRecord,
     },
+    splitter::{Edge as SplitterEdge, Splitter},
 };
 
 /// The rendered bounds of the expanded pane, and the only bounds it has:
@@ -61,12 +52,6 @@ const ROW_ICON_WIDTH: f32 = 20.0;
 const ROW_ICON_SIZE: u16 = 16;
 /// Icons that stand alone as the illustration of a whole pane state.
 const STATUS_ICON_SIZE: u16 = 20;
-/// Pointer target of the resize handle. Wider than the rule it draws, because
-/// a one-pixel grab target cannot be hit; the extra pixels come out of the
-/// pane, so it stays as narrow as a comfortable target allows.
-const RESIZE_HANDLE_WIDTH: f32 = 4.0;
-/// One keyboard resize step, and the step assistive technologies report.
-const RESIZE_STEP: f32 = 16.0;
 const RESIZE_HANDLE_NAME: &str = "Resize sidebar";
 
 /// The responsive density selected by the application from its available
@@ -632,7 +617,7 @@ pub enum SidebarAction {
     Refresh,
     CreatePullRequest {
         project_id: ProjectId,
-        repository: PathBuf,
+        worktree: Option<PathBuf>,
     },
     OpenSettings,
     /// A width requested by the pane's resize handle, already clamped to the
@@ -920,7 +905,7 @@ fn footer<'a>(
                     &*project.chrome.create_pull_request_name,
                     SidebarAction::CreatePullRequest {
                         project_id: project.id,
-                        repository: project.repository.clone(),
+                        worktree: None,
                     },
                     project.chrome.create_pull_request_id.clone(),
                 ),
@@ -1310,7 +1295,7 @@ fn project_view<'a>(
             &*chrome.create_pull_request_name,
             SidebarAction::CreatePullRequest {
                 project_id,
-                repository: entity.repository.clone(),
+                worktree: None,
             },
             chrome.create_pull_request_id.clone(),
         ),
@@ -1595,396 +1580,18 @@ fn icon_action<'a>(
 /// reports pointer motion only while the pointer is inside its own bounds: a
 /// handle this narrow would lose the gesture on the first pixel of travel. A
 /// widget sees every event, so the grab survives the pointer leaving it.
-fn resize_handle(width: f32, modal_open: bool) -> ResizeHandle<'static> {
-    ResizeHandle {
-        content: widget::container(widget::divider::vertical::default())
-            .center_x(Length::Fixed(RESIZE_HANDLE_WIDTH))
-            .height(Length::Fill)
-            .into(),
+fn resize_handle(width: f32, modal_open: bool) -> Splitter<'static, SidebarAction> {
+    Splitter::new(
+        resize_handle_id(),
+        RESIZE_HANDLE_NAME,
         width,
+        EXPANDED_WIDTH_MIN,
+        EXPANDED_WIDTH_MAX,
+        SplitterEdge::Trailing,
         modal_open,
-        id: resize_handle_id(),
-    }
-}
-
-struct ResizeHandle<'a> {
-    content: Element<'a, SidebarAction>,
-    /// The width the pane renders at, and the origin every gesture measures
-    /// from. Owned by the application, so the handle stores nothing itself.
-    width: f32,
-    /// Set while a dialog is on screen, when the keyboard is not ours to read.
-    modal_open: bool,
-    id: Id,
-}
-
-/// Where a drag began. The width is captured with the pointer so the pane
-/// tracks the pointer exactly instead of accumulating each frame's rounding.
-#[derive(Debug, Clone, Copy)]
-struct ResizeOrigin {
-    pointer_x: f32,
-    width: f32,
-}
-
-#[derive(Debug, Default)]
-struct ResizeHandleState {
-    drag: Option<ResizeOrigin>,
-    is_focused: bool,
-    /// Set while an arrow key repeats. A held key is one gesture, so the
-    /// width settles when it is released rather than on every repeat.
-    repeating: bool,
-}
-
-impl operation::Focusable for ResizeHandleState {
-    fn is_focused(&self) -> bool {
-        self.is_focused
-    }
-
-    fn focus(&mut self) {
-        self.is_focused = true;
-    }
-
-    fn unfocus(&mut self) {
-        self.is_focused = false;
-    }
-}
-
-impl ResizeHandle<'_> {
-    fn child_layout<'layout>(layout: Layout<'layout>) -> Layout<'layout> {
-        layout
-            .children()
-            .next()
-            .expect("resize handle content layout")
-            .with_virtual_offset(layout.virtual_offset())
-    }
-
-    fn resize(&self, width: f32) -> SidebarAction {
-        SidebarAction::Resize {
-            width: clamp_expanded_width(width),
-        }
-    }
-}
-
-/// The width a drag requests: the pointer's travel added to the width the
-/// gesture began at. Measured from the origin rather than the previous frame,
-/// so a pointer returning to where it started restores the width it started
-/// with, whatever the clamp did in between.
-fn dragged_width(origin: ResizeOrigin, pointer_x: f32) -> f32 {
-    clamp_expanded_width(origin.width + pointer_x - origin.pointer_x)
-}
-
-impl Widget<SidebarAction, Theme, Renderer> for ResizeHandle<'_> {
-    fn tag(&self) -> tree::Tag {
-        tree::Tag::of::<ResizeHandleState>()
-    }
-
-    fn state(&self) -> tree::State {
-        tree::State::new(ResizeHandleState::default())
-    }
-
-    fn children(&self) -> Vec<Tree> {
-        vec![Tree::new(&self.content)]
-    }
-
-    fn diff(&mut self, tree: &mut Tree) {
-        tree.diff_children(std::slice::from_mut(&mut self.content));
-    }
-
-    fn size(&self) -> Size<Length> {
-        self.content.as_widget().size()
-    }
-
-    fn layout(
-        &mut self,
-        tree: &mut Tree,
-        renderer: &Renderer,
-        limits: &layout::Limits,
-    ) -> layout::Node {
-        let content = self
-            .content
-            .as_widget_mut()
-            .layout(&mut tree.children[0], renderer, limits)
-            .move_to(Point::ORIGIN);
-        layout::Node::with_children(content.size(), vec![content])
-    }
-
-    fn operate(
-        &mut self,
-        tree: &mut Tree,
-        layout: Layout<'_>,
-        renderer: &Renderer,
-        operation: &mut dyn Operation,
-    ) {
-        let bounds = layout.bounds();
-        operation.traverse(&mut |operation| {
-            self.content.as_widget_mut().operate(
-                &mut tree.children[0],
-                Self::child_layout(layout),
-                renderer,
-                operation,
-            );
-        });
-        let state = tree.state.downcast_mut::<ResizeHandleState>();
-        operation.focusable(Some(&self.id), bounds, state);
-    }
-
-    fn update(
-        &mut self,
-        tree: &mut Tree,
-        event: &Event,
-        layout: Layout<'_>,
-        cursor: mouse::Cursor,
-        renderer: &Renderer,
-        clipboard: &mut dyn Clipboard,
-        shell: &mut Shell<'_, SidebarAction>,
-        viewport: &Rectangle,
-    ) {
-        let bounds = layout.bounds();
-        let state = tree.state.downcast_mut::<ResizeHandleState>();
-        match event {
-            Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)) => {
-                // Focus follows the press, and is surrendered when the press
-                // lands elsewhere, exactly as libcosmic's buttons do: the
-                // arrow keys must never resize the pane from a text field.
-                state.is_focused = cursor.is_over(bounds);
-                if let Some(position) = cursor.position().filter(|_| state.is_focused) {
-                    state.drag = Some(ResizeOrigin {
-                        pointer_x: position.x,
-                        width: self.width,
-                    });
-                    shell.capture_event();
-                    return;
-                }
-            }
-            Event::Mouse(mouse::Event::CursorMoved { position }) => {
-                if let Some(origin) = state.drag {
-                    shell.publish(SidebarAction::Resize {
-                        width: dragged_width(origin, position.x),
-                    });
-                    shell.capture_event();
-                    return;
-                }
-            }
-            Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)) => {
-                if state.drag.take().is_some() {
-                    shell.publish(SidebarAction::ResizeFinished);
-                    shell.capture_event();
-                    return;
-                }
-            }
-            // The release that ends a drag is delivered to whichever surface
-            // owns the pointer, so a lost window ends the grab instead.
-            Event::Window(window::Event::Unfocused) => {
-                let dragging = state.drag.take().is_some();
-                let repeating = std::mem::take(&mut state.repeating);
-                if dragging || repeating {
-                    shell.publish(SidebarAction::ResizeFinished);
-                }
-            }
-            // A single keystroke is a whole gesture, so it settles the width
-            // at once. A held key is one gesture still under way: settling on
-            // every repeat would rewrite and fsync the settings file at the
-            // key-repeat rate, so a repeated gesture settles on release.
-            // An arrow carrying a modifier belongs to whoever reserved that
-            // chord - `Alt+Left` and `Alt+Right` navigate columns by default -
-            // so only a bare arrow resizes the pane. The four are read
-            // individually rather than as `is_empty`, which would also consult
-            // the lock flags this iced fork carries: a user holding caps lock
-            // would silently lose the gesture.
-            //
-            // A dialog on screen takes the keyboard even though this widget
-            // keeps the focus flag it had when the dialog opened: an arrow
-            // aimed at a dialog control must not quietly retune the pane and
-            // write the settings file behind it.
-            Event::Keyboard(keyboard::Event::KeyPressed {
-                key,
-                modifiers,
-                repeat,
-                ..
-            }) if state.is_focused && !self.modal_open && !chorded(*modifiers) => {
-                if let Some(step) = resize_step(key) {
-                    shell.publish(self.resize(self.width + step));
-                    if *repeat {
-                        state.repeating = true;
-                    } else {
-                        shell.publish(SidebarAction::ResizeFinished);
-                    }
-                    shell.capture_event();
-                    return;
-                }
-            }
-            Event::Keyboard(keyboard::Event::KeyReleased { key, .. }) if state.repeating => {
-                if resize_step(key).is_some() {
-                    state.repeating = false;
-                    shell.publish(SidebarAction::ResizeFinished);
-                    shell.capture_event();
-                    return;
-                }
-            }
-            Event::A11y(id, request) if *id == self.id => {
-                use iced_accessibility::accesskit::Action;
-                match request.action {
-                    Action::Focus => state.is_focused = true,
-                    Action::Blur => state.is_focused = false,
-                    // A dialog is not ours to resize behind, whoever asks:
-                    // the keyboard path stands down for one, and an
-                    // assistive technology reaches this widget by another
-                    // road rather than with another right.
-                    Action::Increment if !self.modal_open => {
-                        shell.publish(self.resize(self.width + RESIZE_STEP));
-                        shell.publish(SidebarAction::ResizeFinished);
-                    }
-                    Action::Decrement if !self.modal_open => {
-                        shell.publish(self.resize(self.width - RESIZE_STEP));
-                        shell.publish(SidebarAction::ResizeFinished);
-                    }
-                    _ => {}
-                }
-                shell.capture_event();
-                return;
-            }
-            _ => {}
-        }
-        self.content.as_widget_mut().update(
-            &mut tree.children[0],
-            event,
-            Self::child_layout(layout),
-            cursor,
-            renderer,
-            clipboard,
-            shell,
-            viewport,
-        );
-    }
-
-    fn mouse_interaction(
-        &self,
-        tree: &Tree,
-        layout: Layout<'_>,
-        cursor: mouse::Cursor,
-        _viewport: &Rectangle,
-        _renderer: &Renderer,
-    ) -> mouse::Interaction {
-        let state = tree.state.downcast_ref::<ResizeHandleState>();
-        if state.drag.is_some() || cursor.is_over(layout.bounds()) {
-            mouse::Interaction::ResizingHorizontally
-        } else {
-            mouse::Interaction::default()
-        }
-    }
-
-    fn draw(
-        &self,
-        tree: &Tree,
-        renderer: &mut Renderer,
-        theme: &Theme,
-        style: &renderer::Style,
-        layout: Layout<'_>,
-        cursor: mouse::Cursor,
-        viewport: &Rectangle,
-    ) {
-        self.content.as_widget().draw(
-            &tree.children[0],
-            renderer,
-            theme,
-            style,
-            Self::child_layout(layout),
-            cursor,
-            viewport,
-        );
-        // The rule alone cannot show focus: it looks the same either way.
-        if tree.state.downcast_ref::<ResizeHandleState>().is_focused {
-            renderer.fill_quad(
-                renderer::Quad {
-                    bounds: layout.bounds(),
-                    border: Border::default(),
-                    shadow: Shadow::default(),
-                    snap: true,
-                },
-                cosmic::iced::Background::Color(theme.cosmic().accent.base.into()),
-            );
-        }
-    }
-
-    fn overlay<'a>(
-        &'a mut self,
-        tree: &'a mut Tree,
-        layout: Layout<'a>,
-        renderer: &Renderer,
-        viewport: &Rectangle,
-        translation: cosmic::iced::Vector,
-    ) -> Option<overlay::Element<'a, SidebarAction, Theme, Renderer>> {
-        self.content.as_widget_mut().overlay(
-            &mut tree.children[0],
-            Self::child_layout(layout),
-            renderer,
-            viewport,
-            translation,
-        )
-    }
-
-    fn a11y_nodes(
-        &self,
-        layout: Layout<'_>,
-        _state: &Tree,
-        _cursor: mouse::Cursor,
-    ) -> iced_accessibility::A11yTree {
-        use iced_accessibility::accesskit::{Action, Node, Rect, Role};
-
-        let Rectangle {
-            x,
-            y,
-            width,
-            height,
-        } = layout.bounds();
-        let mut node = Node::new(Role::Splitter);
-        node.add_action(Action::Focus);
-        node.add_action(Action::Increment);
-        node.add_action(Action::Decrement);
-        node.set_bounds(Rect::new(
-            f64::from(x),
-            f64::from(y),
-            f64::from(x + width),
-            f64::from(y + height),
-        ));
-        node.set_label(RESIZE_HANDLE_NAME);
-        node.set_numeric_value(f64::from(self.width));
-        node.set_min_numeric_value(f64::from(EXPANDED_WIDTH_MIN));
-        node.set_max_numeric_value(f64::from(EXPANDED_WIDTH_MAX));
-        node.set_numeric_value_step(f64::from(RESIZE_STEP));
-        iced_accessibility::A11yTree::leaf(node, self.id.clone())
-    }
-
-    fn id(&self) -> Option<Id> {
-        Some(self.id.clone())
-    }
-
-    fn set_id(&mut self, id: Id) {
-        self.id = id;
-    }
-}
-
-impl<'a> From<ResizeHandle<'a>> for Element<'a, SidebarAction> {
-    fn from(handle: ResizeHandle<'a>) -> Self {
-        Self::new(handle)
-    }
-}
-
-/// The width delta a key requests, or `None` for keys the handle ignores.
-fn resize_step(key: &keyboard::Key) -> Option<f32> {
-    match key {
-        keyboard::Key::Named(keyboard::key::Named::ArrowLeft) => Some(-RESIZE_STEP),
-        keyboard::Key::Named(keyboard::key::Named::ArrowRight) => Some(RESIZE_STEP),
-        _ => None,
-    }
-}
-
-/// Whether a keystroke carries a modifier that could make it someone's chord.
-///
-/// The four are read individually because `Modifiers::is_empty` also consults
-/// the lock flags, which say what the keyboard is latched to rather than what
-/// the user is holding down.
-fn chorded(modifiers: keyboard::Modifiers) -> bool {
-    modifiers.control() || modifiers.alt() || modifiers.shift() || modifiers.logo()
+        |width| SidebarAction::Resize { width },
+        || SidebarAction::ResizeFinished,
+    )
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -2207,6 +1814,10 @@ fn filter_id(filter: SidebarFilter) -> Id {
 mod tests {
     use super::*;
     use crate::{github::RemoteValue, repository::WorktreeLock};
+    use cosmic::iced::{
+        Size,
+        advanced::{Layout, layout, widget::Tree},
+    };
     use uuid::Uuid;
 
     fn project_id(value: u128) -> ProjectId {
@@ -2692,32 +2303,6 @@ mod tests {
     }
 
     #[test]
-    fn dragging_the_handle_tracks_the_pointer_within_the_rendered_bounds() {
-        let origin = ResizeOrigin {
-            pointer_x: 600.0,
-            width: DEFAULT_EXPANDED_WIDTH,
-        };
-
-        assert_eq!(dragged_width(origin, 640.0), DEFAULT_EXPANDED_WIDTH + 40.0);
-        assert_eq!(dragged_width(origin, 560.0), DEFAULT_EXPANDED_WIDTH - 40.0);
-        assert_eq!(dragged_width(origin, 4_000.0), EXPANDED_WIDTH_MAX);
-        assert_eq!(dragged_width(origin, 0.0), EXPANDED_WIDTH_MIN);
-        // A gesture that returns to its origin restores the width it began
-        // at, however far past the bounds it travelled first.
-        assert_eq!(dragged_width(origin, 600.0), DEFAULT_EXPANDED_WIDTH);
-    }
-
-    #[test]
-    fn the_resize_handle_answers_to_the_keyboard_in_whole_steps() {
-        let step = |named| resize_step(&keyboard::Key::Named(named));
-
-        assert_eq!(step(keyboard::key::Named::ArrowRight), Some(RESIZE_STEP));
-        assert_eq!(step(keyboard::key::Named::ArrowLeft), Some(-RESIZE_STEP));
-        assert_eq!(step(keyboard::key::Named::Enter), None);
-        assert_eq!(step(keyboard::key::Named::ArrowUp), None);
-    }
-
-    #[test]
     fn the_resize_handle_is_a_named_focusable_splitter() {
         use iced_accessibility::accesskit::{Action, Role};
 
@@ -2730,7 +2315,7 @@ mod tests {
         );
 
         let tree = Tree::new(&handle);
-        let bounds = Size::new(RESIZE_HANDLE_WIDTH, 480.0);
+        let bounds = Size::new(crate::splitter::WIDTH, 480.0);
         let node = layout::Node::with_children(bounds, vec![layout::Node::new(bounds)]);
         let accessible = handle.as_widget().a11y_nodes(
             Layout::new(&node),
@@ -2755,7 +2340,10 @@ mod tests {
             node.max_numeric_value(),
             Some(f64::from(EXPANDED_WIDTH_MAX))
         );
-        assert_eq!(node.numeric_value_step(), Some(f64::from(RESIZE_STEP)));
+        assert_eq!(
+            node.numeric_value_step(),
+            Some(f64::from(crate::splitter::KEYBOARD_STEP))
+        );
         for action in [Action::Focus, Action::Increment, Action::Decrement] {
             assert!(
                 node.supports_action(action),

@@ -29,11 +29,12 @@ use cosmic::{
 use url::Url;
 
 use crate::{
-    design::{self, DockLayout},
+    design::{self, DockLayout, InspectorLayout},
     github::{
         CreatePullRequestRequest, GitHubRepoKey, GitHubService, ListPullRequestsRequest,
         PullRequest, PullRequestCheck, PullRequestCreationOutcome, PullRequestStateFilter,
     },
+    inspector::{self, InspectorAction, RuntimeStatus as InspectorRuntimeStatus},
     instance,
     lifecycle::{LifecycleAction, LifecycleBudget, LifecycleManager},
     location::SanitizedLocation,
@@ -53,6 +54,7 @@ use crate::{
         self, SidebarAction, SidebarDataState, SidebarMode, SidebarModel, SidebarProject,
         SidebarPullRequest, SidebarState, SidebarWorktree,
     },
+    splitter::{Edge as SplitterEdge, Splitter},
     terminal::{
         HostedTerminalHandle, TerminalConfig, TerminalEvent, TerminalSurface, TerminalWidget,
     },
@@ -953,6 +955,28 @@ fn update_workspace_viewport(
     }
 }
 
+fn pull_request_head(
+    projects: &[SidebarProject],
+    project_id: ProjectId,
+    worktree: Option<&Path>,
+) -> String {
+    projects
+        .iter()
+        .find(|project| project.id == project_id)
+        .and_then(|project| match worktree {
+            Some(path) => project
+                .worktrees
+                .iter()
+                .find(|worktree| worktree.path == path)
+                .and_then(|worktree| worktree.branch.clone()),
+            None => project
+                .worktrees
+                .iter()
+                .find_map(|worktree| worktree.branch.clone()),
+        })
+        .unwrap_or_default()
+}
+
 #[derive(Debug, Clone)]
 pub struct LoadedRepository {
     project: ProjectState,
@@ -1031,6 +1055,21 @@ struct InspectorTransition {
     started_at: Instant,
     from: f32,
     to: f32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ContextOverlayChange {
+    Entered,
+    Exited,
+    Unchanged,
+}
+
+const fn context_overlay_change(was_overlay: bool, is_overlay: bool) -> ContextOverlayChange {
+    match (was_overlay, is_overlay) {
+        (false, true) => ContextOverlayChange::Entered,
+        (true, false) => ContextOverlayChange::Exited,
+        _ => ContextOverlayChange::Unchanged,
+    }
 }
 
 impl InspectorTransition {
@@ -1407,6 +1446,8 @@ pub enum Message {
     KeyEvent(keyboard::Event),
     FocusAdjacent(crate::workspace::FocusDirection),
     FocusProjectSearch,
+    ToggleContextInspector,
+    ContextInspector(InspectorAction),
     CloseInspector,
     SelectSettingsCategory(SettingsCategory),
     SettingsChanged {
@@ -1640,6 +1681,9 @@ pub struct Cagents {
     /// are both derived from it and the surface does not report a width until
     /// it has been mapped. `Message::WindowResized` replaces it.
     window_width: f32,
+    /// The header-bar preference before a modal context overlay temporarily
+    /// suppresses every native window control outside its focus boundary.
+    window_headerbar_enabled: bool,
     core: Core,
     settings_path: Option<PathBuf>,
     settings_write_blocked: bool,
@@ -1651,6 +1695,12 @@ pub struct Cagents {
     frame_clock: FrameClock,
     inspector: Option<Inspector>,
     inspector_transition: Option<InspectorTransition>,
+    context_inspector_open: bool,
+    /// The overlay state whose focus and native-surface transition has already
+    /// been applied. The rendered mount also depends on workspace focus, so it
+    /// cannot be derived solely from inspector-open and window-resize events.
+    context_inspector_overlay_active: bool,
+    context_inspector_restore_focus: Option<widget::Id>,
     settings_category: SettingsCategory,
     keyboard_modifiers: keyboard::Modifiers,
     settings_draft: SettingsDraft,
@@ -2447,7 +2497,7 @@ impl Cagents {
         }
         self.persist();
 
-        let surfaces_visible = self.inspector.is_none();
+        let surfaces_visible = self.workspace_surfaces_visible();
         match state.kind {
             CardKind::Terminal(session) => {
                 self.cards.insert(card, CardRuntime::Loading);
@@ -2564,6 +2614,7 @@ impl Cagents {
         synchronize_scroll: bool,
         additional_durable_change: bool,
     ) -> Task<Message> {
+        let context_overlay_task = self.sync_context_overlay_state();
         let focused = self.workspace.focused();
         let viewport_durable_changed =
             durable_viewport_update_pending(&self.durable, focused, &update.transitions)
@@ -2576,7 +2627,7 @@ impl Cagents {
         let mut tasks = Vec::new();
         let mut schedule_delayed_sweep = false;
         let mut reconcile_now = false;
-        let surfaces_visible = self.inspector.is_none();
+        let surfaces_visible = self.workspace_surfaces_visible();
         for transition in update.transitions {
             let browser_card = self
                 .durable
@@ -2612,9 +2663,12 @@ impl Cagents {
         if synchronize_scroll && update.offset_changed {
             tasks.push(self.synchronize_workspace_scroll());
         }
-        if let Some(card) = self.workspace.take_widget_focus_request() {
+        if let Some(card) = self.workspace.take_widget_focus_request()
+            && !self.context_inspector_overlay_active
+        {
             tasks.push(workspace_widget::focus_card(card).map(cosmic::Action::App));
         }
+        tasks.push(context_overlay_task);
         if reconcile_now {
             tasks.push(cosmic::task::message(Message::LifecycleSweep));
         }
@@ -2712,7 +2766,7 @@ impl Cagents {
         prefetch: &HashSet<CardId>,
     ) -> Task<Message> {
         let now = Instant::now();
-        let surfaces_visible = self.inspector.is_none();
+        let surfaces_visible = self.workspace_surfaces_visible();
         let actions = self.lifecycle.reconcile(visible, prefetch, now);
         // Actions are only emitted for real transitions, so an empty sweep left
         // the durable state untouched and needs no snapshot.
@@ -3377,7 +3431,7 @@ impl Cagents {
         // typing aimed at the dialog and write it into a shell, which runs
         // what it is given. The inspector additionally hides the workspace, so
         // that shell would not even be on screen.
-        let card_focused = focused && !self.modal_is_open();
+        let card_focused = focused && !self.workspace_inputs_blocked();
         #[cfg(not(feature = "integrated-browser"))]
         let browser_toolbar: Option<Element<'a, Message>> = browser_session.map(|_| {
             let address = chrome
@@ -3672,7 +3726,8 @@ impl Cagents {
         let was_open = self.inspector.take().is_some();
         self.inspector_transition = None;
         if was_open {
-            self.set_workspace_surfaces_visible(true);
+            let visible = self.workspace_surfaces_visible();
+            self.set_workspace_surfaces_visible(visible);
         }
     }
 
@@ -3687,6 +3742,172 @@ impl Cagents {
         self.inspector.is_some()
             || self.worktree_dialog.is_some()
             || self.pull_request_dialog.is_some()
+    }
+
+    fn context_inspector_is_overlay(&self) -> bool {
+        matches!(
+            inspector::mount_for_width(
+                self.window_width,
+                self.context_inspector_open,
+                self.workspace.focused().is_some(),
+            ),
+            Some(InspectorLayout::Overlay)
+        )
+    }
+
+    fn workspace_inputs_blocked(&self) -> bool {
+        self.modal_is_open() || self.context_inspector_is_overlay()
+    }
+
+    fn workspace_surfaces_visible(&self) -> bool {
+        workspace_surfaces_should_render(
+            self.inspector.is_some(),
+            self.context_inspector_is_overlay(),
+        )
+    }
+
+    fn sync_context_overlay_headerbar(&mut self) {
+        let overlay_open = self.context_inspector_is_overlay();
+        self.core.window.show_headerbar =
+            headerbar_should_render(self.window_headerbar_enabled, overlay_open);
+    }
+
+    fn enter_context_overlay(&mut self) -> Task<Message> {
+        // The header toggle belongs to the docked tree we are leaving and is
+        // guaranteed to return when the modal closes. Recording it before the
+        // focus operation makes every breakpoint entry deterministic, even if
+        // a focused docked inspector child disappears during the re-layout.
+        self.context_inspector_restore_focus = Some(context_inspector_toggle_id());
+        iced::widget::operation::focus(inspector::close_focus_id()).map(cosmic::Action::App)
+    }
+
+    fn sync_context_overlay_state(&mut self) -> Task<Message> {
+        let was_overlay = self.context_inspector_overlay_active;
+        let is_overlay = self.context_inspector_is_overlay();
+        self.context_inspector_overlay_active = is_overlay;
+        self.sync_context_overlay_headerbar();
+        if was_overlay != is_overlay {
+            let visible = self.workspace_surfaces_visible();
+            self.set_workspace_surfaces_visible(visible);
+        }
+        match context_overlay_change(was_overlay, is_overlay) {
+            ContextOverlayChange::Entered => self.enter_context_overlay(),
+            ContextOverlayChange::Exited
+                if !self.context_inspector_open || self.workspace.focused().is_none() =>
+            {
+                self.context_inspector_restore_focus
+                    .take()
+                    .map_or_else(Task::none, |id| {
+                        iced::widget::operation::focus(id).map(cosmic::Action::App)
+                    })
+            }
+            ContextOverlayChange::Exited => {
+                // A width change kept the inspector mounted and focused as a
+                // docked pane. A later docked close must not restore a target
+                // from the preceding modal interval.
+                self.context_inspector_restore_focus = None;
+                Task::none()
+            }
+            ContextOverlayChange::Unchanged => Task::none(),
+        }
+    }
+
+    fn set_context_inspector_open(&mut self, open: bool) -> Task<Message> {
+        if self.context_inspector_open == open {
+            return Task::none();
+        }
+        self.context_inspector_open = open;
+        self.sync_context_overlay_state()
+    }
+
+    fn inspector_runtime_status(&self, card: CardId) -> InspectorRuntimeStatus {
+        match self.cards.get(&card) {
+            Some(CardRuntime::Loading) | None => InspectorRuntimeStatus::Starting,
+            Some(CardRuntime::Failed(_)) => InspectorRuntimeStatus::Unavailable,
+            #[cfg(feature = "integrated-browser")]
+            Some(CardRuntime::Browser(browser)) => match browser.lifecycle {
+                BrowserLifecycle::Restoring => InspectorRuntimeStatus::Restoring,
+                BrowserLifecycle::Hibernating => InspectorRuntimeStatus::Suspending,
+                BrowserLifecycle::Hibernated => InspectorRuntimeStatus::Suspended,
+                BrowserLifecycle::Closed => InspectorRuntimeStatus::Unavailable,
+                BrowserLifecycle::Visible | BrowserLifecycle::OffscreenHot
+                    if browser.load_state.is_some() =>
+                {
+                    InspectorRuntimeStatus::Loading
+                }
+                BrowserLifecycle::Visible | BrowserLifecycle::OffscreenHot => {
+                    InspectorRuntimeStatus::Ready
+                }
+            },
+            Some(CardRuntime::Terminal(_))
+            | Some(CardRuntime::Repository(_))
+            | Some(CardRuntime::PullRequests(_)) => InspectorRuntimeStatus::Ready,
+        }
+    }
+
+    fn handle_context_inspector_action(&mut self, action: InspectorAction) -> Task<Message> {
+        match action {
+            InspectorAction::Close => self.set_context_inspector_open(false),
+            InspectorAction::Resize { width } => {
+                self.settings.inspector_width =
+                    width.clamp(design::INSPECTOR_MIN_WIDTH, design::INSPECTOR_MAX_WIDTH);
+                Task::none()
+            }
+            InspectorAction::ResizeFinished => {
+                if let Err(error) = self.save_settings_now() {
+                    self.status = Some(TransientNotice::error(format!(
+                        "could not save inspector width: {error}"
+                    )));
+                }
+                Task::none()
+            }
+            command => {
+                let close_overlay = if self.context_inspector_is_overlay() {
+                    self.set_context_inspector_open(false)
+                } else {
+                    Task::none()
+                };
+                let command = match command {
+                    InspectorAction::NewTerminalAt(path) => self.add_terminal(path),
+                    InspectorAction::Retry(card) => cosmic::task::message(Message::RetryCard(card)),
+                    InspectorAction::ReloadBrowser(card) => {
+                        #[cfg(feature = "integrated-browser")]
+                        {
+                            cosmic::task::message(Message::BrowserReload(card))
+                        }
+                        #[cfg(not(feature = "integrated-browser"))]
+                        {
+                            cosmic::task::message(Message::RetryCard(card))
+                        }
+                    }
+                    InspectorAction::OpenBrowser(url) => {
+                        cosmic::task::message(Message::OpenBrowser(url))
+                    }
+                    InspectorAction::RefreshRepositories => {
+                        cosmic::task::message(Message::Sidebar(SidebarAction::Refresh))
+                    }
+                    InspectorAction::CreatePullRequest {
+                        project_id,
+                        worktree,
+                    } => {
+                        cosmic::task::message(Message::Sidebar(SidebarAction::CreatePullRequest {
+                            project_id,
+                            worktree: Some(worktree),
+                        }))
+                    }
+                    InspectorAction::FocusProjectSearch => {
+                        cosmic::task::message(Message::FocusProjectSearch)
+                    }
+                    InspectorAction::CloseCard(card) => {
+                        cosmic::task::message(Message::CloseCard(card))
+                    }
+                    InspectorAction::Close
+                    | InspectorAction::Resize { .. }
+                    | InspectorAction::ResizeFinished => unreachable!("handled above"),
+                };
+                Task::batch([close_overlay, command])
+            }
+        }
     }
 
     /// Opens `inspector` from closed, and moves keyboard focus into it.
@@ -3730,7 +3951,8 @@ impl Cagents {
         if transition.is_complete(now) {
             if transition.to == 0.0 {
                 self.inspector = None;
-                self.set_workspace_surfaces_visible(true);
+                let visible = self.workspace_surfaces_visible();
+                self.set_workspace_surfaces_visible(visible);
             }
             self.inspector_transition = None;
         }
@@ -3901,6 +4123,7 @@ impl Application for Cagents {
         let workspace = Self::rebuild_workspace(&durable);
         let (terminal_wake_tx, terminal_wake_rx) = async_channel::unbounded();
         let window_scale_factor = core.scale_factor().max(0.01);
+        let window_headerbar_enabled = core.window.show_headerbar;
         let settings_draft = SettingsDraft::from_settings(&settings);
         let mut app = Self {
             core,
@@ -3926,6 +4149,7 @@ impl Application for Cagents {
             browser_parent_lifetime: None,
             window_scale_factor,
             window_width: 1_600.0,
+            window_headerbar_enabled,
             settings_path,
             settings_write_blocked,
             sidebar_model: SidebarModel::ready(SidebarMode::Expanded, sidebar_projects),
@@ -3936,6 +4160,12 @@ impl Application for Cagents {
             frame_clock: FrameClock::default(),
             inspector: None,
             inspector_transition: None,
+            context_inspector_open: true,
+            context_inspector_overlay_active: false,
+            // The initial estimate is wide, but the first compositor resize
+            // can immediately mount the default-open inspector as a modal.
+            // Keep a valid post-close target ready for that narrow startup.
+            context_inspector_restore_focus: Some(context_inspector_toggle_id()),
             settings_category: SettingsCategory::General,
             keyboard_modifiers: keyboard::Modifiers::empty(),
             settings_draft,
@@ -3961,9 +4191,18 @@ impl Application for Cagents {
             SidebarMode::for_width(app.window_width),
             app.settings.sidebar_width,
         );
+        let inspector_width = if app.context_inspector_open
+            && matches!(
+                design::ShellLayout::for_width(app.window_width).inspector,
+                InspectorLayout::Docked
+            ) {
+            app.settings.inspector_width + crate::splitter::WIDTH
+        } else {
+            0.0
+        };
         let _ = app
             .workspace
-            .resize_viewport((app.window_width - sidebar_width).max(0.0));
+            .resize_viewport((app.window_width - sidebar_width - inspector_width).max(0.0));
         let mut tasks = vec![app.initialize_runtimes()];
         #[cfg(feature = "integrated-browser")]
         tasks.push(cosmic::task::message(Message::InitializeBrowserFactory));
@@ -4035,7 +4274,7 @@ impl Application for Cagents {
                             self.durable.cards.iter().find(|state| state.id == card),
                         )
                         .expect("accepted terminal start has an open terminal card")
-                            && self.inspector.is_none();
+                            && self.workspace_surfaces_visible();
                         let visibility = if visible {
                             handle.reveal()
                         } else {
@@ -4268,7 +4507,10 @@ impl Application for Cagents {
                             Self::repository_load_task(repository, Some(id), false)
                         }))
                     }
-                    SidebarAction::CreatePullRequest { project_id, .. } => {
+                    SidebarAction::CreatePullRequest {
+                        project_id,
+                        worktree,
+                    } => {
                         let Some(repository) = self.github_repositories.get(&project_id).cloned()
                         else {
                             self.status = Some(TransientNotice::warning(
@@ -4276,18 +4518,11 @@ impl Application for Cagents {
                             ));
                             return Task::none();
                         };
-                        let head = self
-                            .sidebar_model
-                            .projects
-                            .iter()
-                            .find(|project| project.id == project_id)
-                            .and_then(|project| {
-                                project
-                                    .worktrees
-                                    .iter()
-                                    .find_map(|worktree| worktree.branch.clone())
-                            })
-                            .unwrap_or_default();
+                        let head = pull_request_head(
+                            &self.sidebar_model.projects,
+                            project_id,
+                            worktree.as_deref(),
+                        );
                         self.pull_request_dialog = Some(PullRequestDialog {
                             repository,
                             base: "main".into(),
@@ -4464,7 +4699,7 @@ impl Application for Cagents {
                 if width.is_finite() && width > 0.0 {
                     self.window_width = width;
                 }
-                Task::none()
+                self.sync_context_overlay_state()
             }
             Message::OpenBrowser(url) => {
                 self.show_workspace_for_action();
@@ -4786,12 +5021,17 @@ impl Application for Cagents {
                     if self.worktree_dialog.is_some() || self.pull_request_dialog.is_some() {
                         return cosmic::task::message(Message::CancelDialog);
                     }
+                    if self.context_inspector_is_overlay() {
+                        return cosmic::task::message(Message::ContextInspector(
+                            InspectorAction::Close,
+                        ));
+                    }
                 }
                 // A chord typed at a dialog is not the workspace's to act on:
                 // Ctrl+W must not close the card behind the dialog. The dialog
                 // is an overlay, so it has already seen the keystroke by the
                 // time this runs, and what it does with one is its own affair.
-                if self.modal_is_open() {
+                if self.workspace_inputs_blocked() {
                     return Task::none();
                 }
                 match workspace_widget::global_shortcut(&event, &self.settings.keyboard_shortcuts) {
@@ -4843,6 +5083,10 @@ impl Application for Cagents {
                     .chain(iced::widget::operation::select_all(id))
                     .map(cosmic::Action::App)
             }
+            Message::ToggleContextInspector => {
+                self.set_context_inspector_open(!self.context_inspector_open)
+            }
+            Message::ContextInspector(action) => self.handle_context_inspector_action(action),
             Message::CloseInspector => {
                 self.close_inspector();
                 Task::none()
@@ -5078,6 +5322,9 @@ impl Application for Cagents {
     /// duplicated the focused card's name and cost a row of workspace height for
     /// a bar that was otherwise empty apart from the window controls.
     fn header_end(&self) -> Vec<Element<'_, Message>> {
+        if self.context_inspector_is_overlay() {
+            return Vec::new();
+        }
         let compact_commands = self.window_width < design::WIDE_BREAKPOINT;
         let total = self.workspace.cards().len();
         let navigator: Option<Element<'_, Message>> =
@@ -5257,13 +5504,32 @@ impl Application for Cagents {
                     .into(),
             ]
         };
-        let mut header_children = Vec::with_capacity(actions.len() + 2);
+        let mut header_children = Vec::with_capacity(actions.len() + 3);
         if let Some(exception) = runtime_exception {
             header_children.push(exception);
         }
         if let Some(navigator) = navigator {
             header_children.push(navigator);
         }
+        let inspector_label = if self.context_inspector_open {
+            "Collapse context inspector"
+        } else {
+            "Show context inspector"
+        };
+        header_children.push(
+            widget::button::icon(widget::icon::from_name("view-list-symbolic"))
+                .id(context_inspector_toggle_id())
+                .name(inspector_label)
+                .tooltip(inspector_label)
+                .width(ICON_CONTROL_SIZE)
+                .height(ICON_CONTROL_SIZE)
+                .on_press_maybe(
+                    self.workspace
+                        .focused()
+                        .map(|_| Message::ToggleContextInspector),
+                )
+                .into(),
+        );
         header_children.extend(actions);
         header_children
     }
@@ -5393,15 +5659,88 @@ impl Application for Cagents {
             main_children.push(widget::divider::horizontal::default().into());
         }
         main_children.push(workspace);
-        let main = widget::column::with_children(main_children)
+        let main_content: Element<'_, Message> = widget::column::with_children(main_children)
             .spacing(0)
             .width(Length::Fill)
-            .height(Length::Fill);
-
-        widget::row::with_children(vec![sidebar, main.into()])
             .height(Length::Fill)
-            .width(Length::Fill)
-            .into()
+            .into();
+
+        let context_model = self
+            .context_inspector_open
+            .then(|| self.workspace.focused())
+            .flatten()
+            .and_then(|card| {
+                self.card_state(card).map(|state| {
+                    inspector::model_for_card(
+                        state,
+                        self.inspector_runtime_status(card),
+                        &self.sidebar_model.projects,
+                    )
+                })
+            });
+        if let Some(model) = context_model {
+            let width = self
+                .settings
+                .inspector_width
+                .clamp(design::INSPECTOR_MIN_WIDTH, design::INSPECTOR_MAX_WIDTH);
+            let splitter: Element<'_, Message> = Splitter::new(
+                widget::Id::new("context-inspector.resize-handle"),
+                inspector::RESIZE_HANDLE_NAME,
+                width,
+                design::INSPECTOR_MIN_WIDTH,
+                design::INSPECTOR_MAX_WIDTH,
+                SplitterEdge::Leading,
+                self.modal_is_open(),
+                |width| Message::ContextInspector(InspectorAction::Resize { width }),
+                || Message::ContextInspector(InspectorAction::ResizeFinished),
+            )
+            .into();
+            let pane = inspector::view(model, width).map(Message::ContextInspector);
+            let inspector_surface: Element<'_, Message> =
+                widget::row::with_children(vec![splitter, pane])
+                    .spacing(0)
+                    .height(Length::Fill)
+                    .into();
+            match inspector::mount_for_width(window_width, true, true)
+                .expect("an open contextual inspector with a model has a mount")
+            {
+                InspectorLayout::Docked => {
+                    widget::row::with_children(vec![sidebar, main_content, inspector_surface])
+                        .spacing(0)
+                        .width(Length::Fill)
+                        .height(Length::Fill)
+                        .into()
+                }
+                InspectorLayout::Overlay => {
+                    let background = widget::row::with_children(vec![sidebar, main_content])
+                        .spacing(0)
+                        .width(Length::Fill)
+                        .height(Length::Fill);
+                    let dismiss = iced::widget::opaque(
+                        widget::mouse_area(
+                            widget::container(iced::widget::Space::new())
+                                .width(Length::Fill)
+                                .height(Length::Fill),
+                        )
+                        .on_press(Message::ContextInspector(InspectorAction::Close)),
+                    );
+                    let aligned = widget::container(inspector_surface)
+                        .align_x(Alignment::End)
+                        .width(Length::Fill)
+                        .height(Length::Fill);
+                    let foreground =
+                        iced::widget::Stack::with_children(vec![dismiss, aligned.into()])
+                            .width(Length::Fill)
+                            .height(Length::Fill);
+                    inspector::ModalOverlay::new(background, foreground).into()
+                }
+            }
+        } else {
+            widget::row::with_children(vec![sidebar, main_content])
+                .height(Length::Fill)
+                .width(Length::Fill)
+                .into()
+        }
     }
 }
 
@@ -5726,6 +6065,11 @@ fn settings_category_controls<'a>(
 /// The settings dialog's first focusable control, focused when it opens.
 fn settings_close_id() -> widget::Id {
     widget::Id::new("dialog.settings.close")
+}
+
+/// The stable header control that invokes and regains focus from the inspector.
+fn context_inspector_toggle_id() -> widget::Id {
+    widget::Id::new("command.toggle-context-inspector")
 }
 
 /// The worktree dialog's first field, focused when it opens.
@@ -6094,6 +6438,17 @@ fn close_focused_message(workspace: &Workspace) -> Option<Message> {
     workspace.focused().map(Message::CloseCard)
 }
 
+const fn workspace_surfaces_should_render(
+    settings_inspector_open: bool,
+    context_inspector_overlay: bool,
+) -> bool {
+    !settings_inspector_open && !context_inspector_overlay
+}
+
+const fn headerbar_should_render(configured: bool, context_inspector_overlay: bool) -> bool {
+    configured && !context_inspector_overlay
+}
+
 fn unix_millis() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -6105,6 +6460,7 @@ fn unix_millis() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use cosmic::iced::futures::StreamExt;
 
     fn browser_kind(raw: &str) -> CardKind {
         let url = Url::parse(raw).unwrap();
@@ -6117,6 +6473,54 @@ mod tests {
             scroll_y: 0.0,
             fidelity: crate::model::BrowserRestoreFidelity::HistoryAndScroll,
         })
+    }
+
+    #[test]
+    fn pull_request_head_prefers_the_context_worktree() {
+        let project_id = ProjectId::new();
+        let selected = PathBuf::from("/repo/selected");
+        let project = SidebarProject::new(
+            project_id,
+            RepositoryId::new(),
+            "repo".into(),
+            PathBuf::from("/repo"),
+            vec![
+                SidebarWorktree::new(
+                    crate::model::WorktreeId::new(),
+                    PathBuf::from("/repo/first"),
+                    Some("first".into()),
+                    false,
+                    false,
+                    None,
+                    None,
+                    None,
+                ),
+                SidebarWorktree::new(
+                    crate::model::WorktreeId::new(),
+                    selected.clone(),
+                    Some("selected".into()),
+                    false,
+                    false,
+                    None,
+                    None,
+                    None,
+                ),
+            ],
+            Vec::new(),
+        );
+
+        assert_eq!(
+            pull_request_head(&[project.clone()], project_id, None),
+            "first"
+        );
+        assert_eq!(
+            pull_request_head(&[project.clone()], project_id, Some(&selected)),
+            "selected"
+        );
+        assert_eq!(
+            pull_request_head(&[project], project_id, Some(Path::new("/repo/missing"))),
+            ""
+        );
     }
 
     fn health_event(
@@ -6360,6 +6764,189 @@ mod tests {
     }
 
     #[test]
+    fn native_surfaces_stay_hidden_until_every_overlay_is_closed() {
+        assert!(workspace_surfaces_should_render(false, false));
+        assert!(!workspace_surfaces_should_render(true, false));
+        assert!(!workspace_surfaces_should_render(false, true));
+        assert!(!workspace_surfaces_should_render(true, true));
+    }
+
+    #[test]
+    fn native_headerbar_stays_outside_a_context_overlay_focus_boundary() {
+        assert!(headerbar_should_render(true, false));
+        assert!(!headerbar_should_render(true, true));
+        assert!(!headerbar_should_render(false, false));
+        assert!(!headerbar_should_render(false, true));
+    }
+
+    #[test]
+    fn context_overlay_update_captures_traps_and_restores_focus_across_startup_and_escape() {
+        assert_eq!(
+            context_inspector_toggle_id().to_string(),
+            "command.toggle-context-inspector"
+        );
+        assert_eq!(
+            inspector::close_focus_id().to_string(),
+            "context-inspector.close"
+        );
+        assert_ne!(
+            context_inspector_toggle_id().to_string(),
+            inspector::close_focus_id().to_string()
+        );
+        assert_eq!(
+            context_overlay_change(false, true),
+            ContextOverlayChange::Entered
+        );
+        assert_eq!(
+            context_overlay_change(true, false),
+            ContextOverlayChange::Exited
+        );
+        assert_eq!(
+            context_overlay_change(false, false),
+            ContextOverlayChange::Unchanged
+        );
+        assert_eq!(
+            context_overlay_change(true, true),
+            ContextOverlayChange::Unchanged
+        );
+
+        let mut app = context_inspector_test_app(true);
+        assert!(!app.context_inspector_is_overlay());
+        assert_eq!(
+            app.context_inspector_restore_focus
+                .as_ref()
+                .map(ToString::to_string),
+            Some(context_inspector_toggle_id().to_string())
+        );
+
+        // The compositor's first narrow size is the real startup transition.
+        app.context_inspector_restore_focus = None;
+        let _focus_close = app.update(Message::WindowResized(design::WIDE_BREAKPOINT - 1.0));
+        assert!(app.context_inspector_is_overlay());
+        assert!(app.context_inspector_overlay_active);
+        assert!(app.workspace_inputs_blocked());
+        assert_eq!(
+            app.context_inspector_restore_focus
+                .as_ref()
+                .map(ToString::to_string),
+            Some(context_inspector_toggle_id().to_string())
+        );
+        assert_eq!(
+            app.core.window.show_headerbar,
+            headerbar_should_render(app.window_headerbar_enabled, true)
+        );
+
+        let escape = keyboard::Event::KeyPressed {
+            key: keyboard::Key::Named(keyboard::key::Named::Escape),
+            modified_key: keyboard::Key::Named(keyboard::key::Named::Escape),
+            physical_key: keyboard::key::Physical::Code(keyboard::key::Code::Escape),
+            location: keyboard::Location::Standard,
+            modifiers: keyboard::Modifiers::empty(),
+            text: None,
+            repeat: false,
+        };
+        let close = task_app_message(app.update(Message::KeyEvent(escape)));
+        assert!(matches!(
+            close,
+            Message::ContextInspector(InspectorAction::Close)
+        ));
+        let _restore_focus = app.update(close);
+        assert!(!app.context_inspector_open);
+        assert!(!app.context_inspector_overlay_active);
+        assert!(!app.workspace_inputs_blocked());
+        assert!(app.context_inspector_restore_focus.is_none());
+        assert_eq!(
+            app.core.window.show_headerbar,
+            headerbar_should_render(app.window_headerbar_enabled, false)
+        );
+
+        // Re-entering from a live docked inspector captures afresh instead of
+        // depending on the startup value consumed by the first Escape.
+        let _wide = app.update(Message::WindowResized(design::WIDE_BREAKPOINT));
+        let _open_docked = app.update(Message::ToggleContextInspector);
+        assert!(!app.context_inspector_is_overlay());
+        app.context_inspector_restore_focus = None;
+        let _focus_close = app.update(Message::WindowResized(design::WIDE_BREAKPOINT - 1.0));
+        assert!(app.context_inspector_is_overlay());
+        assert_eq!(
+            app.context_inspector_restore_focus
+                .as_ref()
+                .map(ToString::to_string),
+            Some(context_inspector_toggle_id().to_string())
+        );
+
+        // A real first-card update can create the overlay without any resize:
+        // narrow startup begins empty, then the focused context arrives.
+        let mut startup = context_inspector_test_app(false);
+        let _narrow = startup.update(Message::WindowResized(design::WIDE_BREAKPOINT - 1.0));
+        assert!(!startup.context_inspector_is_overlay());
+        assert!(!startup.context_inspector_overlay_active);
+        assert_eq!(
+            startup
+                .context_inspector_restore_focus
+                .as_ref()
+                .map(ToString::to_string),
+            Some(context_inspector_toggle_id().to_string())
+        );
+        let _focus_close = startup.add_repository_card(
+            ProjectId::new(),
+            PathBuf::from("/repo"),
+            PathBuf::from("/repo/worktree"),
+        );
+        assert!(startup.workspace.focused().is_some());
+        assert!(startup.context_inspector_is_overlay());
+        assert!(startup.context_inspector_overlay_active);
+        assert!(startup.workspace_inputs_blocked());
+
+        let close = task_app_message(startup.update(Message::KeyEvent(
+            keyboard::Event::KeyPressed {
+                key: keyboard::Key::Named(keyboard::key::Named::Escape),
+                modified_key: keyboard::Key::Named(keyboard::key::Named::Escape),
+                physical_key: keyboard::key::Physical::Code(keyboard::key::Code::Escape),
+                location: keyboard::Location::Standard,
+                modifiers: keyboard::Modifiers::empty(),
+                text: None,
+                repeat: false,
+            },
+        )));
+        let _restore_focus = startup.update(close);
+        assert!(!startup.context_inspector_open);
+        assert!(!startup.context_inspector_overlay_active);
+        assert!(startup.context_inspector_restore_focus.is_none());
+
+        // Losing the final context is another real overlay exit: it restores
+        // the header target even though the open preference itself stays on.
+        let _focus_close = startup.update(Message::ToggleContextInspector);
+        assert!(startup.context_inspector_overlay_active);
+        let final_card = startup.workspace.focused().unwrap();
+        startup.workspace.request_close(final_card).unwrap();
+        let _restore_focus = startup.update(Message::CommitClose(final_card));
+        assert!(startup.workspace.focused().is_none());
+        assert!(!startup.context_inspector_is_overlay());
+        assert!(!startup.context_inspector_overlay_active);
+        assert!(startup.context_inspector_restore_focus.is_none());
+    }
+
+    #[test]
+    fn context_inspector_resize_persists_only_when_the_gesture_finishes() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("settings.toml");
+        let mut app = context_inspector_test_app(true);
+        app.settings_path = Some(path.clone());
+        app.settings_write_blocked = false;
+
+        let _live_resize = app.update(Message::ContextInspector(InspectorAction::Resize {
+            width: 384.0,
+        }));
+        assert_eq!(app.settings.inspector_width, 384.0);
+        assert!(!path.exists(), "live key repeats must not persist settings");
+
+        let _finished = app.update(Message::ContextInspector(InspectorAction::ResizeFinished));
+        let saved = std::fs::read_to_string(path).unwrap();
+        assert!(saved.contains("inspector_width = 384.0"));
+    }
+
+    #[test]
     fn embedded_application_icon_is_valid_rgba() {
         let (rgba, size) = application_window_icon().into_raw();
         assert_eq!(size.width, APPLICATION_ICON_SIZE);
@@ -6598,6 +7185,83 @@ mod tests {
                     last_exit: None,
                 },
             }),
+        }
+    }
+
+    fn context_inspector_test_app(with_focused_card: bool) -> Cagents {
+        let card = with_focused_card.then(terminal_card_state);
+        let card_id = card.as_ref().map(|card| card.id);
+        let durable = Arc::new(WorkspaceState {
+            cards: card.into_iter().collect(),
+            focused: card_id,
+            ..WorkspaceState::default()
+        });
+        let workspace = Cagents::rebuild_workspace(&durable);
+        let settings = AppSettings::default();
+        let (terminal_wake_tx, terminal_wake_rx) = async_channel::unbounded();
+        let core = Core::default();
+        let window_headerbar_enabled = core.window.show_headerbar;
+
+        Cagents {
+            workspace,
+            durable,
+            cards: card_id
+                .map(|card_id| HashMap::from([(card_id, CardRuntime::Loading)]))
+                .unwrap_or_default(),
+            card_chrome: HashMap::new(),
+            lifecycle: LifecycleManager::new(LifecycleBudget {
+                max_hot_cards: settings.max_hot_cards,
+                offscreen_grace: Duration::from_millis(settings.hibernation_delay_ms),
+            }),
+            lifecycle_sweep_deadline: None,
+            lifecycle_sweep_generation: 0,
+            terminal_wake_tx,
+            terminal_wake_rx,
+            session: None,
+            save_health: None,
+            settings_draft: SettingsDraft::from_settings(&settings),
+            settings,
+            #[cfg(feature = "integrated-browser")]
+            browser_teardowns: Vec::new(),
+            terminal_teardowns: Vec::new(),
+            #[cfg(feature = "integrated-browser")]
+            browser_factory: None,
+            #[cfg(feature = "integrated-browser")]
+            browser_parent_lifetime: None,
+            window_scale_factor: 1.0,
+            window_width: 1_600.0,
+            window_headerbar_enabled,
+            core,
+            settings_path: None,
+            settings_write_blocked: true,
+            sidebar_model: SidebarModel::ready(SidebarMode::Expanded, Vec::new()),
+            sidebar_state: SidebarState::default(),
+            github_repositories: HashMap::new(),
+            worktree_dialog: None,
+            pull_request_dialog: None,
+            frame_clock: FrameClock::default(),
+            inspector: None,
+            inspector_transition: None,
+            context_inspector_open: true,
+            context_inspector_overlay_active: false,
+            context_inspector_restore_focus: Some(context_inspector_toggle_id()),
+            settings_category: SettingsCategory::General,
+            keyboard_modifiers: keyboard::Modifiers::empty(),
+            settings_feedback: None,
+            status: None,
+        }
+    }
+
+    fn task_app_message(task: Task<Message>) -> Message {
+        let mut stream = iced::runtime::task::into_stream(task).expect("task has an output");
+        let action = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap()
+            .block_on(stream.next())
+            .expect("task produced an action");
+        match action {
+            iced::runtime::Action::Output(cosmic::Action::App(message)) => message,
+            _ => panic!("task did not produce an application message"),
         }
     }
 
