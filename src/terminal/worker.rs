@@ -829,26 +829,8 @@ impl Worker {
     }
 
     fn encode_key(&mut self, input: KeyInput) {
-        let mut event = match key::Event::new() {
-            Ok(event) => event,
-            Err(error) => {
-                self.error("create key event", error.to_string());
-                return;
-            }
-        };
-        event
-            .set_action(map_key_action(input.action))
-            .set_key(map_key(input.key))
-            .set_mods(map_modifiers(input.modifiers))
-            .set_utf8(input.text);
-        if let Some(codepoint) = input.unshifted_codepoint {
-            event.set_unshifted_codepoint(codepoint);
-        }
-
-        self.key_encoder.set_options_from_terminal(&self.terminal);
-        let mut encoded = Vec::with_capacity(32);
-        match self.key_encoder.encode_to_vec(&event, &mut encoded) {
-            Ok(()) => self.write_pty(&encoded, "write encoded key"),
+        match encode_key_input(&self.terminal, &mut self.key_encoder, input) {
+            Ok(encoded) => self.write_pty(&encoded, "write encoded key"),
             Err(error) => self.error("encode key", error.to_string()),
         }
     }
@@ -1238,11 +1220,38 @@ impl TranscriptWriter {
     }
 }
 
-fn map_key_action(action: KeyAction) -> key::Action {
+fn encode_key_input(
+    terminal: &Terminal<'_, '_>,
+    encoder: &mut KeyEncoder<'_>,
+    input: KeyInput,
+) -> Result<Vec<u8>, libghostty_vt::Error> {
+    // Legacy encodings have no repeat event type, so a repeated event must be
+    // encoded as another press. Keep Repeat only when the child asked for it.
+    let report_events = terminal
+        .kitty_keyboard_flags()?
+        .contains(key::KittyKeyFlags::REPORT_EVENTS);
+    let mut event = key::Event::new()?;
+    event
+        .set_action(map_key_action(input.action, report_events))
+        .set_key(map_key(input.key))
+        .set_mods(map_modifiers(input.modifiers))
+        .set_utf8(input.text);
+    if let Some(codepoint) = input.unshifted_codepoint {
+        event.set_unshifted_codepoint(codepoint);
+    }
+
+    encoder.set_options_from_terminal(terminal);
+    let mut encoded = Vec::with_capacity(32);
+    encoder.encode_to_vec(&event, &mut encoded)?;
+    Ok(encoded)
+}
+
+fn map_key_action(action: KeyAction, report_events: bool) -> key::Action {
     match action {
         KeyAction::Press => key::Action::Press,
         KeyAction::Release => key::Action::Release,
-        KeyAction::Repeat => key::Action::Repeat,
+        KeyAction::Repeat if report_events => key::Action::Repeat,
+        KeyAction::Repeat => key::Action::Press,
     }
 }
 
@@ -1412,6 +1421,89 @@ mod tests {
             generation,
             ..RenderSnapshot::empty()
         })
+    }
+
+    fn key_input(
+        action: KeyAction,
+        key: TerminalKey,
+        text: Option<&str>,
+        unshifted_codepoint: Option<char>,
+    ) -> KeyInput {
+        KeyInput {
+            action,
+            key,
+            modifiers: KeyModifiers::default(),
+            text: text.map(str::to_owned),
+            unshifted_codepoint,
+        }
+    }
+
+    #[test]
+    fn legacy_repeats_encode_once_as_ordinary_key_presses() {
+        let terminal = Terminal::new(TerminalOptions {
+            cols: 80,
+            rows: 24,
+            max_scrollback: 1_000,
+        })
+        .unwrap();
+        let mut encoder = KeyEncoder::new().unwrap();
+        let cases = [
+            (TerminalKey::ArrowDown, None, None, &b"\x1b[B"[..]),
+            (TerminalKey::Character('x'), Some("x"), Some('x'), &b"x"[..]),
+            (TerminalKey::Backspace, None, None, &b"\x7f"[..]),
+        ];
+
+        for (key, text, unshifted_codepoint, expected) in cases {
+            let press = encode_key_input(
+                &terminal,
+                &mut encoder,
+                key_input(KeyAction::Press, key, text, unshifted_codepoint),
+            )
+            .unwrap();
+            let repeat = encode_key_input(
+                &terminal,
+                &mut encoder,
+                key_input(KeyAction::Repeat, key, text, unshifted_codepoint),
+            )
+            .unwrap();
+
+            assert_eq!(press, expected, "unexpected press encoding for {key:?}");
+            assert_eq!(repeat, expected, "unexpected repeat encoding for {key:?}");
+        }
+    }
+
+    #[test]
+    fn event_reporting_protocol_preserves_repeat_semantics() {
+        let mut terminal = Terminal::new(TerminalOptions {
+            cols: 80,
+            rows: 24,
+            max_scrollback: 1_000,
+        })
+        .unwrap();
+        terminal.vt_write(b"\x1b[>2u");
+        assert!(
+            terminal
+                .kitty_keyboard_flags()
+                .unwrap()
+                .contains(key::KittyKeyFlags::REPORT_EVENTS)
+        );
+        let mut encoder = KeyEncoder::new().unwrap();
+
+        let press = encode_key_input(
+            &terminal,
+            &mut encoder,
+            key_input(KeyAction::Press, TerminalKey::ArrowDown, None, None),
+        )
+        .unwrap();
+        let repeat = encode_key_input(
+            &terminal,
+            &mut encoder,
+            key_input(KeyAction::Repeat, TerminalKey::ArrowDown, None, None),
+        )
+        .unwrap();
+
+        assert_eq!(press, b"\x1b[1;1:1B");
+        assert_eq!(repeat, b"\x1b[1;1:2B");
     }
 
     #[test]

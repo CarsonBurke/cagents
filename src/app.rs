@@ -47,7 +47,7 @@ use crate::{
         RepositoryService, StatusSnapshot, ValidatedBranchName, WorktreeCreationOutcome,
         WorktreeRecord,
     },
-    session::SessionRuntime,
+    session::{SessionRuntime, SessionSaveHealth, SessionSaveHealthEvent},
     settings::{self, AppSettings, KeyboardShortcuts, LinkOpenDestination, LinkOpenGesture},
     sidebar::{
         self, SidebarAction, SidebarDataState, SidebarMode, SidebarModel, SidebarProject,
@@ -180,6 +180,83 @@ struct TransientNotice {
     message: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SaveHealthState {
+    database_path: Option<PathBuf>,
+    revision: u64,
+    health: SessionSaveHealth,
+    last_successful_flush_at_unix_ms: Option<i64>,
+    retry_requested: bool,
+}
+
+impl SaveHealthState {
+    fn new(database_path: PathBuf) -> Self {
+        Self {
+            database_path: Some(database_path),
+            revision: 0,
+            health: SessionSaveHealth::Healthy,
+            last_successful_flush_at_unix_ms: None,
+            retry_requested: false,
+        }
+    }
+
+    fn writer_unavailable(database_path: Option<PathBuf>) -> Self {
+        Self {
+            database_path,
+            revision: 1,
+            health: SessionSaveHealth::WriterUnavailable,
+            last_successful_flush_at_unix_ms: None,
+            retry_requested: false,
+        }
+    }
+
+    fn apply(&mut self, event: SessionSaveHealthEvent) -> bool {
+        if event.revision <= self.revision {
+            return false;
+        }
+        self.revision = event.revision;
+        if event.last_successful_flush_at_unix_ms.is_some() {
+            self.last_successful_flush_at_unix_ms = event.last_successful_flush_at_unix_ms;
+        }
+        // Recovery is a user-visible fact, not a transient edge. A later
+        // healthy flush updates its timestamp but cannot erase it before the
+        // person has acknowledged that persistence resumed.
+        if !matches!(
+            (&self.health, &event.health),
+            (
+                SessionSaveHealth::Recovered { .. },
+                SessionSaveHealth::Healthy
+            )
+        ) {
+            self.health = event.health;
+        }
+        self.retry_requested = false;
+        true
+    }
+
+    fn request_retry(&mut self, session: &SessionRuntime) -> bool {
+        if self.retry_requested || !matches!(self.health, SessionSaveHealth::RetryExhausted { .. })
+        {
+            return false;
+        }
+        self.retry_requested = session.retry_save();
+        self.retry_requested
+    }
+
+    fn acknowledge_recovery(&mut self) -> bool {
+        if matches!(self.health, SessionSaveHealth::Recovered { .. }) {
+            self.health = SessionSaveHealth::Healthy;
+            true
+        } else {
+            false
+        }
+    }
+
+    fn is_visible(&self) -> bool {
+        !matches!(self.health, SessionSaveHealth::Healthy)
+    }
+}
+
 impl TransientNotice {
     fn new(severity: NoticeSeverity, message: impl Into<String>) -> Self {
         Self {
@@ -201,6 +278,228 @@ impl TransientNotice {
     }
 }
 
+fn unix_time_label(value: i64) -> String {
+    let seconds = value.div_euclid(1_000);
+    let milliseconds = value.rem_euclid(1_000);
+    let days = seconds.div_euclid(86_400);
+    let seconds_of_day = seconds.rem_euclid(86_400);
+    let (year, month, day) = civil_date_from_unix_days(days);
+    let hour = seconds_of_day / 3_600;
+    let minute = (seconds_of_day % 3_600) / 60;
+    let second = seconds_of_day % 60;
+    format!("{year:04}-{month:02}-{day:02} {hour:02}:{minute:02}:{second:02}.{milliseconds:03} UTC")
+}
+
+/// Converts days since 1970-01-01 to the proleptic Gregorian calendar.
+fn civil_date_from_unix_days(days: i64) -> (i64, i64, i64) {
+    let shifted = days + 719_468;
+    let era = shifted.div_euclid(146_097);
+    let day_of_era = shifted - era * 146_097;
+    let year_of_era =
+        (day_of_era - day_of_era / 1_460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+    let mut year = year_of_era + era * 400;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let month_prime = (5 * day_of_year + 2) / 153;
+    let day = day_of_year - (153 * month_prime + 2) / 5 + 1;
+    let month = month_prime + if month_prime < 10 { 3 } else { -9 };
+    year += i64::from(month <= 2);
+    (year, month, day)
+}
+
+fn last_success_label(value: Option<i64>) -> String {
+    value.map_or_else(
+        || "none in this run".to_owned(),
+        |value| unix_time_label(value),
+    )
+}
+
+fn notice_surface<'a>(
+    severity: NoticeSeverity,
+    body: Element<'a, Message>,
+    action: Option<Element<'a, Message>>,
+    compact: bool,
+) -> Element<'a, Message> {
+    let spacing = cosmic::theme::spacing();
+    let mut children = vec![
+        widget::icon::from_name(severity.icon()).size(16).into(),
+        body,
+    ];
+    if let Some(action) = action {
+        children.push(action);
+    }
+    let mut surface = widget::container(
+        widget::row::with_children(children)
+            .align_y(Alignment::Center)
+            .spacing(spacing.space_xxs),
+    )
+    .class(cosmic::theme::Container::custom(move |theme| {
+        let cosmic = theme.cosmic();
+        let component = match severity {
+            NoticeSeverity::Success => &cosmic.success,
+            NoticeSeverity::Warning => &cosmic.warning,
+            NoticeSeverity::Error => &cosmic.destructive,
+        };
+        cosmic::iced::widget::container::Style {
+            icon_color: Some(component.on.into()),
+            text_color: Some(component.on.into()),
+            background: Some(iced::Background::Color(component.base.into())),
+            border: iced::Border {
+                width: 1.0,
+                color: component.border.into(),
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+    }))
+    .padding(if compact {
+        Padding::from([0, spacing.space_xs])
+    } else {
+        Padding::from(spacing.space_xs)
+    })
+    .width(Length::Fill);
+    if compact {
+        surface = surface.height(Length::Fixed(NOTICE_ROW_HEIGHT));
+    }
+    surface.into()
+}
+
+fn transient_notice_view(notice: &TransientNotice) -> Element<'_, Message> {
+    let severity = notice.severity;
+    notice_surface(
+        severity,
+        widget::text::body(&notice.message)
+            .wrapping(cosmic::iced::widget::text::Wrapping::None)
+            .ellipsize(cosmic::iced::widget::text::Ellipsize::End(
+                EllipsizeHeightLimit::Lines(1),
+            ))
+            .width(Length::Fill)
+            .into(),
+        Some(
+            widget::button::icon(widget::icon::from_name("window-close-symbolic"))
+                .id(widget::Id::new("status.dismiss"))
+                .name(format!("Dismiss {} notice", severity.label()))
+                .tooltip("Dismiss notice")
+                .width(ICON_CONTROL_SIZE)
+                .height(ICON_CONTROL_SIZE)
+                .on_press(Message::DismissStatus)
+                .into(),
+        ),
+        true,
+    )
+}
+
+fn save_health_view(health: &SaveHealthState) -> Option<Element<'_, Message>> {
+    if !health.is_visible() {
+        return None;
+    }
+    let path = health.database_path.as_deref().map_or_else(
+        || "unavailable (the data directory could not be resolved)".to_owned(),
+        |path| path.display().to_string(),
+    );
+    let last_success = last_success_label(health.last_successful_flush_at_unix_ms);
+    let (severity, title, detail, guidance, action): (
+        _,
+        String,
+        String,
+        &'static str,
+        Option<Element<'_, Message>>,
+    ) = match &health.health {
+        SessionSaveHealth::Healthy => return None,
+        SessionSaveHealth::Retrying {
+            category,
+            first_failed_at_unix_ms,
+            attempts,
+        } => (
+            NoticeSeverity::Warning,
+            format!("Session changes are not saved — {}", category.label()),
+            format!(
+                "Database: {path}\nFirst failure: {} · Attempts: {attempts}\nLast successful flush: {last_success}",
+                unix_time_label(*first_failed_at_unix_ms),
+            ),
+            "Automatic retries are still running; cagents remains usable.",
+            None,
+        ),
+        SessionSaveHealth::RetryExhausted {
+            category,
+            first_failed_at_unix_ms,
+            attempts,
+        } => {
+            let (guidance, action) = if health.retry_requested {
+                ("Retry requested; waiting for the session writer.", None)
+            } else {
+                (
+                    category.guidance(),
+                    Some(
+                        widget::button::standard("Retry save")
+                            .id(widget::Id::new("session-save.retry"))
+                            .name("Retry saving the session")
+                            .on_press(Message::RetrySessionSave)
+                            .into(),
+                    ),
+                )
+            };
+            (
+                NoticeSeverity::Error,
+                format!("Session changes are not saved — {}", category.label()),
+                format!(
+                    "Database: {path}\nFirst failure: {} · Attempts: {attempts}\nLast successful flush: {last_success}",
+                    unix_time_label(*first_failed_at_unix_ms),
+                ),
+                guidance,
+                action,
+            )
+        }
+        SessionSaveHealth::Recovered {
+            recovered_at_unix_ms,
+        } => (
+            NoticeSeverity::Success,
+            "Session saving recovered".to_owned(),
+            format!(
+                "Database: {path}\nRecovered: {}\nLast successful flush: {last_success}",
+                unix_time_label(*recovered_at_unix_ms),
+            ),
+            "Changes are being saved again.",
+            Some(
+                widget::button::icon(widget::icon::from_name("window-close-symbolic"))
+                    .id(widget::Id::new("session-save.acknowledge-recovery"))
+                    .name("Acknowledge session save recovery")
+                    .tooltip("Acknowledge recovery")
+                    .width(ICON_CONTROL_SIZE)
+                    .height(ICON_CONTROL_SIZE)
+                    .on_press(Message::AcknowledgeSessionRecovery)
+                    .into(),
+            ),
+        ),
+        SessionSaveHealth::WriterUnavailable => (
+            NoticeSeverity::Error,
+            "Session changes cannot be saved — writer unavailable".to_owned(),
+            format!("Database: {path}\nLast successful flush: {last_success}"),
+            "Keep cagents open if you need the running terminals, then restart it to restore session saving.",
+            None,
+        ),
+    };
+    let spacing = cosmic::theme::spacing();
+    Some(notice_surface(
+        severity,
+        widget::column::with_children(vec![
+            widget::text::body(title)
+                .wrapping(cosmic::iced::widget::text::Wrapping::WordOrGlyph)
+                .into(),
+            widget::text::caption(detail)
+                .wrapping(cosmic::iced::widget::text::Wrapping::WordOrGlyph)
+                .into(),
+            widget::text::caption(guidance)
+                .wrapping(cosmic::iced::widget::text::Wrapping::WordOrGlyph)
+                .into(),
+        ])
+        .spacing(spacing.space_xxxs)
+        .width(Length::Fill)
+        .into(),
+        action,
+        false,
+    ))
+}
+
 #[derive(Debug, Clone, Copy)]
 struct TerminalWakeup {
     card: CardId,
@@ -209,6 +508,9 @@ struct TerminalWakeup {
 
 #[derive(Clone)]
 struct TerminalWakeSource(async_channel::Receiver<TerminalWakeup>);
+
+#[derive(Clone)]
+struct SessionHealthSource(async_channel::Receiver<SessionSaveHealthEvent>);
 
 impl PartialEq for TerminalWakeSource {
     fn eq(&self, _other: &Self) -> bool {
@@ -224,12 +526,53 @@ impl std::hash::Hash for TerminalWakeSource {
     }
 }
 
+impl PartialEq for SessionHealthSource {
+    fn eq(&self, _other: &Self) -> bool {
+        true
+    }
+}
+
+impl Eq for SessionHealthSource {}
+
+impl std::hash::Hash for SessionHealthSource {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        std::hash::Hash::hash(&"cagents-session-save-health", state);
+    }
+}
+
 fn terminal_wake_stream(
     source: &TerminalWakeSource,
 ) -> Pin<Box<dyn cosmic::iced::futures::Stream<Item = TerminalWakeup> + Send + 'static>> {
     Box::pin(cosmic::iced::futures::stream::unfold(
         source.0.clone(),
         |receiver| async move { receiver.recv().await.ok().map(|wake| (wake, receiver)) },
+    ))
+}
+
+fn session_health_stream(
+    source: &SessionHealthSource,
+) -> Pin<Box<dyn cosmic::iced::futures::Stream<Item = SessionSaveHealthEvent> + Send + 'static>> {
+    Box::pin(cosmic::iced::futures::stream::unfold(
+        (source.0.clone(), false),
+        |(receiver, ended)| async move {
+            if ended {
+                return None;
+            }
+            match receiver.recv().await {
+                Ok(event) => {
+                    let ended = matches!(event.health, SessionSaveHealth::WriterUnavailable);
+                    Some((event, (receiver, ended)))
+                }
+                Err(_) => Some((
+                    SessionSaveHealthEvent {
+                        revision: u64::MAX,
+                        health: SessionSaveHealth::WriterUnavailable,
+                        last_successful_flush_at_unix_ms: None,
+                    },
+                    (receiver, true),
+                )),
+            }
+        },
     ))
 }
 
@@ -628,6 +971,7 @@ type BootstrapResult = (
     Option<PathBuf>,
     bool,
     Option<String>,
+    Option<SaveHealthState>,
 );
 
 #[derive(Debug, Clone)]
@@ -1075,6 +1419,9 @@ pub enum Message {
         value: String,
     },
     ResetSettings,
+    SessionSaveHealthChanged(SessionSaveHealthEvent),
+    RetrySessionSave,
+    AcknowledgeSessionRecovery,
     DismissStatus,
 }
 
@@ -1277,6 +1624,7 @@ pub struct Cagents {
     terminal_wake_tx: async_channel::Sender<TerminalWakeup>,
     terminal_wake_rx: async_channel::Receiver<TerminalWakeup>,
     session: Option<SessionRuntime>,
+    save_health: Option<SaveHealthState>,
     settings: AppSettings,
     // These owners are declared before `core`: application Drop empties and
     // joins them explicitly, and field drop order is the final backstop.
@@ -1353,7 +1701,7 @@ async fn open_system_url_with_opener(url: &Url, opener: impl AsRef<OsStr>) -> Re
 
 impl Cagents {
     fn bootstrap() -> BootstrapResult {
-        let (settings, settings_path, settings_write_blocked, mut status) =
+        let (settings, settings_path, settings_write_blocked, status) =
             match settings::default_path() {
                 Ok(path) => match settings::load(&path) {
                     Ok(settings) => (settings, Some(path), false, None),
@@ -1366,16 +1714,25 @@ impl Cagents {
                 },
                 Err(error) => (AppSettings::default(), None, true, Some(error.to_string())),
             };
-        let (session, restored, projects, worktrees) = match SessionRuntime::open_default() {
-            Ok((mut session, restored)) => {
-                let (projects, worktrees) = session.take_catalog();
-                (Some(session), restored, projects, worktrees)
-            }
-            Err(error) => {
-                status = Some(error.to_string());
-                (None, None, Vec::new(), Vec::new())
-            }
-        };
+        let default_database_path = SessionRuntime::default_database_path().ok();
+        let (session, restored, projects, worktrees, save_health) =
+            match SessionRuntime::open_default() {
+                Ok((mut session, restored)) => {
+                    let (projects, worktrees) = session.take_catalog();
+                    let save_health = SaveHealthState::new(session.database_path().to_owned());
+                    (
+                        Some(session),
+                        restored,
+                        projects,
+                        worktrees,
+                        Some(save_health),
+                    )
+                }
+                Err(_) => {
+                    let save_health = SaveHealthState::writer_unavailable(default_database_path);
+                    (None, None, Vec::new(), Vec::new(), Some(save_health))
+                }
+            };
         let mut restored = restored.unwrap_or_default();
         normalize_restored_titles(&mut restored);
         (
@@ -1387,6 +1744,7 @@ impl Cagents {
             settings_path,
             settings_write_blocked,
             status,
+            save_health,
         )
     }
 
@@ -3512,6 +3870,7 @@ impl Application for Cagents {
             settings_path,
             settings_write_blocked,
             status,
+            save_health,
         ) = Self::bootstrap();
         let sidebar_projects = projects
             .iter()
@@ -3556,6 +3915,7 @@ impl Application for Cagents {
             terminal_wake_tx,
             terminal_wake_rx,
             session,
+            save_health,
             settings,
             #[cfg(feature = "integrated-browser")]
             browser_teardowns: Vec::new(),
@@ -4498,6 +4858,24 @@ impl Application for Cagents {
                 Task::none()
             }
             Message::ResetSettings => self.reset_settings(),
+            Message::SessionSaveHealthChanged(event) => {
+                if let Some(health) = &mut self.save_health {
+                    health.apply(event);
+                }
+                Task::none()
+            }
+            Message::RetrySessionSave => {
+                if let (Some(session), Some(health)) = (&self.session, &mut self.save_health) {
+                    health.request_retry(session);
+                }
+                Task::none()
+            }
+            Message::AcknowledgeSessionRecovery => {
+                if let Some(health) = &mut self.save_health {
+                    health.acknowledge_recovery();
+                }
+                Task::none()
+            }
             Message::DismissStatus => {
                 self.status = None;
                 Task::none()
@@ -4530,6 +4908,15 @@ impl Application for Cagents {
                 _ => None,
             }),
         ];
+        if let Some(session) = &self.session {
+            subscriptions.push(
+                Subscription::run_with(
+                    SessionHealthSource(session.health_receiver()),
+                    session_health_stream,
+                )
+                .map(Message::SessionSaveHealthChanged),
+            );
+        }
         if let Some(window) = self.core.main_window_id()
             && (self.workspace.camera().is_animating() || self.inspector_transition.is_some())
         {
@@ -4898,54 +5285,8 @@ impl Application for Cagents {
         // the window's header bar already carries the name; see
         // `sync_window_title`.
 
-        let notice: Option<Element<'_, Message>> = self.status.as_ref().map(|notice| {
-            let severity = notice.severity;
-            widget::container(
-                widget::row::with_children(vec![
-                    widget::icon::from_name(severity.icon()).size(16).into(),
-                    widget::text::body(&notice.message)
-                        .wrapping(cosmic::iced::widget::text::Wrapping::None)
-                        .ellipsize(cosmic::iced::widget::text::Ellipsize::End(
-                            EllipsizeHeightLimit::Lines(1),
-                        ))
-                        .width(Length::Fill)
-                        .into(),
-                    widget::button::icon(widget::icon::from_name("window-close-symbolic"))
-                        .id(widget::Id::new("status.dismiss"))
-                        .name(format!("Dismiss {} notice", severity.label()))
-                        .tooltip("Dismiss notice")
-                        .width(ICON_CONTROL_SIZE)
-                        .height(ICON_CONTROL_SIZE)
-                        .on_press(Message::DismissStatus)
-                        .into(),
-                ])
-                .align_y(Alignment::Center)
-                .spacing(spacing.space_xxs),
-            )
-            .class(cosmic::theme::Container::custom(move |theme| {
-                let cosmic = theme.cosmic();
-                let component = match severity {
-                    NoticeSeverity::Success => &cosmic.success,
-                    NoticeSeverity::Warning => &cosmic.warning,
-                    NoticeSeverity::Error => &cosmic.destructive,
-                };
-                cosmic::iced::widget::container::Style {
-                    icon_color: Some(component.on.into()),
-                    text_color: Some(component.on.into()),
-                    background: Some(iced::Background::Color(component.base.into())),
-                    border: iced::Border {
-                        width: 1.0,
-                        color: component.border.into(),
-                        ..Default::default()
-                    },
-                    ..Default::default()
-                }
-            }))
-            .height(Length::Fixed(NOTICE_ROW_HEIGHT))
-            .padding([0, spacing.space_xs])
-            .width(Length::Fill)
-            .into()
-        });
+        let save_health = self.save_health.as_ref().and_then(save_health_view);
+        let notice = self.status.as_ref().map(transient_notice_view);
 
         let workspace: Element<'_, Message> = if self.workspace.cards().is_empty() {
             let directory = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/"));
@@ -5042,7 +5383,11 @@ impl Application for Cagents {
             )
         };
 
-        let mut main_children: Vec<Element<'_, Message>> = Vec::with_capacity(3);
+        let mut main_children: Vec<Element<'_, Message>> = Vec::with_capacity(5);
+        if let Some(save_health) = save_health {
+            main_children.push(save_health);
+            main_children.push(widget::divider::horizontal::default().into());
+        }
         if let Some(notice) = notice {
             main_children.push(notice);
             main_children.push(widget::divider::horizontal::default().into());
@@ -5772,6 +6117,115 @@ mod tests {
             scroll_y: 0.0,
             fidelity: crate::model::BrowserRestoreFidelity::HistoryAndScroll,
         })
+    }
+
+    fn health_event(
+        revision: u64,
+        health: SessionSaveHealth,
+        last_successful_flush_at_unix_ms: Option<i64>,
+    ) -> SessionSaveHealthEvent {
+        SessionSaveHealthEvent {
+            revision,
+            health,
+            last_successful_flush_at_unix_ms,
+        }
+    }
+
+    #[test]
+    fn save_health_timestamps_are_exact_utc_values() {
+        assert_eq!(unix_time_label(0), "1970-01-01 00:00:00.000 UTC");
+        assert_eq!(
+            unix_time_label(946_684_800_123),
+            "2000-01-01 00:00:00.123 UTC"
+        );
+    }
+
+    #[test]
+    fn closed_health_channel_reports_unavailable_once_then_ends() {
+        use cosmic::iced::futures::{StreamExt, executor::block_on};
+
+        let (sender, receiver) = async_channel::unbounded();
+        drop(sender);
+        let source = SessionHealthSource(receiver);
+        let mut stream = session_health_stream(&source);
+
+        block_on(async {
+            assert_eq!(
+                stream.next().await,
+                Some(SessionSaveHealthEvent {
+                    revision: u64::MAX,
+                    health: SessionSaveHealth::WriterUnavailable,
+                    last_successful_flush_at_unix_ms: None,
+                })
+            );
+            assert_eq!(stream.next().await, None);
+        });
+    }
+
+    #[test]
+    fn save_health_reducer_preserves_recovery_and_rejects_stale_completion() {
+        let mut state = SaveHealthState::new(PathBuf::from("/exact/session.sqlite3"));
+        assert!(!state.is_visible());
+        assert!(state.apply(health_event(1, SessionSaveHealth::Healthy, Some(10))));
+        assert_eq!(state.last_successful_flush_at_unix_ms, Some(10));
+
+        assert!(state.apply(health_event(
+            2,
+            SessionSaveHealth::Retrying {
+                category: crate::session::SaveFailureCategory::Busy,
+                first_failed_at_unix_ms: 20,
+                attempts: 1,
+            },
+            Some(10),
+        )));
+        assert!(state.is_visible());
+        assert!(state.apply(health_event(
+            3,
+            SessionSaveHealth::RetryExhausted {
+                category: crate::session::SaveFailureCategory::Busy,
+                first_failed_at_unix_ms: 20,
+                attempts: 4,
+            },
+            Some(10),
+        )));
+
+        assert!(!state.apply(health_event(
+            2,
+            SessionSaveHealth::Recovered {
+                recovered_at_unix_ms: 25,
+            },
+            Some(25),
+        )));
+        assert!(matches!(
+            state.health,
+            SessionSaveHealth::RetryExhausted { .. }
+        ));
+
+        assert!(state.apply(health_event(
+            4,
+            SessionSaveHealth::Recovered {
+                recovered_at_unix_ms: 30,
+            },
+            Some(30),
+        )));
+        assert!(state.apply(health_event(5, SessionSaveHealth::Healthy, Some(40))));
+        assert!(matches!(state.health, SessionSaveHealth::Recovered { .. }));
+        assert_eq!(state.last_successful_flush_at_unix_ms, Some(40));
+        assert!(state.acknowledge_recovery());
+        assert!(!state.is_visible());
+
+        assert!(!state.apply(health_event(
+            4,
+            SessionSaveHealth::Retrying {
+                category: crate::session::SaveFailureCategory::Database,
+                first_failed_at_unix_ms: 30,
+                attempts: 9,
+            },
+            None,
+        )));
+        assert!(state.apply(health_event(6, SessionSaveHealth::WriterUnavailable, None,)));
+        assert_eq!(state.last_successful_flush_at_unix_ms, Some(40));
+        assert!(state.is_visible());
     }
 
     fn launch_recipe(working_directory: impl Into<PathBuf>) -> LaunchRecipe {
