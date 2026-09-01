@@ -566,6 +566,22 @@ INSTALL_STAGE=$PREFIX/.staging.$$
 tar --no-same-owner --no-same-permissions -xzf "$ARCHIVE_PATH" -C "$INSTALL_STAGE" \
     || fail 'archive extraction failed'
 AUTOSTART_EXEC=$(desktop_exec_escape "$BIN_TARGET")
+DESKTOP_EXEC=$(desktop_exec_escape "$BIN_TARGET")
+DESKTOP_ICON=$PREFIX/current/share/icons/hicolor/scalable/apps/dev.cagents.Cagents.svg
+DESKTOP_FILE=$INSTALL_STAGE/$TOP_LEVEL/share/applications/dev.cagents.Cagents.desktop
+{
+    while IFS= read -r line || [ -n "$line" ]; do
+        case $line in
+            Exec=*) printf 'Exec="%s" ui\n' "$DESKTOP_EXEC" ;;
+            TryExec=*) printf 'TryExec=%s\n' "$BIN_TARGET" ;;
+            Icon=*) printf 'Icon=%s\n' "$DESKTOP_ICON" ;;
+            *) printf '%s\n' "$line" ;;
+        esac
+    done
+} < "$DESKTOP_FILE" > "$DESKTOP_FILE.rewritten" \
+    || fail 'could not prepare the application desktop entry'
+mv "$DESKTOP_FILE.rewritten" "$DESKTOP_FILE" \
+    || fail 'could not replace the application desktop entry'
 {
     printf '%s\n' \
         '[Desktop Entry]' \

@@ -860,6 +860,9 @@ fn execute(command: TopCommand) -> Result<CommandOutput, AppError> {
 }
 
 fn launch_ui() -> Result<CommandOutput, AppError> {
+    if instance::activate_running_ui().map_err(|error| AppError::new("launch", error))? {
+        return Ok(already_running_ui_output());
+    }
     let executable =
         sibling_executable("cagents-ui").map_err(|error| AppError::new("launch", error))?;
     let mut command = Command::new(&executable);
@@ -882,6 +885,11 @@ fn launch_ui() -> Result<CommandOutput, AppError> {
             let _ = child.kill();
         }
         let _ = child.wait();
+        if handshake_reports_already_running(&error)
+            && instance::activate_running_ui().map_err(|error| AppError::new("launch", error))?
+        {
+            return Ok(already_running_ui_output());
+        }
         return Err(AppError::new("launch", error));
     }
     Ok(CommandOutput {
@@ -889,6 +897,18 @@ fn launch_ui() -> Result<CommandOutput, AppError> {
         data: json!({ "launched": true, "executable": executable }),
         human: "cagents-ui started".to_owned(),
     })
+}
+
+fn already_running_ui_output() -> CommandOutput {
+    CommandOutput {
+        command: "ui",
+        data: json!({ "launched": true, "already_running": true }),
+        human: "cagents is already running".to_owned(),
+    }
+}
+
+fn handshake_reports_already_running(error: &io::Error) -> bool {
+    error.to_string() == instance::ApplicationLeaseError::AlreadyRunning.to_string()
 }
 
 fn read_ui_launch_handshake(stdout: &mut ChildStdout) -> io::Result<()> {
@@ -1497,5 +1517,14 @@ mod tests {
             parse_ui_launch_handshake(b"unknown").unwrap_err().kind(),
             io::ErrorKind::InvalidData
         );
+        let already_running = parse_ui_launch_handshake(
+            format!(
+                "{UI_LAUNCH_ERROR_PREFIX}{}",
+                instance::ApplicationLeaseError::AlreadyRunning
+            )
+            .as_bytes(),
+        )
+        .unwrap_err();
+        assert!(handshake_reports_already_running(&already_running));
     }
 }
