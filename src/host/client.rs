@@ -218,7 +218,7 @@ pub(crate) fn serve(stream: UnixStream, client_id: ClientId, host: SharedHost) {
                         .request_shutdown();
                     // This connection stays open, so the accept loop would not
                     // otherwise observe the flag until the client disconnects.
-                    super::platform::wake();
+                    crate::daemon::wake();
                 }
             }
             Err(error) => {

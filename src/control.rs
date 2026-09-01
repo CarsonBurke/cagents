@@ -1030,7 +1030,7 @@ fn execute_daemon(command: DaemonCommand) -> Result<CommandOutput, AppError> {
             })
         }
         DaemonCommand::StopForRebuild => {
-            let stopped = crate::host::terminate_daemon_from_lock()
+            let stopped = crate::daemon::terminate_daemon_from_lock()
                 .map_err(|error| AppError::new("daemon_process", error))?;
             Ok(CommandOutput {
                 command: "daemon.stop_for_rebuild",

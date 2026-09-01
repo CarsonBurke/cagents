@@ -5,14 +5,18 @@ use std::{
     os::{
         fd::AsRawFd,
         unix::{
-            fs::{FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt},
-            net::{UnixListener, UnixStream},
+            fs::{MetadataExt, OpenOptionsExt, PermissionsExt},
+            net::UnixStream,
         },
     },
     path::{Path, PathBuf},
     process,
-    thread::{self, JoinHandle},
     time::Duration,
+};
+#[cfg(feature = "ui")]
+use std::{
+    os::unix::{fs::FileTypeExt, net::UnixListener},
+    thread::{self, JoinHandle},
 };
 
 use directories::ProjectDirs;
@@ -34,9 +38,19 @@ const PRIVATE_FILE_MODE: u32 = 0o600;
 const LEASE_CAPABLE_PROCESS_NAME: &str = "cagents-ui-v2";
 const LEGACY_PROCESS_NAME: &str = "cagents-ui";
 const LEASE_MARKER_FILE: &str = ".cagents-ui-lease-v1";
-#[cfg(feature = "integrated-browser")]
+// `full` names the product that ships the embedded browser: it claims that
+// package's application id, window class, and peer directory. A UI built with
+// `full` but without `integrated-browser` would claim them while running the
+// browserless code paths, so refuse the combination instead of shipping an
+// identity the binary cannot honour.
+#[cfg(all(feature = "ui", feature = "full", not(feature = "integrated-browser")))]
+compile_error!(
+    "a `full` UI must select `integrated-browser`; build the browserless UI with \
+     --no-default-features --features ui"
+);
+#[cfg(feature = "full")]
 const PEER_PACKAGE_DIRECTORY: &str = "/usr/libexec/cagents-browserless";
-#[cfg(not(feature = "integrated-browser"))]
+#[cfg(not(feature = "full"))]
 const PEER_PACKAGE_DIRECTORY: &str = "/usr/libexec/cagents";
 pub const UI_LAUNCH_HANDSHAKE_ENV: &str = "CAGENTS_UI_LAUNCH_HANDSHAKE";
 pub const UI_LAUNCH_READY: &str = "ready";
@@ -140,6 +154,7 @@ impl ApplicationLease {
 }
 
 /// A later `cagents ui` invocation asking the running window to come forward.
+#[cfg(feature = "ui")]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UiActivation {
     pub token: Option<String>,
@@ -147,11 +162,13 @@ pub struct UiActivation {
 
 /// Owns the per-instance activation socket used by `cagents ui` to focus an
 /// already-running window instead of failing the exclusive session lease.
+#[cfg(feature = "ui")]
 pub struct UiActivationListener {
     socket_path: PathBuf,
     thread: Option<JoinHandle<()>>,
 }
 
+#[cfg(feature = "ui")]
 impl UiActivationListener {
     pub fn bind(events: async_channel::Sender<UiActivation>) -> io::Result<Self> {
         let runtime_directory = env::var_os("XDG_RUNTIME_DIR")
@@ -198,6 +215,7 @@ impl UiActivationListener {
     }
 }
 
+#[cfg(feature = "ui")]
 impl Drop for UiActivationListener {
     fn drop(&mut self) {
         let woke = UnixStream::connect(&self.socket_path)
@@ -272,6 +290,7 @@ fn require_owned_runtime_directory(runtime_directory: &Path) -> io::Result<()> {
     Ok(())
 }
 
+#[cfg(feature = "ui")]
 fn prepare_activation_socket_path(path: &Path) -> io::Result<()> {
     match fs::symlink_metadata(path) {
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
@@ -295,6 +314,7 @@ fn prepare_activation_socket_path(path: &Path) -> io::Result<()> {
     }
 }
 
+#[cfg(feature = "ui")]
 fn serve_activation_socket(listener: UnixListener, events: async_channel::Sender<UiActivation>) {
     loop {
         let Ok((stream, _)) = listener.accept() else {
@@ -317,11 +337,13 @@ fn serve_activation_socket(listener: UnixListener, events: async_channel::Sender
     }
 }
 
+#[cfg(feature = "ui")]
 enum ActivationRequest {
     Activate(Option<String>),
     Shutdown,
 }
 
+#[cfg(feature = "ui")]
 fn read_activation_request(stream: &UnixStream) -> io::Result<ActivationRequest> {
     parse_activation_request(&read_capped_line(stream)?)
 }
@@ -345,6 +367,7 @@ fn read_capped_line(stream: &UnixStream) -> io::Result<String> {
     Ok(line)
 }
 
+#[cfg(feature = "ui")]
 fn parse_activation_request(line: &str) -> io::Result<ActivationRequest> {
     match line.split_once(' ') {
         None if line == "activate" => Ok(ActivationRequest::Activate(None)),
@@ -414,7 +437,7 @@ pub const NAME: &str = if IS_DEVELOPMENT {
 
 pub const APPLICATION_ID: &str = if IS_DEVELOPMENT {
     "dev.cagents.Cagents.Development"
-} else if cfg!(feature = "integrated-browser") {
+} else if cfg!(feature = "full") {
     "dev.cagents.Cagents"
 } else {
     "dev.cagents.Cagents.Browserless"
@@ -523,6 +546,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "ui")]
     #[test]
     fn activation_request_parses_focus_tokens_and_rejects_noise() {
         assert!(matches!(
@@ -541,6 +565,7 @@ mod tests {
         assert!(parse_activation_request("activate ").is_err());
     }
 
+    #[cfg(feature = "ui")]
     #[test]
     fn activation_socket_focuses_a_running_listener() {
         let runtime = tempdir().unwrap();
@@ -558,6 +583,7 @@ mod tests {
         assert_eq!(activation.token.as_deref(), Some("wayland-token"));
     }
 
+    #[cfg(feature = "ui")]
     #[test]
     fn activation_replaces_a_stale_socket_and_rejects_a_symlink() {
         let runtime = tempdir().unwrap();
@@ -585,7 +611,7 @@ mod tests {
     #[cfg(not(any(debug_assertions, feature = "development")))]
     #[test]
     fn optimized_builds_without_development_feature_use_production_namespaces() {
-        let application_id = if cfg!(feature = "integrated-browser") {
+        let application_id = if cfg!(feature = "full") {
             "dev.cagents.Cagents"
         } else {
             "dev.cagents.Cagents.Browserless"

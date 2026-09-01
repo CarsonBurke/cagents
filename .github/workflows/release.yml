@@ -50,12 +50,14 @@ jobs:
           fi
           printf 'VERSION=%s\n' "$version" >> "$GITHUB_ENV"
 
-      - name: Test both feature configurations in the release profile
+      - name: Test isolated product boundaries in the release profile
         run: |
           set -euo pipefail
           zig version
-          cargo test --locked --release --all-targets
           cargo test --locked --release --no-default-features --all-targets
+          cargo test --locked --release --no-default-features --features host --all-targets
+          cargo test --locked --release --no-default-features --features ui --all-targets
+          cargo test --locked --release --features integrated-browser --all-targets
 
       - name: Build full and browserless Linux packages
         run: |

@@ -1,8 +1,8 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
-    fs::{self, DirBuilder, File, OpenOptions},
+    fs::OpenOptions,
     io,
-    os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt},
+    os::unix::fs::OpenOptionsExt,
     path::{Path, PathBuf},
     str::FromStr,
     sync::{Mutex, MutexGuard},
@@ -16,24 +16,23 @@ use serde::{Serialize, de::DeserializeOwned};
 use serde_json::Value;
 use thiserror::Error;
 
-use crate::model::{
-    BootId, BrowserRestoreFidelity, BrowserSession, CardId, CardKind, CardState, Existence,
-    Exposure, HostSessionProof, OperationId, ProjectId, ProjectState, Residency,
-    TerminalContinuity, TerminalId, TerminalSession, Tombstone, TranscriptMetadata, WorkspaceId,
-    WorkspaceState, WorktreeId, WorktreeState,
+use crate::{
+    model::{
+        BootId, BrowserRestoreFidelity, BrowserSession, CardId, CardKind, CardState, Existence,
+        Exposure, HostSessionProof, OperationId, ProjectId, ProjectState, Residency,
+        TerminalContinuity, TerminalId, TerminalSession, Tombstone, TranscriptMetadata,
+        WorkspaceId, WorkspaceState, WorktreeId, WorktreeState,
+    },
+    secure_file::{
+        migrate_existing_private_file, open_existing_private_file, prepare_private_directory,
+        validate_and_privatize_open_file,
+    },
 };
 
 pub const CURRENT_SCHEMA_VERSION: u32 = 3;
 pub const DEFAULT_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 pub const MAX_BUSY_TIMEOUT: Duration = Duration::from_secs(10);
-const PRIVATE_DIRECTORY_MODE: u32 = 0o700;
 const PRIVATE_FILE_MODE: u32 = 0o600;
-const O_NOFOLLOW: i32 = 0o400000;
-const O_NONBLOCK: i32 = 0o4000;
-
-unsafe extern "C" {
-    fn geteuid() -> u32;
-}
 
 #[derive(Debug, Error)]
 pub enum StoreError {
@@ -857,141 +856,6 @@ impl StateStore {
     }
 }
 
-fn storage_error(path: &Path, message: impl std::fmt::Display) -> io::Error {
-    io::Error::new(
-        io::ErrorKind::PermissionDenied,
-        format!("unsafe storage path {}: {message}", path.display()),
-    )
-}
-
-fn effective_uid() -> u32 {
-    // SAFETY: geteuid has no preconditions and does not modify memory.
-    unsafe { geteuid() }
-}
-
-fn reject_symlink_components(path: &Path) -> io::Result<()> {
-    let mut ancestors = path
-        .ancestors()
-        .filter(|path| !path.as_os_str().is_empty())
-        .collect::<Vec<_>>();
-    ancestors.reverse();
-    for component in ancestors {
-        match fs::symlink_metadata(component) {
-            Ok(metadata) if metadata.file_type().is_symlink() => {
-                return Err(storage_error(component, "symbolic links are not allowed"));
-            }
-            Ok(_) => {}
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error),
-        }
-    }
-    Ok(())
-}
-
-fn validate_owned_directory(path: &Path) -> io::Result<()> {
-    let metadata = fs::symlink_metadata(path)?;
-    if metadata.file_type().is_symlink() || !metadata.is_dir() {
-        return Err(storage_error(path, "expected a real directory"));
-    }
-    let expected_uid = effective_uid();
-    if metadata.uid() != expected_uid {
-        return Err(storage_error(
-            path,
-            format!(
-                "directory is owned by uid {}, expected {expected_uid}",
-                metadata.uid()
-            ),
-        ));
-    }
-    Ok(())
-}
-
-fn prepare_private_directory(path: &Path) -> io::Result<()> {
-    let path = if path.as_os_str().is_empty() {
-        Path::new(".")
-    } else {
-        path
-    };
-    reject_symlink_components(path)?;
-    match fs::symlink_metadata(path) {
-        Ok(_) => {}
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            let mut builder = DirBuilder::new();
-            builder.recursive(true).mode(PRIVATE_DIRECTORY_MODE);
-            builder.create(path)?;
-        }
-        Err(error) => return Err(error),
-    }
-    reject_symlink_components(path)?;
-    validate_owned_directory(path)?;
-    fs::set_permissions(path, fs::Permissions::from_mode(PRIVATE_DIRECTORY_MODE))?;
-    validate_owned_directory(path)
-}
-
-fn validate_owned_regular_file(path: &Path, metadata: &fs::Metadata) -> io::Result<()> {
-    if !metadata.is_file() {
-        return Err(storage_error(path, "expected a regular file"));
-    }
-    let expected_uid = effective_uid();
-    if metadata.uid() != expected_uid {
-        return Err(storage_error(
-            path,
-            format!(
-                "file is owned by uid {}, expected {expected_uid}",
-                metadata.uid()
-            ),
-        ));
-    }
-    Ok(())
-}
-
-fn migrate_existing_private_file(path: &Path) -> io::Result<bool> {
-    match fs::symlink_metadata(path) {
-        Ok(metadata) => {
-            if metadata.file_type().is_symlink() {
-                return Err(storage_error(path, "symbolic links are not allowed"));
-            }
-            validate_owned_regular_file(path, &metadata)?;
-            fs::set_permissions(path, fs::Permissions::from_mode(PRIVATE_FILE_MODE))?;
-            Ok(true)
-        }
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
-        Err(error) => Err(error),
-    }
-}
-
-fn validate_and_privatize_open_file(path: &Path, file: &File) -> io::Result<()> {
-    let metadata = file.metadata()?;
-    validate_owned_regular_file(path, &metadata)?;
-    file.set_permissions(fs::Permissions::from_mode(PRIVATE_FILE_MODE))
-}
-
-fn open_existing_private_file(path: &Path) -> io::Result<File> {
-    let file = OpenOptions::new()
-        .read(true)
-        .custom_flags(O_NOFOLLOW | O_NONBLOCK)
-        .open(path)?;
-    validate_and_privatize_open_file(path, &file)?;
-    Ok(file)
-}
-
-pub(crate) fn open_private_append_file(path: &Path) -> io::Result<File> {
-    let parent = path
-        .parent()
-        .filter(|parent| !parent.as_os_str().is_empty())
-        .unwrap_or_else(|| Path::new("."));
-    prepare_private_directory(parent)?;
-    migrate_existing_private_file(path)?;
-    let file = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .mode(PRIVATE_FILE_MODE)
-        .custom_flags(O_NOFOLLOW | O_NONBLOCK)
-        .open(path)?;
-    validate_and_privatize_open_file(path, &file)?;
-    Ok(file)
-}
-
 fn sqlite_sidecar_path(path: &Path, suffix: &str) -> PathBuf {
     let mut sidecar = path.as_os_str().to_os_string();
     sidecar.push(suffix);
@@ -1022,7 +886,7 @@ fn prepare_private_database(path: &Path) -> io::Result<()> {
             .write(true)
             .create_new(true)
             .mode(PRIVATE_FILE_MODE)
-            .custom_flags(O_NOFOLLOW | O_NONBLOCK)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
             .open(path)?;
         validate_and_privatize_open_file(path, &file)?;
     }

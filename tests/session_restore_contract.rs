@@ -1,3 +1,5 @@
+#![cfg(feature = "ui")]
+
 use std::{collections::BTreeMap, path::PathBuf, sync::Arc};
 
 use cagents::{

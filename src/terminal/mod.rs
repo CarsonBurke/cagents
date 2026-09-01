@@ -1,8 +1,12 @@
 mod hosted;
 pub mod ipc;
 mod snapshot;
+#[cfg(feature = "ui")]
 mod surface;
+mod types;
+#[cfg(feature = "ui")]
 mod widget;
+#[cfg(feature = "host")]
 mod worker;
 pub use ipc::TerminalSpawnOptions;
 
@@ -11,10 +15,13 @@ pub use snapshot::{
     CellSnapshot, CellStyle, CellText, CursorShape, CursorSnapshot, RenderSnapshot, Rgb,
     RowSnapshot, Underline,
 };
+#[cfg(feature = "ui")]
 pub use surface::TerminalSurface;
-pub use widget::{CellMetrics, TerminalWidget};
-pub use worker::{
+pub use types::{
     KeyAction, KeyInput, KeyModifiers, MouseAction, MouseButton, MouseInput, TerminalConfig,
-    TerminalEvent, TerminalHandle, TerminalKey, TerminalSendError, TerminalSize,
-    TerminalStartError, TerminalWake,
+    TerminalEvent, TerminalKey, TerminalSendError, TerminalSize, TerminalStartError, TerminalWake,
 };
+#[cfg(feature = "ui")]
+pub use widget::{CellMetrics, TerminalWidget};
+#[cfg(feature = "host")]
+pub use worker::TerminalHandle;

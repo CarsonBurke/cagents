@@ -7,9 +7,39 @@ license = "MIT"
 publish = false
 
 [features]
-default = ["integrated-browser"]
+default = ["full"]
 development = []
+# Product identity only. Keep this separate from the embedded-browser
+# implementation so the CLI and daemon do not resolve Servo.
+full = []
+host = [
+    "dep:image",
+    "dep:ksni",
+    "dep:libghostty-vt",
+    "dep:portable-pty",
+    "dep:tokio",
+    "dep:tracing-subscriber",
+]
+ui = [
+    "dep:ashpd",
+    "dep:async-channel",
+    "dep:async-lsp",
+    "dep:blake3",
+    "dep:iced_accessibility",
+    "dep:image",
+    "dep:imara-diff",
+    "dep:libcosmic",
+    "dep:lsp-types",
+    "dep:rusqlite",
+    "dep:tempfile",
+    "dep:tokio",
+    "dep:tokio-util",
+    "dep:toml",
+    "dep:tracing-subscriber",
+]
 integrated-browser = [
+    "full",
+    "ui",
     "dep:dpi",
     "dep:euclid",
     "dep:keyboard-types",
@@ -30,58 +60,66 @@ name = "cagents-ui"
 path = "src/bin/cagents-ui.rs"
 test = false
 bench = false
+required-features = ["ui"]
 
 [[bin]]
 name = "cagentsd"
 path = "src/bin/cagentsd.rs"
 test = false
 bench = false
+required-features = ["host"]
+
 [dependencies]
 arc-swap = "1.7"
-async-channel = "2.5"
-ashpd = { version = "0.12.3", default-features = false, features = ["tokio", "wayland"] }
-async-lsp = { version = "0.2.4", default-features = false, features = ["omni-trait", "tracing"] }
+async-channel = { version = "2.5", optional = true }
+ashpd = { version = "0.12.3", default-features = false, features = ["tokio", "wayland"], optional = true }
+async-lsp = { version = "0.2.4", default-features = false, features = ["omni-trait", "tracing"], optional = true }
 bitflags = { version = "2.9", features = ["serde"] }
-blake3 = "1.8"
+blake3 = { version = "1.8", optional = true }
 clap = { version = "4.5", features = ["derive"] }
 crossbeam-channel = "0.5"
 dpi = { version = "=0.1.2", optional = true }
 directories = "6.0"
 euclid = { version = "=0.22.11", optional = true }
-image = { version = "0.25", default-features = false, features = ["png"] }
-iced_accessibility = { git = "https://github.com/pop-os/libcosmic.git", rev = "caec74c2559924443f12fc6faf97a5bcefe6271d" }
+image = { version = "0.25", default-features = false, features = ["png"], optional = true }
+iced_accessibility = { git = "https://github.com/pop-os/libcosmic.git", rev = "caec74c2559924443f12fc6faf97a5bcefe6271d", optional = true }
 keyboard-types = { version = "=0.8.3", features = ["serde"], optional = true }
-libcosmic = { git = "https://github.com/pop-os/libcosmic.git", rev = "caec74c2559924443f12fc6faf97a5bcefe6271d", default-features = false, features = ["a11y", "highlighter", "markdown", "multi-window", "surface-message", "tokio", "wayland", "wgpu", "winit", "xdg-portal"] }
-imara-diff = "0.2.0"
-ksni = "0.3.6"
+# `highlighter` backs the editor's syntax highlighting; it is not in libcosmic's
+# default set and the editor is the only consumer.
+libcosmic = { git = "https://github.com/pop-os/libcosmic.git", rev = "caec74c2559924443f12fc6faf97a5bcefe6271d", default-features = false, features = ["a11y", "highlighter", "markdown", "multi-window", "surface-message", "tokio", "wayland", "wgpu", "winit", "xdg-portal"], optional = true }
+imara-diff = { version = "0.2.0", optional = true }
+ksni = { version = "0.3.6", optional = true }
 libc = "0.2.189"
-libghostty-vt = { version = "0.2.1", default-features = false, features = ["tracing"] }
+libghostty-vt = { version = "0.2.1", default-features = false, features = ["tracing"], optional = true }
 # Pinned to the version `async-lsp` 0.2.4 depends on so protocol types unify.
-lsp-types = "0.95"
-portable-pty = "0.9"
+lsp-types = { version = "0.95", optional = true }
+portable-pty = { version = "0.9", optional = true }
 # Binary IPC codec. The terminal snapshot protocol is a per-frame, per-cell
 # binary payload; a self-describing text format costs ~24x more bytes and one
 # heap allocation per character cell on both sides. postcard is already in the
 # resolved dependency graph, needs no additional crates, and its externally
 # tagged enum encoding is why the wire enums below carry no `serde(tag)`.
 postcard = { version = "1.1", default-features = false, features = ["use-std"] }
-rusqlite = { version = "0.37", features = ["bundled"] }
+rusqlite = { version = "0.37", features = ["bundled"], optional = true }
 raw-window-handle = { version = "=0.6.2", optional = true }
 serde = { version = "1.0", features = ["derive"] }
 serde_bytes = "0.11"
 serde_json = "1.0"
 servo = { version = "=0.1.3", git = "https://github.com/servo/servo.git", rev = "5c14ac9428d8d95c2f6c2f0300fe248d3929f282", default-features = false, features = ["baked-in-resources", "js_jit"], optional = true }
 thiserror = "2.0"
-tempfile = "3.21"
-tokio = { version = "1.47", features = ["fs", "process", "rt-multi-thread", "sync", "time"] }
-tokio-util = { version = "0.7", features = ["compat"] }
+tempfile = { version = "3.21", optional = true }
+tokio = { version = "1.47", features = ["fs", "process", "rt-multi-thread", "sync", "time"], optional = true }
+tokio-util = { version = "0.7", features = ["compat"], optional = true }
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
-toml = "1.1.4"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"], optional = true }
+toml = { version = "1.1.4", optional = true }
 url = { version = "2.5", features = ["serde"] }
 uuid = { version = "1.18", features = ["serde", "v4"] }
 wayland-client = { version = "=0.31.15", features = ["system"], optional = true }
 wayland-protocols = { version = "=0.32.13", features = ["client"], optional = true }
+
+[dev-dependencies]
+tempfile = "3.21"
 
 [profile.dev]
 debug = "line-tables-only"
