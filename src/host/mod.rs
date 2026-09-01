@@ -1,9 +1,6 @@
 mod client;
 mod delivery;
-mod platform;
 mod state;
-
-pub(crate) use platform::terminate_daemon_from_lock;
 
 use std::{
     fs, io,
@@ -21,14 +18,12 @@ use thiserror::Error;
 use uuid::Uuid;
 
 use crate::{
+    daemon::{self, HostLease, PlatformError, RuntimePaths},
     model::{HostIncarnation, HostSessionId, HostSessionProof},
     terminal_ipc::{PROTOCOL_VERSION, ServerEnvelope, ServerMessage},
 };
 
-use self::{
-    platform::{HostLease, PlatformError, RuntimePaths},
-    state::{HostState, SharedHost},
-};
+use self::state::{HostState, SharedHost};
 
 // Together with MAX_CLIENT_FRAME_BYTES this caps hostile in-flight request
 // payloads at 256 MiB, while ordinary GUI/CLI fan-out remains ample.
@@ -109,10 +104,10 @@ impl From<PlatformError> for HostError {
 }
 
 pub fn run() -> Result<(), HostError> {
-    platform::install_signal_handlers()?;
+    daemon::install_signal_handlers()?;
     let proof = HostSessionProof {
         host_session_id: HostSessionId::new(Uuid::new_v4().to_string()),
-        boot_id: platform::read_boot_id()?,
+        boot_id: daemon::read_boot_id()?,
         host_incarnation: HostIncarnation::new(Uuid::new_v4().to_string()),
     };
     let paths = RuntimePaths::discover()?;
@@ -135,7 +130,7 @@ pub fn run() -> Result<(), HostError> {
 
     loop {
         reap_finished(&mut clients);
-        if platform::termination_requested() {
+        if daemon::termination_requested() {
             host.lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .request_shutdown();
@@ -150,8 +145,8 @@ pub fn run() -> Result<(), HostError> {
 
         let fatal = match listener.accept() {
             Ok((stream, _address)) => {
-                match platform::peer_uid(&stream) {
-                    Ok(uid) if uid == platform::current_uid() => {}
+                match daemon::peer_uid(&stream) {
+                    Ok(uid) if uid == daemon::current_uid() => {}
                     Ok(uid) => {
                         tracing::warn!(peer_uid = uid, "rejected cagents daemon peer");
                         let _ = stream.shutdown(Shutdown::Both);
@@ -177,7 +172,7 @@ pub fn run() -> Result<(), HostError> {
                         // wakes cannot refuse the connection the wakeup exists to
                         // admit, and can reap this thread without a timer.
                         drop(permit);
-                        platform::wake();
+                        daemon::wake();
                     }) {
                     Ok(client) => clients.push(client),
                     Err(error) => tracing::warn!(%error, "could not start cagents daemon client"),
@@ -188,7 +183,7 @@ pub fn run() -> Result<(), HostError> {
             // exits, or a signal arrives; an idle daemon blocks here indefinitely
             // instead of waking on a timer.
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                platform::wait_for_activity(&listener).err()
+                daemon::wait_for_activity(&listener).err()
             }
             Err(error) if error.kind() == io::ErrorKind::Interrupted => None,
             Err(error) => Some(error),

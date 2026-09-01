@@ -81,8 +81,8 @@ run_cli() {
         cargo run --quiet --locked --profile dev-runtime --no-default-features \
             --features development --bin cagents -- "$@"
     else
-        cargo run --quiet --locked --profile dev-runtime --features development \
-            --bin cagents -- "$@"
+        cargo run --quiet --locked --profile dev-runtime \
+            --features development --bin cagents -- "$@"
     fi
 }
 
@@ -100,19 +100,32 @@ if [ "$fresh_daemon" = true ]; then
     done
 fi
 
+# Build each product boundary separately. Cargo features are package-wide, so a
+# single --bins invocation would reunify the UI and host graphs and make the UI
+# compile Ghostty while making the daemon compile libcosmic.
 if [ "$browserless" = true ]; then
-    cargo build --locked --profile dev-runtime --no-default-features --features development --bins
+    cargo build --locked --profile dev-runtime --no-default-features \
+        --features development --bin cagents
+    cargo build --locked --profile dev-runtime --no-default-features \
+        --features development,host --bin cagentsd
+    cargo build --locked --profile dev-runtime --no-default-features \
+        --features development,ui --bin cagents-ui
 else
-    cargo build --locked --profile dev-runtime --features development --bins
+    cargo build --locked --profile dev-runtime \
+        --features development --bin cagents
+    cargo build --locked --profile dev-runtime \
+        --features development,host --bin cagentsd
+    cargo build --locked --profile dev-runtime \
+        --features development,integrated-browser --bin cagents-ui
 fi
 
 run_ui() {
     if [ "$browserless" = true ]; then
         exec cargo run --quiet --locked --profile dev-runtime --no-default-features \
-            --features development --bin cagents-ui -- "$@"
+            --features development,ui --bin cagents-ui -- "$@"
     fi
-    exec cargo run --quiet --locked --profile dev-runtime --features development \
-        --bin cagents-ui -- "$@"
+    exec cargo run --quiet --locked --profile dev-runtime \
+        --features development,integrated-browser --bin cagents-ui -- "$@"
 }
 
 if [ -n "$log_file" ]; then

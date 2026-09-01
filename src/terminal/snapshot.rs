@@ -1,5 +1,6 @@
 use std::sync::Arc;
 
+#[cfg(feature = "host")]
 use libghostty_vt::{
     RenderState, Terminal,
     render::{CellIterator, CursorVisualStyle, Dirty, RowIterator},
@@ -13,6 +14,7 @@ pub struct Rgb {
     pub blue: u8,
 }
 
+#[cfg(feature = "host")]
 impl From<GhosttyRgb> for Rgb {
     fn from(value: GhosttyRgb) -> Self {
         Self {
@@ -234,6 +236,7 @@ impl RenderSnapshot {
     }
 }
 
+#[cfg(feature = "host")]
 pub(crate) struct VisualResources {
     render_state: RenderState<'static>,
     rows: RowIterator<'static>,
@@ -245,6 +248,7 @@ pub(crate) struct VisualResources {
     grapheme_scratch: String,
 }
 
+#[cfg(feature = "host")]
 impl VisualResources {
     pub(crate) fn new() -> Result<Self, libghostty_vt::Error> {
         Ok(Self {
@@ -390,6 +394,7 @@ impl VisualResources {
     }
 }
 
+#[cfg(feature = "host")]
 fn map_underline(value: GhosttyUnderline) -> Underline {
     match value {
         GhosttyUnderline::None => Underline::None,
@@ -402,6 +407,7 @@ fn map_underline(value: GhosttyUnderline) -> Underline {
     }
 }
 
+#[cfg(feature = "host")]
 fn map_cursor(value: CursorVisualStyle) -> CursorShape {
     match value {
         CursorVisualStyle::Bar => CursorShape::Bar,
@@ -412,7 +418,7 @@ fn map_cursor(value: CursorVisualStyle) -> CursorShape {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "host"))]
 mod tests {
     use super::*;
     use libghostty_vt::TerminalOptions;

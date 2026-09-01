@@ -1,3 +1,5 @@
+#![cfg(feature = "ui")]
+
 //! Observable Git behaviour of `RepositoryService` against the real `git`.
 //!
 //! Every assertion here is made against a temporary worktree and a local bare

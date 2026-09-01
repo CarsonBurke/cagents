@@ -35,22 +35,30 @@ rustup toolchain install 1.93.0 --profile minimal
 rustup default 1.93.0
 ```
 
-Install Zig 0.15.2 from [ziglang.org](https://ziglang.org/download/) and ensure `zig` is on `PATH`. The default feature set includes the integrated Servo browser. Ordinary debug builds automatically use the isolated development instance; optimized builds are production unless the Cargo `development` feature is explicitly enabled.
+Install Zig 0.15.2 from [ziglang.org](https://ziglang.org/download/) and ensure `zig` is on `PATH`. The terminal host uses Ghostty's native library, so daemon builds require Zig. Ordinary debug builds automatically use the isolated development instance; optimized builds are production unless the Cargo `development` feature is explicitly enabled.
 
-Use the development instance for source-tree work. Start with the browserless lane unless the change touches the embedded browser:
+The CLI, UI client, and terminal host have separate Cargo feature boundaries:
 
 ```sh
-# Fast type-check: 518 Linux packages; no Servo/WebRender/SpiderMonkey.
-cargo check --locked --no-default-features --bins
+# Control CLI: no UI, Ghostty, SQLite, or Servo graph.
+cargo check --locked --no-default-features --bin cagents
 
-# Full integration boundary: 977 Linux packages.
-cargo check --locked --bins
+# Terminal daemon: Ghostty/PTY host, no UI or Servo graph.
+cargo check --locked --no-default-features --features host --bin cagentsd
+
+# Browserless UI client: libcosmic, no Ghostty or Servo graph.
+cargo check --locked --no-default-features --features ui --bin cagents-ui
+
+# Integrated UI client: libcosmic and Servo, no Ghostty graph.
+cargo check --locked --features integrated-browser --bin cagents-ui
 ```
 
-For the browserless configuration, this single command builds the same three executables while excluding the `integrated-browser` feature and Servo's engine graph:
+Cargo features are package-wide, so combining `ui` and `host` in one `--bins` invocation would undo that isolation. Build a matched browserless release as three feature-disjoint targets:
 
 ```sh
-cargo build --locked --release --no-default-features --bins
+cargo build --locked --release --no-default-features --bin cagents
+cargo build --locked --release --no-default-features --features host --bin cagentsd
+cargo build --locked --release --no-default-features --features ui --bin cagents-ui
 ```
 
 Browserless builds keep terminals, repositories, worktrees, GitHub pull-request flows, and persistence. New links use the desktop portal and fall back to the system `xdg-open` handler when a portal is unavailable; Debian packages install `xdg-utils`, and portable/source users must provide it for that fallback. A restored browser card retains its saved URL, history, scroll position, and fidelity, shows that the integrated browser is unavailable, and offers **Open in system browser**. Running only one binary from an unrelated directory is not a supported layout; `cagents`, `cagents-ui`, and `cagentsd` must remain together.
@@ -62,7 +70,7 @@ scripts/run-development --browserless
 scripts/run-development
 ```
 
-The browserless UI preserves saved browser descriptors and opens their URLs through the system browser instead of compiling Servo. The default build retains the integrated browser.
+The browserless UI preserves saved browser descriptors and opens their URLs through the system browser instead of compiling Servo. The normal development runner enables `integrated-browser` only for the UI target; the matched CLI and daemon retain the same full-product identity without resolving Servo.
 
 For UI diagnosis, add `--debug`. It enables Rust backtraces and `cagents=debug,cagentsd=debug,warn` tracing; an explicit `RUST_LOG` or `RUST_BACKTRACE` value takes precedence. Use `--fresh-daemon` after changing daemon, terminal-host, or protocol code so the UI cannot reconnect to an older development daemon:
 
@@ -74,7 +82,7 @@ scripts/run-development --browserless --debug --log-file /tmp/cagents-ui.log
 
 `--log-file` captures UI tracing and panic output in a stable artifact while Cargo diagnostics remain in the invoking terminal. Fresh-daemon mode compiles a feature-matched control CLI, pins and validates the isolated daemon through a Linux pidfd, and signals it without depending on the old wire protocol; stopping it terminates its hosted development terminals. `scripts/run-development` is POSIX shell; the repository contains no Python development tooling. Python remains a native build prerequisite for the full Servo dependency graph.
 
-The runner builds the three sibling executables in one Cargo pass and executes the selected UI through Cargo, so configured target directories and target triples are honored. Its `dev-runtime` profile keeps dependencies optimized for usable UI performance while the ordinary `dev` profile stays cheap for checks. The development instance has its own application ID, configuration, session database, transcripts, application lease, and `$XDG_RUNTIME_DIR/cagents-development/` daemon, so it can run beside the installed production instance. `cagents`, `cagents-ui`, and `cagentsd` must remain together.
+The runner builds the three sibling executables with separate Cargo feature sets and executes the selected UI through Cargo, so configured target directories and target triples are honored. UI-only compilation never builds Ghostty, and daemon-only compilation never builds libcosmic or Servo. Its `dev-runtime` profile keeps UI dependencies optimized for usable UI performance while the ordinary `dev` profile stays cheap for checks. The development instance has its own application ID, configuration, session database, transcripts, application lease, and `$XDG_RUNTIME_DIR/cagents-development/` daemon, so it can run beside the installed production instance. `cagents`, `cagents-ui`, and `cagentsd` must remain together.
 
 ## Install a release
 

@@ -1,3 +1,5 @@
+#![cfg(feature = "ui")]
+
 use cagents::{
     capability::{BrowserCapability, BrowserRestoreAction, browser_restore_action},
     location::SanitizedLocation,

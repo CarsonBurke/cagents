@@ -1,57 +1,79 @@
 use std::{
     env,
-    ffi::{c_int, c_short, c_ulong, c_void},
-    fs::{self, DirBuilder, File, OpenOptions},
-    io::{self, Read, Seek, SeekFrom, Write},
+    ffi::c_int,
+    fs::{self, File, OpenOptions},
+    io::{self, Seek, SeekFrom},
     os::{
         fd::{AsRawFd, FromRawFd},
         unix::{
-            fs::{DirBuilderExt, FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt},
-            net::{UnixListener, UnixStream},
+            fs::{FileTypeExt, MetadataExt, OpenOptionsExt},
+            net::UnixStream,
         },
     },
     path::{Path, PathBuf},
+};
+
+#[cfg(feature = "host")]
+use std::{
+    ffi::{c_short, c_ulong, c_void},
+    fs::DirBuilder,
+    io::{Read, Write},
+    os::unix::{
+        fs::{DirBuilderExt, PermissionsExt},
+        net::UnixListener,
+    },
     sync::{
         LazyLock,
         atomic::{AtomicBool, AtomicI32, Ordering},
     },
 };
 
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
+#[cfg(feature = "host")]
+use serde::Serialize;
 use thiserror::Error;
 
-use crate::{
-    instance,
-    model::{BootId, HostSessionProof},
-    terminal_ipc::SOCKET_FILE_NAME,
-};
+#[cfg(feature = "host")]
+use crate::model::{BootId, HostSessionProof};
+use crate::{instance, terminal_ipc::SOCKET_FILE_NAME};
 
+#[cfg(feature = "host")]
 const PRIVATE_DIRECTORY_MODE: u32 = 0o700;
+#[cfg(feature = "host")]
 const PRIVATE_FILE_MODE: u32 = 0o600;
 const O_NOFOLLOW: c_int = 0o400000;
 const LOCK_EX: c_int = 2;
 const LOCK_NB: c_int = 4;
 const LOCK_UN: c_int = 8;
+#[cfg(feature = "host")]
 const SOL_SOCKET: c_int = 1;
+#[cfg(feature = "host")]
 const SO_PEERCRED: c_int = 17;
+#[cfg(feature = "host")]
 const SIGINT: c_int = 2;
 const SIGTERM: c_int = 15;
+#[cfg(feature = "host")]
 const POLLIN: c_short = 0x001;
+#[cfg(feature = "host")]
 const POLL_FOREVER: c_int = -1;
 
+#[cfg(feature = "host")]
 static TERMINATION_REQUESTED: AtomicBool = AtomicBool::new(false);
 
 /// The daemon's wakeup pipe. It is created once and never dropped, because the
 /// signal handler writes to its sending descriptor: that descriptor must never
 /// be closed, and its number must never be recycled by an unrelated `open`.
+#[cfg(feature = "host")]
 static WAKEUP: LazyLock<io::Result<Wakeup>> = LazyLock::new(Wakeup::create);
 /// The sending descriptor of [`WAKEUP`], readable from a signal handler, which
 /// must touch nothing but lock-free atomics.
+#[cfg(feature = "host")]
 static WAKEUP_FD: AtomicI32 = AtomicI32::new(-1);
 
 unsafe extern "C" {
     fn flock(fd: c_int, operation: c_int) -> c_int;
     fn geteuid() -> u32;
+    #[cfg(feature = "host")]
     fn getsockopt(
         socket: c_int,
         level: c_int,
@@ -59,12 +81,16 @@ unsafe extern "C" {
         option_value: *mut c_void,
         option_len: *mut u32,
     ) -> c_int;
+    #[cfg(feature = "host")]
     fn signal(signal: c_int, handler: usize) -> usize;
+    #[cfg(feature = "host")]
     fn poll(fds: *mut PollFd, count: c_ulong, timeout: c_int) -> c_int;
+    #[cfg(feature = "host")]
     #[link_name = "write"]
     fn write_byte(fd: c_int, buffer: *const c_void, count: usize) -> isize;
 }
 
+#[cfg(feature = "host")]
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default)]
 struct UCred {
@@ -73,6 +99,7 @@ struct UCred {
     gid: u32,
 }
 
+#[cfg(feature = "host")]
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct PollFd {
@@ -81,6 +108,7 @@ struct PollFd {
     revents: c_short,
 }
 
+#[cfg(feature = "host")]
 /// A socket pair used purely as a wakeup channel: any byte written to `writer`
 /// interrupts a [`wait_for_activity`] blocked on `reader`.
 struct Wakeup {
@@ -88,6 +116,7 @@ struct Wakeup {
     writer: UnixStream,
 }
 
+#[cfg(feature = "host")]
 impl Wakeup {
     fn create() -> io::Result<Self> {
         let (reader, writer) = UnixStream::pair()?;
@@ -114,6 +143,7 @@ impl Wakeup {
     }
 }
 
+#[cfg(feature = "host")]
 fn wakeup() -> io::Result<&'static Wakeup> {
     // `io::Error` is not `Clone`, so the stored failure is reproduced rather
     // than handed out; kind and message are what callers report.
@@ -124,6 +154,7 @@ fn wakeup() -> io::Result<&'static Wakeup> {
 
 /// Interrupts a blocking [`wait_for_activity`] from any thread. Losing a byte to
 /// a full pipe is harmless, because a full pipe is a pending wakeup.
+#[cfg(feature = "host")]
 pub(crate) fn wake() {
     if let Ok(wakeup) = &*WAKEUP {
         wakeup.wake();
@@ -132,6 +163,7 @@ pub(crate) fn wake() {
 
 /// Blocks until `listener` has a connection pending or something calls [`wake`].
 /// There is no timeout: an idle daemon causes no wakeups at all.
+#[cfg(feature = "host")]
 pub(crate) fn wait_for_activity(listener: &UnixListener) -> io::Result<()> {
     let wakeup = wakeup()?;
     let mut fds = [
@@ -169,6 +201,7 @@ pub(crate) enum PlatformError {
     #[error("runtime path {path:?} is not owned by the current user")]
     WrongRuntimeOwner { path: PathBuf },
     #[error("runtime path {path:?} is not a real directory")]
+    #[cfg(feature = "host")]
     UnsafeRuntimeDirectory { path: PathBuf },
     #[error("daemon lock path {path:?} is not a regular file")]
     UnsafeLockPath { path: PathBuf },
@@ -184,6 +217,7 @@ pub(crate) enum PlatformError {
 
 #[derive(Clone, Debug)]
 pub(crate) struct RuntimePaths {
+    #[cfg(feature = "host")]
     pub(crate) directory: PathBuf,
     pub(crate) socket: PathBuf,
     pub(crate) lock: PathBuf,
@@ -199,16 +233,19 @@ impl RuntimePaths {
         Ok(Self {
             socket: directory.join(SOCKET_FILE_NAME),
             lock: directory.join("cagentsd.lock"),
+            #[cfg(feature = "host")]
             directory,
         })
     }
 }
 
+#[cfg(feature = "host")]
 pub(crate) struct HostLease {
     socket_path: PathBuf,
     lock: File,
 }
 
+#[cfg(feature = "host")]
 impl HostLease {
     pub(crate) fn acquire(
         paths: &RuntimePaths,
@@ -244,6 +281,7 @@ impl HostLease {
     }
 }
 
+#[cfg(feature = "host")]
 impl Drop for HostLease {
     fn drop(&mut self) {
         match fs::remove_file(&self.socket_path) {
@@ -256,12 +294,14 @@ impl Drop for HostLease {
     }
 }
 
+#[cfg(feature = "host")]
 #[derive(Serialize)]
 struct LockMetadata<'a> {
     pid: u32,
     proof: &'a HostSessionProof,
 }
 
+#[cfg(feature = "host")]
 fn write_lock_metadata(lock: &mut File, proof: &HostSessionProof) -> Result<(), PlatformError> {
     lock.set_len(0)?;
     lock.seek(SeekFrom::Start(0))?;
@@ -405,6 +445,7 @@ fn open_validated_pidfd(lock: &File, pid: u32, proc_root: &Path) -> io::Result<F
     Ok(pidfd)
 }
 
+#[cfg(feature = "host")]
 fn prepare_runtime_directory(path: &Path) -> Result<(), PlatformError> {
     match fs::symlink_metadata(path) {
         Ok(_) => {}
@@ -422,6 +463,7 @@ fn prepare_runtime_directory(path: &Path) -> Result<(), PlatformError> {
     validate_runtime_directory(path, &fs::symlink_metadata(path)?, effective_uid)
 }
 
+#[cfg(feature = "host")]
 fn validate_runtime_directory(
     path: &Path,
     metadata: &fs::Metadata,
@@ -486,6 +528,7 @@ pub(crate) fn current_uid() -> u32 {
     unsafe { geteuid() }
 }
 
+#[cfg(feature = "host")]
 pub(crate) fn peer_uid(stream: &UnixStream) -> io::Result<u32> {
     let mut credentials = UCred::default();
     let mut length =
@@ -513,6 +556,7 @@ pub(crate) fn peer_uid(stream: &UnixStream) -> io::Result<u32> {
     Ok(credentials.uid)
 }
 
+#[cfg(feature = "host")]
 pub(crate) fn read_boot_id() -> io::Result<BootId> {
     let value = fs::read_to_string("/proc/sys/kernel/random/boot_id")?;
     let value = value.trim();
@@ -525,6 +569,7 @@ pub(crate) fn read_boot_id() -> io::Result<BootId> {
     Ok(BootId::new(value))
 }
 
+#[cfg(feature = "host")]
 extern "C" fn request_termination(_signal: c_int) {
     TERMINATION_REQUESTED.store(true, Ordering::Release);
     let fd = WAKEUP_FD.load(Ordering::Acquire);
@@ -542,6 +587,7 @@ extern "C" fn request_termination(_signal: c_int) {
     }
 }
 
+#[cfg(feature = "host")]
 pub(crate) fn install_signal_handlers() -> io::Result<()> {
     // The handler writes to the wakeup pipe, so the pipe must exist first.
     wakeup()?;
@@ -555,11 +601,12 @@ pub(crate) fn install_signal_handlers() -> io::Result<()> {
     Ok(())
 }
 
+#[cfg(feature = "host")]
 pub(crate) fn termination_requested() -> bool {
     TERMINATION_REQUESTED.load(Ordering::Acquire)
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "host"))]
 mod tests {
     use std::os::unix::fs::symlink;
 

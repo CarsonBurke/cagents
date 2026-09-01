@@ -7,18 +7,22 @@
 
 ## Choose the cheapest correct build lane
 
-- Start with the browserless lane unless the change touches the embedded browser, Servo integration, browser capability gating, or default feature behavior.
-- Browserless check: `cargo check --locked --no-default-features --features development --bins`
-- Integrated-browser check: `cargo check --locked --features development --bins`
-- The production default includes `integrated-browser`. Do not change that default to make local development faster.
-- Before finishing a Cargo feature or dependency change, run both checks. Browserless builds must not resolve or compile Servo, WebRender, or SpiderMonkey.
+- Start with the isolated boundary that owns the change:
+  - CLI: `cargo check --locked --no-default-features --bin cagents`
+  - daemon/terminal host: `cargo check --locked --no-default-features --features host --bin cagentsd`
+  - browserless UI: `cargo check --locked --no-default-features --features ui --bin cagents-ui`
+  - integrated UI: `cargo check --locked --features integrated-browser --bin cagents-ui`
+- The default `full` feature selects production identity only. `ui`, `host`, and
+  `integrated-browser` select implementation graphs; never reunify `ui` and
+  `host` in one Cargo invocation just to shorten a command.
+- Before finishing a feature or dependency change, run every affected isolated boundary. UI-only builds must not resolve Ghostty; host-only builds must not resolve libcosmic, Servo, WebRender, or SpiderMonkey.
 - Do not run independent cold Cargo builds concurrently. They contend for the shared build directory and memory; lower `CARGO_BUILD_JOBS` when the host is already under memory pressure.
 
 ## Run the application through the development runner
 
 - Use `scripts/run-development --browserless` for ordinary UI, session, sidebar, settings, and terminal work.
 - Use `scripts/run-development` when the changed behavior requires the embedded browser.
-- Do not use a direct `cargo run` as the normal UI workflow. The runner builds the three sibling executables together and selects the isolated development application ID, state, and daemon.
+- Do not use a direct `cargo run` as the normal UI workflow. The runner builds the three matched executables with separate feature sets, then selects the isolated development application ID, state, and daemon.
 - The runner uses the `dev-runtime` profile so UI dependencies remain optimized. Keep ordinary `dev` checks unoptimized; do not restore a wildcard `opt-level` under `[profile.dev.package."*"]`.
 - Add `--debug --log-file /tmp/cagents-ui.log` when diagnosing UI behavior.
 - Add `--fresh-daemon` after changing daemon, terminal-host, IPC/protocol, or process-lifecycle code. It uses the daemon lock and a Linux pidfd rather than the wire protocol, so it remains safe across protocol changes; this terminates terminals hosted by that daemon.

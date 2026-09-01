@@ -78,42 +78,40 @@ done
 BUILD_SECONDS=skipped
 if [ "${CAGENTS_SKIP_BUILD:-0}" != 1 ]; then
     BUILD_STARTED=$(date +%s)
-    if [ "$VARIANT" = browserless ]; then
-        cargo build \
-            --manifest-path "$ROOT_DIR/Cargo.toml" \
-            --locked \
-            --release \
-            --no-default-features \
-            --target-dir "$TARGET_DIR" \
-            --bin cagents \
-            --bin cagents-ui \
-            --bin cagentsd
-    else
-        command -v zig >/dev/null 2>&1 || fail 'required command not found: zig'
-        # Build scripts run outside the repository and cannot rely on a mise shim
-        # rediscovering mise.toml from their working directory. Resolve the real Zig
-        # executable while this script still has the project context, then put that
-        # directory ahead of any version-manager shim.
-        ZIG_ENV=$(zig env) || fail 'could not inspect the Zig installation'
-        ZIG_EXECUTABLE=$(printf '%s\n' "$ZIG_ENV" | sed -n \
-            -e 's/^[[:space:]]*"zig_exe":[[:space:]]*"\([^"]*\)",\{0,1\}[[:space:]]*$/\1/p' \
-            -e 's/^[[:space:]]*\.zig_exe[[:space:]]*=[[:space:]]*"\([^"]*\)",\{0,1\}[[:space:]]*$/\1/p')
-        case $ZIG_EXECUTABLE in
-            /*) ;;
-            *) fail 'zig env did not report an absolute zig_exe' ;;
-        esac
-        [ -x "$ZIG_EXECUTABLE" ] || fail "zig executable is not runnable: $ZIG_EXECUTABLE"
-        PATH=${ZIG_EXECUTABLE%/*}:$PATH
-        export PATH
+    command -v zig >/dev/null 2>&1 || fail 'required command not found: zig'
+    # Native build scripts run outside the repository and cannot rely on a mise
+    # shim rediscovering mise.toml. Resolve the real executable up front.
+    ZIG_ENV=$(zig env) || fail 'could not inspect the Zig installation'
+    ZIG_EXECUTABLE=$(printf '%s\n' "$ZIG_ENV" | sed -n \
+        -e 's/^[[:space:]]*"zig_exe":[[:space:]]*"\([^"]*\)",\{0,1\}[[:space:]]*$/\1/p' \
+        -e 's/^[[:space:]]*\.zig_exe[[:space:]]*=[[:space:]]*"\([^"]*\)",\{0,1\}[[:space:]]*$/\1/p')
+    case $ZIG_EXECUTABLE in
+        /*) ;;
+        *) fail 'zig env did not report an absolute zig_exe' ;;
+    esac
+    [ -x "$ZIG_EXECUTABLE" ] || fail "zig executable is not runnable: $ZIG_EXECUTABLE"
+    PATH=${ZIG_EXECUTABLE%/*}:$PATH
+    export PATH
 
+    build_target() {
         cargo build \
             --manifest-path "$ROOT_DIR/Cargo.toml" \
             --locked \
             --release \
             --target-dir "$TARGET_DIR" \
-            --bin cagents \
-            --bin cagents-ui \
-            --bin cagentsd
+            "$@"
+    }
+
+    # Keep package feature sets disjoint. A single invocation would unify
+    # package features and compile/link both host and UI implementation graphs.
+    if [ "$VARIANT" = browserless ]; then
+        build_target --no-default-features --bin cagents
+        build_target --no-default-features --features host --bin cagentsd
+        build_target --no-default-features --features ui --bin cagents-ui
+    else
+        build_target --bin cagents
+        build_target --features host --bin cagentsd
+        build_target --features integrated-browser --bin cagents-ui
     fi
     BUILD_FINISHED=$(date +%s)
     BUILD_SECONDS=$((BUILD_FINISHED - BUILD_STARTED))
@@ -122,7 +120,7 @@ fi
 if [ "$VARIANT" = browserless ]; then
     RESOLVED_PACKAGE_IDS=$(
         cargo tree --manifest-path "$ROOT_DIR/Cargo.toml" --locked \
-            --no-default-features --edges normal --prefix none |
+            --no-default-features --features ui,host --edges normal --prefix none |
             sed 's/ (\*)$//' |
             LC_ALL=C sort -u |
             wc -l
@@ -130,7 +128,7 @@ if [ "$VARIANT" = browserless ]; then
 else
     RESOLVED_PACKAGE_IDS=$(
         cargo tree --manifest-path "$ROOT_DIR/Cargo.toml" --locked \
-            --edges normal --prefix none |
+            --features host,integrated-browser --edges normal --prefix none |
             sed 's/ (\*)$//' |
             LC_ALL=C sort -u |
             wc -l
