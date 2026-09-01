@@ -117,6 +117,10 @@ if [ "${CAGENTS_SKIP_BUILD:-0}" != 1 ]; then
     BUILD_SECONDS=$((BUILD_FINISHED - BUILD_STARTED))
 fi
 
+# Report the package's whole resolved graph: the union of the lanes built above.
+# `cargo tree` only reads Cargo.lock, so unifying the features here resolves
+# nothing that a build would compile. Never copy these feature sets into a
+# build command.
 if [ "$VARIANT" = browserless ]; then
     RESOLVED_PACKAGE_IDS=$(
         cargo tree --manifest-path "$ROOT_DIR/Cargo.toml" --locked \

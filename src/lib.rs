@@ -5,7 +5,7 @@ pub mod browser;
 #[cfg(feature = "ui")]
 pub mod capability;
 pub mod control;
-pub mod daemon;
+pub(crate) mod daemon;
 #[cfg(feature = "ui")]
 pub mod design;
 #[cfg(feature = "ui")]

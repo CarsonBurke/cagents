@@ -36,6 +36,7 @@
 ## Verify the changed surface
 
 - Run the narrow test target that covers the changed contract.
+- A bare `cargo test` runs only the shared CLI lane: the `ui` and `host` unit tests and every gated integration target are compiled out under the default `full` feature. Run `cargo test --locked --no-default-features --all-targets`, then the same with `--features host` and with `--features ui`, to cover the boundaries the change touches.
 - For UI changes, launch the actual native UI with the development runner and exercise the changed path. A successful compile alone is insufficient.
 - For browser or feature-boundary changes, verify both browserless and integrated lanes.
 - Use `cargo fmt --check` after Rust edits.

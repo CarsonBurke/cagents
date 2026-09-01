@@ -38,6 +38,16 @@ const PRIVATE_FILE_MODE: u32 = 0o600;
 const LEASE_CAPABLE_PROCESS_NAME: &str = "cagents-ui-v2";
 const LEGACY_PROCESS_NAME: &str = "cagents-ui";
 const LEASE_MARKER_FILE: &str = ".cagents-ui-lease-v1";
+// `full` names the product that ships the embedded browser: it claims that
+// package's application id, window class, and peer directory. A UI built with
+// `full` but without `integrated-browser` would claim them while running the
+// browserless code paths, so refuse the combination instead of shipping an
+// identity the binary cannot honour.
+#[cfg(all(feature = "ui", feature = "full", not(feature = "integrated-browser")))]
+compile_error!(
+    "a `full` UI must select `integrated-browser`; build the browserless UI with \
+     --no-default-features --features ui"
+);
 #[cfg(feature = "full")]
 const PEER_PACKAGE_DIRECTORY: &str = "/usr/libexec/cagents-browserless";
 #[cfg(not(feature = "full"))]

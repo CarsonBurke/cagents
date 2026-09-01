@@ -39,9 +39,9 @@ use crate::{instance, terminal_ipc::SOCKET_FILE_NAME};
 
 #[cfg(feature = "host")]
 const PRIVATE_DIRECTORY_MODE: u32 = 0o700;
-#[cfg(feature = "host")]
+#[cfg(any(feature = "host", test))]
 const PRIVATE_FILE_MODE: u32 = 0o600;
-const O_NOFOLLOW: c_int = 0o400000;
+const O_NOFOLLOW: c_int = libc::O_NOFOLLOW;
 const LOCK_EX: c_int = 2;
 const LOCK_NB: c_int = 4;
 const LOCK_UN: c_int = 8;
@@ -72,7 +72,6 @@ static WAKEUP_FD: AtomicI32 = AtomicI32::new(-1);
 
 unsafe extern "C" {
     fn flock(fd: c_int, operation: c_int) -> c_int;
-    fn geteuid() -> u32;
     #[cfg(feature = "host")]
     fn getsockopt(
         socket: c_int,
@@ -524,8 +523,8 @@ fn recover_stale_socket(path: &Path) -> Result<(), PlatformError> {
 }
 
 pub(crate) fn current_uid() -> u32 {
-    // SAFETY: geteuid has no preconditions.
-    unsafe { geteuid() }
+    // SAFETY: geteuid has no preconditions and no failure state.
+    unsafe { libc::geteuid() }
 }
 
 #[cfg(feature = "host")]
@@ -606,15 +605,19 @@ pub(crate) fn termination_requested() -> bool {
     TERMINATION_REQUESTED.load(Ordering::Acquire)
 }
 
-#[cfg(all(test, feature = "host"))]
+#[cfg(test)]
 mod tests {
+    #[cfg(feature = "host")]
     use std::os::unix::fs::symlink;
+    use std::os::unix::{fs::PermissionsExt, net::UnixListener};
 
     use tempfile::tempdir;
 
     use super::*;
+    #[cfg(feature = "host")]
     use crate::model::{HostIncarnation, HostSessionId};
 
+    #[cfg(feature = "host")]
     fn proof() -> HostSessionProof {
         HostSessionProof {
             host_session_id: HostSessionId::new("session"),
@@ -627,14 +630,17 @@ mod tests {
         RuntimePaths {
             socket: directory.join(SOCKET_FILE_NAME),
             lock: directory.join("cagentsd.lock"),
+            #[cfg(feature = "host")]
             directory,
         }
     }
 
+    #[cfg(feature = "host")]
     fn mode(path: &Path) -> u32 {
         fs::symlink_metadata(path).unwrap().permissions().mode() & 0o777
     }
 
+    #[cfg(feature = "host")]
     #[test]
     fn runtime_directory_symlink_fails_closed_without_touching_target() {
         let root = tempdir().unwrap();
@@ -657,6 +663,7 @@ mod tests {
         assert!(!target.join("cagentsd.lock").exists());
     }
 
+    #[cfg(feature = "host")]
     #[test]
     fn lock_symlink_fails_closed_without_touching_target() {
         let root = tempdir().unwrap();
@@ -674,6 +681,7 @@ mod tests {
         assert_eq!(mode(&target), 0o644);
     }
 
+    #[cfg(feature = "host")]
     #[test]
     fn new_runtime_and_lock_paths_are_private() {
         let root = tempdir().unwrap();
@@ -687,6 +695,7 @@ mod tests {
         drop(lease);
     }
 
+    #[cfg(feature = "host")]
     #[test]
     fn existing_runtime_and_lock_paths_are_made_private() {
         let root = tempdir().unwrap();
@@ -744,6 +753,7 @@ mod tests {
         assert!(!paths.socket.exists());
     }
 
+    #[cfg(feature = "host")]
     #[test]
     fn non_directory_runtime_path_and_mismatched_owners_are_rejected() {
         let root = tempdir().unwrap();
