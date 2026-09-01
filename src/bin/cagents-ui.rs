@@ -3,6 +3,14 @@ use tracing_subscriber::EnvFilter;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let _application_lease = cagents::instance::ApplicationLease::acquire_for_ui()?;
+    let (activation_tx, activation_rx) = async_channel::unbounded();
+    let activation = match cagents::instance::UiActivationListener::bind(activation_tx) {
+        Ok(listener) => Some((listener, activation_rx)),
+        Err(error) => {
+            eprintln!("cagents-ui: could not listen for later launches: {error}");
+            None
+        }
+    };
 
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -20,6 +28,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .min_width(900.0)
                 .min_height(600.0),
         );
-    cosmic::app::run::<cagents::app::Cagents>(settings, ())?;
+    let activation_rx = activation.as_ref().map(|(_, rx)| rx.clone());
+    let _activation = activation;
+    cosmic::app::run::<cagents::app::Cagents>(settings, activation_rx)?;
     Ok(())
 }

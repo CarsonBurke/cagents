@@ -132,15 +132,36 @@ jobs:
           root="$staging/cagents-${VERSION}"
           desktop-file-validate \
             "$root/share/applications/dev.cagents.Cagents.desktop"
+          grep -Fqx 'StartupWMClass=dev.cagents.Cagents' \
+            "$root/share/applications/dev.cagents.Cagents.desktop"
+          grep -Fqx 'TryExec=cagents' \
+            "$root/share/applications/dev.cagents.Cagents.desktop"
           appstreamcli validate --no-net --override=url-homepage-missing=info \
             "$root/share/metainfo/dev.cagents.Cagents.metainfo.xml"
           dpkg-deb --info "dist/cagents_${VERSION}_amd64.deb" >/dev/null
           dpkg-deb --info "dist/cagents-browserless_${VERSION}_amd64.deb" >/dev/null
+          debian_root="$staging/cagents-deb"
+          mkdir "$debian_root"
+          dpkg-deb --extract "dist/cagents_${VERSION}_amd64.deb" "$debian_root"
+          desktop-file-validate \
+            "$debian_root/usr/share/applications/dev.cagents.Cagents.desktop"
+          grep -Fqx 'Exec=/usr/bin/cagents ui' \
+            "$debian_root/usr/share/applications/dev.cagents.Cagents.desktop"
+          grep -Fqx 'TryExec=/usr/bin/cagents' \
+            "$debian_root/usr/share/applications/dev.cagents.Cagents.desktop"
+          grep -Fqx 'StartupWMClass=dev.cagents.Cagents' \
+            "$debian_root/usr/share/applications/dev.cagents.Cagents.desktop"
           browserless_root="$staging/cagents-browserless-deb"
           mkdir "$browserless_root"
           dpkg-deb --extract \
             "dist/cagents-browserless_${VERSION}_amd64.deb" "$browserless_root"
           desktop-file-validate \
+            "$browserless_root/usr/share/applications/dev.cagents.Cagents.Browserless.desktop"
+          grep -Fqx 'Exec=/usr/bin/cagents-browserless ui' \
+            "$browserless_root/usr/share/applications/dev.cagents.Cagents.Browserless.desktop"
+          grep -Fqx 'TryExec=/usr/bin/cagents-browserless' \
+            "$browserless_root/usr/share/applications/dev.cagents.Cagents.Browserless.desktop"
+          grep -Fqx 'StartupWMClass=dev.cagents.Cagents.Browserless' \
             "$browserless_root/usr/share/applications/dev.cagents.Cagents.Browserless.desktop"
           appstreamcli validate --no-net --override=url-homepage-missing=info \
             "$browserless_root/usr/share/metainfo/dev.cagents.Cagents.Browserless.metainfo.xml"

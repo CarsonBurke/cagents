@@ -174,7 +174,9 @@ strip --strip-unneeded "$BIN_DIR/cagents" "$BIN_DIR/cagents-ui" "$BIN_DIR/cagent
 sed \
     -e "s/^Name=cagents\$/Name=$PACKAGE_NAME/" \
     -e "s/^Exec=cagents ui\$/Exec=$COMMAND_NAME ui/" \
+    -e "s/^TryExec=cagents\$/TryExec=$COMMAND_NAME/" \
     -e "s/^Icon=dev\\.cagents\\.Cagents\$/Icon=$DESKTOP_ID/" \
+    -e "s/^StartupWMClass=dev\\.cagents\\.Cagents\$/StartupWMClass=$DESKTOP_ID/" \
     "$ROOT_DIR/packaging/dev.cagents.Cagents.desktop" \
     > "$SHARE_DIR/applications/$DESKTOP_ID.desktop"
 sed \
@@ -225,7 +227,12 @@ install -m 0755 "$BIN_DIR/cagents-ui" "$DEB_ROOT/usr/libexec/$PACKAGE_NAME/cagen
 install -m 0755 "$BIN_DIR/cagentsd" "$DEB_ROOT/usr/libexec/$PACKAGE_NAME/cagentsd"
 install -m 0644 "$BIN_DIR/.cagents-ui-lease-v1" "$DEB_ROOT/usr/libexec/$PACKAGE_NAME/.cagents-ui-lease-v1"
 ln -s "../libexec/$PACKAGE_NAME/cagents" "$DEB_ROOT/usr/bin/$COMMAND_NAME"
-install -m 0644 "$SHARE_DIR/applications/$DESKTOP_ID.desktop" "$DEB_ROOT/usr/share/applications/$DESKTOP_ID.desktop"
+sed \
+    -e "s|^Exec=.*|Exec=/usr/bin/$COMMAND_NAME ui|" \
+    -e "s|^TryExec=.*|TryExec=/usr/bin/$COMMAND_NAME|" \
+    "$SHARE_DIR/applications/$DESKTOP_ID.desktop" \
+    > "$DEB_ROOT/usr/share/applications/$DESKTOP_ID.desktop"
+chmod 0644 "$DEB_ROOT/usr/share/applications/$DESKTOP_ID.desktop"
 sed \
     -e "s|^Exec=.*|Exec=/usr/bin/$COMMAND_NAME daemon start|" \
     -e "s|^TryExec=.*|TryExec=/usr/bin/$COMMAND_NAME|" \

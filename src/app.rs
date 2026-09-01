@@ -519,6 +519,9 @@ struct TerminalWakeup {
 struct TerminalWakeSource(async_channel::Receiver<TerminalWakeup>);
 
 #[derive(Clone)]
+struct UiActivationSource(async_channel::Receiver<instance::UiActivation>);
+
+#[derive(Clone)]
 struct SessionHealthSource(async_channel::Receiver<SessionSaveHealthEvent>);
 
 impl PartialEq for TerminalWakeSource {
@@ -532,6 +535,20 @@ impl Eq for TerminalWakeSource {}
 impl std::hash::Hash for TerminalWakeSource {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
         std::hash::Hash::hash(&"cagents-terminal-wakes", state);
+    }
+}
+
+impl PartialEq for UiActivationSource {
+    fn eq(&self, _other: &Self) -> bool {
+        true
+    }
+}
+
+impl Eq for UiActivationSource {}
+
+impl std::hash::Hash for UiActivationSource {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        std::hash::Hash::hash(&"cagents-ui-activation", state);
     }
 }
 
@@ -586,6 +603,21 @@ fn terminal_wake_stream(
     Box::pin(cosmic::iced::futures::stream::unfold(
         source.0.clone(),
         |receiver| async move { receiver.recv().await.ok().map(|wake| (wake, receiver)) },
+    ))
+}
+
+fn ui_activation_stream(
+    source: &UiActivationSource,
+) -> Pin<Box<dyn cosmic::iced::futures::Stream<Item = instance::UiActivation> + Send + 'static>> {
+    Box::pin(cosmic::iced::futures::stream::unfold(
+        source.0.clone(),
+        |receiver| async move {
+            receiver
+                .recv()
+                .await
+                .ok()
+                .map(|activation| (activation, receiver))
+        },
     ))
 }
 
@@ -1718,6 +1750,9 @@ pub enum Message {
     BrowserFactoryReady(Result<BrowserFactoryBinding, String>),
     WindowScaleFactorChanged(f32),
     WindowResized(f32),
+    ActivateUi {
+        token: Option<String>,
+    },
     OpenBrowser(Url),
     ExternalLinkOpened(Result<(), String>),
     NewBrowser,
@@ -2146,6 +2181,7 @@ pub struct Cagents {
     lifecycle_sweep_generation: u64,
     terminal_wake_tx: async_channel::Sender<TerminalWakeup>,
     terminal_wake_rx: async_channel::Receiver<TerminalWakeup>,
+    activation_rx: async_channel::Receiver<instance::UiActivation>,
     session: Option<SessionRuntime>,
     save_health: Option<SaveHealthState>,
     settings: AppSettings,
@@ -5368,6 +5404,12 @@ impl Cagents {
         })
     }
 
+    fn activate_main_window(&self, token: Option<String>) -> Task<Message> {
+        iced::Task::done(cosmic::Action::Cosmic(cosmic::app::Action::Activate(
+            token.unwrap_or_default(),
+        )))
+    }
+
     fn begin_dirty_close(
         &mut self,
         intent: DirtyCloseIntent,
@@ -5699,7 +5741,7 @@ impl Cagents {
 
 impl Application for Cagents {
     type Executor = cosmic::executor::Default;
-    type Flags = ();
+    type Flags = Option<async_channel::Receiver<instance::UiActivation>>;
     type Message = Message;
 
     const APP_ID: &'static str = instance::APPLICATION_ID;
@@ -5714,7 +5756,7 @@ impl Application for Cagents {
         Some(Message::WindowCloseRequested(id))
     }
 
-    fn init(core: Core, (): ()) -> (Self, Task<Message>) {
+    fn init(core: Core, activation_rx: Self::Flags) -> (Self, Task<Message>) {
         let (
             durable,
             session,
@@ -5754,6 +5796,7 @@ impl Application for Cagents {
             .collect();
         let workspace = Self::rebuild_workspace(&durable);
         let (terminal_wake_tx, terminal_wake_rx) = async_channel::unbounded();
+        let activation_rx = activation_rx.unwrap_or_else(|| async_channel::unbounded().1);
         let window_scale_factor = core.scale_factor().max(0.01);
         let window_headerbar_enabled = core.window.show_headerbar;
         let settings_draft = SettingsDraft::from_settings(&settings);
@@ -5774,6 +5817,7 @@ impl Application for Cagents {
             next_lsp_document: 0,
             terminal_wake_tx,
             terminal_wake_rx,
+            activation_rx,
             session,
             save_health,
             settings,
@@ -6635,6 +6679,7 @@ impl Application for Cagents {
                 }
                 self.sync_context_overlay_state()
             }
+            Message::ActivateUi { token } => self.activate_main_window(token),
             Message::OpenBrowser(url) => {
                 self.show_workspace_for_action();
                 self.add_browser(url)
@@ -7171,6 +7216,13 @@ impl Application for Cagents {
             .map(|wake| Message::TerminalWake {
                 card: wake.card,
                 generation: wake.generation,
+            }),
+            Subscription::run_with(
+                UiActivationSource(self.activation_rx.clone()),
+                ui_activation_stream,
+            )
+            .map(|activation| Message::ActivateUi {
+                token: activation.token,
             }),
             event::listen_with(|event, _status, event_window| match event {
                 iced::Event::Keyboard(event) => Some(Message::KeyEvent(event)),
@@ -10752,6 +10804,7 @@ mod tests {
             lifecycle_sweep_generation: 0,
             terminal_wake_tx,
             terminal_wake_rx,
+            activation_rx: async_channel::unbounded().1,
             session: None,
             save_health: None,
             settings_draft: SettingsDraft::from_settings(&settings),
@@ -10788,6 +10841,15 @@ mod tests {
             settings_feedback: None,
             status: None,
         }
+    }
+
+    #[test]
+    fn a_later_launch_can_request_focus_without_a_mapped_window() {
+        let mut app = context_inspector_test_app(false);
+        let _ = app.update(Message::ActivateUi { token: None });
+        let _ = app.update(Message::ActivateUi {
+            token: Some("wayland-token".into()),
+        });
     }
 
     #[test]

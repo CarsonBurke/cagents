@@ -116,7 +116,7 @@ rm -rf "$download_dir"
 
 SHA-256 confirms that the files match the release manifest; it does not protect against compromise of the GitHub repository or release itself. Inspect the tag, release, and installer according to your trust requirements.
 
-The installer never uses `sudo` and refuses to run as root. It installs an immutable version below `${XDG_DATA_HOME:-$HOME/.local/share}/cagents-install/`, switches the `current` symlink atomically, creates desktop metadata links under `${XDG_DATA_HOME:-$HOME/.local/share}`, and exposes only `$HOME/.local/bin/cagents` on `PATH`. Ensure `$HOME/.local/bin` is in `PATH`.
+The installer never uses `sudo` and refuses to run as root. It installs an immutable version below `${XDG_DATA_HOME:-$HOME/.local/share}/cagents-install/`, switches the `current` symlink atomically, creates desktop metadata links under `${XDG_DATA_HOME:-$HOME/.local/share}`, and exposes only `$HOME/.local/bin/cagents` on `PATH`. The application menu entry uses that installed binary and icon by absolute path, so launching from the desktop does not depend on `PATH`. Terminal use of the `cagents` command still requires `$HOME/.local/bin` on `PATH`.
 
 ### Convenience curl install
 

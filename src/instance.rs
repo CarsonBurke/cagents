@@ -1,13 +1,18 @@
 use std::{
     env,
     fs::{self, File, OpenOptions},
-    io::{self, Write},
+    io::{self, BufRead, BufReader, Read, Write},
     os::{
         fd::AsRawFd,
-        unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt},
+        unix::{
+            fs::{FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt},
+            net::{UnixListener, UnixStream},
+        },
     },
     path::{Path, PathBuf},
     process,
+    thread::{self, JoinHandle},
+    time::Duration,
 };
 
 use directories::ProjectDirs;
@@ -18,6 +23,13 @@ const APPLICATION_LOCK_FILE: &str = if IS_DEVELOPMENT {
 } else {
     "cagents-ui.lock"
 };
+const ACTIVATION_SOCKET_FILE: &str = if IS_DEVELOPMENT {
+    "cagents-development-ui.activate"
+} else {
+    "cagents-ui.activate"
+};
+const ACTIVATION_IO_TIMEOUT: Duration = Duration::from_secs(1);
+const MAX_ACTIVATION_LINE_BYTES: usize = 4096;
 const PRIVATE_FILE_MODE: u32 = 0o600;
 const LEASE_CAPABLE_PROCESS_NAME: &str = "cagents-ui-v2";
 const LEGACY_PROCESS_NAME: &str = "cagents-ui";
@@ -126,6 +138,227 @@ impl ApplicationLease {
         Ok(Self { _lock: lock })
     }
 }
+
+/// A later `cagents ui` invocation asking the running window to come forward.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UiActivation {
+    pub token: Option<String>,
+}
+
+/// Owns the per-instance activation socket used by `cagents ui` to focus an
+/// already-running window instead of failing the exclusive session lease.
+pub struct UiActivationListener {
+    socket_path: PathBuf,
+    thread: Option<JoinHandle<()>>,
+}
+
+impl UiActivationListener {
+    pub fn bind(events: async_channel::Sender<UiActivation>) -> io::Result<Self> {
+        let runtime_directory = env::var_os("XDG_RUNTIME_DIR")
+            .map(PathBuf::from)
+            .filter(|path| path.is_absolute())
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::NotFound,
+                    "XDG_RUNTIME_DIR is not set to an absolute path",
+                )
+            })?;
+        Self::bind_in(&runtime_directory, events)
+    }
+
+    fn bind_in(
+        runtime_directory: &Path,
+        events: async_channel::Sender<UiActivation>,
+    ) -> io::Result<Self> {
+        require_owned_runtime_directory(runtime_directory)?;
+
+        let socket_path = runtime_directory.join(ACTIVATION_SOCKET_FILE);
+        prepare_activation_socket_path(&socket_path)?;
+        let listener = UnixListener::bind(&socket_path)?;
+        // SAFETY: fchmod receives the bound listener's live descriptor.
+        if unsafe { libc::fchmod(listener.as_raw_fd(), PRIVATE_FILE_MODE) } != 0 {
+            let error = io::Error::last_os_error();
+            let _ = fs::remove_file(&socket_path);
+            return Err(error);
+        }
+        let thread = match thread::Builder::new()
+            .name("cagents-ui-activate".into())
+            .spawn(move || serve_activation_socket(listener, events))
+        {
+            Ok(thread) => thread,
+            Err(error) => {
+                let _ = fs::remove_file(&socket_path);
+                return Err(error);
+            }
+        };
+        Ok(Self {
+            socket_path,
+            thread: Some(thread),
+        })
+    }
+}
+
+impl Drop for UiActivationListener {
+    fn drop(&mut self) {
+        let woke = UnixStream::connect(&self.socket_path)
+            .and_then(|mut stream| {
+                stream.set_write_timeout(Some(ACTIVATION_IO_TIMEOUT))?;
+                writeln!(stream, "shutdown")
+            })
+            .is_ok();
+        if let Some(thread) = self.thread.take() {
+            if woke {
+                let _ = thread.join();
+            }
+        }
+        let _ = fs::remove_file(&self.socket_path);
+    }
+}
+
+/// Asks a running UI to focus its window. Returns `true` when that instance
+/// acknowledged the request.
+pub fn activate_running_ui() -> io::Result<bool> {
+    let Some(runtime_directory) = env::var_os("XDG_RUNTIME_DIR")
+        .map(PathBuf::from)
+        .filter(|path| path.is_absolute())
+    else {
+        return Ok(false);
+    };
+    activate_running_ui_in(&runtime_directory)
+}
+
+fn activate_running_ui_in(runtime_directory: &Path) -> io::Result<bool> {
+    require_owned_runtime_directory(runtime_directory)?;
+    let socket_path = runtime_directory.join(ACTIVATION_SOCKET_FILE);
+    let mut stream = match UnixStream::connect(&socket_path) {
+        Ok(stream) => stream,
+        Err(error)
+            if matches!(
+                error.kind(),
+                io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused
+            ) =>
+        {
+            return Ok(false);
+        }
+        Err(error) => return Err(error),
+    };
+    stream.set_write_timeout(Some(ACTIVATION_IO_TIMEOUT))?;
+    stream.set_read_timeout(Some(ACTIVATION_IO_TIMEOUT))?;
+    let token = env::var("XDG_ACTIVATION_TOKEN").ok().filter(|token| {
+        !token.is_empty()
+            && !token.contains('\n')
+            && !token.contains('\r')
+            && token.len() < MAX_ACTIVATION_LINE_BYTES
+    });
+    writeln!(
+        stream,
+        "{}",
+        match token.as_deref() {
+            Some(token) => format!("activate {token}"),
+            None => "activate".to_owned(),
+        }
+    )?;
+    Ok(read_capped_line(&stream)? == "ok")
+}
+
+fn require_owned_runtime_directory(runtime_directory: &Path) -> io::Result<()> {
+    let metadata = fs::symlink_metadata(runtime_directory)?;
+    if !metadata.is_dir() || metadata.uid() != current_uid() {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "runtime path is not an owned directory",
+        ));
+    }
+    Ok(())
+}
+
+fn prepare_activation_socket_path(path: &Path) -> io::Result<()> {
+    match fs::symlink_metadata(path) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+        Ok(metadata) => {
+            if metadata.file_type().is_symlink() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "activation socket path is a symlink",
+                ));
+            }
+            if metadata.file_type().is_socket() {
+                fs::remove_file(path)
+            } else {
+                Err(io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    "activation path exists and is not a socket",
+                ))
+            }
+        }
+    }
+}
+
+fn serve_activation_socket(listener: UnixListener, events: async_channel::Sender<UiActivation>) {
+    loop {
+        let Ok((stream, _)) = listener.accept() else {
+            break;
+        };
+        let _ = stream.set_read_timeout(Some(ACTIVATION_IO_TIMEOUT));
+        let _ = stream.set_write_timeout(Some(ACTIVATION_IO_TIMEOUT));
+        match read_activation_request(&stream) {
+            Ok(ActivationRequest::Shutdown) => break,
+            Ok(ActivationRequest::Activate(token)) => {
+                let _ = writeln!(&stream, "ok");
+                if events.send_blocking(UiActivation { token }).is_err() {
+                    break;
+                }
+            }
+            Err(_) => {
+                let _ = writeln!(&stream, "error");
+            }
+        }
+    }
+}
+
+enum ActivationRequest {
+    Activate(Option<String>),
+    Shutdown,
+}
+
+fn read_activation_request(stream: &UnixStream) -> io::Result<ActivationRequest> {
+    parse_activation_request(&read_capped_line(stream)?)
+}
+
+fn read_capped_line(stream: &UnixStream) -> io::Result<String> {
+    let mut line = String::new();
+    let read =
+        BufReader::new(stream.take(MAX_ACTIVATION_LINE_BYTES as u64 + 1)).read_line(&mut line)?;
+    if read == 0 || line.len() > MAX_ACTIVATION_LINE_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "activation request was empty or too large",
+        ));
+    }
+    if line.ends_with('\n') {
+        line.pop();
+        if line.ends_with('\r') {
+            line.pop();
+        }
+    }
+    Ok(line)
+}
+
+fn parse_activation_request(line: &str) -> io::Result<ActivationRequest> {
+    match line.split_once(' ') {
+        None if line == "activate" => Ok(ActivationRequest::Activate(None)),
+        None if line == "shutdown" => Ok(ActivationRequest::Shutdown),
+        Some(("activate", token)) if !token.is_empty() => {
+            Ok(ActivationRequest::Activate(Some(token.to_owned())))
+        }
+        _ => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "activation request was not recognized",
+        )),
+    }
+}
+
 fn mark_lease_capable_process() -> io::Result<()> {
     fs::write("/proc/self/comm", format!("{LEASE_CAPABLE_PROCESS_NAME}\n"))
 }
@@ -276,6 +509,7 @@ mod tests {
                 STORAGE_NAME,
                 RUNTIME_SUBDIRECTORY,
                 APPLICATION_LOCK_FILE,
+                ACTIVATION_SOCKET_FILE,
             ),
             (
                 "development",
@@ -284,8 +518,68 @@ mod tests {
                 "cagents-development",
                 "cagents-development",
                 "cagents-development-ui.lock",
+                "cagents-development-ui.activate",
             )
         );
+    }
+
+    #[test]
+    fn activation_request_parses_focus_tokens_and_rejects_noise() {
+        assert!(matches!(
+            parse_activation_request("activate").unwrap(),
+            ActivationRequest::Activate(None)
+        ));
+        assert!(matches!(
+            parse_activation_request("activate wayland-token").unwrap(),
+            ActivationRequest::Activate(Some(token)) if token == "wayland-token"
+        ));
+        assert!(matches!(
+            parse_activation_request("shutdown").unwrap(),
+            ActivationRequest::Shutdown
+        ));
+        assert!(parse_activation_request("open").is_err());
+        assert!(parse_activation_request("activate ").is_err());
+    }
+
+    #[test]
+    fn activation_socket_focuses_a_running_listener() {
+        let runtime = tempdir().unwrap();
+        let (sender, receiver) = async_channel::unbounded();
+        let _listener = UiActivationListener::bind_in(runtime.path(), sender).unwrap();
+
+        assert!(activate_running_ui_in(runtime.path()).unwrap());
+        let activation = receiver.recv_blocking().unwrap();
+        assert_eq!(activation.token, None);
+
+        let mut stream = UnixStream::connect(runtime.path().join(ACTIVATION_SOCKET_FILE)).unwrap();
+        writeln!(stream, "activate wayland-token").unwrap();
+        assert_eq!(read_capped_line(&stream).unwrap(), "ok");
+        let activation = receiver.recv_blocking().unwrap();
+        assert_eq!(activation.token.as_deref(), Some("wayland-token"));
+    }
+
+    #[test]
+    fn activation_replaces_a_stale_socket_and_rejects_a_symlink() {
+        let runtime = tempdir().unwrap();
+        let leftover = UnixListener::bind(runtime.path().join(ACTIVATION_SOCKET_FILE)).unwrap();
+        drop(leftover);
+        let (sender, receiver) = async_channel::unbounded();
+        let _listener = UiActivationListener::bind_in(runtime.path(), sender).unwrap();
+        assert!(activate_running_ui_in(runtime.path()).unwrap());
+        assert_eq!(receiver.recv_blocking().unwrap().token, None);
+
+        let runtime = tempdir().unwrap();
+        let target = runtime.path().join("target");
+        File::create(&target).unwrap();
+        symlink(&target, runtime.path().join(ACTIVATION_SOCKET_FILE)).unwrap();
+        let (sender, _receiver) = async_channel::unbounded();
+        assert!(UiActivationListener::bind_in(runtime.path(), sender).is_err());
+    }
+
+    #[test]
+    fn activation_is_absent_when_no_ui_is_listening() {
+        let runtime = tempdir().unwrap();
+        assert!(!activate_running_ui_in(runtime.path()).unwrap());
     }
 
     #[cfg(not(any(debug_assertions, feature = "development")))]
@@ -304,6 +598,7 @@ mod tests {
                 STORAGE_NAME,
                 RUNTIME_SUBDIRECTORY,
                 APPLICATION_LOCK_FILE,
+                ACTIVATION_SOCKET_FILE,
             ),
             (
                 "production",
@@ -312,6 +607,7 @@ mod tests {
                 "cagents",
                 "cagents",
                 "cagents-ui.lock",
+                "cagents-ui.activate",
             )
         );
     }
