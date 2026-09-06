@@ -1,5 +1,5 @@
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, HashMap},
     ffi::{CStr, CString},
     fmt,
     mem::MaybeUninit,
@@ -531,6 +531,10 @@ pub struct WorkspaceState {
     pub existence: Existence,
     pub cards: Vec<CardState>,
     pub focused: Option<CardId>,
+    #[serde(default)]
+    pub active_worktree: Option<PathBuf>,
+    #[serde(default)]
+    pub worktree_focus: HashMap<PathBuf, CardId>,
 }
 
 impl Default for WorkspaceState {
@@ -542,6 +546,8 @@ impl Default for WorkspaceState {
             existence: Existence::Open,
             cards: Vec::new(),
             focused: None,
+            active_worktree: None,
+            worktree_focus: HashMap::new(),
         }
     }
 }
@@ -569,6 +575,23 @@ impl WorkspaceState {
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn legacy_workspace_descriptor_defaults_navigation_context() {
+        let id = WorkspaceId::new();
+        let descriptor = serde_json::json!({
+            "schema_version": 1,
+            "id": id,
+            "generation": 0,
+            "existence": "open",
+            "cards": [],
+            "focused": null,
+        });
+        let restored: WorkspaceState = serde_json::from_value(descriptor).unwrap();
+        assert_eq!(restored.id, id);
+        assert_eq!(restored.active_worktree, None);
+        assert!(restored.worktree_focus.is_empty());
+    }
 
     #[test]
     fn passwd_shell_wins_when_environment_is_absent_or_stale() {

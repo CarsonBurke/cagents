@@ -21,6 +21,8 @@ pub mod host;
 pub mod inspector;
 pub mod instance;
 #[cfg(feature = "ui")]
+pub mod interaction;
+#[cfg(feature = "ui")]
 pub mod lifecycle;
 pub mod location;
 #[cfg(feature = "ui")]

@@ -205,6 +205,23 @@ Launch **cagents** from the desktop application menu, or launch it from a termin
 cagents ui
 ```
 
+- Open repositories from the **Projects** pane on the left. Select a worktree to
+  restore its terminals; selecting it again does not create another terminal.
+  **New terminal** (`Ctrl+T`) starts in that worktree and inserts immediately to
+  the right of its focused column.
+- The right-hand **Source control** pane follows the selected worktree. It holds
+  files, diffs, staging, commits, push/publish, history, and pull-request actions.
+  Worktree rows show matching pull requests and their reported CI status.
+- Switching worktrees hides their columns without closing hosted shells or
+  discarding editor buffers. Worktree selection and remembered column focus
+  survive restarts, including when a shared browser column has focus. Application
+  close checks unsaved editors in every worktree, not only the visible one.
+  Legacy columns without a registered worktree remain accessible across worktrees.
+- Open **Settings** from the lower-left gear. The modal dims the workspace and
+  preserves input focus until dismissed. Runtime diagnostics are available only
+  through the debug-inspector button in development builds, not the production
+  Git pane.
+
 The control CLI includes human-readable output by default and stable JSON envelopes for automation:
 
 ```sh
@@ -256,8 +273,8 @@ max_hot_cards = 6
 hibernation_delay_ms = 30000
 terminal_font_size = 14.0
 terminal_font_family = ""
-sidebar_width = 280.0
-inspector_width = 360.0
+sidebar_width = 260.0
+inspector_width = 380.0
 default_column_fraction = 0.72
 terminal_scrollback_lines = 10000
 link_open_destination = "integrated_browser"
@@ -279,8 +296,8 @@ next_column = ["Alt+W", "Alt+Right"]
 | `terminal_font_size` | float | `14.0` | finite values from `8.0` through `40.0`, inclusive |
 | `terminal_font_family` | string | `""` | empty for the system monospace font, or a non-whitespace family name up to 128 bytes. The family must be fixed-pitch; one whose glyph widths differ falls back to the system monospace font, because the grid is a single pitch |
 | `terminal_scrollback_lines` | non-negative integer | `10000` | `0` through `1000000` lines for newly started terminals |
-| `sidebar_width` | float | `280.0` | finite values from `240.0` through `400.0`, inclusive |
-| `inspector_width` | float | `360.0` | finite values from `320.0` through `420.0`, inclusive |
+| `sidebar_width` | float | `260.0` | finite values from `220.0` through `420.0`, inclusive |
+| `inspector_width` | float | `380.0` | finite values from `320.0` through `480.0`, inclusive |
 | `default_column_fraction` | float | `0.72` | finite values from `0.25` through `1.0`, inclusive |
 | `link_open_destination` | string | `"integrated_browser"` | `"integrated_browser"` or `"system_default"` |
 | `link_open_gesture` | string | `"control_click"` | `"control_click"` or `"control_shift_click"` |

@@ -1,6 +1,10 @@
 #![cfg(feature = "ui")]
 
-use std::{collections::BTreeMap, path::PathBuf, sync::Arc};
+use std::{
+    collections::{BTreeMap, HashMap},
+    path::PathBuf,
+    sync::Arc,
+};
 
 use cagents::{
     model::{
@@ -80,6 +84,8 @@ impl RestoreFixture {
             id: WorkspaceId::new(),
             generation: 0,
             existence: Existence::Open,
+            active_worktree: Some(worktree_path.clone()),
+            worktree_focus: HashMap::from([(worktree_path.clone(), terminal_card_id)]),
             cards: vec![
                 CardState {
                     id: terminal_card_id,
@@ -211,6 +217,8 @@ fn clean_shutdown_reopen_restores_workspace_catalog_and_live_host_proof() {
     assert_eq!(restored.id, fixture.workspace.id);
     assert_eq!(restored.generation, 1);
     assert_eq!(restored.focused, Some(fixture.browser_card_id));
+    assert_eq!(restored.active_worktree, fixture.workspace.active_worktree);
+    assert_eq!(restored.worktree_focus, fixture.workspace.worktree_focus);
     assert_eq!(
         restored
             .cards
@@ -330,4 +338,47 @@ fn changed_boot_reopens_terminal_as_relaunchable_not_live() {
     assert!(!terminal.continuity.can_resume_live(&fixture.proof));
 
     reopened.shutdown().unwrap();
+}
+
+#[test]
+fn browser_focus_and_navigation_only_snapshots_survive_restart_without_cards() {
+    let directory = tempdir().unwrap();
+    let database_path = directory.path().join("navigation.sqlite3");
+    let fixture = RestoreFixture::new();
+    fixture.persist(&database_path);
+
+    let (mut runtime, restored) =
+        SessionRuntime::open(&database_path, fixture.boot_id.clone()).unwrap();
+    let mut state = restored.unwrap();
+    assert_eq!(state.focused, Some(fixture.browser_card_id));
+    assert_eq!(state.active_worktree, Some(fixture.worktree.path.clone()));
+    assert_eq!(state.worktree_focus, fixture.workspace.worktree_focus);
+    state.active_worktree = Some(PathBuf::from("/srv/empty-worktree"));
+    state
+        .worktree_focus
+        .insert(fixture.worktree.path.clone(), fixture.repository_card_id);
+    runtime.snapshot(Arc::new(state.clone()));
+    runtime.shutdown();
+    assert_eq!(runtime.last_error(), None);
+
+    let (mut runtime, restored) =
+        SessionRuntime::open(&database_path, fixture.boot_id.clone()).unwrap();
+    let mut restored = restored.unwrap();
+    assert_eq!(restored.focused, state.focused);
+    assert_eq!(restored.active_worktree, state.active_worktree);
+    assert_eq!(restored.worktree_focus, state.worktree_focus);
+    restored.cards.clear();
+    restored.focused = None;
+    restored.worktree_focus.clear();
+    runtime.snapshot(Arc::new(restored));
+    runtime.shutdown();
+    assert_eq!(runtime.last_error(), None);
+
+    let (mut runtime, restored) = SessionRuntime::open(&database_path, fixture.boot_id).unwrap();
+    let restored = restored.unwrap();
+    assert_eq!(restored.focused, None);
+    assert_eq!(restored.active_worktree, state.active_worktree);
+    assert!(restored.worktree_focus.is_empty());
+    assert!(restored.cards.iter().all(|card| !card.existence.is_open()));
+    runtime.shutdown();
 }

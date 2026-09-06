@@ -204,9 +204,9 @@ pub struct WorkspaceConfig {
 impl Default for WorkspaceConfig {
     fn default() -> Self {
         Self {
-            gap: 0.0,
-            leading_padding: 12.0,
-            trailing_padding: 12.0,
+            gap: 4.0,
+            leading_padding: 0.0,
+            trailing_padding: 4.0,
             overscan: 360.0,
             reveal_margin: 12.0,
             line_scroll_pixels: 48.0,
@@ -286,19 +286,10 @@ impl StripGeometry {
         } else {
             cursor + config.trailing_padding
         };
-        let total_width = if !geometry.is_empty() && total_width < viewport_width {
-            let centering_offset = (viewport_width - total_width) / 2.0;
-            for card in &mut geometry {
-                card.start += centering_offset;
-                card.end += centering_offset;
-            }
-            for end in &mut prefix_ends {
-                *end += centering_offset;
-            }
-            viewport_width
-        } else {
-            total_width
-        };
+        // An underfilled strip stays anchored to navigation. Centering the
+        // entire strip introduces a dead leading band and moves existing
+        // columns whenever another column is inserted or the viewport grows.
+        let total_width = total_width.max(viewport_width);
 
         Self {
             cards: geometry,
@@ -1415,7 +1406,7 @@ mod tests {
                     assert_eq!(cards[2].start, cards[1].end + workspace.config.gap);
                     assert_eq!(
                         workspace.geometry().total_width(),
-                        cards[2].end + workspace.config.trailing_padding
+                        (cards[2].end + workspace.config.trailing_padding).max(800.0)
                     );
                 }
             }
@@ -1462,16 +1453,32 @@ mod tests {
     }
 
     #[test]
-    fn underfilled_strip_centers_columns_without_changing_their_widths() {
-        let workspace = workspace_with_widths(&[CardWidth::Fraction(0.7)], 1_000.0);
-        let geometry = workspace.geometry();
-        let card = geometry.card_at(0).unwrap();
+    fn underfilled_strip_stays_leading_aligned_through_resize_and_insertion() {
+        let mut workspace = workspace_with_widths(&[CardWidth::Fraction(0.35)], 1_000.0);
+        let first = workspace.focused().unwrap();
+        for width in [1_000.0, 1_440.0, 800.0] {
+            workspace.resize_viewport(width);
+            let geometry = workspace.geometry();
+            let card = geometry.card(first).unwrap();
+            assert_eq!(card.start, workspace.config.leading_padding);
+            assert_eq!(geometry.max_offset(width), 0.0);
+            assert_eq!(workspace.projection(width).mounted[0].start, card.start);
+        }
 
-        assert_eq!(card.width(), 700.0);
-        assert_eq!(card.start, 150.0);
-        assert_eq!(card.end, 850.0);
-        assert_eq!(geometry.total_width(), 1_000.0);
-        assert_eq!(geometry.max_offset(1_000.0), 0.0);
+        workspace.resize_viewport(1_440.0);
+        workspace
+            .add_card(card(CardWidth::Fraction(0.35)), 1, false)
+            .unwrap();
+        let geometry = workspace.geometry();
+        assert_eq!(
+            geometry.card(first).unwrap().start,
+            workspace.config.leading_padding
+        );
+        assert_eq!(geometry.max_offset(workspace.viewport_width()), 0.0);
+        assert_eq!(
+            geometry.card_at(1).unwrap().start,
+            geometry.card(first).unwrap().end + workspace.config.gap,
+        );
     }
 
     #[test]

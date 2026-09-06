@@ -302,6 +302,8 @@ impl SessionRuntime {
     /// The snapshot is shared, not copied: the writer thread reads it through
     /// the `Arc` and never mutates it, which is why the storage generations it
     /// writes against live in the writer thread rather than in the snapshot.
+    /// Navigation-only changes are complete snapshots too: card fingerprints
+    /// may skip card writes, but must never skip the workspace metadata update.
     pub fn snapshot(&self, state: Arc<WorkspaceState>) {
         let (lock, changed) = &*self.queue;
         if let Ok(mut queue) = lock.lock()
@@ -1005,6 +1007,8 @@ mod tests {
             generation: 0,
             existence: Existence::Open,
             focused: None,
+            active_worktree: None,
+            worktree_focus: HashMap::new(),
             cards: vec![CardState {
                 id: CardId::new(),
                 generation: 0,
