@@ -5806,6 +5806,11 @@ impl Application for Cagents {
             self.deferred_navigation.push_back(message);
             return Task::none();
         }
+        if !self.workspace.camera().is_animating() && self.inspector_transition.is_none() {
+            // A new animation starts from its first frame, not from time spent
+            // idle while the window-frame subscription was disconnected.
+            self.frame_clock.reset();
+        }
         let task = match message {
             Message::NewTerminal => {
                 self.show_workspace_for_action();
@@ -9144,6 +9149,35 @@ mod tests {
         assert!(app.inspector.is_none());
         assert!(app.inspector_transition.is_none());
         assert!(app.deferred_navigation.is_empty());
+    }
+
+    #[test]
+    fn a_new_camera_animation_does_not_consume_the_previous_idle_interval() {
+        let mut app = context_inspector_test_app(false);
+        let cards = vec![
+            terminal_card_state(),
+            terminal_card_state(),
+            terminal_card_state(),
+        ];
+        let target = cards[2].id;
+        app.durable = Arc::new(WorkspaceState {
+            focused: Some(cards[0].id),
+            cards,
+            ..WorkspaceState::default()
+        });
+        app.workspace = Cagents::rebuild_workspace(&app.durable);
+        app.workspace.resize_viewport(600.0);
+        app.workspace.native_scroll(0.0, 600.0);
+        let previous_frame = Instant::now();
+        let _ = app.frame_clock.elapsed(previous_frame);
+
+        let _ = app.update(Message::FocusCard(target));
+        let first_frame = previous_frame + Duration::from_secs(2);
+        let _ = app.update(Message::Frame(first_frame));
+        assert_eq!(app.workspace.camera().offset(), 0.0);
+        let _ = app.update(Message::Frame(first_frame + Duration::from_millis(16)));
+        assert!(app.workspace.camera().offset() > 0.0);
+        assert!(app.workspace.camera().offset() < app.workspace.camera().target() / 2.0);
     }
 
     #[test]
