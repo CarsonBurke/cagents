@@ -450,8 +450,23 @@ struct V2TomlSettings {
     link_open_destination: LinkOpenDestination,
     #[serde(default)]
     link_open_gesture: LinkOpenGesture,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_v2_keyboard_shortcuts")]
     keyboard_shortcuts: KeyboardShortcuts,
+}
+
+fn deserialize_v2_keyboard_shortcuts<'de, D>(deserializer: D) -> Result<KeyboardShortcuts, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let mut shortcuts = toml::Table::deserialize(deserializer)?;
+    for (_, binding) in &mut shortcuts {
+        if let toml::Value::String(chord) = binding {
+            *binding = toml::Value::Array(vec![toml::Value::String(std::mem::take(chord))]);
+        }
+    }
+    toml::Value::Table(shortcuts)
+        .try_into()
+        .map_err(serde::de::Error::custom)
 }
 
 #[derive(Debug, Deserialize)]
@@ -1075,6 +1090,36 @@ mod tests {
         assert_eq!(migrated.terminal_font_size, previous.terminal_font_size);
         assert_eq!(migrated.inspector_width, design::INSPECTOR_DEFAULT_WIDTH);
         assert_eq!(migrated.language_servers, default_language_servers());
+    }
+
+    #[test]
+    fn version_two_scalar_shortcuts_migrate_without_losing_custom_bindings() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("settings.toml");
+        fs::write(
+            &path,
+            r#"schema_version = 2
+max_hot_cards = 6
+hibernation_delay_ms = 30000
+terminal_font_size = 14.0
+sidebar_width = 280.0
+default_column_fraction = 0.72
+[keyboard_shortcuts]
+new_terminal = "Ctrl+Shift+T"
+previous_column = "Alt+Q"
+next_column = ["Alt+W", "Alt+Right"]
+"#,
+        )
+        .unwrap();
+        let migrated = load(&path).unwrap();
+        assert_eq!(migrated.keyboard_shortcuts.new_terminal, ["Ctrl+Shift+T"]);
+        assert_eq!(migrated.keyboard_shortcuts.previous_column, ["Alt+Q"]);
+        assert_eq!(
+            migrated.keyboard_shortcuts.next_column,
+            ["Alt+W", "Alt+Right"]
+        );
+        save(&path, &migrated).unwrap();
+        assert_eq!(load(&path).unwrap(), migrated);
     }
 
     #[test]
