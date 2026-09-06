@@ -216,6 +216,7 @@ cagents ui
   discarding editor buffers. Worktree selection and remembered column focus
   survive restarts, including when a shared browser column has focus. Application
   close checks unsaved editors in every worktree, not only the visible one.
+  Legacy columns without a registered worktree remain accessible across worktrees.
 - Open **Settings** from the lower-left gear. The modal dims the workspace and
   preserves input focus until dismissed. Runtime diagnostics are available only
   through the debug-inspector button in development builds, not the production

@@ -2,11 +2,13 @@ use super::*;
 
 /// Ownership comes from the launch recipe, never a shell's current directory or
 /// OSC title. Component-aware matching also keeps `repo-fix` outside `repo`.
-fn worktree_root<'a>(directory: &'a Path, roots: impl Iterator<Item = &'a Path>) -> &'a Path {
+fn worktree_root<'a>(
+    directory: &'a Path,
+    roots: impl Iterator<Item = &'a Path>,
+) -> Option<&'a Path> {
     roots
         .filter(|root| directory.starts_with(root))
         .max_by_key(|root| root.components().count())
-        .unwrap_or(directory)
 }
 
 fn card_directory(card: &CardState) -> Option<&Path> {
@@ -19,8 +21,11 @@ fn card_directory(card: &CardState) -> Option<&Path> {
 
 fn belongs_to_scope(card: &CardState, scope: &Path, roots: &[&Path]) -> bool {
     card.existence.is_open()
-        && card_directory(card)
-            .is_none_or(|directory| worktree_root(directory, roots.iter().copied()) == scope)
+        && card_directory(card).is_none_or(|directory| {
+            // Older sessions could launch outside Git repositories. Keep those
+            // cards reachable until closed or their owning worktree is registered.
+            worktree_root(directory, roots.iter().copied()).is_none_or(|root| root == scope)
+        })
 }
 
 /// A view descriptor, not a replacement for the persisted workspace. Global
@@ -89,7 +94,9 @@ impl Cagents {
             .flat_map(|project| &project.worktrees)
             .map(|worktree| worktree.path.as_path())
             .collect::<Vec<_>>();
-        let path = worktree_root(&path, roots.iter().copied()).to_path_buf();
+        let path = worktree_root(&path, roots.iter().copied())
+            .unwrap_or(&path)
+            .to_path_buf();
         if let Some(previous) = &self.active_workspace
             && let Some(focused) = self.workspace.focused()
         {
@@ -101,10 +108,13 @@ impl Cagents {
             &roots,
             self.worktree_focus.get(&path).copied(),
         );
-        let has_terminal = scoped
-            .cards
-            .iter()
-            .any(|card| matches!(&card.kind, CardKind::Terminal(_)));
+        let has_terminal = scoped.cards.iter().any(|card| match &card.kind {
+            CardKind::Terminal(session) => {
+                let directory = session.launch.working_directory.as_path();
+                worktree_root(directory, roots.iter().copied()).unwrap_or(directory) == path
+            }
+            _ => false,
+        });
         let width = self.workspace.viewport_width();
         // Hide before replacing the strip: its former widgets no longer get a
         // chance to send native-surface visibility updates after unmounting.
@@ -183,6 +193,7 @@ impl Cagents {
                     .flat_map(|project| &project.worktrees)
                     .map(|worktree| worktree.path.as_path()),
             )
+            .unwrap_or(directory)
             .to_path_buf(),
         )
     }
@@ -220,6 +231,7 @@ impl Cagents {
                 .flat_map(|project| &project.worktrees)
                 .map(|worktree| worktree.path.as_path()),
         )
+        .unwrap_or(directory)
         .to_path_buf();
         // A global browser may retain focus in the restored scope, but never
         // becomes an ownership source for that scope.
@@ -280,20 +292,70 @@ mod tests {
         card
     }
 
+    fn register_worktrees(app: &mut Cagents, paths: &[&str]) {
+        app.sidebar_model.projects = vec![SidebarProject::new(
+            ProjectId::new(),
+            RepositoryId::new(),
+            "repo".into(),
+            paths[0].into(),
+            paths
+                .iter()
+                .map(|path| {
+                    SidebarWorktree::new(
+                        crate::model::WorktreeId::new(),
+                        (*path).into(),
+                        None,
+                        false,
+                        false,
+                        None,
+                        None,
+                        None,
+                    )
+                })
+                .collect(),
+            Vec::new(),
+        )];
+    }
+
+    #[test]
+    fn legacy_unscoped_terminals_remain_accessible_without_owning_new_worktrees() {
+        let mut app = super::super::tests::context_inspector_test_app(false);
+        let legacy = terminal("/home/user");
+        let owned = terminal("/repo");
+        app.durable = Arc::new(WorkspaceState {
+            cards: vec![legacy.clone(), owned.clone()],
+            focused: Some(owned.id),
+            ..WorkspaceState::default()
+        });
+        register_worktrees(&mut app, &["/repo", "/other"]);
+
+        let _ = app.select_worktree("/repo".into(), false);
+        assert!(app.workspace.card(legacy.id).is_some());
+        let _ = app.select_worktree("/other".into(), true);
+        assert!(app.workspace.card(legacy.id).is_some());
+        assert!(app.workspace.card(owned.id).is_none());
+        let focused = app.card_state(app.workspace.focused().unwrap()).unwrap();
+        assert!(matches!(&focused.kind, CardKind::Terminal(session)
+            if session.launch.working_directory == Path::new("/other")));
+        assert_ne!(focused.id, legacy.id);
+        assert!(app.workspace.focus(legacy.id).is_ok());
+        assert_eq!(app.terminal_directory(), Some(PathBuf::from("/other")));
+    }
+
     #[test]
     fn ownership_uses_the_longest_component_root() {
         let roots = [Path::new("/repo"), Path::new("/repo/nested")];
         assert_eq!(
             worktree_root(Path::new("/repo/nested/src"), roots.into_iter()),
-            Path::new("/repo/nested")
+            Some(Path::new("/repo/nested"))
         );
         assert_eq!(
             worktree_root(Path::new("/repo/src"), roots.into_iter()),
-            Path::new("/repo")
+            Some(Path::new("/repo"))
         );
         assert_eq!(
             worktree_root(Path::new("/repo-fix/src"), roots.into_iter()),
-            Path::new("/repo-fix/src")
+            None
         );
     }
 
@@ -474,6 +536,7 @@ mod tests {
     #[test]
     fn application_close_protects_unsaved_editors_in_hidden_worktrees() {
         let mut app = super::super::tests::context_inspector_test_app(false);
+        register_worktrees(&mut app, &["/a", "/b"]);
         let editor = repository("/a");
         app.durable = Arc::new(WorkspaceState {
             cards: vec![editor.clone(), terminal("/b")],
@@ -496,6 +559,7 @@ mod tests {
     #[test]
     fn browser_focus_does_not_replace_persisted_worktree_selection() {
         let mut app = super::super::tests::context_inspector_test_app(false);
+        register_worktrees(&mut app, &["/a", "/b"]);
         let a = terminal("/a");
         let b = terminal("/b");
         let mut browser = terminal("/unused");
@@ -519,6 +583,7 @@ mod tests {
         let _ = app.apply_viewport(update, false, false);
         let mut restarted = super::super::tests::context_inspector_test_app(false);
         restarted.durable = Arc::clone(&app.durable);
+        restarted.sidebar_model = app.sidebar_model.clone();
         let _ = restarted.restore_worktree_scope();
         assert_eq!(restarted.terminal_directory(), Some(PathBuf::from("/b")));
         assert_eq!(restarted.workspace.focused(), Some(browser.id));
