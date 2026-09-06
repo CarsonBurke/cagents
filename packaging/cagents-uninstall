@@ -90,10 +90,12 @@ read_daemon_status() {
         case $daemon_output in
             *'
 '*) DAEMON_STATUS=unknown ;;
-            '{"ok":true,"command":"daemon.status","data":{'*'"running":true'*)
+            '{"ok":true,"command":"daemon.status","data":{'*'"running":true'*|\
+            '{"command":"daemon.status","data":{'*'"running":true,'*'},"ok":true}')
                 DAEMON_STATUS=running
                 ;;
-            '{"ok":true,"command":"daemon.status","data":{'*'"running":false'*)
+            '{"ok":true,"command":"daemon.status","data":{'*'"running":false'*|\
+            '{"command":"daemon.status","data":{'*'"running":false,'*'},"ok":true}')
                 DAEMON_STATUS=stopped
                 ;;
             *) DAEMON_STATUS=unknown ;;

@@ -128,10 +128,12 @@ read_daemon_status() {
         case $daemon_output in
             *'
 '*) DAEMON_STATUS=unknown ;;
-            '{"ok":true,"command":"daemon.status","data":{'*'"running":true'*)
+            '{"ok":true,"command":"daemon.status","data":{'*'"running":true'*|\
+            '{"command":"daemon.status","data":{'*'"running":true,'*'},"ok":true}')
                 DAEMON_STATUS=running
                 ;;
-            '{"ok":true,"command":"daemon.status","data":{'*'"running":false'*)
+            '{"ok":true,"command":"daemon.status","data":{'*'"running":false'*|\
+            '{"command":"daemon.status","data":{'*'"running":false,'*'},"ok":true}')
                 DAEMON_STATUS=stopped
                 ;;
             *) DAEMON_STATUS=unknown ;;
@@ -614,6 +616,10 @@ ensure_link() {
     link_kind=$3
     if [ -e "$link_path" ] || [ -L "$link_path" ]; then
         check_link_destination "$link_path" "$link_target"
+        if [ "$link_kind" = desktop ]; then
+            # Refresh directory watchers after switching the version target.
+            ln -snf "$link_target" "$link_path" || fail "cannot refresh link $link_path"
+        fi
         return
     fi
 
@@ -629,12 +635,6 @@ ensure_link() {
     ln -s "$link_target" "$link_path" || fail "cannot create link $link_path"
 }
 
-ensure_link "$BIN_TARGET" "$BIN_LINK" bin
-ensure_link "$DESKTOP_TARGET" "$DESKTOP_LINK" desktop
-ensure_link "$ICON_TARGET" "$ICON_LINK" icon
-ensure_link "$RASTER_ICON_TARGET" "$RASTER_ICON_LINK" raster_icon
-ensure_link "$METAINFO_TARGET" "$METAINFO_LINK" metainfo
-ensure_link "$AUTOSTART_TARGET" "$AUTOSTART_LINK" autostart
 
 if [ "$HAD_CURRENT" -eq 1 ]; then
     read_daemon_status "$PREFIX/current/bin/cagents"
@@ -647,6 +647,15 @@ rm -f "$CURRENT_TEMP"
 ln -s "versions/$VERSION" "$CURRENT_TEMP"
 CURRENT_SWITCHED=1
 mv -Tf "$CURRENT_TEMP" "$PREFIX/current"
+
+# Publish launchers only after their executable and icon targets exist. Menus
+# can cache a dangling desktop link as missing until their next full rescan.
+ensure_link "$BIN_TARGET" "$BIN_LINK" bin
+ensure_link "$DESKTOP_TARGET" "$DESKTOP_LINK" desktop
+ensure_link "$ICON_TARGET" "$ICON_LINK" icon
+ensure_link "$RASTER_ICON_TARGET" "$RASTER_ICON_LINK" raster_icon
+ensure_link "$METAINFO_TARGET" "$METAINFO_LINK" metainfo
+ensure_link "$AUTOSTART_TARGET" "$AUTOSTART_LINK" autostart
 TRANSACTION_COMMITTED=1
 if "$PREFIX/current/bin/cagents" daemon start >/dev/null; then
     DAEMON_STARTED=1
