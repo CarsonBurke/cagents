@@ -217,6 +217,11 @@ cagents daemon stop
 
 Run `cagents --help` or `cagents terminal --help` for the complete command set.
 
+If pull-request creation fails, cagents restores the submitted title, description,
+branches, and draft setting. If the remote outcome is uncertain, the form remains
+editable but another creation attempt is blocked until you check GitHub and confirm
+that no pull request was created.
+
 ## Daemon and user data
 
 There is no system daemon or service unit. The standard production installation starts its per-user sibling `cagentsd` immediately and registers it for graphical-login autostart. While that daemon is running, cagents exposes a system-tray item that opens the UI and can stop the daemon. The daemon remains independent of the UI so terminals survive window and UI-process restarts.

@@ -3914,8 +3914,8 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         .collect()
     }
 
-    /// The root of the work tree containing `directory`. Only valid once
-    /// [`Self::discovery_commands`] has reported `directory` to be inside one.
+    /// The root of the work tree containing `directory`, or configured by
+    /// `core.worktree` when `directory` is a Git directory.
     pub fn worktree_root_command(&self, directory: &Path) -> CommandSpec {
         self.git_read(
             directory,
@@ -4052,15 +4052,13 @@ impl<E: ProcessExecutor> RepositoryService<E> {
     /// The work tree a Git directory belongs to, resolved from outside every
     /// work tree.
     ///
-    /// `git worktree list` is the way in: it answers from inside a Git
-    /// directory, and it prints each work tree's own root, so no path
-    /// arithmetic is needed. A candidate is matched by asking it for its Git
-    /// directory rather than by position or by name — the main work tree's Git
-    /// directory is the common directory, a linked work tree's is
-    /// `<common>/worktrees/<id>`, and `<id>` cannot be derived from the work
-    /// tree's path. A candidate whose directory has been deleted cannot
-    /// answer, so its failure is skipped rather than propagated; a
-    /// cancellation belongs to the whole request and ends the search.
+    /// `git worktree list` answers from inside a Git directory. Match each
+    /// candidate by its Git directory, then ask Git for the actual root: the
+    /// main entry can name the metadata directory for a custom Git directory,
+    /// while `--show-toplevel` respects `core.worktree`. A linked work tree's
+    /// Git directory is `<common>/worktrees/<id>`, and `<id>` cannot be derived
+    /// from the work tree's path. Deleted candidates cannot answer and are
+    /// skipped; cancellation belongs to the whole request and ends the search.
     fn worktree_root_of(
         &self,
         git_directory: &Path,
@@ -4086,7 +4084,18 @@ impl<E: ProcessExecutor> RepositoryService<E> {
                 continue;
             };
             if candidate_git_dir.as_path() == git_dir {
-                return Ok(candidate.path);
+                let command = self.worktree_root_command(&candidate.path);
+                let output = match self.run_checked(&command, cancellation) {
+                    Ok(output) => output,
+                    Err(failure) if failure.kind == ProcessFailureKind::Cancelled => {
+                        return Err(failure.into());
+                    }
+                    Err(_) => continue,
+                };
+                return attach_repository_process(
+                    parse_path_line(&output.stdout, "worktree_root"),
+                    &output,
+                );
             }
         }
         Err(RepositoryError::NoWorkTree {
@@ -6427,130 +6436,168 @@ mod tests {
         );
     }
 
-    #[test]
-    fn discovery_asks_for_the_work_tree_root_only_where_one_exists() {
-        let fake = Arc::new(FakeExecutor::with_outputs(vec![
-            success(b"false\n"),
-            success(b"/repo/.git\n"),
-            success(b"/repo/.git\n"),
-            success(b"true\n"),
-            success(b"/repo\n"),
-        ]));
-        let service = RepositoryService::new("git", fake.clone());
-        let repository = service
-            .discover(Path::new("/repo/subdir"), &CancellationToken::new())
-            .unwrap();
-        assert_eq!(repository.common_dir, PathBuf::from("/repo/.git"));
-        assert_eq!(repository.worktree_root, Some(PathBuf::from("/repo")));
+    mod discovery {
+        use super::*;
 
-        let commands = fake.commands.lock().unwrap();
-        assert_eq!(commands.len(), 5);
-        // `--show-toplevel` is asked last, and only of a path the fourth query
-        // has just proved to be inside a work tree.
-        assert!(
-            commands[4]
-                .arguments
-                .contains(&OsString::from("--show-toplevel"))
-        );
-        assert!(
-            commands[4]
-                .arguments
-                .contains(&OsString::from("/repo/subdir"))
-        );
-        assert!(
-            commands[..4].iter().all(|command| {
-                !command
-                    .arguments
-                    .contains(&OsString::from("--show-toplevel"))
-            }),
-            "the first four queries must all be valid inside a Git directory"
-        );
-    }
+        struct IsolatedExecutor;
 
-    /// A project remembers its common directory, so reopening one hands that
-    /// path straight back to discovery. `--show-toplevel` exits 128 there,
-    /// which put a red banner on every single load, and the repository has to
-    /// resolve to its work tree rather than root itself inside `.git`.
-    #[test]
-    fn a_git_directory_selected_as_the_repository_resolves_to_its_work_tree() {
-        let fake = Arc::new(FakeExecutor::with_outputs(vec![
-            success(b"false\n"),
-            success(b"/repo/.git\n"),
-            success(b"/repo/.git\n"),
-            success(b"false\n"),
-            success(b"worktree /repo\0\0"),
-            success(b"/repo/.git\n"),
-        ]));
-        let service = RepositoryService::new("git", fake.clone());
-        let repository = service
-            .discover(Path::new("/repo/.git"), &CancellationToken::new())
-            .unwrap();
+        impl ProcessExecutor for IsolatedExecutor {
+            fn execute(
+                &self,
+                command: &CommandSpec,
+                cancellation: &CancellationToken,
+            ) -> Result<ProcessOutput, ProcessFailure> {
+                SystemProcessExecutor.execute(
+                    &command
+                        .clone()
+                        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                        .env("GIT_CONFIG_SYSTEM", "/dev/null")
+                        .env("GIT_CONFIG_NOSYSTEM", "1")
+                        .env("GIT_AUTHOR_NAME", "Cagents Contract")
+                        .env("GIT_AUTHOR_EMAIL", "contract@example.invalid")
+                        .env("GIT_COMMITTER_NAME", "Cagents Contract")
+                        .env("GIT_COMMITTER_EMAIL", "contract@example.invalid"),
+                    cancellation,
+                )
+            }
+        }
 
-        assert!(!repository.is_bare);
-        assert_eq!(repository.worktree_root, Some(PathBuf::from("/repo")));
+        fn service() -> RepositoryService<IsolatedExecutor> {
+            RepositoryService::new("git", Arc::new(IsolatedExecutor))
+        }
 
-        let commands = fake.commands.lock().unwrap();
-        assert!(
-            commands.iter().all(|command| {
-                !command
-                    .arguments
-                    .contains(&OsString::from("--show-toplevel"))
-            }),
-            "no query may be `--show-toplevel` while the selected path is a Git directory"
-        );
-        // The candidate is asked for its own Git directory from the work tree,
-        // which can answer, rather than from the Git directory, which cannot.
-        assert!(commands[5].arguments.contains(&OsString::from("/repo")));
-        assert!(commands[5].arguments.contains(&OsString::from("--git-dir")));
-    }
+        fn git(directory: &Path, arguments: &[&str]) {
+            let service = service();
+            service
+                .run_checked(
+                    &service.git_read(directory, arguments.iter().copied()),
+                    &CancellationToken::new(),
+                )
+                .expect("Git fixture command succeeds");
+        }
 
-    /// Falling back to the Git directory is what titled a reopened card `.git`
-    /// and rooted its file tree inside the repository's own metadata. A
-    /// non-bare repository whose work trees cannot be resolved has no root at
-    /// all, and saying so is better than adopting one that is wrong.
-    #[test]
-    fn a_git_directory_no_work_tree_claims_is_never_adopted_as_a_root() {
-        let fake = Arc::new(FakeExecutor::with_outputs(vec![
-            success(b"false\n"),
-            success(b"/repo/.git\n"),
-            success(b"/repo/.git\n"),
-            success(b"false\n"),
-            success(b"worktree /elsewhere\0\0"),
-            success(b"/elsewhere/.git\n"),
-        ]));
-        let service = RepositoryService::new("git", fake);
-        let error = service
-            .discover(Path::new("/repo/.git"), &CancellationToken::new())
-            .unwrap_err();
+        #[test]
+        fn persisted_common_directory_preserves_identity_and_main_worktree() {
+            let directory = tempfile::tempdir().unwrap();
+            git(directory.path(), &["init", "-b", "main", "checkout"]);
+            let root = directory.path().join("checkout").canonicalize().unwrap();
+            let nested = root.join("nested");
+            fs::create_dir(&nested).unwrap();
+            let service = service();
+            let cancellation = CancellationToken::new();
+            let initial = service.discover(&nested, &cancellation).unwrap();
+            let reopened = service
+                .discover(&initial.common_dir, &cancellation)
+                .unwrap();
+            assert_eq!(initial.worktree_root.as_deref(), Some(root.as_path()));
+            assert_eq!(reopened.worktree_root, initial.worktree_root);
+            assert_eq!(reopened.id, initial.id);
+            assert_eq!(reopened.common_dir, initial.common_dir);
+            assert!(!reopened.is_bare);
 
-        assert!(
-            matches!(
-                &error,
-                RepositoryError::NoWorkTree { git_dir } if git_dir == Path::new("/repo/.git")
-            ),
-            "{error:?}"
-        );
-    }
+            git(&root, &["commit", "--allow-empty", "-m", "initial"]);
+            git(&root, &["worktree", "add", "-b", "linked", "../linked"]);
+            let linked = directory.path().join("linked").canonicalize().unwrap();
+            let linked_info = service.discover(&linked, &cancellation).unwrap();
+            let linked_reopened = service
+                .discover(&linked_info.git_dir, &cancellation)
+                .unwrap();
+            assert_eq!(
+                linked_reopened.worktree_root.as_deref(),
+                Some(linked.as_path())
+            );
+            assert_eq!(linked_reopened.id, initial.id);
+            assert_eq!(linked_reopened.common_dir, initial.common_dir);
+            let project_reopened = service
+                .discover(&linked_info.common_dir, &cancellation)
+                .unwrap();
+            assert_eq!(
+                project_reopened.worktree_root.as_deref(),
+                Some(root.as_path())
+            );
+            assert_eq!(project_reopened.id, initial.id);
+        }
 
-    /// A bare repository has no work tree to resolve, and both of the queries
-    /// that would look for one fail there, so discovery must not ask.
-    #[test]
-    fn a_bare_repository_resolves_no_work_tree_and_asks_for_none() {
-        let fake = Arc::new(FakeExecutor::with_outputs(vec![
-            success(b"true\n"),
-            success(b"/repo.git\n"),
-            success(b"/repo.git\n"),
-        ]));
-        let service = RepositoryService::new("git", fake.clone());
-        let repository = service
-            .discover(Path::new("/repo.git"), &CancellationToken::new())
-            .unwrap();
+        #[test]
+        fn custom_git_directory_resolves_configured_worktree_not_metadata() {
+            let directory = tempfile::tempdir().unwrap();
+            git(
+                directory.path(),
+                &[
+                    "init",
+                    "-b",
+                    "main",
+                    "--separate-git-dir",
+                    "metadata",
+                    "checkout",
+                ],
+            );
+            let root = directory.path().join("checkout").canonicalize().unwrap();
+            let metadata = directory.path().join("metadata").canonicalize().unwrap();
+            git(&root, &["config", "core.worktree", "../checkout"]);
+            let service = service();
+            let cancellation = CancellationToken::new();
+            let initial = service.discover(&root, &cancellation).unwrap();
+            let reopened = service
+                .discover(&initial.common_dir, &cancellation)
+                .unwrap();
+            assert_eq!(reopened.common_dir, metadata);
+            assert_eq!(reopened.worktree_root.as_deref(), Some(root.as_path()));
+            assert_eq!(reopened.id, initial.id);
+            assert!(!reopened.is_bare);
+        }
 
-        assert!(repository.is_bare);
-        assert_eq!(repository.worktree_root, None);
-        // Three queries, not five: neither `--is-inside-work-tree` nor
-        // `--show-toplevel` has anything to say about a bare repository.
-        assert_eq!(fake.commands.lock().unwrap().len(), 3);
+        #[test]
+        fn separate_git_directory_without_worktree_backlink_is_not_a_root() {
+            let directory = tempfile::tempdir().unwrap();
+            git(
+                directory.path(),
+                &[
+                    "init",
+                    "-b",
+                    "main",
+                    "--separate-git-dir",
+                    "metadata",
+                    "checkout",
+                ],
+            );
+            let root = directory.path().join("checkout").canonicalize().unwrap();
+            let metadata = directory.path().join("metadata").canonicalize().unwrap();
+            let service = service();
+            let cancellation = CancellationToken::new();
+            assert_eq!(
+                service
+                    .discover(&root, &cancellation)
+                    .unwrap()
+                    .worktree_root,
+                Some(root),
+            );
+            let error = service.discover(&metadata, &cancellation).unwrap_err();
+            assert!(
+                matches!(&error, RepositoryError::NoWorkTree { git_dir } if git_dir == &metadata),
+                "{error:?}"
+            );
+        }
+
+        #[test]
+        fn bare_repository_preserves_identity_without_a_worktree() {
+            let directory = tempfile::tempdir().unwrap();
+            git(
+                directory.path(),
+                &["init", "--bare", "-b", "main", "bare.git"],
+            );
+            let root = directory.path().join("bare.git").canonicalize().unwrap();
+            let service = service();
+            let cancellation = CancellationToken::new();
+            let initial = service.discover(&root, &cancellation).unwrap();
+            let reopened = service
+                .discover(&initial.common_dir, &cancellation)
+                .unwrap();
+            assert!(reopened.is_bare);
+            assert_eq!(reopened.worktree_root, None);
+            assert_eq!(reopened.common_dir, root);
+            assert_eq!(reopened.id, initial.id);
+        }
     }
 
     #[test]

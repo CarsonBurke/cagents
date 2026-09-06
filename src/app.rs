@@ -1076,14 +1076,16 @@ struct WorktreeDialog {
     base: String,
     destination: String,
 }
-#[derive(Debug, Clone)]
-struct PullRequestDialog {
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PullRequestDialog {
     repository: GitHubRepoKey,
     base: String,
     head: String,
     title: String,
     body: String,
     draft: bool,
+    /// An uncertain remote outcome requires reconciliation before another create.
+    retry_confirmation: Option<bool>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1390,7 +1392,10 @@ fn completion_navigates(message: &Message) -> bool {
         } | Message::WorktreeCreated {
             result: Ok(WorktreeCreationOutcome::Created { .. }),
             ..
-        } | Message::PullRequestCreated(Ok(PullRequestCreationOutcome::Created { .. }))
+        } | Message::PullRequestCreated {
+            result: Ok(PullRequestCreationOutcome::Created { .. }),
+            ..
+        }
     )
 }
 
@@ -1808,8 +1813,13 @@ pub enum Message {
     PullRequestTitleChanged(String),
     PullRequestBodyChanged(String),
     PullRequestDraftChanged(bool),
+    PullRequestRetryConfirmed(bool),
     SubmitPullRequest,
-    PullRequestCreated(Result<PullRequestCreationOutcome, String>),
+    PullRequestCreated {
+        dialog: PullRequestDialog,
+        generation: u64,
+        result: Result<PullRequestCreationOutcome, String>,
+    },
     CancelDialog,
     KeyEvent(keyboard::Event),
     FocusAdjacent(crate::workspace::FocusDirection),
@@ -2210,6 +2220,8 @@ pub struct Cagents {
     github_repositories: HashMap<ProjectId, GitHubRepoKey>,
     worktree_dialog: Option<WorktreeDialog>,
     pull_request_dialog: Option<PullRequestDialog>,
+    /// Opening or dismissing a newer draft supersedes in-flight draft recovery.
+    pull_request_dialog_generation: u64,
     dirty_repository_close: Option<DirtyRepositoryClose>,
     /// A source-control navigation waiting for its repository card to finish
     /// listing files.
@@ -5505,6 +5517,25 @@ impl Cagents {
         }
     }
 
+    fn restore_pull_request_dialog(
+        &mut self,
+        dialog: PullRequestDialog,
+        generation: u64,
+    ) -> Task<Message> {
+        if generation != self.pull_request_dialog_generation || self.pull_request_dialog.is_some() {
+            return Task::none();
+        }
+        self.pull_request_dialog = Some(dialog);
+        if self.dirty_repository_close.is_some()
+            || self.sidebar_state.pending_discard().is_some()
+            || self.worktree_dialog.is_some()
+            || self.inspector.is_some()
+        {
+            return Task::none();
+        }
+        iced::widget::operation::focus(pull_request_dialog_focus_id()).map(cosmic::Action::App)
+    }
+
     fn focus_context_overlay_if_exposed(&self) -> Task<Message> {
         if self.context_inspector_is_overlay()
             && !self.modal_is_open()
@@ -5838,6 +5869,7 @@ impl Application for Cagents {
             github_repositories: HashMap::new(),
             worktree_dialog: None,
             pull_request_dialog: None,
+            pull_request_dialog_generation: 0,
             dirty_repository_close: None,
             pending_panel_open: None,
             deferred_navigation: VecDeque::new(),
@@ -6278,6 +6310,8 @@ impl Application for Cagents {
                             project_id,
                             worktree.as_deref(),
                         );
+                        self.pull_request_dialog_generation =
+                            self.pull_request_dialog_generation.wrapping_add(1);
                         self.pull_request_dialog = Some(PullRequestDialog {
                             repository,
                             base: "main".into(),
@@ -6285,6 +6319,7 @@ impl Application for Cagents {
                             title: String::new(),
                             body: String::new(),
                             draft: false,
+                            retry_confirmation: None,
                         });
                         iced::widget::operation::focus(pull_request_dialog_focus_id())
                             .map(cosmic::Action::App)
@@ -6928,7 +6963,22 @@ impl Application for Cagents {
                 }
                 Task::none()
             }
+            Message::PullRequestRetryConfirmed(confirmed) => {
+                if let Some(dialog) = &mut self.pull_request_dialog
+                    && dialog.retry_confirmation.is_some()
+                {
+                    dialog.retry_confirmation = Some(confirmed);
+                }
+                Task::none()
+            }
             Message::SubmitPullRequest => {
+                if self
+                    .pull_request_dialog
+                    .as_ref()
+                    .is_some_and(|dialog| dialog.retry_confirmation == Some(false))
+                {
+                    return Task::none();
+                }
                 let Some(dialog) = self.pull_request_dialog.take() else {
                     return Task::none();
                 };
@@ -6951,20 +7001,34 @@ impl Application for Cagents {
                     return iced::widget::operation::focus(pull_request_dialog_focus_id())
                         .map(cosmic::Action::App);
                 }
+                let generation = self.pull_request_dialog_generation;
                 let submit = cosmic::task::future(async move {
+                    let mut dialog = dialog;
                     let result = tokio::task::spawn_blocking(move || {
                         GitHubService::system("gh")
                             .create(&request, &CancellationToken::default())
                             .map_err(|error| error.to_string())
                     })
                     .await
-                    .map_err(|error| format!("pull request creator join failed: {error}"))
+                    .map_err(|error| {
+                        // A worker panic does not prove that gh made no mutation.
+                        dialog.retry_confirmation = Some(false);
+                        format!("pull request creator join failed: {error}")
+                    })
                     .and_then(|result| result);
-                    Message::PullRequestCreated(result)
+                    Message::PullRequestCreated {
+                        dialog,
+                        generation,
+                        result,
+                    }
                 });
                 Task::batch([submit, self.focus_context_overlay_if_exposed()])
             }
-            Message::PullRequestCreated(result) => match result {
+            Message::PullRequestCreated {
+                mut dialog,
+                generation,
+                result,
+            } => match result {
                 Ok(PullRequestCreationOutcome::Created { url, .. }) => {
                     self.status = Some(TransientNotice::success(format!(
                         "created pull request {url}"
@@ -6973,22 +7037,30 @@ impl Application for Cagents {
                 }
                 Ok(PullRequestCreationOutcome::NotCreated { failure }) => {
                     self.status = Some(TransientNotice::error(failure.to_string()));
-                    Task::none()
+                    self.restore_pull_request_dialog(dialog, generation)
                 }
                 Ok(PullRequestCreationOutcome::OutcomeUnknown { failure }) => {
                     self.status = Some(TransientNotice::warning(format!(
                         "pull request outcome is unknown; reconcile before retrying: {failure}"
                     )));
-                    Task::none()
+                    dialog.retry_confirmation = Some(false);
+                    self.restore_pull_request_dialog(dialog, generation)
                 }
                 Err(error) => {
                     self.status = Some(TransientNotice::error(error));
-                    Task::none()
+                    self.restore_pull_request_dialog(dialog, generation)
                 }
             },
             Message::CancelDialog => {
-                self.worktree_dialog = None;
-                self.pull_request_dialog = None;
+                if self.worktree_dialog.take().is_none()
+                    && self.pull_request_dialog.take().is_some()
+                {
+                    self.pull_request_dialog_generation =
+                        self.pull_request_dialog_generation.wrapping_add(1);
+                }
+                if let Some(target) = self.nested_modal_focus_target() {
+                    return iced::widget::operation::focus(target).map(cosmic::Action::App);
+                }
                 self.focus_context_overlay_if_exposed()
             }
             Message::KeyEvent(event) => {
@@ -7429,68 +7501,85 @@ impl Application for Cagents {
         }
 
         let dialog = self.pull_request_dialog.as_ref()?;
-        Some(
-            widget::container(
-                widget::column::with_children(vec![
-                    widget::text::title3("Create pull request").into(),
-                    widget::text::caption(dialog.repository.gh_selector()).into(),
-                    widget::column::with_children(vec![
-                        widget::text::caption("Title").into(),
-                        widget::text_input("Title", &dialog.title)
-                            .id(pull_request_dialog_focus_id())
-                            .on_input(Message::PullRequestTitleChanged)
-                            .into(),
-                    ])
-                    .spacing(spacing.space_xxxs)
+        let mut rows: Vec<Element<'_, Message>> = vec![
+            widget::text::title3("Create pull request").into(),
+            widget::text::caption(dialog.repository.gh_selector()).into(),
+            widget::column::with_children(vec![
+                widget::text::caption("Title").into(),
+                widget::text_input("Title", &dialog.title)
+                    .id(pull_request_dialog_focus_id())
+                    .on_input(Message::PullRequestTitleChanged)
                     .into(),
-                    widget::column::with_children(vec![
-                        widget::text::caption("Head branch").into(),
-                        widget::text_input("Head branch", &dialog.head)
-                            .id(widget::Id::new("dialog.pull-request.head"))
-                            .on_input(Message::PullRequestHeadChanged)
-                            .into(),
-                    ])
-                    .spacing(spacing.space_xxxs)
-                    .into(),
-                    widget::column::with_children(vec![
-                        widget::text::caption("Base branch").into(),
-                        widget::text_input("Base branch", &dialog.base)
-                            .id(widget::Id::new("dialog.pull-request.base"))
-                            .on_input(Message::PullRequestBaseChanged)
-                            .into(),
-                    ])
-                    .spacing(spacing.space_xxxs)
-                    .into(),
-                    widget::column::with_children(vec![
-                        widget::text::caption("Description").into(),
-                        widget::text_input("Description", &dialog.body)
-                            .id(widget::Id::new("dialog.pull-request.description"))
-                            .on_input(Message::PullRequestBodyChanged)
-                            .into(),
-                    ])
-                    .spacing(spacing.space_xxxs)
-                    .into(),
-                    widget::checkbox(dialog.draft)
-                        .label("Create as draft")
-                        .on_toggle(Message::PullRequestDraftChanged)
-                        .into(),
-                    widget::row::with_children(vec![
-                        widget::button::standard("Cancel")
-                            .on_press(Message::CancelDialog)
-                            .into(),
-                        widget::button::suggested("Create")
-                            .on_press(Message::SubmitPullRequest)
-                            .into(),
-                    ])
-                    .spacing(spacing.space_xxs)
-                    .into(),
-                ])
-                .spacing(spacing.space_xs),
-            )
-            .class(cosmic::theme::Container::Dialog(false))
-            .padding(spacing.space_m)
-            .max_width(620)
+            ])
+            .spacing(spacing.space_xxxs)
             .into(),
+            widget::column::with_children(vec![
+                widget::text::caption("Head branch").into(),
+                widget::text_input("Head branch", &dialog.head)
+                    .id(widget::Id::new("dialog.pull-request.head"))
+                    .on_input(Message::PullRequestHeadChanged)
+                    .into(),
+            ])
+            .spacing(spacing.space_xxxs)
+            .into(),
+            widget::column::with_children(vec![
+                widget::text::caption("Base branch").into(),
+                widget::text_input("Base branch", &dialog.base)
+                    .id(widget::Id::new("dialog.pull-request.base"))
+                    .on_input(Message::PullRequestBaseChanged)
+                    .into(),
+            ])
+            .spacing(spacing.space_xxxs)
+            .into(),
+            widget::column::with_children(vec![
+                widget::text::caption("Description").into(),
+                widget::text_input("Description", &dialog.body)
+                    .id(widget::Id::new("dialog.pull-request.description"))
+                    .on_input(Message::PullRequestBodyChanged)
+                    .into(),
+            ])
+            .spacing(spacing.space_xxxs)
+            .into(),
+            widget::checkbox(dialog.draft)
+                .label("Create as draft")
+                .on_toggle(Message::PullRequestDraftChanged)
+                .into(),
+        ];
+        if let Some(confirmed) = dialog.retry_confirmation {
+            rows.push(
+                widget::text::body(
+                    "GitHub may have created this pull request. Check GitHub before retrying to avoid creating a duplicate.",
+                )
+                .into(),
+            );
+            rows.push(
+                widget::checkbox(confirmed)
+                    .label("I checked GitHub; no pull request was created")
+                    .on_toggle(Message::PullRequestRetryConfirmed)
+                    .into(),
+            );
+        }
+        rows.push(
+            widget::row::with_children(vec![
+                widget::button::standard("Cancel")
+                    .on_press(Message::CancelDialog)
+                    .into(),
+                widget::button::suggested("Create")
+                    .on_press_maybe(
+                        (dialog.retry_confirmation != Some(false))
+                            .then_some(Message::SubmitPullRequest),
+                    )
+                    .into(),
+            ])
+            .spacing(spacing.space_xxs)
+            .into(),
+        );
+        Some(
+            widget::container(widget::column::with_children(rows).spacing(spacing.space_xs))
+                .class(cosmic::theme::Container::Dialog(false))
+                .padding(spacing.space_m)
+                .max_width(620)
+                .into(),
         )
     }
 
@@ -9510,15 +9599,211 @@ mod tests {
 
         let repository = GitHubRepoKey::new("github.com", None, "owner", "repo").unwrap();
         let key = crate::github::PullRequestKey::new(repository, 45).unwrap();
-        assert!(completion_navigates(&Message::PullRequestCreated(Ok(
-            PullRequestCreationOutcome::Created {
+        assert!(completion_navigates(&Message::PullRequestCreated {
+            dialog: pull_request_test_dialog(),
+            generation: 0,
+            result: Ok(PullRequestCreationOutcome::Created {
                 key,
                 url: Url::parse("https://github.com/owner/repo/pull/45").unwrap(),
                 pull_request: None,
                 normalization_warning: None,
-            }
-        ))));
+            }),
+        }));
         assert!(!completion_navigates(&Message::ExternalLinkOpened(Ok(()))));
+    }
+
+    fn pull_request_test_dialog() -> PullRequestDialog {
+        PullRequestDialog {
+            repository: GitHubRepoKey::new("github.com", None, "owner", "repo").unwrap(),
+            base: "release".into(),
+            head: "topic/authored-change".into(),
+            title: "Keep the authored title".into(),
+            body: "A carefully authored description.\n\nWith details for reviewers.".into(),
+            draft: true,
+            retry_confirmation: None,
+        }
+    }
+
+    fn pull_request_test_failure(exit_code: i32) -> crate::repository::ProcessFailure {
+        crate::repository::ProcessFailure {
+            kind: crate::repository::ProcessFailureKind::Exit,
+            program: "gh".into(),
+            exit_code: Some(exit_code),
+            signal: None,
+            stdout: Vec::new(),
+            stderr: b"pull request create failed".to_vec(),
+            message: "pull request create failed".into(),
+            started: true,
+        }
+    }
+
+    #[test]
+    fn pull_request_local_rejection_preserves_authored_draft() {
+        let mut app = context_inspector_test_app(false);
+        let mut dialog = pull_request_test_dialog();
+        dialog.title.clear();
+        app.pull_request_dialog = Some(dialog.clone());
+
+        let _ = app.update(Message::SubmitPullRequest);
+
+        assert_eq!(app.pull_request_dialog.as_ref(), Some(&dialog));
+    }
+
+    #[test]
+    fn pull_request_remote_failure_restores_hidden_draft_for_retry() {
+        for result in [
+            Ok(PullRequestCreationOutcome::NotCreated {
+                failure: pull_request_test_failure(4),
+            }),
+            Err("pull request creator failed".into()),
+        ] {
+            let mut app = context_inspector_test_app(false);
+            let dialog = pull_request_test_dialog();
+            app.pull_request_dialog = Some(dialog.clone());
+
+            // Dropping the task avoids invoking gh; the update transition itself
+            // must remove the draft until its asynchronous completion arrives.
+            let _ = app.update(Message::SubmitPullRequest);
+            assert!(app.pull_request_dialog.is_none());
+            let _ = app.update(Message::PullRequestCreated {
+                dialog: dialog.clone(),
+                generation: app.pull_request_dialog_generation,
+                result,
+            });
+
+            assert_eq!(app.pull_request_dialog.as_ref(), Some(&dialog));
+            let _ = app.update(Message::SubmitPullRequest);
+            assert!(app.pull_request_dialog.is_none(), "retry should submit");
+        }
+    }
+
+    #[test]
+    fn pull_request_unknown_outcome_keeps_edits_but_requires_reconciliation() {
+        let mut app = context_inspector_test_app(false);
+        let dialog = pull_request_test_dialog();
+        app.pull_request_dialog = Some(dialog.clone());
+        let _ = app.update(Message::SubmitPullRequest);
+
+        let _ = app.update(Message::PullRequestCreated {
+            dialog: dialog.clone(),
+            generation: app.pull_request_dialog_generation,
+            result: Ok(PullRequestCreationOutcome::OutcomeUnknown {
+                failure: pull_request_test_failure(1),
+            }),
+        });
+        let mut expected = dialog;
+        expected.retry_confirmation = Some(false);
+        assert_eq!(app.pull_request_dialog.as_ref(), Some(&expected));
+
+        let revised_body = "Revised description after checking the remote".to_owned();
+        let _ = app.update(Message::PullRequestBodyChanged(revised_body.clone()));
+        let _ = app.update(Message::SubmitPullRequest);
+        expected.body = revised_body;
+        assert_eq!(app.pull_request_dialog.as_ref(), Some(&expected));
+
+        let _ = app.update(Message::PullRequestRetryConfirmed(true));
+        let _ = app.update(Message::SubmitPullRequest);
+        assert!(app.pull_request_dialog.is_none());
+    }
+
+    #[test]
+    fn pull_request_success_does_not_reopen_submitted_draft() {
+        let mut app = context_inspector_test_app(false);
+        let dialog = pull_request_test_dialog();
+        app.pull_request_dialog = Some(dialog.clone());
+        let _ = app.update(Message::SubmitPullRequest);
+        let key = crate::github::PullRequestKey::new(dialog.repository.clone(), 45).unwrap();
+
+        let _ = app.update(Message::PullRequestCreated {
+            dialog,
+            generation: app.pull_request_dialog_generation,
+            result: Ok(PullRequestCreationOutcome::Created {
+                key,
+                url: Url::parse("https://github.com/owner/repo/pull/45").unwrap(),
+                pull_request: None,
+                normalization_warning: None,
+            }),
+        });
+
+        assert!(app.pull_request_dialog.is_none());
+    }
+
+    #[test]
+    fn pull_request_stale_failure_does_not_replace_a_newer_draft() {
+        let mut app = context_inspector_test_app(false);
+        let dialog = pull_request_test_dialog();
+        app.pull_request_dialog = Some(dialog.clone());
+        let _ = app.update(Message::SubmitPullRequest);
+        let generation = app.pull_request_dialog_generation;
+        let project_id = ProjectId::new();
+        app.github_repositories
+            .insert(project_id, dialog.repository.clone());
+        let _ = app.update(Message::Sidebar(SidebarAction::CreatePullRequest {
+            project_id,
+            worktree: None,
+        }));
+        let _ = app.update(Message::PullRequestTitleChanged("Newer PR".into()));
+        let _ = app.update(Message::PullRequestHeadChanged("new-topic".into()));
+        let _ = app.update(Message::PullRequestBodyChanged("Newer description".into()));
+        let newer = app.pull_request_dialog.clone().unwrap();
+        let failure = Message::PullRequestCreated {
+            dialog,
+            generation,
+            result: Ok(PullRequestCreationOutcome::NotCreated {
+                failure: pull_request_test_failure(4),
+            }),
+        };
+
+        let _ = app.update(failure.clone());
+        assert_eq!(app.pull_request_dialog.as_ref(), Some(&newer));
+
+        let _ = app.update(Message::SubmitPullRequest);
+        assert!(app.pull_request_dialog.is_none());
+        let _ = app.update(failure.clone());
+        assert!(
+            app.pull_request_dialog.is_none(),
+            "newer request is in flight"
+        );
+
+        let _ = app.update(Message::CancelDialog);
+        let _ = app.update(failure);
+        assert!(
+            app.pull_request_dialog.is_none(),
+            "dismissed drafts stay closed"
+        );
+    }
+
+    #[test]
+    fn pull_request_recovery_survives_cancelling_an_unrelated_worktree_dialog() {
+        for complete_before_cancel in [false, true] {
+            let mut app = context_inspector_test_app(false);
+            let dialog = pull_request_test_dialog();
+            app.pull_request_dialog = Some(dialog.clone());
+            let _ = app.update(Message::SubmitPullRequest);
+            let completion = Message::PullRequestCreated {
+                dialog: dialog.clone(),
+                generation: app.pull_request_dialog_generation,
+                result: Ok(PullRequestCreationOutcome::NotCreated {
+                    failure: pull_request_test_failure(4),
+                }),
+            };
+            let _ = app.update(Message::Sidebar(SidebarAction::NewWorktree {
+                project_id: ProjectId::new(),
+                repository: PathBuf::from("/repo"),
+            }));
+            assert!(app.worktree_dialog.is_some());
+            if complete_before_cancel {
+                let _ = app.update(completion.clone());
+            }
+            let _ = app.update(Message::CancelDialog);
+            if !complete_before_cancel {
+                let _ = app.update(completion);
+            }
+            assert!(app.worktree_dialog.is_none());
+            assert_eq!(app.pull_request_dialog.as_ref(), Some(&dialog));
+            let _ = app.update(Message::CancelDialog);
+            assert!(app.pull_request_dialog.is_none());
+        }
     }
 
     #[test]
@@ -9614,14 +9899,16 @@ mod tests {
         let repository = GitHubRepoKey::new("github.com", None, "owner", "repo").unwrap();
         let key = crate::github::PullRequestKey::new(repository, 45).unwrap();
         app.deferred_navigation
-            .push_back(Message::PullRequestCreated(Ok(
-                PullRequestCreationOutcome::Created {
+            .push_back(Message::PullRequestCreated {
+                dialog: pull_request_test_dialog(),
+                generation: 0,
+                result: Ok(PullRequestCreationOutcome::Created {
                     key,
                     url: Url::parse("https://github.com/owner/repo/pull/45").unwrap(),
                     pull_request: None,
                     normalization_warning: None,
-                },
-            )));
+                }),
+            });
         app.inspector = Some(Inspector::Settings);
         app.inspector_transition = Some(InspectorTransition {
             started_at: Instant::now() - DIALOG_TRANSITION_DURATION,
@@ -9668,6 +9955,7 @@ mod tests {
             title: String::new(),
             body: String::new(),
             draft: false,
+            retry_confirmation: None,
         });
         assert_eq!(
             app.nested_modal_focus_target().unwrap().to_string(),
@@ -10827,6 +11115,7 @@ mod tests {
             github_repositories: HashMap::new(),
             worktree_dialog: None,
             pull_request_dialog: None,
+            pull_request_dialog_generation: 0,
             dirty_repository_close: None,
             pending_panel_open: None,
             deferred_navigation: VecDeque::new(),
