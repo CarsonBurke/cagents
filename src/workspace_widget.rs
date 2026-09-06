@@ -127,10 +127,15 @@ pub struct FrameClock {
 
 impl FrameClock {
     pub fn elapsed(&mut self, frame: Instant) -> Option<Duration> {
-        let previous = self.last.replace(frame)?;
-        frame
-            .checked_duration_since(previous)
-            .filter(|elapsed| *elapsed <= Duration::from_millis(250))
+        let Some(previous) = self.last else {
+            self.last = Some(frame);
+            return None;
+        };
+        let elapsed = frame.checked_duration_since(previous)?;
+        self.last = Some(frame);
+        // Occluded Wayland windows can receive frames only once per second.
+        // Bound catch-up work without starving their animations indefinitely.
+        Some(elapsed.min(Duration::from_millis(250)))
     }
 
     pub fn reset(&mut self) {
@@ -1067,17 +1072,6 @@ impl<Message> Widget<Message, Theme, Renderer> for PanSurface<'_, Message> {
         let content_layout = Self::child_layout(layout);
         let state = tree.state.downcast_mut::<PanSurfaceState>();
 
-        // Reported on redraw rather than from `layout`, because layout runs
-        // during view building where publishing a message would fight the
-        // reflow it triggers.
-        if let Event::Window(window::Event::RedrawRequested(_)) = event {
-            let size = layout.bounds().size();
-            if state.last_size != Some(size) {
-                state.last_size = Some(size);
-                shell.publish((self.on_resize)(size));
-            }
-        }
-
         if let Event::Keyboard(keyboard::Event::ModifiersChanged(modifiers)) = event {
             state.modifiers = *modifiers;
         }
@@ -1161,6 +1155,18 @@ impl<Message> Widget<Message, Theme, Renderer> for PanSurface<'_, Message> {
             shell,
             &clipped,
         );
+        // Reported on redraw rather than from `layout`, because layout runs
+        // during view building where publishing a message would fight the
+        // reflow it triggers.
+        // Publish after native scroll feedback from the old layout, so that
+        // feedback cannot cancel the newly computed focused-card reveal.
+        if let Event::Window(window::Event::RedrawRequested(_)) = event {
+            let size = layout.bounds().size();
+            if state.last_size != Some(size) {
+                state.last_size = Some(size);
+                shell.publish((self.on_resize)(size));
+            }
+        }
     }
 
     fn mouse_interaction(
@@ -1925,7 +1931,7 @@ mod tests {
     }
 
     #[test]
-    fn frame_clock_ignores_first_and_stale_frames() {
+    fn frame_clock_bounds_throttled_frames_without_rewinding_for_stale_frames() {
         let start = Instant::now();
         let mut clock = FrameClock::default();
         assert_eq!(clock.elapsed(start), None);
@@ -1933,7 +1939,11 @@ mod tests {
             clock.elapsed(start + Duration::from_millis(16)),
             Some(Duration::from_millis(16))
         );
-        assert_eq!(clock.elapsed(start + Duration::from_secs(2)), None);
+        assert_eq!(
+            clock.elapsed(start + Duration::from_secs(2)),
+            Some(Duration::from_millis(250))
+        );
+        assert_eq!(clock.elapsed(start + Duration::from_secs(1)), None);
         assert_eq!(
             clock.elapsed(start + Duration::from_millis(2_016)),
             Some(Duration::from_millis(16))
