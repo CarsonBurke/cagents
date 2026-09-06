@@ -405,14 +405,10 @@ impl Engine {
             if card.mailbox.shutdown_requested() {
                 card.closed = true;
             }
-        }
-        self.cards.retain_mut(|card| {
-            if !card.closed {
-                return true;
+            if card.closed {
+                card.close();
             }
-            card.close();
-            false
-        });
+        }
         // Every webview keeps an owning clone of the runtime alive, so dropping
         // the engine's handle only means anything - and is the whole point -
         // once no card holds one. Hibernating one of six cards now costs that
@@ -420,6 +416,9 @@ impl Engine {
         if self.servo.is_some() && !self.cards.iter().any(|card| card.session.is_some()) {
             self.servo = None;
         }
+        // The final card's teardown barrier also covers the shared engine.
+        // Releasing it before Servo drops lets application exit race JS shutdown.
+        self.cards.retain(|card| !card.closed);
     }
 
     /// Drains Wayland events for cards that are not driving their own frames.
@@ -765,9 +764,8 @@ impl Card {
         }
     }
 
-    /// Releases everything this card owns. The engine drops the card itself
-    /// immediately afterwards, which is what releases
-    /// `BrowserHandle::shutdown`.
+    /// Releases this card's resources. The engine releases its teardown barrier
+    /// only after any now-unowned shared runtime has also shut down.
     fn close(&mut self) {
         self.destroy_session();
         self.lifecycle.close();
