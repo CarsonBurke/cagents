@@ -349,7 +349,8 @@ impl Engine {
                     wake_queued: self.wake_queued.clone(),
                 }))
                 .build();
-            servo.setup_logging();
+            // The UI owns the process-wide log bridge; Servo's setup_logging
+            // installs a second global logger and panics after UI startup.
             self.servo = Some(servo);
         }
         self.servo.as_ref().expect("engine runtime created")
