@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, HashMap},
     fs::OpenOptions,
     io,
     os::unix::fs::OpenOptionsExt,
@@ -138,6 +138,8 @@ pub struct WorkspaceManifest {
     pub schema_version: u32,
     pub existence: Existence,
     pub focused: Option<CardId>,
+    pub active_worktree: Option<PathBuf>,
+    pub worktree_focus: HashMap<PathBuf, CardId>,
     pub cards: Vec<CardSummary>,
     pub updated_at_unix_ms: i64,
 }
@@ -302,8 +304,8 @@ impl StateStore {
     /// `base` supplies the generations the snapshot was derived from; the
     /// `generation` fields inside `state` are ignored. Cards whose persisted
     /// content fingerprint is unchanged are left untouched, so a quiet
-    /// workspace costs one small `workspaces` row update per flush instead of
-    /// a full rewrite of every card and payload row.
+    /// workspace updates only its workspace row and navigation metadata per
+    /// flush instead of rewriting every card and payload row.
     pub fn save_workspace(
         &self,
         state: &WorkspaceState,
@@ -599,9 +601,12 @@ impl StateStore {
     }
 
     pub fn load_workspace_manifest(&self, id: WorkspaceId) -> Result<Option<WorkspaceManifest>> {
-        let inner = self.lock_inner()?;
+        let mut inner = self.lock_inner()?;
         ensure_open(&inner)?;
-        load_workspace_manifest_connection(&inner.connection, id)
+        let transaction = inner.connection.transaction()?;
+        let manifest = load_workspace_manifest_connection(&transaction, id)?;
+        transaction.commit()?;
+        Ok(manifest)
     }
 
     pub fn load_card(
@@ -619,23 +624,25 @@ impl StateStore {
         id: WorkspaceId,
         proof: Option<&HostSessionProof>,
     ) -> Result<Option<WorkspaceState>> {
-        let inner = self.lock_inner()?;
+        let mut inner = self.lock_inner()?;
         ensure_open(&inner)?;
-        let Some(manifest) = load_workspace_manifest_connection(&inner.connection, id)? else {
+        let transaction = inner.connection.transaction()?;
+        let Some(manifest) = load_workspace_manifest_connection(&transaction, id)? else {
             return Ok(None);
         };
 
         let mut cards = Vec::with_capacity(manifest.cards.len());
         for summary in &manifest.cards {
-            let card = load_card_connection(&inner.connection, summary.id, &self.boot_id, proof)?
+            let card = load_card_connection(&transaction, summary.id, &self.boot_id, proof)?
                 .ok_or_else(|| {
-                StoreError::InvalidState(format!(
-                    "workspace {} references missing card {}",
-                    id, summary.id
-                ))
-            })?;
+                    StoreError::InvalidState(format!(
+                        "workspace {} references missing card {}",
+                        id, summary.id
+                    ))
+                })?;
             cards.push(card);
         }
+        transaction.commit()?;
 
         Ok(Some(WorkspaceState {
             schema_version: manifest.schema_version,
@@ -644,6 +651,8 @@ impl StateStore {
             existence: manifest.existence,
             cards,
             focused: manifest.focused,
+            active_worktree: manifest.active_worktree,
+            worktree_focus: manifest.worktree_focus,
         }))
     }
 
@@ -1344,6 +1353,16 @@ fn save_workspace_transaction(
             focused,
             timestamp,
         ])?;
+    set_metadata(
+        transaction,
+        &format!("workspace:{workspace_id}:navigation:active_worktree"),
+        &to_json(&state.active_worktree)?,
+    )?;
+    set_metadata(
+        transaction,
+        &format!("workspace:{workspace_id}:navigation:worktree_focus"),
+        &to_json(&state.worktree_focus)?,
+    )?;
 
     let existing = existing_cards(transaction, &workspace_id)?;
     let incoming_ids = state
@@ -2041,6 +2060,20 @@ fn load_workspace_manifest_connection(
             .as_deref()
             .map(|value| parse_id("card", value))
             .transpose()?,
+        active_worktree: metadata(
+            connection,
+            &format!("workspace:{id}:navigation:active_worktree"),
+        )?
+        .map(|value| from_json("workspace active worktree", &value))
+        .transpose()?
+        .flatten(),
+        worktree_focus: metadata(
+            connection,
+            &format!("workspace:{id}:navigation:worktree_focus"),
+        )?
+        .map(|value| from_json("workspace worktree focus", &value))
+        .transpose()?
+        .unwrap_or_default(),
         cards,
         updated_at_unix_ms: updated_at,
     }))
@@ -2341,8 +2374,8 @@ fn next_generation(expected: u64, kind: &str, id: impl std::fmt::Display) -> Res
     })
 }
 
-fn metadata(transaction: &Transaction<'_>, key: &str) -> Result<Option<String>> {
-    Ok(transaction
+fn metadata(connection: &Connection, key: &str) -> Result<Option<String>> {
+    Ok(connection
         .prepare_cached("SELECT value FROM metadata WHERE key = ?1")?
         .query_row([key], |row| row.get(0))
         .optional()?)
@@ -2464,6 +2497,8 @@ mod tests {
                 }),
             }],
             focused: Some(card_id),
+            active_worktree: None,
+            worktree_focus: HashMap::new(),
         }
     }
 
@@ -2672,12 +2707,20 @@ mod tests {
                 fidelity: BrowserRestoreFidelity::ExactLive,
             }),
         };
+        workspace.active_worktree = Some(PathBuf::from("/tmp/worktree-b"));
+        workspace
+            .worktree_focus
+            .insert(PathBuf::from("/tmp/worktree-b"), workspace.cards[0].id);
+        workspace.focused = Some(browser_card.id);
         workspace.cards.push(browser_card);
         let mut lane = SaveLane::default();
         assert_eq!(lane.save(&store, &workspace).unwrap().generation, 1);
 
         let restored = store.load_workspace(workspace.id, None).unwrap().unwrap();
         assert_eq!(restored.generation, 1);
+        assert_eq!(restored.focused, workspace.focused);
+        assert_eq!(restored.active_worktree, workspace.active_worktree);
+        assert_eq!(restored.worktree_focus, workspace.worktree_focus);
         assert!(
             restored
                 .cards
@@ -2691,6 +2734,85 @@ mod tests {
         assert_eq!(browser.fidelity, BrowserRestoreFidelity::HistoryAndScroll);
         assert_eq!(browser.history_index, 1);
         assert_eq!(browser.scroll_y, 450.0);
+
+        let card_generations = lane.cards.clone();
+        workspace.active_worktree = Some(PathBuf::from("/tmp/empty-worktree"));
+        workspace
+            .worktree_focus
+            .insert(PathBuf::from("/tmp/worktree-b"), workspace.cards[1].id);
+        let commit = lane.save(&store, &workspace).unwrap();
+        assert_eq!(commit.card_generations, card_generations);
+        let restored = store.load_workspace(workspace.id, None).unwrap().unwrap();
+        assert_eq!(restored.focused, workspace.focused);
+        assert_eq!(restored.active_worktree, workspace.active_worktree);
+        assert_eq!(restored.worktree_focus, workspace.worktree_focus);
+        assert_eq!(restored.generation, 2);
+        assert_eq!(store.schema_version().unwrap(), 3);
+    }
+
+    #[test]
+    fn missing_navigation_metadata_restores_legacy_defaults() {
+        let directory = tempdir().unwrap();
+        let store =
+            StateStore::open(directory.path().join("legacy.sqlite3"), boot("boot-a")).unwrap();
+        let mut workspace = workspace_with_terminal(&boot("boot-a"));
+        workspace.active_worktree = Some(PathBuf::from("/tmp/worktree-b"));
+        workspace
+            .worktree_focus
+            .insert(PathBuf::from("/tmp/worktree-b"), workspace.cards[0].id);
+        SaveLane::default().save(&store, &workspace).unwrap();
+        {
+            let inner = store.lock_inner().unwrap();
+            inner
+                .connection
+                .execute(
+                    "DELETE FROM metadata WHERE key IN (?1, ?2)",
+                    params![
+                        format!("workspace:{}:navigation:active_worktree", workspace.id),
+                        format!("workspace:{}:navigation:worktree_focus", workspace.id),
+                    ],
+                )
+                .unwrap();
+        }
+        let restored = store.load_workspace(workspace.id, None).unwrap().unwrap();
+        assert_eq!(restored.active_worktree, None);
+        assert!(restored.worktree_focus.is_empty());
+    }
+
+    #[test]
+    fn corrupt_navigation_metadata_is_not_treated_as_missing() {
+        let directory = tempdir().unwrap();
+        let store =
+            StateStore::open(directory.path().join("corrupt.sqlite3"), boot("boot-a")).unwrap();
+        let workspace = WorkspaceState::default();
+        SaveLane::default().save(&store, &workspace).unwrap();
+        for (field, value) in [
+            ("active_worktree", "{"),
+            ("active_worktree", "42"),
+            ("worktree_focus", r#"{"/tmp/worktree-b":"not-a-card-id"}"#),
+        ] {
+            {
+                let mut inner = store.lock_inner().unwrap();
+                let transaction = inner.connection.transaction().unwrap();
+                set_metadata(
+                    &transaction,
+                    &format!("workspace:{}:navigation:active_worktree", workspace.id),
+                    "null",
+                )
+                .unwrap();
+                set_metadata(
+                    &transaction,
+                    &format!("workspace:{}:navigation:{field}", workspace.id),
+                    value,
+                )
+                .unwrap();
+                transaction.commit().unwrap();
+            }
+            assert!(matches!(
+                store.load_workspace(workspace.id, None),
+                Err(StoreError::InvalidState(_))
+            ));
+        }
     }
 
     #[test]

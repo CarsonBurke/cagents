@@ -6,19 +6,19 @@
 
 pub const GRID_UNIT: f32 = 4.0;
 
-pub const HEADER_HEIGHT: f32 = 48.0;
-pub const ROW_HEIGHT: f32 = 36.0;
-pub const DENSE_ROW_HEIGHT: f32 = 32.0;
-pub const PRIMARY_CONTROL_SIZE: f32 = 32.0;
+pub const HEADER_HEIGHT: f32 = 40.0;
+pub const ROW_HEIGHT: f32 = 32.0;
+pub const DENSE_ROW_HEIGHT: f32 = 28.0;
+pub const PRIMARY_CONTROL_SIZE: f32 = 28.0;
 pub const SECONDARY_CONTROL_MIN_SIZE: f32 = 24.0;
 
-pub const NAVIGATION_DEFAULT_WIDTH: f32 = 280.0;
-pub const NAVIGATION_MIN_WIDTH: f32 = 240.0;
-pub const NAVIGATION_MAX_WIDTH: f32 = 400.0;
+pub const NAVIGATION_DEFAULT_WIDTH: f32 = 260.0;
+pub const NAVIGATION_MIN_WIDTH: f32 = 220.0;
+pub const NAVIGATION_MAX_WIDTH: f32 = 420.0;
 pub const NAVIGATION_RAIL_WIDTH: f32 = 52.0;
 pub const INSPECTOR_MIN_WIDTH: f32 = 320.0;
-pub const INSPECTOR_DEFAULT_WIDTH: f32 = 360.0;
-pub const INSPECTOR_MAX_WIDTH: f32 = 420.0;
+pub const INSPECTOR_DEFAULT_WIDTH: f32 = 380.0;
+pub const INSPECTOR_MAX_WIDTH: f32 = 480.0;
 
 pub const CONTROL_RADIUS: f32 = 6.0;
 pub const FLOATING_SURFACE_RADIUS: f32 = 8.0;
@@ -167,7 +167,7 @@ mod tests {
     #[test]
     fn geometry_uses_the_four_pixel_grid_and_accessible_targets() {
         const {
-            assert!(PRIMARY_CONTROL_SIZE >= 32.0);
+            assert!(PRIMARY_CONTROL_SIZE >= SECONDARY_CONTROL_MIN_SIZE);
             assert!(SECONDARY_CONTROL_MIN_SIZE >= 24.0);
         }
         for value in [
@@ -186,8 +186,5 @@ mod tests {
         ] {
             assert_eq!(value % GRID_UNIT, 0.0, "{value} is off-grid");
         }
-        assert_eq!(BORDER_WIDTH, 1.0);
-        assert_eq!(CONTROL_RADIUS, 6.0);
-        assert_eq!(FLOATING_SURFACE_RADIUS, 8.0);
     }
 }

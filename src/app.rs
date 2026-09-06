@@ -1,3 +1,8 @@
+mod chrome_ui;
+mod settings_ui;
+mod worktree_ui;
+use settings_ui::settings_dialog;
+
 use std::{
     borrow::Cow,
     collections::{HashMap, HashSet, VecDeque},
@@ -146,13 +151,11 @@ enum TerminalStartMode {
 }
 
 const TOOLBAR_FOCUS_ID: &str = "cagents-workspace-toolbar";
-const APP_HEADER_HEIGHT: f32 = design::HEADER_HEIGHT;
 const NOTICE_ROW_HEIGHT: f32 = design::ROW_HEIGHT;
 const CARD_HEADER_HEIGHT: f32 = design::HEADER_HEIGHT;
 const BROWSER_TOOLBAR_HEIGHT: f32 = design::ROW_HEIGHT;
 #[cfg(feature = "integrated-browser")]
 const BROWSER_PROGRESS_HEIGHT: f32 = 2.0;
-const FOCUS_RAIL_HEIGHT: f32 = 2.0;
 const ICON_CONTROL_SIZE: f32 = design::PRIMARY_CONTROL_SIZE;
 const DIALOG_TRANSITION_DURATION: Duration = Duration::from_millis(160);
 const CONTENT_MAX_WIDTH: f32 = 560.0;
@@ -921,32 +924,6 @@ fn display_path(path: &Path) -> Cow<'_, str> {
     match relative {
         Some(relative) => Cow::Owned(format!("~/{}", relative.display())),
         None => path.to_string_lossy(),
-    }
-}
-
-/// Whether `title` is the same path as `caption`, only written shorter.
-///
-/// Prompt themes commonly report the working directory with every component but
-/// the last shortened to its first letters, so a card whose shell does that
-/// stacks `~/D/r/cagents` above `~/Documents/repositories/cagents` and says one
-/// thing twice, the readable copy second. Compared component by component
-/// rather than as substrings, so a title naming anything else - a running
-/// command, an edited file - always survives.
-fn title_abbreviates_path(title: &str, caption: &str) -> bool {
-    if title.is_empty() {
-        return false;
-    }
-    let mut components = caption.split('/');
-    let mut abbreviated = title.split('/');
-    loop {
-        match (abbreviated.next(), components.next()) {
-            // An empty abbreviation is not an abbreviation: `starts_with("")`
-            // holds for every component, which would make one blank component
-            // match a whole path.
-            (Some(short), Some(full)) if !short.is_empty() && full.starts_with(short) => {}
-            (None, None) => return true,
-            _ => return false,
-        }
     }
 }
 
@@ -1825,6 +1802,8 @@ pub enum Message {
     FocusAdjacent(crate::workspace::FocusDirection),
     FocusProjectSearch,
     ToggleContextInspector,
+    #[cfg(feature = "development")]
+    ToggleDebugInspector,
     ContextInspector(InspectorAction),
     CloseInspector,
     SelectSettingsCategory(SettingsCategory),
@@ -2021,7 +2000,6 @@ struct CardChrome {
     unfocused_name: String,
     resize_name: String,
     close_name: String,
-    close_tooltip: String,
 }
 
 impl CardChrome {
@@ -2057,10 +2035,6 @@ impl CardChrome {
                     workspace_widget::GlobalShortcut::CloseFocusedCard,
                     shortcuts,
                 ),
-            ),
-            close_tooltip: workspace_widget::shortcut_tooltip(
-                workspace_widget::GlobalShortcut::CloseFocusedCard,
-                shortcuts,
             ),
         }
     }
@@ -2217,6 +2191,8 @@ pub struct Cagents {
     settings_write_blocked: bool,
     sidebar_model: SidebarModel,
     sidebar_state: SidebarState,
+    active_workspace: Option<PathBuf>,
+    worktree_focus: HashMap<PathBuf, CardId>,
     github_repositories: HashMap<ProjectId, GitHubRepoKey>,
     worktree_dialog: Option<WorktreeDialog>,
     pull_request_dialog: Option<PullRequestDialog>,
@@ -2238,6 +2214,7 @@ pub struct Cagents {
     inspector: Option<Inspector>,
     inspector_transition: Option<InspectorTransition>,
     context_inspector_open: bool,
+    debug_inspector_open: bool,
     /// The overlay state whose focus and native-surface transition has already
     /// been applied. The rendered mount also depends on workspace focus, so it
     /// cannot be derived solely from inspector-open and window-resize events.
@@ -2634,10 +2611,15 @@ impl Cagents {
             residency: Residency::Hydrating { epoch: 1 },
             kind: CardKind::Terminal(session.clone()),
         };
+        let scope = if self.active_workspace.as_deref() != Some(working_directory.as_path()) {
+            self.select_worktree(working_directory.clone(), false)
+        } else {
+            Task::none()
+        };
+        let (index, durable_index) = self.terminal_insertion_indices();
         let durable = Arc::make_mut(&mut self.durable);
-        durable.cards.push(card.clone());
+        durable.cards.insert(durable_index, card.clone());
         durable.focused = Some(card_id);
-        let index = self.workspace.cards().len();
         let update = self
             .workspace
             .add_card(
@@ -2663,6 +2645,7 @@ impl Cagents {
         );
         self.persist();
         Task::batch([
+            scope,
             self.start_terminal(card_id, session, true),
             self.apply_viewport(update, true, false),
         ])
@@ -2833,7 +2816,19 @@ impl Cagents {
         cosmic::task::future(async move { Message::ExternalUrlOpened(open_system_url(url).await) })
     }
 
-    fn persist(&self) {
+    fn persist(&mut self) {
+        if let Some(scope) = &self.active_workspace
+            && let Some(focused) = self.workspace.focused()
+        {
+            self.worktree_focus.insert(scope.clone(), focused);
+        }
+        if self.durable.active_worktree != self.active_workspace
+            || self.durable.worktree_focus != self.worktree_focus
+        {
+            let durable = Arc::make_mut(&mut self.durable);
+            durable.active_worktree.clone_from(&self.active_workspace);
+            durable.worktree_focus.clone_from(&self.worktree_focus);
+        }
         if let Some(session) = &self.session {
             session.snapshot(Arc::clone(&self.durable));
         }
@@ -3724,7 +3719,6 @@ impl Cagents {
     fn card_view<'a>(&'a self, id: CardId, focused: bool) -> Element<'a, Message> {
         let spacing = cosmic::theme::spacing();
         let card = self.card_state(id);
-        let title = card.map_or("Card", |card| card.title.as_str());
         let labels = card_kind_labels(card.map(|card| &card.kind));
         // `sync_chrome` keeps an entry for every durable card; a miss can
         // only be a card that is not durable, which renders degenerate chrome.
@@ -3738,165 +3732,7 @@ impl Cagents {
             CardKind::Browser(session) => Some(session),
             _ => None,
         });
-        let caption = card.map(|card| card_kind_caption(&card.kind));
-
-        let mut title_lines: Vec<Element<'a, Message>> = vec![
-            widget::text::body(title)
-                .wrapping(cosmic::iced::widget::text::Wrapping::None)
-                .ellipsize(cosmic::iced::widget::text::Ellipsize::End(
-                    EllipsizeHeightLimit::Lines(1),
-                ))
-                .width(Length::Fill)
-                .into(),
-        ];
-        if let Some(caption) = caption
-            .clone()
-            .filter(|caption| !title_abbreviates_path(title, caption))
-        {
-            title_lines.push(
-                widget::text::caption(caption)
-                    .wrapping(cosmic::iced::widget::text::Wrapping::None)
-                    .ellipsize(cosmic::iced::widget::text::Ellipsize::End(
-                        EllipsizeHeightLimit::Lines(1),
-                    ))
-                    .width(Length::Fill)
-                    .into(),
-            );
-        }
-        let title_button = widget::button::custom(
-            widget::row::with_children(vec![
-                widget::icon::from_name(labels.icon).size(16).into(),
-                widget::column::with_children(title_lines)
-                    .spacing(0)
-                    .width(Length::Fill)
-                    .into(),
-            ])
-            .align_y(Alignment::Center)
-            .spacing(spacing.space_xxs),
-        )
-        .id(chrome.map_or_else(
-            || workspace_widget::card_focus_id(id),
-            |chrome| chrome.focus_id.clone(),
-        ))
-        .name(chrome.map_or_else(
-            || {
-                Cow::Owned(card_accessible_name(
-                    labels.type_label,
-                    title,
-                    caption.as_deref().unwrap_or(""),
-                    focused,
-                ))
-            },
-            |chrome| Cow::Borrowed(chrome.accessible_name(focused)),
-        ))
-        .padding([0, spacing.space_xxs])
-        .height(Length::Fill)
-        .width(Length::Fill)
-        .class(cosmic::theme::Button::Text)
-        .on_press(Message::FocusCard(id));
-        let mut title_tooltip: Vec<Element<'a, Message>> =
-            vec![widget::text::caption(title).into()];
-        if let Some(caption) = caption.clone() {
-            title_tooltip.push(widget::text::caption(caption).into());
-        }
-        let title_region: Element<'a, Message> = widget::tooltip::tooltip(
-            title_button,
-            widget::column::with_children(title_tooltip).spacing(0),
-            widget::tooltip::Position::Bottom,
-        )
-        .into();
-
-        let mut header_children = vec![title_region];
-        let runtime_status = match self.cards.get(&id) {
-            Some(CardRuntime::Loading) | None => Some((labels.starting, true)),
-            Some(CardRuntime::Failed(_)) => Some(("Unavailable", false)),
-            #[cfg(feature = "integrated-browser")]
-            Some(CardRuntime::Browser(browser))
-                if browser.lifecycle == BrowserLifecycle::Restoring =>
-            {
-                Some(("Restoring…", true))
-            }
-            #[cfg(feature = "integrated-browser")]
-            Some(CardRuntime::Browser(browser)) if browser.load_state.is_some() => {
-                Some(("Loading…", true))
-            }
-            _ => None,
-        };
-        if let Some((label, busy)) = runtime_status {
-            if busy {
-                header_children.push(
-                    widget::progress_bar::circular::Circular::new()
-                        .size(16.0)
-                        .into(),
-                );
-            }
-            header_children.push(widget::text::caption(label).into());
-        }
-
-        header_children.push(
-            widget::button::icon(widget::icon::from_name("window-close-symbolic"))
-                .id(chrome.map_or_else(
-                    || card_control_id(id, "close"),
-                    |chrome| chrome.close_id.clone(),
-                ))
-                .name(chrome.map_or_else(
-                    || {
-                        Cow::Owned(format!(
-                            "{}, {}",
-                            card_close_name(labels.type_label, title),
-                            workspace_widget::shortcut_chords(
-                                workspace_widget::GlobalShortcut::CloseFocusedCard,
-                                &self.settings.keyboard_shortcuts,
-                            ),
-                        ))
-                    },
-                    |chrome| Cow::Borrowed(chrome.close_name.as_str()),
-                ))
-                .tooltip(chrome.map_or_else(
-                    || {
-                        Cow::Owned(workspace_widget::shortcut_tooltip(
-                            workspace_widget::GlobalShortcut::CloseFocusedCard,
-                            &self.settings.keyboard_shortcuts,
-                        ))
-                    },
-                    |chrome| Cow::Borrowed(chrome.close_tooltip.as_str()),
-                ))
-                .width(ICON_CONTROL_SIZE)
-                .height(ICON_CONTROL_SIZE)
-                .on_press(Message::CloseCard(id))
-                .into(),
-        );
-
-        let rail = widget::container(iced::widget::Space::new())
-            .height(Length::Fixed(FOCUS_RAIL_HEIGHT))
-            .width(Length::Fill)
-            .class(cosmic::theme::Container::custom(move |theme| {
-                let color = if focused {
-                    *theme.cosmic().accent_color()
-                } else {
-                    *theme.cosmic().bg_divider()
-                };
-                cosmic::iced::widget::container::Style {
-                    background: Some(iced::Background::Color(color.into())),
-                    ..Default::default()
-                }
-            }));
-        let header_row = widget::container(
-            widget::row::with_children(header_children)
-                .align_y(Alignment::Center)
-                .spacing(spacing.space_xxxs)
-                .width(Length::Fill),
-        )
-        .height(Length::Fixed(CARD_HEADER_HEIGHT - FOCUS_RAIL_HEIGHT))
-        .padding([0, spacing.space_xxs])
-        .class(if focused {
-            cosmic::theme::Container::Secondary
-        } else {
-            cosmic::theme::Container::Background
-        });
-        let header = widget::column::with_children(vec![rail.into(), header_row.into()])
-            .spacing(0)
-            .height(Length::Fixed(CARD_HEADER_HEIGHT));
+        let header = self.column_header(id, focused);
 
         #[cfg(feature = "integrated-browser")]
         let browser_toolbar: Option<Element<'a, Message>> = browser_session.map(|session| {
@@ -4293,6 +4129,11 @@ impl Cagents {
     /// pull-request list - is [`SidebarFocus::None`], which leaves the panel
     /// where it is rather than tearing it down.
     fn sidebar_focus(&self) -> SidebarFocus {
+        if let Some(worktree) = &self.active_workspace {
+            return SidebarFocus::Repository {
+                worktree: worktree.clone(),
+            };
+        }
         let Some(card) = self.workspace.focused().and_then(|id| self.card_state(id)) else {
             return SidebarFocus::None;
         };
@@ -5098,7 +4939,7 @@ impl Cagents {
             inspector::mount_for_width(
                 self.window_width,
                 self.context_inspector_open,
-                self.workspace.focused().is_some(),
+                self.workspace.focused().is_some() || self.active_workspace.is_some(),
             ),
             Some(InspectorLayout::Overlay)
         )
@@ -5866,6 +5707,8 @@ impl Application for Cagents {
             settings_write_blocked,
             sidebar_model: SidebarModel::ready(SidebarMode::Expanded, sidebar_projects),
             sidebar_state: SidebarState::default(),
+            active_workspace: None,
+            worktree_focus: HashMap::new(),
             github_repositories: HashMap::new(),
             worktree_dialog: None,
             pull_request_dialog: None,
@@ -5877,6 +5720,7 @@ impl Application for Cagents {
             inspector: None,
             inspector_transition: None,
             context_inspector_open: true,
+            debug_inspector_open: false,
             context_inspector_overlay_active: false,
             // The initial estimate is wide, but the first compositor resize
             // can immediately mount the default-open inspector as a modal.
@@ -5919,7 +5763,8 @@ impl Application for Cagents {
         let _ = app
             .workspace
             .resize_viewport((app.window_width - sidebar_width - inspector_width).max(0.0));
-        let mut tasks = vec![app.initialize_runtimes()];
+        let scope = app.restore_worktree_scope();
+        let mut tasks = vec![scope, app.initialize_runtimes()];
         #[cfg(feature = "integrated-browser")]
         tasks.push(cosmic::task::message(Message::InitializeBrowserFactory));
         if let Some(window_id) = app.core.main_window_id() {
@@ -5935,13 +5780,7 @@ impl Application for Cagents {
                     Self::repository_load_task(project.repository, Some(project.id), false)
                 }),
         );
-        let mut task = Task::batch(tasks);
-        if app.durable.cards.is_empty() {
-            task = Task::batch([
-                task,
-                app.add_terminal(std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/"))),
-            ]);
-        }
+        let task = Task::batch(tasks);
         let chrome = app.sync_chrome();
         (app, Task::batch([task, chrome]))
     }
@@ -5970,20 +5809,10 @@ impl Application for Cagents {
         let task = match message {
             Message::NewTerminal => {
                 self.show_workspace_for_action();
-                let directory = self
-                    .workspace
-                    .focused()
-                    .and_then(|id| self.cards.get(&id))
-                    .and_then(|runtime| match runtime {
-                        CardRuntime::Repository(runtime) => {
-                            Some(runtime.descriptor.worktree.clone())
-                        }
-                        _ => None,
-                    })
-                    .unwrap_or_else(|| {
-                        std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/"))
-                    });
-                self.add_terminal(directory)
+                match self.terminal_directory() {
+                    Some(directory) => self.add_terminal(directory),
+                    None => cosmic::task::message(Message::OpenRepository),
+                }
             }
             Message::TerminalStarted { card, result } => {
                 let accept = can_accept_terminal_start(
@@ -6036,6 +5865,12 @@ impl Application for Cagents {
                         self.status = Some(TransientNotice::error(error));
                         tasks.push(cosmic::task::message(Message::LifecycleSweep));
                     }
+                }
+                if self
+                    .card_state(card)
+                    .is_some_and(|state| state.exposure == Exposure::Offscreen)
+                {
+                    tasks.push(self.reconcile_scoped_lifecycle());
                 }
                 self.persist();
                 Task::batch(tasks)
@@ -6157,14 +5992,7 @@ impl Application for Cagents {
                             .map(|(record, _)| record.path.clone())
                             .unwrap_or_else(|| loaded.repository.selected_path.clone());
                         if open_cards {
-                            task = Task::batch([
-                                self.add_repository_card(
-                                    loaded.project.id,
-                                    loaded.repository.common_dir.clone(),
-                                    worktree.clone(),
-                                ),
-                                self.add_terminal(worktree),
-                            ]);
+                            task = self.select_worktree(worktree, true);
                         }
                     }
                     Err(error) => {
@@ -6254,16 +6082,15 @@ impl Application for Cagents {
                         repository,
                     } => {
                         self.show_workspace_for_action();
-                        self.add_repository_card(project_id, repository.clone(), repository)
+                        let path = self.sidebar_model.projects.iter()
+                            .find(|project| project.id == project_id)
+                            .and_then(|project| project.worktrees.first())
+                            .map_or(repository, |worktree| worktree.path.clone());
+                        self.select_worktree(path, true)
                     }
-                    SidebarAction::OpenWorktree {
-                        project_id, path, ..
-                    } => {
+                    SidebarAction::OpenWorktree { path, .. } => {
                         self.show_workspace_for_action();
-                        Task::batch([
-                            self.add_repository_card(project_id, path.clone(), path.clone()),
-                            self.add_terminal(path),
-                        ])
+                        self.select_worktree(path, true)
                     }
                     SidebarAction::OpenPullRequest { url, .. } => self.open_clicked_link(url),
                     SidebarAction::NewWorktree {
@@ -6527,8 +6354,11 @@ impl Application for Cagents {
                     return Task::none();
                 }
                 let dirty = self
-                    .workspace
-                    .order()
+                    .durable
+                    .cards
+                    .iter()
+                    .filter(|card| card.existence.is_open())
+                    .map(|card| card.id)
                     .filter(|card| {
                         matches!(self.cards.get(card), Some(CardRuntime::Repository(runtime)) if runtime.blocks_navigation())
                     })
@@ -6912,11 +6742,17 @@ impl Application for Cagents {
                             "created worktree {}",
                             worktree.path.display()
                         )));
-                        let terminal = self.add_terminal(worktree.path);
-                        // `add_terminal` pushed a durable card, and this arm
-                        // returns without reaching the `sync_chrome` at the
-                        // tail of `update`, so refresh the cache here to keep
-                        // the "an entry for every durable card" invariant true.
+                        if let Some(project) = self
+                            .sidebar_model
+                            .projects
+                            .iter_mut()
+                            .find(|project| project.id == project_id)
+                        {
+                            project
+                                .worktrees
+                                .push(SidebarWorktree::from_repository(&worktree, None));
+                        }
+                        let terminal = self.select_worktree(worktree.path, true);
                         let chrome = self.sync_chrome();
                         return Task::batch([
                             terminal,
@@ -7161,6 +6997,14 @@ impl Application for Cagents {
             Message::ToggleContextInspector if self.modal_is_open() => Task::none(),
             Message::ToggleContextInspector => {
                 self.set_context_inspector_open(!self.context_inspector_open)
+            }
+            #[cfg(feature = "development")]
+            Message::ToggleDebugInspector => {
+                if self.modal_is_open() {
+                    return Task::none();
+                }
+                self.debug_inspector_open = !self.debug_inspector_open;
+                self.set_context_inspector_open(true)
             }
             Message::ContextInspector(_) if self.modal_is_open() => Task::none(),
             Message::ContextInspector(action) => self.handle_context_inspector_action(action),
@@ -7589,216 +7433,7 @@ impl Application for Cagents {
     /// duplicated the focused card's name and cost a row of workspace height for
     /// a bar that was otherwise empty apart from the window controls.
     fn header_end(&self) -> Vec<Element<'_, Message>> {
-        if self.context_inspector_is_overlay() {
-            return Vec::new();
-        }
-        let compact_commands = self.window_width < design::WIDE_BREAKPOINT;
-        let total = self.workspace.cards().len();
-        let navigator: Option<Element<'_, Message>> =
-            should_show_card_navigator(total).then(|| {
-                let current = self
-                    .workspace
-                    .focused()
-                    .and_then(|focused| self.workspace.order().position(|id| id == focused))
-                    .map_or(0, |index| index + 1);
-                let previous = workspace_widget::shortcut_descriptor(
-                    workspace_widget::GlobalShortcut::FocusAdjacent(
-                        crate::workspace::FocusDirection::Left,
-                    ),
-                );
-                let next = workspace_widget::shortcut_descriptor(
-                    workspace_widget::GlobalShortcut::FocusAdjacent(
-                        crate::workspace::FocusDirection::Right,
-                    ),
-                );
-                widget::row::with_children(vec![
-                    widget::button::icon(widget::icon::from_name("go-previous-symbolic"))
-                        .id(widget::Id::new("command.previous-column"))
-                        .name(format!(
-                            "{}, {}",
-                            previous.label,
-                            workspace_widget::shortcut_chords(
-                                previous.action,
-                                &self.settings.keyboard_shortcuts,
-                            )
-                        ))
-                        .tooltip(workspace_widget::shortcut_tooltip(
-                            previous.action,
-                            &self.settings.keyboard_shortcuts,
-                        ))
-                        .width(ICON_CONTROL_SIZE)
-                        .height(ICON_CONTROL_SIZE)
-                        .on_press_maybe((current > 1).then_some(Message::FocusAdjacent(
-                            crate::workspace::FocusDirection::Left,
-                        )))
-                        .into(),
-                    widget::container(widget::text::caption(format!("{current} / {total}")))
-                        .center_x(Length::Fixed(APP_HEADER_HEIGHT))
-                        .align_y(Alignment::Center)
-                        .into(),
-                    widget::button::icon(widget::icon::from_name("go-next-symbolic"))
-                        .id(widget::Id::new("command.next-column"))
-                        .name(format!(
-                            "{}, {}",
-                            next.label,
-                            workspace_widget::shortcut_chords(
-                                next.action,
-                                &self.settings.keyboard_shortcuts,
-                            )
-                        ))
-                        .tooltip(workspace_widget::shortcut_tooltip(
-                            next.action,
-                            &self.settings.keyboard_shortcuts,
-                        ))
-                        .width(ICON_CONTROL_SIZE)
-                        .height(ICON_CONTROL_SIZE)
-                        .on_press_maybe((current > 0 && current < total).then_some(
-                            Message::FocusAdjacent(crate::workspace::FocusDirection::Right),
-                        ))
-                        .into(),
-                ])
-                .align_y(Alignment::Center)
-                .spacing(0)
-                .into()
-            });
-
-        let failed = self
-            .cards
-            .values()
-            .filter(|runtime| matches!(runtime, CardRuntime::Failed(_)))
-            .count();
-
-        let runtime_exception: Option<Element<'_, Message>> = if failed > 0 {
-            let label = format!(
-                "{failed} runtime{} unavailable",
-                if failed == 1 { "" } else { "s" }
-            );
-            // The indicator is the only place a failure off-screen is visible,
-            // so it reveals the column whose recovery buttons live in the card.
-            let first_failed = self
-                .workspace
-                .order()
-                .find(|id| matches!(self.cards.get(id), Some(CardRuntime::Failed(_))));
-            Some(
-                widget::button::icon(widget::icon::from_name("dialog-warning-symbolic"))
-                    .id(widget::Id::new("command.runtime-exception"))
-                    .name(label.clone())
-                    .tooltip(label)
-                    .width(ICON_CONTROL_SIZE)
-                    .height(ICON_CONTROL_SIZE)
-                    .on_press_maybe(first_failed.map(Message::FocusCard))
-                    .into(),
-            )
-        } else {
-            None
-        };
-
-        let new_terminal =
-            workspace_widget::shortcut_descriptor(workspace_widget::GlobalShortcut::NewTerminal);
-        let actions: Vec<Element<'_, Message>> = if compact_commands {
-            vec![
-                widget::button::icon(widget::icon::from_name("utilities-terminal-symbolic"))
-                    .id(widget::Id::new(TOOLBAR_FOCUS_ID))
-                    .name(format!(
-                        "{}, {}",
-                        new_terminal.label,
-                        workspace_widget::shortcut_chords(
-                            new_terminal.action,
-                            &self.settings.keyboard_shortcuts,
-                        )
-                    ))
-                    .tooltip(workspace_widget::shortcut_tooltip(
-                        new_terminal.action,
-                        &self.settings.keyboard_shortcuts,
-                    ))
-                    .class(cosmic::theme::Button::Suggested)
-                    .width(ICON_CONTROL_SIZE)
-                    .height(ICON_CONTROL_SIZE)
-                    .on_press(Message::NewTerminal)
-                    .into(),
-                widget::button::icon(widget::icon::from_name("folder-open-symbolic"))
-                    .id(widget::Id::new("command.open-repository"))
-                    .name("Open repository")
-                    .tooltip("Open repository")
-                    .width(ICON_CONTROL_SIZE)
-                    .height(ICON_CONTROL_SIZE)
-                    .on_press(Message::OpenRepository)
-                    .into(),
-                widget::button::icon(widget::icon::from_name("internet-web-browser-symbolic"))
-                    .id(widget::Id::new("command.new-browser"))
-                    .name("New browser")
-                    .tooltip("New browser")
-                    .width(ICON_CONTROL_SIZE)
-                    .height(ICON_CONTROL_SIZE)
-                    .on_press(Message::NewBrowser)
-                    .into(),
-            ]
-        } else {
-            vec![
-                widget::button::suggested("New terminal")
-                    .id(widget::Id::new(TOOLBAR_FOCUS_ID))
-                    .name(format!(
-                        "{}, {}",
-                        new_terminal.label,
-                        workspace_widget::shortcut_chords(
-                            new_terminal.action,
-                            &self.settings.keyboard_shortcuts,
-                        )
-                    ))
-                    .tooltip(workspace_widget::shortcut_tooltip(
-                        new_terminal.action,
-                        &self.settings.keyboard_shortcuts,
-                    ))
-                    .leading_icon(widget::icon::from_name("utilities-terminal-symbolic").size(16))
-                    .height(ICON_CONTROL_SIZE)
-                    .on_press(Message::NewTerminal)
-                    .into(),
-                widget::button::standard("Open repository")
-                    .id(widget::Id::new("command.open-repository"))
-                    .name("Open repository")
-                    .tooltip("Open a repository and add its worktrees")
-                    .leading_icon(widget::icon::from_name("folder-open-symbolic").size(16))
-                    .height(ICON_CONTROL_SIZE)
-                    .on_press(Message::OpenRepository)
-                    .into(),
-                widget::button::standard("New browser")
-                    .id(widget::Id::new("command.new-browser"))
-                    .name("New browser")
-                    .tooltip("Open a browser column")
-                    .leading_icon(widget::icon::from_name("internet-web-browser-symbolic").size(16))
-                    .height(ICON_CONTROL_SIZE)
-                    .on_press(Message::NewBrowser)
-                    .into(),
-            ]
-        };
-        let mut header_children = Vec::with_capacity(actions.len() + 3);
-        if let Some(exception) = runtime_exception {
-            header_children.push(exception);
-        }
-        if let Some(navigator) = navigator {
-            header_children.push(navigator);
-        }
-        let inspector_label = if self.context_inspector_open {
-            "Collapse context inspector"
-        } else {
-            "Show context inspector"
-        };
-        header_children.push(
-            widget::button::icon(widget::icon::from_name("view-list-symbolic"))
-                .id(context_inspector_toggle_id())
-                .name(inspector_label)
-                .tooltip(inspector_label)
-                .width(ICON_CONTROL_SIZE)
-                .height(ICON_CONTROL_SIZE)
-                .on_press_maybe(
-                    self.workspace
-                        .focused()
-                        .map(|_| Message::ToggleContextInspector),
-                )
-                .into(),
-        );
-        header_children.extend(actions);
-        header_children
+        self.workflow_header()
     }
 
     fn view(&self) -> Element<'_, Message> {
@@ -7933,7 +7568,7 @@ impl Application for Cagents {
             .into();
 
         let context_model = self
-            .context_inspector_open
+            .debug_inspector_open
             .then(|| self.workspace.focused())
             .flatten()
             .and_then(|card| {
@@ -7954,7 +7589,9 @@ impl Application for Cagents {
                     }
                 })
             });
-        if let Some(model) = context_model {
+        let surface: Element<'_, Message> = if self.context_inspector_open
+            && (self.active_workspace.is_some() || self.workspace.focused().is_some())
+        {
             let width = self
                 .settings
                 .inspector_width
@@ -7971,7 +7608,14 @@ impl Application for Cagents {
                 || Message::ContextInspector(InspectorAction::ResizeFinished),
             )
             .into();
-            let pane = inspector::view(model, width).map(Message::ContextInspector);
+            let pane = if cfg!(feature = "development") {
+                context_model.map_or_else(
+                    || self.git_surface(width),
+                    |model| inspector::view(model, width).map(Message::ContextInspector),
+                )
+            } else {
+                self.git_surface(width)
+            };
             let inspector_surface: Element<'_, Message> =
                 widget::row::with_children(vec![splitter, pane])
                     .spacing(0)
@@ -7996,7 +7640,15 @@ impl Application for Cagents {
                         widget::mouse_area(
                             widget::container(iced::widget::Space::new())
                                 .width(Length::Fill)
-                                .height(Length::Fill),
+                                .height(Length::Fill)
+                                .class(cosmic::theme::Container::custom(|_| {
+                                    iced::widget::container::Style {
+                                        background: Some(iced::Background::Color(
+                                            iced::Color::from_rgba(0.0, 0.0, 0.0, 0.4),
+                                        )),
+                                        ..Default::default()
+                                    }
+                                })),
                         )
                         .on_press(Message::ContextInspector(InspectorAction::Close)),
                     );
@@ -8016,7 +7668,11 @@ impl Application for Cagents {
                 .height(Length::Fill)
                 .width(Length::Fill)
                 .into()
-        }
+        };
+        crate::interaction::drive_animation(
+            surface,
+            self.workspace.camera().is_animating() || self.inspector_transition.is_some(),
+        )
     }
 }
 
@@ -8067,283 +7723,6 @@ impl Drop for Cagents {
     }
 }
 
-fn setting_input<'a>(
-    label: &'static str,
-    detail: impl Into<Cow<'a, str>> + 'a,
-    value: &'a str,
-    field: SettingsField,
-) -> Element<'a, Message> {
-    let spacing = cosmic::theme::spacing();
-    widget::column::with_children(vec![
-        widget::text::caption_heading(label).into(),
-        widget::text_input(label, value)
-            .on_input(move |value| Message::SettingsChanged { field, value })
-            .width(Length::Fill)
-            .into(),
-        widget::text::caption(detail)
-            .wrapping(cosmic::iced::widget::text::Wrapping::Word)
-            .into(),
-    ])
-    .spacing(spacing.space_xxxs)
-    .width(Length::Fill)
-    .into()
-}
-
-/// A row that edits its draft freely but only applies on Enter.
-///
-/// For a field whose every distinct value costs something permanent. Adopting
-/// a font family interns its name for the lifetime of the process and measures
-/// the grid for it - four shaping calls - so applying one per keystroke would
-/// leak a name and shape a grid for every prefix the user typed through.
-fn setting_input_on_submit<'a>(
-    label: &'static str,
-    detail: impl Into<Cow<'a, str>> + 'a,
-    value: &'a str,
-    field: SettingsField,
-) -> Element<'a, Message> {
-    let spacing = cosmic::theme::spacing();
-    widget::column::with_children(vec![
-        widget::text::caption_heading(label).into(),
-        widget::text_input(label, value)
-            .on_input(move |value| Message::SettingsDraftChanged { field, value })
-            .on_submit(move |value| Message::SettingsChanged { field, value })
-            .width(Length::Fill)
-            .into(),
-        widget::text::caption(detail)
-            .wrapping(cosmic::iced::widget::text::Wrapping::Word)
-            .into(),
-    ])
-    .spacing(spacing.space_xxxs)
-    .width(Length::Fill)
-    .into()
-}
-
-fn settings_choice<'a>(
-    label: &'static str,
-    detail: &'static str,
-    field: SettingsField,
-    choices: impl IntoIterator<Item = (&'static str, &'static str, bool)>,
-) -> Element<'a, Message> {
-    let spacing = cosmic::theme::spacing();
-    let buttons: Vec<Element<'a, Message>> = choices
-        .into_iter()
-        .map(|(choice, value, selected)| -> Element<'a, Message> {
-            let button = widget::button::standard(choice).on_press(Message::SettingsChanged {
-                field,
-                value: value.to_owned(),
-            });
-            if selected {
-                button.class(cosmic::theme::Button::Suggested).into()
-            } else {
-                button.into()
-            }
-        })
-        .collect();
-    widget::column::with_children(vec![
-        widget::text::caption_heading(label).into(),
-        widget::row::with_children(buttons)
-            .spacing(spacing.space_xxs)
-            .into(),
-        widget::text::caption(detail)
-            .wrapping(cosmic::iced::widget::text::Wrapping::Word)
-            .into(),
-    ])
-    .spacing(spacing.space_xxxs)
-    .width(Length::Fill)
-    .into()
-}
-
-fn settings_group<'a>(
-    title: &'static str,
-    description: &'static str,
-    controls: Vec<Element<'a, Message>>,
-) -> Element<'a, Message> {
-    let spacing = cosmic::theme::spacing();
-    let mut children = Vec::with_capacity(controls.len() + 2);
-    children.push(widget::text::title4(title).into());
-    children.push(
-        widget::text::caption(description)
-            .wrapping(cosmic::iced::widget::text::Wrapping::Word)
-            .into(),
-    );
-    children.extend(controls);
-    widget::container(
-        widget::column::with_children(children)
-            .spacing(spacing.space_s)
-            .width(Length::Fill),
-    )
-    .class(cosmic::theme::Container::Card)
-    .padding(spacing.space_s)
-    .width(Length::Fill)
-    .into()
-}
-
-fn settings_category_controls<'a>(
-    category: SettingsCategory,
-    draft: &'a SettingsDraft,
-) -> Vec<Element<'a, Message>> {
-    let spacing = cosmic::theme::spacing();
-    match category {
-        SettingsCategory::General => vec![
-            settings_group(
-                "Runtime",
-                "Control how many live columns cagents keeps active and when background work is suspended.",
-                vec![
-                    setting_input(
-                        "Maximum hot columns",
-                        "Applies immediately; extra background columns may hibernate.",
-                        &draft.max_hot_cards,
-                        SettingsField::MaxHotCards,
-                    ),
-                    setting_input(
-                        "Hibernation delay (ms)",
-                        "Applies immediately to background columns.",
-                        &draft.hibernation_delay_ms,
-                        SettingsField::HibernationDelayMs,
-                    ),
-                ],
-            ),
-            settings_group(
-                "Configuration",
-                "The on-disk settings format is managed by cagents.",
-                vec![
-                    widget::container(widget::text::monotext(&draft.schema_version))
-                        .class(cosmic::theme::Container::Secondary)
-                        .padding([spacing.space_xxs, spacing.space_xs])
-                        .width(Length::Fill)
-                        .into(),
-                ],
-            ),
-        ],
-        SettingsCategory::Appearance => vec![settings_group(
-            "Workspace layout",
-            "Tune the persistent navigation and the starting size of newly created columns.",
-            vec![
-                setting_input(
-                    "Sidebar width (px)",
-                    format!(
-                        "Applies immediately, {}. Dragging the pane's edge sets it too.",
-                        sidebar_width_range()
-                    ),
-                    &draft.sidebar_width,
-                    SettingsField::SidebarWidth,
-                ),
-                setting_input(
-                    "Default column fraction",
-                    "Applies to new columns only; existing widths are preserved.",
-                    &draft.default_column_fraction,
-                    SettingsField::DefaultColumnFraction,
-                ),
-            ],
-        )],
-        SettingsCategory::Terminal => vec![settings_group(
-            "Integrated terminal",
-            "Rendering changes apply immediately. Scrollback capacity applies to terminals started after the change.",
-            vec![
-                setting_input(
-                    "Font size",
-                    "A value from 8 to 40 pixels.",
-                    &draft.terminal_font_size,
-                    SettingsField::TerminalFontSize,
-                ),
-                setting_input_on_submit(
-                    "Font family",
-                    "Leave empty for the system monospace font. Powerline prompts need a font that includes their glyphs. Must be fixed-pitch: a family whose glyphs differ in width would not line up on the grid, so it falls back to the system monospace font. Applies when you press Enter.",
-                    &draft.terminal_font_family,
-                    SettingsField::TerminalFontFamily,
-                ),
-                setting_input(
-                    "Scrollback lines",
-                    "From 0 to 1,000,000 lines per newly started terminal.",
-                    &draft.terminal_scrollback_lines,
-                    SettingsField::TerminalScrollbackLines,
-                ),
-            ],
-        )],
-        SettingsCategory::Links => vec![settings_group(
-            "Link handling",
-            "Choose where modified clicks on known links open. Regular clicks stay inside the workspace.",
-            vec![
-                settings_choice(
-                    "Open modified links in",
-                    "Applies to pull request links and other links whose destination is known to cagents.",
-                    SettingsField::LinkOpenDestination,
-                    [
-                        (
-                            "Integrated browser",
-                            LinkOpenDestination::IntegratedBrowser.as_str(),
-                            draft.link_open_destination == LinkOpenDestination::IntegratedBrowser,
-                        ),
-                        (
-                            "System default",
-                            LinkOpenDestination::SystemDefault.as_str(),
-                            draft.link_open_destination == LinkOpenDestination::SystemDefault,
-                        ),
-                    ],
-                ),
-                settings_choice(
-                    "Modified-click gesture",
-                    "This gesture opens the link in the destination above.",
-                    SettingsField::LinkOpenGesture,
-                    [
-                        (
-                            "Ctrl+Click",
-                            LinkOpenGesture::ControlClick.as_str(),
-                            draft.link_open_gesture == LinkOpenGesture::ControlClick,
-                        ),
-                        (
-                            "Ctrl+Shift+Click",
-                            LinkOpenGesture::ControlShiftClick.as_str(),
-                            draft.link_open_gesture == LinkOpenGesture::ControlShiftClick,
-                        ),
-                    ],
-                ),
-            ],
-        )],
-        SettingsCategory::Keyboard => vec![settings_group(
-            "Keyboard shortcuts",
-            "Each row takes one or more chords separated by commas, and applies when you press Enter. Use Ctrl, Alt, or Super, optionally with Shift, plus A-Z, 0-9, Left, or Right. Every chord in the table must be unique.",
-            vec![
-                // Applied on submit, not per keystroke: a partly typed list
-                // parses on its way to the one the user means - "Alt+A" is a
-                // valid chord while "Alt+A, Alt+Left" is being typed - and
-                // adopting each prefix would rebind the action and rewrite the
-                // settings file at typing speed.
-                setting_input_on_submit(
-                    "New terminal",
-                    "Creates a terminal column.",
-                    &draft.keyboard_shortcuts.new_terminal,
-                    SettingsField::ShortcutNewTerminal,
-                ),
-                setting_input_on_submit(
-                    "Close focused column",
-                    "Closes the active workspace column.",
-                    &draft.keyboard_shortcuts.close_focused_column,
-                    SettingsField::ShortcutCloseFocusedColumn,
-                ),
-                setting_input_on_submit(
-                    "Search projects",
-                    "Moves keyboard focus to project search.",
-                    &draft.keyboard_shortcuts.search_projects,
-                    SettingsField::ShortcutSearchProjects,
-                ),
-                setting_input_on_submit(
-                    "Previous column",
-                    "Moves focus left and may repeat while held.",
-                    &draft.keyboard_shortcuts.previous_column,
-                    SettingsField::ShortcutPreviousColumn,
-                ),
-                setting_input_on_submit(
-                    "Next column",
-                    "Moves focus right and may repeat while held.",
-                    &draft.keyboard_shortcuts.next_column,
-                    SettingsField::ShortcutNextColumn,
-                ),
-            ],
-        )],
-    }
-}
-
 /// The settings dialog's first focusable control, focused when it opens.
 fn settings_close_id() -> widget::Id {
     widget::Id::new("dialog.settings.close")
@@ -8371,163 +7750,6 @@ fn worktree_dialog_focus_id() -> widget::Id {
 /// The pull-request dialog's first field, focused when it opens.
 fn pull_request_dialog_focus_id() -> widget::Id {
     widget::Id::new("dialog.pull-request.title")
-}
-
-fn settings_dialog<'a>(
-    category: SettingsCategory,
-    draft: &'a SettingsDraft,
-    feedback: Option<&'a SettingsFeedback>,
-    window_width: f32,
-    progress: f32,
-) -> Element<'a, Message> {
-    let spacing = cosmic::theme::spacing();
-    let narrow = window_width < design::OVERLAY_DOCK_BREAKPOINT;
-    let navigation_buttons: Vec<Element<'a, Message>> = SettingsCategory::ALL
-        .into_iter()
-        .map(|item| -> Element<'a, Message> {
-            widget::button::custom(widget::text::body(item.label()))
-                .name(item.label())
-                .class(cosmic::theme::Button::Text)
-                .selected(item == category)
-                .on_press(Message::SelectSettingsCategory(item))
-                .width(Length::Fill)
-                .into()
-        })
-        .collect();
-    let navigation_content: Element<'a, Message> = if narrow {
-        widget::row::with_children(navigation_buttons)
-            .spacing(spacing.space_xxxs)
-            .width(Length::Fill)
-            .into()
-    } else {
-        widget::column::with_children(navigation_buttons)
-            .spacing(spacing.space_xxs)
-            .width(Length::Fill)
-            .into()
-    };
-    let navigation: Element<'a, Message> = widget::container(navigation_content)
-        .class(cosmic::theme::Container::Secondary)
-        .padding(if narrow {
-            spacing.space_xxs
-        } else {
-            spacing.space_s
-        })
-        .width(if narrow {
-            Length::Fill
-        } else {
-            Length::Fixed(220.0)
-        })
-        .height(if narrow { Length::Shrink } else { Length::Fill })
-        .into();
-
-    let controls = settings_category_controls(category, draft);
-    let content: Element<'a, Message> = widget::container(
-        widget::scrollable(
-            widget::column::with_children(controls)
-                .spacing(spacing.space_s)
-                .width(Length::Fill)
-                .max_width(CONTENT_MAX_WIDTH),
-        )
-        .class(cosmic::style::iced::Scrollable::Minimal)
-        .width(Length::Fill)
-        .height(Length::Fill),
-    )
-    .class(cosmic::theme::Container::Primary)
-    .padding(spacing.space_m)
-    .width(Length::Fill)
-    .height(Length::Fill)
-    .into();
-    let settings_body: Element<'a, Message> = if narrow {
-        widget::column::with_children(vec![navigation, content])
-            .spacing(spacing.space_xs)
-            .height(Length::Fill)
-            .into()
-    } else {
-        widget::row::with_children(vec![navigation, content])
-            .spacing(spacing.space_s)
-            .height(Length::Fill)
-            .into()
-    };
-
-    let feedback: Element<'a, Message> = if let Some(feedback) = feedback {
-        let (icon, message) = match feedback {
-            SettingsFeedback::Saved => ("emblem-ok-symbolic", "Saved to settings.toml".to_owned()),
-            SettingsFeedback::Invalid(message) => ("dialog-warning-symbolic", message.clone()),
-            SettingsFeedback::Error(message) => (
-                "dialog-error-symbolic",
-                format!("Could not save settings: {message}"),
-            ),
-        };
-        widget::row::with_children(vec![
-            widget::icon::from_name(icon).size(16).into(),
-            widget::text::caption(message)
-                .wrapping(cosmic::iced::widget::text::Wrapping::Word)
-                .width(Length::Fill)
-                .into(),
-        ])
-        .align_y(Alignment::Center)
-        .spacing(spacing.space_xxs)
-        .into()
-    } else {
-        iced::widget::Space::new().width(Length::Fill).into()
-    };
-
-    let header = widget::row::with_children(vec![
-        widget::column::with_children(vec![
-            widget::text::title2("Settings").into(),
-            widget::text::caption(category.label()).into(),
-        ])
-        .spacing(spacing.space_xxxs)
-        .width(Length::Fill)
-        .into(),
-        widget::button::icon(widget::icon::from_name("window-close-symbolic"))
-            .id(settings_close_id())
-            .name("Close settings")
-            .on_press(Message::CloseInspector)
-            .into(),
-    ])
-    .align_y(Alignment::Center);
-    let footer = widget::row::with_children(vec![
-        widget::button::standard("Reset to defaults")
-            .leading_icon(widget::icon::from_name("edit-undo-symbolic").size(16))
-            .on_press(Message::ResetSettings)
-            .into(),
-        feedback,
-    ])
-    .align_y(Alignment::Center)
-    .spacing(spacing.space_xs);
-    let surface = widget::container(
-        widget::column::with_children(vec![
-            header.into(),
-            widget::divider::horizontal::light().into(),
-            settings_body,
-            widget::divider::horizontal::light().into(),
-            footer.into(),
-        ])
-        .spacing(spacing.space_s)
-        .width(Length::Fill)
-        .height(Length::Fill),
-    )
-    .class(cosmic::theme::Container::Dialog(false))
-    .padding(spacing.space_m)
-    .width(Length::Fill)
-    .height(Length::Fill)
-    .max_width(1_100.0)
-    .max_height(820.0);
-
-    let progress = progress.clamp(0.0, 1.0);
-    let offset = 18.0 * (1.0 - progress);
-    widget::container(surface)
-        .center(Length::Fill)
-        .padding(Padding {
-            top: 28.0 + offset,
-            right: 28.0,
-            bottom: 28.0 - offset,
-            left: 28.0,
-        })
-        .width(Length::Fill)
-        .height(Length::Fill)
-        .into()
 }
 
 #[cfg(feature = "integrated-browser")]
@@ -11058,7 +10280,7 @@ mod tests {
         assert_eq!(state.diagnostics_version, None);
     }
 
-    fn context_inspector_test_app(with_focused_card: bool) -> Cagents {
+    pub(super) fn context_inspector_test_app(with_focused_card: bool) -> Cagents {
         let card = with_focused_card.then(terminal_card_state);
         let card_id = card.as_ref().map(|card| card.id);
         let durable = Arc::new(WorkspaceState {
@@ -11112,6 +10334,8 @@ mod tests {
             settings_write_blocked: true,
             sidebar_model: SidebarModel::ready(SidebarMode::Expanded, Vec::new()),
             sidebar_state: SidebarState::default(),
+            active_workspace: None,
+            worktree_focus: HashMap::new(),
             github_repositories: HashMap::new(),
             worktree_dialog: None,
             pull_request_dialog: None,
@@ -11123,6 +10347,7 @@ mod tests {
             inspector: None,
             inspector_transition: None,
             context_inspector_open: true,
+            debug_inspector_open: false,
             context_inspector_overlay_active: false,
             context_inspector_restore_focus: Some(context_inspector_toggle_id()),
             settings_category: SettingsCategory::General,
@@ -11167,21 +10392,34 @@ mod tests {
         let mut app = context_inspector_test_app(true);
         let card = app.workspace.focused().unwrap();
         app.workspace.resize_viewport(1_000.0);
+        let limits = app.workspace.fractional_width_limits();
 
         let _ = app.update(Message::ResizeCard { card, width: 640.0 });
         assert_eq!(app.workspace.geometry().card(card).unwrap().width(), 640.0);
         assert_eq!(app.card_state(card).unwrap().width_fraction, 0.64);
 
         let _ = app.update(Message::ResizeCard { card, width: 10.0 });
-        assert_eq!(app.workspace.geometry().card(card).unwrap().width(), 480.0);
-        assert_eq!(app.card_state(card).unwrap().width_fraction, 0.48);
+        assert_eq!(
+            app.workspace.geometry().card(card).unwrap().width(),
+            limits.minimum
+        );
+        assert_eq!(
+            app.card_state(card).unwrap().width_fraction,
+            limits.minimum / 1_000.0
+        );
 
         let _ = app.update(Message::ResizeCard {
             card,
             width: 5_000.0,
         });
-        assert_eq!(app.workspace.geometry().card(card).unwrap().width(), 976.0);
-        assert_eq!(app.card_state(card).unwrap().width_fraction, 0.976);
+        assert_eq!(
+            app.workspace.geometry().card(card).unwrap().width(),
+            limits.maximum
+        );
+        assert_eq!(
+            app.card_state(card).unwrap().width_fraction,
+            limits.maximum / 1_000.0
+        );
     }
 
     fn task_app_message(task: Task<Message>) -> Message {
@@ -11656,33 +10894,6 @@ mod tests {
 
         assert!(is_escape_press(&event(false)));
         assert!(!is_escape_press(&event(true)));
-    }
-
-    #[test]
-    fn a_shell_shortened_working_directory_is_recognised_as_the_same_path() {
-        // A prompt that abbreviates every component but the last would
-        // otherwise stack two spellings of one path in the card header.
-        assert!(title_abbreviates_path(
-            "~/D/r/cagents",
-            "~/Documents/repositories/cagents"
-        ));
-        assert!(title_abbreviates_path(
-            "~/Documents/repositories/cagents",
-            "~/Documents/repositories/cagents"
-        ));
-        assert!(title_abbreviates_path("~", "~"));
-    }
-
-    #[test]
-    fn a_title_naming_anything_but_the_directory_survives() {
-        let caption = "~/Documents/repositories/cagents";
-
-        assert!(!title_abbreviates_path("cargo test", caption));
-        assert!(!title_abbreviates_path("~/D/r/other", caption));
-        // A prefix of the components is a different, shorter path.
-        assert!(!title_abbreviates_path("~/D/r", caption));
-        assert!(!title_abbreviates_path("~/D/r/cagents/src", caption));
-        assert!(!title_abbreviates_path("", caption));
     }
 
     #[test]

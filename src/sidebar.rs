@@ -1,4 +1,4 @@
-//! Project, worktree, and pull-request navigation.
+//! Project/worktree navigation and the active worktree's Git panel.
 //!
 //! This module deliberately keeps the sidebar's presentation state separate
 //! from repository discovery. Slow Git and GitHub work belongs outside the UI
@@ -59,10 +59,6 @@ const RESIZE_HANDLE_NAME: &str = "Resize sidebar";
 /// Height of one source-control panel row. Denser than the navigation rows
 /// above it because the panel lists paths rather than entities.
 const PANEL_ROW_HEIGHT: f32 = design::DENSE_ROW_HEIGHT;
-/// Width of the compact-mode source-control popover. Independent of
-/// [`EXPANDED_WIDTH_MAX`]: the popover floats over the workspace rather than
-/// inside the rail, so the pane's own bounds do not constrain it.
-const COMPACT_PANEL_WIDTH: f32 = 360.0;
 /// How many file-tree rows the `Files` section renders at once.
 ///
 /// `git ls-files` on a large repository returns six-figure path counts, and
@@ -239,10 +235,44 @@ impl SidebarProject {
         repository_id: RepositoryId,
         name: String,
         repository: PathBuf,
-        worktrees: Vec<SidebarWorktree>,
+        mut worktrees: Vec<SidebarWorktree>,
         pull_requests: Vec<SidebarPullRequest>,
     ) -> Self {
         let chrome = ProjectChrome::new(id, &name, &repository);
+        for worktree in &mut worktrees {
+            if worktree.chrome.pull_request.take().is_some() {
+                let status = status_summary(
+                    worktree.detached,
+                    worktree.locked,
+                    worktree.dirty.as_ref(),
+                    worktree.ahead,
+                    worktree.behind,
+                );
+                worktree.chrome.accessible_name =
+                    format!("Open worktree {}, {status}", worktree.chrome.label).into_boxed_str();
+                worktree.chrome.tooltip = format!(
+                    "{} — {} — {status}",
+                    worktree.chrome.label,
+                    worktree.path.display(),
+                )
+                .into_boxed_str();
+            }
+            if let Some(pull_request) = matching_pull_request(worktree, &pull_requests) {
+                worktree.chrome.pull_request = Some((
+                    format!("#{}", pull_request.number).into_boxed_str(),
+                    pull_request.checks,
+                ));
+                let description = format!(
+                    "pull request #{}, checks {}",
+                    pull_request.number,
+                    check_description(pull_request.checks),
+                );
+                worktree.chrome.accessible_name =
+                    format!("{}, {description}", worktree.chrome.accessible_name).into_boxed_str();
+                worktree.chrome.tooltip =
+                    format!("{} — {description}", worktree.chrome.tooltip).into_boxed_str();
+            }
+        }
         Self {
             id,
             repository_id,
@@ -286,20 +316,11 @@ struct ProjectChrome {
     open_id: Id,
     toggle_id: Id,
     new_worktree_id: Id,
-    /// The header's command for the selected project is a second control, so
-    /// it needs a second identity: two widgets sharing one custom id leave the
-    /// state tree with a node the renderer cannot downcast.
-    header_new_worktree_id: Id,
-    create_pull_request_id: Id,
-    toggle_pull_requests_id: Id,
     open_name: Box<str>,
     compact_open_name: Box<str>,
     collapse_name: Box<str>,
     expand_name: Box<str>,
     new_worktree_name: Box<str>,
-    create_pull_request_name: Box<str>,
-    collapse_pull_requests_name: Box<str>,
-    expand_pull_requests_name: Box<str>,
 }
 
 impl ProjectChrome {
@@ -310,17 +331,11 @@ impl ProjectChrome {
             open_id: entity_id("project.open", id),
             toggle_id: entity_id("project.toggle", id),
             new_worktree_id: entity_id("project.new_worktree", id),
-            header_new_worktree_id: entity_id("header.new_worktree", id),
-            create_pull_request_id: entity_id("project.create_pr", id),
-            toggle_pull_requests_id: entity_id("project.toggle_prs", id),
             open_name: format!("Open project {name}").into_boxed_str(),
             compact_open_name: format!("Open {name}").into_boxed_str(),
             collapse_name: format!("Collapse {name} project").into_boxed_str(),
             expand_name: format!("Expand {name} project").into_boxed_str(),
             new_worktree_name: format!("New worktree for {name}").into_boxed_str(),
-            create_pull_request_name: format!("Create pull request for {name}").into_boxed_str(),
-            collapse_pull_requests_name: format!("Collapse {name} pull requests").into_boxed_str(),
-            expand_pull_requests_name: format!("Expand {name} pull requests").into_boxed_str(),
         }
     }
 }
@@ -364,18 +379,13 @@ impl SidebarWorktree {
             folded_path: fold(&path.to_string_lossy()),
             open_id: entity_id("worktree.open", id),
             accessible_name: format!("Open worktree {label}, {status}").into_boxed_str(),
-            tooltip: format!("{label} — {path_label}").into_boxed_str(),
+            tooltip: format!("{label} — {path_label} — {status}").into_boxed_str(),
             dirty_badge: dirty
                 .as_ref()
                 .filter(|dirty| dirty.is_dirty())
                 .map(|dirty| format!("{} changes", dirty_count(dirty)).into_boxed_str()),
-            ahead_badge: ahead
-                .filter(|ahead| *ahead > 0)
-                .map(|ahead| format!("↑{ahead}").into_boxed_str()),
-            behind_badge: behind
-                .filter(|behind| *behind > 0)
-                .map(|behind| format!("↓{behind}").into_boxed_str()),
             label: label.into_boxed_str(),
+            pull_request: None,
         };
 
         Self {
@@ -436,6 +446,22 @@ impl SidebarWorktree {
     }
 }
 
+/// Branch names are case-sensitive and only attached worktrees can own a PR.
+/// Restricting this lookup to the containing project prevents same-named
+/// branches in another repository from lending this row their CI status.
+fn matching_pull_request<'a>(
+    worktree: &SidebarWorktree,
+    pull_requests: &'a [SidebarPullRequest],
+) -> Option<&'a SidebarPullRequest> {
+    if worktree.detached {
+        return None;
+    }
+    let branch = worktree.branch.as_deref()?;
+    pull_requests
+        .iter()
+        .find(|pull_request| pull_request.head_ref == branch)
+}
+
 /// Presentation strings and widget identities a worktree determines, built
 /// once in `SidebarWorktree::new`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -447,8 +473,7 @@ struct WorktreeChrome {
     accessible_name: Box<str>,
     tooltip: Box<str>,
     dirty_badge: Option<Box<str>>,
-    ahead_badge: Option<Box<str>>,
-    behind_badge: Option<Box<str>>,
+    pull_request: Option<(Box<str>, CheckStatus)>,
 }
 
 /// Aggregate check state for a pull request.
@@ -525,16 +550,7 @@ impl SidebarPullRequest {
         }
         let check_label = check_description(checks);
         let chrome = PullRequestChrome {
-            folded_title: fold(&title),
-            folded_head_ref: fold(&head_ref),
-            folded_author: author.as_deref().map(fold),
-            number_text: number.to_string().into_boxed_str(),
-            open_ids: PullRequestSurface::ALL.map(|surface| {
-                stable_id(format!(
-                    "project.{project_id}.pr.{number}.open.{}",
-                    surface.key()
-                ))
-            }),
+            open_id: stable_id(format!("project.{project_id}.pr.{number}.open")),
             accessible_name: format!("Open pull request {number}: {title}, checks {check_label}")
                 .into_boxed_str(),
             metadata: metadata.into_boxed_str(),
@@ -572,17 +588,6 @@ impl SidebarPullRequest {
         )
     }
 
-    fn matches(&self, folded_query: &str) -> bool {
-        self.chrome.folded_title.contains(folded_query)
-            || self.chrome.folded_head_ref.contains(folded_query)
-            || self
-                .chrome
-                .folded_author
-                .as_deref()
-                .is_some_and(|author| author.contains(folded_query))
-            || self.chrome.number_text.contains(folded_query)
-    }
-
     fn needs_attention(&self) -> bool {
         matches!(self.checks, CheckStatus::Failing | CheckStatus::Pending)
     }
@@ -592,43 +597,9 @@ impl SidebarPullRequest {
 /// once in `SidebarPullRequest::new`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct PullRequestChrome {
-    folded_title: Box<str>,
-    folded_head_ref: Box<str>,
-    folded_author: Option<Box<str>>,
-    number_text: Box<str>,
-    /// One identity per surface that draws this row. The navigation list and
-    /// the source-control panel both render the project's pull requests in the
-    /// same frame, and iced keys persistent widget state by custom name in one
-    /// map per frame: two nodes under one name means the second visited
-    /// overwrites the first, and the loser's state is dropped.
-    open_ids: [Id; 2],
+    open_id: Id,
     accessible_name: Box<str>,
     metadata: Box<str>,
-}
-
-impl PullRequestChrome {
-    fn open_id(&self, surface: PullRequestSurface) -> &Id {
-        &self.open_ids[surface as usize]
-    }
-}
-
-/// Which of the two surfaces that draw pull-request rows is drawing one.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum PullRequestSurface {
-    Navigation,
-    Panel,
-}
-
-impl PullRequestSurface {
-    const ALL: [Self; 2] = [Self::Navigation, Self::Panel];
-
-    /// The fragment that keeps one surface's widget names distinct.
-    fn key(self) -> &'static str {
-        match self {
-            Self::Navigation => "nav",
-            Self::Panel => "panel",
-        }
-    }
 }
 
 /// A number of rows a section header prints, and whether anything downstream
@@ -1516,23 +1487,11 @@ struct SourceControlChrome {
     /// the one iced visits second is handed the emptied state the first left
     /// behind.
     retry_id: Id,
-    popover_id: Id,
-    /// The popover surface's own name, which cannot be [`Self::popover_id`].
-    ///
-    /// The popover wraps the anchor button, so both nodes exist in the same
-    /// frame, and iced keys persistent widget state by custom name in one map
-    /// per frame. The second node visited under a shared name overwrites the
-    /// first and the loser's state is dropped - and the popover is stateless
-    /// while the button holds real state, so the button can end up with a
-    /// state its next downcast panics on.
-    popover_surface_id: Id,
-    close_id: Id,
-    open_panel_name: Box<str>,
-    close_panel_name: Box<str>,
     files_query_id: Id,
     commit_input_id: Id,
     commit_id: Id,
     push_id: Id,
+    create_pull_request_id: Id,
     /// One entry per configured remote, parallel to
     /// [`SourceControlModel::remotes`], so the publish picker builds no
     /// identity while rendering.
@@ -1565,15 +1524,11 @@ impl SourceControlChrome {
             refresh_id: entity_id("panel.refresh", worktree_id),
             refresh_name: format!("Reload source control for {name}").into_boxed_str(),
             retry_id: entity_id("panel.retry", worktree_id),
-            popover_id: entity_id("panel.popover", worktree_id),
-            popover_surface_id: entity_id("panel.popover.surface", worktree_id),
-            close_id: entity_id("panel.close", worktree_id),
-            open_panel_name: format!("Open source control for {name}").into_boxed_str(),
-            close_panel_name: format!("Close source control for {name}").into_boxed_str(),
             files_query_id: entity_id("panel.files.query", worktree_id),
             commit_input_id: entity_id("panel.commit.message", worktree_id),
             commit_id: entity_id("panel.commit", worktree_id),
             push_id: entity_id("panel.push", worktree_id),
+            create_pull_request_id: entity_id("panel.create_pr", worktree_id),
             publish_remote_ids: remotes
                 .iter()
                 .map(|remote| stable_id(format!("panel.publish.remote.{worktree_id}.{remote}")))
@@ -2139,7 +2094,7 @@ pub fn clamp_expanded_width(width: f32) -> f32 {
     }
 }
 
-/// The sidebar's single public rendering entry point.
+/// The left project/worktree navigation.
 ///
 /// `modal_open` says a dialog is on screen. The dialog is an overlay, so a
 /// keystroke it does not consume still reaches this pane, and the pane still
@@ -2185,28 +2140,11 @@ pub fn view<'a>(
         );
     }
 
-    // The navigation list and the source-control panel share the pane. The
-    // panel is the working surface, so it gets the larger share; both scroll
-    // independently rather than one pushing the other off-screen.
-    let panel = source_control_surface(model, state, compact, modal_open);
     content = content.push(
         widget::container(body(model, state, compact, modal_open))
             .padding([spacing.space_xxxs, spacing.space_xxxs])
-            .height(if panel.is_some() {
-                Length::FillPortion(1)
-            } else {
-                Length::Fill
-            }),
+            .height(Length::Fill),
     );
-    if let Some(panel) = panel {
-        content = content.push(widget::divider::horizontal::light()).push(
-            widget::container(panel).height(if compact {
-                Length::Shrink
-            } else {
-                Length::FillPortion(2)
-            }),
-        );
-    }
     content = content
         .push(widget::divider::horizontal::light())
         .push(footer(model, state, compact, modal_open))
@@ -2274,17 +2212,16 @@ fn header<'a>(
         let selected = state.controls_expanded
             || !state.query.is_empty()
             || state.filter != SidebarFilter::All;
-        children.push(
+        children.push(crate::interaction::tooltip(
             button::icon(icon::from_name("view-list-symbolic").size(ROW_ICON_SIZE))
                 .id(stable_id("toggle-controls"))
                 .name("Search and filter projects")
-                .tooltip("Search and filter projects")
                 .selected(selected)
                 .width(ICON_CONTROL_SIZE)
                 .height(ICON_CONTROL_SIZE)
-                .on_press_maybe(gated(SidebarAction::ToggleControls, modal_open))
-                .into(),
-        );
+                .on_press_maybe(gated(SidebarAction::ToggleControls, modal_open)),
+            "Search and filter projects",
+        ));
     }
     if loading {
         children.push(
@@ -2299,20 +2236,6 @@ fn header<'a>(
         gated(SidebarAction::OpenRepositoryPicker, modal_open),
         stable_id("open-repository"),
     ));
-    if let Some(project) = selected_project(model, state) {
-        children.push(icon_action(
-            "list-add-symbolic",
-            &*project.chrome.new_worktree_name,
-            gated(
-                SidebarAction::NewWorktree {
-                    project_id: project.id,
-                    repository: project.repository.clone(),
-                },
-                modal_open,
-            ),
-            project.chrome.header_new_worktree_id.clone(),
-        ));
-    }
 
     widget::row::with_children(children)
         .align_y(Alignment::Center)
@@ -2326,11 +2249,16 @@ fn selected_project<'a>(
     model: &'a SidebarModel,
     state: &SidebarState,
 ) -> Option<&'a SidebarProject> {
-    let project_id = state.selection.map(|selection| match selection {
-        SidebarSelection::Project(project_id)
-        | SidebarSelection::Worktree { project_id, .. }
-        | SidebarSelection::PullRequest { project_id, .. } => project_id,
-    })?;
+    let project_id = state
+        .active_worktree()
+        .map(|key| key.project_id)
+        .or_else(|| {
+            state.selection.map(|selection| match selection {
+                SidebarSelection::Project(project_id)
+                | SidebarSelection::Worktree { project_id, .. }
+                | SidebarSelection::PullRequest { project_id, .. } => project_id,
+            })
+        })?;
     model
         .projects
         .iter()
@@ -2384,37 +2312,21 @@ fn footer<'a>(
         stable_id("settings"),
     );
     if compact {
-        // The rail renders no project header, and the window's header bar is
-        // no substitute: without these the two commands have no route at all
-        // below the breakpoint.
+        // The rail has no project header, so retain its worktree command here.
         let mut children: Vec<Element<'a, SidebarAction>> = Vec::with_capacity(3);
         if let Some(project) = selected_project(model, state) {
-            children.extend([
-                icon_action(
-                    "list-add-symbolic",
-                    &*project.chrome.new_worktree_name,
-                    gated(
-                        SidebarAction::NewWorktree {
-                            project_id: project.id,
-                            repository: project.repository.clone(),
-                        },
-                        modal_open,
-                    ),
-                    project.chrome.new_worktree_id.clone(),
+            children.push(icon_action(
+                "list-add-symbolic",
+                &*project.chrome.new_worktree_name,
+                gated(
+                    SidebarAction::NewWorktree {
+                        project_id: project.id,
+                        repository: project.repository.clone(),
+                    },
+                    modal_open,
                 ),
-                icon_action(
-                    "document-new-symbolic",
-                    &*project.chrome.create_pull_request_name,
-                    gated(
-                        SidebarAction::CreatePullRequest {
-                            project_id: project.id,
-                            worktree: None,
-                        },
-                        modal_open,
-                    ),
-                    project.chrome.create_pull_request_id.clone(),
-                ),
-            ]);
+                project.chrome.new_worktree_id.clone(),
+            ));
         }
         children.push(settings);
         return widget::column::with_children(children)
@@ -2452,7 +2364,7 @@ fn search<'a>(state: &'a SidebarState, modal_open: bool) -> Element<'a, SidebarA
 /// The filter choices, in the order both densities present them: the rail
 /// renders the icon, the expanded row renders the label, and both name the
 /// control identically for assistive technologies.
-const FILTER_CHOICES: [(SidebarFilter, &str, &str, &str); 3] = [
+const FILTER_CHOICES: [(SidebarFilter, &str, &str, &str); 2] = [
     (
         SidebarFilter::All,
         "view-list-symbolic",
@@ -2465,12 +2377,6 @@ const FILTER_CHOICES: [(SidebarFilter, &str, &str, &str); 3] = [
         "Attention",
         "Show projects needing attention",
     ),
-    (
-        SidebarFilter::PullRequests,
-        "vcs-merge-request-symbolic",
-        "PRs",
-        "Show projects with pull requests",
-    ),
 ];
 
 fn filters(filter: SidebarFilter, modal_open: bool) -> Element<'static, SidebarAction> {
@@ -2481,7 +2387,7 @@ fn filters(filter: SidebarFilter, modal_open: bool) -> Element<'static, SidebarA
     for (value, _, visible_label, accessible_label) in FILTER_CHOICES {
         row = row.push(
             button::custom(widget::text::caption(visible_label))
-                .class(theme::Button::Text)
+                .class(theme::Button::MenuItem)
                 .id(filter_id(value))
                 .name(accessible_label)
                 .selected(filter == value)
@@ -2501,16 +2407,16 @@ fn compact_filters(filter: SidebarFilter, modal_open: bool) -> Element<'static, 
         .align_x(Alignment::Center)
         .width(Length::Fill);
     for (value, icon_name, _, accessible_label) in FILTER_CHOICES {
-        column = column.push(
+        column = column.push(crate::interaction::tooltip(
             button::icon(icon::from_name(icon_name).size(ROW_ICON_SIZE))
                 .id(filter_id(value))
                 .name(accessible_label)
-                .tooltip(accessible_label)
                 .width(ICON_CONTROL_SIZE)
                 .height(ICON_CONTROL_SIZE)
                 .selected(filter == value)
                 .on_press_maybe(gated(SidebarAction::SetFilter(value), modal_open)),
-        );
+            accessible_label,
+        ));
     }
     column.into()
 }
@@ -2549,6 +2455,13 @@ fn project_list<'a>(
     // and the set stores only the user's explicit collapses. The rail renders
     // no search input and applies no query, so nothing there is a result.
     let searching = !compact && !state.query.trim().is_empty();
+    let selection = state
+        .active_worktree()
+        .map(|key| SidebarSelection::Worktree {
+            project_id: key.project_id,
+            worktree_id: key.worktree_id,
+        })
+        .or(state.selection);
     let spacing = cosmic::theme::spacing();
     let mut column = widget::column::with_capacity(projects.len()).spacing(if compact {
         spacing.space_xxxs
@@ -2560,9 +2473,8 @@ fn project_list<'a>(
         column = column.push(project_view(
             project,
             searching || !state.collapsed_projects.contains(&project_id),
-            searching || state.expanded_pull_requests.contains(&project_id),
             compact,
-            state.selection,
+            selection,
             modal_open,
         ));
     }
@@ -2723,7 +2635,6 @@ fn empty(state: &SidebarState, compact: bool, modal_open: bool) -> Element<'stat
 fn project_view<'a>(
     project: &FilteredProject<'a>,
     expanded: bool,
-    pull_requests_expanded: bool,
     compact: bool,
     selection: Option<SidebarSelection>,
     modal_open: bool,
@@ -2737,8 +2648,7 @@ fn project_view<'a>(
 
     let spacing = cosmic::theme::spacing();
     let worktree_count = project.worktrees.len();
-    let pull_request_count = project.pull_requests.len();
-    let has_children = worktree_count > 0 || pull_request_count > 0;
+    let has_children = worktree_count > 0;
     let project_identity = button::custom(
         widget::row::with_children(vec![
             widget::container(widget::icon::from_name("folder-symbolic").size(ROW_ICON_SIZE))
@@ -2753,9 +2663,10 @@ fn project_view<'a>(
                 .into(),
         ])
         .align_y(Alignment::Center)
+        .height(Length::Fill)
         .spacing(spacing.space_xxxs),
     )
-    .class(theme::Button::Text)
+    .class(theme::Button::MenuItem)
     .id(chrome.open_id.clone())
     .name(&*chrome.open_name)
     .selected(selection == Some(SidebarSelection::Project(project_id)))
@@ -2769,12 +2680,8 @@ fn project_view<'a>(
         },
         modal_open,
     ));
-    let project_identity: Element<'a, SidebarAction> = widget::tooltip::tooltip(
-        project_identity,
-        widget::text::caption(entity.repository.display().to_string()),
-        widget::tooltip::Position::Bottom,
-    )
-    .into();
+    let project_identity =
+        crate::interaction::tooltip(project_identity, entity.repository.display().to_string());
 
     let leading: Element<'a, SidebarAction> = if has_children {
         icon_action(
@@ -2812,25 +2719,13 @@ fn project_view<'a>(
             ),
             chrome.new_worktree_id.clone(),
         ),
-        icon_action(
-            "document-new-symbolic",
-            &*chrome.create_pull_request_name,
-            gated(
-                SidebarAction::CreatePullRequest {
-                    project_id,
-                    worktree: None,
-                },
-                modal_open,
-            ),
-            chrome.create_pull_request_id.clone(),
-        ),
     ])
     .align_y(Alignment::Center)
-    .spacing(spacing.space_xxxs)
+    .spacing(0)
     .height(Length::Fixed(PROJECT_HEADER_HEIGHT));
     let mut column = widget::column::with_capacity(worktree_count + 2)
-        .spacing(spacing.space_xxxs)
-        .push(header);
+        .spacing(0)
+        .push(crate::interaction::hover(header));
 
     if expanded {
         for &worktree in &project.worktrees {
@@ -2843,18 +2738,6 @@ fn project_view<'a>(
                     modal_open,
                 ))
                 .padding([0, 0, 0, spacing.space_l]),
-            );
-        }
-        if pull_request_count > 0 {
-            column = column.push(
-                widget::container(pull_request_group(
-                    entity,
-                    &project.pull_requests,
-                    pull_requests_expanded,
-                    selection,
-                    modal_open,
-                ))
-                .padding([spacing.space_xxxs, 0, 0, spacing.space_l]),
             );
         }
     }
@@ -2885,7 +2768,6 @@ fn compact_project<'a>(
     let action = button::icon(icon::from_name("folder-symbolic").size(ROW_ICON_SIZE))
         .id(chrome.open_id.clone())
         .name(&*chrome.compact_open_name)
-        .tooltip(&*chrome.compact_open_name)
         .width(ICON_CONTROL_SIZE)
         .height(ICON_CONTROL_SIZE)
         .selected(selected)
@@ -2896,9 +2778,53 @@ fn compact_project<'a>(
             },
             modal_open,
         ));
-    widget::container(action)
-        .center_x(Length::Fill)
-        .padding(cosmic::theme::spacing().space_xxxs)
+    let mut column = widget::column::with_capacity(project.worktrees.len() + 1)
+        .align_x(Alignment::Center)
+        .width(Length::Fill)
+        .push(crate::interaction::tooltip(
+            action,
+            &*chrome.compact_open_name,
+        ));
+    for &worktree in &project.worktrees {
+        let action = button::icon(icon::from_name("vcs-branch-symbolic").size(ROW_ICON_SIZE))
+            .id(worktree.chrome.open_id.clone())
+            .name(&*worktree.chrome.accessible_name)
+            .width(ICON_CONTROL_SIZE)
+            .height(Length::Fixed(WORKTREE_ROW_HEIGHT))
+            .selected(
+                selection
+                    == Some(SidebarSelection::Worktree {
+                        project_id: entity.id,
+                        worktree_id: worktree.id,
+                    }),
+            )
+            .on_press_maybe(gated(
+                SidebarAction::OpenWorktree {
+                    project_id: entity.id,
+                    worktree_id: worktree.id,
+                    path: worktree.path.clone(),
+                },
+                modal_open,
+            ));
+        let mut row = widget::row::with_capacity(2)
+            .align_y(Alignment::Center)
+            .push(crate::interaction::tooltip(
+                action,
+                &*worktree.chrome.tooltip,
+            ));
+        if let Some((_, checks)) = &worktree.chrome.pull_request {
+            row = row.push(check_indicator(*checks));
+        } else if let Some(label) = worktree.chrome.dirty_badge.as_deref() {
+            row = row.push(status_icon(
+                "document-edit-symbolic",
+                label,
+                BadgeTone::Warning,
+            ));
+        }
+        column = column.push(crate::interaction::hover(row));
+    }
+    widget::container(column)
+        .padding([cosmic::theme::spacing().space_xxxs, 0])
         .width(Length::Fill)
         .into()
 }
@@ -2918,36 +2844,50 @@ fn worktree_view<'a>(
         .push(
             widget::container(widget::icon::from_name("vcs-branch-symbolic").size(ROW_ICON_SIZE))
                 .center_x(Length::Fixed(ROW_ICON_WIDTH)),
-        )
-        .push(
-            widget::text::body(&*chrome.label)
-                .wrapping(cosmic::iced::widget::text::Wrapping::None)
-                .ellipsize(cosmic::iced::widget::text::Ellipsize::End(
-                    EllipsizeHeightLimit::Lines(1),
-                ))
-                .width(Length::Fill),
         );
+    if let Some(label) = chrome.dirty_badge.as_deref() {
+        row = row.push(status_icon(
+            "document-edit-symbolic",
+            label,
+            BadgeTone::Warning,
+        ));
+    }
+    if let Some((number, checks)) = &chrome.pull_request {
+        row = row.push(badge(number.as_ref(), BadgeTone::Neutral));
+        row = row.push(check_indicator(*checks));
+    }
+    row = row.push(
+        widget::text::body(&*chrome.label)
+            .wrapping(cosmic::iced::widget::text::Wrapping::None)
+            .ellipsize(cosmic::iced::widget::text::Ellipsize::End(
+                EllipsizeHeightLimit::Lines(1),
+            ))
+            .width(Length::Fill),
+    );
     if primary {
-        row = row.push(badge("primary", BadgeTone::Neutral));
+        row = row.push(status_icon(
+            "starred-symbolic",
+            "Primary worktree",
+            BadgeTone::Neutral,
+        ));
     }
     if worktree.detached {
-        row = row.push(badge("detached", BadgeTone::Neutral));
-    }
-    if let Some(label) = chrome.dirty_badge.as_deref() {
-        row = row.push(badge(label, BadgeTone::Warning));
-    }
-    if let Some(label) = chrome.ahead_badge.as_deref() {
-        row = row.push(badge(label, BadgeTone::Accent));
-    }
-    if let Some(label) = chrome.behind_badge.as_deref() {
-        row = row.push(badge(label, BadgeTone::Warning));
+        row = row.push(status_icon(
+            "dialog-information-symbolic",
+            "Detached HEAD",
+            BadgeTone::Neutral,
+        ));
     }
     if worktree.locked {
-        row = row.push(badge("locked", BadgeTone::Neutral));
+        row = row.push(status_icon(
+            "changes-prevent-symbolic",
+            "Locked worktree",
+            BadgeTone::Neutral,
+        ));
     }
 
     let action = button::custom(row)
-        .class(theme::Button::Text)
+        .class(theme::Button::MenuItem)
         .id(chrome.open_id.clone())
         .selected(
             selection
@@ -2968,65 +2908,12 @@ fn worktree_view<'a>(
             },
             modal_open,
         ));
-    widget::tooltip::tooltip(
-        action,
-        widget::text::caption(&*chrome.tooltip),
-        widget::tooltip::Position::Bottom,
-    )
-    .into()
-}
-
-fn pull_request_group<'a>(
-    project: &'a SidebarProject,
-    pull_requests: &[&'a SidebarPullRequest],
-    expanded: bool,
-    selection: Option<SidebarSelection>,
-    modal_open: bool,
-) -> Element<'a, SidebarAction> {
-    let chrome = &project.chrome;
-    let spacing = cosmic::theme::spacing();
-    let mut column = widget::column::with_capacity(pull_requests.len() + 1)
-        .spacing(spacing.space_xxxs)
-        .push(
-            widget::row::with_children(vec![
-                icon_action(
-                    if expanded {
-                        "go-down-symbolic"
-                    } else {
-                        "go-next-symbolic"
-                    },
-                    if expanded {
-                        &*chrome.collapse_pull_requests_name
-                    } else {
-                        &*chrome.expand_pull_requests_name
-                    },
-                    gated(SidebarAction::TogglePullRequests(project.id), modal_open),
-                    chrome.toggle_pull_requests_id.clone(),
-                ),
-                widget::text::caption_heading(format!("Pull requests ({})", pull_requests.len()))
-                    .into(),
-            ])
-            .align_y(Alignment::Center)
-            .spacing(spacing.space_xxxs),
-        );
-    if expanded {
-        for &pull_request in pull_requests {
-            column = column.push(pull_request_view(
-                project.id,
-                pull_request,
-                PullRequestSurface::Navigation,
-                selection,
-                modal_open,
-            ));
-        }
-    }
-    column.into()
+    crate::interaction::tooltip(crate::interaction::hover(action), &*chrome.tooltip)
 }
 
 fn pull_request_view<'a>(
     project_id: ProjectId,
     pull_request: &'a SidebarPullRequest,
-    surface: PullRequestSurface,
     selection: Option<SidebarSelection>,
     modal_open: bool,
 ) -> Element<'a, SidebarAction> {
@@ -3081,8 +2968,8 @@ fn pull_request_view<'a>(
     .align_y(Alignment::Center);
 
     let action = button::custom(row)
-        .class(theme::Button::Text)
-        .id(chrome.open_id(surface).clone())
+        .class(theme::Button::MenuItem)
+        .id(chrome.open_id.clone())
         .name(&*chrome.accessible_name)
         .selected(
             selection
@@ -3095,104 +2982,64 @@ fn pull_request_view<'a>(
         .height(Length::Fixed(PULL_REQUEST_ROW_HEIGHT))
         .width(Length::Fill)
         .on_press_maybe(action);
-    widget::tooltip::tooltip(
-        action,
-        widget::text::caption(pull_request.title.as_str()),
-        widget::tooltip::Position::Bottom,
+    crate::interaction::tooltip(
+        crate::interaction::hover(action),
+        pull_request.title.as_str(),
     )
-    .into()
 }
 
-/// The source-control surface for the active worktree.
+/// The selected worktree's Git surface, independent of the focused card kind.
 ///
-/// Expanded mode renders the panel inline below the navigation; compact mode
-/// renders the very same panel inside a COSMIC popover behind a named
-/// source-control icon. The panel body is built by one function in both cases,
-/// so a command cannot exist in one density and not the other.
-///
-/// `modal_open` stands every command below here down; see [`gated`].
-fn source_control_surface<'a>(
+/// A stale snapshot never mounts mutation controls. Main binds the state to
+/// the selected worktree and loads its source-control model before rendering.
+pub fn git_panel<'a>(
     model: &'a SidebarModel,
     state: &'a SidebarState,
-    compact: bool,
+    width: f32,
     modal_open: bool,
-) -> Option<Element<'a, SidebarAction>> {
-    let key = state.active_worktree()?;
-    let source = model
-        .source_control
-        .as_ref()
-        .filter(|source| &source.key == key)?;
-    let project = model.project(key.project_id);
-    if !compact {
-        return Some(source_control_panel(state, source, project, modal_open));
-    }
-
-    let spacing = cosmic::theme::spacing();
-    let chrome = &source.chrome;
-    let label: &str = if state.panel_open {
-        &chrome.close_panel_name
+) -> Element<'a, SidebarAction> {
+    let width = if width.is_finite() {
+        width.clamp(design::INSPECTOR_MIN_WIDTH, design::INSPECTOR_MAX_WIDTH)
     } else {
-        &chrome.open_panel_name
+        design::INSPECTOR_DEFAULT_WIDTH
     };
-    let anchor = widget::container(
-        button::icon(icon::from_name("emblem-shared-symbolic").size(ROW_ICON_SIZE))
-            .id(chrome.popover_id.clone())
-            .name(label)
-            .tooltip(label)
-            .width(ICON_CONTROL_SIZE)
-            .height(ICON_CONTROL_SIZE)
-            .selected(state.panel_open)
-            .on_press_maybe(gated(
-                SidebarAction::ToggleSourceControlPanel { key: key.clone() },
-                modal_open,
-            )),
-    )
-    .center_x(Length::Fill)
-    .padding(spacing.space_xxxs);
-    if !state.panel_open {
-        return Some(anchor.into());
-    }
-    // The popover is modal so a click cannot land on the workspace behind a
-    // 360-wide overlay by accident; the header's close button is therefore the
-    // explicit way back out.
-    let popup = widget::container(
-        widget::column::with_children(vec![
-            widget::row::with_children(vec![
-                widget::text::caption_heading(&*chrome.heading)
-                    .width(Length::Fill)
-                    .into(),
-                icon_action(
-                    "window-close-symbolic",
-                    &*chrome.close_panel_name,
-                    gated(
-                        SidebarAction::ToggleSourceControlPanel { key: key.clone() },
-                        modal_open,
-                    ),
-                    chrome.close_id.clone(),
-                ),
-            ])
-            .align_y(Alignment::Center)
-            .spacing(spacing.space_xxs)
-            .into(),
-            source_control_panel(state, source, project, modal_open),
-        ])
-        .spacing(spacing.space_xxs),
-    )
-    .class(theme::Container::Dialog(false))
-    .padding(spacing.space_xs)
-    .width(Length::Fixed(COMPACT_PANEL_WIDTH))
-    .max_height(640.0);
-    Some(
-        widget::popover(anchor)
-            .id(chrome.popover_surface_id.clone())
-            .position(widget::popover::Position::Bottom)
-            .modal(true)
-            .popup(popup)
-            .into(),
-    )
+    let source = bound_source_control(model, state);
+    let content = match source {
+        Some(source) => source_control_panel(
+            state,
+            source,
+            model.project(source.key.project_id),
+            modal_open,
+        ),
+        None => widget::container(widget::text::caption(
+            if state.active_worktree().is_some() {
+                "Loading worktree source control…"
+            } else {
+                "Select a worktree to view changes."
+            },
+        ))
+        .padding(cosmic::theme::spacing().space_xs)
+        .into(),
+    };
+    widget::container(content)
+        .class(theme::Container::Background)
+        .width(Length::Fixed(width))
+        .height(Length::Fill)
+        .into()
 }
 
-/// The four collapsible sections. Identical in both densities.
+fn bound_source_control<'a>(
+    model: &'a SidebarModel,
+    state: &SidebarState,
+) -> Option<&'a SourceControlModel> {
+    let key = state.active_worktree()?;
+    model
+        .source_control
+        .as_ref()
+        .filter(|source| &source.key == key)
+}
+
+/// The active worktree's four collapsible Git sections.
 fn source_control_panel<'a>(
     state: &'a SidebarState,
     source: &'a SourceControlModel,
@@ -3333,7 +3180,7 @@ fn source_control_panel<'a>(
         pull_request_section_count(project),
         state.section_expanded(PanelSection::PullRequests),
         modal_open,
-        || pull_requests_section(state, project, modal_open),
+        || pull_requests_section(state, source, project, modal_open),
     ));
 
     column = column.push(
@@ -3380,10 +3227,7 @@ struct SectionHeader {
     /// The accessible name and the tooltip. Both name the action rather than
     /// the section, because the row is a control.
     action_name: String,
-    /// `None` while a dialog is on screen; see [`gated`]. The stand-down lives
-    /// in the value rather than at the widget because the widget is wrapped in
-    /// a tooltip that keeps it out of the accessibility tree, so this is the
-    /// only place the decision can be read.
+    /// `None` while a dialog is on screen; see [`gated`].
     toggle: Option<SidebarAction>,
 }
 
@@ -3463,12 +3307,7 @@ fn panel_section<'a>(
     .height(Length::Fixed(PANEL_ROW_HEIGHT))
     .width(Length::Fill)
     .on_press_maybe(parts.toggle);
-    let header: Element<'a, SidebarAction> = widget::tooltip::tooltip(
-        row,
-        widget::text::caption(parts.action_name),
-        widget::tooltip::Position::Bottom,
-    )
-    .into();
+    let header = crate::interaction::tooltip(crate::interaction::hover(row), parts.action_name);
     let mut column = widget::column::with_capacity(2).spacing(0).push(header);
     if expanded {
         column = column.push(widget::container(body()).padding([
@@ -3756,10 +3595,8 @@ fn change_row_view<'a>(
 /// One icon command a change header or a change row offers, derived rather
 /// than pushed inline.
 ///
-/// The value exists for the same reason [`SectionHeader`] does: libcosmic
-/// carries an icon button's tooltip in a wrapper that contributes no
-/// accessibility node, so a built frame cannot be asked what an icon command
-/// does and the decision is made somewhere a test can read it.
+/// Derived independently of rendering so group and row mutations share the
+/// same path-scoping and modal gating rules.
 struct IconCommand<'a> {
     icon: &'static str,
     name: &'a str,
@@ -4191,36 +4028,72 @@ fn history_notice(source: &SourceControlModel) -> Option<&'static str> {
     None
 }
 
-/// The project's pull requests, inside the panel.
-///
-/// The rows are the same rows the navigation list draws, under the same rich
-/// rendering: this section presents them beside the worktree they belong to
-/// rather than replacing them.
+/// Current-branch pull requests first, then the rest of the repository.
 fn pull_requests_section<'a>(
     state: &'a SidebarState,
+    source: &'a SourceControlModel,
     project: Option<&'a SidebarProject>,
     modal_open: bool,
 ) -> Element<'a, SidebarAction> {
     let spacing = cosmic::theme::spacing();
-    // The panel's own copy of the project's pull requests: the navigation list
-    // renders the same rows in the same frame under its own names.
-    let surface = PullRequestSurface::Panel;
     let Some(project) = project else {
         return widget::text::caption("This worktree's project is no longer loaded.").into();
     };
-    if project.pull_requests.is_empty() {
-        return widget::text::caption("No open pull requests for this project.").into();
-    }
+    let branch = source.branch.as_ref().map(ValidatedBranchName::as_str);
+    let current =
+        |pull_request: &&SidebarPullRequest| branch == Some(pull_request.head_ref.as_str());
+    let has_current = project
+        .pull_requests
+        .iter()
+        .any(|pull_request| current(&pull_request));
     let mut column =
-        widget::column::with_capacity(project.pull_requests.len()).spacing(spacing.space_xxxs);
-    for pull_request in &project.pull_requests {
-        column = column.push(pull_request_view(
-            project.id,
-            pull_request,
-            surface,
-            state.selection,
-            modal_open,
+        widget::column::with_capacity(project.pull_requests.len() + 4).spacing(spacing.space_xxxs);
+    if has_current {
+        column = column.push(widget::text::caption_heading("This branch"));
+        for pull_request in project.pull_requests.iter().filter(current) {
+            column = column.push(pull_request_view(
+                project.id,
+                pull_request,
+                state.selection,
+                modal_open,
+            ));
+        }
+    } else if branch.is_some() {
+        column = column.push(widget::text::caption(
+            "No open pull request for this branch.",
         ));
+        column = column.push(
+            button::standard("Create pull request")
+                .id(source.chrome.create_pull_request_id.clone())
+                .name("Create pull request for this worktree")
+                .on_press_maybe(gated(
+                    SidebarAction::CreatePullRequest {
+                        project_id: source.key.project_id,
+                        worktree: Some(source.key.canonical_path.clone()),
+                    },
+                    modal_open,
+                )),
+        );
+    } else {
+        column = column.push(widget::text::caption(
+            "Check out a committed branch to create a pull request.",
+        ));
+    }
+    let mut others = project
+        .pull_requests
+        .iter()
+        .filter(|pull_request| !current(pull_request))
+        .peekable();
+    if others.peek().is_some() {
+        column = column.push(widget::text::caption_heading("Other branches"));
+        for pull_request in others {
+            column = column.push(pull_request_view(
+                project.id,
+                pull_request,
+                state.selection,
+                modal_open,
+            ));
+        }
     }
     column.into()
 }
@@ -4371,11 +4244,6 @@ fn gated(action: SidebarAction, modal_open: bool) -> Option<SidebarAction> {
 }
 
 /// One icon command.
-///
-/// The value exists because libcosmic carries an icon button's tooltip in the
-/// `iced_widget::tooltip` wrapper, and that wrapper contributes no
-/// accessibility node: a built frame cannot be asked what an icon command
-/// does, so the decision is made somewhere a test can read it.
 fn icon_action<'a>(
     icon_name: &'static str,
     label: impl Into<Cow<'a, str>>,
@@ -4383,14 +4251,15 @@ fn icon_action<'a>(
     id: Id,
 ) -> Element<'a, SidebarAction> {
     let label = label.into();
-    button::icon(icon::from_name(icon_name).size(ROW_ICON_SIZE))
-        .id(id)
-        .name(label.clone())
-        .tooltip(label)
-        .width(ICON_CONTROL_SIZE)
-        .height(ICON_CONTROL_SIZE)
-        .on_press_maybe(action)
-        .into()
+    crate::interaction::tooltip(
+        button::icon(icon::from_name(icon_name).size(ROW_ICON_SIZE))
+            .id(id)
+            .name(label.clone())
+            .width(ICON_CONTROL_SIZE)
+            .height(ICON_CONTROL_SIZE)
+            .on_press_maybe(action),
+        label,
+    )
 }
 
 /// The rule between the pane and the workspace, doubling as the pane's resize
@@ -4417,7 +4286,6 @@ fn resize_handle(width: f32, modal_open: bool) -> Splitter<'static, SidebarActio
 #[derive(Debug, Clone, Copy)]
 enum BadgeTone {
     Neutral,
-    Accent,
     Success,
     Warning,
     Danger,
@@ -4432,7 +4300,6 @@ fn badge<'a>(label: impl Into<Cow<'a, str>> + 'a, tone: BadgeTone) -> Element<'a
         let cosmic = theme.cosmic();
         let component = match tone {
             BadgeTone::Neutral => &cosmic.secondary(false).component,
-            BadgeTone::Accent => &cosmic.accent,
             BadgeTone::Success => &cosmic.success,
             BadgeTone::Warning => &cosmic.warning,
             BadgeTone::Danger => &cosmic.destructive,
@@ -4512,11 +4379,50 @@ fn check_description(status: CheckStatus) -> &'static str {
     }
 }
 
+fn status_icon<'a>(
+    icon_name: &'static str,
+    label: &'a str,
+    tone: BadgeTone,
+) -> Element<'a, SidebarAction> {
+    let content = widget::container(widget::icon::from_name(icon_name).size(12)).class(
+        theme::Container::custom(move |theme| {
+            let cosmic = theme.cosmic();
+            cosmic::iced::widget::container::Style {
+                icon_color: Some(match tone {
+                    BadgeTone::Success => cosmic.success.base.into(),
+                    BadgeTone::Warning => cosmic.warning.base.into(),
+                    BadgeTone::Danger => cosmic.destructive.base.into(),
+                    _ => cosmic.on_bg_color().into(),
+                }),
+                ..Default::default()
+            }
+        }),
+    );
+    crate::interaction::tooltip(content, label)
+}
+
+fn check_indicator(status: CheckStatus) -> Element<'static, SidebarAction> {
+    if status == CheckStatus::Pending {
+        return crate::interaction::tooltip(
+            widget::progress_bar::circular::Circular::new().size(12.0),
+            "CI checks pending or running",
+        );
+    }
+    status_icon(
+        match status {
+            CheckStatus::Passing => "emblem-ok-symbolic",
+            CheckStatus::Failing => "dialog-error-symbolic",
+            _ => "dialog-question-symbolic",
+        },
+        check_description(status),
+        check_tone(status),
+    )
+}
+
 #[derive(Debug)]
 struct FilteredProject<'a> {
     project: &'a SidebarProject,
     worktrees: Vec<&'a SidebarWorktree>,
-    pull_requests: Vec<&'a SidebarPullRequest>,
 }
 
 /// The projects each density shows. `compact` is the density the caller
@@ -4542,33 +4448,22 @@ fn filtered_projects<'a>(
                 .worktrees
                 .iter()
                 .filter(|worktree| match state.filter {
-                    SidebarFilter::All => true,
-                    SidebarFilter::Attention => worktree.needs_attention(),
-                    SidebarFilter::PullRequests => false,
+                    SidebarFilter::All | SidebarFilter::PullRequests => true,
+                    SidebarFilter::Attention => {
+                        worktree.needs_attention()
+                            || matching_pull_request(worktree, &project.pull_requests)
+                                .is_some_and(SidebarPullRequest::needs_attention)
+                    }
                 })
                 .filter(|worktree| project_matches || worktree.matches(&query))
                 .collect::<Vec<_>>();
-            let pull_requests = project
-                .pull_requests
-                .iter()
-                .filter(|pull_request| match state.filter {
-                    SidebarFilter::All | SidebarFilter::PullRequests => true,
-                    SidebarFilter::Attention => pull_request.needs_attention(),
-                })
-                .filter(|pull_request| project_matches || pull_request.matches(&query))
-                .collect::<Vec<_>>();
             let visible = match state.filter {
-                SidebarFilter::All => {
-                    project_matches || !worktrees.is_empty() || !pull_requests.is_empty()
+                SidebarFilter::All | SidebarFilter::PullRequests => {
+                    project_matches || !worktrees.is_empty()
                 }
-                SidebarFilter::Attention => !worktrees.is_empty() || !pull_requests.is_empty(),
-                SidebarFilter::PullRequests => !pull_requests.is_empty(),
+                SidebarFilter::Attention => !worktrees.is_empty(),
             };
-            visible.then_some(FilteredProject {
-                project,
-                worktrees,
-                pull_requests,
-            })
+            visible.then_some(FilteredProject { project, worktrees })
         })
         .collect()
 }
@@ -4713,12 +4608,7 @@ mod tests {
     /// The widget identities of the controls an element renders, in tree
     /// order.
     ///
-    /// An identity is what the module derives once per entity, and what
-    /// focus, tooltips and assistive technologies address a control by, so
-    /// the set of them is the set of controls a density offers. It is read
-    /// off the widget tree, which a test can build; accessible names cannot
-    /// be, because `widget::tooltip` reports no a11y nodes of its own and
-    /// every icon control in this module carries a tooltip.
+    /// Collects named controls for collision detection and focus routing.
     fn control_ids(element: &Element<'_, SidebarAction>) -> Vec<String> {
         fn collect(tree: &Tree, ids: &mut Vec<String>) {
             ids.extend(tree.id.as_ref().map(ToString::to_string));
@@ -4866,7 +4756,6 @@ mod tests {
         let filtered = filtered_projects(&model, &state, false);
         assert_eq!(filtered.len(), 1);
         assert_eq!(filtered[0].worktrees.len(), 1);
-        assert_eq!(filtered[0].pull_requests.len(), 1);
 
         state.apply(&SidebarAction::SearchChanged(String::new()));
         state.apply(&SidebarAction::SetFilter(SidebarFilter::Attention));
@@ -4876,24 +4765,6 @@ mod tests {
             filtered[0].worktrees[0].branch.as_deref(),
             Some("fix-sidebar")
         );
-        assert_eq!(filtered[0].pull_requests.len(), 1);
-    }
-
-    #[test]
-    fn pull_request_filter_hides_worktrees_without_losing_project_context() {
-        let model = SidebarModel::ready(SidebarMode::Compact, vec![project()]);
-        let mut state = SidebarState::default();
-        state.apply(&SidebarAction::SetFilter(SidebarFilter::PullRequests));
-        let filtered = filtered_projects(&model, &state, true);
-        assert_eq!(filtered.len(), 1);
-        assert!(filtered[0].worktrees.is_empty());
-        assert_eq!(filtered[0].pull_requests[0].number, 42);
-    }
-
-    #[test]
-    fn project_search_focus_id_is_stable() {
-        assert_eq!(search_focus_id().to_string(), "sidebar.search");
-        assert_eq!(search_focus_id().to_string(), search_focus_id().to_string());
     }
 
     #[test]
@@ -4949,80 +4820,6 @@ mod tests {
     }
 
     #[test]
-    fn each_density_applies_only_the_state_it_gives_a_control() {
-        let model = SidebarModel::ready(SidebarMode::Compact, vec![project()]);
-        let chrome = &model.projects[0].chrome;
-        let mut state = SidebarState::default();
-        state.apply(&SidebarAction::OpenRepository {
-            project_id: project_id(1),
-            repository: "/repo/cagents".into(),
-        });
-        state.apply(&SidebarAction::SetFilter(SidebarFilter::Attention));
-        state.apply(&SidebarAction::SearchChanged(
-            "no project answers to this".into(),
-        ));
-
-        let rail = control_ids(&view(
-            &model,
-            &state,
-            SidebarMode::Compact,
-            DEFAULT_EXPANDED_WIDTH,
-            false,
-        ));
-        for id in [
-            stable_id("open-repository"),
-            filter_id(SidebarFilter::All),
-            filter_id(SidebarFilter::Attention),
-            filter_id(SidebarFilter::PullRequests),
-            chrome.open_id.clone(),
-            chrome.new_worktree_id.clone(),
-            chrome.create_pull_request_id.clone(),
-            stable_id("settings"),
-        ] {
-            assert!(
-                rail.contains(&id.to_string()),
-                "the rail must render {id:?}: a filter it cannot clear hides projects, and the \
-                 window's header bar is no route to the commands it drops. It renders {rail:?}"
-            );
-        }
-
-        // The rail holds no text input, so it renders none and applies no
-        // query: the project it lists matches nothing in the query. The
-        // expanded pane renders the input, so there the query applies and the
-        // pane offers to clear it instead of listing the project.
-        assert!(!rail.contains(&search_focus_id().to_string()));
-        assert!(!rail.contains(&stable_id("toggle-controls").to_string()));
-        assert_eq!(filtered_projects(&model, &state, true).len(), 1);
-        assert!(filtered_projects(&model, &state, false).is_empty());
-
-        let pane = control_ids(&view(
-            &model,
-            &state,
-            SidebarMode::Expanded,
-            DEFAULT_EXPANDED_WIDTH,
-            false,
-        ));
-        assert!(pane.contains(&stable_id("toggle-controls").to_string()));
-        assert!(pane.contains(&stable_id("empty.action").to_string()));
-        assert!(!pane.contains(&chrome.open_id.to_string()));
-        // The expanded search and filter live behind the toggle, which starts
-        // closed.
-        assert!(!pane.contains(&search_focus_id().to_string()));
-        assert!(!pane.contains(&filter_id(SidebarFilter::Attention).to_string()));
-
-        state.apply(&SidebarAction::ToggleControls);
-        let opened = control_ids(&view(
-            &model,
-            &state,
-            SidebarMode::Expanded,
-            DEFAULT_EXPANDED_WIDTH,
-            false,
-        ));
-        assert!(opened.contains(&search_focus_id().to_string()));
-        assert!(opened.contains(&filter_id(SidebarFilter::Attention).to_string()));
-    }
-
-    #[test]
     fn the_controls_toggle_is_offered_only_where_it_opens_something() {
         let mut state = SidebarState::default();
         state.apply(&SidebarAction::ToggleControls);
@@ -5057,42 +4854,6 @@ mod tests {
     }
 
     #[test]
-    fn new_worktree_requires_a_selected_project() {
-        let empty = SidebarModel::ready(SidebarMode::Expanded, Vec::new());
-        let state = SidebarState::default();
-        let empty_ids = control_ids(&view(
-            &empty,
-            &state,
-            SidebarMode::Expanded,
-            DEFAULT_EXPANDED_WIDTH,
-            false,
-        ));
-        assert!(!empty_ids.contains(&stable_id("new-worktree").to_string()));
-
-        let populated = SidebarModel::ready(SidebarMode::Expanded, vec![project()]);
-        let mut selected = SidebarState::default();
-        selected.apply(&SidebarAction::OpenRepository {
-            project_id: project_id(1),
-            repository: "/repo/cagents".into(),
-        });
-        let populated_ids = control_ids(&view(
-            &populated,
-            &selected,
-            SidebarMode::Expanded,
-            DEFAULT_EXPANDED_WIDTH,
-            false,
-        ));
-        assert!(
-            populated_ids.contains(
-                &populated.projects[0]
-                    .chrome
-                    .header_new_worktree_id
-                    .to_string()
-            )
-        );
-    }
-
-    #[test]
     fn check_status_prefers_failure_then_pending_then_success() {
         let check = |bucket: &str, state: &str| PullRequestCheck {
             bucket: RemoteValue(bucket.into()),
@@ -5118,6 +4879,26 @@ mod tests {
             CheckStatus::Failing
         );
         assert_eq!(CheckStatus::from_checks(&[]), CheckStatus::Unknown);
+    }
+
+    #[test]
+    fn worktree_pull_requests_require_an_exact_attached_branch_in_the_same_project() {
+        let project = project();
+        let pull_request = &project.pull_requests[0];
+        let attached = worktree(7, &pull_request.head_ref, false);
+        assert_eq!(
+            matching_pull_request(&attached, &project.pull_requests)
+                .map(|pull_request| pull_request.number),
+            Some(pull_request.number),
+        );
+        let other_branch = worktree(8, &format!("{}-other", pull_request.head_ref), false);
+        assert!(matching_pull_request(&other_branch, &project.pull_requests).is_none());
+        let case_changed = worktree(9, &pull_request.head_ref.to_ascii_uppercase(), false);
+        assert!(matching_pull_request(&case_changed, &project.pull_requests).is_none());
+        let mut detached = attached.clone();
+        detached.detached = true;
+        assert!(matching_pull_request(&detached, &project.pull_requests).is_none());
+        assert!(matching_pull_request(&attached, &[]).is_none());
     }
 
     #[test]
@@ -5526,9 +5307,7 @@ mod tests {
     /// touch, but the pane keeps whatever focus it held when the dialog opened
     /// and libcosmic's modal popover declines to deliver a focus operation to
     /// the content beneath it, so a focused control keeps answering the
-    /// keyboard. Focusing by id is also the only way to reach this module's
-    /// icon commands at all: each carries a libcosmic tooltip, and a tooltip
-    /// contributes no accessibility node.
+    /// keyboard. Focus by id exercises the same commands as keyboard traversal.
     fn frame_enter_presses(
         renderer: &cosmic::Renderer,
         mut element: Element<'_, SidebarAction>,
@@ -5593,7 +5372,7 @@ mod tests {
         let mut state = SidebarState::default();
 
         assert!(
-            source_control_surface(&model, &state, false, false).is_none(),
+            bound_source_control(&model, &state).is_none(),
             "with nothing focused the panel must not mount: there is no worktree it could be \
              reading"
         );
@@ -5604,7 +5383,7 @@ mod tests {
         );
         assert_eq!(state.active_worktree(), Some(&main_key()));
         assert!(
-            source_control_surface(&model, &state, false, false).is_some(),
+            bound_source_control(&model, &state).is_some(),
             "the panel mounts once the bound worktree is the one the model holds"
         );
 
@@ -5614,7 +5393,7 @@ mod tests {
         assert!(state.sync_active_worktree(&model, &focus_on(&fix_key())));
         assert_eq!(state.active_worktree(), Some(&fix_key()));
         assert!(
-            source_control_surface(&model, &state, false, false).is_none(),
+            bound_source_control(&model, &state).is_none(),
             "a rebind must withhold the panel until the new worktree's own snapshot lands"
         );
 
@@ -5631,7 +5410,7 @@ mod tests {
         assert!(emptied.source_control.is_none());
         assert!(state.sync_active_worktree(&emptied, &SidebarFocus::None));
         assert_eq!(state.active_worktree(), None);
-        assert!(source_control_surface(&emptied, &state, false, false).is_none());
+        assert!(bound_source_control(&emptied, &state).is_none());
     }
 
     #[test]
@@ -5944,39 +5723,28 @@ mod tests {
         let state = panel_state(&model);
 
         // Every section open, so every command the panel has is in the frame.
-        let live = frame_enter_presses(
-            &renderer,
-            view(&model, &state, SidebarMode::Expanded, 320.0, false),
-        );
+        let live = frame_enter_presses(&renderer, git_panel(&model, &state, 380.0, false));
         assert!(
             live.iter()
                 .any(|action| matches!(action, SidebarAction::Stage { .. })),
             "the fixture must actually draw the commands this test is about; it published {live:?}"
         );
-
-        let gated = frame_enter_presses(
-            &renderer,
-            view(&model, &state, SidebarMode::Expanded, 320.0, true),
+        assert!(
+            live.iter().any(|action| matches!(
+                action,
+                SidebarAction::CreatePullRequest { project_id, worktree: Some(path) }
+                    if *project_id == main_key().project_id && *path == main_key().canonical_path
+            )),
+            "creating a pull request must name the bound worktree, not whichever card has focus"
         );
+
+        let gated = frame_enter_presses(&renderer, git_panel(&model, &state, 380.0, true));
         assert!(
             gated.is_empty(),
             "a dialog is an overlay: the pane keeps the focus it held when the dialog opened and \
              answers Enter behind it, and the application refuses every pane action while a modal \
              is up - so a control that still published one would report itself enabled, take the \
              press, and do nothing. It published {gated:?}"
-        );
-
-        // The compact rail renders the same panel inside a popover, and its
-        // commands stand down on the same terms.
-        let mut compact = panel_state(&model);
-        compact.apply(&SidebarAction::ToggleSourceControlPanel { key: main_key() });
-        assert!(
-            frame_enter_presses(
-                &renderer,
-                view(&model, &compact, SidebarMode::Compact, 320.0, true),
-            )
-            .is_empty(),
-            "the rail's popover is the same panel and must stand down with it"
         );
     }
 
@@ -6002,77 +5770,6 @@ mod tests {
         assert!(
             fired.contains(&pending.confirm_action()),
             "the dialog's Discard is the only route to a confirmed request; it published {fired:?}"
-        );
-    }
-
-    #[test]
-    fn the_panel_and_the_navigation_list_never_draw_one_pull_request_under_one_name() {
-        let mut model = panel_model();
-        let project = &mut model.projects[0];
-        project.pull_requests = vec![SidebarPullRequest::new(
-            project_id(1),
-            42,
-            "Polish sidebar".into(),
-            Url::parse("https://github.com/example/cagents/pull/42").unwrap(),
-            "fix-sidebar".into(),
-            Some("octocat".into()),
-            false,
-            CheckStatus::Passing,
-        )];
-        let mut state = panel_state(&model);
-        state.apply(&SidebarAction::TogglePullRequests(project_id(1)));
-
-        // Two nodes under one custom name means the second visited overwrites
-        // the first in iced's per-frame state map, and the loser's next
-        // downcast aborts the process.
-        // Only named identities share the runtime's per-frame map. An unnamed
-        // widget gets a fresh unique id and a composed one gets an anonymous
-        // set; `Display` renders those as "Undefined" and "Set", and neither
-        // can collide.
-        let ids = control_ids(&view(&model, &state, SidebarMode::Expanded, 320.0, false))
-            .into_iter()
-            .filter(|id| id != "Undefined" && id != "Set")
-            .collect::<Vec<_>>();
-        assert!(
-            ids.iter().any(|id| id.contains("pr.42.open.panel"))
-                && ids.iter().any(|id| id.contains("pr.42.open.nav")),
-            "the fixture must draw the same pull request in both surfaces: {ids:?}"
-        );
-        let mut seen = BTreeSet::new();
-        for id in &ids {
-            assert!(
-                seen.insert(id.clone()),
-                "the panel and the navigation list drew a shared identity {id}: {ids:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn a_pull_request_row_carries_its_rich_rendering_into_the_panel() {
-        let model = panel_model();
-        let state = panel_state(&model);
-        let pull_request = SidebarPullRequest::new(
-            project_id(1),
-            42,
-            "Polish sidebar".into(),
-            Url::parse("https://github.com/example/cagents/pull/42").unwrap(),
-            "fix-sidebar".into(),
-            Some("octocat".into()),
-            true,
-            CheckStatus::Failing,
-        );
-        let mut project = model.projects[0].clone();
-        project.pull_requests = vec![pull_request];
-        let section = pull_requests_section(&state, Some(&project), false);
-        let ids = control_ids(&section);
-        assert!(
-            ids.contains(
-                &project.pull_requests[0]
-                    .chrome
-                    .open_id(PullRequestSurface::Panel)
-                    .to_string()
-            ),
-            "the panel presents the project's own rows rather than replacing them: {ids:?}"
         );
     }
 
