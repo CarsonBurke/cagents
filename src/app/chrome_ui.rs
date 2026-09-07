@@ -67,35 +67,69 @@ impl Cagents {
             workspace_widget::GlobalShortcut::NewTerminal,
             &self.settings.keyboard_shortcuts,
         );
-        actions.push(command(
-            widget::icon::from_name("utilities-terminal-symbolic"),
-            new_terminal_label,
-            widget::Id::new(TOOLBAR_FOCUS_ID),
-            Some(Message::NewTerminal),
-        ));
+        actions.push(
+            if self.window_width >= design::EXPANDED_NAVIGATION_BREAKPOINT {
+                tooltip(
+                    widget::button::standard("Terminal")
+                        .leading_icon(
+                            widget::icon::from_name("utilities-terminal-symbolic").size(16),
+                        )
+                        .id(widget::Id::new(TOOLBAR_FOCUS_ID))
+                        .name(new_terminal_label.clone())
+                        .height(ICON_CONTROL_SIZE)
+                        .on_press(Message::NewTerminal),
+                    new_terminal_label,
+                )
+            } else {
+                command(
+                    widget::icon::from_name("utilities-terminal-symbolic"),
+                    new_terminal_label,
+                    widget::Id::new(TOOLBAR_FOCUS_ID),
+                    Some(Message::NewTerminal),
+                )
+            },
+        );
         actions.push(command(
             browser_icon(),
             "New browser",
             widget::Id::new("command.new-browser"),
             Some(Message::NewBrowser),
         ));
-        actions.push(command(
-            widget::icon::from_name("view-list-symbolic"),
-            if self.context_inspector_open {
-                "Hide Git panel"
+        let panel_label = if self.context_inspector_open {
+            "Hide context panel"
+        } else {
+            "Show context panel"
+        };
+        actions.push(
+            if self.window_width >= design::EXPANDED_NAVIGATION_BREAKPOINT {
+                tooltip(
+                    widget::button::custom(
+                        widget::row::with_children(vec![
+                            widget::icon::from_name("view-list-symbolic")
+                                .size(16)
+                                .into(),
+                            widget::text::body("Context").into(),
+                        ])
+                        .spacing(design::GRID_UNIT)
+                        .align_y(Alignment::Center),
+                    )
+                    .class(cosmic::theme::Button::Text)
+                    .id(context_inspector_toggle_id())
+                    .name(panel_label)
+                    .selected(self.context_inspector_open)
+                    .height(ICON_CONTROL_SIZE)
+                    .on_press(Message::ToggleContextInspector),
+                    panel_label,
+                )
             } else {
-                "Show Git panel"
+                command(
+                    widget::icon::from_name("view-list-symbolic"),
+                    panel_label,
+                    context_inspector_toggle_id(),
+                    Some(Message::ToggleContextInspector),
+                )
             },
-            context_inspector_toggle_id(),
-            Some(Message::ToggleContextInspector),
-        ));
-        #[cfg(feature = "development")]
-        actions.push(command(
-            widget::icon::from_name("applications-engineering-symbolic"),
-            "Toggle debug inspector",
-            widget::Id::new("command.debug-inspector"),
-            Some(Message::ToggleDebugInspector),
-        ));
+        );
         actions
     }
 
@@ -199,7 +233,7 @@ impl Cagents {
         )
         .height(CARD_HEADER_HEIGHT - 1.0)
         .padding([0, 4])
-        .class(cosmic::theme::Container::Background);
+        .class(cosmic::theme::Container::Primary);
         let rail = widget::container(iced::widget::Space::new())
             .height(1)
             .width(Length::Fill)
@@ -220,32 +254,88 @@ impl Cagents {
         )
     }
 
-    pub(super) fn git_surface(&self, width: f32) -> Element<'_, Message> {
-        let title = widget::row::with_children(vec![
-            widget::text::caption_heading("Source control")
+    pub(super) fn context_panel(
+        &self,
+        model: Option<inspector::InspectorModel>,
+        width: f32,
+    ) -> Element<'_, Message> {
+        let tabs = widget::row::with_children(ContextTab::ALL.into_iter().map(|tab| {
+            widget::button::custom(widget::text::body(tab.label()))
+                .class(if self.context_tab == tab {
+                    cosmic::theme::Button::Suggested
+                } else {
+                    cosmic::theme::Button::Text
+                })
+                .name(format!("{} panel tab", tab.label()))
+                .selected(self.context_tab == tab)
+                .height(design::ROW_HEIGHT)
                 .width(Length::Fill)
-                .into(),
+                .padding([4, 8])
+                .on_press_maybe((!self.modal_is_open()).then_some(Message::SelectContextTab(tab)))
+                .into()
+        }))
+        .spacing(design::GRID_UNIT)
+        .width(Length::Fill);
+        let heading = widget::row::with_children(vec![
+            tabs.into(),
             command(
                 widget::icon::from_name("window-close-symbolic"),
-                "Close Git panel",
+                "Close context panel",
                 inspector::close_focus_id(),
                 Some(Message::ContextInspector(InspectorAction::Close)),
             ),
         ])
-        .align_y(Alignment::Center)
-        .height(design::HEADER_HEIGHT);
-        widget::column::with_children(vec![
-            widget::container(title).padding([0, 12]).into(),
-            widget::divider::horizontal::default().into(),
-            sidebar::git_panel(
-                &self.sidebar_model,
-                &self.sidebar_state,
-                width,
-                self.modal_is_open(),
-            )
-            .map(Message::Sidebar),
-        ])
-        .spacing(0)
+        .spacing(design::GRID_UNIT)
+        .align_y(Alignment::Center);
+        let body = match self.context_tab {
+            ContextTab::Changes => sidebar::git_panel(
+                &self.sidebar_model, &self.sidebar_state, width, self.modal_is_open(),
+            ).map(Message::Sidebar),
+            ContextTab::Context | ContextTab::Code => model.map_or_else(
+                || {
+                    let (title, detail) = if self.context_tab == ContextTab::Code {
+                        ("No code column selected", "Open a file from Changes → Files to see editor actions, diagnostics, and language-server results here.")
+                    } else {
+                        ("Workspace context", "Select a terminal, browser, or repository column to see its details and available actions.")
+                    };
+                    widget::container(widget::column::with_children(vec![
+                        widget::icon::from_name(if self.context_tab == ContextTab::Code {
+                            "text-x-generic-symbolic"
+                        } else { "dialog-information-symbolic" }).size(28).into(),
+                        widget::text::heading(title).into(),
+                        widget::text::body(detail)
+                            .wrapping(iced::widget::text::Wrapping::Word)
+                            .width(Length::Fill).into(),
+                        if self.context_tab == ContextTab::Code && self.sidebar_state.active_worktree().is_some() {
+                            widget::button::standard("Browse files")
+                                .on_press(Message::SelectContextTab(ContextTab::Changes)).into()
+                        } else {
+                            widget::button::standard("Open repository")
+                                .on_press(Message::OpenRepository).into()
+                        },
+                    ]).spacing(12).width(Length::Fill))
+                    .padding(20)
+                    .width(Length::Fill)
+                    .height(Length::Fill)
+                    .into()
+                },
+                |model| inspector::view(model, width).map(Message::ContextInspector),
+            ),
+        };
+        widget::container(
+            widget::column::with_children(vec![
+                widget::container(heading)
+                    .padding([8, 8])
+                    .width(Length::Fill)
+                    .into(),
+                widget::divider::horizontal::light().into(),
+                body,
+            ])
+            .spacing(0)
+            .width(Length::Fill)
+            .height(Length::Fill),
+        )
+        .class(cosmic::theme::Container::Background)
         .width(width)
         .height(Length::Fill)
         .into()

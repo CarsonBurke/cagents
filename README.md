@@ -84,6 +84,29 @@ scripts/run-development --browserless --debug --log-file /tmp/cagents-ui.log
 
 The runner builds the three sibling executables with separate Cargo feature sets and executes the selected UI through Cargo, so configured target directories and target triples are honored. UI-only compilation never builds Ghostty, and daemon-only compilation never builds libcosmic or Servo. Its `dev-runtime` profile keeps UI dependencies optimized for usable UI performance while the ordinary `dev` profile stays cheap for checks. The development instance has its own application ID, configuration, session database, transcripts, application lease, and `$XDG_RUNTIME_DIR/cagents-development/` daemon, so it can run beside the installed production instance. `cagents`, `cagents-ui`, and `cagentsd` must remain together.
 
+### Build and test resource usage
+
+Repository-local Cargo configuration defaults to **two concurrent compilation jobs**, including compilation for `cargo test` and every build in `scripts/run-development`. Cargo otherwise defaults to the logical CPU count, which can create substantial compiler RAM pressure on high-core-count or shared machines. Override this with standard Cargo controls: `CARGO_BUILD_JOBS` also applies to the runner, while `-j` takes precedence for an individual Cargo invocation. Run the isolated feature lanes sequentially, not as independent concurrent cold builds.
+
+```sh
+# Reduce compilation concurrency further on a memory-constrained host.
+CARGO_BUILD_JOBS=1 scripts/run-development --browserless
+
+# Opt into more compilation jobs when system RAM is available.
+cargo check --locked -j 4 --no-default-features --features ui --bin cagents-ui
+
+# Test only the owning boundary and target; keep UI and host separate.
+cargo test --locked --no-default-features --features host --lib terminal::
+cargo test --locked --no-default-features --features host --test terminal_load_contract
+cargo test --locked --no-default-features --features ui --test session_restore_contract
+```
+
+Compilation jobs and test execution threads are separate controls: `-j` does not serialize tests within a test binary. For a specific resource-heavy test target, append `-- --test-threads=1`; there is no repository-wide test-thread cap. A test-name filter limits execution, not compilation of the selected target and feature graph, so start with the narrow feature lane and `--lib` or `--test NAME`, rather than `--all-features`.
+
+The jobs setting is not a hard process or memory limit. In the pinned dependencies, parallel `cc` builds share Cargo's jobserver; CMake uses it for supported Makefile builds and otherwise can launch a separate pool based on `NUM_JOBS`. SpiderMonkey's Make 4.4 compatibility path also starts a separate pool sized by `NUM_JOBS`, potentially approaching twice the Cargo job count alongside Cargo work. Ghostty's build script invokes `zig build` without forwarding a job limit, so Cargo's setting alone does not guarantee bounded Zig internal parallelism. A single compiler or linker can still require substantial RAM. The existing reduced dependency debug information and optimized `dev-runtime` dependencies remain intentional; use ordinary `cargo check` for cheap checks and the runner for usable UI performance.
+
+Rust, C/C++, Zig, and linker allocations consume **system RAM**, not GPU VRAM. GPU memory reported by tools such as `nvidia-smi` belongs to GPU workloads (for example, rendering or ML), not these compiler jobs. Those workloads may also consume system RAM; lowering Cargo concurrency does not reclaim their allocations or guarantee a build will fit when RAM and swap are already under pressure. Browserless lanes avoid the large Servo/SpiderMonkey compilation graph when embedded-browser behavior is not being changed.
+
 ## Install a release
 
 All examples in this section become usable only after canonical hosting exists. Set the real repository and choose a published version:
@@ -209,18 +232,26 @@ cagents ui
   restore its terminals; selecting it again does not create another terminal.
   **New terminal** (`Ctrl+T`) starts in that worktree and inserts immediately to
   the right of its focused column.
-- The right-hand **Source control** pane follows the selected worktree. It holds
-  files, diffs, staging, commits, push/publish, history, and pull-request actions.
+- The right-hand inspector has **Context**, **Changes**, and **Code** tabs.
+  Context follows the focused terminal or browser; Changes follows the selected
+  worktree with files, diffs, staging, commits, push/publish, history, and
+  pull-request actions; Code holds repository/editor and language-server details.
   Worktree rows show matching pull requests and their reported CI status.
 - Switching worktrees hides their columns without closing hosted shells or
   discarding editor buffers. Worktree selection and remembered column focus
   survive restarts, including when a shared browser column has focus. Application
   close checks unsaved editors in every worktree, not only the visible one.
   Legacy columns without a registered worktree remain accessible across worktrees.
-- Open **Settings** from the lower-left gear. The modal dims the workspace and
-  preserves input focus until dismissed. Runtime diagnostics are available only
-  through the debug-inspector button in development builds, not the production
-  Git pane.
+- Open **Settings** from the lower-left gear. Appearance includes system/light/dark
+  themes and interface scaling. Terminal controls include font family and size,
+  line spacing, padding, and cursor shape; changes apply without restarting.
+  The modal dims the workspace and preserves input focus until dismissed.
+  Interface text uses the desktop's installed font and Fontconfig fallbacks;
+  install Open Sans and Noto Sans Mono if those families are not already available.
+- If a terminal reports a different daemon incarnation, its original daemon is
+  gone. The card offers **Retry** to start a new terminal with the saved launch
+  recipe. Existing transcripts remain available; the old running process cannot
+  be recovered by attaching to the replacement daemon.
 
 The control CLI includes human-readable output by default and stable JSON envelopes for automation:
 
@@ -271,8 +302,13 @@ are rejected.
 schema_version = 3
 max_hot_cards = 6
 hibernation_delay_ms = 30000
+app_theme = "system"
+ui_scale = 1.0
 terminal_font_size = 14.0
 terminal_font_family = ""
+terminal_line_height = 1.286
+terminal_padding = 8.0
+terminal_cursor_style = "application"
 sidebar_width = 260.0
 inspector_width = 380.0
 default_column_fraction = 0.72
@@ -293,8 +329,13 @@ next_column = ["Alt+W", "Alt+Right"]
 | `schema_version` | integer | `3` | exactly `3` |
 | `max_hot_cards` | non-negative integer | `6` | `1` through `9223372036854775807` |
 | `hibernation_delay_ms` | non-negative integer | `30000` | `0` through `9223372036854775807` milliseconds |
+| `app_theme` | string | `"system"` | `"system"`, `"dark"`, or `"light"` |
+| `ui_scale` | float | `1.0` | finite values from `0.8` through `1.5`, inclusive; multiplies display scaling |
 | `terminal_font_size` | float | `14.0` | finite values from `8.0` through `40.0`, inclusive |
 | `terminal_font_family` | string | `""` | empty for the system monospace font, or a non-whitespace family name up to 128 bytes. The family must be fixed-pitch; one whose glyph widths differ falls back to the system monospace font, because the grid is a single pitch |
+| `terminal_line_height` | float | `1.286` | finite values from `1.0` through `2.0`, inclusive; relative to font size |
+| `terminal_padding` | float | `8.0` | finite values from `0.0` through `24.0`, inclusive; logical pixels |
+| `terminal_cursor_style` | string | `"application"` | `"application"` respects the terminal program; `"block"`, `"beam"`, or `"underline"` overrides it |
 | `terminal_scrollback_lines` | non-negative integer | `10000` | `0` through `1000000` lines for newly started terminals |
 | `sidebar_width` | float | `260.0` | finite values from `220.0` through `420.0`, inclusive |
 | `inspector_width` | float | `380.0` | finite values from `320.0` through `480.0`, inclusive |

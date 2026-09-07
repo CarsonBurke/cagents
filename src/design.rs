@@ -6,11 +6,11 @@
 
 pub const GRID_UNIT: f32 = 4.0;
 
-pub const HEADER_HEIGHT: f32 = 40.0;
+pub const HEADER_HEIGHT: f32 = 44.0;
 pub const ROW_HEIGHT: f32 = 32.0;
 pub const DENSE_ROW_HEIGHT: f32 = 28.0;
-pub const PRIMARY_CONTROL_SIZE: f32 = 28.0;
-pub const SECONDARY_CONTROL_MIN_SIZE: f32 = 24.0;
+pub const PRIMARY_CONTROL_SIZE: f32 = 32.0;
+pub const SECONDARY_CONTROL_MIN_SIZE: f32 = 28.0;
 
 pub const NAVIGATION_DEFAULT_WIDTH: f32 = 260.0;
 pub const NAVIGATION_MIN_WIDTH: f32 = 220.0;

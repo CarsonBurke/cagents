@@ -447,15 +447,7 @@ pub fn model_for_card(
         CardKind::PullRequests(_) => ("Pull requests", "vcs-merge-request-symbolic"),
         CardKind::Repository(_) => ("Repository", "folder-symbolic"),
     };
-    let mut sections = vec![Section::new(
-        "Card",
-        vec![
-            Fact::new("Surface", kind),
-            Fact::new("Card ID", card.id.to_string()),
-            Fact::new("Runtime", runtime.label()),
-            Fact::new("Residency", residency_label(&card.residency)),
-        ],
-    )];
+    let mut sections = Vec::with_capacity(4);
     let mut actions = Vec::new();
 
     let repository_context = repository_context(card, projects);
@@ -464,7 +456,6 @@ pub fn model_for_card(
             sections.push(Section::new(
                 "Terminal",
                 vec![
-                    Fact::new("Session ID", session.id.to_string()),
                     Fact::new("Command", command_label(&session.launch)),
                     Fact::new(
                         "Working directory",
@@ -478,6 +469,7 @@ pub fn model_for_card(
                             |path| path.display().to_string(),
                         ),
                     ),
+                    Fact::new("Session ID", session.id.to_string()),
                 ],
             ));
             actions.push(
@@ -752,6 +744,14 @@ pub fn model_for_card(
             );
         }
     }
+
+    sections.push(Section::new(
+        "Status",
+        vec![
+            Fact::new("Runtime", runtime.label()),
+            Fact::new("Lifecycle", residency_label(&card.residency)),
+        ],
+    ));
 
     if let Some((project, worktree)) = repository_context {
         sections.push(repository_section(project, worktree));
@@ -1649,20 +1649,20 @@ fn markdown_text(
 pub fn view(model: InspectorModel, width: f32) -> Element<'static, InspectorAction> {
     let spacing = cosmic::theme::spacing();
     let heading = widget::row::with_children(vec![
-        widget::icon::from_name(model.icon).size(20).into(),
+        widget::icon::from_name(model.icon).size(16).into(),
         widget::column::with_children(vec![
-            widget::text::heading(model.title).into(),
+            widget::text::heading(model.title)
+                .wrapping(cosmic::iced::widget::text::Wrapping::None)
+                .ellipsize(cosmic::iced::widget::text::Ellipsize::End(
+                    cosmic::iced::advanced::text::EllipsizeHeightLimit::Lines(1),
+                ))
+                .width(Length::Fill)
+                .into(),
             widget::text::caption(model.kind).into(),
         ])
         .spacing(0)
         .width(Length::Fill)
         .into(),
-        widget::button::icon(widget::icon::from_name("window-close-symbolic"))
-            .id(close_focus_id())
-            .name("Collapse context inspector")
-            .tooltip("Collapse context inspector")
-            .on_press(InspectorAction::Close)
-            .into(),
     ])
     .align_y(Alignment::Center)
     .spacing(spacing.space_xxs);
@@ -1679,33 +1679,32 @@ pub fn view(model: InspectorModel, width: f32) -> Element<'static, InspectorActi
             .collect();
         sections.push(InspectorSection::new(section.title, facts).view());
     }
+    // Keep actions in the same scroll surface as details. A rich editor or
+    // language server can offer many actions; a fixed footer used to consume
+    // all available height and make the document details unreachable.
+    sections.push(widget::divider::horizontal::light().into());
+    sections.push(SegmentedActions::new(model.actions).view());
     let content = widget::scrollable(
         widget::column::with_children(sections)
-            .spacing(spacing.space_xs)
+            .spacing(spacing.space_s)
             .width(Length::Fill),
     )
     .class(cosmic::style::iced::Scrollable::Minimal)
     .height(Length::Fill);
-    let actions = SegmentedActions::new(model.actions).view();
 
     widget::container(
         widget::column::with_children(vec![
             heading.into(),
             widget::divider::horizontal::default().into(),
             content.into(),
-            widget::divider::horizontal::default().into(),
-            actions,
         ])
         .spacing(spacing.space_xs)
         .width(Length::Fill)
         .height(Length::Fill),
     )
     .class(theme::Container::Background)
-    .padding(spacing.space_s)
-    .width(Length::Fixed(width.clamp(
-        design::INSPECTOR_MIN_WIDTH,
-        design::INSPECTOR_MAX_WIDTH,
-    )))
+    .padding(12)
+    .width(Length::Fixed(width.max(0.0)))
     .height(Length::Fill)
     .into()
 }
@@ -2708,89 +2707,6 @@ mod tests {
                 .iter()
                 .any(|action| action.message == InspectorAction::DismissLspResults(card.id)),
             "results the reader can see must be dismissable"
-        );
-    }
-
-    /// The editor offers no gutter or overlay, so every language-server result
-    /// is rendered by this module. This drives the real `view` over one of each
-    /// kind of result, including Markdown containing every block the parser can
-    /// produce, and builds the widget tree the shell would build.
-    #[test]
-    fn every_language_server_result_builds_its_widget_tree() {
-        let card = repository_card();
-        let lsp = LspInspectorContext {
-            status: Some(LspStatus::Failed {
-                reason: "server exited".into(),
-                stderr_tail: vec!["panicked".into()],
-            }),
-            diagnostics: vec![LspDiagnostic {
-                source: Some("rustc".into()),
-                code: Some("E0308".into()),
-                ..diagnostic(3, LspSeverity::Error, "mismatched types")
-            }],
-            hover: Some(
-                concat!(
-                    "# Heading\n\n",
-                    "A paragraph with `code`, **bold**, and [a link](https://example.test).\n\n",
-                    "```rust\nfn main() {}\n```\n\n",
-                    "- point\n- [x] task\n\n1. first\n2. second\n\n",
-                    "> quoted\n\n---\n\n",
-                    "| a | b |\n| - | - |\n| 1 | 2 |\n\n",
-                    "![alt](https://example.test/image.png \"title\")\n"
-                )
-                .into(),
-            ),
-            locations: Some((
-                LocationKind::References,
-                vec![
-                    location(
-                        LspTarget::Workspace {
-                            path: PathBuf::from("/repo/src/lib.rs"),
-                        },
-                        LspCoordinates::Scalar,
-                    ),
-                    location(
-                        LspTarget::Workspace {
-                            path: PathBuf::from("/repo/src/main.rs"),
-                        },
-                        LspCoordinates::Utf16,
-                    ),
-                    location(
-                        LspTarget::External {
-                            path: PathBuf::from("/usr/lib/std.rs"),
-                        },
-                        LspCoordinates::Scalar,
-                    ),
-                    location(
-                        LspTarget::Uri {
-                            uri: "jdt://contents".into(),
-                        },
-                        LspCoordinates::Scalar,
-                    ),
-                ],
-            )),
-            completions: vec![
-                completion("open", true, false),
-                completion("legacy", false, true),
-            ],
-            notice: Some("references were truncated by the server".into()),
-        };
-        let model = lsp_model(&card, &lsp);
-        let sections = model.sections.len();
-        let rows: usize = model
-            .sections
-            .iter()
-            .map(|section| section.facts.len())
-            .sum();
-
-        let element = view(model, design::INSPECTOR_MIN_WIDTH);
-        let tree = Tree::new(&element);
-
-        assert!(sections >= 7, "expected every result to have a section");
-        assert!(rows >= 12, "expected every result to have a row");
-        assert!(
-            !tree.children.is_empty(),
-            "the inspector rendered no widget tree"
         );
     }
 

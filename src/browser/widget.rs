@@ -59,6 +59,7 @@ fn native_placement(
     clip: Rectangle,
     virtual_offset: f32,
     scale_factor: f32,
+    ui_scale: f32,
 ) -> NativePlacement {
     let virtual_offset = if virtual_offset.is_finite() {
         virtual_offset.max(0.0)
@@ -94,10 +95,12 @@ fn native_placement(
     NativePlacement {
         buffer,
         placement: SurfacePlacement {
-            logical_x: (left - virtual_offset).round() as i32,
-            logical_y: top.round() as i32,
-            logical_width: (width.round() as i32).max(1),
-            logical_height: (height.round() as i32).max(1),
+            // iced units include the user's UI multiplier; Wayland parent
+            // surface coordinates include only the compositor's display scale.
+            logical_x: ((left - virtual_offset) * ui_scale).round() as i32,
+            logical_y: (top * ui_scale).round() as i32,
+            logical_width: ((width * ui_scale).round() as i32).max(1),
+            logical_height: ((height * ui_scale).round() as i32).max(1),
             source_x,
             source_y,
             source_width: source.width.min(buffer.width - source_x),
@@ -113,6 +116,7 @@ pub struct BrowserWidget<'a, Message> {
     handle: &'a BrowserHandle,
     ime: Option<InputMethodState>,
     scale_factor: f32,
+    ui_scale: f32,
     model_focused: bool,
     virtual_offset: f32,
     on_focus: Option<Message>,
@@ -136,6 +140,7 @@ impl<'a, Message> BrowserWidget<'a, Message> {
             handle,
             ime: None,
             scale_factor: 1.0,
+            ui_scale: 1.0,
             virtual_offset: 0.0,
             model_focused: false,
             on_focus: None,
@@ -146,6 +151,13 @@ impl<'a, Message> BrowserWidget<'a, Message> {
 
     pub fn scale_factor(mut self, scale_factor: f32) -> Self {
         self.scale_factor = scale_factor.max(0.01);
+        self
+    }
+
+    /// Converts iced geometry to the parent Wayland surface's logical units.
+    /// `scale_factor` separately includes both display and interface scaling.
+    pub fn ui_scale(mut self, ui_scale: f32) -> Self {
+        self.ui_scale = ui_scale.max(0.01);
         self
     }
 
@@ -277,7 +289,13 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for BrowserWidget<'_, Mess
     ) {
         let bounds = layout.bounds();
         let state = tree.state.downcast_mut::<WidgetState>();
-        let native = native_placement(bounds, *viewport, self.virtual_offset, self.scale_factor);
+        let native = native_placement(
+            bounds,
+            *viewport,
+            self.virtual_offset,
+            self.scale_factor,
+            self.ui_scale,
+        );
         if state.last_scale_factor != Some(self.scale_factor) {
             state.last_scale_factor = Some(self.scale_factor);
             if let Err(error) = self.handle.set_scale_factor(self.scale_factor)
@@ -574,6 +592,7 @@ mod tests {
             Rectangle::new(Point::new(400.0, 0.0), Size::new(800.0, 700.0)),
             300.4,
             1.25,
+            1.0,
         );
 
         assert_eq!(native.placement.logical_x, 232);
@@ -619,6 +638,7 @@ mod tests {
             Rectangle::new(Point::new(501.0, 44.0), Size::new(479.0, 596.0)),
             400.0,
             1.0,
+            1.0,
         );
         assert!(clipped_left.presented);
         assert_eq!(clipped_left.buffer, PhysicalViewport::new(480, 596));
@@ -633,6 +653,7 @@ mod tests {
             Rectangle::new(Point::new(500.0, 44.0), Size::new(479.0, 596.0)),
             400.0,
             1.0,
+            1.0,
         );
         assert!(clipped_right.presented);
         assert_eq!(clipped_right.placement.logical_x, 100);
@@ -644,6 +665,7 @@ mod tests {
             body,
             Rectangle::new(Point::new(500.0, 45.0), Size::new(480.0, 595.0)),
             400.0,
+            1.0,
             1.0,
         );
         assert!(clipped_top.presented);
@@ -660,6 +682,7 @@ mod tests {
             Rectangle::new(Point::new(300.0, 0.0), Size::new(400.0, 325.0)),
             0.0,
             2.0,
+            1.0,
         );
 
         assert!(native.presented);
@@ -687,16 +710,43 @@ mod tests {
     }
 
     #[test]
+    fn interface_scale_converts_clipped_placement_without_rescaling_buffer_coordinates() {
+        let native = native_placement(
+            Rectangle::new(Point::new(200.0, 40.0), Size::new(400.0, 300.0)),
+            Rectangle::new(Point::new(240.0, 50.0), Size::new(320.0, 250.0)),
+            100.0,
+            1.5 * 1.25,
+            1.25,
+        );
+        assert!(native.presented);
+        assert_eq!(native.buffer, PhysicalViewport::new(750, 563));
+        assert_eq!(
+            native.placement,
+            SurfacePlacement {
+                logical_x: 175,
+                logical_y: 63,
+                logical_width: 400,
+                logical_height: 313,
+                source_x: 75,
+                source_y: 19,
+                source_width: 600,
+                source_height: 469,
+            }
+        );
+    }
+
+    #[test]
     fn only_a_card_with_no_overlap_at_all_is_unmapped() {
         let body = Rectangle::new(Point::new(500.0, 44.0), Size::new(480.0, 596.0));
 
-        assert!(native_placement(body, body, 400.0, 1.0).presented);
+        assert!(native_placement(body, body, 400.0, 1.0, 1.0).presented);
         // Scrolled entirely past the right edge of the workspace viewport.
         assert!(
             !native_placement(
                 body,
                 Rectangle::new(Point::new(0.0, 0.0), Size::new(500.0, 700.0)),
                 400.0,
+                1.0,
                 1.0,
             )
             .presented
@@ -707,6 +757,7 @@ mod tests {
                 body,
                 Rectangle::new(Point::new(500.0, 640.0), Size::new(480.0, 100.0)),
                 400.0,
+                1.0,
                 1.0,
             )
             .presented
@@ -721,6 +772,7 @@ mod tests {
             Rectangle::new(Point::new(500.0, 44.0), Size::new(480.0, 596.0)),
             Rectangle::new(Point::new(0.0, 0.0), Size::new(10.0, 10.0)),
             400.0,
+            1.0,
             1.0,
         );
 

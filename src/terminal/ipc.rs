@@ -1070,12 +1070,12 @@ pub fn validate_proof(
         Some(_) => Err(ProtocolError::new(
             ProtocolErrorCode::ProofMismatch,
             "the request targets a different cagents daemon incarnation",
-            true,
+            false,
         )),
         None => Err(ProtocolError::new(
             ProtocolErrorCode::ProofMismatch,
             "a cagents daemon proof is required after the handshake",
-            true,
+            false,
         )),
     }
 }
@@ -1309,9 +1309,15 @@ mod tests {
     fn every_host_proof_component_fences_stale_clients() {
         let current = proof("session", "boot", "incarnation");
         assert!(validate_proof(Some(&current), &current).is_ok());
-        assert!(validate_proof(Some(&proof("old", "boot", "incarnation")), &current).is_err());
-        assert!(validate_proof(Some(&proof("session", "old", "incarnation")), &current).is_err());
-        assert!(validate_proof(Some(&proof("session", "boot", "old")), &current).is_err());
-        assert!(validate_proof(None, &current).is_err());
+        for supplied in [
+            Some(proof("old", "boot", "incarnation")),
+            Some(proof("session", "old", "incarnation")),
+            Some(proof("session", "boot", "old")),
+            None,
+        ] {
+            let error = validate_proof(supplied.as_ref(), &current).unwrap_err();
+            assert_eq!(error.code, ProtocolErrorCode::ProofMismatch);
+            assert!(!error.retryable);
+        }
     }
 }

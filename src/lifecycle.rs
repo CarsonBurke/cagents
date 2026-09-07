@@ -44,6 +44,8 @@ struct RuntimeCard {
 pub struct LifecycleManager {
     budget: LifecycleBudget,
     cards: HashMap<CardId, RuntimeCard>,
+    exposed: HashSet<CardId>,
+    hot: HashSet<CardId>,
 }
 
 impl LifecycleManager {
@@ -55,6 +57,8 @@ impl LifecycleManager {
         Self {
             budget,
             cards: HashMap::new(),
+            exposed: HashSet::new(),
+            hot: HashSet::new(),
         }
     }
 
@@ -69,8 +73,9 @@ impl LifecycleManager {
     }
 
     pub fn next_offscreen_sweep_delay(&self, now: Instant) -> Option<Duration> {
-        self.cards
-            .values()
+        self.hot
+            .iter()
+            .filter_map(|card| self.cards.get(card))
             .filter(|runtime| {
                 runtime.exposure == Exposure::Offscreen
                     && matches!(runtime.residency, Residency::Hot)
@@ -90,6 +95,16 @@ impl LifecycleManager {
         residency: Residency,
         now: Instant,
     ) {
+        if exposure == Exposure::Offscreen {
+            self.exposed.remove(&card);
+        } else {
+            self.exposed.insert(card);
+        }
+        if matches!(residency, Residency::Hot | Residency::Hydrating { .. }) {
+            self.hot.insert(card);
+        } else {
+            self.hot.remove(&card);
+        }
         self.cards.insert(
             card,
             RuntimeCard {
@@ -103,6 +118,8 @@ impl LifecycleManager {
 
     pub fn remove(&mut self, card: CardId) {
         self.cards.remove(&card);
+        self.exposed.remove(&card);
+        self.hot.remove(&card);
     }
 
     pub fn reconcile(
@@ -113,14 +130,31 @@ impl LifecycleManager {
     ) -> Vec<LifecycleAction> {
         let mut actions = Vec::new();
 
-        for (&card, runtime) in &mut self.cards {
-            let next_exposure = if visible.contains(&card) {
-                Exposure::Visible
-            } else if prefetch.contains(&card) {
-                Exposure::Prefetch
-            } else {
-                Exposure::Offscreen
+        // Cold offscreen cards cannot change during a viewport sweep. Visit
+        // only the previous and next exposed bands, not every saved card.
+        self.exposed.retain(|card| {
+            if visible.contains(card) || prefetch.contains(card) {
+                return true;
+            }
+            if let Some(runtime) = self.cards.get_mut(card) {
+                runtime.exposure = Exposure::Offscreen;
+                actions.push(LifecycleAction::SetExposure {
+                    card: *card,
+                    exposure: Exposure::Offscreen,
+                });
+            }
+            false
+        });
+        for (&card, next_exposure) in visible.iter().map(|card| (card, Exposure::Visible)).chain(
+            prefetch
+                .iter()
+                .filter(|card| !visible.contains(*card))
+                .map(|card| (card, Exposure::Prefetch)),
+        ) {
+            let Some(runtime) = self.cards.get_mut(&card) else {
+                continue;
             };
+            self.exposed.insert(card);
             if runtime.exposure != next_exposure {
                 runtime.exposure = next_exposure;
                 actions.push(LifecycleAction::SetExposure {
@@ -133,62 +167,45 @@ impl LifecycleManager {
             }
         }
 
-        let mut hydrate_candidates: Vec<_> = self
-            .cards
-            .iter()
-            .filter(|(_, runtime)| {
-                runtime.exposure != Exposure::Offscreen
-                    && matches!(runtime.residency, Residency::Cold | Residency::Hibernated)
-            })
-            .map(|(&card, runtime)| (card, runtime.exposure))
-            .collect();
-        hydrate_candidates.sort_by_key(|(_, exposure)| match exposure {
-            Exposure::Visible => 0,
-            Exposure::Prefetch => 1,
-            Exposure::Offscreen => 2,
-        });
-
-        let mut hot = self
-            .cards
-            .values()
-            .filter(|runtime| {
-                matches!(
-                    runtime.residency,
-                    Residency::Hot | Residency::Hydrating { .. }
-                )
-            })
-            .count();
-        for (card, _) in hydrate_candidates {
-            if hot >= self.budget.max_hot_cards {
+        // Visible work always wins the budget. Iterating the two bands in
+        // priority order avoids allocating and sorting hydration candidates.
+        for card in visible.iter().chain(prefetch.iter()) {
+            if self.hot.len() >= self.budget.max_hot_cards {
                 break;
             }
-            let runtime = self.cards.get_mut(&card).expect("candidate exists");
+            let Some(runtime) = self.cards.get_mut(card) else {
+                continue;
+            };
+            if !matches!(runtime.residency, Residency::Cold | Residency::Hibernated) {
+                continue;
+            }
             runtime.epoch = runtime.epoch.wrapping_add(1);
             runtime.residency = Residency::Hydrating {
                 epoch: runtime.epoch,
             };
             actions.push(LifecycleAction::Hydrate {
-                card,
+                card: *card,
                 epoch: runtime.epoch,
             });
-            hot += 1;
+            self.hot.insert(*card);
         }
 
         let mut eviction_candidates: Vec<_> = self
-            .cards
+            .hot
             .iter()
+            .filter_map(|card| self.cards.get(card).map(|runtime| (*card, runtime)))
             .filter(|(_, runtime)| {
                 runtime.exposure == Exposure::Offscreen
                     && matches!(runtime.residency, Residency::Hot)
             })
-            .map(|(&card, runtime)| (card, runtime.last_visible))
+            .map(|(card, runtime)| (card, runtime.last_visible))
             .collect();
         eviction_candidates.sort_by_key(|(_, last_visible)| *last_visible);
 
         for (card, last_visible) in eviction_candidates {
             let grace_elapsed =
                 now.saturating_duration_since(last_visible) >= self.budget.offscreen_grace;
-            if !grace_elapsed && hot <= self.budget.max_hot_cards {
+            if !grace_elapsed && self.hot.len() <= self.budget.max_hot_cards {
                 continue;
             }
             let runtime = self.cards.get_mut(&card).expect("candidate exists");
@@ -200,7 +217,7 @@ impl LifecycleManager {
                 card,
                 epoch: runtime.epoch,
             });
-            hot = hot.saturating_sub(1);
+            self.hot.remove(&card);
         }
 
         actions
@@ -225,6 +242,9 @@ impl LifecycleManager {
                 retryable: true,
             },
         };
+        if !matches!(runtime.residency, Residency::Hot) {
+            self.hot.remove(&card);
+        }
         true
     }
 
@@ -250,6 +270,72 @@ impl LifecycleManager {
 mod tests {
     use super::*;
 
+    #[test]
+    fn failed_or_removed_hydration_releases_the_hot_budget() {
+        let now = Instant::now();
+        let first = CardId::new();
+        let second = CardId::new();
+        let third = CardId::new();
+        let mut manager = LifecycleManager::new(LifecycleBudget {
+            max_hot_cards: 1,
+            offscreen_grace: Duration::from_secs(30),
+        });
+        for card in [first, second, third] {
+            manager.register(card, Exposure::Offscreen, Residency::Cold, now);
+        }
+        let actions = manager.reconcile(&HashSet::from([first]), &HashSet::from([second]), now);
+        let epoch = actions
+            .iter()
+            .find_map(|action| match action {
+                LifecycleAction::Hydrate { card, epoch } if *card == first => Some(*epoch),
+                _ => None,
+            })
+            .unwrap();
+        assert!(!actions.iter().any(|action| matches!(
+            action, LifecycleAction::Hydrate { card, .. } if *card == second
+        )));
+        assert!(manager.hydration_finished(
+            first,
+            epoch,
+            Err(RuntimeError {
+                code: "restore_failed".into(),
+                message: "Restore failed".into(),
+            })
+        ));
+        let actions = manager.reconcile(&HashSet::from([second]), &HashSet::new(), now);
+        assert!(actions.iter().any(|action| matches!(
+            action, LifecycleAction::Hydrate { card, .. } if *card == second
+        )));
+        assert_eq!(manager.state(first).unwrap().0, &Exposure::Offscreen);
+        manager.remove(second);
+        let actions = manager.reconcile(&HashSet::from([third]), &HashSet::new(), now);
+        assert!(actions.iter().any(|action| matches!(
+            action, LifecycleAction::Hydrate { card, .. } if *card == third
+        )));
+    }
+
+    #[test]
+    fn replacing_a_runtime_does_not_leave_stale_exposure_or_hot_budget() {
+        let now = Instant::now();
+        let replaced = CardId::new();
+        let waiting = CardId::new();
+        let mut manager = LifecycleManager::new(LifecycleBudget {
+            max_hot_cards: 1,
+            offscreen_grace: Duration::ZERO,
+        });
+        manager.register(replaced, Exposure::Visible, Residency::Hot, now);
+        manager.register(replaced, Exposure::Offscreen, Residency::Hibernated, now);
+        manager.register(waiting, Exposure::Offscreen, Residency::Cold, now);
+        let actions = manager.reconcile(&HashSet::from([waiting]), &HashSet::new(), now);
+        assert!(actions.iter().any(|action| matches!(
+            action, LifecycleAction::Hydrate { card, .. } if *card == waiting
+        )));
+        assert!(!actions.iter().any(|action| matches!(
+            action, LifecycleAction::SetExposure { card, .. }
+                | LifecycleAction::Hibernate { card, .. } if *card == replaced
+        )));
+        assert_eq!(manager.next_offscreen_sweep_delay(now), None);
+    }
     #[test]
     fn ignores_stale_transition_completions() {
         let now = Instant::now();

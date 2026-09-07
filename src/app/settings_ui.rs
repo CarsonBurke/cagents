@@ -82,7 +82,7 @@ fn setting_field<'a>(
     control: Element<'a, Message>,
 ) -> Element<'a, Message> {
     widget::column::with_children(vec![
-        widget::text::heading(label).into(),
+        widget::text::caption_heading(label).into(),
         control,
         widget::text::caption(detail)
             .wrapping(iced::widget::text::Wrapping::Word)
@@ -92,6 +92,52 @@ fn setting_field<'a>(
     .spacing(design::GRID_UNIT)
     .width(Length::Fill)
     .into()
+}
+
+fn setting_stepper<'a>(
+    label: &'static str,
+    detail: impl Into<Cow<'a, str>> + 'a,
+    value: &'a str,
+    field: SettingsField,
+    min: f32,
+    max: f32,
+    step: f32,
+    default: f32,
+    unit: &'static str,
+) -> Element<'a, Message> {
+    let current = value.parse::<f32>().unwrap_or(default).clamp(min, max);
+    let change = |next: f32| Message::SettingsChanged {
+        field,
+        value: format!("{:.3}", next.clamp(min, max)),
+    };
+    let control = widget::row::with_children(vec![
+        widget::button::icon(widget::icon::from_name("list-remove-symbolic"))
+            .name(format!("Decrease {label}"))
+            .width(design::ROW_HEIGHT)
+            .height(design::ROW_HEIGHT)
+            .on_press_maybe((current > min).then(|| change(current - step)))
+            .into(),
+        widget::container(widget::text::body(format!("{}{}", current, unit)))
+            .center_x(Length::Fill)
+            .center_y(design::ROW_HEIGHT)
+            .width(Length::Fill)
+            .into(),
+        widget::button::icon(widget::icon::from_name("list-add-symbolic"))
+            .name(format!("Increase {label}"))
+            .width(design::ROW_HEIGHT)
+            .height(design::ROW_HEIGHT)
+            .on_press_maybe((current < max).then(|| change(current + step)))
+            .into(),
+        widget::button::text("Reset")
+            .name(format!("Reset {label}"))
+            .on_press_maybe((current != default).then(|| change(default)))
+            .into(),
+    ])
+    .spacing(design::GRID_UNIT)
+    .align_y(Alignment::Center)
+    .width(Length::Fill)
+    .into();
+    setting_field(label, detail, control)
 }
 
 fn settings_choice<'a>(
@@ -156,10 +202,15 @@ fn settings_group<'a>(
         .into(),
     );
     children.extend(controls);
-    widget::column::with_children(children)
-        .spacing(4.0 * design::GRID_UNIT)
-        .width(Length::Fill)
-        .into()
+    widget::container(
+        widget::column::with_children(children)
+            .spacing(4.0 * design::GRID_UNIT)
+            .width(Length::Fill),
+    )
+    .class(cosmic::theme::Container::Card)
+    .padding(4.0 * design::GRID_UNIT)
+    .width(Length::Fill)
+    .into()
 }
 
 fn settings_category_controls<'a>(
@@ -168,93 +219,185 @@ fn settings_category_controls<'a>(
     progress: f32,
 ) -> Vec<Element<'a, Message>> {
     match category {
-        SettingsCategory::General => vec![
+        SettingsCategory::General => vec![settings_group(
+            "Runtime",
+            "Control how many live columns cagents keeps active and when background work is suspended.",
+            vec![
+                setting_input(
+                    "Maximum hot columns",
+                    "Applies immediately; extra background columns may hibernate.",
+                    &draft.max_hot_cards,
+                    SettingsField::MaxHotCards,
+                    progress,
+                ),
+                setting_input(
+                    "Hibernation delay (ms)",
+                    "Applies immediately to background columns.",
+                    &draft.hibernation_delay_ms,
+                    SettingsField::HibernationDelayMs,
+                    progress,
+                ),
+            ],
+        )],
+        SettingsCategory::Appearance => vec![
             settings_group(
-                "Runtime",
-                "Control how many live columns cagents keeps active and when background work is suspended.",
+                "Interface",
+                "Make the workbench comfortable on your display. Changes apply immediately and are saved automatically.",
                 vec![
-                    setting_input(
-                        "Maximum hot columns",
-                        "Applies immediately; extra background columns may hibernate.",
-                        &draft.max_hot_cards,
-                        SettingsField::MaxHotCards,
+                    settings_choice(
+                        "Color scheme",
+                        "System follows your desktop, including later theme changes.",
+                        SettingsField::AppTheme,
+                        [
+                            ("System", "system", draft.app_theme == "system"),
+                            ("Dark", "dark", draft.app_theme == "dark"),
+                            ("Light", "light", draft.app_theme == "light"),
+                        ],
                         progress,
                     ),
-                    setting_input(
-                        "Hibernation delay (ms)",
-                        "Applies immediately to background columns.",
-                        &draft.hibernation_delay_ms,
-                        SettingsField::HibernationDelayMs,
-                        progress,
+                    setting_stepper(
+                        "Interface scale",
+                        "Scales the entire interface independently of display scaling.",
+                        &draft.ui_scale,
+                        SettingsField::UiScale,
+                        0.8,
+                        1.5,
+                        0.05,
+                        1.0,
+                        "×",
                     ),
                 ],
             ),
             settings_group(
-                "Configuration",
-                "The on-disk settings format is managed by cagents.",
+                "Workspace layout",
+                "Keep navigation and context readable without giving up working space.",
                 vec![
-                    widget::row::with_children(vec![
-                        widget::text::body("Schema version")
-                            .width(Length::Fill)
-                            .into(),
-                        widget::text::monotext(&draft.schema_version).into(),
-                    ])
-                    .align_y(Alignment::Center)
-                    .spacing(2.0 * design::GRID_UNIT)
-                    .into(),
+                    setting_stepper(
+                        "Projects pane width",
+                        "Also adjustable by dragging the pane edge.",
+                        &draft.sidebar_width,
+                        SettingsField::SidebarWidth,
+                        design::NAVIGATION_MIN_WIDTH,
+                        design::NAVIGATION_MAX_WIDTH,
+                        20.0,
+                        design::NAVIGATION_DEFAULT_WIDTH,
+                        " px",
+                    ),
+                    setting_stepper(
+                        "Context panel width",
+                        "Used when docked; the panel fits the available width when overlaid.",
+                        &draft.inspector_width,
+                        SettingsField::InspectorWidth,
+                        design::INSPECTOR_MIN_WIDTH,
+                        design::INSPECTOR_MAX_WIDTH,
+                        20.0,
+                        design::INSPECTOR_DEFAULT_WIDTH,
+                        " px",
+                    ),
+                    setting_stepper(
+                        "New column width",
+                        "Fraction of the workspace. Existing column widths are preserved.",
+                        &draft.default_column_fraction,
+                        SettingsField::DefaultColumnFraction,
+                        0.25,
+                        1.0,
+                        0.05,
+                        0.72,
+                        "×",
+                    ),
                 ],
             ),
         ],
-        SettingsCategory::Appearance => vec![settings_group(
-            "Workspace layout",
-            "Tune the persistent navigation and the starting size of newly created columns.",
-            vec![
-                setting_input(
-                    "Projects pane width (px)",
-                    format!(
-                        "Applies immediately, {}. Dragging the pane's edge sets it too.",
-                        sidebar_width_range()
+        SettingsCategory::Terminal => vec![
+            settings_group(
+                "Text & cursor",
+                "Tune every open terminal live. Application colors are controlled by the shell or terminal program.",
+                vec![
+                    setting_stepper(
+                        "Font size",
+                        "Logical pixels before interface and display scaling.",
+                        &draft.terminal_font_size,
+                        SettingsField::TerminalFontSize,
+                        8.0,
+                        40.0,
+                        1.0,
+                        14.0,
+                        " px",
                     ),
-                    &draft.sidebar_width,
-                    SettingsField::SidebarWidth,
-                    progress,
-                ),
-                setting_input(
-                    "Default column fraction",
-                    "Applies to new columns only; existing widths are preserved.",
-                    &draft.default_column_fraction,
-                    SettingsField::DefaultColumnFraction,
-                    progress,
-                ),
-            ],
-        )],
-        SettingsCategory::Terminal => vec![settings_group(
-            "Integrated terminal",
-            "Rendering changes apply immediately. Scrollback capacity applies to terminals started after the change.",
-            vec![
-                setting_input(
-                    "Font size",
-                    "A value from 8 to 40 pixels.",
-                    &draft.terminal_font_size,
-                    SettingsField::TerminalFontSize,
-                    progress,
-                ),
-                setting_input_on_submit(
-                    "Font family",
-                    "Leave empty for the system monospace font. Powerline prompts need a font that includes their glyphs. Must be fixed-pitch: a family whose glyphs differ in width would not line up on the grid, so it falls back to the system monospace font. Applies when you press Enter.",
-                    &draft.terminal_font_family,
-                    SettingsField::TerminalFontFamily,
-                    progress,
-                ),
-                setting_input(
+                    setting_input_on_submit(
+                        "Font family",
+                        "Leave empty for system monospace. Use an installed fixed-pitch family, including a Nerd Font for Powerline glyphs. Proportional families fall back to monospace. Press Enter to apply.",
+                        &draft.terminal_font_family,
+                        SettingsField::TerminalFontFamily,
+                        progress,
+                    ),
+                    settings_choice(
+                        "Font preset",
+                        "Choose System to reset a custom family; enter any installed monospace family above.",
+                        SettingsField::TerminalFontFamily,
+                        [(
+                            "System monospace",
+                            "",
+                            draft.terminal_font_family.is_empty(),
+                        )],
+                        progress,
+                    ),
+                    setting_stepper(
+                        "Line height",
+                        "Space between text baselines, relative to font size.",
+                        &draft.terminal_line_height,
+                        SettingsField::TerminalLineHeight,
+                        1.0,
+                        2.0,
+                        0.05,
+                        1.286,
+                        "×",
+                    ),
+                    setting_stepper(
+                        "Inner padding",
+                        "Breathing room between terminal text and the column edge.",
+                        &draft.terminal_padding,
+                        SettingsField::TerminalPadding,
+                        0.0,
+                        24.0,
+                        2.0,
+                        8.0,
+                        " px",
+                    ),
+                    settings_choice(
+                        "Cursor shape",
+                        "Application lets the running program choose its cursor; other choices override the shape.",
+                        SettingsField::TerminalCursorStyle,
+                        [
+                            (
+                                "Application",
+                                "application",
+                                draft.terminal_cursor_style == "application",
+                            ),
+                            ("Block", "block", draft.terminal_cursor_style == "block"),
+                            ("Beam", "beam", draft.terminal_cursor_style == "beam"),
+                            (
+                                "Underline",
+                                "underline",
+                                draft.terminal_cursor_style == "underline",
+                            ),
+                        ],
+                        progress,
+                    ),
+                ],
+            ),
+            settings_group(
+                "History",
+                "Keep enough output to investigate a task without retaining unlimited terminal history.",
+                vec![setting_input_on_submit(
                     "Scrollback lines",
-                    "From 0 to 1,000,000 lines per newly started terminal.",
+                    "0–1,000,000 lines per newly started terminal. Press Enter to apply; existing history is preserved.",
                     &draft.terminal_scrollback_lines,
                     SettingsField::TerminalScrollbackLines,
                     progress,
-                ),
-            ],
-        )],
+                )],
+            ),
+        ],
         SettingsCategory::Links => vec![settings_group(
             "Link handling",
             "Choose where modified clicks on known links open. Regular clicks stay inside the workspace.",
@@ -437,13 +580,7 @@ pub(super) fn settings_dialog<'a>(
     };
 
     let groups = settings_category_controls(category, draft, progress);
-    let mut controls = Vec::with_capacity(groups.len() * 2);
-    for group in groups {
-        if !controls.is_empty() {
-            controls.push(widget::divider::horizontal::light().into());
-        }
-        controls.push(group);
-    }
+    let controls = groups;
     let content: Element<'a, Message> = widget::container(
         widget::scrollable(
             widget::column::with_children(controls)
