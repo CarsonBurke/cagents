@@ -1,0 +1,3 @@
+[build]
+# Limit concurrent compilation on shared hosts; override with CARGO_BUILD_JOBS or -j.
+jobs = 2
