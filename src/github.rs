@@ -475,6 +475,121 @@ pub enum GitHubError {
     },
 }
 
+/// Only a completed refresh grants authority. Cached presentation rows deliberately
+/// live outside this value and cannot supply a repository to a mutation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GitHubAvailability {
+    MissingCli,
+    Unauthenticated,
+    NotAssociated,
+    Loading,
+    Ready {
+        repository_key: GitHubRepoKey,
+        pull_requests: Vec<(PullRequest, Vec<PullRequestCheck>)>,
+        refreshed_at: i64,
+    },
+    Failed {
+        detail: String,
+    },
+}
+
+impl GitHubAvailability {
+    pub fn repository_key(&self) -> Option<&GitHubRepoKey> {
+        match self {
+            Self::Ready { repository_key, .. } => Some(repository_key),
+            _ => None,
+        }
+    }
+
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::MissingCli => "GitHub CLI is unavailable; local Git remains available.",
+            Self::Unauthenticated => {
+                "GitHub authentication is required; local Git remains available."
+            }
+            Self::NotAssociated => "No supported GitHub remote is associated.",
+            Self::Loading => "Refreshing GitHub; mutations are disabled.",
+            Self::Ready { pull_requests, .. } if pull_requests.is_empty() => {
+                "GitHub is up to date; no open pull requests."
+            }
+            Self::Ready { .. } => "GitHub is up to date.",
+            Self::Failed { .. } => "GitHub refresh failed; retry to authorize mutations.",
+        }
+    }
+
+    pub fn from_error(error: GitHubError) -> Self {
+        match error {
+            GitHubError::Process(failure) if failure.kind == ProcessFailureKind::Spawn => {
+                Self::MissingCli
+            }
+            GitHubError::Process(failure) if failure.exit_code == Some(4) => Self::Unauthenticated,
+            GitHubError::AuthenticationRequired { .. } | GitHubError::NoActiveAccount(_) => {
+                Self::Unauthenticated
+            }
+            GitHubError::Validation(_) => Self::NotAssociated,
+            GitHubError::InvalidResponse { source, .. } => Self::from_error(*source),
+            error => Self::Failed {
+                detail: error.to_string(),
+            },
+        }
+    }
+}
+
+/// A syntactically valid GitHub-shaped remote identity. Forge support for
+/// non-public hosts must additionally be established by gh's configured hosts.
+fn remote_repository_key(remote: &str) -> Option<GitHubRepoKey> {
+    let parsed = if remote.contains("://") {
+        Url::parse(remote).ok()?
+    } else {
+        let (authority, path) = remote.split_once(':')?;
+        if authority.contains('/') {
+            return None;
+        }
+        Url::parse(&format!("ssh://{authority}/{path}")).ok()?
+    };
+    if !matches!(parsed.scheme(), "https" | "ssh") {
+        return None;
+    }
+    let mut path = parsed.path().trim_matches('/').split('/');
+    let (owner, repository) = (path.next()?, path.next()?);
+    if path.next().is_some() {
+        return None;
+    }
+    GitHubRepoKey::new(parsed.host_str()?, parsed.port(), owner, repository).ok()
+}
+
+impl<E: ProcessExecutor> GitHubService<E> {
+    /// Public GitHub or an enterprise host already known to gh. Arbitrary HTTPS
+    /// remotes are not evidence that a repository belongs to GitHub.
+    pub fn has_associated_remote(
+        &self,
+        remotes: &[crate::repository::RemoteRecord],
+        cancellation: &CancellationToken,
+    ) -> Result<bool, GitHubError> {
+        let keys: Vec<_> = remotes
+            .iter()
+            .filter_map(|remote| remote.fetch_url.as_deref())
+            .filter_map(remote_repository_key)
+            .collect();
+        if keys.iter().any(|key| key.host == "github.com") {
+            return Ok(true);
+        }
+        if keys.is_empty() {
+            return Ok(false);
+        }
+        let output = self.executor.execute(
+            &self.gh_command(["auth", "status", "--json", "hosts"]),
+            cancellation,
+        )?;
+        // gh can return a failing auth exit status while still reporting known
+        // accounts as JSON; those hosts remain associated but cannot authorize.
+        let envelope: GhAuthEnvelope = parse_json(&output.stdout)?;
+        Ok(keys
+            .iter()
+            .any(|key| envelope.hosts.contains_key(&key.authority())))
+    }
+}
+
 #[derive(Debug, Deserialize)]
 struct GhAuthEnvelope {
     hosts: BTreeMap<String, Vec<GhAuthAccount>>,
@@ -1138,6 +1253,52 @@ mod tests {
 
     fn repository() -> GitHubRepoKey {
         GitHubRepoKey::new("github.com", None, "owner", "repo").unwrap()
+    }
+
+    #[test]
+    fn remote_association_requires_public_github_or_a_known_enterprise_host() {
+        let remote = |url: &str| crate::repository::RemoteRecord {
+            name: "origin".into(),
+            fetch_url: Some(url.into()),
+            push_url: None,
+        };
+        let service = GitHubService::new("gh", Arc::new(FakeExecutor::default()));
+        assert!(
+            service
+                .has_associated_remote(
+                    &[remote("git@github.com:owner/repo.git")],
+                    &CancellationToken::new()
+                )
+                .unwrap()
+        );
+        assert!(
+            !service
+                .has_associated_remote(&[remote("/local/repository")], &CancellationToken::new())
+                .unwrap()
+        );
+        let service = GitHubService::new(
+            "gh",
+            Arc::new(FakeExecutor::with_outputs(vec![
+                success(br#"{"hosts":{}}"#),
+                success(br#"{"hosts":{"enterprise.example":[]}}"#),
+            ])),
+        );
+        assert!(
+            !service
+                .has_associated_remote(
+                    &[remote("https://gitlab.com/owner/repo")],
+                    &CancellationToken::new()
+                )
+                .unwrap()
+        );
+        assert!(
+            service
+                .has_associated_remote(
+                    &[remote("ssh://git@enterprise.example/owner/repo.git")],
+                    &CancellationToken::new()
+                )
+                .unwrap()
+        );
     }
 
     #[test]

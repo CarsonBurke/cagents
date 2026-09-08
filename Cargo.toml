@@ -9,6 +9,8 @@ publish = false
 [features]
 default = ["full"]
 development = []
+# Opt-in local redraw-scheduling fixture; ordinary builds use a zero-state recorder.
+latency-harness = ["ui"]
 # Product identity only. Keep this separate from the embedded-browser
 # implementation so the CLI and daemon do not resolve Servo.
 full = []

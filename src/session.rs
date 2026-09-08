@@ -203,7 +203,6 @@ struct QueueState {
     shutdown: bool,
 }
 
-#[derive(Debug)]
 pub struct SessionRuntime {
     queue: Arc<(Mutex<QueueState>, Condvar)>,
     last_error: Arc<Mutex<Option<String>>>,
@@ -212,6 +211,16 @@ pub struct SessionRuntime {
     database_path: PathBuf,
     restored_projects: Vec<ProjectState>,
     restored_worktrees: Vec<WorktreeState>,
+    operation_store: Arc<StateStore>,
+}
+
+impl std::fmt::Debug for SessionRuntime {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("SessionRuntime")
+            .field("worker_running", &self.worker.is_some())
+            .finish_non_exhaustive()
+    }
 }
 
 impl SessionRuntime {
@@ -230,7 +239,7 @@ impl SessionRuntime {
         boot_id: BootId,
     ) -> Result<(Self, Option<WorkspaceState>), SessionError> {
         let database_path = database_path.as_ref().to_path_buf();
-        let store = StateStore::open(&database_path, boot_id)?;
+        let store = Arc::new(StateStore::open(&database_path, boot_id)?);
         let restored = store
             .list_workspaces()?
             .into_iter()
@@ -268,6 +277,7 @@ impl SessionRuntime {
         let health = HealthPublisher::new(health_tx);
         let worker_queue = Arc::clone(&queue);
         let worker_error = Arc::clone(&last_error);
+        let operation_store = Arc::clone(&store);
         let worker = thread::Builder::new()
             .name("cagents-session-writer".into())
             .spawn(move || {
@@ -291,6 +301,7 @@ impl SessionRuntime {
                 database_path,
                 restored_projects: projects,
                 restored_worktrees: worktrees,
+                operation_store,
             },
             restored,
         ))
@@ -363,6 +374,11 @@ impl SessionRuntime {
             std::mem::take(&mut self.restored_projects),
             std::mem::take(&mut self.restored_worktrees),
         )
+    }
+
+    /// Shares the existing connection, never opens a second startup-reconciling store.
+    pub fn operation_store(&self) -> Arc<StateStore> {
+        Arc::clone(&self.operation_store)
     }
 
     pub fn last_error(&self) -> Option<String> {
@@ -471,6 +487,33 @@ impl SessionStore for StateStore {
 
     fn shutdown(&self) -> Result<(), StoreError> {
         Self::shutdown(self)
+    }
+}
+
+impl SessionStore for Arc<StateStore> {
+    fn replace_terminal_identity(
+        &self,
+        card_id: CardId,
+        expected_terminal_id: TerminalId,
+        replacement: &TerminalSession,
+    ) -> Result<(), StoreError> {
+        StateStore::replace_terminal_identity(self, card_id, expected_terminal_id, replacement)
+    }
+    fn save_workspace(
+        &self,
+        state: &WorkspaceState,
+        base: SnapshotBase<'_>,
+    ) -> Result<crate::persistence::WorkspaceCommit, StoreError> {
+        StateStore::save_workspace(self, state, base)
+    }
+    fn save_project(&self, project: &ProjectState) -> Result<u64, StoreError> {
+        StateStore::save_project(self, project)
+    }
+    fn save_worktree(&self, worktree: &WorktreeState) -> Result<u64, StoreError> {
+        StateStore::save_worktree(self, worktree)
+    }
+    fn shutdown(&self) -> Result<(), StoreError> {
+        StateStore::shutdown(self)
     }
 }
 

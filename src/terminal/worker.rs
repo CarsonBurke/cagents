@@ -8,6 +8,7 @@ use std::{
         atomic::{AtomicBool, AtomicU64, Ordering},
     },
     thread::{self, JoinHandle},
+    time::{SystemTime, UNIX_EPOCH},
 };
 
 use arc_swap::ArcSwap;
@@ -23,7 +24,7 @@ use portable_pty::{
 };
 
 use crate::{
-    model::{LaunchRecipe, TerminalSession},
+    model::{LaunchRecipe, TerminalOutputActivity, TerminalSession},
     secure_file::open_private_append_file,
 };
 
@@ -75,6 +76,7 @@ enum WorkerEvent {
     Command(Option<Command>),
     Pty(Option<PtyMessage>),
     ChildExit(Option<ChildExit>),
+    Capture,
 }
 
 #[derive(Debug)]
@@ -102,6 +104,11 @@ type WakeCallback = dyn Fn(TerminalWake) + Send + Sync + 'static;
 struct PublishedState {
     snapshot: ArcSwap<RenderSnapshot>,
     published_generation: AtomicU64,
+    acknowledged_generation: AtomicU64,
+    capture_tx: Sender<()>,
+    capture_rx: Receiver<()>,
+    activity: Mutex<Option<TerminalOutputActivity>>,
+    completed: AtomicBool,
     wake_pending: AtomicBool,
     visible: AtomicBool,
     wake: Arc<WakeCallback>,
@@ -109,9 +116,15 @@ struct PublishedState {
 
 impl PublishedState {
     fn new(visible: bool, wake: Arc<WakeCallback>) -> Self {
+        let (capture_tx, capture_rx) = crossbeam_channel::bounded(1);
         Self {
             snapshot: ArcSwap::from_pointee(RenderSnapshot::empty()),
             published_generation: AtomicU64::new(0),
+            acknowledged_generation: AtomicU64::new(0),
+            capture_tx,
+            capture_rx,
+            activity: Mutex::new(None),
+            completed: AtomicBool::new(false),
             wake_pending: AtomicBool::new(false),
             visible: AtomicBool::new(visible),
             wake,
@@ -157,6 +170,14 @@ impl PublishedState {
     }
 
     fn acknowledge(&self, observed_generation: u64) {
+        let observed_generation =
+            observed_generation.min(self.published_generation.load(Ordering::Acquire));
+        let previous = self
+            .acknowledged_generation
+            .fetch_max(observed_generation, Ordering::AcqRel);
+        if observed_generation > previous {
+            let _ = self.capture_tx.try_send(());
+        }
         self.wake_pending.store(false, Ordering::Release);
         let latest = self.published_generation.load(Ordering::Acquire);
         if latest > observed_generation && self.visible.load(Ordering::Acquire) {
@@ -229,6 +250,7 @@ impl TerminalHandle {
         let worker = thread::Builder::new()
             .name(format!("terminal-{:?}", session.id))
             .spawn(move || {
+                let completion = Arc::clone(&worker_published);
                 let result = Worker::start(session, config, command_rx, event_tx, worker_published);
                 match result {
                     Ok(worker) => {
@@ -239,6 +261,10 @@ impl TerminalHandle {
                         let _ = startup_tx.send(Err(error));
                     }
                 }
+                // Only completed teardown is evidence that no worker/PTY
+                // remains. An unexpected panic conservatively retains live
+                // inventory rather than certifying unobserved cleanup.
+                completion.completed.store(true, Ordering::Release);
             })
             .map_err(|error| TerminalStartError::Worker(error.to_string()))?;
 
@@ -264,6 +290,21 @@ impl TerminalHandle {
 
     pub fn snapshot(&self) -> Arc<RenderSnapshot> {
         self.inner.published.snapshot.load_full()
+    }
+
+    pub fn activity(&self) -> Option<TerminalOutputActivity> {
+        *self
+            .inner
+            .published
+            .activity
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+    }
+
+    /// True only after final capture, PTY teardown and reader/reaper cleanup.
+    /// Foreground-process exit alone does not imply completion.
+    pub fn is_completed(&self) -> bool {
+        self.inner.published.completed.load(Ordering::Acquire)
     }
 
     pub fn generation(&self) -> u64 {
@@ -366,6 +407,7 @@ fn command_channel(capacity: usize) -> (Sender<Command>, Receiver<Command>) {
 }
 
 struct Worker {
+    terminal_id: crate::model::TerminalId,
     terminal: Terminal<'static, 'static>,
     key_encoder: KeyEncoder<'static>,
     mouse_encoder: MouseEncoder<'static>,
@@ -373,6 +415,8 @@ struct Worker {
     visual: Option<VisualResources>,
     visibility: Visibility,
     generation: u64,
+    capture_dirty: bool,
+    force_capture: bool,
     current_size: TerminalSize,
     commands: Receiver<Command>,
     pty_rx: Receiver<PtyMessage>,
@@ -488,6 +532,7 @@ impl Worker {
             .map_err(|error| format!("start child reaper: {error}"))?;
 
         Ok(Self {
+            terminal_id: session.id,
             terminal,
             key_encoder,
             mouse_encoder,
@@ -495,6 +540,8 @@ impl Worker {
             visual,
             visibility,
             generation: 0,
+            capture_dirty: false,
+            force_capture: false,
             current_size,
             commands,
             pty_rx,
@@ -523,13 +570,17 @@ impl Worker {
                 &self.commands,
                 &self.pty_rx,
                 &self.child_exit_rx,
+                &self.published.capture_rx,
                 pty_open,
                 !exited,
             ) {
                 WorkerEvent::Command(Some(command)) => {
+                    // Commands and returned capture credit share the worker's
+                    // serialization boundary with PTY parsing.
                     shutting_down = self.handle_command(command);
                 }
                 WorkerEvent::Command(None) => shutting_down = true,
+                WorkerEvent::Capture => self.capture_if_ready(),
                 WorkerEvent::Pty(message) => {
                     pty_open = self.handle_pty_message(message);
                 }
@@ -542,6 +593,23 @@ impl Worker {
             }
         }
 
+        // The parser is about to disappear. Preserve its final grid even when
+        // a consumer has not returned credit for the preceding frame.
+        if self.capture_dirty {
+            // A hidden terminal still needs a recoverable final grid once its
+            // parser is destroyed. Do not re-enable its visual wake callback.
+            if self.visual.is_none() {
+                match VisualResources::new() {
+                    Ok(visual) => self.visual = Some(visual),
+                    Err(error) => self.error("build final terminal snapshot", error.to_string()),
+                }
+            }
+            self.visibility = Visibility::Visible;
+            self.published
+                .acknowledged_generation
+                .store(self.generation, Ordering::Release);
+            self.capture_if_ready();
+        }
         if shutting_down && !exited {
             match self.child_exit_rx.try_recv() {
                 Ok(result) => self.handle_child_exit(&mut exited, result),
@@ -621,6 +689,25 @@ impl Worker {
     }
 
     fn process_output(&mut self, bytes: Vec<u8>) {
+        if bytes.is_empty() {
+            return;
+        }
+        {
+            let mut activity = self
+                .published
+                .activity
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            let sequence = activity.map_or(1, |fact| fact.sequence.saturating_add(1));
+            let last_output_at_unix_ms = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|elapsed| elapsed.as_millis().min(i64::MAX as u128) as i64)
+                .unwrap_or(-1);
+            *activity = Some(TerminalOutputActivity {
+                sequence,
+                last_output_at_unix_ms,
+            });
+        }
         if let Some(transcript) = &self.transcript
             && transcript.send(bytes.clone()).is_err()
         {
@@ -628,11 +715,17 @@ impl Worker {
             self.transcript = None;
         }
 
+        let parse_started =
+            tracing::enabled!(target: "cagents::terminal_pipeline", tracing::Level::TRACE)
+                .then(std::time::Instant::now);
         self.terminal.vt_write(&bytes);
-        self.drain_effects();
-        if self.visibility == Visibility::Visible {
-            self.publish_snapshot(false);
+        if let Some(started) = parse_started {
+            tracing::trace!(target: "cagents::terminal_pipeline", stage = "parse",
+                terminal_id = %self.terminal_id, bytes = bytes.len(),
+                elapsed_ns = started.elapsed().as_nanos() as u64);
         }
+        self.drain_effects();
+        self.publish_snapshot(false);
     }
 
     /// Returns true when shutdown was requested.
@@ -755,6 +848,9 @@ impl Worker {
     }
 
     fn reveal(&mut self) {
+        self.published
+            .acknowledged_generation
+            .store(self.generation, Ordering::Release);
         if self.visual.is_none() {
             match VisualResources::new() {
                 Ok(visual) => self.visual = Some(visual),
@@ -788,6 +884,9 @@ impl Worker {
             }
         }
         if visible {
+            self.published
+                .acknowledged_generation
+                .store(self.generation, Ordering::Release);
             self.visibility = Visibility::Visible;
             self.published.visible.store(true, Ordering::Release);
             self.publish_snapshot(true);
@@ -798,6 +897,21 @@ impl Worker {
     }
 
     fn publish_snapshot(&mut self, force: bool) {
+        self.capture_dirty = true;
+        self.force_capture |= force;
+        self.capture_if_ready();
+    }
+
+    fn capture_if_ready(&mut self) {
+        if !self.capture_dirty
+            || self
+                .published
+                .acknowledged_generation
+                .load(Ordering::Acquire)
+                < self.generation
+        {
+            return;
+        }
         if self.visibility != Visibility::Visible {
             return;
         }
@@ -805,12 +919,38 @@ impl Worker {
             return;
         };
         let next_generation = self.generation.saturating_add(1);
-        match visual.capture(&self.terminal, next_generation, force) {
+        let activity = *self
+            .published
+            .activity
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let capture_started =
+            tracing::enabled!(target: "cagents::terminal_pipeline", tracing::Level::TRACE)
+                .then(std::time::Instant::now);
+        let captured = visual.capture(
+            &self.terminal,
+            next_generation,
+            self.force_capture,
+            activity,
+        );
+        if let Some(started) = capture_started {
+            tracing::trace!(target: "cagents::terminal_pipeline", stage = "capture",
+                terminal_id = %self.terminal_id, generation = next_generation,
+                activity_sequence = activity.map_or(0, |fact| fact.sequence),
+                published = matches!(&captured, Ok(Some(_))),
+                elapsed_ns = started.elapsed().as_nanos() as u64);
+        }
+        match captured {
             Ok(Some(snapshot)) => {
+                self.capture_dirty = false;
+                self.force_capture = false;
                 self.generation = next_generation;
                 self.published.publish(snapshot);
             }
-            Ok(None) => {}
+            Ok(None) => {
+                self.capture_dirty = false;
+                self.force_capture = false;
+            }
             Err(error) => self.error("build terminal snapshot", error.to_string()),
         }
     }
@@ -852,21 +992,25 @@ fn wait_for_worker_event(
     commands: &Receiver<Command>,
     pty: &Receiver<PtyMessage>,
     child_exit: &Receiver<ChildExit>,
+    capture: &Receiver<()>,
     pty_open: bool,
     child_running: bool,
 ) -> WorkerEvent {
     match (pty_open, child_running) {
         (true, true) => crossbeam_channel::select! {
             recv(commands) -> message => WorkerEvent::Command(message.ok()),
+            recv(capture) -> _ => WorkerEvent::Capture,
             recv(pty) -> message => WorkerEvent::Pty(message.ok()),
             recv(child_exit) -> message => WorkerEvent::ChildExit(message.ok()),
         },
         (true, false) => crossbeam_channel::select! {
             recv(commands) -> message => WorkerEvent::Command(message.ok()),
+            recv(capture) -> _ => WorkerEvent::Capture,
             recv(pty) -> message => WorkerEvent::Pty(message.ok()),
         },
         (false, true) => crossbeam_channel::select! {
             recv(commands) -> message => WorkerEvent::Command(message.ok()),
+            recv(capture) -> _ => WorkerEvent::Capture,
             recv(child_exit) -> message => WorkerEvent::ChildExit(message.ok()),
         },
         (false, false) => WorkerEvent::Command(commands.recv().ok()),
@@ -1260,6 +1404,188 @@ mod tests {
 
     use super::*;
 
+    fn capture_worker() -> (Worker, Receiver<TerminalEvent>) {
+        let recipe = LaunchRecipe {
+            program: "/bin/true".into(),
+            arguments: Vec::new(),
+            working_directory: PathBuf::from("/"),
+            environment: BTreeMap::new(),
+        };
+        let session = TerminalSession {
+            id: crate::model::TerminalId::new(),
+            launch: recipe.clone(),
+            transcript_path: None,
+            resume_hint: None,
+            continuity: crate::model::TerminalContinuity::RelaunchAvailable {
+                recipe,
+                last_exit: None,
+            },
+        };
+        let (_tx, commands) = command_channel(1);
+        let (events, receiver) = crossbeam_channel::unbounded();
+        let published = Arc::new(PublishedState::new(true, Arc::new(|_| {})));
+        (
+            Worker::start(
+                session,
+                TerminalConfig::default(),
+                commands,
+                events,
+                published,
+            )
+            .unwrap(),
+            receiver,
+        )
+    }
+
+    #[test]
+    fn capture_credit_coalesces_batches_and_preserves_semantic_events() {
+        let (mut worker, events) = capture_worker();
+        worker.publish_snapshot(true);
+        let first = worker.generation;
+        worker.process_output(b"old".to_vec());
+        worker.process_output(b"\r\x1b[2Klatest\x07\x1b]2;title\x07".to_vec());
+        assert_eq!(worker.generation, first);
+        assert_eq!(
+            worker
+                .published
+                .activity
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .unwrap()
+                .sequence,
+            2
+        );
+        assert_eq!(
+            events.try_iter().collect::<Vec<_>>(),
+            vec![
+                TerminalEvent::Bell,
+                TerminalEvent::TitleChanged("title".into())
+            ]
+        );
+        worker.published.acknowledge(first);
+        worker.capture_if_ready();
+        let snapshot = worker.published.snapshot.load_full();
+        assert_eq!(
+            snapshot.lines[0]
+                .cells
+                .iter()
+                .take(6)
+                .map(|cell| cell.text.as_str())
+                .collect::<String>(),
+            "latest"
+        );
+        assert_eq!(snapshot.activity.unwrap().sequence, 2);
+        // Returning old credit cannot buy an extra snapshot.
+        worker.process_output(b"!".to_vec());
+        worker.published.acknowledge(first);
+        worker.capture_if_ready();
+        assert_eq!(worker.generation, first + 1);
+        worker.published.acknowledge(first + 1);
+        worker.capture_if_ready();
+        assert_eq!(worker.published.snapshot.load().lines[0].cells[6].text, "!");
+        // An ACK arriving before the next output also cannot strand that output.
+        worker.published.acknowledge(worker.generation);
+        worker.process_output(b"?".to_vec());
+        assert_eq!(worker.published.snapshot.load().lines[0].cells[7].text, "?");
+        worker.published.acknowledge(worker.generation);
+        let previous = worker.published.snapshot.load_full();
+        worker.process_output(b"\x1b[31m".to_vec());
+        let activity_only = worker.published.snapshot.load_full();
+        assert_eq!(activity_only.lines, previous.lines);
+        assert!(activity_only.activity.unwrap().sequence > previous.activity.unwrap().sequence);
+        worker.run();
+    }
+
+    #[test]
+    fn eof_preserves_final_grid_without_outstanding_consumer_credit() {
+        let (mut worker, _) = capture_worker();
+        worker.publish_snapshot(true);
+        worker.process_output(b"final".to_vec());
+        let published = Arc::clone(&worker.published);
+        // Keep the command channel connected so child EOF, not client teardown,
+        // ends the worker loop.
+        let (_commands, receiver) = command_channel(1);
+        worker.commands = receiver;
+        worker.run();
+        assert_eq!(
+            published.snapshot.load().lines[0]
+                .cells
+                .iter()
+                .take(5)
+                .map(|cell| cell.text.as_str())
+                .collect::<String>(),
+            "final"
+        );
+    }
+
+    #[test]
+    fn hidden_eof_preserves_final_contents_without_visual_wakes() {
+        let (mut worker, _) = capture_worker();
+        worker.set_hidden();
+        worker.process_output(b"hidden".to_vec());
+        assert_eq!(worker.generation, 0);
+        let published = Arc::clone(&worker.published);
+        let (_commands, receiver) = command_channel(1);
+        worker.commands = receiver;
+        worker.run();
+        assert!(!published.wake_pending.load(Ordering::Acquire));
+        assert_eq!(
+            published.snapshot.load().lines[0]
+                .cells
+                .iter()
+                .take(6)
+                .map(|cell| cell.text.as_str())
+                .collect::<String>(),
+            "hidden"
+        );
+    }
+
+    #[test]
+    fn shutdown_preserves_already_parsed_dirty_contents() {
+        let (mut worker, _) = capture_worker();
+        worker.publish_snapshot(true);
+        worker.process_output(b"before shutdown".to_vec());
+        let published = Arc::clone(&worker.published);
+        let (commands, receiver) = command_channel(1);
+        commands.send(Command::Shutdown).unwrap();
+        worker.commands = receiver;
+        worker.run();
+        assert_eq!(
+            published.snapshot.load().lines[0]
+                .cells
+                .iter()
+                .take(15)
+                .map(|cell| cell.text.as_str())
+                .collect::<String>(),
+            "before shutdown"
+        );
+    }
+
+    #[test]
+    fn leader_exit_does_not_end_output_capture_or_redraw_credit() {
+        let (mut worker, events) = capture_worker();
+        worker.publish_snapshot(true);
+        let mut exited = false;
+        worker.handle_child_exit(&mut exited, Ok(ExitStatus::with_exit_code(0)));
+        assert!(matches!(
+            events.try_recv(),
+            Ok(TerminalEvent::Exited { .. })
+        ));
+        worker.process_output(b"descendant".to_vec());
+        worker.published.acknowledge(worker.generation);
+        worker.capture_if_ready();
+        assert_eq!(
+            worker.published.snapshot.load().lines[0]
+                .cells
+                .iter()
+                .take(10)
+                .map(|cell| cell.text.as_str())
+                .collect::<String>(),
+            "descendant"
+        );
+        worker.run();
+    }
+
     fn test_published(visible: bool, wakes: Arc<AtomicUsize>) -> PublishedState {
         PublishedState::new(
             visible,
@@ -1499,7 +1825,14 @@ mod tests {
 
         command_tx.send(Command::Hide).unwrap();
         assert!(matches!(
-            wait_for_worker_event(&command_rx, &pty_rx, &child_exit_rx, false, true),
+            wait_for_worker_event(
+                &command_rx,
+                &pty_rx,
+                &child_exit_rx,
+                &crossbeam_channel::never(),
+                false,
+                true
+            ),
             WorkerEvent::Command(Some(Command::Hide))
         ));
 
@@ -1507,7 +1840,7 @@ mod tests {
             .send(Ok(ExitStatus::with_exit_code(7)))
             .unwrap();
         assert!(matches!(
-            wait_for_worker_event(&command_rx, &pty_rx, &child_exit_rx, false, true),
+            wait_for_worker_event(&command_rx, &pty_rx, &child_exit_rx, &crossbeam_channel::never(), false, true),
             WorkerEvent::ChildExit(Some(Ok(status))) if status.exit_code() == 7
         ));
     }

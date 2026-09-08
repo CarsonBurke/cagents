@@ -22,6 +22,8 @@ pub mod inspector;
 pub mod instance;
 #[cfg(feature = "ui")]
 pub mod interaction;
+#[cfg(feature = "latency-harness")]
+pub mod latency_fixture;
 #[cfg(feature = "ui")]
 pub mod lifecycle;
 pub mod location;

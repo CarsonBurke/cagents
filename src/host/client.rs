@@ -10,10 +10,11 @@ use std::{
 use crate::{
     model::HostSessionProof,
     terminal_ipc::{
-        ClientEnvelope, ClientRequest, MAX_CLIENT_FRAME_BYTES, MAX_INPUT_BYTES,
-        MAX_RESUME_TERMINALS, PROTOCOL_VERSION, ProtocolError, ProtocolErrorCode, ResumeCursor,
-        ServerEnvelope, ServerMessage, ServerResponse, TerminalScroll, TerminalSnapshot,
-        TerminalVisibility, WireTerminalEvent, read_frame_with_limit, validate_proof, write_frame,
+        ClientEnvelope, ClientRequest, FrameCodec, MAX_CLIENT_FRAME_BYTES, MAX_FRAME_BYTES,
+        MAX_INPUT_BYTES, MAX_RESUME_TERMINALS, PROTOCOL_VERSION, ProtocolError, ProtocolErrorCode,
+        ResumeCursor, SHUTDOWN_VERSION, ServerEnvelope, ServerMessage, ServerResponse,
+        ShutdownOperation, ShutdownOutcome, TerminalScroll, TerminalSnapshot, TerminalVisibility,
+        WireTerminalEvent, read_frame_with_limit, validate_proof,
     },
 };
 
@@ -97,10 +98,11 @@ pub(crate) fn serve(stream: UnixStream, client_id: ClientId, host: SharedHost) {
 
     let mut reader = stream;
     let handshake_deadline = Instant::now() + HANDSHAKE_TIMEOUT;
+    let mut codec = FrameCodec::new(MAX_CLIENT_FRAME_BYTES);
     let mut connected = false;
     loop {
         let frame = if connected {
-            read_frame_with_limit::<ClientEnvelope>(&mut reader, MAX_CLIENT_FRAME_BYTES)
+            codec.read::<ClientEnvelope>(&mut reader)
         } else {
             read_handshake_frame(&mut reader, handshake_deadline)
         };
@@ -196,7 +198,15 @@ pub(crate) fn serve(stream: UnixStream, client_id: ClientId, host: SharedHost) {
         match outcome {
             Ok((response, extras, shutdown)) => {
                 let proof = current_proof(&host);
-                if push_response(&delivery, &proof, request_id, response).is_err() {
+                let response_failed =
+                    push_response(&delivery, &proof, request_id, response).is_err();
+                if shutdown {
+                    host.lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .request_shutdown();
+                    crate::daemon::wake();
+                }
+                if response_failed {
                     break;
                 }
                 for message in extras {
@@ -211,14 +221,6 @@ pub(crate) fn serve(stream: UnixStream, client_id: ClientId, host: SharedHost) {
                     {
                         break;
                     }
-                }
-                if shutdown {
-                    host.lock()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner())
-                        .request_shutdown();
-                    // This connection stays open, so the accept loop would not
-                    // otherwise observe the flag until the client disconnects.
-                    crate::daemon::wake();
                 }
             }
             Err(error) => {
@@ -495,14 +497,7 @@ fn process_request(
             let handle = host
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .handle(client_id, terminal_id)?;
-            if generation > handle.generation() {
-                return Err(ProtocolError::new(
-                    ProtocolErrorCode::InvalidRequest,
-                    "cannot acknowledge a terminal generation that was not published",
-                    false,
-                ));
-            }
+                .redraw_ack_handle(client_id, terminal_id, generation)?;
             handle.acknowledge_redraw(generation);
             Ok((ServerResponse::Accepted, Vec::new(), false))
         }
@@ -514,7 +509,50 @@ fn process_request(
             handle.shutdown().map_err(send_error)?;
             Ok((ServerResponse::Accepted, Vec::new(), false))
         }
-        ClientRequest::Shutdown => Ok((ServerResponse::ShutdownAccepted, Vec::new(), true)),
+        ClientRequest::Shutdown => {
+            host.lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .shutdown(
+                    ShutdownOperation::Stop {
+                        require_empty: false,
+                        expected_generation: None,
+                    },
+                    Instant::now(),
+                );
+            Ok((ServerResponse::ShutdownAccepted, Vec::new(), true))
+        }
+        ClientRequest::ShutdownV1 { version, operation } => {
+            if version != SHUTDOWN_VERSION {
+                return Err(ProtocolError::new(
+                    ProtocolErrorCode::UnsupportedVersion,
+                    format!(
+                        "shutdown version {version} is unsupported; expected {SHUTDOWN_VERSION}"
+                    ),
+                    false,
+                ));
+            }
+            let mut state = host.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            let outcome = if matches!(operation, ShutdownOperation::Preflight) {
+                match state.shutdown_preflight(Instant::now()) {
+                    Ok(preflight) => {
+                        return Ok((
+                            ServerResponse::ShutdownPreflight(preflight),
+                            Vec::new(),
+                            false,
+                        ));
+                    }
+                    Err(outcome) => outcome,
+                }
+            } else {
+                state.shutdown(operation, Instant::now())
+            };
+            let shutdown = matches!(outcome, ShutdownOutcome::Accepted { .. });
+            Ok((
+                ServerResponse::ShutdownOutcome(outcome),
+                Vec::new(),
+                shutdown,
+            ))
+        }
     }
 }
 
@@ -624,8 +662,9 @@ fn push_error(
 }
 
 fn writer_loop(mut stream: UnixStream, delivery: Arc<DeliveryQueue>) {
+    let mut codec = FrameCodec::new(MAX_FRAME_BYTES);
     while let Some(message) = delivery.pop() {
-        if write_frame(&mut stream, &message).is_err() {
+        if codec.write(&mut stream, &message).is_err() {
             delivery.abort();
             break;
         }
@@ -636,6 +675,108 @@ fn writer_loop(mut stream: UnixStream, delivery: Arc<DeliveryQueue>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stale_acknowledgment_releases_host_lock_before_synchronous_wake() {
+        let proof = HostSessionProof {
+            host_session_id: crate::model::HostSessionId::new("test"),
+            boot_id: crate::model::BootId::new("test"),
+            host_incarnation: crate::model::HostIncarnation::new("test"),
+        };
+        let host = Arc::new(std::sync::Mutex::new(super::super::state::HostState::new(
+            proof,
+        )));
+        let recipe = crate::model::LaunchRecipe {
+            program: "/bin/cat".into(),
+            arguments: Vec::new(),
+            working_directory: std::path::PathBuf::from("/tmp"),
+            environment: std::collections::BTreeMap::new(),
+        };
+        let session = crate::model::TerminalSession {
+            id: crate::model::TerminalId::new(),
+            launch: recipe.clone(),
+            transcript_path: None,
+            resume_hint: None,
+            continuity: crate::model::TerminalContinuity::RelaunchAvailable {
+                recipe,
+                last_exit: None,
+            },
+        };
+        let id = session.id;
+        let weak = Arc::downgrade(&host);
+        let (wake_tx, wake_rx) = std::sync::mpsc::sync_channel(4);
+        let requester_thread = thread::current().id();
+        let handle = crate::terminal::TerminalHandle::spawn(
+            session.clone(),
+            crate::terminal::TerminalConfig {
+                initially_visible: true,
+                ..Default::default()
+            },
+            move |wake| {
+                let host = weak.upgrade().unwrap();
+                if thread::current().id() == requester_thread {
+                    assert!(
+                        host.try_lock().is_ok(),
+                        "redraw callback must be able to reacquire host state"
+                    );
+                }
+                let _ = wake_tx.try_send(wake.generation);
+            },
+        )
+        .unwrap();
+        {
+            let mut state = host.lock().unwrap_or_else(|error| error.into_inner());
+            state.reserve_spawn(id).unwrap();
+            state
+                .finish_spawn(1, session, handle.clone(), true)
+                .unwrap();
+        }
+        handle.input(b"initial-publication\n".to_vec()).unwrap();
+        let published = wake_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(published > 0);
+        process_request(
+            &host,
+            1,
+            ClientRequest::AcknowledgeRedraw {
+                terminal_id: id,
+                generation: 0,
+            },
+        )
+        .unwrap();
+        assert!(wake_rx.recv_timeout(Duration::from_secs(5)).unwrap() >= published);
+        handle.shutdown().unwrap();
+    }
+
+    #[test]
+    fn unsupported_shutdown_revision_does_not_mutate_host() {
+        let proof = HostSessionProof {
+            host_session_id: crate::model::HostSessionId::new("test"),
+            boot_id: crate::model::BootId::new("test"),
+            host_incarnation: crate::model::HostIncarnation::new("test"),
+        };
+        let host = Arc::new(std::sync::Mutex::new(super::super::state::HostState::new(
+            proof,
+        )));
+        let error = process_request(
+            &host,
+            1,
+            ClientRequest::ShutdownV1 {
+                version: SHUTDOWN_VERSION + 1,
+                operation: ShutdownOperation::Stop {
+                    require_empty: false,
+                    expected_generation: None,
+                },
+            },
+        )
+        .unwrap_err();
+        assert_eq!(error.code, ProtocolErrorCode::UnsupportedVersion);
+        assert!(
+            host.lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .reserve_spawn(crate::model::TerminalId::new())
+                .is_ok()
+        );
+    }
 
     #[test]
     fn handshake_timeout_tracks_one_absolute_deadline() {

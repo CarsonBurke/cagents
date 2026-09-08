@@ -429,6 +429,423 @@ impl TerminalContinuity {
     }
 }
 
+/// Display-only wall time; ordering is exclusively the current worker sequence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TerminalOutputActivity {
+    pub sequence: u64,
+    pub last_output_at_unix_ms: i64,
+}
+
+/// Quiet means only that no PTY output has been observed for five seconds.
+pub const TERMINAL_QUIET_AFTER: std::time::Duration = std::time::Duration::from_secs(5);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TerminalActivityState {
+    Starting,
+    OutputActive,
+    Quiet,
+    Exited,
+    Failed,
+    Unknown,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TerminalActivityLifecycle {
+    Starting,
+    Live,
+    Exited,
+    Failed,
+    Unknown,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TerminalActivityTimer {
+    pub terminal_id: TerminalId,
+    pub proof: HostSessionProof,
+    pub sequence: u64,
+    pub deadline: std::time::Duration,
+}
+
+/// Ephemeral, proof-fenced presentation state, never persisted or inferred from text.
+/// Consumers schedule `timer()` only while mounted and use one monotonic clock origin.
+#[derive(Debug, Clone)]
+pub struct TerminalActivity {
+    terminal_id: TerminalId,
+    proof: HostSessionProof,
+    revision: u64,
+    output: Option<TerminalOutputActivity>,
+    output_high_water: Option<TerminalOutputActivity>,
+    observed_at: std::time::Duration,
+    state: TerminalActivityState,
+    timer: Option<TerminalActivityTimer>,
+}
+
+impl TerminalActivity {
+    pub fn new(terminal_id: TerminalId, proof: HostSessionProof) -> Self {
+        Self {
+            terminal_id,
+            proof,
+            revision: 0,
+            output: None,
+            output_high_water: None,
+            observed_at: std::time::Duration::ZERO,
+            state: TerminalActivityState::Unknown,
+            timer: None,
+        }
+    }
+
+    pub fn state(&self) -> TerminalActivityState {
+        self.state
+    }
+
+    pub fn timer(&self) -> Option<TerminalActivityTimer> {
+        self.timer.clone()
+    }
+
+    pub fn observe(
+        &mut self,
+        proof: &HostSessionProof,
+        revision: u64,
+        lifecycle: TerminalActivityLifecycle,
+        output: Option<TerminalOutputActivity>,
+        now: std::time::Duration,
+        unix_ms: i64,
+    ) -> bool {
+        if proof != &self.proof || !proof.is_complete() || revision < self.revision {
+            return false;
+        }
+        if !matches!(
+            lifecycle,
+            TerminalActivityLifecycle::Exited | TerminalActivityLifecycle::Failed
+        ) && output
+            .zip(self.output_high_water)
+            .is_some_and(|(new, old)| {
+                new.sequence < old.sequence || new.sequence == old.sequence && new != old
+            })
+        {
+            return false;
+        }
+        let previous = self.state;
+        let previous_timer = self.timer.clone();
+        self.revision = revision;
+        let clock_reversed = now < self.observed_at;
+        self.observed_at = self.observed_at.max(now);
+        // Terminal lifecycle evidence cannot be undone by late live descriptors.
+        if self.state == TerminalActivityState::Failed {
+            return false;
+        }
+        if lifecycle == TerminalActivityLifecycle::Failed {
+            self.state = TerminalActivityState::Failed;
+            self.timer = None;
+        } else if self.state == TerminalActivityState::Exited
+            || lifecycle == TerminalActivityLifecycle::Exited
+        {
+            self.state = TerminalActivityState::Exited;
+            self.timer = None;
+        } else if clock_reversed {
+            self.state = TerminalActivityState::Unknown;
+            self.timer = None;
+        } else if lifecycle == TerminalActivityLifecycle::Starting {
+            self.state = TerminalActivityState::Starting;
+            self.timer = None;
+        } else if lifecycle != TerminalActivityLifecycle::Live || output.is_none() {
+            self.state = TerminalActivityState::Unknown;
+            self.timer = None;
+        } else if let Some(output) = output {
+            if output.sequence == 0 || output.last_output_at_unix_ms < 0 {
+                self.state = TerminalActivityState::Unknown;
+                self.timer = None;
+            } else if self.output != Some(output)
+                || self.timer.is_none() && self.state != TerminalActivityState::Quiet
+            {
+                // Wall time is used only to age an initial observation; never to
+                // extend a previously armed deadline after a clock adjustment.
+                let age = unix_ms
+                    .checked_sub(output.last_output_at_unix_ms)
+                    .and_then(|age| u64::try_from(age).ok());
+                if let Some(age) = age {
+                    let age = std::time::Duration::from_millis(age);
+                    self.state = if age >= TERMINAL_QUIET_AFTER {
+                        TerminalActivityState::Quiet
+                    } else {
+                        TerminalActivityState::OutputActive
+                    };
+                    self.timer = (age < TERMINAL_QUIET_AFTER).then(|| TerminalActivityTimer {
+                        terminal_id: self.terminal_id,
+                        proof: self.proof.clone(),
+                        sequence: output.sequence,
+                        deadline: now.saturating_add(TERMINAL_QUIET_AFTER.saturating_sub(age)),
+                    });
+                } else {
+                    self.state = TerminalActivityState::Unknown;
+                    self.timer = None;
+                }
+            }
+        }
+        self.output = output;
+        if let Some(output) = output
+            && self
+                .output_high_water
+                .is_none_or(|old| output.sequence > old.sequence)
+        {
+            self.output_high_water = Some(output);
+        }
+        self.state != previous || self.timer != previous_timer
+    }
+
+    pub fn expire(&mut self, timer: &TerminalActivityTimer, now: std::time::Duration) -> bool {
+        if self.timer.as_ref() != Some(timer)
+            || timer.terminal_id != self.terminal_id
+            || timer.proof != self.proof
+            || self
+                .output
+                .is_none_or(|output| output.sequence != timer.sequence)
+            || self.state != TerminalActivityState::OutputActive
+            || now < self.observed_at
+            || now < timer.deadline
+        {
+            return false;
+        }
+        self.observed_at = now;
+        self.state = TerminalActivityState::Quiet;
+        self.timer = None;
+        true
+    }
+}
+
+#[cfg(test)]
+mod activity_tests {
+    use super::*;
+    use std::time::Duration;
+
+    fn proof(incarnation: &str) -> HostSessionProof {
+        HostSessionProof {
+            host_session_id: HostSessionId::new("host"),
+            boot_id: BootId::new("boot"),
+            host_incarnation: HostIncarnation::new(incarnation),
+        }
+    }
+
+    fn output(sequence: u64) -> Option<TerminalOutputActivity> {
+        Some(TerminalOutputActivity {
+            sequence,
+            last_output_at_unix_ms: 10_000,
+        })
+    }
+
+    #[test]
+    fn activity_timers_cannot_overwrite_output_identity_or_lifecycle() {
+        let proof = proof("first");
+        let mut activity = TerminalActivity::new(TerminalId::new(), proof.clone());
+        activity.observe(
+            &proof,
+            1,
+            TerminalActivityLifecycle::Live,
+            output(1),
+            Duration::ZERO,
+            10_000,
+        );
+        let old = activity.timer().unwrap();
+        activity.observe(
+            &proof,
+            2,
+            TerminalActivityLifecycle::Live,
+            output(2),
+            Duration::from_secs(1),
+            10_000,
+        );
+        assert!(!activity.expire(&old, Duration::from_secs(10)));
+        let current = activity.timer().unwrap();
+        assert!(!activity.observe(
+            &proof,
+            1,
+            TerminalActivityLifecycle::Live,
+            output(1),
+            Duration::from_secs(2),
+            10_000
+        ));
+        assert!(!activity.expire(&current, Duration::ZERO));
+        assert!(activity.expire(&current, Duration::from_secs(6)));
+        assert_eq!(activity.state(), TerminalActivityState::Quiet);
+        let mut other = TerminalActivity::new(TerminalId::new(), proof.clone());
+        assert!(!other.expire(&current, Duration::from_secs(10)));
+        activity.observe(
+            &proof,
+            3,
+            TerminalActivityLifecycle::Exited,
+            output(2),
+            Duration::from_secs(7),
+            10_000,
+        );
+        assert!(!activity.expire(&current, Duration::from_secs(10)));
+        assert_eq!(activity.state(), TerminalActivityState::Exited);
+        activity.observe(
+            &proof,
+            4,
+            TerminalActivityLifecycle::Failed,
+            None,
+            Duration::from_secs(1),
+            10_000,
+        );
+        assert_eq!(activity.state(), TerminalActivityState::Failed);
+        activity.observe(
+            &proof,
+            5,
+            TerminalActivityLifecycle::Live,
+            output(3),
+            Duration::from_secs(10),
+            10_000,
+        );
+        assert_eq!(activity.state(), TerminalActivityState::Failed);
+        let mut active = TerminalActivity::new(TerminalId::new(), proof.clone());
+        active.observe(
+            &proof,
+            1,
+            TerminalActivityLifecycle::Starting,
+            output(1),
+            Duration::ZERO,
+            10_000,
+        );
+        assert_eq!(active.state(), TerminalActivityState::Starting);
+        assert!(active.timer().is_none());
+        active.observe(
+            &proof,
+            2,
+            TerminalActivityLifecycle::Live,
+            output(2),
+            Duration::from_secs(1),
+            10_000,
+        );
+        let active_timer = active.timer().unwrap();
+        active.observe(
+            &proof,
+            3,
+            TerminalActivityLifecycle::Exited,
+            output(2),
+            Duration::from_secs(2),
+            10_000,
+        );
+        assert_eq!(active.state(), TerminalActivityState::Exited);
+        assert!(!active.expire(&active_timer, Duration::from_secs(10)));
+    }
+
+    #[test]
+    fn activity_restart_missing_facts_and_clock_reversal_are_unknown() {
+        let current = proof("new");
+        let mut activity = TerminalActivity::new(TerminalId::new(), current.clone());
+        assert!(!activity.observe(
+            &proof("old"),
+            9,
+            TerminalActivityLifecycle::Live,
+            output(9),
+            Duration::ZERO,
+            10_000
+        ));
+        assert_eq!(activity.state(), TerminalActivityState::Unknown);
+        activity.observe(
+            &current,
+            1,
+            TerminalActivityLifecycle::Live,
+            None,
+            Duration::ZERO,
+            10_000,
+        );
+        assert_eq!(activity.state(), TerminalActivityState::Unknown);
+        activity.observe(
+            &current,
+            2,
+            TerminalActivityLifecycle::Live,
+            output(1),
+            Duration::from_secs(2),
+            9_999,
+        );
+        assert_eq!(activity.state(), TerminalActivityState::Unknown);
+        activity.observe(
+            &current,
+            3,
+            TerminalActivityLifecycle::Live,
+            output(2),
+            Duration::from_secs(3),
+            10_000,
+        );
+        let deadline = activity.timer().unwrap();
+        activity.observe(
+            &current,
+            4,
+            TerminalActivityLifecycle::Live,
+            output(2),
+            Duration::from_secs(4),
+            1,
+        );
+        assert_eq!(activity.timer(), Some(deadline.clone()));
+        activity.observe(
+            &current,
+            5,
+            TerminalActivityLifecycle::Live,
+            output(3),
+            Duration::from_secs(1),
+            10_000,
+        );
+        assert_eq!(activity.state(), TerminalActivityState::Unknown);
+        assert!(!activity.expire(&deadline, Duration::from_secs(10)));
+        let mut incomplete = current.clone();
+        incomplete.boot_id = BootId::new("");
+        let mut invalid = TerminalActivity::new(TerminalId::new(), incomplete.clone());
+        invalid.observe(
+            &incomplete,
+            1,
+            TerminalActivityLifecycle::Starting,
+            output(1),
+            Duration::ZERO,
+            10_000,
+        );
+        assert_eq!(invalid.state(), TerminalActivityState::Unknown);
+    }
+
+    #[test]
+    fn missing_activity_does_not_erase_sequence_high_water() {
+        let proof = proof("host");
+        let mut activity = TerminalActivity::new(TerminalId::new(), proof.clone());
+        activity.observe(
+            &proof,
+            1,
+            TerminalActivityLifecycle::Live,
+            output(10),
+            Duration::ZERO,
+            10_000,
+        );
+        let stale_timer = activity.timer().unwrap();
+        activity.observe(
+            &proof,
+            1,
+            TerminalActivityLifecycle::Live,
+            None,
+            Duration::from_secs(1),
+            10_000,
+        );
+        assert_eq!(activity.state(), TerminalActivityState::Unknown);
+        assert!(!activity.observe(
+            &proof,
+            1,
+            TerminalActivityLifecycle::Live,
+            output(9),
+            Duration::from_secs(2),
+            10_000
+        ));
+        assert_eq!(activity.state(), TerminalActivityState::Unknown);
+        assert!(!activity.expire(&stale_timer, Duration::from_secs(10)));
+        activity.observe(
+            &proof,
+            1,
+            TerminalActivityLifecycle::Live,
+            output(11),
+            Duration::from_secs(3),
+            10_000,
+        );
+        assert_eq!(activity.state(), TerminalActivityState::OutputActive);
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TerminalSession {
     pub id: TerminalId,
