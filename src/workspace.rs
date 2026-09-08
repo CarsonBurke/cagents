@@ -1,8 +1,4 @@
-use std::{
-    collections::{HashMap, HashSet},
-    fmt,
-    time::Duration,
-};
+use std::{collections::HashMap, fmt, sync::Arc, time::Duration};
 
 use serde::{Deserialize, Serialize};
 
@@ -649,6 +645,7 @@ struct PendingClose {
 #[derive(Debug, Clone)]
 pub struct Workspace {
     cards: Vec<WorkspaceCard>,
+    card_indices: Arc<HashMap<CardId, usize>>,
     focused: Option<CardId>,
     viewport_width: f32,
     geometry: StripGeometry,
@@ -656,6 +653,7 @@ pub struct Workspace {
     pan: Option<PanState>,
     scroll_sync: Option<ScrollSync>,
     visibility: HashMap<CardId, VisibilityClass>,
+    visibility_bands: Option<VisibilityBands>,
     pending_widget_focus: Option<CardId>,
     pending_close: Option<PendingClose>,
     config: WorkspaceConfig,
@@ -666,6 +664,7 @@ impl Workspace {
         let config = config.validate()?;
         Ok(Self {
             cards: Vec::new(),
+            card_indices: Arc::default(),
             focused: None,
             viewport_width: 0.0,
             geometry: StripGeometry::build(&[], 0.0, config),
@@ -673,6 +672,7 @@ impl Workspace {
             pan: None,
             scroll_sync: None,
             visibility: HashMap::new(),
+            visibility_bands: None,
             pending_widget_focus: None,
             pending_close: None,
             config,
@@ -697,7 +697,7 @@ impl Workspace {
     }
 
     pub fn card(&self, id: CardId) -> Option<&WorkspaceCard> {
-        self.cards.iter().find(|card| card.id == id)
+        self.cards.get(*self.card_indices.get(&id)?)
     }
 
     pub fn geometry(&self) -> &StripGeometry {
@@ -736,6 +736,15 @@ impl Workspace {
         })
     }
 
+    /// Only cards in the visible/overscan band, without scanning the strip.
+    pub fn mounted_visibility(&self) -> impl Iterator<Item = (CardId, VisibilityClass)> + '_ {
+        self.visibility.iter().map(|(&id, &class)| (id, class))
+    }
+
+    pub(crate) fn card_indices(&self) -> &Arc<HashMap<CardId, usize>> {
+        &self.card_indices
+    }
+
     pub fn is_panning(&self) -> bool {
         self.pan.is_some()
     }
@@ -765,6 +774,7 @@ impl Workspace {
             index,
             WorkspaceCard::new(card.id, card.accessible_name, card.width)?,
         );
+        self.rebuild_card_indices();
         if self.focused.is_none() || focus {
             self.focused = Some(id);
             self.pending_widget_focus = Some(id);
@@ -815,6 +825,7 @@ impl Workspace {
         if source != destination {
             let card = self.cards.remove(source);
             self.cards.insert(destination, card);
+            self.rebuild_card_indices();
             self.rebuild_geometry();
             self.reveal_focused();
         }
@@ -919,6 +930,7 @@ impl Workspace {
 
         let index = self.index_of(id).ok_or(WorkspaceError::UnknownCard(id))?;
         self.cards.remove(index);
+        self.rebuild_card_indices();
         self.pending_close = None;
         self.visibility.remove(&id);
         if self.pending_widget_focus == Some(id) {
@@ -964,7 +976,11 @@ impl Workspace {
     }
 
     pub fn resize_viewport(&mut self, width: f32) -> ViewportUpdate {
-        self.viewport_width = finite_nonnegative(width);
+        let width = finite_nonnegative(width);
+        if self.viewport_width == width {
+            return ViewportUpdate::unchanged();
+        }
+        self.viewport_width = width;
         self.rebuild_geometry();
         self.reveal_focused();
         self.camera
@@ -1004,6 +1020,13 @@ impl Workspace {
             {
                 self.scroll_sync = None;
             }
+            return self
+                .refresh_visibility((self.camera.offset() - old_offset).abs() > f32::EPSILON);
+        }
+
+        // Iced also reports the current offset when content bounds change.
+        // Layout feedback without movement must not cancel a focused-card reveal.
+        if (offset - self.camera.offset()).abs() <= f32::EPSILON {
             return self
                 .refresh_visibility((self.camera.offset() - old_offset).abs() > f32::EPSILON);
         }
@@ -1138,11 +1161,22 @@ impl Workspace {
     }
 
     fn index_of(&self, id: CardId) -> Option<usize> {
-        self.cards.iter().position(|card| card.id == id)
+        self.card_indices.get(&id).copied()
+    }
+
+    fn rebuild_card_indices(&mut self) {
+        self.card_indices = Arc::new(
+            self.cards
+                .iter()
+                .enumerate()
+                .map(|(index, card)| (card.id, index))
+                .collect(),
+        );
     }
 
     fn rebuild_geometry(&mut self) {
         self.geometry = StripGeometry::build(&self.cards, self.viewport_width, self.config);
+        self.visibility_bands = None;
         self.camera
             .clamp(self.geometry.max_offset(self.viewport_width));
     }
@@ -1166,38 +1200,54 @@ impl Workspace {
             self.viewport_width,
             self.config.overscan,
         );
-        let mut next = HashMap::with_capacity(bands.mounted.len());
-        for index in bands.mounted {
-            let card = self.geometry.cards[index];
+        if self.visibility_bands.as_ref() == Some(&bands) {
+            return ViewportUpdate {
+                offset_changed,
+                transitions: Vec::new(),
+            };
+        }
+
+        let mut transitions = Vec::new();
+        self.visibility.retain(|id, class| {
+            let mounted = self
+                .card_indices
+                .get(id)
+                .is_some_and(|index| bands.mounted.contains(index));
+            if !mounted {
+                transitions.push(VisibilityTransition {
+                    id: *id,
+                    from: *class,
+                    to: VisibilityClass::Offscreen,
+                });
+            }
+            mounted
+        });
+        for index in bands.mounted.clone() {
+            let id = self.geometry.cards[index].id;
             let class = if bands.visible.contains(&index) {
                 VisibilityClass::Visible
             } else {
                 VisibilityClass::Overscan
             };
-            next.insert(card.id, class);
-        }
-
-        let mut affected: HashSet<_> = self.visibility.keys().copied().collect();
-        affected.extend(next.keys().copied());
-        let mut affected: Vec<_> = affected.into_iter().collect();
-        affected.sort_by_key(|id| self.index_of(*id).unwrap_or(usize::MAX));
-        let mut transitions = Vec::new();
-        for id in affected {
-            let old = self
+            let previous = self
                 .visibility
-                .get(&id)
-                .copied()
+                .insert(id, class)
                 .unwrap_or(VisibilityClass::Offscreen);
-            let new = next.get(&id).copied().unwrap_or(VisibilityClass::Offscreen);
-            if old != new {
+            if previous != class {
                 transitions.push(VisibilityTransition {
                     id,
-                    from: old,
-                    to: new,
+                    from: previous,
+                    to: class,
                 });
             }
         }
-        self.visibility = next;
+        transitions.sort_unstable_by_key(|transition| {
+            self.card_indices
+                .get(&transition.id)
+                .copied()
+                .unwrap_or(usize::MAX)
+        });
+        self.visibility_bands = Some(bands);
         ViewportUpdate {
             offset_changed,
             transitions,
@@ -1320,6 +1370,78 @@ mod tests {
             workspace.add_card(card(width), index, index == 0).unwrap();
         }
         workspace
+    }
+
+    #[test]
+    fn visibility_tracks_identity_when_reordering_inside_the_same_bands() {
+        let mut workspace = workspace_with_widths(&[CardWidth::Fixed(500.0); 4], 600.0);
+        let ids: Vec<_> = workspace.order().collect();
+        assert_eq!(workspace.visibility(ids[0]), Some(VisibilityClass::Visible));
+        assert_eq!(
+            workspace.visibility(ids[3]),
+            Some(VisibilityClass::Offscreen)
+        );
+
+        let update = workspace.reorder(ids[3], 0).unwrap();
+        assert!(update.transitions.contains(&VisibilityTransition {
+            id: ids[3],
+            from: VisibilityClass::Offscreen,
+            to: VisibilityClass::Visible,
+        }));
+        assert_eq!(workspace.card(ids[3]).unwrap().id, ids[3]);
+        assert_eq!(workspace.focused_index(), Some(1));
+        let projection = workspace.projection(600.0);
+        for mounted in projection.mounted {
+            assert_eq!(workspace.visibility(mounted.id), Some(mounted.visibility));
+        }
+
+        workspace.request_close(ids[3]).unwrap();
+        workspace.commit_close(ids[3]).unwrap();
+        assert_eq!(workspace.card(ids[3]), None);
+        assert_eq!(workspace.visibility(ids[3]), None);
+        assert_eq!(workspace.focused_index(), Some(0));
+    }
+
+    #[test]
+    fn scrolling_within_a_band_emits_no_duplicate_exposure_changes() {
+        let mut workspace = workspace_with_widths(&[CardWidth::Fixed(500.0); 6], 600.0);
+        let initial: HashMap<_, _> = workspace.mounted_visibility().collect();
+        for offset in [1.0, 2.0, 3.0] {
+            let update = workspace.native_scroll(offset, 600.0);
+            assert!(update.offset_changed);
+            assert!(update.transitions.is_empty());
+            assert_eq!(
+                workspace.mounted_visibility().collect::<HashMap<_, _>>(),
+                initial
+            );
+        }
+        let update = workspace.native_scroll(2_000.0, 600.0);
+        for (id, class) in initial {
+            assert!(update.transitions.contains(&VisibilityTransition {
+                id,
+                from: class,
+                to: VisibilityClass::Offscreen,
+            }));
+        }
+        assert!(
+            workspace
+                .native_scroll(2_000.0, 600.0)
+                .transitions
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn unchanged_width_does_not_restart_reveal_after_manual_scrolling() {
+        let mut workspace = workspace_with_widths(&[CardWidth::Fixed(500.0); 4], 600.0);
+        workspace.native_scroll(700.0, 600.0);
+        let camera = workspace.camera();
+        assert_eq!(
+            workspace.resize_viewport(600.0),
+            ViewportUpdate::unchanged()
+        );
+        assert_eq!(workspace.camera(), camera);
+        assert!(!workspace.camera().is_animating());
     }
 
     #[test]
@@ -1691,6 +1813,26 @@ mod tests {
         assert_eq!(workspace.camera().offset(), animated_offset);
         assert!(workspace.camera().is_animating());
         assert_eq!(workspace.pending_widget_focus, Some(restored_focus));
+    }
+
+    #[test]
+    fn layout_feedback_before_first_frame_preserves_new_card_reveal() {
+        let mut workspace = workspace_with_widths(&[CardWidth::Fixed(500.0); 2], 600.0);
+        workspace.native_scroll(100.0, 600.0);
+        let added = card(CardWidth::Fixed(500.0));
+        let added_id = added.id;
+        workspace.add_card(added, 2, true).unwrap();
+        let target = workspace.camera().target();
+        assert!(target > workspace.camera().offset());
+
+        workspace.native_scroll(workspace.camera().offset(), 600.0);
+        workspace.resize_viewport(600.0);
+        workspace.tick(Duration::from_millis(16));
+
+        assert_eq!(workspace.focused(), Some(added_id));
+        assert_eq!(workspace.camera().target(), target);
+        assert!(workspace.camera().offset() > 100.0);
+        assert!(workspace.camera().is_animating());
     }
 
     #[test]

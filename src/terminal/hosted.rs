@@ -23,10 +23,10 @@ use super::{
     KeyInput, MouseInput, RenderSnapshot, TerminalEvent, TerminalSendError, TerminalSize,
     TerminalWake,
     ipc::{
-        ClientEnvelope, ClientRequest, FrameError, PROTOCOL_VERSION, ProtocolError, ResumeCursor,
-        ServerEnvelope, ServerMessage, ServerResponse, TerminalScroll, TerminalSnapshot,
-        TerminalSpawnOptions, TerminalVisibility, WireTerminalSize, daemon_socket_path, read_frame,
-        write_frame,
+        ClientEnvelope, ClientRequest, FrameError, PROTOCOL_VERSION, ProtocolError,
+        ProtocolErrorCode, ResumeCursor, ServerEnvelope, ServerMessage, ServerResponse,
+        TerminalScroll, TerminalSnapshot, TerminalSpawnOptions, TerminalVisibility,
+        WireTerminalSize, daemon_socket_path, read_frame, write_frame,
     },
 };
 
@@ -124,6 +124,8 @@ struct HostedPublishedState {
     generation: AtomicU64,
     event_sequence: AtomicU64,
     acknowledged_generation: AtomicU64,
+    acknowledgement_tx: Sender<()>,
+    acknowledgement_rx: Receiver<()>,
     wake_pending: AtomicBool,
     semantic_wake_pending: AtomicBool,
     visibility: AtomicU8,
@@ -137,11 +139,14 @@ impl HostedPublishedState {
         visible: bool,
         wake: Arc<WakeCallback>,
     ) -> Self {
+        let (acknowledgement_tx, acknowledgement_rx) = crossbeam_channel::bounded(1);
         Self {
             snapshot: ArcSwap::from_pointee(RenderSnapshot::empty()),
             generation: AtomicU64::new(0),
             event_sequence: AtomicU64::new(0),
             acknowledged_generation: AtomicU64::new(0),
+            acknowledgement_tx,
+            acknowledgement_rx,
             wake_pending: AtomicBool::new(false),
             semantic_wake_pending: AtomicBool::new(false),
             visibility: AtomicU8::new(Self::visibility_code(if visible {
@@ -235,8 +240,16 @@ impl HostedPublishedState {
     }
 
     fn acknowledge(&self, observed_generation: u64) {
-        self.acknowledged_generation
+        let previous = self
+            .acknowledged_generation
             .fetch_max(observed_generation, Ordering::AcqRel);
+        if observed_generation > previous {
+            // Returning redraw credit must wake the socket worker even when
+            // the daemon is waiting for that credit and no input is arriving.
+            // The atomic carries the newest generation; one queued edge is
+            // sufficient regardless of how many frames the UI acknowledges.
+            let _ = self.acknowledgement_tx.try_send(());
+        }
         self.wake_pending.store(false, Ordering::Release);
         let latest = self.generation.load(Ordering::Acquire);
         if latest > observed_generation && self.is_visible() {
@@ -809,6 +822,7 @@ impl Drop for ConnectionIo {
 #[derive(Debug)]
 enum ClientWork {
     Stop,
+    Acknowledge,
     Command(ClientCommand),
     Server(Box<ServerEnvelope>),
     CommandsClosed,
@@ -819,9 +833,11 @@ fn wait_for_client_work(
     stop: &WorkerStop,
     commands: &Receiver<ClientCommand>,
     incoming: &Receiver<ServerRead>,
+    acknowledgements: &Receiver<()>,
 ) -> ClientWork {
     crossbeam_channel::select_biased! {
         recv(stop.notification()) -> _ => ClientWork::Stop,
+        recv(acknowledgements) -> _ => ClientWork::Acknowledge,
         recv(commands) -> command => match command {
             Ok(command) => ClientWork::Command(command),
             Err(_) => ClientWork::CommandsClosed,
@@ -1025,15 +1041,26 @@ fn serve_connection(
         match envelope.message {
             ServerMessage::Response {
                 response: ServerResponse::Connected { proof, resumed },
-            } if envelope.proof == proof && published.pin_proof(&proof) => {
+            } => {
+                if envelope.proof != proof || !published.pin_proof(&proof) {
+                    return reject_handshake(
+                        events,
+                        published,
+                        stop,
+                        ProtocolError::new(
+                            ProtocolErrorCode::ProofMismatch,
+                            "the daemon returned a different or incomplete session proof",
+                            false,
+                        ),
+                    );
+                }
                 let attached = resumed
                     .iter()
                     .any(|terminal| terminal.session.id == terminal_id && terminal.attached);
                 break (proof, attached);
             }
             ServerMessage::Error(error) => {
-                publish_protocol_error(events, published, "connect to cagents daemon", error);
-                return ConnectionEnd::Retry;
+                return reject_handshake(events, published, stop, error);
             }
             _ => return ConnectionEnd::Retry,
         }
@@ -1180,11 +1207,17 @@ fn serve_connection(
         }
 
         let work = if pending.len() < MAX_IN_FLIGHT_REQUESTS {
-            wait_for_client_work(stop, commands, connection.incoming())
+            wait_for_client_work(
+                stop,
+                commands,
+                connection.incoming(),
+                &published.acknowledgement_rx,
+            )
         } else {
             wait_for_server_or_stop(stop, connection.incoming())
         };
         let envelope = match work {
+            ClientWork::Acknowledge => continue,
             ClientWork::Stop => {
                 connection.close();
                 return ConnectionEnd::Stop;
@@ -1443,6 +1476,47 @@ fn accept_server_event(
     Ok(())
 }
 
+fn reject_handshake(
+    events: &Sender<TerminalEvent>,
+    published: &HostedPublishedState,
+    stop: &WorkerStop,
+    mut error: ProtocolError,
+) -> ConnectionEnd {
+    // A reconnect can recover transport failures, but this handle may never
+    // target another incarnation, even when the protocol marks it retryable.
+    let retry = error.retryable && error.code != ProtocolErrorCode::ProofMismatch;
+    if error.code == ProtocolErrorCode::ProofMismatch {
+        error.message.push_str(
+            "; this terminal cannot reconnect to the current daemon. Retry to start a new terminal",
+        );
+    }
+    if retry {
+        publish_protocol_error(events, published, "connect to cagents daemon", error);
+        return ConnectionEnd::Retry;
+    }
+
+    // The terminal cannot recover after this worker exits. Preserve its final
+    // failure even when earlier events fill the inbox, but let dropping the
+    // handle cancel the wait. Wake the consumer before applying backpressure.
+    published.request_semantic_wake();
+    if stop.is_requested() {
+        return ConnectionEnd::Stop;
+    }
+    let event = TerminalEvent::Error {
+        operation: "connect to cagents daemon",
+        message: error.message,
+    };
+    crossbeam_channel::select_biased! {
+        recv(stop.notification()) -> _ => {}
+        send(events, event) -> sent => {
+            if sent.is_ok() {
+                published.request_semantic_wake();
+            }
+        }
+    }
+    ConnectionEnd::Stop
+}
+
 fn publish_protocol_error(
     events: &Sender<TerminalEvent>,
     published: &HostedPublishedState,
@@ -1471,7 +1545,12 @@ fn publish_event(
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::AtomicUsize;
+    use std::{os::unix::net::UnixListener, sync::atomic::AtomicUsize};
+
+    use crate::{
+        model::{BootId, HostIncarnation, HostSessionId, LaunchRecipe},
+        terminal::ipc::TerminalDescriptor,
+    };
 
     use super::*;
 
@@ -1486,6 +1565,261 @@ mod tests {
             }),
         );
         (published, wake_count)
+    }
+
+    #[test]
+    fn permanent_handshake_failure_waits_for_inbox_space_or_stop() {
+        for cancel in [false, true] {
+            let (events, inbox) = crossbeam_channel::bounded(1);
+            events.send(TerminalEvent::Bell).unwrap();
+            let (wakes, wake_rx) = crossbeam_channel::unbounded();
+            let published = HostedPublishedState::new(
+                Some(proof("old")),
+                false,
+                Arc::new(move |_| {
+                    let _ = wakes.send(());
+                }),
+            );
+            let stop = Arc::new(WorkerStop::default());
+            let worker_stop = Arc::clone(&stop);
+            let (finished, finish_rx) = crossbeam_channel::bounded(1);
+            let worker = thread::spawn(move || {
+                let end = reject_handshake(
+                    &events,
+                    &published,
+                    &worker_stop,
+                    ProtocolError::new(ProtocolErrorCode::ProofMismatch, "old daemon", false),
+                );
+                finished.send(end).unwrap();
+            });
+            wake_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            if cancel {
+                stop.request();
+            } else {
+                assert!(matches!(inbox.recv().unwrap(), TerminalEvent::Bell));
+                assert!(matches!(
+                    inbox.recv_timeout(Duration::from_secs(5)).unwrap(),
+                    TerminalEvent::Error {
+                        operation: "connect to cagents daemon",
+                        ..
+                    }
+                ));
+            }
+            assert_eq!(
+                finish_rx.recv_timeout(Duration::from_secs(5)).unwrap(),
+                ConnectionEnd::Stop
+            );
+            worker.join().unwrap();
+        }
+    }
+
+    fn proof(incarnation: &str) -> HostSessionProof {
+        HostSessionProof {
+            host_session_id: HostSessionId::new("session"),
+            boot_id: BootId::new("boot"),
+            host_incarnation: HostIncarnation::new(incarnation),
+        }
+    }
+
+    fn session() -> TerminalSession {
+        TerminalDescriptor::relaunchable(
+            TerminalId::new(),
+            LaunchRecipe {
+                program: "/bin/sh".to_owned(),
+                arguments: Vec::new(),
+                working_directory: PathBuf::from("/"),
+                environment: BTreeMap::new(),
+            },
+            None,
+        )
+        .session
+    }
+
+    fn accept_connection(listener: &UnixListener) -> UnixStream {
+        listener.set_nonblocking(true).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            match listener.accept() {
+                Ok((stream, _)) => {
+                    stream
+                        .set_read_timeout(Some(Duration::from_secs(2)))
+                        .unwrap();
+                    return stream;
+                }
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    assert!(Instant::now() < deadline, "client did not connect");
+                    thread::sleep(Duration::from_millis(1));
+                }
+                Err(error) => panic!("could not accept client: {error}"),
+            }
+        }
+    }
+
+    fn assert_handshake_stops(message: ServerMessage) {
+        let directory = tempfile::tempdir().unwrap();
+        let socket = directory.path().join("daemon.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let pinned = proof("old");
+        let (wake_tx, wake_rx) = crossbeam_channel::unbounded();
+        let handle = HostedTerminalHandle::attach_or_spawn_at(
+            socket,
+            session(),
+            TerminalSpawnOptions::default(),
+            Some(pinned.clone()),
+            move |wake| {
+                let _ = wake_tx.send(wake);
+            },
+        )
+        .unwrap();
+        handle.input(b"must not replay".to_vec()).unwrap();
+        let mut stream = accept_connection(&listener);
+        let connect: ClientEnvelope = read_frame(&mut stream).unwrap().unwrap();
+        assert!(matches!(
+            connect.request,
+            ClientRequest::Connect { expected_host: Some(expected), .. } if expected == pinned
+        ));
+        write_frame(
+            &mut stream,
+            &ServerEnvelope {
+                version: PROTOCOL_VERSION,
+                request_id: Some(connect.request_id),
+                proof: proof("new"),
+                message,
+            },
+        )
+        .unwrap();
+
+        let events = handle.events();
+        assert!(matches!(
+            events.recv_timeout(Duration::from_secs(2)).unwrap(),
+            TerminalEvent::Error {
+                operation: "connect to cagents daemon",
+                ..
+            }
+        ));
+        wake_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        // A second receive proves the worker exited, rather than backing off.
+        assert_eq!(
+            events.recv_timeout(Duration::from_secs(2)),
+            Err(crossbeam_channel::RecvTimeoutError::Disconnected)
+        );
+        assert_eq!(handle.input(vec![b'x']), Err(TerminalSendError::Closed));
+        assert_eq!(handle.proof(), Some(pinned));
+        // Not even the queued input or original spawn intent crossed the fence.
+        assert_eq!(read_frame::<ClientEnvelope>(&mut stream).unwrap(), None);
+        assert!(matches!(
+            listener.accept(),
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock
+        ));
+    }
+
+    #[test]
+    fn stale_handshake_stops_even_when_an_older_daemon_marks_it_retryable() {
+        assert_handshake_stops(ServerMessage::Error(ProtocolError::new(
+            ProtocolErrorCode::ProofMismatch,
+            "the request targets a different cagents daemon incarnation",
+            true,
+        )));
+    }
+
+    #[test]
+    fn non_retryable_handshake_failure_stops_the_client() {
+        assert_handshake_stops(ServerMessage::Error(ProtocolError::new(
+            ProtocolErrorCode::PermissionDenied,
+            "terminal access denied",
+            false,
+        )));
+    }
+
+    #[test]
+    fn connected_response_cannot_repin_a_stale_terminal() {
+        assert_handshake_stops(ServerMessage::Response {
+            response: ServerResponse::Connected {
+                proof: proof("new"),
+                resumed: Vec::new(),
+            },
+        });
+    }
+
+    #[test]
+    fn transient_disconnect_and_retryable_handshake_preserve_same_host_reconnect() {
+        let directory = tempfile::tempdir().unwrap();
+        let socket = directory.path().join("daemon.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let pinned = proof("same");
+        let terminal_id = TerminalId::new();
+        let handle =
+            HostedTerminalHandle::connect_at(socket, terminal_id, Some(pinned.clone()), |_| {})
+                .unwrap();
+        handle.input(vec![b'x']).unwrap();
+
+        for attempt in 0..3 {
+            let mut stream = accept_connection(&listener);
+            let connect: ClientEnvelope = read_frame(&mut stream).unwrap().unwrap();
+            assert!(matches!(
+                connect.request,
+                ClientRequest::Connect { expected_host: Some(expected), .. } if expected == pinned
+            ));
+            if attempt == 0 {
+                // EOF before the handshake remains a transient transport error.
+                continue;
+            }
+            let message = if attempt == 1 {
+                ServerMessage::Error(ProtocolError::new(
+                    ProtocolErrorCode::QueueFull,
+                    "daemon is busy",
+                    true,
+                ))
+            } else {
+                ServerMessage::Response {
+                    response: ServerResponse::Connected {
+                        proof: pinned.clone(),
+                        resumed: Vec::new(),
+                    },
+                }
+            };
+            write_frame(
+                &mut stream,
+                &ServerEnvelope {
+                    version: PROTOCOL_VERSION,
+                    request_id: Some(connect.request_id),
+                    proof: pinned.clone(),
+                    message,
+                },
+            )
+            .unwrap();
+            if attempt == 1 {
+                assert!(matches!(
+                    handle
+                        .events()
+                        .recv_timeout(Duration::from_secs(2))
+                        .unwrap(),
+                    TerminalEvent::Error { .. }
+                ));
+                continue;
+            }
+            let attach: ClientEnvelope = read_frame(&mut stream).unwrap().unwrap();
+            assert_eq!(attach.proof, Some(pinned.clone()));
+            assert!(matches!(
+                attach.request,
+                ClientRequest::Attach { terminal_id: id, .. } if id == terminal_id
+            ));
+            let visibility: ClientEnvelope = read_frame(&mut stream).unwrap().unwrap();
+            assert!(matches!(
+                visibility.request,
+                ClientRequest::SetVisibility { .. }
+            ));
+            let input: ClientEnvelope = read_frame(&mut stream).unwrap().unwrap();
+            assert_eq!(input.proof, Some(pinned.clone()));
+            assert!(matches!(
+                input.request,
+                ClientRequest::Input { terminal_id: id, bytes }
+                    if id == terminal_id && bytes == *b"x"
+            ));
+            assert_eq!(handle.proof(), Some(pinned.clone()));
+            drop(handle);
+            break;
+        }
     }
 
     #[test]
@@ -1602,14 +1936,183 @@ mod tests {
         let stop = WorkerStop::default();
         let (command_tx, command_rx) = crossbeam_channel::bounded(COMMAND_CAPACITY);
         let (_server_tx, server_rx) = crossbeam_channel::bounded(EVENT_CAPACITY);
+        let (published, _) = published_state(true);
         command_tx
             .try_send(ClientCommand::Input(vec![b'x']))
             .unwrap();
 
         assert!(matches!(
-            wait_for_client_work(&stop, &command_rx, &server_rx),
+            wait_for_client_work(&stop, &command_rx, &server_rx, &published.acknowledgement_rx),
             ClientWork::Command(ClientCommand::Input(bytes)) if bytes == *b"x"
         ));
+    }
+
+    #[test]
+    fn redraw_credit_wakes_idle_client_and_coalesces_to_latest_generation() {
+        let stop = WorkerStop::default();
+        let (_command_tx, command_rx) = crossbeam_channel::bounded(COMMAND_CAPACITY);
+        let (_server_tx, server_rx) = crossbeam_channel::bounded(EVENT_CAPACITY);
+        let (published, _) = published_state(true);
+
+        published.acknowledge(1);
+        published.acknowledge(2);
+        published.acknowledge(1);
+        assert!(matches!(
+            wait_for_client_work(
+                &stop,
+                &command_rx,
+                &server_rx,
+                &published.acknowledgement_rx
+            ),
+            ClientWork::Acknowledge
+        ));
+        assert_eq!(published.acknowledged_generation.load(Ordering::Acquire), 2);
+        assert_eq!(
+            published.acknowledgement_rx.try_recv(),
+            Err(TryRecvError::Empty)
+        );
+        published.acknowledge(2);
+        assert_eq!(
+            published.acknowledgement_rx.try_recv(),
+            Err(TryRecvError::Empty)
+        );
+        published.acknowledge(3);
+        assert!(matches!(
+            wait_for_client_work(
+                &stop,
+                &command_rx,
+                &server_rx,
+                &published.acknowledgement_rx
+            ),
+            ClientWork::Acknowledge
+        ));
+    }
+
+    #[test]
+    fn progressive_snapshots_return_redraw_credit_without_mouse_or_keyboard_input() {
+        use crate::terminal::{CellSnapshot, CellText, RowSnapshot};
+
+        let directory = tempfile::tempdir().unwrap();
+        let socket = directory.path().join("daemon.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let session = session();
+        let terminal_id = session.id;
+        let pinned = proof("progressive");
+        let (wake_tx, wake_rx) = crossbeam_channel::unbounded();
+        let handle = HostedTerminalHandle::connect_at(
+            socket,
+            terminal_id,
+            Some(pinned.clone()),
+            move |wake| {
+                let _ = wake_tx.send(wake);
+            },
+        )
+        .unwrap();
+        let mut stream = accept_connection(&listener);
+        let connect: ClientEnvelope = read_frame(&mut stream).unwrap().unwrap();
+        let send = |stream: &mut UnixStream, request_id, message| {
+            write_frame(
+                stream,
+                &ServerEnvelope {
+                    version: PROTOCOL_VERSION,
+                    request_id,
+                    proof: pinned.clone(),
+                    message,
+                },
+            )
+            .unwrap();
+        };
+        send(
+            &mut stream,
+            Some(connect.request_id),
+            ServerMessage::Response {
+                response: ServerResponse::Connected {
+                    proof: pinned.clone(),
+                    resumed: vec![TerminalDescriptor {
+                        session,
+                        generation: 0,
+                        event_sequence: 0,
+                        oldest_event_sequence: 1,
+                        attached: true,
+                        transcript: None,
+                    }],
+                },
+            },
+        );
+        let visibility: ClientEnvelope = read_frame(&mut stream).unwrap().unwrap();
+        assert!(matches!(
+            visibility.request,
+            ClientRequest::SetVisibility { .. }
+        ));
+        send(
+            &mut stream,
+            Some(visibility.request_id),
+            ServerMessage::Response {
+                response: ServerResponse::Accepted,
+            },
+        );
+
+        let mut previous = RenderSnapshot::empty();
+        for (index, text) in ["a", "b", "c"].into_iter().enumerate() {
+            let generation = index as u64 + 1;
+            send(
+                &mut stream,
+                None,
+                ServerMessage::Redraw {
+                    terminal_id,
+                    generation,
+                },
+            );
+            let request: ClientEnvelope = read_frame(&mut stream).unwrap().unwrap();
+            assert!(matches!(
+                request.request,
+                ClientRequest::Snapshot { terminal_id: id, after_generation }
+                    if id == terminal_id && after_generation == generation - 1
+            ));
+            let snapshot = RenderSnapshot {
+                generation,
+                columns: 1,
+                rows: 1,
+                lines: vec![Arc::new(RowSnapshot {
+                    cells: vec![CellSnapshot {
+                        text: CellText::new(text),
+                        ..CellSnapshot::default()
+                    }],
+                })]
+                .into(),
+                ..RenderSnapshot::empty()
+            };
+            send(
+                &mut stream,
+                Some(request.request_id),
+                ServerMessage::Response {
+                    response: ServerResponse::Snapshot {
+                        terminal_id,
+                        snapshot: Some(TerminalSnapshot::diff(&snapshot, &previous)),
+                    },
+                },
+            );
+            let wake = wake_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+            assert_eq!(wake.generation, generation);
+            let observed = handle.snapshot();
+            assert_eq!(observed.lines[0].cells[0].text, text);
+            handle.acknowledge_redraw(observed.generation);
+            let ack: ClientEnvelope = read_frame(&mut stream).unwrap().unwrap();
+            assert!(matches!(
+                ack.request,
+                ClientRequest::AcknowledgeRedraw { terminal_id: id, generation: acknowledged }
+                    if id == terminal_id && acknowledged == generation
+            ));
+            send(
+                &mut stream,
+                Some(ack.request_id),
+                ServerMessage::Response {
+                    response: ServerResponse::Accepted,
+                },
+            );
+            previous = snapshot;
+        }
+        drop(handle);
     }
 
     #[test]

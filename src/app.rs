@@ -60,7 +60,10 @@ use crate::{
         self, LspIntent, RepositoryAction, RepositoryRuntime, RepositoryRuntimeStatus,
     },
     session::{SessionRuntime, SessionSaveHealth, SessionSaveHealthEvent},
-    settings::{self, AppSettings, KeyboardShortcuts, LinkOpenDestination, LinkOpenGesture},
+    settings::{
+        self, AppSettings, AppTheme, KeyboardShortcuts, LinkOpenDestination, LinkOpenGesture,
+        TerminalCursorStyle,
+    },
     sidebar::{
         self, ActiveWorktreeKey, MutationKind, PanelSection, SidebarAction, SidebarDataState,
         SidebarFocus, SidebarMode, SidebarModel, SidebarProject, SidebarPullRequest, SidebarState,
@@ -1070,6 +1073,26 @@ enum Inspector {
     Settings,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ContextTab {
+    #[default]
+    Context,
+    Changes,
+    Code,
+}
+
+impl ContextTab {
+    const ALL: [Self; 3] = [Self::Context, Self::Changes, Self::Code];
+
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Context => "Context",
+            Self::Changes => "Changes",
+            Self::Code => "Code",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SettingsCategory {
     General,
@@ -1081,16 +1104,16 @@ pub enum SettingsCategory {
 
 impl SettingsCategory {
     const ALL: [Self; 5] = [
-        Self::General,
         Self::Appearance,
         Self::Terminal,
+        Self::General,
         Self::Links,
         Self::Keyboard,
     ];
 
     const fn label(self) -> &'static str {
         match self {
-            Self::General => "General",
+            Self::General => "Performance",
             Self::Appearance => "Appearance",
             Self::Terminal => "Terminal",
             Self::Links => "Browser & links",
@@ -1291,6 +1314,7 @@ fn user_workspace_message_blocked_while_modal(message: &Message) -> bool {
         | Message::FocusAdjacent(_)
         | Message::FocusProjectSearch
         | Message::ToggleContextInspector
+        | Message::SelectContextTab(_)
         | Message::ContextInspector(_)
         | Message::DismissStatus => true,
         Message::Repository(action) => !repository_action_allowed_while_modal(action),
@@ -1412,6 +1436,12 @@ fn repository_task(task: iced::Task<RepositoryAction>) -> Task<Message> {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SettingsField {
+    AppTheme,
+    UiScale,
+    TerminalLineHeight,
+    TerminalPadding,
+    TerminalCursorStyle,
+    InspectorWidth,
     MaxHotCards,
     HibernationDelayMs,
     TerminalFontSize,
@@ -1463,7 +1493,12 @@ impl ShortcutDraft {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct SettingsDraft {
-    schema_version: String,
+    app_theme: String,
+    ui_scale: String,
+    terminal_line_height: String,
+    terminal_padding: String,
+    terminal_cursor_style: String,
+    inspector_width: String,
     max_hot_cards: String,
     hibernation_delay_ms: String,
     terminal_font_size: String,
@@ -1479,7 +1514,23 @@ struct SettingsDraft {
 impl SettingsDraft {
     fn from_settings(settings: &AppSettings) -> Self {
         Self {
-            schema_version: settings.schema_version.to_string(),
+            app_theme: match settings.app_theme {
+                AppTheme::System => "system",
+                AppTheme::Dark => "dark",
+                AppTheme::Light => "light",
+            }
+            .into(),
+            ui_scale: settings.ui_scale.to_string(),
+            terminal_line_height: settings.terminal_line_height.to_string(),
+            terminal_padding: settings.terminal_padding.to_string(),
+            terminal_cursor_style: match settings.terminal_cursor_style {
+                TerminalCursorStyle::Application => "application",
+                TerminalCursorStyle::Block => "block",
+                TerminalCursorStyle::Beam => "beam",
+                TerminalCursorStyle::Underline => "underline",
+            }
+            .into(),
+            inspector_width: settings.inspector_width.to_string(),
             max_hot_cards: settings.max_hot_cards.to_string(),
             hibernation_delay_ms: settings.hibernation_delay_ms.to_string(),
             terminal_font_size: settings.terminal_font_size.to_string(),
@@ -1495,6 +1546,12 @@ impl SettingsDraft {
 
     fn set(&mut self, field: SettingsField, value: String) {
         match field {
+            SettingsField::AppTheme => self.app_theme = value,
+            SettingsField::UiScale => self.ui_scale = value,
+            SettingsField::TerminalLineHeight => self.terminal_line_height = value,
+            SettingsField::TerminalPadding => self.terminal_padding = value,
+            SettingsField::TerminalCursorStyle => self.terminal_cursor_style = value,
+            SettingsField::InspectorWidth => self.inspector_width = value,
             SettingsField::MaxHotCards => self.max_hot_cards = value,
             SettingsField::HibernationDelayMs => self.hibernation_delay_ms = value,
             SettingsField::TerminalFontSize => self.terminal_font_size = value,
@@ -1560,6 +1617,56 @@ fn settings_update(
     let value = raw_value.trim();
     let mut next = current.clone();
     let parsed = match field {
+        SettingsField::AppTheme => match value {
+            "system" => {
+                next.app_theme = AppTheme::System;
+                Ok(())
+            }
+            "dark" => {
+                next.app_theme = AppTheme::Dark;
+                Ok(())
+            }
+            "light" => {
+                next.app_theme = AppTheme::Light;
+                Ok(())
+            }
+            _ => Err("Choose System, Dark, or Light.".into()),
+        },
+        SettingsField::TerminalCursorStyle => match value {
+            "application" => {
+                next.terminal_cursor_style = TerminalCursorStyle::Application;
+                Ok(())
+            }
+            "block" => {
+                next.terminal_cursor_style = TerminalCursorStyle::Block;
+                Ok(())
+            }
+            "beam" => {
+                next.terminal_cursor_style = TerminalCursorStyle::Beam;
+                Ok(())
+            }
+            "underline" => {
+                next.terminal_cursor_style = TerminalCursorStyle::Underline;
+                Ok(())
+            }
+            _ => Err("Choose an application, block, beam, or underline cursor.".into()),
+        },
+        SettingsField::UiScale => value
+            .parse::<f32>()
+            .map(|value| next.ui_scale = value)
+            .map_err(|_| "Interface scale must be a number.".to_owned()),
+        SettingsField::TerminalLineHeight => value
+            .parse::<f32>()
+            .map(|value| next.terminal_line_height = value)
+            .map_err(|_| "Line height must be a number.".to_owned()),
+        SettingsField::TerminalPadding => value
+            .parse::<f32>()
+            .map(|value| next.terminal_padding = value)
+            .map_err(|_| "Terminal padding must be a number.".to_owned()),
+        SettingsField::InspectorWidth => value
+            .parse::<f32>()
+            .map(|value| next.inspector_width = value)
+            .map_err(|_| "Context panel width must be a number.".to_owned()),
         SettingsField::MaxHotCards => value
             .parse::<usize>()
             .map(|value| next.max_hot_cards = value)
@@ -1802,8 +1909,7 @@ pub enum Message {
     FocusAdjacent(crate::workspace::FocusDirection),
     FocusProjectSearch,
     ToggleContextInspector,
-    #[cfg(feature = "development")]
-    ToggleDebugInspector,
+    SelectContextTab(ContextTab),
     ContextInspector(InspectorAction),
     CloseInspector,
     SelectSettingsCategory(SettingsCategory),
@@ -2178,14 +2284,12 @@ pub struct Cagents {
     browser_factory: Option<Arc<RawWaylandSubsurfaceFactory>>,
     #[cfg(feature = "integrated-browser")]
     browser_parent_lifetime: Option<Arc<ParentWindowLifetime>>,
+    /// Compositor scale, before the user's interface scale multiplier.
     window_scale_factor: f32,
     /// Starts at an estimate, because the pane density and the strip's viewport
     /// are both derived from it and the surface does not report a width until
     /// it has been mapped. `Message::WindowResized` replaces it.
     window_width: f32,
-    /// The header-bar preference before a modal context overlay temporarily
-    /// suppresses every native window control outside its focus boundary.
-    window_headerbar_enabled: bool,
     core: Core,
     settings_path: Option<PathBuf>,
     settings_write_blocked: bool,
@@ -2214,7 +2318,7 @@ pub struct Cagents {
     inspector: Option<Inspector>,
     inspector_transition: Option<InspectorTransition>,
     context_inspector_open: bool,
-    debug_inspector_open: bool,
+    context_tab: ContextTab,
     /// The overlay state whose focus and native-surface transition has already
     /// been applied. The rendered mount also depends on workspace focus, so it
     /// cannot be derived solely from inspector-open and window-resize events.
@@ -2744,7 +2848,12 @@ impl Cagents {
         };
         let mut startup_error = None;
         if let Some(factory) = self.browser_factory.clone() {
-            match spawn_browser(&session, true, self.window_scale_factor, Some(factory)) {
+            match spawn_browser(
+                &session,
+                true,
+                effective_surface_scale(self.window_scale_factor, self.settings.ui_scale),
+                Some(factory),
+            ) {
                 Ok(runtime) => {
                     self.cards.insert(card_id, CardRuntime::Browser(runtime));
                 }
@@ -3072,7 +3181,7 @@ impl Cagents {
                 match spawn_browser(
                     &session,
                     state.exposure == Exposure::Visible && surfaces_visible,
-                    self.window_scale_factor,
+                    effective_surface_scale(self.window_scale_factor, self.settings.ui_scale),
                     Some(factory),
                 ) {
                     Ok(runtime) => {
@@ -3297,25 +3406,27 @@ impl Cagents {
     }
 
     fn lifecycle_sweep(&mut self) -> Task<Message> {
-        let browser_ids = self
-            .durable
-            .cards
-            .iter()
-            .filter_map(|card| matches!(&card.kind, CardKind::Browser(_)).then_some(card.id))
-            .collect::<HashSet<_>>();
-        let visible = self
-            .workspace
-            .order()
-            .filter(|id| self.workspace.visibility(*id) == Some(VisibilityClass::Visible))
-            .collect::<HashSet<_>>();
-        let prefetch = self
-            .workspace
-            .order()
-            .filter(|id| {
-                self.workspace.visibility(*id) == Some(VisibilityClass::Overscan)
-                    && !browser_ids.contains(id)
-            })
-            .collect::<HashSet<_>>();
+        let mut visible = HashSet::new();
+        let mut prefetch = HashSet::new();
+        for (id, visibility) in self.workspace.mounted_visibility() {
+            if visibility == VisibilityClass::Visible {
+                visible.insert(id);
+            } else if visibility == VisibilityClass::Overscan {
+                let browser = match self.cards.get(&id) {
+                    Some(CardRuntime::Terminal(_))
+                    | Some(CardRuntime::Repository(_))
+                    | Some(CardRuntime::PullRequests(_)) => false,
+                    #[cfg(feature = "integrated-browser")]
+                    Some(CardRuntime::Browser(_)) => true,
+                    _ => self
+                        .card_state(id)
+                        .is_some_and(|card| matches!(card.kind, CardKind::Browser(_))),
+                };
+                if !browser {
+                    prefetch.insert(id);
+                }
+            }
+        }
         self.reconcile_lifecycle(&visible, &prefetch)
     }
 
@@ -3382,7 +3493,10 @@ impl Cagents {
                         match spawn_browser(
                             &session,
                             visible.contains(&card) && surfaces_visible,
-                            self.window_scale_factor,
+                            effective_surface_scale(
+                                self.window_scale_factor,
+                                self.settings.ui_scale,
+                            ),
                             Some(factory),
                         ) {
                             Ok(runtime) => {
@@ -3875,7 +3989,13 @@ impl Cagents {
             Some(CardRuntime::Terminal(handle)) => TerminalWidget::new(handle.clone())
                 .font_size(self.settings.terminal_font_size)
                 .font_family(&self.settings.terminal_font_family)
-                .scale_factor(self.window_scale_factor)
+                .line_height(self.settings.terminal_line_height)
+                .padding(self.settings.terminal_padding)
+                .cursor_style(self.settings.terminal_cursor_style)
+                .scale_factor(effective_surface_scale(
+                    self.window_scale_factor,
+                    self.settings.ui_scale,
+                ))
                 .model_focused(card_focused)
                 .on_focus(Message::FocusCard(id))
                 .on_command_error(move |error| Message::TerminalError {
@@ -3887,7 +4007,11 @@ impl Cagents {
             Some(CardRuntime::Browser(browser)) => BrowserWidget::new(&browser.handle)
                 .model_focused(card_focused)
                 .on_focus(Message::FocusCard(id))
-                .scale_factor(self.window_scale_factor)
+                .scale_factor(effective_surface_scale(
+                    self.window_scale_factor,
+                    self.settings.ui_scale,
+                ))
+                .ui_scale(self.settings.ui_scale)
                 .virtual_offset(self.workspace.camera().offset())
                 .input_method(browser.ime.clone())
                 .on_error(move |error| Message::BrowserError {
@@ -4956,12 +5080,6 @@ impl Cagents {
         )
     }
 
-    fn sync_context_overlay_headerbar(&mut self) {
-        let overlay_open = self.context_inspector_is_overlay();
-        self.core.window.show_headerbar =
-            headerbar_should_render(self.window_headerbar_enabled, overlay_open);
-    }
-
     fn enter_context_overlay(&mut self) -> Task<Message> {
         // The header toggle belongs to the docked tree we are leaving and is
         // guaranteed to return when the modal closes. Recording it before the
@@ -4979,7 +5097,6 @@ impl Cagents {
         let was_overlay = self.context_inspector_overlay_active;
         let is_overlay = self.context_inspector_is_overlay();
         self.context_inspector_overlay_active = is_overlay;
-        self.sync_context_overlay_headerbar();
         if was_overlay != is_overlay {
             let visible = self.workspace_surfaces_visible();
             self.set_workspace_surfaces_visible(visible);
@@ -5050,6 +5167,7 @@ impl Cagents {
             InspectorAction::Resize { width } => {
                 self.settings.inspector_width =
                     width.clamp(design::INSPECTOR_MIN_WIDTH, design::INSPECTOR_MAX_WIDTH);
+                self.settings_draft.inspector_width = self.settings.inspector_width.to_string();
                 Task::none()
             }
             InspectorAction::ResizeFinished => {
@@ -5505,8 +5623,39 @@ impl Cagents {
         }
     }
 
+    fn synchronize_appearance(&mut self, previous_scale: f32) -> Task<Message> {
+        // COSMIC applies its scale action asynchronously. Use the previous
+        // persisted preference, not Core's possibly not-yet-updated value.
+        self.window_width *= previous_scale / self.settings.ui_scale;
+        #[cfg(feature = "integrated-browser")]
+        for runtime in self.cards.values() {
+            if let CardRuntime::Browser(browser) = runtime {
+                let _ = browser.handle.set_scale_factor(effective_surface_scale(
+                    self.window_scale_factor,
+                    self.settings.ui_scale,
+                ));
+            }
+        }
+        let theme = match self.settings.app_theme {
+            AppTheme::System => {
+                cosmic::Theme::system(Arc::new(self.core.system_theme().cosmic().clone()))
+            }
+            AppTheme::Dark => cosmic::Theme::dark(),
+            AppTheme::Light => cosmic::Theme::light(),
+        };
+        let overlay = self.sync_context_overlay_state();
+        Task::batch([
+            cosmic::command::set_theme(theme),
+            overlay,
+            Task::done(cosmic::Action::Cosmic(cosmic::app::Action::ScaleFactor(
+                self.settings.ui_scale,
+            ))),
+        ])
+    }
+
     fn apply_setting_input(&mut self, field: SettingsField, value: String) -> Task<Message> {
         self.settings_draft.set(field, value.clone());
+        let previous_scale = self.settings.ui_scale;
         match settings_update(&self.settings, field, &value) {
             SettingsDecision::Invalid(message) => {
                 self.settings_feedback = Some(SettingsFeedback::Invalid(message));
@@ -5534,6 +5683,9 @@ impl Cagents {
                     self.card_chrome.clear();
                 }
                 match field {
+                    SettingsField::AppTheme | SettingsField::UiScale => {
+                        self.synchronize_appearance(previous_scale)
+                    }
                     SettingsField::MaxHotCards => cosmic::task::message(Message::LifecycleSweep),
                     SettingsField::HibernationDelayMs => {
                         // Reconciled here rather than through a queued
@@ -5545,6 +5697,10 @@ impl Cagents {
                     SettingsField::TerminalFontSize
                     | SettingsField::TerminalFontFamily
                     | SettingsField::TerminalScrollbackLines
+                    | SettingsField::TerminalLineHeight
+                    | SettingsField::TerminalPadding
+                    | SettingsField::TerminalCursorStyle
+                    | SettingsField::InspectorWidth
                     | SettingsField::SidebarWidth
                     | SettingsField::DefaultColumnFraction
                     | SettingsField::LinkOpenDestination
@@ -5594,6 +5750,7 @@ impl Cagents {
     }
 
     fn reset_settings(&mut self) -> Task<Message> {
+        let previous_scale = self.settings.ui_scale;
         self.settings = AppSettings::default();
         self.settings_draft = SettingsDraft::from_settings(&self.settings);
         self.card_chrome.clear();
@@ -5607,7 +5764,13 @@ impl Cagents {
             Err(error) => SettingsFeedback::Error(error),
         });
         let sweep = self.lifecycle_sweep();
-        Task::batch([resync, sweep, self.reschedule_offscreen_lifecycle_sweep()])
+        let appearance = self.synchronize_appearance(previous_scale);
+        Task::batch([
+            resync,
+            sweep,
+            appearance,
+            self.reschedule_offscreen_lifecycle_sweep(),
+        ])
     }
 }
 
@@ -5670,7 +5833,6 @@ impl Application for Cagents {
         let (terminal_wake_tx, terminal_wake_rx) = async_channel::unbounded();
         let activation_rx = activation_rx.unwrap_or_else(|| async_channel::unbounded().1);
         let window_scale_factor = core.scale_factor().max(0.01);
-        let window_headerbar_enabled = core.window.show_headerbar;
         let settings_draft = SettingsDraft::from_settings(&settings);
         let mut app = Self {
             core,
@@ -5702,7 +5864,6 @@ impl Application for Cagents {
             browser_parent_lifetime: None,
             window_scale_factor,
             window_width: 1_600.0,
-            window_headerbar_enabled,
             settings_path,
             settings_write_blocked,
             sidebar_model: SidebarModel::ready(SidebarMode::Expanded, sidebar_projects),
@@ -5720,13 +5881,13 @@ impl Application for Cagents {
             inspector: None,
             inspector_transition: None,
             context_inspector_open: true,
-            debug_inspector_open: false,
+            context_tab: ContextTab::default(),
             context_inspector_overlay_active: false,
             // The initial estimate is wide, but the first compositor resize
             // can immediately mount the default-open inspector as a modal.
             // Keep a valid post-close target ready for that narrow startup.
             context_inspector_restore_focus: Some(context_inspector_toggle_id()),
-            settings_category: SettingsCategory::General,
+            settings_category: SettingsCategory::Appearance,
             keyboard_modifiers: keyboard::Modifiers::empty(),
             settings_draft,
             settings_feedback: None,
@@ -5764,7 +5925,11 @@ impl Application for Cagents {
             .workspace
             .resize_viewport((app.window_width - sidebar_width - inspector_width).max(0.0));
         let scope = app.restore_worktree_scope();
-        let mut tasks = vec![scope, app.initialize_runtimes()];
+        let mut tasks = vec![
+            scope,
+            app.initialize_runtimes(),
+            app.synchronize_appearance(1.0),
+        ];
         #[cfg(feature = "integrated-browser")]
         tasks.push(cosmic::task::message(Message::InitializeBrowserFactory));
         if let Some(window_id) = app.core.main_window_id() {
@@ -5811,6 +5976,13 @@ impl Application for Cagents {
             // idle while the window-frame subscription was disconnected.
             self.frame_clock.reset();
         }
+        // Camera-only events cannot change labels, selected worktrees, or
+        // repository bindings. Keep per-frame work proportional to visible
+        // columns rather than rebuilding every card's chrome.
+        let camera_only = matches!(
+            &message,
+            Message::Frame(_) | Message::Viewport(_) | Message::Pan(_) | Message::Wheel(_)
+        );
         let task = match message {
             Message::NewTerminal => {
                 self.show_workspace_for_action();
@@ -5835,6 +6007,15 @@ impl Application for Cagents {
                 let mut tasks = Vec::new();
                 match result {
                     Ok(handle) => {
+                        // A worker can publish its first event before this start
+                        // result reaches the UI. Adopt and drain it before sending
+                        // commands, which could otherwise mask a permanent failure
+                        // as a closed visibility channel.
+                        self.cards.insert(card, CardRuntime::Terminal(handle));
+                        self.drain_terminal(card, 0);
+                        let Some(CardRuntime::Terminal(handle)) = self.cards.get(&card) else {
+                            return cosmic::task::message(Message::LifecycleSweep);
+                        };
                         let visible = terminal_start_visibility(
                             self.durable.cards.iter().find(|state| state.id == card),
                         )
@@ -5847,7 +6028,6 @@ impl Application for Cagents {
                         };
                         match visibility {
                             Ok(()) => {
-                                self.cards.insert(card, CardRuntime::Terminal(handle));
                                 if self.finish_initial_hydration(card, Ok(())) {
                                     let delay =
                                         Duration::from_millis(self.settings.hibernation_delay_ms);
@@ -5855,7 +6035,6 @@ impl Application for Cagents {
                                 }
                             }
                             Err(error) => {
-                                self.begin_terminal_teardown(handle);
                                 let error = format!(
                                     "could not apply restored terminal visibility: {error}"
                                 );
@@ -6157,7 +6336,7 @@ impl Application for Cagents {
                             .map(cosmic::Action::App)
                     }
                     SidebarAction::OpenSettings => {
-                        self.settings_category = SettingsCategory::General;
+                        self.settings_category = SettingsCategory::Appearance;
                         self.settings_draft = SettingsDraft::from_settings(&self.settings);
                         self.settings_feedback = None;
                         self.open_inspector(Inspector::Settings)
@@ -6534,7 +6713,10 @@ impl Application for Cagents {
                     #[cfg(feature = "integrated-browser")]
                     for runtime in self.cards.values() {
                         if let CardRuntime::Browser(browser) = runtime {
-                            let _ = browser.handle.set_scale_factor(scale_factor);
+                            let _ = browser.handle.set_scale_factor(effective_surface_scale(
+                                scale_factor,
+                                self.settings.ui_scale,
+                            ));
                         }
                     }
                 }
@@ -7003,13 +7185,9 @@ impl Application for Cagents {
             Message::ToggleContextInspector => {
                 self.set_context_inspector_open(!self.context_inspector_open)
             }
-            #[cfg(feature = "development")]
-            Message::ToggleDebugInspector => {
-                if self.modal_is_open() {
-                    return Task::none();
-                }
-                self.debug_inspector_open = !self.debug_inspector_open;
-                self.set_context_inspector_open(true)
+            Message::SelectContextTab(tab) => {
+                self.context_tab = tab;
+                Task::none()
             }
             Message::ContextInspector(_) if self.modal_is_open() => Task::none(),
             Message::ContextInspector(action) => self.handle_context_inspector_action(action),
@@ -7120,6 +7298,9 @@ impl Application for Cagents {
                 self.reload_source_control(&key)
             }
         };
+        if camera_only {
+            return Task::batch([task, self.release_deferred_navigation_if_unblocked()]);
+        }
         self.synchronize_sidebar_selection();
         let binding = self.rebind_source_control();
         // `view` cannot rebuild the chrome cache itself, so refresh it here.
@@ -7572,14 +7753,23 @@ impl Application for Cagents {
             .height(Length::Fill)
             .into();
 
-        let context_model = self
-            .debug_inspector_open
+        let context_model = (self.context_inspector_open
+            && self.context_tab != ContextTab::Changes)
             .then(|| self.workspace.focused())
             .flatten()
             .and_then(|card| {
-                self.card_state(card).map(|state| {
+                self.card_state(card).and_then(|state| {
+                    if self.context_tab == ContextTab::Code
+                        && !matches!(state.kind, CardKind::Repository(_))
+                    {
+                        return None;
+                    }
                     let repository = match self.cards.get(&card) {
-                        Some(CardRuntime::Repository(runtime)) => Some(runtime.inspector_context()),
+                        Some(CardRuntime::Repository(runtime))
+                            if self.context_tab == ContextTab::Code =>
+                        {
+                            Some(runtime.inspector_context())
+                        }
                         _ => None,
                     };
                     let model = inspector::model_for_card(
@@ -7588,10 +7778,14 @@ impl Application for Cagents {
                         &self.sidebar_model.projects,
                         repository.as_ref(),
                     );
-                    match self.lsp_context(card) {
-                        Some(lsp) => inspector::with_lsp(model, card, lsp),
-                        None => model,
-                    }
+                    Some(if self.context_tab == ContextTab::Code {
+                        match self.lsp_context(card) {
+                            Some(lsp) => inspector::with_lsp(model, card, lsp),
+                            None => model,
+                        }
+                    } else {
+                        model
+                    })
                 })
             });
         let surface: Element<'_, Message> = if self.context_inspector_open
@@ -7600,7 +7794,8 @@ impl Application for Cagents {
             let width = self
                 .settings
                 .inspector_width
-                .clamp(design::INSPECTOR_MIN_WIDTH, design::INSPECTOR_MAX_WIDTH);
+                .clamp(design::INSPECTOR_MIN_WIDTH, design::INSPECTOR_MAX_WIDTH)
+                .min((window_width - crate::splitter::WIDTH).max(0.0));
             let splitter: Element<'_, Message> = Splitter::new(
                 widget::Id::new("context-inspector.resize-handle"),
                 inspector::RESIZE_HANDLE_NAME,
@@ -7613,14 +7808,7 @@ impl Application for Cagents {
                 || Message::ContextInspector(InspectorAction::ResizeFinished),
             )
             .into();
-            let pane = if cfg!(feature = "development") {
-                context_model.map_or_else(
-                    || self.git_surface(width),
-                    |model| inspector::view(model, width).map(Message::ContextInspector),
-                )
-            } else {
-                self.git_surface(width)
-            };
+            let pane = self.context_panel(context_model, width);
             let inspector_surface: Element<'_, Message> =
                 widget::row::with_children(vec![splitter, pane])
                     .spacing(0)
@@ -7921,8 +8109,8 @@ const fn workspace_surfaces_should_render(
     !settings_inspector_open && !context_inspector_overlay
 }
 
-const fn headerbar_should_render(configured: bool, context_inspector_overlay: bool) -> bool {
-    configured && !context_inspector_overlay
+const fn effective_surface_scale(display_scale: f32, ui_scale: f32) -> f32 {
+    display_scale * ui_scale
 }
 
 fn unix_millis() -> i64 {
@@ -9243,45 +9431,9 @@ mod tests {
     }
 
     #[test]
-    fn native_headerbar_stays_outside_a_context_overlay_focus_boundary() {
-        assert!(headerbar_should_render(true, false));
-        assert!(!headerbar_should_render(true, true));
-        assert!(!headerbar_should_render(false, false));
-        assert!(!headerbar_should_render(false, true));
-    }
-
-    #[test]
     fn context_overlay_update_captures_traps_and_restores_focus_across_startup_and_escape() {
-        assert_eq!(
-            context_inspector_toggle_id().to_string(),
-            "command.toggle-context-inspector"
-        );
-        assert_eq!(
-            inspector::close_focus_id().to_string(),
-            "context-inspector.close"
-        );
-        assert_ne!(
-            context_inspector_toggle_id().to_string(),
-            inspector::close_focus_id().to_string()
-        );
-        assert_eq!(
-            context_overlay_change(false, true),
-            ContextOverlayChange::Entered
-        );
-        assert_eq!(
-            context_overlay_change(true, false),
-            ContextOverlayChange::Exited
-        );
-        assert_eq!(
-            context_overlay_change(false, false),
-            ContextOverlayChange::Unchanged
-        );
-        assert_eq!(
-            context_overlay_change(true, true),
-            ContextOverlayChange::Unchanged
-        );
-
         let mut app = context_inspector_test_app(true);
+        let headerbar_enabled = app.core.window.show_headerbar;
         assert!(!app.context_inspector_is_overlay());
         assert_eq!(
             app.context_inspector_restore_focus
@@ -9302,10 +9454,7 @@ mod tests {
                 .map(ToString::to_string),
             Some(context_inspector_toggle_id().to_string())
         );
-        assert_eq!(
-            app.core.window.show_headerbar,
-            headerbar_should_render(app.window_headerbar_enabled, true)
-        );
+        assert_eq!(app.core.window.show_headerbar, headerbar_enabled);
 
         let escape = keyboard::Event::KeyPressed {
             key: keyboard::Key::Named(keyboard::key::Named::Escape),
@@ -9326,10 +9475,25 @@ mod tests {
         assert!(!app.context_inspector_overlay_active);
         assert!(!app.workspace_inputs_blocked());
         assert!(app.context_inspector_restore_focus.is_none());
-        assert_eq!(
-            app.core.window.show_headerbar,
-            headerbar_should_render(app.window_headerbar_enabled, false)
-        );
+        assert_eq!(app.core.window.show_headerbar, headerbar_enabled);
+
+        // Panel tabs change the tools, not workspace focus or the overlay
+        // boundary, and remain available in production builds.
+        let focused = app.workspace.focused();
+        let _ = app.update(Message::ToggleContextInspector);
+        for tab in [ContextTab::Changes, ContextTab::Code, ContextTab::Context] {
+            let _ = app.update(Message::SelectContextTab(tab));
+            assert_eq!(app.context_tab, tab);
+            assert_eq!(app.workspace.focused(), focused);
+            assert!(app.context_inspector_overlay_active);
+            assert_eq!(app.core.window.show_headerbar, headerbar_enabled);
+        }
+        let _ = app.open_inspector(Inspector::Settings);
+        let _ = app.update(Message::SelectContextTab(ContextTab::Code));
+        assert_eq!(app.context_tab, ContextTab::Context);
+        app.inspector = None;
+        app.inspector_transition = None;
+        let _ = app.update(Message::ContextInspector(InspectorAction::Close));
 
         // Re-entering from a live docked inspector captures afresh instead of
         // depending on the startup value consumed by the first Escape.
@@ -9473,6 +9637,106 @@ mod tests {
             ),
             Residency::Hibernated
         );
+    }
+
+    #[test]
+    fn daemon_rejection_before_terminal_started_remains_relaunchable() {
+        use crate::{
+            model::{BootId, HostIncarnation, HostSessionId},
+            terminal::ipc::{
+                ClientEnvelope, PROTOCOL_VERSION, ProtocolError, ProtocolErrorCode, ServerEnvelope,
+                ServerMessage, read_frame, write_frame,
+            },
+        };
+        use std::os::unix::net::UnixListener;
+
+        let directory = tempfile::tempdir().unwrap();
+        let socket = directory.path().join("daemon.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let old_proof = HostSessionProof {
+            host_session_id: HostSessionId::new("old-session"),
+            boot_id: BootId::new("same-boot"),
+            host_incarnation: HostIncarnation::new("old-incarnation"),
+        };
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let request: ClientEnvelope = read_frame(&mut stream).unwrap().unwrap();
+            write_frame(
+                &mut stream,
+                &ServerEnvelope {
+                    version: PROTOCOL_VERSION,
+                    request_id: Some(request.request_id),
+                    proof: HostSessionProof {
+                        host_session_id: HostSessionId::new("new-session"),
+                        boot_id: BootId::new("same-boot"),
+                        host_incarnation: HostIncarnation::new("new-incarnation"),
+                    },
+                    message: ServerMessage::Error(ProtocolError::new(
+                        ProtocolErrorCode::ProofMismatch,
+                        "daemon was replaced",
+                        false,
+                    )),
+                },
+            )
+            .unwrap();
+        });
+
+        let mut app = context_inspector_test_app(true);
+        let card = app.workspace.focused().unwrap();
+        let state = app.card_state_mut(card).unwrap();
+        let CardKind::Terminal(session) = &mut state.kind else {
+            panic!("expected terminal fixture");
+        };
+        let old_id = session.id;
+        session.continuity = TerminalContinuity::DetachedSameBoot {
+            host_session_id: old_proof.host_session_id.clone(),
+            boot_id: old_proof.boot_id.clone(),
+            host_incarnation: old_proof.host_incarnation.clone(),
+        };
+        app.lifecycle.register(
+            card,
+            Exposure::Visible,
+            Residency::Hydrating { epoch: 1 },
+            Instant::now(),
+        );
+        let (wake_tx, wake_rx) = std::sync::mpsc::channel();
+        let handle =
+            HostedTerminalHandle::connect_at(socket, old_id, Some(old_proof), move |wake| {
+                let _ = wake_tx.send(wake);
+            })
+            .unwrap();
+        let wake = wake_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        server.join().unwrap();
+        // The subscription can deliver this edge before the start task returns.
+        let _ = app.update(Message::TerminalWake {
+            card,
+            generation: wake.generation,
+        });
+        let _ = app.update(Message::TerminalStarted {
+            card,
+            result: Ok(TerminalSurface::from(handle)),
+        });
+        assert!(matches!(
+            &app.card_state(card).unwrap().kind,
+            CardKind::Terminal(TerminalSession {
+                continuity: TerminalContinuity::RelaunchAvailable { .. },
+                ..
+            })
+        ));
+        assert!(matches!(app.cards.get(&card), Some(CardRuntime::Failed(_))));
+
+        let _ = app.retry_card(card);
+        let CardKind::Terminal(replacement) = &app.card_state(card).unwrap().kind else {
+            panic!("retry must preserve the terminal card");
+        };
+        assert_ne!(replacement.id, old_id);
+        assert!(matches!(
+            terminal_start_mode(replacement),
+            Ok(TerminalStartMode::Spawn(_))
+        ));
     }
 
     #[test]
@@ -10326,7 +10590,6 @@ mod tests {
         let settings = AppSettings::default();
         let (terminal_wake_tx, terminal_wake_rx) = async_channel::unbounded();
         let core = Core::default();
-        let window_headerbar_enabled = core.window.show_headerbar;
 
         Cagents {
             workspace,
@@ -10362,7 +10625,6 @@ mod tests {
             browser_parent_lifetime: None,
             window_scale_factor: 1.0,
             window_width: 1_600.0,
-            window_headerbar_enabled,
             core,
             settings_path: None,
             settings_write_blocked: true,
@@ -10381,10 +10643,10 @@ mod tests {
             inspector: None,
             inspector_transition: None,
             context_inspector_open: true,
-            debug_inspector_open: false,
+            context_tab: ContextTab::default(),
             context_inspector_overlay_active: false,
             context_inspector_restore_focus: Some(context_inspector_toggle_id()),
-            settings_category: SettingsCategory::General,
+            settings_category: SettingsCategory::Appearance,
             keyboard_modifiers: keyboard::Modifiers::empty(),
             settings_feedback: None,
             status: None,
@@ -10853,6 +11115,24 @@ mod tests {
         };
         assert_eq!(updated.terminal_font_size, 16.0);
         assert_eq!(updated.sidebar_width, settings.sidebar_width);
+    }
+
+    #[test]
+    fn rapid_interface_scale_changes_use_the_last_preference_before_cosmic_catches_up() {
+        let mut app = context_inspector_test_app(true);
+        let original_width = app.window_width;
+        // Deliberately do not execute the returned COSMIC actions: input can
+        // arrive before the runtime has applied the previous scale action.
+        let _ = app.apply_setting_input(SettingsField::UiScale, "1.25".into());
+        assert!(app.context_inspector_is_overlay());
+        let _ = app.apply_setting_input(SettingsField::UiScale, "1.5".into());
+        assert!((app.window_width - original_width / 1.5).abs() < 0.01);
+        let _ = app.apply_setting_input(SettingsField::UiScale, "NaN".into());
+        assert!((app.window_width - original_width / 1.5).abs() < 0.01);
+        assert_eq!(app.settings.ui_scale, 1.5);
+        let _ = app.apply_setting_input(SettingsField::UiScale, "1.0".into());
+        assert!((app.window_width - original_width).abs() < 0.01);
+        assert!(!app.context_inspector_is_overlay());
     }
 
     #[test]

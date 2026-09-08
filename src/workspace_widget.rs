@@ -1,8 +1,4 @@
-use std::{
-    collections::{HashMap, HashSet},
-    mem,
-    time::Duration,
-};
+use std::{collections::HashMap, mem, sync::Arc, time::Duration};
 
 use cosmic::iced::advanced::Renderer as _;
 use cosmic::iced::advanced::{
@@ -376,7 +372,7 @@ where
     let projection = workspace.projection(viewport_width);
     let strip = VirtualStrip::new(
         &projection,
-        workspace.order().collect(),
+        Arc::clone(workspace.card_indices()),
         projection
             .mounted
             .iter()
@@ -667,14 +663,14 @@ struct VirtualCard<'a, Message> {
 
 struct VirtualStrip<'a, Message> {
     total_width: f32,
-    retained: HashSet<CardId>,
+    retained: Arc<HashMap<CardId, usize>>,
     cards: Vec<VirtualCard<'a, Message>>,
 }
 
 impl<'a, Message> VirtualStrip<'a, Message> {
     fn new(
         projection: &ViewportProjection,
-        retained: Vec<CardId>,
+        retained: Arc<HashMap<CardId, usize>>,
         cards: Vec<VirtualCard<'a, Message>>,
     ) -> Self {
         debug_assert_eq!(
@@ -683,7 +679,7 @@ impl<'a, Message> VirtualStrip<'a, Message> {
         );
         Self {
             total_width: projection.total_width,
-            retained: retained.into_iter().collect(),
+            retained,
             cards,
         }
     }
@@ -693,6 +689,7 @@ impl<'a, Message> VirtualStrip<'a, Message> {
 struct VirtualStripState {
     mounted: Vec<CardId>,
     detached: HashMap<CardId, Tree>,
+    retained: Arc<HashMap<CardId, usize>>,
 }
 
 impl<Message> Widget<Message, Theme, Renderer> for VirtualStrip<'_, Message> {
@@ -704,6 +701,7 @@ impl<Message> Widget<Message, Theme, Renderer> for VirtualStrip<'_, Message> {
         tree::State::new(VirtualStripState {
             mounted: self.cards.iter().map(|card| card.id).collect(),
             detached: HashMap::new(),
+            retained: Arc::clone(&self.retained),
         })
     }
 
@@ -715,25 +713,43 @@ impl<Message> Widget<Message, Theme, Renderer> for VirtualStrip<'_, Message> {
     }
 
     fn diff(&mut self, tree: &mut Tree) {
-        let old_children = mem::take(&mut tree.children);
         let state = tree.state.downcast_mut::<VirtualStripState>();
-        let old_ids = mem::take(&mut state.mounted);
-        for (id, child) in old_ids.into_iter().zip(old_children) {
-            state.detached.insert(id, child);
+        let membership_changed = !Arc::ptr_eq(&state.retained, &self.retained);
+        if state
+            .mounted
+            .iter()
+            .copied()
+            .eq(self.cards.iter().map(|card| card.id))
+        {
+            // Camera movement normally leaves the mounted band unchanged.
+            // Diff those children in place, keeping their identity and storage.
+            for (card, child) in self.cards.iter_mut().zip(&mut tree.children) {
+                child.diff(&mut card.content);
+            }
+        } else {
+            let mut children = mem::take(&mut tree.children);
+            for (id, child) in state.mounted.drain(..).zip(children.drain(..)) {
+                state.detached.insert(id, child);
+            }
+            for card in &mut self.cards {
+                let mut child = state
+                    .detached
+                    .remove(&card.id)
+                    .unwrap_or_else(|| Tree::new(&card.content));
+                child.diff(&mut card.content);
+                children.push(child);
+                state.mounted.push(card.id);
+            }
+            tree.children = children;
         }
-        state.detached.retain(|id, _| self.retained.contains(id));
-
-        let mut children = Vec::with_capacity(self.cards.len());
-        for card in &mut self.cards {
-            let mut child = state
+        // Detached trees are retained for focus/selection continuity, but need
+        // pruning only after structural changes, never on animation frames.
+        if membership_changed {
+            state
                 .detached
-                .remove(&card.id)
-                .unwrap_or_else(|| Tree::new(&card.content));
-            child.diff(&mut card.content);
-            children.push(child);
+                .retain(|id, _| self.retained.contains_key(id));
+            state.retained = Arc::clone(&self.retained);
         }
-        state.mounted = self.cards.iter().map(|card| card.id).collect();
-        tree.children = children;
     }
 
     fn size(&self) -> Size<Length> {
@@ -1299,6 +1315,7 @@ mod tests {
     use super::*;
     use crate::settings::parse_chords;
     use crate::workspace::{CardWidth, WorkspaceCard};
+    use std::collections::HashSet;
 
     #[test]
     fn projection_never_exposes_offscreen_cards_to_the_widget_builder() {
@@ -1642,6 +1659,14 @@ mod tests {
     }
 
     impl Widget<(), Theme, Renderer> for AccessibleProbe {
+        fn tag(&self) -> tree::Tag {
+            tree::Tag::of::<u64>()
+        }
+
+        fn state(&self) -> tree::State {
+            tree::State::new(self.node)
+        }
+
         fn size(&self) -> Size<Length> {
             Size::new(Length::Fill, Length::Fill)
         }
@@ -1670,14 +1695,78 @@ mod tests {
         fn a11y_nodes(
             &self,
             layout: Layout<'_>,
-            _state: &Tree,
+            state: &Tree,
             _cursor: mouse::Cursor,
         ) -> iced_accessibility::A11yTree {
             use iced_accessibility::accesskit::{Node, Role};
 
             assert_eq!(layout.virtual_offset(), self.expected_virtual_offset);
-            iced_accessibility::A11yTree::leaf(Node::new(Role::Button), self.node)
+            iced_accessibility::A11yTree::leaf(
+                Node::new(Role::Button),
+                *state.state.downcast_ref::<u64>(),
+            )
         }
+    }
+
+    #[test]
+    fn scrolling_restores_card_state_but_closed_cards_do_not_keep_it() {
+        use iced_accessibility::A11yId;
+
+        let first = CardId::new();
+        let second = CardId::new();
+        let retained = Arc::new(HashMap::from([(first, 0), (second, 1)]));
+        let make_strip = |retained, id, node| VirtualStrip {
+            total_width: 200.0,
+            retained,
+            cards: vec![VirtualCard {
+                id,
+                x: 0.0,
+                width: 100.0,
+                content: Element::new(AccessibleProbe {
+                    node,
+                    expected_virtual_offset: Vector::ZERO,
+                }),
+            }],
+        };
+        let mut strip: Element<'_, ()> = Element::new(make_strip(Arc::clone(&retained), first, 1));
+        let mut tree = Tree::new(&strip);
+        let layout = layout::Node::with_children(
+            Size::new(200.0, 80.0),
+            vec![layout::Node::new(Size::new(100.0, 80.0))],
+        );
+        for (id, initial, expected) in [
+            (first, 2, 1), // The same band diffs in place.
+            (second, 3, 3),
+            (first, 4, 1), // Remount restores the first card's state.
+        ] {
+            strip = Element::new(make_strip(Arc::clone(&retained), id, initial));
+            tree.diff(&mut strip);
+            assert!(
+                strip
+                    .as_widget()
+                    .a11y_nodes(Layout::new(&layout), &tree, mouse::Cursor::Unavailable,)
+                    .contains(&A11yId::from(expected as u64))
+            );
+        }
+
+        // Close the first card while only the second is mounted. Reusing its
+        // identity afterwards must create fresh state, not revive a stale tree.
+        strip = Element::new(make_strip(Arc::clone(&retained), second, 5));
+        tree.diff(&mut strip);
+        strip = Element::new(make_strip(
+            Arc::new(HashMap::from([(second, 0)])),
+            second,
+            6,
+        ));
+        tree.diff(&mut strip);
+        strip = Element::new(make_strip(retained, first, 7));
+        tree.diff(&mut strip);
+        assert!(
+            strip
+                .as_widget()
+                .a11y_nodes(Layout::new(&layout), &tree, mouse::Cursor::Unavailable,)
+                .contains(&A11yId::from(7_u64))
+        );
     }
 
     #[test]
@@ -1687,7 +1776,13 @@ mod tests {
         let cards = [CardId::new(), CardId::new()];
         let strip = VirtualStrip {
             total_width: 200.0,
-            retained: cards.into_iter().collect(),
+            retained: Arc::new(
+                cards
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, id)| (id, index))
+                    .collect(),
+            ),
             cards: cards
                 .into_iter()
                 .enumerate()

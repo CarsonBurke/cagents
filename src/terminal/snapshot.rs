@@ -444,6 +444,36 @@ mod tests {
     }
 
     #[test]
+    fn incremental_repaints_preserve_untouched_rows_and_publish_late_output() {
+        let mut terminal = Terminal::new(TerminalOptions {
+            cols: 8,
+            rows: 3,
+            max_scrollback: 16,
+        })
+        .unwrap();
+        let mut visual = VisualResources::new().unwrap();
+        terminal.vt_write(b"header\r\nwaiting\r\nfooter");
+        let first = visual.capture(&terminal, 1, true).unwrap().unwrap();
+
+        terminal.vt_write(b"\x1b[2;1H\x1b[2Kdone");
+        let second = visual.capture(&terminal, 2, false).unwrap().unwrap();
+        assert_eq!(second.lines[0].cells, first.lines[0].cells);
+        assert_eq!(second.lines[2].cells, first.lines[2].cells);
+        assert_eq!(second.lines[1].cells[0].text, "d");
+        assert_eq!(second.lines[1].cells[3].text, "e");
+        assert_ne!(second.lines[1].cells[4].text, "i");
+
+        // More output after the previous damage was consumed must remain
+        // visible without a forced refresh from mouse or keyboard input.
+        terminal.vt_write(b"\x1b[3;1H\x1b[2Kfinal");
+        let third = visual.capture(&terminal, 3, false).unwrap().unwrap();
+        assert_eq!(third.lines[1].cells, second.lines[1].cells);
+        assert_eq!(third.lines[2].cells[0].text, "f");
+        assert_eq!(third.lines[2].cells[4].text, "l");
+        assert!(visual.capture(&terminal, 4, false).unwrap().is_none());
+    }
+
+    #[test]
     fn a_wide_cluster_is_never_stored_as_narrow_ascii() {
         // The draw layer coalesces a run of cells into one shaped primitive
         // only where every cell is narrow ASCII, because that is the only case

@@ -27,6 +27,35 @@ const LEGACY_SIDEBAR_WIDTH_MAX: f32 = 480.0;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+pub enum AppTheme {
+    #[default]
+    System,
+    Dark,
+    Light,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TerminalCursorStyle {
+    #[default]
+    Application,
+    Block,
+    Beam,
+    Underline,
+}
+
+const fn default_ui_scale() -> f32 {
+    1.0
+}
+const fn default_terminal_line_height() -> f32 {
+    1.286
+}
+const fn default_terminal_padding() -> f32 {
+    8.0
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum LinkOpenDestination {
     #[default]
     IntegratedBrowser,
@@ -254,6 +283,16 @@ pub struct AppSettings {
     pub schema_version: u32,
     pub max_hot_cards: usize,
     pub hibernation_delay_ms: u64,
+    #[serde(default)]
+    pub app_theme: AppTheme,
+    #[serde(default = "default_ui_scale")]
+    pub ui_scale: f32,
+    #[serde(default = "default_terminal_line_height")]
+    pub terminal_line_height: f32,
+    #[serde(default = "default_terminal_padding")]
+    pub terminal_padding: f32,
+    #[serde(default)]
+    pub terminal_cursor_style: TerminalCursorStyle,
     pub terminal_font_size: f32,
     /// The terminal font family, or empty for the system monospace default.
     #[serde(default)]
@@ -288,6 +327,11 @@ impl Default for AppSettings {
             schema_version: SETTINGS_SCHEMA_VERSION,
             max_hot_cards: 6,
             hibernation_delay_ms: 30_000,
+            app_theme: AppTheme::default(),
+            ui_scale: default_ui_scale(),
+            terminal_line_height: default_terminal_line_height(),
+            terminal_padding: default_terminal_padding(),
+            terminal_cursor_style: TerminalCursorStyle::default(),
             terminal_font_size: 14.0,
             terminal_font_family: String::new(),
             sidebar_width: design::NAVIGATION_DEFAULT_WIDTH,
@@ -547,6 +591,7 @@ impl From<V2TomlSettings> for AppSettings {
             // is what a file that omits the key gets as well.
             language_servers: default_language_servers(),
             keyboard_shortcuts: previous.keyboard_shortcuts,
+            ..Self::default()
         }
     }
 }
@@ -576,6 +621,21 @@ impl AppSettings {
                 "hibernation_delay_ms must not exceed 9223372036854775807",
             ));
         }
+        if !(0.8..=1.5).contains(&self.ui_scale) {
+            return Err(SettingsError::Invalid(
+                "ui_scale must be between 0.8 and 1.5",
+            ));
+        }
+        if !(1.0..=2.0).contains(&self.terminal_line_height) {
+            return Err(SettingsError::Invalid(
+                "terminal_line_height must be between 1.0 and 2.0",
+            ));
+        }
+        if !(0.0..=24.0).contains(&self.terminal_padding) {
+            return Err(SettingsError::Invalid(
+                "terminal_padding must be between 0 and 24",
+            ));
+        }
         if !(8.0..=40.0).contains(&self.terminal_font_size) {
             return Err(SettingsError::Invalid(
                 "terminal_font_size must be between 8 and 40",
@@ -601,7 +661,7 @@ impl AppSettings {
             .contains(&self.inspector_width)
         {
             return Err(SettingsError::Invalid(
-                "inspector_width must be between 320 and 420",
+                "inspector_width must be between 320 and 480",
             ));
         }
         if !(0.25..=1.0).contains(&self.default_column_fraction) {
@@ -987,6 +1047,11 @@ mod tests {
         let settings = AppSettings {
             max_hot_cards: 9,
             hibernation_delay_ms: 1_234,
+            app_theme: AppTheme::Light,
+            ui_scale: 1.2,
+            terminal_line_height: 1.5,
+            terminal_padding: 12.0,
+            terminal_cursor_style: TerminalCursorStyle::Beam,
             terminal_font_size: 16.5,
             terminal_font_family: "Fira Code".to_owned(),
             sidebar_width: 360.0,
@@ -1016,6 +1081,65 @@ mod tests {
         fs::write(&path, without_family).unwrap();
 
         assert_eq!(load(&path).unwrap(), AppSettings::default());
+    }
+
+    #[test]
+    fn existing_settings_keep_preferences_when_appearance_keys_are_absent() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = path_in(&directory);
+        let settings = AppSettings {
+            terminal_font_size: 19.0,
+            sidebar_width: 350.0,
+            ..AppSettings::default()
+        };
+        let document = toml::to_string(&settings).unwrap();
+        let document = document
+            .lines()
+            .filter(|line| {
+                ![
+                    "app_theme",
+                    "ui_scale",
+                    "terminal_line_height",
+                    "terminal_padding",
+                    "terminal_cursor_style",
+                ]
+                .iter()
+                .any(|key| line.starts_with(key))
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        fs::write(&path, document).unwrap();
+        assert_eq!(load(&path).unwrap(), settings);
+    }
+
+    #[test]
+    fn appearance_rejects_nonfinite_and_out_of_range_geometry() {
+        for invalid in [f32::NAN, f32::INFINITY, -1.0, 100.0] {
+            assert!(
+                AppSettings {
+                    ui_scale: invalid,
+                    ..AppSettings::default()
+                }
+                .validate()
+                .is_err()
+            );
+            assert!(
+                AppSettings {
+                    terminal_line_height: invalid,
+                    ..AppSettings::default()
+                }
+                .validate()
+                .is_err()
+            );
+            assert!(
+                AppSettings {
+                    terminal_padding: invalid,
+                    ..AppSettings::default()
+                }
+                .validate()
+                .is_err()
+            );
+        }
     }
 
     #[test]
@@ -1071,7 +1195,17 @@ mod tests {
                         .strip_prefix("language_servers")
                         .is_some_and(|rest| rest.starts_with(']') || rest.starts_with('.'));
                 }
-                !inside_language_servers && !line.starts_with("inspector_width")
+                !inside_language_servers
+                    && ![
+                        "inspector_width",
+                        "app_theme",
+                        "ui_scale",
+                        "terminal_line_height",
+                        "terminal_padding",
+                        "terminal_cursor_style",
+                    ]
+                    .iter()
+                    .any(|key| line.starts_with(key))
             })
             .map(|line| {
                 if line.starts_with("schema_version") {

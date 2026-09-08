@@ -28,8 +28,9 @@ use super::{
     TerminalSurface, Underline,
 };
 
-const CONTENT_PADDING_X: f32 = 4.0;
-const CONTENT_PADDING_Y: f32 = 4.0;
+use crate::settings::TerminalCursorStyle;
+
+const DEFAULT_PADDING: f32 = 8.0;
 
 /// Text metrics for one terminal grid at one scale factor.
 ///
@@ -322,7 +323,14 @@ struct TerminalGeometry {
 }
 
 impl TerminalGeometry {
-    fn new(bounds: Rectangle, font_size: f32, scale_factor: f32, family: &str) -> Self {
+    fn new(
+        bounds: Rectangle,
+        font_size: f32,
+        scale_factor: f32,
+        family: &str,
+        line_height: f32,
+        padding: f32,
+    ) -> Self {
         let scale_factor = if scale_factor.is_finite() && scale_factor > 0.0 {
             scale_factor
         } else {
@@ -330,7 +338,10 @@ impl TerminalGeometry {
         };
         // `resolve` already snapped the pitch to whole physical pixels at this
         // scale, so these conversions are exact rather than a second rounding.
-        let metrics = CellMetrics::resolve(font_size, scale_factor, family);
+        let mut metrics = CellMetrics::resolve(font_size, scale_factor, family);
+        // Line spacing does not change font advances, so reuse the measured
+        // faces and only replace their line box. Shaping keys this height too.
+        metrics.height = (font_size * line_height * scale_factor).round().max(1.0) / scale_factor;
         let cell_width_px = (metrics.width * scale_factor).round().max(1.0) as u32;
         let cell_height_px = (metrics.height * scale_factor).round().max(1.0) as u32;
         let cell_width = cell_width_px as f32 / scale_factor;
@@ -339,20 +350,18 @@ impl TerminalGeometry {
         // Size the PTY from the card's stable logical extent. Snapping both
         // absolute edges would make the available physical width depend on
         // the card's fractional x/y position and reflow while panning.
-        let content_width = (bounds.width - CONTENT_PADDING_X * 2.0).max(0.0);
-        let content_height = (bounds.height - CONTENT_PADDING_Y * 2.0).max(0.0);
+        let content_width = (bounds.width - padding * 2.0).max(0.0);
+        let content_height = (bounds.height - padding * 2.0).max(0.0);
         let columns = ((content_width * scale_factor / cell_width_px as f32).floor() as u16).max(1);
         let rows = ((content_height * scale_factor / cell_height_px as f32).floor() as u16).max(1);
 
         // Absolute snapping still gives drawing and input a pixel-aligned
         // origin and a conservative clip. The fixed-size grid may lose a
         // fractional edge pixel to this clip, but its PTY extent stays fixed.
-        let left = ((bounds.x + CONTENT_PADDING_X) * scale_factor).ceil() / scale_factor;
-        let top = ((bounds.y + CONTENT_PADDING_Y) * scale_factor).ceil() / scale_factor;
-        let right =
-            ((bounds.x + bounds.width - CONTENT_PADDING_X) * scale_factor).floor() / scale_factor;
-        let bottom =
-            ((bounds.y + bounds.height - CONTENT_PADDING_Y) * scale_factor).floor() / scale_factor;
+        let left = ((bounds.x + padding) * scale_factor).ceil() / scale_factor;
+        let top = ((bounds.y + padding) * scale_factor).ceil() / scale_factor;
+        let right = ((bounds.x + bounds.width - padding) * scale_factor).floor() / scale_factor;
+        let bottom = ((bounds.y + bounds.height - padding) * scale_factor).floor() / scale_factor;
         let content_bounds = Rectangle {
             x: left,
             y: top,
@@ -454,6 +463,7 @@ struct WidgetState {
 struct ShapeParams {
     font_size: u32,
     scale_factor: u32,
+    cell_height: u32,
     family: &'static str,
     columns: u16,
     fonts: graphics_text::Version,
@@ -503,6 +513,7 @@ impl ShapeCache {
         let params = ShapeParams {
             font_size: font_size.to_bits(),
             scale_factor: geometry.scale_factor.to_bits(),
+            cell_height: geometry.metrics.height.to_bits(),
             family: geometry.metrics.family,
             columns: u16::try_from(column_limit).unwrap_or(u16::MAX),
             fonts: font_system()
@@ -572,6 +583,9 @@ pub struct TerminalWidget<Message> {
     snapshot: Arc<RenderSnapshot>,
     font_size: f32,
     font_family: &'static str,
+    line_height: f32,
+    padding: f32,
+    cursor_style: TerminalCursorStyle,
     scale_factor: f32,
     model_focused: bool,
     on_focus: Option<Message>,
@@ -599,6 +613,9 @@ impl<Message> TerminalWidget<Message> {
             snapshot,
             font_size: DEFAULT_FONT_SIZE,
             font_family: "",
+            line_height: LINE_HEIGHT_RATIO,
+            padding: DEFAULT_PADDING,
+            cursor_style: TerminalCursorStyle::Application,
             scale_factor: 1.0,
             model_focused: false,
             on_focus: None,
@@ -629,6 +646,32 @@ impl<Message> TerminalWidget<Message> {
     /// resolves to whatever the system prefers, which need not cover them.
     pub fn font_family(mut self, family: &str) -> Self {
         self.font_family = intern_family(family);
+        self
+    }
+
+    /// Sets the cell line box as a multiple of the font size.
+    pub fn line_height(mut self, line_height: f32) -> Self {
+        self.line_height = if line_height.is_finite() {
+            line_height.clamp(1.0, 2.0)
+        } else {
+            LINE_HEIGHT_RATIO
+        };
+        self
+    }
+
+    /// Sets the terminal inset in logical pixels, shared by drawing and input.
+    pub fn padding(mut self, padding: f32) -> Self {
+        self.padding = if padding.is_finite() {
+            padding.clamp(0.0, 24.0)
+        } else {
+            DEFAULT_PADDING
+        };
+        self
+    }
+
+    /// Overrides the application's cursor shape without changing visibility.
+    pub fn cursor_style(mut self, cursor_style: TerminalCursorStyle) -> Self {
+        self.cursor_style = cursor_style;
         self
     }
 
@@ -762,8 +805,14 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for TerminalWidget<Message
         _viewport: &Rectangle,
     ) {
         let bounds = layout.bounds();
-        let geometry =
-            TerminalGeometry::new(bounds, self.font_size, self.scale_factor, self.font_family);
+        let geometry = TerminalGeometry::new(
+            bounds,
+            self.font_size,
+            self.scale_factor,
+            self.font_family,
+            self.line_height,
+            self.padding,
+        );
         let state = tree.state.downcast_mut::<WidgetState>();
         self.synchronize_size(state, geometry, shell);
         self.synchronize_focus(state, shell);
@@ -888,8 +937,14 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for TerminalWidget<Message
         }
 
         let bounds = layout.bounds();
-        let geometry =
-            TerminalGeometry::new(bounds, self.font_size, self.scale_factor, self.font_family);
+        let geometry = TerminalGeometry::new(
+            bounds,
+            self.font_size,
+            self.scale_factor,
+            self.font_family,
+            self.line_height,
+            self.padding,
+        );
         let Some(widget_clip) = bounds.intersection(viewport) else {
             self.handle.acknowledge_redraw(self.snapshot.generation);
             return;
@@ -961,12 +1016,18 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for TerminalWidget<Message
                             .map(|bounds| (cursor, bounds))
                     })
                 {
+                    let shape = match self.cursor_style {
+                        TerminalCursorStyle::Application => cursor.shape,
+                        TerminalCursorStyle::Block => CursorShape::Block,
+                        TerminalCursorStyle::Beam => CursorShape::Bar,
+                        TerminalCursorStyle::Underline => CursorShape::Underline,
+                    };
                     // Two physical pixels, never wider than the cell it
                     // outlines.
                     let stroke = (2.0 / geometry.scale_factor)
                         .min(cell_bounds.width)
                         .min(cell_bounds.height);
-                    let cursor_bounds = match cursor.shape {
+                    let cursor_bounds = match shape {
                         CursorShape::Bar => Rectangle {
                             width: stroke,
                             ..cell_bounds
@@ -978,7 +1039,7 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for TerminalWidget<Message
                         },
                         CursorShape::Block | CursorShape::HollowBlock => cell_bounds,
                     };
-                    let border = if cursor.shape == CursorShape::HollowBlock {
+                    let border = if shape == CursorShape::HollowBlock {
                         Border {
                             color: color(cursor.color),
                             width: 1.0 / geometry.scale_factor,
@@ -987,7 +1048,7 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for TerminalWidget<Message
                     } else {
                         Border::default()
                     };
-                    let fill = if cursor.shape == CursorShape::HollowBlock {
+                    let fill = if shape == CursorShape::HollowBlock {
                         Color::TRANSPARENT
                     } else {
                         color(cursor.color).scale_alpha(0.65)
@@ -1428,7 +1489,8 @@ mod tests {
             width: 311.3,
             height: 193.7,
         };
-        let geometry = TerminalGeometry::new(bounds, DEFAULT_FONT_SIZE, 1.25, "");
+        let geometry =
+            TerminalGeometry::new(bounds, DEFAULT_FONT_SIZE, 1.25, "", LINE_HEIGHT_RATIO, 4.0);
         let size = geometry.terminal_size();
 
         assert_eq!(size.columns, geometry.columns);
@@ -1453,6 +1515,8 @@ mod tests {
                 DEFAULT_FONT_SIZE,
                 1.25,
                 "",
+                LINE_HEIGHT_RATIO,
+                4.0,
             )
         };
         let baseline = geometry_at(0.0);
@@ -1478,11 +1542,48 @@ mod tests {
             assert_eq!(panned.grid_bounds.width, baseline.grid_bounds.width);
             assert_eq!(panned.grid_bounds.height, baseline.grid_bounds.height);
             assert_eq!(panned.grid_bounds.y, baseline.grid_bounds.y);
-            assert_eq!(
-                panned.grid_bounds.x,
-                ((x + CONTENT_PADDING_X) * 1.25).ceil() / 1.25
-            );
+            assert_eq!(panned.grid_bounds.x, ((x + 4.0) * 1.25).ceil() / 1.25);
         }
+    }
+
+    #[test]
+    fn configured_spacing_and_padding_share_resize_drawing_and_mouse_boundaries() {
+        let bounds = Rectangle {
+            x: 10.2,
+            y: 20.4,
+            width: 360.0,
+            height: 220.0,
+        };
+        let geometry = TerminalGeometry::new(bounds, 16.0, 1.25, "", 1.75, 16.0);
+        let size = geometry.terminal_size();
+        assert_eq!(size.cell_height_px, 35);
+        assert_eq!(size.rows, 6);
+        assert_eq!(
+            size.columns,
+            ((bounds.width - 32.0) * 1.25 / size.cell_width_px as f32).floor() as u16
+        );
+        let second_cell = geometry.cell_bounds(1, 1).unwrap();
+        let position = geometry
+            .cursor_position(mouse::Cursor::Available(Point::new(
+                second_cell.x + second_cell.width / 2.0,
+                second_cell.y + second_cell.height / 2.0,
+            )))
+            .unwrap();
+        assert!((position.x * 1.25 - size.cell_width_px as f32 * 1.5).abs() < 0.001);
+        assert!((position.y * 1.25 - size.cell_height_px as f32 * 1.5).abs() < 0.001);
+        assert!(
+            geometry
+                .cursor_position(mouse::Cursor::Available(Point::new(
+                    bounds.x + 8.0,
+                    bounds.y + 8.0,
+                )))
+                .is_none()
+        );
+        let last = geometry
+            .cell_bounds(size.columns - 1, size.rows - 1)
+            .unwrap();
+        assert!(last.x + last.width <= bounds.x + bounds.width - 16.0);
+        assert!(last.y + last.height <= bounds.y + bounds.height - 16.0);
     }
 
     #[test]
@@ -1493,7 +1594,8 @@ mod tests {
             width: 317.3,
             height: 401.2,
         };
-        let geometry = TerminalGeometry::new(bounds, DEFAULT_FONT_SIZE, 1.25, "");
+        let geometry =
+            TerminalGeometry::new(bounds, DEFAULT_FONT_SIZE, 1.25, "", LINE_HEIGHT_RATIO, 4.0);
         let last = geometry
             .cell_bounds(geometry.columns - 1, geometry.rows - 1)
             .unwrap();
@@ -1536,6 +1638,8 @@ mod tests {
             DEFAULT_FONT_SIZE,
             1.25,
             "",
+            LINE_HEIGHT_RATIO,
+            4.0,
         );
         let first_cell = geometry.cell_bounds(0, 0).unwrap();
         let origin = geometry.text_origin(first_cell);
@@ -1559,6 +1663,8 @@ mod tests {
             DEFAULT_FONT_SIZE,
             1.5,
             "",
+            LINE_HEIGHT_RATIO,
+            4.0,
         );
 
         assert!(
@@ -1621,6 +1727,8 @@ mod tests {
             DEFAULT_FONT_SIZE,
             1.0,
             "",
+            LINE_HEIGHT_RATIO,
+            4.0,
         );
         let single = geometry.run_bounds(3, 1, 0).unwrap();
         let five = geometry.run_bounds(3, 5, 0).unwrap();
@@ -1997,6 +2105,8 @@ mod tests {
             DEFAULT_FONT_SIZE,
             1.0,
             family,
+            LINE_HEIGHT_RATIO,
+            4.0,
         )
     }
 
@@ -2066,6 +2176,24 @@ mod tests {
             Arc::ptr_eq(&replaced[1], &rewritten[1]),
             "one rewritten row must not cost the others their buffers"
         );
+    }
+
+    #[test]
+    fn changing_line_height_reshapes_unchanged_text_to_the_new_cell_box() {
+        let bounds = Rectangle {
+            x: 0.0,
+            y: 0.0,
+            width: 900.0,
+            height: 400.0,
+        };
+        let compact = TerminalGeometry::new(bounds, 16.0, 1.25, "", 1.0, 8.0);
+        let spacious = TerminalGeometry::new(bounds, 16.0, 1.25, "", 2.0, 8.0);
+        let rows = vec![row("unchanged text")];
+        let mut cache = ShapeCache::default();
+        cache.refresh(&compact, 16.0, &rows, 80);
+        assert_eq!(cache.rows[0].segments[0].buffer.metrics().line_height, 16.0);
+        cache.refresh(&spacious, 16.0, &rows, 80);
+        assert_eq!(cache.rows[0].segments[0].buffer.metrics().line_height, 32.0);
     }
 
     #[test]

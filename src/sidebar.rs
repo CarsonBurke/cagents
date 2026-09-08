@@ -2135,7 +2135,7 @@ pub fn view<'a>(
     } else if state.controls_expanded && search_is_reachable(model, mode) {
         content = content.push(
             widget::container(controls(state, refresh_enabled, modal_open))
-                .class(theme::Container::Secondary)
+                .class(theme::Container::Primary)
                 .padding(spacing.space_xxs),
         );
     }
@@ -2155,7 +2155,7 @@ pub fn view<'a>(
     widget::container(
         widget::row::with_children(vec![
             widget::container(content)
-                .class(theme::Container::Background)
+                .class(theme::Container::Primary)
                 .width(Length::Fill)
                 .height(Length::Fill)
                 .into(),
@@ -2170,7 +2170,7 @@ pub fn view<'a>(
         ])
         .spacing(0),
     )
-    .class(theme::Container::Background)
+    .class(theme::Container::Primary)
     .width(Length::Fixed(width))
     .height(Length::Fill)
     .into()
@@ -2999,7 +2999,7 @@ pub fn git_panel<'a>(
     modal_open: bool,
 ) -> Element<'a, SidebarAction> {
     let width = if width.is_finite() {
-        width.clamp(design::INSPECTOR_MIN_WIDTH, design::INSPECTOR_MAX_WIDTH)
+        width.clamp(0.0, design::INSPECTOR_MAX_WIDTH)
     } else {
         design::INSPECTOR_DEFAULT_WIDTH
     };
@@ -3011,14 +3011,26 @@ pub fn git_panel<'a>(
             model.project(source.key.project_id),
             modal_open,
         ),
-        None => widget::container(widget::text::caption(
-            if state.active_worktree().is_some() {
-                "Loading worktree source control…"
-            } else {
-                "Select a worktree to view changes."
-            },
-        ))
-        .padding(cosmic::theme::spacing().space_xs)
+        None => widget::container(
+            widget::column::with_children(vec![
+                widget::icon::from_name("vcs-branch-symbolic").size(28).into(),
+                widget::text::heading(if state.active_worktree().is_some() {
+                    "Loading changes"
+                } else {
+                    "No worktree selected"
+                }).into(),
+                widget::text::body(if state.active_worktree().is_some() {
+                    "Reading files, working-tree changes, and branch history."
+                } else {
+                    "Choose a worktree in Projects, or open a repository to review and commit changes."
+                }).wrapping(cosmic::iced::widget::text::Wrapping::Word).width(Length::Fill).into(),
+                button::standard("Open repository")
+                    .on_press_maybe(gated(SidebarAction::OpenRepositoryPicker, modal_open))
+                    .into(),
+            ]).spacing(12).width(Length::Fill),
+        )
+        .padding(20)
+        .width(Length::Fill)
         .into(),
     };
     widget::container(content)
