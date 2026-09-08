@@ -107,6 +107,91 @@ The jobs setting is not a hard process or memory limit. In the pinned dependenci
 
 Rust, C/C++, Zig, and linker allocations consume **system RAM**, not GPU VRAM. GPU memory reported by tools such as `nvidia-smi` belongs to GPU workloads (for example, rendering or ML), not these compiler jobs. Those workloads may also consume system RAM; lowering Cargo concurrency does not reclaim their allocations or guarantee a build will fit when RAM and swap are already under pressure. Browserless lanes avoid the large Servo/SpiderMonkey compilation graph when embedded-browser behavior is not being changed.
 
+### Redraw scheduling measurements
+
+```sh
+sh scripts/run-redraw-latency /tmp/cagents-redraw-reference
+```
+
+The output directory must not already exist. This opt-in `latency-harness` lane
+builds the CLI, host, and browserless UI separately in **release** mode, then runs
+five fresh UI processes with private HOME/XDG directories. Each run walks eight
+synthetic unloaded cards using a fixed seed: 32 warmups and 256 recorded adjacent
+focus changes. No user sessions or PTYs are loaded. A graphical session, `jq`,
+`timeout`, and the normal native release prerequisites are required.
+
+The metric is **requested state committed → first matching-view
+RedrawRequested**. It is redraw scheduling latency, not renderer submission,
+compositor presentation, scanout, or arbitrary input-to-visible latency.
+`card_focus`, future `palette_open`, and future `palette_query` remain separate
+actions. Superseded or unfinished generations settle as abandoned, never as a
+successful redraw.
+
+Private raw JSON, median/p95/p99/worst summaries, a reference-machine manifest,
+and the strict sample schema are emitted. Reports allowlist revision, dirty
+state, fixture/build mode, session/compositor, scale, numeric hardware facts,
+local interaction sequences and durations. They contain no user paths, titles,
+URLs, query text, terminal contents, user identifiers, or stable entity IDs.
+The disabled recorder is an explicit compile-time no-op: it reads no recorder
+clock and allocates nothing. Provisional **50 ms p95 / 100 ms p99** budgets remain
+non-gating until a named reference baseline is accepted. Do not compare ordinary
+unoptimized `dev` or partially optimized `dev-runtime` results with this release
+baseline.
+
+The `linux-headless-release-reference` fixture records five fresh-process runs
+on a Ryzen 9 9900X, NVIDIA RTX 5090/Vulkan UI, and Sway 1.12 headless
+GLES2 compositor at 1280×800, scale 1.0: **16.16 ms median, 18.32 ms p95,
+19.75 ms p99, 25.32 ms worst**, across 1,280 samples. Raw samples and machine
+facts are in `fixtures/linux-headless-release-reference.json`. This is a
+non-gating local reference, not a physical-display baseline.
+
+### Terminal pipeline measurements
+
+```sh
+scripts/benchmark-terminal all
+# Use only a dedicated test daemon: the fixture creates terminal descriptors.
+scripts/benchmark-terminal all --socket /absolute/private/runtime/cagentsd.sock
+RUST_LOG=cagents::terminal_pipeline=trace scripts/benchmark-terminal input
+```
+
+These release workloads exercise idle, burst, short-line, sustained, full-screen
+ANSI, large/resized, and four-terminal output, plus single/multi-terminal input
+probes. Default mode uses real PTYs in-process; `--socket` uses the matched daemon
+and production hosted IPC connection. Both drive synthetic 60 Hz snapshot
+acknowledgements. Their input-to-snapshot budgets are **50 ms p95 / 100 ms p99**;
+JSON records the measured percentiles and whether they pass. This is not an
+input-to-present claim. Daemon mode retains exited descriptors, so do not use a
+personal or production daemon.
+The initial non-gating release throughput budgets are **50 MiB/s aggregate**
+for conventional sustained single/four-terminal output and **5 seconds**
+for the 32 MiB pathological short-line workload. JSON includes actual emitted
+bytes, throughput, and pass/fail; process startup and final-state observation
+are included in wall time.
+
+Snapshot capture consumes generation-matched draw credit rather than capturing
+every PTY batch. Parsing and semantic events continue without credit, dirty state
+is retained, and EOF publishes final contents. Idle terminals do not request a
+continuous redraw loop. Long-lived hosted and daemon IPC connections reuse frame
+buffers. Opt-in `cagents::terminal_pipeline=trace` records parse/capture,
+encode/decode, UI apply, and draw stages where exercised; tracing overhead is
+excluded from release throughput claims. Summarize a collected log with
+`target/release/examples/terminal-workload --summarize-trace /path/to/trace`.
+Missing stages are reported, not estimated. Physical scanout remains unmeasured.
+
+The same reference records all nine untraced backend/IPC workloads and a
+separate traced native run. Iced draw was the largest instrumented CPU stage
+(4.06 s accumulated; 0.88 ms p95), ahead of snapshot capture (1.30 s) and
+IPC encoding (1.19 s); concurrent stage totals are not additive latency.
+Native virtual-keyboard input to a matching compositor screencopy pixel,
+including observer overhead, measured **37.85/47.91 ms p95/p99** for one
+terminal and **38.82/65.10 ms** with three additional updating TUI terminals
+(100 samples each). Both fit the 50/100 ms input budgets. This is an upper
+bound to compositor-visible pixels, not presentation timestamps or physical
+scanout. The fixture uses `terminal-workload --emit visual-input`, which
+accepts `r`, `g`, and `b` to repaint with distinct RGB colors; `q` exits.
+The settled idle native terminal produced no additional terminal draws
+and no measurable UI CPU ticks in a three-second observation.
+
 ## Install a release
 
 All examples in this section become usable only after canonical hosting exists. Set the real repository and choose a published version:
@@ -260,21 +345,83 @@ cagents daemon status
 cagents terminal list
 cagents terminal spawn -- bash -lc 'printf "hello from cagents\\n"'
 cagents --json terminal list
-cagents daemon stop
+cagents daemon stop --require-empty
+cagents daemon stop --confirm
 ```
 
 Run `cagents --help` or `cagents terminal --help` for the complete command set.
+
+`daemon stop --require-empty` atomically rejects both established terminals and
+in-flight spawn reservations. `--expected-generation N` additionally rejects an
+inventory changed since preflight. `daemon stop --confirm` requires an interactive
+terminal, shows the exact count, and commits a daemon-bound confirmation valid for
+60 seconds; inventory changes require a new confirmation. A successful response
+means **termination requested**, not that every PTY has exited. The explicit
+`daemon stop` command without these flags remains a force-stop operation.
 
 If pull-request creation fails, cagents restores the submitted title, description,
 branches, and draft setting. If the remote outcome is uncertain, the form remains
 editable but another creation attempt is blocked until you check GitHub and confirm
 that no pull request was created.
 
+GitHub refresh immediately revokes mutation authority. Missing CLI,
+unauthenticated, unassociated, loading, failed, and ready-empty are distinct
+states; any retained PR rows are stale display data, not an authorized mutation
+target. Only a matching refresh generation can enable creation again.
+
+Worktree creation records a versioned request and exclusive mutation identity in
+the session journal before directory or Git effects. The operation stays visible
+through service-reported validation, base resolution, Git, and reconciliation.
+**Cancel** requests termination once; it does not promise rollback. Restart
+rehydrates journal records without replaying commands and checks process leases,
+Git locks, exact checkout identity, and checkout-completion evidence. Only proven
+**NotCreated** permits a fresh operation ID; **OutcomeUnknown** requires manual
+inspection. A Git ownership lock is retained through the durable Created commit;
+failure to release it is reported rather than hidden.
+
+Closing a live terminal card requires **Terminate terminal** confirmation.
+Pointer close and Ctrl+W share that policy; Cancel/Escape preserve the card and
+restore its focus. Confirmation revalidates terminal identity and daemon proof.
+An unreachable daemon leaves the card intact.
+
+Terminal activity reports only observed PTY facts. **Quiet** means no output was
+observed for **five seconds**, not that an agent is waiting, ready, or finished.
+Starting, output-active, quiet, exited, failed, and unknown follow current
+incarnation evidence; wall time is display-only. Mounted consumers schedule
+one-shot quiet transitions, and hidden terminals do not create periodic redraws.
+
 ## Daemon and user data
 
 There is no system daemon or service unit. The standard production installation starts its per-user sibling `cagentsd` immediately and registers it for graphical-login autostart. While that daemon is running, cagents exposes a system-tray item that opens the UI and can stop the daemon. The daemon remains independent of the UI so terminals survive window and UI-process restarts.
 
-Full and browserless production builds share the established protocol-3 daemon socket and session store. A protocol change must deliberately retain or migrate that namespace. One shared application lease prevents their UI processes from racing writes, and startup rejects an older running UI or Debian peer package that predates the lease marker. Upgrade that peer before switching variants. Stop the shared daemon explicitly with either control command (`cagents daemon stop` or `cagents-browserless daemon stop`); installers and package upgrades stop the daemon owned by the package being changed while preserving a compatible peer package's daemon.
+Full and browserless production builds share the established daemon socket and
+session store. Protocol **4** deliberately retains that namespace, preventing a
+second daemon owner while an incompatible protocol-3 process is still running;
+the handshake rejects incompatible clients without terminating its PTYs. Upgrade
+the three companion executables together. One shared application lease prevents
+their UI processes from racing writes, and startup rejects an older running UI
+or Debian peer package that predates the lease marker. Upgrade that peer before
+switching variants.
+
+`install.sh` verifies the staged CLI against the running daemon before switching
+`current`. Compatible upgrades preserve the daemon PID, session proof, and PTYs.
+An incompatible upgrade can stop only an atomically empty daemon. Otherwise it
+leaves the current installation intact: finish the terminals, or explicitly
+confirm their termination using the installed CLI, then retry. Older CLIs without
+the atomic shutdown operation fail closed; there is no force-stop fallback.
+If publishing launchers fails, the installer restores the previous version
+without stopping compatible sessions. Existing version directories are retained.
+
+Debian upgrades never send signals to daemons. The package records its protocol
+and retains root-private executable-digest evidence under
+`/var/lib/cagents-package-protocols/`, allowing an older compatible executable to
+remain running across repeated upgrades. A running incompatible or unknown
+executable makes `preinst` fail visibly; the administrator must arrange an
+explicit user-owned shutdown before retrying. Removal similarly refuses while
+that package owns a running daemon, even if empty. Package scripts do not connect
+to user IPC as root or inspect terminal contents. An already-installed legacy
+package's outgoing maintainer scripts cannot be changed by the incoming package;
+stop its daemon explicitly before the first transition to this policy.
 
 Cargo debug builds and builds with the explicit `development` feature use a separate daemon, session store, application lease, and runtime namespace. They do not register a tray item or autostart entry, so source-tree development can run beside the installed production application. Release builds without that feature are production builds.
 
@@ -284,7 +431,7 @@ cagents follows the XDG base-directory convention. Production paths are:
 - Session database: `${XDG_DATA_HOME:-$HOME/.local/share}/cagents/sessions.sqlite3`
 - Terminal transcripts: `${XDG_DATA_HOME:-$HOME/.local/share}/cagents/transcripts/`
 - Cache, when present: `${XDG_CACHE_HOME:-$HOME/.cache}/cagents/`
-- Daemon socket and lock: `$XDG_RUNTIME_DIR/cagents/` (shared by full and browserless protocol version 3 builds)
+- Daemon socket and lock: `$XDG_RUNTIME_DIR/cagents/` (shared by full and browserless builds; protocol changes do not create a second owner)
 
 Development substitutes `cagents-development` for the final `cagents` directory component.
 
@@ -378,6 +525,10 @@ To remove both program files and all cagents user data:
 
 The downloaded installer offers the equivalent `--uninstall` and `--purge` options, and both scripts refuse root execution. If a custom `--prefix` was used during installation, invoke that prefix's `current/bin/cagents-uninstall` with the same `--prefix`.
 
+Both user uninstall entrypoints use atomic empty-only shutdown. If live terminals
+or spawn reservations remain, removal fails without terminating them or removing
+program files. Finish them or run `cagents daemon stop --confirm` first.
+
 Remove a Debian installation with:
 
 ```sh
@@ -386,6 +537,20 @@ sudo apt remove cagents-browserless # browserless package
 ```
 
 APT removal and purge do not delete files in the user's XDG directories.
+
+Repeatable upgrade-policy checks:
+
+```sh
+cargo test --locked --no-default-features --test installer_lifecycle_contract
+scripts/smoke-package-upgrades
+```
+
+The second command requires Bubblewrap and `dpkg`, and uses an unprivileged,
+networkless root filesystem with fixture executable processes, including an
+unlinked old executable. It installs/upgrades/removes fixture Debian packages
+using the generated maintainer-script contract, checks mixed-generation
+interruption, and preserves unrelated files and fixture user data. It does not
+signal the host daemon or install a package on the host.
 
 ## Releases
 
