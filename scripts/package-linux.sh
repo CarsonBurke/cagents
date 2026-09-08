@@ -144,6 +144,12 @@ for binary in cagents cagents-ui cagentsd; do
     [ -x "$TARGET_DIR/release/$binary" ] || fail "missing release binary: $TARGET_DIR/release/$binary"
 done
 
+PROTOCOL_VERSION=$("$TARGET_DIR/release/cagents" daemon protocol-version) \
+    || fail 'cannot inspect packaged daemon protocol'
+case $PROTOCOL_VERSION in
+    ''|*[!0-9]*) fail 'packaged CLI returned an invalid daemon protocol version' ;;
+esac
+
 WORK_DIR=$(mktemp -d "${TMPDIR:-/tmp}/cagents-package.XXXXXX")
 cleanup() {
     rm -rf "$WORK_DIR"
@@ -228,6 +234,10 @@ install -m 0755 "$BIN_DIR/cagents" "$DEB_ROOT/usr/libexec/$PACKAGE_NAME/cagents"
 install -m 0755 "$BIN_DIR/cagents-ui" "$DEB_ROOT/usr/libexec/$PACKAGE_NAME/cagents-ui"
 install -m 0755 "$BIN_DIR/cagentsd" "$DEB_ROOT/usr/libexec/$PACKAGE_NAME/cagentsd"
 install -m 0644 "$BIN_DIR/.cagents-ui-lease-v1" "$DEB_ROOT/usr/libexec/$PACKAGE_NAME/.cagents-ui-lease-v1"
+DAEMON_DIGEST=$(sha256sum "$DEB_ROOT/usr/libexec/$PACKAGE_NAME/cagentsd")
+DAEMON_DIGEST=${DAEMON_DIGEST%% *}
+printf '%s %s\n' "$PROTOCOL_VERSION" "$DAEMON_DIGEST" > "$DEB_ROOT/usr/libexec/$PACKAGE_NAME/.cagents-daemon-protocol"
+chmod 0644 "$DEB_ROOT/usr/libexec/$PACKAGE_NAME/.cagents-daemon-protocol"
 ln -s "../libexec/$PACKAGE_NAME/cagents" "$DEB_ROOT/usr/bin/$COMMAND_NAME"
 sed \
     -e "s|^Exec=.*|Exec=/usr/bin/$COMMAND_NAME ui|" \
@@ -258,133 +268,16 @@ Priority: optional
 Description: $PACKAGE_SUMMARY
 $PACKAGE_DESCRIPTION
 EOF
-cat > "$DEB_ROOT/DEBIAN/preinst" <<'EOF'
-#!/bin/sh
-set -e
-other_status=$(dpkg-query -W -f='${db:Status-Status}' '@OTHER_PACKAGE@' 2>/dev/null || :)
-own_daemon=/usr/libexec/@PACKAGE_NAME@/cagentsd
-other_daemon=/usr/libexec/@OTHER_PACKAGE@/cagentsd
-
-is_cagentsd_pid() {
-    pid=$1
-    case $pid in
-        ''|*[!0-9]*) return 1 ;;
-    esac
-    executable=$(readlink "/proc/$pid/exe" 2>/dev/null) || return 1
-    case $executable in
-        "$own_daemon"|"$own_daemon (deleted)") return 0 ;;
-    esac
-    if [ "$other_status" != installed ]; then
-        case $executable in
-            "$other_daemon"|"$other_daemon (deleted)") return 0 ;;
-        esac
-    fi
-    return 1
-}
-
-stop_cagentsd() {
-    cagentsd_pids=
-    for process in /proc/[0-9]*; do
-        pid=${process##*/}
-        if is_cagentsd_pid "$pid"; then
-            cagentsd_pids="$cagentsd_pids $pid"
-        fi
-    done
-
-    for pid in $cagentsd_pids; do
-        if is_cagentsd_pid "$pid"; then
-            kill -TERM "$pid" 2>/dev/null || :
-        fi
-    done
-
-    waited=0
-    while :; do
-        remaining_pids=
-        for pid in $cagentsd_pids; do
-            if is_cagentsd_pid "$pid"; then
-                remaining_pids="$remaining_pids $pid"
-            fi
-        done
-        [ -n "$remaining_pids" ] || return 0
-        if [ "$waited" -ge 30 ]; then
-            printf '%s\n' 'cagents: timed out waiting for cagentsd to stop' >&2
-            return 1
-        fi
-        sleep 1
-        waited=$((waited + 1))
-        cagentsd_pids=$remaining_pids
-    done
-}
-
-stop_cagentsd
-exit 0
-EOF
-cat > "$DEB_ROOT/DEBIAN/prerm" <<'EOF'
-#!/bin/sh
-set -e
-other_status=$(dpkg-query -W -f='${db:Status-Status}' '@OTHER_PACKAGE@' 2>/dev/null || :)
-own_daemon=/usr/libexec/@PACKAGE_NAME@/cagentsd
-other_daemon=/usr/libexec/@OTHER_PACKAGE@/cagentsd
-
-is_cagentsd_pid() {
-    pid=$1
-    case $pid in
-        ''|*[!0-9]*) return 1 ;;
-    esac
-    executable=$(readlink "/proc/$pid/exe" 2>/dev/null) || return 1
-    case $executable in
-        "$own_daemon"|"$own_daemon (deleted)") return 0 ;;
-    esac
-    if [ "$other_status" != installed ]; then
-        case $executable in
-            "$other_daemon"|"$other_daemon (deleted)") return 0 ;;
-        esac
-    fi
-    return 1
-}
-
-stop_cagentsd() {
-    cagentsd_pids=
-    for process in /proc/[0-9]*; do
-        pid=${process##*/}
-        if is_cagentsd_pid "$pid"; then
-            cagentsd_pids="$cagentsd_pids $pid"
-        fi
-    done
-
-    for pid in $cagentsd_pids; do
-        if is_cagentsd_pid "$pid"; then
-            kill -TERM "$pid" 2>/dev/null || :
-        fi
-    done
-
-    waited=0
-    while :; do
-        remaining_pids=
-        for pid in $cagentsd_pids; do
-            if is_cagentsd_pid "$pid"; then
-                remaining_pids="$remaining_pids $pid"
-            fi
-        done
-        [ -n "$remaining_pids" ] || return 0
-        if [ "$waited" -ge 30 ]; then
-            printf '%s\n' 'cagents: timed out waiting for cagentsd to stop' >&2
-            return 1
-        fi
-        sleep 1
-        waited=$((waited + 1))
-        cagentsd_pids=$remaining_pids
-    done
-}
-
-stop_cagentsd
-exit 0
-EOF
-sed -i \
-    -e "s|@PACKAGE_NAME@|$PACKAGE_NAME|g" \
-    -e "s|@OTHER_PACKAGE@|$OTHER_PACKAGE|g" \
-    "$DEB_ROOT/DEBIAN/preinst" "$DEB_ROOT/DEBIAN/prerm"
-chmod 0755 "$DEB_ROOT/DEBIAN/preinst" "$DEB_ROOT/DEBIAN/prerm"
+for phase in preinst prerm; do
+    case $phase in preinst) mode=upgrade ;; prerm) mode=remove ;; esac
+    sed \
+        -e "s|@MODE@|$mode|g" \
+        -e "s|@PACKAGE_NAME@|$PACKAGE_NAME|g" \
+        -e "s|@OTHER_PACKAGE@|$OTHER_PACKAGE|g" \
+        -e "s|@PROTOCOL_VERSION@|$PROTOCOL_VERSION|g" \
+        "$ROOT_DIR/packaging/cagents-package-lifecycle" > "$DEB_ROOT/DEBIAN/$phase"
+    chmod 0755 "$DEB_ROOT/DEBIAN/$phase"
+done
 find "$DEB_ROOT" -exec touch -h -d "@$SOURCE_DATE_EPOCH" {} +
 
 SOURCE_DATE_EPOCH=$SOURCE_DATE_EPOCH dpkg-deb --root-owner-group --build "$DEB_ROOT" "$DIST_DIR/$DEB_NAME"

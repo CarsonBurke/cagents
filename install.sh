@@ -152,8 +152,8 @@ stop_daemon_and_wait() {
         *) fail 'cannot verify daemon status; installation was not changed' ;;
     esac
 
-    "$daemon_cli" daemon stop >/dev/null 2>&1 \
-        || fail 'daemon did not accept the stop request; installation was not changed'
+    "$daemon_cli" daemon stop --require-empty >/dev/null \
+        || fail 'daemon was not stopped: finish terminals or explicitly confirm their termination with cagents daemon stop --confirm, then retry; installation was not changed'
 
     daemon_wait=30
     while [ "$daemon_wait" -gt 0 ]; do
@@ -637,10 +637,21 @@ ensure_link() {
 
 
 if [ "$HAD_CURRENT" -eq 1 ]; then
-    read_daemon_status "$PREFIX/current/bin/cagents"
-    [ "$DAEMON_STATUS" != running ] || OLD_DAEMON_WAS_RUNNING=1
-    stop_daemon_and_wait "$PREFIX/current/bin/cagents"
-    DAEMON_STOPPED_FOR_SWITCH=1
+    # The candidate handshake proves protocol compatibility without changing the
+    # running process. Never stop compatible PTYs merely to replace executables.
+    read_daemon_status "$NEW_VERSION_DIR/bin/cagents"
+    case $DAEMON_STATUS in
+        running)
+            OLD_DAEMON_WAS_RUNNING=1
+            ;;
+        stopped) ;;
+        *)
+            read_daemon_status "$PREFIX/current/bin/cagents"
+            [ "$DAEMON_STATUS" != running ] || OLD_DAEMON_WAS_RUNNING=1
+            stop_daemon_and_wait "$PREFIX/current/bin/cagents"
+            DAEMON_STOPPED_FOR_SWITCH=1
+            ;;
+    esac
 fi
 CURRENT_TEMP=$PREFIX/.current.$$
 rm -f "$CURRENT_TEMP"
