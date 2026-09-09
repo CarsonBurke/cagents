@@ -1,6 +1,15 @@
+mod activity_ui;
 mod chrome_ui;
+mod daemon_stop;
+#[cfg(feature = "latency-harness")]
+mod latency_ui;
+#[cfg(test)]
+mod safety_tests;
 mod settings_ui;
+mod terminal_close;
+mod worktree_operations;
 mod worktree_ui;
+pub use daemon_stop::run_daemon_stop_confirmation;
 use settings_ui::settings_dialog;
 
 use std::{
@@ -36,8 +45,8 @@ use url::Url;
 use crate::{
     design::{self, DockLayout, InspectorLayout},
     github::{
-        CreatePullRequestRequest, GitHubRepoKey, GitHubService, ListPullRequestsRequest,
-        PullRequest, PullRequestCheck, PullRequestCreationOutcome, PullRequestStateFilter,
+        CreatePullRequestRequest, GitHubAvailability, GitHubRepoKey, GitHubService,
+        ListPullRequestsRequest, PullRequestCreationOutcome, PullRequestStateFilter,
     },
     inspector::{self, InspectorAction, RuntimeStatus as InspectorRuntimeStatus},
     instance,
@@ -1032,8 +1041,7 @@ pub struct LoadedRepository {
     project: ProjectState,
     repository: RepositoryInfo,
     worktrees: Vec<(WorktreeRecord, Option<StatusSnapshot>)>,
-    github_repository: Option<GitHubRepoKey>,
-    pull_requests: Vec<(PullRequest, Vec<PullRequestCheck>)>,
+    github: GitHubAvailability,
 }
 
 type BootstrapResult = (
@@ -1059,6 +1067,8 @@ struct WorktreeDialog {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PullRequestDialog {
     repository: GitHubRepoKey,
+    project_id: ProjectId,
+    refresh_generation: u64,
     base: String,
     head: String,
     title: String,
@@ -1390,6 +1400,7 @@ fn completion_navigates(message: &Message) -> bool {
         Message::RepositoryLoaded {
             open_cards: true,
             result: Ok(_),
+            ..
         } | Message::WorktreeCreated {
             result: Ok(WorktreeCreationOutcome::Created { .. }),
             ..
@@ -1808,6 +1819,8 @@ pub enum Message {
     RepositorySelected(Result<PathBuf, String>),
     RepositoryLoaded {
         open_cards: bool,
+        project_id: ProjectId,
+        generation: u64,
         result: Result<Box<LoadedRepository>, String>,
     },
     Repository(RepositoryAction),
@@ -1821,14 +1834,33 @@ pub enum Message {
     CloseCard(CardId),
     WindowCloseRequested(window::Id),
     CommitClose(CardId),
+    ConfirmTerminalClose,
+    CancelTerminalClose,
+    TerminalCloseFinished {
+        card: CardId,
+        terminal: TerminalId,
+        proof: HostSessionProof,
+        outcome: terminal_close::CloseOutcome,
+    },
     SaveAndCloseRepository(CardId),
     OverwriteAndCloseRepository(CardId),
     DiscardAndCloseRepository(CardId),
     CancelRepositoryClose,
     Viewport(WorkspaceViewportEvent),
     Pan(PanGesture),
+    #[cfg(feature = "latency-harness")]
+    LatencyRedraw {
+        generation: crate::performance::Generation,
+        at: Instant,
+    },
+    #[cfg(feature = "latency-harness")]
+    LatencyFixtureStep,
     Wheel(WheelDelta),
     Frame(Instant),
+    TerminalActivityExpired {
+        card: CardId,
+        timer: crate::model::TerminalActivityTimer,
+    },
     LifecycleSweep,
     /// A sweep timer fired, carrying the generation it was armed for; a
     /// generation that has since been superseded is discarded.
@@ -1887,6 +1919,14 @@ pub enum Message {
     WorktreeBaseChanged(String),
     WorktreeDestinationChanged(String),
     SubmitWorktree,
+    WorktreeProgress(crate::repository::WorktreeProgressEvent),
+    WorktreeElapsed,
+    WorktreeOperationFinished {
+        operation: crate::model::OperationId,
+        generation: u64,
+        result: Result<crate::repository::WorktreeOperationReport, String>,
+    },
+    WorktreeOperationsRehydrated(Result<Vec<crate::repository::WorktreeOperationReport>, String>),
     WorktreeCreated {
         project_id: ProjectId,
         repository: PathBuf,
@@ -2297,12 +2337,21 @@ pub struct Cagents {
     sidebar_state: SidebarState,
     active_workspace: Option<PathBuf>,
     worktree_focus: HashMap<PathBuf, CardId>,
-    github_repositories: HashMap<ProjectId, GitHubRepoKey>,
+    github_availability: HashMap<ProjectId, GitHubAvailability>,
+    repository_generations: HashMap<ProjectId, u64>,
     worktree_dialog: Option<WorktreeDialog>,
     pull_request_dialog: Option<PullRequestDialog>,
     /// Opening or dismissing a newer draft supersedes in-flight draft recovery.
     pull_request_dialog_generation: u64,
     dirty_repository_close: Option<DirtyRepositoryClose>,
+    terminal_close: Option<terminal_close::CloseIntent>,
+    terminal_close_attempts: HashSet<TerminalId>,
+    closed_terminal_cards: HashSet<CardId>,
+    uncertain_terminal_proofs: HashMap<CardId, HostSessionProof>,
+    terminal_activity: HashMap<CardId, activity_ui::ActivityPresentation>,
+    activity_origin: Instant,
+    worktree_operations:
+        HashMap<crate::model::OperationId, worktree_operations::ActiveWorktreeOperation>,
     /// A source-control navigation waiting for its repository card to finish
     /// listing files.
     ///
@@ -2315,6 +2364,12 @@ pub struct Cagents {
     pending_panel_open: Option<PendingPanelOpen>,
     deferred_navigation: VecDeque<Message>,
     frame_clock: FrameClock,
+    latency: crate::performance::InteractionLatency,
+    latency_focus: Option<CardId>,
+    #[cfg(feature = "latency-harness")]
+    latency_fixture: Option<crate::latency_fixture::Fixture>,
+    #[cfg(feature = "latency-harness")]
+    latency_fixture_started: bool,
     inspector: Option<Inspector>,
     inspector_transition: Option<InspectorTransition>,
     context_inspector_open: bool,
@@ -2449,17 +2504,39 @@ impl Cagents {
     }
 
     fn repository_load_task(
+        &mut self,
         path: PathBuf,
         project_id: Option<ProjectId>,
         open_cards: bool,
     ) -> Task<Message> {
+        let project_id = project_id.unwrap_or_default();
+        let generation = self.repository_generations.entry(project_id).or_default();
+        *generation = generation.wrapping_add(1);
+        let generation = *generation;
+        self.github_availability
+            .insert(project_id, GitHubAvailability::Loading);
+        if let Some(project) = self
+            .sidebar_model
+            .projects
+            .iter_mut()
+            .find(|project| project.id == project_id)
+        {
+            project.github_status = GitHubAvailability::Loading.label().into();
+            project.revoke_github();
+        }
         cosmic::task::future(async move {
-            let result = tokio::task::spawn_blocking(move || load_repository(&path, project_id))
-                .await
-                .map_err(|error| format!("repository loader join failed: {error}"))
-                .and_then(|result| result)
-                .map(Box::new);
-            Message::RepositoryLoaded { open_cards, result }
+            let result =
+                tokio::task::spawn_blocking(move || load_repository(&path, Some(project_id)))
+                    .await
+                    .map_err(|error| format!("repository loader join failed: {error}"))
+                    .and_then(|result| result)
+                    .map(Box::new);
+            Message::RepositoryLoaded {
+                open_cards,
+                project_id,
+                generation,
+                result,
+            }
         })
     }
 
@@ -3099,8 +3176,8 @@ impl Cagents {
     fn fail_runtime(&mut self, card: CardId, message: String) {
         self.retire_lsp_card(card);
         match self.cards.remove(&card) {
-            Some(CardRuntime::Terminal(handle)) => {
-                self.begin_terminal_teardown(handle);
+            Some(CardRuntime::Terminal(_handle)) => {
+                // A failed or unreachable surface is not authority to terminate its PTY.
             }
             #[cfg(feature = "integrated-browser")]
             Some(CardRuntime::Browser(browser)) => {
@@ -3607,6 +3684,7 @@ impl Cagents {
         };
         let mut durable_changed = false;
         if let Some(proof) = proof {
+            self.uncertain_terminal_proofs.remove(&card);
             let live = TerminalContinuity::Live {
                 host_session_id: proof.host_session_id,
                 boot_id: proof.boot_id,
@@ -3646,6 +3724,12 @@ impl Cagents {
                 }
                 TerminalEvent::Error { operation, message } => {
                     let message = format!("terminal {operation}: {message}");
+                    if operation == "connect to cagents daemon"
+                        && let Some(proof) = terminal_continuity(self.card_state(card))
+                            .and_then(TerminalContinuity::live_proof)
+                    {
+                        self.uncertain_terminal_proofs.insert(card, proof);
+                    }
                     if operation == "connect to cagents daemon"
                         && let Some(state) = self.card_state_mut(card)
                         && let CardKind::Terminal(session) = &mut state.kind
@@ -3847,6 +3931,16 @@ impl Cagents {
             _ => None,
         });
         let header = self.column_header(id, focused);
+        let header: Element<'a, Message> =
+            if matches!(card.map(|card| &card.kind), Some(CardKind::Terminal(_))) {
+                widget::column::with_children(vec![
+                    header,
+                    widget::text::caption(self.terminal_activity_label(id)).into(),
+                ])
+                .into()
+            } else {
+                header
+            };
 
         #[cfg(feature = "integrated-browser")]
         let browser_toolbar: Option<Element<'a, Message>> = browser_session.map(|session| {
@@ -4216,7 +4310,7 @@ impl Cagents {
             }),
             CardKind::Browser(session) => self.sidebar_model.projects.iter().find_map(|project| {
                 project
-                    .pull_requests
+                    .display_pull_requests()
                     .iter()
                     .find(|pull_request| pull_request.url == session.current_url)
                     .map(|pull_request| SidebarAction::OpenPullRequest {
@@ -4232,7 +4326,7 @@ impl Cagents {
                     .find(|project| project.repository == view.repository)
                     .and_then(|project| {
                         project
-                            .pull_requests
+                            .display_pull_requests()
                             .iter()
                             .find(|pull_request| pull_request.number == number)
                             .map(|pull_request| SidebarAction::OpenPullRequest {
@@ -5050,6 +5144,7 @@ impl Cagents {
             || self.worktree_dialog.is_some()
             || self.pull_request_dialog.is_some()
             || self.dirty_repository_close.is_some()
+            || self.terminal_close.is_some()
             // Mounted by `dialog` from the sidebar's own state, so nothing
             // beneath it can learn about it any other way. Leaving it out is
             // how the one dialog that is on screen *because* it is about to
@@ -5792,6 +5887,8 @@ impl Application for Cagents {
     }
 
     fn init(core: Core, activation_rx: Self::Flags) -> (Self, Task<Message>) {
+        #[cfg(feature = "latency-harness")]
+        let latency_fixture = crate::latency_fixture::Fixture::from_env();
         let (
             durable,
             session,
@@ -5802,7 +5899,16 @@ impl Application for Cagents {
             settings_write_blocked,
             status,
             save_health,
-        ) = Self::bootstrap();
+        ) = {
+            #[cfg(feature = "latency-harness")]
+            if latency_fixture.is_some() {
+                Self::fixture_bootstrap()
+            } else {
+                Self::bootstrap()
+            }
+            #[cfg(not(feature = "latency-harness"))]
+            Self::bootstrap()
+        };
         let sidebar_projects = projects
             .iter()
             .filter(|project| project.existence.is_open())
@@ -5870,14 +5976,28 @@ impl Application for Cagents {
             sidebar_state: SidebarState::default(),
             active_workspace: None,
             worktree_focus: HashMap::new(),
-            github_repositories: HashMap::new(),
+            github_availability: HashMap::new(),
+            repository_generations: HashMap::new(),
             worktree_dialog: None,
             pull_request_dialog: None,
             pull_request_dialog_generation: 0,
             dirty_repository_close: None,
+            terminal_close: None,
+            terminal_close_attempts: HashSet::new(),
+            closed_terminal_cards: HashSet::new(),
+            uncertain_terminal_proofs: HashMap::new(),
+            terminal_activity: HashMap::new(),
+            activity_origin: Instant::now(),
+            worktree_operations: HashMap::new(),
             pending_panel_open: None,
             deferred_navigation: VecDeque::new(),
             frame_clock: FrameClock::default(),
+            latency: crate::performance::InteractionLatency::default(),
+            latency_focus: None,
+            #[cfg(feature = "latency-harness")]
+            latency_fixture,
+            #[cfg(feature = "latency-harness")]
+            latency_fixture_started: false,
             inspector: None,
             inspector_transition: None,
             context_inspector_open: true,
@@ -5924,9 +6044,30 @@ impl Application for Cagents {
         let _ = app
             .workspace
             .resize_viewport((app.window_width - sidebar_width - inspector_width).max(0.0));
+        #[cfg(feature = "latency-harness")]
+        if app.latency_fixture.is_some() {
+            app.cards = app
+                .durable
+                .cards
+                .iter()
+                .map(|card| {
+                    (
+                        card.id,
+                        CardRuntime::Failed(
+                            "Synthetic latency workload; no terminal process".into(),
+                        ),
+                    )
+                })
+                .collect();
+            app.lifecycle = LifecycleManager::new(LifecycleBudget::default());
+            app.context_inspector_open = false;
+            let chrome = app.sync_chrome();
+            return (app, chrome);
+        }
         let scope = app.restore_worktree_scope();
         let mut tasks = vec![
             scope,
+            app.rehydrate_worktree_operations(),
             app.initialize_runtimes(),
             app.synchronize_appearance(1.0),
         ];
@@ -5942,7 +6083,7 @@ impl Application for Cagents {
                 .into_iter()
                 .filter(|project| project.existence.is_open())
                 .map(|project| {
-                    Self::repository_load_task(project.repository, Some(project.id), false)
+                    app.repository_load_task(project.repository, Some(project.id), false)
                 }),
         );
         let task = Task::batch(tasks);
@@ -6059,8 +6200,23 @@ impl Application for Cagents {
                 self.persist();
                 Task::batch(tasks)
             }
+            Message::TerminalActivityExpired { card, timer } => {
+                self.expire_terminal_activity(card, timer)
+            }
             Message::TerminalWake { card, generation } => {
+                let started =
+                    tracing::enabled!(target: "cagents::terminal_pipeline", tracing::Level::DEBUG)
+                        .then(Instant::now);
                 self.drain_terminal(card, generation);
+                if let Some(started) = started {
+                    let activity_sequence = match self.cards.get(&card) {
+                        Some(CardRuntime::Terminal(handle)) => {
+                            handle.activity().map_or(0, |fact| fact.sequence)
+                        }
+                        _ => 0,
+                    };
+                    tracing::debug!(target: "cagents::terminal_pipeline", stage = "ui_apply", elapsed_ns = started.elapsed().as_nanos() as u64, generation, activity_sequence);
+                }
                 Task::none()
             }
             Message::TerminalError { card: _, message } => {
@@ -6106,7 +6262,7 @@ impl Application for Cagents {
                         .iter()
                         .find(|project| project.repository == path)
                         .map(|project| project.id);
-                    Self::repository_load_task(path, project_id, true)
+                    self.repository_load_task(path, project_id, true)
                 }
                 Err(error) => {
                     if !error.to_ascii_lowercase().contains("cancel") {
@@ -6115,7 +6271,15 @@ impl Application for Cagents {
                     Task::none()
                 }
             },
-            Message::RepositoryLoaded { open_cards, result } => {
+            Message::RepositoryLoaded {
+                open_cards,
+                project_id,
+                generation,
+                result,
+            } => {
+                if self.repository_generations.get(&project_id) != Some(&generation) {
+                    return Task::none();
+                }
                 let mut task = Task::none();
                 match result {
                     Ok(loaded) => {
@@ -6144,31 +6308,43 @@ impl Application for Cagents {
                                 SidebarWorktree::from_repository(record, status.as_ref())
                             })
                             .collect();
-                        let pull_requests = loaded
-                            .pull_requests
-                            .iter()
-                            .map(|(pull_request, checks)| {
-                                SidebarPullRequest::from_github(
-                                    loaded.project.id,
-                                    pull_request,
-                                    checks,
-                                )
-                            })
-                            .collect();
-                        let sidebar_project = SidebarProject::from_repository(
+                        let pull_requests = match &loaded.github {
+                            GitHubAvailability::Ready { pull_requests, .. } => pull_requests
+                                .iter()
+                                .map(|(pull_request, checks)| {
+                                    SidebarPullRequest::from_github(
+                                        loaded.project.id,
+                                        pull_request,
+                                        checks,
+                                    )
+                                })
+                                .collect(),
+                            _ => self
+                                .sidebar_model
+                                .projects
+                                .iter()
+                                .find(|project| project.id == project_id)
+                                .map(|project| project.display_pull_requests().to_vec())
+                                .unwrap_or_default(),
+                        };
+                        let mut sidebar_project = SidebarProject::from_repository(
                             &loaded.project,
                             &loaded.repository,
                             worktrees,
                             pull_requests,
                         );
-                        if let Some(repository) = loaded.github_repository.clone() {
-                            self.github_repositories
-                                .insert(loaded.project.id, repository);
+                        sidebar_project.github_ready = loaded.github.repository_key().is_some();
+                        if !sidebar_project.github_ready {
+                            sidebar_project.revoke_github();
                         }
+                        sidebar_project.github_status = loaded.github.label().into();
+                        self.github_availability
+                            .insert(project_id, loaded.github.clone());
                         self.sidebar_model
                             .projects
                             .retain(|project| project.id != loaded.project.id);
                         self.sidebar_model.projects.push(sidebar_project);
+                        self.sync_worktree_operation_rows();
                         self.sidebar_model.data_state = SidebarDataState::Ready;
                         let worktree = loaded
                             .worktrees
@@ -6180,6 +6356,18 @@ impl Application for Cagents {
                         }
                     }
                     Err(error) => {
+                        let unavailable = GitHubAvailability::Failed {
+                            detail: error.clone(),
+                        };
+                        if let Some(project) = self
+                            .sidebar_model
+                            .projects
+                            .iter_mut()
+                            .find(|project| project.id == project_id)
+                        {
+                            project.github_status = unavailable.label().into();
+                        }
+                        self.github_availability.insert(project_id, unavailable);
                         self.status = Some(TransientNotice::error(error.clone()));
                         finish_repository_load_failure(&mut self.sidebar_model.data_state, error);
                     }
@@ -6258,6 +6446,7 @@ impl Application for Cagents {
                 }
                 self.sidebar_state.apply(&action);
                 match action {
+                    SidebarAction::CancelWorktreeOperation(id) => self.cancel_worktree_operation(id),
                     SidebarAction::OpenRepositoryPicker => {
                         cosmic::task::message(Message::OpenRepository)
                     }
@@ -6302,14 +6491,14 @@ impl Application for Cagents {
                         }
                         self.sidebar_model.data_state = SidebarDataState::Loading;
                         Task::batch(targets.into_iter().map(|(repository, id)| {
-                            Self::repository_load_task(repository, Some(id), false)
+                            self.repository_load_task(repository, Some(id), false)
                         }))
                     }
                     SidebarAction::CreatePullRequest {
                         project_id,
                         worktree,
                     } => {
-                        let Some(repository) = self.github_repositories.get(&project_id).cloned()
+                        let Some(repository) = self.github_availability.get(&project_id).and_then(GitHubAvailability::repository_key).cloned()
                         else {
                             self.status = Some(TransientNotice::warning(
                                 "This repository is not associated with an authenticated GitHub remote",
@@ -6324,6 +6513,8 @@ impl Application for Cagents {
                         self.pull_request_dialog_generation =
                             self.pull_request_dialog_generation.wrapping_add(1);
                         self.pull_request_dialog = Some(PullRequestDialog {
+                            project_id,
+                            refresh_generation: self.repository_generations.get(&project_id).copied().unwrap_or_default(),
                             repository,
                             base: "main".into(),
                             head,
@@ -6549,18 +6740,15 @@ impl Application for Cagents {
                     .collect::<VecDeque<_>>();
                 self.begin_dirty_close(DirtyCloseIntent::Application(window), dirty)
             }
-            Message::CloseCard(id) => match self.workspace.request_close(id) {
-                Ok(handoff) => workspace_widget::focus_handoff_then(
-                    handoff,
-                    widget::Id::new(TOOLBAR_FOCUS_ID),
-                    Message::CommitClose(id),
-                )
-                .map(cosmic::Action::App),
-                Err(error) => {
-                    self.status = Some(TransientNotice::error(error.to_string()));
-                    Task::none()
-                }
-            },
+            Message::CloseCard(id) => self.begin_card_close(id),
+            Message::ConfirmTerminalClose => self.confirm_terminal_close(),
+            Message::CancelTerminalClose => self.cancel_terminal_close(),
+            Message::TerminalCloseFinished {
+                card,
+                terminal,
+                proof,
+                outcome,
+            } => self.terminal_close_finished(card, terminal, proof, outcome),
             Message::SaveAndCloseRepository(id) => match self.cards.get_mut(&id) {
                 Some(CardRuntime::Repository(runtime))
                     if self
@@ -6602,11 +6790,28 @@ impl Application for Cagents {
             }
             Message::CancelRepositoryClose => self.cancel_dirty_close(),
             Message::CommitClose(id) => {
+                if self
+                    .card_state(id)
+                    .is_none_or(|card| !card.existence.is_open())
+                {
+                    return Task::none();
+                }
+                if self.pending_terminal_spawn(id) {
+                    return self.begin_card_close(id);
+                }
+                if terminal_continuity(self.card_state(id))
+                    .and_then(TerminalContinuity::live_proof)
+                    .is_some()
+                    && !self.closed_terminal_cards.contains(&id)
+                {
+                    return self.begin_card_close(id);
+                }
                 self.retire_lsp_card(id);
                 if let Some(runtime) = self.cards.remove(&id) {
                     match runtime {
-                        CardRuntime::Terminal(handle) => {
-                            self.begin_terminal_teardown(handle);
+                        CardRuntime::Terminal(_handle) => {
+                            // Explicit confirmation already obtained the daemon acknowledgement.
+                            // Dropping the surface only detaches; never send a second shutdown.
                         }
                         #[cfg(feature = "integrated-browser")]
                         CardRuntime::Browser(browser) => {
@@ -6854,6 +7059,19 @@ impl Application for Cagents {
                 }
                 Task::none()
             }
+            Message::WorktreeProgress(event) => self.worktree_progress(event),
+            Message::WorktreeElapsed => {
+                self.sync_worktree_operation_rows();
+                Task::none()
+            }
+            Message::WorktreeOperationFinished {
+                operation,
+                generation,
+                result,
+            } => self.finish_worktree_operation(operation, generation, result),
+            Message::WorktreeOperationsRehydrated(result) => {
+                self.restore_worktree_operations(result)
+            }
             Message::SubmitWorktree => {
                 let Some(dialog) = self.worktree_dialog.take() else {
                     return Task::none();
@@ -6876,23 +7094,7 @@ impl Application for Cagents {
                     });
                 match request {
                     Ok(request) => {
-                        let project_id = dialog.project_id;
-                        let repository = dialog.repository;
-                        let submit = cosmic::task::future(async move {
-                            let result = tokio::task::spawn_blocking(move || {
-                                let _ = std::fs::create_dir_all(&request.managed_root);
-                                RepositoryService::system("git")
-                                    .create_worktree(&request, &CancellationToken::default())
-                            })
-                            .await
-                            .map_err(|error| format!("worktree creator join failed: {error}"))
-                            .and_then(|result| result.map_err(|error| error.to_string()));
-                            Message::WorktreeCreated {
-                                project_id,
-                                repository,
-                                result,
-                            }
-                        });
+                        let submit = self.start_worktree_operation(dialog.project_id, request);
                         Task::batch([submit, self.focus_context_overlay_if_exposed()])
                     }
                     Err(error) => {
@@ -6944,7 +7146,7 @@ impl Application for Cagents {
                         return Task::batch([
                             terminal,
                             chrome,
-                            Self::repository_load_task(repository, Some(project_id), false),
+                            self.repository_load_task(repository, Some(project_id), false),
                         ]);
                     }
                     Ok(other) => {
@@ -7005,6 +7207,20 @@ impl Application for Cagents {
                 let Some(dialog) = self.pull_request_dialog.take() else {
                     return Task::none();
                 };
+                if self.repository_generations.get(&dialog.project_id).copied()
+                    != Some(dialog.refresh_generation)
+                    || self
+                        .github_availability
+                        .get(&dialog.project_id)
+                        .and_then(GitHubAvailability::repository_key)
+                        != Some(&dialog.repository)
+                {
+                    self.status = Some(TransientNotice::warning(
+                        "GitHub identity is stale. Refresh and reopen Create pull request.",
+                    ));
+                    self.pull_request_dialog = Some(dialog);
+                    return Task::none();
+                }
                 let request = CreatePullRequestRequest {
                     repository: dialog.repository.clone(),
                     base: dialog.base.clone(),
@@ -7091,6 +7307,9 @@ impl Application for Cagents {
                     self.keyboard_modifiers = *modifiers;
                 }
                 if is_escape_press(&event) {
+                    if self.terminal_close.is_some() {
+                        return self.cancel_terminal_close();
+                    }
                     if self.dirty_repository_close.is_some() {
                         if self.dirty_repository_close.as_ref().is_some_and(|close| {
                             matches!(self.cards.get(&close.card), Some(CardRuntime::Repository(runtime)) if runtime.is_saving())
@@ -7110,6 +7329,9 @@ impl Application for Cagents {
                             InspectorAction::Close,
                         ));
                     }
+                }
+                if is_tab_press(&event).is_some() && self.terminal_close.is_some() {
+                    return self.cycle_terminal_close_focus();
                 }
                 if let Some(backwards) = is_tab_press(&event)
                     && self.dirty_repository_close.is_some()
@@ -7151,10 +7373,29 @@ impl Application for Cagents {
                     None => Task::none(),
                 }
             }
+            #[cfg(feature = "latency-harness")]
+            Message::LatencyRedraw { generation, at } => {
+                if self.latency_focus == self.workspace.focused()
+                    && self.latency.redraw_scheduled(generation, at)
+                {
+                    return self.latency_fixture_step();
+                }
+                Task::none()
+            }
+            #[cfg(feature = "latency-harness")]
+            Message::LatencyFixtureStep => self.latency_fixture_step(),
             Message::FocusAdjacent(direction) => {
+                let previous = self.workspace.focused();
                 self.show_workspace_for_action();
                 match self.workspace.focus_adjacent(direction) {
-                    Ok(update) => self.apply_viewport(update, true, false),
+                    Ok(update) => {
+                        let task = self.apply_viewport(update, true, false);
+                        if previous != self.workspace.focused() {
+                            self.latency.commit(crate::performance::Action::CardFocus);
+                            self.latency_focus = self.workspace.focused();
+                        }
+                        task
+                    }
                     Err(error) => {
                         self.status = Some(TransientNotice::error(error.to_string()));
                         Task::none()
@@ -7298,6 +7539,10 @@ impl Application for Cagents {
                 self.reload_source_control(&key)
             }
         };
+        if self.latency_focus != self.workspace.focused() {
+            self.latency.abandon_pending();
+        }
+        self.refresh_terminal_activity();
         if camera_only {
             return Task::batch([task, self.release_deferred_navigation_if_unblocked()]);
         }
@@ -7310,6 +7555,7 @@ impl Application for Cagents {
     }
 
     fn subscription(&self) -> Subscription<Message> {
+        let operation_subscriptions = self.worktree_progress_subscriptions();
         let mut subscriptions = vec![
             Subscription::run_with(
                 TerminalWakeSource(self.terminal_wake_rx.clone()),
@@ -7356,6 +7602,8 @@ impl Application for Cagents {
             )
             .map(Message::Lsp),
         );
+        subscriptions.extend(operation_subscriptions);
+        subscriptions.extend(self.activity_subscriptions());
         if let Some(window) = self.core.main_window_id()
             && (self.workspace.camera().is_animating() || self.inspector_transition.is_some())
         {
@@ -7377,6 +7625,9 @@ impl Application for Cagents {
     }
 
     fn dialog(&self) -> Option<Element<'_, Message>> {
+        if self.terminal_close.is_some() {
+            return self.terminal_close_dialog();
+        }
         let spacing = cosmic::theme::spacing();
         // First, because a discard is the one dialog on screen precisely
         // because it is about to destroy work that exists nowhere else.
@@ -7596,8 +7847,15 @@ impl Application for Cagents {
                     .into(),
                 widget::button::suggested("Create")
                     .on_press_maybe(
-                        (dialog.retry_confirmation != Some(false))
-                            .then_some(Message::SubmitPullRequest),
+                        (dialog.retry_confirmation != Some(false)
+                            && self.repository_generations.get(&dialog.project_id)
+                                == Some(&dialog.refresh_generation)
+                            && self
+                                .github_availability
+                                .get(&dialog.project_id)
+                                .and_then(GitHubAvailability::repository_key)
+                                == Some(&dialog.repository))
+                        .then_some(Message::SubmitPullRequest),
                     )
                     .into(),
             ])
@@ -7862,15 +8120,26 @@ impl Application for Cagents {
                 .width(Length::Fill)
                 .into()
         };
-        crate::interaction::drive_animation(
+        let surface = crate::interaction::drive_animation(
             surface,
             self.workspace.camera().is_animating() || self.inspector_transition.is_some(),
-        )
+        );
+        #[cfg(feature = "latency-harness")]
+        return latency_ui::instrument(
+            surface,
+            (self.latency_focus == self.workspace.focused())
+                .then(|| self.latency.pending_generation())
+                .flatten(),
+            self.latency_fixture.is_some() && !self.latency_fixture_started,
+        );
+        #[cfg(not(feature = "latency-harness"))]
+        surface
     }
 }
 
 impl Drop for Cagents {
     fn drop(&mut self) {
+        self.latency.abandon_pending();
         self.persist();
         if !self.settings_write_blocked
             && let Some(path) = &self.settings_path
@@ -8009,29 +8278,45 @@ fn load_repository(path: &Path, project_id: Option<ProjectId>) -> Result<LoadedR
         })
         .collect::<Vec<_>>();
     let github = GitHubService::system("gh");
-    let github_repository = github
-        .resolve_repository(&repository.selected_path, &cancellation)
-        .ok();
-    let pull_requests = github_repository
-        .as_ref()
-        .and_then(|repository| {
-            github
-                .list(
-                    &ListPullRequestsRequest {
-                        repository: repository.clone(),
-                        state: PullRequestStateFilter::Open,
-                        limit: sidebar::PULL_REQUEST_LIST_LIMIT,
-                    },
-                    &cancellation,
-                )
-                .ok()
-                .map(|pull_requests| {
-                    let checks =
-                        github.checks_for_pull_requests(repository, &pull_requests, &cancellation);
-                    pull_requests.into_iter().zip(checks).collect::<Vec<_>>()
-                })
+    let github_availability = (|| {
+        let remotes = service
+            .remotes(&repository.selected_path, &cancellation)
+            .map_err(|error| GitHubAvailability::Failed {
+                detail: error.to_string(),
+            })?;
+        if !github
+            .has_associated_remote(&remotes, &cancellation)
+            .map_err(GitHubAvailability::from_error)?
+        {
+            return Err(GitHubAvailability::NotAssociated);
+        }
+        let key = github
+            .resolve_repository(&repository.selected_path, &cancellation)
+            .map_err(GitHubAvailability::from_error)?;
+        let auth = github
+            .auth_status(&key, &cancellation)
+            .map_err(GitHubAvailability::from_error)?;
+        if auth.state != crate::github::GhAuthState::Authenticated {
+            return Err(GitHubAvailability::Unauthenticated);
+        }
+        let pull_requests = github
+            .list(
+                &ListPullRequestsRequest {
+                    repository: key.clone(),
+                    state: PullRequestStateFilter::Open,
+                    limit: sidebar::PULL_REQUEST_LIST_LIMIT,
+                },
+                &cancellation,
+            )
+            .map_err(GitHubAvailability::from_error)?;
+        let checks = github.checks_for_pull_requests(&key, &pull_requests, &cancellation);
+        Ok(GitHubAvailability::Ready {
+            repository_key: key,
+            pull_requests: pull_requests.into_iter().zip(checks).collect(),
+            refreshed_at: unix_millis(),
         })
-        .unwrap_or_default();
+    })()
+    .unwrap_or_else(|unavailable| unavailable);
     let name = repository
         .common_dir
         .parent()
@@ -8048,8 +8333,7 @@ fn load_repository(path: &Path, project_id: Option<ProjectId>) -> Result<LoadedR
         },
         repository,
         worktrees,
-        github_repository,
-        pull_requests,
+        github: github_availability,
     })
 }
 
@@ -9029,6 +9313,8 @@ mod tests {
 
     fn pull_request_test_dialog() -> PullRequestDialog {
         PullRequestDialog {
+            project_id: ProjectId::new(),
+            refresh_generation: 0,
             repository: GitHubRepoKey::new("github.com", None, "owner", "repo").unwrap(),
             base: "release".into(),
             head: "topic/authored-change".into(),
@@ -9037,6 +9323,19 @@ mod tests {
             draft: true,
             retry_confirmation: None,
         }
+    }
+
+    fn authorize_pull_request_test(app: &mut Cagents, dialog: &PullRequestDialog) {
+        app.repository_generations
+            .insert(dialog.project_id, dialog.refresh_generation);
+        app.github_availability.insert(
+            dialog.project_id,
+            GitHubAvailability::Ready {
+                repository_key: dialog.repository.clone(),
+                pull_requests: Vec::new(),
+                refreshed_at: 0,
+            },
+        );
     }
 
     fn pull_request_test_failure(exit_code: i32) -> crate::repository::ProcessFailure {
@@ -9056,6 +9355,7 @@ mod tests {
     fn pull_request_local_rejection_preserves_authored_draft() {
         let mut app = context_inspector_test_app(false);
         let mut dialog = pull_request_test_dialog();
+        authorize_pull_request_test(&mut app, &dialog);
         dialog.title.clear();
         app.pull_request_dialog = Some(dialog.clone());
 
@@ -9074,6 +9374,7 @@ mod tests {
         ] {
             let mut app = context_inspector_test_app(false);
             let dialog = pull_request_test_dialog();
+            authorize_pull_request_test(&mut app, &dialog);
             app.pull_request_dialog = Some(dialog.clone());
 
             // Dropping the task avoids invoking gh; the update transition itself
@@ -9096,6 +9397,7 @@ mod tests {
     fn pull_request_unknown_outcome_keeps_edits_but_requires_reconciliation() {
         let mut app = context_inspector_test_app(false);
         let dialog = pull_request_test_dialog();
+        authorize_pull_request_test(&mut app, &dialog);
         app.pull_request_dialog = Some(dialog.clone());
         let _ = app.update(Message::SubmitPullRequest);
 
@@ -9125,6 +9427,7 @@ mod tests {
     fn pull_request_success_does_not_reopen_submitted_draft() {
         let mut app = context_inspector_test_app(false);
         let dialog = pull_request_test_dialog();
+        authorize_pull_request_test(&mut app, &dialog);
         app.pull_request_dialog = Some(dialog.clone());
         let _ = app.update(Message::SubmitPullRequest);
         let key = crate::github::PullRequestKey::new(dialog.repository.clone(), 45).unwrap();
@@ -9147,12 +9450,20 @@ mod tests {
     fn pull_request_stale_failure_does_not_replace_a_newer_draft() {
         let mut app = context_inspector_test_app(false);
         let dialog = pull_request_test_dialog();
+        authorize_pull_request_test(&mut app, &dialog);
         app.pull_request_dialog = Some(dialog.clone());
         let _ = app.update(Message::SubmitPullRequest);
         let generation = app.pull_request_dialog_generation;
         let project_id = ProjectId::new();
-        app.github_repositories
-            .insert(project_id, dialog.repository.clone());
+        app.repository_generations.insert(project_id, 0);
+        app.github_availability.insert(
+            project_id,
+            GitHubAvailability::Ready {
+                repository_key: dialog.repository.clone(),
+                pull_requests: Vec::new(),
+                refreshed_at: 0,
+            },
+        );
         let _ = app.update(Message::Sidebar(SidebarAction::CreatePullRequest {
             project_id,
             worktree: None,
@@ -9193,6 +9504,7 @@ mod tests {
         for complete_before_cancel in [false, true] {
             let mut app = context_inspector_test_app(false);
             let dialog = pull_request_test_dialog();
+            authorize_pull_request_test(&mut app, &dialog);
             app.pull_request_dialog = Some(dialog.clone());
             let _ = app.update(Message::SubmitPullRequest);
             let completion = Message::PullRequestCreated {
@@ -9393,6 +9705,8 @@ mod tests {
 
         app.inspector = None;
         app.pull_request_dialog = Some(PullRequestDialog {
+            project_id: ProjectId::new(),
+            refresh_generation: 0,
             repository: GitHubRepoKey::new("github.com", None, "owner", "repo").unwrap(),
             base: "main".into(),
             head: "topic".into(),
@@ -9995,6 +10309,28 @@ mod tests {
     fn closing_a_card_retires_everything_it_held_at_the_lsp_boundary() {
         let mut app = lsp_test_app();
         let card = repository_card(&mut app, "/repo");
+        let Some(CardRuntime::Repository(runtime)) = app.cards.get(&card) else {
+            unreachable!()
+        };
+        let descriptor = runtime.descriptor.clone();
+        Arc::make_mut(&mut app.durable).cards.push(CardState {
+            id: card,
+            generation: 0,
+            title: "Repository".into(),
+            width_fraction: 0.7,
+            existence: Existence::Open,
+            exposure: Exposure::Visible,
+            residency: Residency::Hot,
+            kind: CardKind::Repository(descriptor),
+        });
+        app.workspace
+            .add_card(
+                WorkspaceCard::new(card, "Repository", CardWidth::Fraction(0.7)).unwrap(),
+                0,
+                true,
+            )
+            .unwrap();
+        app.workspace.request_close(card).unwrap();
         let state = lsp_state(&mut app, card);
         state.document = Some(LspDocumentId(1));
         state.path = Some(PathBuf::from("/repo/a.rs"));
@@ -10627,19 +10963,33 @@ mod tests {
             window_width: 1_600.0,
             core,
             settings_path: None,
+            uncertain_terminal_proofs: HashMap::new(),
             settings_write_blocked: true,
             sidebar_model: SidebarModel::ready(SidebarMode::Expanded, Vec::new()),
             sidebar_state: SidebarState::default(),
             active_workspace: None,
             worktree_focus: HashMap::new(),
-            github_repositories: HashMap::new(),
+            github_availability: HashMap::new(),
+            repository_generations: HashMap::new(),
             worktree_dialog: None,
             pull_request_dialog: None,
             pull_request_dialog_generation: 0,
             dirty_repository_close: None,
+            terminal_close: None,
+            terminal_close_attempts: HashSet::new(),
+            closed_terminal_cards: HashSet::new(),
+            terminal_activity: HashMap::new(),
+            activity_origin: Instant::now(),
+            worktree_operations: HashMap::new(),
             pending_panel_open: None,
             deferred_navigation: VecDeque::new(),
             frame_clock: FrameClock::default(),
+            latency: crate::performance::InteractionLatency::default(),
+            latency_focus: None,
+            #[cfg(feature = "latency-harness")]
+            latency_fixture: None,
+            #[cfg(feature = "latency-harness")]
+            latency_fixture_started: false,
             inspector: None,
             inspector_transition: None,
             context_inspector_open: true,

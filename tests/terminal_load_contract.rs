@@ -19,9 +19,9 @@ use crossbeam_channel::Receiver as EventReceiver;
 
 const FAILURE_GUARD: Duration = Duration::from_secs(5);
 const CONTROLLED_SHELL: &str = r#"
-printf '\033]0;ready\007READY\n'
+printf 'READY\n\033]0;ready\007'
 while IFS= read -r step; do
-    printf '\033]0;%s\007%s\n' "$step" "$step"
+    printf '%s\n\033]0;%s\007' "$step" "$step"
 done
 "#;
 
@@ -185,15 +185,25 @@ fn visible_wakes_are_bounded_until_acknowledged_and_then_rearm() {
     );
 
     let latest_observed_generation = terminal.snapshot().generation;
-    assert!(latest_observed_generation > rearmed.generation);
-    terminal.acknowledge_redraw(latest_observed_generation);
+    // Capture itself, not just wake delivery, remains bounded by credit.
+    assert_eq!(latest_observed_generation, rearmed.generation);
     send_step(&terminal, "final");
     wait_for_title(&events, "final");
+    // The title follows the output in the fixture, so all final bytes are
+    // parsed before we request the next useful capture.
+    terminal.acknowledge_redraw(latest_observed_generation);
 
     let final_wake = receive_wake(&wakes, "a second acknowledgement did not rearm delivery");
     assert!(final_wake.generation > rearmed.generation);
     assert_eq!(callbacks.load(Ordering::SeqCst), 3);
     assert_no_queued_wake(&wakes, "one output burst must produce one redraw edge");
+    let final_text = snapshot_text(&terminal);
+    for expected in ["READY", "one", "two", "three", "four", "barrier", "final"] {
+        assert!(
+            final_text.contains(expected),
+            "missing {expected:?}: {final_text:?}"
+        );
+    }
 
     terminal
         .shutdown()
@@ -206,22 +216,26 @@ fn hidden_output_updates_terminal_state_without_redraw_until_reveal() {
 
     let initial = receive_wake(&wakes, "initial visible snapshot did not wake");
     wait_for_title(&events, "ready");
+    terminal.acknowledge_redraw(initial.generation);
+    let ready = receive_wake(&wakes, "returning credit did not capture ready output");
+    assert!(snapshot_text(&terminal).contains("READY"));
+    let visible_callbacks = callbacks.load(Ordering::SeqCst);
     terminal.hide().expect("terminal should hide");
     send_step(&terminal, "HIDDEN_ONE");
     wait_for_title(&events, "HIDDEN_ONE");
 
     let hidden_snapshot = terminal.snapshot();
-    assert!(hidden_snapshot.generation >= initial.generation);
+    assert_eq!(hidden_snapshot.generation, ready.generation);
     assert!(snapshot_text(&terminal).contains("READY"));
     terminal.acknowledge_redraw(hidden_snapshot.generation);
-    assert_eq!(callbacks.load(Ordering::SeqCst), 1);
+    assert_eq!(callbacks.load(Ordering::SeqCst), visible_callbacks);
     assert_no_queued_wake(&wakes, "hidden PTY output must not request a redraw");
 
     send_step(&terminal, "HIDDEN_TWO");
     wait_for_title(&events, "HIDDEN_TWO");
     let still_hidden_snapshot = terminal.snapshot();
     assert!(Arc::ptr_eq(&hidden_snapshot, &still_hidden_snapshot));
-    assert_eq!(callbacks.load(Ordering::SeqCst), 1);
+    assert_eq!(callbacks.load(Ordering::SeqCst), visible_callbacks);
     assert_no_queued_wake(
         &wakes,
         "continued hidden PTY consumption must not publish rendering edges",
@@ -235,7 +249,7 @@ fn hidden_output_updates_terminal_state_without_redraw_until_reveal() {
     let revealed_text = snapshot_text(&terminal);
     assert!(revealed_text.contains("HIDDEN_ONE"), "{revealed_text:?}");
     assert!(revealed_text.contains("HIDDEN_TWO"), "{revealed_text:?}");
-    assert_eq!(callbacks.load(Ordering::SeqCst), 2);
+    assert_eq!(callbacks.load(Ordering::SeqCst), visible_callbacks + 1);
     assert_no_queued_wake(&wakes, "one reveal must emit one current-snapshot edge");
 
     terminal

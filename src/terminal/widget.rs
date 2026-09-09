@@ -949,6 +949,9 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for TerminalWidget<Message
             self.handle.acknowledge_redraw(self.snapshot.generation);
             return;
         };
+        let draw_started =
+            tracing::enabled!(target: "cagents::terminal_pipeline", tracing::Level::TRACE)
+                .then(std::time::Instant::now);
         renderer.with_layer(widget_clip, |renderer| {
             renderer.fill_quad(
                 renderer::Quad {
@@ -1065,6 +1068,14 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for TerminalWidget<Message
                 }
             });
         });
+        if let Some(started) = draw_started {
+            // This records CPU draw-command construction, not GPU completion
+            // or compositor presentation/scanout.
+            tracing::trace!(target: "cagents::terminal_pipeline", stage = "draw",
+                generation = self.snapshot.generation,
+                activity_sequence = self.snapshot.activity.map_or(0, |fact| fact.sequence),
+                elapsed_ns = started.elapsed().as_nanos() as u64);
+        }
 
         self.handle.acknowledge_redraw(self.snapshot.generation);
     }

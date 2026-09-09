@@ -3,7 +3,7 @@ use std::{
     fs,
     sync::{Arc, Mutex, Weak},
     thread,
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use crate::{
@@ -14,6 +14,7 @@ use crate::{
     terminal::{RenderSnapshot, TerminalConfig, TerminalEvent, TerminalHandle, TerminalSendError},
     terminal_ipc::{
         PROTOCOL_VERSION, ProtocolError, ProtocolErrorCode, ServerEnvelope, ServerMessage,
+        ShutdownCapability, ShutdownOperation, ShutdownOutcome, ShutdownPreflight,
         TerminalDescriptor, TerminalSnapshot, TerminalSpawnOptions, TerminalVisibility,
         WireTerminalEvent,
     },
@@ -23,6 +24,8 @@ use super::delivery::{DEFAULT_CLIENT_QUEUE_CAPACITY, DeliveryQueue};
 
 const EVENT_REPLAY_CAPACITY: usize = 256;
 const MAX_TERMINALS: usize = 1024;
+const SHUTDOWN_CONFIRMATION_TTL: Duration = Duration::from_secs(60);
+const MAX_SHUTDOWN_CAPABILITIES: usize = 32;
 
 pub(crate) type ClientId = u64;
 pub(crate) type SharedHost = Arc<Mutex<HostState>>;
@@ -31,6 +34,7 @@ pub(crate) struct TerminalRecord {
     session: TerminalSession,
     handle: TerminalHandle,
     running: bool,
+    completion_observed: bool,
     last_exit: Option<TerminalExit>,
     event_sequence: u64,
     events: VecDeque<(u64, WireTerminalEvent)>,
@@ -168,6 +172,9 @@ pub(crate) struct HostState {
     clients: BTreeMap<ClientId, Arc<DeliveryQueue>>,
     subscriptions: Subscriptions,
     shutting_down: bool,
+    shutdown_requested: bool,
+    inventory_generation: u64,
+    shutdown_capabilities: VecDeque<(ShutdownCapability, Instant)>,
 }
 
 impl HostState {
@@ -179,6 +186,9 @@ impl HostState {
             clients: BTreeMap::new(),
             subscriptions: Subscriptions::default(),
             shutting_down: false,
+            shutdown_requested: false,
+            inventory_generation: 0,
+            shutdown_capabilities: VecDeque::new(),
         }
     }
 
@@ -360,6 +370,7 @@ impl HostState {
         };
         Ok(TerminalDescriptor {
             session,
+            activity: record.handle.activity(),
             generation: record.handle.generation(),
             event_sequence: record.event_sequence,
             oldest_event_sequence: record
@@ -394,11 +405,14 @@ impl HostState {
                 false,
             ));
         }
+        self.inventory_generation += 1;
         Ok(())
     }
 
     pub(crate) fn cancel_spawn(&mut self, terminal_id: TerminalId) {
-        self.spawning.remove(&terminal_id);
+        if self.spawning.remove(&terminal_id) {
+            self.inventory_generation += 1;
+        }
     }
 
     pub(crate) fn finish_spawn(
@@ -407,15 +421,24 @@ impl HostState {
         session: TerminalSession,
         handle: TerminalHandle,
         initially_visible: bool,
-    ) -> TerminalDescriptor {
+    ) -> Result<TerminalDescriptor, ProtocolError> {
         let terminal_id = session.id;
-        self.spawning.remove(&terminal_id);
+        self.cancel_spawn(terminal_id);
+        if self.shutting_down {
+            return Err(ProtocolError::new(
+                ProtocolErrorCode::TerminalUnavailable,
+                "the cagents daemon accepted shutdown while this terminal was spawning",
+                false,
+            ));
+        }
+        self.inventory_generation += 1;
         self.terminals.insert(
             terminal_id,
             TerminalRecord {
                 session,
                 handle,
                 running: true,
+                completion_observed: false,
                 last_exit: None,
                 event_sequence: 0,
                 events: VecDeque::new(),
@@ -429,7 +452,6 @@ impl HostState {
         self.subscriptions
             .attach(client_id, terminal_id, visibility);
         self.descriptor(client_id, terminal_id)
-            .expect("newly inserted terminal must have a descriptor")
     }
 
     pub(crate) fn handle(
@@ -453,6 +475,37 @@ impl HostState {
                 ProtocolErrorCode::TerminalUnavailable,
                 format!("terminal {terminal_id} has exited and can only be relaunched"),
                 true,
+            ));
+        }
+        Ok(record.handle.clone())
+    }
+
+    /// Releasing presentation credit is not a process mutation. A shell's exit
+    /// does not imply PTY EOF: descendants may still be producing output.
+    /// Return the handle; acknowledgment may synchronously wake the host and
+    /// must be performed by the caller after releasing the host lock.
+    pub(crate) fn redraw_ack_handle(
+        &self,
+        client_id: ClientId,
+        terminal_id: TerminalId,
+        generation: u64,
+    ) -> Result<TerminalHandle, ProtocolError> {
+        if !self.subscriptions.attached(client_id, terminal_id) {
+            return Err(ProtocolError::new(
+                ProtocolErrorCode::PermissionDenied,
+                format!("client is not attached to terminal {terminal_id}"),
+                false,
+            ));
+        }
+        let record = self
+            .terminals
+            .get(&terminal_id)
+            .ok_or_else(|| not_found(terminal_id))?;
+        if generation > record.handle.generation() {
+            return Err(ProtocolError::new(
+                ProtocolErrorCode::InvalidRequest,
+                "cannot acknowledge a terminal generation that was not published",
+                false,
             ));
         }
         Ok(record.handle.clone())
@@ -515,12 +568,104 @@ impl HostState {
             .collect())
     }
 
+    fn inventory_count(&mut self) -> u64 {
+        let mut count = self.spawning.len() as u64;
+        for record in self.terminals.values_mut() {
+            if !record.completion_observed && record.handle.is_completed() {
+                record.completion_observed = true;
+                self.inventory_generation += 1;
+            }
+            if !record.completion_observed {
+                count += 1;
+            }
+        }
+        count
+    }
+
+    pub(crate) fn shutdown_preflight(
+        &mut self,
+        now: Instant,
+    ) -> Result<ShutdownPreflight, ShutdownOutcome> {
+        if self.shutting_down {
+            return Err(ShutdownOutcome::AlreadyShuttingDown);
+        }
+        if self.shutdown_capabilities.len() == MAX_SHUTDOWN_CAPABILITIES {
+            self.shutdown_capabilities.pop_front();
+        }
+        let live_terminals = self.inventory_count();
+        let capability = ShutdownCapability {
+            proof: self.proof.clone(),
+            token: uuid::Uuid::new_v4().to_string(),
+            inventory_generation: self.inventory_generation,
+            live_terminals,
+            expires_at_unix_ms: unix_time_ms() + SHUTDOWN_CONFIRMATION_TTL.as_millis() as i64,
+        };
+        self.shutdown_capabilities
+            .push_back((capability.clone(), now + SHUTDOWN_CONFIRMATION_TTL));
+        Ok(ShutdownPreflight { capability })
+    }
+
+    /// Call under the host lock: the predicate and spawn fence are indivisible.
+    pub(crate) fn shutdown(
+        &mut self,
+        operation: ShutdownOperation,
+        now: Instant,
+    ) -> ShutdownOutcome {
+        let count = self.inventory_count();
+        let (require_empty, expected_generation) = match operation {
+            ShutdownOperation::Stop {
+                require_empty,
+                expected_generation,
+            } => (require_empty, expected_generation),
+            ShutdownOperation::Confirm { capability } => {
+                if capability.proof != self.proof {
+                    return ShutdownOutcome::DaemonRestarted;
+                }
+                let Some((stored, deadline)) = self
+                    .shutdown_capabilities
+                    .iter()
+                    .find(|(stored, _)| stored.token == capability.token)
+                else {
+                    return ShutdownOutcome::InvalidCapability;
+                };
+                if stored != &capability {
+                    return ShutdownOutcome::InvalidCapability;
+                }
+                if now >= *deadline {
+                    return ShutdownOutcome::Expired;
+                }
+                (false, Some(capability.inventory_generation))
+            }
+            ShutdownOperation::Preflight => return ShutdownOutcome::InvalidCapability,
+        };
+        // A duplicate of an accepted request cannot request termination twice.
+        if self.shutting_down {
+            return ShutdownOutcome::AlreadyShuttingDown;
+        }
+        if expected_generation.is_some_and(|generation| generation != self.inventory_generation) {
+            return ShutdownOutcome::InventoryChanged {
+                current_count: count,
+            };
+        }
+        if require_empty && count != 0 {
+            return ShutdownOutcome::EmptyRequired {
+                current_count: count,
+            };
+        }
+        self.shutting_down = true;
+        ShutdownOutcome::Accepted {
+            live_terminals_before: count,
+            termination_requested: true,
+        }
+    }
+
     pub(crate) fn request_shutdown(&mut self) {
         self.shutting_down = true;
+        self.shutdown_requested = true;
     }
 
     pub(crate) fn is_shutting_down(&self) -> bool {
-        self.shutting_down
+        self.shutdown_requested
     }
 
     pub(crate) fn graceful_shutdown(&mut self) -> (Vec<TerminalHandle>, Vec<Arc<DeliveryQueue>>) {
@@ -585,6 +730,13 @@ pub(crate) fn spawn_terminal(
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
         .finish_spawn(client_id, session, handle, options.initially_visible);
+    let descriptor = match descriptor {
+        Ok(descriptor) => descriptor,
+        Err(error) => {
+            let _ = redraw_handle.shutdown();
+            return Err(error);
+        }
+    };
     // Initial publication can happen before the record is subscribable. Clear
     // that edge after insertion; the Spawn response carries the same snapshot,
     // and later generations can now produce a fresh wake.
@@ -603,6 +755,7 @@ pub(crate) fn spawn_terminal(
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         state.terminals.remove(&terminal_id);
+        state.inventory_generation += 1;
         state.subscriptions.detach(client_id, terminal_id);
         return Err(ProtocolError::new(
             ProtocolErrorCode::Internal,
@@ -677,7 +830,7 @@ fn broadcast_redraw(host: &Weak<Mutex<HostState>>, terminal_id: TerminalId, gene
     let Some(host) = host.upgrade() else {
         return;
     };
-    let (proof, deliveries, handle) = {
+    let (proof, deliveries) = {
         let state = host.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         let deliveries = state
             .subscriptions
@@ -685,18 +838,16 @@ fn broadcast_redraw(host: &Weak<Mutex<HostState>>, terminal_id: TerminalId, gene
             .into_iter()
             .filter_map(|client_id| state.clients.get(&client_id).cloned())
             .collect::<Vec<_>>();
-        let handle = state
-            .terminals
-            .get(&terminal_id)
-            .map(|record| record.handle.clone());
-        (state.proof.clone(), deliveries, handle)
-    };
-    if deliveries.is_empty() {
-        if let Some(handle) = handle {
-            handle.acknowledge_redraw(generation);
+        if deliveries.is_empty() {
+            // Serialize visibility commands with attachment/reveal changes.
+            // Otherwise this Hide could overtake a newly attached UI's Reveal.
+            if let Some(record) = state.terminals.get(&terminal_id) {
+                let _ = record.handle.hide();
+            }
+            return;
         }
-        return;
-    }
+        (state.proof.clone(), deliveries)
+    };
     let envelope = ServerEnvelope {
         version: PROTOCOL_VERSION,
         request_id: None,
@@ -795,8 +946,291 @@ fn not_found(terminal_id: TerminalId) -> ProtocolError {
 
 #[cfg(test)]
 mod tests {
-    use super::Subscriptions;
-    use crate::{model::TerminalId, terminal_ipc::TerminalVisibility};
+    use super::*;
+    use crate::model::{BootId, HostIncarnation, HostSessionId};
+
+    fn test_host() -> HostState {
+        HostState::new(HostSessionProof {
+            host_session_id: HostSessionId::new("test-session"),
+            boot_id: BootId::new("test-boot"),
+            host_incarnation: HostIncarnation::new("test-incarnation"),
+        })
+    }
+
+    fn empty_stop() -> ShutdownOperation {
+        ShutdownOperation::Stop {
+            require_empty: true,
+            expected_generation: None,
+        }
+    }
+
+    #[test]
+    fn leader_exit_preserves_consumption_credit_but_not_process_authority() {
+        let shared = Arc::new(Mutex::new(test_host()));
+        let recipe = crate::model::LaunchRecipe {
+            program: "/bin/cat".into(),
+            arguments: Vec::new(),
+            working_directory: std::path::PathBuf::from("/tmp"),
+            environment: BTreeMap::new(),
+        };
+        let session = TerminalSession {
+            id: TerminalId::new(),
+            launch: recipe.clone(),
+            transcript_path: None,
+            resume_hint: None,
+            continuity: TerminalContinuity::RelaunchAvailable {
+                recipe,
+                last_exit: None,
+            },
+        };
+        let id = session.id;
+        let handle =
+            TerminalHandle::spawn(session.clone(), TerminalConfig::default(), |_| {}).unwrap();
+        {
+            let mut state = shared.lock().unwrap_or_else(|error| error.into_inner());
+            state.reserve_spawn(id).unwrap();
+            state
+                .finish_spawn(1, session, handle.clone(), false)
+                .unwrap();
+        }
+        // The shell-exit event can precede PTY EOF while a descendant owns it.
+        record_event(
+            &Arc::downgrade(&shared),
+            id,
+            TerminalEvent::Exited {
+                exit_code: 0,
+                signal: None,
+            },
+        );
+        let capability = {
+            let mut state = shared.lock().unwrap_or_else(|error| error.into_inner());
+            let generation = handle.generation();
+            assert!(state.redraw_ack_handle(1, id, generation).is_ok());
+            assert_eq!(
+                state.handle(1, id).err().unwrap().code,
+                ProtocolErrorCode::TerminalUnavailable
+            );
+            assert_eq!(
+                state
+                    .redraw_ack_handle(2, id, generation)
+                    .err()
+                    .unwrap()
+                    .code,
+                ProtocolErrorCode::PermissionDenied
+            );
+            assert_eq!(
+                state.redraw_ack_handle(1, id, u64::MAX).err().unwrap().code,
+                ProtocolErrorCode::InvalidRequest
+            );
+            assert_eq!(
+                state.shutdown(empty_stop(), Instant::now()),
+                ShutdownOutcome::EmptyRequired { current_count: 1 }
+            );
+            state.shutdown_preflight(Instant::now()).unwrap().capability
+        };
+        handle.shutdown().unwrap();
+        let mut state = shared.lock().unwrap_or_else(|error| error.into_inner());
+        assert_eq!(
+            state.shutdown(ShutdownOperation::Confirm { capability }, Instant::now()),
+            ShutdownOutcome::InventoryChanged { current_count: 0 }
+        );
+        assert_eq!(
+            state.terminals.len(),
+            1,
+            "completed descriptors remain available as history"
+        );
+        assert_eq!(
+            state.shutdown(empty_stop(), Instant::now()),
+            ShutdownOutcome::Accepted {
+                live_terminals_before: 0,
+                termination_requested: true
+            }
+        );
+    }
+
+    #[test]
+    fn established_terminals_require_confirmation_and_pending_finish_is_rejected() {
+        let now = Instant::now();
+        let mut state = test_host();
+        let recipe = crate::model::LaunchRecipe {
+            program: "/bin/cat".into(),
+            arguments: Vec::new(),
+            working_directory: std::path::PathBuf::from("/tmp"),
+            environment: BTreeMap::new(),
+        };
+        let mut handles = Vec::new();
+        for count in 1..=3 {
+            let session = TerminalSession {
+                id: TerminalId::new(),
+                launch: recipe.clone(),
+                transcript_path: None,
+                resume_hint: None,
+                continuity: TerminalContinuity::RelaunchAvailable {
+                    recipe: recipe.clone(),
+                    last_exit: None,
+                },
+            };
+            state.reserve_spawn(session.id).unwrap();
+            let handle =
+                TerminalHandle::spawn(session.clone(), TerminalConfig::default(), |_| {}).unwrap();
+            handles.push(handle.clone());
+            state.finish_spawn(1, session, handle, false).unwrap();
+            assert_eq!(
+                state.shutdown(empty_stop(), now),
+                ShutdownOutcome::EmptyRequired {
+                    current_count: count
+                }
+            );
+        }
+        let pending = TerminalSession {
+            id: TerminalId::new(),
+            launch: recipe.clone(),
+            transcript_path: None,
+            resume_hint: None,
+            continuity: TerminalContinuity::RelaunchAvailable {
+                recipe,
+                last_exit: None,
+            },
+        };
+        state.reserve_spawn(pending.id).unwrap();
+        let capability = state.shutdown_preflight(now).unwrap().capability;
+        assert_eq!(capability.live_terminals, 4);
+        assert_eq!(
+            state.shutdown(ShutdownOperation::Confirm { capability }, now),
+            ShutdownOutcome::Accepted {
+                live_terminals_before: 4,
+                termination_requested: true
+            }
+        );
+        let pending_handle =
+            TerminalHandle::spawn(pending.clone(), TerminalConfig::default(), |_| {}).unwrap();
+        assert!(
+            state
+                .finish_spawn(1, pending, pending_handle.clone(), false)
+                .is_err()
+        );
+        assert_eq!(state.terminals.len(), 3);
+        pending_handle.shutdown().unwrap();
+        for handle in handles {
+            handle.shutdown().unwrap();
+        }
+    }
+
+    #[test]
+    fn shutdown_reservations_and_spawn_fence_are_atomic() {
+        let now = Instant::now();
+        let mut empty = test_host();
+        assert_eq!(
+            empty.shutdown(empty_stop(), now),
+            ShutdownOutcome::Accepted {
+                live_terminals_before: 0,
+                termination_requested: true
+            }
+        );
+        assert!(empty.reserve_spawn(TerminalId::new()).is_err());
+        assert_eq!(
+            empty.shutdown(empty_stop(), now),
+            ShutdownOutcome::AlreadyShuttingDown
+        );
+        for count in [1, 7] {
+            let mut state = test_host();
+            for _ in 0..count {
+                state.reserve_spawn(TerminalId::new()).unwrap();
+            }
+            assert_eq!(
+                state.shutdown(empty_stop(), now),
+                ShutdownOutcome::EmptyRequired {
+                    current_count: count
+                }
+            );
+            assert!(!state.shutting_down);
+        }
+    }
+
+    #[test]
+    fn shutdown_capabilities_detect_inventory_aba_expiry_tampering_and_restart() {
+        let now = Instant::now();
+        let mut state = test_host();
+        let capability = state.shutdown_preflight(now).unwrap().capability;
+        let terminal_id = TerminalId::new();
+        state.reserve_spawn(terminal_id).unwrap();
+        state.cancel_spawn(terminal_id);
+        assert_eq!(
+            state.shutdown(ShutdownOperation::Confirm { capability }, now),
+            ShutdownOutcome::InventoryChanged { current_count: 0 }
+        );
+        let capability = state.shutdown_preflight(now).unwrap().capability;
+        assert_eq!(
+            state.shutdown(
+                ShutdownOperation::Confirm {
+                    capability: capability.clone()
+                },
+                now + SHUTDOWN_CONFIRMATION_TTL
+            ),
+            ShutdownOutcome::Expired
+        );
+        let mut tampered = capability.clone();
+        tampered.live_terminals = 500;
+        assert_eq!(
+            state.shutdown(
+                ShutdownOperation::Confirm {
+                    capability: tampered
+                },
+                now
+            ),
+            ShutdownOutcome::InvalidCapability
+        );
+        let mut restarted = test_host();
+        restarted.proof.host_incarnation = HostIncarnation::new("new-incarnation");
+        assert_eq!(
+            restarted.shutdown(
+                ShutdownOperation::Confirm {
+                    capability: capability.clone()
+                },
+                now
+            ),
+            ShutdownOutcome::DaemonRestarted
+        );
+        assert!(matches!(
+            state.shutdown(
+                ShutdownOperation::Confirm {
+                    capability: capability.clone()
+                },
+                now
+            ),
+            ShutdownOutcome::Accepted { .. }
+        ));
+        assert_eq!(
+            state.shutdown(ShutdownOperation::Confirm { capability }, now),
+            ShutdownOutcome::AlreadyShuttingDown
+        );
+    }
+
+    #[test]
+    fn concurrent_reservation_and_empty_stop_have_only_safe_orderings() {
+        for spawn_first in [false, true] {
+            let host = Arc::new(Mutex::new(test_host()));
+            let (release, wait) = std::sync::mpsc::channel();
+            let other = Arc::clone(&host);
+            let worker = thread::spawn(move || {
+                wait.recv().unwrap();
+                other.lock().unwrap().reserve_spawn(TerminalId::new())
+            });
+            if spawn_first {
+                release.send(()).unwrap();
+                worker.join().unwrap().unwrap();
+                assert_eq!(
+                    host.lock().unwrap().shutdown(empty_stop(), Instant::now()),
+                    ShutdownOutcome::EmptyRequired { current_count: 1 }
+                );
+            } else {
+                let outcome = host.lock().unwrap().shutdown(empty_stop(), Instant::now());
+                release.send(()).unwrap();
+                assert!(matches!(outcome, ShutdownOutcome::Accepted { .. }));
+                assert!(worker.join().unwrap().is_err());
+            }
+        }
+    }
 
     #[test]
     fn disconnect_drops_only_attachments_and_allows_reconnect() {

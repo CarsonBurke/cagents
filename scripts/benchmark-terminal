@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+set -euo pipefail
+root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+cd "$root"
+# Synthetic demand drives real PTY parsing/capture. --socket PATH additionally
+# uses the matched running daemon and production reusable IPC connection.
+# --emit MODE runs only the output generator, including inside the native UI.
+# Enable stage timing separately: RUST_LOG=cagents::terminal_pipeline=trace.
+exec cargo run --release --locked --no-default-features --features host --example terminal-workload -- "$@"

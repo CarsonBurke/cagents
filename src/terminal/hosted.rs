@@ -23,9 +23,9 @@ use super::{
     KeyInput, MouseInput, RenderSnapshot, TerminalEvent, TerminalSendError, TerminalSize,
     TerminalWake,
     ipc::{
-        ClientEnvelope, ClientRequest, FrameError, PROTOCOL_VERSION, ProtocolError,
-        ProtocolErrorCode, ResumeCursor, ServerEnvelope, ServerMessage, ServerResponse,
-        TerminalScroll, TerminalSnapshot, TerminalSpawnOptions, TerminalVisibility,
+        ClientEnvelope, ClientRequest, FrameCodec, FrameError, MAX_FRAME_BYTES, PROTOCOL_VERSION,
+        ProtocolError, ProtocolErrorCode, ResumeCursor, ServerEnvelope, ServerMessage,
+        ServerResponse, TerminalScroll, TerminalSnapshot, TerminalSpawnOptions, TerminalVisibility,
         WireTerminalSize, daemon_socket_path, read_frame, write_frame,
     },
 };
@@ -123,6 +123,8 @@ struct HostedPublishedState {
     snapshot: ArcSwap<RenderSnapshot>,
     generation: AtomicU64,
     event_sequence: AtomicU64,
+    activity: Mutex<Option<crate::model::TerminalOutputActivity>>,
+    activity_current: AtomicBool,
     acknowledged_generation: AtomicU64,
     acknowledgement_tx: Sender<()>,
     acknowledgement_rx: Receiver<()>,
@@ -144,6 +146,8 @@ impl HostedPublishedState {
             snapshot: ArcSwap::from_pointee(RenderSnapshot::empty()),
             generation: AtomicU64::new(0),
             event_sequence: AtomicU64::new(0),
+            activity: Mutex::new(None),
+            activity_current: AtomicBool::new(false),
             acknowledged_generation: AtomicU64::new(0),
             acknowledgement_tx,
             acknowledgement_rx,
@@ -164,10 +168,51 @@ impl HostedPublishedState {
         if generation <= self.generation.load(Ordering::Acquire) {
             return;
         }
+        let activity = snapshot.activity;
         self.snapshot.store(Arc::new(snapshot));
         self.generation.store(generation, Ordering::Release);
+        self.observe_activity(activity);
         if self.is_visible() {
             self.request_wake(generation);
+        }
+    }
+
+    fn activity(&self) -> Option<crate::model::TerminalOutputActivity> {
+        if !self.activity_current.load(Ordering::Acquire) {
+            return None;
+        }
+        *self
+            .activity
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+    }
+
+    fn observe_activity(&self, observed: Option<crate::model::TerminalOutputActivity>) {
+        let Some(observed) = observed else {
+            self.invalidate_activity();
+            return;
+        };
+        let mut activity = self
+            .activity
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if activity.is_some_and(|old| {
+            observed.sequence < old.sequence || observed.sequence == old.sequence && observed != old
+        }) {
+            return;
+        }
+        let changed = *activity != Some(observed) || !self.activity_current.load(Ordering::Acquire);
+        *activity = Some(observed);
+        self.activity_current.store(true, Ordering::Release);
+        drop(activity);
+        if changed {
+            self.request_wake(self.generation.load(Ordering::Acquire));
+        }
+    }
+
+    fn invalidate_activity(&self) {
+        if self.activity_current.swap(false, Ordering::AcqRel) {
+            self.request_wake(self.generation.load(Ordering::Acquire));
         }
     }
 
@@ -180,10 +225,18 @@ impl HostedPublishedState {
     /// ask for a full repaint; silently keeping the stale grid would render
     /// stale text indefinitely.
     fn apply(&self, snapshot: TerminalSnapshot) -> bool {
+        let apply_started =
+            tracing::enabled!(target: "cagents::terminal_pipeline", tracing::Level::TRACE)
+                .then(std::time::Instant::now);
         let current = self.snapshot.load();
         match snapshot.apply(Some(current.as_ref())) {
             Ok(resolved) => {
                 self.publish(resolved);
+                if let Some(started) = apply_started {
+                    tracing::trace!(target: "cagents::terminal_pipeline", stage = "snapshot_apply",
+                        generation = self.generation.load(Ordering::Acquire),
+                        elapsed_ns = started.elapsed().as_nanos() as u64);
+                }
                 true
             }
             Err(error) => {
@@ -558,6 +611,10 @@ impl HostedTerminalHandle {
         self.inner.published.snapshot.load_full()
     }
 
+    pub fn activity(&self) -> Option<crate::model::TerminalOutputActivity> {
+        self.inner.published.activity()
+    }
+
     pub fn generation(&self) -> u64 {
         self.inner.published.generation.load(Ordering::Acquire)
     }
@@ -638,6 +695,9 @@ impl HostedTerminalHandle {
     }
 
     fn try_command(&self, command: ClientCommand) -> Result<(), TerminalSendError> {
+        if self.inner.stop.is_requested() {
+            return Err(TerminalSendError::Closed);
+        }
         self.inner
             .commands
             .try_send(command)
@@ -762,6 +822,7 @@ enum ServerRead {
 /// than once per frame.
 struct ConnectionIo {
     writer: UnixStream,
+    codec: FrameCodec,
     incoming: Option<Receiver<ServerRead>>,
     reader: Option<JoinHandle<()>>,
 }
@@ -774,8 +835,9 @@ impl ConnectionIo {
         let reader = thread::Builder::new()
             .name(format!("hosted-terminal-reader-{terminal_id}"))
             .spawn(move || {
+                let mut codec = FrameCodec::new(MAX_FRAME_BYTES);
                 loop {
-                    let message = match read_frame::<ServerEnvelope>(&mut reader_stream) {
+                    let message = match codec.read::<ServerEnvelope>(&mut reader_stream) {
                         Ok(Some(envelope)) => ServerRead::Envelope(Box::new(envelope)),
                         Ok(None) | Err(_) => ServerRead::Closed,
                     };
@@ -787,13 +849,14 @@ impl ConnectionIo {
             })?;
         Ok(Self {
             writer,
+            codec: FrameCodec::new(MAX_FRAME_BYTES),
             incoming: Some(incoming_rx),
             reader: Some(reader),
         })
     }
 
-    fn writer(&mut self) -> &mut UnixStream {
-        &mut self.writer
+    fn writer(&mut self) -> (&mut UnixStream, &mut FrameCodec) {
+        (&mut self.writer, &mut self.codec)
     }
 
     fn incoming(&self) -> &Receiver<ServerRead> {
@@ -892,20 +955,26 @@ fn client_loop(
     };
     loop {
         if stop.is_requested() {
-            return;
+            break;
         }
-        match serve_connection(&connection, &mut carried) {
-            ConnectionEnd::Stop => return,
+        let end = serve_connection(&connection, &mut carried);
+        published.invalidate_activity();
+        match end {
+            ConnectionEnd::Stop => break,
             ConnectionEnd::Retry => {}
         }
 
         if wait_before_reconnect(&stop, &commands, &mut carried, reconnect_delay)
             == ConnectionEnd::Stop
         {
-            return;
+            break;
         }
         reconnect_delay = (reconnect_delay * 2).min(MAX_RECONNECT_DELAY);
     }
+    // Fence command submission before dropping the semantic sender. Argument
+    // destruction otherwise disconnects `events` before `commands`, briefly
+    // accepting input after consumers already observed permanent termination.
+    stop.request();
 }
 
 fn wait_before_reconnect(
@@ -1057,6 +1126,12 @@ fn serve_connection(
                 let attached = resumed
                     .iter()
                     .any(|terminal| terminal.session.id == terminal_id && terminal.attached);
+                if let Some(terminal) = resumed
+                    .iter()
+                    .find(|terminal| terminal.session.id == terminal_id && terminal.attached)
+                {
+                    published.observe_activity(terminal.activity);
+                }
                 break (proof, attached);
             }
             ServerMessage::Error(error) => {
@@ -1250,11 +1325,13 @@ fn serve_connection(
                         if terminal.session.id == terminal_id =>
                     {
                         attached = true;
+                        published.observe_activity(terminal.activity);
                     }
                     (PendingRequest::Spawn, ServerResponse::Spawned { terminal })
                         if terminal.session.id == terminal_id =>
                     {
                         attached = true;
+                        published.observe_activity(terminal.activity);
                     }
                     (
                         PendingRequest::Snapshot,
@@ -1432,7 +1509,7 @@ fn serve_connection(
 }
 
 fn send_request(
-    stream: &mut UnixStream,
+    (stream, codec): (&mut UnixStream, &mut FrameCodec),
     proof: &HostSessionProof,
     next_request_id: &mut u64,
     pending: &mut BTreeMap<u64, PendingRequest>,
@@ -1441,7 +1518,7 @@ fn send_request(
 ) -> Result<(), FrameError> {
     let request_id = *next_request_id;
     *next_request_id = (*next_request_id).wrapping_add(1).max(2);
-    write_frame(
+    codec.write(
         stream,
         &ClientEnvelope {
             version: PROTOCOL_VERSION,
@@ -1565,6 +1642,44 @@ mod tests {
             }),
         );
         (published, wake_count)
+    }
+
+    #[test]
+    fn connection_loss_invalidates_activity_without_discarding_grid_or_high_water() {
+        for visible in [false, true] {
+            let (published, wakes) = published_state(visible);
+            let fact = crate::model::TerminalOutputActivity {
+                sequence: 10,
+                last_output_at_unix_ms: 1_000,
+            };
+            published.publish(RenderSnapshot {
+                generation: 1,
+                activity: Some(fact),
+                ..RenderSnapshot::empty()
+            });
+            let grid = published.snapshot.load_full();
+            published.acknowledge(1);
+            let before = wakes.load(Ordering::Relaxed);
+            published.invalidate_activity();
+            assert_eq!(published.activity(), None);
+            assert!(Arc::ptr_eq(&grid, &published.snapshot.load_full()));
+            assert_eq!(wakes.load(Ordering::Relaxed), before + usize::from(visible));
+            published.observe_activity(Some(crate::model::TerminalOutputActivity {
+                sequence: 9,
+                ..fact
+            }));
+            assert_eq!(published.activity(), None);
+            // A validated same-incarnation descriptor can restore evidence even
+            // when no new visual generation needs to cross the wire.
+            published.observe_activity(Some(fact));
+            assert_eq!(published.activity(), Some(fact));
+            published.observe_activity(None);
+            published.observe_activity(Some(crate::model::TerminalOutputActivity {
+                sequence: 9,
+                ..fact
+            }));
+            assert_eq!(published.activity(), None);
+        }
     }
 
     #[test]
@@ -2032,6 +2147,7 @@ mod tests {
                         session,
                         generation: 0,
                         event_sequence: 0,
+                        activity: None,
                         oldest_event_sequence: 1,
                         attached: true,
                         transcript: None,

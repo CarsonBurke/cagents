@@ -10,8 +10,8 @@ use thiserror::Error;
 use crate::{
     instance,
     model::{
-        HostSessionProof, LaunchRecipe, TerminalContinuity, TerminalId, TerminalSession,
-        TranscriptMetadata,
+        HostSessionProof, LaunchRecipe, TerminalContinuity, TerminalId, TerminalOutputActivity,
+        TerminalSession, TranscriptMetadata,
     },
     terminal::{
         CellSnapshot, CellStyle, CellText, CursorShape, CursorSnapshot, KeyInput, MouseInput,
@@ -28,7 +28,8 @@ use crate::{
 /// therefore only diagnoses skew between versions that share a codec, and every
 /// reader must treat an undecodable frame as a possible version skew rather than
 /// as a corrupt peer.
-pub const PROTOCOL_VERSION: u16 = 3;
+/// Version 4 adds daemon-owned output activity to descriptors and snapshots.
+pub const PROTOCOL_VERSION: u16 = 4;
 /// Postcard encodes an 80x24 grid in roughly 20 KiB and a typical single-row
 /// delta in a few hundred bytes, but a full repaint of a very large grid after
 /// a resize still has to fit, so keep generous headroom.
@@ -37,10 +38,10 @@ pub const MAX_FRAME_BYTES: usize = 8 * 1024 * 1024;
 pub const MAX_CLIENT_FRAME_BYTES: usize = 2 * 1024 * 1024;
 pub const MAX_INPUT_BYTES: usize = 1024 * 1024;
 pub const MAX_RESUME_TERMINALS: usize = 1024;
-/// Production full and browserless builds retain this namespace while protocol
-/// version 3 remains current so upgrades can resume existing terminals.
+/// Production full and browserless builds retain the runtime namespace; a
+/// mismatched daemon is preserved and reported, never automatically replaced.
 #[cfg(test)]
-const RUNTIME_NAMESPACE_PROTOCOL_VERSION: u16 = 3;
+const RUNTIME_NAMESPACE_PROTOCOL_VERSION: u16 = 4;
 pub const SOCKET_FILE_NAME: &str = "cagentsd.sock";
 
 /// Returns the current user's cagents daemon socket path.
@@ -140,6 +141,11 @@ pub enum ClientRequest {
         terminal_id: TerminalId,
     },
     Shutdown,
+    /// Additive shutdown contract; unsupported revisions never fall back to force.
+    ShutdownV1 {
+        version: u16,
+        operation: ShutdownOperation,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -293,6 +299,56 @@ pub enum ServerResponse {
         snapshot: Option<TerminalSnapshot>,
     },
     ShutdownAccepted,
+    ShutdownPreflight(ShutdownPreflight),
+    ShutdownOutcome(ShutdownOutcome),
+}
+
+pub const SHUTDOWN_VERSION: u16 = 1;
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ShutdownOperation {
+    Preflight,
+    Stop {
+        require_empty: bool,
+        expected_generation: Option<u64>,
+    },
+    Confirm {
+        capability: ShutdownCapability,
+    },
+}
+
+/// A short-lived, daemon-bound authority for precisely one observed inventory.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ShutdownCapability {
+    pub proof: HostSessionProof,
+    pub token: String,
+    pub inventory_generation: u64,
+    pub live_terminals: u64,
+    pub expires_at_unix_ms: i64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ShutdownPreflight {
+    pub capability: ShutdownCapability,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ShutdownOutcome {
+    Accepted {
+        live_terminals_before: u64,
+        termination_requested: bool,
+    },
+    EmptyRequired {
+        current_count: u64,
+    },
+    InventoryChanged {
+        current_count: u64,
+    },
+    Expired,
+    DaemonRestarted,
+    InvalidCapability,
+    AlreadyShuttingDown,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -339,6 +395,7 @@ pub struct TerminalDescriptor {
     pub oldest_event_sequence: u64,
     pub attached: bool,
     pub transcript: Option<TranscriptMetadata>,
+    pub activity: Option<TerminalOutputActivity>,
 }
 
 impl TerminalDescriptor {
@@ -363,6 +420,7 @@ impl TerminalDescriptor {
             oldest_event_sequence: 1,
             attached: false,
             transcript: None,
+            activity: None,
         }
     }
 }
@@ -377,6 +435,7 @@ impl TerminalDescriptor {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TerminalSnapshot {
     pub generation: u64,
+    pub activity: Option<TerminalOutputActivity>,
     pub columns: u16,
     pub rows: u16,
     pub foreground: WireRgb,
@@ -420,6 +479,7 @@ impl TerminalSnapshot {
     pub fn full(value: &RenderSnapshot) -> Self {
         Self {
             generation: value.generation,
+            activity: value.activity,
             columns: value.columns,
             rows: value.rows,
             foreground: value.foreground.into(),
@@ -467,6 +527,7 @@ impl TerminalSnapshot {
 
         Self {
             generation: value.generation,
+            activity: value.activity,
             columns: value.columns,
             rows: value.rows,
             foreground: value.foreground.into(),
@@ -491,6 +552,7 @@ impl TerminalSnapshot {
     ) -> Result<RenderSnapshot, SnapshotApplyError> {
         let Self {
             generation,
+            activity,
             columns,
             rows,
             foreground,
@@ -534,6 +596,7 @@ impl TerminalSnapshot {
 
         Ok(RenderSnapshot {
             generation,
+            activity,
             columns,
             rows,
             foreground: foreground.into(),
@@ -891,7 +954,14 @@ impl FrameCodec {
         }
         self.buffer.resize(length, 0);
         reader.read_exact(&mut self.buffer[..length])?;
-        Ok(Some(postcard::from_bytes(&self.buffer[..length])?))
+        let started =
+            tracing::enabled!(target: "cagents::terminal_pipeline", tracing::Level::TRACE)
+                .then(std::time::Instant::now);
+        let value = postcard::from_bytes(&self.buffer[..length])?;
+        if let Some(started) = started {
+            tracing::trace!(target: "cagents::terminal_pipeline", stage = "ipc_decode", elapsed_ns = started.elapsed().as_nanos() as u64, bytes = length);
+        }
+        Ok(Some(value))
     }
 
     pub fn write<T: Serialize>(
@@ -899,8 +969,14 @@ impl FrameCodec {
         writer: &mut impl Write,
         value: &T,
     ) -> Result<(), FrameError> {
+        let started =
+            tracing::enabled!(target: "cagents::terminal_pipeline", tracing::Level::TRACE)
+                .then(std::time::Instant::now);
         let payload_length = encode_frame(&mut self.buffer, self.maximum, value)?;
         self.buffer[..LENGTH_PREFIX_BYTES].copy_from_slice(&(payload_length as u32).to_be_bytes());
+        if let Some(started) = started {
+            tracing::trace!(target: "cagents::terminal_pipeline", stage = "ipc_encode", elapsed_ns = started.elapsed().as_nanos() as u64, bytes = payload_length);
+        }
         writer.write_all(&self.buffer)?;
         writer.flush()?;
         Ok(())
@@ -1094,6 +1170,32 @@ mod tests {
             boot_id: BootId::new(boot),
             host_incarnation: HostIncarnation::new(incarnation),
         }
+    }
+    #[test]
+    fn activity_survives_full_and_unchanged_row_delta_snapshots() {
+        let mut base = grid(1, &["ab"]);
+        base.activity = Some(TerminalOutputActivity {
+            sequence: 10,
+            last_output_at_unix_ms: 100,
+        });
+        let full = TerminalSnapshot::full(&base);
+        let restored = full.apply(None).unwrap();
+        assert_eq!(restored.activity, base.activity);
+        let next = RenderSnapshot {
+            generation: 2,
+            activity: Some(TerminalOutputActivity {
+                sequence: 11,
+                last_output_at_unix_ms: 101,
+            }),
+            ..base.clone()
+        };
+        let delta = TerminalSnapshot::diff(&next, &restored);
+        let mut bytes = Vec::new();
+        write_frame(&mut bytes, &delta).unwrap();
+        let wire: TerminalSnapshot = read_frame(&mut Cursor::new(bytes)).unwrap().unwrap();
+        let applied = wire.apply(Some(&restored)).unwrap();
+        assert_eq!(applied.activity, next.activity);
+        assert_eq!(applied.lines, restored.lines);
     }
 
     #[test]
@@ -1291,6 +1393,7 @@ mod tests {
     fn grid(generation: u64, rows: &[&str]) -> RenderSnapshot {
         RenderSnapshot {
             generation,
+            activity: None,
             columns: rows.first().map_or(0, |first| first.chars().count() as u16),
             rows: rows.len() as u16,
             foreground: Rgb::default(),

@@ -2,6 +2,21 @@ use cosmic::{Core, app::cosmic::Cosmic, iced};
 use tracing_subscriber::EnvFilter;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let mut arguments = std::env::args().skip(1);
+    if let Some(argument) = arguments.next() {
+        if argument != "--confirm-daemon-stop" {
+            return Err(format!("unknown UI argument: {argument}").into());
+        }
+        let payload = arguments
+            .next()
+            .ok_or("missing shutdown confirmation capability")?;
+        if payload.len() > 4096 || arguments.next().is_some() {
+            return Err("invalid shutdown confirmation capability arguments".into());
+        }
+        let capability: cagents::terminal::ipc::ShutdownCapability =
+            serde_json::from_str(&payload)?;
+        return cagents::app::run_daemon_stop_confirmation(capability);
+    }
     let _application_lease = cagents::instance::ApplicationLease::acquire_for_ui()?;
     let (activation_tx, activation_rx) = async_channel::unbounded();
     let activation = match cagents::instance::UiActivationListener::bind(activation_tx) {
@@ -18,7 +33,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .unwrap_or_else(|_| EnvFilter::new("cagents=info,warn")),
         )
         .init();
-    cagents::terminal::ensure_daemon_ready()?;
+    let fixture =
+        cfg!(feature = "latency-harness") && std::env::var_os("CAGENTS_LATENCY_OUTPUT").is_some();
+    if !fixture {
+        cagents::terminal::ensure_daemon_ready()?;
+    }
 
     // The pinned COSMIC run helper does not wire its scale_factor callback
     // into iced. Build the daemon through the public shell API so interface

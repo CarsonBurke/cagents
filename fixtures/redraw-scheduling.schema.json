@@ -1,0 +1,78 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Cagents private redraw-scheduling run",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "metric", "manifest", "samples", "summary"],
+  "properties": {
+    "schema_version": {"const": 1},
+    "metric": {"const": "redraw_scheduling"},
+    "manifest": {"$ref": "#/$defs/manifest"},
+    "samples": {"type": "array", "minItems": 256, "maxItems": 256, "items": {"$ref": "#/$defs/sample"}},
+    "summary": {"$ref": "#/$defs/summary"}
+  },
+  "$defs": {
+    "duration": {"type": ["integer", "null"], "minimum": 0},
+    "sample": {
+      "type": "object", "additionalProperties": false,
+      "required": ["sequence", "action", "outcome", "redraw_scheduling_ns"],
+      "properties": {
+        "sequence": {"type": "integer", "minimum": 1},
+        "action": {"enum": ["card_focus", "palette_open", "palette_query"]},
+        "outcome": {"enum": ["redraw_scheduled", "abandoned"]},
+        "redraw_scheduling_ns": {"$ref": "#/$defs/duration"}
+      },
+      "allOf": [{"if": {"properties": {"outcome": {"const": "abandoned"}}}, "then": {"properties": {"redraw_scheduling_ns": {"type": "null"}}}, "else": {"properties": {"redraw_scheduling_ns": {"type": "integer", "minimum": 0}}}}]
+    },
+    "summary": {
+      "type": "object", "additionalProperties": false,
+      "required": ["action", "redraw_scheduled", "abandoned", "median_ns", "p95_ns", "p99_ns", "worst_ns"],
+      "properties": {
+        "action": {"const": "card_focus"},
+        "redraw_scheduled": {"type": "integer", "minimum": 0, "maximum": 256},
+        "abandoned": {"type": "integer", "minimum": 0, "maximum": 256},
+        "median_ns": {"$ref": "#/$defs/duration"},
+        "p95_ns": {"$ref": "#/$defs/duration"},
+        "p99_ns": {"$ref": "#/$defs/duration"},
+        "worst_ns": {"$ref": "#/$defs/duration"}
+      }
+    },
+    "manifest": {
+      "type": "object", "additionalProperties": false,
+      "required": ["reference", "revision", "working_tree_dirty", "fixture_version", "seed", "build_mode", "run", "session", "compositor", "scale", "hardware", "budgets_gating", "provisional_p95_ns", "provisional_p99_ns"],
+      "properties": {
+        "reference": {"const": "unnamed-local-non-gating"},
+        "revision": {"type": "string", "pattern": "^[0-9a-fA-F]{40}$"},
+        "working_tree_dirty": {"type": "boolean"},
+        "fixture_version": {"const": "adjacent-card-focus-v1"},
+        "seed": {"const": "0x434147454e545338"},
+        "build_mode": {"const": "release-browserless"},
+        "run": {"type": "integer", "minimum": 1, "maximum": 5},
+        "session": {"enum": ["wayland", "x11", "unknown"]},
+        "compositor": {"enum": ["niri", "sway", "hyprland", "cosmic-comp", "mutter", "kwin", "unknown"]},
+        "scale": {"type": "number", "exclusiveMinimum": 0},
+        "hardware": {"$ref": "#/$defs/hardware"},
+        "budgets_gating": {"const": false},
+        "provisional_p95_ns": {"const": 50000000},
+        "provisional_p99_ns": {"const": 100000000}
+      }
+    },
+    "hardware": {
+      "type": "object", "additionalProperties": false,
+      "required": ["architecture", "logical_cpus", "cpu_vendor", "cpu_family", "cpu_model", "memory_bytes", "gpus"],
+      "properties": {
+        "architecture": {"type": "string", "pattern": "^[a-z0-9_]+$", "maxLength": 24},
+        "logical_cpus": {"type": "integer", "minimum": 0},
+        "cpu_vendor": {"enum": ["amd", "intel", "other"]},
+        "cpu_family": {"$ref": "#/$defs/duration"},
+        "cpu_model": {"$ref": "#/$defs/duration"},
+        "memory_bytes": {"$ref": "#/$defs/duration"},
+        "gpus": {"type": "array", "items": {
+          "type": "object", "additionalProperties": false,
+          "required": ["vendor", "device"],
+          "properties": {"vendor": {"type": "integer", "minimum": 0, "maximum": 65535}, "device": {"type": "integer", "minimum": 0, "maximum": 65535}}
+        }}
+      }
+    }
+  }
+}

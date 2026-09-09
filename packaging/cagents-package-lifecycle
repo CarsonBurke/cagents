@@ -1,0 +1,86 @@
+#!/bin/sh
+# Substituted at package creation; called by dpkg under its mutation lock.
+set -eu
+mode=@MODE@
+package=@PACKAGE_NAME@
+other_package=@OTHER_PACKAGE@
+candidate_protocol=@PROTOCOL_VERSION@
+evidence_dir=/var/lib/cagents-package-protocols
+
+refuse() {
+    printf '%s\n' "cagents: $*; no daemon was signalled; stop it explicitly as its owner and retry" >&2
+    exit 1
+}
+
+# The outgoing package must never kill sessions before the new preinst runs.
+if [ "$mode" = remove ]; then
+    case ${1:-} in
+        upgrade|failed-upgrade|deconfigure) exit 0 ;;
+        remove) ;;
+        *) exit 0 ;;
+    esac
+else
+    case ${1:-} in
+        install|upgrade) ;;
+        *) exit 0 ;;
+    esac
+fi
+
+# Retain protocol evidence for older, still-running executable inodes across
+# repeated compatible upgrades. Only root-owned package metadata is trusted.
+if [ -e "$evidence_dir" ] || [ -L "$evidence_dir" ]; then
+    [ ! -L "$evidence_dir" ] && [ -d "$evidence_dir" ] \
+        && [ "$(stat -c '%u:%a' "$evidence_dir")" = 0:700 ] \
+        || refuse 'unsafe package protocol evidence directory'
+else
+    (umask 077 && mkdir "$evidence_dir") || refuse 'cannot create protocol evidence'
+fi
+
+remember_installed() {
+    installed=/usr/libexec/$1
+    stamp=$installed/.cagents-daemon-protocol
+    [ -f "$stamp" ] && [ ! -L "$stamp" ] || return 0
+    [ "$(stat -c '%u:%a' "$stamp")" = 0:644 ] || return 0
+    stamp_value=$(cat "$stamp")
+    protocol=${stamp_value%% *}
+    expected_digest=${stamp_value#* }
+    case $protocol in ''|*[!0-9]*) return 0 ;; esac
+    case $expected_digest in ''|*[!0-9a-f]*) return 0 ;; esac
+    [ "${#expected_digest}" -eq 64 ] || return 0
+    [ -f "$installed/cagentsd" ] && [ ! -L "$installed/cagentsd" ] || return 0
+    [ "$(stat -c '%u' "$installed/cagentsd")" = 0 ] || return 0
+    digest=$(sha256sum "$installed/cagentsd")
+    digest=${digest%% *}
+    # dpkg may have unpacked only one member of this pair before interruption.
+    # Never certify the old executable with a newly unpacked protocol stamp.
+    [ "$digest" = "$expected_digest" ] || return 0
+    record=$evidence_dir/$digest
+    [ ! -L "$record" ] || refuse 'unsafe protocol evidence record'
+    (umask 077 && printf '%s\n' "$protocol" > "$record") \
+        || refuse 'cannot retain installed protocol evidence'
+}
+remember_installed "$package"
+remember_installed "$other_package"
+
+for process in /proc/[0-9]*; do
+    executable=$(readlink "$process/exe" 2>/dev/null) || continue
+    case $executable in
+        /usr/libexec/"$package"/cagentsd|/usr/libexec/"$package"/cagentsd\ \(deleted\)) ;;
+        /usr/libexec/"$other_package"/cagentsd|/usr/libexec/"$other_package"/cagentsd\ \(deleted\))
+            # Both package variants share the production daemon namespace.
+            [ "$mode" != remove ] || continue
+            ;;
+        *) continue ;;
+    esac
+    [ "$mode" != remove ] || refuse 'removal deferred while this package owns a running daemon'
+    digest=$(sha256sum "$process/exe" 2>/dev/null) \
+        || refuse 'cannot establish running daemon compatibility'
+    digest=${digest%% *}
+    record=$evidence_dir/$digest
+    [ -f "$record" ] && [ ! -L "$record" ] \
+        && [ "$(stat -c '%u:%a' "$record")" = 0:600 ] \
+        || refuse 'upgrade deferred: running daemon protocol is unknown'
+    [ "$(cat "$record")" = "$candidate_protocol" ] \
+        || refuse 'upgrade deferred: running daemon protocol is incompatible'
+done
+exit 0

@@ -1,7 +1,7 @@
 use std::{
     collections::BTreeMap,
     ffi::{OsStr, OsString},
-    io::{self, Read},
+    io::{self, IsTerminal, Read, Write},
     os::{
         fd::AsRawFd,
         unix::{net::UnixStream, process::CommandExt},
@@ -24,8 +24,9 @@ use crate::{
         self, TerminalSpawnOptions,
         ipc::{
             ClientEnvelope, ClientRequest, FrameError, PROTOCOL_VERSION, ProtocolErrorCode,
-            ServerEnvelope, ServerMessage, ServerResponse, TerminalDescriptor, TerminalSnapshot,
-            TerminalVisibility, daemon_socket_path, read_frame, write_frame,
+            SHUTDOWN_VERSION, ServerEnvelope, ServerMessage, ServerResponse, ShutdownCapability,
+            ShutdownOperation, ShutdownOutcome, ShutdownPreflight, TerminalDescriptor,
+            TerminalSnapshot, TerminalVisibility, daemon_socket_path, read_frame, write_frame,
         },
     },
 };
@@ -74,8 +75,17 @@ pub enum DaemonCommand {
     Start,
     /// Report whether the daemon is running.
     Status,
-    /// Stop the daemon and its hosted resources.
-    Stop,
+    /// Request daemon termination (use --confirm for a counted interactive confirmation).
+    Stop {
+        #[arg(long, conflicts_with = "confirm")]
+        require_empty: bool,
+        #[arg(long, conflicts_with = "confirm")]
+        expected_generation: Option<u64>,
+        #[arg(long)]
+        confirm: bool,
+    },
+    /// Print this executable's wire protocol version without contacting a daemon.
+    ProtocolVersion,
     /// Stop any development daemon without relying on its wire protocol.
     #[command(hide = true)]
     StopForRebuild,
@@ -177,9 +187,11 @@ pub enum ControlError {
     InvalidTimeout,
     #[error("daemon answered a full-snapshot request with an incremental one it could not resolve")]
     IncrementalSnapshot,
+    #[error("shutdown request rejected: {0:?}")]
+    ShutdownRejected(ShutdownOutcome),
 }
 
-/// A bounded, synchronous client for the version 3 cagents daemon protocol.
+/// A bounded, synchronous client for the current cagents daemon protocol.
 pub struct ControlClient {
     stream: UnixStream,
     proof: HostSessionProof,
@@ -298,10 +310,47 @@ impl ControlClient {
         self.finish_visible_attachment(terminal_id, result)
     }
 
-    pub fn shutdown_daemon(&mut self) -> Result<(), ControlError> {
-        match self.request_strict(ClientRequest::Shutdown)? {
-            ServerResponse::ShutdownAccepted => Ok(()),
-            response => Err(unexpected_response("daemon shutdown acceptance", &response)),
+    pub fn shutdown_preflight(&mut self) -> Result<ShutdownPreflight, ControlError> {
+        match self.request_strict(ClientRequest::ShutdownV1 {
+            version: SHUTDOWN_VERSION,
+            operation: ShutdownOperation::Preflight,
+        })? {
+            ServerResponse::ShutdownPreflight(preflight) => Ok(preflight),
+            ServerResponse::ShutdownOutcome(outcome) => {
+                Err(ControlError::ShutdownRejected(outcome))
+            }
+            response => Err(unexpected_response("shutdown preflight", &response)),
+        }
+    }
+
+    pub fn shutdown_with_policy(
+        &mut self,
+        require_empty: bool,
+        expected_generation: Option<u64>,
+    ) -> Result<ShutdownOutcome, ControlError> {
+        self.shutdown_operation(ShutdownOperation::Stop {
+            require_empty,
+            expected_generation,
+        })
+    }
+
+    pub fn confirm_shutdown(
+        &mut self,
+        capability: ShutdownCapability,
+    ) -> Result<ShutdownOutcome, ControlError> {
+        self.shutdown_operation(ShutdownOperation::Confirm { capability })
+    }
+
+    fn shutdown_operation(
+        &mut self,
+        operation: ShutdownOperation,
+    ) -> Result<ShutdownOutcome, ControlError> {
+        match self.request_strict(ClientRequest::ShutdownV1 {
+            version: SHUTDOWN_VERSION,
+            operation,
+        })? {
+            ServerResponse::ShutdownOutcome(outcome) => Ok(outcome),
+            response => Err(unexpected_response("shutdown outcome", &response)),
         }
     }
 
@@ -731,6 +780,8 @@ fn response_name(response: &ServerResponse) -> &'static str {
         ServerResponse::Accepted => "accepted",
         ServerResponse::Snapshot { .. } => "snapshot",
         ServerResponse::ShutdownAccepted => "shutdown_accepted",
+        ServerResponse::ShutdownPreflight(_) => "shutdown_preflight",
+        ServerResponse::ShutdownOutcome(_) => "shutdown_outcome",
     }
 }
 
@@ -1015,19 +1066,54 @@ fn execute_daemon(command: DaemonCommand) -> Result<CommandOutput, AppError> {
                 },
             })
         }
-        DaemonCommand::Stop => {
+        DaemonCommand::ProtocolVersion => Ok(CommandOutput {
+            command: "daemon.protocol_version",
+            data: json!({ "protocol_version": PROTOCOL_VERSION, "shutdown_version": SHUTDOWN_VERSION }),
+            human: PROTOCOL_VERSION.to_string(),
+        }),
+        DaemonCommand::Stop {
+            require_empty,
+            expected_generation,
+            confirm,
+        } => {
             let socket =
                 daemon_socket_path().map_err(|error| AppError::new("socket_path", error))?;
-            let mut client = ControlClient::connect(&socket)
-                .map_err(|error| AppError::new("daemon_connection", error))?;
-            client
-                .shutdown_daemon()
-                .map_err(|error| AppError::new("protocol", error))?;
-            Ok(CommandOutput {
-                command: "daemon.stop",
-                data: json!({ "instance": instance::NAME, "stopped": true }),
-                human: format!("{} daemon stopping", instance::NAME),
-            })
+            let mut client = ControlClient::connect(&socket).map_err(protocol_error)?;
+            let outcome = if confirm {
+                if !io::stdin().is_terminal() {
+                    return Err(AppError::new(
+                        "confirmation_required",
+                        "interactive confirmation requires a terminal; use the cagents UI or --require-empty",
+                    ));
+                }
+                let preflight = client.shutdown_preflight().map_err(protocol_error)?;
+                eprint!(
+                    "Stop daemon and terminate {} hosted terminals (including pending spawns)? Type yes to confirm: ",
+                    preflight.capability.live_terminals
+                );
+                io::stderr()
+                    .flush()
+                    .map_err(|error| AppError::new("confirmation_input", error))?;
+                let mut answer = String::new();
+                io::stdin()
+                    .read_line(&mut answer)
+                    .map_err(|error| AppError::new("confirmation_input", error))?;
+                if answer.trim() != "yes" {
+                    return Ok(CommandOutput {
+                        command: "daemon.stop",
+                        data: json!({ "outcome": "cancelled", "termination_requested": false }),
+                        human: "Shutdown cancelled; no termination requested".into(),
+                    });
+                }
+                client
+                    .confirm_shutdown(preflight.capability)
+                    .map_err(protocol_error)?
+            } else {
+                client
+                    .shutdown_with_policy(require_empty, expected_generation)
+                    .map_err(protocol_error)?
+            };
+            shutdown_output(outcome)
         }
         DaemonCommand::StopForRebuild => {
             let stopped = crate::daemon::terminate_daemon_from_lock()
@@ -1041,6 +1127,80 @@ fn execute_daemon(command: DaemonCommand) -> Result<CommandOutput, AppError> {
                     format!("{} daemon stopped", instance::NAME)
                 },
             })
+        }
+    }
+}
+
+fn shutdown_output(outcome: ShutdownOutcome) -> Result<CommandOutput, AppError> {
+    let data = shutdown_outcome_json(&outcome);
+    let human = shutdown_outcome_message(&outcome);
+    if matches!(outcome, ShutdownOutcome::Accepted { .. }) {
+        Ok(CommandOutput {
+            command: "daemon.stop",
+            data,
+            human,
+        })
+    } else {
+        Err(AppError {
+            kind: "shutdown_rejected",
+            message: human,
+            details: Some(data),
+        })
+    }
+}
+
+pub fn shutdown_outcome_json(outcome: &ShutdownOutcome) -> Value {
+    match outcome {
+        ShutdownOutcome::Accepted {
+            live_terminals_before,
+            termination_requested,
+        } => json!({
+            "outcome": "accepted", "live_terminals_before": live_terminals_before,
+            "termination_requested": termination_requested
+        }),
+        ShutdownOutcome::EmptyRequired { current_count } => {
+            json!({ "outcome": "empty_required", "current_count": current_count, "termination_requested": false })
+        }
+        ShutdownOutcome::InventoryChanged { current_count } => {
+            json!({ "outcome": "inventory_changed", "current_count": current_count, "termination_requested": false })
+        }
+        other => json!({ "outcome": match other {
+            ShutdownOutcome::Expired => "expired",
+            ShutdownOutcome::DaemonRestarted => "daemon_restarted",
+            ShutdownOutcome::InvalidCapability => "invalid_capability",
+            ShutdownOutcome::AlreadyShuttingDown => "already_shutting_down",
+            _ => unreachable!(),
+        }, "termination_requested": false }),
+    }
+}
+
+pub fn shutdown_outcome_message(outcome: &ShutdownOutcome) -> String {
+    match outcome {
+        ShutdownOutcome::Accepted {
+            live_terminals_before,
+            termination_requested,
+        } => format!(
+            "Shutdown accepted: live_terminals_before={live_terminals_before}, termination_requested={termination_requested}; termination has not been confirmed complete"
+        ),
+        ShutdownOutcome::EmptyRequired { current_count } => format!(
+            "Shutdown rejected: empty_required, current_count={current_count}, termination_requested=false"
+        ),
+        ShutdownOutcome::InventoryChanged { current_count } => format!(
+            "Shutdown rejected: inventory_changed, current_count={current_count}, termination_requested=false; refresh confirmation"
+        ),
+        ShutdownOutcome::Expired => {
+            "Shutdown confirmation expired; refresh confirmation (termination_requested=false)"
+                .into()
+        }
+        ShutdownOutcome::DaemonRestarted => {
+            "Daemon restarted; refresh confirmation (termination_requested=false)".into()
+        }
+        ShutdownOutcome::InvalidCapability => {
+            "Invalid shutdown confirmation; refresh confirmation (termination_requested=false)"
+                .into()
+        }
+        ShutdownOutcome::AlreadyShuttingDown => {
+            "Shutdown already requested; termination is not yet confirmed complete".into()
         }
     }
 }
@@ -1240,6 +1400,97 @@ mod tests {
     };
 
     use super::*;
+    #[test]
+    fn require_empty_is_one_guarded_request_and_never_a_list_then_force() {
+        let (client_stream, mut server_stream) = UnixStream::pair().unwrap();
+        let peer_proof = proof("session", "boot", "incarnation");
+        let server = thread::spawn(move || {
+            let _: ClientEnvelope = read_frame(&mut server_stream).unwrap().unwrap();
+            write_frame(
+                &mut server_stream,
+                &connected_envelope(1, peer_proof.clone(), peer_proof.clone()),
+            )
+            .unwrap();
+            let request: ClientEnvelope = read_frame(&mut server_stream).unwrap().unwrap();
+            assert_eq!(
+                request.request,
+                ClientRequest::ShutdownV1 {
+                    version: SHUTDOWN_VERSION,
+                    operation: ShutdownOperation::Stop {
+                        require_empty: true,
+                        expected_generation: Some(9)
+                    },
+                }
+            );
+            write_frame(
+                &mut server_stream,
+                &ServerEnvelope {
+                    version: PROTOCOL_VERSION,
+                    request_id: Some(request.request_id),
+                    proof: peer_proof,
+                    message: ServerMessage::Response {
+                        response: ServerResponse::ShutdownOutcome(ShutdownOutcome::EmptyRequired {
+                            current_count: 1,
+                        }),
+                    },
+                },
+            )
+            .unwrap();
+            assert!(
+                read_frame::<ClientEnvelope>(&mut server_stream)
+                    .unwrap()
+                    .is_none()
+            );
+        });
+        let mut client = ControlClient::from_stream(client_stream).unwrap();
+        assert_eq!(
+            client.shutdown_with_policy(true, Some(9)).unwrap(),
+            ShutdownOutcome::EmptyRequired { current_count: 1 }
+        );
+        drop(client);
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn shutdown_cli_policies_and_results_preserve_acceptance_not_completion() {
+        let cli = Cli::try_parse_from([
+            "cagents",
+            "daemon",
+            "stop",
+            "--require-empty",
+            "--expected-generation",
+            "9",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            TopCommand::Daemon {
+                command: DaemonCommand::Stop {
+                    require_empty: true,
+                    expected_generation: Some(9),
+                    confirm: false
+                }
+            }
+        ));
+        assert!(
+            Cli::try_parse_from(["cagents", "daemon", "stop", "--require-empty", "--confirm"])
+                .is_err()
+        );
+        let output = shutdown_output(ShutdownOutcome::Accepted {
+            live_terminals_before: 7,
+            termination_requested: true,
+        })
+        .unwrap();
+        assert_eq!(
+            output.data,
+            json!({ "outcome": "accepted", "live_terminals_before": 7, "termination_requested": true })
+        );
+        assert!(output.data.get("stopped").is_none());
+        let error = shutdown_output(ShutdownOutcome::InventoryChanged { current_count: 1 })
+            .err()
+            .unwrap();
+        assert_eq!(error.details.unwrap()["outcome"], "inventory_changed");
+    }
 
     fn proof(session: &str, boot: &str, incarnation: &str) -> HostSessionProof {
         HostSessionProof {

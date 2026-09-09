@@ -114,8 +114,8 @@ stop_daemon_and_wait() {
         *) fail 'cannot verify daemon status; cagents was not removed' ;;
     esac
 
-    "$daemon_cli" daemon stop >/dev/null 2>&1 \
-        || fail 'daemon did not accept the stop request; cagents was not removed'
+    "$daemon_cli" daemon stop --require-empty >/dev/null \
+        || fail 'daemon was not stopped: finish terminals or explicitly confirm their termination with cagents daemon stop --confirm, then retry; cagents was not removed'
 
     daemon_wait=30
     while [ "$daemon_wait" -gt 0 ]; do

@@ -21,6 +21,10 @@ impl TerminalSurface {
         self.0.snapshot()
     }
 
+    pub fn activity(&self) -> Option<crate::model::TerminalOutputActivity> {
+        self.0.activity()
+    }
+
     pub fn generation(&self) -> u64 {
         self.0.generation()
     }

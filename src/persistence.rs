@@ -745,9 +745,28 @@ impl StateStore {
                 "new journal operations must have pending status".into(),
             ));
         }
-        let inner = self.lock_inner()?;
+        let mut inner = self.lock_inner()?;
         ensure_open(&inner)?;
-        inner.connection.execute(
+        let transaction = inner
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        // A resolved NotCreated operation is the only identity that may be retried.
+        // The write transaction closes the check/insert race across store connections.
+        if operation.entity_kind == "worktree_creation" {
+            let occupied: bool = transaction.query_row(
+                "SELECT EXISTS(SELECT 1 FROM pending_operations
+                 WHERE entity_kind = ?1 AND entity_id = ?2 AND action = ?3
+                 AND status != 'rolled_back')",
+                params![operation.entity_kind, operation.entity_id, operation.action],
+                |row| row.get(0),
+            )?;
+            if occupied {
+                return Err(StoreError::InvalidState(
+                    "worktree operation lease is occupied".into(),
+                ));
+            }
+        }
+        transaction.execute(
             "INSERT INTO pending_operations (
                 operation_id, entity_kind, entity_id, action, base_generation, payload_json,
                 status, created_at_unix_ms, updated_at_unix_ms
@@ -764,6 +783,7 @@ impl StateStore {
                 operation.updated_at_unix_ms,
             ],
         )?;
+        transaction.commit()?;
         Ok(())
     }
 
@@ -796,17 +816,58 @@ impl StateStore {
         Ok(())
     }
 
+    /// Compare-and-swap the durable evidence and its generic journal status.
+    /// A stale worker/reconciler must never overwrite newer evidence.
+    pub fn update_operation(
+        &self,
+        id: OperationId,
+        expected_payload: &Value,
+        payload: &Value,
+        status: PendingOperationStatus,
+    ) -> Result<()> {
+        let inner = self.lock_inner()?;
+        ensure_open(&inner)?;
+        let changed = inner.connection.execute(
+            "UPDATE pending_operations SET payload_json = ?1, status = ?2,
+             updated_at_unix_ms = ?3 WHERE operation_id = ?4 AND payload_json = ?5
+             AND (status IN ('pending', 'needs_reconciliation')
+                  OR (status = 'applied' AND ?2 = 'applied'))",
+            params![
+                to_json(payload)?,
+                status.as_str(),
+                now_unix_ms(),
+                id.to_string(),
+                to_json(expected_payload)?
+            ],
+        )?;
+        if changed != 1 {
+            return Err(StoreError::InvalidState(format!(
+                "stale or resolved operation {id}"
+            )));
+        }
+        Ok(())
+    }
+
     pub fn operations_requiring_reconciliation(&self) -> Result<Vec<PendingOperation>> {
+        self.operation_rows(true)
+    }
+
+    pub fn journaled_worktree_operations(&self) -> Result<Vec<PendingOperation>> {
+        self.operation_rows(false)
+    }
+
+    fn operation_rows(&self, unresolved_only: bool) -> Result<Vec<PendingOperation>> {
         let inner = self.lock_inner()?;
         ensure_open(&inner)?;
         let mut statement = inner.connection.prepare(
             "SELECT operation_id, entity_kind, entity_id, action, base_generation, payload_json,
                     status, created_at_unix_ms, updated_at_unix_ms
              FROM pending_operations
-             WHERE status IN ('pending', 'needs_reconciliation')
+             WHERE (?1 AND status IN ('pending', 'needs_reconciliation'))
+                OR (NOT ?1 AND entity_kind = 'worktree_creation')
              ORDER BY created_at_unix_ms, operation_id",
         )?;
-        let rows = statement.query_map([], |row| {
+        let rows = statement.query_map([unresolved_only], |row| {
             Ok((
                 row.get::<_, String>(0)?,
                 row.get::<_, String>(1)?,
@@ -829,7 +890,9 @@ impl StateStore {
                 entity_id,
                 action,
                 base_generation: i64_to_u64(generation, "operation base generation")?,
-                payload: from_json("operation payload", &payload)?,
+                // Retain malformed bytes as data so one damaged payload does not
+                // hide every other operation's recovery row.
+                payload: serde_json::from_str(&payload).unwrap_or(Value::String(payload)),
                 status: PendingOperationStatus::parse(&status)?,
                 created_at_unix_ms: created,
                 updated_at_unix_ms: updated,

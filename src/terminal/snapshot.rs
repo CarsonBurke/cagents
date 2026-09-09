@@ -204,6 +204,7 @@ pub struct CursorSnapshot {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RenderSnapshot {
     pub generation: u64,
+    pub activity: Option<crate::model::TerminalOutputActivity>,
     pub columns: u16,
     pub rows: u16,
     pub foreground: Rgb,
@@ -217,6 +218,7 @@ impl RenderSnapshot {
     pub fn empty() -> Self {
         Self {
             generation: 0,
+            activity: None,
             columns: 0,
             rows: 0,
             foreground: Rgb::default(),
@@ -267,10 +269,16 @@ impl VisualResources {
         terminal: &Terminal<'static, 'static>,
         generation: u64,
         force: bool,
+        activity: Option<crate::model::TerminalOutputActivity>,
     ) -> Result<Option<Arc<RenderSnapshot>>, libghostty_vt::Error> {
         let snapshot = self.render_state.update(terminal)?;
         let damage = snapshot.dirty()?;
-        let mut should_publish = damage != Dirty::Clean || force;
+        let mut should_publish = damage != Dirty::Clean
+            || force
+            || self
+                .previous
+                .as_ref()
+                .is_some_and(|previous| previous.activity != activity);
 
         let columns = snapshot.cols()?;
         let rows = snapshot.rows()?;
@@ -381,6 +389,7 @@ impl VisualResources {
 
         let owned = Arc::new(RenderSnapshot {
             generation,
+            activity,
             columns,
             rows,
             foreground,
@@ -434,7 +443,7 @@ mod tests {
         terminal.vt_write(b"plain \x1b[31mred\x1b[0m");
 
         let mut visual = VisualResources::new().unwrap();
-        let snapshot = visual.capture(&terminal, 1, true).unwrap().unwrap();
+        let snapshot = visual.capture(&terminal, 1, true, None).unwrap().unwrap();
 
         assert_eq!(snapshot.generation, 1);
         assert_eq!(snapshot.columns, 12);
@@ -453,10 +462,10 @@ mod tests {
         .unwrap();
         let mut visual = VisualResources::new().unwrap();
         terminal.vt_write(b"header\r\nwaiting\r\nfooter");
-        let first = visual.capture(&terminal, 1, true).unwrap().unwrap();
+        let first = visual.capture(&terminal, 1, true, None).unwrap().unwrap();
 
         terminal.vt_write(b"\x1b[2;1H\x1b[2Kdone");
-        let second = visual.capture(&terminal, 2, false).unwrap().unwrap();
+        let second = visual.capture(&terminal, 2, false, None).unwrap().unwrap();
         assert_eq!(second.lines[0].cells, first.lines[0].cells);
         assert_eq!(second.lines[2].cells, first.lines[2].cells);
         assert_eq!(second.lines[1].cells[0].text, "d");
@@ -466,11 +475,11 @@ mod tests {
         // More output after the previous damage was consumed must remain
         // visible without a forced refresh from mouse or keyboard input.
         terminal.vt_write(b"\x1b[3;1H\x1b[2Kfinal");
-        let third = visual.capture(&terminal, 3, false).unwrap().unwrap();
+        let third = visual.capture(&terminal, 3, false, None).unwrap().unwrap();
         assert_eq!(third.lines[1].cells, second.lines[1].cells);
         assert_eq!(third.lines[2].cells[0].text, "f");
         assert_eq!(third.lines[2].cells[4].text, "l");
-        assert!(visual.capture(&terminal, 4, false).unwrap().is_none());
+        assert!(visual.capture(&terminal, 4, false, None).unwrap().is_none());
     }
 
     #[test]
@@ -488,7 +497,7 @@ mod tests {
         .unwrap();
         terminal.vt_write("a漢b".as_bytes());
         let mut visual = VisualResources::new().unwrap();
-        let snapshot = visual.capture(&terminal, 1, true).unwrap().unwrap();
+        let snapshot = visual.capture(&terminal, 1, true, None).unwrap().unwrap();
         let cells = &snapshot.lines[0].cells;
 
         assert!(cells[0].text.is_narrow_ascii(), "plain ASCII must coalesce");
@@ -541,8 +550,8 @@ mod tests {
         .unwrap();
         let mut visual = VisualResources::new().unwrap();
 
-        let first = visual.capture(&terminal, 7, true).unwrap().unwrap();
-        let second = visual.capture(&terminal, 8, true).unwrap().unwrap();
+        let first = visual.capture(&terminal, 7, true, None).unwrap().unwrap();
+        let second = visual.capture(&terminal, 8, true, None).unwrap().unwrap();
 
         assert_eq!(first.generation, 7);
         assert_eq!(second.generation, 8);

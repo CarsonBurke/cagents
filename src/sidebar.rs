@@ -219,6 +219,18 @@ impl SidebarModel {
 
 /// A project row derived from durable project state and repository discovery.
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorktreeOperationRow {
+    pub id: crate::model::OperationId,
+    pub label: String,
+    pub cancellable: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CachedDisplay {
+    pub rows: Vec<SidebarPullRequest>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SidebarProject {
     pub id: ProjectId,
     pub repository_id: RepositoryId,
@@ -226,6 +238,11 @@ pub struct SidebarProject {
     pub repository: PathBuf,
     pub worktrees: Vec<SidebarWorktree>,
     pub pull_requests: Vec<SidebarPullRequest>,
+    pub github_status: String,
+    pub github_ready: bool,
+    pub github_stale: bool,
+    pub cached_display: Option<CachedDisplay>,
+    pub operations: Vec<WorktreeOperationRow>,
     chrome: ProjectChrome,
 }
 
@@ -280,6 +297,11 @@ impl SidebarProject {
             repository,
             worktrees,
             pull_requests,
+            github_status: "GitHub has not been refreshed.".into(),
+            github_ready: false,
+            github_stale: false,
+            cached_display: None,
+            operations: Vec::new(),
             chrome,
         }
     }
@@ -298,6 +320,25 @@ impl SidebarProject {
             worktrees,
             pull_requests,
         )
+    }
+
+    pub fn display_pull_requests(&self) -> &[SidebarPullRequest] {
+        self.cached_display
+            .as_ref()
+            .map_or(&self.pull_requests, |cached| &cached.rows)
+    }
+
+    pub fn revoke_github(&mut self) {
+        if !self.pull_requests.is_empty() {
+            self.cached_display = Some(CachedDisplay {
+                rows: std::mem::take(&mut self.pull_requests),
+            });
+        }
+        self.github_ready = false;
+        self.github_stale = self
+            .cached_display
+            .as_ref()
+            .is_some_and(|cached| !cached.rows.is_empty());
     }
 
     fn matches(&self, folded_query: &str) -> bool {
@@ -1897,6 +1938,7 @@ impl SidebarState {
             }
             SidebarAction::CancelPublish | SidebarAction::Push { .. } => self.publish = None,
             SidebarAction::OpenRepositoryPicker
+            | SidebarAction::CancelWorktreeOperation(_)
             | SidebarAction::NewWorktree { .. }
             | SidebarAction::Refresh
             | SidebarAction::RefreshWorktree { .. }
@@ -1920,6 +1962,7 @@ impl SidebarState {
 /// Not `Eq`: the resize request carries a width, and widths are measurements.
 #[derive(Debug, Clone, PartialEq)]
 pub enum SidebarAction {
+    CancelWorktreeOperation(crate::model::OperationId),
     SearchChanged(String),
     SetFilter(SidebarFilter),
     ToggleControls,
@@ -2726,6 +2769,28 @@ fn project_view<'a>(
     let mut column = widget::column::with_capacity(worktree_count + 2)
         .spacing(0)
         .push(crate::interaction::hover(header));
+    column = column.push(widget::text::caption(&entity.github_status));
+    if entity.github_stale {
+        column = column.push(widget::text::caption(
+            "Cached pull requests — stale; not authorized for mutations.",
+        ));
+    }
+    for operation in &entity.operations {
+        column = column.push(
+            widget::row::with_children(vec![
+                widget::text::caption(&operation.label)
+                    .width(Length::Fill)
+                    .into(),
+                button::standard("Cancel")
+                    .on_press_maybe(
+                        (operation.cancellable && !modal_open)
+                            .then_some(SidebarAction::CancelWorktreeOperation(operation.id)),
+                    )
+                    .into(),
+            ])
+            .spacing(4),
+        );
+    }
 
     if expanded {
         for &worktree in &project.worktrees {
@@ -2785,6 +2850,28 @@ fn compact_project<'a>(
             action,
             &*chrome.compact_open_name,
         ));
+    for operation in &entity.operations {
+        let action = button::icon(
+            icon::from_name(if operation.cancellable {
+                "process-stop-symbolic"
+            } else {
+                "dialog-information-symbolic"
+            })
+            .size(ROW_ICON_SIZE),
+        )
+        .name(if operation.cancellable {
+            format!("Cancel worktree operation: {}", operation.label)
+        } else {
+            operation.label.clone()
+        })
+        .width(ICON_CONTROL_SIZE)
+        .height(ICON_CONTROL_SIZE)
+        .on_press_maybe(
+            (operation.cancellable && !modal_open)
+                .then_some(SidebarAction::CancelWorktreeOperation(operation.id)),
+        );
+        column = column.push(crate::interaction::tooltip(action, &operation.label));
+    }
     for &worktree in &project.worktrees {
         let action = button::icon(icon::from_name("vcs-branch-symbolic").size(ROW_ICON_SIZE))
             .id(worktree.chrome.open_id.clone())
@@ -3215,7 +3302,7 @@ fn source_control_panel<'a>(
 /// difference from the `Vec` alone.
 fn pull_request_section_count(project: Option<&SidebarProject>) -> Option<RowCount> {
     let project = project?;
-    let count = project.pull_requests.len();
+    let count = project.display_pull_requests().len();
     Some(if count >= usize::from(PULL_REQUEST_LIST_LIMIT) {
         RowCount::at_least(count)
     } else {
@@ -4051,18 +4138,27 @@ fn pull_requests_section<'a>(
     let Some(project) = project else {
         return widget::text::caption("This worktree's project is no longer loaded.").into();
     };
+    if !project.github_ready && project.display_pull_requests().is_empty() {
+        return widget::text::caption(&project.github_status).into();
+    }
     let branch = source.branch.as_ref().map(ValidatedBranchName::as_str);
     let current =
         |pull_request: &&SidebarPullRequest| branch == Some(pull_request.head_ref.as_str());
     let has_current = project
-        .pull_requests
+        .display_pull_requests()
         .iter()
         .any(|pull_request| current(&pull_request));
-    let mut column =
-        widget::column::with_capacity(project.pull_requests.len() + 4).spacing(spacing.space_xxxs);
+    let mut column = widget::column::with_capacity(project.display_pull_requests().len() + 4)
+        .spacing(spacing.space_xxxs);
+    column = column.push(widget::text::caption(&project.github_status));
+    if project.github_stale {
+        column = column.push(widget::text::caption(
+            "Cached pull requests — stale; not authorized for mutations.",
+        ));
+    }
     if has_current {
         column = column.push(widget::text::caption_heading("This branch"));
-        for pull_request in project.pull_requests.iter().filter(current) {
+        for pull_request in project.display_pull_requests().iter().filter(current) {
             column = column.push(pull_request_view(
                 project.id,
                 pull_request,
@@ -4070,7 +4166,7 @@ fn pull_requests_section<'a>(
                 modal_open,
             ));
         }
-    } else if branch.is_some() {
+    } else if branch.is_some() && project.github_ready {
         column = column.push(widget::text::caption(
             "No open pull request for this branch.",
         ));
@@ -4083,7 +4179,7 @@ fn pull_requests_section<'a>(
                         project_id: source.key.project_id,
                         worktree: Some(source.key.canonical_path.clone()),
                     },
-                    modal_open,
+                    modal_open || !project.github_ready,
                 )),
         );
     } else {
@@ -4092,7 +4188,7 @@ fn pull_requests_section<'a>(
         ));
     }
     let mut others = project
-        .pull_requests
+        .display_pull_requests()
         .iter()
         .filter(|pull_request| !current(pull_request))
         .peekable();
@@ -4463,7 +4559,7 @@ fn filtered_projects<'a>(
                     SidebarFilter::All | SidebarFilter::PullRequests => true,
                     SidebarFilter::Attention => {
                         worktree.needs_attention()
-                            || matching_pull_request(worktree, &project.pull_requests)
+                            || matching_pull_request(worktree, project.display_pull_requests())
                                 .is_some_and(SidebarPullRequest::needs_attention)
                     }
                 })
@@ -5731,7 +5827,10 @@ mod tests {
     #[test]
     fn no_panel_command_is_pressable_while_a_dialog_is_open() {
         let renderer = headless_renderer();
-        let model = panel_model();
+        let mut model = panel_model();
+        for project in &mut model.projects {
+            project.github_ready = true;
+        }
         let state = panel_state(&model);
 
         // Every section open, so every command the panel has is in the frame.
