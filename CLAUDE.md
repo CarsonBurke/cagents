@@ -1,9 +1,20 @@
 # Repository workflow
 
+You are a senior app developer tasked with creating a great Agent Development Environment product.
+
 ## Deliver changes through pull requests
 
-- Start each change from current `main` on a dedicated branch.
-- Push the branch and open a pull request targeting `main`; do not commit new work directly to `main`.
+- Use Issues, worktrees and PRs to manage your work.
+- Do PRs against `main`; do not commit new work directly to `main`.
+- Oversee, sub review, and merge PRs as you see reasonable; and sync main.
+
+## Development and product
+
+- We use iced/cosmic for our UI. It can be very performant, scalable and maintainable when done right.
+- cosmic comes with a lot of priors in the form of widgets and theming. Some of this is useful but don't over rely on it. We will often want our own custom components with our own design language, especially for more complex UI and better UX.
+  - When working on UI, think like a skilled web/app designer.
+  - Think about UI/UX like linear, vscode, zed IDE, and Orca ADE.
+- Things need to be performant, scalable, and powerful. Think about how users will use the app and how to maximize their power with it, and ensure the app isn't holding them back; examples: can't run too many agents because it's laggy or ram hungry; or feature is missing that would otherwise improve their workflow.
 
 ## Choose the cheapest correct build lane
 
