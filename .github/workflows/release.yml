@@ -14,11 +14,14 @@ concurrency:
 
 jobs:
   release:
-    name: Build and publish Linux release
+    name: Build and publish Linux x86_64 release
     runs-on: ubuntu-22.04
-    timeout-minutes: 120
+    # Servo plus isolated host/UI/editor validation share one bounded build lane.
+    timeout-minutes: 180
     env:
       CARGO_TARGET_DIR: ${{ github.workspace }}/target
+      CARGO_BUILD_JOBS: "2"
+      CAGENTS_RELEASE_TARGET: x86_64-unknown-linux-gnu
     defaults:
       run:
         shell: bash
@@ -35,19 +38,42 @@ jobs:
         with:
           packaging: "true"
 
-      - name: Require the tag to match Cargo.toml
+      - name: Validate the canonical repository, release versions, and target
         run: |
           set -euo pipefail
+          if [[ "$GITHUB_REPOSITORY" != CarsonBurke/cagents ]]; then
+            echo "Releases must be published from CarsonBurke/cagents" >&2
+            exit 1
+          fi
+          case "$CAGENTS_RELEASE_TARGET" in
+            x86_64-unknown-linux-gnu)
+              [[ "$(uname -s)" == Linux && "$(uname -m)" == x86_64 ]]
+              printf 'DEB_ARCH=amd64\n' >> "$GITHUB_ENV"
+              ;;
+            *)
+              echo "Unsupported release target: $CAGENTS_RELEASE_TARGET" >&2
+              exit 1
+              ;;
+          esac
+          rust_host="$(rustc -vV | sed -n 's/^host: //p')"
+          [[ "$rust_host" == "$CAGENTS_RELEASE_TARGET" ]]
           version="$(cargo metadata --locked --no-deps --format-version 1 \
             | jq -r '.packages[] | select(.name == "cagents") | .version')"
-          if [[ -z "$version" || "$version" == *$'\n'* ]]; then
-            echo "Could not determine one cagents package version" >&2
+          if [[ ! "$version" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+            echo "Expected one stable cagents semantic version" >&2
             exit 1
           fi
           if [[ "$GITHUB_REF_NAME" != "v${version}" ]]; then
             echo "Release tag $GITHUB_REF_NAME does not match Cargo.toml version $version (expected v${version})" >&2
             exit 1
           fi
+          editor_version="$(cargo metadata --locked --no-deps --format-version 1 \
+            | jq -r '.packages[] | select(.name == "ceditor") | .version')"
+          if [[ "$editor_version" != "$version" ]]; then
+            echo "ceditor version $editor_version must match cagents version $version" >&2
+            exit 1
+          fi
+          printf 'SOURCE_DATE_EPOCH=%s\n' "$(git show -s --format=%ct HEAD)" >> "$GITHUB_ENV"
           printf 'VERSION=%s\n' "$version" >> "$GITHUB_ENV"
 
       - name: Test isolated product boundaries in the release profile
@@ -57,12 +83,14 @@ jobs:
           cargo test --locked --release --no-default-features --all-targets
           cargo test --locked --release --no-default-features --features host --all-targets
           cargo test --locked --release --no-default-features --features ui --all-targets
+          cargo test --locked --release --package ceditor --all-targets
           cargo test --locked --release --features integrated-browser --all-targets
 
-      - name: Build full and browserless Linux packages
+      - name: Build full, browserless, and standalone editor packages sequentially
         run: |
           ./scripts/package-linux.sh --variant full
           ./scripts/package-linux.sh --variant browserless
+          ./scripts/package-ceditor-linux.sh
 
       - name: Record full-to-browserless artifact deltas
         run: |
@@ -107,7 +135,41 @@ jobs:
           debian_package_byte_reduction=$((full_deb - browserless_deb))
           EOF
 
-      - name: Stamp the installer and regenerate checksums
+      - name: Generate release target metadata
+        run: |
+          set -euo pipefail
+          jq -n --arg version "$VERSION" --arg target "$CAGENTS_RELEASE_TARGET" \
+            --arg deb_arch "$DEB_ARCH" '{
+              schema_version: 1,
+              repository: "CarsonBurke/cagents",
+              version: $version,
+              targets: [{
+                target: $target,
+                os: "linux",
+                architecture: "x86_64",
+                libc: "gnu",
+                minimum_glibc: "2.35",
+                products: {
+                  cagents: {
+                    archive: ("cagents-" + $version + "-" + $target + ".tar.gz"),
+                    deb: ("cagents_" + $version + "_" + $deb_arch + ".deb"),
+                    installer: "install.sh",
+                    checksums: "SHA256SUMS"
+                  },
+                  "cagents-browserless": {
+                    archive: ("cagents-browserless-" + $version + "-" + $target + ".tar.gz"),
+                    deb: ("cagents-browserless_" + $version + "_" + $deb_arch + ".deb"),
+                    checksums: "SHA256SUMS-browserless"
+                  },
+                  ceditor: {
+                    archive: ("ceditor-" + $version + "-" + $target + ".tar.gz"),
+                    checksums: "SHA256SUMS-ceditor"
+                  }
+                }
+              }]
+            }' > dist/release-metadata.json
+
+      - name: Stamp the installer and checksum every release payload
         run: |
           set -euo pipefail
           sed -i \
@@ -118,11 +180,19 @@ jobs:
             cd dist
             rm -f SHA256SUMS
             sha256sum \
-              "cagents-${VERSION}-x86_64-unknown-linux-gnu.tar.gz" \
-              "cagents_${VERSION}_amd64.deb" \
+              "cagents-${VERSION}-${CAGENTS_RELEASE_TARGET}.tar.gz" \
+              "cagents_${VERSION}_${DEB_ARCH}.deb" \
               "cagents-${VERSION}-sizes.txt" \
               "cagents-${VERSION}-artifact-comparison.txt" \
-              install.sh > SHA256SUMS
+              "cagents-browserless-${VERSION}-${CAGENTS_RELEASE_TARGET}.tar.gz" \
+              "cagents-browserless_${VERSION}_${DEB_ARCH}.deb" \
+              "cagents-browserless-${VERSION}-sizes.txt" \
+              "ceditor-${VERSION}-${CAGENTS_RELEASE_TARGET}.tar.gz" \
+              SHA256SUMS-browserless SHA256SUMS-ceditor \
+              release-metadata.json install.sh > SHA256SUMS
+            sha256sum --check --strict SHA256SUMS
+            sha256sum --check --strict SHA256SUMS-browserless
+            sha256sum --check --strict SHA256SUMS-ceditor
           )
 
       - name: Validate packaged desktop metadata
@@ -130,21 +200,27 @@ jobs:
           set -euo pipefail
           staging="$(mktemp -d)"
           trap 'rm -rf "$staging"' EXIT
-          tar -xzf "dist/cagents-${VERSION}-x86_64-unknown-linux-gnu.tar.gz" -C "$staging"
+          tar -xzf "dist/cagents-${VERSION}-${CAGENTS_RELEASE_TARGET}.tar.gz" -C "$staging"
           root="$staging/cagents-${VERSION}"
           desktop-file-validate \
             "$root/share/applications/dev.cagents.Cagents.desktop"
+          grep -Fqx 'Exec=cagents ui' \
+            "$root/share/applications/dev.cagents.Cagents.desktop"
+          test -x "$root/bin/cagents"
+          test -x "$root/bin/cagents-ui"
+          test -x "$root/bin/cagentsd"
+          test -s "$root/share/icons/hicolor/scalable/apps/dev.cagents.Cagents.svg"
           grep -Fqx 'StartupWMClass=dev.cagents.Cagents' \
             "$root/share/applications/dev.cagents.Cagents.desktop"
           grep -Fqx 'TryExec=cagents' \
             "$root/share/applications/dev.cagents.Cagents.desktop"
           appstreamcli validate --no-net --override=url-homepage-missing=info \
             "$root/share/metainfo/dev.cagents.Cagents.metainfo.xml"
-          dpkg-deb --info "dist/cagents_${VERSION}_amd64.deb" >/dev/null
-          dpkg-deb --info "dist/cagents-browserless_${VERSION}_amd64.deb" >/dev/null
+          dpkg-deb --info "dist/cagents_${VERSION}_${DEB_ARCH}.deb" >/dev/null
+          dpkg-deb --info "dist/cagents-browserless_${VERSION}_${DEB_ARCH}.deb" >/dev/null
           debian_root="$staging/cagents-deb"
           mkdir "$debian_root"
-          dpkg-deb --extract "dist/cagents_${VERSION}_amd64.deb" "$debian_root"
+          dpkg-deb --extract "dist/cagents_${VERSION}_${DEB_ARCH}.deb" "$debian_root"
           desktop-file-validate \
             "$debian_root/usr/share/applications/dev.cagents.Cagents.desktop"
           grep -Fqx 'Exec=/usr/bin/cagents ui' \
@@ -156,7 +232,7 @@ jobs:
           browserless_root="$staging/cagents-browserless-deb"
           mkdir "$browserless_root"
           dpkg-deb --extract \
-            "dist/cagents-browserless_${VERSION}_amd64.deb" "$browserless_root"
+            "dist/cagents-browserless_${VERSION}_${DEB_ARCH}.deb" "$browserless_root"
           desktop-file-validate \
             "$browserless_root/usr/share/applications/dev.cagents.Cagents.Browserless.desktop"
           grep -Fqx 'Exec=/usr/bin/cagents-browserless ui' \
@@ -167,6 +243,37 @@ jobs:
             "$browserless_root/usr/share/applications/dev.cagents.Cagents.Browserless.desktop"
           appstreamcli validate --no-net --override=url-homepage-missing=info \
             "$browserless_root/usr/share/metainfo/dev.cagents.Cagents.Browserless.metainfo.xml"
+          tar -xzf "dist/cagents-browserless-${VERSION}-${CAGENTS_RELEASE_TARGET}.tar.gz" -C "$staging"
+          browserless_archive="$staging/cagents-browserless-${VERSION}"
+          desktop-file-validate \
+            "$browserless_archive/share/applications/dev.cagents.Cagents.Browserless.desktop"
+          grep -Fqx 'Exec=cagents-browserless ui' \
+            "$browserless_archive/share/applications/dev.cagents.Cagents.Browserless.desktop"
+          grep -Fqx 'TryExec=cagents-browserless' \
+            "$browserless_archive/share/applications/dev.cagents.Cagents.Browserless.desktop"
+          grep -Fqx 'StartupWMClass=dev.cagents.Cagents.Browserless' \
+            "$browserless_archive/share/applications/dev.cagents.Cagents.Browserless.desktop"
+          test -x "$browserless_archive/bin/cagents-browserless"
+          test -x "$browserless_archive/bin/cagents-ui"
+          test -x "$browserless_archive/bin/cagentsd"
+          test -s "$browserless_archive/share/icons/hicolor/scalable/apps/dev.cagents.Cagents.Browserless.svg"
+          appstreamcli validate --no-net --override=url-homepage-missing=info \
+            "$browserless_archive/share/metainfo/dev.cagents.Cagents.Browserless.metainfo.xml"
+          tar -xzf "dist/ceditor-${VERSION}-${CAGENTS_RELEASE_TARGET}.tar.gz" -C "$staging"
+          editor_root="$staging/ceditor-${VERSION}"
+          desktop-file-validate "$editor_root/share/applications/io.github.cagents.ceditor.desktop"
+          grep -Fqx 'Exec=ceditor %F' "$editor_root/share/applications/io.github.cagents.ceditor.desktop"
+          grep -Fqx 'Icon=io.github.cagents.ceditor' "$editor_root/share/applications/io.github.cagents.ceditor.desktop"
+          grep -Fqx 'StartupWMClass=io.github.cagents.ceditor' \
+            "$editor_root/share/applications/io.github.cagents.ceditor.desktop"
+          test -x "$editor_root/bin/ceditor"
+          test -s "$editor_root/share/icons/hicolor/scalable/apps/io.github.cagents.ceditor.svg"
+          # Exercise the stripped, shipped editor without a display or user state.
+          [[ "$("$editor_root/bin/ceditor" --version)" == "ceditor $VERSION" ]]
+          editor_config="$staging/editor-config"
+          settings_path="$(XDG_CONFIG_HOME="$editor_config" "$editor_root/bin/ceditor" --settings-path)"
+          [[ "$settings_path" == "$editor_config/ceditor/settings.toml" ]]
+          [[ ! -e "$editor_config" ]]
 
       - name: Stage and publish the GitHub release
         env:
@@ -176,17 +283,55 @@ jobs:
 
           release_marker='<!-- cagents-release-workflow -->'
           assets=(
-            "dist/cagents-${VERSION}-x86_64-unknown-linux-gnu.tar.gz"
-            "dist/cagents_${VERSION}_amd64.deb"
+            "dist/cagents-${VERSION}-${CAGENTS_RELEASE_TARGET}.tar.gz"
+            "dist/cagents_${VERSION}_${DEB_ARCH}.deb"
             "dist/cagents-${VERSION}-sizes.txt"
             "dist/cagents-${VERSION}-artifact-comparison.txt"
             dist/SHA256SUMS
             dist/install.sh
-            "dist/cagents-browserless-${VERSION}-x86_64-unknown-linux-gnu.tar.gz"
-            "dist/cagents-browserless_${VERSION}_amd64.deb"
+            "dist/cagents-browserless-${VERSION}-${CAGENTS_RELEASE_TARGET}.tar.gz"
+            "dist/cagents-browserless_${VERSION}_${DEB_ARCH}.deb"
             "dist/cagents-browserless-${VERSION}-sizes.txt"
             dist/SHA256SUMS-browserless
+            "dist/ceditor-${VERSION}-${CAGENTS_RELEASE_TARGET}.tar.gz"
+            dist/SHA256SUMS-ceditor
+            dist/release-metadata.json
           )
+          notes="$RUNNER_TEMP/cagents-release-notes.txt"
+          cat > "$notes" <<EOF
+          $release_marker
+
+          ## Linux x86_64 binaries
+
+          Full cagents, browserless cagents, and the standalone ceditor are available
+          for \`$CAGENTS_RELEASE_TARGET\` (glibc 2.35 or newer, Wayland).
+          Windows and macOS binaries are not provided.
+
+          Authenticate with \`gh auth login\` for private-repository access, then download
+          and verify the complete release before running its installer:
+
+          \`\`\`sh
+          gh release download "$GITHUB_REF_NAME" --repo CarsonBurke/cagents --dir "cagents-$VERSION-release"
+          cd "cagents-$VERSION-release"
+          sha256sum --check --strict SHA256SUMS
+          CAGENTS_ARCHIVE="\$PWD/cagents-$VERSION-$CAGENTS_RELEASE_TARGET.tar.gz" CAGENTS_CHECKSUMS="\$PWD/SHA256SUMS" sh ./install.sh --restart-daemon
+          \`\`\`
+
+          The Update action performs the same verified full-package migration for
+          supported self-managed installs. Debian packages must be upgraded with the
+          system package manager; browserless and source installations are not
+          self-replaced by Update.
+
+          To install only ceditor after checksum verification (without cagents):
+
+          \`\`\`sh
+          mkdir -p "\$HOME/.local"
+          tar -xzf "ceditor-$VERSION-$CAGENTS_RELEASE_TARGET.tar.gz" --strip-components=1 -C "\$HOME/.local"
+          \`\`\`
+
+          Ensure \`\$HOME/.local/bin\` is on PATH. Archive desktop entries and icons
+          reside under \`share/\`; \`release-metadata.json\` lists exact supported assets.
+          EOF
 
           if release_state="$(
             gh release view "$GITHUB_REF_NAME" \
@@ -205,8 +350,8 @@ jobs:
               --repo "$GITHUB_REPOSITORY" \
               --verify-tag \
               --draft \
-              --title "cagents ${GITHUB_REF_NAME}" \
-              --notes "$release_marker" \
+              --title "cagents and ceditor ${GITHUB_REF_NAME}" \
+              --notes-file "$notes" \
               --generate-notes
           fi
 
@@ -229,6 +374,20 @@ jobs:
             printf 'Expected:\n%s\nActual:\n%s\n' "$expected_assets" "$actual_assets" >&2
             exit 1
           fi
+
+          # Verify what GitHub serves, not merely the local files we uploaded.
+          # gh authenticates asset downloads for private repositories and drafts.
+          downloaded="$(mktemp -d)"
+          trap 'rm -rf "$downloaded"' EXIT
+          gh release download "$GITHUB_REF_NAME" \
+            --repo "$GITHUB_REPOSITORY" --dir "$downloaded"
+          cmp dist/SHA256SUMS "$downloaded/SHA256SUMS"
+          (
+            cd "$downloaded"
+            sha256sum --check --strict SHA256SUMS
+            sha256sum --check --strict SHA256SUMS-browserless
+            sha256sum --check --strict SHA256SUMS-ceditor
+          )
 
           if [[ "$(
             gh release view "$GITHUB_REF_NAME" \
