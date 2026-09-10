@@ -36,6 +36,7 @@ struct Wire {
 type Pending = Arc<Mutex<BTreeMap<u64, crossbeam_channel::Sender<Result<(), String>>>>>;
 struct Inner {
     id: TerminalId,
+    session: Session,
     proof: HostSessionProof,
     wire: Arc<Mutex<Wire>>,
     cancel: UnixStream,
@@ -167,8 +168,10 @@ impl ClientHandle {
                 },
             )
             .map_err(|e| e.to_string())?;
-        let initial = match receive(&mut stream, &mut codec, 2, Some(&proof))? {
-            ServerResponse::ChatAttached { session, snapshot } if session.id == id => snapshot,
+        let (session, initial) = match receive(&mut stream, &mut codec, 2, Some(&proof))? {
+            ServerResponse::ChatAttached { session, snapshot } if session.id == id => {
+                (session, snapshot)
+            }
             _ => return Err("Daemon did not attach the exact native chat".into()),
         };
         stream.set_read_timeout(None).map_err(|e| e.to_string())?;
@@ -186,6 +189,7 @@ impl ClientHandle {
         let (visibility_tx, visibility_rx) = crossbeam_channel::bounded(1);
         let inner = Arc::new(Inner {
             id,
+            session,
             proof: proof.clone(),
             wire: wire.clone(),
             cancel,
@@ -304,6 +308,11 @@ impl ClientHandle {
         }).map_err(|e| e.to_string())?;
         *inner.reader.lock().unwrap_or_else(|p| p.into_inner()) = Some(worker);
         Ok(Self { inner })
+    }
+    pub fn session(&self) -> Session {
+        let mut session = self.inner.session.clone();
+        session.launch.session_id = self.snapshot().session_id.clone();
+        session
     }
     pub fn snapshot(&self) -> Arc<Snapshot> {
         self.inner

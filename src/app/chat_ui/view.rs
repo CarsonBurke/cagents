@@ -31,119 +31,26 @@ fn command(target: Target, value: Command) -> Message {
 impl Cagents {
     pub(in crate::app) fn chat_view(&self, card: CardId) -> Element<'_, Message> {
         match self.cards.get(&card) {
-            Some(CardRuntime::Chat(runtime)) => runtime.view(),
+            Some(CardRuntime::Chat(runtime)) => {
+                runtime.view(self.chat_start_pending(card) || self.chat_ui.closed.contains(&card))
+            }
             _ => widget::text::body("Connecting to native chat…").into(),
         }
-    }
-    pub(in crate::app) fn chat_switch_dialog(&self) -> Option<Element<'_, Message>> {
-        let switch = self.chat_ui.switch.as_ref()?;
-        let provider = switch
-            .session
-            .as_ref()
-            .map(|session| session.launch.provider);
-        let detail = if switch.closing {
-            "Close this chat and interrupt its active work. The daemon must acknowledge shutdown before the card is removed. Closing the app window instead only detaches and leaves the agent working."
-        } else if switch.returning {
-            if provider == Some(Provider::Codex) {
-                "Return to the original Codex terminal. Native chat detaches; the daemon-owned proxy and any active work continue. Both views address the same conversation."
-            } else {
-                "Stop the native chat writer, then launch the CLI with this exact conversation identity. Active work is interrupted. The transcript remains in the provider's session; no latest-session lookup or fork is used."
-            }
-        } else if provider == Some(Provider::Codex) {
-            "Join the existing Codex conversation through its supported app-server proxy. The original CLI stays alive. If this exact session cannot be joined safely, the terminal is kept and an error is shown."
-        } else {
-            "Stop this agent CLI, then resume its exact conversation in native chat. Active work is interrupted. This is a process handoff, not a live view of the terminal; the provider controls what history is available. The original launch and terminal descriptor are retained."
-        };
-        let mut rows = vec![
-            design::heading(if switch.closing {
-                "Close chat?"
-            } else if switch.returning {
-                "Return to terminal?"
-            } else {
-                "Switch to native chat?"
-            })
-            .into(),
-            body(detail),
-        ];
-        if let Some(session) = &switch.session {
-            rows.push(
-                widget::text::caption(format!(
-                    "{} · {}",
-                    session.launch.provider.label(),
-                    session
-                        .launch
-                        .session_id
-                        .as_deref()
-                        .unwrap_or("Waiting for exact conversation identity")
-                ))
-                .into(),
-            );
-        }
-        if switch.selection_source.is_some() {
-            rows.push(body("Select the current agent conversation explicitly. Paste its complete UUID from the CLI's session information. This does not search your conversations or choose a recent one; you are responsible for selecting the session currently running here."));
-            let input = widget::text_input("Exact conversation UUID", &switch.entered_identity)
-                .id(widget::Id::new("dialog.chat-switch.identity"));
-            rows.push(if switch.pending {
-                input.into()
-            } else {
-                input
-                    .on_input(|identity| action(Action::SwitchIdentity(identity)))
-                    .into()
-            });
-        }
-        if let Some(error) = &switch.error {
-            rows.push(body(error.as_str()));
-        }
-        if switch.pending {
-            rows.push(
-                widget::text::caption("Waiting for the daemon to acknowledge the handoff…").into(),
-            );
-        }
-        rows.push(
-            widget::row::with_children(vec![
-                widget::button::standard(if switch.error.is_some() {
-                    "Keep current view"
-                } else {
-                    "Cancel"
-                })
-                .id(widget::Id::new("dialog.chat-switch.cancel"))
-                .on_press_maybe((!switch.pending).then_some(action(Action::DismissSwitch)))
-                .into(),
-                widget::button::suggested(if switch.closing {
-                    "Stop and close chat"
-                } else if switch.returning {
-                    "Return to terminal"
-                } else {
-                    "Switch to chat"
-                })
-                .id(widget::Id::new("dialog.chat-switch.confirm"))
-                .on_press_maybe(
-                    (!switch.pending && switch.error.is_none())
-                        .then_some(action(Action::ConfirmSwitch)),
-                )
-                .into(),
-            ])
-            .spacing(8)
-            .into(),
-        );
-        Some(super::super::dialog_ui::surface(
-            widget::column::with_children(rows).spacing(12),
-            560.0,
-        ))
     }
 }
 
 impl Runtime {
-    fn view(&self) -> Element<'_, Message> {
+    fn view(&self, transitioning: bool) -> Element<'_, Message> {
         let target = self.target;
-        let available = !self.disconnected && !self.snapshot.exited && self.pending.is_none();
+        let available =
+            !transitioning && !self.disconnected && !self.snapshot.exited && self.pending.is_none();
         let snapshot = &self.snapshot;
         let mut transcript = Vec::new();
         if snapshot.has_earlier {
             transcript.push(
                 widget::button::text("Load earlier history")
                     .on_press_maybe(
-                        (!self.disconnected && self.pending.is_none())
+                        (!transitioning && !self.disconnected && self.pending.is_none())
                             .then_some(command(target, Command::LoadEarlier)),
                     )
                     .into(),
@@ -185,11 +92,16 @@ impl Runtime {
             content.push(
                 widget::button::text("Jump to latest")
                     .on_press_maybe(
-                        (!self.disconnected && self.pending.is_none())
+                        (!transitioning && !self.disconnected && self.pending.is_none())
                             .then_some(command(target, Command::Refresh)),
                     )
                     .into(),
             );
+        }
+        if transitioning {
+            content.push(body(
+                "Switching or closing this session… Editing and session controls are disabled. You can still read and copy the conversation.",
+            ));
         }
         if let Some(error) = self.error.as_ref().or(snapshot.error.as_ref()) {
             content.push(body(error.as_str()));
@@ -207,7 +119,9 @@ impl Runtime {
                     icon(
                         "view-refresh-symbolic",
                         "Reconnect to this session",
-                        self.pending.is_none(),
+                        !transitioning
+                            && self.pending.is_none()
+                            && !self.attachment_chooser_pending,
                         Action::Reconnect(target),
                     ),
                 ])
@@ -262,12 +176,17 @@ impl Runtime {
                 .iter()
                 .map(|model| model.id.clone())
                 .collect::<Vec<_>>();
-            controls.push(
+            controls.push(if transitioning {
+                widget::button::standard(
+                    selected.map_or_else(|| "Model".to_owned(), |index| labels[index].clone()),
+                )
+                .into()
+            } else {
                 widget::dropdown(labels, selected, move |index| {
                     action(Action::Model(target, ids[index].clone()))
                 })
-                .into(),
-            );
+                .into()
+            });
         }
         if snapshot.capabilities.reasoning_selection
             && let Some(model) = snapshot
@@ -282,7 +201,12 @@ impl Runtime {
                 .position(|reasoning| Some(reasoning) == snapshot.reasoning.as_ref());
             let reasoning = model.reasoning.clone();
             let model_id = model.id.clone();
-            controls.push(
+            controls.push(if transitioning {
+                widget::button::standard(
+                    selected.map_or("Reasoning", |index| model.reasoning[index].as_str()),
+                )
+                .into()
+            } else {
                 widget::dropdown(model.reasoning.clone(), selected, move |index| {
                     action(Action::Reasoning(
                         target,
@@ -290,8 +214,8 @@ impl Runtime {
                         reasoning[index].clone(),
                     ))
                 })
-                .into(),
-            );
+                .into()
+            });
         }
         if !snapshot.capabilities.permission_modes.is_empty() {
             let selected = snapshot
@@ -300,14 +224,19 @@ impl Runtime {
                 .iter()
                 .position(|mode| Some(mode) == self.permission_mode.as_ref());
             let modes = snapshot.capabilities.permission_modes.clone();
-            controls.push(
+            controls.push(if transitioning {
+                widget::button::standard(selected.map_or("Permissions", |index| {
+                    snapshot.capabilities.permission_modes[index].as_str()
+                }))
+                .into()
+            } else {
                 widget::dropdown(
                     snapshot.capabilities.permission_modes.clone(),
                     selected,
                     move |index| action(Action::PermissionMode(target, modes[index].clone())),
                 )
-                .into(),
-            );
+                .into()
+            });
         }
         if !controls.is_empty() {
             content.push(
@@ -324,7 +253,9 @@ impl Runtime {
         {
             content.push(
                 widget::button::text("Append provider's suggested draft")
-                    .on_press(action(Action::AppendProviderDraft(target)))
+                    .on_press_maybe(
+                        (!transitioning).then_some(action(Action::AppendProviderDraft(target))),
+                    )
                     .into(),
             );
         }
@@ -340,7 +271,10 @@ impl Runtime {
                         command.name.trim_start_matches('/'),
                         command.description
                     ))
-                    .on_press(action(Action::Slash(target, command.name.clone())))
+                    .on_press_maybe(
+                        (!transitioning)
+                            .then_some(action(Action::Slash(target, command.name.clone()))),
+                    )
                     .into()
                 })
                 .collect::<Vec<Element<'_, Message>>>();
@@ -363,7 +297,7 @@ impl Runtime {
                     icon(
                         "edit-delete-symbolic",
                         "Remove attachment",
-                        true,
+                        !transitioning,
                         Action::RemoveAttachment(target, index),
                     ),
                 ])
@@ -381,7 +315,13 @@ impl Runtime {
                 .height(Length::Fill)
                 .into(),
         ];
-        content.push(
+        content.push(if transitioning {
+            widget::container(widget::scrollable(body(draft.clone())))
+                .height(104)
+                .width(Length::Fill)
+                .padding(8)
+                .into()
+        } else {
             iced::widget::text_editor::TextEditor::new(&self.composer)
                 .id(card_control_id(target.card, "chat-composer"))
                 .placeholder("Message · Enter for a new line · use Send to submit")
@@ -389,15 +329,15 @@ impl Runtime {
                 .height(104)
                 .padding(8)
                 .on_action(move |event| action(Action::Composer(target, event)))
-                .into(),
-        );
+                .into()
+        });
         let has_draft = !draft.trim().is_empty() || !self.attachments.is_empty();
         let mut actions = Vec::new();
         if snapshot.capabilities.attachments {
             actions.push(icon(
                 "mail-attachment-symbolic",
                 "Attach files",
-                available,
+                available && !self.attachment_chooser_pending,
                 Action::Attach(target),
             ));
         }
@@ -415,7 +355,9 @@ impl Runtime {
                 .iter()
                 .map(|command| command.name.clone())
                 .collect::<Vec<_>>();
-            actions.push(
+            actions.push(if transitioning {
+                widget::button::standard("Slash commands").into()
+            } else {
                 widget::dropdown(
                     snapshot
                         .commands
@@ -431,8 +373,8 @@ impl Runtime {
                     None,
                     move |index| action(Action::Slash(target, commands[index].clone())),
                 )
-                .into(),
-            );
+                .into()
+            });
         }
         actions.push(iced::widget::Space::new().width(Length::Fill).into());
         if snapshot.busy {
@@ -492,7 +434,11 @@ impl Runtime {
         content.push(
             widget::text::caption(format!(
                 "{} · {} in / {} out{}{}",
-                if self.pending.is_some() {
+                if transitioning {
+                    "Session transition in progress"
+                } else if self.attachment_chooser_pending {
+                    "Choosing attachments"
+                } else if self.pending.is_some() {
                     "Awaiting acknowledgement"
                 } else if snapshot.detail.is_empty() {
                     if snapshot.busy { "Working" } else { "Ready" }
@@ -730,14 +676,14 @@ impl Runtime {
                         target.card, request.id, field.id
                     )))
                     .secure(field.secret)
-                    .on_input(move |value| {
+                    .on_input_maybe(available.then_some(move |value| {
                         action(Action::Field(
                             target,
                             request_id.clone(),
                             field_id.clone(),
                             value,
                         ))
-                    })
+                    }))
                     .into(),
                 );
             }

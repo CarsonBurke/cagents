@@ -73,6 +73,16 @@ pub fn create(launch: &Launch) -> Result<(ProcessSpec, Box<dyn Adapter>), String
                     start[key] = json!(value);
                 }
             }
+            "--profile" | "-p" | "--config" | "-c" | "--add-dir" | "--remote-auth-token-env"
+                if launch.session_id.is_some() =>
+            {
+                // The exact thread is already configured on the shared
+                // server. Keep its live permissions/model, not TUI defaults.
+                args.next()
+                    .ok_or_else(|| format!("Missing value for Codex {arg}"))?;
+            }
+            "--search" | "--dangerously-bypass-approvals-and-sandbox"
+                if launch.session_id.is_some() => {}
             _ => {
                 return Err(format!(
                     "Codex launch option {arg:?} cannot safely be translated to native app-server mode"
@@ -1486,9 +1496,45 @@ mod tests {
 
     #[test]
     fn joins_exact_thread_without_settings_or_history_overrides() {
-        let mut adapter = adapter();
+        let directory = tempfile::tempdir().unwrap();
+        let socket = directory.path().join("shared.sock");
+        let _server = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        let launch = Launch {
+            provider: crate::chat::Provider::Codex,
+            session_id: Some("thread-exact".into()),
+            recipe: crate::model::LaunchRecipe {
+                program: "codex".into(),
+                arguments: [
+                    "resume",
+                    "thread-exact",
+                    "--remote",
+                    &format!("unix://{}", socket.display()),
+                    "--profile",
+                    "work",
+                    "--config",
+                    "model=\"other-model\"",
+                    "--model",
+                    "other-model",
+                    "--search",
+                    "--dangerously-bypass-approvals-and-sandbox",
+                ]
+                .into_iter()
+                .map(str::to_owned)
+                .collect(),
+                working_directory: directory.path().into(),
+                environment: BTreeMap::from([(
+                    "CODEX_HOME".into(),
+                    directory.path().to_str().unwrap().into(),
+                )]),
+            },
+        };
+        let (spec, mut adapter) = create(&launch).unwrap();
+        assert!(matches!(
+            spec.transport,
+            TransportSpec::UnixWebSocket { .. }
+        ));
         let initialize = adapter.initialize().unwrap();
-        let step = adapter.receive(json!({"id":initialize.writes[0]["id"],"result":{"userAgent":"codex","codexHome":"/tmp"}})).unwrap();
+        let step = adapter.receive(json!({"id":initialize.writes[0]["id"],"result":{"userAgent":"codex","codexHome":directory.path()}})).unwrap();
         let resume = step
             .writes
             .iter()

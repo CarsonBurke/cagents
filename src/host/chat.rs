@@ -78,6 +78,75 @@ fn start(
     terminate_source: bool,
 ) -> Result<ServerResponse, ProtocolError> {
     let reservation_id = session.id;
+    if let Some(proof) = source.as_ref() {
+        let handle = {
+            let state = host.lock().unwrap_or_else(|p| p.into_inner());
+            validate_proof(Some(proof), state.proof())?;
+            let record = state
+                .terminals
+                .get(&session.id)
+                .ok_or_else(|| error("The proven source terminal no longer exists"))?;
+            if record.handle.is_completed() {
+                return Err(unavailable(
+                    "The source agent has exited; resume its exact conversation in the terminal first",
+                ));
+            }
+            record.handle.clone()
+        };
+        // ChatStart already runs off the UI thread. Ask the PTY owner for fresh
+        // evidence, rather than trusting a saved hint or a user-entered UUID.
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let (hint, recipe) = loop {
+            let hint = handle.observe_agent().map_err(unavailable)?;
+            if let Some(recipe) = hint
+                .as_deref()
+                .and_then(crate::model::agent_recovery::recipe_from_hint)
+            {
+                break (hint, recipe);
+            }
+            if Instant::now() >= deadline || handle.is_completed() {
+                return Err(unavailable(
+                    "The active agent has no process-bound conversation identity. Resume this exact conversation in the provider CLI, then retry. Shared Codex servers do not expose a TUI-to-thread binding; no recent session or private backend is selected.",
+                ));
+            }
+            thread::sleep(Duration::from_millis(100));
+        };
+        let provider = match std::path::Path::new(&recipe.program)
+            .file_name()
+            .and_then(|name| name.to_str())
+        {
+            Some("omp") => Provider::Omp,
+            Some("claude") => Provider::Claude,
+            Some("codex") => Provider::Codex,
+            _ => return Err(error("The foreground process is not a supported agent")),
+        };
+        let id = recipe
+            .arguments
+            .windows(2)
+            .find(|pair| pair[0] == "resume" || pair[0] == "--resume")
+            .map(|pair| pair[1].clone())
+            .ok_or_else(|| error("Missing process-bound conversation identity"))?;
+        if provider != session.launch.provider
+            || session
+                .launch
+                .session_id
+                .as_ref()
+                .is_some_and(|expected| expected != &id)
+        {
+            return Err(error(
+                "The active conversation changed before the handoff; retry from the current terminal",
+            ));
+        }
+        session.launch.recipe = recipe;
+        session.launch.session_id = Some(id);
+        let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
+        validate_proof(Some(proof), state.proof())?;
+        let record = state
+            .terminals
+            .get_mut(&session.id)
+            .ok_or_else(|| error("The proven source terminal no longer exists"))?;
+        record.session.resume_hint = hint;
+    }
     // A Codex TUI remains live while its native view is detached. Switching
     // that proven source back is an attachment, never a second daemon writer.
     if source.is_some() && !terminate_source && session.launch.provider == Provider::Codex {
@@ -209,12 +278,9 @@ fn start(
                         "Requested conversation differs from the source's exact resume identity",
                     ));
                 }
-            } else if id.len() != 36
-                || uuid::Uuid::parse_str(id).is_err()
-                || (session.launch.provider != Provider::Codex && !terminate_source)
-            {
+            } else {
                 return Err(error(
-                    "Fresh observed agents require an explicitly chosen full conversation UUID and confirmed CLI stop (Codex same-server join does not stop its TUI)",
+                    "The source no longer has an exact process-bound conversation identity",
                 ));
             }
             if session.launch.provider != Provider::Codex
@@ -222,7 +288,7 @@ fn start(
                 && !record.handle.is_completed()
             {
                 return Err(error(
-                    "This provider requires explicit confirmation to stop the CLI before exact native resume",
+                    "This provider requires stopping the CLI before exact native resume",
                 ));
             }
             let handle = record.handle.clone();
@@ -251,6 +317,16 @@ fn start(
     drop(retired);
     let result = (|| {
         if let Some(handle) = source_handle {
+            let current = handle
+                .observe_agent()
+                .map_err(unavailable)?
+                .as_deref()
+                .and_then(crate::model::agent_recovery::recipe_from_hint);
+            if current.as_ref() != Some(&session.launch.recipe) {
+                return Err(error(
+                    "The foreground conversation changed during handoff; no native writer was started",
+                ));
+            }
             if session.launch.provider != Provider::Codex && !handle.is_completed() {
                 handle.shutdown().map_err(super::state::send_error)?;
                 let deadline = Instant::now() + Duration::from_secs(10);

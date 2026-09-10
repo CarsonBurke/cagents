@@ -15,7 +15,7 @@ use cosmic::{Element, Renderer, Theme, widget};
 use serde::Deserialize;
 
 const HOVER_DURATION: Duration = Duration::from_millis(120);
-const TOOLTIP_DELAY: Duration = Duration::from_millis(450);
+const TOOLTIP_DELAY: Duration = Duration::from_millis(1_000);
 
 /// Soft full-bounds hover feedback, including when a child captures the event.
 /// The native animation clock requests frames only until its target is reached.
@@ -62,13 +62,14 @@ pub fn fade<'a, Message: 'a>(
 
 /// Delayed, stationary tooltips that do not hide their control from assistive
 /// technology (the pinned upstream Tooltip does not forward a11y nodes).
-/// Give the control its own accessible name/description as well.
+/// Give the control its own accessible name/description as well. The dwell clock
+/// follows the control, not its label, so live status text cannot postpone it.
 pub fn tooltip<'a, Message: 'a>(
     content: impl Into<Element<'a, Message>>,
     label: impl Into<Cow<'a, str>>,
 ) -> Element<'a, Message> {
     let label = label.into();
-    let tip = cosmic::widget::container(cosmic::widget::text(label.clone()).size(12))
+    let tip = cosmic::widget::container(cosmic::widget::text(label).size(12))
         .class(cosmic::theme::Container::custom(|_| Default::default()))
         .padding(8)
         .max_width(320)
@@ -76,10 +77,7 @@ pub fn tooltip<'a, Message: 'a>(
     Effect {
         content: content.into(),
         kind: Kind::Tooltip,
-        tip: Some(Tip {
-            label,
-            content: tip,
-        }),
+        tip: Some(Tip { content: tip }),
     }
     .into()
 }
@@ -347,7 +345,6 @@ struct Effect<'a, Message> {
 }
 
 struct Tip<'a, Message> {
-    label: Cow<'a, str>,
     content: Element<'a, Message>,
 }
 
@@ -365,7 +362,6 @@ struct State {
     tooltip: Animation<bool>,
     entered: Option<Instant>,
     tip_open: bool,
-    label: Option<String>,
     inspect_control: bool,
     disabled: bool,
     focused: bool,
@@ -380,7 +376,6 @@ impl Default for State {
             tooltip: Animation::new(false).duration(HOVER_DURATION),
             entered: None,
             tip_open: false,
-            label: None,
             inspect_control: true,
             disabled: false,
             focused: true,
@@ -402,10 +397,7 @@ impl<Message> Widget<Message, Theme, Renderer> for Effect<'_, Message> {
         }
     }
     fn state(&self) -> tree::State {
-        tree::State::new(State {
-            label: self.tip.as_ref().map(|tip| tip.label.to_string()),
-            ..State::default()
-        })
+        tree::State::new(State::default())
     }
     fn children(&self) -> Vec<Tree> {
         let mut children = vec![Tree::new(&self.content)];
@@ -424,13 +416,8 @@ impl<Message> Widget<Message, Theme, Renderer> for Effect<'_, Message> {
         let changed_control = identity.as_ref() != control_identity(&tree.children[0]);
         let state = tree.state.downcast_mut::<State>();
         state.inspect_control = true;
-        if changed_control
-            || state.label.as_deref() != self.tip.as_ref().map(|tip| tip.label.as_ref())
-        {
-            *state = State {
-                label: self.tip.as_ref().map(|tip| tip.label.to_string()),
-                ..State::default()
-            };
+        if changed_control {
+            *state = State::default();
         }
     }
     fn size(&self) -> Size<Length> {

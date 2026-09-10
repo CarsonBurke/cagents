@@ -35,9 +35,6 @@ pub enum CopyPart {
 #[derive(Clone)]
 pub enum Action {
     Switch(CardId),
-    ConfirmSwitch,
-    DismissSwitch,
-    SwitchIdentity(String),
     Ready(Target, Ready),
     Wake(Target, Wake),
     Reconnect(Target),
@@ -86,10 +83,28 @@ impl Action {
                 | Self::HandoffFinished(..)
                 | Self::CloseFinished(..)
                 | Self::UrlFinished(..)
-                | Self::ConfirmSwitch
-                | Self::DismissSwitch
-                | Self::SwitchIdentity(..)
         )
+    }
+
+    fn mutation_target(&self) -> Option<Target> {
+        match self {
+            Self::Composer(target, action) if action.is_edit() => Some(*target),
+            Self::Reconnect(target)
+            | Self::Submit(target, _)
+            | Self::AppendProviderDraft(target)
+            | Self::Command(target, _)
+            | Self::Attach(target)
+            | Self::Attached(target, _)
+            | Self::RemoveAttachment(target, _)
+            | Self::Model(target, _)
+            | Self::Reasoning(target, _, _)
+            | Self::PermissionMode(target, _)
+            | Self::Field(target, _, _, _)
+            | Self::Choice(target, _, _, _)
+            | Self::Answer(target, _, _)
+            | Self::Slash(target, _) => Some(*target),
+            _ => None,
+        }
     }
 }
 
@@ -97,25 +112,14 @@ struct Attempt {
     target: Target,
     session: chat::Session,
 }
-struct Switch {
-    card: CardId,
-    session: Option<chat::Session>,
-    returning: bool,
-    closing: bool,
-    pending: bool,
-    error: Option<String>,
-    keyboard_nav: bool,
-    selection_source: Option<TerminalSession>,
-    entered_identity: String,
-    focus_index: usize,
-}
 
 pub(super) struct State {
     sender: async_channel::Sender<(Target, Wake)>,
     receiver: async_channel::Receiver<(Target, Wake)>,
     generation: u64,
     attempts: HashMap<CardId, Attempt>,
-    switch: Option<Switch>,
+    handoffs: HashSet<Target>,
+    closing: HashSet<Target>,
     closed: HashSet<CardId>,
 }
 impl Default for State {
@@ -126,7 +130,8 @@ impl Default for State {
             receiver,
             generation: 0,
             attempts: HashMap::new(),
-            switch: None,
+            handoffs: HashSet::new(),
+            closing: HashSet::new(),
             closed: HashSet::new(),
         }
     }
@@ -218,6 +223,7 @@ pub(super) struct Runtime {
     composer: text_editor::Content<cosmic::Renderer>,
     revision: u64,
     attachments: Vec<Attachment>,
+    attachment_chooser_pending: bool,
     expanded: HashSet<String>,
     raw: HashSet<String>,
     answers: HashMap<(String, String), Vec<String>>,
@@ -244,6 +250,7 @@ impl Runtime {
             composer: text_editor::Content::new(),
             revision: 0,
             attachments: Vec::new(),
+            attachment_chooser_pending: false,
             expanded: HashSet::new(),
             raw: HashSet::new(),
             answers: HashMap::new(),
@@ -317,6 +324,19 @@ impl Runtime {
             self.refresh();
         }
     }
+    fn terminal_return_blocker(&self) -> Option<&'static str> {
+        if self.attachment_chooser_pending {
+            Some("Finish or cancel the file chooser before returning to the terminal.")
+        } else if self.pending.is_some() {
+            Some("Wait for the pending chat command to finish before returning to the terminal.")
+        } else if !self.composer.is_empty() || !self.attachments.is_empty() {
+            Some(
+                "Your unsent draft and attachments cannot be transferred to the terminal. Send them, or copy the draft and clear it and remove the attachments, then return.",
+            )
+        } else {
+            None
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -355,39 +375,14 @@ fn observed_launch(session: &TerminalSession) -> Option<LaunchRecipe> {
         })
 }
 
-fn selected_conversion(source: &TerminalSession, identity: &str) -> Result<chat::Session, String> {
-    let identity = identity.trim();
-    if identity.len() != 36 || uuid::Uuid::parse_str(identity).is_err() {
-        return Err("Enter the complete conversation UUID shown by this agent. Prefixes and newest-session selectors are not accepted.".into());
-    }
-    let recipe = observed_launch(source).ok_or("The foreground agent launch is not known.")?;
-    let provider = match Path::new(&recipe.program)
-        .file_name()
-        .and_then(|name| name.to_str())
-    {
-        Some("omp") => Provider::Omp,
-        Some("claude") => Provider::Claude,
-        Some("codex") => Provider::Codex,
-        _ => return Err("This is not a supported agent launch.".into()),
-    };
-    let launch = chat::Launch {
-        provider,
-        recipe,
-        session_id: Some(identity.to_owned()),
-    };
-    if launch.terminal_recipe().is_none() {
-        return Err("The observed launch contains arguments that cannot safely be replayed. Resume this exact conversation in the CLI first, then switch to chat.".into());
-    }
-    Ok(chat::Session {
-        id: source.id,
-        launch,
-        proof: None,
-        terminal: Some(source.clone()),
-    })
-}
-
 pub(super) fn conversion(session: &TerminalSession) -> Result<chat::Session, String> {
-    let recipe = session.agent_resume_recipe().ok_or_else(|| "Native chat is unavailable: no exact validated agent conversation identity is known. Keep this terminal; newest-session and fork recovery are never used.".to_owned())?;
+    let recipe = session
+        .agent_resume_recipe()
+        .or_else(|| observed_launch(session))
+        .ok_or_else(|| {
+            "No supported foreground agent is known. Focus the running agent terminal and retry."
+                .to_owned()
+        })?;
     let program = Path::new(&recipe.program)
         .file_name()
         .and_then(|name| name.to_str());
@@ -406,16 +401,13 @@ pub(super) fn conversion(session: &TerminalSession) -> Result<chat::Session, Str
         .arguments
         .windows(2)
         .find(|pair| pair[0] == identity_flag)
-        .map(|pair| pair[1].clone())
-        .ok_or_else(|| {
-            "Validated recovery recipe has no exact conversation identity.".to_owned()
-        })?;
+        .map(|pair| pair[1].clone());
     Ok(chat::Session {
         id: session.id,
         launch: chat::Launch {
             provider,
             recipe,
-            session_id: Some(session_id),
+            session_id,
         },
         proof: None,
         terminal: Some(session.clone()),
@@ -460,20 +452,23 @@ impl Cagents {
         Subscription::run_with(Source(self.chat_ui.receiver.clone()), stream)
             .map(|(target, wake)| Message::ChatUi(Action::Wake(target, wake)))
     }
-    pub(super) fn chat_modal(&self) -> bool {
-        self.chat_ui.switch.is_some()
-    }
-    pub(super) fn chat_modal_pending(&self) -> bool {
-        self.chat_ui
-            .switch
-            .as_ref()
-            .is_some_and(|switch| switch.pending)
-    }
     pub(super) fn chat_forget(&mut self, card: CardId) {
         self.chat_ui.attempts.remove(&card);
+        self.chat_ui.handoffs.retain(|target| target.card != card);
+        self.chat_ui.closing.retain(|target| target.card != card);
     }
     pub(super) fn chat_start_pending(&self, card: CardId) -> bool {
         self.chat_ui.attempts.contains_key(&card)
+            || self
+                .chat_ui
+                .handoffs
+                .iter()
+                .any(|target| target.card == card)
+            || self
+                .chat_ui
+                .closing
+                .iter()
+                .any(|target| target.card == card)
     }
     pub(super) fn chat_switch_available(&self, card: CardId) -> bool {
         match self.card_state(card).map(|state| &state.kind) {
@@ -498,27 +493,28 @@ impl Cagents {
         self.chat_ui.closed.contains(&card)
     }
     pub(super) fn begin_chat_close(&mut self, card: CardId) -> Task<Message> {
-        if self.chat_modal() {
+        if self.chat_start_pending(card) {
             return Task::none();
         }
         let Some(CardRuntime::Chat(runtime)) = self.cards.get(&card) else {
             return Task::none();
         };
-        self.chat_ui.switch = Some(Switch {
-            card,
-            session: Some(runtime.session.clone()),
-            returning: false,
-            closing: true,
-            pending: false,
-            error: None,
-            keyboard_nav: self.core.keyboard_nav(),
-            focus_index: 0,
-            selection_source: None,
-            entered_identity: String::new(),
-        });
-        self.core.set_keyboard_nav(false);
-        iced::widget::operation::focus(widget::Id::new("dialog.chat-switch.cancel"))
-            .map(cosmic::Action::App)
+        if runtime.attachment_chooser_pending {
+            self.status = Some(TransientNotice::error(
+                "Finish or cancel the file chooser before closing the chat.",
+            ));
+            return Task::none();
+        }
+        let target = runtime.target;
+        let handle = runtime.handle.clone();
+        self.chat_ui.closing.insert(target);
+        cosmic::task::future(async move {
+            let result = tokio::task::spawn_blocking(move || handle.close())
+                .await
+                .map_err(|error| error.to_string())
+                .and_then(|result| result);
+            Message::ChatUi(Action::CloseFinished(target, result))
+        })
     }
     pub(super) fn start_chat(
         &mut self,
@@ -564,6 +560,9 @@ impl Cagents {
         }
     }
     fn chat_send(&mut self, target: Target, command: Command, clear_draft: bool) -> Task<Message> {
+        if self.chat_start_pending(target.card) {
+            return Task::none();
+        }
         let Some(runtime) = self.chat_runtime_mut(target) else {
             return Task::none();
         };
@@ -608,164 +607,74 @@ impl Cagents {
         })
     }
     pub(super) fn handle_chat_ui(&mut self, action: Action) -> Task<Message> {
-        if self.chat_modal() && !action.allowed_while_modal() {
+        if let Some(target) = action.mutation_target()
+            && (self.chat_start_pending(target.card) || self.chat_ui.closed.contains(&target.card))
+        {
             return Task::none();
         }
         match action {
             Action::Switch(card) => {
-                let (session, returning, error) =
-                    match self.card_state(card).map(|state| &state.kind) {
-                        Some(CardKind::Terminal(terminal)) => match conversion(terminal) {
-                            Ok(session) => (Some(session), false, None),
-                            Err(error) => (None, false, Some(error)),
-                        },
-                        Some(CardKind::Chat(session)) => {
-                            (Some(session.clone()), true, return_terminal(session).err())
-                        }
-                        _ => return Task::none(),
-                    };
-                let selection_source = if session.is_none() {
-                    self.card_state(card).and_then(|card| match &card.kind {
-                        CardKind::Terminal(source) if observed_launch(source).is_some() => {
-                            Some(source.clone())
-                        }
-                        _ => None,
-                    })
-                } else {
-                    None
-                };
-                self.chat_ui.switch = Some(Switch {
-                    card,
-                    session,
-                    returning,
-                    closing: false,
-                    pending: false,
-                    error,
-                    keyboard_nav: self.core.keyboard_nav(),
-                    focus_index: 0,
-                    selection_source,
-                    entered_identity: String::new(),
-                });
-                self.core.set_keyboard_nav(false);
-                return iced::widget::operation::focus(widget::Id::new(
-                    "dialog.chat-switch.cancel",
-                ))
-                .map(cosmic::Action::App);
-            }
-            Action::SwitchIdentity(identity) => {
-                let Some(switch) = self
-                    .chat_ui
-                    .switch
-                    .as_mut()
-                    .filter(|switch| !switch.pending)
-                else {
-                    return Task::none();
-                };
-                let Some(source) = &switch.selection_source else {
-                    return Task::none();
-                };
-                switch.entered_identity = identity;
-                match selected_conversion(source, &switch.entered_identity) {
-                    Ok(session) => {
-                        switch.session = Some(session);
-                        switch.error = None;
-                    }
-                    Err(error) => {
-                        switch.session = None;
-                        switch.error = Some(error);
-                    }
-                }
-            }
-            Action::DismissSwitch => {
-                if self.chat_modal_pending() {
+                if self.chat_start_pending(card) {
                     return Task::none();
                 }
-                if let Some(switch) = self.chat_ui.switch.take() {
-                    self.core.set_keyboard_nav(switch.keyboard_nav);
-                    return iced::widget::operation::focus(card_control_id(switch.card, "chat"))
-                        .map(cosmic::Action::App);
-                }
-            }
-            Action::ConfirmSwitch => {
-                let Some(switch) = self.chat_ui.switch.as_ref() else {
-                    return Task::none();
-                };
-                if switch.pending || switch.error.is_some() {
-                    return Task::none();
-                }
-                let card = switch.card;
-                let Some(session) = switch.session.clone() else {
-                    return Task::none();
-                };
-                if switch.closing {
-                    let Some(CardRuntime::Chat(runtime)) = self.cards.get(&card) else {
-                        return Task::none();
-                    };
-                    if runtime.session.id != session.id {
-                        return Task::none();
-                    }
-                    let target = runtime.target;
-                    let handle = runtime.handle.clone();
-                    self.chat_ui.switch.as_mut().unwrap().pending = true;
-                    return cosmic::task::future(async move {
-                        let result = tokio::task::spawn_blocking(move || handle.close())
-                            .await
-                            .map_err(|error| error.to_string())
-                            .and_then(|result| result);
-                        Message::ChatUi(Action::CloseFinished(target, result))
-                    });
-                }
-                if switch.returning {
-                    let Some(CardRuntime::Chat(runtime)) = self.cards.get(&card) else {
-                        return Task::none();
-                    };
-                    if runtime.session.id != session.id || runtime.pending.is_some() {
-                        return Task::none();
-                    }
-                    let mut current_session = runtime.session.clone();
-                    current_session.launch.session_id =
-                        runtime.handle.snapshot().session_id.clone();
-                    let terminal = match return_terminal(&current_session) {
-                        Ok(terminal) => terminal,
-                        Err(error) => {
-                            self.chat_ui.switch.as_mut().unwrap().error = Some(error);
+                match self.card_state(card).map(|state| &state.kind) {
+                    Some(CardKind::Terminal(terminal)) => {
+                        let source = terminal.continuity.live_proof();
+                        let session = match conversion(terminal) {
+                            Ok(session) => session,
+                            Err(error) => {
+                                self.status = Some(TransientNotice::error(error));
+                                return Task::none();
+                            }
+                        };
+                        if source.is_none() {
+                            self.status = Some(TransientNotice::error(
+                                "Reconnect the original terminal before switching its active conversation.",
+                            ));
                             return Task::none();
                         }
-                    };
-                    let target = runtime.target;
-                    let handle = runtime.handle.clone();
-                    let detach = runtime.session.launch.provider == Provider::Codex
-                        && runtime
-                            .session
-                            .terminal
-                            .as_ref()
-                            .is_some_and(|source| source.id == terminal.id);
-                    self.chat_ui.switch.as_mut().unwrap().pending = true;
-                    return cosmic::task::future(async move {
-                        let result = if detach {
-                            Ok(())
-                        } else {
-                            tokio::task::spawn_blocking(move || handle.close())
-                                .await
-                                .map_err(|error| error.to_string())
-                                .and_then(|result| result)
+                        let terminate = session.launch.provider != Provider::Codex;
+                        return self.start_chat(card, session, true, source, terminate);
+                    }
+                    Some(CardKind::Chat(_)) => {
+                        let Some(CardRuntime::Chat(runtime)) = self.cards.get(&card) else {
+                            return Task::none();
                         };
-                        Message::ChatUi(Action::HandoffFinished(target, result))
-                    });
+                        if let Some(reason) = runtime.terminal_return_blocker() {
+                            self.status = Some(TransientNotice::error(reason));
+                            return Task::none();
+                        }
+                        let mut session = runtime.session.clone();
+                        session.launch.session_id = runtime.handle.snapshot().session_id.clone();
+                        let terminal = match return_terminal(&session) {
+                            Ok(terminal) => terminal,
+                            Err(error) => {
+                                self.status = Some(TransientNotice::error(error));
+                                return Task::none();
+                            }
+                        };
+                        let target = runtime.target;
+                        let handle = runtime.handle.clone();
+                        let detach = session.launch.provider == Provider::Codex
+                            && session
+                                .terminal
+                                .as_ref()
+                                .is_some_and(|source| source.id == terminal.id);
+                        self.chat_ui.handoffs.insert(target);
+                        return cosmic::task::future(async move {
+                            let result = if detach {
+                                Ok(())
+                            } else {
+                                tokio::task::spawn_blocking(move || handle.close())
+                                    .await
+                                    .map_err(|error| error.to_string())
+                                    .and_then(|result| result)
+                            };
+                            Message::ChatUi(Action::HandoffFinished(target, result))
+                        });
+                    }
+                    _ => return Task::none(),
                 }
-                let Some(CardKind::Terminal(current)) =
-                    self.card_state(card).map(|state| &state.kind)
-                else {
-                    return Task::none();
-                };
-                if session.terminal.as_ref() != Some(current) {
-                    self.chat_ui.switch.as_mut().unwrap().error = Some("The terminal identity changed while this dialog was open. Keep the current view and reopen the switch dialog to review the new source.".into());
-                    return Task::none();
-                }
-                let source = current.continuity.live_proof();
-                let terminate = session.launch.provider != Provider::Codex;
-                self.chat_ui.switch.as_mut().unwrap().pending = true;
-                return self.start_chat(card, session, true, source, terminate);
             }
             Action::Ready(target, ready) => {
                 let result = ready.0.lock().ok().and_then(|mut ready| ready.take());
@@ -786,7 +695,9 @@ impl Cagents {
                         && match &card.kind {
                             CardKind::Chat(session) => session.id == attempt.session.id,
                             CardKind::Terminal(session) => {
-                                Some(session) == attempt.session.terminal.as_ref()
+                                attempt.session.terminal.as_ref().is_some_and(|source| {
+                                    source.id == session.id && source.launch == session.launch
+                                })
                             }
                             _ => false,
                         }
@@ -795,7 +706,7 @@ impl Cagents {
                 }
                 match result {
                     Ok(handle) => {
-                        let mut session = attempt.session;
+                        let mut session = handle.session();
                         session.proof = handle.proof();
                         let visible = self.workspace.visibility(target.card)
                             == Some(VisibilityClass::Visible);
@@ -822,15 +733,6 @@ impl Cagents {
                             session = runtime.session.clone();
                         }
                         self.commit_chat_session(target.card, session);
-                        if self
-                            .chat_ui
-                            .switch
-                            .as_ref()
-                            .is_some_and(|switch| switch.card == target.card)
-                        {
-                            let switch = self.chat_ui.switch.take().unwrap();
-                            self.core.set_keyboard_nav(switch.keyboard_nav);
-                        }
                         return iced::widget::operation::focus(card_control_id(
                             target.card,
                             "chat-composer",
@@ -838,22 +740,15 @@ impl Cagents {
                         .map(cosmic::Action::App);
                     }
                     Err(error) => {
-                        if let Some(switch) = self
-                            .chat_ui
-                            .switch
-                            .as_mut()
-                            .filter(|switch| switch.card == target.card)
-                        {
-                            switch.pending = false;
-                            switch.error = Some(error.clone());
-                        }
                         if let Some(CardRuntime::Chat(runtime)) = self.cards.get_mut(&target.card) {
                             runtime.error = Some(error);
                             runtime.disconnected = true;
-                        } else if !self.chat_modal() {
-                            self.cards.insert(target.card, CardRuntime::Failed(error));
+                        } else {
+                            // Failed recognition/attachment must never replace or
+                            // tear down the user's still-running terminal.
+                            self.status = Some(TransientNotice::error(error));
                         }
-                        self.drain_terminal(target.card, 0);
+                        return self.drain_terminal(target.card, 0);
                     }
                 }
             }
@@ -875,6 +770,12 @@ impl Cagents {
                 let Some(runtime) = self.chat_runtime_mut(target) else {
                     return Task::none();
                 };
+                if runtime.attachment_chooser_pending {
+                    runtime.error = Some(
+                        "Finish or cancel the file chooser before reconnecting the chat.".into(),
+                    );
+                    return Task::none();
+                }
                 let session = runtime.session.clone();
                 return self.start_chat(target.card, session, false, None, false);
             }
@@ -1027,9 +928,11 @@ impl Cagents {
                 let Some(runtime) = self.chat_runtime_mut(target) else {
                     return Task::none();
                 };
-                if !runtime.snapshot.capabilities.attachments {
+                if !runtime.snapshot.capabilities.attachments || runtime.attachment_chooser_pending
+                {
                     return Task::none();
                 }
+                runtime.attachment_chooser_pending = true;
                 let directory = runtime.session.launch.recipe.working_directory.clone();
                 return cosmic::task::future(async move {
                     let result = match file_chooser::open::Dialog::new()
@@ -1053,6 +956,9 @@ impl Cagents {
             }
             Action::Attached(target, result) => {
                 if let Some(runtime) = self.chat_runtime_mut(target) {
+                    if !std::mem::take(&mut runtime.attachment_chooser_pending) {
+                        return Task::none();
+                    }
                     match result {
                         Ok(Some(paths)) => {
                             for path in paths {
@@ -1240,19 +1146,23 @@ impl Cagents {
                 }
             }
             Action::HandoffFinished(target, result) => {
-                let Some(switch) = self.chat_ui.switch.as_mut().filter(|switch| {
-                    switch.card == target.card && switch.pending && switch.returning
-                }) else {
+                if self.chat_runtime_mut(target).is_none() {
                     return Task::none();
-                };
+                }
+                if !self.chat_ui.handoffs.remove(&target) {
+                    return Task::none();
+                }
                 if let Err(error) = result {
-                    switch.pending = false;
-                    switch.error = Some(error);
+                    self.status = Some(TransientNotice::error(error));
                     return Task::none();
                 }
                 let Some(runtime) = self.chat_runtime_mut(target) else {
                     return Task::none();
                 };
+                if let Some(reason) = runtime.terminal_return_blocker() {
+                    self.status = Some(TransientNotice::error(reason));
+                    return Task::none();
+                }
                 runtime.session.launch.session_id = runtime.handle.snapshot().session_id.clone();
                 let session = runtime.session.clone();
                 let terminal = return_terminal(&session);
@@ -1260,14 +1170,10 @@ impl Cagents {
                 let terminal = match terminal {
                     Ok(terminal) => terminal,
                     Err(error) => {
-                        let switch = self.chat_ui.switch.as_mut().unwrap();
-                        switch.pending = false;
-                        switch.error = Some(error);
+                        self.status = Some(TransientNotice::error(error));
                         return Task::none();
                     }
                 };
-                let switch = self.chat_ui.switch.take().unwrap();
-                self.core.set_keyboard_nav(switch.keyboard_nav);
                 self.chat_forget(target.card);
                 return self.finish_chat_terminal_handoff(target.card, terminal);
             }
@@ -1275,49 +1181,15 @@ impl Cagents {
                 if self.chat_runtime_mut(target).is_none() {
                     return Task::none();
                 }
-                let Some(switch) = self.chat_ui.switch.as_mut().filter(|switch| {
-                    switch.card == target.card && switch.pending && switch.closing
-                }) else {
-                    return Task::none();
-                };
-                if let Err(error) = result {
-                    switch.pending = false;
-                    switch.error = Some(error);
+                if !self.chat_ui.closing.remove(&target) {
                     return Task::none();
                 }
-                let switch = self.chat_ui.switch.take().unwrap();
-                self.core.set_keyboard_nav(switch.keyboard_nav);
+                if let Err(error) = result {
+                    self.status = Some(TransientNotice::error(error));
+                    return Task::none();
+                }
                 self.chat_ui.closed.insert(target.card);
                 return cosmic::task::message(Message::CommitClose(target.card));
-            }
-        }
-        Task::none()
-    }
-    pub(super) fn chat_modal_key(&mut self, event: &keyboard::Event) -> Task<Message> {
-        if is_escape_press(event) {
-            return self.handle_chat_ui(Action::DismissSwitch);
-        }
-        if let Some(backwards) = is_tab_press(event) {
-            if let Some(switch) = self.chat_ui.switch.as_mut() {
-                if switch.pending {
-                    return Task::none();
-                }
-                let mut controls = vec!["dialog.chat-switch.cancel"];
-                if switch.selection_source.is_some() {
-                    controls.push("dialog.chat-switch.identity");
-                }
-                if switch.error.is_none() {
-                    controls.push("dialog.chat-switch.confirm");
-                }
-                switch.focus_index = if backwards {
-                    (switch.focus_index + controls.len() - 1) % controls.len()
-                } else {
-                    (switch.focus_index + 1) % controls.len()
-                };
-                return iced::widget::operation::focus(widget::Id::new(
-                    controls[switch.focus_index],
-                ))
-                .map(cosmic::Action::App);
             }
         }
         Task::none()

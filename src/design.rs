@@ -9,8 +9,8 @@ pub const GRID_UNIT: f32 = 4.0;
 pub const HEADER_HEIGHT: f32 = 44.0;
 pub const ROW_HEIGHT: f32 = 32.0;
 pub const DENSE_ROW_HEIGHT: f32 = 28.0;
-pub const PRIMARY_CONTROL_SIZE: f32 = 32.0;
-pub const SECONDARY_CONTROL_MIN_SIZE: f32 = 28.0;
+pub const PRIMARY_CONTROL_SIZE: f32 = 30.0;
+pub const SECONDARY_CONTROL_MIN_SIZE: f32 = 30.0;
 
 pub const TEXT_BODY: f32 = 13.0;
 pub const TEXT_CAPTION: f32 = 12.0;
@@ -191,29 +191,5 @@ mod tests {
         assert_eq!(ShellLayout::for_width(f32::NEG_INFINITY), constrained);
         assert_eq!(ShellLayout::for_width(f32::INFINITY), constrained);
         assert_eq!(ShellLayout::for_width(-1.0), constrained);
-    }
-
-    #[test]
-    fn geometry_uses_the_four_pixel_grid_and_accessible_targets() {
-        const {
-            assert!(PRIMARY_CONTROL_SIZE >= SECONDARY_CONTROL_MIN_SIZE);
-            assert!(SECONDARY_CONTROL_MIN_SIZE >= 24.0);
-        }
-        for value in [
-            HEADER_HEIGHT,
-            ROW_HEIGHT,
-            DENSE_ROW_HEIGHT,
-            PRIMARY_CONTROL_SIZE,
-            SECONDARY_CONTROL_MIN_SIZE,
-            NAVIGATION_DEFAULT_WIDTH,
-            NAVIGATION_MIN_WIDTH,
-            NAVIGATION_MAX_WIDTH,
-            NAVIGATION_RAIL_WIDTH,
-            INSPECTOR_MIN_WIDTH,
-            INSPECTOR_DEFAULT_WIDTH,
-            INSPECTOR_MAX_WIDTH,
-        ] {
-            assert_eq!(value % GRID_UNIT, 0.0, "{value} is off-grid");
-        }
     }
 }

@@ -91,33 +91,50 @@ fn setting_stepper<'a>(
         value: format!("{:.3}", next.clamp(min, max)),
     };
     let control = widget::row::with_children(vec![
-        widget::button::icon(widget::icon::from_name("list-remove-symbolic"))
-            .name(format!("Decrease {label}"))
-            .width(design::ROW_HEIGHT)
-            .height(design::ROW_HEIGHT)
-            .on_press_maybe((current > min).then(|| change(current - step)))
-            .into(),
+        crate::ui_controls::icon_control(
+            crate::ui_controls::symbolic_icon("list-remove-symbolic"),
+            format!("Decrease {label}"),
+            false,
+            current > min,
+            (current > min).then(|| change(current - step)),
+        )
+        .into(),
         widget::container(widget::text::body(format!("{}{}", current, unit)))
-            .center_x(Length::Fill)
-            .center_y(design::ROW_HEIGHT)
-            .width(Length::Fill)
+            .center_x(72)
+            .center_y(design::PRIMARY_CONTROL_SIZE)
             .into(),
-        widget::button::icon(widget::icon::from_name("list-add-symbolic"))
-            .name(format!("Increase {label}"))
-            .width(design::ROW_HEIGHT)
-            .height(design::ROW_HEIGHT)
-            .on_press_maybe((current < max).then(|| change(current + step)))
-            .into(),
-        widget::button::text("Reset")
-            .name(format!("Reset {label}"))
-            .on_press_maybe((current != default).then(|| change(default)))
-            .into(),
+        crate::ui_controls::icon_control(
+            crate::ui_controls::symbolic_icon("list-add-symbolic"),
+            format!("Increase {label}"),
+            false,
+            current < max,
+            (current < max).then(|| change(current + step)),
+        )
+        .into(),
+        crate::ui_controls::icon_control(
+            crate::ui_controls::symbolic_icon("edit-undo-symbolic"),
+            format!("Reset {label}"),
+            false,
+            current != default,
+            (current != default).then(|| change(default)),
+        )
+        .into(),
     ])
     .spacing(design::GRID_UNIT)
     .align_y(Alignment::Center)
-    .width(Length::Fill)
+    .width(Length::Shrink)
     .into();
-    setting_field(label, detail, control)
+    widget::column::with_children(vec![
+        widget::text::caption_heading(label).into(),
+        widget::text::caption(detail)
+            .wrapping(iced::widget::text::Wrapping::Word)
+            .width(Length::Fill)
+            .into(),
+        control,
+    ])
+    .spacing(design::GRID_UNIT)
+    .width(Length::Fill)
+    .into()
 }
 
 fn settings_choice<'a>(
@@ -638,40 +655,31 @@ pub(super) fn settings_dialog<'a>(
             .width(Length::Fill)
             .into()
     };
-    let reset: Element<'a, Message> = widget::button::custom(
-        widget::row::with_children(vec![
-            settings_icon("edit-undo-symbolic", progress).into(),
-            widget::text::body("Reset to defaults").into(),
-        ])
-        .align_y(Alignment::Center)
-        .spacing(8),
+    let reset = crate::ui_controls::icon_control(
+        crate::ui_controls::symbolic_icon("edit-undo-symbolic"),
+        "Reset all settings to defaults",
+        false,
+        true,
+        Some(Message::ResetSettings),
     )
-    .name("Reset to defaults")
-    .on_press(Message::ResetSettings)
     .into();
-    let footer: Element<'a, Message> = if narrow {
-        widget::column::with_children(vec![feedback, reset])
-            .spacing(2.0 * design::GRID_UNIT)
-            .width(Length::Fill)
-            .into()
-    } else {
-        widget::row::with_children(vec![feedback, reset])
-            .align_y(Alignment::Center)
-            .spacing(3.0 * design::GRID_UNIT)
-            .width(Length::Fill)
-            .into()
-    };
+    let footer: Element<'a, Message> = widget::row::with_children(vec![feedback, reset])
+        .align_y(Alignment::Center)
+        .spacing(3.0 * design::GRID_UNIT)
+        .width(Length::Fill)
+        .into();
     let header = widget::container(
         widget::row::with_children(vec![
             widget::text::title4("Settings").width(Length::Fill).into(),
-            widget::button::custom(settings_icon("window-close-symbolic", progress))
-                .id(settings_close_id())
-                .name("Close settings")
-                .width(design::PRIMARY_CONTROL_SIZE)
-                .height(design::PRIMARY_CONTROL_SIZE)
-                .padding(design::GRID_UNIT)
-                .on_press(Message::CloseInspector)
-                .into(),
+            crate::ui_controls::icon_control(
+                crate::ui_controls::symbolic_icon("window-close-symbolic"),
+                "Close settings",
+                false,
+                true,
+                Some(Message::CloseInspector),
+            )
+            .id(settings_close_id())
+            .into(),
         ])
         .align_y(Alignment::Center)
         .height(design::HEADER_HEIGHT),
@@ -694,6 +702,7 @@ pub(super) fn settings_dialog<'a>(
         900.0,
     );
     let surface = widget::container(surface)
+        .max_width(900.0)
         .height(Length::Fill)
         .max_height(760.0);
 

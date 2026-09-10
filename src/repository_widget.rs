@@ -35,7 +35,7 @@ use crate::{
         CancellationToken, DiffBasis, DiffContent, DiffSide, HistoryRequest, HistoryRevision,
         MAX_DIFF_SIDE_BYTES, RepositoryService, RepositorySnapshot, ValidatedRefName,
     },
-    ui_controls::icon_control,
+    ui_controls::{icon_control, segmented_controls},
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -336,6 +336,10 @@ pub enum RepositoryAction {
     OpenExternalEditor {
         card: CardId,
     },
+    StageSelected {
+        card: CardId,
+        stage: bool,
+    },
     ApplySourceSurface {
         card: CardId,
         diff: bool,
@@ -401,6 +405,7 @@ impl RepositoryAction {
             | Self::DiscardEdits { card }
             | Self::BackToFiles { card }
             | Self::OpenExternalEditor { card }
+            | Self::StageSelected { card, .. }
             | Self::ApplySourceSurface { card, .. }
             | Self::ApplyMarkdownMode { card, .. }
             | Self::ApplyDiffMode { card, .. }
@@ -735,6 +740,11 @@ enum DocumentState {
     None,
     Loading(PathBuf),
     Editable(EditorDocument),
+    Image {
+        handle: iced::widget::image::Handle,
+        width: u32,
+        height: u32,
+    },
     ReadOnly {
         path: PathBuf,
         reason: ReadOnlyReason,
@@ -811,6 +821,7 @@ pub struct RepositoryRuntime {
     /// document operation.
     generation: u64,
     file_list_generation: u64,
+    mutation_refresh_pending: bool,
     files: FileListState,
     selected: Option<RepositoryFile>,
     document: DocumentState,
@@ -901,6 +912,7 @@ impl RepositoryRuntime {
             descriptor,
             generation: 0,
             file_list_generation: 0,
+            mutation_refresh_pending: false,
             files: FileListState::Loading,
             selected: None,
             document: DocumentState::None,
@@ -1165,6 +1177,58 @@ impl RepositoryRuntime {
         files_task(identity)
     }
 
+    /// Refreshes Git's status and mutable comparisons without replacing the
+    /// open buffer or changing the identity of its loads and saves.
+    pub fn refresh_after_mutation(&mut self, card: CardId) -> Task<RepositoryAction> {
+        self.mutation_refresh_pending = true;
+        // Only object-id comparisons are immutable. A branch comparison also
+        // reads HEAD, which may have moved in a commit.
+        self.diffs
+            .retain(|(basis, _)| matches!(basis, DiffBasis::CommitToParent { .. }));
+        self.initial_load(card)
+    }
+
+    fn refresh_selected_status(&mut self, card: CardId) -> Task<RepositoryAction> {
+        let Some(path) = self.selected.as_ref().map(|file| file.path.clone()) else {
+            return Task::none();
+        };
+        // A discarded untracked file or committed deletion can disappear from
+        // the list entirely. Keep its buffer, but remove all obsolete Git facts.
+        let file = self.file(&path).cloned().unwrap_or_else(|| RepositoryFile {
+            path: path.clone(),
+            staged_old_path: None,
+            unstaged_old_path: None,
+            staged: false,
+            unstaged: false,
+            status: None,
+        });
+        if !file.has_basis(&self.diff_basis) && self.basis_resolution.is_none() {
+            self.diff_basis = if file.unstaged {
+                DiffBasis::IndexToWorktree
+            } else {
+                DiffBasis::HeadToIndex
+            };
+            if !file.changed() {
+                self.source_surface = SourceSurface::Editor;
+            }
+            self.diff_change = 0;
+            self.diff_viewport = ListViewport::default();
+        }
+        let identity = self.current_identity(card, path);
+        let mut tasks = Vec::new();
+        for basis in [DiffBasis::HeadToIndex, DiffBasis::IndexToWorktree] {
+            if file.has_basis(&basis) {
+                let previous_path = file.previous_path(&basis);
+                tasks.push(self.request_diff(identity.clone(), basis, previous_path));
+            }
+        }
+        if matches!(self.diff_basis, DiffBasis::MergeBaseToHead { .. }) {
+            tasks.push(self.request_diff(identity, self.diff_basis.clone(), None));
+        }
+        self.selected = Some(file);
+        Task::batch(tasks)
+    }
+
     /// Removes and returns every protocol notification the open buffer has
     /// earned since the last drain, oldest first.
     ///
@@ -1381,6 +1445,33 @@ impl RepositoryRuntime {
         self.selected.as_ref().map(|file| file.path.as_path())
     }
 
+    pub fn selected_staging_selection(
+        &self,
+        stage: bool,
+    ) -> Option<crate::repository::PathSelection> {
+        use crate::repository::{PathSelection, RepoPath};
+        let file = self.selected.as_ref()?;
+        if self.mutation_refresh_pending
+            || self.blocks_navigation()
+            || !(if stage { file.unstaged } else { file.staged })
+        {
+            return None;
+        }
+        let old_path = if stage {
+            &file.unstaged_old_path
+        } else {
+            &file.staged_old_path
+        };
+        Some(PathSelection {
+            path: RepoPath::parse(file.path.as_os_str()).ok()?,
+            old_path: old_path
+                .as_ref()
+                .map(|path| RepoPath::parse(path.as_os_str()))
+                .transpose()
+                .ok()?,
+        })
+    }
+
     /// Re-announces the open buffer to a replaced language-server manager.
     ///
     /// A manager's server set is fixed at construction, so a changed
@@ -1428,6 +1519,12 @@ impl RepositoryRuntime {
         if matches!(&self.document, DocumentState::Editable(_)) {
             self.lsp_intents.push(LspIntent::Close);
         }
+    }
+
+    fn can_show_diff(&self) -> bool {
+        self.selected
+            .as_ref()
+            .is_some_and(|file| file.has_basis(&self.diff_basis) || self.basis_resolution.is_some())
     }
 
     pub fn is_dirty(&self) -> bool {
@@ -1486,6 +1583,7 @@ impl RepositoryRuntime {
             DocumentState::Editable(document) if document.error.is_some() => "Save failed",
             DocumentState::Editable(_) if self.is_dirty() => "Unsaved changes",
             DocumentState::Editable(_) => "Editable",
+            DocumentState::Image { .. } => "Image preview",
             DocumentState::ReadOnly { .. } => "Read-only",
             DocumentState::Failed { .. } => "Unavailable",
         };
@@ -1769,17 +1867,22 @@ impl RepositoryRuntime {
         match action {
             RepositoryAction::RefreshFiles { card } => self.initial_load(card),
             RepositoryAction::NewTerminal { .. } => Task::none(),
+            RepositoryAction::StageSelected { .. } => Task::none(),
             RepositoryAction::FilesLoaded { identity, result } => {
                 if !self.accepts_file_list(&identity) || identity.path != Path::new(".") {
                     return Task::none();
                 }
-                // A selection, its loaded diff bases, and an active save form
-                // one snapshot. A file-list request may have run before a save
-                // or an external index change, so never splice its per-path
-                // status into that snapshot. Returning to the file list starts
-                // another refresh before a new selection is made.
+                // Ordinary list refreshes leave the selection's snapshot alone.
+                // Mutation refreshes explicitly reconcile it after this newest
+                // authoritative status read, without replacing the document.
+                let refresh_selected = self.mutation_refresh_pending && result.is_ok();
                 self.files = result.map_or_else(FileListState::Failed, FileListState::Ready);
-                Task::none()
+                if refresh_selected {
+                    self.mutation_refresh_pending = false;
+                    self.refresh_selected_status(identity.card)
+                } else {
+                    Task::none()
+                }
             }
             RepositoryAction::OpenFile { card, path } => {
                 if self.blocks_navigation() {
@@ -1802,6 +1905,19 @@ impl RepositoryRuntime {
                         content_hash,
                         markdown,
                     )),
+                    Ok(FileContent::Image {
+                        width,
+                        height,
+                        rgba,
+                    }) => DocumentState::Image {
+                        handle: iced::widget::image::Handle::from_rgba(
+                            width,
+                            height,
+                            iced::advanced::graphics::core::Bytes::from_owner(rgba),
+                        ),
+                        width,
+                        height,
+                    },
                     Ok(FileContent::ReadOnly(reason)) => DocumentState::ReadOnly {
                         path: identity.path,
                         reason,
@@ -1948,6 +2064,12 @@ impl RepositoryRuntime {
                     // conflict, and not on a failure — in none of those does
                     // the file on disk match this buffer.
                     self.push_lsp_save();
+                    if self.mutation_refresh_pending {
+                        // Status may have been read before this save reached
+                        // disk. Supersede that read rather than let it erase the
+                        // newly saved worktree change.
+                        return self.refresh_after_mutation(identity.card);
+                    }
                     let Some(selected) = self.selected.as_mut() else {
                         return Task::none();
                     };
@@ -2002,7 +2124,7 @@ impl RepositoryRuntime {
                 } else {
                     SourceSurface::Editor
                 };
-                if self.is_saving() || (surface == SourceSurface::Diff && self.selected.is_none()) {
+                if self.is_saving() || (surface == SourceSurface::Diff && !self.can_show_diff()) {
                     return Task::none();
                 }
                 self.source_surface = surface;
@@ -2012,6 +2134,7 @@ impl RepositoryRuntime {
                 if self.is_saving() {
                     return Task::none();
                 }
+                self.source_surface = SourceSurface::Editor;
                 self.markdown_mode = if preview {
                     MarkdownMode::Preview
                 } else {
@@ -2035,6 +2158,10 @@ impl RepositoryRuntime {
                     return Task::none();
                 };
                 let identity = self.current_identity(card, selected.path.clone());
+                if self.is_saving() {
+                    return Task::none();
+                }
+                self.source_surface = SourceSurface::Diff;
                 self.basis_resolution = Some(BasisResolution::Resolving(choice));
                 basis_task(identity, choice)
             }
@@ -2074,14 +2201,16 @@ impl RepositoryRuntime {
                 Task::none()
             }
             RepositoryAction::ApplyDiffBasis { card, basis } => {
-                if !self
-                    .selected
-                    .as_ref()
-                    .is_some_and(|file| file.has_basis(&basis))
+                if self.is_saving()
+                    || !self
+                        .selected
+                        .as_ref()
+                        .is_some_and(|file| file.has_basis(&basis))
                 {
                     return Task::none();
                 }
                 self.basis_resolution = None;
+                self.source_surface = SourceSurface::Diff;
                 self.diff_basis = basis;
                 self.diff_change = 0;
                 self.diff_viewport = ListViewport::default();
@@ -2210,6 +2339,9 @@ impl RepositoryRuntime {
         basis: DiffBasis,
         old_path: Option<PathBuf>,
     ) -> Task<RepositoryAction> {
+        if self.mutation_refresh_pending && !matches!(basis, DiffBasis::CommitToParent { .. }) {
+            return Task::none();
+        }
         self.next_diff_request = self.next_diff_request.wrapping_add(1).max(1);
         let request = self.next_diff_request;
         self.set_diff_state(basis.clone(), DiffState::Loading { request });
@@ -2711,16 +2843,15 @@ fn bytes_to_path(bytes: &[u8]) -> PathBuf {
 }
 
 pub fn view(card: CardId, runtime: &RepositoryRuntime) -> Element<'_, RepositoryAction> {
-    let (surface_key, body) = if runtime.selected.is_some() {
-        (1_u8, selected_file_view(card, runtime))
+    let body = if runtime.selected.is_some() {
+        selected_file_view(card, runtime)
     } else {
-        (0, file_list_view(card, runtime))
+        file_list_view(card, runtime)
     };
-    // The file list and selected-file editor are both columns but have
-    // unrelated stateful descendants. Key the surface so the reconciler does
-    // not reuse a list row's stateless tree as editor state when a fast file
-    // load skips the intermediate loading frame.
-    iced::widget::keyed_column([(surface_key, body)])
+    // Ordinary columns reconcile children through Tree::diff, including tag
+    // changes. The pinned keyed column directly diffs equal-length children
+    // even when keys change, which reuses incompatible placeholder state.
+    widget::column::with_children([body])
         .width(Length::Fill)
         .height(Length::Fill)
         .into()
@@ -2886,12 +3017,29 @@ fn branch_comparison_icon() -> widget::icon::Handle {
     ICON.clone()
 }
 
-fn selected_file_view(card: CardId, runtime: &RepositoryRuntime) -> Element<'_, RepositoryAction> {
-    let spacing = cosmic::theme::spacing();
-    let selected = runtime.selected.as_ref().expect("selected file exists");
+/// The parent card embeds this in its existing title row, not above the body.
+pub fn selected_file_toolbar(
+    card: CardId,
+    runtime: &RepositoryRuntime,
+) -> Option<Element<'_, RepositoryAction>> {
+    let selected = runtime.selected.as_ref()?;
+    let editing = runtime.source_surface == SourceSurface::Editor
+        && runtime.markdown_mode == MarkdownMode::Edit;
+    let editable = matches!(runtime.document, DocumentState::Editable(_));
+    let title = selected
+        .path
+        .file_name()
+        .unwrap_or(selected.path.as_os_str())
+        .to_string_lossy();
+    let title = crate::interaction::tooltip(
+        widget::text::body(title)
+            .wrapping(iced::widget::text::Wrapping::None)
+            .width(128),
+        selected.path.to_string_lossy(),
+    );
     let mut controls: Vec<Element<'_, RepositoryAction>> = vec![
         icon_control(
-            widget::icon::from_name("go-previous-symbolic").handle(),
+            crate::ui_controls::symbolic_icon("go-previous-symbolic"),
             "Back to repository files",
             false,
             !runtime.blocks_navigation(),
@@ -2899,35 +3047,47 @@ fn selected_file_view(card: CardId, runtime: &RepositoryRuntime) -> Element<'_, 
         )
         .id(focus_restore_id(card))
         .into(),
-        crate::file_icon::icon(&selected.path).size(20).into(),
-        crate::design::heading(selected.path.to_string_lossy())
-            .width(Length::Fill)
+        title.into(),
+        segmented_controls(vec![
+            icon_control(
+                crate::ui_controls::symbolic_icon("view-reveal-symbolic"),
+                "View file",
+                runtime.source_surface == SourceSurface::Editor && (!editable || !editing),
+                !runtime.is_saving(),
+                Some(RepositoryAction::ApplyMarkdownMode {
+                    card,
+                    preview: true,
+                }),
+            )
             .into(),
+            icon_control(
+                crate::ui_controls::symbolic_icon("document-edit-symbolic"),
+                "Edit file",
+                editable && editing,
+                editable && !runtime.is_saving(),
+                Some(RepositoryAction::ApplyMarkdownMode {
+                    card,
+                    preview: false,
+                }),
+            )
+            .into(),
+            icon_control(
+                comparison_icon(),
+                "View diff",
+                runtime.source_surface == SourceSurface::Diff,
+                runtime.can_show_diff() && !runtime.is_saving(),
+                Some(RepositoryAction::ApplySourceSurface { card, diff: true }),
+            )
+            .into(),
+        ]),
+        // Keep history comparisons reachable even when neither local basis
+        // exists and Diff itself is disabled.
+        diff_basis_controls(card, runtime),
     ];
-    // Drawn for any selected file, not only a locally changed one. The two
-    // committed comparisons exist precisely for files the branch changed and
-    // the worktree has not, and gating this control on a local change is what
-    // would leave them unreachable there.
-    controls.extend([
-        icon_control(
-            crate::ui_controls::symbolic_icon("document-edit-symbolic"),
-            "Edit file",
-            runtime.source_surface == SourceSurface::Editor,
-            !runtime.is_saving(),
-            Some(RepositoryAction::ApplySourceSurface { card, diff: false }),
-        )
-        .into(),
-        icon_control(
-            comparison_icon(),
-            "View diff",
-            runtime.source_surface == SourceSurface::Diff,
-            !runtime.is_saving(),
-            Some(RepositoryAction::ApplySourceSurface { card, diff: true }),
-        )
-        .into(),
-    ]);
+    if runtime.source_surface == SourceSurface::Diff {
+        controls.push(diff_review_controls(card, runtime));
+    }
     if runtime.is_dirty() {
-        controls.push(widget::text::caption("Unsaved").into());
         controls.push(
             icon_control(
                 crate::ui_controls::symbolic_icon("edit-undo-symbolic"),
@@ -2939,73 +3099,121 @@ fn selected_file_view(card: CardId, runtime: &RepositoryRuntime) -> Element<'_, 
             .into(),
         );
     }
-    controls.extend([
-        icon_control(
-            crate::ui_controls::symbolic_icon("document-save-symbolic"),
-            if runtime.is_saving() {
-                "Saving file…"
-            } else {
-                "Save file"
-            },
+    if editable {
+        controls.push(
+            icon_control(
+                crate::ui_controls::symbolic_icon("document-save-symbolic"),
+                if runtime.is_saving() {
+                    "Saving file…"
+                } else if runtime.is_dirty() {
+                    "Save unsaved changes"
+                } else {
+                    "Save file"
+                },
+                runtime.is_dirty(),
+                runtime.can_save(),
+                Some(RepositoryAction::Save {
+                    card,
+                    overwrite: false,
+                }),
+            )
+            .into(),
+        );
+    }
+    for (stage, available, icon, label) in [
+        (
+            true,
+            selected.unstaged,
+            "list-add-symbolic",
+            "Stage file changes",
+        ),
+        (
             false,
-            runtime.can_save(),
-            Some(RepositoryAction::Save {
-                card,
-                overwrite: false,
-            }),
-        )
-        .into(),
+            selected.staged,
+            "list-remove-symbolic",
+            "Unstage file changes",
+        ),
+    ] {
+        if available && !runtime.mutation_refresh_pending {
+            controls.push(
+                icon_control(
+                    crate::ui_controls::symbolic_icon(icon),
+                    label,
+                    false,
+                    !runtime.blocks_navigation(),
+                    Some(RepositoryAction::StageSelected { card, stage }),
+                )
+                .into(),
+            );
+        }
+    }
+    controls.push(
         icon_control(
             crate::ui_controls::symbolic_icon("document-open-symbolic"),
-            "Open file in external editor",
+            "Open file externally",
             false,
             !runtime.is_saving(),
             Some(RepositoryAction::OpenExternalEditor { card }),
         )
         .into(),
-    ]);
-    let header = widget::container(
-        widget::row::with_children(controls)
-            .align_y(Alignment::Center)
-            .spacing(spacing.space_xxs),
+    );
+    // Native horizontal scrolling retains every action and keyboard target
+    // without a Responsive wrapper hiding controls from accessibility.
+    Some(
+        widget::scrollable(
+            widget::row::with_children(controls)
+                .spacing(2)
+                .align_y(Alignment::Center),
+        )
+        .direction(iced::widget::scrollable::Direction::Horizontal(
+            iced::widget::scrollable::Scrollbar::default()
+                .width(2)
+                .scroller_width(2),
+        ))
+        .width(Length::Fill)
+        .height(34)
+        .into(),
     )
-    .padding([spacing.space_xxs, spacing.space_s]);
-    let body = match runtime.source_surface {
+}
+
+fn selected_file_view(card: CardId, runtime: &RepositoryRuntime) -> Element<'_, RepositoryAction> {
+    match runtime.source_surface {
         SourceSurface::Editor => editor_surface(card, runtime),
         SourceSurface::Diff => diff_surface(card, runtime),
-    };
-    widget::column::with_children(vec![
-        header.into(),
-        widget::divider::horizontal::default().into(),
-        body,
-    ])
-    .height(Length::Fill)
-    .width(Length::Fill)
-    .into()
+    }
 }
 
 fn editor_surface(card: CardId, runtime: &RepositoryRuntime) -> Element<'_, RepositoryAction> {
-    let (state_key, content) = match &runtime.document {
-        DocumentState::None => (
-            0_u8,
-            information_state(
-                "No file selected",
-                "Choose a file from the repository list.",
-            ),
+    let content = match &runtime.document {
+        DocumentState::None => information_state(
+            "No file selected",
+            "Choose a file from the repository list.",
         ),
-        DocumentState::Loading(path) => (1, loading(format!("Loading {}…", path.display()))),
-        DocumentState::Failed { path, message } => (
-            2,
-            information_state(format!("Could not open {}", path.display()), message),
-        ),
-        DocumentState::ReadOnly { path, reason } => (3, read_only_state(path, reason)),
-        // The key forces Iced to build a fresh subtree when an asynchronous
-        // load replaces a stateless placeholder with the stateful editor.
-        // A generic wrapper is insufficient because its own identity can be
-        // retained while its child still carries the placeholder's state.
-        DocumentState::Editable(document) => (4, editable_document_view(card, runtime, document)),
+        DocumentState::Loading(path) => loading(format!("Loading {}…", path.display())),
+        DocumentState::Failed { path, message } => {
+            information_state(format!("Could not open {}", path.display()), message)
+        }
+        DocumentState::ReadOnly { path, reason } => read_only_state(path, reason),
+        DocumentState::Editable(document) => editable_document_view(card, runtime, document),
+        DocumentState::Image {
+            handle,
+            width,
+            height,
+        } => crate::interaction::tooltip(
+            widget::container(
+                iced::widget::image(handle.clone())
+                    .content_fit(iced::ContentFit::Contain)
+                    .width(Length::Fill)
+                    .height(Length::Fill),
+            )
+            .padding(12)
+            .width(Length::Fill)
+            .height(Length::Fill),
+            format!("{width} × {height} pixels"),
+        )
+        .into(),
     };
-    iced::widget::keyed_column([(state_key, content)])
+    widget::column::with_children([content])
         .width(Length::Fill)
         .height(Length::Fill)
         .into()
@@ -3018,40 +3226,6 @@ fn editable_document_view<'a>(
 ) -> Element<'a, RepositoryAction> {
     let spacing = cosmic::theme::spacing();
     let mut rows: Vec<Element<'a, RepositoryAction>> = Vec::new();
-    if document.markdown {
-        rows.push(
-            widget::container(
-                widget::row::with_children([
-                    icon_control(
-                        crate::ui_controls::symbolic_icon("document-edit-symbolic"),
-                        "Edit Markdown",
-                        runtime.markdown_mode == MarkdownMode::Edit,
-                        !runtime.is_saving(),
-                        Some(RepositoryAction::ApplyMarkdownMode {
-                            card,
-                            preview: false,
-                        }),
-                    )
-                    .into(),
-                    icon_control(
-                        crate::ui_controls::symbolic_icon("view-reveal-symbolic"),
-                        "Preview Markdown",
-                        runtime.markdown_mode == MarkdownMode::Preview,
-                        !runtime.is_saving(),
-                        Some(RepositoryAction::ApplyMarkdownMode {
-                            card,
-                            preview: true,
-                        }),
-                    )
-                    .into(),
-                ])
-                .spacing(2),
-            )
-            .padding([spacing.space_xxs, spacing.space_s])
-            .into(),
-        );
-        rows.push(widget::divider::horizontal::default().into());
-    }
     if let Some(error) = document
         .error
         .as_ref()
@@ -3147,8 +3321,18 @@ fn editable_document_view<'a>(
                         style.border = iced::Border::default();
                         style
                     })
-                    .on_action(move |action| RepositoryAction::EditorAction { card, action }),
+                    .on_action(move |action| {
+                        if runtime.markdown_mode == MarkdownMode::Preview && action.is_edit() {
+                            RepositoryAction::ApplyMarkdownMode {
+                                card,
+                                preview: true,
+                            }
+                        } else {
+                            RepositoryAction::EditorAction { card, action }
+                        }
+                    }),
             )
+            .interaction(iced::mouse::Interaction::Text)
             .into()
         };
     rows.push(content);
@@ -3167,12 +3351,12 @@ fn diff_basis_controls(card: CardId, runtime: &RepositoryRuntime) -> Element<'_,
         None => Some(basis_choice(&runtime.diff_basis)),
     };
     let file = runtime.selected.as_ref();
-    widget::row::with_children([
+    segmented_controls(vec![
         icon_control(
             crate::ui_controls::symbolic_icon("document-edit-symbolic"),
             "Unstaged changes",
             selected == Some(BasisChoice::Unstaged),
-            file.is_some_and(|file| file.unstaged),
+            !runtime.is_saving() && file.is_some_and(|file| file.unstaged),
             Some(RepositoryAction::ApplyDiffBasis {
                 card,
                 basis: DiffBasis::IndexToWorktree,
@@ -3183,7 +3367,7 @@ fn diff_basis_controls(card: CardId, runtime: &RepositoryRuntime) -> Element<'_,
             crate::ui_controls::symbolic_icon("object-select-symbolic"),
             "Staged changes",
             selected == Some(BasisChoice::Staged),
-            file.is_some_and(|file| file.staged),
+            !runtime.is_saving() && file.is_some_and(|file| file.staged),
             Some(RepositoryAction::ApplyDiffBasis {
                 card,
                 basis: DiffBasis::HeadToIndex,
@@ -3194,7 +3378,7 @@ fn diff_basis_controls(card: CardId, runtime: &RepositoryRuntime) -> Element<'_,
             branch_comparison_icon(),
             "Compare branch with base",
             selected == Some(BasisChoice::Committed(CommittedChoice::Branch)),
-            file.is_some(),
+            !runtime.is_saving() && file.is_some(),
             Some(RepositoryAction::SelectCommittedBasis {
                 card,
                 choice: CommittedChoice::Branch,
@@ -3205,7 +3389,7 @@ fn diff_basis_controls(card: CardId, runtime: &RepositoryRuntime) -> Element<'_,
             crate::ui_controls::symbolic_icon("document-open-recent-symbolic"),
             "Last commit changes",
             selected == Some(BasisChoice::Committed(CommittedChoice::LastCommit)),
-            file.is_some(),
+            !runtime.is_saving() && file.is_some(),
             Some(RepositoryAction::SelectCommittedBasis {
                 card,
                 choice: CommittedChoice::LastCommit,
@@ -3213,38 +3397,95 @@ fn diff_basis_controls(card: CardId, runtime: &RepositoryRuntime) -> Element<'_,
         )
         .into(),
     ])
-    .spacing(2)
-    .into()
+}
+
+fn diff_review_controls(
+    card: CardId,
+    runtime: &RepositoryRuntime,
+) -> Element<'_, RepositoryAction> {
+    let model = match runtime.diff_state(&runtime.diff_basis) {
+        Some(DiffState::Ready(RenderedDiff::Text { model, .. })) => Some(model),
+        _ => None,
+    };
+    let change_count = model.map_or(0, |model| model.change_starts(runtime.diff_mode).len());
+    let mut controls = vec![
+        segmented_controls(vec![
+            icon_control(
+                crate::ui_controls::symbolic_icon("view-list-symbolic"),
+                "Inline diff",
+                runtime.diff_mode == DiffMode::Inline,
+                model.is_some(),
+                Some(RepositoryAction::ApplyDiffMode { card, split: false }),
+            )
+            .into(),
+            icon_control(
+                comparison_icon(),
+                "Side-by-side diff",
+                runtime.diff_mode == DiffMode::Split,
+                model.is_some(),
+                Some(RepositoryAction::ApplyDiffMode { card, split: true }),
+            )
+            .into(),
+        ]),
+        icon_control(
+            crate::ui_controls::symbolic_icon("go-up-symbolic"),
+            "Previous change",
+            false,
+            change_count != 0,
+            Some(RepositoryAction::PreviousChange { card }),
+        )
+        .into(),
+        crate::interaction::tooltip(
+            widget::text::caption(if change_count == 0 {
+                "0/0".into()
+            } else {
+                format!("{}/{change_count}", runtime.diff_change + 1)
+            }),
+            basis_label(&runtime.diff_basis),
+        ),
+        icon_control(
+            crate::ui_controls::symbolic_icon("go-down-symbolic"),
+            "Next change",
+            false,
+            change_count != 0,
+            Some(RepositoryAction::NextChange { card }),
+        )
+        .into(),
+    ];
+    if let Some(model) = model {
+        controls.push(crate::interaction::tooltip(
+            widget::text::caption(format!("+{} −{}", model.additions, model.deletions)),
+            match runtime.diff_state(&runtime.diff_basis) {
+                Some(DiffState::Ready(RenderedDiff::Text {
+                    old_label,
+                    new_label,
+                    ..
+                })) => format!(
+                    "{}: {old_label} → {new_label}",
+                    basis_label(&runtime.diff_basis)
+                ),
+                _ => basis_label(&runtime.diff_basis),
+            },
+        ));
+    }
+    widget::row::with_children(controls)
+        .spacing(2)
+        .align_y(Alignment::Center)
+        .into()
 }
 
 fn diff_surface(card: CardId, runtime: &RepositoryRuntime) -> Element<'_, RepositoryAction> {
-    let spacing = cosmic::theme::spacing();
-    // The basis control belongs above every state, not only above a text diff.
-    // An unresolved committed comparison replaces the body, and if the only
-    // way to leave that basis were drawn inside the body, the user would be
-    // stranded in it — with the diff they were reading still cached behind,
-    // and `basis_resolution` surviving an Edit/Diff round trip.
-    let header = widget::container(
-        widget::row::with_children(vec![
-            diff_basis_controls(card, runtime),
-            // Which comparison this is: a commit diff and unstaged work must
-            // not read the same.
-            widget::text::caption(basis_label(&runtime.diff_basis)).into(),
-            iced::widget::Space::new().width(Length::Fill).into(),
-            icon_control(
-                crate::ui_controls::symbolic_icon("document-edit-symbolic"),
-                "Open in editor",
-                false,
-                !runtime.is_saving(),
-                Some(RepositoryAction::ApplySourceSurface { card, diff: false }),
-            )
-            .into(),
-        ])
-        .align_y(Alignment::Center)
-        .spacing(spacing.space_xxs),
-    )
-    .padding([spacing.space_xxs, spacing.space_s]);
-    let body = match &runtime.basis_resolution {
+    if runtime.mutation_refresh_pending
+        && !matches!(runtime.diff_basis, DiffBasis::CommitToParent { .. })
+    {
+        return match &runtime.files {
+            FileListState::Failed(error) => {
+                information_state("Could not refresh file status", error.clone())
+            }
+            _ => loading("Refreshing file status…"),
+        };
+    }
+    match &runtime.basis_resolution {
         Some(BasisResolution::Resolving(choice)) => {
             loading(format!("Resolving the {} comparison…", choice.label()))
         }
@@ -3275,10 +3516,7 @@ fn diff_surface(card: CardId, runtime: &RepositoryRuntime) -> Element<'_, Reposi
                 information_state("Could not compute diff", error.clone())
             }
         },
-    };
-    widget::column::with_children(vec![header.into(), body])
-        .height(Length::Fill)
-        .into()
+    }
 }
 
 /// A comparison with no text rows, reported as the fact it is.
@@ -3389,58 +3627,6 @@ fn diff_model_view<'a>(
     old_label: &'a str,
     new_label: &'a str,
 ) -> Element<'a, RepositoryAction> {
-    let spacing = cosmic::theme::spacing();
-    let change_count = model.change_starts(runtime.diff_mode).len();
-    let toolbar = widget::container(
-        widget::row::with_children(vec![
-            icon_control(
-                widget::icon::from_name("view-list-symbolic").handle(),
-                "Inline diff",
-                runtime.diff_mode == DiffMode::Inline,
-                true,
-                Some(RepositoryAction::ApplyDiffMode { card, split: false }),
-            )
-            .into(),
-            icon_control(
-                comparison_icon(),
-                "Side-by-side diff",
-                runtime.diff_mode == DiffMode::Split,
-                true,
-                Some(RepositoryAction::ApplyDiffMode { card, split: true }),
-            )
-            .into(),
-            // Which two sides this comparison is between. Which comparison it
-            // is, the surface header above already says.
-            widget::text::caption(format!("{old_label} → {new_label}")).into(),
-            widget::text::caption(format!("+{}  −{}", model.additions, model.deletions)).into(),
-            iced::widget::Space::new().width(Length::Fill).into(),
-            icon_control(
-                widget::icon::from_name("go-up-symbolic").handle(),
-                "Previous change",
-                false,
-                change_count != 0,
-                Some(RepositoryAction::PreviousChange { card }),
-            )
-            .into(),
-            widget::text::caption(if change_count == 0 {
-                "0 / 0".into()
-            } else {
-                format!("{} / {change_count}", runtime.diff_change + 1)
-            })
-            .into(),
-            icon_control(
-                widget::icon::from_name("go-down-symbolic").handle(),
-                "Next change",
-                false,
-                change_count != 0,
-                Some(RepositoryAction::NextChange { card }),
-            )
-            .into(),
-        ])
-        .align_y(Alignment::Center)
-        .spacing(spacing.space_xxs),
-    )
-    .padding([spacing.space_xxs, spacing.space_s]);
     let rows: Element<'a, RepositoryAction> = if model.is_empty() {
         information_state(
             "No content changes",
@@ -3524,13 +3710,7 @@ fn diff_model_view<'a>(
         })
         .into()
     };
-    widget::column::with_children(vec![
-        toolbar.into(),
-        widget::divider::horizontal::default().into(),
-        rows,
-    ])
-    .height(Length::Fill)
-    .into()
+    rows
 }
 
 const DIFF_FONT_SIZE: f32 = 14.0;
@@ -3932,13 +4112,21 @@ fn read_only_state(path: &Path, reason: &ReadOnlyReason) -> Element<'static, Rep
         ),
         ReadOnlyReason::Binary => format!("{} contains binary data.", path.display()),
         ReadOnlyReason::InvalidUtf8 => format!("{} is not valid UTF-8.", path.display()),
+        ReadOnlyReason::Image(message) => format!("{}: {message}", path.display()),
         ReadOnlyReason::Oversize { bytes, limit } => format!(
             "{} is {bytes} bytes; editable files are limited to {limit} bytes.",
             path.display()
         ),
         ReadOnlyReason::NotRegularFile => format!("{} is not a regular file.", path.display()),
     };
-    information_state("Read-only file", &detail)
+    information_state(
+        if matches!(reason, ReadOnlyReason::Image(_)) {
+            "Image preview unavailable"
+        } else {
+            "Read-only file"
+        },
+        &detail,
+    )
 }
 
 fn loading(message: impl Into<String>) -> Element<'static, RepositoryAction> {
@@ -4664,6 +4852,137 @@ mod tests {
         assert!(runtime.blocks_navigation());
         assert_eq!(runtime.source_surface, SourceSurface::Editor);
         assert_eq!(runtime.markdown_mode, MarkdownMode::Edit);
+    }
+
+    #[test]
+    fn mutation_refresh_reconciles_staging_without_obsoleting_document_loads() {
+        let card = CardId::new();
+        let (mut runtime, identity) = RepositoryRuntime::lsp_selection_fixture(card);
+        runtime.source_surface = SourceSurface::Diff;
+        let old_request = runtime.next_diff_request;
+        let _ = runtime.refresh_after_mutation(card);
+        let mut staged = runtime.selected.clone().unwrap();
+        staged.staged = true;
+        staged.unstaged = false;
+        staged.status = Some("M ".into());
+        let _ = runtime.update(RepositoryAction::FilesLoaded {
+            identity: AsyncIdentity {
+                card,
+                worktree: identity.worktree.clone(),
+                path: PathBuf::from("."),
+                generation: runtime.file_list_generation,
+            },
+            result: Ok(vec![staged]),
+        });
+        let _ = runtime.update(RepositoryAction::FileLoaded {
+            identity: identity.clone(),
+            result: Ok(FileContent::Editable {
+                text: "loaded\n".into(),
+                content_hash: blake3::hash(b"loaded\n"),
+                markdown: false,
+            }),
+        });
+        let _ = runtime.update(RepositoryAction::DiffLoaded {
+            identity,
+            basis: DiffBasis::IndexToWorktree,
+            request: old_request,
+            content: RenderedDiff::Error("obsolete diff".into()),
+        });
+        let context = runtime.inspector_context();
+        assert!(context.has_staged);
+        assert!(!context.has_unstaged);
+        assert_eq!(runtime.diff_basis, DiffBasis::HeadToIndex);
+        assert!(runtime.diff_state(&DiffBasis::IndexToWorktree).is_none());
+        assert!(matches!(
+            runtime.diff_state(&DiffBasis::HeadToIndex),
+            Some(DiffState::Loading { .. })
+        ));
+        assert!(matches!(
+            &runtime.document,
+            DocumentState::Editable(document) if document.content.text() == "loaded\n"
+        ));
+    }
+
+    #[test]
+    fn mutation_refresh_keeps_dirty_buffer_save_and_pinned_commit_when_path_disappears() {
+        let card = CardId::new();
+        let (mut runtime, completion) = RepositoryRuntime::post_persist_failure_fixture(card);
+        let DocumentState::Editable(document) = &mut runtime.document else {
+            unreachable!();
+        };
+        document.replace_text("still editing\n");
+        let commit = DiffBasis::CommitToParent {
+            oid: fixture_oid(1),
+            parent: Some(fixture_oid(2)),
+        };
+        runtime.diff_basis = commit.clone();
+        runtime.source_surface = SourceSurface::Diff;
+        runtime.set_diff_state(
+            commit.clone(),
+            DiffState::Ready(staged_text_diff(model_with(4))),
+        );
+        let _ = runtime.refresh_after_mutation(card);
+        let _ = runtime.update(RepositoryAction::FilesLoaded {
+            identity: AsyncIdentity {
+                card,
+                worktree: runtime.descriptor.worktree.clone(),
+                path: PathBuf::from("."),
+                generation: runtime.file_list_generation,
+            },
+            result: Ok(Vec::new()),
+        });
+        let context = runtime.inspector_context();
+        assert!(!context.has_staged && !context.has_unstaged);
+        assert!(context.dirty && context.saving);
+        assert_eq!(runtime.diff_basis, commit);
+        assert_eq!(runtime.source_surface, SourceSurface::Diff);
+        assert_eq!(context.diff_additions, Some(4));
+        let _ = runtime.update(completion);
+        let DocumentState::Editable(document) = &runtime.document else {
+            panic!("mutation refresh must retain the edited buffer");
+        };
+        assert_eq!(document.content.text(), "still editing\n");
+        assert_eq!(document.saved_text, "B\n");
+        assert!(document.dirty);
+        assert!(document.active_save.is_none());
+        assert!(!document.conflict);
+    }
+
+    #[test]
+    fn save_completion_supersedes_status_read_started_before_it() {
+        let card = CardId::new();
+        let (mut runtime, completion) = RepositoryRuntime::post_persist_failure_fixture(card);
+        let _ = runtime.refresh_after_mutation(card);
+        let stale_identity = AsyncIdentity {
+            card,
+            worktree: runtime.descriptor.worktree.clone(),
+            path: PathBuf::from("."),
+            generation: runtime.file_list_generation,
+        };
+        let _ = runtime.update(completion);
+        let _ = runtime.update(RepositoryAction::FilesLoaded {
+            identity: stale_identity,
+            result: Ok(Vec::new()),
+        });
+        assert!(runtime.mutation_refresh_pending);
+        let mut changed = runtime.selected.clone().unwrap();
+        changed.unstaged = true;
+        changed.status = Some(" M".into());
+        let _ = runtime.update(RepositoryAction::FilesLoaded {
+            identity: AsyncIdentity {
+                card,
+                worktree: runtime.descriptor.worktree.clone(),
+                path: PathBuf::from("."),
+                generation: runtime.file_list_generation,
+            },
+            result: Ok(vec![changed]),
+        });
+        assert!(runtime.inspector_context().has_unstaged);
+        assert!(matches!(
+            runtime.diff_state(&DiffBasis::IndexToWorktree),
+            Some(DiffState::Loading { .. })
+        ));
+        assert!(!runtime.is_saving());
     }
 
     #[test]
@@ -5490,6 +5809,35 @@ mod tests {
     }
 
     #[test]
+    fn image_preview_never_enters_edit_save_or_language_server_pipelines() {
+        let card = CardId::new();
+        let (mut runtime, identity) = RepositoryRuntime::lsp_selection_fixture(card);
+        runtime.set_auto_save(true);
+        drop(runtime.update(RepositoryAction::FileLoaded {
+            identity,
+            result: Ok(FileContent::Image {
+                width: 1,
+                height: 1,
+                rgba: vec![255, 0, 0, 255].into(),
+            }),
+        }));
+        drop(runtime.update(RepositoryAction::EditorAction {
+            card,
+            action: text_editor::Action::Edit(text_editor::Edit::Insert('x')),
+        }));
+        drop(runtime.update(RepositoryAction::Save {
+            card,
+            overwrite: true,
+        }));
+        assert!(!runtime.is_dirty());
+        assert!(!runtime.can_save());
+        assert!(!runtime.is_saving());
+        assert!(runtime.take_lsp_intents().is_empty());
+        assert_eq!(runtime.inspector_context().document, "Image preview");
+        assert!(matches!(runtime.document, DocumentState::Image { .. }));
+    }
+
+    #[test]
     fn an_edit_reports_the_whole_document_at_the_next_version() {
         let card = CardId::new();
         let (mut runtime, _) = RepositoryRuntime::lsp_open_fixture(card, "fn main() {}\n");
@@ -6306,12 +6654,9 @@ mod tests {
         runtime.diff_basis = DiffBasis::HeadToIndex;
 
         let _ = runtime.update(RepositoryAction::ApplySourceSurface { card, diff: true });
-        assert_eq!(runtime.source_surface, SourceSurface::Diff);
-        // Neither working comparison has anything to show, and nothing was
-        // invented to fill the surface.
+        assert_eq!(runtime.source_surface, SourceSurface::Editor);
         assert!(runtime.diff_state(&DiffBasis::HeadToIndex).is_none());
-        assert_eq!(runtime.inspector_context().diff_state, Some("No changes"));
-        let _ = diff_surface(card, &runtime);
+        assert!(!runtime.can_show_diff());
 
         let commit = DiffBasis::CommitToParent {
             oid: fixture_oid(4),
@@ -6322,6 +6667,8 @@ mod tests {
             basis: commit.clone(),
         });
         assert_eq!(runtime.diff_basis, commit);
+        assert_eq!(runtime.source_surface, SourceSurface::Diff);
+        assert!(runtime.can_show_diff());
         assert!(matches!(
             runtime.diff_state(&commit),
             Some(DiffState::Loading { .. })
@@ -6738,6 +7085,75 @@ mod tests {
             &viewport,
         );
         renderer.screenshot(Size::new(width, height), 1.0, Color::BLACK)
+    }
+
+    #[test]
+    fn opening_an_image_reconciles_the_mounted_file_list_and_renders_pixels() {
+        use cosmic::iced::advanced::renderer::{Headless, Style};
+        use cosmic::iced::{Color, Rectangle, Size};
+        let card = CardId::new();
+        let mut runtime = RepositoryRuntime::new(RepositoryView {
+            project: ProjectId::new(),
+            repository: "/repo/.git".into(),
+            worktree: "/repo".into(),
+        });
+        let file = RepositoryFile {
+            path: "picture.png".into(),
+            staged_old_path: None,
+            unstaged_old_path: None,
+            staged: false,
+            unstaged: true,
+            status: Some("??".into()),
+        };
+        runtime.files = FileListState::Ready(vec![file.clone()]);
+        let mut tree = Tree::new(view(card, &runtime).as_widget());
+        let mut renderer = headless_renderer();
+        let viewport = Rectangle::with_size(Size::new(320.0, 240.0));
+        let _ = runtime.update(RepositoryAction::OpenFile {
+            card,
+            path: file.path,
+        });
+        {
+            let mut element = view(card, &runtime);
+            tree.diff(element.as_widget_mut());
+            element.as_widget_mut().layout(
+                &mut tree,
+                &renderer,
+                &layout::Limits::new(Size::ZERO, viewport.size()),
+            );
+        }
+        let _ = runtime.update(RepositoryAction::FileLoaded {
+            identity: AsyncIdentity {
+                card,
+                worktree: runtime.descriptor.worktree.clone(),
+                path: "picture.png".into(),
+                generation: runtime.generation,
+            },
+            result: Ok(FileContent::Image {
+                width: 1,
+                height: 1,
+                rgba: vec![200, 20, 40, 255].into(),
+            }),
+        });
+        let mut element = view(card, &runtime);
+        tree.diff(element.as_widget_mut());
+        let node = element.as_widget_mut().layout(
+            &mut tree,
+            &renderer,
+            &layout::Limits::new(Size::ZERO, viewport.size()),
+        );
+        element.as_widget().draw(
+            &tree,
+            &mut renderer,
+            &cosmic::Theme::dark(),
+            &Style::default(),
+            Layout::new(&node),
+            iced::mouse::Cursor::Unavailable,
+            &viewport,
+        );
+        let pixels = renderer.screenshot(Size::new(320, 240), 1.0, Color::BLACK);
+        let center = (120 * 320 + 160) * 4;
+        assert_eq!(&pixels[center..center + 4], &[200, 20, 40, 255]);
     }
 
     /// The colour families a render puts on screen, as (brightest channel,

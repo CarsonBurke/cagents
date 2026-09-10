@@ -33,7 +33,7 @@ use serde::Deserialize;
 use serde::Serialize;
 use thiserror::Error;
 
-#[cfg(feature = "host")]
+#[cfg(any(feature = "host", feature = "ui"))]
 use crate::model::{BootId, HostSessionProof};
 use crate::{instance, terminal_ipc::SOCKET_FILE_NAME};
 
@@ -238,6 +238,98 @@ impl RuntimePaths {
     }
 }
 
+/// Serializes recovery discovery through confirmed attachment across all UIs.
+/// The file is never unlinked; only its owning guard releases the flock.
+#[cfg(feature = "ui")]
+pub(crate) struct RecoveryLease {
+    lock: File,
+}
+
+#[cfg(feature = "ui")]
+impl RecoveryLease {
+    pub(crate) fn acquire(
+        socket: &Path,
+        timeout: std::time::Duration,
+    ) -> Result<Self, PlatformError> {
+        let directory_path = socket.parent().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "daemon socket has no runtime directory",
+            )
+        })?;
+        let directory = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY | O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(directory_path)?;
+        let metadata = directory.metadata()?;
+        validate_owner(directory_path, &metadata, current_uid())?;
+        if metadata.mode() & 0o022 != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "daemon recovery directory is writable by another user",
+            )
+            .into());
+        }
+        let lock_path = directory_path.join("cagentsd.recovery.lock");
+        // SAFETY: directory is a live directory descriptor and the fixed name
+        // is NUL-terminated. Opening relative to it cannot follow a swapped path.
+        let fd = unsafe {
+            libc::openat(
+                directory.as_raw_fd(),
+                c"cagentsd.recovery.lock".as_ptr(),
+                libc::O_CREAT | libc::O_RDWR | libc::O_CLOEXEC | libc::O_NONBLOCK | O_NOFOLLOW,
+                0o600 as libc::mode_t,
+            )
+        };
+        if fd < 0 {
+            return Err(io::Error::last_os_error().into());
+        }
+        // SAFETY: openat returned a new descriptor, transferred exactly once.
+        let lock = unsafe { File::from_raw_fd(fd) };
+        let metadata = lock.metadata()?;
+        validate_lock_file(&lock_path, &metadata, current_uid())?;
+        if metadata.nlink() != 1 || metadata.mode() & 0o077 != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "daemon recovery lock is not a private, singly linked file",
+            )
+            .into());
+        }
+        let started = std::time::Instant::now();
+        loop {
+            // SAFETY: flock receives a live descriptor and scalar flags.
+            if unsafe { flock(lock.as_raw_fd(), LOCK_EX | LOCK_NB) } == 0 {
+                return Ok(Self { lock });
+            }
+            let error = io::Error::last_os_error();
+            if error.kind() != io::ErrorKind::WouldBlock
+                && error.kind() != io::ErrorKind::Interrupted
+            {
+                return Err(error.into());
+            }
+            let remaining = timeout.saturating_sub(started.elapsed());
+            if remaining.is_zero() {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "another terminal recovery is still awaiting attachment; retry after it completes",
+                ).into());
+            }
+            std::thread::sleep(remaining.min(std::time::Duration::from_millis(20)));
+        }
+    }
+}
+
+#[cfg(feature = "ui")]
+impl Drop for RecoveryLease {
+    fn drop(&mut self) {
+        // A concurrently spawned child can inherit this open-file description
+        // until exec closes CLOEXEC descriptors. Explicit unlock prevents that
+        // unrelated child from extending the recovery critical section.
+        // SAFETY: this guard owns the live locked descriptor.
+        unsafe { flock(self.lock.as_raw_fd(), libc::LOCK_UN) };
+    }
+}
+
 #[cfg(feature = "host")]
 pub(crate) struct HostLease {
     socket_path: PathBuf,
@@ -319,6 +411,63 @@ fn write_lock_metadata(lock: &mut File, proof: &HostSessionProof) -> Result<(), 
 #[derive(Deserialize)]
 struct StoredLockMetadata {
     pid: u32,
+}
+
+/// Authenticate the current socket against the daemon's exclusive lease before
+/// using a new incarnation as evidence that an old owner has been replaced.
+/// Merely reaching a socket (or receiving a proof mismatch) is not authority.
+#[cfg(feature = "ui")]
+pub(crate) fn replacement_owner(
+    socket: &Path,
+    proof: &HostSessionProof,
+) -> Result<u32, PlatformError> {
+    #[derive(Deserialize)]
+    struct RecoveryMetadata {
+        pid: u32,
+        proof: HostSessionProof,
+    }
+
+    let lock_path = socket.with_file_name("cagentsd.lock");
+    let lock = OpenOptions::new()
+        .read(true)
+        .custom_flags(O_NOFOLLOW)
+        .open(&lock_path)?;
+    validate_lock_file(&lock_path, &lock.metadata()?, current_uid())?;
+    // SAFETY: flock receives a live descriptor and no pointers.
+    if unsafe { flock(lock.as_raw_fd(), LOCK_EX | LOCK_NB) } == 0 {
+        // SAFETY: this descriptor owns the lock just acquired.
+        let _ = unsafe { flock(lock.as_raw_fd(), LOCK_UN) };
+        return Err(io::Error::other("daemon ownership is not held").into());
+    }
+    let error = io::Error::last_os_error();
+    if error.kind() != io::ErrorKind::WouldBlock {
+        return Err(error.into());
+    }
+    let metadata: RecoveryMetadata = serde_json::from_reader(&lock)?;
+    if !proof.is_complete() || metadata.proof != *proof || read_boot_id()? != proof.boot_id {
+        return Err(io::Error::other("daemon lease does not match its discovery proof").into());
+    }
+    let _pidfd = open_validated_pidfd(&lock, metadata.pid, Path::new("/proc"))?;
+    let stream = UnixStream::connect(socket)?;
+    let mut credential: libc::ucred = unsafe { std::mem::zeroed() };
+    let mut length = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+    // SAFETY: credential and length are valid writable buffers of the declared size.
+    if unsafe {
+        libc::getsockopt(
+            stream.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_PEERCRED,
+            (&mut credential as *mut libc::ucred).cast(),
+            &mut length,
+        )
+    } != 0
+    {
+        return Err(io::Error::last_os_error().into());
+    }
+    if credential.uid != current_uid() || u32::try_from(credential.pid).ok() != Some(metadata.pid) {
+        return Err(io::Error::other("daemon socket does not belong to its lease owner").into());
+    }
+    Ok(metadata.pid)
 }
 
 /// Sends SIGTERM to the daemon identified by the current instance's lock.
@@ -555,7 +704,7 @@ pub(crate) fn peer_uid(stream: &UnixStream) -> io::Result<u32> {
     Ok(credentials.uid)
 }
 
-#[cfg(feature = "host")]
+#[cfg(any(feature = "host", feature = "ui"))]
 pub(crate) fn read_boot_id() -> io::Result<BootId> {
     let value = fs::read_to_string("/proc/sys/kernel/random/boot_id")?;
     let value = value.trim();
@@ -789,5 +938,43 @@ mod tests {
         ));
         assert_eq!(fs::read(&not_directory).unwrap(), b"untouched");
         assert_eq!(fs::read(&lock).unwrap(), b"untouched");
+    }
+
+    #[cfg(feature = "ui")]
+    #[test]
+    fn recovery_lease_serializes_separate_openers_until_owner_drops() {
+        let root = tempdir().unwrap();
+        let socket = root.path().join(SOCKET_FILE_NAME);
+        let lease = RecoveryLease::acquire(&socket, std::time::Duration::ZERO).unwrap();
+        assert!(matches!(
+            RecoveryLease::acquire(&socket, std::time::Duration::from_millis(5)),
+            Err(PlatformError::Io(error)) if error.kind() == io::ErrorKind::TimedOut
+        ));
+        drop(lease);
+        let replacement = RecoveryLease::acquire(&socket, std::time::Duration::ZERO).unwrap();
+        // Releasing an earlier owner must not unlink the shared lock identity.
+        assert!(matches!(
+            RecoveryLease::acquire(&socket, std::time::Duration::ZERO),
+            Err(PlatformError::Io(error)) if error.kind() == io::ErrorKind::TimedOut
+        ));
+        drop(replacement);
+    }
+
+    #[cfg(feature = "ui")]
+    #[test]
+    fn recovery_lease_rejects_symlink_without_touching_target() {
+        let root = tempdir().unwrap();
+        let target = root.path().join("target");
+        fs::write(&target, b"untouched").unwrap();
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o600)).unwrap();
+        std::os::unix::fs::symlink(&target, root.path().join("cagentsd.recovery.lock")).unwrap();
+        assert!(
+            RecoveryLease::acquire(
+                &root.path().join(SOCKET_FILE_NAME),
+                std::time::Duration::ZERO,
+            )
+            .is_err()
+        );
+        assert_eq!(fs::read(&target).unwrap(), b"untouched");
     }
 }

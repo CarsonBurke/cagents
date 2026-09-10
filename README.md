@@ -317,13 +317,17 @@ cagents ui
   restore its terminals; selecting it again does not create another terminal.
   **New terminal** (`Ctrl+T`) starts in that worktree and inserts immediately to
   the right of its focused column.
+  Drag a project header to reorder projects; the order survives restarts.
 - The right-hand inspector has neutral, icon-only **Files**, **Changes**, and
   **Details** tabs; hover for tooltips. Files browses the selected worktree,
   Changes provides diffs, staging, commits, push/publish, history, and
   pull-request actions, and Details follows the focused card. The file list's
   **Tree** and **Flat** icons also have tooltips. Right-click project or worktree
   rows for their actions; there is no ellipsis menu button. Worktree rows show
-  matching pull requests and their reported CI status.
+  matching pull requests and their reported CI status. Icon tooltips appear
+  after one second. Change rows color their status/counts and replace them with
+  action buttons on hover. Untracked text files show measured additions;
+  binary, unsafe, oversized, or budget-limited files retain unknown counts.
 - Switching worktrees remembers each strip's horizontal scroll position and
   focused column. Hidden terminal presentation is released while hosted PTYs
   keep running, and editor buffers remain intact. Scroll positions are remembered
@@ -356,22 +360,32 @@ cagents ui
   errors, and durability warnings stop automatic saving and remain visible;
   autosave does not silently overwrite external changes. Disable **Save files
   automatically** in Settings for manual saving.
-- If a terminal reports a different daemon incarnation, its original daemon is
-  gone. The card offers **Retry** to start a new terminal with the saved launch
-  recipe. Existing transcripts remain available; the old running process cannot
-  be recovered by attaching to the replacement daemon.
+  Images open as previews. File/view/edit/diff controls share the card's single
+  toolbar; selected modes stay highlighted and unavailable comparisons are
+  disabled rather than opening an empty diff.
+- When a daemon incarnation changes, cagents authenticates the replacement and
+  checks for surviving owners before recovering safe shell or exact agent
+  launches. Unknown or orphaned processes block recovery rather than risking
+  duplicate writers. **Retry** explicitly authorizes saved launch recipes that
+  cannot be replayed automatically. Transcripts remain available; recovery
+  starts or adopts a proven replacement, not the old terminal process.
 
 ### Native agent chat
 
 Supported OMP, Claude, and Codex terminal sessions offer **Switch to chat**.
 The switch uses an exact provider conversation identity, not terminal-text
-scraping, a most-recent-session lookup, or a fork. If the launch does not identify
-the conversation, the dialog asks you to select the current session explicitly
-by its complete UUID; it does not search private conversation history.
+scraping, a most-recent-session lookup, or a fork. The switch opens the detected
+conversation directly, without a session-picker dialog. If process-bound exact
+identity is unavailable, the terminal remains intact: resume that exact
+conversation in the provider CLI and retry. Fresh OMP sessions must first have a
+saved session file; fresh Codex sessions without an observable exact identity
+cannot be selected safely from the shared daemon's other conversations.
 
-- **OMP and Claude:** confirm a stop-and-resume handoff. Active work is
-  interrupted, the CLI stops, and native chat resumes the same conversation.
+- **OMP and Claude:** switching performs a stop-and-resume handoff. Active work
+  is interrupted, the CLI stops, and native chat resumes the same conversation.
   Returning to the terminal stops the native writer before resuming the CLI.
+  Unsent drafts, attachments, and pending commands block return so they cannot
+  be silently lost.
   This is not a simultaneous live view; available history depends on the
   provider. The original launch recipe and terminal descriptor are retained.
 - **Codex:** join the exact existing conversation directly over the shared
@@ -453,11 +467,9 @@ Pointer close and Ctrl+W share that policy; Cancel/Escape preserve the card and
 restore its focus. Confirmation revalidates terminal identity and daemon proof.
 An unreachable daemon leaves the card intact.
 
-Terminal activity reports only observed PTY facts. **Quiet** means no output was
-observed for **five seconds**, not that an agent is waiting, ready, or finished.
-Starting, output-active, quiet, exited, failed, and unknown follow current
-incarnation evidence; wall time is display-only. Mounted consumers schedule
-one-shot quiet transitions, and hidden terminals do not create periodic redraws.
+Terminal activity remains an observed PTY fact, not an agent-completion signal.
+The terminal view has no activity-status strip. Hidden terminals do not create
+periodic presentation redraws.
 
 ## Daemon and user data
 

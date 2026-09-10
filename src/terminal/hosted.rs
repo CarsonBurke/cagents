@@ -6,7 +6,7 @@ use std::{
     path::{Path, PathBuf},
     process::{Command, Stdio},
     sync::{
-        Arc, Mutex, OnceLock,
+        Arc, Condvar, Mutex, OnceLock,
         atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering},
     },
     thread::{self, JoinHandle},
@@ -119,6 +119,12 @@ pub enum HostedTerminalStartError {
     },
 }
 
+#[derive(Default)]
+struct AttachmentState {
+    confirmed: bool,
+    failure: Option<String>,
+}
+
 struct HostedPublishedState {
     snapshot: ArcSwap<RenderSnapshot>,
     generation: AtomicU64,
@@ -132,6 +138,8 @@ struct HostedPublishedState {
     semantic_wake_pending: AtomicBool,
     visibility: AtomicU8,
     proof: Mutex<Option<HostSessionProof>>,
+    attachment: Mutex<AttachmentState>,
+    attachment_changed: Condvar,
     wake: Arc<WakeCallback>,
 }
 
@@ -159,6 +167,8 @@ impl HostedPublishedState {
                 TerminalVisibility::Hidden
             })),
             proof: Mutex::new(expected_host),
+            attachment: Mutex::new(AttachmentState::default()),
+            attachment_changed: Condvar::new(),
             wake,
         }
     }
@@ -370,6 +380,45 @@ impl HostedPublishedState {
             TerminalVisibility::Visible => 0,
             TerminalVisibility::Hidden => 1,
             TerminalVisibility::Hibernated => 2,
+        }
+    }
+
+    fn confirm_attachment(&self) {
+        self.attachment
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .confirmed = true;
+        self.attachment_changed.notify_all();
+    }
+
+    fn fail_attachment(&self, message: String) {
+        let mut attachment = self
+            .attachment
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if attachment.failure.is_none() {
+            attachment.failure = Some(message);
+        }
+        self.attachment_changed.notify_all();
+    }
+
+    fn wait_until_attached(&self, timeout: Duration) -> Result<(), String> {
+        let attachment = self
+            .attachment
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let (attachment, _) = self
+            .attachment_changed
+            .wait_timeout_while(attachment, timeout, |state| {
+                !state.confirmed && state.failure.is_none()
+            })
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(message) = &attachment.failure {
+            Err(message.clone())
+        } else if attachment.confirmed {
+            Ok(())
+        } else {
+            Err("timed out waiting for the daemon to attach the terminal".to_owned())
         }
     }
 
@@ -629,8 +678,23 @@ impl HostedTerminalHandle {
         self.inner.terminal_id
     }
 
+    /// Returns the fenced host identity only after the daemon accepted this terminal.
     pub fn proof(&self) -> Option<HostSessionProof> {
-        self.inner.published.proof()
+        let confirmed = self
+            .inner
+            .published
+            .attachment
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .confirmed;
+        confirmed.then(|| self.inner.published.proof()).flatten()
+    }
+
+    /// Waits for a successful terminal attach, spawn, or reconnect resume.
+    /// Semantic events remain queued for the UI; authenticating the daemon alone
+    /// does not confirm that it accepted this terminal.
+    pub fn wait_until_attached(&self, timeout: Duration) -> Result<(), String> {
+        self.inner.published.wait_until_attached(timeout)
     }
 
     pub fn snapshot(&self) -> Arc<RenderSnapshot> {
@@ -987,6 +1051,7 @@ fn client_loop(
 ) {
     let mut reconnect_delay = INITIAL_RECONNECT_DELAY;
     let mut carried = None;
+    let mut reconnect_started = None;
     let connection = ConnectionContext {
         socket,
         terminal_id,
@@ -1000,11 +1065,29 @@ fn client_loop(
         if stop.is_requested() {
             break;
         }
-        let end = serve_connection(&connection, &mut carried);
+        let end = serve_connection(&connection, &mut carried, || {
+            reconnect_started = None;
+            reconnect_delay = INITIAL_RECONNECT_DELAY;
+        });
         published.invalidate_activity();
         match end {
             ConnectionEnd::Stop => break,
-            ConnectionEnd::Retry => {}
+            ConnectionEnd::Retry => {
+                let started = reconnect_started.get_or_insert_with(Instant::now);
+                if started.elapsed() >= DAEMON_READY_TIMEOUT {
+                    reject_handshake(
+                        &events,
+                        &published,
+                        &stop,
+                        ProtocolError::new(
+                            ProtocolErrorCode::InvalidRequest,
+                            "daemon connection was lost; rediscovery is required before this terminal can continue",
+                            false,
+                        ),
+                    );
+                    break;
+                }
+            }
         }
 
         if wait_before_reconnect(&stop, &commands, &mut carried, reconnect_delay)
@@ -1018,6 +1101,7 @@ fn client_loop(
     // destruction otherwise disconnects `events` before `commands`, briefly
     // accepting input after consumers already observed permanent termination.
     stop.request();
+    published.fail_attachment("hosted terminal connection stopped".to_owned());
 }
 
 fn wait_before_reconnect(
@@ -1061,6 +1145,7 @@ fn wait_before_reconnect(
 fn serve_connection(
     context: &ConnectionContext<'_>,
     carried: &mut Option<ClientCommand>,
+    mut did_attach: impl FnMut(),
 ) -> ConnectionEnd {
     let ConnectionContext {
         socket,
@@ -1107,9 +1192,13 @@ fn serve_connection(
         return ConnectionEnd::Retry;
     }
 
+    let handshake_deadline = Instant::now() + DAEMON_READY_TIMEOUT;
     let (proof, mut attached) = loop {
         if stop.is_requested() {
             return ConnectionEnd::Stop;
+        }
+        if Instant::now() >= handshake_deadline {
+            return ConnectionEnd::Retry;
         }
         let envelope = match read_frame::<ServerEnvelope>(&mut stream) {
             Ok(Some(envelope)) => envelope,
@@ -1174,6 +1263,8 @@ fn serve_connection(
                     .find(|terminal| terminal.session.id == terminal_id && terminal.attached)
                 {
                     published.observe_activity(terminal.activity);
+                    published.confirm_attachment();
+                    did_attach();
                 }
                 break (proof, attached);
             }
@@ -1382,6 +1473,8 @@ fn serve_connection(
                             return ConnectionEnd::Retry;
                         }
                         published.request_semantic_wake();
+                        published.confirm_attachment();
+                        did_attach();
                     }
                     (PendingRequest::Spawn, ServerResponse::Spawned { terminal })
                         if terminal.session.id == terminal_id =>
@@ -1397,6 +1490,8 @@ fn serve_connection(
                             return ConnectionEnd::Retry;
                         }
                         published.request_semantic_wake();
+                        published.confirm_attachment();
+                        did_attach();
                     }
                     (
                         PendingRequest::Snapshot,
@@ -1454,12 +1549,15 @@ fn serve_connection(
                 let Some(request_id) = envelope.request_id else {
                     return ConnectionEnd::Retry;
                 };
+                let mut attachment_failed = false;
                 let operation = match pending.remove(&request_id) {
                     Some(PendingRequest::Attach) => {
+                        attachment_failed = true;
                         published.mark_detached();
                         "attach hosted terminal"
                     }
                     Some(PendingRequest::Spawn) => {
+                        attachment_failed = true;
                         published.mark_detached();
                         "spawn hosted terminal"
                     }
@@ -1473,8 +1571,16 @@ fn serve_connection(
                     Some(PendingRequest::Command(operation)) => operation,
                     None => return ConnectionEnd::Retry,
                 };
-                let retry = error.retryable;
+                let retry = error.retryable && error.code != ProtocolErrorCode::ProofMismatch;
+                let fatal =
+                    !retry && (attachment_failed || error.code == ProtocolErrorCode::ProofMismatch);
+                if fatal {
+                    published.fail_attachment(format!("{operation}: {}", error.message));
+                }
                 publish_protocol_error(events, published, operation, error);
+                if fatal {
+                    return ConnectionEnd::Stop;
+                }
                 if retry {
                     return ConnectionEnd::Retry;
                 }
@@ -1626,21 +1732,17 @@ fn reject_handshake(
     events: &Sender<TerminalEvent>,
     published: &HostedPublishedState,
     stop: &WorkerStop,
-    mut error: ProtocolError,
+    error: ProtocolError,
 ) -> ConnectionEnd {
     // A reconnect can recover transport failures, but this handle may never
     // target another incarnation, even when the protocol marks it retryable.
     let retry = error.retryable && error.code != ProtocolErrorCode::ProofMismatch;
-    if error.code == ProtocolErrorCode::ProofMismatch {
-        error.message.push_str(
-            "; this terminal cannot reconnect to the current daemon. Retry to start a new terminal",
-        );
-    }
     if retry {
         publish_protocol_error(events, published, "connect to cagents daemon", error);
         return ConnectionEnd::Retry;
     }
 
+    published.fail_attachment(error.message.clone());
     // The terminal cannot recover after this worker exits. Preserve its final
     // failure even when earlier events fill the inbox, but let dropping the
     // handle cancel the wait. Wake the consumer before applying backpressure.
@@ -1839,6 +1941,160 @@ mod tests {
         }
     }
 
+    #[test]
+    fn terminal_identity_is_published_only_after_attachment_acknowledgement() {
+        for spawn in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            let socket = directory.path().join("daemon.sock");
+            let listener = UnixListener::bind(&socket).unwrap();
+            let session = session();
+            let pinned = proof("confirmed");
+            let handle = if spawn {
+                HostedTerminalHandle::attach_or_spawn_at(
+                    socket,
+                    session.clone(),
+                    TerminalSpawnOptions::default(),
+                    Some(pinned.clone()),
+                    |_| {},
+                )
+            } else {
+                HostedTerminalHandle::connect_at(socket, session.id, Some(pinned.clone()), |_| {})
+            }
+            .unwrap();
+            assert_eq!(handle.proof(), None);
+            let mut stream = accept_connection(&listener);
+            let connect: ClientEnvelope = read_frame(&mut stream).unwrap().unwrap();
+            let send = |stream: &mut UnixStream, request_id, response| {
+                write_frame(
+                    stream,
+                    &ServerEnvelope {
+                        version: PROTOCOL_VERSION,
+                        request_id: Some(request_id),
+                        proof: pinned.clone(),
+                        message: ServerMessage::Response { response },
+                    },
+                )
+                .unwrap();
+            };
+            send(
+                &mut stream,
+                connect.request_id,
+                ServerResponse::Connected {
+                    proof: pinned.clone(),
+                    resumed: Vec::new(),
+                },
+            );
+            let request: ClientEnvelope = read_frame(&mut stream).unwrap().unwrap();
+            assert_eq!(request.proof, Some(pinned.clone()));
+            match &request.request {
+                ClientRequest::Spawn {
+                    session: requested, ..
+                } if spawn => {
+                    assert_eq!(requested.id, session.id);
+                }
+                ClientRequest::Attach { terminal_id, .. } if !spawn => {
+                    assert_eq!(*terminal_id, session.id);
+                }
+                other => panic!("unexpected attachment request: {other:?}"),
+            }
+            // Daemon authentication and sending a fenced request are not proof
+            // that the daemon has accepted the exact terminal identity.
+            assert_eq!(handle.proof(), None);
+            assert!(handle.wait_until_attached(Duration::ZERO).is_err());
+            let terminal = TerminalDescriptor {
+                session,
+                generation: 0,
+                event_sequence: 0,
+                activity: None,
+                oldest_event_sequence: 1,
+                attached: true,
+                transcript: None,
+            };
+            send(
+                &mut stream,
+                request.request_id,
+                if spawn {
+                    ServerResponse::Spawned { terminal }
+                } else {
+                    ServerResponse::Attached { terminal }
+                },
+            );
+            handle.wait_until_attached(Duration::from_secs(2)).unwrap();
+            assert_eq!(handle.proof(), Some(pinned));
+            assert!(matches!(
+                handle
+                    .events()
+                    .recv_timeout(Duration::from_secs(2))
+                    .unwrap(),
+                TerminalEvent::ResumeHintChanged(_)
+            ));
+        }
+    }
+
+    #[test]
+    fn rejected_spawn_wakes_attachment_waiter_without_consuming_failure_event() {
+        let directory = tempfile::tempdir().unwrap();
+        let socket = directory.path().join("daemon.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let pinned = proof("rejected");
+        let handle = HostedTerminalHandle::attach_or_spawn_at(
+            socket,
+            session(),
+            TerminalSpawnOptions::default(),
+            Some(pinned.clone()),
+            |_| {},
+        )
+        .unwrap();
+        let mut stream = accept_connection(&listener);
+        let connect: ClientEnvelope = read_frame(&mut stream).unwrap().unwrap();
+        write_frame(
+            &mut stream,
+            &ServerEnvelope {
+                version: PROTOCOL_VERSION,
+                request_id: Some(connect.request_id),
+                proof: pinned.clone(),
+                message: ServerMessage::Response {
+                    response: ServerResponse::Connected {
+                        proof: pinned.clone(),
+                        resumed: Vec::new(),
+                    },
+                },
+            },
+        )
+        .unwrap();
+        let spawn: ClientEnvelope = read_frame(&mut stream).unwrap().unwrap();
+        assert!(matches!(spawn.request, ClientRequest::Spawn { .. }));
+        write_frame(
+            &mut stream,
+            &ServerEnvelope {
+                version: PROTOCOL_VERSION,
+                request_id: Some(spawn.request_id),
+                proof: pinned,
+                message: ServerMessage::Error(ProtocolError::new(
+                    ProtocolErrorCode::PermissionDenied,
+                    "terminal access denied",
+                    false,
+                )),
+            },
+        )
+        .unwrap();
+        let failure = handle
+            .wait_until_attached(Duration::from_secs(2))
+            .unwrap_err();
+        assert!(failure.contains("terminal access denied"));
+        assert_eq!(handle.proof(), None);
+        assert!(matches!(
+            handle
+                .events()
+                .recv_timeout(Duration::from_secs(2))
+                .unwrap(),
+            TerminalEvent::Error {
+                operation: "spawn hosted terminal",
+                ..
+            }
+        ));
+    }
+
     fn assert_handshake_stops(message: ServerMessage) {
         let directory = tempfile::tempdir().unwrap();
         let socket = directory.path().join("daemon.sock");
@@ -1888,7 +2144,8 @@ mod tests {
             Err(crossbeam_channel::RecvTimeoutError::Disconnected)
         );
         assert_eq!(handle.input(vec![b'x']), Err(TerminalSendError::Closed));
-        assert_eq!(handle.proof(), Some(pinned));
+        assert_eq!(handle.proof(), None);
+        assert!(handle.wait_until_attached(Duration::ZERO).is_err());
         // Not even the queued input or original spawn intent crossed the fence.
         assert_eq!(read_frame::<ClientEnvelope>(&mut stream).unwrap(), None);
         assert!(matches!(
@@ -2000,7 +2257,7 @@ mod tests {
                 ClientRequest::Input { terminal_id: id, bytes }
                     if id == terminal_id && bytes == *b"x"
             ));
-            assert_eq!(handle.proof(), Some(pinned.clone()));
+            assert_eq!(handle.proof(), None);
             drop(handle);
             break;
         }
