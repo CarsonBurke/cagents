@@ -140,7 +140,12 @@ impl Cagents {
         self.set_workspace_surfaces_visible(false);
         self.active_workspace = Some(path.clone());
         self.workspace_view_generation = self.workspace_view_generation.wrapping_add(1);
-        self.workspace_scroll_id = widget::Id::unique();
+        // Iced inherits old anonymous IDs during diff. A named generation ID
+        // forces a new scroll state so operations address this worktree's strip.
+        self.workspace_scroll_id = widget::Id::new(format!(
+            "workspace-strip-{}",
+            self.workspace_view_generation
+        ));
         self.workspace = Self::rebuild_workspace(&scoped);
         self.workspace.resize_viewport(width);
         // Focus selects the initial position only on the first visit. Returning
@@ -373,6 +378,114 @@ mod tests {
         let _ = app.select_worktree("/repo/nested".into(), true);
         assert_eq!(app.durable.cards.len(), 1);
         assert_eq!(app.workspace.focused(), Some(card.id));
+    }
+
+    #[test]
+    fn switched_strip_accepts_scroll_operations_after_native_tree_diff() {
+        use cosmic::iced::advanced::widget::{Operation, Tree};
+        use cosmic::iced::advanced::{Layout, layout, renderer::Headless, widget::operation};
+        use cosmic::iced::{Rectangle, Size, Vector};
+        let renderer = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(cosmic::Renderer::new(
+                cosmic::iced::Font::default(),
+                cosmic::iced::Pixels(14.0),
+                Some("tiny-skia"),
+            ))
+            .unwrap();
+        let mut app = super::super::tests::context_inspector_test_app(false);
+        register_worktrees(&mut app, &["/a", "/b"]);
+        let a = terminal("/a");
+        let b = terminal("/b");
+        app.durable = Arc::new(WorkspaceState {
+            cards: vec![a, b],
+            ..WorkspaceState::default()
+        });
+        let mut workspace = Workspace::default();
+        workspace.resize_viewport(300.0);
+        for index in 0..3 {
+            workspace
+                .add_card(
+                    WorkspaceCard::new(
+                        CardId::new(),
+                        format!("Pane {index}"),
+                        crate::workspace::CardWidth::Fixed(500.0),
+                    )
+                    .unwrap(),
+                    index,
+                    false,
+                )
+                .unwrap();
+        }
+        let shortcuts = app.settings.keyboard_shortcuts.clone();
+        let make = |id| -> Element<'_, ()> {
+            workspace_widget::view(
+                &workspace,
+                &shortcuts,
+                300.0,
+                id,
+                |_| {
+                    iced::widget::Space::new()
+                        .width(Length::Fill)
+                        .height(Length::Fill)
+                        .into()
+                },
+                workspace_widget::card_widget_id,
+                workspace_widget::Events { viewport: |_| () },
+            )
+        };
+        let _ = app.select_worktree("/a".into(), false);
+        let mut element = make(app.workspace_scroll_id.clone());
+        let mut tree = Tree::new(&element);
+        let limits = layout::Limits::new(Size::ZERO, Size::new(300.0, 100.0));
+        element
+            .as_widget_mut()
+            .layout(&mut tree, &renderer, &limits);
+        let _ = app.select_worktree("/b".into(), false);
+        cosmic::iced::advanced::widget::tree::NAMED
+            .with(|cache| *cache.borrow_mut() = tree.take_all_named());
+        element = make(app.workspace_scroll_id.clone());
+        tree.diff(&mut element);
+        let node = element
+            .as_widget_mut()
+            .layout(&mut tree, &renderer, &limits);
+        element.as_widget_mut().operate(
+            &mut tree,
+            Layout::new(&node),
+            &renderer,
+            &mut operation::scrollable::scroll_to::<()>(
+                app.workspace_scroll_id.clone(),
+                operation::scrollable::AbsoluteOffset {
+                    x: Some(240.0),
+                    y: None,
+                },
+            ),
+        );
+        #[derive(Default)]
+        struct Offset(f32);
+        impl Operation for Offset {
+            fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
+                visit(self);
+            }
+            fn scrollable(
+                &mut self,
+                _: Option<&widget::Id>,
+                _: Rectangle,
+                _: Rectangle,
+                translation: Vector,
+                _: &mut dyn operation::Scrollable,
+            ) {
+                self.0 = translation.x;
+            }
+        }
+        let mut offset = Offset::default();
+        element
+            .as_widget_mut()
+            .operate(&mut tree, Layout::new(&node), &renderer, &mut offset);
+        assert_eq!(offset.0, 240.0);
+        cosmic::iced::advanced::widget::tree::NAMED.with(|cache| cache.borrow_mut().clear());
     }
 
     #[test]

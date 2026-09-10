@@ -388,7 +388,7 @@ where
         .direction(widget::scrollable::Direction::Horizontal(
             widget::scrollable::Scrollbar::hidden(),
         ))
-        .id(scroll_id)
+        .id(scroll_id.clone())
         .class(cosmic::style::iced::Scrollable::Minimal)
         .width(Length::Fill)
         .height(Length::Fill)
@@ -399,9 +399,14 @@ where
             }))
         });
 
-    WorkspaceSurface::new(scrollable, shortcuts, move |size: Size| {
-        on_viewport(WorkspaceViewportEvent::Resized(size.width))
-    })
+    // Scrollable exposes a composite ID that Iced inherits during diff even
+    // when its requested ID changes. Key its entire subtree by worktree so
+    // programmatic scroll operations cannot keep targeting the departed strip.
+    WorkspaceSurface::new(
+        cosmic::widget::id_container(scrollable, scroll_id),
+        shortcuts,
+        move |size: Size| on_viewport(WorkspaceViewportEvent::Resized(size.width)),
+    )
     .into()
 }
 
@@ -1925,6 +1930,7 @@ mod tests {
 
     #[test]
     fn composed_workspace_view_exposes_every_mounted_card_to_a_screen_reader() {
+        use cosmic::iced::advanced::renderer::Headless;
         use iced_accessibility::A11yId;
 
         const VIEWPORT_WIDTH: f32 = 700.0;
@@ -1955,7 +1961,7 @@ mod tests {
                 + 1
         };
         let shortcuts = KeyboardShortcuts::default();
-        let composed: Element<'_, ()> = view(
+        let mut composed: Element<'_, ()> = view(
             &workspace,
             &shortcuts,
             VIEWPORT_WIDTH,
@@ -1969,32 +1975,21 @@ mod tests {
             card_widget_id,
             Events { viewport: |_| () },
         );
-        let tree = Tree::new(&composed);
-
-        // The view nests workspace surface > scrollable > strip > card surface > id
-        // container > card, and every one of those contributes a layout node.
-        let strip_node = layout::Node::with_children(
-            Size::new(projection.total_width, HEIGHT),
-            projection
-                .mounted
-                .iter()
-                .map(|card| {
-                    let size = Size::new(card.width, HEIGHT);
-                    layout::Node::with_children(
-                        size,
-                        vec![layout::Node::with_children(
-                            size,
-                            vec![layout::Node::new(size)],
-                        )],
-                    )
-                    .move_to(Point::new(card.start, 0.0))
-                })
-                .collect(),
-        );
-        let surface_size = Size::new(VIEWPORT_WIDTH, HEIGHT);
-        let surface_node = layout::Node::with_children(
-            surface_size,
-            vec![layout::Node::with_children(surface_size, vec![strip_node])],
+        let mut tree = Tree::new(&composed);
+        let renderer = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(Renderer::new(
+                cosmic::iced::Font::default(),
+                cosmic::iced::Pixels(14.0),
+                Some("tiny-skia"),
+            ))
+            .unwrap();
+        let surface_node = composed.as_widget_mut().layout(
+            &mut tree,
+            &renderer,
+            &layout::Limits::new(Size::ZERO, Size::new(VIEWPORT_WIDTH, HEIGHT)),
         );
         let accessible = composed.as_widget().a11y_nodes(
             Layout::new(&surface_node),
