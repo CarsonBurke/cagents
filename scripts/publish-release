@@ -340,12 +340,13 @@ assert_owned_draft() {
 
 releases=$(release_for_tag)
 if [[ $(jq 'length' <<< "$releases") == 0 ]]; then
-    gh release create "$TAG" --repo "$REPOSITORY" --verify-tag --draft \
-        --title "cagents and ceditor $TAG" --notes-file "$NOTES" --generate-notes
-    releases=$(release_for_tag)
+    # Use the creation response: the releases listing can lag behind this write.
+    release=$(gh api --hostname github.com --method POST "repos/$REPOSITORY/releases" \
+        -f "tag_name=$TAG" -f "name=cagents and ceditor $TAG" \
+        -F draft=true -F "body=@$NOTES")
+else
+    release=$(jq -c '.[0]' <<< "$releases")
 fi
-[[ $(jq 'length' <<< "$releases") == 1 ]] || fail 'could not find the newly created draft'
-release=$(jq -c '.[0]' <<< "$releases")
 assert_owned_draft "$release"
 RELEASE_ID=$(jq -er '.id | select(type == "number")' <<< "$release")
 
