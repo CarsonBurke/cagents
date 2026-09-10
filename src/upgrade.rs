@@ -92,6 +92,11 @@ pub(crate) fn ensure_no_surviving_process(
             Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
             Err(error) => return Err(process_error(error)),
         };
+        // exec can temporarily expose an empty proc file before publishing the
+        // new arguments/environment. Absence of evidence cannot permit replay.
+        if argv.is_empty() {
+            return Err(format!("cannot inspect process invocation ({pid})"));
+        }
         if argv.split(|byte| *byte == 0).any(|arg| {
             exact_identity.is_some_and(|(provider, id)| {
                 std::str::from_utf8(arg).ok().is_some_and(|arg| {
@@ -120,6 +125,9 @@ pub(crate) fn ensure_no_surviving_process(
             }
             Err(error) => return Err(process_error(error)),
         };
+        if environment.is_empty() {
+            return Err(format!("cannot inspect process environment ({pid})"));
+        }
         let mut cagents = false;
         for entry in environment.split(|byte| *byte == 0) {
             if entry == terminal_marker.as_bytes() {
@@ -825,6 +833,26 @@ mod tests {
         );
         source.launch.arguments = vec!["--continue".into()];
         assert!(recovery_recipe(source).is_err());
+    }
+
+    #[cfg(any(feature = "host", feature = "ui"))]
+    #[test]
+    fn recovery_refuses_empty_process_evidence_during_exec() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = checkpoint(directory.path()).terminals.remove(0).source;
+        let process = directory.path().join("42");
+        fs::create_dir(&process).unwrap();
+        fs::write(process.join("stat"), b"42 (exec) D 1").unwrap();
+        fs::write(process.join("cmdline"), b"").unwrap();
+        fs::write(process.join("environ"), b"TERM_PROGRAM=cagents\0").unwrap();
+        assert!(ensure_no_surviving_process(&source, u32::MAX, directory.path()).is_err());
+
+        fs::write(process.join("cmdline"), b"/bin/sleep\0").unwrap();
+        fs::write(process.join("environ"), b"").unwrap();
+        assert!(ensure_no_surviving_process(&source, u32::MAX, directory.path()).is_err());
+
+        fs::write(process.join("environ"), b"PATH=/bin\0").unwrap();
+        assert!(ensure_no_surviving_process(&source, u32::MAX, directory.path()).is_ok());
     }
 
     #[test]

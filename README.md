@@ -588,6 +588,9 @@ memory, foreground jobs, or arbitrary commands. Unknown conversation identity,
 unsupported command recipes, and surviving or ambiguous owners block recovery;
 the durable checkpoint remains available instead of inventing a fresh
 conversation or replaying commands. Keep the matching provider session storage.
+Empty process arguments or environment are also ambiguous: Linux can expose
+them during `exec`, so recovery refuses to restart sessions without inspectable
+evidence rather than assuming that an unmarked process is safe to duplicate.
 An old shell's unsaved in-memory variables or jobs are not a resumable shell
 snapshot.
 Daemon startup waiting scales with the checkpoint inventory, including the
