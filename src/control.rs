@@ -34,7 +34,7 @@ use crate::{
 const IO_TIMEOUT: Duration = Duration::from_secs(5);
 const SNAPSHOT_RETRY_INTERVAL: Duration = Duration::from_millis(25);
 const WAIT_POLL_INTERVAL: Duration = Duration::from_millis(100);
-const UI_LAUNCH_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
+const UI_LAUNCH_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_UI_LAUNCH_HANDSHAKE_BYTES: usize = 4096;
 const MAX_WAIT_SECONDS: f64 = 24.0 * 60.0 * 60.0;
 
@@ -56,7 +56,14 @@ pub struct Cli {
 #[derive(Debug, Subcommand)]
 pub enum TopCommand {
     /// Launch the native cagents UI and return immediately.
-    Ui,
+    Ui {
+        /// Open another durable window slot instead of activating a running UI.
+        #[arg(long, conflicts_with = "window")]
+        new_window: bool,
+        /// Reopen or activate a named window slot.
+        #[arg(long, value_parser = parse_window_slot)]
+        window: Option<String>,
+    },
     /// Manage the persistent cagents daemon.
     Daemon {
         #[command(subcommand)]
@@ -67,6 +74,14 @@ pub enum TopCommand {
         #[command(subcommand)]
         command: TerminalCommand,
     },
+    /// Run the detached updater started by an explicit application Update action.
+    #[command(hide = true)]
+    UpdateWorker { job_id: String },
+}
+
+fn parse_window_slot(value: &str) -> Result<String, String> {
+    instance::validate_window_slot(value).map_err(|error| error.to_string())?;
+    Ok(value.to_owned())
 }
 
 #[derive(Debug, Subcommand)]
@@ -83,6 +98,18 @@ pub enum DaemonCommand {
         expected_generation: Option<u64>,
         #[arg(long)]
         confirm: bool,
+    },
+    /// Checkpoint resumable sessions and stop for a full application upgrade.
+    PrepareUpgrade {
+        /// Authorize interruption and resumption of all supported hosted sessions.
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Archive an interrupted upgrade checkpoint without resuming its processes.
+    AbandonUpgrade {
+        /// Require explicit manual recovery of conversations in the archived checkpoint.
+        #[arg(long)]
+        yes: bool,
     },
     /// Print this executable's wire protocol version without contacting a daemon.
     ProtocolVersion,
@@ -242,6 +269,16 @@ impl ControlClient {
         }
     }
 
+    pub fn resolve_upgrade_chat(
+        &mut self,
+        source: crate::chat::Session,
+    ) -> Result<crate::chat::Session, ControlError> {
+        match self.request_strict(ClientRequest::ResolveUpgradeChat { source })? {
+            ServerResponse::UpgradeChatResolved { session } => Ok(session),
+            response => Err(unexpected_response("a restored native chat", &response)),
+        }
+    }
+
     pub fn spawn(
         &mut self,
         session: TerminalSession,
@@ -351,6 +388,16 @@ impl ControlClient {
                 Err(ControlError::ShutdownRejected(outcome))
             }
             response => Err(unexpected_response("shutdown preflight", &response)),
+        }
+    }
+
+    pub fn prepare_upgrade(
+        &mut self,
+        capability: ShutdownCapability,
+    ) -> Result<(u64, u64), ControlError> {
+        match self.request_strict(ClientRequest::PrepareUpgrade { capability })? {
+            ServerResponse::UpgradePrepared { terminals, chats } => Ok((terminals, chats)),
+            response => Err(unexpected_response("an upgrade checkpoint", &response)),
         }
     }
 
@@ -831,6 +878,8 @@ fn response_name(response: &ServerResponse) -> &'static str {
         ServerResponse::ChatClosed { .. } => "chat_closed",
         ServerResponse::TerminalCloseChecked { .. } => "terminal_close_checked",
         ServerResponse::AgentActivity { .. } => "agent_activity",
+        ServerResponse::UpgradePrepared { .. } => "upgrade_prepared",
+        ServerResponse::UpgradeChatResolved { .. } => "upgrade_chat_resolved",
     }
 }
 
@@ -953,40 +1002,41 @@ where
 
 fn execute(command: TopCommand) -> Result<CommandOutput, AppError> {
     match command {
-        TopCommand::Ui => launch_ui(),
+        TopCommand::Ui { new_window, window } => launch_ui(new_window, window.as_deref()),
         TopCommand::Daemon { command } => execute_daemon(command),
         TopCommand::Terminal { command } => execute_terminal(command),
+        TopCommand::UpdateWorker { job_id } => {
+            crate::update::run_worker(&job_id).map_err(|error| AppError::new("update", error))?;
+            Ok(CommandOutput {
+                command: "update.worker",
+                data: json!({ "job_id": job_id, "complete": true }),
+                human: "Application update complete".into(),
+            })
+        }
     }
 }
 
-fn launch_ui() -> Result<CommandOutput, AppError> {
-    if instance::activate_running_ui().map_err(|error| AppError::new("launch", error))? {
+fn launch_ui(new_window: bool, slot: Option<&str>) -> Result<CommandOutput, AppError> {
+    let activate = || match slot {
+        Some(slot) => instance::activate_window(slot),
+        None => instance::activate_running_ui(),
+    };
+    if !new_window && activate().map_err(|error| AppError::new("launch", error))? {
         return Ok(already_running_ui_output());
     }
     let executable =
         sibling_executable("cagents-ui").map_err(|error| AppError::new("launch", error))?;
     let mut command = Command::new(&executable);
-    command
-        .env(UI_LAUNCH_HANDSHAKE_ENV, "1")
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .process_group(0);
-    let mut child = command
-        .spawn()
-        .map_err(|error| AppError::new("launch", error))?;
-    let launch_result = child
-        .stdout
-        .take()
-        .ok_or_else(|| io::Error::other("cagents-ui handshake pipe was not created"))
-        .and_then(|mut stdout| read_ui_launch_handshake(&mut stdout));
-    if let Err(error) = launch_result {
-        if child.try_wait().ok().flatten().is_none() {
-            let _ = child.kill();
-        }
-        let _ = child.wait();
-        if handshake_reports_already_running(&error)
-            && instance::activate_running_ui().map_err(|error| AppError::new("launch", error))?
+    if new_window {
+        command.arg("--new-window");
+    }
+    if let Some(slot) = slot {
+        command.args(["--window", slot]);
+    }
+    if let Err(error) = spawn_ui_process(&mut command) {
+        if !new_window
+            && handshake_reports_already_running(&error)
+            && activate().map_err(|error| AppError::new("launch", error))?
         {
             return Ok(already_running_ui_output());
         }
@@ -997,6 +1047,40 @@ fn launch_ui() -> Result<CommandOutput, AppError> {
         data: json!({ "launched": true, "executable": executable }),
         human: "cagents-ui started".to_owned(),
     })
+}
+
+pub(crate) fn spawn_ui_process(command: &mut Command) -> io::Result<()> {
+    // Capture the budget before spawning: the child can consume the checkpoint
+    // while restoring, but the launcher must retain its full startup allowance.
+    let timeout = crate::upgrade::handoff::startup_timeout().map_err(io::Error::other)?
+        + UI_LAUNCH_HANDSHAKE_TIMEOUT;
+    command
+        .env(UI_LAUNCH_HANDSHAKE_ENV, "1")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .process_group(0);
+    // SAFETY: the hook performs only the close_range syscall before exec.
+    unsafe {
+        command.pre_exec(crate::daemon::seal_inherited_descriptors);
+    }
+    let mut child = command.spawn()?;
+    let result = child
+        .stdout
+        .take()
+        .ok_or_else(|| io::Error::other("cagents-ui handshake pipe was not created"))
+        .and_then(|mut stdout| read_ui_launch_handshake(&mut stdout, timeout));
+    if let Err(error) = result {
+        if child.try_wait().ok().flatten().is_none() {
+            let _ = child.kill();
+        }
+        let _ = child.wait();
+        return Err(error);
+    }
+    thread::spawn(move || {
+        let _ = child.wait();
+    });
+    Ok(())
 }
 
 fn already_running_ui_output() -> CommandOutput {
@@ -1011,7 +1095,7 @@ fn handshake_reports_already_running(error: &io::Error) -> bool {
     error.to_string() == instance::ApplicationLeaseError::AlreadyRunning.to_string()
 }
 
-fn read_ui_launch_handshake(stdout: &mut ChildStdout) -> io::Result<()> {
+fn read_ui_launch_handshake(stdout: &mut ChildStdout, timeout: Duration) -> io::Result<()> {
     let descriptor = stdout.as_raw_fd();
     // SAFETY: fcntl receives a live descriptor and integer flags only.
     let flags = unsafe { libc::fcntl(descriptor, libc::F_GETFL) };
@@ -1021,7 +1105,7 @@ fn read_ui_launch_handshake(stdout: &mut ChildStdout) -> io::Result<()> {
         return Err(io::Error::last_os_error());
     }
 
-    let deadline = Instant::now() + UI_LAUNCH_HANDSHAKE_TIMEOUT;
+    let deadline = Instant::now() + timeout;
     let mut response = Vec::new();
     let mut buffer = [0_u8; 256];
     loop {
@@ -1049,7 +1133,7 @@ fn read_ui_launch_handshake(stdout: &mut ChildStdout) -> io::Result<()> {
                 if Instant::now() >= deadline {
                     return Err(io::Error::new(
                         io::ErrorKind::TimedOut,
-                        "cagents-ui did not acknowledge startup within 5 seconds",
+                        format!("cagents-ui did not acknowledge initialization within {timeout:?}"),
                     ));
                 }
                 thread::sleep(Duration::from_millis(10));
@@ -1087,9 +1171,10 @@ fn execute_daemon(command: DaemonCommand) -> Result<CommandOutput, AppError> {
             })
         }
         DaemonCommand::Status => {
-            let socket =
-                daemon_socket_path().map_err(|error| AppError::new("socket_path", error))?;
-            let running = match ControlClient::connect(&socket) {
+            let paths = crate::daemon::RuntimePaths::discover()
+                .map_err(|error| AppError::new("socket_path", error))?;
+            let socket = &paths.socket;
+            let running = match ControlClient::connect(socket) {
                 Ok(_) => true,
                 Err(ControlError::Connect(error))
                     if matches!(
@@ -1097,7 +1182,8 @@ fn execute_daemon(command: DaemonCommand) -> Result<CommandOutput, AppError> {
                         io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused
                     ) =>
                 {
-                    false
+                    crate::daemon::HostLease::is_held(&paths)
+                        .map_err(|error| AppError::new("daemon_status", error))?
                 }
                 Err(error) => return Err(AppError::new("protocol", error)),
             };
@@ -1163,6 +1249,46 @@ fn execute_daemon(command: DaemonCommand) -> Result<CommandOutput, AppError> {
                     .map_err(protocol_error)?
             };
             shutdown_output(outcome)
+        }
+        DaemonCommand::PrepareUpgrade { yes } => {
+            if !yes {
+                return Err(AppError::new(
+                    "confirmation_required",
+                    "full upgrade interrupts hosted processes; pass --yes to checkpoint and resume supported sessions",
+                ));
+            }
+            let socket =
+                daemon_socket_path().map_err(|error| AppError::new("socket_path", error))?;
+            let mut client = ControlClient::connect(&socket).map_err(protocol_error)?;
+            let preflight = client.shutdown_preflight().map_err(protocol_error)?;
+            let (terminals, chats) = client
+                .prepare_upgrade(preflight.capability)
+                .map_err(protocol_error)?;
+            Ok(CommandOutput {
+                command: "daemon.prepare_upgrade",
+                data: json!({ "terminals": terminals, "chats": chats }),
+                human: format!(
+                    "Checkpointed {terminals} terminals and {chats} chats; daemon shutdown requested for upgrade"
+                ),
+            })
+        }
+        DaemonCommand::AbandonUpgrade { yes } => {
+            if !yes {
+                return Err(AppError::new(
+                    "confirmation_required",
+                    "pass --yes to archive the interrupted checkpoint; its conversations will require explicit manual recovery",
+                ));
+            }
+            let archive = crate::upgrade::abandon()
+                .map_err(|error| AppError::new("upgrade_recovery", error))?;
+            Ok(CommandOutput {
+                command: "daemon.abandon_upgrade",
+                data: json!({ "archive": archive, "resumed": false }),
+                human: format!(
+                    "Archived checkpoint at {}; no processes resumed. Recover exact conversations manually after checking their existing writers",
+                    archive.display()
+                ),
+            })
         }
         DaemonCommand::StopForRebuild => {
             let stopped = crate::daemon::terminate_daemon_from_lock()

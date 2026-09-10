@@ -26,3 +26,5 @@ pub use types::{
 pub use widget::{CellMetrics, TerminalWidget};
 #[cfg(feature = "host")]
 pub use worker::TerminalHandle;
+#[cfg(feature = "host")]
+pub(crate) use worker::UpgradeSnapshot;

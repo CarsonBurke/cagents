@@ -1,9 +1,10 @@
-use std::{fs, io, os::unix::fs::MetadataExt, path::Path, time::Duration};
+use std::{path::Path, time::Duration};
 
 use crate::{
     control::ControlClient,
     model::{HostSessionProof, LaunchRecipe, TerminalSession},
     terminal::ensure_daemon_ready,
+    upgrade::{ensure_no_surviving_process, exact_conversation},
 };
 
 pub(super) struct RecoveredTerminal {
@@ -80,6 +81,25 @@ fn reconcile_at(
                 "the terminal exited while disconnected; use Retry to launch it again".into(),
             );
         }
+    }
+    if proof != expected
+        && let Some(restored) = terminals.iter().find(|terminal| {
+            terminal.upgrade_sources.iter().any(|source| {
+                source.id == session.id
+                    && source.launch == session.launch
+                    && source.continuity.live_proof().as_ref() == Some(&expected)
+            }) && terminal.session.continuity.can_resume_live(&proof)
+        })
+    {
+        crate::daemon::replacement_owner(socket, &proof)
+            .map_err(|error| format!("cannot establish upgraded daemon ownership: {error}"))?;
+        // Only the replacement daemon's committed checkpoint can authorize
+        // adopting a new process. Ordinary ID coincidence remains forbidden.
+        return Ok(RecoveredTerminal {
+            session: restored.session.clone(),
+            expected_host: Some(proof),
+            recovery_lease,
+        });
     }
     if proof != expected
         && terminals
@@ -182,293 +202,13 @@ fn recovery_recipe(
     session: &TerminalSession,
     explicit_retry: bool,
 ) -> Result<LaunchRecipe, String> {
-    if let Some(recipe) = session.agent_resume_recipe() {
-        return Ok(recipe);
-    }
-    if explicit_retry
-        || LaunchRecipe::shell(session.launch.working_directory.clone())
-            .is_ok_and(|shell| shell == session.launch)
-    {
-        return Ok(session.launch.clone());
-    }
-    Err("the previous daemon was replaced; this command cannot safely be replayed automatically. Explicit Retry is required".into())
-}
-
-/// Recipes passed here have already been normalized by agent_resume_recipe.
-/// Only the provider's resume selector identifies the writer, never UUID-shaped
-/// values of unrelated model, profile, or configuration flags.
-fn exact_conversation(recipe: &LaunchRecipe) -> Option<(crate::agent::Provider, uuid::Uuid)> {
-    let provider = crate::agent::Provider::from_program(&recipe.program)?;
-    let id = provider.resume_id(&recipe.arguments)?;
-    Some((provider, uuid::Uuid::parse_str(id).ok()?))
-}
-
-/// The lease proves the previous daemon no longer owns this runtime. Its PTY
-/// descendants can nevertheless survive SIGHUP, so inspect before recreating a
-/// shell or opening an exact conversation for writing. Unknown evidence blocks.
-fn ensure_no_surviving_process(
-    session: &TerminalSession,
-    owner: u32,
-    proc_root: &Path,
-) -> Result<(), String> {
-    use std::collections::HashMap;
-    let mut processes = HashMap::new();
-    let manager = UserManagerSession::connect();
-    for entry in fs::read_dir(proc_root).map_err(process_error)? {
-        let entry = entry.map_err(process_error)?;
-        let Some(pid) = entry
-            .file_name()
-            .to_str()
-            .and_then(|name| name.parse::<u32>().ok())
-        else {
-            continue;
-        };
-        let metadata = match entry.metadata() {
-            Ok(metadata) => metadata,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
-            Err(error) => return Err(process_error(error)),
-        };
-        if metadata.uid() != crate::daemon::current_uid() {
-            continue;
-        }
-        let stat = match fs::read_to_string(entry.path().join("stat")) {
-            Ok(stat) => stat,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
-            Err(error) => return Err(process_error(error)),
-        };
-        let fields = stat
-            .rsplit_once(')')
-            .ok_or("cannot inspect process ancestry")?
-            .1;
-        let mut fields = fields.split_whitespace();
-        let state = fields.next().ok_or("cannot inspect process state")?;
-        let parent = fields
-            .next()
-            .and_then(|value| value.parse::<u32>().ok())
-            .ok_or("cannot inspect process parent")?;
-        if state != "Z" && state != "X" {
-            processes.insert(pid, parent);
-        }
-    }
-    let exact_resume = session.agent_resume_recipe();
-    let exact_identity = exact_resume.as_ref().and_then(exact_conversation);
-    let terminal_marker = format!("CAGENTS_TERMINAL_ID={}", session.id);
-    for &pid in processes.keys() {
-        if pid == std::process::id() || belongs_to_owner(pid, owner, &processes) {
-            continue;
-        }
-        let path = proc_root.join(pid.to_string());
-        let argv = match fs::read(path.join("cmdline")) {
-            Ok(argv) => argv,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
-            Err(error) => return Err(process_error(error)),
-        };
-        if argv.split(|byte| *byte == 0).any(|arg| {
-            exact_identity.is_some_and(|(provider, id)| {
-                std::str::from_utf8(arg).ok().is_some_and(|arg| {
-                    uuid::Uuid::parse_str(arg).ok() == Some(id)
-                        || provider
-                            .session_file_id(Path::new(arg))
-                            .and_then(|locator| uuid::Uuid::parse_str(&locator).ok())
-                            == Some(id)
-                })
-            })
-        }) {
-            return Err(format!(
-                "agent session still has a live process ({pid}); automatic recovery would duplicate its writer"
-            ));
-        }
-        let environment = match fs::read(path.join("environ")) {
-            Ok(environment) => environment,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+    crate::upgrade::recovery_recipe(session).or_else(|error| {
+        if explicit_retry {
+            Ok(session.launch.clone())
+        } else {
             Err(error)
-                if error.kind() == io::ErrorKind::PermissionDenied
-                    && manager
-                        .as_ref()
-                        .is_some_and(|manager| manager.contains(pid)) =>
-            {
-                continue;
-            }
-            Err(error) => return Err(process_error(error)),
-        };
-        let mut cagents = false;
-        for entry in environment.split(|byte| *byte == 0) {
-            if entry == terminal_marker.as_bytes() {
-                return Err(format!(
-                    "terminal {} still has a live process ({pid}); preserving it",
-                    session.id
-                ));
-            }
-            cagents |=
-                entry.starts_with(b"CAGENTS_TERMINAL_ID=") || entry == b"TERM_PROGRAM=cagents";
         }
-        if cagents && !belongs_to_other_daemon(pid, session, &processes, proc_root)? {
-            return Err(format!(
-                "an unclassified cagents process ({pid}) survives outside the replacement daemon; preserving it instead of launching a duplicate"
-            ));
-        }
-    }
-    Ok(())
-}
-
-/// The user manager and PAM helper can deny environ reads even to their owner.
-/// A hosted PTY always starts a new POSIX session; its descendants cannot join
-/// this pre-existing service session. Authenticate it, never trust process names.
-struct UserManagerSession {
-    id: i32,
-    process: fs::File,
-}
-
-impl UserManagerSession {
-    fn connect() -> Option<Self> {
-        use std::os::{
-            fd::{AsRawFd, FromRawFd},
-            unix::net::UnixStream,
-        };
-        let uid = crate::daemon::current_uid();
-        let stream = UnixStream::connect(format!("/run/user/{uid}/systemd/private")).ok()?;
-        let mut credentials: libc::ucred = unsafe { std::mem::zeroed() };
-        let mut length = std::mem::size_of_val(&credentials) as libc::socklen_t;
-        // SAFETY: both output buffers are valid for the supplied lengths.
-        if unsafe {
-            libc::getsockopt(
-                stream.as_raw_fd(),
-                libc::SOL_SOCKET,
-                libc::SO_PEERCRED,
-                (&mut credentials as *mut libc::ucred).cast(),
-                &mut length,
-            )
-        } != 0
-            || length as usize != std::mem::size_of_val(&credentials)
-            || credentials.uid != uid
-            || credentials.pid <= 1
-        {
-            return None;
-        }
-        let mut descriptor: libc::c_int = -1;
-        length = std::mem::size_of_val(&descriptor) as libc::socklen_t;
-        // SO_PEERPIDFD binds the descriptor to the actual socket peer, unlike
-        // opening a numeric PID after obtaining credentials (a PID reuse race).
-        // SAFETY: descriptor/length are valid writable buffers.
-        if unsafe {
-            libc::getsockopt(
-                stream.as_raw_fd(),
-                libc::SOL_SOCKET,
-                libc::SO_PEERPIDFD,
-                (&mut descriptor as *mut libc::c_int).cast(),
-                &mut length,
-            )
-        } != 0
-        {
-            return None;
-        }
-        // SAFETY: successful SO_PEERPIDFD transfers one owned descriptor.
-        let process = unsafe { fs::File::from_raw_fd(descriptor) };
-        let manager = Self {
-            id: credentials.pid,
-            process,
-        };
-        manager.contains(credentials.pid as u32).then_some(manager)
-    }
-
-    fn contains(&self, pid: u32) -> bool {
-        use std::os::fd::AsRawFd;
-        let Ok(pid) = i32::try_from(pid) else {
-            return false;
-        };
-        let mut poll = libc::pollfd {
-            fd: self.process.as_raw_fd(),
-            events: libc::POLLIN,
-            revents: 0,
-        };
-        // SAFETY: getsid takes scalar PIDs; poll borrows one initialized entry.
-        // The manager must still be a live session leader after the SID reads.
-        unsafe {
-            libc::getsid(self.id) == self.id
-                && libc::getsid(pid) == self.id
-                && libc::poll(&mut poll, 1, 0) == 0
-        }
-    }
-}
-
-fn belongs_to_owner(pid: u32, owner: u32, processes: &std::collections::HashMap<u32, u32>) -> bool {
-    let mut current = pid;
-    for _ in 0..processes.len() {
-        if current == owner {
-            return true;
-        }
-        let Some(parent) = processes.get(&current).copied() else {
-            break;
-        };
-        if parent == current {
-            break;
-        }
-        current = parent;
-    }
-    false
-}
-
-fn belongs_to_other_daemon(
-    pid: u32,
-    session: &TerminalSession,
-    processes: &std::collections::HashMap<u32, u32>,
-    proc_root: &Path,
-) -> Result<bool, String> {
-    let mut current = pid;
-    for _ in 0..processes.len() {
-        let path = proc_root.join(current.to_string());
-        if fs::read_link(path.join("exe"))
-            .ok()
-            .is_some_and(|exe| exe.file_name().is_some_and(|name| name == "cagentsd"))
-        {
-            for entry in fs::read_dir(path.join("fd")).map_err(process_error)? {
-                let entry = entry.map_err(process_error)?;
-                let Ok(lock_path) = fs::read_link(entry.path()) else {
-                    continue;
-                };
-                if lock_path
-                    .file_name()
-                    .is_none_or(|name| name != "cagentsd.lock")
-                {
-                    continue;
-                }
-                #[derive(serde::Deserialize)]
-                struct Metadata {
-                    proof: HostSessionProof,
-                }
-                let metadata: Metadata =
-                    serde_json::from_reader(fs::File::open(&lock_path).map_err(process_error)?)
-                        .map_err(|error| {
-                            format!("cannot inspect surviving daemon proof: {error}")
-                        })?;
-                if session.continuity.live_proof().as_ref() == Some(&metadata.proof) {
-                    return Err(
-                        "the original daemon still has live processes; preserving its terminals"
-                            .into(),
-                    );
-                }
-                let socket = lock_path.with_file_name(crate::terminal::ipc::SOCKET_FILE_NAME);
-                return crate::daemon::replacement_owner(&socket, &metadata.proof)
-                    .map(|owner| owner == current)
-                    .map_err(|error| format!("cannot authenticate surviving daemon: {error}"));
-            }
-            return Err(
-                "a surviving daemon has unknown ownership; automatic recovery is unsafe".into(),
-            );
-        }
-        let Some(parent) = processes.get(&current).copied() else {
-            break;
-        };
-        if parent == current {
-            break;
-        }
-        current = parent;
-    }
-    Ok(false)
-}
-
-fn process_error(error: io::Error) -> String {
-    format!("cannot rule out surviving terminal processes; automatic recovery is unsafe: {error}")
+    })
 }
 
 #[cfg(test)]
@@ -482,7 +222,9 @@ mod tests {
         },
     };
     use std::{
+        fs,
         fs::{File, OpenOptions},
+        io,
         os::{
             fd::AsRawFd,
             unix::{fs::OpenOptionsExt, net::UnixListener},
@@ -629,6 +371,48 @@ mod tests {
         server.join().unwrap();
         assert_eq!(recovered.session, original);
         assert_eq!(recovered.expected_host, Some(owner));
+    }
+
+    #[test]
+    fn committed_upgrade_lineage_adopts_restored_process_without_replaying() {
+        let directory = tempfile::tempdir().unwrap();
+        let socket = directory.path().join("daemon.sock");
+        let owner = proof("upgraded");
+        let original = session(directory.path(), &proof("old"));
+        let _lease = lease(directory.path(), &owner);
+        let mut restored = session(directory.path(), &owner);
+        restored.id = original.id;
+        restored.launch.working_directory = directory.path().join("current-directory");
+        let mut descriptor =
+            TerminalDescriptor::relaunchable(restored.id, restored.launch.clone(), None);
+        descriptor.session = restored.clone();
+        let mut intermediate = original.clone();
+        intermediate.continuity = session(directory.path(), &proof("intermediate")).continuity;
+        descriptor.upgrade_sources = vec![original.clone(), intermediate];
+        let server = discovery(&socket, owner.clone(), vec![descriptor], 1);
+        let recovered = reconcile_at(original, false, &socket, directory.path()).unwrap();
+        server.join().unwrap();
+        assert_eq!(recovered.session, restored);
+        assert_eq!(recovered.expected_host, Some(owner));
+    }
+
+    #[test]
+    fn upgrade_id_without_matching_source_proof_cannot_retarget_card() {
+        let directory = tempfile::tempdir().unwrap();
+        let socket = directory.path().join("daemon.sock");
+        let owner = proof("upgraded");
+        let original = session(directory.path(), &proof("old"));
+        let mut restored = session(directory.path(), &owner);
+        restored.id = original.id;
+        let mut wrong_source = session(directory.path(), &proof("unrelated"));
+        wrong_source.id = original.id;
+        let mut descriptor =
+            TerminalDescriptor::relaunchable(restored.id, restored.launch.clone(), None);
+        descriptor.session = restored;
+        descriptor.upgrade_sources = vec![wrong_source];
+        let server = discovery(&socket, owner, vec![descriptor], 0);
+        assert!(reconcile_at(original, false, &socket, directory.path()).is_err());
+        server.join().unwrap();
     }
 
     #[test]

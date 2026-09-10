@@ -60,6 +60,12 @@ fn stage_order(stage: WorktreeProgressStage) -> u8 {
     }
 }
 impl Cagents {
+    pub(super) fn has_active_worktree_operations(&self) -> bool {
+        self.worktree_operations
+            .values()
+            .any(|operation| !operation.finished)
+    }
+
     pub(super) fn start_worktree_input(
         &mut self,
         project_id: ProjectId,

@@ -156,14 +156,19 @@ fn receive(
 }
 impl ClientHandle {
     pub fn connect(
-        session: Session,
+        mut session: Session,
         spawn: bool,
         source: Option<HostSessionProof>,
         terminate_source: bool,
         wake: impl Fn(Wake) + Send + Sync + 'static,
     ) -> Result<Self, String> {
         let wake: Arc<dyn Fn(Wake) + Send + Sync> = Arc::new(wake);
-        if !spawn && session.proof.is_none() {
+        if !spawn
+            && session
+                .proof
+                .as_ref()
+                .is_none_or(|proof| !proof.is_complete())
+        {
             return Err(
                 "Exact chat attachment requires the saved daemon proof; explicitly recover instead"
                     .into(),
@@ -183,11 +188,7 @@ impl ClientHandle {
             .set_write_timeout(Some(Duration::from_secs(5)))
             .map_err(|e| e.to_string())?;
         let mut codec = FrameCodec::new(ipc::MAX_FRAME_BYTES);
-        let expected = if spawn {
-            source.clone()
-        } else {
-            session.proof.clone()
-        };
+        let expected = if spawn { source.clone() } else { None };
         codec
             .write(
                 &mut stream,
@@ -206,6 +207,38 @@ impl ClientHandle {
             ServerResponse::Connected { proof, .. } => proof,
             _ => return Err("Daemon did not complete native chat handshake".into()),
         };
+        if !proof.is_complete() {
+            return Err("Daemon returned an incomplete native chat ownership proof".into());
+        }
+        let mut attach_request = 2;
+        if !spawn && session.proof.as_ref() != Some(&proof) {
+            // Discovery does not authorize a new writer. Only a daemon-owned
+            // upgrade checkpoint can map the saved source to a restored actor.
+            codec
+                .write(
+                    &mut stream,
+                    &ClientEnvelope {
+                        version: PROTOCOL_VERSION,
+                        request_id: attach_request,
+                        proof: Some(proof.clone()),
+                        request: ClientRequest::ResolveUpgradeChat {
+                            source: session.clone(),
+                        },
+                    },
+                )
+                .map_err(|error| error.to_string())?;
+            session = match receive(&mut stream, &mut codec, attach_request, Some(&proof))? {
+                ServerResponse::UpgradeChatResolved { session: restored }
+                    if restored.id == session.id
+                        && restored.proof.as_ref() == Some(&proof)
+                        && restored.launch.provider == session.launch.provider =>
+                {
+                    restored
+                }
+                _ => return Err("Daemon did not prove the saved chat's upgrade lineage".into()),
+            };
+            attach_request += 1;
+        }
         let id = session.id;
         let request = if spawn {
             ClientRequest::ChatStart {
@@ -221,7 +254,7 @@ impl ClientHandle {
                 &mut stream,
                 &ClientEnvelope {
                     version: PROTOCOL_VERSION,
-                    request_id: 2,
+                    request_id: attach_request,
                     proof: Some(proof.clone()),
                     request,
                 },
@@ -255,10 +288,10 @@ impl ClientHandle {
                 }
                 ServerMessage::Response {
                     response: ServerResponse::ChatAttached { session, snapshot },
-                } if session.id == id && envelope.request_id == Some(2) => {
+                } if session.id == id && envelope.request_id == Some(attach_request) => {
                     break (session, snapshot);
                 }
-                ServerMessage::Error(error) if envelope.request_id == Some(2) => {
+                ServerMessage::Error(error) if envelope.request_id == Some(attach_request) => {
                     return Err(error.message);
                 }
                 _ => return Err("Daemon did not attach the exact native chat".into()),
@@ -282,7 +315,7 @@ impl ClientHandle {
         let activity = Arc::new(Mutex::new(activity));
         let observed = Arc::new(Mutex::new(early_observed));
         let snapshot = Arc::new(Mutex::new(Arc::new(initial)));
-        let next = Arc::new(AtomicU64::new(3));
+        let next = Arc::new(AtomicU64::new(attach_request + 1));
         let alive = Arc::new(AtomicBool::new(true));
         let visible = Arc::new(AtomicBool::new(false));
         let pending: Pending = Arc::new(Mutex::new(BTreeMap::new()));

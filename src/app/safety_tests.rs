@@ -335,11 +335,25 @@ fn terminal_close_opt_out_persists_only_on_close_and_can_be_reenabled() {
     assert!(!path.exists());
     request_active_close(&mut app, card);
     let _ = app.update(Message::TerminalCloseDontAskChanged(true));
-    let _ = app.update(Message::ConfirmTerminalClose);
+    // The process may finish while its confirmation is open. Keep this
+    // preference test independent of any real daemon or process shutdown.
+    let CardKind::Terminal(session) = &mut app.card_state_mut(card).unwrap().kind else {
+        unreachable!()
+    };
+    session.continuity = TerminalContinuity::Exited {
+        last_exit: TerminalExit {
+            code: Some(0),
+            signal: None,
+            occurred_at_unix_ms: 1,
+        },
+    };
+    let close = app.update(Message::ConfirmTerminalClose);
+    tests::settle_settings_task(&mut app, close);
     assert!(!settings::load(&path).unwrap().confirm_terminal_close);
-    let _ = app.update(Message::SettingsChanged {
+    let enable = app.update(Message::SettingsChanged {
         field: SettingsField::ConfirmTerminalClose,
         value: "true".into(),
     });
+    tests::settle_settings_task(&mut app, enable);
     assert!(settings::load(&path).unwrap().confirm_terminal_close);
 }

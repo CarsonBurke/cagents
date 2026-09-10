@@ -12,6 +12,7 @@ mod pull_request_ui;
 mod safety_tests;
 mod settings_ui;
 mod terminal_close;
+mod update_ui;
 mod worktree_operations;
 mod worktree_ui;
 pub use daemon_stop::run_daemon_stop_confirmation;
@@ -1093,6 +1094,13 @@ type BootstrapResult = (
     Option<SaveHealthState>,
 );
 
+/// Loaded before iced starts: session restoration and file locks never wait on
+/// the native event loop. Only successfully restored launches can report ready.
+pub struct Startup {
+    bootstrap: BootstrapResult,
+    window_view: Option<WindowView>,
+}
+
 #[derive(Debug, Clone)]
 struct WorktreeDialog {
     project_id: ProjectId,
@@ -1123,13 +1131,108 @@ enum Inspector {
     Settings,
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum ContextTab {
     #[default]
     Files,
     Changes,
     PullRequest,
     Details,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct WindowView {
+    sidebar_width: f32,
+    inspector_width: f32,
+    context_inspector_open: bool,
+    context_tab: ContextTab,
+    sidebar: sidebar::SidebarView,
+    worktree_offsets: HashMap<PathBuf, f32>,
+}
+
+/// Captured on the event loop; all storage work runs on the blocking pool.
+struct SettingsSave {
+    generation: u64,
+    path: PathBuf,
+    base: AppSettings,
+    desired: AppSettings,
+    view: WindowView,
+    store: Option<Arc<crate::persistence::StateStore>>,
+    lane: Arc<std::sync::Mutex<Option<SettingsSaved>>>,
+    reset: bool,
+}
+
+#[derive(Clone, Debug)]
+pub struct SettingsSaved {
+    generation: u64,
+    path: PathBuf,
+    settings: AppSettings,
+}
+
+impl SettingsSave {
+    fn run(self) -> Result<SettingsSaved, String> {
+        let mut lane = self
+            .lane
+            .lock()
+            .map_err(|_| "settings save lane unavailable")?;
+        if let Some(saved) = lane.as_ref()
+            && saved.generation > self.generation
+        {
+            return Ok(saved.clone());
+        }
+        if let Some(store) = self.store {
+            let value = serde_json::to_string(&self.view).map_err(|error| error.to_string())?;
+            store
+                .save_window_view(&value)
+                .map_err(|error| error.to_string())?;
+        }
+        if self.reset {
+            settings::save(&self.path, &self.desired)
+        } else {
+            let base = lane.as_ref().map_or(&self.base, |saved| &saved.settings);
+            settings::save_merged(&self.path, base, &self.desired)
+        }
+        .map_err(|error| error.to_string())?;
+        let saved = SettingsSaved {
+            generation: self.generation,
+            path: self.path,
+            settings: self.desired,
+        };
+        *lane = Some(saved.clone());
+        Ok(saved)
+    }
+}
+
+struct WorkspaceSave {
+    settings: SettingsSave,
+    flush: std::sync::mpsc::Receiver<Result<(), String>>,
+}
+
+async fn flush_workspace(
+    save: Result<WorkspaceSave, String>,
+) -> (Result<SettingsSaved, String>, Result<(), String>) {
+    let outcome = tokio::task::spawn_blocking(move || {
+        let save = match save {
+            Ok(save) => save,
+            Err(error) => return (Err(error.clone()), Err(error)),
+        };
+        let saved = save.settings.run();
+        let result = saved
+            .as_ref()
+            .map(|_| ())
+            .map_err(Clone::clone)
+            .and_then(|()| {
+                save.flush
+                    .recv_timeout(Duration::from_secs(20))
+                    .map_err(|error| format!("workspace save did not complete: {error}"))?
+            });
+        (saved, result)
+    })
+    .await;
+    outcome.unwrap_or_else(|error| {
+        let error = error.to_string();
+        (Err(error.clone()), Err(error))
+    })
 }
 
 impl ContextTab {
@@ -1263,6 +1366,7 @@ fn repository_action_allowed_while_modal(action: &RepositoryAction) -> bool {
         RepositoryAction::FilesLoaded { .. }
             | RepositoryAction::FileLoaded { .. }
             | RepositoryAction::DiffLoaded { .. }
+            | RepositoryAction::DiffBasisResolved { .. }
             | RepositoryAction::SaveFinished { .. }
             | RepositoryAction::AutoSaveDue { .. }
     )
@@ -1371,6 +1475,7 @@ fn user_workspace_message_blocked_while_modal(message: &Message) -> bool {
         | Message::DismissStatus => true,
         Message::Repository(action) => !repository_action_allowed_while_modal(action),
         Message::ChatUi(action) => !action.allowed_while_modal(),
+        Message::UpdateUi(update_ui::Action::Apply) => true,
         Message::PullRequestUi(action) => !action.allowed_while_modal(),
         Message::Sidebar(action) => !answers_discard_confirmation(action),
         #[cfg(feature = "integrated-browser")]
@@ -1381,6 +1486,49 @@ fn user_workspace_message_blocked_while_modal(message: &Message) -> bool {
         | Message::BrowserNavigate(_) => true,
         _ => false,
     }
+}
+
+fn user_message_blocked_during_update(message: &Message) -> bool {
+    user_workspace_message_blocked_while_modal(message)
+        || matches!(
+            message,
+            Message::KeyEvent(_)
+                | Message::Viewport { .. }
+                | Message::NewWindow
+                | Message::WindowCloseRequested(_)
+                | Message::CommitClose(_)
+                | Message::ConfirmTerminalClose
+                | Message::CancelTerminalClose
+                | Message::TerminalCloseDontAskChanged(_)
+                | Message::SaveAndCloseRepository(_)
+                | Message::OverwriteAndCloseRepository(_)
+                | Message::DiscardAndCloseRepository(_)
+                | Message::CancelRepositoryClose
+                | Message::WorktreeBranchChanged(_)
+                | Message::WorktreeBaseChanged(_)
+                | Message::WorktreeDestinationChanged(_)
+                | Message::ToggleWorktreeAdvanced
+                | Message::SubmitWorktree
+                | Message::PullRequestBaseChanged(_)
+                | Message::PullRequestHeadChanged(_)
+                | Message::PullRequestTitleChanged(_)
+                | Message::PullRequestBodyChanged(_)
+                | Message::PullRequestDraftChanged(_)
+                | Message::PullRequestRetryConfirmed(_)
+                | Message::SubmitPullRequest
+                | Message::CancelDialog
+                | Message::CloseInspector
+                | Message::SelectSettingsCategory(_)
+                | Message::SettingsChanged { .. }
+                | Message::SettingsDraftChanged { .. }
+                | Message::ResetSettings
+                | Message::NativeWindowAction(_)
+                | Message::ProjectUi(
+                    project_ui::Action::Command { .. }
+                        | project_ui::Action::ConfirmDelete
+                        | project_ui::Action::Dismiss
+                )
+        )
 }
 
 fn focused_save_in_flight(
@@ -1918,6 +2066,10 @@ pub enum Message {
         result: Result<Box<LoadedRepository>, String>,
     },
     Repository(RepositoryAction),
+    ResolvedDiffBasis {
+        card: CardId,
+        basis: DiffBasis,
+    },
     Sidebar(SidebarAction),
     FocusCard(CardId),
     ResizeCard {
@@ -1928,6 +2080,26 @@ pub enum Message {
     CyclePaneWidth,
     CloseCard(CardId),
     WindowCloseRequested(window::Id),
+    NewWindow,
+    NewWindowOpened {
+        saved: Result<SettingsSaved, String>,
+        result: Result<(), String>,
+    },
+    SettingsSaved {
+        generation: u64,
+        result: Result<SettingsSaved, String>,
+    },
+    StartupWindowOpened(window::Id),
+    StartupReported(Result<(), String>),
+    UiUpdate(instance::UiUpdateRequest),
+    UiUpdateWatchdog(u64),
+    UiUpdateFlushed {
+        generation: u64,
+        committing: bool,
+        response: std::sync::mpsc::SyncSender<String>,
+        saved: Result<SettingsSaved, String>,
+        result: Result<(), String>,
+    },
     CommitClose(CardId),
     ConfirmTerminalClose,
     CancelTerminalClose,
@@ -2070,6 +2242,7 @@ pub enum Message {
     PullRequestUi(pull_request_ui::Action),
     NativeWindowAction(cosmic::app::Action),
     ChatUi(chat_ui::Action),
+    UpdateUi(update_ui::Action),
     ResetSettings,
     SessionSaveHealthChanged(SessionSaveHealthEvent),
     Lsp(LspEvent),
@@ -2423,6 +2596,15 @@ pub struct Cagents {
     session: Option<SessionRuntime>,
     save_health: Option<SaveHealthState>,
     settings: AppSettings,
+    settings_base: AppSettings,
+    settings_save_generation: u64,
+    settings_ack_generation: u64,
+    settings_reset_generation: Option<u64>,
+    settings_save_lane: Arc<std::sync::Mutex<Option<SettingsSaved>>>,
+    update_prepared: bool,
+    update_flush_pending: bool,
+    update_generation: u64,
+    update_committed: bool,
     // These owners are declared before `core`: application Drop empties and
     // joins them explicitly, and field drop order is the final backstop.
     #[cfg(feature = "integrated-browser")]
@@ -2444,6 +2626,7 @@ pub struct Cagents {
     sidebar_model: SidebarModel,
     project_ui: project_ui::State,
     chat_ui: chat_ui::State,
+    update_ui: update_ui::State,
     pull_request_inspector: pull_request_ui::State,
     sidebar_state: SidebarState,
     active_workspace: Option<PathBuf>,
@@ -2546,7 +2729,7 @@ async fn open_system_url_with_opener(url: &Url, opener: impl AsRef<OsStr>) -> Re
 }
 
 impl Cagents {
-    fn bootstrap() -> BootstrapResult {
+    fn bootstrap(strict: bool) -> Result<BootstrapResult, String> {
         let (settings, settings_path, settings_write_blocked, status) =
             match settings::default_path() {
                 Ok(path) => match settings::load(&path) {
@@ -2560,6 +2743,9 @@ impl Cagents {
                 },
                 Err(error) => (AppSettings::default(), None, true, Some(error.to_string())),
             };
+        if strict && let Some(error) = &status {
+            return Err(error.clone());
+        }
         let default_database_path = SessionRuntime::default_database_path().ok();
         let (session, restored, projects, worktrees, save_health) =
             match SessionRuntime::open_default() {
@@ -2574,14 +2760,17 @@ impl Cagents {
                         Some(save_health),
                     )
                 }
-                Err(_) => {
+                Err(error) => {
+                    if strict {
+                        return Err(format!("could not restore workspace: {error}"));
+                    }
                     let save_health = SaveHealthState::writer_unavailable(default_database_path);
                     (None, None, Vec::new(), Vec::new(), Some(save_health))
                 }
             };
         let mut restored = restored.unwrap_or_default();
         normalize_restored_titles(&mut restored);
-        (
+        Ok((
             restored,
             session,
             projects,
@@ -2591,7 +2780,46 @@ impl Cagents {
             settings_write_blocked,
             status,
             save_health,
-        )
+        ))
+    }
+
+    pub fn load_startup() -> Result<Startup, String> {
+        #[cfg(feature = "latency-harness")]
+        if crate::latency_fixture::Fixture::from_env().is_some() {
+            return Ok(Startup {
+                bootstrap: Self::fixture_bootstrap(),
+                window_view: None,
+            });
+        }
+        let strict = instance::ui_launch_handshake_requested();
+        let mut bootstrap = Self::bootstrap(strict)?;
+        let view = bootstrap
+            .1
+            .as_ref()
+            .map(|session| {
+                session
+                    .operation_store()
+                    .load_window_view()
+                    .map_err(|error| error.to_string())?
+                    .map(|value| {
+                        serde_json::from_str::<WindowView>(&value)
+                            .map_err(|error| format!("could not restore window view: {error}"))
+                    })
+                    .transpose()
+            })
+            .transpose();
+        let window_view = match view {
+            Ok(view) => view.flatten(),
+            Err(error) if strict => return Err(error),
+            Err(error) => {
+                bootstrap.7 = Some(error);
+                None
+            }
+        };
+        Ok(Startup {
+            bootstrap,
+            window_view,
+        })
     }
 
     fn rebuild_workspace(state: &WorkspaceState) -> Workspace {
@@ -5645,14 +5873,7 @@ impl Cagents {
                     width.clamp(design::INSPECTOR_MIN_WIDTH, design::INSPECTOR_MAX_WIDTH);
                 Task::none()
             }
-            InspectorAction::ResizeFinished => {
-                if let Err(error) = self.save_settings_now() {
-                    self.status = Some(TransientNotice::error(format!(
-                        "could not save inspector width: {error}"
-                    )));
-                }
-                Task::none()
-            }
+            InspectorAction::ResizeFinished => self.save_settings_task(false),
             // A request's answer is rendered by this very panel, so dismissing
             // an overlay inspector on the way to asking for it would show the
             // user nothing at all. These five stay put; the four below move the
@@ -6065,7 +6286,7 @@ impl Cagents {
         self.focus_context_overlay_if_exposed()
     }
 
-    fn save_settings_now(&mut self) -> Result<(), String> {
+    fn capture_settings_save(&mut self) -> Result<SettingsSave, String> {
         if self.settings_write_blocked {
             return Err(
                 "settings were not loaded successfully; use Reset to defaults to replace them"
@@ -6076,10 +6297,76 @@ impl Cagents {
             Some(path) => path,
             None => settings::default_path().map_err(|error| error.to_string())?,
         };
-        settings::save(&path, &self.settings).map_err(|error| error.to_string())?;
-        self.settings_path = Some(path);
-        self.settings_write_blocked = false;
+        let mut view = WindowView {
+            sidebar_width: self.settings.sidebar_width,
+            inspector_width: self.settings.inspector_width,
+            context_inspector_open: self.context_inspector_open,
+            context_tab: self.context_tab,
+            sidebar: self.sidebar_state.saved_view(),
+            worktree_offsets: self.worktree_offsets.clone(),
+        };
+        if let Some(path) = &self.active_workspace {
+            view.worktree_offsets
+                .insert(path.clone(), self.workspace.camera().offset());
+        }
+        self.settings_save_generation += 1;
+        Ok(SettingsSave {
+            generation: self.settings_save_generation,
+            path,
+            base: self.settings_base.clone(),
+            desired: self.settings.clone(),
+            view,
+            store: self.session.as_ref().map(SessionRuntime::operation_store),
+            lane: Arc::clone(&self.settings_save_lane),
+            reset: self.settings_reset_generation.is_some(),
+        })
+    }
+
+    fn acknowledge_settings_save(&mut self, saved: SettingsSaved) {
+        if saved.generation >= self.settings_ack_generation {
+            self.settings_ack_generation = saved.generation;
+            self.settings_base = saved.settings;
+            self.settings_path = Some(saved.path);
+            if self
+                .settings_reset_generation
+                .is_some_and(|generation| saved.generation >= generation)
+            {
+                self.settings_reset_generation = None;
+            }
+        }
+    }
+
+    fn save_settings_now(&mut self) -> Result<(), String> {
+        let saved = self.capture_settings_save()?.run()?;
+        self.acknowledge_settings_save(saved);
         Ok(())
+    }
+
+    fn save_settings_task(&mut self, reset: bool) -> Task<Message> {
+        if reset {
+            self.settings_reset_generation = Some(self.settings_save_generation + 1);
+        }
+        let save = self.capture_settings_save();
+        let generation = self.settings_save_generation;
+        cosmic::task::future(async move {
+            let result = tokio::task::spawn_blocking(move || save?.run())
+                .await
+                .map_err(|error| error.to_string())
+                .and_then(|result| result);
+            Message::SettingsSaved { generation, result }
+        })
+    }
+
+    fn capture_workspace_save(&mut self) -> Result<WorkspaceSave, String> {
+        let flush = self
+            .session
+            .as_ref()
+            .ok_or_else(|| "workspace storage unavailable".to_owned())?
+            .request_flush()?;
+        Ok(WorkspaceSave {
+            settings: self.capture_settings_save()?,
+            flush,
+        })
     }
 
     fn synchronize_lifecycle_budget(&mut self) {
@@ -6163,7 +6450,9 @@ impl Cagents {
             let mut errors: Vec<_> = self.settings_invalid.values().cloned().collect();
             errors.sort();
             Some(SettingsFeedback::Invalid(errors.join(" ")))
-        } else if !self.settings_pending.is_empty() {
+        } else if !self.settings_pending.is_empty()
+            || self.settings_ack_generation < self.settings_save_generation
+        {
             Some(SettingsFeedback::Pending)
         } else {
             Some(SettingsFeedback::Saved)
@@ -6221,7 +6510,7 @@ impl Cagents {
             SettingsDecision::Unchanged => {
                 self.settings_invalid.remove(&field);
                 if self.settings_save_error.is_some() {
-                    self.settings_save_error = self.save_settings_now().err();
+                    return self.save_settings_task(false);
                 }
                 self.refresh_settings_feedback();
                 Task::none()
@@ -6230,7 +6519,7 @@ impl Cagents {
                 self.settings = settings;
                 self.synchronize_lifecycle_budget();
                 self.settings_invalid.remove(&field);
-                self.settings_save_error = self.save_settings_now().err();
+                let save = self.save_settings_task(false);
                 self.refresh_settings_feedback();
                 if matches!(
                     field,
@@ -6243,7 +6532,7 @@ impl Cagents {
                 ) {
                     self.card_chrome.clear();
                 }
-                match field {
+                let effect = match field {
                     SettingsField::WorktreeSort => {
                         self.sidebar_state
                             .set_worktree_sort(self.settings.worktree_sort);
@@ -6291,7 +6580,8 @@ impl Cagents {
                     | SettingsField::ShortcutPreviousColumn
                     | SettingsField::ShortcutNextColumn
                     | SettingsField::ShortcutCyclePaneWidth => Task::none(),
-                }
+                };
+                Task::batch([save, effect])
             }
         }
     }
@@ -6344,7 +6634,7 @@ impl Cagents {
         // processes whenever the user had configured their own.
         let resync = self.synchronize_language_servers();
         self.settings_write_blocked = false;
-        self.settings_save_error = self.save_settings_now().err();
+        let save = self.save_settings_task(true);
         self.refresh_settings_feedback();
         let sweep = self.lifecycle_sweep();
         let appearance = self.synchronize_appearance(previous_scale);
@@ -6357,6 +6647,7 @@ impl Cagents {
             }
         }));
         Task::batch([
+            save,
             resync,
             sweep,
             appearance,
@@ -6368,7 +6659,10 @@ impl Cagents {
 
 impl Application for Cagents {
     type Executor = cosmic::executor::Default;
-    type Flags = Option<async_channel::Receiver<instance::UiActivation>>;
+    type Flags = (
+        Option<async_channel::Receiver<instance::UiActivation>>,
+        Startup,
+    );
     type Message = Message;
 
     const APP_ID: &'static str = instance::APPLICATION_ID;
@@ -6383,7 +6677,7 @@ impl Application for Cagents {
         Some(Message::WindowCloseRequested(id))
     }
 
-    fn init(mut core: Core, activation_rx: Self::Flags) -> (Self, Task<Message>) {
+    fn init(mut core: Core, (activation_rx, startup): Self::Flags) -> (Self, Task<Message>) {
         core.window.show_headerbar = false;
         core.window.border_padding = Some(0);
         #[cfg(feature = "latency-harness")]
@@ -6393,21 +6687,22 @@ impl Application for Cagents {
             session,
             projects,
             worktrees,
-            settings,
+            mut settings,
             settings_path,
             settings_write_blocked,
             status,
             save_health,
-        ) = {
-            #[cfg(feature = "latency-harness")]
-            if latency_fixture.is_some() {
-                Self::fixture_bootstrap()
+        ) = startup.bootstrap;
+        let window_view = startup.window_view;
+        if let Some(view) = &window_view {
+            settings.sidebar_width = sidebar::clamp_expanded_width(view.sidebar_width);
+            settings.inspector_width = if view.inspector_width.is_finite() {
+                view.inspector_width
+                    .clamp(design::INSPECTOR_MIN_WIDTH, design::INSPECTOR_MAX_WIDTH)
             } else {
-                Self::bootstrap()
-            }
-            #[cfg(not(feature = "latency-harness"))]
-            Self::bootstrap()
-        };
+                AppSettings::default().inspector_width
+            };
+        }
         let sidebar_projects = projects
             .iter()
             .filter(|project| project.existence.is_open())
@@ -6459,6 +6754,15 @@ impl Application for Cagents {
             activation_rx,
             session,
             save_health,
+            settings_base: settings.clone(),
+            settings_save_generation: 0,
+            settings_ack_generation: 0,
+            settings_reset_generation: None,
+            settings_save_lane: Arc::new(std::sync::Mutex::new(None)),
+            update_prepared: false,
+            update_flush_pending: false,
+            update_generation: 0,
+            update_committed: false,
             settings,
             #[cfg(feature = "integrated-browser")]
             browser_teardowns: Vec::new(),
@@ -6475,6 +6779,7 @@ impl Application for Cagents {
             sidebar_state: SidebarState::default(),
             project_ui: project_ui::State::default(),
             chat_ui: chat_ui::State::default(),
+            update_ui: update_ui::State::default(),
             pull_request_inspector: pull_request_ui::State::default(),
             active_workspace: None,
             worktree_focus: HashMap::new(),
@@ -6505,8 +6810,12 @@ impl Application for Cagents {
             latency_fixture_started: false,
             inspector: None,
             inspector_transition: None,
-            context_inspector_open: true,
-            context_tab: ContextTab::default(),
+            context_inspector_open: window_view
+                .as_ref()
+                .is_none_or(|view| view.context_inspector_open),
+            context_tab: window_view
+                .as_ref()
+                .map_or(ContextTab::default(), |view| view.context_tab),
             context_inspector_overlay_active: false,
             // The initial estimate is wide, but the first compositor resize
             // can immediately mount the default-open inspector as a modal.
@@ -6524,6 +6833,10 @@ impl Application for Cagents {
             lifecycle_sweep_deadline: None,
             lifecycle_sweep_generation: 0,
         };
+        if let Some(view) = window_view {
+            app.sidebar_state.restore_view(view.sidebar);
+            app.worktree_offsets = view.worktree_offsets;
+        }
         app.sidebar_model
             .apply_project_order(&app.durable.project_order);
         app.sidebar_state
@@ -6584,6 +6897,7 @@ impl Application for Cagents {
             app.rehydrate_worktree_operations(),
             app.initialize_runtimes(),
             app.synchronize_appearance(1.0),
+            app.update_update_ui(update_ui::Action::Check),
         ];
         #[cfg(feature = "integrated-browser")]
         tasks.push(cosmic::task::message(Message::InitializeBrowserFactory));
@@ -6613,6 +6927,11 @@ impl Application for Cagents {
     }
 
     fn update(&mut self, message: Message) -> Task<Message> {
+        // Freeze user input, not lifecycle completions. Dropping a completed
+        // save/Git/spawn result would strand that operation if another window vetoed.
+        if self.update_prepared && user_message_blocked_during_update(&message) {
+            return Task::none();
+        }
         if self.modal_is_open() && user_workspace_message_blocked_while_modal(&message) {
             return Task::none();
         }
@@ -6991,11 +7310,21 @@ impl Application for Cagents {
                     }
                 }))
             }
+            Message::ResolvedDiffBasis { card, basis } => {
+                let task = match self.cards.get_mut(&card) {
+                    Some(CardRuntime::Repository(runtime)) => repository_task(
+                        runtime.update(RepositoryAction::ApplyDiffBasis { card, basis }),
+                    ),
+                    _ => Task::none(),
+                };
+                Task::batch([task, self.drain_lsp_intents(card)])
+            }
             Message::Repository(action) => {
                 if self.modal_is_open() && !repository_action_allowed_while_modal(&action) {
                     return Task::none();
                 }
                 let card = action.card();
+                let basis_resolved = matches!(action, RepositoryAction::DiffBasisResolved { .. });
                 let save_finished = matches!(action, RepositoryAction::SaveFinished { .. });
                 // A parked source-control navigation is answered by the very
                 // file list it is waiting on, and only after the card has taken
@@ -7003,9 +7332,15 @@ impl Application for Cagents {
                 let files_loaded = matches!(action, RepositoryAction::FilesLoaded { .. });
                 let closing_card = self.dirty_repository_close.as_ref().map(|close| close.card);
                 let task = match self.cards.get_mut(&card) {
-                    Some(CardRuntime::Repository(runtime)) => {
-                        repository_task(runtime.update(action))
-                    }
+                    Some(CardRuntime::Repository(runtime)) => runtime
+                        .update(action)
+                        .map(move |action| match action {
+                            RepositoryAction::ApplyDiffBasis { card, basis } if basis_resolved => {
+                                Message::ResolvedDiffBasis { card, basis }
+                            }
+                            action => Message::Repository(action),
+                        })
+                        .map(cosmic::Action::App),
                     _ => Task::none(),
                 };
                 // Every buffer transition the action caused is recorded on the
@@ -7148,11 +7483,7 @@ impl Application for Cagents {
                             width.clamp(sidebar::EXPANDED_WIDTH_MIN, sidebar::EXPANDED_WIDTH_MAX);
                         Task::none()
                     }
-                    SidebarAction::ResizeFinished => {
-                        self.settings_save_error = self.save_settings_now().err();
-                        self.refresh_settings_feedback();
-                        Task::none()
-                    }
+                    SidebarAction::ResizeFinished => self.save_settings_task(false),
                     // Expanding `History` is the only thing that asks for the
                     // first page; the tail of `update` sees the new toggle and
                     // issues the walk.
@@ -7365,6 +7696,214 @@ impl Application for Cagents {
             Message::CloseCard(_) if self.dirty_repository_close.is_some() => Task::none(),
             Message::CloseCard(id) if matches!(self.cards.get(&id), Some(CardRuntime::Repository(runtime)) if runtime.blocks_navigation()) => {
                 self.begin_dirty_close(DirtyCloseIntent::Card(id), VecDeque::from([id]))
+            }
+            Message::UpdateUi(action) => self.update_update_ui(action),
+            Message::StartupWindowOpened(window) => {
+                if self.core.main_window_id() != Some(window) {
+                    return Task::none();
+                }
+                cosmic::task::future(async {
+                    let result =
+                        tokio::task::spawn_blocking(|| instance::report_ui_startup(&Ok(())))
+                            .await
+                            .map_err(|error| error.to_string())
+                            .and_then(|result| result.map_err(|error| error.to_string()));
+                    Message::StartupReported(result)
+                })
+            }
+            Message::StartupReported(result) => match result {
+                Ok(()) => Task::none(),
+                Err(error) => {
+                    tracing::error!(%error, "could not acknowledge UI startup");
+                    iced::exit()
+                }
+            },
+            Message::NewWindow => {
+                self.persist();
+                let save = self.capture_workspace_save();
+                let source = instance::window_slot().to_owned();
+                cosmic::task::future(async move {
+                    let (saved, result) = flush_workspace(save).await;
+                    let result = match result {
+                        Ok(()) => tokio::task::spawn_blocking(move || {
+                            instance::launch_window(true, None, Some(&source))
+                                .map_err(|error| error.to_string())
+                        })
+                        .await
+                        .map_err(|error| error.to_string())
+                        .and_then(|result| result),
+                        Err(error) => Err(error),
+                    };
+                    Message::NewWindowOpened { saved, result }
+                })
+            }
+            Message::NewWindowOpened { saved, result } => {
+                if let Ok(saved) = saved {
+                    self.acknowledge_settings_save(saved);
+                }
+                if let Err(error) = result {
+                    self.status = Some(TransientNotice::error(format!(
+                        "Could not open a new window: {error}"
+                    )));
+                }
+                Task::none()
+            }
+            Message::SettingsSaved { generation, result } => {
+                match result {
+                    Ok(saved) => {
+                        if saved.generation >= self.settings_ack_generation {
+                            self.settings_save_error = None;
+                        }
+                        self.acknowledge_settings_save(saved);
+                    }
+                    Err(error) if generation >= self.settings_ack_generation => {
+                        self.status = Some(TransientNotice::warning(format!(
+                            "Could not save settings: {error}"
+                        )));
+                        self.settings_save_error = Some(error);
+                    }
+                    Err(_) => {}
+                }
+                self.refresh_settings_feedback();
+                Task::none()
+            }
+            Message::UiUpdate(request) => match request.action {
+                instance::UiUpdateAction::Prepare => {
+                    if self.update_prepared {
+                        let _ = request
+                            .response
+                            .send("error: window is already preparing an update".into());
+                        return Task::none();
+                    }
+                    if let Some(reason) = self.window_update_blocker() {
+                        let _ = request.response.send(format!("error: {reason}"));
+                        return Task::none();
+                    }
+                    self.persist();
+                    let save = self.capture_workspace_save();
+                    self.update_prepared = true;
+                    self.update_flush_pending = true;
+                    self.update_committed = false;
+                    self.update_generation = self.update_generation.wrapping_add(1);
+                    let generation = self.update_generation;
+                    self.status = Some(TransientNotice::warning("Saving windows for update…"));
+                    Task::batch([
+                        cosmic::task::future(async move {
+                            let (saved, result) = flush_workspace(save).await;
+                            Message::UiUpdateFlushed {
+                                generation,
+                                committing: false,
+                                response: request.response,
+                                saved,
+                                result,
+                            }
+                        }),
+                        cosmic::task::future(async move {
+                            tokio::time::sleep(Duration::from_secs(1)).await;
+                            Message::UiUpdateWatchdog(generation)
+                        }),
+                    ])
+                }
+                instance::UiUpdateAction::Cancel => {
+                    if self.update_committed {
+                        let _ = request
+                            .response
+                            .try_send("error: window is already closing".into());
+                        return Task::none();
+                    }
+                    self.update_prepared = false;
+                    self.update_flush_pending = false;
+                    self.update_generation = self.update_generation.wrapping_add(1);
+                    self.status = Some(TransientNotice::warning(
+                        "Update cancelled; window is ready.",
+                    ));
+                    let _ = request.response.send("ok".into());
+                    Task::none()
+                }
+                instance::UiUpdateAction::Commit => {
+                    if !self.update_prepared || self.update_flush_pending || self.update_committed {
+                        let _ = request
+                            .response
+                            .send("error: window was not prepared".into());
+                        return Task::none();
+                    }
+                    if let Some(reason) = self.window_update_blocker() {
+                        let _ = request.response.send(format!("error: {reason}"));
+                        return Task::none();
+                    }
+                    self.persist();
+                    let save = self.capture_workspace_save();
+                    self.update_flush_pending = true;
+                    let generation = self.update_generation;
+                    cosmic::task::future(async move {
+                        let (saved, result) = flush_workspace(save).await;
+                        Message::UiUpdateFlushed {
+                            generation,
+                            committing: true,
+                            response: request.response,
+                            saved,
+                            result,
+                        }
+                    })
+                }
+            },
+            Message::UiUpdateFlushed {
+                generation,
+                committing,
+                response,
+                saved,
+                result,
+            } => {
+                if let Ok(saved) = saved {
+                    self.acknowledge_settings_save(saved);
+                }
+                if generation != self.update_generation || !self.update_prepared {
+                    let _ =
+                        response.try_send("error: window update preparation was cancelled".into());
+                    return Task::none();
+                }
+                self.update_flush_pending = false;
+                match result {
+                    Ok(()) => {
+                        if response.try_send("ok".into()).is_err() {
+                            self.update_prepared = false;
+                            self.status = Some(TransientNotice::warning(
+                                "Updater disconnected; window is ready.",
+                            ));
+                            return Task::none();
+                        }
+                        if committing {
+                            self.update_committed = true;
+                            return self.exit_after_language_servers();
+                        }
+                    }
+                    Err(error) => {
+                        self.update_prepared = false;
+                        self.status = Some(TransientNotice::error(error.clone()));
+                        let _ = response.try_send(format!("error: {error}").replace('\n', " "));
+                    }
+                }
+                Task::none()
+            }
+            Message::UiUpdateWatchdog(generation) => {
+                if self.update_prepared
+                    && !self.update_committed
+                    && generation == self.update_generation
+                {
+                    if !instance::update_in_progress() {
+                        self.update_prepared = false;
+                        self.update_flush_pending = false;
+                        self.update_generation = self.update_generation.wrapping_add(1);
+                        self.status =
+                            Some(TransientNotice::warning("Update ended; window is ready."));
+                    } else {
+                        return cosmic::task::future(async move {
+                            tokio::time::sleep(Duration::from_secs(1)).await;
+                            Message::UiUpdateWatchdog(generation)
+                        });
+                    }
+                }
+                Task::none()
             }
             Message::WindowCloseRequested(window) => {
                 if self.dirty_repository_close.is_some() {
@@ -8260,6 +8799,7 @@ impl Application for Cagents {
         let mut subscriptions = vec![
             self.chat_subscription(),
             self.terminal_agent_activity_subscription(),
+            self.update_subscription(),
             Subscription::run_with(
                 TerminalWakeSource(self.terminal_wake_rx.clone()),
                 terminal_wake_stream,
@@ -8272,8 +8812,11 @@ impl Application for Cagents {
                 UiActivationSource(self.activation_rx.clone()),
                 ui_activation_stream,
             )
-            .map(|activation| Message::ActivateUi {
-                token: activation.token,
+            .map(|activation| match activation.update {
+                Some(request) => Message::UiUpdate(request),
+                None => Message::ActivateUi {
+                    token: activation.token,
+                },
             }),
             event::listen_with(|event, _status, event_window| match event {
                 iced::Event::Keyboard(event) => Some(Message::KeyEvent(event)),
@@ -8873,10 +9416,7 @@ impl Drop for Cagents {
     fn drop(&mut self) {
         self.latency.abandon_pending();
         self.persist();
-        if !self.settings_write_blocked
-            && let Some(path) = &self.settings_path
-            && let Err(error) = settings::save(path, &self.settings)
-        {
+        if let Err(error) = self.save_settings_now() {
             tracing::error!(%error, "failed to persist settings");
         }
         if let Some(session) = &mut self.session {
@@ -9128,6 +9668,89 @@ fn unix_millis() -> i64 {
 mod tests {
     use super::*;
     use cosmic::iced::futures::StreamExt;
+
+    #[test]
+    fn update_prepare_vetoes_dirty_editor_without_closing_or_freezing() {
+        let mut app = context_inspector_test_app(true);
+        let card = app.workspace.focused().unwrap();
+        app.cards.insert(
+            card,
+            CardRuntime::Repository(Box::new(RepositoryRuntime::dirty_fixture(card))),
+        );
+        let (response, receiver) = std::sync::mpsc::sync_channel(1);
+        let _ = app.update(Message::UiUpdate(instance::UiUpdateRequest {
+            action: instance::UiUpdateAction::Prepare,
+            response,
+        }));
+        assert!(receiver.try_recv().unwrap().starts_with("error:"));
+        assert!(!app.update_prepared);
+        assert!(app.cards.contains_key(&card));
+        assert!(app.dirty_repository_close.is_none());
+    }
+
+    #[test]
+    fn cancelled_update_unfreezes_the_existing_window() {
+        let mut app = context_inspector_test_app(true);
+        app.update_prepared = true;
+        let (response, receiver) = std::sync::mpsc::sync_channel(1);
+        let _ = app.update(Message::UiUpdate(instance::UiUpdateRequest {
+            action: instance::UiUpdateAction::Cancel,
+            response,
+        }));
+        assert_eq!(receiver.try_recv().unwrap(), "ok");
+        assert!(!app.update_prepared);
+        assert!(app.workspace.focused().is_some());
+    }
+
+    #[test]
+    fn update_freeze_drains_diff_basis_resolution_without_accepting_new_choices() {
+        let mut app = context_inspector_test_app(true);
+        let card = app.workspace.focused().unwrap();
+        let (mut runtime, identity) = RepositoryRuntime::open_fixture(card, "notes.txt", "");
+        let choice = repository_widget::CommittedChoice::LastCommit;
+        drop(runtime.update(RepositoryAction::SelectCommittedBasis { card, choice }));
+        app.cards
+            .insert(card, CardRuntime::Repository(Box::new(runtime)));
+        app.update_prepared = true;
+        let basis = DiffBasis::CommitToParent {
+            oid: crate::repository::Oid::parse_object("ab".repeat(20)).unwrap(),
+            parent: None,
+        };
+        let task = app.update(Message::Repository(RepositoryAction::DiffBasisResolved {
+            identity,
+            choice,
+            result: Ok(repository_widget::ResolvedBasis::Ready(basis)),
+        }));
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                if let Some(mut stream) = iced::runtime::task::into_stream(task) {
+                    while let Some(action) = stream.next().await {
+                        if let iced::runtime::Action::Output(cosmic::Action::App(message)) = action
+                        {
+                            drop(app.update(message));
+                        }
+                    }
+                }
+            });
+        let context = match &app.cards[&card] {
+            CardRuntime::Repository(runtime) => runtime.inspector_context(),
+            _ => unreachable!(),
+        };
+        assert_eq!(context.diff_basis, Some("Commit"));
+        drop(
+            app.update(Message::Repository(RepositoryAction::ApplyDiffBasis {
+                card,
+                basis: DiffBasis::IndexToWorktree,
+            })),
+        );
+        let CardRuntime::Repository(runtime) = &app.cards[&card] else {
+            unreachable!()
+        };
+        assert_eq!(runtime.inspector_context().diff_basis, Some("Commit"));
+    }
 
     fn browser_kind(raw: &str) -> CardKind {
         let url = Url::parse(raw).unwrap();
@@ -9523,6 +10146,66 @@ mod tests {
             .expect("a headless renderer")
     }
 
+    pub(super) fn settle_settings_task(app: &mut Cagents, task: Task<Message>) {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                if let Some(mut stream) = iced::runtime::task::into_stream(task) {
+                    while let Some(action) = stream.next().await {
+                        if let iced::runtime::Action::Output(cosmic::Action::App(
+                            message @ Message::SettingsSaved { .. },
+                        )) = action
+                        {
+                            let _ = app.update(message);
+                        }
+                    }
+                }
+            });
+    }
+
+    #[test]
+    fn out_of_order_settings_saves_and_acknowledgments_preserve_latest_edits() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("settings.toml");
+        let mut app = context_inspector_test_app(false);
+        app.settings_path = Some(path.clone());
+        app.settings_write_blocked = false;
+        app.settings.terminal_font_size = 18.0;
+        let older = app.capture_settings_save().unwrap();
+        app.settings.terminal_font_size = 20.0;
+        let newer = app.capture_settings_save().unwrap();
+        let newer_ack = newer.run().unwrap();
+        let older_ack = older.run().unwrap();
+        app.acknowledge_settings_save(newer_ack);
+        app.settings.terminal_font_size = 22.0;
+        app.acknowledge_settings_save(older_ack);
+        assert_eq!(settings::load(&path).unwrap().terminal_font_size, 20.0);
+        assert_eq!(app.settings.terminal_font_size, 22.0);
+        app.save_settings_now().unwrap();
+        assert_eq!(settings::load(&path).unwrap().terminal_font_size, 22.0);
+    }
+
+    #[test]
+    fn reverting_an_edit_before_save_acknowledgment_persists_the_revert() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("settings.toml");
+        let mut app = context_inspector_test_app(false);
+        app.settings_path = Some(path.clone());
+        app.settings_write_blocked = false;
+        let original = app.settings.terminal_font_size;
+        app.settings.terminal_font_size = 18.0;
+        let first = app.capture_settings_save().unwrap();
+        app.settings.terminal_font_size = original;
+        let second = app.capture_settings_save().unwrap();
+        let first_ack = first.run().unwrap();
+        let second_ack = second.run().unwrap();
+        app.acknowledge_settings_save(second_ack);
+        app.acknowledge_settings_save(first_ack);
+        assert_eq!(settings::load(&path).unwrap().terminal_font_size, original);
+    }
+
     #[test]
     fn settings_autosave_rejects_stale_debounce_and_flushes_each_valid_field() {
         let directory = tempfile::tempdir().unwrap();
@@ -9538,14 +10221,16 @@ mod tests {
         let _ = app.autosave_setting(field, stale);
         assert!(!path.exists());
         assert!(app.settings.terminal_font_family.is_empty());
-        let _ = app.autosave_setting(field, latest);
+        let task = app.autosave_setting(field, latest);
+        settle_settings_task(&mut app, task);
         assert_eq!(
             settings::load(&path).unwrap().terminal_font_family,
             "Fira Code"
         );
         let _ =
             app.queue_setting_input(SettingsField::ManagedWorktreeDirectory, "../trees/".into());
-        let _ = app.update(Message::CloseInspector);
+        let task = app.update(Message::CloseInspector);
+        settle_settings_task(&mut app, task);
         assert_eq!(
             settings::load(&path).unwrap().managed_worktree_directory,
             "../trees/"
@@ -9565,7 +10250,8 @@ mod tests {
         let _ = app.queue_setting_input(field, "Ctrl+".into());
         let _ = app.autosave_setting(field, app.settings_generation);
         assert_eq!(std::fs::read(&path).unwrap(), before);
-        let _ = app.apply_setting_input(SettingsField::TerminalFontSize, "18".into());
+        let task = app.apply_setting_input(SettingsField::TerminalFontSize, "18".into());
+        settle_settings_task(&mut app, task);
         assert!(matches!(
             app.settings_feedback,
             Some(SettingsFeedback::Invalid(_))
@@ -9587,7 +10273,8 @@ mod tests {
         std::fs::write(&path, "not valid toml").unwrap();
         let mut app = context_inspector_test_app(false);
         app.settings_path = Some(path.clone());
-        let _ = app.apply_setting_input(SettingsField::TerminalFontSize, "18".into());
+        let task = app.apply_setting_input(SettingsField::TerminalFontSize, "18".into());
+        settle_settings_task(&mut app, task);
         assert!(matches!(
             app.settings_feedback,
             Some(SettingsFeedback::Error(_))
@@ -9599,7 +10286,8 @@ mod tests {
             app.settings_feedback,
             Some(SettingsFeedback::Error(_))
         ));
-        let _ = app.reset_settings();
+        let task = app.reset_settings();
+        settle_settings_task(&mut app, task);
         let _ = app.autosave_setting(SettingsField::TerminalFontFamily, stale);
         assert_eq!(settings::load(&path).unwrap(), AppSettings::default());
     }
@@ -9614,10 +10302,10 @@ mod tests {
                 };
                 while let Some(action) = stream.next().await {
                     if let iced::runtime::Action::Output(cosmic::Action::App(
-                        Message::Repository(action),
+                        message @ (Message::Repository(_) | Message::SettingsSaved { .. }),
                     )) = action
                     {
-                        pending.push_back(app.update(Message::Repository(action)));
+                        pending.push_back(app.update(message));
                     }
                 }
             }
@@ -10854,9 +11542,9 @@ mod tests {
         assert_eq!(app.settings.inspector_width, 384.0);
         assert!(!path.exists(), "live key repeats must not persist settings");
 
-        let _finished = app.update(Message::ContextInspector(InspectorAction::ResizeFinished));
-        let saved = std::fs::read_to_string(path).unwrap();
-        assert!(saved.contains("inspector_width = 384.0"));
+        let finished = app.update(Message::ContextInspector(InspectorAction::ResizeFinished));
+        settle_settings_task(&mut app, finished);
+        assert_eq!(settings::load(&path).unwrap().inspector_width, 384.0);
     }
 
     #[test]
@@ -11908,6 +12596,15 @@ mod tests {
             session: None,
             save_health: None,
             settings_draft: SettingsDraft::from_settings(&settings),
+            settings_base: settings.clone(),
+            settings_save_generation: 0,
+            settings_ack_generation: 0,
+            settings_reset_generation: None,
+            settings_save_lane: Arc::new(std::sync::Mutex::new(None)),
+            update_prepared: false,
+            update_flush_pending: false,
+            update_generation: 0,
+            update_committed: false,
             settings,
             #[cfg(feature = "integrated-browser")]
             browser_teardowns: Vec::new(),
@@ -11927,6 +12624,7 @@ mod tests {
             sidebar_state: SidebarState::default(),
             project_ui: project_ui::State::default(),
             chat_ui: chat_ui::State::default(),
+            update_ui: update_ui::State::default(),
             pull_request_inspector: pull_request_ui::State::default(),
             active_workspace: None,
             worktree_focus: HashMap::new(),

@@ -1827,7 +1827,7 @@ fn civil_from_days(days: i64) -> (i64, i64, i64) {
     (if month <= 2 { year + 1 } else { year }, month, day)
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 enum SidebarSelection {
     Project(ProjectId),
     Worktree {
@@ -1852,6 +1852,14 @@ pub enum FileListMode {
     #[default]
     Tree,
     Flat,
+}
+
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct SidebarView {
+    query: String,
+    controls_expanded: bool,
+    collapsed_projects: BTreeSet<ProjectId>,
+    selection: Option<SidebarSelection>,
 }
 
 /// Persistent interaction state owned by the application.
@@ -1887,6 +1895,21 @@ pub struct SidebarState {
 }
 
 impl SidebarState {
+    pub fn saved_view(&self) -> SidebarView {
+        SidebarView {
+            query: self.query.clone(),
+            controls_expanded: self.controls_expanded,
+            collapsed_projects: self.collapsed_projects.clone(),
+            selection: self.selection,
+        }
+    }
+
+    pub fn restore_view(&mut self, view: SidebarView) {
+        self.query = view.query;
+        self.controls_expanded = view.controls_expanded;
+        self.collapsed_projects = view.collapsed_projects;
+        self.selection = view.selection;
+    }
     pub fn set_worktree_sort(&mut self, order: crate::settings::WorktreeSort) {
         self.worktree_sort = order;
     }

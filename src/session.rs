@@ -208,6 +208,7 @@ struct QueueState {
     worktrees: HashMap<WorktreeId, WorktreeState>,
     terminal_replacements: HashMap<CardId, TerminalIdentityReplacement>,
     retry_requested: bool,
+    checkpoints: Vec<std::sync::mpsc::SyncSender<std::result::Result<(), String>>>,
     shutdown: bool,
 }
 
@@ -233,11 +234,22 @@ impl std::fmt::Debug for SessionRuntime {
 
 impl SessionRuntime {
     pub fn default_database_path() -> Result<PathBuf, SessionError> {
-        let project_dirs =
-            instance::project_dirs().ok_or(SessionError::DataDirectoryUnavailable)?;
-        Ok(project_dirs.data_dir().join("sessions.sqlite3"))
+        instance::window_database_path(instance::window_slot())
+            .map_err(|error| SessionError::Store(StoreError::Io(error)))
     }
 
+    /// Initializes a named window from a consistent SQLite snapshot, never a
+    /// byte copy of a live WAL database. IDs and exact migration links survive.
+    pub fn initialize_window(source: &str) -> Result<(), SessionError> {
+        let destination = Self::default_database_path()?;
+        let source = instance::window_database_path(source)
+            .map_err(|error| SessionError::Store(StoreError::Io(error)))?;
+        if destination == source || destination.exists() || !source.exists() {
+            return Ok(());
+        }
+        StateStore::copy_snapshot(&source, &destination)?;
+        Ok(())
+    }
     pub fn open_default() -> Result<(Self, Option<WorkspaceState>), SessionError> {
         Self::open(Self::default_database_path()?, current_boot_id()?)
     }
@@ -450,6 +462,31 @@ impl SessionRuntime {
         &self.database_path
     }
 
+    /// A writer-lane barrier. Failure leaves pending writes retryable and never
+    /// tears down the session, so an update veto can safely resume this window.
+    pub fn request_flush(
+        &self,
+    ) -> std::result::Result<std::sync::mpsc::Receiver<std::result::Result<(), String>>, String>
+    {
+        let (response, receiver) = std::sync::mpsc::sync_channel(1);
+        let (lock, changed) = &*self.queue;
+        let mut queue = lock
+            .lock()
+            .map_err(|_| "session writer queue unavailable")?;
+        if queue.shutdown {
+            return Err("session writer is shutting down".into());
+        }
+        queue.checkpoints.push(response);
+        changed.notify_one();
+        drop(queue);
+        Ok(receiver)
+    }
+
+    pub fn flush(&self, timeout: Duration) -> std::result::Result<(), String> {
+        self.request_flush()?
+            .recv_timeout(timeout)
+            .map_err(|error| format!("session flush: {error}"))?
+    }
     pub fn shutdown(&mut self) {
         let (lock, changed) = &*self.queue;
         if let Ok(mut queue) = lock.lock() {
@@ -863,6 +900,7 @@ fn persistence_loop(
             && state.worktrees.is_empty()
             && state.terminal_replacements.is_empty()
             && !state.retry_requested
+            && state.checkpoints.is_empty()
             && !state.shutdown
         {
             state = if let Some(deadline) = due {
@@ -925,7 +963,10 @@ fn persistence_loop(
             );
         }
         let shutdown = state.shutdown;
-        let should_persist = shutdown || due.is_some_and(|deadline| Instant::now() >= deadline);
+        let checkpoints = std::mem::take(&mut state.checkpoints);
+        let should_persist = shutdown
+            || !checkpoints.is_empty()
+            || due.is_some_and(|deadline| Instant::now() >= deadline);
         drop(state);
 
         if should_persist {
@@ -944,6 +985,14 @@ fn persistence_loop(
                 due = (!retry_exhausted).then(|| Instant::now() + retry_delay);
                 retry_delay = retry_delay.saturating_mul(2).min(config.retry_max);
             }
+        }
+        for checkpoint in checkpoints {
+            let result = if writes.is_empty() {
+                Ok(())
+            } else {
+                Err("workspace could not be saved; resolve save errors before updating".into())
+            };
+            let _ = checkpoint.send(result);
         }
 
         if shutdown {
@@ -1444,6 +1493,72 @@ mod tests {
             latest.cards.iter().map(|card| card.id).collect()
         );
         reopened.shutdown();
+    }
+
+    #[test]
+    fn window_snapshots_keep_identity_and_reopen_independently_while_source_is_live() {
+        let directory = tempdir().unwrap();
+        let primary = directory.path().join("sessions.sqlite3");
+        let secondary = directory
+            .path()
+            .join("windows/monitor-two/sessions.sqlite3");
+        let boot = BootId::new("window-test");
+        let (mut first, _) = SessionRuntime::open(&primary, boot.clone()).unwrap();
+        let mut one = workspace();
+        first.snapshot(Arc::new(one.clone()));
+        first.flush(Duration::from_secs(5)).unwrap();
+        first
+            .operation_store()
+            .save_window_view("first-monitor")
+            .unwrap();
+        StateStore::copy_snapshot(&primary, &secondary).unwrap();
+        let (mut second, restored) = SessionRuntime::open(&secondary, boot.clone()).unwrap();
+        let mut two = restored.unwrap();
+        assert_eq!(one.id, two.id);
+        assert_eq!(one.cards[0].id, two.cards[0].id);
+        assert_eq!(one.cards[0].kind, two.cards[0].kind);
+        one.cards[0].width_fraction = 0.3;
+        one.focused = Some(one.cards[0].id);
+        two.cards[0].width_fraction = 0.8;
+        two.focused = None;
+        first.snapshot(Arc::new(one.clone()));
+        second.snapshot(Arc::new(two.clone()));
+        second
+            .operation_store()
+            .save_window_view("second-monitor")
+            .unwrap();
+        first.flush(Duration::from_secs(5)).unwrap();
+        second.flush(Duration::from_secs(5)).unwrap();
+        first.shutdown();
+        // Closing one writer does not close or corrupt the other's live store.
+        two.cards[0].width_fraction = 0.9;
+        second.snapshot(Arc::new(two.clone()));
+        second.flush(Duration::from_secs(5)).unwrap();
+        second.shutdown();
+        let (mut first, restored_one) = SessionRuntime::open(&primary, boot.clone()).unwrap();
+        let (mut second, restored_two) = SessionRuntime::open(&secondary, boot).unwrap();
+        assert_eq!(restored_one.unwrap().cards[0].width_fraction, 0.3);
+        let restored_two = restored_two.unwrap();
+        assert_eq!(restored_two.cards[0].width_fraction, 0.9);
+        assert_eq!(restored_two.focused, None);
+        assert_eq!(
+            first
+                .operation_store()
+                .load_window_view()
+                .unwrap()
+                .as_deref(),
+            Some("first-monitor")
+        );
+        assert_eq!(
+            second
+                .operation_store()
+                .load_window_view()
+                .unwrap()
+                .as_deref(),
+            Some("second-monitor")
+        );
+        first.shutdown();
+        second.shutdown();
     }
 
     #[test]

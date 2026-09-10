@@ -13,6 +13,7 @@ Install the cagents Linux x86_64 release for the current user.
 Options:
   --version VERSION  Install a release version (default: latest v* release)
   --prefix PATH      Installation root (default: $XDG_DATA_HOME/cagents-install)
+  --restart-daemon   Checkpoint supported sessions and replace the running daemon
   --uninstall        Remove program files while preserving user data
   --purge            Uninstall and also remove cagents user data
   --help             Show this help
@@ -33,6 +34,7 @@ VERSION=
 PREFIX=
 UNINSTALL=0
 PURGE=0
+RESTART_DAEMON=0
 
 while [ "$#" -gt 0 ]; do
     case $1 in
@@ -45,6 +47,10 @@ while [ "$#" -gt 0 ]; do
             [ "$#" -ge 2 ] || fail '--prefix requires a path'
             PREFIX=$2
             shift 2
+            ;;
+        --restart-daemon)
+            RESTART_DAEMON=1
+            shift
             ;;
         --uninstall)
             UNINSTALL=1
@@ -64,6 +70,9 @@ while [ "$#" -gt 0 ]; do
             ;;
     esac
 done
+
+[ "$RESTART_DAEMON" -eq 0 ] || [ "$UNINSTALL" -eq 0 ] \
+    || fail '--restart-daemon cannot be combined with --uninstall or --purge'
 
 if [ "$(id -u)" -eq 0 ]; then
     fail 'refusing to run as root; install cagents from your user account'
@@ -155,6 +164,11 @@ stop_daemon_and_wait() {
     "$daemon_cli" daemon stop --require-empty >/dev/null \
         || fail 'daemon was not stopped: finish terminals or explicitly confirm their termination with cagents daemon stop --confirm, then retry; installation was not changed'
 
+    wait_for_daemon_shutdown "$daemon_cli"
+}
+
+wait_for_daemon_shutdown() {
+    daemon_cli=$1
     daemon_wait=30
     while [ "$daemon_wait" -gt 0 ]; do
         read_daemon_status "$daemon_cli"
@@ -163,6 +177,23 @@ stop_daemon_and_wait() {
         [ "$daemon_wait" -eq 0 ] || sleep 1
     done
     fail 'could not verify that the daemon stopped; installation was not changed'
+}
+
+prepare_daemon_upgrade() {
+    daemon_cli=$1
+    # Discover support without issuing an unknown mutation to a legacy CLI.
+    if ! daemon_help=$("$daemon_cli" daemon --help 2>/dev/null) \
+        || ! printf '%s\n' "$daemon_help" | awk '
+            $1 == "prepare-upgrade" { supported = 1 }
+            END { exit !supported }
+        '; then
+        fail 'the installed CLI cannot checkpoint upgrades; for the one-time legacy bootstrap, finish sessions or explicitly terminate disposable sessions with the installed CLI, then retry after its daemon exits; installation was not changed'
+    fi
+    "$daemon_cli" --json daemon prepare-upgrade --yes >/dev/null \
+        || fail 'daemon checkpoint preparation failed; installation was not changed'
+    wait_for_daemon_shutdown "$daemon_cli"
+    DAEMON_STOPPED_FOR_SWITCH=1
+    DAEMON_CHECKPOINTED=1
 }
 
 uninstall_cagents() {
@@ -257,15 +288,32 @@ need_command tar
 need_command readlink
 
 CURL_OPTIONS="--proto =https --tlsv1.2 --fail --location --silent --show-error"
-if [ -z "$VERSION" ]; then
+AUTHENTICATED_GH=0
+if [ -z "$VERSION" ] || [ -z "$LOCAL_ARCHIVE" ] || [ -z "$LOCAL_CHECKSUMS" ]; then
     validate_repository
-    need_command curl
-    latest_url=$(curl $CURL_OPTIONS -o /dev/null -w '%{url_effective}' "https://github.com/$REPOSITORY/releases/latest") \
-        || fail 'could not resolve the latest release'
-    case $latest_url in
-        https://github.com/"$REPOSITORY"/releases/tag/v*) VERSION=${latest_url##*/v} ;;
-        *) fail 'latest release did not redirect to a v* tag' ;;
-    esac
+    if command -v gh >/dev/null 2>&1 && gh auth status --hostname github.com >/dev/null 2>&1; then
+        AUTHENTICATED_GH=1
+    elif [ "$REPOSITORY" = CarsonBurke/cagents ]; then
+        fail 'private release access requires an authenticated GitHub CLI account; run gh auth login --hostname github.com with access to CarsonBurke/cagents; installation was not changed'
+    fi
+fi
+if [ -z "$VERSION" ]; then
+    if [ "$AUTHENTICATED_GH" -eq 1 ]; then
+        latest_tag=$(gh release view --repo "github.com/$REPOSITORY" --json tagName --jq .tagName) \
+            || fail 'could not resolve the latest release with the authenticated GitHub account'
+        case $latest_tag in
+            v*) VERSION=${latest_tag#v} ;;
+            *) fail 'latest release must have a v* tag' ;;
+        esac
+    else
+        need_command curl
+        latest_url=$(curl $CURL_OPTIONS -o /dev/null -w '%{url_effective}' "https://github.com/$REPOSITORY/releases/latest") \
+            || fail 'could not resolve the public release; for private repositories, authenticate with gh auth login --hostname github.com'
+        case $latest_url in
+            https://github.com/"$REPOSITORY"/releases/tag/v*) VERSION=${latest_url##*/v} ;;
+            *) fail 'latest release did not redirect to a v* tag' ;;
+        esac
+    fi
 fi
 case $VERSION in
     ''|[!0-9]*|*..*|*[!0-9A-Za-z.+~-]*) fail "unsafe release version: $VERSION" ;;
@@ -288,8 +336,10 @@ HAD_CURRENT=0
 PREVIOUS_CURRENT_TARGET=
 ROLLBACK_OK=1
 DAEMON_STOPPED_FOR_SWITCH=0
+DAEMON_CHECKPOINTED=0
 OLD_DAEMON_WAS_RUNNING=0
 DAEMON_STARTED=0
+DAEMON_START_ATTEMPTED=0
 BIN_LINK=$HOME/.local/bin/cagents
 DESKTOP_LINK=$DATA_HOME/applications/dev.cagents.Cagents.desktop
 ICON_LINK=$DATA_HOME/icons/hicolor/scalable/apps/dev.cagents.Cagents.svg
@@ -316,6 +366,19 @@ cleanup() {
     fi
     if [ -n "$CURRENT_TEMP" ]; then
         rm -f "$CURRENT_TEMP" || :
+    fi
+
+    if [ "$TRANSACTION_COMMITTED" -eq 0 ] \
+        && [ "$DAEMON_CHECKPOINTED" -eq 1 ] \
+        && [ "$DAEMON_START_ATTEMPTED" -eq 1 ]; then
+        read_daemon_status "$NEW_VERSION_DIR/bin/cagents"
+        if [ "$DAEMON_STATUS" != stopped ]; then
+            # This also fences interruption while daemon start is in flight.
+            # A possible replacement writer must retain its own executables.
+            TRANSACTION_COMMITTED=1
+            printf '%s: replacement daemon shutdown is not proven; retained the new installation and recovery state; inspect cagents daemon status before retrying\n' \
+                "$PROGRAM" >&2
+        fi
     fi
 
     if [ "$TRANSACTION_COMMITTED" -eq 0 ] && [ "$CURRENT_SWITCHED" -eq 1 ]; then
@@ -388,23 +451,30 @@ umask 077
 ARCHIVE_PATH=$DOWNLOAD_DIR/$ARCHIVE_NAME
 CHECKSUMS_PATH=$DOWNLOAD_DIR/SHA256SUMS
 
+download_release_asset() {
+    asset_name=$1
+    asset_path=$2
+    if [ "$AUTHENTICATED_GH" -eq 1 ]; then
+        gh release download "v$VERSION" --repo "github.com/$REPOSITORY" \
+            --pattern "$asset_name" --output "$asset_path" \
+            || fail "could not download $asset_name with the authenticated GitHub account"
+    else
+        need_command curl
+        curl $CURL_OPTIONS -o "$asset_path" \
+            "https://github.com/$REPOSITORY/releases/download/v$VERSION/$asset_name" \
+            || fail "could not download public asset $asset_name; for private repositories, authenticate with gh auth login --hostname github.com"
+    fi
+}
+
 if [ -n "$LOCAL_ARCHIVE" ]; then
     cp "$LOCAL_ARCHIVE" "$ARCHIVE_PATH"
 else
-    validate_repository
-    need_command curl
-    curl $CURL_OPTIONS \
-        -o "$ARCHIVE_PATH" \
-        "https://github.com/$REPOSITORY/releases/download/v$VERSION/$ARCHIVE_NAME"
+    download_release_asset "$ARCHIVE_NAME" "$ARCHIVE_PATH"
 fi
 if [ -n "$LOCAL_CHECKSUMS" ]; then
     cp "$LOCAL_CHECKSUMS" "$CHECKSUMS_PATH"
 else
-    validate_repository
-    need_command curl
-    curl $CURL_OPTIONS \
-        -o "$CHECKSUMS_PATH" \
-        "https://github.com/$REPOSITORY/releases/download/v$VERSION/SHA256SUMS"
+    download_release_asset SHA256SUMS "$CHECKSUMS_PATH"
 fi
 
 if ! EXPECTED_HASH=$(awk -v target="$ARCHIVE_NAME" '
@@ -637,21 +707,33 @@ ensure_link() {
 
 
 if [ "$HAD_CURRENT" -eq 1 ]; then
-    # The candidate handshake proves protocol compatibility without changing the
-    # running process. Never stop compatible PTYs merely to replace executables.
-    read_daemon_status "$NEW_VERSION_DIR/bin/cagents"
-    case $DAEMON_STATUS in
-        running)
-            OLD_DAEMON_WAS_RUNNING=1
-            ;;
-        stopped) ;;
-        *)
-            read_daemon_status "$PREFIX/current/bin/cagents"
-            [ "$DAEMON_STATUS" != running ] || OLD_DAEMON_WAS_RUNNING=1
-            stop_daemon_and_wait "$PREFIX/current/bin/cagents"
-            DAEMON_STOPPED_FOR_SWITCH=1
-            ;;
-    esac
+    if [ "$RESTART_DAEMON" -eq 1 ]; then
+        read_daemon_status "$PREFIX/current/bin/cagents"
+        case $DAEMON_STATUS in
+            running)
+                OLD_DAEMON_WAS_RUNNING=1
+                prepare_daemon_upgrade "$PREFIX/current/bin/cagents"
+                ;;
+            stopped) ;;
+            *) fail 'cannot verify the installed daemon status; installation was not changed' ;;
+        esac
+    else
+        # The candidate handshake proves protocol compatibility without changing
+        # the running process. Compatible updates never replace live PTYs.
+        read_daemon_status "$NEW_VERSION_DIR/bin/cagents"
+        case $DAEMON_STATUS in
+            running)
+                OLD_DAEMON_WAS_RUNNING=1
+                ;;
+            stopped) ;;
+            *)
+                read_daemon_status "$PREFIX/current/bin/cagents"
+                [ "$DAEMON_STATUS" != running ] || OLD_DAEMON_WAS_RUNNING=1
+                stop_daemon_and_wait "$PREFIX/current/bin/cagents"
+                DAEMON_STOPPED_FOR_SWITCH=1
+                ;;
+        esac
+    fi
 fi
 CURRENT_TEMP=$PREFIX/.current.$$
 rm -f "$CURRENT_TEMP"
@@ -667,13 +749,20 @@ ensure_link "$ICON_TARGET" "$ICON_LINK" icon
 ensure_link "$RASTER_ICON_TARGET" "$RASTER_ICON_LINK" raster_icon
 ensure_link "$METAINFO_TARGET" "$METAINFO_LINK" metainfo
 ensure_link "$AUTOSTART_TARGET" "$AUTOSTART_LINK" autostart
-TRANSACTION_COMMITTED=1
+# A checkpointed update commits only after the replacement starts. Ordinary
+# installs retain their existing login-autostart behavior on startup failure.
+[ "$DAEMON_CHECKPOINTED" -eq 1 ] || TRANSACTION_COMMITTED=1
+DAEMON_START_ATTEMPTED=1
 if "$PREFIX/current/bin/cagents" daemon start >/dev/null; then
     DAEMON_STARTED=1
 else
+    if [ "$DAEMON_CHECKPOINTED" -eq 1 ]; then
+        fail 'replacement daemon startup failed; checking rollback safety while preserving durable recovery state'
+    fi
     printf '%s: installed cagents, but its production daemon could not start now; login autostart remains enabled\n' \
         "$PROGRAM" >&2
 fi
+TRANSACTION_COMMITTED=1
 if command -v gtk-update-icon-cache >/dev/null 2>&1; then
     gtk-update-icon-cache --force --ignore-theme-index "$DATA_HOME/icons/hicolor" >/dev/null 2>&1 || :
 fi

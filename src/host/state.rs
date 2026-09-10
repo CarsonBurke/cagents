@@ -1,7 +1,7 @@
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
     fs,
-    sync::{Arc, Mutex, Weak},
+    sync::{Arc, Mutex, RwLock, Weak},
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -33,6 +33,8 @@ pub(crate) type SharedHost = Arc<Mutex<HostState>>;
 pub(crate) struct TerminalRecord {
     pub(super) session: TerminalSession,
     pub(super) handle: TerminalHandle,
+    options: TerminalSpawnOptions,
+    upgrade_sources: Vec<TerminalSession>,
     running: bool,
     completion_observed: bool,
     last_exit: Option<TerminalExit>,
@@ -189,6 +191,14 @@ pub(crate) struct HostState {
     pub(super) chats: BTreeMap<TerminalId, super::chat::Record>,
     pub(super) chat_spawning: BTreeMap<TerminalId, crate::chat::Launch>,
     pub(crate) agent_observer: Arc<crate::agent::observe::Observer>,
+    /// Exclusive upgrade barrier; ordinary client operations remain concurrent.
+    pub(super) control_gate: Arc<RwLock<()>>,
+    upgrade: Option<(
+        crate::upgrade::handoff::Store,
+        crate::upgrade::handoff::Checkpoint,
+        Vec<crate::terminal::UpgradeSnapshot>,
+    )>,
+    pub(super) upgrade_chats: BTreeMap<TerminalId, Vec<crate::upgrade::handoff::ChatSource>>,
 }
 
 impl HostState {
@@ -206,6 +216,9 @@ impl HostState {
             chats: BTreeMap::new(),
             chat_spawning: BTreeMap::new(),
             agent_observer: Arc::new(crate::agent::observe::Observer::new()),
+            control_gate: Arc::new(RwLock::new(())),
+            upgrade: None,
+            upgrade_chats: BTreeMap::new(),
         }
     }
 
@@ -477,6 +490,7 @@ impl HostState {
                 .unwrap_or_else(|| record.event_sequence.saturating_add(1)),
             attached,
             transcript: transcript_metadata(record.session.transcript_path.as_deref()),
+            upgrade_sources: record.upgrade_sources.clone(),
         })
     }
 
@@ -548,6 +562,8 @@ impl HostState {
             TerminalRecord {
                 session,
                 handle,
+                options: TerminalSpawnOptions::default(),
+                upgrade_sources: Vec::new(),
                 running: true,
                 completion_observed: false,
                 last_exit: None,
@@ -733,6 +749,41 @@ impl HostState {
         Ok(ShutdownPreflight { capability })
     }
 
+    fn validate_upgrade_capability(
+        &mut self,
+        capability: &ShutdownCapability,
+        now: Instant,
+    ) -> Result<(), String> {
+        let count = self.inventory_count();
+        if self.shutting_down {
+            return Err("Daemon is already shutting down".into());
+        }
+        if capability.proof != self.proof {
+            return Err("Daemon changed; obtain a new upgrade preflight".into());
+        }
+        let Some((stored, deadline)) = self
+            .shutdown_capabilities
+            .iter()
+            .find(|(stored, _)| stored.token == capability.token)
+        else {
+            return Err("Invalid upgrade capability; obtain a new preflight".into());
+        };
+        if stored != capability || now >= *deadline {
+            return Err("Invalid or expired upgrade capability; obtain a new preflight".into());
+        }
+        if capability.inventory_generation != self.inventory_generation
+            || capability.live_terminals != count
+        {
+            return Err("Daemon inventory changed; obtain a new upgrade preflight".into());
+        }
+        if !self.spawning.is_empty() || !self.chat_spawning.is_empty() {
+            return Err(
+                "Sessions are still starting; wait for reservations to settle and retry".into(),
+            );
+        }
+        Ok(())
+    }
+
     /// Call under the host lock: the predicate and spawn fence are indivisible.
     pub(crate) fn shutdown(
         &mut self,
@@ -817,6 +868,310 @@ impl HostState {
     }
 }
 
+fn upgrade_error(message: impl Into<String>) -> ProtocolError {
+    ProtocolError::new(ProtocolErrorCode::InvalidRequest, message, false)
+}
+
+/// Caller holds control_gate throughout reversible snapshots and durable commit.
+pub(super) fn prepare_upgrade(
+    host: &SharedHost,
+    capability: ShutdownCapability,
+) -> Result<(u64, u64), ProtocolError> {
+    prepare_upgrade_with(host, capability, crate::upgrade::handoff::Store::discover)
+}
+
+fn prepare_upgrade_with(
+    host: &SharedHost,
+    capability: ShutdownCapability,
+    discover: impl FnOnce() -> Result<crate::upgrade::handoff::Store, String>,
+) -> Result<(u64, u64), ProtocolError> {
+    use crate::upgrade::handoff::{Chat, Checkpoint, Phase, Terminal};
+    let (proof, terminals, chats) = {
+        let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
+        state
+            .validate_upgrade_capability(&capability, Instant::now())
+            .map_err(upgrade_error)?;
+        let terminals = state
+            .terminals
+            .iter()
+            .filter(|(_, record)| !record.handle.is_completed())
+            .map(|(&id, record)| {
+                Ok((
+                    state.descriptor(0, id)?.session,
+                    record.handle.clone(),
+                    record.options.clone(),
+                    record.upgrade_sources.clone(),
+                ))
+            })
+            .collect::<Result<Vec<_>, ProtocolError>>()?;
+        let mut chats = Vec::new();
+        for record in state
+            .chats
+            .values()
+            .filter(|record| record.handle.owns_work())
+        {
+            if record.handle.is_completed() {
+                return Err(upgrade_error(
+                    "A native provider has unconfirmed work after a failed close; resolve that provider before upgrading",
+                ));
+            }
+            let source = record.session.clone();
+            let mut launch = source.launch.clone();
+            launch.session_id = record.handle.confirmed_session_id();
+            if launch.terminal_recipe().is_none() {
+                return Err(upgrade_error(format!(
+                    "Native chat {} has no exact resumable conversation; wait for provider initialization or close it explicitly",
+                    source.id
+                )));
+            }
+            chats.push(Chat {
+                previous_sources: state
+                    .upgrade_chats
+                    .get(&source.id)
+                    .cloned()
+                    .unwrap_or_default(),
+                source,
+                launch,
+            });
+        }
+        (state.proof.clone(), terminals, chats)
+    };
+    let store = discover().map_err(upgrade_error)?;
+    if let Some(previous) = store.load().map_err(upgrade_error)?
+        && (previous.proof != proof || previous.phase != Phase::Prepared)
+    {
+        return Err(upgrade_error(format!(
+            "An unresolved upgrade checkpoint exists at {}; it will not be overwritten",
+            store.path.display()
+        )));
+    }
+    let mut frozen = Vec::with_capacity(terminals.len());
+    let mut saved = Vec::with_capacity(terminals.len());
+    for (mut source, handle, mut options, previous_sources) in terminals {
+        let snapshot = handle.prepare_upgrade().map_err(upgrade_error)?;
+        source.resume_hint = snapshot.hint.clone();
+        let exact = source
+            .resume_hint
+            .as_deref()
+            .and_then(crate::model::agent_recovery::recipe_from_hint);
+        // A shell recipe alone cannot authorize losing its arbitrary running job.
+        if snapshot.active && exact.is_none() {
+            return Err(upgrade_error(format!(
+                "Terminal {} has active work without a process-bound exact agent identity; finish or close it before upgrading",
+                source.id
+            )));
+        }
+        let recipe = crate::upgrade::recovery_recipe(&source).map_err(upgrade_error)?;
+        options.columns = snapshot.size.columns;
+        options.rows = snapshot.size.rows;
+        options.cell_width_px = snapshot.size.cell_width_px;
+        options.cell_height_px = snapshot.size.cell_height_px;
+        options.theme = snapshot.theme;
+        options.initially_visible = false;
+        saved.push(Terminal {
+            source,
+            previous_sources,
+            recipe,
+            options,
+        });
+        frozen.push(snapshot);
+    }
+    let checkpoint = Checkpoint::new(proof, saved, chats);
+    let counts = (
+        checkpoint.terminals.len() as u64,
+        checkpoint.chats.len() as u64,
+    );
+    let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
+    state
+        .validate_upgrade_capability(&capability, Instant::now())
+        .map_err(upgrade_error)?;
+    // Failure leaves control enabled and drops reversible pidfd freeze guards.
+    store.save(&checkpoint).map_err(upgrade_error)?;
+    state.upgrade = Some((store, checkpoint, frozen));
+    state.shutting_down = true;
+    state.shutdown_capabilities.clear();
+    Ok(counts)
+}
+
+/// Provider close must succeed before Ready can authorize another writer.
+pub(super) fn finish_upgrade(host: &SharedHost) -> Result<(), String> {
+    let Some((store, mut checkpoint, mut frozen)) = host
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .upgrade
+        .take()
+    else {
+        return Ok(());
+    };
+    for terminal in &mut frozen {
+        terminal.stop()?;
+    }
+    let chats = {
+        let state = host.lock().unwrap_or_else(|p| p.into_inner());
+        checkpoint
+            .chats
+            .iter()
+            .map(|chat| {
+                state
+                    .chats
+                    .get(&chat.source.id)
+                    .map(|record| record.handle.clone())
+                    .ok_or_else(|| {
+                        "Checkpoint native provider disappeared during shutdown".to_string()
+                    })
+            })
+            .collect::<Result<Vec<_>, _>>()?
+    };
+    for (chat, handle) in checkpoint.chats.iter_mut().zip(chats) {
+        handle.close()?;
+        if handle.owns_work() {
+            return Err("Native provider shutdown remains unconfirmed; checkpoint retained".into());
+        }
+        chat.launch.session_id = handle.confirmed_session_id();
+        chat.launch.recipe = chat.launch.terminal_recipe().ok_or(
+            "Closed provider did not retain its exact conversation identity; checkpoint retained",
+        )?;
+    }
+    let handles = host
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .terminals
+        .values()
+        .map(|record| record.handle.clone())
+        .collect::<Vec<_>>();
+    for handle in handles {
+        if let Err(error) = handle.shutdown()
+            && !handle.is_completed()
+        {
+            return Err(error.to_string());
+        }
+    }
+    checkpoint.phase = crate::upgrade::handoff::Phase::Ready;
+    store.save(&checkpoint)
+}
+
+/// Runs while HostLease is held, before binding the public listener.
+pub(super) fn restore_upgrade(host: &SharedHost) -> Result<(), String> {
+    restore_upgrade_from(
+        host,
+        crate::upgrade::handoff::Store::discover()?,
+        std::path::Path::new("/proc"),
+    )
+}
+
+fn restore_upgrade_from(
+    host: &SharedHost,
+    store: crate::upgrade::handoff::Store,
+    proc_root: &std::path::Path,
+) -> Result<(), String> {
+    use crate::upgrade::{ensure_no_surviving_process, handoff::Phase};
+    let Some(mut checkpoint) = store.load()? else {
+        return Ok(());
+    };
+    checkpoint.validate()?;
+    if !checkpoint.chats.is_empty() {
+        checkpoint.require_ready().map_err(|error| format!(
+            "{error}. Evidence: {}. After inspecting the exact provider conversations, `cagents daemon abandon-upgrade --yes` archives this checkpoint and permits an empty daemon start; native sessions then require explicit manual recovery",
+            store.path.display()
+        ))?;
+    }
+    for terminal in &checkpoint.terminals {
+        ensure_no_surviving_process(&terminal.source, std::process::id(), proc_root)?;
+    }
+    for chat in &checkpoint.chats {
+        let terminal = TerminalSession {
+            id: chat.source.id,
+            launch: chat
+                .launch
+                .terminal_recipe()
+                .ok_or("Native exact recipe unavailable")?,
+            transcript_path: None,
+            resume_hint: None,
+            continuity: TerminalContinuity::DetachedSameBoot {
+                host_session_id: checkpoint.proof.host_session_id.clone(),
+                boot_id: checkpoint.proof.boot_id.clone(),
+                host_incarnation: checkpoint.proof.host_incarnation.clone(),
+            },
+        };
+        ensure_no_surviving_process(&terminal, std::process::id(), proc_root)?;
+    }
+    checkpoint.phase = Phase::Restoring;
+    store.save(&checkpoint)?;
+    let restored = (|| {
+        for terminal in &checkpoint.terminals {
+            let mut session = terminal.source.clone();
+            session.launch = terminal.recipe.clone();
+            session.continuity = TerminalContinuity::RelaunchAvailable {
+                recipe: session.launch.clone(),
+                last_exit: None,
+            };
+            spawn_terminal(host, 0, session, terminal.options.clone())
+                .map_err(|error| error.message)?;
+            let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
+            let sources = &mut state
+                .terminals
+                .get_mut(&terminal.source.id)
+                .expect("restored terminal")
+                .upgrade_sources;
+            sources.clone_from(&terminal.previous_sources);
+            sources.push(terminal.source.clone());
+            state
+                .detach(0, terminal.source.id)
+                .map_err(|error| error.message)?;
+        }
+        for chat in &checkpoint.chats {
+            super::chat::restore_upgrade(host, chat)?;
+        }
+        Ok::<_, String>(())
+    })();
+    if let Err(error) = restored {
+        // A synchronous failure can be retried only after positively closing
+        // every newly started writer. A crash has no such proof and retains
+        // Restoring, which is never automatically replayed for native sessions.
+        if close_failed_restore(host).is_ok() {
+            checkpoint.phase = Phase::Ready;
+            store.save(&checkpoint)?;
+        }
+        return Err(format!(
+            "Upgrade restore failed: {error}; checkpoint retained at {}",
+            store.path.display()
+        ));
+    }
+    store.remove()
+}
+
+fn close_failed_restore(host: &SharedHost) -> Result<(), String> {
+    let (chats, terminals) = {
+        let state = host.lock().unwrap_or_else(|p| p.into_inner());
+        (
+            state
+                .chats
+                .values()
+                .map(|record| record.handle.clone())
+                .collect::<Vec<_>>(),
+            state
+                .terminals
+                .values()
+                .map(|record| record.handle.clone())
+                .collect::<Vec<_>>(),
+        )
+    };
+    for chat in chats {
+        chat.close()?;
+        if chat.owns_work() {
+            return Err("Failed restore still has unconfirmed native work".into());
+        }
+    }
+    for terminal in terminals {
+        if !terminal.is_completed()
+            && terminal.close_checked(true) != crate::terminal_ipc::TerminalCloseResult::Closed
+        {
+            return Err("Failed restore still has unconfirmed terminal processes".into());
+        }
+    }
+    Ok(())
+}
+
 pub(crate) fn spawn_terminal(
     shared: &SharedHost,
     client_id: ClientId,
@@ -877,6 +1232,13 @@ pub(crate) fn spawn_terminal(
             return Err(error);
         }
     };
+    shared
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .terminals
+        .get_mut(&terminal_id)
+        .expect("finished spawn")
+        .options = options;
     // Initial publication can happen before the record is subscribable. Clear
     // that edge after insertion; the Spawn response carries the same snapshot,
     // and later generations can now produce a fresh wake.
@@ -1164,6 +1526,411 @@ mod tests {
             boot_id: BootId::new("test-boot"),
             host_incarnation: HostIncarnation::new("test-incarnation"),
         })
+    }
+
+    #[test]
+    fn native_upgrade_retains_hidden_lineage_and_restarts_final_claude_conversation_once() {
+        use crate::{
+            agent::Provider,
+            chat::{Command, Launch, Session},
+            model::LaunchRecipe,
+            terminal_ipc::ClientRequest,
+            upgrade::handoff::Store,
+        };
+        use std::os::unix::fs::PermissionsExt;
+        const A: &str = "12345678-1234-4234-8234-123456789abc";
+        const B: &str = "98765432-1234-4234-8234-123456789abc";
+        let directory = tempfile::tempdir().unwrap();
+        let cwd = directory.path().canonicalize().unwrap();
+        let executable = cwd.join("claude");
+        let log = cwd.join("launches");
+        fs::write(&executable, r#"#!/usr/bin/env python3
+import json, os, sys
+identity = next(arg.split("=", 1)[1] for arg in sys.argv if arg.startswith("--resume="))
+with open(os.environ["LAUNCH_LOG"], "a") as log:
+    log.write(json.dumps(sys.argv[1:]) + "\n")
+print(json.dumps({"type": "system", "subtype": "init", "session_id": identity}), flush=True)
+for line in sys.stdin:
+    request = json.loads(line)
+    if request["request"]["subtype"] == "interrupt":
+        print(json.dumps({"type": "conversation_reset", "session_id": identity}), flush=True)
+        identity = os.environ["NEXT_SESSION"]
+        print(json.dumps({"type": "system", "subtype": "init", "session_id": identity}), flush=True)
+    print(json.dumps({"type": "control_response", "response": {"subtype": "success", "request_id": request["request_id"], "response": {}}}), flush=True)
+"#).unwrap();
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
+        let config = cwd.join("config");
+        let project: String = cwd
+            .to_str()
+            .unwrap()
+            .chars()
+            .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+            .collect();
+        let history = config.join("projects").join(project);
+        fs::create_dir_all(&history).unwrap();
+        for id in [A, B] {
+            fs::write(history.join(format!("{id}.jsonl")), "").unwrap();
+        }
+        let host = Arc::new(Mutex::new(test_host()));
+        let source = Session {
+            id: TerminalId::new(),
+            launch: Launch {
+                provider: Provider::Claude,
+                recipe: LaunchRecipe {
+                    program: executable.to_string_lossy().into_owned(),
+                    arguments: vec!["--resume".into(), A.into()],
+                    working_directory: cwd.clone(),
+                    environment: BTreeMap::from([
+                        (
+                            "CLAUDE_CONFIG_DIR".into(),
+                            config.to_string_lossy().into_owned(),
+                        ),
+                        ("LAUNCH_LOG".into(), log.to_string_lossy().into_owned()),
+                        ("NEXT_SESSION".into(), B.into()),
+                    ]),
+                },
+                session_id: Some(A.into()),
+            },
+            proof: Some(
+                host.lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .proof()
+                    .clone(),
+            ),
+            terminal: None,
+        };
+        super::super::chat::process(
+            &host,
+            1,
+            ClientRequest::ChatStart {
+                session: source.clone(),
+                source: None,
+                terminate_source: false,
+            },
+        )
+        .unwrap();
+        let handle = host.lock().unwrap_or_else(|p| p.into_inner()).chats[&source.id]
+            .handle
+            .clone();
+        let wait_for_identity = |expected: &str| {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while handle.confirmed_session_id().as_deref() != Some(expected) {
+                assert!(
+                    Instant::now() < deadline,
+                    "provider failed to confirm {expected}"
+                );
+                thread::sleep(Duration::from_millis(10));
+            }
+        };
+        wait_for_identity(A);
+        // The hidden actor changes conversations without a presentation read
+        // refreshing its persisted card's original launch or cached identity.
+        handle.command(Command::Interrupt).unwrap();
+        wait_for_identity(B);
+        let store = Store::open(&cwd.join("checkpoint")).unwrap();
+        let capability = host
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .shutdown_preflight(Instant::now())
+            .unwrap()
+            .capability;
+        prepare_upgrade_with(&host, capability, || Ok(store)).unwrap();
+        finish_upgrade(&host).unwrap();
+        let store = Store::open(&cwd.join("checkpoint")).unwrap();
+        let saved = store.load().unwrap().unwrap();
+        saved.require_ready().unwrap();
+        assert_eq!(saved.chats[0].source, source);
+        assert_eq!(saved.chats[0].launch.session_id.as_deref(), Some(B));
+        let empty_proc = cwd.join("proc");
+        fs::create_dir(&empty_proc).unwrap();
+        let mut replacement = test_host();
+        replacement.proof.host_incarnation = HostIncarnation::new("replacement-incarnation");
+        let replacement = Arc::new(Mutex::new(replacement));
+        restore_upgrade_from(&replacement, store, &empty_proc).unwrap();
+        let restored = super::super::chat::resolve_upgrade(&replacement, &source).unwrap();
+        assert_eq!(restored.launch.session_id.as_deref(), Some(B));
+        assert_ne!(restored.proof, source.proof);
+        let mut hidden = source.clone();
+        hidden.launch.session_id = None;
+        assert_eq!(
+            super::super::chat::resolve_upgrade(&replacement, &hidden).unwrap(),
+            restored
+        );
+        let mut changed = source.clone();
+        changed.launch.recipe.arguments = vec!["--resume".into(), B.into()];
+        assert!(super::super::chat::resolve_upgrade(&replacement, &changed).is_err());
+        changed = source.clone();
+        changed.proof = restored.proof.clone();
+        assert!(super::super::chat::resolve_upgrade(&replacement, &changed).is_err());
+        changed = source.clone();
+        changed.id = TerminalId::new();
+        assert!(super::super::chat::resolve_upgrade(&replacement, &changed).is_err());
+        changed = source.clone();
+        changed.terminal = Some(TerminalSession {
+            id: source.id,
+            launch: source.launch.recipe.clone(),
+            transcript_path: None,
+            resume_hint: None,
+            continuity: TerminalContinuity::RelaunchAvailable {
+                recipe: source.launch.recipe.clone(),
+                last_exit: None,
+            },
+        });
+        assert!(super::super::chat::resolve_upgrade(&replacement, &changed).is_err());
+        restore_upgrade_from(
+            &replacement,
+            Store::open(&cwd.join("checkpoint")).unwrap(),
+            &empty_proc,
+        )
+        .unwrap();
+        // The durable P1 card stays closed at P2. A second full handoff must
+        // carry its issued launch/proof, not just the most recent P2 source.
+        let capability = replacement
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .shutdown_preflight(Instant::now())
+            .unwrap()
+            .capability;
+        prepare_upgrade_with(&replacement, capability, || {
+            Store::open(&cwd.join("checkpoint"))
+        })
+        .unwrap();
+        finish_upgrade(&replacement).unwrap();
+        let store = Store::open(&cwd.join("checkpoint")).unwrap();
+        let second = store.load().unwrap().unwrap();
+        assert_eq!(second.chats[0].previous_sources[0].source, source);
+        let mut forged = second.clone();
+        forged.chats[0].previous_sources[0].source.id = TerminalId::new();
+        assert!(forged.validate().is_err());
+        let mut forged = second.clone();
+        forged.chats[0].previous_sources[0]
+            .source
+            .launch
+            .recipe
+            .environment
+            .insert("UNRELATED".into(), "1".into());
+        assert!(forged.validate().is_err());
+        let mut forged = second.clone();
+        forged.chats[0].previous_sources[0].source.proof = second.chats[0].source.proof.clone();
+        assert!(forged.validate().is_err());
+        let mut third = test_host();
+        third.proof.host_incarnation = HostIncarnation::new("third-incarnation");
+        let replacement = Arc::new(Mutex::new(third));
+        restore_upgrade_from(&replacement, store, &empty_proc).unwrap();
+        let third = super::super::chat::resolve_upgrade(&replacement, &source).unwrap();
+        assert_eq!(third.launch.session_id.as_deref(), Some(B));
+        assert_ne!(third.proof, restored.proof);
+        assert_eq!(
+            super::super::chat::resolve_upgrade(&replacement, &hidden).unwrap(),
+            third
+        );
+        assert_eq!(
+            super::super::chat::resolve_upgrade(&replacement, &restored).unwrap(),
+            third
+        );
+        assert!(super::super::chat::resolve_upgrade(&replacement, &changed).is_err());
+        let mut unrelated = source.clone();
+        unrelated.proof = third.proof.clone();
+        assert!(super::super::chat::resolve_upgrade(&replacement, &unrelated).is_err());
+        unrelated = source.clone();
+        unrelated.launch.recipe.arguments = vec!["--resume".into(), B.into()];
+        assert!(super::super::chat::resolve_upgrade(&replacement, &unrelated).is_err());
+        restore_upgrade_from(
+            &replacement,
+            Store::open(&cwd.join("checkpoint")).unwrap(),
+            &empty_proc,
+        )
+        .unwrap();
+        let launches: Vec<Vec<String>> = fs::read_to_string(log)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(
+            launches.len(),
+            3,
+            "consumed checkpoint spawned another writer"
+        );
+        assert!(launches[0].contains(&format!("--resume={A}")));
+        assert!(launches[1].contains(&format!("--resume={B}")));
+        assert!(!launches[1].iter().any(|arg| arg.contains(A)));
+        assert!(launches[2].contains(&format!("--resume={B}")));
+        assert!(!launches[2].iter().any(|arg| arg.contains(A)));
+        let restored_handle = replacement.lock().unwrap_or_else(|p| p.into_inner()).chats
+            [&source.id]
+            .handle
+            .clone();
+        restored_handle.close().unwrap();
+    }
+
+    #[test]
+    fn upgrade_commit_failure_preserves_live_control_authority() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = crate::upgrade::handoff::Store::open(directory.path()).unwrap();
+        // An open directory descriptor is retained but cannot create files after
+        // unlink. This fails the real persistence operation, not a mock echo.
+        fs::remove_dir(directory.path()).unwrap();
+        let host = Arc::new(Mutex::new(test_host()));
+        let capability = host
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .shutdown_preflight(Instant::now())
+            .unwrap()
+            .capability;
+        assert!(prepare_upgrade_with(&host, capability, || Ok(store)).is_err());
+        let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
+        assert!(!state.is_shutting_down());
+        assert!(state.reserve_spawn(TerminalId::new()).is_ok());
+    }
+
+    #[test]
+    fn upgrade_rejects_stale_inventory_and_pending_reservations_without_shutdown() {
+        let mut state = test_host();
+        let now = Instant::now();
+        let stale = state.shutdown_preflight(now).unwrap().capability;
+        let id = TerminalId::new();
+        state.reserve_spawn(id).unwrap();
+        assert!(state.validate_upgrade_capability(&stale, now).is_err());
+        let pending = state.shutdown_preflight(now).unwrap().capability;
+        assert!(state.validate_upgrade_capability(&pending, now).is_err());
+        state.cancel_spawn(id);
+        let current = state.shutdown_preflight(now).unwrap().capability;
+        assert!(state.validate_upgrade_capability(&current, now).is_ok());
+        assert!(!state.shutting_down);
+    }
+
+    #[test]
+    fn committed_upgrade_fences_control_and_retains_checkpoint_until_close() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = crate::upgrade::handoff::Store::open(directory.path()).unwrap();
+        let host = Arc::new(Mutex::new(test_host()));
+        let capability = host
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .shutdown_preflight(Instant::now())
+            .unwrap()
+            .capability;
+        assert_eq!(
+            prepare_upgrade_with(&host, capability, || Ok(store)).unwrap(),
+            (0, 0)
+        );
+        assert!(
+            host.lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .reserve_spawn(TerminalId::new())
+                .is_err()
+        );
+        let checkpoint = crate::upgrade::handoff::Store::open(directory.path())
+            .unwrap()
+            .load()
+            .unwrap()
+            .unwrap();
+        assert!(checkpoint.require_ready().is_err());
+        finish_upgrade(&host).unwrap();
+        crate::upgrade::handoff::Store::open(directory.path())
+            .unwrap()
+            .load()
+            .unwrap()
+            .unwrap()
+            .require_ready()
+            .unwrap();
+    }
+
+    #[test]
+    fn restored_shell_links_exact_old_source_and_does_not_replay_consumed_checkpoint() {
+        use crate::upgrade::handoff::{Checkpoint, Phase, Store, Terminal};
+        let directory = tempfile::tempdir().unwrap();
+        let empty_proc = directory.path().join("proc");
+        fs::create_dir(&empty_proc).unwrap();
+        let old = test_host().proof().clone();
+        let recipe = crate::model::LaunchRecipe::shell(directory.path().to_owned()).unwrap();
+        let source = TerminalSession {
+            id: TerminalId::new(),
+            launch: recipe.clone(),
+            transcript_path: Some(directory.path().join("shell.log")),
+            resume_hint: None,
+            continuity: TerminalContinuity::DetachedSameBoot {
+                host_session_id: old.host_session_id.clone(),
+                boot_id: old.boot_id.clone(),
+                host_incarnation: old.host_incarnation.clone(),
+            },
+        };
+        let mut checkpoint = Checkpoint::new(
+            old,
+            vec![Terminal {
+                source: source.clone(),
+                previous_sources: Vec::new(),
+                recipe,
+                options: TerminalSpawnOptions::default(),
+            }],
+            Vec::new(),
+        );
+        checkpoint.phase = Phase::Ready;
+        let store = Store::open(directory.path()).unwrap();
+        store.save(&checkpoint).unwrap();
+        let mut replacement = test_host();
+        replacement.proof.host_incarnation = HostIncarnation::new("replacement-incarnation");
+        let expected = replacement.proof.clone();
+        let host = Arc::new(Mutex::new(replacement));
+        restore_upgrade_from(&host, store, &empty_proc).unwrap();
+        let descriptor = host
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .descriptor(0, source.id)
+            .unwrap();
+        assert_eq!(descriptor.upgrade_sources, vec![source.clone()]);
+        assert_eq!(descriptor.session.continuity.live_proof(), Some(expected));
+        assert_eq!(descriptor.session.transcript_path, source.transcript_path);
+        restore_upgrade_from(&host, Store::open(directory.path()).unwrap(), &empty_proc).unwrap();
+        let capability = host
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .shutdown_preflight(Instant::now())
+            .unwrap()
+            .capability;
+        prepare_upgrade_with(&host, capability, || Store::open(directory.path())).unwrap();
+        finish_upgrade(&host).unwrap();
+        let store = Store::open(directory.path()).unwrap();
+        let second = store.load().unwrap().unwrap();
+        let mut forged = second.clone();
+        forged.terminals[0].previous_sources[0].id = TerminalId::new();
+        assert!(forged.validate().is_err());
+        let mut forged = second.clone();
+        forged.terminals[0].previous_sources[0]
+            .launch
+            .environment
+            .insert("UNRELATED".into(), "1".into());
+        assert!(forged.validate().is_err());
+        let mut forged = second.clone();
+        forged.terminals[0].previous_sources[0].continuity =
+            second.terminals[0].source.continuity.clone();
+        assert!(forged.validate().is_err());
+        let mut third = test_host();
+        third.proof.host_incarnation = HostIncarnation::new("third-incarnation");
+        let host = Arc::new(Mutex::new(third));
+        restore_upgrade_from(&host, store, &empty_proc).unwrap();
+        let third = host
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .descriptor(0, source.id)
+            .unwrap();
+        assert_eq!(
+            third.upgrade_sources,
+            vec![source.clone(), second.terminals[0].source.clone()]
+        );
+        assert_ne!(
+            third.session.continuity.live_proof(),
+            descriptor.session.continuity.live_proof()
+        );
+        let handle = {
+            let state = host.lock().unwrap_or_else(|p| p.into_inner());
+            assert_eq!(state.terminals.len(), 1);
+            state.terminals[&source.id].handle.clone()
+        };
+        assert_eq!(
+            handle.close_checked(true),
+            crate::terminal_ipc::TerminalCloseResult::Closed
+        );
     }
 
     #[test]

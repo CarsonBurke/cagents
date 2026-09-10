@@ -2,11 +2,34 @@ use cosmic::{Core, app::cosmic::Cosmic, iced};
 use tracing_subscriber::EnvFilter;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let mut arguments = std::env::args().skip(1);
-    if let Some(argument) = arguments.next() {
-        if argument != "--confirm-daemon-stop" {
-            return Err(format!("unknown UI argument: {argument}").into());
+    let previous_hook = std::panic::take_hook();
+    let main_thread = std::thread::current().id();
+    std::panic::set_hook(Box::new(move |panic| {
+        if std::thread::current().id() == main_thread {
+            let _ = cagents::instance::report_ui_startup(&Err(format!(
+                "UI initialization failed: {panic}"
+            )));
         }
+        previous_hook(panic);
+    }));
+    let result = run();
+    if let Err(error) = &result {
+        let _ = cagents::instance::report_ui_startup(&Err(error.to_string()));
+    } else {
+        let _ = cagents::instance::report_ui_startup(&Err(
+            "UI exited before opening its window".into()
+        ));
+    }
+    result
+}
+
+fn run() -> Result<(), Box<dyn std::error::Error>> {
+    let mut arguments = std::env::args().skip(1).peekable();
+    if arguments
+        .peek()
+        .is_some_and(|argument| argument == "--confirm-daemon-stop")
+    {
+        arguments.next();
         let payload = arguments
             .next()
             .ok_or("missing shutdown confirmation capability")?;
@@ -17,27 +40,48 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             serde_json::from_str(&payload)?;
         return cagents::app::run_daemon_stop_confirmation(capability);
     }
-    let _application_lease = cagents::instance::ApplicationLease::acquire_for_ui()?;
-    let (activation_tx, activation_rx) = async_channel::unbounded();
-    let activation = match cagents::instance::UiActivationListener::bind(activation_tx) {
-        Ok(listener) => Some((listener, activation_rx)),
-        Err(error) => {
-            eprintln!("cagents-ui: could not listen for later launches: {error}");
-            None
+    let mut new_window = false;
+    let mut slot = None;
+    let mut source = None;
+    while let Some(argument) = arguments.next() {
+        match argument.as_str() {
+            "--new-window" => new_window = true,
+            "--window" => slot = Some(arguments.next().ok_or("missing window name")?),
+            "--from-window" => source = Some(arguments.next().ok_or("missing source window name")?),
+            _ => return Err(format!("unknown UI argument: {argument}").into()),
         }
-    };
+    }
+    if new_window && slot.is_some() {
+        return Err("--new-window and --window are mutually exclusive".into());
+    }
+    let fixture =
+        cfg!(feature = "latency-harness") && std::env::var_os("CAGENTS_LATENCY_OUTPUT").is_some();
+    let startup = (|| -> Result<_, Box<dyn std::error::Error>> {
+        let lease = cagents::instance::WindowLease::acquire(new_window, slot.as_deref())?;
+        cagents::session::SessionRuntime::initialize_window(
+            source
+                .as_deref()
+                .unwrap_or(cagents::instance::PRIMARY_WINDOW),
+        )?;
+        let (activation_tx, activation_rx) = async_channel::unbounded();
+        let listener = cagents::instance::UiActivationListener::bind(activation_tx)?;
+        if !fixture {
+            cagents::terminal::ensure_daemon_ready()?;
+        }
+        let restored = cagents::app::Cagents::load_startup()?;
+        Ok((lease, (listener, activation_rx), restored))
+    })();
+    let (_application_lease, activation, restored) = startup?;
+    let restored = std::cell::RefCell::new(Some(restored));
+    let activation = Some(activation);
 
     tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
         .with_env_filter(
             EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| EnvFilter::new("cagents=info,warn")),
         )
         .init();
-    let fixture =
-        cfg!(feature = "latency-harness") && std::env::var_os("CAGENTS_LATENCY_OUTPUT").is_some();
-    if !fixture {
-        cagents::terminal::ensure_daemon_ready()?;
-    }
 
     // The pinned COSMIC run helper does not wire its scale_factor callback
     // into iced. Build the daemon through the public shell API so interface
@@ -70,8 +114,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let (window, open) = iced::window::open(window_settings);
             let mut core = Core::default();
             core.set_main_window_id(Some(window));
-            let (shell, initialize) = Shell::init((core, activation_rx.clone()));
-            (shell, iced::Task::batch([open.discard(), initialize]))
+            let startup = restored.borrow_mut().take().expect("UI initialized once");
+            let (shell, initialize) = Shell::init((core, (activation_rx.clone(), startup)));
+            let opened = open
+                .map(cagents::app::Message::StartupWindowOpened)
+                .map(cosmic::Action::App);
+            (shell, iced::Task::batch([opened, initialize]))
         },
         Shell::update,
         Shell::view,

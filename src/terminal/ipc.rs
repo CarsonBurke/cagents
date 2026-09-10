@@ -33,7 +33,8 @@ use crate::{
 /// Version 5 adds exact agent recovery identity semantic events.
 /// Version 6 adds parser themes, viewport scrolling, and proof-bound native chat.
 /// Version 7 adds PTY-owner-checked terminal close decisions.
-pub const PROTOCOL_VERSION: u16 = 7;
+/// Version 8 adds durable upgrade preparation and restored source linkage.
+pub const PROTOCOL_VERSION: u16 = 8;
 /// Postcard encodes an 80x24 grid in roughly 20 KiB and a typical single-row
 /// delta in a few hundred bytes, but a full repaint of a very large grid after
 /// a resize still has to fit, so keep generous headroom.
@@ -196,6 +197,12 @@ pub enum ClientRequest {
     },
     RefreshAgentActivity {
         terminal_id: TerminalId,
+    },
+    PrepareUpgrade {
+        capability: ShutdownCapability,
+    },
+    ResolveUpgradeChat {
+        source: crate::chat::Session,
     },
 }
 
@@ -400,6 +407,13 @@ pub enum ServerResponse {
         terminal_id: TerminalId,
         activity: Option<crate::agent::Activity>,
     },
+    UpgradePrepared {
+        terminals: u64,
+        chats: u64,
+    },
+    UpgradeChatResolved {
+        session: crate::chat::Session,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -503,6 +517,9 @@ pub struct TerminalDescriptor {
     pub transcript: Option<TranscriptMetadata>,
     pub activity: Option<TerminalOutputActivity>,
     pub agent_activity: Option<crate::agent::Activity>,
+    /// Authenticated former daemon identities retained by durable upgrade restore.
+    #[serde(default)]
+    pub upgrade_sources: Vec<TerminalSession>,
 }
 
 impl TerminalDescriptor {
@@ -529,6 +546,7 @@ impl TerminalDescriptor {
             transcript: None,
             activity: None,
             agent_activity: None,
+            upgrade_sources: Vec::new(),
         }
     }
 }

@@ -28,6 +28,18 @@ case $(getconf GNU_LIBC_VERSION 2>/dev/null || :) in
     *) fail 'packaging requires a glibc host' ;;
 esac
 
+# Release names describe an explicitly supported native target, not whichever
+# platform happened to invoke the packager. Add ports only with a real build lane.
+RELEASE_TARGET=${CAGENTS_RELEASE_TARGET:-x86_64-unknown-linux-gnu}
+case $RELEASE_TARGET in
+    x86_64-unknown-linux-gnu) DEB_ARCH=amd64 ;;
+    *) fail "unsupported release target: $RELEASE_TARGET" ;;
+esac
+case ${CARGO_BUILD_TARGET:-} in
+    '') ;;
+    *) fail 'unset CARGO_BUILD_TARGET; this script packages native release binaries' ;;
+esac
+
 if [ -z "${VERSION:-}" ]; then
     VERSION=$(sed -n '/^\[package\]/,/^\[/{s/^version = "\([^"]*\)"/\1/p;}' "$ROOT_DIR/Cargo.toml" | sed -n '1p')
 fi
@@ -39,8 +51,8 @@ case $VARIANT in
     full)
         TARGET_DIR=${CARGO_TARGET_DIR:-"$ROOT_DIR/target"}
         TOP_LEVEL=cagents-$VERSION
-        ARCHIVE_NAME=cagents-$VERSION-x86_64-unknown-linux-gnu.tar.gz
-        DEB_NAME=cagents_${VERSION}_amd64.deb
+        ARCHIVE_NAME=cagents-$VERSION-$RELEASE_TARGET.tar.gz
+        DEB_NAME=cagents_${VERSION}_${DEB_ARCH}.deb
         PACKAGE_NAME=cagents
         PACKAGE_SUMMARY='coding-agent workspace for Wayland'
         PACKAGE_DESCRIPTION=' cagents organizes coding-agent sessions, repositories, worktrees,
@@ -55,8 +67,8 @@ case $VARIANT in
     browserless)
         TARGET_DIR=${CARGO_TARGET_DIR:-"$ROOT_DIR/target/browserless"}
         TOP_LEVEL=cagents-browserless-$VERSION
-        ARCHIVE_NAME=cagents-browserless-$VERSION-x86_64-unknown-linux-gnu.tar.gz
-        DEB_NAME=cagents-browserless_${VERSION}_amd64.deb
+        ARCHIVE_NAME=cagents-browserless-$VERSION-$RELEASE_TARGET.tar.gz
+        DEB_NAME=cagents-browserless_${VERSION}_${DEB_ARCH}.deb
         PACKAGE_NAME=cagents-browserless
         PACKAGE_SUMMARY='browserless coding-agent workspace for Wayland'
         PACKAGE_DESCRIPTION=' cagents without the integrated Servo browser; saved browser cards
@@ -259,7 +271,7 @@ install -m 0644 "$SHARE_DIR/doc/cagents/LICENSE" "$DEB_ROOT/usr/share/doc/$PACKA
 cat > "$DEB_ROOT/DEBIAN/control" <<EOF
 Package: $PACKAGE_NAME
 Version: $VERSION
-Architecture: amd64
+Architecture: $DEB_ARCH
 Maintainer: cagents contributors <maintainers@cagents.dev>
 Depends: git, libc6 (>= 2.35), libfontconfig1, libfreetype6, libgcc-s1, libstdc++6, libwayland-client0, libxkbcommon0, zlib1g$EXTRA_DEPENDS
 Recommends: gh
@@ -291,6 +303,7 @@ ARCHIVE_BYTES=$(wc -c < "$DIST_DIR/$ARCHIVE_NAME")
 DEB_BYTES=$(wc -c < "$DIST_DIR/$DEB_NAME")
 cat > "$DIST_DIR/$SIZE_NAME" <<EOF
 variant=$VARIANT
+target=$RELEASE_TARGET
 resolved_package_ids=$RESOLVED_PACKAGE_IDS
 build_seconds=$BUILD_SECONDS
 installed_binary_bytes=$INSTALLED_BYTES
