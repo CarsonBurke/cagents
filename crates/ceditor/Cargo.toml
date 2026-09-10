@@ -1,0 +1,21 @@
+[package]
+name = "ceditor"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.93"
+license = "MIT"
+publish = false
+
+[features]
+default = []
+development = []
+
+[dependencies]
+cagents = { path = "../..", default-features = false, features = ["ui"] }
+clap = { version = "4.5", features = ["derive"] }
+directories = "6.0"
+libcosmic = { git = "https://github.com/pop-os/libcosmic.git", rev = "caec74c2559924443f12fc6faf97a5bcefe6271d", default-features = false, features = ["tokio", "wayland", "wgpu", "winit"] }
+tokio = { version = "1.47", features = ["rt-multi-thread"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+
+tempfile = "3.21"

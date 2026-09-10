@@ -1,3 +1,9 @@
+[workspace]
+members = [".", "crates/ceditor"]
+# Existing root build lanes keep their isolated feature graphs.
+default-members = ["."]
+resolver = "3"
+
 [package]
 name = "cagents"
 version = "0.1.0"

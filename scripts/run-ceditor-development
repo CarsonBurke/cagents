@@ -1,0 +1,19 @@
+#!/bin/sh
+set -eu
+caller_cwd=$PWD
+root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+cd "$root"
+case "${1:-}" in
+    --help)
+        printf '%s\n' 'Usage: scripts/run-ceditor-development [--] [FILE_OR_DIRECTORY...]' '' 'Builds only ceditor with dev-runtime and an isolated development identity.' 'No daemon, terminal host, Zig, or Servo is required.' 'Pass -- --help for ceditor CLI help; -- --settings-path prints its settings path.'
+        exit 0
+        ;;
+    --) shift ;;
+esac
+cargo build --locked --profile dev-runtime --package ceditor --features development
+# Cargo metadata honors target-dir from Cargo config as well as the environment.
+# It does not build or start any cagents binary.
+target=$(cargo metadata --no-deps --format-version 1 | sed -n 's/.*"target_directory":"\([^"]*\)".*/\1/p')
+[ -n "$target" ] || { printf '%s\n' 'Cargo did not report its target directory' >&2; exit 1; }
+cd "$caller_cwd"
+exec "$target/dev-runtime/ceditor" "$@"
