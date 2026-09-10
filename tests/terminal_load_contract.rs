@@ -105,7 +105,9 @@ fn wait_for_title(events: &EventReceiver<TerminalEvent>, expected: &str) {
         );
         match events.recv_timeout(remaining) {
             Ok(TerminalEvent::TitleChanged(title)) if title == expected => return,
-            Ok(TerminalEvent::TitleChanged(_)) | Ok(TerminalEvent::Bell) => {}
+            Ok(TerminalEvent::TitleChanged(_))
+            | Ok(TerminalEvent::ResumeHintChanged(_))
+            | Ok(TerminalEvent::Bell) => {}
             Ok(TerminalEvent::Error { operation, message }) => {
                 panic!("terminal error during {operation}: {message}")
             }
@@ -255,6 +257,41 @@ fn hidden_output_updates_terminal_state_without_redraw_until_reveal() {
     terminal
         .shutdown()
         .expect("terminal should shut down cleanly");
+}
+
+#[test]
+fn hibernated_terminal_preserves_process_output_through_hidden_restore() {
+    let (terminal, events, callbacks, wakes) = spawn_with_probe(true);
+    let initial = receive_wake(&wakes, "initial terminal snapshot did not wake");
+    wait_for_title(&events, "ready");
+    terminal.acknowledge_redraw(initial.generation);
+    receive_wake(&wakes, "ready output was not captured");
+    let visible_callbacks = callbacks.load(Ordering::SeqCst);
+
+    terminal.hibernate().unwrap();
+    send_step(&terminal, "WHILE_HIBERNATED");
+    wait_for_title(&events, "WHILE_HIBERNATED");
+    let detached = terminal.snapshot();
+    assert!(detached.detached);
+    assert_eq!(callbacks.load(Ordering::SeqCst), visible_callbacks);
+
+    terminal.restore(false).unwrap();
+    send_step(&terminal, "AFTER_HIDDEN_RESTORE");
+    wait_for_title(&events, "AFTER_HIDDEN_RESTORE");
+    assert!(Arc::ptr_eq(&detached, &terminal.snapshot()));
+    assert_no_queued_wake(&wakes, "hidden restoration must not publish a frame");
+
+    terminal.restore(true).unwrap();
+    receive_wake(
+        &wakes,
+        "visible restoration did not recover terminal output",
+    );
+    let text = snapshot_text(&terminal);
+    for expected in ["READY", "WHILE_HIBERNATED", "AFTER_HIDDEN_RESTORE"] {
+        assert!(text.contains(expected), "missing {expected:?}: {text:?}");
+    }
+    assert_eq!(callbacks.load(Ordering::SeqCst), visible_callbacks + 1);
+    assert!(!terminal.snapshot().detached);
 }
 
 #[test]

@@ -445,6 +445,52 @@ impl TerminalGeometry {
     }
 }
 
+/// An overlay: its generous hit target never subtracts space from the grid.
+#[derive(Clone, Copy, Debug)]
+struct TerminalScrollbar {
+    track: Rectangle,
+    thumb: Rectangle,
+    max_offset: u64,
+}
+
+impl TerminalScrollbar {
+    fn new(bounds: Rectangle, scroll: super::ScrollSnapshot, focused: bool) -> Option<Self> {
+        if !focused || !scroll.scrollable() || bounds.height <= 0.0 || bounds.width <= 0.0 {
+            return None;
+        }
+        let track = Rectangle {
+            x: bounds.x + (bounds.width - 12.0).max(0.0),
+            width: bounds.width.min(12.0),
+            ..bounds
+        };
+        let height = (track.height * (scroll.len as f64 / scroll.total as f64) as f32)
+            .max(24.0)
+            .min(track.height);
+        let max_offset = scroll.max_offset();
+        let thumb = Rectangle {
+            y: track.y
+                + (track.height - height)
+                    * (scroll.offset.min(max_offset) as f64 / max_offset as f64) as f32,
+            height,
+            ..track
+        };
+        Some(Self {
+            track,
+            thumb,
+            max_offset,
+        })
+    }
+
+    fn row_at(self, pointer_y: f32, grab_offset: f32) -> u64 {
+        let travel = self.track.height - self.thumb.height;
+        if travel <= 0.0 {
+            return 0;
+        }
+        let fraction = ((pointer_y - self.track.y - grab_offset) / travel).clamp(0.0, 1.0);
+        (fraction as f64 * self.max_offset as f64).round() as u64
+    }
+}
+
 #[derive(Default)]
 struct WidgetState {
     last_size: Option<TerminalSize>,
@@ -453,6 +499,8 @@ struct WidgetState {
     pressed_buttons: u8,
     modifiers: KeyModifiers,
     last_cursor: Option<Point>,
+    scrollbar_drag: Option<f32>,
+    wheel_remainder: f32,
     /// Shaped text, reused across frames. Mutated through `&self` because
     /// `draw` is the only place that knows which rows are actually visible.
     shaped: RefCell<ShapeCache>,
@@ -615,7 +663,7 @@ impl<Message> TerminalWidget<Message> {
             font_family: "",
             line_height: LINE_HEIGHT_RATIO,
             padding: DEFAULT_PADDING,
-            cursor_style: TerminalCursorStyle::Application,
+            cursor_style: TerminalCursorStyle::default(),
             scale_factor: 1.0,
             model_focused: false,
             on_focus: None,
@@ -723,6 +771,7 @@ impl<Message> TerminalWidget<Message> {
                 state.focused = self.model_focused;
                 if !state.focused {
                     state.pressed_buttons = 0;
+                    state.scrollbar_drag = None;
                 }
             }
             Err(error) => self.publish_error(error, shell),
@@ -816,6 +865,45 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for TerminalWidget<Message
         let state = tree.state.downcast_mut::<WidgetState>();
         self.synchronize_size(state, geometry, shell);
         self.synchronize_focus(state, shell);
+        let scrollbar = TerminalScrollbar::new(bounds, self.snapshot.scroll, self.model_focused);
+        if scrollbar.is_none() {
+            state.scrollbar_drag = None;
+        }
+        if let Some(bar) = scrollbar {
+            let target = match event {
+                Event::Mouse(mouse::Event::ButtonPressed(IcedMouseButton::Left))
+                    if cursor.is_over(bar.track) =>
+                {
+                    let position = cursor.position().expect("cursor over scrollbar");
+                    let grab = if bar.thumb.contains(position) {
+                        position.y - bar.thumb.y
+                    } else {
+                        bar.thumb.height / 2.0
+                    };
+                    state.scrollbar_drag = Some(grab);
+                    Some(bar.row_at(position.y, grab))
+                }
+                Event::Mouse(mouse::Event::CursorMoved { position })
+                    if state.scrollbar_drag.is_some() =>
+                {
+                    Some(bar.row_at(position.y, state.scrollbar_drag.unwrap()))
+                }
+                Event::Mouse(mouse::Event::ButtonReleased(IcedMouseButton::Left))
+                    if state.scrollbar_drag.take().is_some() =>
+                {
+                    shell.capture_event();
+                    return;
+                }
+                _ => None,
+            };
+            if let Some(row) = target {
+                if let Err(error) = self.handle.scroll_to_row(row) {
+                    self.publish_error(error, shell);
+                }
+                shell.capture_event();
+                return;
+            }
+        }
 
         match event {
             Event::Keyboard(keyboard::Event::KeyPressed {
@@ -909,13 +997,50 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for TerminalWidget<Message
                     ScrollDelta::Lines { y, .. } => *y,
                     ScrollDelta::Pixels { y, .. } => *y / geometry.cell_height,
                 };
-                let delta = -(lines.round() as isize);
+                state.wheel_remainder -= lines;
+                let delta = (state.wheel_remainder.trunc() as isize).clamp(-128, 128);
+                state.wheel_remainder -= delta as f32;
                 if delta != 0 {
-                    match self.handle.scroll_lines(delta) {
-                        Ok(()) => shell.capture_event(),
-                        Err(error) => self.publish_error(error, shell),
+                    if self.snapshot.scroll.mouse_tracking && !state.modifiers.shift {
+                        if let Some(position) = geometry.cursor_position(cursor) {
+                            for _ in 0..delta.unsigned_abs() {
+                                self.send_mouse(
+                                    state,
+                                    geometry,
+                                    position,
+                                    MouseAction::Press,
+                                    Some(if delta < 0 {
+                                        MouseButton::WheelUp
+                                    } else {
+                                        MouseButton::WheelDown
+                                    }),
+                                    shell,
+                                );
+                            }
+                        }
+                    } else if self.snapshot.scroll.alternate_screen && !state.modifiers.shift {
+                        for _ in 0..delta.unsigned_abs() {
+                            let input = KeyInput {
+                                action: KeyAction::Press,
+                                key: if delta < 0 {
+                                    TerminalKey::ArrowUp
+                                } else {
+                                    TerminalKey::ArrowDown
+                                },
+                                modifiers: state.modifiers,
+                                text: None,
+                                unshifted_codepoint: None,
+                            };
+                            if let Err(error) = self.handle.key(input) {
+                                self.publish_error(error, shell);
+                                break;
+                            }
+                        }
+                    } else if let Err(error) = self.handle.scroll_lines(delta) {
+                        self.publish_error(error, shell);
                     }
                 }
+                shell.capture_event();
             }
             _ => {}
         }
@@ -1067,6 +1192,26 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for TerminalWidget<Message
                     );
                 }
             });
+            if let Some(bar) =
+                TerminalScrollbar::new(bounds, self.snapshot.scroll, self.model_focused)
+            {
+                renderer.fill_quad(
+                    renderer::Quad {
+                        bounds: Rectangle {
+                            x: bar.track.x + (bar.track.width - 4.0).max(0.0),
+                            width: bar.track.width.min(3.0),
+                            ..bar.thumb
+                        },
+                        border: Border {
+                            radius: 2.0.into(),
+                            ..Border::default()
+                        },
+                        shadow: Shadow::default(),
+                        snap: true,
+                    },
+                    color(self.snapshot.foreground).scale_alpha(0.45),
+                );
+            }
         });
         if let Some(started) = draw_started {
             // This records CPU draw-command construction, not GPU completion
@@ -1088,6 +1233,11 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for TerminalWidget<Message
         _viewport: &Rectangle,
         _renderer: &Renderer,
     ) -> mouse::Interaction {
+        if TerminalScrollbar::new(layout.bounds(), self.snapshot.scroll, self.model_focused)
+            .is_some_and(|bar| cursor.is_over(bar.track))
+        {
+            return mouse::Interaction::Pointer;
+        }
         if cursor.is_over(layout.bounds()) {
             mouse::Interaction::Text
         } else {
@@ -1491,6 +1641,52 @@ mod tests {
     use crate::terminal::CellText;
 
     use super::*;
+
+    #[test]
+    fn scrollbar_requires_focused_history_and_drag_clamps_to_real_offsets() {
+        let bounds = Rectangle {
+            x: 20.0,
+            y: 30.0,
+            width: 400.0,
+            height: 300.0,
+        };
+        let scroll = super::super::ScrollSnapshot {
+            total: 100,
+            offset: 40,
+            len: 20,
+            alternate_screen: false,
+            mouse_tracking: false,
+        };
+        assert!(TerminalScrollbar::new(bounds, scroll, false).is_none());
+        assert!(
+            TerminalScrollbar::new(
+                bounds,
+                super::super::ScrollSnapshot {
+                    alternate_screen: true,
+                    ..scroll
+                },
+                true
+            )
+            .is_none()
+        );
+        assert!(
+            TerminalScrollbar::new(
+                bounds,
+                super::super::ScrollSnapshot {
+                    total: 20,
+                    ..scroll
+                },
+                true
+            )
+            .is_none()
+        );
+        let bar = TerminalScrollbar::new(bounds, scroll, true).unwrap();
+        assert_eq!(bar.thumb.height, 60.0);
+        assert_eq!(bar.row_at(bar.thumb.y + 10.0, 10.0), 40);
+        assert_eq!(bar.row_at(-500.0, 10.0), 0);
+        assert_eq!(bar.row_at(900.0, 10.0), 80);
+        assert_eq!(bar.track.x + bar.track.width, bounds.x + bounds.width);
+    }
 
     #[test]
     fn fractional_scale_grid_and_resize_share_one_geometry() {

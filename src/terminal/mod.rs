@@ -13,13 +13,14 @@ pub use ipc::TerminalSpawnOptions;
 pub use hosted::{HostedTerminalHandle, HostedTerminalStartError, ensure_daemon_ready};
 pub use snapshot::{
     CellSnapshot, CellStyle, CellText, CursorShape, CursorSnapshot, RenderSnapshot, Rgb,
-    RowSnapshot, Underline,
+    RowSnapshot, ScrollSnapshot, Underline,
 };
 #[cfg(feature = "ui")]
 pub use surface::TerminalSurface;
 pub use types::{
     KeyAction, KeyInput, KeyModifiers, MouseAction, MouseButton, MouseInput, TerminalConfig,
-    TerminalEvent, TerminalKey, TerminalSendError, TerminalSize, TerminalStartError, TerminalWake,
+    TerminalEvent, TerminalKey, TerminalSendError, TerminalSize, TerminalStartError, TerminalTheme,
+    TerminalWake,
 };
 #[cfg(feature = "ui")]
 pub use widget::{CellMetrics, TerminalWidget};

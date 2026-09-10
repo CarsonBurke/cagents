@@ -1,5 +1,5 @@
 use std::{
-    cell::RefCell,
+    cell::{Cell, RefCell},
     io::{BufWriter, Read, Write},
     path::PathBuf,
     rc::Rc,
@@ -17,7 +17,8 @@ use libghostty_vt::{
     Terminal, TerminalOptions, focus,
     key::{self, Encoder as KeyEncoder},
     mouse::{self, Encoder as MouseEncoder},
-    terminal::{Mode, ScrollViewport},
+    style::{PaletteIndex, RgbColor},
+    terminal::{ColorScheme, Mode, ScrollViewport},
 };
 use portable_pty::{
     ChildKiller, CommandBuilder, ExitStatus, MasterPty, PtySize, native_pty_system,
@@ -33,7 +34,7 @@ use super::{
     types::{
         KeyAction, KeyInput, KeyModifiers, MouseAction, MouseButton, MouseInput, TerminalConfig,
         TerminalEvent, TerminalKey, TerminalSendError, TerminalSize, TerminalStartError,
-        TerminalWake,
+        TerminalTheme, TerminalWake,
     },
 };
 
@@ -48,6 +49,7 @@ enum Command {
     Focus(bool),
     Resize(TerminalSize),
     Scroll(ScrollCommand),
+    SetTheme(TerminalTheme),
     Hide,
     Reveal,
     Hibernate,
@@ -60,6 +62,7 @@ enum ScrollCommand {
     Top,
     Bottom,
     Delta(isize),
+    Row(usize),
 }
 
 #[derive(Debug)]
@@ -357,6 +360,14 @@ impl TerminalHandle {
         self.try_command(Command::Scroll(ScrollCommand::Bottom))
     }
 
+    pub fn scroll_to_row(&self, row: usize) -> Result<(), TerminalSendError> {
+        self.try_command(Command::Scroll(ScrollCommand::Row(row)))
+    }
+
+    pub fn set_theme(&self, theme: TerminalTheme) -> Result<(), TerminalSendError> {
+        self.try_command(Command::SetTheme(theme))
+    }
+
     pub fn hide(&self) -> Result<(), TerminalSendError> {
         self.try_command(Command::Hide)
     }
@@ -408,7 +419,11 @@ fn command_channel(capacity: usize) -> (Sender<Command>, Receiver<Command>) {
 
 struct Worker {
     terminal_id: crate::model::TerminalId,
+    launch: LaunchRecipe,
+    resume_hint: Option<String>,
+    resume_foreground: Option<libc::pid_t>,
     terminal: Terminal<'static, 'static>,
+    theme: Rc<Cell<TerminalTheme>>,
     key_encoder: KeyEncoder<'static>,
     mouse_encoder: MouseEncoder<'static>,
     effects: Rc<RefCell<Vec<Effect>>>,
@@ -451,6 +466,15 @@ impl Worker {
             max_scrollback: config.max_scrollback,
         })
         .map_err(|error| format!("create Ghostty terminal: {error}"))?;
+        apply_theme(&mut terminal, config.theme)
+            .map_err(|error| format!("configure terminal theme: {error}"))?;
+        let theme = Rc::new(Cell::new(config.theme));
+        terminal
+            .on_color_scheme({
+                let theme = Rc::clone(&theme);
+                move |_| Some(theme_scheme(theme.get()))
+            })
+            .map_err(|error| format!("register color scheme query: {error}"))?;
 
         let effects = Rc::new(RefCell::new(Vec::new()));
         terminal
@@ -533,7 +557,11 @@ impl Worker {
 
         Ok(Self {
             terminal_id: session.id,
+            resume_hint: crate::model::agent_recovery::observed_hint_from_launch(&session.launch),
+            resume_foreground: None,
+            launch: session.launch,
             terminal,
+            theme,
             key_encoder,
             mouse_encoder,
             effects,
@@ -692,6 +720,7 @@ impl Worker {
         if bytes.is_empty() {
             return;
         }
+        self.refresh_resume_hint(false);
         {
             let mut activity = self
                 .published
@@ -760,9 +789,31 @@ impl Worker {
                     ScrollCommand::Top => ScrollViewport::Top,
                     ScrollCommand::Bottom => ScrollViewport::Bottom,
                     ScrollCommand::Delta(delta) => ScrollViewport::Delta(delta),
+                    ScrollCommand::Row(row) => ScrollViewport::Row(row),
                 });
                 if self.visibility == Visibility::Visible {
                     self.publish_snapshot(false);
+                }
+            }
+            Command::SetTheme(theme) => {
+                if self.theme.get() != theme {
+                    match apply_theme(&mut self.terminal, theme) {
+                        Ok(()) => {
+                            self.theme.set(theme);
+                            if self
+                                .terminal
+                                .mode(Mode::COLOR_SCHEME_REPORT)
+                                .unwrap_or(false)
+                            {
+                                let mut buffer = [0; 32];
+                                if let Ok(len) = theme_scheme(theme).encode_report(&mut buffer) {
+                                    self.write_pty(&buffer[..len], "report terminal color scheme");
+                                }
+                            }
+                            self.publish_snapshot(true);
+                        }
+                        Err(error) => self.error("set terminal theme", error.to_string()),
+                    }
                 }
             }
             Command::Hide => self.set_hidden(),
@@ -874,25 +925,10 @@ impl Worker {
     }
 
     fn restore_visuals(&mut self, visible: bool) {
-        if self.visual.is_none() {
-            match VisualResources::new() {
-                Ok(visual) => self.visual = Some(visual),
-                Err(error) => {
-                    self.error("restore render state", error.to_string());
-                    return;
-                }
-            }
-        }
         if visible {
-            self.published
-                .acknowledged_generation
-                .store(self.generation, Ordering::Release);
-            self.visibility = Visibility::Visible;
-            self.published.visible.store(true, Ordering::Release);
-            self.publish_snapshot(true);
+            self.reveal();
         } else {
-            self.visibility = Visibility::Hidden;
-            self.published.suppress_wakes();
+            self.set_hidden();
         }
     }
 
@@ -961,8 +997,31 @@ impl Worker {
             match effect {
                 Effect::PtyWrite(bytes) => self.write_pty(&bytes, "write terminal response"),
                 Effect::Bell => self.emit(TerminalEvent::Bell),
-                Effect::Title(title) => self.emit(TerminalEvent::TitleChanged(title)),
+                Effect::Title(title) => {
+                    self.refresh_resume_hint(true);
+                    self.emit(TerminalEvent::TitleChanged(title));
+                }
             }
+        }
+    }
+
+    fn refresh_resume_hint(&mut self, title_changed: bool) {
+        let Some(fd) = self.master.as_raw_fd() else {
+            return;
+        };
+        // SAFETY: the master owns this live PTY descriptor throughout the call.
+        let foreground = unsafe { libc::tcgetpgrp(fd) };
+        // An exited group is not evidence that the last saved identity changed.
+        if foreground <= 0 || (!title_changed && self.resume_foreground == Some(foreground)) {
+            return;
+        }
+        self.resume_foreground = Some(foreground);
+        // PTY output is already wake-driven. Only a changed foreground group or
+        // title reads argv; steady output does not scan /proc or allocate hints.
+        let hint = crate::model::agent_recovery::foreground_hint(foreground, &self.launch);
+        if hint != self.resume_hint {
+            self.resume_hint = hint.clone();
+            self.emit(TerminalEvent::ResumeHintChanged(hint));
         }
     }
 
@@ -986,6 +1045,63 @@ impl Worker {
     fn error(&self, operation: &'static str, message: String) {
         self.emit(TerminalEvent::Error { operation, message });
     }
+}
+
+fn theme_scheme(theme: TerminalTheme) -> ColorScheme {
+    if theme == TerminalTheme::Light {
+        ColorScheme::Light
+    } else {
+        ColorScheme::Dark
+    }
+}
+
+/// Set parser defaults, not resolved UI RGB values: truecolor and application
+/// OSC overrides retain their meaning, and OSC queries observe the same colors.
+fn apply_theme(
+    terminal: &mut Terminal<'_, '_>,
+    theme: TerminalTheme,
+) -> Result<(), libghostty_vt::Error> {
+    let (foreground, background, ansi) = match theme {
+        TerminalTheme::Dark => (
+            0xd8dee9,
+            0x20242b,
+            [
+                0x3b4252, 0xbf616a, 0xa3be8c, 0xebcb8b, 0x81a1c1, 0xb48ead, 0x88c0d0, 0xe5e9f0,
+                0x4c566a, 0xd08770, 0xb1d196, 0xf0d399, 0x8fbcdb, 0xc5a0c0, 0x93ccdc, 0xeceff4,
+            ],
+        ),
+        TerminalTheme::Light => (
+            0x24292f,
+            0xffffff,
+            [
+                0x24292f, 0xcf222e, 0x116329, 0x7d4e00, 0x0969da, 0x8250df, 0x1b7c83, 0x6e7781,
+                0x57606a, 0xa40e26, 0x1a7f37, 0x9a6700, 0x0550ae, 0x6639ba, 0x0a6269, 0x8c959f,
+            ],
+        ),
+        TerminalTheme::SolarizedDark => (
+            0x839496,
+            0x002b36,
+            [
+                0x073642, 0xdc322f, 0x859900, 0xb58900, 0x268bd2, 0xd33682, 0x2aa198, 0xeee8d5,
+                0x002b36, 0xcb4b16, 0x586e75, 0x657b83, 0x839496, 0x6c71c4, 0x93a1a1, 0xfdf6e3,
+            ],
+        ),
+    };
+    let rgb = |value: u32| RgbColor {
+        r: (value >> 16) as u8,
+        g: (value >> 8) as u8,
+        b: value as u8,
+    };
+    terminal
+        .set_default_fg_color(Some(rgb(foreground)))?
+        .set_default_bg_color(Some(rgb(background)))?
+        .set_default_cursor_color(Some(rgb(foreground)))?;
+    let mut palette = terminal.default_color_palette()?;
+    for (index, value) in ansi.into_iter().enumerate() {
+        palette.set(PaletteIndex(index as u8), rgb(value));
+    }
+    terminal.set_default_color_palette(Some(palette))?;
+    Ok(())
 }
 
 fn wait_for_worker_event(
@@ -1376,6 +1492,8 @@ fn map_mouse_button(button: MouseButton) -> mouse::Button {
         MouseButton::Middle => mouse::Button::Middle,
         MouseButton::Back => mouse::Button::Four,
         MouseButton::Forward => mouse::Button::Five,
+        MouseButton::WheelUp => mouse::Button::Four,
+        MouseButton::WheelDown => mouse::Button::Five,
         MouseButton::Other(number) => match number {
             4 => mouse::Button::Four,
             5 => mouse::Button::Five,
@@ -1403,6 +1521,69 @@ mod tests {
     use tempfile::tempdir;
 
     use super::*;
+
+    #[test]
+    fn changing_parser_theme_preserves_truecolor_and_osc_overrides_and_queries() {
+        let mut terminal = Terminal::new(TerminalOptions {
+            cols: 8,
+            rows: 2,
+            max_scrollback: 0,
+        })
+        .unwrap();
+        let replies = Rc::new(RefCell::new(Vec::new()));
+        terminal
+            .on_pty_write({
+                let replies = Rc::clone(&replies);
+                move |_, bytes| replies.borrow_mut().extend_from_slice(bytes)
+            })
+            .unwrap();
+        apply_theme(&mut terminal, TerminalTheme::Dark).unwrap();
+        terminal.vt_write(b"\x1b[38;2;18;52;86mT\x1b[0mD\x1b[31mR\x1b[0m");
+        let mut visual = VisualResources::new().unwrap();
+        let dark = visual.capture(&terminal, 1, true, None).unwrap().unwrap();
+        terminal.vt_write(b"\x1b]10;?\x07\x1b]11;?\x07\x1b]4;1;?\x07");
+        let dark_queries = std::mem::take(&mut *replies.borrow_mut());
+        apply_theme(&mut terminal, TerminalTheme::Light).unwrap();
+        let light = visual.capture(&terminal, 2, true, None).unwrap().unwrap();
+        assert_eq!(
+            dark.lines[0].cells[0].foreground,
+            light.lines[0].cells[0].foreground
+        );
+        assert_ne!(
+            dark.lines[0].cells[1].foreground,
+            light.lines[0].cells[1].foreground
+        );
+        assert_ne!(
+            dark.lines[0].cells[2].foreground,
+            light.lines[0].cells[2].foreground
+        );
+        terminal.vt_write(b"\x1b]10;?\x07\x1b]11;?\x07\x1b]4;1;?\x07");
+        let light_queries = std::mem::take(&mut *replies.borrow_mut());
+        assert!(!light_queries.is_empty());
+        assert_ne!(dark_queries, light_queries);
+        terminal.vt_write(b"\x1b]10;#123456\x07\x1b]11;#345678\x07\x1b]4;1;#56789a\x07");
+        terminal.vt_write(b"\x1b]10;?\x07\x1b]11;?\x07\x1b]4;1;?\x07");
+        let overridden = std::mem::take(&mut *replies.borrow_mut());
+        apply_theme(&mut terminal, TerminalTheme::SolarizedDark).unwrap();
+        terminal.vt_write(b"\x1b]10;?\x07\x1b]11;?\x07\x1b]4;1;?\x07");
+        assert_eq!(*replies.borrow(), overridden);
+        terminal.vt_write(b"\x1b]110\x07\x1b]111\x07\x1b]104;1\x07");
+        assert_eq!(
+            terminal.fg_color().unwrap(),
+            terminal.default_fg_color().unwrap()
+        );
+        assert_eq!(
+            terminal.bg_color().unwrap(),
+            terminal.default_bg_color().unwrap()
+        );
+        assert_eq!(
+            terminal.color_palette().unwrap().get(PaletteIndex::RED),
+            terminal
+                .default_color_palette()
+                .unwrap()
+                .get(PaletteIndex::RED)
+        );
+    }
 
     fn capture_worker() -> (Worker, Receiver<TerminalEvent>) {
         let recipe = LaunchRecipe {

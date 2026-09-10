@@ -76,8 +76,38 @@ impl DeliveryQueue {
             }
             return Ok(());
         }
+        if let ServerMessage::ChatChanged { chat_id } = &message.message
+            && state.messages.iter().any(|candidate| {
+                matches!(&candidate.message,
+                ServerMessage::ChatChanged { chat_id: existing } if existing == chat_id)
+            })
+        {
+            return Ok(());
+        }
 
-        if state.messages.len() >= self.capacity {
+        // Native transcript pages can be several MiB. Two queued pages are
+        // sufficient for the single-read-credit client; do not allow the ordinary
+        // small-message count limit to retain gigabytes for a stalled peer.
+        let large_chat = |message: &ServerMessage| {
+            matches!(
+                message,
+                ServerMessage::Response {
+                    response: crate::terminal_ipc::ServerResponse::ChatAttached { .. }
+                        | crate::terminal_ipc::ServerResponse::ChatSnapshot { .. }
+                        | crate::terminal_ipc::ServerResponse::ChatListed { .. }
+                        | crate::terminal_ipc::ServerResponse::ChatClosed { .. }
+                }
+            )
+        };
+        let chat_backlog = large_chat(&message.message)
+            && state
+                .messages
+                .iter()
+                .filter(|queued| large_chat(&queued.message))
+                .take(2)
+                .count()
+                == 2;
+        if state.messages.len() >= self.capacity || chat_backlog {
             state.aborted = true;
             state.messages.clear();
             self.available.notify_all();

@@ -73,6 +73,14 @@ impl TerminalSurface {
         self.0.scroll_to_bottom()
     }
 
+    pub fn scroll_to_row(&self, row: u64) -> Result<(), TerminalSendError> {
+        self.0.scroll_to_row(row)
+    }
+
+    pub fn set_theme(&self, theme: super::TerminalTheme) -> Result<(), TerminalSendError> {
+        self.0.set_theme(theme)
+    }
+
     pub fn hide(&self) -> Result<(), TerminalSendError> {
         self.0.hide()
     }

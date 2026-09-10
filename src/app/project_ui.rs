@@ -1,0 +1,802 @@
+use super::*;
+use crate::repository::{CommandSpec, ProcessExecutor, SystemProcessExecutor};
+use crate::{
+    github::avatar::{self, OwnerKey},
+    model::WorktreeId,
+    sidebar::ProjectCommand,
+};
+
+#[derive(Debug, Default)]
+pub struct State {
+    owners: HashMap<OwnerKey, Option<iced::advanced::image::Handle>>,
+    projects: HashMap<ProjectId, OwnerKey>,
+    dialog: Option<Dialog>,
+    file_editor: Option<FileEditorDialog>,
+}
+
+impl State {
+    pub fn modal_open(&self) -> bool {
+        self.dialog.is_some() || self.file_editor.is_some()
+    }
+    pub fn deleting(&self) -> bool {
+        self.dialog.as_ref().is_some_and(|dialog| dialog.pending)
+    }
+}
+
+#[derive(Debug)]
+struct FileEditorDialog {
+    path: PathBuf,
+    editors: Vec<Editor>,
+    loading: bool,
+}
+
+#[derive(Debug, Clone)]
+struct Dialog {
+    target: Target,
+    editors: Vec<Editor>,
+    delete: bool,
+    pending: bool,
+    error: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct Target {
+    project: ProjectId,
+    worktree: Option<WorktreeId>,
+    repository: PathBuf,
+    path: PathBuf,
+    label: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct Editor {
+    label: &'static str,
+    executable: PathBuf,
+}
+
+#[derive(Debug, Clone)]
+pub enum Action {
+    OpenMenu {
+        project_id: ProjectId,
+        worktree_id: Option<WorktreeId>,
+    },
+    Command {
+        project_id: ProjectId,
+        worktree_id: Option<WorktreeId>,
+        command: ProjectCommand,
+    },
+    EditorsLoaded {
+        target: Target,
+        editors: Vec<Editor>,
+    },
+    OpenEditor(PathBuf),
+    FileEditorsLoaded {
+        path: PathBuf,
+        editors: Vec<Editor>,
+    },
+    ConfirmDelete,
+    Deleted {
+        target: Target,
+        result: Result<Option<String>, String>,
+    },
+    AvatarLoaded {
+        owner: OwnerKey,
+        image: Option<iced::advanced::image::Handle>,
+    },
+    Finished(Result<(), String>),
+    Dismiss,
+}
+
+impl Cagents {
+    pub(super) fn open_file_in_editor(&mut self, path: PathBuf) -> Task<Message> {
+        if self.modal_is_open() {
+            return Task::none();
+        }
+        if !path.is_absolute() || !path.is_file() {
+            self.status = Some(TransientNotice::error("The selected file is unavailable."));
+            return Task::none();
+        }
+        self.project_ui.file_editor = Some(FileEditorDialog {
+            path: path.clone(),
+            editors: Vec::new(),
+            loading: true,
+        });
+        let load = cosmic::task::future(async move {
+            let editors = tokio::task::spawn_blocking(installed_editors)
+                .await
+                .unwrap_or_default();
+            Message::ProjectUi(Action::FileEditorsLoaded { path, editors })
+        });
+        Task::batch([load, focus_dialog()])
+    }
+
+    /// Run after installing RepositoryLoaded's new sidebar model, never in view.
+    pub(super) fn project_avatar_task(&mut self, project: ProjectId) -> Task<Message> {
+        let owner = self
+            .github_availability
+            .get(&project)
+            .and_then(GitHubAvailability::repository_key)
+            .and_then(OwnerKey::from_repository);
+        let Some(owner) = owner.or_else(|| self.project_ui.projects.get(&project).cloned()) else {
+            return Task::none();
+        };
+        self.project_ui.projects.insert(project, owner.clone());
+        if let Some(image) = self.project_ui.owners.get(&owner) {
+            if let Some(row) = self
+                .sidebar_model
+                .projects
+                .iter_mut()
+                .find(|row| row.id == project)
+            {
+                row.avatar.clone_from(image);
+            }
+            return Task::none();
+        }
+        // Insert before starting: None means loading or failed, both intentionally
+        // deduplicated for this app lifetime, including repeated repository refreshes.
+        self.project_ui.owners.insert(owner.clone(), None);
+        cosmic::task::future(async move {
+            let key = owner.clone();
+            let image = tokio::task::spawn_blocking(move || avatar::load(&key))
+                .await
+                .ok()
+                .flatten();
+            Message::ProjectUi(Action::AvatarLoaded { owner, image })
+        })
+    }
+
+    fn project_target(&self, project: ProjectId, worktree: Option<WorktreeId>) -> Option<Target> {
+        let row = self
+            .sidebar_model
+            .projects
+            .iter()
+            .find(|row| row.id == project)?;
+        let selected = match worktree {
+            Some(id) => Some(row.worktrees.iter().find(|worktree| worktree.id == id)?),
+            None => row.worktrees.first(),
+        };
+        Some(Target {
+            project,
+            worktree,
+            repository: row.repository.clone(),
+            path: selected.map_or_else(|| row.repository.clone(), |worktree| worktree.path.clone()),
+            label: selected.filter(|_| worktree.is_some()).map_or_else(
+                || row.name.clone(),
+                |worktree| worktree.path.display().to_string(),
+            ),
+        })
+    }
+
+    pub(super) fn handle_project_action(&mut self, action: Action) -> Task<Message> {
+        match action {
+            Action::FileEditorsLoaded { path, editors } => {
+                if let Some(dialog) = &mut self.project_ui.file_editor
+                    && dialog.path == path
+                {
+                    dialog.editors = editors;
+                    dialog.loading = false;
+                }
+            }
+            Action::AvatarLoaded { owner, image } => {
+                for project in &mut self.sidebar_model.projects {
+                    if self.project_ui.projects.get(&project.id) == Some(&owner) {
+                        project.avatar.clone_from(&image);
+                    }
+                }
+                self.project_ui.owners.insert(owner, image);
+            }
+            Action::OpenMenu {
+                project_id,
+                worktree_id,
+            } => {
+                if self.modal_is_open() {
+                    return Task::none();
+                }
+                let Some(target) = self.project_target(project_id, worktree_id) else {
+                    return Task::none();
+                };
+                self.project_ui.dialog = Some(Dialog {
+                    target: target.clone(),
+                    editors: Vec::new(),
+                    delete: false,
+                    pending: false,
+                    error: None,
+                });
+                let load = cosmic::task::future(async move {
+                    let editors = tokio::task::spawn_blocking(installed_editors)
+                        .await
+                        .unwrap_or_default();
+                    Message::ProjectUi(Action::EditorsLoaded { target, editors })
+                });
+                return Task::batch([load, focus_dialog()]);
+            }
+            Action::EditorsLoaded { target, editors } => {
+                if let Some(dialog) = &mut self.project_ui.dialog
+                    && dialog.target.project == target.project
+                    && dialog.target.worktree == target.worktree
+                    && dialog.target.path == target.path
+                {
+                    dialog.editors = editors;
+                }
+            }
+            Action::Command {
+                project_id,
+                worktree_id,
+                command,
+            } => {
+                if self.project_ui.file_editor.is_some() {
+                    return Task::none();
+                }
+                if self.project_ui.deleting()
+                    || (self.modal_is_open() && !self.project_ui.modal_open())
+                {
+                    return Task::none();
+                }
+                let Some(target) = self.project_target(project_id, worktree_id) else {
+                    return Task::none();
+                };
+                match command {
+                    ProjectCommand::Editors => {
+                        self.project_ui.dialog = None;
+                        return self.handle_project_action(Action::OpenMenu {
+                            project_id,
+                            worktree_id,
+                        });
+                    }
+                    ProjectCommand::Delete => {
+                        let error = self.worktree_deletion_blocker(&target);
+                        self.project_ui.dialog = Some(Dialog {
+                            target,
+                            editors: Vec::new(),
+                            delete: true,
+                            pending: false,
+                            error,
+                        });
+                        return focus_dialog();
+                    }
+                    ProjectCommand::Reveal => {
+                        self.project_ui.dialog = None;
+                        return launch_task(PathBuf::from("xdg-open"), target.path, false);
+                    }
+                    ProjectCommand::NewTerminal => {
+                        self.project_ui.dialog = None;
+                        self.show_workspace_for_action();
+                        let select = self.select_worktree(target.path.clone(), false);
+                        let terminal = self.add_terminal(target.path);
+                        return Task::batch([select, terminal]);
+                    }
+                    ProjectCommand::NewWorktree => {
+                        self.project_ui.dialog = None;
+                        return cosmic::task::message(Message::Sidebar(
+                            SidebarAction::NewWorktree {
+                                project_id,
+                                repository: target.repository,
+                            },
+                        ));
+                    }
+                    ProjectCommand::RepositoryUrl => {
+                        let url = self
+                            .github_availability
+                            .get(&project_id)
+                            .and_then(GitHubAvailability::repository_key)
+                            .and_then(|key| {
+                                Url::parse(&format!(
+                                    "https://{}/{}/{}",
+                                    key.authority(),
+                                    key.owner,
+                                    key.name
+                                ))
+                                .ok()
+                            });
+                        self.project_ui.dialog = None;
+                        if let Some(url) = url {
+                            return self.open_clicked_link(url);
+                        }
+                        self.status = Some(TransientNotice::warning(
+                            "No GitHub repository URL is available. Refresh the repository after authenticating gh.",
+                        ));
+                    }
+                }
+            }
+            Action::OpenEditor(executable) => {
+                if let Some(dialog) = &self.project_ui.file_editor {
+                    if !dialog
+                        .editors
+                        .iter()
+                        .any(|editor| editor.executable == executable)
+                    {
+                        return Task::none();
+                    }
+                    let path = dialog.path.clone();
+                    self.project_ui.file_editor = None;
+                    return launch_task(executable, path, true);
+                }
+                let Some(dialog) = &self.project_ui.dialog else {
+                    return Task::none();
+                };
+                if dialog.pending
+                    || dialog.delete
+                    || !dialog
+                        .editors
+                        .iter()
+                        .any(|editor| editor.executable == executable)
+                {
+                    return Task::none();
+                }
+                let path = dialog.target.path.clone();
+                self.project_ui.dialog = None;
+                return launch_task(executable, path, true);
+            }
+            Action::Dismiss => {
+                if self.project_ui.deleting() {
+                    return Task::none();
+                }
+                self.project_ui.dialog = None;
+                self.project_ui.file_editor = None;
+                let focus = self.nested_modal_focus_target().unwrap_or_else(|| {
+                    self.workspace
+                        .focused()
+                        .map(workspace_widget::card_focus_id)
+                        .unwrap_or_else(|| widget::Id::new(TOOLBAR_FOCUS_ID))
+                });
+                return Task::batch([
+                    iced::widget::operation::focus(focus).map(cosmic::Action::App),
+                    self.lifecycle_sweep(),
+                    self.sync_chrome(),
+                ]);
+            }
+            Action::ConfirmDelete => {
+                let Some(dialog) = &self.project_ui.dialog else {
+                    return Task::none();
+                };
+                if !dialog.delete || dialog.pending {
+                    return Task::none();
+                }
+                let target = dialog.target.clone();
+                if let Some(error) = self.worktree_deletion_blocker(&target) {
+                    self.project_ui.dialog.as_mut().unwrap().error = Some(error);
+                    return Task::none();
+                }
+                let Some(store) = self.session.as_ref().map(SessionRuntime::operation_store) else {
+                    return Task::none();
+                };
+                let dialog = self.project_ui.dialog.as_mut().unwrap();
+                dialog.pending = true;
+                dialog.error = None;
+                return cosmic::task::future(async move {
+                    let request = target.clone();
+                    let result =
+                        tokio::task::spawn_blocking(move || delete_worktree(&request, &store))
+                            .await
+                            .map_err(|error| error.to_string())
+                            .and_then(|result| result);
+                    Message::ProjectUi(Action::Deleted { target, result })
+                });
+            }
+            Action::Deleted { target, result } => match result {
+                Err(error) => {
+                    if let Some(dialog) = &mut self.project_ui.dialog {
+                        dialog.pending = false;
+                        dialog.error = Some(error);
+                    }
+                }
+                Ok(warning) => {
+                    self.project_ui.dialog = None;
+                    // No terminals can reach this point; clean repository cards are
+                    // tombstoned without manufacturing terminal-close acknowledgments.
+                    let ids = self.durable.cards.iter().filter(|card| card.existence.is_open()
+                        && matches!(&card.kind, CardKind::Repository(view) if view.worktree.starts_with(&target.path)))
+                        .map(|card| card.id).collect::<Vec<_>>();
+                    for id in ids {
+                        self.retire_lsp_card(id);
+                        self.cards.remove(&id);
+                        self.lifecycle.remove(id);
+                        if let Some(card) = self.card_state_mut(id) {
+                            card.existence = removed_existence();
+                        }
+                    }
+                    self.worktree_offsets.remove(&target.path);
+                    self.worktree_focus.remove(&target.path);
+                    if let Some(project) = self
+                        .sidebar_model
+                        .projects
+                        .iter_mut()
+                        .find(|project| project.id == target.project)
+                    {
+                        project
+                            .worktrees
+                            .retain(|worktree| Some(worktree.id) != target.worktree);
+                    }
+                    let scope = if self.active_workspace.as_ref() == Some(&target.path) {
+                        target.repository.clone()
+                    } else {
+                        self.active_workspace
+                            .clone()
+                            .unwrap_or_else(|| target.repository.clone())
+                    };
+                    let select = self.select_worktree(scope, false);
+                    self.persist();
+                    self.status = Some(match warning {
+                        Some(warning) => TransientNotice::error(warning),
+                        None => TransientNotice::success("Worktree deleted; branch retained."),
+                    });
+                    let refresh =
+                        self.repository_load_task(target.repository, Some(target.project), false);
+                    return Task::batch([
+                        select,
+                        refresh,
+                        self.lifecycle_sweep(),
+                        self.sync_chrome(),
+                    ]);
+                }
+            },
+            Action::Finished(result) => {
+                if let Err(error) = result {
+                    self.status = Some(TransientNotice::error(error));
+                }
+            }
+        }
+        Task::none()
+    }
+
+    fn worktree_deletion_blocker(&self, target: &Target) -> Option<String> {
+        if self.session.is_none() {
+            return Some(
+                "Session storage is unavailable; deletion cannot be recorded safely.".into(),
+            );
+        }
+        let Some(id) = target.worktree else {
+            return Some("The primary repository cannot be deleted.".into());
+        };
+        let Some(project) = self
+            .sidebar_model
+            .projects
+            .iter()
+            .find(|project| project.id == target.project)
+        else {
+            return Some("The project disappeared. Refresh before deleting.".into());
+        };
+        let Some(worktree) = project
+            .worktrees
+            .iter()
+            .find(|worktree| worktree.id == id && worktree.path == target.path)
+        else {
+            return Some("The worktree changed. Refresh before deleting.".into());
+        };
+        if worktree.path == project.repository
+            || project.repository.parent() == Some(worktree.path.as_path())
+        {
+            return Some("The primary worktree cannot be deleted.".into());
+        }
+        if worktree.locked {
+            return Some("This worktree is locked. Unlock it explicitly in Git first.".into());
+        }
+        if worktree
+            .dirty
+            .as_ref()
+            .is_some_and(|dirty| dirty.is_dirty())
+        {
+            return Some(
+                "Commit, stash, or discard the worktree changes before deleting it.".into(),
+            );
+        }
+        if self
+            .durable
+            .cards
+            .iter()
+            .any(|card| card.existence.is_open() && self.pending_terminal_spawn(card.id))
+        {
+            return Some(
+                "Wait for pending terminals to finish starting before deleting a worktree.".into(),
+            );
+        }
+        if self.durable.cards.iter().any(|card| {
+            card.existence.is_open()
+                && match &card.kind {
+                    CardKind::Terminal(session) => {
+                        session.launch.working_directory.starts_with(&target.path)
+                    }
+                    CardKind::Chat(session) => session
+                        .launch
+                        .recipe
+                        .working_directory
+                        .starts_with(&target.path),
+                    _ => false,
+                }
+        }) {
+            return Some("Close this worktree’s terminal and chat cards first. Running, hidden, and detached sessions are never terminated by deletion.".into());
+        }
+        if self.cards.values().any(|runtime| {
+            matches!(runtime, CardRuntime::Repository(runtime)
+            if runtime.descriptor.worktree.starts_with(&target.path) && runtime.blocks_navigation())
+        }) {
+            return Some(
+                "Save and close this worktree’s unsaved editor buffers before deleting it.".into(),
+            );
+        }
+        None
+    }
+
+    pub(super) fn project_dialog_view(&self) -> Option<Element<'_, Message>> {
+        if let Some(dialog) = &self.project_ui.file_editor {
+            let mut content = widget::column::with_capacity(dialog.editors.len() + 4)
+                .spacing(12)
+                .push(widget::text::title3("Open file in editor"))
+                .push(widget::text::body(dialog.path.display().to_string()))
+                .push(
+                    widget::button::standard("Close")
+                        .id(widget::Id::new("dialog.project.close"))
+                        .on_press(Message::ProjectUi(Action::Dismiss)),
+                );
+            if dialog.loading {
+                content = content.push(widget::text::caption("Finding installed editors…"));
+            } else if dialog.editors.is_empty() {
+                content = content.push(widget::text::caption("No supported editor found on PATH (VS Code, VSCodium, Cursor, Zed, Sublime Text)."));
+            }
+            for editor in &dialog.editors {
+                content = content.push(
+                    widget::button::text(format!("Open in {}", editor.label)).on_press(
+                        Message::ProjectUi(Action::OpenEditor(editor.executable.clone())),
+                    ),
+                );
+            }
+            return Some(super::dialog_ui::surface(content, 480.0));
+        }
+        let dialog = self.project_ui.dialog.as_ref()?;
+        let target = &dialog.target;
+        let mut content = widget::column::with_capacity(12)
+            .spacing(12)
+            .push(widget::text::title3(if dialog.delete {
+                "Delete worktree?"
+            } else {
+                "Open in external editor"
+            }))
+            .push(widget::text::body(&target.label))
+            .push(widget::text::caption(target.path.display().to_string()))
+            .push(
+                widget::button::standard(if dialog.delete { "Cancel" } else { "Close" })
+                    .id(widget::Id::new("dialog.project.close"))
+                    .on_press_maybe(
+                        (!dialog.pending).then_some(Message::ProjectUi(Action::Dismiss)),
+                    ),
+            );
+        if dialog.delete {
+            content = content.push(widget::text::body("Git will remove this clean worktree directory. The branch is retained. Primary, locked, dirty, and in-use worktrees are never removed."));
+            if let Some(error) = &dialog.error {
+                content = content.push(widget::text::body(error));
+            }
+            content = content.push(
+                widget::row::with_children(vec![
+                    widget::button::destructive(if dialog.pending {
+                        "Deleting…"
+                    } else {
+                        "Delete worktree"
+                    })
+                    .on_press_maybe(
+                        (!dialog.pending && dialog.error.is_none())
+                            .then_some(Message::ProjectUi(Action::ConfirmDelete)),
+                    )
+                    .into(),
+                ])
+                .spacing(8),
+            );
+        } else {
+            if dialog.editors.is_empty() {
+                content = content.push(widget::text::caption("No supported editor found on PATH (VS Code, VSCodium, Cursor, Zed, Sublime Text)."));
+            }
+            for editor in &dialog.editors {
+                content = content.push(
+                    widget::button::text(format!("Open in {}", editor.label)).on_press(
+                        Message::ProjectUi(Action::OpenEditor(editor.executable.clone())),
+                    ),
+                );
+            }
+        }
+        Some(super::dialog_ui::surface(content, 480.0))
+    }
+}
+
+fn focus_dialog() -> Task<Message> {
+    iced::widget::operation::focus(widget::Id::new("dialog.project.close")).map(cosmic::Action::App)
+}
+
+fn installed_editors() -> Vec<Editor> {
+    use std::os::unix::fs::PermissionsExt;
+    let paths = std::env::var_os("PATH")
+        .map(|path| {
+            std::env::split_paths(&path)
+                .filter(|path| path.is_absolute())
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    [
+        ("VS Code", "code"),
+        ("VSCodium", "codium"),
+        ("Cursor", "cursor"),
+        ("Zed", "zed"),
+        ("Zed", "zeditor"),
+        ("Sublime Text", "subl"),
+    ]
+    .into_iter()
+    .filter_map(|(label, binary)| {
+        paths
+            .iter()
+            .map(|path| path.join(binary))
+            .find(|path| {
+                path.metadata()
+                    .is_ok_and(|meta| meta.is_file() && meta.permissions().mode() & 0o111 != 0)
+            })
+            .map(|executable| Editor { label, executable })
+    })
+    .fold(Vec::new(), |mut editors, editor| {
+        if !editors
+            .iter()
+            .any(|known: &Editor| known.label == editor.label)
+        {
+            editors.push(editor);
+        }
+        editors
+    })
+}
+
+fn launch_task(executable: PathBuf, path: PathBuf, editor: bool) -> Task<Message> {
+    cosmic::task::future(async move {
+        let result = tokio::task::spawn_blocking(move || {
+            let mut command = std::process::Command::new(executable);
+            if editor {
+                command.arg("--");
+            }
+            let child = command
+                .arg(&path)
+                .current_dir(if path.is_file() {
+                    path.parent().unwrap_or(&path)
+                } else {
+                    &path
+                })
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .map_err(|error| format!("Could not open {}: {error}", path.display()))?;
+            // Reap the launcher without waiting for a long-lived editor on the UI thread.
+            std::thread::spawn(move || {
+                let _ = {
+                    let mut child = child;
+                    child.wait()
+                };
+            });
+            Ok(())
+        })
+        .await
+        .map_err(|error| error.to_string())
+        .and_then(|result| result);
+        Message::ProjectUi(Action::Finished(result))
+    })
+}
+
+fn removed_existence() -> Existence {
+    Existence::Closed {
+        tombstone: crate::model::Tombstone {
+            operation_id: None,
+            closed_at_unix_ms: unix_millis(),
+            reason: Some("worktree deleted by user".into()),
+        },
+    }
+}
+
+fn delete_worktree(
+    target: &Target,
+    store: &crate::persistence::StateStore,
+) -> Result<Option<String>, String> {
+    let id = target
+        .worktree
+        .ok_or("The primary repository cannot be deleted.")?;
+    let durable = store
+        .load_worktree(id)
+        .map_err(|error| format!("Cannot verify durable worktree: {error}"))?
+        .ok_or("Wait for the worktree catalog to finish saving, then try again.")?;
+    if !durable.existence.is_open()
+        || durable.project_id != target.project
+        || durable.path != target.path
+    {
+        return Err("Durable worktree identity changed; refresh before deleting.".into());
+    }
+    let service = RepositoryService::system("git");
+    let cancellation = CancellationToken::default();
+    let records = service
+        .list_worktrees(&target.repository, &cancellation)
+        .map_err(|error| error.to_string())?;
+    let record = records
+        .iter()
+        .find(|record| record.id == id && record.path == target.path)
+        .ok_or("Worktree changed or disappeared; refresh before deleting.")?;
+    if records.first().is_some_and(|primary| primary.id == id) || record.bare {
+        return Err("The primary worktree cannot be deleted.".into());
+    }
+    if record.lock.locked {
+        return Err("The worktree is locked; unlock it explicitly in Git first.".into());
+    }
+    if service
+        .status(&target.path, &cancellation)
+        .map_err(|error| error.to_string())?
+        .dirty
+        .is_dirty()
+    {
+        return Err("The worktree has changes; commit, stash, or discard them first.".into());
+    }
+    let socket = crate::terminal::ipc::daemon_socket_path().map_err(|error| error.to_string())?;
+    let mut client = crate::control::ControlClient::connect(&socket)
+        .map_err(|error| format!("Cannot verify detached terminals: {error}"))?;
+    let canonical_target = target
+        .path
+        .canonicalize()
+        .map_err(|error| format!("Cannot resolve worktree identity: {error}"))?;
+    for terminal in client
+        .list()
+        .map_err(|error| format!("Cannot verify detached terminals: {error}"))?
+    {
+        let directory = &terminal.session.launch.working_directory;
+        let owns_target = directory.starts_with(&target.path)
+            || directory
+                .canonicalize()
+                .is_ok_and(|directory| directory.starts_with(&canonical_target));
+        if owns_target
+            && !matches!(
+                terminal.session.continuity,
+                TerminalContinuity::Exited { .. }
+                    | TerminalContinuity::RelaunchAvailable {
+                        last_exit: Some(_),
+                        ..
+                    }
+            )
+        {
+            return Err("A daemon terminal still belongs to this worktree. Close it explicitly before deleting.".into());
+        }
+    }
+    for session in crate::chat::client::inventory()
+        .map_err(|error| format!("Cannot verify detached chats: {error}"))?
+    {
+        let directory = &session.launch.recipe.working_directory;
+        if directory.starts_with(&target.path)
+            || directory
+                .canonicalize()
+                .is_ok_and(|directory| directory.starts_with(&canonical_target))
+        {
+            return Err("A daemon chat still belongs to this worktree. Close it explicitly before deleting.".into());
+        }
+    }
+    // Git itself rechecks cleanliness/locks and owns directory removal; no force,
+    // rm -rf, branch deletion, shell interpolation, or terminal termination.
+    let command = CommandSpec::new("git")
+        .cwd(&target.repository)
+        .args(["worktree", "remove", "--"])
+        .arg(target.path.as_os_str())
+        .timeout(Duration::from_secs(30))
+        .output_limits(64 * 1024, 64 * 1024);
+    let result = SystemProcessExecutor
+        .execute(&command, &cancellation)
+        .and_then(|output| output.require_success(&command.program));
+    if let Err(error) = result {
+        // A timeout may happen after removal. Reconcile before saying it failed.
+        let records = service
+            .list_worktrees(&target.repository, &cancellation)
+            .map_err(|_| error.to_string())?;
+        if records.iter().any(|record| record.id == id) {
+            return Err(error.to_string());
+        }
+    }
+    let saved = (|| -> Result<(), String> {
+        let mut worktree = store
+            .load_worktree(id)
+            .map_err(|error| error.to_string())?
+            .ok_or("Removed worktree was not present in durable catalog.")?;
+        worktree.existence = removed_existence();
+        store
+            .save_worktree(&worktree)
+            .map_err(|error| error.to_string())?;
+        Ok(())
+    })();
+    Ok(saved
+        .err()
+        .map(|error| format!("Worktree removed, but catalog persistence failed: {error}")))
+}

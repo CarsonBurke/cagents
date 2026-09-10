@@ -15,9 +15,7 @@ use cosmic::{Element, Renderer, Task, Theme};
 use crate::{
     model::CardId,
     settings::{KeyboardShortcuts, ShortcutBinding, ShortcutKey, format_chords, parse_shortcut},
-    workspace::{
-        FocusDirection, FocusHandoff, FocusTarget, ViewportProjection, WheelDelta, Workspace,
-    },
+    workspace::{FocusDirection, FocusHandoff, FocusTarget, ViewportProjection, Workspace},
 };
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -30,13 +28,7 @@ pub struct ViewportSample {
 pub enum WorkspaceViewportEvent {
     Scrolled(ViewportSample),
     Resized(f32),
-}
-
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub enum PanGesture {
-    Begin { pointer_x: f32 },
-    Update { pointer_x: f32 },
-    End,
+    PointerFocused(CardId),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -45,6 +37,7 @@ pub enum GlobalShortcut {
     CloseFocusedCard,
     FocusProjectSearch,
     FocusAdjacent(FocusDirection),
+    CyclePaneWidth,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -80,6 +73,11 @@ pub const GLOBAL_SHORTCUT_DESCRIPTORS: &[ShortcutDescriptor] = &[
         label: "Next column",
         repeatable: true,
     },
+    ShortcutDescriptor {
+        action: GlobalShortcut::CyclePaneWidth,
+        label: "Cycle pane width",
+        repeatable: true,
+    },
 ];
 
 pub fn shortcut_descriptor(action: GlobalShortcut) -> &'static ShortcutDescriptor {
@@ -89,8 +87,7 @@ pub fn shortcut_descriptor(action: GlobalShortcut) -> &'static ShortcutDescripto
         .expect("every dispatched global shortcut has a descriptor")
 }
 
-/// Every chord bound to `action`. Never empty: `KeyboardShortcuts::validate`
-/// rejects an action with no chord.
+/// Every configured chord; pane-width cycling may be explicitly unbound.
 pub fn shortcut_keys(action: GlobalShortcut, shortcuts: &KeyboardShortcuts) -> &[String] {
     match action {
         GlobalShortcut::NewTerminal => &shortcuts.new_terminal,
@@ -98,6 +95,7 @@ pub fn shortcut_keys(action: GlobalShortcut, shortcuts: &KeyboardShortcuts) -> &
         GlobalShortcut::FocusProjectSearch => &shortcuts.search_projects,
         GlobalShortcut::FocusAdjacent(FocusDirection::Left) => &shortcuts.previous_column,
         GlobalShortcut::FocusAdjacent(FocusDirection::Right) => &shortcuts.next_column,
+        GlobalShortcut::CyclePaneWidth => &shortcuts.cycle_pane_width,
     }
 }
 
@@ -109,6 +107,9 @@ pub fn shortcut_chords(action: GlobalShortcut, shortcuts: &KeyboardShortcuts) ->
 
 pub fn shortcut_tooltip(action: GlobalShortcut, shortcuts: &KeyboardShortcuts) -> String {
     let descriptor = shortcut_descriptor(action);
+    if shortcut_keys(action, shortcuts).is_empty() {
+        return format!("{} — unbound", descriptor.label);
+    }
     format!(
         "{} — {}",
         descriptor.label,
@@ -156,10 +157,6 @@ pub fn card_widget_id(id: CardId) -> widget::Id {
 
 pub fn card_focus_id(id: CardId) -> widget::Id {
     widget::Id::new(format!("cagents-workspace-card-{id}-focus"))
-}
-
-pub fn workspace_scroll_id() -> widget::Id {
-    widget::Id::new("cagents-workspace-horizontal-scroll")
 }
 
 pub fn animation_frames<Message, F>(app_window: window::Id, map: F) -> Subscription<Message>
@@ -321,17 +318,10 @@ fn physical_digit(physical_key: keyboard::key::Physical) -> Option<char> {
 }
 
 /// The application's constructors for the events the strip reports.
-///
-/// Grouped rather than passed positionally because three bare closures of the
-/// same shape at a call site say nothing about which is which.
-pub struct Events<ViewportMessage, PanMessage, WheelMessage> {
+pub struct Events<ViewportMessage> {
     /// Scroll offsets and width changes, which the owner applies to the
     /// workspace so the next frame's projection matches what was drawn.
     pub viewport: ViewportMessage,
-    /// Middle-drag panning of the strip.
-    pub pan: PanMessage,
-    /// Wheel and touchpad scrolling that the strip handles itself.
-    pub wheel: WheelMessage,
 }
 
 /// Renders the workspace strip.
@@ -347,27 +337,23 @@ pub struct Events<ViewportMessage, PanMessage, WheelMessage> {
 /// function rebuilds because `widget::Id::new` allocates, and every mounted
 /// card would pay that on every redraw; the owner is expected to return a
 /// cached clone.
-pub fn view<'a, Message, BuildCard, ContainerId, ViewportMessage, PanMessage, WheelMessage>(
+pub fn view<'a, Message, BuildCard, ContainerId, ViewportMessage>(
     workspace: &'a Workspace,
     shortcuts: &'a KeyboardShortcuts,
     viewport_width: f32,
     scroll_id: widget::Id,
     build_card: BuildCard,
     container_id: ContainerId,
-    events: Events<ViewportMessage, PanMessage, WheelMessage>,
+    events: Events<ViewportMessage>,
 ) -> Element<'a, Message>
 where
-    Message: 'static,
+    Message: Clone + 'static,
     BuildCard: Fn(CardViewContext) -> Element<'a, Message> + 'a,
     ContainerId: Fn(CardId) -> widget::Id + 'a,
     ViewportMessage: Fn(WorkspaceViewportEvent) -> Message + Clone + 'a,
-    PanMessage: Fn(PanGesture) -> Message + 'a,
-    WheelMessage: Fn(WheelDelta) -> Message + 'a,
 {
     let Events {
         viewport: on_viewport,
-        pan: on_pan,
-        wheel: on_wheel,
     } = events;
     let projection = workspace.projection(viewport_width);
     let strip = VirtualStrip::new(
@@ -388,7 +374,11 @@ where
                     id: card.id,
                     x: mounted.start,
                     width: mounted.width,
-                    content: CardSurface::new(content).into(),
+                    content: CardSurface::new(content)
+                        .on_pointer_focus(on_viewport(WorkspaceViewportEvent::PointerFocused(
+                            card.id,
+                        )))
+                        .into(),
                 })
             })
             .collect(),
@@ -409,25 +399,28 @@ where
             }))
         });
 
-    PanSurface::new(
-        scrollable,
-        shortcuts,
-        on_pan,
-        on_wheel,
-        move |size: Size| on_viewport(WorkspaceViewportEvent::Resized(size.width)),
-    )
+    WorkspaceSurface::new(scrollable, shortcuts, move |size: Size| {
+        on_viewport(WorkspaceViewportEvent::Resized(size.width))
+    })
     .into()
 }
 
 struct CardSurface<'a, Message> {
     content: Element<'a, Message>,
+    on_pointer_focus: Option<Message>,
 }
 
 impl<'a, Message> CardSurface<'a, Message> {
     fn new(content: impl Into<Element<'a, Message>>) -> Self {
         Self {
             content: content.into(),
+            on_pointer_focus: None,
         }
+    }
+
+    fn on_pointer_focus(mut self, message: Message) -> Self {
+        self.on_pointer_focus = Some(message);
+        self
     }
 
     fn child_layout<'layout>(layout: Layout<'layout>) -> Layout<'layout> {
@@ -465,7 +458,7 @@ fn should_forward_to_raw_children(event_captured: bool) -> bool {
     !event_captured
 }
 
-impl<Message> Widget<Message, Theme, Renderer> for CardSurface<'_, Message> {
+impl<Message: Clone> Widget<Message, Theme, Renderer> for CardSurface<'_, Message> {
     fn tag(&self) -> tree::Tag {
         tree::Tag::of::<SurfacePointer>()
     }
@@ -544,6 +537,15 @@ impl<Message> Widget<Message, Theme, Renderer> for CardSurface<'_, Message> {
         let Some(clipped) = clipped_viewport(layout.bounds(), viewport) else {
             return;
         };
+        // Observe before the child can capture the press, but do not capture it
+        // ourselves: text selection, caret placement and controls still get it.
+        if !shell.is_event_captured()
+            && matches!(event, Event::Mouse(mouse::Event::ButtonPressed(_)))
+            && cursor.is_over(clipped)
+            && let Some(message) = &self.on_pointer_focus
+        {
+            shell.publish(message.clone());
+        }
         self.content.as_widget_mut().update(
             &mut tree.children[0],
             event,
@@ -648,7 +650,7 @@ impl<Message> Widget<Message, Theme, Renderer> for CardSurface<'_, Message> {
     }
 }
 
-impl<'a, Message: 'a> From<CardSurface<'a, Message>> for Element<'a, Message> {
+impl<'a, Message: Clone + 'a> From<CardSurface<'a, Message>> for Element<'a, Message> {
     fn from(surface: CardSurface<'a, Message>) -> Self {
         Element::new(surface)
     }
@@ -692,6 +694,25 @@ struct VirtualStripState {
     retained: Arc<HashMap<CardId, usize>>,
 }
 
+// Iced extracts named states before diffing. A departing virtual card must
+// reclaim those states before being parked outside the traversed child tree;
+// otherwise the next frame drops them and remounting downcasts State::None.
+fn reclaim_named_states(tree: &mut Tree) {
+    if let Some(widget::Id(iced_accessibility::id::Internal::Custom(_, name))) = &tree.id {
+        if let Some((state, children)) = tree::NAMED.with(|named| named.borrow_mut().remove(name)) {
+            tree.state = state;
+            for (index, child) in children {
+                if let Some(slot) = tree.children.get_mut(index) {
+                    *slot = child;
+                }
+            }
+        }
+    }
+    for child in &mut tree.children {
+        reclaim_named_states(child);
+    }
+}
+
 impl<Message> Widget<Message, Theme, Renderer> for VirtualStrip<'_, Message> {
     fn tag(&self) -> tree::Tag {
         tree::Tag::of::<VirtualStripState>()
@@ -728,7 +749,8 @@ impl<Message> Widget<Message, Theme, Renderer> for VirtualStrip<'_, Message> {
             }
         } else {
             let mut children = mem::take(&mut tree.children);
-            for (id, child) in state.mounted.drain(..).zip(children.drain(..)) {
+            for (id, mut child) in state.mounted.drain(..).zip(children.drain(..)) {
+                reclaim_named_states(&mut child);
                 state.detached.insert(id, child);
             }
             for card in &mut self.cards {
@@ -837,6 +859,14 @@ impl<Message> Widget<Message, Theme, Renderer> for VirtualStrip<'_, Message> {
                     viewport,
                 );
             }
+        }
+        // Wheel input belongs to terminal/file content, never the outer strip.
+        // Consume any remainder after children so the native scrollable cannot
+        // turn a horizontal trackpad gesture into pane navigation.
+        if matches!(event, Event::Mouse(mouse::Event::WheelScrolled { .. }))
+            && cursor.is_over(*viewport)
+        {
+            shell.capture_event();
         }
     }
 
@@ -974,27 +1004,21 @@ impl<'a, Message: 'a> From<VirtualStrip<'a, Message>> for Element<'a, Message> {
     }
 }
 
-struct PanSurface<'a, Message> {
+struct WorkspaceSurface<'a, Message> {
     content: Element<'a, Message>,
     shortcuts: &'a KeyboardShortcuts,
-    on_pan: Box<dyn Fn(PanGesture) -> Message + 'a>,
-    on_wheel: Box<dyn Fn(WheelDelta) -> Message + 'a>,
     on_resize: Box<dyn Fn(Size) -> Message + 'a>,
 }
 
-impl<'a, Message> PanSurface<'a, Message> {
+impl<'a, Message> WorkspaceSurface<'a, Message> {
     fn new(
         content: impl Into<Element<'a, Message>>,
         shortcuts: &'a KeyboardShortcuts,
-        on_pan: impl Fn(PanGesture) -> Message + 'a,
-        on_wheel: impl Fn(WheelDelta) -> Message + 'a,
         on_resize: impl Fn(Size) -> Message + 'a,
     ) -> Self {
         Self {
             content: content.into(),
             shortcuts,
-            on_pan: Box::new(on_pan),
-            on_wheel: Box::new(on_wheel),
             on_resize: Box::new(on_resize),
         }
     }
@@ -1003,15 +1027,13 @@ impl<'a, Message> PanSurface<'a, Message> {
         layout
             .children()
             .next()
-            .expect("pan surface content layout")
+            .expect("workspace surface content layout")
             .with_virtual_offset(layout.virtual_offset())
     }
 }
 
 #[derive(Default)]
-struct PanSurfaceState {
-    dragging: bool,
-    modifiers: keyboard::Modifiers,
+struct WorkspaceSurfaceState {
     /// Last reported bounds. Size reporting lives in this widget instead of a
     /// `widget::sensor` wrapper because `sensor` reports no accessibility
     /// nodes, and wrapping the strip in one hid every card from screen
@@ -1021,13 +1043,13 @@ struct PanSurfaceState {
     last_size: Option<Size>,
 }
 
-impl<Message> Widget<Message, Theme, Renderer> for PanSurface<'_, Message> {
+impl<Message> Widget<Message, Theme, Renderer> for WorkspaceSurface<'_, Message> {
     fn tag(&self) -> tree::Tag {
-        tree::Tag::of::<PanSurfaceState>()
+        tree::Tag::of::<WorkspaceSurfaceState>()
     }
 
     fn state(&self) -> tree::State {
-        tree::State::new(PanSurfaceState::default())
+        tree::State::new(WorkspaceSurfaceState::default())
     }
 
     fn children(&self) -> Vec<Tree> {
@@ -1086,11 +1108,7 @@ impl<Message> Widget<Message, Theme, Renderer> for PanSurface<'_, Message> {
         viewport: &Rectangle,
     ) {
         let content_layout = Self::child_layout(layout);
-        let state = tree.state.downcast_mut::<PanSurfaceState>();
-
-        if let Event::Keyboard(keyboard::Event::ModifiersChanged(modifiers)) = event {
-            state.modifiers = *modifiers;
-        }
+        let state = tree.state.downcast_mut::<WorkspaceSurfaceState>();
 
         match event {
             Event::Keyboard(
@@ -1109,48 +1127,6 @@ impl<Message> Widget<Message, Theme, Renderer> for PanSurface<'_, Message> {
             ) if is_global_shortcut_chord(key, *physical_key, *modifiers, self.shortcuts) => {
                 shell.capture_event();
                 return;
-            }
-            Event::Mouse(mouse::Event::WheelScrolled { delta })
-                if cursor.is_over(layout.bounds()) =>
-            {
-                let delta = match *delta {
-                    mouse::ScrollDelta::Lines { x, y } => WheelDelta::Lines { x, y },
-                    mouse::ScrollDelta::Pixels { x, y } => WheelDelta::Pixels { x, y },
-                };
-                if let Some(delta) = horizontal_pan_delta(delta, state.modifiers.shift()) {
-                    shell.publish((self.on_wheel)(delta));
-                    shell.capture_event();
-                    return;
-                }
-            }
-            Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Middle))
-                if cursor.is_over(layout.bounds()) =>
-            {
-                if let Some(position) = cursor.position() {
-                    state.dragging = true;
-                    shell.publish((self.on_pan)(PanGesture::Begin {
-                        pointer_x: position.x,
-                    }));
-                    shell.capture_event();
-                    return;
-                }
-            }
-            Event::Mouse(mouse::Event::CursorMoved { position }) if state.dragging => {
-                shell.publish((self.on_pan)(PanGesture::Update {
-                    pointer_x: position.x,
-                }));
-                shell.capture_event();
-                return;
-            }
-            Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Middle)) if state.dragging => {
-                state.dragging = false;
-                shell.publish((self.on_pan)(PanGesture::End));
-                shell.capture_event();
-                return;
-            }
-            Event::Window(window::Event::Unfocused) if state.dragging => {
-                state.dragging = false;
-                shell.publish((self.on_pan)(PanGesture::End));
             }
             _ => {}
         }
@@ -1193,10 +1169,7 @@ impl<Message> Widget<Message, Theme, Renderer> for PanSurface<'_, Message> {
         viewport: &Rectangle,
         renderer: &Renderer,
     ) -> mouse::Interaction {
-        let state = tree.state.downcast_ref::<PanSurfaceState>();
-        if state.dragging {
-            mouse::Interaction::Grabbing
-        } else if let Some(clipped) = clipped_viewport(layout.bounds(), viewport) {
+        if let Some(clipped) = clipped_viewport(layout.bounds(), viewport) {
             self.content.as_widget().mouse_interaction(
                 &tree.children[0],
                 Self::child_layout(layout),
@@ -1280,32 +1253,8 @@ impl<Message> Widget<Message, Theme, Renderer> for PanSurface<'_, Message> {
     }
 }
 
-fn horizontal_pan_delta(delta: WheelDelta, shift: bool) -> Option<WheelDelta> {
-    let (x, y) = match delta {
-        WheelDelta::Lines { x, y } | WheelDelta::Pixels { x, y } => (x, y),
-    };
-    let horizontal = x.abs() > y.abs() && x.abs() > f32::EPSILON;
-    let component = if horizontal {
-        x
-    } else if shift && y.abs() > f32::EPSILON {
-        y
-    } else {
-        return None;
-    };
-    Some(match delta {
-        WheelDelta::Lines { .. } => WheelDelta::Lines {
-            x: component,
-            y: 0.0,
-        },
-        WheelDelta::Pixels { .. } => WheelDelta::Pixels {
-            x: component,
-            y: 0.0,
-        },
-    })
-}
-
-impl<'a, Message: 'a> From<PanSurface<'a, Message>> for Element<'a, Message> {
-    fn from(surface: PanSurface<'a, Message>) -> Self {
+impl<'a, Message: 'a> From<WorkspaceSurface<'a, Message>> for Element<'a, Message> {
+    fn from(surface: WorkspaceSurface<'a, Message>) -> Self {
         Element::new(surface)
     }
 }
@@ -1316,6 +1265,82 @@ mod tests {
     use crate::settings::parse_chords;
     use crate::workspace::{CardWidth, WorkspaceCard};
     use std::collections::HashSet;
+
+    #[test]
+    fn parked_editor_preserves_focus_across_named_state_extraction() {
+        use cosmic::iced::advanced::{renderer::Headless, widget::operation};
+        let renderer = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(Renderer::new(
+                cosmic::iced::Font::default(),
+                cosmic::iced::Pixels(14.0),
+                Some("tiny-skia"),
+            ))
+            .unwrap();
+        let ids = [CardId::new(), CardId::new()];
+        let retained = Arc::new(HashMap::from([(ids[0], 0), (ids[1], 1)]));
+        let content = cosmic::widget::text_editor::Content::with_text("retained draft");
+        let editor = widget::Id::new("parked-editor");
+        let make = |index: usize| -> Element<'_, ()> {
+            let child = widget::text_editor::TextEditor::new(&content)
+                .id(if index == 0 {
+                    editor.clone()
+                } else {
+                    widget::Id::new("other-editor")
+                })
+                .on_action(|_| ());
+            VirtualStrip {
+                total_width: 320.0,
+                retained: retained.clone(),
+                cards: vec![VirtualCard {
+                    id: ids[index],
+                    x: 0.0,
+                    width: 320.0,
+                    content: cosmic::widget::id_container(
+                        child,
+                        widget::Id::new(format!("parked-card-{index}")),
+                    )
+                    .into(),
+                }],
+            }
+            .into()
+        };
+        let limits = layout::Limits::new(Size::ZERO, Size::new(320.0, 200.0));
+        let mut element = make(0);
+        let mut tree = Tree::new(&element);
+        let node = element
+            .as_widget_mut()
+            .layout(&mut tree, &renderer, &limits);
+        element.as_widget_mut().operate(
+            &mut tree,
+            Layout::new(&node),
+            &renderer,
+            &mut operation::focusable::focus::<()>(editor.clone()),
+        );
+        for index in [1, 1, 0] {
+            // Reproduce the real runtime, which extracts names before every
+            // view diff and drops unclaimed names at the next frame.
+            tree::NAMED.with(|cache| *cache.borrow_mut() = tree.take_all_named());
+            element = make(index);
+            tree.diff(&mut element);
+            element
+                .as_widget_mut()
+                .layout(&mut tree, &renderer, &limits);
+        }
+        let node = element
+            .as_widget_mut()
+            .layout(&mut tree, &renderer, &limits);
+        let mut focused = operation::focusable::find_focused();
+        let mut probe = operation::black_box::<_, ()>(&mut focused);
+        element
+            .as_widget_mut()
+            .operate(&mut tree, Layout::new(&node), &renderer, &mut probe);
+        drop(probe);
+        assert!(matches!(focused.finish(), operation::Outcome::Some(id) if id == editor));
+        tree::NAMED.with(|cache| cache.borrow_mut().clear());
+    }
 
     #[test]
     fn projection_never_exposes_offscreen_cards_to_the_widget_builder() {
@@ -1467,22 +1492,6 @@ mod tests {
         );
         assert_eq!(resized, WorkspaceViewportEvent::Resized(800.0));
         assert_ne!(scrolled, resized);
-    }
-
-    #[test]
-    fn wheel_arbitration_reserves_only_horizontal_or_shifted_vertical_input() {
-        assert_eq!(
-            horizontal_pan_delta(WheelDelta::Pixels { x: -32.0, y: 2.0 }, false,),
-            Some(WheelDelta::Pixels { x: -32.0, y: 0.0 })
-        );
-        assert_eq!(
-            horizontal_pan_delta(WheelDelta::Pixels { x: 2.0, y: -32.0 }, false,),
-            None
-        );
-        assert_eq!(
-            horizontal_pan_delta(WheelDelta::Lines { x: 0.0, y: -3.0 }, true,),
-            Some(WheelDelta::Lines { x: -3.0, y: 0.0 })
-        );
     }
 
     fn key_press(
@@ -1653,6 +1662,96 @@ mod tests {
         assert!(should_forward_to_raw_children(false));
     }
 
+    #[test]
+    fn wheel_scrolls_card_content_without_moving_the_workspace() {
+        use cosmic::iced::advanced::{clipboard, renderer::Headless};
+        use cosmic::iced::{Font, Pixels};
+
+        #[derive(Debug, Clone)]
+        enum Observation {
+            Content(f32),
+            Workspace(WorkspaceViewportEvent),
+        }
+
+        let renderer = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(Renderer::new(
+                Font::default(),
+                Pixels(14.0),
+                Some("tiny-skia"),
+            ))
+            .unwrap();
+        let mut workspace = Workspace::default();
+        workspace.resize_viewport(400.0);
+        for index in 0..3 {
+            workspace
+                .add_card(
+                    WorkspaceCard::new(CardId::new(), "Scrollable", CardWidth::Fixed(320.0))
+                        .unwrap(),
+                    index,
+                    index == 0,
+                )
+                .unwrap();
+        }
+        let shortcuts = KeyboardShortcuts::default();
+        let mut element = view(
+            &workspace,
+            &shortcuts,
+            400.0,
+            widget::Id::unique(),
+            |_| {
+                widget::scrollable(widget::Space::new().width(Length::Fill).height(2_000.0))
+                    .height(Length::Fill)
+                    .on_scroll(|viewport| Observation::Content(viewport.absolute_offset().y))
+                    .into()
+            },
+            card_widget_id,
+            Events {
+                viewport: Observation::Workspace,
+            },
+        );
+        let mut tree = Tree::new(&element);
+        let viewport = Rectangle::with_size(Size::new(400.0, 300.0));
+        let node = element.as_widget_mut().layout(
+            &mut tree,
+            &renderer,
+            &layout::Limits::new(viewport.size(), viewport.size()),
+        );
+        let mut messages = Vec::new();
+        let mut clipboard = clipboard::Null;
+        for delta in [
+            mouse::ScrollDelta::Pixels {
+                x: -120.0,
+                y: -120.0,
+            },
+            mouse::ScrollDelta::Pixels { x: -120.0, y: 0.0 },
+            mouse::ScrollDelta::Lines { x: -3.0, y: 0.0 },
+        ] {
+            let mut shell = Shell::new(&mut messages);
+            element.as_widget_mut().update(
+                &mut tree,
+                &Event::Mouse(mouse::Event::WheelScrolled { delta }),
+                Layout::new(&node),
+                mouse::Cursor::Available(Point::new(100.0, 100.0)),
+                &renderer,
+                &mut clipboard,
+                &mut shell,
+                &viewport,
+            );
+        }
+        assert!(
+            messages
+                .iter()
+                .any(|message| matches!(message, Observation::Content(offset) if *offset > 0.0))
+        );
+        assert!(!messages.iter().any(|message| matches!(
+            message,
+            Observation::Workspace(WorkspaceViewportEvent::Scrolled(_))
+        )));
+    }
+
     struct AccessibleProbe {
         node: u64,
         expected_virtual_offset: Vector,
@@ -1800,7 +1899,7 @@ mod tests {
         };
         let shortcuts = KeyboardShortcuts::default();
         let surface: Element<'_, ()> =
-            Element::new(PanSurface::new(strip, &shortcuts, |_| (), |_| (), |_| ()));
+            Element::new(WorkspaceSurface::new(strip, &shortcuts, |_| ()));
         let tree = Tree::new(&surface);
         let card_node = || {
             layout::Node::with_children(
@@ -1860,7 +1959,7 @@ mod tests {
             &workspace,
             &shortcuts,
             VIEWPORT_WIDTH,
-            workspace_scroll_id(),
+            widget::Id::unique(),
             |context| {
                 Element::new(AccessibleProbe {
                     node: probe_id(context.id),
@@ -1868,15 +1967,11 @@ mod tests {
                 })
             },
             card_widget_id,
-            Events {
-                viewport: |_| (),
-                pan: |_| (),
-                wheel: |_| (),
-            },
+            Events { viewport: |_| () },
         );
         let tree = Tree::new(&composed);
 
-        // The view nests pan surface > scrollable > strip > card surface > id
+        // The view nests workspace surface > scrollable > strip > card surface > id
         // container > card, and every one of those contributes a layout node.
         let strip_node = layout::Node::with_children(
             Size::new(projection.total_width, HEIGHT),

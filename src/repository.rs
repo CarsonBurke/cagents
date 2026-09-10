@@ -3818,6 +3818,99 @@ pub struct CreateWorktreeRequest {
     pub operation_id: OperationId,
 }
 
+/// User intent, resolved without creating directories or changing Git refs.
+#[derive(Debug, Clone)]
+pub struct WorktreeInput {
+    pub repository: PathBuf,
+    pub input: String,
+    pub base: String,
+    pub managed_directory: String,
+    /// Optional final destination, absolute or relative to the repository root.
+    pub destination: String,
+    pub operation_id: OperationId,
+}
+
+fn worktree_branch_input(input: &str) -> Result<String, ValidationError> {
+    let input = input.trim();
+    if !input.contains("://") {
+        return ValidatedBranchName::parse(input).map(|branch| branch.0);
+    }
+    let url = url::Url::parse(input)
+        .map_err(|_| ValidationError::InvalidBranch("Enter a branch or Linear issue URL".into()))?;
+    if url.scheme() != "https" || url.host_str() != Some("linear.app") {
+        return Err(ValidationError::InvalidBranch(
+            "Expected an https://linear.app issue URL".into(),
+        ));
+    }
+    let segments: Vec<_> = url.path_segments().into_iter().flatten().collect();
+    let issue = segments
+        .iter()
+        .position(|segment| *segment == "issue")
+        .and_then(|index| segments.get(index + 1).map(|key| (index, *key)))
+        .filter(|(_, key)| linear_issue_key(key));
+    let Some((index, key)) = issue else {
+        return Err(ValidationError::InvalidBranch(
+            "Linear URL must contain /issue/TEAM-123".into(),
+        ));
+    };
+    let title = segments.get(index + 2).copied().unwrap_or_default();
+    let mut decoded = Vec::with_capacity(title.len());
+    let mut bytes = title.bytes();
+    while let Some(byte) = bytes.next() {
+        if byte == b'%' {
+            let hex = bytes
+                .next()
+                .and_then(|high| char::from(high).to_digit(16))
+                .zip(bytes.next().and_then(|low| char::from(low).to_digit(16)))
+                .ok_or_else(|| {
+                    ValidationError::InvalidBranch("Malformed URL title encoding".into())
+                })?;
+            decoded.push((hex.0 * 16 + hex.1) as u8);
+        } else {
+            decoded.push(byte);
+        }
+    }
+    let title = String::from_utf8(decoded)
+        .map_err(|_| ValidationError::InvalidBranch("URL title is not UTF-8".into()))?;
+    // Only use the slug actually supplied in the URL, never inferred metadata.
+    let slug = title
+        .split(|ch: char| !ch.is_alphanumeric())
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join("-")
+        .to_lowercase();
+    ValidatedBranchName::parse(if slug.is_empty() {
+        key.to_string()
+    } else {
+        format!("{key}-{slug}")
+    })
+    .map(|branch| branch.0)
+}
+
+fn linear_issue_key(value: &str) -> bool {
+    value.split_once('-').is_some_and(|(team, number)| {
+        !team.is_empty()
+            && team.bytes().all(|byte| byte.is_ascii_alphabetic())
+            && !number.is_empty()
+            && number.bytes().all(|byte| byte.is_ascii_digit())
+    })
+}
+
+fn branch_destination_component(branch: &str) -> String {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    let mut component = String::with_capacity(branch.len());
+    for byte in branch.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_') {
+            component.push(char::from(byte));
+        } else {
+            component.push('%');
+            component.push(char::from(HEX[(byte >> 4) as usize]));
+            component.push(char::from(HEX[(byte & 15) as usize]));
+        }
+    }
+    component
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorktreeCreationPlan {
     pub validate_branch: CommandSpec,
@@ -5349,6 +5442,277 @@ impl<E: ProcessExecutor> RepositoryService<E> {
                 failure: failure.into(),
             },
         }
+    }
+
+    /// Resolve branch/ticket intent using local refs and advertised remote refs.
+    /// Fetching is deferred until the durable journal owns the mutation.
+    pub fn resolve_worktree_request(
+        &self,
+        input: &WorktreeInput,
+        cancellation: &CancellationToken,
+    ) -> Result<CreateWorktreeRequest, RepositoryError> {
+        let discovered = self.discover(&input.repository, cancellation)?;
+        let repository = discovered.worktree_root.unwrap_or(discovered.common_dir);
+        let output = self.run_checked(&self.refs_command(&repository), cancellation)?;
+        let refs = parse_refs(&output.stdout)?;
+        let remotes = self.remotes(&repository, cancellation)?;
+        let mut name = worktree_branch_input(&input.input)?;
+        let explicit = remotes
+            .iter()
+            .filter_map(|remote| {
+                name.strip_prefix(&format!("{}/", remote.name))
+                    .map(|branch| (remote.name.clone(), branch.to_owned()))
+            })
+            .max_by_key(|(remote, _)| remote.len());
+        if let Some((_, branch)) = &explicit {
+            name = branch.clone();
+        }
+        let branch = ValidatedBranchName::parse(name)?;
+        let local = refs
+            .local
+            .iter()
+            .find(|local| local.name.as_str() == branch.full_ref());
+        let selected_remote = if let Some((remote, name)) = explicit {
+            Some((remote, name))
+        } else if let Some(local) = local {
+            local.upstream.as_ref().and_then(|upstream| {
+                remotes
+                    .iter()
+                    .filter_map(|remote| {
+                        upstream
+                            .as_str()
+                            .strip_prefix(&format!("refs/remotes/{}/", remote.name))
+                            .map(|name| (remote.name.clone(), name.to_owned()))
+                    })
+                    .max_by_key(|(remote, _)| remote.len())
+            })
+        } else {
+            let mut candidates = Vec::new();
+            for remote in &remotes {
+                if self
+                    .remote_ref_oid(
+                        &repository,
+                        &remote.name,
+                        &RemoteSideRef::parse(branch.full_ref())?,
+                        cancellation,
+                    )?
+                    .is_some()
+                {
+                    candidates.push((remote.name.clone(), branch.as_str().to_owned()));
+                }
+            }
+            if candidates.len() > 1 {
+                return Err(ValidationError::InvalidBranch(format!(
+                    "{} exists on multiple remotes; enter one of: {}",
+                    branch.as_str(),
+                    candidates
+                        .iter()
+                        .map(|(remote, branch)| format!("{remote}/{branch}"))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ))
+                .into());
+            }
+            candidates.pop()
+        };
+        let existing = local.is_some() || selected_remote.is_some();
+        if existing && !input.base.trim().is_empty() {
+            return Err(ValidationError::InvalidBase(
+                "An existing branch keeps its history; clear the base override or choose a new branch".into()
+            ).into());
+        }
+        if let Some(worktree) = self
+            .list_worktrees(&repository, cancellation)?
+            .iter()
+            .find(|worktree| worktree.branch.as_deref() == Some(branch.full_ref().as_str()))
+        {
+            return Err(ValidationError::InvalidBranch(format!(
+                "{} is already checked out at {}; use that worktree or switch its branch first",
+                branch.as_str(),
+                worktree.path.display()
+            ))
+            .into());
+        }
+        let (base, track) = if let Some((remote, name)) = selected_remote {
+            (
+                BaseRevision::remote_ref(format!("refs/remotes/{remote}/{name}"))?,
+                true,
+            )
+        } else if local.is_some() {
+            (BaseRevision::LocalBranch(branch.clone()), false)
+        } else if !input.base.trim().is_empty() {
+            (
+                self.resolve_worktree_base(
+                    &repository,
+                    input.base.trim(),
+                    &refs,
+                    &remotes,
+                    cancellation,
+                )?,
+                false,
+            )
+        } else {
+            (
+                self.default_worktree_base(&repository, &refs, &remotes, cancellation)?,
+                false,
+            )
+        };
+        let configured = input.managed_directory.trim();
+        let configured = Path::new(if configured.is_empty() {
+            "worktrees/"
+        } else {
+            configured
+        });
+        let managed = if configured.is_absolute() {
+            configured.to_path_buf()
+        } else {
+            repository.join(configured)
+        };
+        let (managed_root, destination) = if input.destination.trim().is_empty() {
+            let managed = canonical_managed_directory(&managed)
+                .map_err(|error| ValidationError::Io(error.to_string()))?;
+            let destination = managed.join(branch_destination_component(branch.as_str()));
+            (managed, destination)
+        } else {
+            let path = Path::new(input.destination.trim());
+            let path = if path.is_absolute() {
+                path.to_path_buf()
+            } else {
+                repository.join(path)
+            };
+            let parent = path
+                .parent()
+                .ok_or(ValidationError::DestinationOutsideRoot)?;
+            let root = canonical_future_path(parent)
+                .map_err(|error| ValidationError::Io(error.to_string()))?;
+            let leaf = path
+                .file_name()
+                .ok_or(ValidationError::DestinationOutsideRoot)?;
+            (root.clone(), root.join(leaf))
+        };
+        if inspect_destination(&destination) != DestinationResidualState::Absent {
+            return Err(ValidationError::DestinationOccupied.into());
+        }
+        Ok(CreateWorktreeRequest {
+            // Preserve the project identity used to restore operation rows.
+            // Only relative destination resolution uses its worktree root.
+            repository: input.repository.clone(),
+            managed_root,
+            destination,
+            branch,
+            base,
+            track,
+            operation_id: input.operation_id,
+        })
+    }
+
+    fn resolve_worktree_base(
+        &self,
+        repository: &Path,
+        name: &str,
+        refs: &RefListing,
+        remotes: &[RemoteRecord],
+        cancellation: &CancellationToken,
+    ) -> Result<BaseRevision, RepositoryError> {
+        if is_hex_oid(name) {
+            return Ok(BaseRevision::object_id(name)?);
+        }
+        let local_name = name.strip_prefix("refs/heads/").unwrap_or(name);
+        if refs
+            .local
+            .iter()
+            .any(|local| local.name.as_str() == format!("refs/heads/{local_name}"))
+        {
+            return Ok(BaseRevision::LocalBranch(ValidatedBranchName::parse(
+                local_name,
+            )?));
+        }
+        let remote_name = name.strip_prefix("refs/remotes/").unwrap_or(name);
+        if let Some((remote, branch)) = remotes
+            .iter()
+            .filter_map(|remote| {
+                remote_name
+                    .strip_prefix(&format!("{}/", remote.name))
+                    .map(|branch| (&remote.name, branch))
+            })
+            .max_by_key(|(remote, _)| remote.len())
+        {
+            ValidatedBranchName::parse(branch)?;
+            return Ok(BaseRevision::remote_ref(format!(
+                "refs/remotes/{remote}/{branch}"
+            ))?);
+        }
+        let branch = ValidatedBranchName::parse(name)?;
+        let mut candidates = Vec::new();
+        for remote in remotes {
+            if self
+                .remote_ref_oid(
+                    repository,
+                    &remote.name,
+                    &RemoteSideRef::parse(branch.full_ref())?,
+                    cancellation,
+                )?
+                .is_some()
+            {
+                candidates.push(format!("refs/remotes/{}/{name}", remote.name));
+            }
+        }
+        if candidates.len() == 1 {
+            return Ok(BaseRevision::remote_ref(candidates.remove(0))?);
+        }
+        Err(ValidationError::InvalidBase(format!(
+            "Cannot uniquely resolve {name}; use a local branch, remote/branch, or full commit ID"
+        ))
+        .into())
+    }
+
+    fn default_worktree_base(
+        &self,
+        repository: &Path,
+        refs: &RefListing,
+        remotes: &[RemoteRecord],
+        cancellation: &CancellationToken,
+    ) -> Result<BaseRevision, RepositoryError> {
+        let remote = remotes
+            .iter()
+            .find(|remote| remote.name == "origin")
+            .or_else(|| (remotes.len() == 1).then(|| &remotes[0]));
+        if let Some(remote) = remote {
+            validate_remote_name(&remote.name)?;
+            let output = self.run_checked(
+                &self.git_read(
+                    repository,
+                    ["ls-remote", "--symref", remote.name.as_str(), "HEAD"],
+                ),
+                cancellation,
+            )?;
+            let text = String::from_utf8_lossy(&output.stdout);
+            if let Some(branch) = text.lines().find_map(|line| {
+                line.strip_prefix("ref: refs/heads/")
+                    .and_then(|line| line.strip_suffix("\tHEAD"))
+            }) {
+                return Ok(BaseRevision::remote_ref(format!(
+                    "refs/remotes/{}/{branch}",
+                    remote.name
+                ))?);
+            }
+        }
+        for name in ["main", "master"] {
+            if refs
+                .local
+                .iter()
+                .any(|local| local.name.as_str() == format!("refs/heads/{name}"))
+            {
+                return Ok(BaseRevision::LocalBranch(ValidatedBranchName::parse(name)?));
+            }
+        }
+        if let Some(head) = self.resolve_head(repository, cancellation)? {
+            return Ok(BaseRevision::object_id(head.to_string())?);
+        }
+        Err(ValidationError::InvalidBase(
+            "No default branch or commit exists; create an initial commit or specify a base".into(),
+        )
+        .into())
     }
 
     pub fn plan_worktree_creation(
@@ -9100,6 +9464,8 @@ struct WorktreeJournal {
     effects_started: bool,
     checkout_completed: bool,
     base_oid: Option<String>,
+    #[serde(default)]
+    existing_branch_oid: Option<String>,
     outcome: Option<WorktreeCreationOutcome>,
     warnings: Vec<ProcessFailure>,
     detail: String,
@@ -9121,6 +9487,22 @@ fn journal_identity(common: &Path, request: &CreateWorktreeRequest) -> String {
         request.destination.as_os_str().as_bytes(),
     ))
     .expect("byte slices and strings serialize")
+}
+
+// Configured roots may intentionally be siblings (../worktrees). Resolve
+// symlinks before each parent step, then hand the journal an absolute path
+// without traversal components. Explicit destinations keep the strict guard.
+fn canonical_managed_directory(path: &Path) -> io::Result<PathBuf> {
+    let mut resolved = PathBuf::new();
+    for component in path.components() {
+        if component == std::path::Component::ParentDir {
+            resolved = canonical_future_path(&resolved)?;
+            resolved.pop();
+        } else {
+            resolved.push(component.as_os_str());
+        }
+    }
+    canonical_future_path(&resolved)
 }
 
 fn canonical_future_path(path: &Path) -> io::Result<PathBuf> {
@@ -9378,6 +9760,70 @@ impl<E: ProcessExecutor> RepositoryService<E> {
                 )
                 .into());
             }
+            // The durable identity lease must win over changed repository state:
+            // a replay is still a conflict after an earlier attempt made a branch.
+            if journal.existing_branch_oid.is_some()
+                && !(matches!(&journal.request.base, BaseRevision::LocalBranch(branch) if branch == &journal.request.branch)
+                    || (journal.request.track
+                        && matches!(&journal.request.base, BaseRevision::RemoteRef(_))))
+            {
+                return Err(ValidationError::InvalidBranch(
+                    "Branch already exists; resolve it as an existing branch instead of overriding its base".into()
+                ).into());
+            }
+            if let Some(worktree) = self
+                .list_worktrees(&journal.request.repository, cancellation)?
+                .iter()
+                .find(|worktree| {
+                    worktree.branch.as_deref() == Some(journal.request.branch.full_ref().as_str())
+                })
+            {
+                return Err(ValidationError::InvalidBranch(format!(
+                    "Branch is already checked out at {}; no branch was changed",
+                    worktree.path.display()
+                ))
+                .into());
+            }
+            // Fetch is a mutation too: journal its intention before updating any
+            // remote-tracking ref. Never fetch into a local branch or force it.
+            journal.effects_started = true;
+            journal
+                .persist(store, &payload)
+                .map(|next| payload = next)
+                .map_err(|error| {
+                    journal_write_failed = true;
+                    ValidationError::Io(format!("journal write failed: {error}"))
+                })?;
+            if let BaseRevision::RemoteRef(reference) = &journal.request.base {
+                let remotes = self.remotes(&journal.request.repository, cancellation)?;
+                let (remote, branch) = remotes
+                    .iter()
+                    .filter_map(|remote| {
+                        reference
+                            .strip_prefix(&format!("refs/remotes/{}/", remote.name))
+                            .map(|branch| (&remote.name, branch))
+                    })
+                    .max_by_key(|(remote, _)| remote.len())
+                    .ok_or_else(|| {
+                        ValidationError::InvalidBase(format!(
+                            "No configured remote owns {reference}"
+                        ))
+                    })?;
+                validate_remote_name(remote)?;
+                ValidatedBranchName::parse(branch)?;
+                let mut fetch = self.git_mutation(
+                    &journal.request.repository,
+                    [
+                        "fetch",
+                        "--no-tags",
+                        "--no-recurse-submodules",
+                        remote.as_str(),
+                        &format!("refs/heads/{branch}:{reference}"),
+                    ],
+                );
+                fetch.inherited_lease = Some(lease.as_raw_fd());
+                self.run_checked(&fetch, cancellation)?;
+            }
             let resolve = self.git_read(
                 &journal.request.repository,
                 [
@@ -9388,9 +9834,45 @@ impl<E: ProcessExecutor> RepositoryService<E> {
                 ],
             );
             let output = self.run_checked(&resolve, cancellation)?;
-            let oid = parse_utf8_line(&output.stdout, "base_oid")?;
+            let mut oid = parse_utf8_line(&output.stdout, "base_oid")?;
             if !is_hex_oid(&oid) {
                 return Err(ValidationError::InvalidBase(oid).into());
+            }
+            if let Some(existing) = &journal.existing_branch_oid {
+                let current = self.resolve_optional_revision(
+                    &journal.request.repository,
+                    &journal.request.branch.full_ref(),
+                    cancellation,
+                )?;
+                if current.as_ref().map(Oid::as_str) != Some(existing.as_str()) {
+                    return Err(ValidationError::InvalidBranch(
+                        "Branch changed while preparing; submit again".into(),
+                    )
+                    .into());
+                }
+                if existing != &oid {
+                    let ahead = self.git_read(
+                        &journal.request.repository,
+                        [
+                            "merge-base",
+                            "--is-ancestor",
+                            oid.as_str(),
+                            existing.as_str(),
+                        ],
+                    );
+                    let output = self.run(&ahead, cancellation)?;
+                    if output.success {
+                        // Locally ahead: keep every local commit.
+                        oid.clone_from(existing);
+                    } else if output.exit_code == Some(1) {
+                        self.run_checked(&self.git_read(&journal.request.repository,
+                            ["merge-base", "--is-ancestor", existing.as_str(), oid.as_str()]), cancellation)
+                            .map_err(|_| ValidationError::InvalidBranch(
+                                "Local and upstream branches diverged; reconcile them before creating a worktree".into()))?;
+                    } else {
+                        return Err(git_failure(&ahead, output).into());
+                    }
+                }
             }
             journal.base_oid = Some(oid.clone());
             // Persist intention before the first managed-directory or Git effect.
@@ -9424,16 +9906,50 @@ impl<E: ProcessExecutor> RepositoryService<E> {
             let plan = self.plan_worktree_creation(&journal.request)?;
             self.run_checked(&plan.validate_branch, cancellation)?;
             let branch = self.run(&plan.check_branch_absent, cancellation)?;
-            if branch.exit_code != Some(1) {
-                return Err(ValidationError::InvalidBranch(
-                    "branch already exists or cannot be inspected".into(),
+            let mut command = if journal.existing_branch_oid.is_some() {
+                if !branch.success {
+                    return Err(ValidationError::InvalidBranch(
+                        "Existing branch disappeared; submit again".into(),
+                    )
+                    .into());
+                }
+                self.git_mutation(
+                    &journal.request.repository,
+                    [
+                        OsString::from("worktree"),
+                        OsString::from("add"),
+                        OsString::from("--lock"),
+                        OsString::from("--reason"),
+                        format!("cagents:{}", journal.request.operation_id).into(),
+                        OsString::from("--"),
+                        journal.request.destination.as_os_str().to_owned(),
+                        journal.request.branch.as_str().into(),
+                    ],
                 )
-                .into());
-            }
-            let mut command = self.create_worktree_command(&journal.request, &oid)?;
+            } else {
+                if branch.exit_code != Some(1) {
+                    return Err(ValidationError::InvalidBranch(
+                        "Branch appeared during creation; submit again".into(),
+                    )
+                    .into());
+                }
+                self.create_worktree_command(&journal.request, &oid)?
+            };
             command.inherited_lease = Some(lease.as_raw_fd());
             emit(WorktreeProgressStage::RunningGit);
             self.run_checked(&command, cancellation)?;
+            if journal
+                .existing_branch_oid
+                .as_ref()
+                .is_some_and(|existing| existing != &oid)
+            {
+                let mut advance = self.git_mutation(
+                    &journal.request.destination,
+                    ["merge", "--ff-only", "--no-edit", oid.as_str()],
+                );
+                advance.inherited_lease = Some(lease.as_raw_fd());
+                self.run_checked(&advance, cancellation)?;
+            }
             journal.checkout_completed = true;
             journal
                 .persist(store, &payload)
@@ -9520,6 +10036,13 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         }
         let lease_path =
             common_dir.join(format!("cagents-operation-{}.lease", request.operation_id));
+        let existing_branch_oid = self
+            .resolve_optional_revision(
+                &request.repository,
+                &request.branch.full_ref(),
+                cancellation,
+            )?
+            .map(|oid| oid.to_string());
         Ok(WorktreeJournal {
             version: 1,
             request,
@@ -9531,6 +10054,7 @@ impl<E: ProcessExecutor> RepositoryService<E> {
             effects_started: false,
             checkout_completed: false,
             base_oid: None,
+            existing_branch_oid,
             outcome: None,
             warnings: Vec::new(),
             detail: "Prepared durable worktree request".into(),
@@ -9637,7 +10161,17 @@ impl<E: ProcessExecutor> RepositoryService<E> {
             } else {
                 format!("Created with warning: {}", journal.detail)
             };
-        } else if !residual.branch_exists
+        } else if (!residual.branch_exists
+            || journal.existing_branch_oid.as_ref().is_some_and(|before| {
+                self.resolve_optional_revision(
+                    &journal.request.repository,
+                    &journal.request.branch.full_ref(),
+                    &CancellationToken::new(),
+                )
+                .ok()
+                .flatten()
+                .is_some_and(|current| current.as_str() == before)
+            }))
             && residual.registered_worktree.is_none()
             && residual.destination == DestinationResidualState::Absent
         {
@@ -9817,8 +10351,15 @@ impl<E: ProcessExecutor> RepositoryService<E> {
                                 .components()
                                 .any(|part| matches!(part, std::path::Component::ParentDir))
                         })
-                        && (!journal.effects_started
-                            || journal.base_oid.as_ref().is_some_and(|oid| is_hex_oid(oid)))
+                        // Fetch can start before the checkout target is resolved.
+                        // A missing target cannot establish Created ownership.
+                        && journal.base_oid.as_ref().is_none_or(|oid| is_hex_oid(oid))
+                        && journal
+                            .existing_branch_oid
+                            .as_ref()
+                            .is_none_or(|oid| is_hex_oid(oid))
+                        && (!journal.checkout_completed
+                            || (journal.effects_started && journal.base_oid.is_some()))
                         && ValidatedBranchName::parse(journal.request.branch.as_str()).is_ok()
                         && journal.request.base.validate().is_ok() =>
                 {
@@ -9941,6 +10482,60 @@ mod worktree_journal_tests {
             }
         }
 
+        fn git(&self, arguments: &[&str]) -> String {
+            let output = Command::new("git")
+                .arg("-C")
+                .arg(&self.request.repository)
+                .args([
+                    "-c",
+                    "user.name=Test",
+                    "-c",
+                    "user.email=test@example.invalid",
+                    "-c",
+                    "commit.gpgsign=false",
+                    "-c",
+                    "core.hooksPath=/dev/null",
+                ])
+                .args(arguments)
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            String::from_utf8(output.stdout).unwrap().trim().to_owned()
+        }
+
+        fn input(&self, name: &str) -> WorktreeInput {
+            WorktreeInput {
+                repository: self.request.repository.clone(),
+                input: name.into(),
+                base: String::new(),
+                managed_directory: "worktrees/".into(),
+                destination: String::new(),
+                operation_id: OperationId::new(),
+            }
+        }
+
+        fn resolve(&mut self, input: WorktreeInput) {
+            self.request = self
+                .service
+                .resolve_worktree_request(&input, &CancellationToken::new())
+                .unwrap();
+        }
+
+        fn add_remote(&self, name: &str, remote: &Fixture) {
+            self.git(&[
+                "remote",
+                "add",
+                name,
+                remote.request.repository.to_str().unwrap(),
+            ]);
+        }
+
         fn prepare(&self) -> (WorktreeJournal, serde_json::Value) {
             let journal = self
                 .service
@@ -9976,6 +10571,258 @@ mod worktree_journal_tests {
     }
 
     #[test]
+    fn creation_from_project_common_directory_keeps_project_identity() {
+        let mut fixture = Fixture::new();
+        let root = fixture.request.repository.clone();
+        let common = root.join(".git");
+        let mut input = fixture.input("feature/from-sidebar");
+        input.repository = common.clone();
+        fixture.resolve(input);
+        assert_eq!(fixture.request.repository, common);
+        assert_eq!(fixture.request.managed_root, root.join("worktrees"));
+        let report = fixture.run(&CancellationToken::new());
+        assert_eq!(report.state, WorktreeOperationState::Created, "{report:?}");
+        assert_eq!(
+            fs::read_to_string(fixture.request.destination.join("tracked.txt")).unwrap(),
+            fs::read_to_string(root.join("tracked.txt")).unwrap(),
+        );
+    }
+
+    #[test]
+    fn managed_directory_can_create_a_sibling_worktree() {
+        let mut fixture = Fixture::new();
+        let mut input = fixture.input("feature/sibling");
+        input.managed_directory = "../managed trees/".into();
+        fixture.resolve(input);
+        let expected = fixture
+            .request
+            .repository
+            .parent()
+            .unwrap()
+            .join("managed trees");
+        assert_eq!(fixture.request.managed_root, expected);
+        let report = fixture.run(&CancellationToken::new());
+        assert_eq!(report.state, WorktreeOperationState::Created, "{report:?}");
+        assert_eq!(
+            fs::read_to_string(fixture.request.destination.join("tracked.txt")).unwrap(),
+            fs::read_to_string(fixture.request.repository.join("tracked.txt")).unwrap(),
+        );
+    }
+
+    #[test]
+    fn intelligent_creation_uses_live_default_branch_and_keeps_source_changes() {
+        let mut fixture = Fixture::new();
+        let remote = Fixture::new();
+        remote.git(&["commit", "--allow-empty", "-m", "remote default advanced"]);
+        fixture.add_remote("origin", &remote);
+        fs::write(
+            fixture.request.repository.join("tracked.txt"),
+            "local dirty content",
+        )
+        .unwrap();
+        fixture.resolve(fixture.input("feature/new"));
+        let report = fixture.run(&CancellationToken::new());
+        assert_eq!(report.state, WorktreeOperationState::Created, "{report:?}");
+        assert_eq!(
+            fixture.git(&["rev-parse", "feature/new"]),
+            remote.git(&["rev-parse", "main"])
+        );
+        assert_eq!(
+            fs::read_to_string(fixture.request.repository.join("tracked.txt")).unwrap(),
+            "local dirty content"
+        );
+        assert_eq!(
+            fixture.request.destination,
+            fixture.request.repository.join("worktrees/feature%2Fnew")
+        );
+        assert_eq!(
+            fixture.git(&[
+                "for-each-ref",
+                "--format=%(upstream)",
+                "refs/heads/feature/new"
+            ]),
+            ""
+        );
+    }
+
+    #[test]
+    fn intelligent_creation_fetches_existing_upstream_and_tracks_without_new_history() {
+        let mut fixture = Fixture::new();
+        let remote = Fixture::new();
+        remote.git(&["branch", "topic"]);
+        fixture.add_remote("origin", &remote);
+        fixture.git(&["fetch", "origin"]);
+        fixture.git(&["branch", "--track", "topic", "origin/topic"]);
+        remote.git(&["switch", "topic"]);
+        remote.git(&["commit", "--allow-empty", "-m", "new upstream work"]);
+        fixture.resolve(fixture.input("topic"));
+        let report = fixture.run(&CancellationToken::new());
+        assert_eq!(report.state, WorktreeOperationState::Created, "{report:?}");
+        assert_eq!(
+            fixture.git(&["rev-parse", "topic"]),
+            remote.git(&["rev-parse", "topic"])
+        );
+        assert_eq!(
+            fixture.git(&["rev-parse", "topic@{upstream}"]),
+            remote.git(&["rev-parse", "topic"])
+        );
+    }
+
+    #[test]
+    fn intelligent_creation_preserves_ahead_branch_and_rejects_divergence() {
+        let mut fixture = Fixture::new();
+        let remote = Fixture::new();
+        remote.git(&["branch", "topic"]);
+        fixture.add_remote("origin", &remote);
+        fixture.git(&["fetch", "origin"]);
+        fixture.git(&["switch", "-c", "topic", "--track", "origin/topic"]);
+        fixture.git(&["commit", "--allow-empty", "-m", "local work"]);
+        let local = fixture.git(&["rev-parse", "topic"]);
+        fixture.git(&["switch", "main"]);
+        fixture.resolve(fixture.input("topic"));
+        let report = fixture.run(&CancellationToken::new());
+        assert_eq!(report.state, WorktreeOperationState::Created, "{report:?}");
+        assert_eq!(fixture.git(&["rev-parse", "topic"]), local);
+        fixture.git(&[
+            "worktree",
+            "remove",
+            fixture.request.destination.to_str().unwrap(),
+        ]);
+        remote.git(&["switch", "topic"]);
+        remote.git(&["commit", "--allow-empty", "-m", "different remote work"]);
+        fixture.resolve(fixture.input("topic"));
+        assert_eq!(
+            fixture.run(&CancellationToken::new()).state,
+            WorktreeOperationState::LeaseConflict
+        );
+        // Removing a created worktree does not release its replay-proof identity.
+        // A distinct destination permits an independent divergence attempt.
+        let mut input = fixture.input("topic");
+        input.destination = "worktrees/topic-diverged".into();
+        fixture.resolve(input);
+        let report = fixture.run(&CancellationToken::new());
+        assert_eq!(
+            report.state,
+            WorktreeOperationState::NotCreated,
+            "{report:?}"
+        );
+        assert!(report.detail.contains("diverged"), "{report:?}");
+        assert_eq!(fixture.git(&["rev-parse", "topic"]), local);
+        assert!(!fixture.request.destination.exists());
+    }
+
+    #[test]
+    fn intelligent_creation_rejects_checked_out_dirty_branch_without_reset() {
+        let mut fixture = Fixture::new();
+        fixture.git(&["branch", "topic"]);
+        fixture.resolve(fixture.input("topic"));
+        // A checkout after resolution must also be caught by the journaled service.
+        fixture.git(&["switch", "topic"]);
+        let before = fixture.git(&["rev-parse", "topic"]);
+        fs::write(
+            fixture.request.repository.join("tracked.txt"),
+            "unsaved work",
+        )
+        .unwrap();
+        let report = fixture.run(&CancellationToken::new());
+        assert_eq!(
+            report.state,
+            WorktreeOperationState::NotCreated,
+            "{report:?}"
+        );
+        assert!(report.detail.contains("already checked out"), "{report:?}");
+        assert_eq!(fixture.git(&["rev-parse", "topic"]), before);
+        assert_eq!(
+            fs::read_to_string(fixture.request.repository.join("tracked.txt")).unwrap(),
+            "unsaved work"
+        );
+        assert!(!fixture.request.destination.exists());
+    }
+
+    #[test]
+    fn intelligent_creation_disambiguates_remotes_before_fetching() {
+        let mut fixture = Fixture::new();
+        let first = Fixture::new();
+        let second = Fixture::new();
+        first.git(&["branch", "topic"]);
+        second.git(&["branch", "topic"]);
+        second.git(&["switch", "topic"]);
+        second.git(&["commit", "--allow-empty", "-m", "second remote"]);
+        fixture.add_remote("first", &first);
+        fixture.add_remote("second", &second);
+        let error = fixture
+            .service
+            .resolve_worktree_request(&fixture.input("topic"), &CancellationToken::new())
+            .unwrap_err();
+        assert!(error.to_string().contains("first/topic"));
+        assert!(error.to_string().contains("second/topic"));
+        fixture.resolve(fixture.input("second/topic"));
+        let report = fixture.run(&CancellationToken::new());
+        assert_eq!(report.state, WorktreeOperationState::Created, "{report:?}");
+        assert_eq!(
+            fixture.git(&["rev-parse", "topic"]),
+            second.git(&["rev-parse", "topic"])
+        );
+        assert_eq!(fixture.git(&["config", "branch.topic.remote"]), "second");
+    }
+
+    #[test]
+    fn intelligent_creation_accepts_linear_and_safe_managed_path_overrides() {
+        let mut fixture = Fixture::new();
+        let mut input =
+            fixture.input("https://linear.app/team/issue/APP-42/fix-worktree-paths?view=all");
+        input.managed_directory = fixture
+            .directory
+            .path()
+            .join("absolute managed")
+            .to_str()
+            .unwrap()
+            .into();
+        fixture.resolve(input);
+        let report = fixture.run(&CancellationToken::new());
+        assert_eq!(report.state, WorktreeOperationState::Created, "{report:?}");
+        assert_eq!(
+            fixture.git(&["rev-parse", "APP-42-fix-worktree-paths"]),
+            fixture.git(&["rev-parse", "main"])
+        );
+        let mut input = fixture.input("APP-43");
+        input.destination = "custom destination/ticket".into();
+        input.base = "main".into();
+        fixture.resolve(input);
+        let report = fixture.run(&CancellationToken::new());
+        assert_eq!(report.state, WorktreeOperationState::Created, "{report:?}");
+        assert_eq!(
+            fixture.request.destination,
+            fixture.request.repository.join("custom destination/ticket")
+        );
+        assert_eq!(
+            fixture.git(&["rev-parse", "APP-43"]),
+            fixture.git(&["rev-parse", "main"])
+        );
+        let mut input = fixture.input("APP-44");
+        input.destination = fixture.request.destination.to_str().unwrap().into();
+        assert!(matches!(
+            fixture
+                .service
+                .resolve_worktree_request(&input, &CancellationToken::new()),
+            Err(RepositoryError::Validation(
+                ValidationError::DestinationOccupied
+            ))
+        ));
+        input.destination = "../escape".into();
+        assert!(
+            fixture
+                .service
+                .resolve_worktree_request(&input, &CancellationToken::new())
+                .is_err()
+        );
+        assert_ne!(
+            branch_destination_component("a/b"),
+            branch_destination_component("a%2Fb")
+        );
+    }
+
+    #[test]
     fn prepared_interruption_rehydrates_not_created_and_retry_needs_fresh_id() {
         let mut fixture = Fixture::new();
         fixture.prepare();
@@ -9998,6 +10845,63 @@ mod worktree_journal_tests {
         fixture.request.operation_id = OperationId::new();
         let report = fixture.run(&CancellationToken::new());
         assert_eq!(report.state, WorktreeOperationState::Created, "{report:?}");
+    }
+
+    #[test]
+    fn interrupted_base_resolution_requires_quiescence_and_unchanged_branch_identity() {
+        for (existing, moved, expected) in [
+            (false, false, WorktreeOperationState::NotCreated),
+            (true, false, WorktreeOperationState::NotCreated),
+            (true, true, WorktreeOperationState::OutcomeUnknown),
+        ] {
+            let mut fixture = Fixture::new();
+            if existing {
+                fixture.git(&["branch", "feature"]);
+                fixture.request.base = BaseRevision::LocalBranch(fixture.request.branch.clone());
+            }
+            let (mut journal, payload) = fixture.prepare();
+            let lease = worktree_lease(&journal.lease_path, true).unwrap();
+            journal.lease_identity = Some(lease_file_identity(&lease).unwrap());
+            journal.state = WorktreeOperationState::Running;
+            // Fetch intention is durable before base_oid is known.
+            journal.effects_started = true;
+            journal.persist(&fixture.store, &payload).unwrap();
+            if moved {
+                fixture.git(&["commit", "--allow-empty", "-m", "concurrent branch work"]);
+                fixture.git(&["branch", "-f", "feature", "main"]);
+            }
+            let branch_tip = fixture.git(&[
+                "for-each-ref",
+                "--format=%(objectname)",
+                "refs/heads/feature",
+            ]);
+            let report = fixture
+                .service
+                .rehydrate_worktree_operations(&fixture.store)
+                .unwrap()
+                .remove(0);
+            assert_eq!(
+                report.state,
+                WorktreeOperationState::OutcomeUnknown,
+                "{report:?}"
+            );
+            drop(lease);
+            // Other suite cases deliberately pause unrelated forks before exec.
+            // Wait for their CLOEXEC references before checking branch evidence.
+            fixture
+                .service
+                .settle_worktree_journal(&mut journal, Duration::from_secs(5));
+            assert_eq!(journal.state, expected, "{journal:?}");
+            assert_eq!(
+                fixture.git(&[
+                    "for-each-ref",
+                    "--format=%(objectname)",
+                    "refs/heads/feature"
+                ]),
+                branch_tip
+            );
+            assert!(!fixture.request.managed_root.exists());
+        }
     }
 
     #[test]

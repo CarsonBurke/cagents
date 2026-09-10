@@ -1,3 +1,4 @@
+mod chat;
 mod client;
 mod delivery;
 mod state;
@@ -207,6 +208,18 @@ pub fn run() -> Result<(), HostError> {
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
         .graceful_shutdown();
+    let chats = host
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .chats
+        .values()
+        .map(|record| record.handle.clone())
+        .collect::<Vec<_>>();
+    for chat in chats {
+        if let Err(error) = chat.close() {
+            tracing::warn!(%error, "provider shutdown was not confirmed");
+        }
+    }
     for delivery in &deliveries {
         let _ = delivery.push(ServerEnvelope {
             version: PROTOCOL_VERSION,

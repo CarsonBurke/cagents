@@ -25,6 +25,9 @@ use crate::repository::{
     ProcessOutput, SystemProcessExecutor,
 };
 
+#[cfg(feature = "ui")]
+pub mod avatar;
+
 const PR_LIST_FIELDS: &str = "number,title,state,isDraft,headRefName,headRefOid,baseRefName,author,updatedAt,url,mergeable,mergeStateStatus,reviewDecision,labels";
 const PR_VIEW_FIELDS: &str = "number,title,body,state,isDraft,headRefName,headRefOid,baseRefName,author,createdAt,updatedAt,url,mergeable,mergeStateStatus,reviewDecision,labels,additions,deletions,changedFiles";
 const PR_CHECK_FIELDS: &str =

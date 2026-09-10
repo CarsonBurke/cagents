@@ -1,6 +1,6 @@
 //! Immutable native diff models computed away from the application update thread.
 
-use std::{collections::HashMap, path::Path};
+use std::{collections::HashMap, ops::Range, path::Path};
 
 use imara_diff::{Algorithm, Diff, InternedInput};
 
@@ -28,6 +28,8 @@ pub struct InlineDiffRow {
     pub new_line: Option<u32>,
     pub text: String,
     pub kind: DiffRowKind,
+    /// UTF-8 byte ranges in the displayed text, computed once on the diff worker.
+    pub changed: Vec<Range<usize>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -37,6 +39,8 @@ pub struct SplitDiffRow {
     pub old_text: Option<String>,
     pub new_text: Option<String>,
     pub kind: DiffRowKind,
+    pub old_changed: Vec<Range<usize>>,
+    pub new_changed: Vec<Range<usize>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -47,6 +51,8 @@ pub struct DiffModel {
     pub split_change_starts: Vec<usize>,
     pub additions: u32,
     pub deletions: u32,
+    /// Conservative display-column extent, including tab stops, for horizontal scrolling.
+    pub max_line_columns: usize,
 }
 
 impl DiffModel {
@@ -196,6 +202,7 @@ pub fn build_diff(before: &str, after: &str) -> DiffModel {
     let mut new_cursor = 0usize;
     let mut before_endings = HashMap::<&str, u8>::new();
     let mut after_endings = HashMap::<&str, u8>::new();
+    let mut intraline_budget = 4_000_000usize;
 
     for hunk in hunks {
         append_context(
@@ -234,6 +241,7 @@ pub fn build_diff(before: &str, after: &str) -> DiffModel {
                     line.text.clone()
                 },
                 kind: DiffRowKind::Deletion,
+                changed: Vec::new(),
             });
         }
         for (offset, line) in after_lines[new_start..new_end].iter().enumerate() {
@@ -247,6 +255,7 @@ pub fn build_diff(before: &str, after: &str) -> DiffModel {
                     line.text.clone()
                 },
                 kind: DiffRowKind::Addition,
+                changed: Vec::new(),
             });
         }
 
@@ -262,23 +271,43 @@ pub fn build_diff(before: &str, after: &str) -> DiffModel {
                 old_text.is_some_and(|line| line.ending_differs(&after_endings));
             let new_ending_changed =
                 new_text.is_some_and(|line| line.ending_differs(&before_endings));
+            let old_display = old_text.map(|line| {
+                if old_ending_changed {
+                    line.changed_text()
+                } else {
+                    line.text.clone()
+                }
+            });
+            let new_display = new_text.map(|line| {
+                if new_ending_changed {
+                    line.changed_text()
+                } else {
+                    line.text.clone()
+                }
+            });
+            let (old_changed, new_changed) = intraline_changes(
+                old_display.as_deref().unwrap_or(""),
+                new_display.as_deref().unwrap_or(""),
+                &mut intraline_budget,
+            );
+            let inline_start = *inline_change_starts.last().expect("current hunk");
+            if old_text.is_some() {
+                inline_rows[inline_start + offset]
+                    .changed
+                    .clone_from(&old_changed);
+            }
+            if new_text.is_some() {
+                inline_rows[inline_start + old_end - old_start + offset]
+                    .changed
+                    .clone_from(&new_changed);
+            }
             split_rows.push(SplitDiffRow {
                 old_line: old_text.map(|_| (old_start + offset + 1) as u32),
                 new_line: new_text.map(|_| (new_start + offset + 1) as u32),
-                old_text: old_text.map(|line| {
-                    if old_ending_changed {
-                        line.changed_text()
-                    } else {
-                        line.text.clone()
-                    }
-                }),
-                new_text: new_text.map(|line| {
-                    if new_ending_changed {
-                        line.changed_text()
-                    } else {
-                        line.text.clone()
-                    }
-                }),
+                old_text: old_display,
+                new_text: new_display,
+                old_changed,
+                new_changed,
                 kind: match (old_text, new_text) {
                     (Some(_), Some(_)) => DiffRowKind::Modification,
                     (Some(_), None) => DiffRowKind::Deletion,
@@ -301,6 +330,19 @@ pub fn build_diff(before: &str, after: &str) -> DiffModel {
         &mut split_rows,
     );
 
+    let max_line_columns = inline_rows
+        .iter()
+        .map(|row| {
+            row.text.chars().fold(0, |column, ch| {
+                if ch == '\t' {
+                    (column / 8 + 1) * 8
+                } else {
+                    column + if ch.is_ascii() { 1 } else { 2 }
+                }
+            })
+        })
+        .max()
+        .unwrap_or(0);
     DiffModel {
         inline_rows,
         split_rows,
@@ -308,7 +350,80 @@ pub fn build_diff(before: &str, after: &str) -> DiffModel {
         split_change_starts,
         additions: diff.count_additions(),
         deletions: diff.count_removals(),
+        max_line_columns,
     }
+}
+
+/// Word/whitespace/punctuation tokens preserve the original UTF-8 slices. The
+/// byte, token-product and whole-file budgets bound pathological replacement
+/// hunks; when exhausted the actual entire changed line remains highlighted.
+fn intraline_changes(
+    before: &str,
+    after: &str,
+    budget: &mut usize,
+) -> (Vec<Range<usize>>, Vec<Range<usize>>) {
+    let whole = |text: &str| {
+        if text.is_empty() {
+            Vec::new()
+        } else {
+            vec![0..text.len()]
+        }
+    };
+    if before == after {
+        return (Vec::new(), Vec::new());
+    }
+    if before.is_empty() || after.is_empty() || before.len() + after.len() > 8192 || *budget == 0 {
+        return (whole(before), whole(after));
+    }
+    let old_tokens = word_ranges(before);
+    let new_tokens = word_ranges(after);
+    let work = old_tokens.len().saturating_mul(new_tokens.len());
+    if work > 262_144 || work > *budget {
+        return (whole(before), whole(after));
+    }
+    *budget -= work;
+    let mut input = InternedInput::default();
+    input.update_before(old_tokens.iter().map(|range| &before[range.clone()]));
+    input.update_after(new_tokens.iter().map(|range| &after[range.clone()]));
+    let diff = Diff::compute(Algorithm::Histogram, &input);
+    let mut old_changed = Vec::new();
+    let mut new_changed = Vec::new();
+    for hunk in diff.hunks() {
+        if !hunk.before.is_empty() {
+            old_changed.push(
+                old_tokens[hunk.before.start as usize].start
+                    ..old_tokens[hunk.before.end as usize - 1].end,
+            );
+        }
+        if !hunk.after.is_empty() {
+            new_changed.push(
+                new_tokens[hunk.after.start as usize].start
+                    ..new_tokens[hunk.after.end as usize - 1].end,
+            );
+        }
+    }
+    (old_changed, new_changed)
+}
+
+fn word_ranges(text: &str) -> Vec<Range<usize>> {
+    let mut ranges: Vec<Range<usize>> = Vec::new();
+    let mut previous = 0;
+    for (start, ch) in text.char_indices() {
+        let kind = if ch.is_whitespace() {
+            1
+        } else if ch.is_alphanumeric() || ch == '_' {
+            2
+        } else {
+            0
+        };
+        if kind != 0 && kind == previous {
+            ranges.last_mut().expect("preceding token").end = start + ch.len_utf8();
+        } else {
+            ranges.push(start..start + ch.len_utf8());
+        }
+        previous = kind;
+    }
+    ranges
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -332,6 +447,7 @@ fn append_context(
             new_line: Some(new_line as u32),
             text: text.clone(),
             kind: DiffRowKind::Context,
+            changed: Vec::new(),
         });
         split.push(SplitDiffRow {
             old_line: Some(old_line as u32),
@@ -339,6 +455,8 @@ fn append_context(
             old_text: Some(text),
             new_text: Some(after[*new_cursor].text.clone()),
             kind: DiffRowKind::Context,
+            old_changed: Vec::new(),
+            new_changed: Vec::new(),
         });
         *old_cursor += 1;
         *new_cursor += 1;
@@ -426,31 +544,36 @@ mod tests {
                     old_line: Some(1),
                     new_line: Some(1),
                     text: "one".into(),
-                    kind: DiffRowKind::Context
+                    kind: DiffRowKind::Context,
+                    changed: Vec::new(),
                 },
                 InlineDiffRow {
                     old_line: Some(2),
                     new_line: None,
                     text: "two".into(),
-                    kind: DiffRowKind::Deletion
+                    kind: DiffRowKind::Deletion,
+                    changed: vec![0..3],
                 },
                 InlineDiffRow {
                     old_line: None,
                     new_line: Some(2),
                     text: "second".into(),
-                    kind: DiffRowKind::Addition
+                    kind: DiffRowKind::Addition,
+                    changed: vec![0..6],
                 },
                 InlineDiffRow {
                     old_line: Some(3),
                     new_line: Some(3),
                     text: "three".into(),
-                    kind: DiffRowKind::Context
+                    kind: DiffRowKind::Context,
+                    changed: Vec::new(),
                 },
                 InlineDiffRow {
                     old_line: None,
                     new_line: Some(4),
                     text: "four".into(),
-                    kind: DiffRowKind::Addition
+                    kind: DiffRowKind::Addition,
+                    changed: vec![0..4],
                 },
             ]
         );
@@ -458,6 +581,74 @@ mod tests {
         assert_eq!(model.split_rows[1].kind, DiffRowKind::Modification);
         assert_eq!(model.split_rows[1].old_line, Some(2));
         assert_eq!(model.split_rows[1].new_line, Some(2));
+    }
+
+    fn highlighted<'a>(text: &'a str, ranges: &[Range<usize>]) -> Vec<&'a str> {
+        ranges.iter().map(|range| &text[range.clone()]).collect()
+    }
+
+    #[test]
+    fn intraline_spans_preserve_unicode_and_separate_changed_words() {
+        let before = "\tlet café = \"你好 old\";  // keep";
+        let after = "\tlet café = \"你好 new\";  // stay";
+        let model = build_diff(&format!("{before}\n"), &format!("{after}\n"));
+        let row = &model.split_rows[0];
+        assert_eq!(row.old_text.as_deref(), Some(before));
+        assert_eq!(row.new_text.as_deref(), Some(after));
+        assert_eq!(highlighted(before, &row.old_changed), ["old", "keep"]);
+        assert_eq!(highlighted(after, &row.new_changed), ["new", "stay"]);
+        let unicode = build_diff("café = \"旧🙂\";\n", "café = \"新🙃\";\n");
+        let row = &unicode.split_rows[0];
+        assert_eq!(
+            highlighted(row.old_text.as_deref().unwrap(), &row.old_changed).concat(),
+            "旧🙂"
+        );
+        assert_eq!(
+            highlighted(row.new_text.as_deref().unwrap(), &row.new_changed).concat(),
+            "新🙃"
+        );
+    }
+
+    #[test]
+    fn asymmetric_replacement_keeps_missing_side_empty_and_context_unmarked() {
+        let model = build_diff(
+            "keep\nvalue = old;\nend\n",
+            "keep\nvalue = new;\nextra();\nend\n",
+        );
+        let replaced = &model.split_rows[1];
+        assert_eq!(
+            highlighted(replaced.old_text.as_deref().unwrap(), &replaced.old_changed),
+            ["old"]
+        );
+        assert_eq!(
+            highlighted(replaced.new_text.as_deref().unwrap(), &replaced.new_changed),
+            ["new"]
+        );
+        let inserted = &model.split_rows[2];
+        assert_eq!(inserted.old_text, None);
+        assert_eq!(inserted.old_line, None);
+        assert!(inserted.old_changed.is_empty());
+        assert_eq!(
+            highlighted(inserted.new_text.as_deref().unwrap(), &inserted.new_changed),
+            ["extra();"]
+        );
+        assert!(model.split_rows[0].old_changed.is_empty());
+        assert!(model.split_rows[3].new_changed.is_empty());
+    }
+
+    #[test]
+    fn whitespace_edits_and_bounded_fallback_are_real_highlights() {
+        let mut budget = 4_000_000;
+        let (old, new) = intraline_changes("a\t b", "a  b", &mut budget);
+        assert_eq!(highlighted("a\t b", &old), ["\t "]);
+        assert_eq!(highlighted("a  b", &new), ["  "]);
+        let (old, new) = intraline_changes("old café", "new café", &mut 0);
+        assert_eq!(highlighted("old café", &old), ["old café"]);
+        assert_eq!(highlighted("new café", &new), ["new café"]);
+        let long = "界".repeat(4096);
+        let (old, new) = intraline_changes(&long, "short", &mut budget);
+        assert_eq!(highlighted(&long, &old), [long.as_str()]);
+        assert_eq!(highlighted("short", &new), ["short"]);
     }
 
     #[test]

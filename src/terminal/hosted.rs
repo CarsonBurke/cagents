@@ -165,7 +165,10 @@ impl HostedPublishedState {
 
     fn publish(&self, snapshot: RenderSnapshot) {
         let generation = snapshot.generation;
-        if generation <= self.generation.load(Ordering::Acquire) {
+        let current_generation = self.generation.load(Ordering::Acquire);
+        if generation < current_generation
+            || generation == current_generation && !self.snapshot.load().detached
+        {
             return;
         }
         let activity = snapshot.activity;
@@ -225,6 +228,12 @@ impl HostedPublishedState {
     /// ask for a full repaint; silently keeping the stale grid would render
     /// stale text indefinitely.
     fn apply(&self, snapshot: TerminalSnapshot) -> bool {
+        // A reply can already be in flight when its view disappears. Do not
+        // resolve row deltas or repopulate hibernated visuals in the background;
+        // reveal requests the latest grid against the snapshot we actually kept.
+        if !self.is_visible() {
+            return true;
+        }
         let apply_started =
             tracing::enabled!(target: "cagents::terminal_pipeline", tracing::Level::TRACE)
                 .then(std::time::Instant::now);
@@ -290,6 +299,20 @@ impl HostedPublishedState {
         let generation = self.generation.load(Ordering::Acquire);
         self.snapshot
             .store(Arc::new(RenderSnapshot::detached(generation)));
+    }
+
+    fn snapshot_cursor(&self) -> u64 {
+        // Reconnect/attach replay has no visibility vote yet. A hidden view
+        // needs semantic history, not a grid; reveal will request a real cursor.
+        if !self.is_visible() {
+            return u64::MAX;
+        }
+        let snapshot = self.snapshot.load();
+        if snapshot.detached {
+            0
+        } else {
+            snapshot.generation
+        }
     }
 
     fn acknowledge(&self, observed_generation: u64) {
@@ -383,6 +406,7 @@ enum ClientCommand {
     Focus(bool),
     Resize(TerminalSize),
     Scroll(TerminalScroll),
+    SetTheme(super::TerminalTheme),
     Visibility(TerminalVisibility),
     Hibernate,
     Resume { visible: bool },
@@ -399,6 +423,7 @@ impl ClientCommand {
             Self::Focus(_) => "set terminal focus",
             Self::Resize(_) => "resize terminal",
             Self::Scroll(_) => "scroll terminal",
+            Self::SetTheme(_) => "set terminal theme",
             Self::Visibility(_) => "set terminal visibility",
             Self::Hibernate => "hibernate terminal",
             Self::Resume { .. } => "resume terminal",
@@ -424,6 +449,7 @@ impl ClientCommand {
                 terminal_id,
                 scroll,
             },
+            Self::SetTheme(theme) => ClientRequest::SetTheme { terminal_id, theme },
             Self::Visibility(visibility) => ClientRequest::SetVisibility {
                 terminal_id,
                 visibility,
@@ -660,6 +686,14 @@ impl HostedTerminalHandle {
         self.try_command(ClientCommand::Scroll(TerminalScroll::Bottom))
     }
 
+    pub fn scroll_to_row(&self, row: u64) -> Result<(), TerminalSendError> {
+        self.try_command(ClientCommand::Scroll(TerminalScroll::Row(row)))
+    }
+
+    pub fn set_theme(&self, theme: super::TerminalTheme) -> Result<(), TerminalSendError> {
+        self.try_command(ClientCommand::SetTheme(theme))
+    }
+
     pub fn hide(&self) -> Result<(), TerminalSendError> {
         self.try_command(ClientCommand::Visibility(TerminalVisibility::Hidden))?;
         self.inner.published.set_visible(false);
@@ -667,22 +701,31 @@ impl HostedTerminalHandle {
     }
 
     pub fn reveal(&self) -> Result<(), TerminalSendError> {
-        self.try_command(ClientCommand::Visibility(TerminalVisibility::Visible))?;
+        let previous = self.inner.published.desired_visibility();
+        // A visible peer may let the daemon answer immediately with its retained
+        // grid. Open the local gate before that response can reach this client.
         self.inner.published.set_visible(true);
+        if let Err(error) = self.try_command(ClientCommand::Visibility(TerminalVisibility::Visible))
+        {
+            self.inner.published.set_visibility(previous);
+            return Err(error);
+        }
         Ok(())
     }
 
     pub fn hibernate(&self) -> Result<(), TerminalSendError> {
         self.try_command(ClientCommand::Hibernate)?;
-        self.inner
-            .published
-            .set_visibility(TerminalVisibility::Hibernated);
+        self.inner.published.hibernate();
         Ok(())
     }
 
     pub fn restore(&self, visible: bool) -> Result<(), TerminalSendError> {
-        self.try_command(ClientCommand::Resume { visible })?;
+        let previous = self.inner.published.desired_visibility();
         self.inner.published.set_visible(visible);
+        if let Err(error) = self.try_command(ClientCommand::Resume { visible }) {
+            self.inner.published.set_visibility(previous);
+            return Err(error);
+        }
         Ok(())
     }
 
@@ -1055,7 +1098,7 @@ fn serve_connection(
             expected_host: published.proof(),
             resume: vec![ResumeCursor {
                 terminal_id,
-                generation: published.generation.load(Ordering::Acquire),
+                generation: published.snapshot_cursor(),
                 event_sequence: published.event_sequence.load(Ordering::Acquire),
             }],
         },
@@ -1162,17 +1205,21 @@ fn serve_connection(
                 PendingRequest::Attach,
                 ClientRequest::Attach {
                     terminal_id,
-                    after_generation: published.generation.load(Ordering::Acquire),
+                    after_generation: published.snapshot_cursor(),
                     after_event_sequence: published.event_sequence.load(Ordering::Acquire),
                 },
             ),
-            ConnectionIntent::Spawn(spawn) => (
-                PendingRequest::Spawn,
-                ClientRequest::Spawn {
-                    session: spawn.session.clone(),
-                    options: spawn.options.clone(),
-                },
-            ),
+            ConnectionIntent::Spawn(spawn) => {
+                let mut options = spawn.options.clone();
+                options.initially_visible = published.is_visible();
+                (
+                    PendingRequest::Spawn,
+                    ClientRequest::Spawn {
+                        session: spawn.session.clone(),
+                        options,
+                    },
+                )
+            }
         };
         if send_request(
             connection.writer(),
@@ -1326,12 +1373,30 @@ fn serve_connection(
                     {
                         attached = true;
                         published.observe_activity(terminal.activity);
+                        if events
+                            .try_send(TerminalEvent::ResumeHintChanged(
+                                terminal.session.resume_hint,
+                            ))
+                            .is_err()
+                        {
+                            return ConnectionEnd::Retry;
+                        }
+                        published.request_semantic_wake();
                     }
                     (PendingRequest::Spawn, ServerResponse::Spawned { terminal })
                         if terminal.session.id == terminal_id =>
                     {
                         attached = true;
                         published.observe_activity(terminal.activity);
+                        if events
+                            .try_send(TerminalEvent::ResumeHintChanged(
+                                terminal.session.resume_hint,
+                            ))
+                            .is_err()
+                        {
+                            return ConnectionEnd::Retry;
+                        }
+                        published.request_semantic_wake();
                     }
                     (
                         PendingRequest::Snapshot,
@@ -1366,9 +1431,7 @@ fn serve_connection(
                     }
                     (PendingRequest::Acknowledge, ServerResponse::Accepted)
                     | (PendingRequest::Command(_), ServerResponse::Accepted) => {}
-                    (PendingRequest::Hibernate, ServerResponse::Accepted) => {
-                        published.hibernate();
-                    }
+                    (PendingRequest::Hibernate, ServerResponse::Accepted) => {}
                     (PendingRequest::Shutdown(completed), ServerResponse::Accepted) => {
                         let _ = completed.try_send(());
                     }
@@ -1420,7 +1483,10 @@ fn serve_connection(
                 terminal_id: redraw_id,
                 generation,
             } if envelope.request_id.is_none() && redraw_id == terminal_id => {
-                if generation > published.generation.load(Ordering::Acquire) && !snapshot_pending {
+                if published.is_visible()
+                    && generation > published.snapshot_cursor()
+                    && !snapshot_pending
+                {
                     if send_request(
                         connection.writer(),
                         &proof,
@@ -1429,7 +1495,7 @@ fn serve_connection(
                         PendingRequest::Snapshot,
                         ClientRequest::Snapshot {
                             terminal_id,
-                            after_generation: published.generation.load(Ordering::Acquire),
+                            after_generation: published.snapshot_cursor(),
                         },
                     )
                     .is_err()
@@ -1481,7 +1547,10 @@ fn serve_connection(
                 published
                     .event_sequence
                     .fetch_max(event_sequence, Ordering::AcqRel);
-                if generation > published.generation.load(Ordering::Acquire) && !snapshot_pending {
+                if published.is_visible()
+                    && generation > published.snapshot_cursor()
+                    && !snapshot_pending
+                {
                     if send_request(
                         connection.writer(),
                         &proof,
@@ -1490,7 +1559,7 @@ fn serve_connection(
                         PendingRequest::Snapshot,
                         ClientRequest::Snapshot {
                             terminal_id,
-                            after_generation: published.generation.load(Ordering::Acquire),
+                            after_generation: published.snapshot_cursor(),
                         },
                     )
                     .is_err()
@@ -2228,6 +2297,113 @@ mod tests {
             );
             previous = snapshot;
         }
+
+        // Repaint traffic already in flight must not rebuild a hibernated
+        // view, even when another subscriber keeps this terminal visible.
+        handle.hibernate().unwrap();
+        let hibernate: ClientEnvelope = read_frame(&mut stream).unwrap().unwrap();
+        assert!(matches!(hibernate.request, ClientRequest::Hibernate { .. }));
+        let mut background = previous.clone();
+        background.generation += 1;
+        send(
+            &mut stream,
+            None,
+            ServerMessage::Snapshot {
+                terminal_id,
+                snapshot: TerminalSnapshot::full(&background),
+            },
+        );
+        send(
+            &mut stream,
+            None,
+            ServerMessage::Redraw {
+                terminal_id,
+                generation: background.generation,
+            },
+        );
+        send(
+            &mut stream,
+            None,
+            ServerMessage::Event {
+                terminal_id,
+                sequence: 1,
+                event: crate::terminal_ipc::WireTerminalEvent::Bell,
+            },
+        );
+        assert_eq!(
+            handle
+                .events()
+                .recv_timeout(Duration::from_secs(2))
+                .unwrap(),
+            TerminalEvent::Bell
+        );
+        assert!(handle.snapshot().detached);
+        assert_eq!(handle.generation(), previous.generation);
+
+        // Resume before the old hibernate ACK arrives. It must not override
+        // the newer visibility, and the same retained generation must restore
+        // successfully without requiring another byte of process output.
+        handle.restore(true).unwrap();
+        let resume: ClientEnvelope = read_frame(&mut stream).unwrap().unwrap();
+        assert!(matches!(
+            resume.request,
+            ClientRequest::Resume { visible: true, .. }
+        ));
+        for request_id in [hibernate.request_id, resume.request_id] {
+            send(
+                &mut stream,
+                Some(request_id),
+                ServerMessage::Response {
+                    response: ServerResponse::Accepted,
+                },
+            );
+        }
+        send(
+            &mut stream,
+            None,
+            ServerMessage::Redraw {
+                terminal_id,
+                generation: previous.generation,
+            },
+        );
+        let repaint: ClientEnvelope = read_frame(&mut stream).unwrap().unwrap();
+        assert!(matches!(
+            repaint.request,
+            ClientRequest::Snapshot {
+                after_generation: 0,
+                ..
+            }
+        ));
+        send(
+            &mut stream,
+            Some(repaint.request_id),
+            ServerMessage::Response {
+                response: ServerResponse::Snapshot {
+                    terminal_id,
+                    snapshot: Some(TerminalSnapshot::full(&previous)),
+                },
+            },
+        );
+        send(
+            &mut stream,
+            None,
+            ServerMessage::Event {
+                terminal_id,
+                sequence: 2,
+                event: crate::terminal_ipc::WireTerminalEvent::Bell,
+            },
+        );
+        assert_eq!(
+            handle
+                .events()
+                .recv_timeout(Duration::from_secs(2))
+                .unwrap(),
+            TerminalEvent::Bell
+        );
+        let restored = handle.snapshot();
+        assert!(!restored.detached);
+        assert_eq!(restored.generation, previous.generation);
+        assert_eq!(restored.lines[0].cells[0].text, "c");
         drop(handle);
     }
 

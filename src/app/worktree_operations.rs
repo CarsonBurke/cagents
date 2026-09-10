@@ -59,6 +59,64 @@ fn stage_order(stage: WorktreeProgressStage) -> u8 {
     }
 }
 impl Cagents {
+    pub(super) fn start_worktree_input(
+        &mut self,
+        project_id: ProjectId,
+        input: crate::repository::WorktreeInput,
+    ) -> Task<Message> {
+        let Some(dialog) = &mut self.worktree_dialog else {
+            return Task::none();
+        };
+        if dialog.project_id != project_id || dialog.resolving.is_some() {
+            return Task::none();
+        }
+        let operation_id = input.operation_id;
+        dialog.resolving = Some(operation_id);
+        dialog.error = None;
+        cosmic::task::future(async move {
+            let result = tokio::task::spawn_blocking(move || {
+                RepositoryService::system("git")
+                    .resolve_worktree_request(&input, &CancellationToken::new())
+                    .map_err(|error| error.to_string())
+            })
+            .await
+            .map_err(|error| error.to_string())
+            .and_then(|result| result);
+            Message::WorktreeInputResolved {
+                project_id,
+                operation_id,
+                result,
+            }
+        })
+    }
+
+    pub(super) fn finish_worktree_input(
+        &mut self,
+        project_id: ProjectId,
+        operation_id: OperationId,
+        result: Result<CreateWorktreeRequest, String>,
+    ) -> Task<Message> {
+        let Some(dialog) = &mut self.worktree_dialog else {
+            return Task::none();
+        };
+        if dialog.project_id != project_id || dialog.resolving != Some(operation_id) {
+            return Task::none();
+        }
+        dialog.resolving = None;
+        match result {
+            Ok(request) => {
+                self.worktree_dialog = None;
+                let submit = self.start_worktree_operation(project_id, request);
+                Task::batch([submit, self.focus_context_overlay_if_exposed()])
+            }
+            Err(error) => {
+                dialog.error = Some(error.clone());
+                self.status = Some(TransientNotice::error(error));
+                iced::widget::operation::focus(worktree_dialog_focus_id()).map(cosmic::Action::App)
+            }
+        }
+    }
+
     pub(super) fn start_worktree_operation(
         &mut self,
         project: ProjectId,

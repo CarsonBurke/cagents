@@ -317,26 +317,95 @@ cagents ui
   restore its terminals; selecting it again does not create another terminal.
   **New terminal** (`Ctrl+T`) starts in that worktree and inserts immediately to
   the right of its focused column.
-- The right-hand inspector has **Context**, **Changes**, and **Code** tabs.
-  Context follows the focused terminal or browser; Changes follows the selected
-  worktree with files, diffs, staging, commits, push/publish, history, and
-  pull-request actions; Code holds repository/editor and language-server details.
-  Worktree rows show matching pull requests and their reported CI status.
-- Switching worktrees hides their columns without closing hosted shells or
-  discarding editor buffers. Worktree selection and remembered column focus
-  survive restarts, including when a shared browser column has focus. Application
-  close checks unsaved editors in every worktree, not only the visible one.
-  Legacy columns without a registered worktree remain accessible across worktrees.
-- Open **Settings** from the lower-left gear. Appearance includes system/light/dark
-  themes and interface scaling. Terminal controls include font family and size,
-  line spacing, padding, and cursor shape; changes apply without restarting.
+- The right-hand inspector has neutral, icon-only **Files**, **Changes**, and
+  **Details** tabs; hover for tooltips. Files browses the selected worktree,
+  Changes provides diffs, staging, commits, push/publish, history, and
+  pull-request actions, and Details follows the focused card. The file list's
+  **Tree** and **Flat** icons also have tooltips. Right-click project or worktree
+  rows for their actions; there is no ellipsis menu button. Worktree rows show
+  matching pull requests and their reported CI status.
+- Switching worktrees remembers each strip's horizontal scroll position and
+  focused column. Hidden terminal presentation is released while hosted PTYs
+  keep running, and editor buffers remain intact. Scroll positions are remembered
+  during the current UI session; worktree selection and column focus also survive
+  restarts, including when a shared browser column has focus. Application close
+  checks unsaved editors in every worktree, not only the visible one. Legacy
+  columns without a registered worktree remain accessible across worktrees.
+- Hold **Alt+Q / Alt+W** or **Alt+Left / Alt+Right** to move through columns.
+  Mouse-wheel and trackpad scrolling stay inside pane content; they do not pan
+  the workspace strip. **Alt+R** cycles the focused pane through **1/3 → 2/3 →
+  1/2 → full** viewport width and repeats while held. These widths remain
+  viewport-relative when the window is resized.
+- When creating a worktree, enter a branch name, a Linear issue ID such as
+  `APP-42`, or an `https://linear.app/.../issue/APP-42/title-slug` URL. URLs use
+  the issue ID and supplied title slug, without fetching Linear metadata.
+  The managed parent defaults to `worktrees/` relative to the repository root;
+  Settings accepts an absolute or repository-relative parent, and the creation
+  dialog also accepts an explicit destination.
+- Open **Settings** from the lower-left gear. Valid changes save automatically;
+  invalid drafts show an error without replacing the last valid setting.
+  Appearance includes system/light/dark themes and interface scaling.
+  Terminal controls include font family and size, line spacing, padding,
+  cursor shape, and independent **Dark**, **Light**, and **Solarized dark**
+  palettes. The default cursor is a beam. A thin draggable scrollbar appears
+  only on the focused terminal when scrollback is available.
   The modal dims the workspace and preserves input focus until dismissed.
   Interface text uses the desktop's installed font and Fontconfig fallbacks;
   install Open Sans and Noto Sans Mono if those families are not already available.
+- The editor saves automatically after a pause by default. Conflicts, save
+  errors, and durability warnings stop automatic saving and remain visible;
+  autosave does not silently overwrite external changes. Disable **Save files
+  automatically** in Settings for manual saving.
 - If a terminal reports a different daemon incarnation, its original daemon is
   gone. The card offers **Retry** to start a new terminal with the saved launch
   recipe. Existing transcripts remain available; the old running process cannot
   be recovered by attaching to the replacement daemon.
+
+### Native agent chat
+
+Supported OMP, Claude, and Codex terminal sessions offer **Switch to chat**.
+The switch uses an exact provider conversation identity, not terminal-text
+scraping, a most-recent-session lookup, or a fork. If the launch does not identify
+the conversation, the dialog asks you to select the current session explicitly
+by its complete UUID; it does not search private conversation history.
+
+- **OMP and Claude:** confirm a stop-and-resume handoff. Active work is
+  interrupted, the CLI stops, and native chat resumes the same conversation.
+  Returning to the terminal stops the native writer before resuming the CLI.
+  This is not a simultaneous live view; available history depends on the
+  provider. The original launch recipe and terminal descriptor are retained.
+- **Codex:** join the exact existing conversation directly over the shared
+  daemon's local Unix socket, leaving the original CLI alive. Launches using
+  `--remote unix://PATH`, `--remote=unix://PATH`, and existing `--sock` proxy
+  recipes are supported; bare `unix://` uses the existing default socket under
+  `CODEX_HOME`. Remote `ws://` and `wss://` endpoints are not supported.
+  If that session cannot be joined safely, cagents keeps the terminal and
+  reports an error; it does not launch a proxy process, start a replacement
+  daemon, or fall back to a separate conversation. Returning to the terminal
+  detaches the native view while active work continues.
+
+The native view presents streamed messages, tool activity, and explicit provider
+approval/input requests. Controls appear according to provider capabilities:
+OMP supports steering, queued follow-ups, attachments, compaction, model and
+thinking selection; Claude supports attachments, advertised models and slash
+commands, compaction when advertised, and permission modes. Codex controls
+depend on the joined session's advertised direct-input and model capabilities;
+image attachments require an image-capable model. Unsupported controls are not
+substituted with terminal keystrokes. Usage and cost reflect provider reports.
+
+Changing worktrees or closing the application window leaves daemon-owned chat
+work running in the background. Explicit **Stop and close chat** interrupts
+active work and waits for daemon acknowledgement before removing the card.
+Disconnects retain the draft and show **Reconnect to this session** rather than
+silently starting another conversation.
+
+Transcripts use a private disk-backed cache and bounded, pageable display
+windows rather than keeping the entire conversation in UI memory. Use **Load
+earlier history** and **Jump to latest** to navigate. This cache is not a
+permanent archive or a fixed total disk quota; explicit chat close releases it,
+and provider session storage remains the source for resumed history.
+
+### Terminal and repository operations
 
 The control CLI includes human-readable output by default and stable JSON envelopes for automation:
 
@@ -395,9 +464,9 @@ one-shot quiet transitions, and hidden terminals do not create periodic redraws.
 There is no system daemon or service unit. The standard production installation starts its per-user sibling `cagentsd` immediately and registers it for graphical-login autostart. While that daemon is running, cagents exposes a system-tray item that opens the UI and can stop the daemon. The daemon remains independent of the UI so terminals survive window and UI-process restarts.
 
 Full and browserless production builds share the established daemon socket and
-session store. Protocol **4** deliberately retains that namespace, preventing a
-second daemon owner while an incompatible protocol-3 process is still running;
-the handshake rejects incompatible clients without terminating its PTYs. Upgrade
+session store. Protocol **6** deliberately retains that namespace, preventing a
+second daemon owner while an incompatible older process is still running;
+the handshake rejects incompatible clients without terminating their PTYs. Upgrade
 the three companion executables together. One shared application lease prevents
 their UI processes from racing writes, and startup rejects an older running UI
 or Debian peer package that predates the lease marker. Upgrade that peer before
@@ -455,13 +524,16 @@ terminal_font_size = 14.0
 terminal_font_family = ""
 terminal_line_height = 1.286
 terminal_padding = 8.0
-terminal_cursor_style = "application"
+terminal_cursor_style = "beam"
+terminal_theme = "dark"
 sidebar_width = 260.0
 inspector_width = 380.0
 default_column_fraction = 0.72
 terminal_scrollback_lines = 10000
 link_open_destination = "integrated_browser"
 link_open_gesture = "control_click"
+managed_worktree_directory = "worktrees/"
+editor_auto_save = true
 
 [keyboard_shortcuts]
 new_terminal = ["Ctrl+T"]
@@ -469,6 +541,7 @@ close_focused_column = ["Ctrl+W"]
 search_projects = ["Ctrl+F"]
 previous_column = ["Alt+Q", "Alt+Left"]
 next_column = ["Alt+W", "Alt+Right"]
+cycle_pane_width = ["Alt+R"]
 ```
 
 | Key | Type | Default | Accepted values |
@@ -482,18 +555,30 @@ next_column = ["Alt+W", "Alt+Right"]
 | `terminal_font_family` | string | `""` | empty for the system monospace font, or a non-whitespace family name up to 128 bytes. The family must be fixed-pitch; one whose glyph widths differ falls back to the system monospace font, because the grid is a single pitch |
 | `terminal_line_height` | float | `1.286` | finite values from `1.0` through `2.0`, inclusive; relative to font size |
 | `terminal_padding` | float | `8.0` | finite values from `0.0` through `24.0`, inclusive; logical pixels |
-| `terminal_cursor_style` | string | `"application"` | `"application"` respects the terminal program; `"block"`, `"beam"`, or `"underline"` overrides it |
+| `terminal_cursor_style` | string | `"beam"` | `"application"` respects the terminal program; `"block"`, `"beam"`, or `"underline"` overrides it |
+| `terminal_theme` | string | `"dark"` | `"dark"`, `"light"`, or `"solarized_dark"`; independent of `app_theme` |
 | `terminal_scrollback_lines` | non-negative integer | `10000` | `0` through `1000000` lines for newly started terminals |
 | `sidebar_width` | float | `260.0` | finite values from `220.0` through `420.0`, inclusive |
 | `inspector_width` | float | `380.0` | finite values from `320.0` through `480.0`, inclusive |
 | `default_column_fraction` | float | `0.72` | finite values from `0.25` through `1.0`, inclusive |
 | `link_open_destination` | string | `"integrated_browser"` | `"integrated_browser"` or `"system_default"` |
 | `link_open_gesture` | string | `"control_click"` | `"control_click"` or `"control_shift_click"` |
-| `keyboard_shortcuts.*` | array of strings | shown above | one or more chords, each containing Ctrl, Alt, or Super and one A-Z, 0-9, Left, or Right key; Shift is optional. Every chord in the table must be distinct, and a bound chord is reserved rather than forwarded to the process inside a card |
+| `managed_worktree_directory` | string | `"worktrees/"` | nonempty path without control characters; absolute or relative to the repository root |
+| `editor_auto_save` | boolean | `true` | `true` or `false`; automatically save edited files after a pause, stopping on conflicts or save errors |
+| `keyboard_shortcuts.*` | array of strings | shown above | one or more chords, each containing Ctrl, Alt, or Super and one A-Z, 0-9, Left, or Right key; Shift is optional. Every chord in the table must be distinct, and a bound chord is reserved rather than forwarded to the process inside a card. Only `cycle_pane_width` may be empty to leave it unbound |
 
 Version 1 and 2 TOML files are upgraded while loading. Sidebar widths accepted
 by version 1 are clamped to the current visible range; other values are
 preserved. Version 2 files receive the default inspector width.
+Older shortcut tables receive `cycle_pane_width = ["Alt+R"]` unless another
+action already owns Alt+R. In that case the existing binding is preserved and
+pane-width cycling remains unbound (`[]`) until you assign it a free chord.
+An explicitly configured conflicting binding is still rejected.
+
+Settings text fields save valid edits after a short pause; closing the dialog
+also applies valid pending edits. Invalid fields and disk-write failures stay
+visible as errors. Existing explicit preferences, including an
+`"application"` cursor, are preserved rather than replaced with newer defaults.
 
 On first use after upgrading, cagents migrates a sibling `settings.json` only
 when `settings.toml` does not exist. It validates the JSON, writes and syncs the
