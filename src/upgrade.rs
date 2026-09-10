@@ -126,7 +126,23 @@ pub(crate) fn ensure_no_surviving_process(
             Err(error) => return Err(process_error(error)),
         };
         if environment.is_empty() {
-            return Err(format!("cannot inspect process environment ({pid})"));
+            // Sandboxes can intentionally launch with no environment. Only an
+            // initialized zero-length range proves this is not an exec-time gap.
+            let stat = match fs::read_to_string(path.join("stat")) {
+                Ok(stat) => stat,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(process_error(error)),
+            };
+            let published_empty = stat.rsplit_once(')').is_some_and(|(_, fields)| {
+                // Fields after comm begin at 3; env_start/env_end are 50/51.
+                let mut fields = fields.split_whitespace().skip(47);
+                let start = fields.next().and_then(|value| value.parse::<u64>().ok());
+                let end = fields.next().and_then(|value| value.parse::<u64>().ok());
+                matches!((start, end), (Some(start), Some(end)) if start != 0 && start == end)
+            });
+            if !published_empty {
+                return Err(format!("cannot inspect process environment ({pid})"));
+            }
         }
         let mut cagents = false;
         for entry in environment.split(|byte| *byte == 0) {
@@ -837,7 +853,7 @@ mod tests {
 
     #[cfg(any(feature = "host", feature = "ui"))]
     #[test]
-    fn recovery_refuses_empty_process_evidence_during_exec() {
+    fn recovery_distinguishes_exec_evidence_from_published_empty_environments() {
         let directory = tempfile::tempdir().unwrap();
         let source = checkpoint(directory.path()).terminals.remove(0).source;
         let process = directory.path().join("42");
@@ -849,6 +865,35 @@ mod tests {
 
         fs::write(process.join("cmdline"), b"/bin/sleep\0").unwrap();
         fs::write(process.join("environ"), b"").unwrap();
+        assert!(ensure_no_surviving_process(&source, u32::MAX, directory.path()).is_err());
+
+        let mut fields = ["0"; 49];
+        fields[0] = "S";
+        fields[1] = "1";
+        fields[47] = "4096"; // stat fields 50/51: env_start and env_end.
+        fields[48] = "4096";
+        fs::write(
+            process.join("stat"),
+            format!("42 (empty environment) {}", fields.join(" ")),
+        )
+        .unwrap();
+        assert!(ensure_no_surviving_process(&source, u32::MAX, directory.path()).is_ok());
+
+        fields[48] = "8192";
+        fs::write(
+            process.join("stat"),
+            format!("42 (unread environment) {}", fields.join(" ")),
+        )
+        .unwrap();
+        assert!(ensure_no_surviving_process(&source, u32::MAX, directory.path()).is_err());
+
+        fields[47] = "0";
+        fields[48] = "0";
+        fs::write(
+            process.join("stat"),
+            format!("42 (unpublished environment) {}", fields.join(" ")),
+        )
+        .unwrap();
         assert!(ensure_no_surviving_process(&source, u32::MAX, directory.path()).is_err());
 
         fs::write(process.join("environ"), b"PATH=/bin\0").unwrap();
