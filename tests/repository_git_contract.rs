@@ -920,6 +920,7 @@ fn a_hook_that_backgrounds_a_pipe_holder_still_releases_the_mutation_lock() {
     {
         let _ = Command::new("kill")
             .arg("-9")
+            .arg("--")
             .arg(format!("-{group}"))
             .output();
     }
