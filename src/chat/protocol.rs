@@ -1,5 +1,5 @@
 //! Provider JSON protocols used by daemon-owned pipe and Unix WebSocket transports.
-use super::{Command, Event, Launch, Provider};
+use super::{Command, Event, Launch};
 use serde_json::Value;
 use std::{collections::BTreeMap, path::PathBuf};
 
@@ -51,9 +51,5 @@ pub trait Adapter: Send {
     fn receive(&mut self, frame: Value) -> Result<Step, String>;
 }
 pub fn create(launch: &Launch) -> Result<(ProcessSpec, Box<dyn Adapter>), String> {
-    match launch.provider {
-        Provider::Omp => omp::create(launch),
-        Provider::Claude => claude::create(launch),
-        Provider::Codex => codex::create(launch),
-    }
+    launch.provider.create_chat(launch)
 }

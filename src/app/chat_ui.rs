@@ -1,6 +1,7 @@
 use super::*;
+use crate::agent::{Activity, Provider};
 use crate::chat::client::{ClientHandle, Wake};
-use crate::chat::{self, Attachment, Command, ItemContent, PromptMode, Provider, Snapshot};
+use crate::chat::{self, Attachment, Command, ItemContent, PromptMode, Snapshot};
 use base64::Engine as _;
 use cosmic::widget::{markdown, text_editor};
 use std::sync::{
@@ -37,6 +38,7 @@ pub enum Action {
     Switch(CardId),
     Ready(Target, Ready),
     Wake(Target, Wake),
+    UpdatesAcknowledged(Target, Result<(), String>),
     Reconnect(Target),
     Composer(Target, text_editor::Action),
     Submit(Target, PromptMode),
@@ -78,6 +80,7 @@ impl Action {
             self,
             Self::Ready(..)
                 | Self::Wake(..)
+                | Self::UpdatesAcknowledged(..)
                 | Self::CommandFinished(..)
                 | Self::Attached(..)
                 | Self::HandoffFinished(..)
@@ -364,15 +367,7 @@ fn observed_launch(session: &TerminalSession) -> Option<LaunchRecipe> {
         .resume_hint
         .as_deref()
         .and_then(crate::model::agent_recovery::observed_launch_from_hint)
-        .or_else(|| {
-            matches!(
-                Path::new(&session.launch.program)
-                    .file_name()
-                    .and_then(|name| name.to_str()),
-                Some("omp" | "claude" | "codex")
-            )
-            .then(|| session.launch.clone())
-        })
+        .or_else(|| Provider::from_program(&session.launch.program).map(|_| session.launch.clone()))
 }
 
 pub(super) fn conversion(session: &TerminalSession) -> Result<chat::Session, String> {
@@ -383,20 +378,9 @@ pub(super) fn conversion(session: &TerminalSession) -> Result<chat::Session, Str
             "No supported foreground agent is known. Focus the running agent terminal and retry."
                 .to_owned()
         })?;
-    let program = Path::new(&recipe.program)
-        .file_name()
-        .and_then(|name| name.to_str());
-    let provider = match program {
-        Some("omp") => Provider::Omp,
-        Some("claude") => Provider::Claude,
-        Some("codex") => Provider::Codex,
-        _ => return Err("This terminal is not a supported agent session.".into()),
-    };
-    let identity_flag = if provider == Provider::Codex {
-        "resume"
-    } else {
-        "--resume"
-    };
+    let provider = Provider::from_program(&recipe.program)
+        .ok_or("This terminal is not a supported agent session.")?;
+    let identity_flag = provider.resume_flag();
     let session_id = recipe
         .arguments
         .windows(2)
@@ -456,6 +440,7 @@ impl Cagents {
         self.chat_ui.attempts.remove(&card);
         self.chat_ui.handoffs.retain(|target| target.card != card);
         self.chat_ui.closing.retain(|target| target.card != card);
+        self.observe_agent_activity_for_card(card, None);
     }
     pub(super) fn chat_start_pending(&self, card: CardId) -> bool {
         self.chat_ui.attempts.contains_key(&card)
@@ -552,6 +537,40 @@ impl Cagents {
                 Ready(Arc::new(Mutex::new(Some(result)))),
             ))
         })
+    }
+    pub(super) fn acknowledge_chat_updates(&mut self, scope: &Path) -> Task<Message> {
+        Task::batch(self.cards.iter().filter_map(|(&card, runtime)| {
+            let CardRuntime::Chat(runtime) = runtime else {
+                return None;
+            };
+            let state = self.card_state(card)?;
+            if !state.existence.is_open() {
+                return None;
+            }
+            let CardKind::Chat(session) = &state.kind else {
+                return None;
+            };
+            let directory = session.launch.recipe.working_directory.as_path();
+            let roots = self
+                .sidebar_model
+                .projects
+                .iter()
+                .flat_map(|project| &project.worktrees)
+                .map(|worktree| worktree.path.as_path());
+            if worktree_ui::worktree_root(directory, roots).unwrap_or(directory) != scope {
+                return None;
+            }
+            let target = runtime.target;
+            let handle = runtime.handle.clone();
+            let epoch = handle.begin_acknowledgement();
+            Some(cosmic::task::future(async move {
+                let result = tokio::task::spawn_blocking(move || handle.acknowledge_updates(epoch))
+                    .await
+                    .map_err(|error| error.to_string())
+                    .and_then(|result| result);
+                Message::ChatUi(Action::UpdatesAcknowledged(target, result))
+            }))
+        }))
     }
     fn chat_runtime_mut(&mut self, target: Target) -> Option<&mut Runtime> {
         match self.cards.get_mut(&target.card) {
@@ -708,6 +727,11 @@ impl Cagents {
                     Ok(handle) => {
                         let mut session = handle.session();
                         session.proof = handle.proof();
+                        let activity = Activity {
+                            provider: session.launch.provider,
+                            state: handle.take_activity(),
+                        };
+                        let observed = handle.take_observed();
                         let visible = self.workspace.visibility(target.card)
                             == Some(VisibilityClass::Visible);
                         if let Some(CardRuntime::Chat(runtime)) = self.cards.get_mut(&target.card) {
@@ -733,6 +757,10 @@ impl Cagents {
                             session = runtime.session.clone();
                         }
                         self.commit_chat_session(target.card, session);
+                        self.observe_agent_activity_for_card(target.card, Some(activity));
+                        if observed {
+                            self.observe_agent_update_for_card(target.card);
+                        }
                         return iced::widget::operation::focus(card_control_id(
                             target.card,
                             "chat-composer",
@@ -743,6 +771,7 @@ impl Cagents {
                         if let Some(CardRuntime::Chat(runtime)) = self.cards.get_mut(&target.card) {
                             runtime.error = Some(error);
                             runtime.disconnected = true;
+                            self.observe_agent_activity_for_card(target.card, None);
                         } else {
                             // Failed recognition/attachment must never replace or
                             // tear down the user's still-running terminal.
@@ -752,12 +781,44 @@ impl Cagents {
                     }
                 }
             }
+            Action::UpdatesAcknowledged(target, result) => {
+                if let Some(runtime) = self.chat_runtime_mut(target)
+                    && let Err(error) = result
+                {
+                    runtime.error = Some(error);
+                }
+            }
             Action::Wake(target, wake) => {
                 let Some(runtime) = self.chat_runtime_mut(target) else {
                     return Task::none();
                 };
                 match wake {
-                    Wake::Changed => runtime.refresh(),
+                    Wake::Changed => {
+                        runtime.refresh();
+                        let activity = Activity {
+                            provider: runtime.session.launch.provider,
+                            state: runtime.handle.take_activity(),
+                        };
+                        let session = runtime.session.clone();
+                        self.observe_agent_activity_for_card(target.card, Some(activity));
+                        self.commit_chat_session(target.card, session);
+                        return Task::none();
+                    }
+                    Wake::Observed => {
+                        if !runtime.handle.take_observed() {
+                            return Task::none();
+                        }
+                        self.observe_agent_update_for_card(target.card);
+                        return Task::none();
+                    }
+                    Wake::Activity => {
+                        let activity = Activity {
+                            provider: runtime.session.launch.provider,
+                            state: runtime.handle.take_activity(),
+                        };
+                        self.observe_agent_activity_for_card(target.card, Some(activity));
+                        return Task::none();
+                    }
                     Wake::Disconnected(error) => {
                         runtime.disconnected = true;
                         runtime.error = Some(error);
@@ -765,6 +826,7 @@ impl Cagents {
                 }
                 let session = runtime.session.clone();
                 self.commit_chat_session(target.card, session);
+                self.observe_agent_activity_for_card(target.card, None);
             }
             Action::Reconnect(target) => {
                 let Some(runtime) = self.chat_runtime_mut(target) else {
@@ -1189,6 +1251,7 @@ impl Cagents {
                     return Task::none();
                 }
                 self.chat_ui.closed.insert(target.card);
+                self.observe_agent_activity_for_card(target.card, None);
                 return cosmic::task::message(Message::CommitClose(target.card));
             }
         }

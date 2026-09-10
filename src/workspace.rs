@@ -7,6 +7,7 @@ use crate::model::CardId;
 const POSITION_EPSILON: f32 = 0.25;
 const VELOCITY_EPSILON: f32 = 0.5;
 const SCROLL_SYNC_EPSILON: f32 = 0.5;
+const LAYOUT_DURATION: Duration = Duration::from_millis(220);
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", content = "value", rename_all = "snake_case")]
@@ -37,15 +38,15 @@ impl CardWidth {
     }
 
     pub fn next_preset(self) -> Self {
-        const PRESETS: [f32; 4] = [1.0 / 3.0, 2.0 / 3.0, 0.5, 1.0];
+        const PRESETS: [f32; 4] = [1.0 / 3.0, 0.5, 2.0 / 3.0, 1.0];
         let next = match self {
             Self::Fraction(fraction) => PRESETS
-                .iter()
-                .position(|preset| (fraction - preset).abs() <= f32::EPSILON)
-                .map_or(0, |index| (index + 1) % PRESETS.len()),
-            Self::Fixed(_) => 0,
+                .into_iter()
+                .find(|preset| *preset > fraction + f32::EPSILON)
+                .unwrap_or(PRESETS[0]),
+            Self::Fixed(_) => PRESETS[0],
         };
-        Self::Fraction(PRESETS[next])
+        Self::Fraction(next)
     }
 
     fn validate(self) -> Result<Self, WorkspaceError> {
@@ -591,6 +592,15 @@ struct PendingClose {
     handoff: FocusHandoff,
 }
 
+/// Transient presentation geometry. Durable cards and `geometry()` always hold
+/// the target widths, so saving or switching worktrees cannot persist a frame.
+#[derive(Debug, Clone)]
+struct LayoutTransition {
+    from_widths: Vec<f32>,
+    geometry: StripGeometry,
+    elapsed: Duration,
+}
+
 #[derive(Debug, Clone)]
 pub struct Workspace {
     cards: Vec<WorkspaceCard>,
@@ -598,6 +608,7 @@ pub struct Workspace {
     focused: Option<CardId>,
     viewport_width: f32,
     geometry: StripGeometry,
+    layout_transition: Option<LayoutTransition>,
     camera: Camera,
     scroll_sync: Option<ScrollSync>,
     visibility: HashMap<CardId, VisibilityClass>,
@@ -616,6 +627,7 @@ impl Workspace {
             focused: None,
             viewport_width: 0.0,
             geometry: StripGeometry::build(&[], 0.0, config),
+            layout_transition: None,
             camera: Camera::new(config.animation_omega)?,
             scroll_sync: None,
             visibility: HashMap::new(),
@@ -653,6 +665,16 @@ impl Workspace {
 
     pub fn camera(&self) -> Camera {
         self.camera
+    }
+
+    pub fn is_animating(&self) -> bool {
+        self.camera.is_animating() || self.layout_transition.is_some()
+    }
+
+    pub fn presentation_geometry(&self) -> &StripGeometry {
+        self.layout_transition
+            .as_ref()
+            .map_or(&self.geometry, |transition| &transition.geometry)
     }
 
     pub fn viewport_width(&self) -> f32 {
@@ -712,6 +734,8 @@ impl Workspace {
             });
         }
 
+        let animate = focus && !self.cards.is_empty() && self.viewport_width > 0.0;
+        let previous = animate.then(|| self.presentation_geometry().clone());
         let id = card.id;
         self.cards.insert(
             index,
@@ -723,6 +747,9 @@ impl Workspace {
             self.pending_widget_focus = Some(id);
         }
         self.rebuild_geometry();
+        if let Some(previous) = previous {
+            self.begin_layout_transition(previous);
+        }
         if focus {
             self.reveal_focused();
         }
@@ -737,6 +764,28 @@ impl Workspace {
         let index = self.index_of(id).ok_or(WorkspaceError::UnknownCard(id))?;
         self.cards[index].width = width.validate()?;
         self.rebuild_geometry();
+        self.reveal_focused();
+        Ok(self.refresh_visibility(false))
+    }
+
+    /// Width presets animate; direct drag updates use `set_card_width` so the
+    /// boundary continues to follow the pointer without a trailing animation.
+    pub fn animate_card_width(
+        &mut self,
+        id: CardId,
+        width: CardWidth,
+    ) -> Result<ViewportUpdate, WorkspaceError> {
+        let index = self.index_of(id).ok_or(WorkspaceError::UnknownCard(id))?;
+        let width = width.validate()?;
+        if self.cards[index].width == width {
+            return Ok(ViewportUpdate::unchanged());
+        }
+        let previous = self.presentation_geometry().clone();
+        let camera = self.camera;
+        self.cards[index].width = width;
+        self.rebuild_geometry();
+        self.camera = camera;
+        self.begin_layout_transition(previous);
         self.reveal_focused();
         Ok(self.refresh_visibility(false))
     }
@@ -951,7 +1000,8 @@ impl Workspace {
                 .clamp(self.geometry.max_offset(self.viewport_width));
         }
 
-        let offset = finite_nonnegative(offset).min(self.geometry.max_offset(self.viewport_width));
+        let offset = finite_nonnegative(offset)
+            .min(self.presentation_geometry().max_offset(self.viewport_width));
         let recognized = self
             .scroll_sync
             .as_mut()
@@ -981,9 +1031,26 @@ impl Workspace {
     }
 
     pub fn tick(&mut self, elapsed: Duration) -> ViewportUpdate {
+        if let Some(transition) = &mut self.layout_transition {
+            transition.elapsed = transition.elapsed.saturating_add(elapsed);
+            if transition.elapsed >= LAYOUT_DURATION {
+                self.layout_transition = None;
+            } else {
+                Self::interpolate_layout(
+                    transition,
+                    &self.geometry,
+                    self.viewport_width,
+                    self.config,
+                );
+            }
+            self.visibility_bands = None;
+        }
         let changed = self.camera.step(elapsed);
-        self.camera
-            .clamp(self.geometry.max_offset(self.viewport_width));
+        self.camera.clamp(
+            self.presentation_geometry()
+                .max_offset(self.viewport_width)
+                .max(self.geometry.max_offset(self.viewport_width)),
+        );
         self.refresh_visibility(changed)
     }
 
@@ -991,7 +1058,7 @@ impl Workspace {
         let viewport_width = finite_nonnegative(viewport_width);
         let rebuilt_geometry;
         let geometry = if (viewport_width - self.viewport_width).abs() <= f32::EPSILON {
-            &self.geometry
+            self.presentation_geometry()
         } else {
             rebuilt_geometry = StripGeometry::build(&self.cards, viewport_width, self.config);
             &rebuilt_geometry
@@ -1071,10 +1138,79 @@ impl Workspace {
     }
 
     fn rebuild_geometry(&mut self) {
+        self.layout_transition = None;
         self.geometry = StripGeometry::build(&self.cards, self.viewport_width, self.config);
         self.visibility_bands = None;
         self.camera
             .clamp(self.geometry.max_offset(self.viewport_width));
+    }
+
+    fn begin_layout_transition(&mut self, previous: StripGeometry) {
+        if self.viewport_width <= 0.0 {
+            return;
+        }
+        let widths: HashMap<_, _> = previous
+            .cards()
+            .iter()
+            .map(|card| (card.id, card.width()))
+            .collect();
+        let from_widths: Vec<_> = self
+            .geometry
+            .cards()
+            .iter()
+            .map(|card| widths.get(&card.id).copied().unwrap_or(1.0))
+            .collect();
+        if self
+            .geometry
+            .cards()
+            .iter()
+            .zip(&from_widths)
+            .all(|(card, width)| (card.width() - width).abs() <= POSITION_EPSILON)
+        {
+            return;
+        }
+        let mut transition = LayoutTransition {
+            from_widths,
+            geometry: self.geometry.clone(),
+            elapsed: Duration::ZERO,
+        };
+        Self::interpolate_layout(
+            &mut transition,
+            &self.geometry,
+            self.viewport_width,
+            self.config,
+        );
+        self.layout_transition = Some(transition);
+        self.visibility_bands = None;
+    }
+
+    fn interpolate_layout(
+        transition: &mut LayoutTransition,
+        target: &StripGeometry,
+        viewport_width: f32,
+        config: WorkspaceConfig,
+    ) {
+        let progress =
+            (transition.elapsed.as_secs_f32() / LAYOUT_DURATION.as_secs_f32()).clamp(0.0, 1.0);
+        let eased = 1.0 - (1.0 - progress).powi(3);
+        let mut cursor = config.leading_padding;
+        for (((card, end), target), from) in transition
+            .geometry
+            .cards
+            .iter_mut()
+            .zip(&mut transition.geometry.prefix_ends)
+            .zip(target.cards())
+            .zip(&transition.from_widths)
+        {
+            card.start = cursor;
+            card.end = cursor + from + (target.width() - from) * eased;
+            *end = card.end;
+            cursor = card.end + config.gap;
+        }
+        let trailing = cursor - config.gap + config.trailing_padding;
+        // Keep the destination reachable during a reveal. Shrinking content
+        // still retains its current extent until the final frame.
+        transition.geometry.total_width = trailing.max(viewport_width).max(target.total_width());
     }
 
     fn reveal_focused(&mut self) {
@@ -1088,7 +1224,7 @@ impl Workspace {
 
     fn refresh_visibility(&mut self, offset_changed: bool) -> ViewportUpdate {
         let bands = visibility_bands(
-            &self.geometry,
+            self.presentation_geometry(),
             self.camera.offset(),
             self.viewport_width,
             self.config.overscan,
@@ -1263,6 +1399,85 @@ mod tests {
             workspace.add_card(card(width), index, index == 0).unwrap();
         }
         workspace
+    }
+
+    #[test]
+    fn width_animation_preserves_targets_retargets_continuously_and_stops() {
+        let mut workspace = workspace_with_widths(&[CardWidth::Fraction(0.5); 2], 800.0);
+        let id = workspace.focused().unwrap();
+        workspace
+            .animate_card_width(id, CardWidth::Fraction(1.0))
+            .unwrap();
+        assert_eq!(workspace.card(id).unwrap().width, CardWidth::Fraction(1.0));
+        assert_eq!(workspace.geometry().card(id).unwrap().width(), 800.0);
+        assert_eq!(
+            workspace.presentation_geometry().card(id).unwrap().width(),
+            400.0
+        );
+        workspace.tick(Duration::from_millis(80));
+        let intermediate = workspace.presentation_geometry().card(id).unwrap().width();
+        assert!(intermediate > 400.0 && intermediate < 800.0);
+        assert!(workspace.projection(800.0).mounted_are_disjoint());
+        workspace
+            .animate_card_width(id, CardWidth::Fraction(1.0 / 3.0))
+            .unwrap();
+        assert_eq!(
+            workspace.presentation_geometry().card(id).unwrap().width(),
+            intermediate
+        );
+        workspace.tick(LAYOUT_DURATION);
+        assert_eq!(workspace.presentation_geometry(), workspace.geometry());
+        assert!(!workspace.is_animating());
+        let settled = workspace.projection(800.0);
+        assert_eq!(
+            workspace.tick(Duration::from_secs(1)),
+            ViewportUpdate::unchanged()
+        );
+        assert_eq!(workspace.projection(800.0), settled);
+    }
+
+    #[test]
+    fn inserted_pane_moves_neighbors_without_overlapping_or_losing_focus() {
+        let mut workspace = workspace_with_widths(&[CardWidth::Fixed(300.0); 2], 900.0);
+        let second = workspace.order().nth(1).unwrap();
+        let inserted = card(CardWidth::Fixed(300.0));
+        let inserted_id = inserted.id;
+        workspace.add_card(inserted, 1, true).unwrap();
+        let initial = workspace
+            .presentation_geometry()
+            .card(second)
+            .unwrap()
+            .start;
+        let target = workspace.geometry().card(second).unwrap().start;
+        assert!(initial < target);
+        assert_eq!(workspace.focused(), Some(inserted_id));
+        assert_eq!(workspace.take_widget_focus_request(), Some(inserted_id));
+        workspace.tick(Duration::from_millis(80));
+        let intermediate = workspace
+            .presentation_geometry()
+            .card(second)
+            .unwrap()
+            .start;
+        assert!(intermediate > initial && intermediate < target);
+        assert!(workspace.projection(900.0).mounted_are_disjoint());
+        workspace.tick(LAYOUT_DURATION);
+        assert_eq!(
+            workspace
+                .presentation_geometry()
+                .card(second)
+                .unwrap()
+                .start,
+            target
+        );
+        for _ in 0..120 {
+            if !workspace.is_animating() {
+                break;
+            }
+            workspace.tick(Duration::from_millis(16));
+            assert!(workspace.projection(900.0).mounted_are_disjoint());
+        }
+        assert!(!workspace.is_animating());
+        assert_eq!(workspace.focused(), Some(inserted_id));
     }
     #[test]
     fn held_navigation_reaches_the_strip_edge_without_restarting_the_camera() {
@@ -1481,7 +1696,7 @@ mod tests {
             workspace
                 .set_card_width(id, CardWidth::Fraction(0.61))
                 .unwrap();
-            for fraction in [1.0 / 3.0, 2.0 / 3.0, 0.5, 1.0, 1.0 / 3.0] {
+            for fraction in [2.0 / 3.0, 1.0, 1.0 / 3.0, 0.5, 2.0 / 3.0] {
                 let next = workspace.card(id).unwrap().width.next_preset();
                 workspace.set_card_width(id, next).unwrap();
                 assert!(

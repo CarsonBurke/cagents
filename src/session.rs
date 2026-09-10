@@ -1462,7 +1462,7 @@ mod tests {
         let mut chat = crate::chat::Session {
             id: terminal.id,
             launch: crate::chat::Launch {
-                provider: crate::chat::Provider::Omp,
+                provider: crate::agent::Provider::Omp,
                 recipe: terminal.launch.clone(),
                 session_id: None,
             },

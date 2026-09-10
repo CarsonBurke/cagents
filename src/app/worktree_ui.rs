@@ -2,7 +2,7 @@ use super::*;
 
 /// Ownership comes from the launch recipe, never a shell's current directory or
 /// OSC title. Component-aware matching also keeps `repo-fix` outside `repo`.
-fn worktree_root<'a>(
+pub(super) fn worktree_root<'a>(
     directory: &'a Path,
     roots: impl Iterator<Item = &'a Path>,
 ) -> Option<&'a Path> {
@@ -84,6 +84,45 @@ fn insertion_indices(
 }
 
 impl Cagents {
+    fn acknowledge_terminal_updates(&mut self, scope: &Path) {
+        for (&card, runtime) in &self.cards {
+            let CardRuntime::Terminal(handle) = runtime else {
+                continue;
+            };
+            let Some(state) = self
+                .card_state(card)
+                .filter(|state| state.existence.is_open())
+            else {
+                continue;
+            };
+            let Some(directory) = card_directory(state) else {
+                continue;
+            };
+            let roots = self
+                .sidebar_model
+                .projects
+                .iter()
+                .flat_map(|project| &project.worktrees)
+                .map(|worktree| worktree.path.as_path());
+            if worktree_root(directory, roots).unwrap_or(directory) == scope
+                && let Err(error) = handle.acknowledge_updates()
+            {
+                self.status = Some(TransientNotice::error(format!(
+                    "Could not acknowledge terminal output: {error}"
+                )));
+            }
+        }
+    }
+
+    fn acknowledge_worktree_updates(&mut self, path: &Path) -> Task<Message> {
+        if let Some(key) = self.sidebar_model.worktree_at(path) {
+            self.sidebar_state
+                .acknowledge_agent_update(key.project_id, key.worktree_id);
+        }
+        self.acknowledge_terminal_updates(path);
+        self.acknowledge_chat_updates(path)
+    }
+
     pub(super) fn select_worktree(
         &mut self,
         path: PathBuf,
@@ -114,11 +153,16 @@ impl Cagents {
                 .filter(|card| belongs_to_scope(card, &path, &roots))
                 .map(|card| card.id))
         {
-            return if create_if_empty && !has_terminal {
+            if !create_if_empty {
+                return Task::none();
+            }
+            let acknowledged = self.acknowledge_worktree_updates(&path);
+            let terminal = if !has_terminal {
                 self.add_terminal(path)
             } else {
                 Task::none()
             };
+            return Task::batch([acknowledged, terminal]);
         }
         if let Some(previous) = &self.active_workspace {
             self.worktree_offsets
@@ -135,6 +179,15 @@ impl Cagents {
             &roots,
             self.worktree_focus.get(&path).copied(),
         );
+        let departing = self
+            .active_workspace
+            .clone()
+            .filter(|previous| previous != &path);
+        let departed = departing.as_deref().map_or_else(Task::none, |previous| {
+            self.acknowledge_terminal_updates(previous);
+            self.acknowledge_chat_updates(previous)
+        });
+        let acknowledged = self.acknowledge_worktree_updates(&path);
         let width = self.workspace.viewport_width();
         // Hide before replacing the strip: its former widgets no longer get a
         // chance to send native-surface visibility updates after unmounting.
@@ -190,7 +243,14 @@ impl Cagents {
         } else {
             Task::none()
         };
-        Task::batch([viewport, residency, source_control, terminal])
+        Task::batch([
+            viewport,
+            residency,
+            source_control,
+            terminal,
+            departed,
+            acknowledged,
+        ])
     }
 
     pub(super) fn reconcile_scoped_lifecycle(&mut self) -> Task<Message> {
@@ -359,7 +419,7 @@ mod tests {
         card.kind = CardKind::Chat(crate::chat::Session {
             id: source.id,
             launch: crate::chat::Launch {
-                provider: crate::chat::Provider::Omp,
+                provider: crate::agent::Provider::Omp,
                 recipe: source.launch.clone(),
                 session_id: None,
             },
@@ -931,6 +991,7 @@ mod tests {
                     bare: false,
                     lock: crate::repository::WorktreeLock::default(),
                     prunable_reason: None,
+                    created_at_unix_ms: None,
                 },
                 warnings: Vec::new(),
             }),

@@ -268,6 +268,9 @@ impl Claude {
     }
     fn status(&mut self, busy: bool, detail: impl Into<String>, step: &mut Step) {
         self.busy = busy;
+        if !busy {
+            step.events.push(Event::Waiting(false));
+        }
         step.events.push(Event::Status {
             busy,
             detail: detail.into(),
@@ -1542,11 +1545,17 @@ impl Claude {
                     false,
                 )));
             }
-            "session_state_changed" => match string(frame, "state") {
-                "idle" => self.status(false, "Claude is idle", step),
-                "requires_action" => self.status(true, "Claude is waiting for your response", step),
-                state => self.status(true, format!("Claude: {state}"), step),
-            },
+            "session_state_changed" => {
+                let state = string(frame, "state");
+                step.events.push(Event::Waiting(state == "requires_action"));
+                match state {
+                    "idle" => self.status(false, "Claude is idle", step),
+                    "requires_action" => {
+                        self.status(true, "Claude is waiting for your response", step)
+                    }
+                    state => self.status(true, format!("Claude: {state}"), step),
+                }
+            }
             "status" => step.events.push(Event::Status {
                 busy: self.busy,
                 detail: format!("Claude: {}", string(frame, "status")),
@@ -2188,7 +2197,7 @@ fn elicitation_value(schema: &Value, values: &[String]) -> Result<Value, String>
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::chat::Provider;
+    use crate::agent::Provider;
     use std::io::Write as _;
 
     fn approval(id: &str, tool: &str, input: Value) -> Value {

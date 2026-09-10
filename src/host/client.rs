@@ -2,13 +2,13 @@ use std::{
     io::{self, Read},
     net::Shutdown,
     os::unix::net::UnixStream,
-    sync::Arc,
+    sync::{Arc, Mutex},
     thread,
     time::{Duration, Instant},
 };
 
 use crate::{
-    model::HostSessionProof,
+    model::{HostSessionProof, TerminalId},
     terminal_ipc::{
         ClientEnvelope, ClientRequest, FrameCodec, MAX_CLIENT_FRAME_BYTES, MAX_FRAME_BYTES,
         MAX_INPUT_BYTES, MAX_RESUME_TERMINALS, PROTOCOL_VERSION, ProtocolError, ProtocolErrorCode,
@@ -100,6 +100,7 @@ pub(crate) fn serve(stream: UnixStream, client_id: ClientId, host: SharedHost) {
     let handshake_deadline = Instant::now() + HANDSHAKE_TIMEOUT;
     let mut codec = FrameCodec::new(MAX_CLIENT_FRAME_BYTES);
     let mut connected = false;
+    let mut activity_job = AgentActivityJob::default();
     loop {
         let frame = if connected {
             codec.read::<ClientEnvelope>(&mut reader)
@@ -194,6 +195,15 @@ pub(crate) fn serve(stream: UnixStream, client_id: ClientId, host: SharedHost) {
         }
 
         let request_id = envelope.request_id;
+        if let ClientRequest::RefreshAgentActivity { terminal_id } = envelope.request {
+            if let Err(error) =
+                activity_job.schedule(&host, client_id, &delivery, request_id, terminal_id)
+                && push_error(&delivery, &host, request_id, error).is_err()
+            {
+                break;
+            }
+            continue;
+        }
         let outcome = process_request(&host, client_id, envelope.request);
         match outcome {
             Ok((response, extras, shutdown)) => {
@@ -231,6 +241,9 @@ pub(crate) fn serve(stream: UnixStream, client_id: ClientId, host: SharedHost) {
         }
     }
 
+    // Stop publication before removing this delivery identity. Joining below
+    // waits only for the already-running bounded probe, never queued work.
+    activity_job.cancel();
     let handles = host
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -242,7 +255,156 @@ pub(crate) fn serve(stream: UnixStream, client_id: ClientId, host: SharedHost) {
         handle.acknowledge_redraw(handle.generation());
     }
     delivery.close_after_drain();
+    drop(activity_job);
     let _ = writer.join();
+}
+
+/// At most one query is admitted per connection, with no pending backlog.
+/// A finished worker is reaped before its replacement is created; idle clients
+/// have no polling worker. Overflow is an explicit retryable protocol response.
+#[derive(Default)]
+struct AgentActivityJob {
+    worker: Option<thread::JoinHandle<()>>,
+    // Serializes cancellation with apply/publication, not with provider I/O.
+    cancelled: Arc<Mutex<bool>>,
+}
+
+impl AgentActivityJob {
+    fn schedule(
+        &mut self,
+        host: &SharedHost,
+        client_id: ClientId,
+        delivery: &Arc<DeliveryQueue>,
+        request_id: u64,
+        terminal_id: TerminalId,
+    ) -> Result<(), ProtocolError> {
+        let (handle, observer, proof) = {
+            let state = host.lock().unwrap_or_else(|error| error.into_inner());
+            let handle = state.handle(client_id, terminal_id)?;
+            if state.shutting_down
+                || !state
+                    .clients
+                    .get(&client_id)
+                    .is_some_and(|current| Arc::ptr_eq(current, delivery))
+            {
+                return Err(ProtocolError::new(
+                    ProtocolErrorCode::TerminalUnavailable,
+                    "client connection is closing",
+                    true,
+                ));
+            }
+            (
+                handle,
+                Arc::clone(&state.agent_observer),
+                state.proof().clone(),
+            )
+        };
+        if self
+            .worker
+            .as_ref()
+            .is_some_and(|worker| !worker.is_finished())
+        {
+            return Err(ProtocolError::new(
+                ProtocolErrorCode::QueueFull,
+                "an agent activity query is already running on this connection",
+                true,
+            ));
+        }
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
+        let host = Arc::clone(host);
+        let delivery = Arc::clone(delivery);
+        let cancelled = Arc::clone(&self.cancelled);
+        self.worker = Some(
+            thread::Builder::new()
+                .name(format!("cagentsd-activity-{client_id}"))
+                .spawn(move || {
+                    let process = {
+                        let cancelled = cancelled.lock().unwrap_or_else(|error| error.into_inner());
+                        if *cancelled {
+                            return;
+                        }
+                        handle.observe_agent_process()
+                    };
+                    let activity = process.as_ref().and_then(|process| {
+                        (process.provider != crate::agent::Provider::Omp)
+                            .then(|| observer.activity(process.provider, &process.launch))
+                            .flatten()
+                    });
+                    let cancelled = cancelled.lock().unwrap_or_else(|error| error.into_inner());
+                    if *cancelled {
+                        return;
+                    }
+                    // The connection may have detached, shut down, or been replaced
+                    // while the provider was queried. Never publish to its successor.
+                    let attached = {
+                        let state = host.lock().unwrap_or_else(|error| error.into_inner());
+                        if state.shutting_down
+                            || state.proof() != &proof
+                            || !state
+                                .clients
+                                .get(&client_id)
+                                .is_some_and(|current| Arc::ptr_eq(current, &delivery))
+                        {
+                            delivery.abort();
+                            return;
+                        }
+                        state.handle(client_id, terminal_id)
+                    };
+                    let message = match attached {
+                        Ok(_) => {
+                            // Fresh raw process identity and deadline are checked by
+                            // the PTY owner. Neither observation nor apply holds HostState.
+                            let activity = process.and_then(|process| {
+                                if process.provider == crate::agent::Provider::Omp {
+                                    handle.agent_activity()
+                                } else {
+                                    handle.apply_agent_activity(process, activity)
+                                }
+                            });
+                            ServerMessage::Response {
+                                response: ServerResponse::AgentActivity {
+                                    terminal_id,
+                                    activity,
+                                },
+                            }
+                        }
+                        Err(error) => ServerMessage::Error(error),
+                    };
+                    let _ = delivery.push(ServerEnvelope {
+                        version: PROTOCOL_VERSION,
+                        request_id: Some(request_id),
+                        proof,
+                        message,
+                    });
+                })
+                .map_err(|error| {
+                    ProtocolError::new(
+                        ProtocolErrorCode::Internal,
+                        format!("could not start agent activity query: {error}"),
+                        true,
+                    )
+                })?,
+        );
+        Ok(())
+    }
+
+    fn cancel(&self) {
+        *self
+            .cancelled
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = true;
+    }
+}
+
+impl Drop for AgentActivityJob {
+    fn drop(&mut self) {
+        self.cancel();
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
+    }
 }
 
 type RequestOutcome = (ServerResponse, Vec<ServerMessage>, bool);
@@ -253,11 +415,17 @@ fn process_request(
     request: ClientRequest,
 ) -> Result<RequestOutcome, ProtocolError> {
     match request {
+        ClientRequest::RefreshAgentActivity { .. } => Err(ProtocolError::new(
+            ProtocolErrorCode::Internal,
+            "agent activity requests require asynchronous scheduling",
+            false,
+        )),
         request @ (ClientRequest::ChatStart { .. }
         | ClientRequest::ChatAttach { .. }
         | ClientRequest::ChatDetach { .. }
         | ClientRequest::ChatCommand { .. }
         | ClientRequest::ChatVisibility { .. }
+        | ClientRequest::ChatAcknowledge { .. }
         | ClientRequest::ChatRead { .. }
         | ClientRequest::ChatClose { .. }
         | ClientRequest::ChatList) => Ok((
@@ -394,8 +562,13 @@ fn process_request(
             let handle = host
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .handle(client_id, terminal_id)?;
-            handle.focus(focused).map_err(send_error)?;
+                .focus_handle(client_id, terminal_id)?;
+            if let Some(handle) = handle {
+                match handle.focus(focused) {
+                    Ok(()) | Err(crate::terminal::TerminalSendError::Closed) => {}
+                    Err(error) => return Err(send_error(error)),
+                }
+            }
             Ok((ServerResponse::Accepted, Vec::new(), false))
         }
         ClientRequest::SetTheme { terminal_id, theme } => {
@@ -520,6 +693,12 @@ fn process_request(
                 false,
             ))
         }
+        ClientRequest::TerminalAcknowledge { terminal_id, epoch } => {
+            host.lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .acknowledge_output(client_id, terminal_id, epoch)?;
+            Ok((ServerResponse::Accepted, Vec::new(), false))
+        }
         ClientRequest::AcknowledgeRedraw {
             terminal_id,
             generation,
@@ -538,6 +717,24 @@ fn process_request(
                 .handle(client_id, terminal_id)?;
             handle.shutdown().map_err(send_error)?;
             Ok((ServerResponse::Accepted, Vec::new(), false))
+        }
+        ClientRequest::CloseTerminalChecked {
+            terminal_id,
+            allow_active,
+        } => {
+            let handle = host
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .handle(client_id, terminal_id)?;
+            let outcome = handle.close_checked(allow_active);
+            Ok((
+                ServerResponse::TerminalCloseChecked {
+                    terminal_id,
+                    outcome,
+                },
+                Vec::new(),
+                false,
+            ))
         }
         ClientRequest::Shutdown => {
             let outcome = host
@@ -710,6 +907,314 @@ fn writer_loop(mut stream: UnixStream, delivery: Arc<DeliveryQueue>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn slow_agent_probe_does_not_block_ipc_and_disconnect_reaps_it() {
+        fn send(
+            stream: &mut UnixStream,
+            proof: &HostSessionProof,
+            request_id: u64,
+            request: ClientRequest,
+        ) {
+            FrameCodec::new(MAX_CLIENT_FRAME_BYTES)
+                .write(
+                    stream,
+                    &ClientEnvelope {
+                        version: PROTOCOL_VERSION,
+                        request_id,
+                        proof: Some(proof.clone()),
+                        request,
+                    },
+                )
+                .unwrap();
+        }
+
+        fn response(stream: &mut UnixStream, proof: &HostSessionProof) -> ServerEnvelope {
+            let mut codec = FrameCodec::new(MAX_FRAME_BYTES);
+            loop {
+                let envelope = codec.read::<ServerEnvelope>(stream).unwrap().unwrap();
+                assert_eq!(&envelope.proof, proof);
+                if envelope.request_id.is_some() {
+                    return envelope;
+                }
+            }
+        }
+
+        fn wait_file(path: &std::path::Path) {
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while !std::fs::metadata(path).is_ok_and(|metadata| metadata.len() > 0) {
+                assert!(
+                    Instant::now() < deadline,
+                    "fixture did not start: {}",
+                    path.display()
+                );
+                thread::sleep(Duration::from_millis(5));
+            }
+        }
+
+        struct Cleanup {
+            stream: UnixStream,
+            server: Option<thread::JoinHandle<()>>,
+            handle: Option<crate::terminal::TerminalHandle>,
+        }
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = self.stream.shutdown(Shutdown::Both);
+                if let Some(handle) = &self.handle {
+                    let _ = handle.shutdown();
+                }
+                if let Some(server) = self.server.take() {
+                    server.join().unwrap();
+                }
+            }
+        }
+
+        let directory = tempfile::tempdir().unwrap();
+        let executable = directory.path().join("claude");
+        // A real ELF foreground executable with an exact provider basename.
+        // The copied shell reads our local `agents` script for the real probe;
+        // no installed provider, credentials, network, or model is involved.
+        std::fs::copy("/bin/sh", &executable).unwrap();
+        std::fs::write(
+            directory.path().join("agents"),
+            "printf '%s' \"$$\" > probe-started\nexec /bin/sleep 30\n",
+        )
+        .unwrap();
+        let launch = crate::model::LaunchRecipe {
+            program: executable.to_string_lossy().into_owned(),
+            arguments: vec![
+                "-c".into(),
+                "printf ready > terminal-ready; while IFS= read -r line; do printf '%s\\n' \"$line\"; done".into(),
+            ],
+            working_directory: directory.path().to_path_buf(),
+            environment: [
+                ("HOME".into(), directory.path().to_string_lossy().into_owned()),
+                ("CLAUDE_CONFIG_DIR".into(), directory.path().to_string_lossy().into_owned()),
+                ("PATH".into(), "/usr/bin:/bin".into()),
+            ].into_iter().collect(),
+        };
+        let terminal_id = TerminalId::new();
+        let session = crate::model::TerminalSession {
+            id: terminal_id,
+            launch: launch.clone(),
+            transcript_path: None,
+            resume_hint: None,
+            continuity: crate::model::TerminalContinuity::RelaunchAvailable {
+                recipe: launch,
+                last_exit: None,
+            },
+        };
+        let proof = HostSessionProof {
+            host_session_id: crate::model::HostSessionId::new("slow-probe"),
+            boot_id: crate::model::BootId::new("slow-probe"),
+            host_incarnation: crate::model::HostIncarnation::new("slow-probe"),
+        };
+        let host = Arc::new(Mutex::new(super::super::state::HostState::new(
+            proof.clone(),
+        )));
+        let (mut stream, server_stream) = UnixStream::pair().unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
+        stream
+            .set_write_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
+        let server_host = Arc::clone(&host);
+        let mut cleanup = Cleanup {
+            stream: stream.try_clone().unwrap(),
+            server: Some(thread::spawn(move || serve(server_stream, 1, server_host))),
+            handle: None,
+        };
+        send(
+            &mut stream,
+            &proof,
+            1,
+            ClientRequest::Connect {
+                expected_host: Some(proof.clone()),
+                resume: Vec::new(),
+            },
+        );
+        assert!(matches!(
+            response(&mut stream, &proof).message,
+            ServerMessage::Response {
+                response: ServerResponse::Connected { .. }
+            }
+        ));
+        send(
+            &mut stream,
+            &proof,
+            2,
+            ClientRequest::Spawn {
+                session,
+                options: Default::default(),
+            },
+        );
+        assert!(matches!(
+            response(&mut stream, &proof).message,
+            ServerMessage::Response {
+                response: ServerResponse::Spawned { .. }
+            }
+        ));
+        cleanup.handle = Some(host.lock().unwrap().handle(1, terminal_id).unwrap());
+        wait_file(&directory.path().join("terminal-ready"));
+        send(
+            &mut stream,
+            &proof,
+            3,
+            ClientRequest::RefreshAgentActivity { terminal_id },
+        );
+        let started = directory.path().join("probe-started");
+        wait_file(&started);
+        let probe_pid: i32 = std::fs::read_to_string(&started).unwrap().parse().unwrap();
+
+        // Repeated refresh frames get explicit bounded backpressure, while
+        // interactive requests over this same socket overtake the slow query.
+        for request_id in 4..12 {
+            send(
+                &mut stream,
+                &proof,
+                request_id,
+                ClientRequest::RefreshAgentActivity { terminal_id },
+            );
+        }
+        send(
+            &mut stream,
+            &proof,
+            12,
+            ClientRequest::Input {
+                terminal_id,
+                bytes: b"responsive\n".to_vec(),
+            },
+        );
+        send(
+            &mut stream,
+            &proof,
+            13,
+            ClientRequest::Resize {
+                terminal_id,
+                size: crate::terminal_ipc::WireTerminalSize {
+                    columns: 90,
+                    rows: 30,
+                    cell_width_px: 9,
+                    cell_height_px: 18,
+                },
+            },
+        );
+        send(
+            &mut stream,
+            &proof,
+            14,
+            ClientRequest::Focus {
+                terminal_id,
+                focused: true,
+            },
+        );
+        send(
+            &mut stream,
+            &proof,
+            15,
+            ClientRequest::AcknowledgeRedraw {
+                terminal_id,
+                generation: 0,
+            },
+        );
+        for request_id in 4..16 {
+            let envelope = response(&mut stream, &proof);
+            assert_eq!(envelope.request_id, Some(request_id));
+            if request_id < 12 {
+                assert!(matches!(
+                    envelope.message,
+                    ServerMessage::Error(ProtocolError {
+                        code: ProtocolErrorCode::QueueFull,
+                        retryable: true,
+                        ..
+                    })
+                ));
+            } else {
+                assert!(matches!(envelope.message, ServerMessage::Response { .. }));
+            }
+        }
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let envelope = response(&mut stream, &proof);
+        assert_eq!(envelope.request_id, Some(3));
+        assert!(matches!(envelope.message, ServerMessage::Response {
+            response: ServerResponse::AgentActivity { terminal_id: id, activity: None },
+        } if id == terminal_id));
+        assert_eq!(
+            unsafe { libc::kill(probe_pid, 0) },
+            -1,
+            "timed-out probe must be reaped"
+        );
+        // Reap the first connection before exercising in-flight cancellation on
+        // a fresh one, rather than racing its post-response thread epilogue.
+        let handle = cleanup.handle.take();
+        drop(cleanup);
+        let (mut stream, server_stream) = UnixStream::pair().unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
+        let server_host = Arc::clone(&host);
+        let cleanup = Cleanup {
+            stream: stream.try_clone().unwrap(),
+            server: Some(thread::spawn(move || serve(server_stream, 2, server_host))),
+            handle,
+        };
+        send(
+            &mut stream,
+            &proof,
+            1,
+            ClientRequest::Connect {
+                expected_host: Some(proof.clone()),
+                resume: Vec::new(),
+            },
+        );
+        assert!(matches!(
+            response(&mut stream, &proof).message,
+            ServerMessage::Response {
+                response: ServerResponse::Connected { .. }
+            }
+        ));
+        send(
+            &mut stream,
+            &proof,
+            2,
+            ClientRequest::Attach {
+                terminal_id,
+                after_generation: 0,
+                after_event_sequence: 0,
+            },
+        );
+        assert!(matches!(
+            response(&mut stream, &proof).message,
+            ServerMessage::Response {
+                response: ServerResponse::Attached { .. }
+            }
+        ));
+
+        // A disconnect with another query in flight joins it through the same
+        // provider deadline. Reset this isolated observer to avoid its failure TTL.
+        host.lock().unwrap().agent_observer = Arc::new(crate::agent::observe::Observer::new());
+        std::fs::remove_file(&started).unwrap();
+        send(
+            &mut stream,
+            &proof,
+            3,
+            ClientRequest::RefreshAgentActivity { terminal_id },
+        );
+        wait_file(&started);
+        let probe_pid: i32 = std::fs::read_to_string(&started).unwrap().parse().unwrap();
+        let disconnected = Instant::now();
+        drop(cleanup);
+        assert!(disconnected.elapsed() < Duration::from_secs(5));
+        assert_eq!(
+            unsafe { libc::kill(probe_pid, 0) },
+            -1,
+            "disconnected probe must be reaped"
+        );
+        assert!(!host.lock().unwrap().clients.contains_key(&2));
+    }
 
     #[test]
     fn stale_acknowledgment_releases_host_lock_before_synchronous_wake() {

@@ -7,10 +7,20 @@ use std::{fs, io::Read};
 use serde::{Deserialize, Serialize};
 
 use super::LaunchRecipe;
+use crate::agent::Provider;
 
 const MAX_HINT_BYTES: usize = 16 * 1024;
 const MAX_ARGV_BYTES: usize = 8 * 1024;
 
+/// Host-only activity evidence, separate from normalized recovery authority.
+#[cfg(feature = "host")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct AgentProcess {
+    pub pid: i32,
+    pub start: u64,
+    pub provider: Provider,
+    pub launch: LaunchRecipe,
+}
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct AgentResumeHint {
@@ -26,9 +36,8 @@ fn exact_id(value: &str) -> bool {
 /// Rebuild an interactive resume invocation without replaying an initial prompt,
 /// forking a conversation, or carrying an implicit latest-session selector.
 pub fn resume_recipe(launch: &LaunchRecipe) -> Option<LaunchRecipe> {
-    let agent = Path::new(&launch.program).file_name()?.to_str()?;
-    if !matches!(agent, "omp" | "claude" | "codex")
-        || launch.arguments.len() > 128
+    let provider = Provider::from_program(&launch.program)?;
+    if launch.arguments.len() > 128
         || launch.arguments.iter().map(String::len).sum::<usize>() > MAX_ARGV_BYTES
     {
         return None;
@@ -43,9 +52,7 @@ pub fn resume_recipe(launch: &LaunchRecipe) -> Option<LaunchRecipe> {
             .map_or((argument.as_str(), None), |(flag, value)| {
                 (flag, Some(value))
             });
-        if (agent == "codex" && matches!(flag, "-C" | "--cd"))
-            || (agent == "omp" && flag == "--cwd")
-        {
+        if provider.is_cwd_option(flag) {
             let value = inline.or_else(|| args.next().map(String::as_str))?;
             if value.is_empty() || value.starts_with('-') || value.contains('\0') {
                 return None;
@@ -53,13 +60,7 @@ pub fn resume_recipe(launch: &LaunchRecipe) -> Option<LaunchRecipe> {
             working_directory = launch.working_directory.join(value);
             continue;
         }
-        let identity = match agent {
-            "codex" => flag == "resume",
-            "claude" => matches!(flag, "--resume" | "-r" | "--session-id"),
-            "omp" => matches!(flag, "--resume" | "-r"),
-            _ => false,
-        };
-        if identity {
+        if provider.is_identity_option(flag) {
             let value = inline.or_else(|| args.next().map(String::as_str))?;
             if id.is_some() || !exact_id(value) {
                 return None;
@@ -67,72 +68,13 @@ pub fn resume_recipe(launch: &LaunchRecipe) -> Option<LaunchRecipe> {
             id = Some(value.to_owned());
             continue;
         }
-        let takes_value = match agent {
-            "omp" => matches!(
-                flag,
-                "--profile"
-                    | "--session-dir"
-                    | "--model"
-                    | "--provider"
-                    | "--thinking"
-                    | "--config"
-                    | "--add-dir"
-                    | "--approval-mode"
-            ),
-            "claude" => matches!(
-                flag,
-                "--model"
-                    | "--agent"
-                    | "--permission-mode"
-                    | "--settings"
-                    | "--setting-sources"
-                    | "--effort"
-            ),
-            "codex" => matches!(
-                flag,
-                "--model"
-                    | "-m"
-                    | "--profile"
-                    | "-p"
-                    | "--config"
-                    | "-c"
-                    | "--sandbox"
-                    | "-s"
-                    | "--ask-for-approval"
-                    | "-a"
-                    | "--add-dir"
-                    | "--remote"
-                    | "--remote-auth-token-env"
-            ),
-            _ => false,
-        };
-        let switch = match agent {
-            "omp" => matches!(
-                flag,
-                "--no-lsp"
-                    | "--no-tools"
-                    | "--no-extensions"
-                    | "--no-skills"
-                    | "--no-rules"
-                    | "--auto-approve"
-            ),
-            "claude" => matches!(
-                flag,
-                "--dangerously-skip-permissions" | "--bare" | "--safe-mode" | "--no-chrome"
-            ),
-            "codex" => matches!(
-                flag,
-                "--no-alt-screen" | "--search" | "--dangerously-bypass-approvals-and-sandbox"
-            ),
-            _ => false,
-        };
-        if takes_value {
+        if provider.is_value_option(flag) {
             let value = inline.or_else(|| args.next().map(String::as_str))?;
             if value.is_empty() || value.starts_with('-') || value.contains('\0') {
                 return None;
             }
             arguments.extend([flag.to_owned(), value.to_owned()]);
-        } else if switch && inline.is_none() {
+        } else if provider.is_switch(flag) && inline.is_none() {
             arguments.push(flag.to_owned());
         } else {
             // Unknown flags or positional prompts may change session identity.
@@ -140,11 +82,7 @@ pub fn resume_recipe(launch: &LaunchRecipe) -> Option<LaunchRecipe> {
         }
     }
     let id = id?;
-    if agent == "codex" {
-        arguments.splice(0..0, ["resume".into(), id]);
-    } else {
-        arguments.extend(["--resume".into(), id]);
-    }
+    provider.append_resume(&mut arguments, id);
     Some(LaunchRecipe {
         arguments,
         working_directory,
@@ -173,9 +111,8 @@ pub fn observed_hint_from_launch(launch: &LaunchRecipe) -> Option<String> {
     if let Some(hint) = hint_from_launch(launch) {
         return Some(hint);
     }
-    let agent = Path::new(&launch.program).file_name()?.to_str()?;
-    if !matches!(agent, "omp" | "claude" | "codex")
-        || launch.arguments.len() > 128
+    Provider::from_program(&launch.program)?;
+    if launch.arguments.len() > 128
         || launch.arguments.iter().map(String::len).sum::<usize>() > MAX_ARGV_BYTES
     {
         return None;
@@ -195,13 +132,10 @@ pub fn observed_launch_from_hint(hint: &str) -> Option<LaunchRecipe> {
     let hint: AgentResumeHint = serde_json::from_str(hint).ok()?;
     match hint.version {
         1 => resume_recipe(&hint.recipe),
-        2 => {
-            let agent = Path::new(&hint.recipe.program).file_name()?.to_str()?;
-            (matches!(agent, "omp" | "claude" | "codex")
-                && hint.recipe.arguments.len() <= 128
-                && hint.recipe.arguments.iter().map(String::len).sum::<usize>() <= MAX_ARGV_BYTES)
-                .then_some(hint.recipe)
-        }
+        2 => (Provider::from_program(&hint.recipe.program).is_some()
+            && hint.recipe.arguments.len() <= 128
+            && hint.recipe.arguments.iter().map(String::len).sum::<usize>() <= MAX_ARGV_BYTES)
+            .then_some(hint.recipe),
         _ => None,
     }
 }
@@ -217,64 +151,12 @@ fn bounded_read(path: impl AsRef<Path>, limit: usize) -> Option<Vec<u8>> {
     (bytes.len() <= limit).then_some(bytes)
 }
 
-/// Normalize only known executable/JavaScript entrypoints, never shell command
-/// strings or arbitrary scripts whose arguments happen to mention an agent.
-#[cfg(any(feature = "host", test))]
-fn agent_launch(mut launch: LaunchRecipe) -> Option<LaunchRecipe> {
-    let name = Path::new(&launch.program).file_name()?.to_str()?;
-    if matches!(name, "node" | "nodejs" | "bun") {
-        let script = Path::new(launch.arguments.first()?);
-        let name = script.file_name()?.to_str()?;
-        let provider = match name {
-            "codex" | "codex.js" => "codex",
-            "omp" | "omp.js" => "omp",
-            "claude" => "claude",
-            "cli.js" if script.to_str()?.contains("@anthropic-ai/claude-code/") => "claude",
-            _ => return None,
-        };
-        launch.program = provider.into();
-        launch.arguments.remove(0);
-    }
-    let name = Path::new(&launch.program).file_name()?.to_str()?;
-    if !matches!(name, "omp" | "claude" | "codex") {
-        return None;
-    }
-    // Shared servers, tool subprocesses and noninteractive commands are not the
-    // foreground conversation, even when their executable is the same agent.
-    if launch.arguments.first().is_some_and(|arg| {
-        matches!(
-            arg.as_str(),
-            "app-server" | "exec" | "review" | "mcp-server" | "proxy" | "agents"
-        ) || arg.starts_with("__omp_")
-    }) {
-        return None;
-    }
-    Some(launch)
-}
-
 #[cfg(feature = "host")]
 fn process_identity(stat: &[u8]) -> Option<(i32, u64)> {
     let stat = std::str::from_utf8(stat).ok()?;
     let mut fields = stat.rsplit_once(')')?.1.split_whitespace();
     let group = fields.nth(2)?.parse().ok()?;
     Some((group, fields.nth(16)?.parse().ok()?))
-}
-
-/// A filename is evidence only when the foreground process actually has it
-/// open (or OMP's terminal binding was written during this process lifetime).
-#[cfg(any(feature = "host", feature = "ui"))]
-pub(crate) fn session_file_id(path: &Path, agent: &str) -> Option<String> {
-    let stem = path.file_stem()?.to_str()?;
-    (path.extension()?.to_str()? == "jsonl").then_some(())?;
-    let id = match agent {
-        "claude" => stem,
-        "omp" => stem.rsplit_once('_')?.1,
-        "codex" if stem.starts_with("rollout-") && stem.len() >= 36 => {
-            stem.get(stem.len() - 36..)?
-        }
-        _ => return None,
-    };
-    exact_id(id).then(|| id.to_owned())
 }
 
 #[cfg(feature = "host")]
@@ -286,59 +168,10 @@ enum SessionIdentity {
 
 #[cfg(feature = "host")]
 fn runtime_identity(root: &Path, launch: &LaunchRecipe, start: u64) -> Option<SessionIdentity> {
-    let agent = Path::new(&launch.program).file_name()?.to_str()?;
-    let home = launch
-        .environment
-        .get("HOME")
-        .map(std::path::PathBuf::from)?;
-    let session_root = match agent {
-        "omp" => {
-            let profile = launch
-                .arguments
-                .iter()
-                .enumerate()
-                .find_map(|(index, arg)| {
-                    arg.strip_prefix("--profile=")
-                        .map(str::to_owned)
-                        .or_else(|| {
-                            (arg == "--profile")
-                                .then(|| launch.arguments.get(index + 1).cloned())
-                                .flatten()
-                        })
-                })
-                .or_else(|| launch.environment.get("OMP_PROFILE").cloned());
-            if let Some(profile) = profile {
-                if profile.is_empty() || profile == "." || profile == ".." || profile.contains('/')
-                {
-                    return None;
-                }
-                home.join(".omp/profiles").join(profile).join("agent")
-            } else {
-                launch
-                    .environment
-                    .get("PI_CODING_AGENT_DIR")
-                    .map(std::path::PathBuf::from)
-                    .unwrap_or_else(|| home.join(".omp/agent"))
-            }
-        }
-        "claude" => launch
-            .environment
-            .get("CLAUDE_CONFIG_DIR")
-            .map(std::path::PathBuf::from)
-            .unwrap_or_else(|| home.join(".claude")),
-        "codex" => launch
-            .environment
-            .get("CODEX_HOME")
-            .map(std::path::PathBuf::from)
-            .unwrap_or_else(|| home.join(".codex")),
-        _ => return None,
-    };
+    let provider = Provider::from_program(&launch.program)?;
+    let session_root = provider.session_root(launch)?;
     let mut identity = None;
-    let expected = session_root.join(if agent == "claude" {
-        "projects"
-    } else {
-        "sessions"
-    });
+    let expected = session_root.join(provider.session_directory());
     let entries = match fs::read_dir(root.join("fd")) {
         Ok(entries) => entries,
         Err(_) => return Some(SessionIdentity::Ambiguous),
@@ -369,14 +202,14 @@ fn runtime_identity(root: &Path, launch: &LaunchRecipe, start: u64) -> Option<Se
         if flags & libc::O_ACCMODE as u32 == libc::O_RDONLY as u32 {
             continue;
         }
-        if let Some(id) = session_file_id(&path, agent) {
+        if let Some(id) = provider.session_file_id(&path) {
             if identity.as_ref().is_some_and(|previous| previous != &id) {
                 return Some(SessionIdentity::Ambiguous);
             }
             identity = Some(id);
         }
     }
-    if identity.is_some() || agent != "omp" {
+    if identity.is_some() || provider != Provider::Omp {
         return identity.map(SessionIdentity::Exact);
     }
     // OMP publishes the exact active session by controlling terminal, including
@@ -421,35 +254,65 @@ fn runtime_identity(root: &Path, launch: &LaunchRecipe, start: u64) -> Option<Se
         // prior --resume argument could select the old conversation.
         return Some(SessionIdentity::Ambiguous);
     }
-    session_file_id(session, agent).map(SessionIdentity::Exact)
+    provider
+        .session_file_id(session)
+        .map(SessionIdentity::Exact)
 }
 
 #[cfg(feature = "host")]
 fn process_launch(root: &Path, base: &LaunchRecipe) -> Option<(LaunchRecipe, u64, i32)> {
+    read_process_launch(root, Some(base))
+}
+
+#[cfg(feature = "host")]
+fn read_process_launch(
+    root: &Path,
+    base: Option<&LaunchRecipe>,
+) -> Option<(LaunchRecipe, u64, i32)> {
     let before = process_identity(&bounded_read(root.join("stat"), 4096)?)?;
     let bytes = bounded_read(root.join("cmdline"), MAX_ARGV_BYTES)?;
+    let bytes = bytes.strip_suffix(&[0]).unwrap_or(&bytes);
     let mut argv = bytes
         .split(|byte| *byte == 0)
-        .filter(|arg| !arg.is_empty())
+        .filter(|arg| base.is_none() || !arg.is_empty())
         .map(|arg| std::str::from_utf8(arg).map(str::to_owned));
     let program = argv.next()?.ok()?;
     let arguments = argv.collect::<Result<Vec<_>, _>>().ok()?;
+    if base.is_none() && arguments.len() > 128 {
+        return None;
+    }
     let working_directory = fs::read_link(root.join("cwd")).ok()?;
-    let mut environment = base.environment.clone();
-    // Preserve provider/account roots from this actual process, not the UI's
-    // environment. Do not import session IDs: child shells inherit parent IDs.
-    if let Some(bytes) = bounded_read(root.join("environ"), 128 * 1024) {
+    let mut environment = base
+        .map(|base| base.environment.clone())
+        .unwrap_or_default();
+    // Recovery retains its existing fallback. Activity requires the actual
+    // allowlisted environment: missing keys must not inherit terminal overrides.
+    let bytes = bounded_read(root.join("environ"), 128 * 1024);
+    if base.is_none() && bytes.is_none() {
+        return None;
+    }
+    if let Some(bytes) = bytes {
         for entry in bytes.split(|byte| *byte == 0) {
-            let Some((name, value)) = std::str::from_utf8(entry)
-                .ok()
-                .and_then(|s| s.split_once('='))
-            else {
+            let Some(index) = entry.iter().position(|byte| *byte == b'=') else {
+                continue;
+            };
+            let Ok(name) = std::str::from_utf8(&entry[..index]) else {
                 continue;
             };
             if matches!(
                 name,
-                "HOME" | "CODEX_HOME" | "CLAUDE_CONFIG_DIR" | "PI_CODING_AGENT_DIR" | "OMP_PROFILE"
+                "HOME"
+                    | "PATH"
+                    | "CODEX_HOME"
+                    | "CLAUDE_CONFIG_DIR"
+                    | "PI_CODING_AGENT_DIR"
+                    | "OMP_PROFILE"
             ) {
+                let value = match std::str::from_utf8(&entry[index + 1..]) {
+                    Ok(value) => value,
+                    Err(_) if base.is_some() => continue,
+                    Err(_) => return None,
+                };
                 environment.insert(name.into(), value.into());
             }
         }
@@ -477,6 +340,51 @@ pub(crate) fn foreground_hint(pid: libc::pid_t, base: &LaunchRecipe) -> Option<S
         .flatten()
 }
 
+/// Observe raw executable/script/account identity through the same bounded
+/// foreground walker as recovery, without resolving conversation authority.
+#[cfg(feature = "host")]
+pub(crate) fn foreground_agent(pid: libc::pid_t) -> Option<AgentProcess> {
+    if pid <= 0 {
+        return None;
+    }
+    let (group, _) = process_identity(&bounded_read(format!("/proc/{pid}/stat"), 4096)?)?;
+    inspect_agent_process(Path::new("/proc"), pid, group, &mut 64)
+        .ok()
+        .flatten()
+}
+
+#[cfg(feature = "host")]
+fn inspect_agent_process(
+    proc_root: &Path,
+    pid: i32,
+    group: i32,
+    remaining: &mut usize,
+) -> Result<Option<AgentProcess>, ()> {
+    walk_foreground(
+        proc_root,
+        pid,
+        group,
+        remaining,
+        &|root| read_process_launch(root, None),
+        &|root, pid, mut launch, start| {
+            let provider = Provider::recognize_launch(&launch).ok_or(())?;
+            // Recognition uses argv, execution uses the actual installation.
+            // Native Claude installations can have a version-only exe basename.
+            launch.program = fs::read_link(root.join("exe"))
+                .map_err(|_| ())?
+                .to_str()
+                .ok_or(())?
+                .to_owned();
+            Ok(Some(AgentProcess {
+                pid,
+                start,
+                provider,
+                launch,
+            }))
+        },
+    )
+}
+
 // Err means inspection is incomplete or conflicting, never "no agent": a
 // forwarding ancestor must not upgrade it to exact evidence from stale argv.
 #[cfg(feature = "host")]
@@ -487,38 +395,42 @@ fn inspect_process(
     base: &LaunchRecipe,
     remaining: &mut usize,
 ) -> Result<Option<String>, ()> {
+    walk_foreground(
+        proc_root,
+        pid,
+        group,
+        remaining,
+        &|root| process_launch(root, base),
+        &recovery_observation,
+    )
+}
+
+#[cfg(feature = "host")]
+fn walk_foreground<T: PartialEq>(
+    proc_root: &Path,
+    pid: i32,
+    group: i32,
+    remaining: &mut usize,
+    read_launch: &impl Fn(&Path) -> Option<(LaunchRecipe, u64, i32)>,
+    observe: &impl Fn(&Path, i32, LaunchRecipe, u64) -> Result<Option<T>, ()>,
+) -> Result<Option<T>, ()> {
     *remaining = remaining.checked_sub(1).ok_or(())?;
     let root = proc_root.join(pid.to_string());
-    let (raw, start, observed_group) = process_launch(&root, base).ok_or(())?;
+    let (raw, start, observed_group) = read_launch(&root).ok_or(())?;
     if observed_group != group {
         return Ok(None);
     }
-    let interpreter = matches!(
-        Path::new(&raw.program)
-            .file_name()
-            .and_then(|name| name.to_str()),
-        Some("node" | "nodejs" | "bun")
-    );
-    let native_agent = matches!(
-        Path::new(&raw.program)
-            .file_name()
-            .and_then(|name| name.to_str()),
-        Some("codex" | "claude" | "omp")
-    );
-    let recognized = agent_launch(raw);
+    let interpreter = Provider::is_interpreter(&raw.program);
+    let native_agent = Provider::from_program(&raw.program).is_some();
+    let recognized = Provider::recognize_launch(&raw);
     if native_agent && recognized.is_none() {
         return Ok(None);
     }
     // Claude and OMP run directly inside their JS interpreters and own their
     // tool children just like native agents. Only Codex's recognized JS
     // launcher forwards ownership to a native child.
-    let forwarding_launcher = interpreter
-        && recognized.as_ref().is_some_and(|launch| {
-            Path::new(&launch.program)
-                .file_name()
-                .and_then(|name| name.to_str())
-                == Some("codex")
-        });
+    let forwarding_launcher =
+        interpreter && recognized.is_some_and(Provider::forwards_to_native_child);
     if forwarding_launcher || recognized.is_none() {
         let mut child_hint = None;
         let bytes = bounded_read(root.join(format!("task/{pid}/children")), 4096).ok_or(())?;
@@ -526,12 +438,13 @@ fn inspect_process(
             .map_err(|_| ())?
             .split_whitespace()
         {
-            if let Some(hint) = inspect_process(
+            if let Some(hint) = walk_foreground(
                 proc_root,
                 child.parse().map_err(|_| ())?,
                 group,
-                base,
                 remaining,
+                read_launch,
+                observe,
             )? {
                 if child_hint
                     .as_ref()
@@ -546,25 +459,36 @@ fn inspect_process(
             return Ok(child_hint);
         }
     }
-    let Some(mut launch) = recognized else {
+    if recognized.is_none() {
         return Ok(None);
-    };
-    if let Some(identity) = runtime_identity(&root, &launch, start) {
+    }
+    let observation = observe(&root, pid, raw, start)?;
+    if process_identity(&bounded_read(root.join("stat"), 4096).ok_or(())?).ok_or(())?
+        != (group, start)
+    {
+        return Err(());
+    }
+    Ok(observation)
+}
+
+#[cfg(feature = "host")]
+fn recovery_observation(
+    root: &Path,
+    _pid: i32,
+    raw: LaunchRecipe,
+    start: u64,
+) -> Result<Option<String>, ()> {
+    let mut launch = Provider::normalize_launch(raw).ok_or(())?;
+    if let Some(identity) = runtime_identity(root, &launch, start) {
         let SessionIdentity::Exact(id) = identity else {
             return Err(());
         };
         // Runtime binding is current; stale resume argv must not win after an
         // in-process session switch. Never replay a prompt or unknown option.
         if let Some(mut recipe) = resume_recipe(&launch) {
-            let flag = if Path::new(&recipe.program)
-                .file_name()
-                .and_then(|name| name.to_str())
-                == Some("codex")
-            {
-                "resume"
-            } else {
-                "--resume"
-            };
+            let flag = Provider::from_program(&recipe.program)
+                .ok_or(())?
+                .resume_flag();
             let index = recipe
                 .arguments
                 .iter()
@@ -573,22 +497,11 @@ fn inspect_process(
             recipe.arguments[index + 1] = id;
             launch = recipe;
         } else {
-            let flag = if Path::new(&launch.program)
-                .file_name()
-                .and_then(|name| name.to_str())
-                == Some("codex")
-            {
-                "resume"
-            } else {
-                "--resume"
-            };
+            let flag = Provider::from_program(&launch.program)
+                .ok_or(())?
+                .resume_flag();
             launch.arguments.extend([flag.into(), id]);
         }
-    }
-    if process_identity(&bounded_read(root.join("stat"), 4096).ok_or(())?).ok_or(())?
-        != (group, start)
-    {
-        return Err(());
     }
     observed_hint_from_launch(&launch).map(Some).ok_or(())
 }
@@ -628,6 +541,97 @@ mod tests {
                 .join(" "),
         )
         .unwrap();
+    }
+    #[cfg(feature = "host")]
+    fn activity_fixture(proc_root: &Path, recipe: &LaunchRecipe, executable: &Path) {
+        process_fixture(proc_root, 100, recipe, &[]);
+        std::os::unix::fs::symlink(executable, proc_root.join("100/exe")).unwrap();
+        let environment = recipe
+            .environment
+            .iter()
+            .map(|(key, value)| format!("{key}={value}\0"))
+            .collect::<String>();
+        fs::write(proc_root.join("100/environ"), environment).unwrap();
+    }
+
+    #[cfg(feature = "host")]
+    #[test]
+    fn activity_retains_actual_interpreter_and_only_the_process_account_environment() {
+        let directory = tempfile::tempdir().unwrap();
+        let script = "/opt/node_modules/@anthropic-ai/claude-code/cli.js";
+        let mut raw = launch(
+            "node",
+            &[script, "--resume", "a1b2c3d4-1111-4111-8111-123456789abc"],
+        );
+        raw.environment = BTreeMap::from([
+            ("HOME".into(), "/home/actual".into()),
+            ("PATH".into(), "/actual/bin".into()),
+            ("UNRELATED_TOKEN".into(), "synthetic-test-value".into()),
+        ]);
+        activity_fixture(directory.path(), &raw, Path::new("/actual/bin/node"));
+        let mut base = raw.clone();
+        base.environment
+            .insert("CLAUDE_CONFIG_DIR".into(), "/stale/claude".into());
+        base.environment
+            .insert("CODEX_HOME".into(), "/stale/codex".into());
+        let recovery = inspect_process(directory.path(), 100, 100, &base, &mut 64)
+            .unwrap()
+            .unwrap();
+        let recovered = observed_launch_from_hint(&recovery).unwrap();
+        assert_eq!(recovered.program, "claude");
+        assert_eq!(recovered.environment["CLAUDE_CONFIG_DIR"], "/stale/claude");
+
+        let process = inspect_agent_process(directory.path(), 100, 100, &mut 64)
+            .unwrap()
+            .unwrap();
+        assert_eq!(process.provider, Provider::Claude);
+        assert_eq!(process.launch.program, "/actual/bin/node");
+        assert_eq!(process.launch.arguments, raw.arguments);
+        assert_eq!(
+            process.launch.environment,
+            BTreeMap::from([
+                ("HOME".into(), "/home/actual".into()),
+                ("PATH".into(), "/actual/bin".into()),
+            ])
+        );
+    }
+
+    #[cfg(feature = "host")]
+    #[test]
+    fn activity_recognizes_native_argv_but_executes_the_versioned_binary() {
+        let directory = tempfile::tempdir().unwrap();
+        activity_fixture(
+            directory.path(),
+            &launch("claude", &[]),
+            Path::new("/home/actual/.local/share/claude/versions/2.1.0"),
+        );
+        let process = inspect_agent_process(directory.path(), 100, 100, &mut 64)
+            .unwrap()
+            .unwrap();
+        assert_eq!(process.provider, Provider::Claude);
+        assert_eq!(
+            process.launch.program,
+            "/home/actual/.local/share/claude/versions/2.1.0"
+        );
+    }
+
+    #[cfg(feature = "host")]
+    #[test]
+    fn activity_refuses_unreadable_or_non_utf8_account_evidence() {
+        let directory = tempfile::tempdir().unwrap();
+        activity_fixture(
+            directory.path(),
+            &launch("claude", &[]),
+            Path::new("/opt/claude"),
+        );
+        let environ = directory.path().join("100/environ");
+        fs::remove_file(&environ).unwrap();
+        assert!(inspect_agent_process(directory.path(), 100, 100, &mut 64).is_err());
+        fs::write(&environ, b"HOME=/home/actual\0CLAUDE_CONFIG_DIR=\xff\0").unwrap();
+        assert!(inspect_agent_process(directory.path(), 100, 100, &mut 64).is_err());
+        fs::write(&environ, b"HOME=/home/actual\0").unwrap();
+        fs::remove_file(directory.path().join("100/exe")).unwrap();
+        assert!(inspect_agent_process(directory.path(), 100, 100, &mut 64).is_err());
     }
 
     #[cfg(feature = "host")]
@@ -727,7 +731,7 @@ mod tests {
     #[test]
     fn npm_launchers_resolve_exact_sessions_without_selecting_server_processes() {
         let id = "a1b2c3d4-1111-4111-8111-123456789abc";
-        let codex = agent_launch(launch(
+        let codex = Provider::normalize_launch(launch(
             "/usr/bin/node",
             &[
                 "/opt/node_modules/@openai/codex/bin/codex.js",
@@ -744,16 +748,21 @@ mod tests {
             recipe.arguments,
             ["resume", id, "--remote", "unix:///tmp/existing.sock"]
         );
-        assert!(agent_launch(launch("node", &["/tmp/tool.js", "codex", "resume", id])).is_none());
         assert!(
-            agent_launch(launch(
+            Provider::normalize_launch(launch("node", &["/tmp/tool.js", "codex", "resume", id]))
+                .is_none()
+        );
+        assert!(
+            Provider::normalize_launch(launch(
                 "codex",
                 &["app-server", "--listen", "unix:///tmp/s"]
             ))
             .is_none()
         );
-        assert!(agent_launch(launch("omp", &["__omp_worker_js_eval_process"])).is_none());
-        let claude = agent_launch(launch(
+        assert!(
+            Provider::normalize_launch(launch("omp", &["__omp_worker_js_eval_process"])).is_none()
+        );
+        let claude = Provider::normalize_launch(launch(
             "node",
             &[
                 "/opt/node_modules/@anthropic-ai/claude-code/cli.js",

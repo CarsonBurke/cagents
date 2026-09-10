@@ -31,7 +31,7 @@ impl Application for DaemonStop {
     type Message = StopMessage;
     const APP_ID: &'static str = "dev.cagents.Cagents.StopConfirmation";
     fn init(core: Core, (capability, failed): Self::Flags) -> (Self, Task<StopMessage>) {
-        (Self { core, capability, pending: false, settled: false, detail: "Confirming this request terminates the counted hosted terminals. Cancel makes no shutdown request.".into(), failed }, Task::none())
+        (Self { core, capability, pending: false, settled: false, detail: "Confirming this request terminates the counted hosted terminals. Cancel makes no shutdown request.".into(), failed }, iced::widget::operation::focus(widget::Id::new("daemon-stop.confirm")).map(cosmic::Action::App))
     }
     fn core(&self) -> &Core {
         &self.core
@@ -105,7 +105,8 @@ impl Application for DaemonStop {
                     }
                 };
                 let _ = writeln!(std::io::stdout(), "{}", self.detail);
-                Task::none()
+                iced::widget::operation::focus(widget::Id::new("daemon-stop.cancel"))
+                    .map(cosmic::Action::App)
             }
             StopMessage::Refreshed(result) if self.pending => {
                 self.pending = false;
@@ -121,7 +122,12 @@ impl Application for DaemonStop {
                         self.detail = format!("Failed to refresh the daemon: {error}");
                     }
                 }
-                Task::none()
+                iced::widget::operation::focus(widget::Id::new(if self.settled {
+                    "daemon-stop.cancel"
+                } else {
+                    "daemon-stop.confirm"
+                }))
+                .map(cosmic::Action::App)
             }
             _ => Task::none(),
         }
@@ -144,6 +150,7 @@ impl Application for DaemonStop {
                 widget::text::body(&self.detail).into(),
                 widget::row::with_children(vec![
                     widget::button::standard(if self.settled { "Close" } else { "Cancel" })
+                        .id(widget::Id::new("daemon-stop.cancel"))
                         .on_press_maybe((!self.pending).then_some(StopMessage::Cancel))
                         .into(),
                     widget::button::standard("Refresh count")
@@ -153,6 +160,7 @@ impl Application for DaemonStop {
                         )
                         .into(),
                     widget::button::destructive("Stop daemon")
+                        .id(widget::Id::new("daemon-stop.confirm"))
                         .on_press_maybe(
                             (!self.pending && !self.settled).then_some(StopMessage::Confirm),
                         )

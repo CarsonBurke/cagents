@@ -23,10 +23,22 @@ pub fn symbolic_icon(name: &str) -> widget::icon::Handle {
     static PREVIEW: LazyLock<widget::icon::Handle> = LazyLock::new(|| {
         widget::icon::from_svg_bytes(br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16"><g fill="none" stroke="black" stroke-width="1.5"><path d="M1 8s2.5-4.5 7-4.5S15 8 15 8s-2.5 4.5-7 4.5S1 8 1 8Z"/><circle cx="8" cy="8" r="2"/></g></svg>"#.as_slice()).symbolic(true)
     });
+    static SPLIT_PANEL: LazyLock<widget::icon::Handle> = LazyLock::new(|| {
+        widget::icon::from_svg_bytes(br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16"><g fill="none" stroke="black" stroke-width="1.4" stroke-linejoin="round"><rect x="1.5" y="2.5" width="13" height="11" rx="1.5"/><path d="M10 3v10"/></g></svg>"#.as_slice()).symbolic(true)
+    });
+    static PULL_REQUEST: LazyLock<widget::icon::Handle> = LazyLock::new(|| {
+        widget::icon::from_svg_bytes(br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16"><g fill="none" stroke="black" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><circle cx="4" cy="3" r="1.5"/><circle cx="4" cy="13" r="1.5"/><circle cx="12" cy="13" r="1.5"/><path d="M4 4.5v7M12 11.5V6a3 3 0 0 0-3-3H7m2-2L7 3l2 2"/></g></svg>"#.as_slice()).symbolic(true)
+    });
+    static MERGED_PULL_REQUEST: LazyLock<widget::icon::Handle> = LazyLock::new(|| {
+        widget::icon::from_svg_bytes(br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16"><g fill="none" stroke="black" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><circle cx="4" cy="3" r="1.5"/><circle cx="4" cy="13" r="1.5"/><circle cx="12" cy="3" r="1.5"/><path d="M4 4.5v7M12 4.5V6a3 3 0 0 1-3 3H4"/></g></svg>"#.as_slice()).symbolic(true)
+    });
     match name {
         "document-edit-symbolic" => CHANGES.clone(),
         "view-list-tree-symbolic" => TREE.clone(),
         "view-reveal-symbolic" => PREVIEW.clone(),
+        "view-split-right-symbolic" => SPLIT_PANEL.clone(),
+        "pull-request-symbolic" => PULL_REQUEST.clone(),
+        "merged-pull-request-symbolic" => MERGED_PULL_REQUEST.clone(),
         _ => widget::icon::from_name(name).handle(),
     }
 }
@@ -51,7 +63,7 @@ pub fn icon_control<'a, Message: Clone + 'a>(
         button: widget::button::custom(content)
             .name(label.clone())
             .selected(selected)
-            .class(control_style(selected))
+            .class(control_style(selected, false))
             .width(crate::design::PRIMARY_CONTROL_SIZE)
             .height(crate::design::PRIMARY_CONTROL_SIZE)
             .padding(0)
@@ -63,6 +75,12 @@ pub fn icon_control<'a, Message: Clone + 'a>(
 impl<'a, Message: Clone + 'a> IconControl<'a, Message> {
     pub fn id(mut self, id: widget::Id) -> Self {
         self.button = self.button.id(id);
+        self
+    }
+
+    /// Pane selectors are flat tabs, unlike standalone toolbar controls.
+    pub fn tab(mut self, selected: bool) -> Self {
+        self.button = self.button.class(control_style(selected, true));
         self
     }
 }
@@ -92,7 +110,7 @@ pub fn segmented_controls<'a, Message: 'a>(
             border: iced::Border {
                 color: theme.current_container().component.divider.into(),
                 width: crate::design::BORDER_WIDTH,
-                radius: (crate::design::CONTROL_RADIUS + 2.0).into(),
+                radius: theme.cosmic().corner_radii.radius_m.into(),
             },
             ..Default::default()
         }
@@ -100,10 +118,14 @@ pub fn segmented_controls<'a, Message: 'a>(
     .into()
 }
 
-fn control_style(selected: bool) -> cosmic::theme::Button {
+fn control_style(selected: bool, tab: bool) -> cosmic::theme::Button {
     let appearance = move |focused: bool, theme: &cosmic::Theme| widget::button::Style {
         background: selected.then(|| iced::Background::Color(theme.cosmic().accent.base.into())),
-        border_radius: crate::design::CONTROL_RADIUS.into(),
+        border_radius: if tab {
+            0.0.into()
+        } else {
+            theme.cosmic().corner_radii.radius_s.into()
+        },
         border_width: if focused { 1.0 } else { 0.0 },
         border_color: if selected {
             theme.cosmic().accent.on.into()

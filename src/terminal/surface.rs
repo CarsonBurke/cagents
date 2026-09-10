@@ -25,6 +25,14 @@ impl TerminalSurface {
         self.0.activity()
     }
 
+    pub fn refresh_agent_activity(&self) -> Result<(), TerminalSendError> {
+        self.0.refresh_agent_activity()
+    }
+
+    pub fn agent_activity(&self) -> Option<crate::agent::Activity> {
+        self.0.agent_activity()
+    }
+
     pub fn generation(&self) -> u64 {
         self.0.generation()
     }
@@ -35,6 +43,14 @@ impl TerminalSurface {
 
     pub fn acknowledge_redraw(&self, observed_generation: u64) {
         self.0.acknowledge_redraw(observed_generation);
+    }
+
+    pub fn take_observed_output(&self) -> bool {
+        self.0.take_observed_output()
+    }
+
+    pub fn acknowledge_updates(&self) -> Result<(), TerminalSendError> {
+        self.0.acknowledge_updates()
     }
 
     pub fn events(&self) -> Receiver<TerminalEvent> {

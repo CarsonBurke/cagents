@@ -1,10 +1,16 @@
+mod close_processes;
+#[cfg(test)]
+mod close_tests;
+
+use close_processes::{FrozenFamily, RootIdentity};
+
 use std::{
     cell::{Cell, RefCell},
     io::{BufWriter, Read, Write},
     path::PathBuf,
     rc::Rc,
     sync::{
-        Arc, Mutex,
+        Arc, Mutex, OnceLock,
         atomic::{AtomicBool, AtomicU64, Ordering},
     },
     thread::{self, JoinHandle},
@@ -25,7 +31,7 @@ use portable_pty::{
 };
 
 use crate::{
-    model::{LaunchRecipe, TerminalOutputActivity, TerminalSession},
+    model::{LaunchRecipe, TerminalOutputActivity, TerminalSession, agent_recovery::AgentProcess},
     secure_file::open_private_append_file,
 };
 
@@ -53,8 +59,22 @@ enum Command {
     Hide,
     Reveal,
     Hibernate,
-    Restore { visible: bool },
+    Restore {
+        visible: bool,
+    },
     ObserveAgent(Sender<Option<String>>),
+    ObserveAgentProcess(Sender<Option<AgentProcess>>),
+    ApplyAgentActivity {
+        process: AgentProcess,
+        activity: Option<crate::agent::Activity>,
+        reply: Sender<Option<crate::agent::Activity>>,
+        deadline: std::time::Instant,
+    },
+    CloseChecked {
+        allow_active: bool,
+        deadline: std::time::Instant,
+        reply: Sender<super::ipc::TerminalCloseResult>,
+    },
     Shutdown,
 }
 
@@ -81,6 +101,7 @@ enum WorkerEvent {
     Pty(Option<PtyMessage>),
     ChildExit(Option<ChildExit>),
     Capture,
+    ObserveForeground,
 }
 
 #[derive(Debug)]
@@ -112,10 +133,13 @@ struct PublishedState {
     capture_tx: Sender<()>,
     capture_rx: Receiver<()>,
     activity: Mutex<Option<TerminalOutputActivity>>,
+    agent_activity: Mutex<Option<crate::agent::Activity>>,
     completed: AtomicBool,
     wake_pending: AtomicBool,
     visible: AtomicBool,
     wake: Arc<WakeCallback>,
+    output_observer: OnceLock<Arc<dyn Fn(u64) + Send + Sync>>,
+    output_armed: AtomicBool,
 }
 
 impl PublishedState {
@@ -128,10 +152,13 @@ impl PublishedState {
             capture_tx,
             capture_rx,
             activity: Mutex::new(None),
+            agent_activity: Mutex::new(None),
             completed: AtomicBool::new(false),
             wake_pending: AtomicBool::new(false),
             visible: AtomicBool::new(visible),
             wake,
+            output_observer: OnceLock::new(),
+            output_armed: AtomicBool::new(false),
         }
     }
 
@@ -305,6 +332,63 @@ impl TerminalHandle {
             .unwrap_or_else(|error| error.into_inner())
     }
 
+    pub(crate) fn agent_activity(&self) -> Option<crate::agent::Activity> {
+        *self
+            .inner
+            .published
+            .agent_activity
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+    }
+
+    pub(crate) fn observe_agent_process(&self) -> Option<AgentProcess> {
+        let (reply, result) = crossbeam_channel::bounded(1);
+        let process = self
+            .try_command(Command::ObserveAgentProcess(reply))
+            .ok()
+            .and_then(|()| result.recv_timeout(std::time::Duration::from_secs(3)).ok())
+            .flatten();
+        if process.is_none() {
+            self.invalidate_agent_activity();
+        }
+        process
+    }
+
+    pub(crate) fn apply_agent_activity(
+        &self,
+        process: AgentProcess,
+        activity: Option<crate::agent::Activity>,
+    ) -> Option<crate::agent::Activity> {
+        let (reply, result) = crossbeam_channel::bounded(1);
+        let timeout = std::time::Duration::from_secs(3);
+        let deadline = std::time::Instant::now() + timeout;
+        if self
+            .try_command(Command::ApplyAgentActivity {
+                process,
+                activity,
+                reply,
+                deadline,
+            })
+            .is_ok()
+            && let Ok(activity) = result.recv_timeout(timeout)
+        {
+            return activity;
+        }
+        self.invalidate_agent_activity();
+        None
+    }
+
+    fn invalidate_agent_activity(&self) {
+        // A failed owner request cannot leave attach descriptors claiming work.
+        // Its hosted response independently publishes the scalar clear.
+        *self
+            .inner
+            .published
+            .agent_activity
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = None;
+    }
+
     /// True only after final capture, PTY teardown and reader/reaper cleanup.
     /// Foreground-process exit alone does not imply completion.
     pub fn is_completed(&self) -> bool {
@@ -323,6 +407,30 @@ impl TerminalHandle {
     /// the client calls it after drawing.
     pub fn acknowledge_redraw(&self, observed_generation: u64) {
         self.inner.published.acknowledge(observed_generation);
+    }
+
+    /// Install the host's lightweight observer before arming a subscription.
+    pub(crate) fn set_output_observer(&self, observer: impl Fn(u64) + Send + Sync + 'static) {
+        let _ = self.inner.published.output_observer.set(Arc::new(observer));
+    }
+
+    /// Arm one output edge and return its history boundary atomically with PTY
+    /// activity publication. Captures and redraw credit are deliberately unrelated.
+    pub(crate) fn observe_next_output(&self) -> u64 {
+        let published = &self.inner.published;
+        let activity = published
+            .activity
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        published.output_armed.store(true, Ordering::Release);
+        activity.map_or(0, |fact| fact.sequence)
+    }
+
+    pub(crate) fn stop_observing_output(&self) {
+        self.inner
+            .published
+            .output_armed
+            .store(false, Ordering::Release);
     }
 
     pub fn events(&self) -> Receiver<TerminalEvent> {
@@ -396,6 +504,41 @@ impl TerminalHandle {
             .map_err(|error| format!("Cannot inspect the active agent: {error}"))
     }
 
+    /// Inspection and the close decision are one serialized PTY-owner command.
+    pub(crate) fn close_checked(&self, allow_active: bool) -> super::ipc::TerminalCloseResult {
+        use super::ipc::TerminalCloseResult;
+        let (reply, result) = crossbeam_channel::bounded(1);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        if let Err(error) = self.try_command(Command::CloseChecked {
+            allow_active,
+            deadline,
+            reply,
+        }) {
+            return TerminalCloseResult::Unknown(error.to_string());
+        }
+        let outcome = result
+            .recv_timeout(std::time::Duration::from_secs(3))
+            .unwrap_or_else(|error| TerminalCloseResult::Unknown(error.to_string()));
+        if outcome == TerminalCloseResult::Closed {
+            // Completion is not reported until the owner has released its PTY.
+            match self.inner.worker.lock() {
+                Ok(mut worker) => {
+                    if let Some(worker) = worker.take() {
+                        if worker.join().is_err() {
+                            return TerminalCloseResult::Unknown(
+                                "Terminal worker failed during close".into(),
+                            );
+                        }
+                    }
+                }
+                Err(_) => {
+                    return TerminalCloseResult::Unknown("Terminal worker unavailable".into());
+                }
+            }
+        }
+        outcome
+    }
+
     pub fn shutdown(&self) -> Result<(), TerminalSendError> {
         self.send_command(Command::Shutdown)?;
         if let Ok(mut worker) = self.inner.worker.lock()
@@ -434,6 +577,10 @@ struct Worker {
     launch: LaunchRecipe,
     resume_hint: Option<String>,
     resume_foreground: Option<libc::pid_t>,
+    agent_provider: Option<crate::agent::Provider>,
+    agent_process: Option<AgentProcess>,
+    display_title: String,
+    agent_exited: bool,
     terminal: Terminal<'static, 'static>,
     theme: Rc<Cell<TerminalTheme>>,
     key_encoder: KeyEncoder<'static>,
@@ -454,6 +601,8 @@ struct Worker {
     writer: Box<dyn Write + Send>,
     child_killer: Box<dyn ChildKiller + Send + Sync>,
     child_exit_rx: Receiver<ChildExit>,
+    child_identity: Option<RootIdentity>,
+    checked_shutdown: bool,
     child_reaper: Option<JoinHandle<()>>,
     reader: Option<JoinHandle<()>>,
 }
@@ -523,6 +672,9 @@ impl Worker {
             .slave
             .spawn_command(command)
             .map_err(|error| format!("spawn {}: {error:#}", session.launch.program))?;
+        let child_identity = child
+            .process_id()
+            .and_then(|pid| RootIdentity::capture(pid as libc::pid_t).ok());
         drop(pair.slave);
         let mut reader = pair
             .master
@@ -572,6 +724,10 @@ impl Worker {
             terminal_id: session.id,
             resume_hint: crate::model::agent_recovery::observed_hint_from_launch(&session.launch),
             resume_foreground: None,
+            agent_provider: None,
+            agent_process: None,
+            display_title: String::new(),
+            agent_exited: false,
             launch: session.launch,
             terminal,
             theme,
@@ -593,6 +749,8 @@ impl Worker {
             writer,
             child_killer,
             child_exit_rx,
+            child_identity,
+            checked_shutdown: false,
             child_reaper: Some(child_reaper),
             reader: Some(reader_thread),
         })
@@ -622,6 +780,7 @@ impl Worker {
                 }
                 WorkerEvent::Command(None) => shutting_down = true,
                 WorkerEvent::Capture => self.capture_if_ready(),
+                WorkerEvent::ObserveForeground => self.refresh_resume_hint(true),
                 WorkerEvent::Pty(message) => {
                     pty_open = self.handle_pty_message(message);
                 }
@@ -657,6 +816,13 @@ impl Worker {
                 Err(TryRecvError::Disconnected) => {
                     self.handle_child_exit(&mut exited, Err("child reaper closed".into()));
                 }
+                Err(TryRecvError::Empty) if self.checked_shutdown => {
+                    let result = self
+                        .child_exit_rx
+                        .recv()
+                        .unwrap_or_else(|_| Err("child reaper closed".into()));
+                    self.handle_child_exit(&mut exited, result);
+                }
                 Err(TryRecvError::Empty) => match self.child_killer.kill() {
                     Ok(()) => {
                         let result = self
@@ -690,8 +856,12 @@ impl Worker {
         // same OS thread on which they were constructed and used.
     }
 
-    fn handle_child_exit(&self, exited: &mut bool, result: ChildExit) {
+    fn handle_child_exit(&mut self, exited: &mut bool, result: ChildExit) {
         if let Some(event) = child_exit_event(exited, result) {
+            self.agent_exited = true;
+            self.agent_provider = None;
+            self.agent_process = None;
+            self.set_agent_activity(None);
             self.emit(event);
         }
     }
@@ -734,7 +904,7 @@ impl Worker {
             return;
         }
         self.refresh_resume_hint(false);
-        {
+        let observed_sequence = {
             let mut activity = self
                 .published
                 .activity
@@ -749,6 +919,14 @@ impl Worker {
                 sequence,
                 last_output_at_unix_ms,
             });
+            (self.published.output_armed.load(Ordering::Acquire)
+                && self.published.output_armed.swap(false, Ordering::AcqRel))
+            .then_some(sequence)
+        };
+        if let Some(sequence) = observed_sequence
+            && let Some(observer) = self.published.output_observer.get()
+        {
+            observer(sequence);
         }
         if let Some(transcript) = &self.transcript
             && transcript.send(bytes.clone()).is_err()
@@ -773,9 +951,56 @@ impl Worker {
     /// Returns true when shutdown was requested.
     fn handle_command(&mut self, command: Command) -> bool {
         match command {
+            Command::ApplyAgentActivity {
+                process,
+                activity,
+                reply,
+                deadline,
+            } => {
+                let current = self.observe_agent_process();
+                let activity = if std::time::Instant::now() < deadline && current == Some(&process)
+                {
+                    activity
+                } else {
+                    None
+                };
+                self.set_agent_activity(activity);
+                let _ = reply.send(
+                    *self
+                        .published
+                        .agent_activity
+                        .lock()
+                        .unwrap_or_else(|error| error.into_inner()),
+                );
+            }
+            Command::CloseChecked {
+                allow_active,
+                deadline,
+                reply,
+            } => {
+                use super::ipc::TerminalCloseResult;
+                let outcome = match self.inspect_close(deadline) {
+                    Ok((true, _)) if !allow_active => TerminalCloseResult::Active,
+                    Ok((_, mut family)) => match family.kill(deadline) {
+                        Ok(()) => {
+                            self.checked_shutdown = true;
+                            TerminalCloseResult::Closed
+                        }
+                        Err(detail) => TerminalCloseResult::Unknown(detail),
+                    },
+                    Err(detail) => TerminalCloseResult::Unknown(detail),
+                };
+                let close = outcome == TerminalCloseResult::Closed;
+                let _ = reply.send(outcome);
+                return close;
+            }
             Command::ObserveAgent(sender) => {
                 self.refresh_resume_hint(true);
                 let _ = sender.send(self.resume_hint.clone());
+            }
+            Command::ObserveAgentProcess(sender) => {
+                let process = self.observe_agent_process().cloned();
+                let _ = sender.send(process);
             }
             Command::Input(bytes) => self.write_pty(&bytes, "write terminal input"),
             Command::Key(input) => self.encode_key(input),
@@ -1018,31 +1243,136 @@ impl Worker {
                 Effect::PtyWrite(bytes) => self.write_pty(&bytes, "write terminal response"),
                 Effect::Bell => self.emit(TerminalEvent::Bell),
                 Effect::Title(title) => {
-                    self.refresh_resume_hint(true);
-                    self.emit(TerminalEvent::TitleChanged(title));
+                    let activity = self.agent_provider.and_then(|provider| {
+                        provider
+                            .activity_from_title(&title)
+                            .map(|state| crate::agent::Activity { provider, state })
+                    });
+                    let display_changed = match agent_title_label(&title, activity) {
+                        Some("") => self.display_title != "π",
+                        Some(label) => self.display_title.strip_prefix("π ") != Some(label),
+                        None => self.display_title != title,
+                    };
+                    let previous = *self
+                        .published
+                        .agent_activity
+                        .lock()
+                        .unwrap_or_else(|error| error.into_inner());
+                    if display_changed || activity != previous {
+                        self.refresh_resume_hint(true);
+                    }
+                    let observed = self.agent_provider.and_then(|provider| {
+                        provider
+                            .activity_from_title(&title)
+                            .map(|state| crate::agent::Activity { provider, state })
+                    });
+                    if self.agent_provider == Some(crate::agent::Provider::Omp) {
+                        self.set_agent_activity(
+                            self.agent_process
+                                .as_ref()
+                                .filter(|process| process.provider == crate::agent::Provider::Omp)
+                                .and(observed),
+                        );
+                    }
+                    if display_changed || observed != activity {
+                        let display = canonical_agent_title(&title, observed);
+                        if display != self.display_title {
+                            self.display_title = display.clone();
+                            self.emit(TerminalEvent::TitleChanged(display));
+                        }
+                    }
                 }
             }
         }
     }
 
-    fn refresh_resume_hint(&mut self, title_changed: bool) {
-        let Some(fd) = self.master.as_raw_fd() else {
-            return;
-        };
-        // SAFETY: the master owns this live PTY descriptor throughout the call.
+    fn inspect_close(&self, deadline: std::time::Instant) -> Result<(bool, FrozenFamily), String> {
+        let root = self
+            .child_identity
+            .as_ref()
+            .ok_or("Child identity unavailable")?;
+        let family = FrozenFamily::capture(root, deadline)?;
+        let fd = self
+            .master
+            .as_raw_fd()
+            .ok_or("PTY descriptor unavailable")?;
+        // SAFETY: this worker owns the live PTY throughout the frozen census.
         let foreground = unsafe { libc::tcgetpgrp(fd) };
-        // An exited group is not evidence that the last saved identity changed.
-        if foreground <= 0 || (!title_changed && self.resume_foreground == Some(foreground)) {
+        if foreground <= 0 {
+            return Err("Foreground process group unavailable".into());
+        }
+        // Process-only policy deliberately permits terminating shell builtins.
+        // The original executable check still prevents an exec'd agent or
+        // command from inheriting an idle shell's authority.
+        let idle_shell = interactive_shell_launch(&self.launch) && root.original_executable();
+        Ok((
+            family.has_jobs() || foreground != root.process.group || !idle_shell,
+            family,
+        ))
+    }
+
+    fn observe_agent_process(&mut self) -> Option<&AgentProcess> {
+        let foreground = || {
+            self.master.as_raw_fd().and_then(|fd| {
+                // SAFETY: this worker owns the live master descriptor.
+                let group = unsafe { libc::tcgetpgrp(fd) };
+                (group > 0).then_some(group)
+            })
+        };
+        let group = foreground();
+        let process = if self.agent_exited {
+            None
+        } else {
+            group
+                .and_then(crate::model::agent_recovery::foreground_agent)
+                .filter(|_| foreground() == group)
+        };
+        if process.is_none() || process != self.agent_process {
+            self.set_agent_activity(None);
+        }
+        self.agent_process = process;
+        self.agent_process.as_ref()
+    }
+
+    fn refresh_resume_hint(&mut self, force: bool) {
+        let foreground = self
+            .master
+            .as_raw_fd()
+            .map(|fd| {
+                // SAFETY: this worker owns the live master descriptor.
+                unsafe { libc::tcgetpgrp(fd) }
+            })
+            .filter(|group| *group > 0);
+        if !force && self.resume_foreground == foreground {
             return;
         }
-        self.resume_foreground = Some(foreground);
-        // PTY output is already wake-driven. Only a changed foreground group or
-        // title reads argv; steady output does not scan /proc or allocate hints.
-        let hint = crate::model::agent_recovery::foreground_hint(foreground, &self.launch);
+        self.resume_foreground = foreground;
+        let hint = if self.agent_exited {
+            None
+        } else {
+            foreground.and_then(|group| {
+                crate::model::agent_recovery::foreground_hint(group, &self.launch)
+            })
+        };
+        self.agent_provider = self.observe_agent_process().map(|process| process.provider);
         if hint != self.resume_hint {
             self.resume_hint = hint.clone();
             self.emit(TerminalEvent::ResumeHintChanged(hint));
         }
+    }
+
+    fn set_agent_activity(&self, activity: Option<crate::agent::Activity>) {
+        let mut current = self
+            .published
+            .agent_activity
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if *current == activity {
+            return;
+        }
+        *current = activity;
+        drop(current);
+        self.emit(TerminalEvent::AgentActivityChanged(activity));
     }
 
     fn write_pty(&mut self, bytes: &[u8], operation: &'static str) {
@@ -1063,8 +1393,31 @@ impl Worker {
     }
 
     fn error(&self, operation: &'static str, message: String) {
+        self.set_agent_activity(None);
         self.emit(TerminalEvent::Error { operation, message });
     }
+}
+
+fn canonical_agent_title(title: &str, activity: Option<crate::agent::Activity>) -> String {
+    if let Some(label) = agent_title_label(title, activity) {
+        if label.is_empty() {
+            "π".into()
+        } else {
+            format!("π {label}")
+        }
+    } else {
+        title.to_owned()
+    }
+}
+
+fn agent_title_label(title: &str, activity: Option<crate::agent::Activity>) -> Option<&str> {
+    if !activity.is_some_and(|activity| activity.provider == crate::agent::Provider::Omp) {
+        return None;
+    }
+    // The lifecycle glyph is view state, never a durable title or recovery ID.
+    let rest = title.strip_prefix("π ")?;
+    let glyph = rest.chars().next()?;
+    Some(rest[glyph.len_utf8()..].strip_prefix(' ').unwrap_or(""))
 }
 
 fn theme_scheme(theme: TerminalTheme) -> ColorScheme {
@@ -1138,6 +1491,7 @@ fn wait_for_worker_event(
             recv(capture) -> _ => WorkerEvent::Capture,
             recv(pty) -> message => WorkerEvent::Pty(message.ok()),
             recv(child_exit) -> message => WorkerEvent::ChildExit(message.ok()),
+            default(std::time::Duration::from_secs(2)) => WorkerEvent::ObserveForeground,
         },
         (true, false) => crossbeam_channel::select! {
             recv(commands) -> message => WorkerEvent::Command(message.ok()),
@@ -1148,6 +1502,7 @@ fn wait_for_worker_event(
             recv(commands) -> message => WorkerEvent::Command(message.ok()),
             recv(capture) -> _ => WorkerEvent::Capture,
             recv(child_exit) -> message => WorkerEvent::ChildExit(message.ok()),
+            default(std::time::Duration::from_secs(2)) => WorkerEvent::ObserveForeground,
         },
         (false, false) => WorkerEvent::Command(commands.recv().ok()),
     }
@@ -1255,6 +1610,55 @@ fn scrub_inherited_markers(command: &mut CommandBuilder) {
     for name in INHERITED_TERMINAL_MARKERS {
         command.env_remove(name);
     }
+}
+
+/// With a PTY, a recognized shell without a command or script operand is an
+/// interactive launch. Unknown invocation forms stay active conservatively.
+fn interactive_shell_launch(recipe: &LaunchRecipe) -> bool {
+    let Some(name) = std::path::Path::new(&recipe.program)
+        .file_name()
+        .and_then(|name| name.to_str())
+    else {
+        return false;
+    };
+    if !matches!(
+        name,
+        "sh" | "bash"
+            | "zsh"
+            | "fish"
+            | "dash"
+            | "ash"
+            | "ksh"
+            | "ksh93"
+            | "mksh"
+            | "pdksh"
+            | "yash"
+            | "csh"
+            | "tcsh"
+    ) {
+        return false;
+    }
+    let mut arguments = recipe.arguments.iter();
+    while let Some(argument) = arguments.next() {
+        match argument.as_str() {
+            "--" => return arguments.next().is_none(),
+            "--login" | "--interactive" | "--noprofile" | "--norc" | "--no-config" | "--posix" => {}
+            "--rcfile" | "--init-file" | "-o" | "+o" | "-O" | "+O" => {
+                if arguments.next().is_none() {
+                    return false;
+                }
+            }
+            option
+                if option.starts_with('-')
+                    && !option.starts_with("--")
+                    && option.len() > 1
+                    && option[1..]
+                        .bytes()
+                        .all(|byte| byte.is_ascii_alphabetic() && byte != b'c') => {}
+            _ => return false,
+        }
+    }
+    true
 }
 
 fn command_from_recipe(recipe: &LaunchRecipe) -> CommandBuilder {
@@ -1531,17 +1935,40 @@ fn map_mouse_button(button: MouseButton) -> mouse::Button {
 
 #[cfg(test)]
 mod tests {
+
     use std::{
         collections::BTreeMap,
         ffi::OsStr,
         fs,
         os::unix::fs::{PermissionsExt, symlink},
         sync::atomic::{AtomicUsize, Ordering},
+        time::Duration,
     };
 
     use tempfile::tempdir;
 
     use super::*;
+
+    #[test]
+    fn omp_display_title_drops_lifecycle_animation_but_preserves_labels() {
+        use crate::agent::{Activity, Provider};
+        let title = |value: &str| {
+            canonical_agent_title(
+                value,
+                Provider::Omp
+                    .activity_from_title(value)
+                    .map(|state| Activity {
+                        provider: Provider::Omp,
+                        state,
+                    }),
+            )
+        };
+        assert_eq!(title("π ⠋ project"), title("π ⠙ project"));
+        assert_eq!(title("π > project"), "π project");
+        assert_eq!(title("π ! renamed"), "π renamed");
+        assert_eq!(title("custom title"), "custom title");
+        assert_eq!(canonical_agent_title("π ⠋ project", None), "π ⠋ project");
+    }
 
     #[test]
     fn changing_parser_theme_preserves_truecolor_and_osc_overrides_and_queries() {
@@ -1613,6 +2040,10 @@ mod tests {
             working_directory: PathBuf::from("/"),
             environment: BTreeMap::new(),
         };
+        capture_worker_for(recipe)
+    }
+
+    fn capture_worker_for(recipe: LaunchRecipe) -> (Worker, Receiver<TerminalEvent>) {
         let session = TerminalSession {
             id: crate::model::TerminalId::new(),
             launch: recipe.clone(),
@@ -1637,6 +2068,134 @@ mod tests {
             .unwrap(),
             receiver,
         )
+    }
+
+    #[test]
+    fn fresh_omp_activity_does_not_require_a_resumable_session() {
+        use crate::agent::{Activity, ActivityState, Provider};
+        use std::time::Instant;
+        let directory = tempdir().unwrap();
+        let executable = directory.path().join("omp");
+        symlink("/bin/sleep", &executable).unwrap();
+        let (mut worker, events) = capture_worker_for(LaunchRecipe {
+            program: executable.to_str().unwrap().into(),
+            arguments: vec!["10".into()],
+            working_directory: directory.path().into(),
+            environment: BTreeMap::from([
+                ("HOME".into(), directory.path().to_str().unwrap().into()),
+                (
+                    "PI_CODING_AGENT_DIR".into(),
+                    directory.path().to_str().unwrap().into(),
+                ),
+            ]),
+        });
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let process = loop {
+            if let Some(process) = worker.observe_agent_process().cloned() {
+                break process;
+            }
+            assert!(Instant::now() < deadline, "PTY foreground never became OMP");
+            std::thread::sleep(Duration::from_millis(1));
+        };
+        let tty = std::fs::read_link(format!("/proc/{}/fd/0", process.pid)).unwrap();
+        let markers = directory.path().join("terminal-sessions");
+        std::fs::create_dir(&markers).unwrap();
+        std::fs::write(
+            markers.join(format!(
+                "pts-{}",
+                tty.file_name().unwrap().to_str().unwrap()
+            )),
+            format!(
+                "{}\n{}\n",
+                directory.path().display(),
+                directory
+                    .path()
+                    .join("sessions/fresh_12345678-1234-1234-1234-123456789abc.jsonl")
+                    .display()
+            ),
+        )
+        .unwrap();
+        worker.handle_command(Command::Hide);
+        let generation = worker.generation;
+        for title in ["π ⠋ fresh", "π ⠙ fresh", "π ! fresh", "π > fresh"] {
+            worker.process_output(format!("\x1b]2;{title}\x07").into_bytes());
+            assert!(worker.resume_hint.is_none());
+        }
+        let activity = events
+            .try_iter()
+            .filter_map(|event| match event {
+                TerminalEvent::AgentActivityChanged(activity) => Some(activity),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            activity,
+            [
+                ActivityState::Working,
+                ActivityState::Waiting,
+                ActivityState::Idle
+            ]
+            .map(|state| Some(Activity {
+                provider: Provider::Omp,
+                state
+            }))
+        );
+        assert_eq!(
+            worker.generation, generation,
+            "hidden activity must not render"
+        );
+        worker.run();
+    }
+
+    #[test]
+    fn activity_application_rejects_replaced_processes_and_expired_results() {
+        use crate::agent::{Activity, ActivityState, Provider};
+        let directory = tempdir().unwrap();
+        let executable = directory.path().join("claude");
+        // A harmless native executable with recognizable argv; no provider I/O.
+        symlink("/bin/sleep", &executable).unwrap();
+        let (mut worker, _) = capture_worker_for(LaunchRecipe {
+            program: executable.to_str().unwrap().into(),
+            arguments: vec!["10".into()],
+            working_directory: directory.path().into(),
+            environment: BTreeMap::new(),
+        });
+        let process = worker.observe_agent_process().cloned().unwrap();
+        let working = Some(Activity {
+            provider: Provider::Claude,
+            state: ActivityState::Working,
+        });
+        let apply = |worker: &mut Worker, process: AgentProcess, deadline| {
+            let (reply, result) = crossbeam_channel::bounded(1);
+            worker.handle_command(Command::ApplyAgentActivity {
+                process,
+                activity: working,
+                reply,
+                deadline,
+            });
+            result.recv().unwrap()
+        };
+        let deadline = || std::time::Instant::now() + Duration::from_secs(3);
+        assert_eq!(apply(&mut worker, process.clone(), deadline()), working);
+        let mut replaced = process.clone();
+        replaced.start = replaced.start.wrapping_add(1);
+        assert_eq!(apply(&mut worker, replaced, deadline()), None);
+        assert_eq!(
+            *worker
+                .published
+                .agent_activity
+                .lock()
+                .unwrap_or_else(|error| error.into_inner()),
+            None
+        );
+        assert_eq!(apply(&mut worker, process.clone(), deadline()), working);
+        let mut other_process = process.clone();
+        other_process.pid += 1;
+        assert_eq!(apply(&mut worker, other_process, deadline()), None);
+        assert_eq!(apply(&mut worker, process.clone(), deadline()), working);
+        assert_eq!(apply(&mut worker, process, std::time::Instant::now()), None);
+        // The disconnected command channel drives normal kill/reap teardown.
+        worker.run();
     }
 
     #[test]

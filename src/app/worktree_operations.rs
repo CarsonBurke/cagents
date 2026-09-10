@@ -17,6 +17,7 @@ pub(super) struct ActiveWorktreeOperation {
     termination_requested: bool,
     finished: bool,
     detail: String,
+    created_worktree: Option<(PathBuf, i64)>,
 }
 
 #[derive(Clone)]
@@ -148,6 +149,7 @@ impl Cagents {
                 detail: "Accepted; waiting for the durable service".into(),
                 completed_elapsed: None,
                 restored: false,
+                created_worktree: None,
             },
         );
         self.sync_worktree_operation_rows();
@@ -227,6 +229,12 @@ impl Cagents {
             .map(|request| request.repository.clone());
         let outcome = match result {
             Ok(report) => {
+                operation.created_worktree = match &report.outcome {
+                    Some(WorktreeCreationOutcome::Created { worktree, .. }) => {
+                        Some((worktree.path.clone(), report.created_at_unix_ms))
+                    }
+                    _ => None,
+                };
                 operation.detail = format!("{:?}: {}", report.state, report.detail);
                 report.outcome
             }
@@ -294,6 +302,12 @@ impl Cagents {
                         report.operation_id,
                         ActiveWorktreeOperation {
                             project,
+                            created_worktree: match &report.outcome {
+                                Some(WorktreeCreationOutcome::Created { worktree, .. }) => {
+                                    Some((worktree.path.clone(), report.created_at_unix_ms))
+                                }
+                                _ => None,
+                            },
                             generation: report.generation,
                             request: report.request,
                             token: None,
@@ -379,6 +393,14 @@ impl Cagents {
                 .collect();
             project.operations.sort_by_key(|row| row.id);
         }
+        self.sidebar_model.apply_worktree_creation_times(
+            self.worktree_operations.values().filter_map(|operation| {
+                operation
+                    .created_worktree
+                    .as_ref()
+                    .map(|(path, time)| (path, *time))
+            }),
+        );
     }
 }
 
@@ -400,6 +422,7 @@ mod tests {
                 id,
                 ActiveWorktreeOperation {
                     project: ProjectId::new(),
+                    created_worktree: None,
                     generation: 2,
                     request: None,
                     token: Some(token.clone()),

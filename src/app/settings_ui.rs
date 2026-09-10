@@ -226,6 +226,21 @@ fn settings_category_controls<'a>(
                     SettingsField::ManagedWorktreeDirectory,
                     progress,
                 ),
+                settings_choice(
+                    "Worktree order",
+                    "Main stays first. Imported worktrees with unknown creation dates follow dated worktrees, ordered by path.",
+                    SettingsField::WorktreeSort,
+                    [
+                        ("Newest", "newest", draft.worktree_sort == "newest"),
+                        ("Oldest", "oldest", draft.worktree_sort == "oldest"),
+                        (
+                            "Alphabetical",
+                            "alphabetical",
+                            draft.worktree_sort == "alphabetical",
+                        ),
+                    ],
+                    progress,
+                ),
                 setting_input(
                     "Maximum hot columns",
                     "Applies immediately; extra background columns may hibernate.",
@@ -400,6 +415,21 @@ fn settings_category_controls<'a>(
                     &draft.terminal_scrollback_lines,
                     SettingsField::TerminalScrollbackLines,
                     progress,
+                )],
+            ),
+            settings_group(
+                "Closing",
+                "Idle shells close immediately. Terminal identity is always checked.",
+                vec![setting_field(
+                    "Active processes",
+                    "Ask before closing a terminal with a foreground program or background jobs.",
+                    widget::toggler(draft.confirm_terminal_close)
+                        .label("Confirm closing active processes".to_owned())
+                        .on_toggle(|enabled| Message::SettingsChanged {
+                            field: SettingsField::ConfirmTerminalClose,
+                            value: enabled.to_string(),
+                        })
+                        .into(),
                 )],
             ),
         ],

@@ -1,5 +1,6 @@
 //! Structured native-agent conversations. Provider JSON stays behind adapters;
 //! the UI and daemon exchange bounded, typed messages rather than terminal text.
+use crate::agent::{ActivityState, Provider};
 use crate::model::LaunchRecipe;
 use serde::{Deserialize, Serialize};
 
@@ -9,29 +10,6 @@ pub mod client;
 pub mod protocol;
 #[cfg(feature = "host")]
 pub mod runtime;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum Provider {
-    Omp,
-    Claude,
-    Codex,
-}
-impl Provider {
-    pub fn executable(self) -> &'static str {
-        match self {
-            Self::Omp => "omp",
-            Self::Claude => "claude",
-            Self::Codex => "codex",
-        }
-    }
-    pub fn label(self) -> &'static str {
-        match self {
-            Self::Omp => "Oh My Pi",
-            Self::Claude => "Claude Code",
-            Self::Codex => "Codex",
-        }
-    }
-}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Launch {
@@ -65,12 +43,7 @@ impl Launch {
                 .map_or((argument.as_str(), None), |(flag, value)| {
                     (flag, Some(value))
                 });
-            let identity = match self.provider {
-                Provider::Codex => flag == "resume",
-                Provider::Claude => matches!(flag, "--resume" | "-r" | "--session-id"),
-                Provider::Omp => matches!(flag, "--resume" | "-r"),
-            };
-            if identity {
+            if self.provider.is_identity_option(flag) {
                 if inline.is_none() {
                     original.next()?;
                 }
@@ -78,11 +51,7 @@ impl Launch {
                 arguments.push(argument.clone());
             }
         }
-        if self.provider == Provider::Codex {
-            arguments.splice(0..0, ["resume".into(), id.into()]);
-        } else {
-            arguments.extend(["--resume".into(), id.into()]);
-        }
+        self.provider.append_resume(&mut arguments, id.into());
         recipe.arguments = arguments;
         crate::model::agent_recovery::resume_recipe(&recipe)
     }
@@ -124,6 +93,22 @@ pub struct Snapshot {
     pub has_later: bool,
     pub composer: Option<String>,
     pub open_url: Option<(String, String)>,
+    /// Provider-confirmed user attention, including requests not yet delivered.
+    pub waiting: bool,
+}
+
+impl Snapshot {
+    pub fn activity(&self) -> ActivityState {
+        if self.exited {
+            ActivityState::Unknown
+        } else if self.waiting || !self.requests.is_empty() {
+            ActivityState::Waiting
+        } else if self.busy {
+            ActivityState::Working
+        } else {
+            ActivityState::Idle
+        }
+    }
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PromptMode {
@@ -312,4 +297,6 @@ pub enum Event {
     Exited {
         code: Option<i32>,
     },
+    /// Authoritative provider attention independent of request presentation.
+    Waiting(bool),
 }

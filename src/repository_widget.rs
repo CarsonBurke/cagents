@@ -22,7 +22,8 @@ use cosmic::{
 
 use crate::{
     diff_view::{
-        DiffMode, DiffModel, DiffRowKind, InlineDiffRow, RenderedDiff, SplitDiffRow,
+        DIFF_FONT_SIZE, DIFF_LINE_HEIGHT, DiffMode, DiffModel, DiffRowKind, DiffSyntax,
+        InlineDiffRow, RenderedDiff, SplitDiffRow, SyntaxSpan, highlighter_settings,
         load_repository_diff,
     },
     editor::{
@@ -333,8 +334,9 @@ pub enum RepositoryAction {
     BackToFiles {
         card: CardId,
     },
-    OpenExternalEditor {
+    OpenExternal {
         card: CardId,
+        editor_id: String,
     },
     StageSelected {
         card: CardId,
@@ -404,7 +406,7 @@ impl RepositoryAction {
             | Self::Reload { card }
             | Self::DiscardEdits { card }
             | Self::BackToFiles { card }
-            | Self::OpenExternalEditor { card }
+            | Self::OpenExternal { card, .. }
             | Self::StageSelected { card, .. }
             | Self::ApplySourceSurface { card, .. }
             | Self::ApplyMarkdownMode { card, .. }
@@ -816,6 +818,9 @@ fn visible_rows(total: usize, viewport: ListViewport, row_height: f32) -> Visibl
 
 pub struct RepositoryRuntime {
     pub descriptor: RepositoryView,
+    directory_only: bool,
+    standalone: bool,
+    external_editors: Vec<crate::sidebar::SidebarEditor>,
     /// Epoch for selected-document, diff, and save work. File-list refreshes
     /// deliberately use a separate epoch so they cannot obsolete an active
     /// document operation.
@@ -910,6 +915,9 @@ impl RepositoryRuntime {
         let identity = descriptor.worktree.display().to_string();
         Self {
             descriptor,
+            directory_only: false,
+            standalone: false,
+            external_editors: Vec::new(),
             generation: 0,
             file_list_generation: 0,
             mutation_refresh_pending: false,
@@ -935,6 +943,22 @@ impl RepositoryRuntime {
             lsp_document: None,
             lsp_intents: Vec::new(),
         }
+    }
+
+    /// Shares the safe editor with ordinary folders without inventing Git state.
+    pub fn new_directory(descriptor: RepositoryView) -> Self {
+        let mut runtime = Self::new(descriptor);
+        runtime.directory_only = true;
+        runtime
+    }
+
+    /// Hides workbench launch controls in an independent editor window.
+    pub fn set_standalone(&mut self, standalone: bool) {
+        self.standalone = standalone;
+    }
+
+    pub fn set_external_editors(&mut self, editors: Vec<crate::sidebar::SidebarEditor>) {
+        self.external_editors = editors;
     }
 
     #[cfg(test)]
@@ -1174,7 +1198,7 @@ impl RepositoryRuntime {
             path: PathBuf::from("."),
             generation: self.file_list_generation,
         };
-        files_task(identity)
+        files_task(identity, self.directory_only)
     }
 
     /// Refreshes Git's status and mutable comparisons without replacing the
@@ -2276,7 +2300,7 @@ impl RepositoryRuntime {
                 self.realize_current_change();
                 self.scroll_to_change()
             }
-            RepositoryAction::MarkdownLink { .. } | RepositoryAction::OpenExternalEditor { .. } => {
+            RepositoryAction::MarkdownLink { .. } | RepositoryAction::OpenExternal { .. } => {
                 Task::none()
             }
         }
@@ -2349,8 +2373,19 @@ impl RepositoryRuntime {
     }
 
     fn open_file(&mut self, card: CardId, path: PathBuf) -> Task<RepositoryAction> {
-        let Some(file) = self.file(&path).cloned() else {
-            return Task::none();
+        let file = match self.file(&path).cloned() {
+            Some(file) => file,
+            None if self.standalone && crate::repository::RepoPath::parse(&path).is_ok() => {
+                RepositoryFile {
+                    path: path.clone(),
+                    staged_old_path: None,
+                    unstaged_old_path: None,
+                    staged: false,
+                    unstaged: false,
+                    status: None,
+                }
+            }
+            None => return Task::none(),
         };
         // Whatever was open is about to be replaced — including by a reload of
         // this very path, which is a different document however identical its
@@ -2470,13 +2505,19 @@ impl RepositoryRuntime {
     }
 }
 
-fn files_task(identity: AsyncIdentity) -> Task<RepositoryAction> {
+fn files_task(identity: AsyncIdentity, directory_only: bool) -> Task<RepositoryAction> {
     let worktree = identity.worktree.clone();
     cosmic::task::future(async move {
-        let result = tokio::task::spawn_blocking(move || load_repository_files(&worktree))
-            .await
-            .map_err(|error| format!("file-list worker failed: {error}"))
-            .and_then(|result| result);
+        let result = tokio::task::spawn_blocking(move || {
+            if directory_only {
+                load_directory_files(&worktree)
+            } else {
+                load_repository_files(&worktree)
+            }
+        })
+        .await
+        .map_err(|error| format!("file-list worker failed: {error}"))
+        .and_then(|result| result);
         RepositoryAction::FilesLoaded { identity, result }
     })
 }
@@ -2608,6 +2649,55 @@ fn base_candidates(snapshot: &RepositorySnapshot) -> Vec<ValidatedRefName> {
                 .map(|record| record.name.clone()),
         )
         .collect()
+}
+
+/// Lists a plain folder without following symlinked directories. Traversal
+/// uses the same descriptor-relative resolver as file loading and saving.
+pub fn load_directory_files(directory: &Path) -> Result<Vec<RepositoryFile>, String> {
+    use std::os::fd::AsRawFd;
+    let root = crate::fs_safety::Root::open(directory).map_err(|error| error.to_string())?;
+    let mut pending = vec![(PathBuf::new(), 0usize)];
+    let mut files = Vec::new();
+    let mut entries = 0usize;
+    while let Some((relative, depth)) = pending.pop() {
+        if depth > 128 {
+            return Err("Folder nesting exceeds 128 levels; open a narrower folder.".into());
+        }
+        let handle = if relative.as_os_str().is_empty() {
+            std::fs::File::open(directory).map_err(|error| error.to_string())?
+        } else {
+            crate::fs_safety::open_beneath(&root, &relative).map_err(|error| error.to_string())?
+        };
+        let descriptor_path = format!("/proc/self/fd/{}", handle.as_raw_fd());
+        for entry in std::fs::read_dir(descriptor_path).map_err(|error| error.to_string())? {
+            let entry = entry.map_err(|error| error.to_string())?;
+            entries += 1;
+            if entries > 100_000 {
+                return Err("Folder exceeds 100,000 entries; open a narrower folder.".into());
+            }
+            let name = entry.file_name();
+            if name == ".git" {
+                continue;
+            }
+            let path = relative.join(name);
+            let metadata = crate::fs_safety::metadata_beneath(&root, &path)
+                .map_err(|error| error.to_string())?;
+            if metadata.is_dir() {
+                pending.push((path, depth + 1));
+            } else {
+                files.push(RepositoryFile {
+                    path,
+                    staged_old_path: None,
+                    unstaged_old_path: None,
+                    staged: false,
+                    unstaged: false,
+                    status: None,
+                });
+            }
+        }
+    }
+    files.sort_by(|left, right| left.path.cmp(&right.path));
+    Ok(files)
 }
 
 pub fn load_repository_files(worktree: &Path) -> Result<Vec<RepositoryFile>, String> {
@@ -2867,45 +2957,6 @@ pub fn editor_focus_id(card: CardId) -> widget::Id {
     widget::Id::new(format!("repository.{card}.editor"))
 }
 
-/// The grammar and colour scheme the editable buffer is highlighted with.
-///
-/// `token` is what the highlighter resolves a grammar from; it matches a
-/// syntax by name as well as by extension, so a file that has no extension is
-/// still recognised by its own name (`Makefile`, `Dockerfile`) instead of
-/// falling back to plain text. Extensions are lowercased so the token a file
-/// resolves under is decided here rather than by whichever casing a grammar
-/// happens to list, and a bare name is passed through as written because that
-/// is what a name match compares against. An unrecognised token is not an
-/// error: the highlighter resolves plain text for it.
-///
-/// An extension wins over a name, so a name that carries an unknown extension
-/// - `Dockerfile.dev`, `Makefile.am` - resolves to plain text rather than to
-/// the grammar its stem names. Recovering those would mean resolving the
-/// grammar here instead of naming it, which is syntect's job and not worth a
-/// direct dependency on it for the case.
-///
-/// The scheme follows the application's own light/dark state rather than being
-/// pinned. Every one of these palettes picks its foregrounds for a background
-/// of its own kind, and reading a dark scheme off a light surface is what
-/// turns highlighted text into unreadable text.
-fn highlighter_settings(path: &Path, dark: bool) -> highlighter::Settings {
-    let token = match path.extension() {
-        Some(extension) => extension.to_string_lossy().to_lowercase(),
-        None => path
-            .file_name()
-            .map(|name| name.to_string_lossy().into_owned())
-            .unwrap_or_default(),
-    };
-    highlighter::Settings {
-        theme: if dark {
-            highlighter::Theme::Base16Ocean
-        } else {
-            highlighter::Theme::InspiredGitHub
-        },
-        token,
-    }
-}
-
 pub fn focus_restore_id(card: CardId) -> widget::Id {
     widget::Id::new(format!("repository.{card}.back"))
 }
@@ -2928,10 +2979,14 @@ fn file_list_view(card: CardId, runtime: &RepositoryRuntime) -> Element<'_, Repo
             ])
             .width(Length::Fill)
             .into(),
-            widget::button::standard("New terminal here")
-                .leading_icon(widget::icon::from_name("utilities-terminal-symbolic").size(16))
-                .on_press(RepositoryAction::NewTerminal { card })
-                .into(),
+            if runtime.standalone {
+                iced::widget::Space::new().into()
+            } else {
+                widget::button::standard("New terminal here")
+                    .leading_icon(widget::icon::from_name("utilities-terminal-symbolic").size(16))
+                    .on_press(RepositoryAction::NewTerminal { card })
+                    .into()
+            },
             widget::button::standard("Refresh")
                 .on_press(RepositoryAction::RefreshFiles { card })
                 .into(),
@@ -2984,6 +3039,14 @@ fn file_list_view(card: CardId, runtime: &RepositoryRuntime) -> Element<'_, Repo
                 );
             }
             widget::scrollable(widget::column::with_children(rows))
+                .direction(iced::widget::scrollable::Direction::Vertical(
+                    iced::widget::scrollable::Scrollbar::default()
+                        .width(crate::design::SCROLLBAR_THUMB_WIDTH)
+                        .scroller_width(crate::design::SCROLLBAR_THUMB_WIDTH)
+                        .spacing(
+                            crate::design::SCROLLBAR_GUTTER - crate::design::SCROLLBAR_THUMB_WIDTH,
+                        ),
+                ))
                 .on_scroll(move |viewport| RepositoryAction::FileViewport {
                     card,
                     offset: viewport.absolute_offset().y,
@@ -3015,6 +3078,20 @@ fn branch_comparison_icon() -> widget::icon::Handle {
         widget::icon::from_svg_bytes(&br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><g fill="none" stroke="black" stroke-width="1.7" stroke-linecap="round"><circle cx="6" cy="5" r="2"/><circle cx="6" cy="19" r="2"/><circle cx="18" cy="5" r="2"/><path d="M6 7v10M18 7c0 7-12 3-12 10"/></g></svg>"#[..]).symbolic(true)
     });
     ICON.clone()
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ExternalEditorCommand<'a>(CardId, &'a str);
+
+impl widget::menu::Action for ExternalEditorCommand<'_> {
+    type Message = RepositoryAction;
+
+    fn message(&self) -> RepositoryAction {
+        RepositoryAction::OpenExternal {
+            card: self.0,
+            editor_id: self.1.to_owned(),
+        }
+    }
 }
 
 /// The parent card embeds this in its existing title row, not above the body.
@@ -3080,10 +3157,10 @@ pub fn selected_file_toolbar(
             )
             .into(),
         ]),
-        // Keep history comparisons reachable even when neither local basis
-        // exists and Diff itself is disabled.
-        diff_basis_controls(card, runtime),
     ];
+    if !runtime.directory_only {
+        controls.push(diff_basis_controls(card, runtime));
+    }
     if runtime.source_surface == SourceSurface::Diff {
         controls.push(diff_review_controls(card, runtime));
     }
@@ -3147,16 +3224,46 @@ pub fn selected_file_toolbar(
             );
         }
     }
-    controls.push(
-        icon_control(
-            crate::ui_controls::symbolic_icon("document-open-symbolic"),
-            "Open file externally",
+    if !runtime.standalone
+        && let Some(editor) = runtime.external_editors.first()
+    {
+        let icon = |editor: &crate::sidebar::SidebarEditor| {
+            if Path::new(&editor.icon).is_absolute() {
+                widget::icon::from_path(PathBuf::from(&editor.icon))
+            } else {
+                widget::icon::from_name(editor.icon.clone()).handle()
+            }
+        };
+        let button = icon_control(
+            icon(editor),
+            format!("Open in {} · right-click for other editors", editor.name),
             false,
             !runtime.is_saving(),
-            Some(RepositoryAction::OpenExternalEditor { card }),
-        )
-        .into(),
-    );
+            Some(RepositoryAction::OpenExternal {
+                card,
+                editor_id: editor.id.clone(),
+            }),
+        );
+        if runtime.is_saving() {
+            controls.push(button.into());
+        } else {
+            let entries = runtime
+                .external_editors
+                .iter()
+                .map(|editor| {
+                    widget::menu::Item::Button(
+                        editor.name.clone(),
+                        Some(icon(editor)),
+                        ExternalEditorCommand(card, editor.id.as_str()),
+                    )
+                })
+                .collect();
+            controls.push(crate::interaction::context_menu(
+                button,
+                widget::menu::items(&HashMap::new(), entries),
+            ));
+        }
+    }
     // Native horizontal scrolling retains every action and keyboard target
     // without a Responsive wrapper hiding controls from accessibility.
     Some(
@@ -3281,60 +3388,70 @@ fn editable_document_view<'a>(
                 .into(),
         );
     }
-    let content: Element<'a, RepositoryAction> =
-        if document.markdown && runtime.markdown_mode == MarkdownMode::Preview {
-            widget::scrollable(
-                widget::container(
-                    markdown::view(&document.markdown_items, cosmic::iced::Theme::Dark)
-                        .map(move |uri| RepositoryAction::MarkdownLink { card, uri }),
+    let content: Element<'a, RepositoryAction> = if document.markdown
+        && runtime.markdown_mode == MarkdownMode::Preview
+    {
+        widget::scrollable(
+            widget::container(
+                markdown::view(&document.markdown_items, cosmic::iced::Theme::Dark)
+                    .map(move |uri| RepositoryAction::MarkdownLink { card, uri }),
+            )
+            .padding(spacing.space_m)
+            .max_width(900),
+        )
+        .direction(iced::widget::scrollable::Direction::Vertical(
+            iced::widget::scrollable::Scrollbar::default()
+                .width(crate::design::SCROLLBAR_THUMB_WIDTH)
+                .scroller_width(crate::design::SCROLLBAR_THUMB_WIDTH)
+                .spacing(crate::design::SCROLLBAR_GUTTER - crate::design::SCROLLBAR_THUMB_WIDTH),
+        ))
+        .height(Length::Fill)
+        .width(Length::Fill)
+        .into()
+    } else {
+        iced::widget::mouse_area(
+            // Iced's own editor rather than libcosmic's wrapper around it.
+            // The wrapper exists to add a context menu, and it pins its
+            // inner editor to `highlighter::PlainText`, so it is incapable
+            // of syntax highlighting. Its second widget tree is also what
+            // could retain the preceding stateless placeholder during an
+            // async file-load transition. With the context menu declined
+            // the wrapper was already a pass-through to exactly this
+            // widget, which is where the focus and editing state live.
+            iced::widget::text_editor::TextEditor::new(&document.content)
+                // Before `highlight_with`: `id` is only offered by the
+                // not-yet-highlighted builder.
+                .id(editor_focus_id(card))
+                .highlight_with::<highlighter::Highlighter>(
+                    highlighter_settings(&document.path, cosmic::theme::is_dark()),
+                    |highlight, _theme: &cosmic::Theme| highlight.to_format(),
                 )
-                .padding(spacing.space_m)
-                .max_width(900),
-            )
-            .height(Length::Fill)
-            .width(Length::Fill)
-            .into()
-        } else {
-            iced::widget::mouse_area(
-                // Iced's own editor rather than libcosmic's wrapper around it.
-                // The wrapper exists to add a context menu, and it pins its
-                // inner editor to `highlighter::PlainText`, so it is incapable
-                // of syntax highlighting. Its second widget tree is also what
-                // could retain the preceding stateless placeholder during an
-                // async file-load transition. With the context menu declined
-                // the wrapper was already a pass-through to exactly this
-                // widget, which is where the focus and editing state live.
-                iced::widget::text_editor::TextEditor::new(&document.content)
-                    // Before `highlight_with`: `id` is only offered by the
-                    // not-yet-highlighted builder.
-                    .id(editor_focus_id(card))
-                    .highlight_with::<highlighter::Highlighter>(
-                        highlighter_settings(&document.path, cosmic::theme::is_dark()),
-                        |highlight, _theme: &cosmic::Theme| highlight.to_format(),
-                    )
-                    .font(Font::MONOSPACE)
-                    .padding(spacing.space_xs)
-                    .height(Length::Fill)
-                    .style(|theme, status| {
-                        use iced::widget::text_editor::Catalog;
-                        let mut style = theme.style(&<cosmic::Theme as Catalog>::default(), status);
-                        style.border = iced::Border::default();
-                        style
-                    })
-                    .on_action(move |action| {
-                        if runtime.markdown_mode == MarkdownMode::Preview && action.is_edit() {
-                            RepositoryAction::ApplyMarkdownMode {
-                                card,
-                                preview: true,
-                            }
-                        } else {
-                            RepositoryAction::EditorAction { card, action }
+                .font(Font::MONOSPACE)
+                .padding(iced::Padding {
+                    right: f32::from(spacing.space_xs) + crate::design::SCROLLBAR_GUTTER,
+                    ..iced::Padding::new(f32::from(spacing.space_xs))
+                })
+                .height(Length::Fill)
+                .style(|theme, status| {
+                    use iced::widget::text_editor::Catalog;
+                    let mut style = theme.style(&<cosmic::Theme as Catalog>::default(), status);
+                    style.border = iced::Border::default();
+                    style
+                })
+                .on_action(move |action| {
+                    if runtime.markdown_mode == MarkdownMode::Preview && action.is_edit() {
+                        RepositoryAction::ApplyMarkdownMode {
+                            card,
+                            preview: true,
                         }
-                    }),
-            )
-            .interaction(iced::mouse::Interaction::Text)
-            .into()
-        };
+                    } else {
+                        RepositoryAction::EditorAction { card, action }
+                    }
+                }),
+        )
+        .interaction(iced::mouse::Interaction::Text)
+        .into()
+    };
     rows.push(content);
     widget::column::with_children(rows)
         .height(Length::Fill)
@@ -3638,14 +3755,11 @@ fn diff_model_view<'a>(
             // counter-translates the fixed gutters/center; only code moves in X.
             let gutter =
                 (model.row_count(DiffMode::Inline).max(1).ilog10() + 1).max(4) as f32 * 8.0 + 12.0;
-            let code_width = model.max_line_columns as f32 * DIFF_FONT_SIZE + 24.0;
-            let viewport_width = (size.width - 12.0).max(1.0);
-            let available_code = match runtime.diff_mode {
-                DiffMode::Inline => viewport_width - 2.0 * gutter - 28.0,
-                DiffMode::Split => (viewport_width - 1.0) / 2.0 - gutter - 16.0,
-            }
-            .max(1.0);
-            let overflow = (code_width - available_code).max(0.0);
+            let code_width =
+                (model.max_line_width[usize::from(cosmic::theme::is_dark())] as f32).max(1.0);
+            let geometry = DiffScrollGeometry::new(size.width, gutter, runtime.diff_mode);
+            let viewport_width = geometry.viewport_width;
+            let overflow = geometry.overflow(code_width);
             let horizontal = runtime.diff_horizontal.clamp(0.0, overflow);
             let total = model.row_count(runtime.diff_mode);
             let visible = visible_rows(total, runtime.diff_viewport, DIFF_ROW_HEIGHT);
@@ -3654,16 +3768,16 @@ fn diff_model_view<'a>(
                 children.push(iced::widget::Space::new().height(visible.top_space).into());
             }
             match runtime.diff_mode {
-                DiffMode::Inline => children.extend(
-                    model.inline_rows[visible.start..visible.end]
-                        .iter()
-                        .map(|row| inline_diff_row(row, gutter, code_width, horizontal)),
-                ),
-                DiffMode::Split => children.extend(
-                    model.split_rows[visible.start..visible.end]
-                        .iter()
-                        .map(|row| split_diff_row(row, gutter, code_width, horizontal)),
-                ),
+                DiffMode::Inline => {
+                    children.extend(model.inline_rows[visible.start..visible.end].iter().map(
+                        |row| inline_diff_row(row, &model.syntax, gutter, code_width, horizontal),
+                    ))
+                }
+                DiffMode::Split => {
+                    children.extend(model.split_rows[visible.start..visible.end].iter().map(
+                        |row| split_diff_row(row, &model.syntax, gutter, code_width, horizontal),
+                    ))
+                }
             };
             if visible.bottom_space > 0.0 {
                 children.push(
@@ -3674,7 +3788,11 @@ fn diff_model_view<'a>(
             }
             // Both-axis scrollbars overlay their content in this iced version.
             // Reserve the bottom rail so the final line remains fully readable.
-            children.push(iced::widget::Space::new().height(12).into());
+            children.push(
+                iced::widget::Space::new()
+                    .height(crate::design::SCROLLBAR_GUTTER)
+                    .into(),
+            );
             let canvas = Element::new(DiffHorizontalContent {
                 content: widget::column::with_children(children)
                     .spacing(0)
@@ -3689,13 +3807,13 @@ fn diff_model_view<'a>(
             widget::scrollable(canvas)
                 .direction(iced::widget::scrollable::Direction::Both {
                     vertical: iced::widget::scrollable::Scrollbar::default()
-                        .width(8)
-                        .scroller_width(8)
-                        .spacing(4),
+                        .width(crate::design::SCROLLBAR_THUMB_WIDTH)
+                        .scroller_width(crate::design::SCROLLBAR_THUMB_WIDTH)
+                        .margin(crate::design::SCROLLBAR_MARGIN),
                     horizontal: iced::widget::scrollable::Scrollbar::default()
-                        .width(8)
-                        .scroller_width(8)
-                        .spacing(4),
+                        .width(crate::design::SCROLLBAR_THUMB_WIDTH)
+                        .scroller_width(crate::design::SCROLLBAR_THUMB_WIDTH)
+                        .margin(crate::design::SCROLLBAR_MARGIN),
                 })
                 .id(runtime.diff_scroll_id.clone())
                 .on_scroll(move |viewport| RepositoryAction::DiffViewport {
@@ -3713,14 +3831,46 @@ fn diff_model_view<'a>(
     rows
 }
 
-const DIFF_FONT_SIZE: f32 = 14.0;
+const DIFF_ROW_PADDING: f32 = 4.0;
+const DIFF_MARKER_WIDTH: f32 = 16.0;
+const DIFF_SPLIT_DIVIDER: f32 = 1.0;
 
-fn inline_diff_row(
-    row: &InlineDiffRow,
+#[derive(Debug, Clone, Copy)]
+struct DiffScrollGeometry {
+    viewport_width: f32,
+    code_viewport: f32,
+}
+
+impl DiffScrollGeometry {
+    fn new(width: f32, gutter: f32, mode: DiffMode) -> Self {
+        let viewport_width = (width - crate::design::SCROLLBAR_GUTTER).max(0.0);
+        let code_viewport = match mode {
+            DiffMode::Inline => {
+                viewport_width - 2.0 * gutter - DIFF_MARKER_WIDTH - 2.0 * DIFF_ROW_PADDING
+            }
+            DiffMode::Split => {
+                (viewport_width - DIFF_SPLIT_DIVIDER) / 2.0 - gutter - 2.0 * DIFF_ROW_PADDING
+            }
+        }
+        .max(0.0);
+        Self {
+            viewport_width,
+            code_viewport,
+        }
+    }
+
+    fn overflow(self, code_width: f32) -> f32 {
+        (code_width - self.code_viewport).max(0.0)
+    }
+}
+
+fn inline_diff_row<'a>(
+    row: &'a InlineDiffRow,
+    syntax: &DiffSyntax,
     gutter: f32,
     code_width: f32,
     horizontal: f32,
-) -> Element<'_, RepositoryAction> {
+) -> Element<'a, RepositoryAction> {
     let marker = match row.kind {
         DiffRowKind::Addition => "+",
         DiffRowKind::Deletion => "−",
@@ -3733,11 +3883,16 @@ fn inline_diff_row(
             widget::text::body(marker)
                 .size(DIFF_FONT_SIZE)
                 .font(Font::MONOSPACE)
-                .width(16)
+                .width(DIFF_MARKER_WIDTH)
                 .into(),
             diff_text(
                 &row.text,
                 &row.changed,
+                syntax.line(
+                    row.new_line.is_none(),
+                    row.new_line.or(row.old_line),
+                    cosmic::theme::is_dark(),
+                ),
                 row.kind,
                 code_width,
                 horizontal,
@@ -3749,12 +3904,13 @@ fn inline_diff_row(
     )
 }
 
-fn split_diff_row(
-    row: &SplitDiffRow,
+fn split_diff_row<'a>(
+    row: &'a SplitDiffRow,
+    syntax: &DiffSyntax,
     gutter: f32,
     code_width: f32,
     horizontal: f32,
-) -> Element<'_, RepositoryAction> {
+) -> Element<'a, RepositoryAction> {
     let old_kind = if row.kind != DiffRowKind::Context && row.old_text.is_some() {
         DiffRowKind::Deletion
     } else {
@@ -3770,13 +3926,14 @@ fn split_diff_row(
             (row.old_line, None),
             row.old_text.as_deref().unwrap_or(""),
             &row.old_changed,
+            syntax.line(true, row.old_line, cosmic::theme::is_dark()),
             old_kind,
             gutter,
             code_width,
             horizontal,
         ),
         widget::container(iced::widget::Space::new())
-            .width(1)
+            .width(DIFF_SPLIT_DIVIDER)
             .height(DIFF_ROW_HEIGHT)
             .class(cosmic::theme::Container::custom(|theme| {
                 let mut color: iced::Color = theme.current_container().on.into();
@@ -3791,6 +3948,7 @@ fn split_diff_row(
             (None, row.new_line),
             row.new_text.as_deref().unwrap_or(""),
             &row.new_changed,
+            syntax.line(false, row.new_line, cosmic::theme::is_dark()),
             new_kind,
             gutter,
             code_width,
@@ -3806,6 +3964,7 @@ fn diff_half<'a>(
     lines: (Option<u32>, Option<u32>),
     text: &'a str,
     changed: &'a [Range<usize>],
+    syntax: &[SyntaxSpan],
     kind: DiffRowKind,
     gutter: f32,
     code_width: f32,
@@ -3814,7 +3973,7 @@ fn diff_half<'a>(
     diff_container(
         widget::row::with_children(vec![
             diff_gutter(lines.0.or(lines.1), gutter),
-            diff_text(text, changed, kind, code_width, horizontal, lines),
+            diff_text(text, changed, syntax, kind, code_width, horizontal, lines),
         ])
         .align_y(Alignment::Center),
         kind,
@@ -3857,30 +4016,20 @@ fn diff_color(kind: DiffRowKind, alpha: f32) -> iced::Color {
 fn diff_text<'a>(
     text: &'a str,
     changed: &[Range<usize>],
+    syntax: &[SyntaxSpan],
     kind: DiffRowKind,
     code_width: f32,
     horizontal: f32,
     lines: (Option<u32>, Option<u32>),
 ) -> Element<'a, RepositoryAction> {
-    let mut spans: Vec<iced::widget::text::Span<'a>> = Vec::with_capacity(changed.len() * 2 + 1);
-    let mut cursor = 0;
-    for range in changed {
-        if cursor < range.start {
-            spans.push(iced::widget::text::Span::new(&text[cursor..range.start]));
-        }
-        spans.push(
-            iced::widget::text::Span::new(&text[range.clone()]).background(diff_color(kind, 0.46)),
-        );
-        cursor = range.end;
-    }
-    if cursor < text.len() {
-        spans.push(iced::widget::text::Span::new(&text[cursor..]));
-    }
+    let spans = crate::diff_view::line_spans(text, changed, syntax, diff_color(kind, 0.46));
     Element::new(DiffHorizontalContent {
         content: iced::widget::rich_text(spans)
             .size(DIFF_FONT_SIZE)
             .font(Font::MONOSPACE)
-            .line_height(iced::widget::text::LineHeight::Absolute(iced::Pixels(24.0)))
+            .line_height(iced::widget::text::LineHeight::Absolute(iced::Pixels(
+                DIFF_LINE_HEIGHT,
+            )))
             .wrapping(iced::widget::text::Wrapping::None)
             .width(code_width)
             .into(),
@@ -3907,7 +4056,7 @@ fn diff_container<'a>(
                 ..Default::default()
             }
         }))
-        .padding([3, 4])
+        .padding([3.0, DIFF_ROW_PADDING])
         .height(DIFF_ROW_HEIGHT)
         .width(Length::FillPortion(1))
         .clip(true)
@@ -4182,6 +4331,120 @@ mod tests {
     use super::*;
 
     #[test]
+    fn diff_scroll_range_matches_shaped_content_and_real_split_half_layout() {
+        let renderer = headless_renderer();
+        for source in [
+            "short".to_owned(),
+            "a very long ASCII line ".repeat(24),
+            "\tCafe\u{301} 界 👩‍💻\tffi ".repeat(18),
+            "__global__ void kernel() { const char* name = \"CUDA\"; }\t".repeat(12),
+        ] {
+            let RenderedDiff::Text { model, .. } = RenderedDiff::from_content(
+                DiffContent::Comparison {
+                    old: DiffSide::Absent,
+                    new: DiffSide::Text {
+                        text: format!("{source}\n"),
+                        bytes: source.len() as u64 + 1,
+                    },
+                    old_label: "old".into(),
+                    new_label: "new".into(),
+                },
+                Path::new("kernel.cu"),
+            ) else {
+                panic!("text comparison must produce rows");
+            };
+            let dark = cosmic::theme::is_dark();
+            let mut widest = 0.0_f32;
+            for row in &model.inline_rows {
+                let mut text: Element<'_, RepositoryAction> =
+                    iced::widget::rich_text(crate::diff_view::line_spans(
+                        &row.text,
+                        &row.changed,
+                        model.syntax.line(
+                            row.new_line.is_none(),
+                            row.new_line.or(row.old_line),
+                            dark,
+                        ),
+                        iced::Color::TRANSPARENT,
+                    ))
+                    .size(DIFF_FONT_SIZE)
+                    .font(Font::MONOSPACE)
+                    .line_height(iced::widget::text::LineHeight::Absolute(iced::Pixels(
+                        DIFF_LINE_HEIGHT,
+                    )))
+                    .wrapping(iced::widget::text::Wrapping::None)
+                    .into();
+                let mut tree = Tree::new(text.as_widget());
+                let node = text.as_widget_mut().layout(
+                    &mut tree,
+                    &renderer,
+                    &layout::Limits::new(
+                        iced::Size::ZERO,
+                        iced::Size::new(f32::INFINITY, f32::INFINITY),
+                    ),
+                );
+                widest = widest.max(node.size().width);
+            }
+            let code_width = model.max_line_width[usize::from(dark)] as f32;
+            assert!(code_width >= widest && code_width - widest < 1.0);
+            // Reuse the model through narrow/wide/narrow viewports and both
+            // modes: no stale range may survive a resize or mode transition.
+            for width in [320.0, 1200.0, 480.0] {
+                for mode in [DiffMode::Split, DiffMode::Inline, DiffMode::Split] {
+                    let geometry = DiffScrollGeometry::new(width, 44.0, mode);
+                    let offset = geometry.overflow(code_width);
+                    if widest <= geometry.code_viewport {
+                        assert_eq!(offset, 0.0, "short lines must not scroll");
+                    } else {
+                        assert!(
+                            (widest - offset - geometry.code_viewport).abs() < 1.0,
+                            "the last shaped pixel, not an estimated column, ends the range"
+                        );
+                    }
+                    let mut row = match mode {
+                        DiffMode::Inline => inline_diff_row(
+                            model.inline_rows.last().unwrap(),
+                            &model.syntax,
+                            44.0,
+                            code_width,
+                            offset,
+                        ),
+                        DiffMode::Split => split_diff_row(
+                            model.split_rows.last().unwrap(),
+                            &model.syntax,
+                            44.0,
+                            code_width,
+                            offset,
+                        ),
+                    };
+                    let mut tree = Tree::new(row.as_widget());
+                    let node = row.as_widget_mut().layout(
+                        &mut tree,
+                        &renderer,
+                        &layout::Limits::new(
+                            iced::Size::ZERO,
+                            iced::Size::new(geometry.viewport_width, DIFF_ROW_HEIGHT),
+                        ),
+                    );
+                    let root = Layout::new(&node);
+                    let halves = match mode {
+                        DiffMode::Inline => vec![root],
+                        DiffMode::Split => root.children().step_by(2).collect(),
+                    };
+                    for half in halves {
+                        let content = half.children().next().unwrap();
+                        let code = content.children().last().unwrap();
+                        assert!((code.bounds().width - geometry.code_viewport).abs() < 0.01);
+                        let shaped = code.children().next().unwrap();
+                        assert!((shaped.bounds().x - code.bounds().x + offset).abs() < 0.01);
+                        assert!((shaped.bounds().width - code_width).abs() < 0.01);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn diff_accessibility_retains_source_and_line_context_through_scrolling() {
         use iced_accessibility::accesskit::Role;
 
@@ -4197,18 +4460,16 @@ mod tests {
             for horizontal in [0.0, 120.0] {
                 let mut rows = vec![iced::widget::Space::new().height(30).into()];
                 match mode {
-                    DiffMode::Inline => rows.extend(
-                        model
-                            .inline_rows
-                            .iter()
-                            .map(|row| inline_diff_row(row, 44.0, 1024.0, horizontal)),
-                    ),
-                    DiffMode::Split => rows.extend(
-                        model
-                            .split_rows
-                            .iter()
-                            .map(|row| split_diff_row(row, 44.0, 1024.0, horizontal)),
-                    ),
+                    DiffMode::Inline => {
+                        rows.extend(model.inline_rows.iter().map(|row| {
+                            inline_diff_row(row, &model.syntax, 44.0, 1024.0, horizontal)
+                        }))
+                    }
+                    DiffMode::Split => {
+                        rows.extend(model.split_rows.iter().map(|row| {
+                            split_diff_row(row, &model.syntax, 44.0, 1024.0, horizontal)
+                        }))
+                    }
                 }
                 let mut element = Element::new(DiffHorizontalContent {
                     content: widget::column::with_children(rows).width(480).into(),
@@ -5288,7 +5549,8 @@ mod tests {
                 split_change_starts: vec![0, 2],
                 additions: 3,
                 deletions: 2,
-                max_line_columns: 0,
+                max_line_width: [0; 2],
+                syntax: DiffSyntax::default(),
             })),
         );
 
@@ -5658,7 +5920,8 @@ mod tests {
                 split_change_starts: vec![0, 50_000, 99_999],
                 additions: 1,
                 deletions: 1,
-                max_line_columns: 4,
+                max_line_width: [34; 2],
+                syntax: DiffSyntax::default(),
             })),
         );
         for offset in [
@@ -5702,7 +5965,8 @@ mod tests {
                 split_change_starts: Vec::new(),
                 additions: 1,
                 deletions: 1,
-                max_line_columns: 4,
+                max_line_width: [34; 2],
+                syntax: DiffSyntax::default(),
             })),
         );
         let card = CardId::new();
@@ -6944,7 +7208,8 @@ mod tests {
             split_change_starts: Vec::new(),
             additions,
             deletions: 0,
-            max_line_columns: 0,
+            max_line_width: [0; 2],
+            syntax: DiffSyntax::default(),
         }
     }
 
@@ -7263,25 +7528,18 @@ mod tests {
                 .any(|(_, highlight)| highlight.color().is_some())
         }
 
-        for (path, token, line) in [
-            ("src/main.rs", "rs", "fn main() {}"),
-            // A grammar lists its extensions in one case, and `README.MD` is
-            // still Markdown.
-            ("README.MD", "md", "# heading"),
-            // No extension to read, so the name is the token — and it is
-            // passed through as written, because that is what a grammar's own
-            // name is matched against.
-            ("Makefile", "Makefile", "all: build"),
-            ("deploy/Dockerfile", "Dockerfile", "FROM scratch"),
+        for (path, line) in [
+            ("src/main.rs", "fn main() {}"),
+            ("README.MD", "# heading"),
+            ("Makefile", "all: build"),
+            ("deploy/Dockerfile", "FROM scratch"),
+            ("deploy/Dockerfile.dev", "FROM scratch"),
+            ("src/kernel.cu", "__global__ void kernel() { return; }"),
         ] {
             let settings = highlighter_settings(Path::new(path), true);
-            assert_eq!(
-                settings.token, token,
-                "{path} must be highlighted as {token}"
-            );
             assert!(
                 colours(&settings.token, line),
-                "{token:?} resolves to no grammar, so {path} would render as flat plain text"
+                "{path} must resolve to a grammar rather than render as flat plain text"
             );
         }
 
@@ -7290,20 +7548,6 @@ mod tests {
             "an unrecognised token must fall back to plain text rather than colour arbitrarily; \
              without that the check above cannot tell a grammar from the fallback"
         );
-
-        // An extension wins over a name, so a name carrying an unknown
-        // extension resolves to plain text. Pinned rather than fixed: naming
-        // the grammar is all this decides, and choosing between two candidate
-        // grammars is syntect's job.
-        for path in ["Dockerfile.dev", "Makefile.am"] {
-            let settings = highlighter_settings(Path::new(path), true);
-            assert!(
-                !colours(&settings.token, "FROM scratch"),
-                "{path} resolves as {:?}; if that now colours, the extension no longer wins and \
-                 the documented gap is gone",
-                settings.token
-            );
-        }
 
         // A scheme picks its foregrounds for a background of its own kind, so
         // reading a dark one off a light surface is what makes highlighted

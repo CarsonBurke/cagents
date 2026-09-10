@@ -51,10 +51,164 @@ pub struct DiffModel {
     pub split_change_starts: Vec<usize>,
     pub additions: u32,
     pub deletions: u32,
-    /// Conservative display-column extent, including tab stops, for horizontal scrolling.
-    pub max_line_columns: usize,
+    /// Shaped logical-pixel extents for [light, dark], rounded up on the worker.
+    pub max_line_width: [u32; 2],
+    pub syntax: DiffSyntax,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SyntaxSpan {
+    range: Range<usize>,
+    color: Option<[u32; 4]>,
+    font: Option<cosmic::iced::Font>,
+}
+
+/// Full-side lexical state, cached for both application palettes. A context
+/// row can have different syntax on each side after a comment delimiter changes.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DiffSyntax {
+    old: [Vec<Vec<SyntaxSpan>>; 2],
+    new: [Vec<Vec<SyntaxSpan>>; 2],
+}
+
+impl DiffSyntax {
+    pub(crate) fn line(&self, old: bool, line: Option<u32>, dark: bool) -> &[SyntaxSpan] {
+        let side = if old { &self.old } else { &self.new };
+        line.and_then(|line| line.checked_sub(1))
+            .and_then(|line| side[usize::from(dark)].get(line as usize))
+            .map_or(&[], Vec::as_slice)
+    }
+}
+
+/// Native bundled grammar names are shared by the editable buffer and diffs.
+/// CUDA uses the bundled C++ grammar (there is no bundled CUDA grammar).
+pub(crate) fn highlighter_settings(path: &Path, dark: bool) -> cosmic::iced::highlighter::Settings {
+    use cosmic::iced::highlighter;
+
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or_default();
+    let extension = path
+        .extension()
+        .map(|extension| extension.to_string_lossy().to_lowercase());
+    let token = match name {
+        "CMakeLists.txt" => "CMake".to_owned(),
+        "Cargo.lock" => "TOML".to_owned(),
+        ".bashrc" | ".bash_profile" | ".bash_login" => "Bash".to_owned(),
+        ".env" => "DotENV".to_owned(),
+        _ if name.starts_with("Dockerfile.") => "Dockerfile".to_owned(),
+        _ => match extension.as_deref() {
+            Some("cu" | "cuh") => "C++".to_owned(),
+            Some("mjs" | "cjs") => "JavaScript".to_owned(),
+            Some("mts" | "cts") => "TypeScript".to_owned(),
+            Some(extension) => extension.to_owned(),
+            None => name.to_owned(),
+        },
+    };
+    highlighter::Settings {
+        theme: if dark {
+            highlighter::Theme::Base16Ocean
+        } else {
+            highlighter::Theme::InspiredGitHub
+        },
+        token,
+    }
+}
+
+fn highlight_side(text: &str, path: &Path, dark: bool) -> Vec<Vec<SyntaxSpan>> {
+    let mut stream = cosmic::iced::highlighter::Stream::new(&highlighter_settings(path, dark));
+    text.split_inclusive('\n')
+        .map(|line| {
+            let line = line
+                .strip_suffix("\r\n")
+                .or_else(|| line.strip_suffix('\n'))
+                .unwrap_or(line);
+            let spans = stream
+                .highlight_line(line)
+                .map(|(range, highlight)| SyntaxSpan {
+                    range,
+                    color: highlight.color().map(|color| {
+                        [
+                            color.r.to_bits(),
+                            color.g.to_bits(),
+                            color.b.to_bits(),
+                            color.a.to_bits(),
+                        ]
+                    }),
+                    font: highlight.font(),
+                })
+                .collect();
+            stream.commit();
+            spans
+        })
+        .collect()
+}
+
+fn build_highlighted_diff(before: &str, after: &str, path: &Path) -> DiffModel {
+    let mut model = build_diff_rows(before, after);
+    model.syntax = DiffSyntax {
+        old: [
+            highlight_side(before, path, false),
+            highlight_side(before, path, true),
+        ],
+        new: [
+            highlight_side(after, path, false),
+            highlight_side(after, path, true),
+        ],
+    };
+    measure_diff(&mut model);
+    model
+}
+
+fn measure_diff(model: &mut DiffModel) {
+    let palettes = if model
+        .syntax
+        .old
+        .iter()
+        .chain(&model.syntax.new)
+        .all(Vec::is_empty)
+    {
+        1
+    } else {
+        2
+    };
+    for palette in 0..palettes {
+        let dark = palette == 1;
+        let mut width = 0.0_f32;
+        for row in &model.split_rows {
+            for (old, line, text, changed) in [
+                (
+                    true,
+                    row.old_line,
+                    row.old_text.as_deref(),
+                    &row.old_changed,
+                ),
+                (
+                    false,
+                    row.new_line,
+                    row.new_text.as_deref(),
+                    &row.new_changed,
+                ),
+            ] {
+                if let Some(text) = text {
+                    let syntax = model.syntax.line(old, line, dark);
+                    if !old
+                        && row.kind == DiffRowKind::Context
+                        && syntax == model.syntax.line(true, row.old_line, dark)
+                    {
+                        continue;
+                    }
+                    width = width.max(shaped_line_width(text, changed, syntax));
+                }
+            }
+        }
+        model.max_line_width[usize::from(dark)] = width.ceil() as u32;
+    }
+    if palettes == 1 {
+        model.max_line_width[1] = model.max_line_width[0];
+    }
+}
 impl DiffModel {
     pub fn is_empty(&self) -> bool {
         self.additions == 0 && self.deletions == 0
@@ -110,7 +264,7 @@ impl RenderedDiff {
     /// An unmerged path never does — it has three index stages and no single
     /// old side — so it is passed through instead of being flattened into a
     /// two-sided diff.
-    pub fn from_content(content: DiffContent) -> Self {
+    pub fn from_content(content: DiffContent, path: &Path) -> Self {
         match content {
             DiffContent::Comparison {
                 old,
@@ -127,9 +281,10 @@ impl RenderedDiff {
                     });
                 }
                 Self::Text {
-                    model: build_diff(
+                    model: build_highlighted_diff(
                         old.text().unwrap_or_default(),
                         new.text().unwrap_or_default(),
+                        path,
                     ),
                     old_label,
                     new_label,
@@ -173,12 +328,18 @@ pub fn load_repository_diff(
     // cancellation: a superseded result is rejected on arrival rather than
     // aborted in flight, so this call owns a token nobody else can cancel.
     match RepositoryService::system("git").diff(&request, &CancellationToken::new()) {
-        Ok(content) => RenderedDiff::from_content(content),
+        Ok(content) => RenderedDiff::from_content(content, relative_path),
         Err(error) => RenderedDiff::Error(error.to_string()),
     }
 }
 
 pub fn build_diff(before: &str, after: &str) -> DiffModel {
+    let mut model = build_diff_rows(before, after);
+    measure_diff(&mut model);
+    model
+}
+
+fn build_diff_rows(before: &str, after: &str) -> DiffModel {
     let input = InternedInput::new(before, after);
     let mut diff = Diff::compute(Algorithm::Histogram, &input);
     diff.postprocess_lines(&input);
@@ -330,19 +491,6 @@ pub fn build_diff(before: &str, after: &str) -> DiffModel {
         &mut split_rows,
     );
 
-    let max_line_columns = inline_rows
-        .iter()
-        .map(|row| {
-            row.text.chars().fold(0, |column, ch| {
-                if ch == '\t' {
-                    (column / 8 + 1) * 8
-                } else {
-                    column + if ch.is_ascii() { 1 } else { 2 }
-                }
-            })
-        })
-        .max()
-        .unwrap_or(0);
     DiffModel {
         inline_rows,
         split_rows,
@@ -350,8 +498,100 @@ pub fn build_diff(before: &str, after: &str) -> DiffModel {
         split_change_starts,
         additions: diff.count_additions(),
         deletions: diff.count_removals(),
-        max_line_columns,
+        max_line_width: [0; 2],
+        syntax: DiffSyntax::default(),
     }
+}
+
+pub(crate) const DIFF_FONT_SIZE: f32 = 14.0;
+pub(crate) const DIFF_LINE_HEIGHT: f32 = 24.0;
+
+/// Use the same native paragraph, advanced shaping, font and no-wrap policy as
+/// Rich text. Character counts are not pixel advances: combining marks, tabs,
+/// fallback glyphs and ligatures must be measured by the renderer.
+fn shaped_line_width(line: &str, changed: &[Range<usize>], syntax: &[SyntaxSpan]) -> f32 {
+    use cosmic::iced::{
+        Font, Pixels, Size,
+        advanced::text::{self, Paragraph as _},
+    };
+
+    let spans = line_spans(line, changed, syntax, cosmic::iced::Color::TRANSPARENT);
+    let paragraph = <cosmic::Renderer as text::Renderer>::Paragraph::with_spans(text::Text {
+        content: spans.as_slice(),
+        bounds: Size::new(f32::INFINITY, f32::INFINITY),
+        size: Pixels(DIFF_FONT_SIZE),
+        line_height: text::LineHeight::Absolute(Pixels(DIFF_LINE_HEIGHT)),
+        font: Font::MONOSPACE,
+        align_x: text::Alignment::Left,
+        align_y: cosmic::iced::alignment::Vertical::Top,
+        shaping: text::Shaping::Advanced,
+        wrapping: text::Wrapping::None,
+        ellipsize: text::Ellipsize::None,
+    });
+    paragraph.min_bounds().width
+}
+
+/// Span boundaries also participate in native shaping, so measurement and
+/// drawing must partition intraline highlights identically.
+pub(crate) fn line_spans<'a>(
+    text: &'a str,
+    changed: &[Range<usize>],
+    syntax: &[SyntaxSpan],
+    background: cosmic::iced::Color,
+) -> Vec<cosmic::iced::widget::text::Span<'a>> {
+    use cosmic::iced::widget::text::Span;
+
+    let mut spans = Vec::with_capacity(changed.len() * 2 + syntax.len() + 1);
+    let mut cursor = 0;
+    let mut change_index = 0;
+    let mut syntax_index = 0;
+    while cursor < text.len() {
+        while changed
+            .get(change_index)
+            .is_some_and(|range| range.end <= cursor)
+        {
+            change_index += 1;
+        }
+        while syntax
+            .get(syntax_index)
+            .is_some_and(|span| span.range.end <= cursor)
+        {
+            syntax_index += 1;
+        }
+        let change = changed.get(change_index);
+        let style = syntax.get(syntax_index);
+        let next_boundary = |range: &Range<usize>| {
+            if range.start > cursor {
+                range.start
+            } else {
+                range.end
+            }
+        };
+        let end = change
+            .map_or(text.len(), next_boundary)
+            .min(style.map_or(text.len(), |span| next_boundary(&span.range)))
+            .min(text.len());
+        let mut span = Span::new(&text[cursor..end]);
+        if change.is_some_and(|range| range.contains(&cursor)) {
+            span = span.background(background);
+        }
+        if let Some(style) = style.filter(|span| span.range.contains(&cursor)) {
+            if let Some(color) = style.color {
+                span = span.color(cosmic::iced::Color::from_rgba(
+                    f32::from_bits(color[0]),
+                    f32::from_bits(color[1]),
+                    f32::from_bits(color[2]),
+                    f32::from_bits(color[3]),
+                ));
+            }
+            if let Some(font) = style.font {
+                span = span.font(font);
+            }
+        }
+        spans.push(span);
+        cursor = end;
+    }
+    spans
 }
 
 /// Word/whitespace/punctuation tokens preserve the original UTF-8 slices. The
@@ -532,6 +772,131 @@ mod tests {
     use crate::repository::{DiffSide, Oid, ValidatedRefName};
 
     #[test]
+    fn cuda_and_named_files_resolve_to_real_bundled_syntax() {
+        for (path, source) in [
+            (
+                "kernel.cu",
+                "__global__ void kernel() { int value = 42; } // CUDA",
+            ),
+            (
+                "kernel.CUH",
+                "template<class T> __device__ T value(T x) { return x; }",
+            ),
+            ("CMakeLists.txt", "set(VERSION \"1.0\") # version"),
+            (
+                "Cargo.lock",
+                "[[package]]\nname = \"example\"\nversion = \"1.0.0\"",
+            ),
+            (".bashrc", "export PATH=\"$HOME/bin:$PATH\" # shell"),
+            (".env", "PORT=8080 # service"),
+            ("Dockerfile.dev", "FROM alpine\nENV MODE=\"development\""),
+            (
+                "module.mjs",
+                "export const value = \"module\"; // JavaScript",
+            ),
+            (
+                "module.cts",
+                "const value: string = \"module\"; // TypeScript",
+            ),
+        ] {
+            for dark in [false, true] {
+                let lines = highlight_side(source, Path::new(path), dark);
+                let colors = lines
+                    .iter()
+                    .flatten()
+                    .filter_map(|span| span.color)
+                    .collect::<std::collections::BTreeSet<_>>();
+                assert!(
+                    colors.len() > 1,
+                    "{path} must distinguish source tokens in both palettes"
+                );
+            }
+        }
+        let source = "template<class T> T value(T input) { return input; }";
+        assert_eq!(
+            highlight_side(source, Path::new("kernel.cu"), true),
+            highlight_side(source, Path::new("kernel.cpp"), true),
+            "CUDA's C++ constructs must use the actual bundled C++ grammar",
+        );
+        assert!(
+            highlight_side(source, Path::new("unknown.unsupported"), true)
+                .iter()
+                .flatten()
+                .all(|span| span.color.is_none())
+        );
+    }
+
+    #[test]
+    fn diff_syntax_keeps_side_specific_multiline_state_and_change_backgrounds() {
+        let before = "/*\nint value = 1;\n*/\nvoid old_kernel() {}\n";
+        let after = "// comment\nint value = 1;\n// end\nvoid new_kernel() {}\n";
+        let model = build_highlighted_diff(before, after, Path::new("kernel.cu"));
+        let context = model
+            .split_rows
+            .iter()
+            .find(|row| row.old_line == Some(2))
+            .unwrap();
+        assert_eq!(context.kind, DiffRowKind::Context);
+        let color_at = |spans: &[SyntaxSpan], index| {
+            spans
+                .iter()
+                .find(|span| span.range.contains(&index))
+                .and_then(|span| span.color)
+        };
+        for dark in [false, true] {
+            let old = model.syntax.line(true, context.old_line, dark);
+            let new = model.syntax.line(false, context.new_line, dark);
+            assert_ne!(
+                color_at(old, 0),
+                color_at(new, 0),
+                "unchanged text is a comment only on the old side"
+            );
+            assert!(color_at(old, 0).is_some() && color_at(new, 0).is_some());
+
+            // Every inline row selects its actual source side; split rows use
+            // both side maps, even for unchanged text after a delimiter edit.
+            for row in &model.inline_rows {
+                let syntax =
+                    model
+                        .syntax
+                        .line(row.new_line.is_none(), row.new_line.or(row.old_line), dark);
+                let background = cosmic::iced::Color::from_rgba(0.2, 0.8, 0.3, 0.46);
+                let spans = line_spans(&row.text, &row.changed, syntax, background);
+                let mut offset = 0;
+                for span in spans {
+                    let length = span.text.len();
+                    if row.changed.iter().any(|range| range.contains(&offset)) {
+                        assert_eq!(
+                            span.highlight.map(|highlight| highlight.background),
+                            Some(background.into()),
+                            "intraline background must coexist with syntax foreground"
+                        );
+                    }
+                    if syntax
+                        .iter()
+                        .any(|style| style.range.contains(&offset) && style.color.is_some())
+                    {
+                        assert!(span.color.is_some());
+                    }
+                    offset += length;
+                }
+                assert_eq!(
+                    offset,
+                    row.text.len(),
+                    "highlighting must preserve the complete source"
+                );
+                let width = shaped_line_width(&row.text, &row.changed, syntax);
+                assert!(width <= model.max_line_width[usize::from(dark)] as f32);
+            }
+        }
+        assert_ne!(
+            color_at(model.syntax.line(false, Some(2), false), 0),
+            color_at(model.syntax.line(false, Some(2), true), 0),
+            "palette changes must select cached matching syntax foregrounds",
+        );
+    }
+
+    #[test]
     fn line_model_has_correct_numbers_and_kinds() {
         let model = build_diff("one\ntwo\nthree\n", "one\nsecond\nthree\nfour\n");
         assert_eq!(model.additions, 2);
@@ -709,12 +1074,15 @@ mod tests {
     #[test]
     fn only_text_and_absent_sides_become_rows() {
         let comparison = |old: DiffSide, new: DiffSide| {
-            RenderedDiff::from_content(DiffContent::Comparison {
-                old,
-                new,
-                old_label: "old".into(),
-                new_label: "new".into(),
-            })
+            RenderedDiff::from_content(
+                DiffContent::Comparison {
+                    old,
+                    new,
+                    old_label: "old".into(),
+                    new_label: "new".into(),
+                },
+                Path::new("sample.txt"),
+            )
         };
         let text = |text: &str| DiffSide::Text {
             text: text.into(),
@@ -771,12 +1139,15 @@ mod tests {
         }
 
         assert!(matches!(
-            RenderedDiff::from_content(DiffContent::Unmerged {
-                base: text("base\n"),
-                ours: text("ours\n"),
-                theirs: text("theirs\n"),
-                worktree: text("merged\n"),
-            }),
+            RenderedDiff::from_content(
+                DiffContent::Unmerged {
+                    base: text("base\n"),
+                    ours: text("ours\n"),
+                    theirs: text("theirs\n"),
+                    worktree: text("merged\n"),
+                },
+                Path::new("sample.txt")
+            ),
             RenderedDiff::NoText(DiffContent::Unmerged { .. })
         ));
     }

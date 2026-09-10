@@ -1,6 +1,7 @@
 //! Native chat connection to the same authenticated daemon as hosted terminals.
 use super::{Command, Session, Snapshot};
 use crate::{
+    agent::ActivityState,
     model::{HostSessionProof, TerminalId},
     terminal_ipc::{
         self as ipc, ClientEnvelope, ClientRequest, FrameCodec, PROTOCOL_VERSION, ServerEnvelope,
@@ -23,6 +24,9 @@ use std::{
 #[derive(Debug, Clone)]
 pub enum Wake {
     Changed,
+    Observed,
+    /// Consume the newest state with `take_activity`; never fetches a transcript.
+    Activity,
     Disconnected(String),
 }
 #[derive(Clone)]
@@ -41,6 +45,8 @@ struct Inner {
     wire: Arc<Mutex<Wire>>,
     cancel: UnixStream,
     snapshot: Arc<Mutex<Arc<Snapshot>>>,
+    activity: Arc<Mutex<ActivityObservation>>,
+    observed: Arc<Mutex<OutputObservation>>,
     next: Arc<AtomicU64>,
     alive: Arc<AtomicBool>,
     visible: Arc<AtomicBool>,
@@ -49,6 +55,59 @@ struct Inner {
     pending: Pending,
     visibility_tx: crossbeam_channel::Sender<()>,
     visibility_worker: Mutex<Option<JoinHandle<()>>>,
+}
+
+#[derive(Default)]
+struct OutputObservation {
+    epoch: u64,
+    pending: bool,
+}
+
+impl OutputObservation {
+    fn observe(&mut self, epoch: u64) -> bool {
+        if epoch != self.epoch {
+            return false;
+        }
+        !std::mem::replace(&mut self.pending, true)
+    }
+
+    fn begin_acknowledgement(&mut self) -> u64 {
+        self.epoch = self
+            .epoch
+            .checked_add(1)
+            .expect("chat observation epoch exhausted");
+        self.pending = false;
+        self.epoch
+    }
+
+    fn take(&mut self) -> bool {
+        std::mem::take(&mut self.pending)
+    }
+}
+
+struct ActivityObservation {
+    generation: u64,
+    state: ActivityState,
+    pending: bool,
+}
+
+impl ActivityObservation {
+    fn observe(&mut self, generation: u64, state: ActivityState) -> bool {
+        if generation < self.generation {
+            return false;
+        }
+        self.generation = generation;
+        if self.state == state {
+            return false;
+        }
+        self.state = state;
+        !std::mem::replace(&mut self.pending, true)
+    }
+
+    fn take(&mut self) -> ActivityState {
+        self.pending = false;
+        self.state
+    }
 }
 fn transmit(
     wire: &Mutex<Wire>,
@@ -168,11 +227,42 @@ impl ClientHandle {
                 },
             )
             .map_err(|e| e.to_string())?;
-        let (session, initial) = match receive(&mut stream, &mut codec, 2, Some(&proof))? {
-            ServerResponse::ChatAttached { session, snapshot } if session.id == id => {
-                (session, snapshot)
+        // Activity can race the attach response after subscription is installed.
+        // Keep only the newest scalar state; the snapshot generation fences any
+        // edge older than the handshake snapshot.
+        let mut early_activity = None;
+        let mut early_observed = OutputObservation::default();
+        let (session, initial) = loop {
+            let envelope: ServerEnvelope = codec
+                .read(&mut stream)
+                .map_err(|error| format!("Cannot decode matched daemon protocol: {error}"))?
+                .ok_or("Daemon disconnected")?;
+            if envelope.version != PROTOCOL_VERSION || envelope.proof != proof {
+                return Err("Daemon identity/version changed during native chat attachment".into());
             }
-            _ => return Err("Daemon did not attach the exact native chat".into()),
+            match envelope.message {
+                ServerMessage::ChatActivity {
+                    chat_id,
+                    state,
+                    generation,
+                } if chat_id == id && envelope.request_id.is_none() => {
+                    early_activity = Some((generation, state));
+                }
+                ServerMessage::ChatObserved { chat_id, epoch }
+                    if chat_id == id && envelope.request_id.is_none() =>
+                {
+                    early_observed.observe(epoch);
+                }
+                ServerMessage::Response {
+                    response: ServerResponse::ChatAttached { session, snapshot },
+                } if session.id == id && envelope.request_id == Some(2) => {
+                    break (session, snapshot);
+                }
+                ServerMessage::Error(error) if envelope.request_id == Some(2) => {
+                    return Err(error.message);
+                }
+                _ => return Err("Daemon did not attach the exact native chat".into()),
+            }
         };
         stream.set_read_timeout(None).map_err(|e| e.to_string())?;
         let mut reader_stream = stream.try_clone().map_err(|e| e.to_string())?;
@@ -181,6 +271,16 @@ impl ClientHandle {
             stream,
             codec: FrameCodec::new(ipc::MAX_CLIENT_FRAME_BYTES),
         }));
+        let mut activity = ActivityObservation {
+            generation: initial.generation,
+            state: initial.activity(),
+            pending: false,
+        };
+        if let Some((generation, state)) = early_activity {
+            activity.observe(generation, state);
+        }
+        let activity = Arc::new(Mutex::new(activity));
+        let observed = Arc::new(Mutex::new(early_observed));
         let snapshot = Arc::new(Mutex::new(Arc::new(initial)));
         let next = Arc::new(AtomicU64::new(3));
         let alive = Arc::new(AtomicBool::new(true));
@@ -194,6 +294,8 @@ impl ClientHandle {
             wire: wire.clone(),
             cancel,
             snapshot: snapshot.clone(),
+            activity: activity.clone(),
+            observed: observed.clone(),
             next: next.clone(),
             alive: alive.clone(),
             wake: wake.clone(),
@@ -242,6 +344,8 @@ impl ClientHandle {
             .lock()
             .unwrap_or_else(|p| p.into_inner()) = Some(visibility_worker);
         let visibility_stop = inner.visibility_tx.clone();
+        // Ready consumes any pre-attachment unread edge; do not publish a wake
+        // before the UI has installed the matching runtime generation.
         let worker = thread::Builder::new().name(format!("chat-client-{id}")).spawn(move || {
             let mut read_pending = false;
             let mut read_again = false;
@@ -255,6 +359,11 @@ impl ClientHandle {
                 if let ServerMessage::Response { response: ServerResponse::ChatClosed { chat_id,snapshot:final_snapshot } }=envelope.message {
                     if chat_id!=id { break "Daemon closed a different chat".into(); }
                     *snapshot.lock().unwrap_or_else(|p|p.into_inner())=Arc::new(final_snapshot);
+                    {
+                        let mut activity = activity.lock().unwrap_or_else(|p| p.into_inner());
+                        activity.state = ActivityState::Unknown;
+                        activity.pending = false;
+                    }
                     alive.store(false,Ordering::Release);
                     let _=visibility_stop.try_send(());
                     let _=reader_stream.shutdown(Shutdown::Both);
@@ -275,6 +384,18 @@ impl ClientHandle {
                         read_again = true;
                     },
                     ServerMessage::ChatChanged { chat_id } if chat_id == id => {},
+                    ServerMessage::ChatObserved { chat_id, epoch } if chat_id == id => {
+                        if !visible.load(Ordering::Acquire)
+                            && observed.lock().unwrap_or_else(|p| p.into_inner()).observe(epoch)
+                        {
+                            wake(Wake::Observed);
+                        }
+                    },
+                    ServerMessage::ChatActivity { chat_id, state, generation } if chat_id == id => {
+                        let changed = activity.lock().unwrap_or_else(|p| p.into_inner())
+                            .observe(generation, state);
+                        if changed { wake(Wake::Activity); }
+                    },
                     ServerMessage::Response { response: ServerResponse::ChatSnapshot { chat_id, snapshot: update } } if chat_id == id => {
                         read_pending = false;
                         if let Some(update) = update {
@@ -300,6 +421,11 @@ impl ClientHandle {
                 }
             };
             alive.store(false, Ordering::Release);
+            {
+                let mut activity = activity.lock().unwrap_or_else(|p| p.into_inner());
+                activity.state = ActivityState::Unknown;
+                activity.pending = false;
+            }
             let _=visibility_stop.try_send(());
             for (_, reply) in std::mem::take(&mut *pending.lock().unwrap_or_else(|p| p.into_inner())) {
                 let _ = reply.try_send(Err(failure.clone()));
@@ -320,6 +446,22 @@ impl ClientHandle {
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .clone()
+    }
+    /// Drains one coalesced activity edge without touching presentation state.
+    pub fn take_activity(&self) -> ActivityState {
+        let mut activity = self
+            .inner
+            .activity
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        activity.take()
+    }
+    pub fn take_observed(&self) -> bool {
+        self.inner
+            .observed
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .take()
     }
     pub fn proof(&self) -> Option<HostSessionProof> {
         Some(self.inner.proof.clone())
@@ -377,6 +519,21 @@ impl ClientHandle {
             }
         }
     }
+    /// Fence pending wakes and wire frames synchronously, before scheduling IO.
+    /// Neither acknowledgement phase changes visibility or reads presentation.
+    pub fn begin_acknowledgement(&self) -> u64 {
+        self.inner
+            .observed
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .begin_acknowledgement()
+    }
+    pub fn acknowledge_updates(&self, epoch: u64) -> Result<(), String> {
+        self.request(ClientRequest::ChatAcknowledge {
+            chat_id: self.inner.id,
+            epoch,
+        })
+    }
     /// Explicitly interrupts active work, waits for shutdown, then closes the owned provider pipe.
     /// Dropping the handle instead only detaches and leaves provider work running.
     /// On success, `snapshot()` contains the final provider identity/state before
@@ -429,5 +586,73 @@ impl Drop for Inner {
         {
             let _ = worker.join();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn selecting_then_leaving_fences_queued_wakes_and_old_wire_observations() {
+        let mut observed = OutputObservation::default();
+        let (wake, queued) = crossbeam_channel::unbounded();
+        // Hidden output queues a wake, but selection acknowledges before it runs.
+        assert!(observed.observe(0));
+        wake.send(Wake::Observed).unwrap();
+        let epoch = observed.begin_acknowledgement();
+        assert_eq!(epoch, 1);
+        // The worktree is hidden again when the pre-selection wake executes.
+        assert!(matches!(queued.recv().unwrap(), Wake::Observed));
+        assert!(
+            !observed.take(),
+            "selection must consume the old unread edge"
+        );
+        // An already-written daemon frame can arrive after the queued wake.
+        assert!(!observed.observe(0));
+        assert!(
+            !observed.take(),
+            "old wire output must not resurrect unread"
+        );
+        assert!(observed.observe(epoch));
+        assert!(
+            !observed.observe(epoch),
+            "fresh output coalesces until drained"
+        );
+        assert!(!observed.observe(0));
+        assert!(
+            observed.take(),
+            "rejecting old output must preserve fresh output"
+        );
+        assert!(!observed.take());
+        // A stale queued wake may consume fresh output; its matching wake must
+        // then be harmless, rather than produce a second unread transition.
+        assert!(observed.observe(epoch));
+        wake.send(Wake::Observed).unwrap();
+        let next_epoch = observed.begin_acknowledgement();
+        assert!(next_epoch > epoch);
+        assert!(observed.observe(next_epoch));
+        wake.send(Wake::Observed).unwrap();
+        assert!(matches!(queued.recv().unwrap(), Wake::Observed));
+        assert!(observed.take());
+        assert!(matches!(queued.recv().unwrap(), Wake::Observed));
+        assert!(!observed.take());
+    }
+
+    #[test]
+    fn activity_wake_coalesces_until_consumed_and_fences_stale_attach_edges() {
+        let mut activity = ActivityObservation {
+            generation: 5,
+            state: ActivityState::Working,
+            pending: false,
+        };
+        assert!(!activity.observe(4, ActivityState::Idle));
+        assert_eq!(activity.take(), ActivityState::Working);
+        assert!(activity.observe(6, ActivityState::Waiting));
+        assert!(!activity.observe(7, ActivityState::Idle));
+        assert_eq!(activity.take(), ActivityState::Idle);
+        assert!(!activity.observe(8, ActivityState::Idle));
+        assert!(activity.observe(9, ActivityState::Working));
+        assert_eq!(activity.take(), ActivityState::Working);
     }
 }

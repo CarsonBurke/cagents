@@ -277,6 +277,30 @@ impl ControlClient {
         self.finish_attachment(terminal_id, action)
     }
 
+    pub fn close_terminal_checked(
+        &mut self,
+        terminal_id: TerminalId,
+        allow_active: bool,
+    ) -> Result<terminal::ipc::TerminalCloseResult, ControlError> {
+        self.attach_and_synchronize(terminal_id)?;
+        let action = self
+            .request_attached(
+                ClientRequest::CloseTerminalChecked {
+                    terminal_id,
+                    allow_active,
+                },
+                terminal_id,
+            )
+            .and_then(|response| match response {
+                ServerResponse::TerminalCloseChecked {
+                    terminal_id: actual,
+                    outcome,
+                } if actual == terminal_id => Ok(outcome),
+                response => Err(unexpected_response("a checked terminal close", &response)),
+            });
+        self.finish_attachment(terminal_id, action)
+    }
+
     pub fn snapshot(&mut self, terminal_id: TerminalId) -> Result<RenderedSnapshot, ControlError> {
         self.attach_and_synchronize(terminal_id)?;
         let visible = self.expect_accepted(
@@ -505,6 +529,10 @@ impl ControlClient {
                     ..
                 }
                 | ServerMessage::Snapshot {
+                    terminal_id: actual,
+                    ..
+                }
+                | ServerMessage::TerminalObserved {
                     terminal_id: actual,
                     ..
                 }
@@ -757,11 +785,14 @@ fn message_targets(message: &ServerMessage, expected: TerminalId) -> bool {
     match message {
         ServerMessage::Redraw { terminal_id, .. }
         | ServerMessage::Snapshot { terminal_id, .. }
+        | ServerMessage::TerminalObserved { terminal_id, .. }
         | ServerMessage::Event { terminal_id, .. } => *terminal_id == expected,
         ServerMessage::Response { .. }
         | ServerMessage::Synchronized { .. }
         | ServerMessage::HostShuttingDown
         | ServerMessage::ChatChanged { .. }
+        | ServerMessage::ChatObserved { .. }
+        | ServerMessage::ChatActivity { .. }
         | ServerMessage::Error(_) => false,
     }
 }
@@ -776,6 +807,9 @@ fn message_name(message: &ServerMessage) -> &'static str {
         ServerMessage::HostShuttingDown => "host_shutting_down",
         ServerMessage::Error(_) => "error",
         ServerMessage::ChatChanged { .. } => "chat_changed",
+        ServerMessage::ChatObserved { .. } => "chat_observed",
+        ServerMessage::ChatActivity { .. } => "chat_activity",
+        ServerMessage::TerminalObserved { .. } => "terminal_observed",
     }
 }
 
@@ -795,6 +829,8 @@ fn response_name(response: &ServerResponse) -> &'static str {
         ServerResponse::ChatSnapshot { .. } => "chat_snapshot",
         ServerResponse::ChatListed { .. } => "chat_listed",
         ServerResponse::ChatClosed { .. } => "chat_closed",
+        ServerResponse::TerminalCloseChecked { .. } => "terminal_close_checked",
+        ServerResponse::AgentActivity { .. } => "agent_activity",
     }
 }
 

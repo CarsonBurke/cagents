@@ -49,8 +49,10 @@ pub const INSPECTOR_MIN_WIDTH: f32 = 320.0;
 pub const INSPECTOR_DEFAULT_WIDTH: f32 = 380.0;
 pub const INSPECTOR_MAX_WIDTH: f32 = 480.0;
 
-pub const CONTROL_RADIUS: f32 = 6.0;
-pub const FLOATING_SURFACE_RADIUS: f32 = 8.0;
+/// Shared gutter geometry for native scrollables and custom-rendered content.
+pub const SCROLLBAR_GUTTER: f32 = 14.0;
+pub const SCROLLBAR_THUMB_WIDTH: f32 = 10.0;
+pub const SCROLLBAR_MARGIN: f32 = 2.0;
 pub const BORDER_WIDTH: f32 = 1.0;
 
 pub const WIDE_BREAKPOINT: f32 = 1_440.0;

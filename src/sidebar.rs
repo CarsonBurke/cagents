@@ -11,7 +11,7 @@
 
 use std::{
     borrow::Cow,
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     path::{Path, PathBuf},
     sync::LazyLock,
 };
@@ -27,7 +27,7 @@ use url::Url;
 use crate::{
     design::{self, NavigationLayout},
     github::{PullRequest, PullRequestCheck},
-    model::{ProjectId, ProjectState, WorktreeId},
+    model::{CardId, ProjectId, ProjectState, WorktreeId},
     repository::{
         ChangeArea, ChangeKind, ChangedPath, CommitIdentity, CommitSummary, ConflictKind,
         DirtyState, DiscardRequest, HISTORY_PAGE_SIZE, HeadState, Oid, PathSelection, PushTarget,
@@ -47,10 +47,9 @@ pub const EXPANDED_WIDTH_MAX: f32 = design::NAVIGATION_MAX_WIDTH;
 /// `settings::AppSettings::default`, so a corrupt file looks like a fresh one.
 const DEFAULT_EXPANDED_WIDTH: f32 = design::NAVIGATION_DEFAULT_WIDTH;
 const COMPACT_WIDTH: f32 = design::NAVIGATION_RAIL_WIDTH;
-const HEADER_HEIGHT: f32 = design::HEADER_HEIGHT;
+const HEADER_HEIGHT: f32 = design::HEADER_HEIGHT - design::BORDER_WIDTH;
 const PROJECT_HEADER_HEIGHT: f32 = design::ROW_HEIGHT;
 const WORKTREE_ROW_HEIGHT: f32 = design::ROW_HEIGHT;
-const PULL_REQUEST_ROW_HEIGHT: f32 = design::ROW_HEIGHT + (2.0 * design::GRID_UNIT);
 const ICON_CONTROL_SIZE: f32 = design::PRIMARY_CONTROL_SIZE;
 const ROW_ICON_WIDTH: f32 = 20.0;
 /// Icons that sit inside a row, beside its text.
@@ -134,6 +133,7 @@ pub enum SidebarDataState {
 pub struct SidebarModel {
     pub mode: SidebarMode,
     pub data_state: SidebarDataState,
+    pub external_editors: Vec<SidebarEditor>,
     pub projects: Vec<SidebarProject>,
     /// Source-control data for the active worktree, and only for it. The panel
     /// shows exactly one worktree, so loading a snapshot per project would read
@@ -142,6 +142,29 @@ pub struct SidebarModel {
 }
 
 impl SidebarModel {
+    /// Apply timestamps from successful, persisted worktree creation journals.
+    /// Never substitute a commit time or a discovery time for creation.
+    pub fn apply_worktree_creation_times<P: AsRef<Path>>(
+        &mut self,
+        times: impl IntoIterator<Item = (P, i64)>,
+    ) {
+        for (path, created) in times {
+            for project in &mut self.projects {
+                if let Some(worktree) = project
+                    .worktrees
+                    .iter_mut()
+                    .find(|row| row.path == path.as_ref())
+                {
+                    worktree.created_at_unix_ms = Some(
+                        worktree
+                            .created_at_unix_ms
+                            .map_or(created, |known| known.max(created)),
+                    );
+                }
+            }
+        }
+    }
+
     /// Known projects follow the durable order; newly discovered projects keep
     /// their relative order at the end until the next persisted reorder.
     pub fn apply_project_order(&mut self, order: &[ProjectId]) {
@@ -179,6 +202,7 @@ impl SidebarModel {
             data_state: SidebarDataState::Ready,
             projects,
             source_control: None,
+            external_editors: Vec::new(),
         }
     }
 
@@ -195,6 +219,7 @@ impl SidebarModel {
             data_state: SidebarDataState::Error(message.into()),
             projects: Vec::new(),
             source_control: None,
+            external_editors: Vec::new(),
         }
     }
 
@@ -298,6 +323,7 @@ impl SidebarProject {
     ) -> Self {
         let chrome = ProjectChrome::new(id, &name, &repository);
         for worktree in &mut worktrees {
+            worktree.pull_request_state = None;
             if worktree.chrome.pull_request.take().is_some() {
                 let status = status_summary(
                     worktree.detached,
@@ -316,6 +342,7 @@ impl SidebarProject {
                 .into_boxed_str();
             }
             if let Some(pull_request) = matching_pull_request(worktree, &pull_requests) {
+                worktree.pull_request_state = pull_request.state;
                 worktree.chrome.pull_request = Some((
                     format!("#{}", pull_request.number).into_boxed_str(),
                     pull_request.checks,
@@ -423,6 +450,13 @@ impl ProjectChrome {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SidebarEditor {
+    pub id: String,
+    pub name: String,
+    pub icon: String,
+}
+
 /// Worktree presentation data derived from a worktree record and its optional
 /// status snapshot. A missing status is represented rather than guessed.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -435,6 +469,8 @@ pub struct SidebarWorktree {
     pub dirty: Option<DirtyState>,
     pub ahead: Option<u64>,
     pub behind: Option<u64>,
+    pub created_at_unix_ms: Option<i64>,
+    pub pull_request_state: Option<WorktreePullRequestState>,
     chrome: WorktreeChrome,
 }
 
@@ -480,6 +516,8 @@ impl SidebarWorktree {
             dirty,
             ahead,
             behind,
+            created_at_unix_ms: None,
+            pull_request_state: None,
             chrome,
         }
     }
@@ -497,7 +535,7 @@ impl SidebarWorktree {
             _ => (None, None),
         };
 
-        Self::new(
+        let mut row = Self::new(
             record.id,
             record.path.clone(),
             record.branch.as_deref().map(|branch| {
@@ -511,7 +549,9 @@ impl SidebarWorktree {
             status.map(|status| status.dirty.clone()),
             ahead,
             behind,
-        )
+        );
+        row.created_at_unix_ms = record.created_at_unix_ms;
+        row
     }
 
     fn matches(&self, folded_query: &str) -> bool {
@@ -599,6 +639,26 @@ impl CheckStatus {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorktreePullRequestState {
+    Open,
+    Draft,
+    Closed,
+    Merged,
+}
+
+impl WorktreePullRequestState {
+    pub fn from_github(pull_request: &PullRequest) -> Option<Self> {
+        match pull_request.state.0.as_str() {
+            "OPEN" if pull_request.is_draft => Some(Self::Draft),
+            "OPEN" => Some(Self::Open),
+            "CLOSED" => Some(Self::Closed),
+            "MERGED" => Some(Self::Merged),
+            _ => None,
+        }
+    }
+}
+
 /// Pull-request presentation data derived from `gh` JSON DTOs.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SidebarPullRequest {
@@ -609,15 +669,13 @@ pub struct SidebarPullRequest {
     pub author: Option<String>,
     pub draft: bool,
     pub checks: CheckStatus,
-    chrome: PullRequestChrome,
+    pub state: Option<WorktreePullRequestState>,
 }
 
 impl SidebarPullRequest {
-    /// `project_id` is required because a pull-request number is only unique
-    /// within its project, and the focus identity is built here.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
-        project_id: ProjectId,
+        _project_id: ProjectId,
         number: u64,
         title: String,
         url: Url,
@@ -626,19 +684,6 @@ impl SidebarPullRequest {
         draft: bool,
         checks: CheckStatus,
     ) -> Self {
-        let mut metadata = format!("#{number} · {head_ref}");
-        if let Some(author) = &author {
-            metadata.push_str(" · @");
-            metadata.push_str(author);
-        }
-        let check_label = check_description(checks);
-        let chrome = PullRequestChrome {
-            open_id: stable_id(format!("project.{project_id}.pr.{number}.open")),
-            accessible_name: format!("Open pull request {number}: {title}, checks {check_label}")
-                .into_boxed_str(),
-            metadata: metadata.into_boxed_str(),
-        };
-
         Self {
             number,
             title,
@@ -647,7 +692,7 @@ impl SidebarPullRequest {
             author,
             draft,
             checks,
-            chrome,
+            state: None,
         }
     }
 
@@ -656,7 +701,7 @@ impl SidebarPullRequest {
         pull_request: &PullRequest,
         checks: &[PullRequestCheck],
     ) -> Self {
-        Self::new(
+        let mut row = Self::new(
             project_id,
             pull_request.number,
             pull_request.title.clone(),
@@ -668,21 +713,14 @@ impl SidebarPullRequest {
                 .map(|author| author.login.clone()),
             pull_request.is_draft,
             CheckStatus::from_checks(checks),
-        )
+        );
+        row.state = WorktreePullRequestState::from_github(pull_request);
+        row
     }
 
     fn needs_attention(&self) -> bool {
         matches!(self.checks, CheckStatus::Failing | CheckStatus::Pending)
     }
-}
-
-/// Presentation strings and widget identities a pull request determines, built
-/// once in `SidebarPullRequest::new`.
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct PullRequestChrome {
-    open_id: Id,
-    accessible_name: Box<str>,
-    metadata: Box<str>,
 }
 
 /// A number of rows a section header prints, and whether anything downstream
@@ -773,23 +811,16 @@ pub enum PanelSection {
     Files,
     Changes,
     History,
-    PullRequests,
 }
 
 impl PanelSection {
-    pub const ALL: [Self; 4] = [
-        Self::Files,
-        Self::Changes,
-        Self::History,
-        Self::PullRequests,
-    ];
+    pub const ALL: [Self; 3] = [Self::Files, Self::Changes, Self::History];
 
     fn title(self) -> &'static str {
         match self {
             Self::Files => "Files",
             Self::Changes => "Changes",
             Self::History => "History",
-            Self::PullRequests => "Pull requests",
         }
     }
 
@@ -1050,15 +1081,24 @@ struct ChangeRowChrome {
 pub struct ChangeGroup {
     pub area: ChangeArea,
     rows: Vec<ChangeRow>,
+    tree: Vec<FileRow>,
+    path_order: Vec<usize>,
     chrome: ChangeGroupChrome,
 }
 
 impl ChangeGroup {
+    fn visible_path(&self, path: &RepoPath) -> Option<&ChangeRow> {
+        self.path_order
+            .binary_search_by(|index| self.rows[*index].entry.path.cmp(path))
+            .ok()
+            .map(|index| &self.rows[self.path_order[index]])
+    }
+
     fn new(worktree_id: WorktreeId, area: ChangeArea, rows: Vec<ChangeRow>) -> Self {
         let title = match area {
             ChangeArea::Conflict => "Conflicts",
             ChangeArea::Staged => "Staged",
-            ChangeArea::Unstaged => "Changes",
+            ChangeArea::Unstaged => "Unstaged",
             ChangeArea::Untracked => "Untracked",
         };
         let key = format!("{worktree_id}.{area:?}");
@@ -1071,7 +1111,21 @@ impl ChangeGroup {
             unstage_all_name: format!("Unstage all visible {title}").into_boxed_str(),
             discard_all_name: format!("Discard all visible {title}").into_boxed_str(),
         };
-        Self { area, rows, chrome }
+        let paths = rows
+            .iter()
+            .take(MAX_VISIBLE_CHANGE_ROWS)
+            .map(|row| row.entry.path.clone())
+            .collect::<Vec<_>>();
+        let tree = file_rows(&paths);
+        let mut path_order: Vec<usize> = (0..paths.len()).collect();
+        path_order.sort_unstable_by(|left, right| paths[*left].cmp(&paths[*right]));
+        Self {
+            area,
+            rows,
+            tree,
+            path_order,
+            chrome,
+        }
     }
 
     pub fn rows(&self) -> &[ChangeRow] {
@@ -1095,15 +1149,6 @@ impl ChangeGroup {
     /// The path selection covering every visible row, rename halves included.
     pub fn visible_selection(&self) -> Vec<PathSelection> {
         self.visible().iter().map(ChangeRow::selection).collect()
-    }
-
-    /// The untracked paths among the visible rows, which discard deletes
-    /// rather than restores.
-    fn visible_untracked(&self) -> Vec<RepoPath> {
-        self.visible()
-            .iter()
-            .map(|row| row.entry.path.clone())
-            .collect()
     }
 }
 
@@ -1224,7 +1269,41 @@ pub struct SourceControlModel {
     chrome: SourceControlChrome,
 }
 
+fn file_rows(paths: &[RepoPath]) -> Vec<FileRow> {
+    build_file_tree(paths)
+        .into_iter()
+        .map(|entry| {
+            let kind = if entry.directory { "folder" } else { "file" };
+            let chrome = FileRowChrome {
+                folded: fold(&entry.path.display()),
+                accessible_name: format!("Open {kind} {}", entry.path.display()).into_boxed_str(),
+                label: entry.path.file_name().into_owned().into_boxed_str(),
+            };
+            FileRow {
+                path: entry.path,
+                depth: entry.depth,
+                directory: entry.directory,
+                chrome,
+            }
+        })
+        .collect()
+}
+
 impl SourceControlModel {
+    /// File navigation for a plain folder, without invented Git data.
+    pub fn directory(key: ActiveWorktreeKey, paths: &[RepoPath]) -> Self {
+        let mut model = Self::empty(key, SidebarDataState::Ready);
+        model.chrome.subheading = model
+            .key
+            .canonical_path
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| model.key.canonical_path.display().to_string())
+            .into_boxed_str();
+        model.files = file_rows(paths);
+        model
+    }
+
     /// The panel before its first snapshot has arrived.
     pub fn loading(key: ActiveWorktreeKey) -> Self {
         Self::empty(key, SidebarDataState::Loading)
@@ -1299,25 +1378,7 @@ impl SourceControlModel {
             .iter()
             .find(|group| group.area == ChangeArea::Staged)
             .map_or(0, |group| group.rows.len());
-        let files = build_file_tree(&snapshot.files.paths)
-            .into_iter()
-            .map(|entry| {
-                let label = entry.path.file_name().into_owned();
-                let kind = if entry.directory { "folder" } else { "file" };
-                let chrome = FileRowChrome {
-                    folded: fold(&entry.path.display()),
-                    accessible_name: format!("Open {kind} {}", entry.path.display())
-                        .into_boxed_str(),
-                    label: label.into_boxed_str(),
-                };
-                FileRow {
-                    path: entry.path,
-                    depth: entry.depth,
-                    directory: entry.directory,
-                    chrome,
-                }
-            })
-            .collect();
+        let files = file_rows(&snapshot.files.paths);
 
         // An unborn `HEAD` has no commit and no history to walk; an unreadable
         // one has neither either, but it is not an empty repository.
@@ -1579,7 +1640,6 @@ struct SourceControlChrome {
     commit_input_id: Id,
     commit_id: Id,
     push_id: Id,
-    create_pull_request_id: Id,
     /// One entry per configured remote, parallel to
     /// [`SourceControlModel::remotes`], so the publish picker builds no
     /// identity while rendering.
@@ -1589,7 +1649,7 @@ struct SourceControlChrome {
     publish_cancel_id: Id,
     publish_branch_id: Id,
     more_history_id: Id,
-    section_ids: [Id; 4],
+    section_ids: [Id; 3],
 }
 
 impl SourceControlChrome {
@@ -1615,7 +1675,6 @@ impl SourceControlChrome {
             commit_input_id: entity_id("panel.commit.message", worktree_id),
             commit_id: entity_id("panel.commit", worktree_id),
             push_id: entity_id("panel.push", worktree_id),
-            create_pull_request_id: entity_id("panel.create_pr", worktree_id),
             publish_remote_ids: remotes
                 .iter()
                 .map(|remote| stable_id(format!("panel.publish.remote.{worktree_id}.{remote}")))
@@ -1806,7 +1865,6 @@ pub struct SidebarState {
     filter: SidebarFilter,
     controls_expanded: bool,
     collapsed_projects: BTreeSet<ProjectId>,
-    expanded_pull_requests: BTreeSet<ProjectId>,
     selection: Option<SidebarSelection>,
     active_worktree: Option<ActiveWorktreeKey>,
     /// Sections toggled away from their default. Storing the toggles rather
@@ -1817,6 +1875,10 @@ pub struct SidebarState {
     panel_open: bool,
     files_query: String,
     file_list_mode: FileListMode,
+    change_list_mode: FileListMode,
+    worktree_sort: crate::settings::WorktreeSort,
+    agent_updates: BTreeSet<(ProjectId, WorktreeId)>,
+    agent_activity: BTreeMap<(ProjectId, WorktreeId), BTreeMap<CardId, crate::agent::Activity>>,
     commit_message: String,
     collapsed_directories: BTreeSet<RepoPath>,
     publish: Option<PublishDraft>,
@@ -1825,6 +1887,95 @@ pub struct SidebarState {
 }
 
 impl SidebarState {
+    pub fn set_worktree_sort(&mut self, order: crate::settings::WorktreeSort) {
+        self.worktree_sort = order;
+    }
+
+    /// Called only when an agent actually emits an observed update, never
+    /// from a guessed completion or generic terminal output.
+    pub fn observe_agent_update(&mut self, project: ProjectId, worktree: WorktreeId) {
+        self.agent_updates.insert((project, worktree));
+    }
+
+    pub fn acknowledge_agent_update(&mut self, project: ProjectId, worktree: WorktreeId) {
+        self.agent_updates.remove(&(project, worktree));
+    }
+
+    pub fn has_agent_update(&self, project: ProjectId, worktree: WorktreeId) -> bool {
+        self.agent_updates.contains(&(project, worktree))
+    }
+
+    pub fn clear_agent_activity(&mut self, card: CardId) {
+        self.agent_activity.retain(|_, cards| {
+            cards.remove(&card);
+            !cards.is_empty()
+        });
+    }
+
+    pub fn set_agent_activity(
+        &mut self,
+        card: CardId,
+        project: ProjectId,
+        worktree: WorktreeId,
+        activity: crate::agent::Activity,
+    ) {
+        if self
+            .agent_activity
+            .get(&(project, worktree))
+            .and_then(|cards| cards.get(&card))
+            == Some(&activity)
+        {
+            return;
+        }
+        self.clear_agent_activity(card);
+        if matches!(
+            activity.state,
+            crate::agent::ActivityState::Working | crate::agent::ActivityState::Waiting
+        ) {
+            self.agent_activity
+                .entry((project, worktree))
+                .or_default()
+                .insert(card, activity);
+        }
+    }
+
+    pub fn agent_activity(
+        &self,
+        project: ProjectId,
+        worktree: WorktreeId,
+    ) -> Option<crate::agent::ActivityState> {
+        use crate::agent::ActivityState;
+        let cards = self.agent_activity.get(&(project, worktree))?;
+        Some(
+            if cards
+                .values()
+                .any(|activity| activity.state == ActivityState::Working)
+            {
+                ActivityState::Working
+            } else {
+                ActivityState::Waiting
+            },
+        )
+    }
+
+    /// Synchronize when editor focus changes outside the file navigator.
+    pub fn select_file(&mut self, key: &ActiveWorktreeKey, path: Option<&Path>) {
+        if self.active_worktree.as_ref() != Some(key) {
+            return;
+        }
+        let current = self
+            .panel_selection
+            .as_ref()
+            .map(|selection| match selection {
+                PanelSelection::File(path) | PanelSelection::Change { path, .. } => path.as_path(),
+            });
+        if current != path {
+            self.panel_selection = path
+                .and_then(|path| RepoPath::parse(path).ok())
+                .map(PanelSelection::File);
+        }
+    }
+
     pub fn query(&self) -> &str {
         &self.query
     }
@@ -1885,6 +2036,10 @@ impl SidebarState {
                 .clone()
                 .filter(|key| model.contains_worktree(key)),
         };
+        self.selection = next.as_ref().map(|key| SidebarSelection::Worktree {
+            project_id: key.project_id,
+            worktree_id: key.worktree_id,
+        });
         if self.active_worktree == next {
             return false;
         }
@@ -1918,9 +2073,6 @@ impl SidebarState {
             SidebarAction::ToggleProject(project_id) => {
                 toggle_membership(&mut self.collapsed_projects, *project_id);
             }
-            SidebarAction::TogglePullRequests(project_id) => {
-                toggle_membership(&mut self.expanded_pull_requests, *project_id);
-            }
             SidebarAction::OpenRepository { project_id, .. } => {
                 self.selection = Some(SidebarSelection::Project(*project_id));
             }
@@ -1948,6 +2100,7 @@ impl SidebarState {
             SidebarAction::ToggleSourceControlPanel { .. } => self.panel_open = !self.panel_open,
             SidebarAction::FilesQueryChanged { query, .. } => self.files_query.clone_from(query),
             SidebarAction::SetFileListMode { mode, .. } => self.file_list_mode = *mode,
+            SidebarAction::SetChangeListMode { mode, .. } => self.change_list_mode = *mode,
             SidebarAction::ToggleDirectory { path, .. } => {
                 if !self.collapsed_directories.remove(path) {
                     self.collapsed_directories.insert(path.clone());
@@ -1995,8 +2148,12 @@ impl SidebarState {
             SidebarAction::OpenRepositoryPicker
             | SidebarAction::CancelWorktreeOperation(_)
             | SidebarAction::ProjectCommand { .. }
+            | SidebarAction::OpenFileInEditor { .. }
             | SidebarAction::NewWorktree { .. }
             | SidebarAction::ReorderProject { .. }
+            | SidebarAction::DragWindow
+            | SidebarAction::MaximizeWindow
+            | SidebarAction::WindowMenu
             | SidebarAction::Refresh
             | SidebarAction::RefreshWorktree { .. }
             | SidebarAction::CreatePullRequest { .. }
@@ -2019,6 +2176,9 @@ impl SidebarState {
 /// Not `Eq`: the resize request carries a width, and widths are measurements.
 #[derive(Debug, Clone, PartialEq)]
 pub enum SidebarAction {
+    DragWindow,
+    MaximizeWindow,
+    WindowMenu,
     ReorderProject {
         project: ProjectId,
         before: Option<ProjectId>,
@@ -2033,7 +2193,6 @@ pub enum SidebarAction {
     SetFilter(SidebarFilter),
     ToggleControls,
     ToggleProject(ProjectId),
-    TogglePullRequests(ProjectId),
     OpenRepositoryPicker,
     OpenRepository {
         project_id: ProjectId,
@@ -2082,6 +2241,15 @@ pub enum SidebarAction {
     SetFileListMode {
         key: ActiveWorktreeKey,
         mode: FileListMode,
+    },
+    SetChangeListMode {
+        key: ActiveWorktreeKey,
+        mode: FileListMode,
+    },
+    OpenFileInEditor {
+        key: ActiveWorktreeKey,
+        path: RepoPath,
+        editor_id: String,
     },
     ToggleDirectory {
         key: ActiveWorktreeKey,
@@ -2207,6 +2375,15 @@ pub fn clamp_expanded_width(width: f32) -> f32 {
     }
 }
 
+fn sidebar_scroll_direction() -> cosmic::iced::widget::scrollable::Direction {
+    cosmic::iced::widget::scrollable::Direction::Vertical(
+        cosmic::iced::widget::scrollable::Scrollbar::default()
+            .width(design::SCROLLBAR_THUMB_WIDTH)
+            .scroller_width(design::SCROLLBAR_THUMB_WIDTH)
+            .spacing(design::SCROLLBAR_GUTTER - design::SCROLLBAR_THUMB_WIDTH),
+    )
+}
+
 /// The left project/worktree navigation.
 ///
 /// `modal_open` says a dialog is on screen. The dialog is an overlay, so a
@@ -2231,10 +2408,12 @@ pub fn view<'a>(
     let loading = matches!(&model.data_state, SidebarDataState::Loading);
     let refresh_enabled = !model.projects.is_empty() && !loading;
     let header_loading = loading && !model.projects.is_empty();
-    let mut content = widget::column::with_capacity(7).push(
-        widget::container(header(model, state, compact, header_loading, modal_open))
-            .padding([0, spacing.space_xxxs]),
-    );
+    let mut content = widget::column::with_capacity(7)
+        .push(
+            widget::container(header(model, state, compact, header_loading, modal_open))
+                .padding([0, spacing.space_xxxs]),
+        )
+        .push(widget::divider::horizontal::default());
 
     // Each density is given the controls its width can hold, and
     // `filtered_projects` applies exactly the state that has a control here:
@@ -2332,6 +2511,7 @@ fn header<'a>(
             || state.filter != SidebarFilter::All;
         children.push(crate::interaction::tooltip(
             button::icon(icon::from_name("view-list-symbolic").size(ROW_ICON_SIZE))
+                .class(quiet_button_style())
                 .id(stable_id("toggle-controls"))
                 .name("Search and filter projects")
                 .selected(selected)
@@ -2355,12 +2535,20 @@ fn header<'a>(
         stable_id("open-repository"),
     ));
 
-    widget::row::with_children(children)
+    let header = widget::row::with_children(children)
         .align_y(Alignment::Center)
         .spacing(spacing.space_xxxs)
         .height(Length::Fixed(HEADER_HEIGHT))
-        .width(Length::Fill)
-        .into()
+        .width(Length::Fill);
+    if modal_open {
+        header.into()
+    } else {
+        widget::mouse_area(header)
+            .on_drag(SidebarAction::DragWindow)
+            .on_double_press(SidebarAction::MaximizeWindow)
+            .on_right_press(SidebarAction::WindowMenu)
+            .into()
+    }
 }
 
 fn selected_project<'a>(
@@ -2581,6 +2769,7 @@ fn project_list<'a>(
         })
         .or(state.selection);
     let spacing = cosmic::theme::spacing();
+    let sticky_viewport = row_interaction::StickyViewport::default();
     let mut column = widget::column::with_capacity(projects.len()).spacing(if compact {
         spacing.space_xxxs
     } else {
@@ -2594,6 +2783,7 @@ fn project_list<'a>(
             compact,
             selection,
             modal_open,
+            sticky_viewport.clone(),
         ));
     }
 
@@ -2601,8 +2791,10 @@ fn project_list<'a>(
         column.into(),
         projects.iter().map(|project| project.project.id).collect(),
         !modal_open && !compact,
+        sticky_viewport,
     );
     widget::scrollable(column)
+        .direction(sidebar_scroll_direction())
         .class(cosmic::style::iced::Scrollable::Minimal)
         .width(Length::Fill)
         .height(Length::Fill)
@@ -2761,12 +2953,13 @@ fn project_view<'a>(
     compact: bool,
     selection: Option<SidebarSelection>,
     modal_open: bool,
+    sticky_viewport: row_interaction::StickyViewport,
 ) -> Element<'a, SidebarAction> {
     let entity = project.project;
     let chrome = &entity.chrome;
     let project_id = entity.id;
     if compact {
-        return compact_project(project, selection, modal_open);
+        return compact_project(project, selection, modal_open, sticky_viewport);
     }
 
     let spacing = cosmic::theme::spacing();
@@ -2789,9 +2982,7 @@ fn project_view<'a>(
         .height(Length::Fill)
         .spacing(spacing.space_xxxs),
     )
-    .class(sidebar_button_style(
-        selection == Some(SidebarSelection::Project(project_id)),
-    ))
+    .class(quiet_button_style())
     .id(chrome.open_id.clone())
     .name(&*chrome.open_name)
     .selected(selection == Some(SidebarSelection::Project(project_id)))
@@ -2829,34 +3020,45 @@ fn project_view<'a>(
             .height(Length::Fixed(ICON_CONTROL_SIZE))
             .into()
     };
-    let header = widget::row::with_children(vec![
-        leading,
-        project_identity,
-        icon_action(
-            "list-add-symbolic",
-            &*chrome.new_worktree_name,
-            gated(
-                SidebarAction::NewWorktree {
-                    project_id,
-                    repository: entity.repository.clone(),
-                },
-                modal_open,
-            ),
-            chrome.new_worktree_id.clone(),
+    let add_worktree = icon_action(
+        "list-add-symbolic",
+        &*chrome.new_worktree_name,
+        gated(
+            SidebarAction::NewWorktree {
+                project_id,
+                repository: entity.repository.clone(),
+            },
+            modal_open,
         ),
+        chrome.new_worktree_id.clone(),
+    );
+    let identity = widget::row::with_children(vec![
+        project_identity,
+        cosmic::iced::widget::Space::new()
+            .width(ICON_CONTROL_SIZE)
+            .into(),
     ])
     .align_y(Alignment::Center)
-    .spacing(0)
-    .height(Length::Fixed(PROJECT_HEADER_HEIGHT));
-    let mut column = widget::column::with_capacity(worktree_count + 2)
+    .height(PROJECT_HEADER_HEIGHT);
+    let identity = RowInteraction::actions(
+        identity.into(),
+        widget::container(add_worktree)
+            .align_right(Length::Fill)
+            .into(),
+    );
+    let header = widget::row::with_children(vec![identity, leading])
+        .align_y(Alignment::Center)
         .spacing(0)
-        .push(context_controls(
-            header,
-            project_id,
-            None,
-            modal_open,
-            entity.github_ready,
-        ));
+        .height(PROJECT_HEADER_HEIGHT);
+    let header = context_controls(
+        header,
+        project_id,
+        None,
+        modal_open,
+        entity.github_ready,
+        project.editors,
+    );
+    let mut column = widget::column::with_capacity(worktree_count + 2).spacing(0);
     // GitHub availability belongs in the Changes panel, not between navigation rows.
     if entity.github_stale {
         column = column.push(widget::text::caption(
@@ -2890,13 +3092,16 @@ fn project_view<'a>(
                     selection,
                     modal_open,
                     entity.github_ready,
+                    project.editors,
+                    project.state.has_agent_update(project_id, worktree.id),
+                    project.state.agent_activity(project_id, worktree.id),
                 ))
                 .padding([0.0, 0.0, 0.0, ICON_CONTROL_SIZE]),
             );
         }
     }
 
-    widget::container(column).width(Length::Fill).into()
+    RowInteraction::group(header, column.into(), sticky_viewport)
 }
 
 fn is_primary_worktree(repository: &Path, worktree: &Path) -> bool {
@@ -2909,6 +3114,7 @@ fn compact_project<'a>(
     project: &FilteredProject<'a>,
     selection: Option<SidebarSelection>,
     modal_open: bool,
+    sticky_viewport: row_interaction::StickyViewport,
 ) -> Element<'a, SidebarAction> {
     let entity = project.project;
     let chrome = &entity.chrome;
@@ -2932,16 +3138,18 @@ fn compact_project<'a>(
             },
             modal_open,
         ));
+    let header = widget::container(context_controls(
+        crate::interaction::tooltip(action, &*chrome.compact_open_name),
+        entity.id,
+        None,
+        modal_open,
+        entity.github_ready,
+        project.editors,
+    ))
+    .center_x(Length::Fill);
     let mut column = widget::column::with_capacity(project.worktrees.len() + 1)
         .align_x(Alignment::Center)
-        .width(Length::Fill)
-        .push(context_controls(
-            crate::interaction::tooltip(action, &*chrome.compact_open_name),
-            entity.id,
-            None,
-            modal_open,
-            entity.github_ready,
-        ));
+        .width(Length::Fill);
     for operation in &entity.operations {
         let action = button::icon(
             icon::from_name(if operation.cancellable {
@@ -2965,26 +3173,29 @@ fn compact_project<'a>(
         column = column.push(crate::interaction::tooltip(action, &operation.label));
     }
     for &worktree in &project.worktrees {
-        let action = button::icon(worktree_icon())
-            .id(worktree.chrome.open_id.clone())
-            .name(&*worktree.chrome.accessible_name)
-            .width(ROW_ICON_WIDTH)
-            .height(Length::Fixed(WORKTREE_ROW_HEIGHT))
-            .selected(
-                selection
-                    == Some(SidebarSelection::Worktree {
-                        project_id: entity.id,
-                        worktree_id: worktree.id,
-                    }),
-            )
-            .on_press_maybe(gated(
-                SidebarAction::OpenWorktree {
-                    project_id: entity.id,
-                    worktree_id: worktree.id,
-                    path: worktree.path.clone(),
-                },
-                modal_open,
-            ));
+        let selected = selection
+            == Some(SidebarSelection::Worktree {
+                project_id: entity.id,
+                worktree_id: worktree.id,
+            });
+        let action = button::custom(worktree_status_icon(
+            worktree,
+            project.state.has_agent_update(entity.id, worktree.id),
+        ))
+        .id(worktree.chrome.open_id.clone())
+        .name(&*worktree.chrome.accessible_name)
+        .width(ROW_ICON_WIDTH)
+        .height(Length::Fixed(WORKTREE_ROW_HEIGHT))
+        .class(sidebar_button_style(selected))
+        .selected(selected)
+        .on_press_maybe(gated(
+            SidebarAction::OpenWorktree {
+                project_id: entity.id,
+                worktree_id: worktree.id,
+                path: worktree.path.clone(),
+            },
+            modal_open,
+        ));
         let mut row = widget::row::with_capacity(2)
             .align_y(Alignment::Center)
             .push(crate::interaction::tooltip(
@@ -3006,12 +3217,17 @@ fn compact_project<'a>(
             Some(worktree.id),
             modal_open,
             entity.github_ready,
+            project.editors,
         ));
     }
-    widget::container(column)
-        .padding([cosmic::theme::spacing().space_xxxs, 0])
-        .width(Length::Fill)
-        .into()
+    widget::container(RowInteraction::group(
+        header.into(),
+        column.into(),
+        sticky_viewport,
+    ))
+    .padding([cosmic::theme::spacing().space_xxxs, 0])
+    .width(Length::Fill)
+    .into()
 }
 
 fn worktree_view<'a>(
@@ -3021,6 +3237,9 @@ fn worktree_view<'a>(
     selection: Option<SidebarSelection>,
     modal_open: bool,
     github_ready: bool,
+    editors: &'a [SidebarEditor],
+    agent_update: bool,
+    activity: Option<crate::agent::ActivityState>,
 ) -> Element<'a, SidebarAction> {
     let chrome = &worktree.chrome;
     let spacing = cosmic::theme::spacing();
@@ -3028,10 +3247,7 @@ fn worktree_view<'a>(
         .align_y(Alignment::Center)
         .spacing(spacing.space_xxxs)
         .height(Length::Fill)
-        .push(
-            widget::container(worktree_icon().icon().size(ROW_ICON_SIZE))
-                .center_x(Length::Fixed(ROW_ICON_WIDTH)),
-        );
+        .push(worktree_status_icon(worktree, agent_update));
     row = row.push(
         design::body(&*chrome.label)
             .wrapping(cosmic::iced::widget::text::Wrapping::None)
@@ -3040,6 +3256,20 @@ fn worktree_view<'a>(
             ))
             .width(Length::Fill),
     );
+    if let Some(activity) = activity {
+        let (label, detail, tone) = match activity {
+            crate::agent::ActivityState::Working => (
+                "working",
+                "An agent is actively working",
+                BadgeTone::Success,
+            ),
+            crate::agent::ActivityState::Waiting => {
+                ("waiting", "An agent needs input", BadgeTone::Warning)
+            }
+            _ => unreachable!("only active agent states are displayed"),
+        };
+        row = row.push(crate::interaction::tooltip(badge(label, tone), detail));
+    }
     if let Some(label) = chrome.dirty_badge.as_deref() {
         row = row.push(status_icon(
             "document-edit-symbolic",
@@ -3112,6 +3342,7 @@ fn worktree_view<'a>(
         Some(worktree.id),
         modal_open,
         github_ready,
+        editors,
     )
 }
 
@@ -3125,27 +3356,27 @@ fn project_icon(project: &SidebarProject, size: u16) -> Element<'_, SidebarActio
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProjectCommand {
     Reveal,
     NewTerminal,
     NewWorktree,
     RepositoryUrl,
-    Editors,
+    OpenEditor(String),
     Delete,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct ContextCommand(ProjectId, Option<WorktreeId>, ProjectCommand);
+struct ContextCommand<'a>(ProjectId, Option<WorktreeId>, &'a ProjectCommand);
 
-impl widget::menu::Action for ContextCommand {
+impl widget::menu::Action for ContextCommand<'_> {
     type Message = SidebarAction;
 
     fn message(&self) -> SidebarAction {
         SidebarAction::ProjectCommand {
             project_id: self.0,
             worktree_id: self.1,
-            command: self.2,
+            command: self.2.clone(),
         }
     }
 }
@@ -3156,31 +3387,42 @@ fn context_controls<'a>(
     worktree_id: Option<WorktreeId>,
     modal_open: bool,
     github_ready: bool,
+    editors: &'a [SidebarEditor],
 ) -> Element<'a, SidebarAction> {
     use widget::menu::{Item, items};
     let menu = (!modal_open).then(|| {
-        let action = |command| ContextCommand(project_id, worktree_id, command);
-        let mut entries = vec![
-            Item::Button("Open folder", None, action(ProjectCommand::Reveal)),
-            Item::Button("New terminal", None, action(ProjectCommand::NewTerminal)),
-            Item::Button("New worktree", None, action(ProjectCommand::NewWorktree)),
-            Item::Button("Open in editor…", None, action(ProjectCommand::Editors)),
+        let mut commands = vec![
+            ("Open folder".to_owned(), None, ProjectCommand::Reveal),
+            ("New terminal".to_owned(), None, ProjectCommand::NewTerminal),
+            ("New worktree".to_owned(), None, ProjectCommand::NewWorktree),
         ];
+        commands.extend(editors.iter().map(|editor| {
+            (
+                editor.name.clone(),
+                Some(editor_icon(editor)),
+                ProjectCommand::OpenEditor(editor.id.clone()),
+            )
+        }));
         if github_ready {
-            entries.push(Item::Button(
-                "Open repository on GitHub",
+            commands.push((
+                "Open repository on GitHub".to_owned(),
                 None,
-                action(ProjectCommand::RepositoryUrl),
+                ProjectCommand::RepositoryUrl,
             ));
         }
         if worktree_id.is_some() {
-            entries.push(Item::Divider);
-            entries.push(Item::Button(
-                "Delete worktree…",
-                None,
-                action(ProjectCommand::Delete),
-            ));
+            commands.push(("Delete worktree…".to_owned(), None, ProjectCommand::Delete));
         }
+        let entries = commands
+            .iter()
+            .map(|(label, icon, command)| {
+                Item::Button(
+                    label.clone(),
+                    icon.clone(),
+                    ContextCommand(project_id, worktree_id, command),
+                )
+            })
+            .collect();
         items(&std::collections::HashMap::new(), entries)
     });
     match menu {
@@ -3189,85 +3431,114 @@ fn context_controls<'a>(
     }
 }
 
-fn pull_request_view<'a>(
-    project_id: ProjectId,
-    pull_request: &'a SidebarPullRequest,
-    selection: Option<SidebarSelection>,
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct FileEditorCommand<'a> {
+    key: &'a ActiveWorktreeKey,
+    path: &'a RepoPath,
+    editor_id: &'a str,
+}
+
+impl widget::menu::Action for FileEditorCommand<'_> {
+    type Message = SidebarAction;
+    fn message(&self) -> SidebarAction {
+        SidebarAction::OpenFileInEditor {
+            key: self.key.clone(),
+            path: self.path.clone(),
+            editor_id: self.editor_id.to_owned(),
+        }
+    }
+}
+
+fn file_context_controls<'a>(
+    content: Element<'a, SidebarAction>,
+    key: &ActiveWorktreeKey,
+    path: &RepoPath,
+    editors: &'a [SidebarEditor],
     modal_open: bool,
 ) -> Element<'a, SidebarAction> {
-    let chrome = &pull_request.chrome;
-    let action = gated(
-        SidebarAction::OpenPullRequest {
-            project_id,
-            number: pull_request.number,
-            url: pull_request.url.clone(),
-        },
-        modal_open,
-    );
-
-    let spacing = cosmic::theme::spacing();
-    let mut detail = widget::row::with_children(vec![
-        widget::text::caption(&*chrome.metadata)
-            .wrapping(cosmic::iced::widget::text::Wrapping::None)
-            .ellipsize(cosmic::iced::widget::text::Ellipsize::End(
-                EllipsizeHeightLimit::Lines(1),
-            ))
-            .width(Length::Fill)
-            .into(),
-    ])
-    .align_y(Alignment::Center)
-    .spacing(spacing.space_xxxs);
-    if pull_request.draft {
-        detail = detail.push(design::caption("draft"));
+    if modal_open || editors.is_empty() {
+        return content;
     }
-    let row = widget::row::with_children(vec![
-        widget::container(
-            widget::icon::from_name("vcs-merge-request-symbolic").size(ROW_ICON_SIZE),
-        )
-        .center_x(Length::Fixed(ROW_ICON_WIDTH))
-        .into(),
-        widget::column::with_children(vec![
-            design::body(pull_request.title.as_str())
-                .wrapping(cosmic::iced::widget::text::Wrapping::None)
-                .ellipsize(cosmic::iced::widget::text::Ellipsize::End(
-                    EllipsizeHeightLimit::Lines(1),
-                ))
-                .width(Length::Fill)
-                .into(),
-            detail.into(),
-        ])
-        .spacing(0)
-        .width(Length::Fill)
-        .into(),
-        check_indicator(pull_request.checks),
-    ])
-    .spacing(spacing.space_xxxs)
-    .align_y(Alignment::Center);
+    let entries = editors
+        .iter()
+        .map(|editor| {
+            widget::menu::Item::Button(
+                editor.name.clone(),
+                Some(editor_icon(editor)),
+                FileEditorCommand {
+                    key,
+                    path,
+                    editor_id: &editor.id,
+                },
+            )
+        })
+        .collect::<Vec<_>>();
+    crate::interaction::context_menu(
+        content,
+        widget::menu::items(&std::collections::HashMap::new(), entries),
+    )
+}
 
-    let action = button::custom(row)
-        .class(sidebar_button_style(
-            selection
-                == Some(SidebarSelection::PullRequest {
-                    project_id,
-                    number: pull_request.number,
+fn editor_icon(editor: &SidebarEditor) -> icon::Handle {
+    if Path::new(&editor.icon).is_absolute() {
+        icon::from_path(PathBuf::from(&editor.icon))
+    } else {
+        icon::from_name(editor.icon.as_str()).handle()
+    }
+}
+
+fn worktree_status_icon(worktree: &SidebarWorktree, update: bool) -> Element<'_, SidebarAction> {
+    let glyph: Element<'_, SidebarAction> = match worktree.pull_request_state {
+        None => worktree_icon().icon().size(ROW_ICON_SIZE).into(),
+        Some(state) => {
+            let (name, label, tone) = match state {
+                WorktreePullRequestState::Open => (
+                    "pull-request-symbolic",
+                    "Open pull request",
+                    BadgeTone::Success,
+                ),
+                WorktreePullRequestState::Draft => (
+                    "pull-request-symbolic",
+                    "Draft pull request",
+                    BadgeTone::Neutral,
+                ),
+                WorktreePullRequestState::Closed => (
+                    "window-close-symbolic",
+                    "Closed pull request",
+                    BadgeTone::Danger,
+                ),
+                WorktreePullRequestState::Merged => (
+                    "merged-pull-request-symbolic",
+                    "Merged pull request",
+                    BadgeTone::Success,
+                ),
+            };
+            status_icon(name, label, tone)
+        }
+    };
+    let dot = widget::container(cosmic::iced::widget::Space::new().width(4).height(4)).class(
+        theme::Container::Custom(Box::new(move |theme| {
+            cosmic::iced::widget::container::Style {
+                background: update.then(|| {
+                    cosmic::iced::Background::Color((*theme.cosmic().accent_color()).into())
                 }),
-        ))
-        .id(chrome.open_id.clone())
-        .name(&*chrome.accessible_name)
-        .selected(
-            selection
-                == Some(SidebarSelection::PullRequest {
-                    project_id,
-                    number: pull_request.number,
-                }),
-        )
-        .padding([0, spacing.space_xxxs])
-        .height(Length::Fixed(PULL_REQUEST_ROW_HEIGHT))
-        .width(Length::Fill)
-        .on_press_maybe(action);
+                border: cosmic::iced::Border {
+                    radius: 2.0.into(),
+                    ..Default::default()
+                },
+                ..Default::default()
+            }
+        })),
+    );
     crate::interaction::tooltip(
-        crate::interaction::hover(action),
-        pull_request.title.as_str(),
+        widget::row::with_children(vec![glyph, dot.into()])
+            .align_y(Alignment::Center)
+            .spacing(0),
+        if update {
+            "New agent activity"
+        } else {
+            "Worktree status"
+        },
     )
 }
 
@@ -3314,13 +3585,9 @@ fn worktree_panel<'a>(
         design::INSPECTOR_DEFAULT_WIDTH
     };
     let content = match bound_source_control(model, state) {
-        Some(source) => source_control_panel(
-            state,
-            source,
-            model.project(source.key.project_id),
-            modal_open,
-            panel,
-        ),
+        Some(source) => {
+            source_control_panel(state, source, &model.external_editors, modal_open, panel)
+        }
         None => widget::container(
             widget::column::with_children(vec![
                 worktree_icon().icon().size(28).into(),
@@ -3371,7 +3638,7 @@ fn bound_source_control<'a>(
 fn source_control_panel<'a>(
     state: &'a SidebarState,
     source: &'a SourceControlModel,
-    project: Option<&'a SidebarProject>,
+    editors: &'a [SidebarEditor],
     modal_open: bool,
     panel: WorktreePanel,
 ) -> Element<'a, SidebarAction> {
@@ -3459,30 +3726,15 @@ fn source_control_panel<'a>(
     }
 
     if matches!(panel, WorktreePanel::Files) {
-        return widget::container(column.push(files_section(state, source, modal_open)))
+        return widget::container(column.push(files_section(state, source, modal_open, editors)))
             .padding([spacing.space_xxxs, spacing.space_xxs])
             .width(Length::Fill)
             .height(Length::Fill)
             .into();
     }
 
-    let mut sections = widget::column::with_capacity(3).spacing(spacing.space_xxxs);
-    sections = sections.push(panel_section(
-        key,
-        PanelSection::Changes,
-        chrome.section_id(PanelSection::Changes).clone(),
-        Some(
-            source
-                .groups()
-                .iter()
-                .map(|group| group.rows().len())
-                .sum::<usize>()
-                .into(),
-        ),
-        state.section_expanded(PanelSection::Changes),
-        modal_open,
-        || changes_section(state, source, modal_open),
-    ));
+    let mut sections = widget::column::with_capacity(2).spacing(spacing.space_xxxs);
+    sections = sections.push(changes_section(state, source, modal_open));
     sections = sections.push(panel_section(
         key,
         PanelSection::History,
@@ -3492,18 +3744,10 @@ fn source_control_panel<'a>(
         modal_open,
         || history_section(source, modal_open),
     ));
-    sections = sections.push(panel_section(
-        key,
-        PanelSection::PullRequests,
-        chrome.section_id(PanelSection::PullRequests).clone(),
-        pull_request_section_count(project),
-        state.section_expanded(PanelSection::PullRequests),
-        modal_open,
-        || pull_requests_section(state, source, project, modal_open),
-    ));
 
     column = column.push(
         widget::scrollable(sections)
+            .direction(sidebar_scroll_direction())
             .class(cosmic::style::iced::Scrollable::Minimal)
             .width(Length::Fill)
             .height(Length::Fill),
@@ -3513,21 +3757,6 @@ fn source_control_panel<'a>(
         .width(Length::Fill)
         .height(Length::Fill)
         .into()
-}
-
-/// How many pull requests the panel's own section header prints.
-///
-/// A listing that came back exactly as full as `PULL_REQUEST_LIST_LIMIT`
-/// allowed is a floor, not a count, and nothing downstream can tell the
-/// difference from the `Vec` alone.
-fn pull_request_section_count(project: Option<&SidebarProject>) -> Option<RowCount> {
-    let project = project?;
-    let count = project.display_pull_requests().len();
-    Some(if count >= usize::from(PULL_REQUEST_LIST_LIMIT) {
-        RowCount::at_least(count)
-    } else {
-        RowCount::exact(count)
-    })
 }
 
 /// The parts of one section header row: what it shows, and the single intent
@@ -3650,6 +3879,7 @@ fn files_section<'a>(
     state: &'a SidebarState,
     source: &'a SourceControlModel,
     modal_open: bool,
+    editors: &'a [SidebarEditor],
 ) -> Element<'a, SidebarAction> {
     let spacing = cosmic::theme::spacing();
     let key = &source.key;
@@ -3704,7 +3934,7 @@ fn files_section<'a>(
             state.panel_selection.as_ref(),
             Some(PanelSelection::File(path)) if *path == row.path
         );
-        rows = rows.push(panel_row(
+        let identity = panel_row(
             &*chrome.accessible_name,
             if flat { 0 } else { row.depth },
             widget::row::with_children(vec![
@@ -3728,35 +3958,14 @@ fn files_section<'a>(
             action,
             selected,
             modal_open,
-        ));
+        );
+        rows = rows.push(if row.directory {
+            identity
+        } else {
+            file_context_controls(identity, key, &row.path, editors, modal_open)
+        });
     }
-    let modes = widget::row::with_children(
-        [
-            (
-                "Tree file list",
-                "view-list-tree-symbolic",
-                FileListMode::Tree,
-            ),
-            ("Flat file list", "view-list-symbolic", FileListMode::Flat),
-        ]
-        .into_iter()
-        .map(|(label, icon, mode)| {
-            crate::ui_controls::icon_control(
-                crate::ui_controls::symbolic_icon(icon),
-                label,
-                state.file_list_mode == mode,
-                !modal_open,
-                gated(
-                    SidebarAction::SetFileListMode {
-                        key: key.clone(),
-                        mode,
-                    },
-                    modal_open,
-                ),
-            )
-            .into()
-        }),
-    );
+    let modes = list_mode_controls(key, state.file_list_mode, false, modal_open);
     widget::column::with_children(vec![
         widget::row::with_children(vec![filter.into(), modes.into()])
             .align_y(Alignment::Center)
@@ -3764,6 +3973,7 @@ fn files_section<'a>(
             .into(),
         slot(notice.map(|notice| widget::text::caption(notice).into())),
         widget::scrollable(rows)
+            .direction(sidebar_scroll_direction())
             .class(cosmic::style::iced::Scrollable::Minimal)
             .width(Length::Fill)
             .height(Length::Fill)
@@ -3831,6 +4041,47 @@ fn visible_file_rows<'a>(
     (visible, hidden)
 }
 
+fn list_mode_controls<'a>(
+    key: &ActiveWorktreeKey,
+    selected: FileListMode,
+    changes: bool,
+    modal_open: bool,
+) -> Element<'a, SidebarAction> {
+    widget::row::with_children(
+        [
+            (
+                "Tree file list",
+                "view-list-tree-symbolic",
+                FileListMode::Tree,
+            ),
+            ("Flat file list", "view-list-symbolic", FileListMode::Flat),
+        ]
+        .into_iter()
+        .map(|(label, icon, mode)| {
+            let action = if changes {
+                SidebarAction::SetChangeListMode {
+                    key: key.clone(),
+                    mode,
+                }
+            } else {
+                SidebarAction::SetFileListMode {
+                    key: key.clone(),
+                    mode,
+                }
+            };
+            crate::ui_controls::icon_control(
+                crate::ui_controls::symbolic_icon(icon),
+                label,
+                selected == mode,
+                !modal_open,
+                gated(action, modal_open),
+            )
+            .into()
+        }),
+    )
+    .into()
+}
+
 fn changes_section<'a>(
     state: &'a SidebarState,
     source: &'a SourceControlModel,
@@ -3839,6 +4090,15 @@ fn changes_section<'a>(
     let spacing = cosmic::theme::spacing();
     let mut column =
         widget::column::with_capacity(source.groups().len() + 2).spacing(spacing.space_xxxs);
+    column = column.push(
+        widget::container(list_mode_controls(
+            &source.key,
+            state.change_list_mode,
+            true,
+            modal_open,
+        ))
+        .align_right(Length::Fill),
+    );
     if source.groups().iter().all(ChangeGroup::is_empty) {
         column = column.push(widget::text::caption("No changes in this worktree."));
     }
@@ -3859,32 +4119,62 @@ fn change_group_view<'a>(
     group: &'a ChangeGroup,
     modal_open: bool,
 ) -> Element<'a, SidebarAction> {
-    let spacing = cosmic::theme::spacing();
-    let chrome = &group.chrome;
-    let mut header_children: Vec<Element<'a, SidebarAction>> =
-        vec![design::heading(&*chrome.title).width(Length::Fill).into()];
-    header_children.extend(
-        group_commands(source, group, modal_open)
-            .into_iter()
-            .map(IconCommand::into_element),
-    );
-    let mut column = widget::column::with_capacity(group.visible().len() + 2).spacing(0);
-    column = column.push(
-        widget::container(
-            widget::row::with_children(header_children)
-                .align_y(Alignment::Center)
-                .spacing(0)
-                .height(PANEL_ROW_HEIGHT),
-        )
-        .padding([0, spacing.space_xxxs]),
-    );
-    for row in group.visible() {
-        column = column.push(change_row_view(state, source, group.area, row, modal_open));
+    let flat = state.change_list_mode == FileListMode::Flat;
+    let (tree, tree_hidden) =
+        visible_file_rows(&group.tree, &state.collapsed_directories, "", flat);
+    let visible: Vec<&ChangeRow> = tree
+        .iter()
+        .filter(|row| !row.directory)
+        .filter_map(|file| group.visible_path(&file.path))
+        .collect();
+    let header = widget::container(design::heading(&*group.chrome.title))
+        .width(Length::Fill)
+        .height(PANEL_ROW_HEIGHT)
+        .center_y(PANEL_ROW_HEIGHT);
+    let commands = group_commands(source, group, &visible, modal_open);
+    let actions = widget::container(widget::row::with_children(
+        commands.into_iter().map(IconCommand::into_element),
+    ))
+    .align_right(Length::Fill)
+    .height(PANEL_ROW_HEIGHT);
+    let mut column = widget::column::with_capacity(tree.len() + 2)
+        .spacing(0)
+        .push(RowInteraction::actions(header.into(), actions.into()));
+    for file in tree {
+        if file.directory {
+            let collapsed = state.collapsed_directories.contains(&file.path);
+            column = column.push(panel_row(
+                &*file.chrome.accessible_name,
+                file.depth,
+                widget::row::with_children(vec![
+                    crate::file_icon::folder(!collapsed).into(),
+                    design::body(&*file.chrome.label).into(),
+                ])
+                .spacing(4)
+                .align_y(Alignment::Center),
+                SidebarAction::ToggleDirectory {
+                    key: source.key.clone(),
+                    path: file.path.clone(),
+                },
+                false,
+                modal_open,
+            ));
+        } else if let Some(row) = group.visible_path(&file.path) {
+            column = column.push(change_row_view(
+                state,
+                source,
+                group.area,
+                row,
+                modal_open,
+                if flat { 0 } else { file.depth },
+                !flat,
+            ));
+        }
     }
-    let hidden = group.hidden();
+    let hidden = group.hidden() + tree_hidden;
     if hidden > 0 {
         column = column.push(widget::text::caption(format!(
-            "{hidden} more paths not shown; group actions apply only to the rows above"
+            "{hidden} more rows not shown; group actions apply only to visible files"
         )));
     }
     column.into()
@@ -3896,6 +4186,8 @@ fn change_row_view<'a>(
     area: ChangeArea,
     row: &'a ChangeRow,
     modal_open: bool,
+    depth: usize,
+    tree: bool,
 ) -> Element<'a, SidebarAction> {
     let spacing = cosmic::theme::spacing();
     let chrome = &row.chrome;
@@ -3937,20 +4229,24 @@ fn change_row_view<'a>(
     }
     let identity = panel_row(
         &*chrome.accessible_name,
-        0,
+        depth,
         widget::row::with_children(vec![
             widget::container(crate::file_icon::icon(row.entry.path.as_path()))
                 .center_x(Length::Fixed(ROW_ICON_WIDTH))
                 .into(),
-            design::body(&*chrome.label)
-                .wrapping(cosmic::iced::widget::text::Wrapping::None)
-                .ellipsize(if chrome.ellipsize_start {
-                    cosmic::iced::widget::text::Ellipsize::Start(EllipsizeHeightLimit::Lines(1))
-                } else {
-                    cosmic::iced::widget::text::Ellipsize::End(EllipsizeHeightLimit::Lines(1))
-                })
-                .width(Length::Fill)
-                .into(),
+            design::body(if tree && row.entry.old_path.is_none() {
+                row.entry.path.file_name()
+            } else {
+                Cow::Borrowed(&*chrome.label)
+            })
+            .wrapping(cosmic::iced::widget::text::Wrapping::None)
+            .ellipsize(if chrome.ellipsize_start {
+                cosmic::iced::widget::text::Ellipsize::Start(EllipsizeHeightLimit::Lines(1))
+            } else {
+                cosmic::iced::widget::text::Ellipsize::End(EllipsizeHeightLimit::Lines(1))
+            })
+            .width(Length::Fill)
+            .into(),
             widget::container(status)
                 .align_right(CHANGE_STATUS_WIDTH)
                 .center_y(Length::Fill)
@@ -4051,11 +4347,12 @@ impl<'a> IconCommand<'a> {
 fn group_commands<'a>(
     source: &'a SourceControlModel,
     group: &'a ChangeGroup,
+    visible: &[&ChangeRow],
     modal_open: bool,
 ) -> Vec<IconCommand<'a>> {
     let key = &source.key;
     let chrome = &group.chrome;
-    if source.busy() {
+    if source.busy() || visible.is_empty() {
         return Vec::new();
     }
     let mut commands = Vec::with_capacity(2);
@@ -4066,7 +4363,7 @@ fn group_commands<'a>(
             action: gated(
                 SidebarAction::Unstage {
                     key: key.clone(),
-                    selection: group.visible_selection(),
+                    selection: visible.iter().map(|row| row.selection()).collect(),
                 },
                 modal_open,
             ),
@@ -4079,7 +4376,7 @@ fn group_commands<'a>(
             action: gated(
                 SidebarAction::Stage {
                     key: key.clone(),
-                    selection: group.visible_selection(),
+                    selection: visible.iter().map(|row| row.selection()).collect(),
                 },
                 modal_open,
             ),
@@ -4093,7 +4390,12 @@ fn group_commands<'a>(
             action: gated(
                 SidebarAction::RequestDiscard {
                     key: key.clone(),
-                    request: discard_request(key, group.area, group.visible_selection(), group),
+                    request: discard_request(
+                        key,
+                        group.area,
+                        visible.iter().map(|row| row.selection()).collect(),
+                        group,
+                    ),
                 },
                 modal_open,
             ),
@@ -4165,7 +4467,7 @@ fn discard_request(
     key: &ActiveWorktreeKey,
     area: ChangeArea,
     selection: Vec<PathSelection>,
-    group: &ChangeGroup,
+    _group: &ChangeGroup,
 ) -> DiscardRequest {
     match area {
         // Untracked paths exist nowhere but the worktree, so discarding them
@@ -4173,7 +4475,10 @@ fn discard_request(
         ChangeArea::Untracked => DiscardRequest {
             worktree: key.canonical_path.clone(),
             tracked: Vec::new(),
-            untracked: group.visible_untracked(),
+            untracked: selection
+                .into_iter()
+                .map(|selection| selection.path)
+                .collect(),
             confirmed: false,
         },
         _ => DiscardRequest {
@@ -4483,88 +4788,6 @@ fn history_notice(source: &SourceControlModel) -> Option<&'static str> {
     None
 }
 
-/// Current-branch pull requests first, then the rest of the repository.
-fn pull_requests_section<'a>(
-    state: &'a SidebarState,
-    source: &'a SourceControlModel,
-    project: Option<&'a SidebarProject>,
-    modal_open: bool,
-) -> Element<'a, SidebarAction> {
-    let spacing = cosmic::theme::spacing();
-    let Some(project) = project else {
-        return widget::text::caption("This worktree's project is no longer loaded.").into();
-    };
-    if !project.github_ready && project.display_pull_requests().is_empty() {
-        return widget::text::caption(&project.github_status).into();
-    }
-    let branch = source.branch.as_ref().map(ValidatedBranchName::as_str);
-    let current =
-        |pull_request: &&SidebarPullRequest| branch == Some(pull_request.head_ref.as_str());
-    let has_current = project
-        .display_pull_requests()
-        .iter()
-        .any(|pull_request| current(&pull_request));
-    let mut column = widget::column::with_capacity(project.display_pull_requests().len() + 4)
-        .spacing(spacing.space_xxxs);
-    column = column.push(widget::text::caption(&project.github_status));
-    if project.github_stale {
-        column = column.push(widget::text::caption(
-            "Cached pull requests — stale; not authorized for mutations.",
-        ));
-    }
-    if has_current {
-        column = column.push(design::heading("This branch"));
-        for pull_request in project.display_pull_requests().iter().filter(current) {
-            column = column.push(pull_request_view(
-                project.id,
-                pull_request,
-                state.selection,
-                modal_open,
-            ));
-        }
-    } else if branch.is_some() && project.github_ready {
-        column = column.push(widget::text::caption(
-            "No open pull request for this branch.",
-        ));
-        column = column.push(
-            button::custom(widget::text::caption("Create pull request"))
-                .class(sidebar_button_style(true))
-                .padding([0, spacing.space_xxxs])
-                .height(PANEL_ROW_HEIGHT)
-                .id(source.chrome.create_pull_request_id.clone())
-                .name("Create pull request for this worktree")
-                .on_press_maybe(gated(
-                    SidebarAction::CreatePullRequest {
-                        project_id: source.key.project_id,
-                        worktree: Some(source.key.canonical_path.clone()),
-                    },
-                    modal_open || !project.github_ready,
-                )),
-        );
-    } else {
-        column = column.push(widget::text::caption(
-            "Check out a committed branch to create a pull request.",
-        ));
-    }
-    let mut others = project
-        .display_pull_requests()
-        .iter()
-        .filter(|pull_request| !current(pull_request))
-        .peekable();
-    if others.peek().is_some() {
-        column = column.push(design::heading("Other branches"));
-        for pull_request in others {
-            column = column.push(pull_request_view(
-                project.id,
-                pull_request,
-                state.selection,
-                modal_open,
-            ));
-        }
-    }
-    column.into()
-}
-
 /// One selectable panel row, indented by tree depth.
 ///
 /// A row carries no [`Id`], and none of the lists that build rows may give it
@@ -4729,10 +4952,14 @@ fn sidebar_button_style(selected: bool) -> theme::Button {
         }
         style.text_color = Some(text);
         style.icon_color = Some(text);
-        style.border_radius = 0.0.into();
-        if alpha > 0.0 {
-            let mut hover = foreground;
-            hover.a = alpha;
+        style.border_radius = theme.cosmic().corner_radii.radius_s.into();
+        if selected || alpha > 0.0 {
+            let mut hover: cosmic::iced::Color = if selected {
+                (*theme.cosmic().accent_color()).into()
+            } else {
+                foreground
+            };
+            hover.a = if selected { 0.18 + alpha } else { alpha };
             style.background = Some(cosmic::iced::Background::Color(hover));
         }
         if focused {
@@ -4773,7 +5000,7 @@ fn panel_icon_action<'a>(
             )
             .center(Length::Fill),
         )
-        .class(sidebar_button_style(false))
+        .class(quiet_button_style())
         .id(id)
         .name(label.clone())
         .padding(0)
@@ -4785,6 +5012,26 @@ fn panel_icon_action<'a>(
 }
 
 /// One icon command.
+fn quiet_button_style() -> theme::Button {
+    fn style(focused: bool, theme: &cosmic::Theme) -> button::Style {
+        let mut style = button::Style::new();
+        style.text_color = Some(theme.current_container().on.into());
+        style.icon_color = style.text_color;
+        style.border_radius = theme.cosmic().corner_radii.radius_s.into();
+        if focused {
+            style.border_width = 1.0;
+            style.border_color = (*theme.cosmic().accent_color()).into();
+        }
+        style
+    }
+    theme::Button::Custom {
+        active: Box::new(style),
+        hovered: Box::new(style),
+        pressed: Box::new(style),
+        disabled: Box::new(|theme| style(false, theme)),
+    }
+}
+
 fn icon_action<'a>(
     icon_name: &'static str,
     label: impl Into<Cow<'a, str>>,
@@ -4794,6 +5041,7 @@ fn icon_action<'a>(
     let label = label.into();
     crate::interaction::tooltip(
         button::icon(icon::from_name(icon_name).size(ROW_ICON_SIZE))
+            .class(quiet_button_style())
             .id(id)
             .name(label.clone())
             .width(ICON_CONTROL_SIZE)
@@ -4925,27 +5173,28 @@ fn status_icon<'a>(
     label: &'a str,
     tone: BadgeTone,
 ) -> Element<'a, SidebarAction> {
-    let content =
-        widget::container(widget::icon(crate::ui_controls::symbolic_icon(icon_name)).size(12))
-            .class(theme::Container::custom(move |theme| {
-                let cosmic = theme.cosmic();
-                cosmic::iced::widget::container::Style {
-                    icon_color: Some(match tone {
-                        BadgeTone::Success => cosmic.success.base.into(),
-                        BadgeTone::Warning => cosmic.warning.base.into(),
-                        BadgeTone::Danger => cosmic.destructive.base.into(),
-                        _ => cosmic.on_bg_color().into(),
-                    }),
-                    ..Default::default()
-                }
-            }));
+    let content = widget::container(
+        widget::icon(crate::ui_controls::symbolic_icon(icon_name)).size(ROW_ICON_SIZE),
+    )
+    .class(theme::Container::custom(move |theme| {
+        let cosmic = theme.cosmic();
+        cosmic::iced::widget::container::Style {
+            icon_color: Some(match tone {
+                BadgeTone::Success => cosmic.success.base.into(),
+                BadgeTone::Warning => cosmic.warning.base.into(),
+                BadgeTone::Danger => cosmic.destructive.base.into(),
+                _ => cosmic.on_bg_color().into(),
+            }),
+            ..Default::default()
+        }
+    }));
     crate::interaction::tooltip(content, label)
 }
 
 fn check_indicator(status: CheckStatus) -> Element<'static, SidebarAction> {
     if status == CheckStatus::Pending {
         return crate::interaction::tooltip(
-            widget::progress_bar::circular::Circular::new().size(12.0),
+            widget::progress_bar::circular::Circular::new().size(f32::from(ROW_ICON_SIZE)),
             "CI checks pending or running",
         );
     }
@@ -4964,6 +5213,8 @@ fn check_indicator(status: CheckStatus) -> Element<'static, SidebarAction> {
 struct FilteredProject<'a> {
     project: &'a SidebarProject,
     worktrees: Vec<&'a SidebarWorktree>,
+    editors: &'a [SidebarEditor],
+    state: &'a SidebarState,
 }
 
 /// The projects each density shows. `compact` is the density the caller
@@ -4972,7 +5223,7 @@ struct FilteredProject<'a> {
 /// has an icon control in both densities, so it always applies.
 fn filtered_projects<'a>(
     model: &'a SidebarModel,
-    state: &SidebarState,
+    state: &'a SidebarState,
     compact: bool,
 ) -> Vec<FilteredProject<'a>> {
     let query = if compact {
@@ -4985,7 +5236,7 @@ fn filtered_projects<'a>(
         .iter()
         .filter_map(|project| {
             let project_matches = query.is_empty() || project.matches(&query);
-            let worktrees = project
+            let mut worktrees = project
                 .worktrees
                 .iter()
                 .filter(|worktree| match state.filter {
@@ -4998,13 +5249,45 @@ fn filtered_projects<'a>(
                 })
                 .filter(|worktree| project_matches || worktree.matches(&query))
                 .collect::<Vec<_>>();
+            worktrees.sort_by(|left, right| {
+                let primary =
+                    |row: &SidebarWorktree| is_primary_worktree(&project.repository, &row.path);
+                primary(right)
+                    .cmp(&primary(left))
+                    .then_with(|| {
+                        use crate::settings::WorktreeSort;
+                        match state.worktree_sort {
+                            WorktreeSort::Alphabetical => {
+                                left.chrome.label.cmp(&right.chrome.label)
+                            }
+                            order => match (left.created_at_unix_ms, right.created_at_unix_ms) {
+                                (Some(left), Some(right)) => {
+                                    if order == WorktreeSort::Newest {
+                                        right.cmp(&left)
+                                    } else {
+                                        left.cmp(&right)
+                                    }
+                                }
+                                (Some(_), None) => std::cmp::Ordering::Less,
+                                (None, Some(_)) => std::cmp::Ordering::Greater,
+                                (None, None) => std::cmp::Ordering::Equal,
+                            },
+                        }
+                    })
+                    .then_with(|| left.path.cmp(&right.path))
+            });
             let visible = match state.filter {
                 SidebarFilter::All | SidebarFilter::PullRequests => {
                     project_matches || !worktrees.is_empty()
                 }
                 SidebarFilter::Attention => !worktrees.is_empty(),
             };
-            visible.then_some(FilteredProject { project, worktrees })
+            visible.then_some(FilteredProject {
+                project,
+                worktrees,
+                editors: &model.external_editors,
+                state,
+            })
         })
         .collect()
 }
@@ -5080,9 +5363,32 @@ mod row_interaction {
         keyboard, mouse, window,
     };
     use cosmic::{Element, Renderer, Theme};
+    use std::{cell::Cell, rc::Rc};
+
+    /// One coordinate shared by the list and its groups, refreshed on each widget
+    /// callback, including operations/accessibility before the next draw.
+    #[derive(Clone, Default)]
+    pub(super) struct StickyViewport(Rc<Cell<f32>>);
+
+    fn sticky_header_bounds(group: Rectangle, height: f32, top: f32) -> Rectangle {
+        Rectangle {
+            y: top
+                .max(group.y)
+                .min(group.y + (group.height - height).max(0.0)),
+            height,
+            ..group
+        }
+    }
 
     enum Kind {
-        Projects { ids: Vec<ProjectId>, enabled: bool },
+        Projects {
+            ids: Vec<ProjectId>,
+            enabled: bool,
+            viewport: StickyViewport,
+        },
+        Group {
+            viewport: StickyViewport,
+        },
         Actions,
     }
 
@@ -5093,6 +5399,7 @@ mod row_interaction {
         drop: Option<(Option<ProjectId>, f32)>,
         hovered: bool,
         focused: bool,
+        header_node: Option<layout::Node>,
     }
 
     pub(super) struct RowInteraction<'a> {
@@ -5123,10 +5430,26 @@ mod row_interaction {
             content: Element<'a, SidebarAction>,
             ids: Vec<ProjectId>,
             enabled: bool,
+            viewport: StickyViewport,
         ) -> Element<'a, SidebarAction> {
             Element::new(Self {
                 children: vec![content],
-                kind: Kind::Projects { ids, enabled },
+                kind: Kind::Projects {
+                    ids,
+                    enabled,
+                    viewport,
+                },
+            })
+        }
+
+        pub(super) fn group(
+            header: Element<'a, SidebarAction>,
+            members: Element<'a, SidebarAction>,
+            viewport: StickyViewport,
+        ) -> Element<'a, SidebarAction> {
+            Element::new(Self {
+                children: vec![header, members],
+                kind: Kind::Group { viewport },
             })
         }
 
@@ -5159,16 +5482,22 @@ mod row_interaction {
         }
 
         fn header_at(&self, layout: Layout<'_>, point: Point) -> Option<ProjectId> {
-            let Kind::Projects { ids, enabled: true } = &self.kind else {
+            let Kind::Projects {
+                ids,
+                enabled: true,
+                viewport,
+            } = &self.kind
+            else {
                 return None;
             };
             ids.iter()
                 .zip(layout.children().next()?.children())
                 .find_map(|(id, row)| {
-                    let bounds = row.bounds();
+                    let bounds =
+                        sticky_header_bounds(row.bounds(), PROJECT_HEADER_HEIGHT, viewport.0.get());
                     // Leave expansion and new-worktree buttons as ordinary controls.
                     let header = Rectangle {
-                        x: bounds.x + ICON_CONTROL_SIZE,
+                        x: bounds.x,
                         y: bounds.y,
                         width: (bounds.width - 2.0 * ICON_CONTROL_SIZE).max(0.0),
                         height: PROJECT_HEADER_HEIGHT,
@@ -5178,16 +5507,44 @@ mod row_interaction {
         }
 
         fn drop_at(&self, layout: Layout<'_>, point: Point) -> (Option<ProjectId>, f32) {
-            let Kind::Projects { ids, .. } = &self.kind else {
+            let Kind::Projects { ids, viewport, .. } = &self.kind else {
                 unreachable!();
             };
             for (id, row) in ids.iter().zip(layout.children().next().unwrap().children()) {
-                if point.y < row.bounds().y + PROJECT_HEADER_HEIGHT / 2.0 {
-                    return (Some(*id), row.bounds().y);
+                let header =
+                    sticky_header_bounds(row.bounds(), PROJECT_HEADER_HEIGHT, viewport.0.get());
+                if point.y < header.y + PROJECT_HEADER_HEIGHT / 2.0 {
+                    return (Some(*id), header.y);
                 }
             }
             (None, layout.bounds().y + layout.bounds().height)
         }
+    }
+
+    /// Retain the header's layout node rather than cloning a layout subtree on
+    /// every frame. All widget entrypoints receive this same translated layout;
+    /// the actual header widget, tree, focus and menu state exist only once.
+    fn child_layouts<'a>(
+        kind: &Kind,
+        state: &'a State,
+        layout: Layout<'a>,
+    ) -> impl DoubleEndedIterator<Item = Layout<'a>> + ExactSizeIterator + use<'a> {
+        let top = match kind {
+            Kind::Group { viewport } => Some(viewport.0.get()),
+            _ => None,
+        };
+        layout.children().enumerate().map(move |(index, child)| {
+            let child = if index == 0
+                && let Some(top) = top
+            {
+                let node = state.header_node.as_ref().expect("group has been laid out");
+                let header = sticky_header_bounds(layout.bounds(), node.size().height, top);
+                Layout::with_offset(Vector::new(header.x, header.y), node)
+            } else {
+                child
+            };
+            child.with_virtual_offset(layout.virtual_offset())
+        })
     }
 
     impl Widget<SidebarAction, Theme, Renderer> for RowInteraction<'_> {
@@ -5205,7 +5562,7 @@ mod row_interaction {
 
         fn diff(&mut self, tree: &mut Tree) {
             tree.diff_children(&mut self.children);
-            if let Kind::Projects { ids, enabled } = &self.kind {
+            if let Kind::Projects { ids, enabled, .. } = &self.kind {
                 let state = tree.state.downcast_mut::<State>();
                 if !enabled || state.origin.is_some_and(|(id, _)| !ids.contains(&id)) {
                     *state = State::default();
@@ -5214,7 +5571,11 @@ mod row_interaction {
         }
 
         fn size(&self) -> Size<Length> {
-            self.children[0].as_widget().size()
+            if matches!(self.kind, Kind::Group { .. }) {
+                Size::new(Length::Fill, Length::Shrink)
+            } else {
+                self.children[0].as_widget().size()
+            }
         }
 
         fn layout(
@@ -5228,6 +5589,28 @@ mod row_interaction {
                     .as_widget_mut()
                     .layout(&mut tree.children[0], renderer, limits);
             let size = base.size();
+            if matches!(self.kind, Kind::Group { .. }) {
+                let members = self.children[1]
+                    .as_widget_mut()
+                    .layout(
+                        &mut tree.children[1],
+                        renderer,
+                        &layout::Limits::new(
+                            Size::ZERO,
+                            Size::new(size.width, limits.max().height),
+                        ),
+                    )
+                    .move_to(Point::new(0.0, size.height));
+                let group_size = Size::new(
+                    size.width.max(members.size().width),
+                    size.height + members.size().height,
+                );
+                tree.state.downcast_mut::<State>().header_node = Some(base);
+                return layout::Node::with_children(
+                    group_size,
+                    vec![layout::Node::new(size), members],
+                );
+            }
             let mut nodes = vec![base];
             if self.children.len() == 2 {
                 nodes.push(self.children[1].as_widget_mut().layout(
@@ -5246,13 +5629,22 @@ mod row_interaction {
             renderer: &Renderer,
             operation: &mut dyn Operation,
         ) {
+            if let Kind::Projects { viewport, .. } = &self.kind {
+                viewport
+                    .0
+                    .set(layout.bounds().y + layout.virtual_offset().y);
+            }
             operation.container(None, layout.bounds());
             operation.traverse(&mut |operation| {
-                for ((child, tree), layout) in self
-                    .children
-                    .iter_mut()
-                    .zip(&mut tree.children)
-                    .zip(layout.children())
+                for ((child, tree), layout) in
+                    self.children
+                        .iter_mut()
+                        .zip(&mut tree.children)
+                        .zip(child_layouts(
+                            &self.kind,
+                            tree.state.downcast_ref::<State>(),
+                            layout,
+                        ))
                 {
                     child
                         .as_widget_mut()
@@ -5273,6 +5665,12 @@ mod row_interaction {
             shell: &mut Shell<'_, SidebarAction>,
             viewport: &Rectangle,
         ) {
+            if let Kind::Projects {
+                viewport: sticky, ..
+            } = &self.kind
+            {
+                sticky.0.set(viewport.y);
+            }
             let state = tree.state.downcast_mut::<State>();
             let hovered = cursor.is_over(layout.bounds()) && cursor.is_over(*viewport);
             if hovered != state.hovered {
@@ -5299,7 +5697,11 @@ mod row_interaction {
                                     &Event::Mouse(mouse::Event::ButtonReleased(
                                         mouse::Button::Left,
                                     )),
-                                    layout.children().next().unwrap(),
+                                    layout
+                                        .children()
+                                        .next()
+                                        .unwrap()
+                                        .with_virtual_offset(layout.virtual_offset()),
                                     mouse::Cursor::Unavailable,
                                     renderer,
                                     clipboard,
@@ -5338,7 +5740,11 @@ mod row_interaction {
                             self.children[0].as_widget_mut().update(
                                 &mut tree.children[0],
                                 &Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)),
-                                layout.children().next().unwrap(),
+                                layout
+                                    .children()
+                                    .next()
+                                    .unwrap()
+                                    .with_virtual_offset(layout.virtual_offset()),
                                 mouse::Cursor::Unavailable,
                                 renderer,
                                 clipboard,
@@ -5359,19 +5765,41 @@ mod row_interaction {
                 }
             }
             let show_actions = state.hovered || state.focused;
+            let group = matches!(self.kind, Kind::Group { .. });
+            let header_bounds = child_layouts(&self.kind, state, layout)
+                .next()
+                .unwrap()
+                .bounds();
+            // Members cannot receive pointer/touch events under the pinned header.
+            let members_viewport = if group {
+                let bottom = header_bounds.y + header_bounds.height;
+                Rectangle {
+                    y: viewport.y.max(bottom),
+                    height: (viewport.y + viewport.height - viewport.y.max(bottom)).max(0.0),
+                    ..*viewport
+                }
+            } else {
+                *viewport
+            };
             for (index, ((child, tree), layout)) in self
                 .children
                 .iter_mut()
                 .zip(&mut tree.children)
-                .zip(layout.children())
+                .zip(child_layouts(&self.kind, state, layout))
                 .enumerate()
                 .rev()
             {
-                let cursor = if index == 1 && !show_actions {
-                    mouse::Cursor::Unavailable
+                let viewport = if group && index == 1 {
+                    &members_viewport
                 } else {
-                    cursor
+                    viewport
                 };
+                let cursor =
+                    if (index == 1 && !show_actions && !group) || !cursor.is_over(*viewport) {
+                        mouse::Cursor::Unavailable
+                    } else {
+                        cursor
+                    };
                 child.as_widget_mut().update(
                     tree, event, layout, cursor, renderer, clipboard, shell, viewport,
                 );
@@ -5391,6 +5819,12 @@ mod row_interaction {
             renderer: &Renderer,
         ) -> mouse::Interaction {
             let state = tree.state.downcast_ref::<State>();
+            if let Kind::Projects {
+                viewport: sticky, ..
+            } = &self.kind
+            {
+                sticky.0.set(viewport.y);
+            }
             if state.dragging {
                 return mouse::Interaction::Grabbing;
             }
@@ -5405,11 +5839,28 @@ mod row_interaction {
             self.children
                 .iter()
                 .zip(&tree.children)
-                .zip(layout.children())
-                .map(|((child, tree), layout)| {
-                    child
-                        .as_widget()
-                        .mouse_interaction(tree, layout, cursor, viewport, renderer)
+                .zip(child_layouts(&self.kind, state, layout))
+                .enumerate()
+                .map(|(index, ((child, tree), child_layout))| {
+                    let cursor = if index == 1
+                        && matches!(self.kind, Kind::Group { .. })
+                        && cursor.is_over(
+                            child_layouts(&self.kind, state, layout)
+                                .next()
+                                .unwrap()
+                                .bounds(),
+                        ) {
+                        mouse::Cursor::Unavailable
+                    } else {
+                        cursor
+                    };
+                    child.as_widget().mouse_interaction(
+                        tree,
+                        child_layout,
+                        cursor,
+                        viewport,
+                        renderer,
+                    )
                 })
                 .find(|interaction| *interaction != mouse::Interaction::None)
                 .unwrap_or_default()
@@ -5426,11 +5877,54 @@ mod row_interaction {
             viewport: &Rectangle,
         ) {
             let state = tree.state.downcast_ref::<State>();
+            if let Kind::Projects {
+                viewport: sticky, ..
+            } = &self.kind
+            {
+                sticky.0.set(viewport.y);
+            }
+            if matches!(self.kind, Kind::Group { .. }) {
+                let mut layouts = child_layouts(&self.kind, state, layout);
+                let header = layouts.next().unwrap();
+                let members = layouts.next().unwrap();
+                self.children[1].as_widget().draw(
+                    &tree.children[1],
+                    renderer,
+                    theme,
+                    style,
+                    members,
+                    cursor,
+                    viewport,
+                );
+                if let Some(clip) = header.bounds().intersection(viewport) {
+                    renderer.with_layer(clip, |renderer| {
+                        if header.bounds().y > layout.bounds().y {
+                            renderer.fill_quad(
+                                renderer::Quad {
+                                    bounds: header.bounds(),
+                                    ..Default::default()
+                                },
+                                cosmic::iced::Color::from(theme.cosmic().primary(false).base),
+                            );
+                        }
+                        self.children[0].as_widget().draw(
+                            &tree.children[0],
+                            renderer,
+                            theme,
+                            style,
+                            header,
+                            cursor,
+                            viewport,
+                        );
+                    });
+                }
+                return;
+            }
             for (index, ((child, tree), layout)) in self
                 .children
                 .iter()
                 .zip(&tree.children)
-                .zip(layout.children())
+                .zip(child_layouts(&self.kind, state, layout))
                 .enumerate()
             {
                 if index == 1 && !(state.hovered || state.focused) {
@@ -5478,14 +5972,28 @@ mod row_interaction {
             viewport: &Rectangle,
             translation: Vector,
         ) -> Option<overlay::Element<'a, SidebarAction, Theme, Renderer>> {
-            overlay::from_children(
-                &mut self.children,
-                tree,
-                layout,
-                renderer,
-                viewport,
-                translation,
-            )
+            if let Kind::Projects {
+                viewport: sticky, ..
+            } = &self.kind
+            {
+                sticky.0.set(viewport.y - translation.y);
+            }
+            let overlays = self
+                .children
+                .iter_mut()
+                .zip(&mut tree.children)
+                .zip(child_layouts(
+                    &self.kind,
+                    tree.state.downcast_ref::<State>(),
+                    layout,
+                ))
+                .filter_map(|((child, tree), layout)| {
+                    child
+                        .as_widget_mut()
+                        .overlay(tree, layout, renderer, viewport, translation)
+                })
+                .collect::<Vec<_>>();
+            (!overlays.is_empty()).then(|| overlay::Group::with_children(overlays).overlay())
         }
 
         fn a11y_nodes(
@@ -5494,15 +6002,44 @@ mod row_interaction {
             tree: &Tree,
             cursor: mouse::Cursor,
         ) -> iced_accessibility::A11yTree {
-            iced_accessibility::A11yTree::join(
+            if let Kind::Projects { viewport, .. } = &self.kind {
+                viewport
+                    .0
+                    .set(layout.bounds().y + layout.virtual_offset().y);
+            }
+            let mut accessible = iced_accessibility::A11yTree::join(
                 self.children
                     .iter()
                     .zip(&tree.children)
-                    .zip(layout.children())
+                    .zip(child_layouts(
+                        &self.kind,
+                        tree.state.downcast_ref::<State>(),
+                        layout,
+                    ))
                     .map(|((child, tree), layout)| {
                         child.as_widget().a11y_nodes(layout, tree, cursor)
                     }),
-            )
+            );
+            // libcosmic buttons report content-coordinate bounds; its scrollable
+            // forwards a virtual offset without translating their AccessKit nodes.
+            // Translate once at the list boundary, not per nested decorator.
+            if matches!(self.kind, Kind::Projects { .. }) {
+                let offset = layout.virtual_offset();
+                let translate = |node: &mut iced_accessibility::A11yNode| {
+                    if let Some(bounds) = node.node().bounds() {
+                        node.node_mut()
+                            .set_bounds(iced_accessibility::accesskit::Rect::new(
+                                bounds.x0 - f64::from(offset.x),
+                                bounds.y0 - f64::from(offset.y),
+                                bounds.x1 - f64::from(offset.x),
+                                bounds.y1 - f64::from(offset.y),
+                            ));
+                    }
+                };
+                accessible.root_mut().iter_mut().for_each(translate);
+                accessible.children_mut().iter_mut().for_each(translate);
+            }
+            accessible
         }
 
         fn drag_destinations(
@@ -5512,12 +6049,14 @@ mod row_interaction {
             renderer: &Renderer,
             destinations: &mut cosmic::iced::advanced::clipboard::DndDestinationRectangles,
         ) {
-            for ((child, tree), layout) in self
-                .children
-                .iter()
-                .zip(&tree.children)
-                .zip(layout.children())
-            {
+            if let Kind::Projects { viewport, .. } = &self.kind {
+                viewport
+                    .0
+                    .set(layout.bounds().y + layout.virtual_offset().y);
+            }
+            for ((child, tree), layout) in self.children.iter().zip(&tree.children).zip(
+                child_layouts(&self.kind, tree.state.downcast_ref::<State>(), layout),
+            ) {
                 child
                     .as_widget()
                     .drag_destinations(tree, layout, renderer, destinations);
@@ -5551,6 +6090,7 @@ mod tests {
             &WorktreeRecord {
                 id: WorktreeId::from_uuid(Uuid::from_u128(id)),
                 path: PathBuf::from(format!("/repo/{branch}")),
+                created_at_unix_ms: None,
                 head_oid: None,
                 branch: Some(format!("refs/heads/{branch}")),
                 detached: false,
@@ -5604,6 +6144,130 @@ mod tests {
                 CheckStatus::Failing,
             )],
         )
+    }
+
+    #[test]
+    fn worktree_sort_pins_root_and_uses_creation_evidence_before_stable_import_fallback() {
+        let mut entry = project();
+        let mut root = worktree(10, "main", false);
+        root.path = entry.repository.clone();
+        let mut older = worktree(11, "z-old", false);
+        older.created_at_unix_ms = Some(100);
+        let mut newer = worktree(12, "a-new", false);
+        newer.created_at_unix_ms = Some(200);
+        let imported = worktree(13, "imported", false);
+        entry.worktrees = vec![imported, older, root, newer];
+        let model = SidebarModel::ready(SidebarMode::Expanded, vec![entry]);
+        let mut state = SidebarState::default();
+        let order = |state: &SidebarState| {
+            filtered_projects(&model, state, false)[0]
+                .worktrees
+                .iter()
+                .map(|row| row.id)
+                .collect::<Vec<_>>()
+        };
+        let id = |id| WorktreeId::from_uuid(Uuid::from_u128(id));
+        assert_eq!(order(&state), vec![id(10), id(12), id(11), id(13)]);
+        state.set_worktree_sort(crate::settings::WorktreeSort::Oldest);
+        assert_eq!(order(&state), vec![id(10), id(11), id(12), id(13)]);
+        state.set_worktree_sort(crate::settings::WorktreeSort::Alphabetical);
+        assert_eq!(order(&state), vec![id(10), id(12), id(13), id(11)]);
+    }
+
+    #[test]
+    fn agent_updates_are_explicit_and_acknowledged_per_worktree() {
+        let mut state = SidebarState::default();
+        let project = project_id(1);
+        let worktree = WorktreeId::from_uuid(Uuid::from_u128(2));
+        assert!(!state.has_agent_update(project, worktree));
+        state.observe_agent_update(project, worktree);
+        state.observe_agent_update(project, worktree);
+        state.acknowledge_agent_update(project_id(3), worktree);
+        assert!(state.has_agent_update(project, worktree));
+        state.acknowledge_agent_update(project, worktree);
+        assert!(!state.has_agent_update(project, worktree));
+    }
+
+    #[test]
+    fn working_agents_aggregate_without_clearing_other_agents_or_unread_updates() {
+        use crate::agent::{Activity, ActivityState, Provider};
+        let mut state = SidebarState::default();
+        let project = project_id(1);
+        let worktree = WorktreeId::from_uuid(Uuid::from_u128(2));
+        let other = WorktreeId::from_uuid(Uuid::from_u128(3));
+        let first = CardId::from_uuid(Uuid::from_u128(4));
+        let second = CardId::from_uuid(Uuid::from_u128(5));
+        let activity = |state| Activity {
+            provider: Provider::Omp,
+            state,
+        };
+        state.observe_agent_update(project, worktree);
+        state.set_agent_activity(first, project, worktree, activity(ActivityState::Working));
+        state.set_agent_activity(second, project, worktree, activity(ActivityState::Waiting));
+        assert_eq!(
+            state.agent_activity(project, worktree),
+            Some(ActivityState::Working)
+        );
+        assert_eq!(state.agent_activity(project, other), None);
+        state.set_agent_activity(first, project, worktree, activity(ActivityState::Idle));
+        assert_eq!(
+            state.agent_activity(project, worktree),
+            Some(ActivityState::Waiting)
+        );
+        state.set_agent_activity(second, project, other, activity(ActivityState::Working));
+        assert_eq!(state.agent_activity(project, worktree), None);
+        assert_eq!(
+            state.agent_activity(project, other),
+            Some(ActivityState::Working)
+        );
+        state.clear_agent_activity(second);
+        assert_eq!(state.agent_activity(project, other), None);
+        assert!(state.has_agent_update(project, worktree));
+    }
+
+    #[test]
+    fn group_mutations_never_include_files_hidden_by_the_change_tree() {
+        let mut snapshot = snapshot();
+        let mut renamed = changed(
+            repo_path("keep.rs"),
+            ChangeArea::Unstaged,
+            ChangeKind::Renamed,
+            None,
+        );
+        renamed.old_path = Some(repo_path("old.rs"));
+        snapshot.status.entries = vec![
+            changed(
+                repo_path("src/hidden.rs"),
+                ChangeArea::Unstaged,
+                ChangeKind::Modified,
+                None,
+            ),
+            renamed.clone(),
+            changed(
+                repo_path("keep.rs"),
+                ChangeArea::Staged,
+                ChangeKind::Modified,
+                None,
+            ),
+        ];
+        let source = SourceControlModel::ready(main_key(), &snapshot);
+        let group = source.group(ChangeArea::Unstaged).unwrap();
+        let collapsed = BTreeSet::from([repo_path("src")]);
+        let (tree, _) = visible_file_rows(&group.tree, &collapsed, "", false);
+        let selected = tree
+            .iter()
+            .filter(|row| !row.directory)
+            .filter_map(|row| group.visible_path(&row.path))
+            .collect::<Vec<_>>();
+        let stage = group_commands(&source, group, &selected, false)
+            .into_iter()
+            .find_map(|command| match command.action {
+                Some(SidebarAction::Stage { selection, .. }) => Some(selection),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(stage, vec![PathSelection::from_changed_path(&renamed)]);
+        assert!(group_commands(&source, group, &[], false).is_empty());
     }
 
     #[test]
@@ -5674,8 +6338,12 @@ mod tests {
                 .on_press(SidebarAction::ToggleProject(project_id(id)))
                 .into()
         }));
-        let mut element =
-            RowInteraction::projects(content.into(), vec![project_id(1), project_id(2)], true);
+        let mut element = RowInteraction::projects(
+            content.into(),
+            vec![project_id(1), project_id(2)],
+            true,
+            row_interaction::StickyViewport::default(),
+        );
         let mut tree = Tree::new(&element);
         let viewport = Rectangle::with_size(Size::new(240.0, 2.0 * PROJECT_HEADER_HEIGHT));
         let node = element.as_widget_mut().layout(
@@ -5776,6 +6444,163 @@ mod tests {
     }
 
     #[test]
+    fn sticky_project_headers_share_displayed_hit_focus_and_push_off_bounds() {
+        use cosmic::iced::{
+            Event, Point, Rectangle, Vector,
+            advanced::{Shell, clipboard, widget::operation},
+            keyboard, mouse,
+        };
+        let renderer = headless_renderer();
+        let sticky = row_interaction::StickyViewport::default();
+        let header_id = Id::new("sticky-project-regression-header");
+        let groups = (1..=2).map(|id| {
+            let header = button::custom(widget::text::body("Project"))
+                .id(if id == 1 {
+                    header_id.clone()
+                } else {
+                    Id::unique()
+                })
+                .name(format!("Sticky project {id}"))
+                .width(240)
+                .height(PROJECT_HEADER_HEIGHT)
+                .on_press(SidebarAction::ToggleProject(project_id(id)));
+            let member = button::custom(widget::text::body("Worktree"))
+                .width(240)
+                .height(3.0 * PROJECT_HEADER_HEIGHT)
+                .on_press(SidebarAction::OpenRepositoryPicker);
+            RowInteraction::group(header.into(), member.into(), sticky.clone())
+        });
+        let mut element = RowInteraction::projects(
+            widget::column::with_children(groups).into(),
+            vec![project_id(1), project_id(2)],
+            true,
+            sticky,
+        );
+        let mut tree = Tree::new(&element);
+        let node = element.as_widget_mut().layout(
+            &mut tree,
+            &renderer,
+            &layout::Limits::new(Size::ZERO, Size::new(240.0, 512.0)),
+        );
+        // Use precisely the content-coordinate cursor/viewport and virtual scroll
+        // offset supplied by iced's scrollable, without relying on a prior draw.
+        let at = |offset| Layout::new(&node).with_virtual_offset(Vector::new(0.0, offset));
+        let accessible_bounds = |element: &Element<'_, SidebarAction>, tree: &Tree, offset| {
+            let accessible =
+                element
+                    .as_widget()
+                    .a11y_nodes(at(offset), tree, mouse::Cursor::Unavailable);
+            let bounds = |label| {
+                accessible
+                    .root()
+                    .iter()
+                    .chain(accessible.children())
+                    .find(|node| node.node().label() == Some(label))
+                    .unwrap()
+                    .node()
+                    .bounds()
+                    .unwrap()
+            };
+            (bounds("Sticky project 1"), bounds("Sticky project 2"))
+        };
+        assert_eq!(accessible_bounds(&element, &tree, 64.0).0.y0, 0.0);
+        let pushed = accessible_bounds(&element, &tree, 112.0);
+        assert_eq!((pushed.0.y0, pushed.0.y1, pushed.1.y0), (-16.0, 16.0, 16.0));
+
+        let mut dispatch = |event: Event, offset: f32, point: Point| {
+            let mut messages = Vec::new();
+            element.as_widget_mut().update(
+                &mut tree,
+                &event,
+                at(offset),
+                mouse::Cursor::Available(point),
+                &renderer,
+                &mut clipboard::Null,
+                &mut Shell::new(&mut messages),
+                &Rectangle::new(Point::new(0.0, offset), Size::new(240.0, 96.0)),
+            );
+            messages
+        };
+        for (offset, y, project) in [(64.0, 80.0, 1), (112.0, 120.0, 1), (112.0, 140.0, 2)] {
+            let point = Point::new(100.0, y);
+            assert!(
+                dispatch(
+                    Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)),
+                    offset,
+                    point
+                )
+                .is_empty()
+            );
+            assert_eq!(
+                dispatch(
+                    Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)),
+                    offset,
+                    point
+                ),
+                vec![SidebarAction::ToggleProject(project_id(project))],
+                "the displayed header owns the click, not the worktree underneath",
+            );
+        }
+        let origin = Point::new(100.0, 80.0);
+        let end = Point::new(100.0, 150.0);
+        assert!(
+            dispatch(
+                Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)),
+                64.0,
+                origin
+            )
+            .is_empty()
+        );
+        assert!(
+            dispatch(
+                Event::Mouse(mouse::Event::CursorMoved {
+                    position: Point::new(end.x, end.y - 64.0)
+                }),
+                64.0,
+                end
+            )
+            .is_empty()
+        );
+        assert_eq!(
+            dispatch(
+                Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)),
+                64.0,
+                end
+            ),
+            vec![SidebarAction::ReorderProject {
+                project: project_id(1),
+                before: None
+            }],
+        );
+        element.as_widget_mut().operate(
+            &mut tree,
+            at(64.0),
+            &renderer,
+            &mut operation::focusable::focus::<()>(header_id),
+        );
+        let mut messages = Vec::new();
+        element.as_widget_mut().update(
+            &mut tree,
+            &Event::Keyboard(keyboard::Event::KeyPressed {
+                key: keyboard::Key::Named(keyboard::key::Named::Enter),
+                modified_key: keyboard::Key::Named(keyboard::key::Named::Enter),
+                physical_key: keyboard::key::Physical::Code(keyboard::key::Code::Enter),
+                location: keyboard::Location::Standard,
+                modifiers: keyboard::Modifiers::empty(),
+                text: None,
+                repeat: false,
+            }),
+            at(64.0),
+            mouse::Cursor::Unavailable,
+            &renderer,
+            &mut clipboard::Null,
+            &mut Shell::new(&mut messages),
+            &Rectangle::new(Point::new(0.0, 64.0), Size::new(240.0, 96.0)),
+        );
+        assert_eq!(messages, vec![SidebarAction::ToggleProject(project_id(1))]);
+    }
+
+    #[test]
     fn context_rows_survive_opening_and_closing_a_modal() {
         let row = |modal| {
             context_controls(
@@ -5784,6 +6609,7 @@ mod tests {
                 Some(WorktreeId::from_uuid(Uuid::from_u128(2))),
                 modal,
                 true,
+                &[],
             )
         };
         let initial = row(false);
@@ -5882,16 +6708,15 @@ mod tests {
                         data_state: data_state.clone(),
                         projects,
                         source_control: None,
+                        external_editors: Vec::new(),
                     };
                     for selection in &selections {
                         for controls_expanded in [false, true] {
-                            let mut state = SidebarState {
+                            let state = SidebarState {
                                 controls_expanded,
                                 selection: *selection,
                                 ..SidebarState::default()
                             };
-                            state.apply(&SidebarAction::TogglePullRequests(project_id(1)));
-                            state.apply(&SidebarAction::TogglePullRequests(project_id(4)));
 
                             let element = view(&model, &state, mode, DEFAULT_EXPANDED_WIDTH, false);
                             let mut seen = BTreeSet::new();
@@ -5929,11 +6754,9 @@ mod tests {
         assert!(!state.collapsed_projects.contains(&id));
 
         state.apply(&SidebarAction::ToggleControls);
-        state.apply(&SidebarAction::TogglePullRequests(id));
         state.apply(&SidebarAction::SearchChanged(" Sidebar ".into()));
         state.apply(&SidebarAction::SetFilter(SidebarFilter::Attention));
         assert!(state.controls_expanded());
-        assert!(state.expanded_pull_requests.contains(&id));
         assert_eq!(state.query(), " Sidebar ");
         assert_eq!(state.filter(), SidebarFilter::Attention);
     }
@@ -6443,6 +7266,7 @@ mod tests {
             &WorktreeRecord {
                 id: key.worktree_id,
                 path: key.canonical_path.clone(),
+                created_at_unix_ms: None,
                 head_oid: None,
                 branch: Some(format!("refs/heads/{branch}")),
                 detached: false,
@@ -6687,20 +7511,6 @@ mod tests {
         let key = main_key();
         let mut state = SidebarState::default();
 
-        // `Changes` is what a source-control surface exists for, so it is the
-        // one section that starts open.
-        assert!(state.section_expanded(PanelSection::Changes));
-        for section in [
-            PanelSection::Files,
-            PanelSection::History,
-            PanelSection::PullRequests,
-        ] {
-            assert!(
-                !state.section_expanded(section),
-                "{section:?} starts closed"
-            );
-        }
-
         for section in PanelSection::ALL {
             let before = state.section_expanded(section);
             state.apply(&SidebarAction::ToggleSection {
@@ -6841,32 +7651,19 @@ mod tests {
 
         // The group command acts on exactly the rows the group drew.
         assert_eq!(
-            group_commands(&source, unstaged, false)
-                .into_iter()
-                .next()
-                .and_then(|command| command.action),
+            group_commands(
+                &source,
+                unstaged,
+                &unstaged.visible().iter().collect::<Vec<_>>(),
+                false
+            )
+            .into_iter()
+            .next()
+            .and_then(|command| command.action),
             Some(SidebarAction::Stage {
                 key,
                 selection: unstaged.visible_selection(),
             })
-        );
-    }
-
-    #[test]
-    fn a_conflict_is_staged_to_resolve_it_and_never_unstaged_or_discarded() {
-        let source = source_control();
-        let group = source
-            .group(ChangeArea::Conflict)
-            .expect("the fixture holds an unmerged path");
-        let icons = group_commands(&source, group, false)
-            .into_iter()
-            .map(|command| command.icon)
-            .collect::<Vec<_>>();
-        assert_eq!(
-            icons,
-            vec!["list-add-symbolic"],
-            "an unmerged path is staged to mark it resolved; there is no index side to unstage \
-             from and no clean copy to restore"
         );
     }
 
@@ -6878,7 +7675,13 @@ mod tests {
             .group(ChangeArea::Unstaged)
             .expect("an unstaged group exists");
         assert!(
-            group_commands(&source, group, false).is_empty()
+            group_commands(
+                &source,
+                group,
+                &group.visible().iter().collect::<Vec<_>>(),
+                false
+            )
+            .is_empty()
                 && row_commands(&source, ChangeArea::Unstaged, &group.rows()[0], false).is_empty(),
             "two `git add` runs against one index corrupt each other's lock, so the second is not \
              offered at all"
@@ -6892,13 +7695,18 @@ mod tests {
         let group = source
             .group(ChangeArea::Unstaged)
             .expect("an unstaged group exists");
-        let request = group_commands(&source, group, false)
-            .into_iter()
-            .find_map(|command| match command.action {
-                Some(SidebarAction::RequestDiscard { request, .. }) => Some(request),
-                _ => None,
-            })
-            .expect("the unstaged group offers a discard");
+        let request = group_commands(
+            &source,
+            group,
+            &group.visible().iter().collect::<Vec<_>>(),
+            false,
+        )
+        .into_iter()
+        .find_map(|command| match command.action {
+            Some(SidebarAction::RequestDiscard { request, .. }) => Some(request),
+            _ => None,
+        })
+        .expect("the unstaged group offers a discard");
         assert!(
             !request.confirmed,
             "the surface may never build a confirmed discard: the service refuses an unconfirmed \
@@ -6945,14 +7753,6 @@ mod tests {
             live.iter()
                 .any(|action| matches!(action, SidebarAction::Stage { .. })),
             "the fixture must actually draw the commands this test is about; it published {live:?}"
-        );
-        assert!(
-            live.iter().any(|action| matches!(
-                action,
-                SidebarAction::CreatePullRequest { project_id, worktree: Some(path) }
-                    if *project_id == main_key().project_id && *path == main_key().canonical_path
-            )),
-            "creating a pull request must name the bound worktree, not whichever card has focus"
         );
 
         let gated = frame_enter_presses(&renderer, git_panel(&model, &state, 380.0, true));

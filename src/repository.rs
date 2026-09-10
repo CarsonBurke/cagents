@@ -1128,6 +1128,9 @@ pub struct WorktreeLock {
 pub struct WorktreeRecord {
     pub id: WorktreeId,
     pub path: PathBuf,
+    /// Filesystem birth time when available, never commit time or mtime.
+    #[serde(default)]
+    pub created_at_unix_ms: Option<i64>,
     pub head_oid: Option<String>,
     pub branch: Option<String>,
     pub detached: bool,
@@ -2453,6 +2456,7 @@ pub fn parse_worktree_list(output: &[u8]) -> Result<Vec<WorktreeRecord>, GitPars
                 current = Some(WorktreeRecord {
                     id: stable_worktree_id(&path),
                     path,
+                    created_at_unix_ms: None,
                     head_oid: None,
                     branch: None,
                     detached: false,
@@ -4340,7 +4344,16 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         let output = self.run_checked(&command, cancellation)?;
         let parsed = parse_worktree_list(&output.stdout);
         match parsed {
-            Ok(worktrees) => Ok(worktrees),
+            Ok(mut worktrees) => {
+                for worktree in &mut worktrees {
+                    worktree.created_at_unix_ms = std::fs::metadata(&worktree.path)
+                        .and_then(|metadata| metadata.created())
+                        .ok()
+                        .and_then(|created| created.duration_since(std::time::UNIX_EPOCH).ok())
+                        .and_then(|duration| i64::try_from(duration.as_millis()).ok());
+                }
+                Ok(worktrees)
+            }
             Err(error) => Err(RepositoryError::InvalidGitOutput {
                 error,
                 process: output,

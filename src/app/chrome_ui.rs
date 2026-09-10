@@ -15,11 +15,15 @@ fn chat_icon() -> widget::icon::Handle {
     ICON.clone()
 }
 
-// The full-width title is a focus target, not a pill-shaped toolbar button.
-// The active rail supplies the focus cue without boxing the whole title.
+// Pane titles are flat intrinsic-width tabs, with native keyboard focus cues.
 fn column_title_style() -> cosmic::theme::Button {
-    fn appearance(_: bool, _: &cosmic::Theme) -> widget::button::Style {
-        widget::button::Style::new()
+    fn appearance(focused: bool, theme: &cosmic::Theme) -> widget::button::Style {
+        widget::button::Style {
+            border_radius: 0.0.into(),
+            border_width: if focused { design::BORDER_WIDTH } else { 0.0 },
+            border_color: (*theme.cosmic().accent_color()).into(),
+            ..widget::button::Style::new()
+        }
     }
     cosmic::theme::Button::Custom {
         active: Box::new(appearance),
@@ -51,6 +55,115 @@ fn command<'a>(
 }
 
 impl Cagents {
+    fn native_header<'a>(
+        &'a self,
+        start: Element<'a, Message>,
+        end: Option<Element<'a, Message>>,
+        window_controls: bool,
+    ) -> Element<'a, Message> {
+        let focused = self
+            .core
+            .focus_chain()
+            .iter()
+            .any(|id| Some(*id) == self.core.main_window_id());
+        let mut header = widget::header_bar()
+            .density(cosmic::cosmic_theme::Density::Compact)
+            .focused(focused)
+            .maximized(self.core.window.is_maximized)
+            .sharp_corners(self.core.window.sharp_corners)
+            .start(start)
+            .on_drag(Message::NativeWindowAction(cosmic::app::Action::Drag))
+            .on_double_click(Message::NativeWindowAction(cosmic::app::Action::Maximize))
+            .on_right_click(Message::NativeWindowAction(
+                cosmic::app::Action::ShowWindowMenu,
+            ));
+        if let Some(end) = end {
+            header = header.end(end);
+        }
+        if window_controls {
+            if self.core.window.show_close
+                && let Some(window) = self.core.main_window_id()
+            {
+                header = header.on_close(Message::WindowCloseRequested(window));
+            }
+            if self.core.window.show_maximize && cosmic::config::show_maximize() {
+                header =
+                    header.on_maximize(Message::NativeWindowAction(cosmic::app::Action::Maximize));
+            }
+            if self.core.window.show_minimize && cosmic::config::show_minimize() {
+                header =
+                    header.on_minimize(Message::NativeWindowAction(cosmic::app::Action::Minimize));
+            }
+        }
+        widget::container(header)
+            .center_y(design::HEADER_HEIGHT - design::BORDER_WIDTH)
+            .width(Length::Fill)
+            .class(cosmic::theme::Container::Background)
+            .into()
+    }
+
+    fn sidebar_toggle(&self) -> Element<'_, Message> {
+        crate::ui_controls::icon_control(
+            crate::ui_controls::symbolic_icon("view-split-right-symbolic"),
+            if self.context_inspector_open {
+                "Hide sidebar"
+            } else {
+                "Show sidebar"
+            },
+            self.context_inspector_open,
+            !self.modal_is_open(),
+            (!self.modal_is_open()).then_some(Message::ToggleContextInspector),
+        )
+        .id(context_inspector_toggle_id())
+        .into()
+    }
+
+    fn workspace_header_width(&self) -> f32 {
+        let navigator = if should_show_card_navigator(self.workspace.cards().len()) {
+            110.0
+        } else {
+            0.0
+        };
+        let controls = if self.context_inspector_open {
+            0.0
+        } else {
+            let count = usize::from(self.core.window.show_close)
+                + usize::from(self.core.window.show_maximize && cosmic::config::show_maximize())
+                + usize::from(self.core.window.show_minimize && cosmic::config::show_minimize());
+            count as f32 * 32.0
+                + count.saturating_sub(1) as f32 * cosmic::theme::spacing().space_xxs as f32
+                + design::PRIMARY_CONTROL_SIZE
+                + 12.0
+        };
+        let width = navigator + 2.0 * design::PRIMARY_CONTROL_SIZE + controls + 32.0;
+        if self.workspace.viewport_width() > 0.0 {
+            width.min(self.workspace.viewport_width())
+        } else {
+            width
+        }
+    }
+
+    /// Overlays only the already-reserved header band, never another row.
+    pub(super) fn workspace_chrome<'a>(
+        &'a self,
+        content: Element<'a, Message>,
+    ) -> Element<'a, Message> {
+        let actions = widget::row::with_children(self.workflow_header())
+            .spacing(4)
+            .align_y(Alignment::Center);
+        let header = self.native_header(actions.into(), None, !self.context_inspector_open);
+        let overlay = widget::container(
+            widget::container(header)
+                .width(self.workspace_header_width())
+                .height(design::HEADER_HEIGHT),
+        )
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .align_x(Alignment::End)
+        .align_y(Alignment::Start);
+        crate::interaction::layer(content, overlay.into())
+    }
+
     pub(super) fn workflow_header(&self) -> Vec<Element<'_, Message>> {
         if self.context_inspector_is_overlay() {
             return Vec::new();
@@ -74,6 +187,7 @@ impl Cagents {
             actions.push(
                 widget::container(widget::text::caption(format!("{current} / {total}")))
                     .center_y(ICON_CONTROL_SIZE)
+                    .center_x(42)
                     .into(),
             );
             actions.push(command(
@@ -101,27 +215,23 @@ impl Cagents {
             widget::Id::new("command.new-browser"),
             Some(Message::NewBrowser),
         ));
-        let panel_label = if self.context_inspector_open {
-            "Hide sidebar"
-        } else {
-            "Show sidebar"
-        };
-        actions.push(
-            crate::ui_controls::icon_control(
-                crate::ui_controls::symbolic_icon("view-list-symbolic"),
-                panel_label,
-                self.context_inspector_open,
-                true,
-                Some(Message::ToggleContextInspector),
-            )
-            .id(context_inspector_toggle_id())
-            .into(),
-        );
+        if !self.context_inspector_open {
+            actions.push(self.sidebar_toggle());
+        }
         actions
     }
 
     pub(super) fn column_header(&self, id: CardId, focused: bool) -> Element<'_, Message> {
         let card = self.card_state(id);
+        let header_width = self.workspace.presentation_geometry().card(id).map_or(
+            self.workspace.viewport_width(),
+            |geometry| {
+                let available = self.workspace.viewport_width()
+                    - self.workspace_header_width()
+                    - (geometry.start - self.workspace.camera().offset());
+                available.clamp(0.0, geometry.width())
+            },
+        );
         let title = card.map_or("Column", |card| card.title.as_str());
         let labels = card_kind_labels(card.map(|card| &card.kind));
         let chrome = self.card_chrome.get(&id);
@@ -135,6 +245,7 @@ impl Cagents {
             || workspace_widget::card_focus_id(id),
             |chrome| chrome.focus_id.clone(),
         );
+        let has_file_toolbar = file_toolbar.is_some();
         let mut children = if let Some(toolbar) = file_toolbar {
             vec![
                 command(
@@ -160,7 +271,7 @@ impl Cagents {
                         .ellipsize(iced::widget::text::Ellipsize::End(
                             EllipsizeHeightLimit::Lines(1),
                         ))
-                        .width(Length::Fill)
+                        .width(Length::Shrink)
                         .into(),
                 ])
                 .spacing(8)
@@ -181,14 +292,17 @@ impl Cagents {
             ))
             .class(column_title_style())
             .padding([0, 8])
-            .width(Length::Fill)
+            .width(Length::Shrink)
             .height(Length::Fill)
             .on_press(Message::FocusCard(id));
             let tip = match caption {
                 Some(caption) => format!("{title}\n{caption}"),
                 None => title.to_owned(),
             };
-            vec![tooltip(crate::interaction::hover(title_control), tip)]
+            vec![tooltip(
+                widget::container(title_control).max_width(280),
+                tip,
+            )]
         };
         let status = match self.cards.get(&id) {
             None | Some(CardRuntime::Loading) => Some((labels.starting, true)),
@@ -245,11 +359,30 @@ impl Cagents {
             widget::row::with_children(children)
                 .align_y(Alignment::Center)
                 .height(Length::Fill)
-                .spacing(4),
+                .spacing(4)
+                .width(if has_file_toolbar {
+                    Length::Fill
+                } else {
+                    Length::Shrink
+                }),
         )
         .height(CARD_HEADER_HEIGHT - 1.0)
         .padding([0, 4])
-        .class(cosmic::theme::Container::Primary);
+        .width(if has_file_toolbar {
+            Length::Fill
+        } else {
+            Length::Shrink
+        })
+        .class(cosmic::theme::Container::custom(move |theme| {
+            iced::widget::container::Style {
+                background: Some(iced::Background::Color(if focused {
+                    theme.current_container().component.base.into()
+                } else {
+                    theme.cosmic().background(false).base.into()
+                })),
+                ..Default::default()
+            }
+        }));
         let rail = widget::container(iced::widget::Space::new())
             .height(1)
             .width(Length::Fill)
@@ -263,7 +396,22 @@ impl Cagents {
                     ..Default::default()
                 }
             }));
-        widget::column::with_children(vec![row.into(), rail.into()])
+        let header_row = widget::row::with_children(vec![
+            row.into(),
+            widget::divider::vertical::default().into(),
+            iced::widget::Space::new().width(Length::Fill).into(),
+        ])
+        .height(CARD_HEADER_HEIGHT - 1.0)
+        .spacing(0)
+        .width(header_width);
+        let header_row = widget::container(header_row).width(header_width).clip(true);
+        let header_row = widget::mouse_area(header_row)
+            .on_drag(Message::NativeWindowAction(cosmic::app::Action::Drag))
+            .on_double_press(Message::NativeWindowAction(cosmic::app::Action::Maximize))
+            .on_right_press(Message::NativeWindowAction(
+                cosmic::app::Action::ShowWindowMenu,
+            ));
+        widget::column::with_children(vec![header_row.into(), rail.into()])
             .spacing(0)
             .width(Length::Fill)
             .height(CARD_HEADER_HEIGHT)
@@ -277,35 +425,26 @@ impl Cagents {
     ) -> Element<'_, Message> {
         let tabs = widget::row::with_children(ContextTab::ALL.into_iter().map(|tab| {
             let selected = self.context_tab == tab;
+            let enabled = !self.modal_is_open()
+                && (tab != ContextTab::PullRequest || self.active_workspace.is_some());
             let icon = match tab {
                 ContextTab::Files => "folder-symbolic",
                 ContextTab::Changes => "document-edit-symbolic",
+                ContextTab::PullRequest => "pull-request-symbolic",
                 ContextTab::Details => "dialog-information-symbolic",
             };
             crate::ui_controls::icon_control(
                 crate::ui_controls::symbolic_icon(icon),
                 format!("{} panel tab", tab.label()),
                 selected,
-                !self.modal_is_open(),
-                (!self.modal_is_open()).then_some(Message::SelectContextTab(tab)),
+                enabled,
+                enabled.then_some(Message::SelectContextTab(tab)),
             )
+            .tab(selected)
             .into()
         }))
         .spacing(0);
-        let heading = widget::row::with_children(vec![
-            tabs.into(),
-            iced::widget::Space::new().width(Length::Fill).into(),
-            command(
-                widget::icon::from_name("window-close-symbolic"),
-                "Close sidebar",
-                inspector::close_focus_id(),
-                Some(Message::ContextInspector(InspectorAction::Close)),
-            ),
-        ])
-        .spacing(0)
-        .align_y(Alignment::Center)
-        .width(Length::Fill)
-        .height(design::HEADER_HEIGHT - design::BORDER_WIDTH);
+        let heading = self.native_header(tabs.into(), Some(self.sidebar_toggle()), true);
         let body = match self.context_tab {
             ContextTab::Files => sidebar::file_panel(
                 &self.sidebar_model,
@@ -321,6 +460,7 @@ impl Cagents {
                 self.modal_is_open(),
             )
             .map(Message::Sidebar),
+            ContextTab::PullRequest => self.pull_request_panel(width),
             ContextTab::Details => model.map_or_else(
                 || {
                     widget::container(

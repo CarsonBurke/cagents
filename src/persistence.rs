@@ -1650,7 +1650,7 @@ fn validate_card_conversion(
                 |row| row.get(0),
             )?;
             let session: crate::chat::Session = from_json("chat card", &content)?;
-            let reattach = session.launch.provider == crate::chat::Provider::Codex
+            let reattach = session.launch.provider == crate::agent::Provider::Codex
                 && session.terminal.as_ref().is_some_and(|source| {
                     terminal.id == source.id
                         && terminal.launch == source.launch
@@ -2815,7 +2815,7 @@ mod tests {
         }
     }
 
-    fn agent_workspace(provider: crate::chat::Provider) -> (WorkspaceState, crate::chat::Session) {
+    fn agent_workspace(provider: crate::agent::Provider) -> (WorkspaceState, crate::chat::Session) {
         let mut workspace = workspace_with_terminal(&boot("chat-boot"));
         let CardKind::Terminal(source) = &mut workspace.cards[0].kind else {
             unreachable!()
@@ -2823,7 +2823,7 @@ mod tests {
         let id = "77777777-1111-4111-8111-111111111111";
         source.launch.program = provider.executable().into();
         source.launch.arguments = vec![
-            if provider == crate::chat::Provider::Codex {
+            if provider == crate::agent::Provider::Codex {
                 "resume"
             } else {
                 "--resume"
@@ -2850,7 +2850,7 @@ mod tests {
         let directory = tempdir().unwrap();
         let store =
             StateStore::open(directory.path().join("chat.sqlite3"), boot("chat-boot")).unwrap();
-        let (mut workspace, chat) = agent_workspace(crate::chat::Provider::Omp);
+        let (mut workspace, chat) = agent_workspace(crate::agent::Provider::Omp);
         let mut lane = SaveLane::default();
         lane.save(&store, &workspace).unwrap();
         let terminal_generation = lane.cards.clone();
@@ -2922,7 +2922,7 @@ mod tests {
         let directory = tempdir().unwrap();
         let store =
             StateStore::open(directory.path().join("chat.sqlite3"), boot("chat-boot")).unwrap();
-        let (mut workspace, chat) = agent_workspace(crate::chat::Provider::Codex);
+        let (mut workspace, chat) = agent_workspace(crate::agent::Provider::Codex);
         let mut lane = SaveLane::default();
         lane.save(&store, &workspace).unwrap();
         let mut wrong = chat.clone();
@@ -2965,7 +2965,7 @@ mod tests {
         migrate_to_v1(&transaction).unwrap();
         migrate_to_v2(&transaction).unwrap();
         migrate_to_v3(&transaction).unwrap();
-        let (mut workspace, chat) = agent_workspace(crate::chat::Provider::Omp);
+        let (mut workspace, chat) = agent_workspace(crate::agent::Provider::Omp);
         let mut browser = workspace.cards[0].clone();
         browser.id = CardId::new();
         let url = Url::parse("https://example.com/retained").unwrap();
