@@ -648,7 +648,7 @@ impl<Message> Widget<Message, Theme, Renderer> for Effect<'_, Message> {
                             renderer::Quad {
                                 bounds: layout.bounds(),
                                 border: cosmic::iced::Border {
-                                    radius: crate::design::CONTROL_RADIUS.into(),
+                                    radius: theme.cosmic().corner_radii.radius_s.into(),
                                     ..Default::default()
                                 },
                                 ..Default::default()

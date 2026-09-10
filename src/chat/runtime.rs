@@ -3,6 +3,7 @@ use super::{
     Command, Event, Item, ItemContent, Snapshot,
     protocol::{Adapter, ProcessSpec, Step, TransportSpec},
 };
+use crate::agent::ActivityState;
 use std::{
     collections::{BTreeMap, VecDeque},
     io::{Read, Write},
@@ -29,6 +30,18 @@ const IO_TIMEOUT: Duration = Duration::from_secs(30);
 const PRESENT_INTERVAL: Duration = Duration::from_millis(50);
 type CommandRequest = (Command, crossbeam_channel::Sender<Result<(), String>>);
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Update {
+    Presentation,
+    Observed {
+        generation: u64,
+    },
+    Activity {
+        state: ActivityState,
+        generation: u64,
+    },
+}
+
 #[derive(Clone)]
 pub struct Handle(Arc<Inner>);
 struct Inner {
@@ -36,12 +49,13 @@ struct Inner {
     wake: Mutex<UnixStream>,
     state: Arc<Mutex<Snapshot>>,
     visible: Arc<AtomicBool>,
+    observe_next: Arc<AtomicBool>,
     stop: Arc<AtomicBool>,
     completed: Arc<AtomicBool>,
     failure: Arc<Mutex<Option<String>>>,
     worker: Mutex<Option<JoinHandle<()>>>,
     store: Arc<Mutex<Store>>,
-    notify: Arc<dyn Fn() + Send + Sync>,
+    notify: Arc<dyn Fn(Update) + Send + Sync>,
 }
 impl Handle {
     pub(crate) fn start(
@@ -50,7 +64,7 @@ impl Handle {
         initial: Step,
         store: Store,
         session_id: Option<String>,
-        notify: impl Fn() + Send + Sync + 'static,
+        notify: impl Fn(Update) + Send + Sync + 'static,
     ) -> Result<Self, String> {
         let child = match &spec.transport {
             TransportSpec::JsonLines => {
@@ -81,16 +95,18 @@ impl Handle {
             ..Snapshot::default()
         }));
         let visible = Arc::new(AtomicBool::new(false));
+        let observe_next = Arc::new(AtomicBool::new(true));
         let stop = Arc::new(AtomicBool::new(false));
         let completed = Arc::new(AtomicBool::new(false));
         let failure = Arc::new(Mutex::new(None));
         let store = Arc::new(Mutex::new(store));
-        let notify: Arc<dyn Fn() + Send + Sync> = Arc::new(notify);
+        let notify: Arc<dyn Fn(Update) + Send + Sync> = Arc::new(notify);
         let inner = Arc::new(Inner {
             commands,
             wake: Mutex::new(wake),
             state: state.clone(),
             visible: visible.clone(),
+            observe_next: observe_next.clone(),
             stop: stop.clone(),
             completed: completed.clone(),
             failure: failure.clone(),
@@ -107,6 +123,7 @@ impl Handle {
                     state,
                     store,
                     visible,
+                    observe_next,
                     stop,
                     incoming,
                     wake: reader,
@@ -119,6 +136,7 @@ impl Handle {
                     indices: BTreeMap::new(),
                     retained: 0,
                     dirty: false,
+                    activity: ActivityState::Idle,
                     last_present: Instant::now(),
                     first_frame: false,
                     started: Instant::now(),
@@ -157,9 +175,11 @@ impl Handle {
                     code
                 });
                 actor.apply(Event::Exited { code });
+                actor.publish_activity();
                 completed.store(true, Ordering::Release);
+                actor.observe_update();
                 if actor.visible.load(Ordering::Acquire) {
-                    (actor.notify)();
+                    (actor.notify)(Update::Presentation);
                 }
             })
             .map_err(|e| e.to_string())?;
@@ -178,7 +198,7 @@ impl Handle {
                 .unwrap_or_else(|p| p.into_inner())
                 .generation += 1;
             if self.0.visible.load(Ordering::Acquire) {
-                (self.0.notify)();
+                (self.0.notify)(Update::Presentation);
             }
             return Ok(());
         }
@@ -211,6 +231,13 @@ impl Handle {
     pub fn set_visible(&self, visible: bool) {
         self.0.visible.store(visible, Ordering::Release);
         self.wake();
+    }
+    /// Rearm provider observation and return its current semantic boundary.
+    /// Lock only resident metadata; never hydrate or clone the transcript.
+    pub(crate) fn observe_next_update(&self) -> u64 {
+        let state = self.0.state.lock().unwrap_or_else(|p| p.into_inner());
+        self.0.observe_next.store(true, Ordering::Release);
+        state.generation
     }
     pub fn snapshot(&self, after: Option<u64>) -> Option<Snapshot> {
         let mut store = self.0.store.lock().unwrap_or_else(|p| p.into_inner());
@@ -421,10 +448,11 @@ struct Actor {
     state: Arc<Mutex<Snapshot>>,
     store: Arc<Mutex<Store>>,
     visible: Arc<AtomicBool>,
+    observe_next: Arc<AtomicBool>,
     stop: Arc<AtomicBool>,
     incoming: crossbeam_channel::Receiver<CommandRequest>,
     wake: UnixStream,
-    notify: Arc<dyn Fn() + Send + Sync>,
+    notify: Arc<dyn Fn(Update) + Send + Sync>,
     output: Vec<u8>,
     pending: VecDeque<Vec<u8>>,
     offset: usize,
@@ -433,6 +461,7 @@ struct Actor {
     indices: BTreeMap<String, usize>,
     retained: usize,
     dirty: bool,
+    activity: ActivityState,
     last_present: Instant,
     first_frame: bool,
     started: Instant,
@@ -518,7 +547,7 @@ impl Actor {
                 partial_started = None;
                 self.first_frame = true;
                 let step = self.adapter.receive(frame)?;
-                self.step(step)?;
+                self.provider_step(step)?;
             }
             if self.output.len() > FRAME_LIMIT {
                 return Err("Provider stdout frame exceeds 32 MiB".into());
@@ -569,7 +598,7 @@ impl Actor {
             {
                 self.dirty = false;
                 self.last_present = Instant::now();
-                (self.notify)();
+                (self.notify)(Update::Presentation);
             }
             let mut fds = [
                 libc::pollfd {
@@ -713,6 +742,7 @@ impl Actor {
                             busy: true,
                             detail: "Waiting for provider turn".into(),
                         });
+                        self.publish_activity();
                     }
                 }
                 Err(message) => {
@@ -723,6 +753,24 @@ impl Actor {
                     let _ = reply.send(Err(message));
                 }
             }
+        }
+        Ok(())
+    }
+    fn observe_update(&self) {
+        let state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        let generation = state.generation;
+        let observed = self.observe_next.swap(false, Ordering::AcqRel);
+        // Host acknowledgement takes host -> state. Never notify under state.
+        drop(state);
+        if observed {
+            (self.notify)(Update::Observed { generation });
+        }
+    }
+    fn provider_step(&mut self, step: Step) -> Result<(), String> {
+        let observed = !step.events.is_empty();
+        self.step(step)?;
+        if observed {
+            self.observe_update();
         }
         Ok(())
     }
@@ -773,6 +821,7 @@ impl Actor {
                 return Err(message);
             }
         }
+        self.publish_activity();
         Ok(())
     }
     fn apply(&mut self, event: Event) {
@@ -786,6 +835,19 @@ impl Actor {
         self.retained = counter.0;
         state.generation = state.generation.saturating_add(1);
         self.dirty = true;
+    }
+    fn publish_activity(&mut self) {
+        let state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        let activity = state.activity();
+        let generation = state.generation;
+        drop(state);
+        if activity != self.activity {
+            self.activity = activity;
+            (self.notify)(Update::Activity {
+                state: activity,
+                generation,
+            });
+        }
     }
     fn touch(&mut self) {
         self.state
@@ -873,6 +935,7 @@ fn apply_event(state: &mut Snapshot, indices: &mut BTreeMap<String, usize>, even
             state.has_earlier = false;
             state.detail = reason;
             state.busy = false;
+            state.waiting = false;
             state.error = None;
         }
         Event::Session { id, title } => {
@@ -974,6 +1037,7 @@ fn apply_event(state: &mut Snapshot, indices: &mut BTreeMap<String, usize>, even
             }
         }
         Event::RequestResolved { id } => state.requests.retain(|request| request.id != id),
+        Event::Waiting(waiting) => state.waiting = waiting,
         Event::Status { busy, detail } => {
             state.busy = busy;
             state.detail = detail;
@@ -1005,6 +1069,7 @@ fn apply_event(state: &mut Snapshot, indices: &mut BTreeMap<String, usize>, even
         }
         Event::Exited { .. } => {
             state.exited = true;
+            state.waiting = false;
             state.busy = false;
         }
     }
@@ -1025,6 +1090,53 @@ mod tests {
                 thinking: false,
             },
         }
+    }
+    #[test]
+    fn outstanding_decisions_remain_waiting_after_streaming_stops() {
+        let mut state = Snapshot::default();
+        let mut indices = BTreeMap::new();
+        apply_event(
+            &mut state,
+            &mut indices,
+            Event::Status {
+                busy: true,
+                detail: String::new(),
+            },
+        );
+        assert_eq!(state.activity(), ActivityState::Working);
+        apply_event(
+            &mut state,
+            &mut indices,
+            Event::Request(super::super::Request {
+                id: "approval".into(),
+                title: String::new(),
+                description: String::new(),
+                fields: Vec::new(),
+                actions: Vec::new(),
+            }),
+        );
+        assert_eq!(state.activity(), ActivityState::Waiting);
+        apply_event(
+            &mut state,
+            &mut indices,
+            Event::Status {
+                busy: false,
+                detail: String::new(),
+            },
+        );
+        assert_eq!(state.activity(), ActivityState::Waiting);
+        apply_event(
+            &mut state,
+            &mut indices,
+            Event::RequestResolved {
+                id: "approval".into(),
+            },
+        );
+        assert_eq!(state.activity(), ActivityState::Idle);
+        apply_event(&mut state, &mut indices, Event::Waiting(true));
+        assert_eq!(state.activity(), ActivityState::Waiting);
+        apply_event(&mut state, &mut indices, Event::Exited { code: None });
+        assert_eq!(state.activity(), ActivityState::Unknown);
     }
     #[test]
     fn older_history_cannot_replace_a_live_stream_and_reset_invalidates_identity() {
@@ -1180,26 +1292,86 @@ mod tests {
         let mut initial = adapter.initialize().unwrap();
         let store = preflight(&spec, &mut initial).unwrap();
         let (notify, notified) = crossbeam_channel::bounded(8);
-        let handle = Handle::start(spec, adapter, initial, store, None, move || {
-            let _ = notify.try_send(());
+        let handle = Handle::start(spec, adapter, initial, store, None, move |update| {
+            let _ = notify.try_send(update);
         })
         .unwrap();
-        until(&handle, |snapshot| {
-            snapshot.items == vec![text("echo", "hello")]
-        });
-        assert!(notified.try_recv().is_err());
+        assert!(matches!(
+            notified.recv_timeout(Duration::from_secs(2)).unwrap(),
+            Update::Observed { .. }
+        ));
+        let generation = handle
+            .0
+            .state
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .generation;
         handle.command(Command::Refresh).unwrap();
-        until(&handle, |snapshot| {
-            snapshot.items == vec![text("echo", "hello world")]
-        });
-        assert!(notified.try_recv().is_err());
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while handle
+            .0
+            .state
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .generation
+            < generation + 2
+        {
+            assert!(Instant::now() < deadline, "hidden echo did not arrive");
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(notified.try_recv().is_err(), "hidden deltas must coalesce");
+        // Acknowledging an offscreen pane rearms activity, not presentation.
+        handle.observe_next_update();
+        handle.command(Command::Refresh).unwrap();
+        assert!(matches!(
+            notified.recv_timeout(Duration::from_secs(2)).unwrap(),
+            Update::Observed { .. }
+        ));
+        while handle
+            .0
+            .state
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .generation
+            < generation + 4
+        {
+            assert!(
+                Instant::now() < deadline,
+                "acknowledged echo did not arrive"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            handle
+                .0
+                .state
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .items
+                .is_empty()
+        );
+        assert!(
+            handle
+                .0
+                .store
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .dirty
+        );
         handle.set_visible(true);
-        notified.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert_eq!(
+            notified.recv_timeout(Duration::from_secs(2)).unwrap(),
+            Update::Presentation
+        );
+        assert_eq!(
+            handle.snapshot(None).unwrap().items,
+            vec![text("echo", "hello world world")]
+        );
         handle.close().unwrap();
         assert!(handle.is_completed());
         assert_eq!(
             handle.snapshot(None).unwrap().items,
-            vec![text("echo", "hello world")]
+            vec![text("echo", "hello world world")]
         );
     }
     struct WebSocketFixture;
@@ -1304,14 +1476,25 @@ mod tests {
         let mut initial = adapter.initialize().unwrap();
         let store = preflight(&spec, &mut initial).unwrap();
         let (notify, notified) = crossbeam_channel::bounded(8);
-        let handle = Handle::start(spec, adapter, initial, store, None, move || {
-            let _ = notify.try_send(());
+        let handle = Handle::start(spec, adapter, initial, store, None, move |update| {
+            let _ = notify.try_send(update);
         })
         .unwrap();
         until(&handle, |snapshot| {
             snapshot.busy && snapshot.items == vec![text("echo", "hello")]
         });
         pong_received.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(matches!(
+            notified.recv_timeout(Duration::from_secs(2)).unwrap(),
+            Update::Activity {
+                state: ActivityState::Working,
+                ..
+            }
+        ));
+        assert!(matches!(
+            notified.recv_timeout(Duration::from_secs(2)).unwrap(),
+            Update::Observed { .. }
+        ));
         assert!(notified.try_recv().is_err());
         let attached = handle.clone();
         attached.set_visible(false);
@@ -1319,6 +1502,18 @@ mod tests {
         assert!(!handle.is_completed());
         handle.close().unwrap();
         server.join().unwrap();
+        let transitions: Vec<_> = notified
+            .try_iter()
+            .filter_map(|update| match update {
+                Update::Activity { state, .. } => Some(state),
+                Update::Presentation => panic!("hidden close must not request presentation"),
+                Update::Observed { .. } => None,
+            })
+            .collect();
+        assert_eq!(
+            transitions,
+            vec![ActivityState::Idle, ActivityState::Unknown]
+        );
         let snapshot = handle.snapshot(None).unwrap();
         assert!(snapshot.exited);
         assert!(!snapshot.busy);
@@ -1366,7 +1561,7 @@ mod tests {
         let mut adapter: Box<dyn Adapter> = Box::new(Echo);
         let mut initial = adapter.initialize().unwrap();
         let store = preflight(&spec, &mut initial).unwrap();
-        let handle = Handle::start(spec, adapter, initial, store, None, || {}).unwrap();
+        let handle = Handle::start(spec, adapter, initial, store, None, |_| {}).unwrap();
         let snapshot = until(&handle, |snapshot| snapshot.exited);
         assert!(snapshot.error.is_some());
         assert!(snapshot.items.is_empty());
@@ -1386,7 +1581,7 @@ mod tests {
         };
         let mut initial = Step::default();
         let store = preflight(&spec, &mut initial).unwrap();
-        let handle = Handle::start(spec, Box::new(Echo), initial, store, None, || {}).unwrap();
+        let handle = Handle::start(spec, Box::new(Echo), initial, store, None, |_| {}).unwrap();
         let snapshot = until(&handle, |snapshot| snapshot.exited);
         assert!(
             snapshot

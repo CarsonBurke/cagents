@@ -1,21 +1,25 @@
 use super::*;
-use crate::control::ControlClient;
+use crate::{control::ControlClient, terminal::ipc::TerminalCloseResult};
 
 #[derive(Debug, Clone)]
 pub(super) struct CloseIntent {
     pub card: CardId,
     pub terminal: TerminalId,
     pub proof: HostSessionProof,
+    pub generation: u64,
     pub restore_card: Option<CardId>,
     pub pending: bool,
+    pub active: bool,
+    pub dont_ask_again: bool,
     pub detail: Option<String>,
-    confirm_focused: bool,
+    focus: usize,
     restore_keyboard_nav: bool,
 }
 
 #[derive(Debug, Clone)]
 pub enum CloseOutcome {
     Closed,
+    Active,
     Stale,
     Unreachable(String),
 }
@@ -25,6 +29,12 @@ fn target_matches(intent: &CloseIntent, state: Option<&CardState>) -> bool {
         if session.id == intent.terminal && session.continuity.live_proof().as_ref() == Some(&intent.proof))
 }
 
+fn exited_target_matches(intent: &CloseIntent, state: Option<&CardState>) -> bool {
+    matches!(state, Some(CardState { kind: CardKind::Terminal(session), .. })
+        if session.id == intent.terminal && matches!(session.continuity,
+            TerminalContinuity::Exited { .. } | TerminalContinuity::RelaunchAvailable { last_exit: Some(_), .. }))
+}
+
 impl Cagents {
     pub(super) fn begin_card_close(&mut self, card: CardId) -> Task<Message> {
         if self.terminal_close.is_some() {
@@ -32,7 +42,7 @@ impl Cagents {
         }
         if self.pending_terminal_spawn(card) {
             self.status = Some(TransientNotice::warning(
-                "Terminal is still starting. The card is kept until the daemon supplies its identity; then use Terminate terminal to close it.",
+                "Terminal is still starting. The card is kept until the daemon supplies its identity; then close it again.",
             ));
             return Task::none();
         }
@@ -46,15 +56,25 @@ impl Cagents {
                 .or_else(|| self.uncertain_terminal_proofs.get(&card).cloned())
         {
             self.terminal_close = Some(CloseIntent {
-                card, terminal: session.id, proof,
-                restore_card: self.workspace.focused(), pending: false,
-                detail: self.uncertain_terminal_proofs.contains_key(&card).then(|| "Daemon unreachable; the card is retained. Reconnect before requesting termination.".into()),
-                confirm_focused: false,
+                card,
+                terminal: session.id,
+                proof,
+                generation: 0,
+                restore_card: self.workspace.focused(),
+                pending: false,
+                active: false,
+                dont_ask_again: false,
+                detail: self.uncertain_terminal_proofs.contains_key(&card).then(|| {
+                    "Daemon unreachable; the card is retained. Reconnect before closing.".into()
+                }),
+                focus: 0,
                 restore_keyboard_nav: self.core.keyboard_nav(),
             });
             self.core.set_keyboard_nav(false);
-            return iced::widget::operation::focus(widget::Id::new("dialog.terminal-close.cancel"))
-                .map(cosmic::Action::App);
+            if self.terminal_close.as_ref().unwrap().detail.is_some() {
+                return close_focus(0);
+            }
+            return self.start_terminal_close(!self.settings.confirm_terminal_close);
         }
         self.request_card_removal(card)
     }
@@ -81,6 +101,7 @@ impl Cagents {
     }
 
     pub(super) fn cancel_terminal_close(&mut self) -> Task<Message> {
+        // A close already submitted to the owner cannot be recalled safely.
         if self
             .terminal_close
             .as_ref()
@@ -109,44 +130,71 @@ impl Cagents {
         let Some(intent) = self.terminal_close.as_ref() else {
             return Task::none();
         };
+        if intent.pending || !intent.active || intent.detail.is_some() {
+            return Task::none();
+        }
+        // The opt-out is committed only by Close, never by toggling or Cancel.
+        // Do not persist a stale target's dialog either.
+        if (target_matches(intent, self.card_state(intent.card))
+            || exited_target_matches(intent, self.card_state(intent.card)))
+            && intent.dont_ask_again
+        {
+            let _ = self.apply_setting_input(SettingsField::ConfirmTerminalClose, "false".into());
+            if let Some(error) = &self.settings_save_error {
+                self.status = Some(TransientNotice::warning(format!(
+                    "Could not save terminal close preference: {error}"
+                )));
+            }
+        }
+        self.start_terminal_close(true)
+    }
+
+    fn start_terminal_close(&mut self, allow_active: bool) -> Task<Message> {
+        let Some(intent) = self.terminal_close.as_ref() else {
+            return Task::none();
+        };
         if intent.pending || intent.detail.is_some() {
             return Task::none();
         }
-        let intent = intent.clone();
-        if !target_matches(&intent, self.card_state(intent.card)) {
-            // An exit while the dialog was open permits removing only that same terminal.
-            if matches!(self.card_state(intent.card), Some(CardState { kind: CardKind::Terminal(session), .. })
-                if session.id == intent.terminal && matches!(session.continuity, TerminalContinuity::Exited { .. } | TerminalContinuity::RelaunchAvailable { last_exit: Some(_), .. }))
-            {
+        if !target_matches(intent, self.card_state(intent.card)) {
+            if exited_target_matches(intent, self.card_state(intent.card)) {
+                let intent = self.terminal_close.take().unwrap();
                 self.core.set_keyboard_nav(intent.restore_keyboard_nav);
-                self.terminal_close = None;
                 self.closed_terminal_cards.insert(intent.card);
                 return self.request_card_removal(intent.card);
             }
-            self.terminal_close.as_mut().unwrap().detail = Some(
-                "Stale target: terminal identity or daemon proof changed. Nothing was terminated."
-                    .into(),
-            );
-            return Task::none();
+            self.terminal_close.as_mut().unwrap().detail =
+                Some("Terminal identity or daemon proof changed. Nothing was closed.".into());
+            return close_focus(0);
         }
         if !self.terminal_close_attempts.insert(intent.terminal) {
-            self.terminal_close.as_mut().unwrap().detail = Some("A termination request was already attempted for this terminal. The card is retained until its outcome is known.".into());
-            return Task::none();
+            self.terminal_close.as_mut().unwrap().detail = Some(
+                "A close was already attempted. The card is retained until its outcome is known."
+                    .into(),
+            );
+            return close_focus(0);
         }
-        self.terminal_close.as_mut().unwrap().pending = true;
+        self.terminal_close_generation = self.terminal_close_generation.wrapping_add(1);
+        let intent = self.terminal_close.as_mut().unwrap();
+        intent.pending = true;
+        intent.generation = self.terminal_close_generation;
+        let intent = intent.clone();
         cosmic::task::future(async move {
             let card = intent.card;
             let terminal = intent.terminal;
             let proof = intent.proof.clone();
-            let outcome = tokio::task::spawn_blocking(move || revalidate_and_close(&intent))
-                .await
-                .unwrap_or_else(|error| {
-                    CloseOutcome::Unreachable(format!("Close worker failed: {error}"))
-                });
+            let generation = intent.generation;
+            let outcome =
+                tokio::task::spawn_blocking(move || revalidate_and_close(&intent, allow_active))
+                    .await
+                    .unwrap_or_else(|error| {
+                        CloseOutcome::Unreachable(format!("Close worker failed: {error}"))
+                    });
             Message::TerminalCloseFinished {
                 card,
                 terminal,
                 proof,
+                generation,
                 outcome,
             }
         })
@@ -157,6 +205,7 @@ impl Cagents {
         card: CardId,
         terminal: TerminalId,
         proof: HostSessionProof,
+        generation: u64,
         outcome: CloseOutcome,
     ) -> Task<Message> {
         let Some(intent) = self.terminal_close.as_ref() else {
@@ -166,12 +215,12 @@ impl Cagents {
             || intent.card != card
             || intent.terminal != terminal
             || intent.proof != proof
+            || intent.generation != generation
         {
             return Task::none();
         }
-        let identity_matches = matches!(self.card_state(card), Some(CardState { kind: CardKind::Terminal(session), .. })
-            if session.id == terminal && (session.continuity.live_proof().as_ref() == Some(&proof)
-                || matches!(session.continuity, TerminalContinuity::Exited { .. } | TerminalContinuity::RelaunchAvailable { last_exit: Some(_), .. })));
+        let identity_matches = target_matches(intent, self.card_state(card))
+            || exited_target_matches(intent, self.card_state(card));
         match outcome {
             CloseOutcome::Closed if identity_matches => {
                 self.core.set_keyboard_nav(intent.restore_keyboard_nav);
@@ -179,51 +228,120 @@ impl Cagents {
                 self.closed_terminal_cards.insert(card);
                 self.request_card_removal(card)
             }
+            CloseOutcome::Active if identity_matches => {
+                // The owner positively declined to close: a later explicit Close
+                // may issue a fresh, independently fenced request.
+                self.terminal_close_attempts.remove(&terminal);
+                let intent = self.terminal_close.as_mut().unwrap();
+                intent.pending = false;
+                intent.active = true;
+                intent.focus = 1;
+                close_focus(1)
+            }
             outcome => {
                 let intent = self.terminal_close.as_mut().unwrap();
                 intent.pending = false;
+                intent.focus = 0;
                 intent.detail = Some(match outcome {
-                    CloseOutcome::Closed | CloseOutcome::Stale => "Stale target: terminal identity or daemon proof changed. The card was kept.".into(),
-                    CloseOutcome::Unreachable(error) => format!("Daemon unreachable or close unconfirmed: {error}. The card was kept; no automatic retry will be sent."),
+                    CloseOutcome::Closed | CloseOutcome::Active | CloseOutcome::Stale => {
+                        "Terminal identity or daemon proof changed. The card was kept.".into()
+                    }
+                    CloseOutcome::Unreachable(error) => format!(
+                        "Close unconfirmed: {error}. The card was kept; no automatic retry will be sent."
+                    ),
                 });
-                Task::none()
+                close_focus(0)
             }
         }
     }
 
-    pub(super) fn cycle_terminal_close_focus(&mut self) -> Task<Message> {
+    pub(super) fn cycle_terminal_close_focus(&mut self, backwards: bool) -> Task<Message> {
         let Some(intent) = self.terminal_close.as_mut() else {
             return Task::none();
         };
-        intent.confirm_focused =
-            !intent.confirm_focused && !intent.pending && intent.detail.is_none();
-        iced::widget::operation::focus(widget::Id::new(if intent.confirm_focused {
-            "dialog.terminal-close.confirm"
+        if intent.pending {
+            return Task::none();
+        }
+        intent.focus = if intent.detail.is_some() || !intent.active {
+            0
         } else {
-            "dialog.terminal-close.cancel"
-        }))
-        .map(cosmic::Action::App)
+            (intent.focus + if backwards { 2 } else { 1 }) % 3
+        };
+        close_focus(intent.focus)
     }
 
     pub(super) fn terminal_close_dialog(&self) -> Option<Element<'_, Message>> {
         let intent = self.terminal_close.as_ref()?;
-        Some(super::dialog_ui::surface(widget::column::with_children(vec![
-            widget::text::title3("Terminate terminal?").into(),
-            widget::text::body("This closes the terminal and terminates its running process. Cancel keeps the terminal card.").into(),
-            widget::text::body(intent.detail.as_deref().unwrap_or(if intent.pending { "Revalidating the daemon and requesting termination…" } else { "The terminal identity and daemon proof will be checked again before termination." })).into(),
+        // Idle shells never show an active-process confirmation, even briefly.
+        if !intent.active && intent.detail.is_none() {
+            return None;
+        }
+        let mut rows: Vec<Element<'_, Message>> = vec![
+            widget::text::title3(if intent.detail.is_some() {
+                "Terminal kept open"
+            } else {
+                "Close active processes?"
+            })
+            .into(),
+            widget::text::body(intent.detail.as_deref().unwrap_or(if intent.pending {
+                "Checking terminal identity and closing…"
+            } else {
+                "This terminal has a running program or background jobs. Closing stops them."
+            }))
+            .into(),
+        ];
+        if intent.active && intent.detail.is_none() {
+            rows.push(
+                widget::button::custom(
+                    widget::checkbox(intent.dont_ask_again)
+                        .label("Don't ask me again")
+                        .on_toggle_maybe(
+                            (!intent.pending).then_some(Message::TerminalCloseDontAskChanged),
+                        ),
+                )
+                .class(cosmic::theme::Button::Text)
+                .id(widget::Id::new("dialog.terminal-close.dont-ask"))
+                .on_press_maybe(
+                    (!intent.pending)
+                        .then_some(Message::TerminalCloseDontAskChanged(!intent.dont_ask_again)),
+                )
+                .into(),
+            );
+        }
+        rows.push(
             widget::row::with_children(vec![
-                widget::button::standard(if intent.detail.is_some() { "Keep card" } else { "Cancel" })
+                widget::button::standard("Cancel")
                     .id(widget::Id::new("dialog.terminal-close.cancel"))
-                    .on_press_maybe((!intent.pending).then_some(Message::CancelTerminalClose)).into(),
-                widget::button::destructive("Terminate terminal")
+                    .on_press_maybe((!intent.pending).then_some(Message::CancelTerminalClose))
+                    .into(),
+                widget::button::destructive("Close")
                     .id(widget::Id::new("dialog.terminal-close.confirm"))
-                    .on_press_maybe((!intent.pending && intent.detail.is_none()).then_some(Message::ConfirmTerminalClose)).into(),
-            ]).spacing(8).into(),
-        ]).spacing(12), 560.0))
+                    .on_press_maybe(
+                        (!intent.pending && intent.active && intent.detail.is_none())
+                            .then_some(Message::ConfirmTerminalClose),
+                    )
+                    .into(),
+            ])
+            .spacing(8)
+            .into(),
+        );
+        Some(super::dialog_ui::surface(
+            widget::column::with_children(rows).spacing(12),
+            560.0,
+        ))
     }
 }
 
-fn revalidate_and_close(intent: &CloseIntent) -> CloseOutcome {
+fn close_focus(index: usize) -> Task<Message> {
+    iced::widget::operation::focus(widget::Id::new(match index {
+        1 => "dialog.terminal-close.confirm",
+        2 => "dialog.terminal-close.dont-ask",
+        _ => "dialog.terminal-close.cancel",
+    }))
+    .map(cosmic::Action::App)
+}
+
+fn revalidate_and_close(intent: &CloseIntent, allow_active: bool) -> CloseOutcome {
     let run = || -> Result<CloseOutcome, String> {
         let path = crate::terminal::ipc::daemon_socket_path().map_err(|error| error.to_string())?;
         let mut client = ControlClient::connect(&path).map_err(|error| error.to_string())?;
@@ -245,10 +363,16 @@ fn revalidate_and_close(intent: &CloseIntent) -> CloseOutcome {
             continuity if continuity.live_proof().as_ref() == Some(&intent.proof) => {}
             _ => return Ok(CloseOutcome::Stale),
         }
-        client
-            .close_terminal(intent.terminal)
-            .map_err(|error| error.to_string())?;
-        Ok(CloseOutcome::Closed)
+        Ok(
+            match client
+                .close_terminal_checked(intent.terminal, allow_active)
+                .map_err(|error| error.to_string())?
+            {
+                TerminalCloseResult::Closed => CloseOutcome::Closed,
+                TerminalCloseResult::Active => CloseOutcome::Active,
+                TerminalCloseResult::Unknown(detail) => CloseOutcome::Unreachable(detail),
+            },
+        )
     };
     run().unwrap_or_else(CloseOutcome::Unreachable)
 }

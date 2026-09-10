@@ -32,7 +32,8 @@ use crate::{
 /// Version 4 adds daemon-owned output activity to descriptors and snapshots.
 /// Version 5 adds exact agent recovery identity semantic events.
 /// Version 6 adds parser themes, viewport scrolling, and proof-bound native chat.
-pub const PROTOCOL_VERSION: u16 = 6;
+/// Version 7 adds PTY-owner-checked terminal close decisions.
+pub const PROTOCOL_VERSION: u16 = 7;
 /// Postcard encodes an 80x24 grid in roughly 20 KiB and a typical single-row
 /// delta in a few hundred bytes, but a full repaint of a very large grid after
 /// a resize still has to fit, so keep generous headroom.
@@ -178,6 +179,24 @@ pub enum ClientRequest {
         chat_id: TerminalId,
     },
     ChatList,
+    /// Acknowledge activity without enabling or reading presentation.
+    ChatAcknowledge {
+        chat_id: TerminalId,
+        epoch: u64,
+    },
+    /// Inspects at the PTY owner and closes only when the chosen policy permits.
+    CloseTerminalChecked {
+        terminal_id: TerminalId,
+        allow_active: bool,
+    },
+    /// Rearm hidden output observation without granting presentation credit.
+    TerminalAcknowledge {
+        terminal_id: TerminalId,
+        epoch: u64,
+    },
+    RefreshAgentActivity {
+        terminal_id: TerminalId,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -313,6 +332,24 @@ pub enum ServerMessage {
     ChatChanged {
         chat_id: TerminalId,
     },
+    /// An observed provider update, coalesced until this subscriber acknowledges.
+    /// Unlike ChatChanged, this never authorizes a presentation read.
+    ChatObserved {
+        chat_id: TerminalId,
+        epoch: u64,
+    },
+    /// First actual output in this subscriber's hidden observation epoch.
+    /// This never authorizes a snapshot read or a redraw acknowledgement.
+    TerminalObserved {
+        terminal_id: TerminalId,
+        epoch: u64,
+    },
+    /// Replaceable native work state, independent of presentation and unread ACKs.
+    ChatActivity {
+        chat_id: TerminalId,
+        state: crate::agent::ActivityState,
+        generation: u64,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -355,6 +392,21 @@ pub enum ServerResponse {
         chat_id: TerminalId,
         snapshot: crate::chat::Snapshot,
     },
+    TerminalCloseChecked {
+        terminal_id: TerminalId,
+        outcome: TerminalCloseResult,
+    },
+    AgentActivity {
+        terminal_id: TerminalId,
+        activity: Option<crate::agent::Activity>,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum TerminalCloseResult {
+    Closed,
+    Active,
+    Unknown(String),
 }
 
 pub const SHUTDOWN_VERSION: u16 = 1;
@@ -450,6 +502,7 @@ pub struct TerminalDescriptor {
     pub attached: bool,
     pub transcript: Option<TranscriptMetadata>,
     pub activity: Option<TerminalOutputActivity>,
+    pub agent_activity: Option<crate::agent::Activity>,
 }
 
 impl TerminalDescriptor {
@@ -475,6 +528,7 @@ impl TerminalDescriptor {
             attached: false,
             transcript: None,
             activity: None,
+            agent_activity: None,
         }
     }
 }
@@ -927,6 +981,9 @@ pub enum WireTerminalEvent {
         operation: String,
         message: String,
     },
+    AgentActivityChanged {
+        activity: Option<crate::agent::Activity>,
+    },
 }
 
 impl From<TerminalEvent> for WireTerminalEvent {
@@ -934,6 +991,9 @@ impl From<TerminalEvent> for WireTerminalEvent {
         match value {
             TerminalEvent::TitleChanged(title) => Self::TitleChanged { title },
             TerminalEvent::ResumeHintChanged(hint) => Self::ResumeHintChanged { hint },
+            TerminalEvent::AgentActivityChanged(activity) => {
+                Self::AgentActivityChanged { activity }
+            }
             TerminalEvent::Bell => Self::Bell,
             TerminalEvent::Exited { exit_code, signal } => Self::Exited { exit_code, signal },
             TerminalEvent::Error { operation, message } => Self::Error {
@@ -949,6 +1009,9 @@ impl From<WireTerminalEvent> for TerminalEvent {
         match value {
             WireTerminalEvent::TitleChanged { title } => Self::TitleChanged(title),
             WireTerminalEvent::ResumeHintChanged { hint } => Self::ResumeHintChanged(hint),
+            WireTerminalEvent::AgentActivityChanged { activity } => {
+                Self::AgentActivityChanged(activity)
+            }
             WireTerminalEvent::Bell => Self::Bell,
             WireTerminalEvent::Exited { exit_code, signal } => Self::Exited { exit_code, signal },
             WireTerminalEvent::Error { operation, message } => Self::Error {

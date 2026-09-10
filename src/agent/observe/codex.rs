@@ -1,0 +1,278 @@
+use super::*;
+use serde_json::{Value, json};
+use std::{
+    collections::BTreeSet,
+    io::{self, Read, Write},
+    os::unix::{fs::MetadataExt, net::UnixStream},
+};
+use tungstenite::{
+    Error as WsError, HandshakeError, Message, WebSocket, client::client_with_config,
+    protocol::WebSocketConfig,
+};
+
+pub(super) fn endpoint(recipe: &LaunchRecipe, home: &Path) -> ProbeResult<PathBuf> {
+    let mut endpoint = home.join("app-server-control/app-server-control.sock");
+    let mut args = recipe.arguments.iter();
+    if Provider::is_interpreter(&recipe.program) {
+        args.next();
+    }
+    while let Some(arg) = args.next() {
+        let remote = match arg.as_str() {
+            "--" => break,
+            "--remote" => Some(args.next().ok_or(())?.as_str()),
+            "--sock" => {
+                endpoint = absolute(recipe, args.next().ok_or(())?)?;
+                None
+            }
+            "--remote-auth-token-env" => return Err(()),
+            _ if arg.starts_with("--remote-auth-token-env=") => return Err(()),
+            _ if arg.starts_with("--remote=") => Some(&arg["--remote=".len()..]),
+            _ if Provider::Codex.is_value_option(arg) || Provider::Codex.is_cwd_option(arg) => {
+                args.next().ok_or(())?;
+                None
+            }
+            _ => None,
+        };
+        if let Some(remote) = remote {
+            endpoint = absolute(recipe, remote.strip_prefix("unix://").ok_or(())?)?;
+        }
+    }
+    // An exact endpoint only: no discovery, server startup, TCP or fallback.
+    Ok(endpoint)
+}
+
+/// Bounds even a peer continuously streaming fragments or handshake headers.
+struct Stream {
+    socket: UnixStream,
+    deadline: Instant,
+    received: usize,
+}
+impl Read for Stream {
+    fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
+        if Instant::now() >= self.deadline || self.received >= MAX_BYTES {
+            return Err(io::ErrorKind::TimedOut.into());
+        }
+        let limit = bytes.len().min(MAX_BYTES - self.received);
+        let count = self.socket.read(&mut bytes[..limit])?;
+        self.received += count;
+        Ok(count)
+    }
+}
+impl Write for Stream {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        if Instant::now() >= self.deadline {
+            return Err(io::ErrorKind::TimedOut.into());
+        }
+        self.socket.write(bytes)
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        self.socket.flush()
+    }
+}
+
+struct Client {
+    socket: WebSocket<Stream>,
+    deadline: Instant,
+    next_id: u64,
+}
+
+fn pause(deadline: Instant) -> ProbeResult<()> {
+    if Instant::now() >= deadline {
+        return Err(());
+    }
+    std::thread::sleep(Duration::from_millis(5));
+    Ok(())
+}
+fn blocked(error: &WsError) -> bool {
+    matches!(error, WsError::Io(error) if error.kind() == io::ErrorKind::WouldBlock)
+}
+
+impl Client {
+    fn connect(key: &Key) -> ProbeResult<Self> {
+        let deadline = Instant::now() + TIMEOUT;
+        let metadata = std::fs::metadata(&key.endpoint).map_err(|_| ())?;
+        let stream = Stream {
+            socket: socket::connect(&key.endpoint, metadata.dev(), metadata.ino())
+                .map_err(|_| ())?,
+            deadline,
+            received: 0,
+        };
+        let config = WebSocketConfig::default()
+            .max_message_size(Some(MAX_BYTES))
+            .max_frame_size(Some(MAX_BYTES))
+            .max_write_buffer_size(MAX_BYTES);
+        let mut handshake = client_with_config("ws://localhost/", stream, Some(config));
+        let socket = loop {
+            match handshake {
+                Ok((socket, _)) => break socket,
+                Err(HandshakeError::Interrupted(pending)) => {
+                    pause(deadline)?;
+                    handshake = pending.handshake();
+                }
+                Err(HandshakeError::Failure(_)) => return Err(()),
+            }
+        };
+        Ok(Self {
+            socket,
+            deadline,
+            next_id: 0,
+        })
+    }
+
+    fn send(&mut self, value: Value) -> ProbeResult<()> {
+        if Instant::now() >= self.deadline {
+            return Err(());
+        }
+        // WouldBlock means tungstenite queued the message; never send it twice.
+        match self.socket.send(Message::Text(value.to_string().into())) {
+            Ok(()) => return Ok(()),
+            Err(error) if blocked(&error) => {}
+            Err(_) => return Err(()),
+        }
+        loop {
+            pause(self.deadline)?;
+            match self.socket.flush() {
+                Ok(()) => return Ok(()),
+                Err(error) if blocked(&error) => {}
+                Err(_) => return Err(()),
+            }
+        }
+    }
+
+    fn call(&mut self, method: &str, params: Value) -> ProbeResult<Value> {
+        self.next_id += 1;
+        let id = self.next_id;
+        self.send(json!({"id":id,"method":method,"params":params}))?;
+        loop {
+            if Instant::now() >= self.deadline {
+                return Err(());
+            }
+            match self.socket.read() {
+                Ok(Message::Text(text)) => {
+                    let mut value: Value = serde_json::from_str(&text).map_err(|_| ())?;
+                    if value["id"].as_u64() == Some(id) && value.get("method").is_none() {
+                        if value.get("error").is_some() {
+                            return Err(());
+                        }
+                        return value
+                            .as_object_mut()
+                            .and_then(|object| object.remove("result"))
+                            .ok_or(());
+                    }
+                    // Never answer replayed approvals or subscribe to sessions.
+                }
+                Ok(Message::Ping(_) | Message::Pong(_)) => {}
+                Ok(_) => return Err(()),
+                Err(error) if blocked(&error) => pause(self.deadline)?,
+                Err(_) => return Err(()),
+            }
+        }
+    }
+
+    fn loaded(&mut self) -> ProbeResult<BTreeSet<String>> {
+        let mut ids = BTreeSet::new();
+        let mut cursor: Option<String> = None;
+        let mut cursors = BTreeSet::new();
+        for _ in 0..MAX_ROWS {
+            let result = self.call("thread/loaded/list", json!({"limit":64,"cursor":cursor}))?;
+            let data = result["data"].as_array().ok_or(())?;
+            if data.len() > 64 {
+                return Err(());
+            }
+            for id in data {
+                let id = id.as_str().filter(|id| !id.is_empty()).ok_or(())?;
+                if !ids.insert(id.to_owned()) || ids.len() > MAX_ROWS {
+                    return Err(());
+                }
+            }
+            match result.get("nextCursor") {
+                None | Some(Value::Null) => return Ok(ids),
+                Some(Value::String(next)) if !next.is_empty() && cursors.insert(next.clone()) => {
+                    cursor = Some(next.clone());
+                }
+                _ => return Err(()),
+            }
+        }
+        Err(())
+    }
+}
+
+pub(super) fn census(key: &Key) -> ProbeResult<Census> {
+    let mut client = Client::connect(key)?;
+    let result = client.call("initialize", json!({
+        "clientInfo":{"name":"cagents_activity","title":"cagents worktree activity","version":env!("CARGO_PKG_VERSION")},
+        "capabilities":{"experimentalApi":true}
+    }))?;
+    socket::verify_account(&result, &key.home).map_err(|_| ())?;
+    client.send(json!({"method":"initialized","params":{}}))?;
+    let ids = client.loaded()?;
+    let mut census = Census::new();
+    for id in &ids {
+        let result = client.call("thread/read", json!({"threadId":id,"includeTurns":false}))?;
+        let thread = &result["thread"];
+        if thread["id"].as_str() != Some(id.as_str()) {
+            return Err(());
+        }
+        add(
+            &mut census,
+            thread["cwd"].as_str().ok_or(())?,
+            state(&thread["status"])?,
+        )?;
+    }
+    // Pagination is not an atomic census. Membership changes invalidate this sweep.
+    if client.loaded()? != ids {
+        return Err(());
+    }
+    Ok(census)
+}
+
+fn state(status: &Value) -> ProbeResult<ActivityState> {
+    match status["type"].as_str() {
+        Some("idle") => Ok(ActivityState::Idle),
+        Some("active") => {
+            let flags = status["activeFlags"].as_array().ok_or(())?;
+            let mut waiting = false;
+            for flag in flags {
+                match flag.as_str() {
+                    Some("waitingOnApproval" | "waitingOnUserInput") => waiting = true,
+                    _ => return Err(()),
+                }
+            }
+            Ok(if waiting {
+                ActivityState::Waiting
+            } else {
+                ActivityState::Working
+            })
+        }
+        Some("systemError") => Ok(ActivityState::Unknown),
+        // A loaded ID became unloaded while reading; no complete live census.
+        _ => Err(()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn active_flags_distinguish_work_from_user_wait() {
+        assert_eq!(
+            state(&json!({"type":"active","activeFlags":[]})),
+            Ok(ActivityState::Working)
+        );
+        assert_eq!(
+            state(&json!({"type":"active","activeFlags":["waitingOnApproval"]})),
+            Ok(ActivityState::Waiting)
+        );
+        assert_eq!(
+            state(&json!({"type":"active","activeFlags":["waitingOnUserInput"]})),
+            Ok(ActivityState::Waiting)
+        );
+        assert_eq!(
+            state(&json!({"type":"systemError"})),
+            Ok(ActivityState::Unknown)
+        );
+        assert!(state(&json!({"type":"notLoaded"})).is_err());
+        assert!(state(&json!({"type":"active","activeFlags":["futureFlag"]})).is_err());
+    }
+}

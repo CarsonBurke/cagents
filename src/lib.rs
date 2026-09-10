@@ -1,3 +1,4 @@
+pub mod agent;
 #[cfg(feature = "ui")]
 pub mod app;
 #[cfg(feature = "integrated-browser")]
@@ -13,6 +14,8 @@ pub mod design;
 pub mod diff_view;
 #[cfg(feature = "ui")]
 pub mod editor;
+#[cfg(feature = "ui")]
+pub mod external_editor;
 #[cfg(feature = "ui")]
 pub mod file_icon;
 pub mod fs_safety;

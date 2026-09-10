@@ -11,30 +11,34 @@ pub struct State {
     owners: HashMap<OwnerKey, Option<iced::advanced::image::Handle>>,
     projects: HashMap<ProjectId, OwnerKey>,
     dialog: Option<Dialog>,
-    file_editor: Option<FileEditorDialog>,
+    editors: Vec<crate::external_editor::Editor>,
 }
 
 impl State {
     pub fn modal_open(&self) -> bool {
-        self.dialog.is_some() || self.file_editor.is_some()
+        self.dialog.is_some()
     }
     pub fn deleting(&self) -> bool {
         self.dialog.as_ref().is_some_and(|dialog| dialog.pending)
     }
-}
-
-#[derive(Debug)]
-struct FileEditorDialog {
-    path: PathBuf,
-    editors: Vec<Editor>,
-    loading: bool,
+    pub(super) fn focus_target(&self) -> widget::Id {
+        widget::Id::new(
+            if self
+                .dialog
+                .as_ref()
+                .is_some_and(|dialog| dialog.error.is_some())
+            {
+                "dialog.project.close"
+            } else {
+                "dialog.project.confirm"
+            },
+        )
+    }
 }
 
 #[derive(Debug, Clone)]
 struct Dialog {
     target: Target,
-    editors: Vec<Editor>,
-    delete: bool,
     pending: bool,
     error: Option<String>,
 }
@@ -49,31 +53,13 @@ pub struct Target {
 }
 
 #[derive(Debug, Clone)]
-pub struct Editor {
-    label: &'static str,
-    executable: PathBuf,
-}
-
-#[derive(Debug, Clone)]
 pub enum Action {
-    OpenMenu {
-        project_id: ProjectId,
-        worktree_id: Option<WorktreeId>,
-    },
     Command {
         project_id: ProjectId,
         worktree_id: Option<WorktreeId>,
         command: ProjectCommand,
     },
-    EditorsLoaded {
-        target: Target,
-        editors: Vec<Editor>,
-    },
-    OpenEditor(PathBuf),
-    FileEditorsLoaded {
-        path: PathBuf,
-        editors: Vec<Editor>,
-    },
+    EditorsLoaded(Result<Vec<crate::external_editor::Editor>, String>),
     ConfirmDelete,
     Deleted {
         target: Target,
@@ -88,26 +74,47 @@ pub enum Action {
 }
 
 impl Cagents {
-    pub(super) fn open_file_in_editor(&mut self, path: PathBuf) -> Task<Message> {
+    pub(super) fn editor_discovery_task() -> Task<Message> {
+        cosmic::task::future(async {
+            let result = tokio::task::spawn_blocking(crate::external_editor::installed)
+                .await
+                .map_err(|error| format!("Could not discover installed editors: {error}"));
+            Message::ProjectUi(Action::EditorsLoaded(result))
+        })
+    }
+
+    pub(super) fn open_file_in_editor(
+        &mut self,
+        path: PathBuf,
+        editor_id: String,
+    ) -> Task<Message> {
         if self.modal_is_open() {
             return Task::none();
         }
-        if !path.is_absolute() || !path.is_file() {
-            self.status = Some(TransientNotice::error("The selected file is unavailable."));
+        self.launch_editor(path, &editor_id)
+    }
+
+    fn launch_editor(&mut self, path: PathBuf, editor_id: &str) -> Task<Message> {
+        let Some(editor) = self
+            .project_ui
+            .editors
+            .iter()
+            .find(|editor| editor.choice.id == editor_id)
+            .cloned()
+        else {
+            self.status = Some(TransientNotice::error(
+                "The selected editor is no longer available.",
+            ));
             return Task::none();
-        }
-        self.project_ui.file_editor = Some(FileEditorDialog {
-            path: path.clone(),
-            editors: Vec::new(),
-            loading: true,
-        });
-        let load = cosmic::task::future(async move {
-            let editors = tokio::task::spawn_blocking(installed_editors)
-                .await
-                .unwrap_or_default();
-            Message::ProjectUi(Action::FileEditorsLoaded { path, editors })
-        });
-        Task::batch([load, focus_dialog()])
+        };
+        cosmic::task::future(async move {
+            let result =
+                tokio::task::spawn_blocking(move || crate::external_editor::launch(&editor, &path))
+                    .await
+                    .map_err(|error| error.to_string())
+                    .and_then(|result| result);
+            Message::ProjectUi(Action::Finished(result))
+        })
     }
 
     /// Run after installing RepositoryLoaded's new sidebar model, never in view.
@@ -169,14 +176,20 @@ impl Cagents {
 
     pub(super) fn handle_project_action(&mut self, action: Action) -> Task<Message> {
         match action {
-            Action::FileEditorsLoaded { path, editors } => {
-                if let Some(dialog) = &mut self.project_ui.file_editor
-                    && dialog.path == path
-                {
-                    dialog.editors = editors;
-                    dialog.loading = false;
+            Action::EditorsLoaded(result) => match result {
+                Ok(editors) => {
+                    let choices: Vec<_> =
+                        editors.iter().map(|editor| editor.choice.clone()).collect();
+                    self.sidebar_model.external_editors = choices.clone();
+                    for runtime in self.cards.values_mut() {
+                        if let CardRuntime::Repository(runtime) = runtime {
+                            runtime.set_external_editors(choices.clone());
+                        }
+                    }
+                    self.project_ui.editors = editors;
                 }
-            }
+                Err(error) => self.status = Some(TransientNotice::warning(error)),
+            },
             Action::AvatarLoaded { owner, image } => {
                 for project in &mut self.sidebar_model.projects {
                     if self.project_ui.projects.get(&project.id) == Some(&owner) {
@@ -185,48 +198,11 @@ impl Cagents {
                 }
                 self.project_ui.owners.insert(owner, image);
             }
-            Action::OpenMenu {
-                project_id,
-                worktree_id,
-            } => {
-                if self.modal_is_open() {
-                    return Task::none();
-                }
-                let Some(target) = self.project_target(project_id, worktree_id) else {
-                    return Task::none();
-                };
-                self.project_ui.dialog = Some(Dialog {
-                    target: target.clone(),
-                    editors: Vec::new(),
-                    delete: false,
-                    pending: false,
-                    error: None,
-                });
-                let load = cosmic::task::future(async move {
-                    let editors = tokio::task::spawn_blocking(installed_editors)
-                        .await
-                        .unwrap_or_default();
-                    Message::ProjectUi(Action::EditorsLoaded { target, editors })
-                });
-                return Task::batch([load, focus_dialog()]);
-            }
-            Action::EditorsLoaded { target, editors } => {
-                if let Some(dialog) = &mut self.project_ui.dialog
-                    && dialog.target.project == target.project
-                    && dialog.target.worktree == target.worktree
-                    && dialog.target.path == target.path
-                {
-                    dialog.editors = editors;
-                }
-            }
             Action::Command {
                 project_id,
                 worktree_id,
                 command,
             } => {
-                if self.project_ui.file_editor.is_some() {
-                    return Task::none();
-                }
                 if self.project_ui.deleting()
                     || (self.modal_is_open() && !self.project_ui.modal_open())
                 {
@@ -236,23 +212,18 @@ impl Cagents {
                     return Task::none();
                 };
                 match command {
-                    ProjectCommand::Editors => {
-                        self.project_ui.dialog = None;
-                        return self.handle_project_action(Action::OpenMenu {
-                            project_id,
-                            worktree_id,
-                        });
+                    ProjectCommand::OpenEditor(editor_id) => {
+                        return self.launch_editor(target.path, &editor_id);
                     }
                     ProjectCommand::Delete => {
                         let error = self.worktree_deletion_blocker(&target);
                         self.project_ui.dialog = Some(Dialog {
                             target,
-                            editors: Vec::new(),
-                            delete: true,
                             pending: false,
                             error,
                         });
-                        return focus_dialog();
+                        return iced::widget::operation::focus(self.project_ui.focus_target())
+                            .map(cosmic::Action::App);
                     }
                     ProjectCommand::Reveal => {
                         self.project_ui.dialog = None;
@@ -298,41 +269,11 @@ impl Cagents {
                     }
                 }
             }
-            Action::OpenEditor(executable) => {
-                if let Some(dialog) = &self.project_ui.file_editor {
-                    if !dialog
-                        .editors
-                        .iter()
-                        .any(|editor| editor.executable == executable)
-                    {
-                        return Task::none();
-                    }
-                    let path = dialog.path.clone();
-                    self.project_ui.file_editor = None;
-                    return launch_task(executable, path, true);
-                }
-                let Some(dialog) = &self.project_ui.dialog else {
-                    return Task::none();
-                };
-                if dialog.pending
-                    || dialog.delete
-                    || !dialog
-                        .editors
-                        .iter()
-                        .any(|editor| editor.executable == executable)
-                {
-                    return Task::none();
-                }
-                let path = dialog.target.path.clone();
-                self.project_ui.dialog = None;
-                return launch_task(executable, path, true);
-            }
             Action::Dismiss => {
                 if self.project_ui.deleting() {
                     return Task::none();
                 }
                 self.project_ui.dialog = None;
-                self.project_ui.file_editor = None;
                 let focus = self.nested_modal_focus_target().unwrap_or_else(|| {
                     self.workspace
                         .focused()
@@ -349,7 +290,7 @@ impl Cagents {
                 let Some(dialog) = &self.project_ui.dialog else {
                     return Task::none();
                 };
-                if !dialog.delete || dialog.pending {
+                if dialog.pending {
                     return Task::none();
                 }
                 let target = dialog.target.clone();
@@ -518,125 +459,34 @@ impl Cagents {
     }
 
     pub(super) fn project_dialog_view(&self) -> Option<Element<'_, Message>> {
-        if let Some(dialog) = &self.project_ui.file_editor {
-            let mut content = widget::column::with_capacity(dialog.editors.len() + 4)
-                .spacing(12)
-                .push(widget::text::title3("Open file in editor"))
-                .push(widget::text::body(dialog.path.display().to_string()))
-                .push(
-                    widget::button::standard("Close")
-                        .id(widget::Id::new("dialog.project.close"))
-                        .on_press(Message::ProjectUi(Action::Dismiss)),
-                );
-            if dialog.loading {
-                content = content.push(widget::text::caption("Finding installed editors…"));
-            } else if dialog.editors.is_empty() {
-                content = content.push(widget::text::caption("No supported editor found on PATH (VS Code, VSCodium, Cursor, Zed, Sublime Text)."));
-            }
-            for editor in &dialog.editors {
-                content = content.push(
-                    widget::button::text(format!("Open in {}", editor.label)).on_press(
-                        Message::ProjectUi(Action::OpenEditor(editor.executable.clone())),
-                    ),
-                );
-            }
-            return Some(super::dialog_ui::surface(content, 480.0));
-        }
         let dialog = self.project_ui.dialog.as_ref()?;
         let target = &dialog.target;
-        let mut content = widget::column::with_capacity(12)
+        let mut content = widget::column::with_capacity(8)
             .spacing(12)
-            .push(widget::text::title3(if dialog.delete {
-                "Delete worktree?"
-            } else {
-                "Open in external editor"
-            }))
+            .push(widget::text::title3("Delete worktree?"))
             .push(widget::text::body(&target.label))
             .push(widget::text::caption(target.path.display().to_string()))
-            .push(
-                widget::button::standard(if dialog.delete { "Cancel" } else { "Close" })
-                    .id(widget::Id::new("dialog.project.close"))
-                    .on_press_maybe(
-                        (!dialog.pending).then_some(Message::ProjectUi(Action::Dismiss)),
-                    ),
-            );
-        if dialog.delete {
-            content = content.push(widget::text::body("Git will remove this clean worktree directory. The branch is retained. Primary, locked, dirty, and in-use worktrees are never removed."));
-            if let Some(error) = &dialog.error {
-                content = content.push(widget::text::body(error));
-            }
-            content = content.push(
-                widget::row::with_children(vec![
-                    widget::button::destructive(if dialog.pending {
-                        "Deleting…"
-                    } else {
-                        "Delete worktree"
-                    })
-                    .on_press_maybe(
-                        (!dialog.pending && dialog.error.is_none())
-                            .then_some(Message::ProjectUi(Action::ConfirmDelete)),
-                    )
-                    .into(),
-                ])
-                .spacing(8),
-            );
-        } else {
-            if dialog.editors.is_empty() {
-                content = content.push(widget::text::caption("No supported editor found on PATH (VS Code, VSCodium, Cursor, Zed, Sublime Text)."));
-            }
-            for editor in &dialog.editors {
-                content = content.push(
-                    widget::button::text(format!("Open in {}", editor.label)).on_press(
-                        Message::ProjectUi(Action::OpenEditor(editor.executable.clone())),
-                    ),
-                );
-            }
+            .push(widget::button::standard("Cancel")
+                .id(widget::Id::new("dialog.project.close"))
+                .on_press_maybe((!dialog.pending).then_some(Message::ProjectUi(Action::Dismiss))))
+            .push(widget::text::body("Git will remove this clean worktree directory. The branch is retained. Primary, locked, dirty, and in-use worktrees are never removed."));
+        if let Some(error) = &dialog.error {
+            content = content.push(widget::text::body(error));
         }
+        content = content.push(
+            widget::button::destructive(if dialog.pending {
+                "Deleting…"
+            } else {
+                "Delete worktree"
+            })
+            .id(widget::Id::new("dialog.project.confirm"))
+            .on_press_maybe(
+                (!dialog.pending && dialog.error.is_none())
+                    .then_some(Message::ProjectUi(Action::ConfirmDelete)),
+            ),
+        );
         Some(super::dialog_ui::surface(content, 480.0))
     }
-}
-
-fn focus_dialog() -> Task<Message> {
-    iced::widget::operation::focus(widget::Id::new("dialog.project.close")).map(cosmic::Action::App)
-}
-
-fn installed_editors() -> Vec<Editor> {
-    use std::os::unix::fs::PermissionsExt;
-    let paths = std::env::var_os("PATH")
-        .map(|path| {
-            std::env::split_paths(&path)
-                .filter(|path| path.is_absolute())
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
-    [
-        ("VS Code", "code"),
-        ("VSCodium", "codium"),
-        ("Cursor", "cursor"),
-        ("Zed", "zed"),
-        ("Zed", "zeditor"),
-        ("Sublime Text", "subl"),
-    ]
-    .into_iter()
-    .filter_map(|(label, binary)| {
-        paths
-            .iter()
-            .map(|path| path.join(binary))
-            .find(|path| {
-                path.metadata()
-                    .is_ok_and(|meta| meta.is_file() && meta.permissions().mode() & 0o111 != 0)
-            })
-            .map(|executable| Editor { label, executable })
-    })
-    .fold(Vec::new(), |mut editors, editor| {
-        if !editors
-            .iter()
-            .any(|known: &Editor| known.label == editor.label)
-        {
-            editors.push(editor);
-        }
-        editors
-    })
 }
 
 fn launch_task(executable: PathBuf, path: PathBuf, editor: bool) -> Task<Message> {

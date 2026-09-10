@@ -125,17 +125,27 @@ struct AttachmentState {
     failure: Option<String>,
 }
 
+#[derive(Default)]
+struct OutputObservation {
+    epoch: u64,
+    pending: bool,
+}
+
 struct HostedPublishedState {
     snapshot: ArcSwap<RenderSnapshot>,
     generation: AtomicU64,
     event_sequence: AtomicU64,
     activity: Mutex<Option<crate::model::TerminalOutputActivity>>,
+    agent_activity: Mutex<Option<crate::agent::Activity>>,
+    agent_refresh_pending: AtomicBool,
+    agent_revision: AtomicU64,
     activity_current: AtomicBool,
     acknowledged_generation: AtomicU64,
     acknowledgement_tx: Sender<()>,
     acknowledgement_rx: Receiver<()>,
     wake_pending: AtomicBool,
     semantic_wake_pending: AtomicBool,
+    output_observation: Mutex<OutputObservation>,
     visibility: AtomicU8,
     proof: Mutex<Option<HostSessionProof>>,
     attachment: Mutex<AttachmentState>,
@@ -155,12 +165,16 @@ impl HostedPublishedState {
             generation: AtomicU64::new(0),
             event_sequence: AtomicU64::new(0),
             activity: Mutex::new(None),
+            agent_activity: Mutex::new(None),
+            agent_refresh_pending: AtomicBool::new(false),
+            agent_revision: AtomicU64::new(0),
             activity_current: AtomicBool::new(false),
             acknowledged_generation: AtomicU64::new(0),
             acknowledgement_tx,
             acknowledgement_rx,
             wake_pending: AtomicBool::new(false),
             semantic_wake_pending: AtomicBool::new(false),
+            output_observation: Mutex::new(OutputObservation::default()),
             visibility: AtomicU8::new(Self::visibility_code(if visible {
                 TerminalVisibility::Visible
             } else {
@@ -227,6 +241,25 @@ impl HostedPublishedState {
         if self.activity_current.swap(false, Ordering::AcqRel) {
             self.request_wake(self.generation.load(Ordering::Acquire));
         }
+    }
+
+    fn observe_agent_activity(
+        &self,
+        events: &Sender<TerminalEvent>,
+        observed: Option<crate::agent::Activity>,
+    ) -> Result<(), TrySendError<TerminalEvent>> {
+        let mut current = self
+            .agent_activity
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if *current == observed {
+            return Ok(());
+        }
+        let sent = events.try_send(TerminalEvent::AgentActivityChanged(observed));
+        *current = observed;
+        drop(current);
+        self.request_semantic_wake();
+        sent
     }
 
     /// Resolves an incoming repaint against the snapshot this client already
@@ -298,6 +331,27 @@ impl HostedPublishedState {
                 generation: self.generation.load(Ordering::Acquire),
             });
         }
+    }
+
+    fn observe_output(&self, epoch: u64) {
+        let mut observation = self
+            .output_observation
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if epoch != observation.epoch || observation.pending {
+            return;
+        }
+        observation.pending = true;
+        drop(observation);
+        self.request_semantic_wake();
+    }
+
+    fn take_observed_output(&self) -> bool {
+        let mut observation = self
+            .output_observation
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        std::mem::take(&mut observation.pending)
     }
 
     fn begin_event_drain(&self) {
@@ -457,10 +511,12 @@ enum ClientCommand {
     Scroll(TerminalScroll),
     SetTheme(super::TerminalTheme),
     Visibility(TerminalVisibility),
+    AcknowledgeOutput(u64),
     Hibernate,
     Resume { visible: bool },
     ShutdownTerminal(Sender<()>),
     Stop,
+    RefreshAgentActivity,
 }
 
 impl ClientCommand {
@@ -474,10 +530,12 @@ impl ClientCommand {
             Self::Scroll(_) => "scroll terminal",
             Self::SetTheme(_) => "set terminal theme",
             Self::Visibility(_) => "set terminal visibility",
+            Self::AcknowledgeOutput(_) => "acknowledge terminal output",
             Self::Hibernate => "hibernate terminal",
             Self::Resume { .. } => "resume terminal",
             Self::ShutdownTerminal(_) => "shutdown terminal",
             Self::Stop => "detach terminal",
+            Self::RefreshAgentActivity => "refresh terminal agent activity",
         }
     }
 
@@ -503,6 +561,9 @@ impl ClientCommand {
                 terminal_id,
                 visibility,
             },
+            Self::AcknowledgeOutput(epoch) => {
+                ClientRequest::TerminalAcknowledge { terminal_id, epoch }
+            }
             Self::Hibernate => ClientRequest::Hibernate { terminal_id },
             Self::Resume { visible } => ClientRequest::Resume {
                 terminal_id,
@@ -510,6 +571,7 @@ impl ClientCommand {
             },
             Self::ShutdownTerminal(_) => ClientRequest::ShutdownTerminal { terminal_id },
             Self::Stop => ClientRequest::Detach { terminal_id },
+            Self::RefreshAgentActivity => ClientRequest::RefreshAgentActivity { terminal_id },
         }
     }
 }
@@ -705,12 +767,52 @@ impl HostedTerminalHandle {
         self.inner.published.activity()
     }
 
+    pub fn agent_activity(&self) -> Option<crate::agent::Activity> {
+        *self
+            .inner
+            .published
+            .agent_activity
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+    }
+
+    pub fn refresh_agent_activity(&self) -> Result<(), TerminalSendError> {
+        let pending = &self.inner.published.agent_refresh_pending;
+        if pending.swap(true, Ordering::AcqRel) {
+            return Ok(());
+        }
+        if let Err(error) = self.try_command(ClientCommand::RefreshAgentActivity) {
+            pending.store(false, Ordering::Release);
+            return Err(error);
+        }
+        Ok(())
+    }
+
     pub fn generation(&self) -> u64 {
         self.inner.published.generation.load(Ordering::Acquire)
     }
 
     pub fn acknowledge_redraw(&self, observed_generation: u64) {
         self.inner.published.acknowledge(observed_generation);
+    }
+
+    pub fn take_observed_output(&self) -> bool {
+        self.inner.published.take_observed_output()
+    }
+
+    /// Acknowledge the scope even if this terminal never became onscreen.
+    pub fn acknowledge_updates(&self) -> Result<(), TerminalSendError> {
+        let mut observation = self
+            .inner
+            .published
+            .output_observation
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let epoch = observation.epoch.wrapping_add(1);
+        self.try_command(ClientCommand::AcknowledgeOutput(epoch))?;
+        observation.epoch = epoch;
+        observation.pending = false;
+        Ok(())
     }
 
     pub fn events(&self) -> Receiver<TerminalEvent> {
@@ -836,6 +938,7 @@ enum PendingRequest {
     Command(&'static str),
     Hibernate,
     Shutdown(Sender<()>),
+    AgentActivity(u64),
 }
 /// Returns the per-user daemon socket, starting the sibling `cagentsd` if necessary.
 ///
@@ -1070,6 +1173,10 @@ fn client_loop(
             reconnect_delay = INITIAL_RECONNECT_DELAY;
         });
         published.invalidate_activity();
+        published
+            .agent_refresh_pending
+            .store(false, Ordering::Release);
+        let _ = published.observe_agent_activity(&events, None);
         match end {
             ConnectionEnd::Stop => break,
             ConnectionEnd::Retry => {
@@ -1263,6 +1370,12 @@ fn serve_connection(
                     .find(|terminal| terminal.session.id == terminal_id && terminal.attached)
                 {
                     published.observe_activity(terminal.activity);
+                    if published
+                        .observe_agent_activity(events, terminal.agent_activity)
+                        .is_err()
+                    {
+                        return ConnectionEnd::Retry;
+                    }
                     published.confirm_attachment();
                     did_attach();
                 }
@@ -1346,6 +1459,24 @@ fn serve_connection(
     {
         return ConnectionEnd::Retry;
     }
+    let epoch = published
+        .output_observation
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .epoch;
+    if epoch != 0
+        && send_request(
+            connection.writer(),
+            &proof,
+            &mut next_request_id,
+            &mut pending,
+            PendingRequest::Command("restore terminal output observation"),
+            ClientRequest::TerminalAcknowledge { terminal_id, epoch },
+        )
+        .is_err()
+    {
+        return ConnectionEnd::Retry;
+    }
 
     loop {
         if stop.is_requested() {
@@ -1377,6 +1508,20 @@ fn serve_connection(
             }
             let operation = command.operation();
             let pending_kind = match &command {
+                ClientCommand::RefreshAgentActivity => {
+                    // A reconnect can retain one queued command while a poll
+                    // is racing it; keep only one request on this connection.
+                    if pending
+                        .values()
+                        .any(|kind| matches!(kind, PendingRequest::AgentActivity(_)))
+                    {
+                        continue;
+                    }
+                    published
+                        .agent_refresh_pending
+                        .store(true, Ordering::Release);
+                    PendingRequest::AgentActivity(published.agent_revision.load(Ordering::Acquire))
+                }
                 ClientCommand::Hibernate => PendingRequest::Hibernate,
                 ClientCommand::ShutdownTerminal(completed) => {
                     PendingRequest::Shutdown(completed.clone())
@@ -1459,11 +1604,33 @@ fn serve_connection(
                     return ConnectionEnd::Retry;
                 };
                 match (kind, response) {
+                    (
+                        PendingRequest::AgentActivity(revision),
+                        ServerResponse::AgentActivity {
+                            terminal_id: response_id,
+                            activity,
+                        },
+                    ) if response_id == terminal_id => {
+                        published
+                            .agent_refresh_pending
+                            .store(false, Ordering::Release);
+                        if revision == published.agent_revision.load(Ordering::Acquire)
+                            && published.observe_agent_activity(events, activity).is_err()
+                        {
+                            return ConnectionEnd::Retry;
+                        }
+                    }
                     (PendingRequest::Attach, ServerResponse::Attached { terminal })
                         if terminal.session.id == terminal_id =>
                     {
                         attached = true;
                         published.observe_activity(terminal.activity);
+                        if published
+                            .observe_agent_activity(events, terminal.agent_activity)
+                            .is_err()
+                        {
+                            return ConnectionEnd::Retry;
+                        }
                         if events
                             .try_send(TerminalEvent::ResumeHintChanged(
                                 terminal.session.resume_hint,
@@ -1481,6 +1648,12 @@ fn serve_connection(
                     {
                         attached = true;
                         published.observe_activity(terminal.activity);
+                        if published
+                            .observe_agent_activity(events, terminal.agent_activity)
+                            .is_err()
+                        {
+                            return ConnectionEnd::Retry;
+                        }
                         if events
                             .try_send(TerminalEvent::ResumeHintChanged(
                                 terminal.session.resume_hint,
@@ -1551,6 +1724,15 @@ fn serve_connection(
                 };
                 let mut attachment_failed = false;
                 let operation = match pending.remove(&request_id) {
+                    Some(PendingRequest::AgentActivity(_)) => {
+                        published
+                            .agent_refresh_pending
+                            .store(false, Ordering::Release);
+                        if published.observe_agent_activity(events, None).is_err() {
+                            return ConnectionEnd::Retry;
+                        }
+                        "refresh terminal agent activity"
+                    }
                     Some(PendingRequest::Attach) => {
                         attachment_failed = true;
                         published.mark_detached();
@@ -1584,6 +1766,12 @@ fn serve_connection(
                 if retry {
                     return ConnectionEnd::Retry;
                 }
+            }
+            ServerMessage::TerminalObserved {
+                terminal_id: observed_id,
+                epoch,
+            } if envelope.request_id.is_none() && observed_id == terminal_id => {
+                published.observe_output(epoch);
             }
             ServerMessage::Redraw {
                 terminal_id: redraw_id,
@@ -1722,7 +1910,24 @@ fn accept_server_event(
     if sequence <= published.event_sequence.load(Ordering::Acquire) {
         return Ok(());
     }
-    events.try_send(event)?;
+    match event {
+        TerminalEvent::AgentActivityChanged(activity) => {
+            published.agent_revision.fetch_add(1, Ordering::AcqRel);
+            published.observe_agent_activity(events, activity)?;
+        }
+        event => {
+            if matches!(
+                event,
+                TerminalEvent::ResumeHintChanged(_)
+                    | TerminalEvent::Exited { .. }
+                    | TerminalEvent::Error { .. }
+            ) {
+                published.agent_revision.fetch_add(1, Ordering::AcqRel);
+                published.observe_agent_activity(events, None)?;
+            }
+            events.try_send(event)?;
+        }
+    }
     published.event_sequence.store(sequence, Ordering::Release);
     published.request_semantic_wake();
     Ok(())
@@ -1813,6 +2018,92 @@ mod tests {
             }),
         );
         (published, wake_count)
+    }
+
+    #[test]
+    fn hidden_agent_activity_coalesces_and_clears_without_presentation_credit() {
+        use crate::agent::{Activity, ActivityState, Provider};
+        let (published, wakes) = published_state(false);
+        let (events, received) = crossbeam_channel::bounded(4);
+        let working = Some(Activity {
+            provider: Provider::Omp,
+            state: ActivityState::Working,
+        });
+        published.observe_agent_activity(&events, working).unwrap();
+        published.observe_agent_activity(&events, working).unwrap();
+        assert_eq!(
+            received.try_recv().unwrap(),
+            TerminalEvent::AgentActivityChanged(working)
+        );
+        assert!(received.try_recv().is_err());
+        assert_eq!(wakes.load(Ordering::Relaxed), 1);
+        published.begin_event_drain();
+        published.observe_agent_activity(&events, None).unwrap();
+        assert_eq!(
+            received.try_recv().unwrap(),
+            TerminalEvent::AgentActivityChanged(None)
+        );
+        assert_eq!(wakes.load(Ordering::Relaxed), 2);
+        assert_eq!(published.snapshot_cursor(), u64::MAX);
+        assert_eq!(published.acknowledged_generation.load(Ordering::Acquire), 0);
+        assert!(published.acknowledgement_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn failed_activity_delivery_retains_clear_for_state_reconciliation() {
+        use crate::agent::{Activity, ActivityState, Provider};
+        let (published, _) = published_state(false);
+        let (events, _) = crossbeam_channel::bounded(1);
+        *published.agent_activity.lock().unwrap() = Some(Activity {
+            provider: Provider::Codex,
+            state: ActivityState::Working,
+        });
+        assert!(published.observe_agent_activity(&events, None).is_err());
+        assert_eq!(*published.agent_activity.lock().unwrap(), None);
+    }
+
+    #[test]
+    fn hidden_output_observation_ignores_history_and_stale_epochs_without_visual_credit() {
+        let (published, wakes) = published_state(false);
+        published.observe_activity(Some(crate::model::TerminalOutputActivity {
+            sequence: 8,
+            last_output_at_unix_ms: 100,
+        }));
+        assert!(
+            !published.take_observed_output(),
+            "attach history is not new output"
+        );
+        assert_eq!(wakes.load(Ordering::Relaxed), 0);
+        published.observe_output(0);
+        published.observe_output(0);
+        assert_eq!(wakes.load(Ordering::Relaxed), 1);
+        assert!(
+            published.take_observed_output(),
+            "the first hidden output must be delivered"
+        );
+        assert!(!published.take_observed_output());
+        published
+            .output_observation
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .epoch = 1;
+        published.begin_event_drain();
+        published.observe_output(0);
+        assert!(
+            !published.take_observed_output(),
+            "an in-flight old scope notification is stale"
+        );
+        assert_eq!(wakes.load(Ordering::Relaxed), 1);
+        published.observe_output(1);
+        assert!(
+            published.take_observed_output(),
+            "acknowledgement rearms an offscreen surface"
+        );
+        assert_eq!(wakes.load(Ordering::Relaxed), 2);
+        assert_eq!(published.generation.load(Ordering::Acquire), 0);
+        assert_eq!(published.acknowledged_generation.load(Ordering::Acquire), 0);
+        assert!(published.acknowledgement_rx.try_recv().is_err());
+        assert_eq!(published.snapshot_cursor(), u64::MAX);
     }
 
     #[test]
@@ -2006,6 +2297,7 @@ mod tests {
                 generation: 0,
                 event_sequence: 0,
                 activity: None,
+                agent_activity: None,
                 oldest_event_sequence: 1,
                 attached: true,
                 transcript: None,
@@ -2474,6 +2766,7 @@ mod tests {
                         generation: 0,
                         event_sequence: 0,
                         activity: None,
+                        agent_activity: None,
                         oldest_event_sequence: 1,
                         attached: true,
                         transcript: None,

@@ -64,6 +64,7 @@ pub enum TerminalEvent {
         operation: &'static str,
         message: String,
     },
+    AgentActivityChanged(Option<crate::agent::Activity>),
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]

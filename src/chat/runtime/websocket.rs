@@ -1,13 +1,9 @@
 //! Codex's existing shared daemon speaks WebSocket text messages over its Unix socket.
 use super::*;
-use std::{
-    io,
-    os::{
-        fd::FromRawFd,
-        unix::fs::{FileTypeExt, MetadataExt},
-    },
-    path::Path,
-};
+use crate::agent::observe::socket::connect;
+#[cfg(test)]
+use std::os::unix::fs::MetadataExt;
+use std::{io, path::Path};
 use tungstenite::{
     Error as WsError, HandshakeError, Message,
     client::client_with_config,
@@ -119,65 +115,6 @@ impl ReadProgress {
     fn partial_started(&self) -> Option<Instant> {
         self.message_started.or(self.frame_started)
     }
-}
-
-fn verify_socket(path: &Path, device: u64, inode: u64) -> Result<(), String> {
-    let metadata = std::fs::metadata(path).map_err(|error| {
-        format!(
-            "Cannot verify exact Codex socket {}: {error}",
-            path.display()
-        )
-    })?;
-    if !metadata.file_type().is_socket() || metadata.dev() != device || metadata.ino() != inode {
-        return Err(
-            "Codex socket identity changed; reconnect explicitly without selecting another daemon"
-                .into(),
-        );
-    }
-    Ok(())
-}
-
-fn connect(path: &Path, device: u64, inode: u64) -> Result<UnixStream, String> {
-    verify_socket(path, device, inode)?;
-    let mut address: libc::sockaddr_un = unsafe { std::mem::zeroed() };
-    address.sun_family = libc::AF_UNIX as _;
-    let bytes = path.as_os_str().as_encoded_bytes();
-    if bytes.is_empty() || bytes.len() >= address.sun_path.len() || bytes.contains(&0) {
-        return Err("Invalid Codex Unix socket path".into());
-    }
-    for (target, byte) in address.sun_path.iter_mut().zip(bytes) {
-        *target = *byte as _;
-    }
-    let fd = unsafe {
-        libc::socket(
-            libc::AF_UNIX,
-            libc::SOCK_STREAM | libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC,
-            0,
-        )
-    };
-    if fd < 0 {
-        return Err(io::Error::last_os_error().to_string());
-    }
-    // Take ownership immediately, including every connection/identity error path.
-    let stream = unsafe { UnixStream::from_raw_fd(fd) };
-    let result = unsafe {
-        libc::connect(
-            fd,
-            (&address as *const libc::sockaddr_un).cast(),
-            (std::mem::offset_of!(libc::sockaddr_un, sun_path) + bytes.len() + 1) as _,
-        )
-    };
-    if result < 0 {
-        // Linux Unix sockets connect immediately or return EAGAIN for a full
-        // backlog. Do not retry against a replaced endpoint or block the host.
-        return Err(format!(
-            "Cannot join existing Codex socket {}: {}",
-            path.display(),
-            io::Error::last_os_error()
-        ));
-    }
-    verify_socket(path, device, inode)?;
-    Ok(stream)
 }
 
 fn would_block(error: &WsError) -> bool {
@@ -344,7 +281,7 @@ impl Actor {
                             format!("Codex WebSocket text is not JSON: {error}")
                         })?;
                         let step = self.adapter.receive(frame)?;
-                        self.step(step)?;
+                        self.provider_step(step)?;
                         read_again = true;
                     }
                     Ok(Message::Ping(_)) => {
@@ -402,7 +339,7 @@ impl Actor {
             {
                 self.dirty = false;
                 self.last_present = Instant::now();
-                (self.notify)();
+                (self.notify)(super::Update::Presentation);
             }
             let timeout = if read_again
                 || (!flushing && (!self.pending.is_empty() || !self.incoming.is_empty()))

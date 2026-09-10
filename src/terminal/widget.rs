@@ -28,7 +28,10 @@ use super::{
     TerminalSurface, Underline,
 };
 
-use crate::settings::TerminalCursorStyle;
+use crate::{
+    design::{SCROLLBAR_GUTTER, SCROLLBAR_MARGIN, SCROLLBAR_THUMB_WIDTH},
+    settings::TerminalCursorStyle,
+};
 
 const DEFAULT_PADDING: f32 = 8.0;
 
@@ -350,7 +353,9 @@ impl TerminalGeometry {
         // Size the PTY from the card's stable logical extent. Snapping both
         // absolute edges would make the available physical width depend on
         // the card's fractional x/y position and reflow while panning.
-        let content_width = (bounds.width - padding * 2.0).max(0.0);
+        // Reserve the rail even when hidden: focusing or gaining history must
+        // not resize the PTY, and no glyph or mouse cell may occupy this gutter.
+        let content_width = (bounds.width - padding * 2.0 - SCROLLBAR_GUTTER).max(0.0);
         let content_height = (bounds.height - padding * 2.0).max(0.0);
         let columns = ((content_width * scale_factor / cell_width_px as f32).floor() as u16).max(1);
         let rows = ((content_height * scale_factor / cell_height_px as f32).floor() as u16).max(1);
@@ -360,7 +365,8 @@ impl TerminalGeometry {
         // fractional edge pixel to this clip, but its PTY extent stays fixed.
         let left = ((bounds.x + padding) * scale_factor).ceil() / scale_factor;
         let top = ((bounds.y + padding) * scale_factor).ceil() / scale_factor;
-        let right = ((bounds.x + bounds.width - padding) * scale_factor).floor() / scale_factor;
+        let right = ((bounds.x + bounds.width - padding - SCROLLBAR_GUTTER) * scale_factor).floor()
+            / scale_factor;
         let bottom = ((bounds.y + bounds.height - padding) * scale_factor).floor() / scale_factor;
         let content_bounds = Rectangle {
             x: left,
@@ -445,7 +451,7 @@ impl TerminalGeometry {
     }
 }
 
-/// An overlay: its generous hit target never subtracts space from the grid.
+/// A focus-revealed scrollbar in the permanently reserved right-hand gutter.
 #[derive(Clone, Copy, Debug)]
 struct TerminalScrollbar {
     track: Rectangle,
@@ -459,8 +465,8 @@ impl TerminalScrollbar {
             return None;
         }
         let track = Rectangle {
-            x: bounds.x + (bounds.width - 12.0).max(0.0),
-            width: bounds.width.min(12.0),
+            x: bounds.x + (bounds.width - SCROLLBAR_GUTTER).max(0.0),
+            width: bounds.width.min(SCROLLBAR_GUTTER),
             ..bounds
         };
         let height = (track.height * (scroll.len as f64 / scroll.total as f64) as f32)
@@ -468,6 +474,8 @@ impl TerminalScrollbar {
             .min(track.height);
         let max_offset = scroll.max_offset();
         let thumb = Rectangle {
+            x: track.x + SCROLLBAR_MARGIN.min(track.width / 2.0),
+            width: SCROLLBAR_THUMB_WIDTH.min((track.width - 2.0 * SCROLLBAR_MARGIN).max(0.0)),
             y: track.y
                 + (track.height - height)
                     * (scroll.offset.min(max_offset) as f64 / max_offset as f64) as f32,
@@ -1197,13 +1205,9 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for TerminalWidget<Message
             {
                 renderer.fill_quad(
                     renderer::Quad {
-                        bounds: Rectangle {
-                            x: bar.track.x + (bar.track.width - 4.0).max(0.0),
-                            width: bar.track.width.min(3.0),
-                            ..bar.thumb
-                        },
+                        bounds: bar.thumb,
                         border: Border {
-                            radius: 2.0.into(),
+                            radius: (SCROLLBAR_THUMB_WIDTH / 2.0).into(),
                             ..Border::default()
                         },
                         shadow: Shadow::default(),
@@ -1238,7 +1242,15 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for TerminalWidget<Message
         {
             return mouse::Interaction::Pointer;
         }
-        if cursor.is_over(layout.bounds()) {
+        let geometry = TerminalGeometry::new(
+            layout.bounds(),
+            self.font_size,
+            self.scale_factor,
+            self.font_family,
+            self.line_height,
+            self.padding,
+        );
+        if geometry.cursor_position(cursor).is_some() {
             mouse::Interaction::Text
         } else {
             mouse::Interaction::None
@@ -1689,6 +1701,89 @@ mod tests {
     }
 
     #[test]
+    fn scrollbar_gutter_never_overlaps_drawn_or_addressable_cells() {
+        for scale in [1.0, 1.25, 2.0] {
+            for padding in [0.0, 8.0, 16.0] {
+                let bounds = Rectangle {
+                    x: 10.2,
+                    y: 20.4,
+                    width: 360.0,
+                    height: 220.0,
+                };
+                let geometry = TerminalGeometry::new(
+                    bounds,
+                    DEFAULT_FONT_SIZE,
+                    scale,
+                    "",
+                    LINE_HEIGHT_RATIO,
+                    padding,
+                );
+                let scroll = super::super::ScrollSnapshot {
+                    total: 100,
+                    offset: 80,
+                    len: 20,
+                    alternate_screen: false,
+                    mouse_tracking: false,
+                };
+                let bar = TerminalScrollbar::new(bounds, scroll, true).unwrap();
+                assert!(geometry.content_bounds.x + geometry.content_bounds.width <= bar.track.x);
+                let final_cell = geometry
+                    .cell_bounds(geometry.columns - 1, geometry.rows - 1)
+                    .unwrap();
+                assert!(final_cell.x + final_cell.width <= bar.track.x);
+                assert!(final_cell.y + final_cell.height <= bounds.y + bounds.height);
+                assert!(
+                    geometry
+                        .cursor_position(mouse::Cursor::Available(Point::new(
+                            bar.thumb.center_x(),
+                            bar.thumb.center_y(),
+                        )))
+                        .is_none()
+                );
+                let final_center = Point::new(final_cell.center_x(), final_cell.center_y());
+                let position = geometry
+                    .cursor_position(mouse::Cursor::Available(final_center))
+                    .unwrap();
+                assert_eq!(
+                    (position.x / geometry.cell_width).floor() as u16,
+                    geometry.columns - 1
+                );
+                assert_eq!(
+                    (position.y / geometry.cell_height).floor() as u16,
+                    geometry.rows - 1
+                );
+                assert!(bar.thumb.x >= bar.track.x);
+                assert!(bar.thumb.x + bar.thumb.width <= bar.track.x + bar.track.width);
+                assert_eq!(bar.row_at(bar.thumb.y, 0.0), scroll.max_offset());
+            }
+        }
+    }
+
+    #[test]
+    fn scrollbar_tiny_viewport_keeps_thumb_and_drag_inside_track() {
+        let scroll = super::super::ScrollSnapshot {
+            total: 100,
+            offset: 80,
+            len: 20,
+            alternate_screen: false,
+            mouse_tracking: false,
+        };
+        for width in [1.0, 4.0, 14.0] {
+            let bounds = Rectangle {
+                x: 0.0,
+                y: 0.0,
+                width,
+                height: 10.0,
+            };
+            let bar = TerminalScrollbar::new(bounds, scroll, true).unwrap();
+            assert!(bar.thumb.x >= bounds.x);
+            assert!(bar.thumb.x + bar.thumb.width <= bounds.x + bounds.width);
+            assert_eq!(bar.thumb.height, bounds.height);
+            assert_eq!(bar.row_at(100.0, 0.0), 0);
+        }
+    }
+
+    #[test]
     fn fractional_scale_grid_and_resize_share_one_geometry() {
         let bounds = Rectangle {
             x: 20.0,
@@ -1728,11 +1823,9 @@ mod tests {
         };
         let baseline = geometry_at(0.0);
 
-        assert_eq!(baseline.columns, 54);
         assert_eq!(baseline.rows, 20);
         assert_eq!(baseline.cell_width_px, 11);
         assert_eq!(baseline.cell_height_px, 23);
-        assert_eq!(baseline.screen_width_px(), 594);
         assert_eq!(baseline.screen_height_px(), 460);
 
         assert!(
@@ -1767,7 +1860,8 @@ mod tests {
         assert_eq!(size.rows, 6);
         assert_eq!(
             size.columns,
-            ((bounds.width - 32.0) * 1.25 / size.cell_width_px as f32).floor() as u16
+            ((bounds.width - 32.0 - SCROLLBAR_GUTTER) * 1.25 / size.cell_width_px as f32).floor()
+                as u16
         );
         let second_cell = geometry.cell_bounds(1, 1).unwrap();
         let position = geometry

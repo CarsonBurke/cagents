@@ -41,6 +41,13 @@ pub(crate) struct TerminalRecord {
 }
 
 #[derive(Default)]
+struct OutputObservation {
+    epoch: u64,
+    after_sequence: u64,
+    notified: bool,
+}
+
+#[derive(Default)]
 struct Subscriptions {
     by_client: BTreeMap<ClientId, BTreeMap<TerminalId, TerminalVisibility>>,
     by_terminal: BTreeMap<TerminalId, BTreeMap<ClientId, TerminalVisibility>>,
@@ -52,6 +59,7 @@ struct Subscriptions {
     /// delta. Dropped on detach and disconnect so a stale base can never be
     /// used as a delta base, and so a departing client frees its rows.
     sent: BTreeMap<(ClientId, TerminalId), Arc<RenderSnapshot>>,
+    output: BTreeMap<(ClientId, TerminalId), OutputObservation>,
 }
 
 impl Subscriptions {
@@ -69,6 +77,7 @@ impl Subscriptions {
             .entry(terminal_id)
             .or_default()
             .insert(client_id, visibility);
+        self.output.entry((client_id, terminal_id)).or_default();
     }
 
     fn detach(&mut self, client_id: ClientId, terminal_id: TerminalId) {
@@ -85,6 +94,7 @@ impl Subscriptions {
             }
         }
         self.sent.remove(&(client_id, terminal_id));
+        self.output.remove(&(client_id, terminal_id));
     }
 
     /// Remembers the capture just sent to `client_id`, so the next repaint for
@@ -112,6 +122,7 @@ impl Subscriptions {
         };
         self.sent
             .retain(|(sent_client, _), _| *sent_client != client_id);
+        self.output.retain(|(client, _), _| *client != client_id);
         for terminal_id in terminals.keys() {
             if let Some(clients) = self.by_terminal.get_mut(terminal_id) {
                 clients.remove(&client_id);
@@ -177,6 +188,7 @@ pub(crate) struct HostState {
     shutdown_capabilities: VecDeque<(ShutdownCapability, Instant)>,
     pub(super) chats: BTreeMap<TerminalId, super::chat::Record>,
     pub(super) chat_spawning: BTreeMap<TerminalId, crate::chat::Launch>,
+    pub(crate) agent_observer: Arc<crate::agent::observe::Observer>,
 }
 
 impl HostState {
@@ -193,6 +205,7 @@ impl HostState {
             shutdown_capabilities: VecDeque::new(),
             chats: BTreeMap::new(),
             chat_spawning: BTreeMap::new(),
+            agent_observer: Arc::new(crate::agent::observe::Observer::new()),
         }
     }
 
@@ -209,6 +222,7 @@ impl HostState {
     pub(crate) fn unregister_client(&mut self, client_id: ClientId) -> Vec<TerminalHandle> {
         for record in self.chats.values_mut() {
             record.subscribers.remove(&client_id);
+            record.observations.remove(&client_id);
             record
                 .handle
                 .set_visible(record.subscribers.values().any(|visible| *visible));
@@ -233,6 +247,7 @@ impl HostState {
             if let Some(record) = self.terminals.get(&terminal_id) {
                 let _ = apply_visibility(&record.handle, visibility);
             }
+            self.disarm_output_if_observed(terminal_id);
         }
         if let Some(delivery) = self.clients.remove(&client_id) {
             delivery.close_after_drain();
@@ -262,6 +277,7 @@ impl HostState {
             self.subscriptions.detach(client_id, terminal_id);
             return Err(send_error(error));
         }
+        self.rearm_output(client_id, terminal_id);
         self.descriptor(client_id, terminal_id)
     }
 
@@ -293,6 +309,7 @@ impl HostState {
                 .attach(client_id, terminal_id, old_requested);
             return Err(send_error(error));
         }
+        self.disarm_output_if_observed(terminal_id);
         Ok(())
     }
 
@@ -346,6 +363,68 @@ impl HostState {
                 },
             });
         }
+        if (old_requested == TerminalVisibility::Visible)
+            != (requested == TerminalVisibility::Visible)
+        {
+            self.rearm_output(client_id, terminal_id);
+        }
+        Ok(())
+    }
+
+    fn rearm_output(&mut self, client_id: ClientId, terminal_id: TerminalId) {
+        let Some(observation) = self.subscriptions.output.get_mut(&(client_id, terminal_id)) else {
+            return;
+        };
+        observation.notified = false;
+        if self
+            .subscriptions
+            .by_client
+            .get(&client_id)
+            .and_then(|terminals| terminals.get(&terminal_id))
+            .is_some_and(|visibility| *visibility != TerminalVisibility::Visible)
+            && let Some(record) = self.terminals.get(&terminal_id)
+        {
+            observation.after_sequence = record.handle.observe_next_output();
+        }
+        self.disarm_output_if_observed(terminal_id);
+    }
+
+    fn disarm_output_if_observed(&self, terminal_id: TerminalId) {
+        let needs_output = self
+            .subscriptions
+            .by_terminal
+            .get(&terminal_id)
+            .is_some_and(|clients| {
+                clients.iter().any(|(client, visibility)| {
+                    *visibility != TerminalVisibility::Visible
+                        && self
+                            .subscriptions
+                            .output
+                            .get(&(*client, terminal_id))
+                            .is_some_and(|observation| !observation.notified)
+                })
+            });
+        if !needs_output && let Some(record) = self.terminals.get(&terminal_id) {
+            record.handle.stop_observing_output();
+        }
+    }
+
+    pub(crate) fn acknowledge_output(
+        &mut self,
+        client_id: ClientId,
+        terminal_id: TerminalId,
+        epoch: u64,
+    ) -> Result<(), ProtocolError> {
+        self.handle(client_id, terminal_id)?;
+        let observation = self
+            .subscriptions
+            .output
+            .get_mut(&(client_id, terminal_id))
+            .expect("attached terminal observation");
+        if epoch > observation.epoch {
+            observation.epoch = epoch;
+            self.rearm_output(client_id, terminal_id);
+        }
         Ok(())
     }
 
@@ -388,6 +467,7 @@ impl HostState {
         Ok(TerminalDescriptor {
             session,
             activity: record.handle.activity(),
+            agent_activity: record.handle.agent_activity(),
             generation: record.handle.generation(),
             event_sequence: record.event_sequence,
             oldest_event_sequence: record
@@ -482,14 +562,15 @@ impl HostState {
         };
         self.subscriptions
             .attach(client_id, terminal_id, visibility);
+        self.rearm_output(client_id, terminal_id);
         self.descriptor(client_id, terminal_id)
     }
 
-    pub(crate) fn handle(
+    fn attached_terminal(
         &self,
         client_id: ClientId,
         terminal_id: TerminalId,
-    ) -> Result<TerminalHandle, ProtocolError> {
+    ) -> Result<&TerminalRecord, ProtocolError> {
         if !self.subscriptions.attached(client_id, terminal_id) {
             return Err(ProtocolError::new(
                 ProtocolErrorCode::PermissionDenied,
@@ -497,10 +578,17 @@ impl HostState {
                 false,
             ));
         }
-        let record = self
-            .terminals
+        self.terminals
             .get(&terminal_id)
-            .ok_or_else(|| not_found(terminal_id))?;
+            .ok_or_else(|| not_found(terminal_id))
+    }
+
+    pub(crate) fn handle(
+        &self,
+        client_id: ClientId,
+        terminal_id: TerminalId,
+    ) -> Result<TerminalHandle, ProtocolError> {
+        let record = self.attached_terminal(client_id, terminal_id)?;
         if !record.running {
             return Err(ProtocolError::new(
                 ProtocolErrorCode::TerminalUnavailable,
@@ -509,6 +597,16 @@ impl HostState {
             ));
         }
         Ok(record.handle.clone())
+    }
+
+    /// A retained final grid can gain or lose UI focus after its process exits.
+    pub(crate) fn focus_handle(
+        &self,
+        client_id: ClientId,
+        terminal_id: TerminalId,
+    ) -> Result<Option<TerminalHandle>, ProtocolError> {
+        let record = self.attached_terminal(client_id, terminal_id)?;
+        Ok(record.running.then(|| record.handle.clone()))
     }
 
     /// Releasing presentation credit is not a process mutation. A shell's exit
@@ -521,17 +619,7 @@ impl HostState {
         terminal_id: TerminalId,
         generation: u64,
     ) -> Result<TerminalHandle, ProtocolError> {
-        if !self.subscriptions.attached(client_id, terminal_id) {
-            return Err(ProtocolError::new(
-                ProtocolErrorCode::PermissionDenied,
-                format!("client is not attached to terminal {terminal_id}"),
-                false,
-            ));
-        }
-        let record = self
-            .terminals
-            .get(&terminal_id)
-            .ok_or_else(|| not_found(terminal_id))?;
+        let record = self.attached_terminal(client_id, terminal_id)?;
         if generation > record.handle.generation() {
             return Err(ProtocolError::new(
                 ProtocolErrorCode::InvalidRequest,
@@ -772,6 +860,9 @@ pub(crate) fn spawn_terminal(
             ));
         }
     };
+    let output_host = Arc::downgrade(shared);
+    handle
+        .set_output_observer(move |sequence| broadcast_output(&output_host, terminal_id, sequence));
 
     let event_rx = handle.events();
     let redraw_handle = handle.clone();
@@ -884,6 +975,56 @@ fn validate_spawn_options(options: &TerminalSpawnOptions) -> Result<(), Protocol
         ));
     }
     Ok(())
+}
+
+fn broadcast_output(host: &Weak<Mutex<HostState>>, terminal_id: TerminalId, sequence: u64) {
+    let Some(host) = host.upgrade() else { return };
+    let mut state = host.lock().unwrap_or_else(|error| error.into_inner());
+    let HostState {
+        proof,
+        subscriptions,
+        clients,
+        terminals,
+        ..
+    } = &mut *state;
+    let Some(subscribers) = subscriptions.by_terminal.get(&terminal_id) else {
+        return;
+    };
+    let mut needs_output = false;
+    for (&client, &visibility) in subscribers {
+        if visibility == TerminalVisibility::Visible {
+            continue;
+        }
+        let Some(observation) = subscriptions.output.get_mut(&(client, terminal_id)) else {
+            continue;
+        };
+        if observation.notified {
+            continue;
+        }
+        if sequence > observation.after_sequence
+            && let Some(delivery) = clients.get(&client)
+        {
+            observation.notified = delivery
+                .push(ServerEnvelope {
+                    version: PROTOCOL_VERSION,
+                    request_id: None,
+                    proof: proof.clone(),
+                    message: ServerMessage::TerminalObserved {
+                        terminal_id,
+                        epoch: observation.epoch,
+                    },
+                })
+                .is_ok();
+        }
+        needs_output |= !observation.notified;
+    }
+    if let Some(record) = terminals.get(&terminal_id) {
+        if needs_output {
+            record.handle.observe_next_output();
+        } else {
+            record.handle.stop_observing_output();
+        }
+    }
 }
 
 fn broadcast_redraw(host: &Weak<Mutex<HostState>>, terminal_id: TerminalId, generation: u64) {
@@ -1024,6 +1165,94 @@ mod tests {
             host_incarnation: HostIncarnation::new("test-incarnation"),
         })
     }
+
+    #[test]
+    fn hidden_output_is_per_subscriber_and_rearms_without_revealing() {
+        let shared = Arc::new(Mutex::new(test_host()));
+        let recipe = crate::model::LaunchRecipe {
+            program: "/bin/cat".into(),
+            arguments: Vec::new(),
+            working_directory: std::path::PathBuf::from("/tmp"),
+            environment: BTreeMap::new(),
+        };
+        let session = TerminalSession {
+            id: TerminalId::new(),
+            launch: recipe.clone(),
+            transcript_path: None,
+            resume_hint: None,
+            continuity: TerminalContinuity::RelaunchAvailable {
+                recipe,
+                last_exit: None,
+            },
+        };
+        let id = session.id;
+        let handle = TerminalHandle::spawn(
+            session.clone(),
+            TerminalConfig {
+                initially_visible: false,
+                ..TerminalConfig::default()
+            },
+            |_| {},
+        )
+        .unwrap();
+        let (first, second) = {
+            let mut state = shared.lock().unwrap_or_else(|error| error.into_inner());
+            let deliveries = (state.register_client(1), state.register_client(2));
+            state.reserve_spawn(id).unwrap();
+            state
+                .finish_spawn(1, session, handle.clone(), false)
+                .unwrap();
+            state.attach(2, id).unwrap();
+            state
+                .set_visibility(2, id, TerminalVisibility::Visible)
+                .unwrap();
+            deliveries
+        };
+        let weak = Arc::downgrade(&shared);
+        broadcast_output(&weak, id, 1);
+        broadcast_output(&weak, id, 2);
+        {
+            let mut state = shared.lock().unwrap_or_else(|error| error.into_inner());
+            state
+                .set_visibility(1, id, TerminalVisibility::Hibernated)
+                .unwrap();
+        }
+        broadcast_output(&weak, id, 3); // Hibernation is not a new hidden epoch.
+        {
+            let mut state = shared.lock().unwrap_or_else(|error| error.into_inner());
+            state.acknowledge_output(1, id, 1).unwrap();
+            assert_eq!(
+                state.subscriptions.by_client[&1][&id],
+                TerminalVisibility::Hibernated
+            );
+            state
+                .set_visibility(2, id, TerminalVisibility::Hidden)
+                .unwrap();
+        }
+        broadcast_output(&weak, TerminalId::new(), 4); // A stale identity has no subscribers.
+        broadcast_output(&weak, id, 4);
+        broadcast_output(&weak, id, 5);
+        {
+            let mut state = shared.lock().unwrap_or_else(|error| error.into_inner());
+            // A late acknowledgement from an earlier scope cannot erase a newer one.
+            state.acknowledge_output(1, id, 0).unwrap();
+            state.acknowledge_output(1, id, 1).unwrap();
+        }
+        broadcast_output(&weak, id, 6);
+        for (delivery, expected) in [(first, vec![0, 1]), (second, vec![0])] {
+            delivery.close_after_drain();
+            let mut epochs = Vec::new();
+            while let Some(envelope) = delivery.pop() {
+                if let ServerMessage::TerminalObserved { terminal_id, epoch } = envelope.message {
+                    assert_eq!(terminal_id, id);
+                    epochs.push(epoch);
+                }
+            }
+            assert_eq!(epochs, expected);
+        }
+        handle.shutdown().unwrap();
+    }
+
     #[test]
     fn disconnected_ui_reattaches_the_same_shell_without_relaunching() {
         let directory = tempfile::tempdir().unwrap();
@@ -1199,6 +1428,11 @@ mod tests {
                 .unwrap();
             let generation = handle.generation();
             assert!(state.redraw_ack_handle(1, id, generation).is_ok());
+            assert!(state.focus_handle(1, id).unwrap().is_none());
+            assert_eq!(
+                state.focus_handle(2, id).err().unwrap().code,
+                ProtocolErrorCode::PermissionDenied
+            );
             assert_eq!(
                 state.handle(1, id).err().unwrap().code,
                 ProtocolErrorCode::TerminalUnavailable

@@ -107,6 +107,7 @@ fn wait_for_title(events: &EventReceiver<TerminalEvent>, expected: &str) {
             Ok(TerminalEvent::TitleChanged(title)) if title == expected => return,
             Ok(TerminalEvent::TitleChanged(_))
             | Ok(TerminalEvent::ResumeHintChanged(_))
+            | Ok(TerminalEvent::AgentActivityChanged(_))
             | Ok(TerminalEvent::Bell) => {}
             Ok(TerminalEvent::Error { operation, message }) => {
                 panic!("terminal error during {operation}: {message}")

@@ -710,16 +710,7 @@ impl Adapter for Codex {
                 .ok_or("Codex RPC response is missing result/error")?;
             match pending {
                 Pending::Initialize => {
-                    if !result["userAgent"].is_string() {
-                        return Err("Unsupported Codex initialize response".into());
-                    }
-                    let server_home =
-                        std::fs::canonicalize(string(result, "codexHome")?).map_err(|e| {
-                            format!("Cannot verify connected Codex account directory: {e}")
-                        })?;
-                    if server_home != self.expected_home {
-                        return Err("The selected Codex daemon belongs to a different CODEX_HOME; refusing to resume there".into());
-                    }
+                    crate::agent::observe::socket::verify_account(result, &self.expected_home)?;
                     step.writes
                         .push(json!({"method":"initialized","params":{}}));
                     if self.thread.is_some() {
@@ -754,6 +745,8 @@ impl Adapter for Codex {
                     self.selected = result["model"].as_str().map(str::to_owned);
                     self.reasoning = result["reasoningEffort"].as_str().map(str::to_owned);
                     self.busy = thread["status"]["type"] == "active";
+                    step.events
+                        .push(Event::Waiting(waiting_on_user(&thread["status"])));
                     step.events.push(Event::Session {
                         id: id.into(),
                         title: thread["name"].as_str().map(str::to_owned),
@@ -818,6 +811,7 @@ impl Adapter for Codex {
                     self.materialized = true;
                     self.turn = Some(string(&result["turn"], "id")?.into());
                     self.busy = true;
+                    step.events.push(Event::Waiting(false));
                     // Preserve selection until an explicit user change. No settings
                     // update RPC is sent while another client's turn is running.
                     step.events.push(Event::Status {
@@ -849,6 +843,8 @@ impl Adapter for Codex {
             }
             "thread/status/changed" => {
                 self.busy = params["status"]["type"] == "active";
+                step.events
+                    .push(Event::Waiting(waiting_on_user(&params["status"])));
                 if !self.busy {
                     self.turn = None;
                 }
@@ -879,6 +875,7 @@ impl Adapter for Codex {
                 self.materialized = true;
                 let turn = &params["turn"];
                 self.busy = method == "turn/started";
+                step.events.push(Event::Waiting(false));
                 self.turn = if self.busy {
                     Some(string(turn, "id")?.into())
                 } else {
@@ -1075,6 +1072,8 @@ impl Codex {
         }
         self.direct_input = thread["canAcceptDirectInput"].as_bool() == Some(true);
         self.busy = thread["status"]["type"] == "active";
+        step.events
+            .push(Event::Waiting(waiting_on_user(&thread["status"])));
         step.events.push(Event::Session {
             id: id.into(),
             title: thread["name"].as_str().map(str::to_owned),
@@ -1086,6 +1085,17 @@ impl Codex {
         step.events.push(Event::Capabilities(self.capabilities()));
         Ok(())
     }
+}
+fn waiting_on_user(status: &Value) -> bool {
+    status["type"] == "active"
+        && status["activeFlags"].as_array().is_some_and(|flags| {
+            flags.iter().any(|flag| {
+                matches!(
+                    flag.as_str(),
+                    Some("waitingOnApproval" | "waitingOnUserInput")
+                )
+            })
+        })
 }
 fn string<'a>(value: &'a Value, key: &str) -> Result<&'a str, String> {
     value[key]
@@ -1500,7 +1510,7 @@ mod tests {
         let socket = directory.path().join("shared.sock");
         let _server = std::os::unix::net::UnixListener::bind(&socket).unwrap();
         let launch = Launch {
-            provider: crate::chat::Provider::Codex,
+            provider: crate::agent::Provider::Codex,
             session_id: Some("thread-exact".into()),
             recipe: crate::model::LaunchRecipe {
                 program: "codex".into(),

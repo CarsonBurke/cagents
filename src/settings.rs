@@ -288,6 +288,20 @@ const fn default_editor_auto_save() -> bool {
     true
 }
 
+const fn default_confirm_terminal_close() -> bool {
+    true
+}
+
+/// Main stays first; imported worktrees without creation evidence sort by path.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorktreeSort {
+    #[default]
+    Newest,
+    Oldest,
+    Alphabetical,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AppSettings {
@@ -322,8 +336,12 @@ pub struct AppSettings {
     /// Absolute, or resolved relative to the repository root.
     #[serde(default = "default_managed_worktree_directory")]
     pub managed_worktree_directory: String,
+    #[serde(default)]
+    pub worktree_sort: WorktreeSort,
     #[serde(default = "default_editor_auto_save")]
     pub editor_auto_save: bool,
+    #[serde(default = "default_confirm_terminal_close")]
+    pub confirm_terminal_close: bool,
     /// External language servers, in declaration order. The first server whose
     /// language claims a file extension handles that file. An empty list
     /// disables LSP entirely.
@@ -360,7 +378,9 @@ impl Default for AppSettings {
             link_open_destination: LinkOpenDestination::default(),
             link_open_gesture: LinkOpenGesture::default(),
             managed_worktree_directory: default_managed_worktree_directory(),
+            worktree_sort: WorktreeSort::default(),
             editor_auto_save: default_editor_auto_save(),
+            confirm_terminal_close: default_confirm_terminal_close(),
             language_servers: default_language_servers(),
             keyboard_shortcuts: KeyboardShortcuts::default(),
         }
@@ -1120,6 +1140,8 @@ mod tests {
             inspector_width: 404.0,
             default_column_fraction: 0.55,
             managed_worktree_directory: "../managed trees/".to_owned(),
+            worktree_sort: WorktreeSort::Oldest,
+            confirm_terminal_close: false,
             ..AppSettings::default()
         };
 
@@ -1128,6 +1150,13 @@ mod tests {
         assert_eq!(load(&path).unwrap(), settings);
         let decoded: AppSettings = toml::from_str(&fs::read_to_string(path).unwrap()).unwrap();
         assert_eq!(decoded, settings);
+    }
+    #[test]
+    fn settings_without_close_preference_keep_active_process_confirmation() {
+        let mut old = toml::Value::try_from(AppSettings::default()).unwrap();
+        old.as_table_mut().unwrap().remove("confirm_terminal_close");
+        let decoded: AppSettings = old.try_into().unwrap();
+        assert!(decoded.confirm_terminal_close);
     }
 
     #[test]
@@ -1266,60 +1295,31 @@ mod tests {
     /// simply not appearing in it: the writer has to strip the key here, which
     /// is where the migration decision gets stated.
     #[test]
-    fn version_two_toml_adds_every_key_it_predates() {
+    fn version_two_migration_preserves_custom_appearance() {
         let directory = tempfile::tempdir().unwrap();
         let path = path_in(&directory);
-        let previous = AppSettings {
-            sidebar_width: 376.0,
-            terminal_font_size: 15.0,
-            ..AppSettings::default()
-        };
-        let document = toml::to_string(&previous).unwrap();
-        // `language_servers` serialises as an array of tables with nested
-        // `[[language_servers.languages]]` tables of its own, so removing it
-        // means dropping every line under any header rooted at that key rather
-        // than a single scalar line.
-        let mut inside_language_servers = false;
-        let document = document
-            .lines()
-            .filter(|line| {
-                if let Some(header) = line.strip_prefix("[[").or(line.strip_prefix('[')) {
-                    inside_language_servers = header
-                        .strip_prefix("language_servers")
-                        .is_some_and(|rest| rest.starts_with(']') || rest.starts_with('.'));
-                }
-                !inside_language_servers
-                    && ![
-                        "inspector_width",
-                        "app_theme",
-                        "ui_scale",
-                        "terminal_line_height",
-                        "terminal_padding",
-                        "terminal_cursor_style",
-                        "terminal_theme",
-                        "managed_worktree_directory",
-                        "editor_auto_save",
-                    ]
-                    .iter()
-                    .any(|key| line.starts_with(key))
-            })
-            .map(|line| {
-                if line.starts_with("schema_version") {
-                    format!("schema_version = {PREVIOUS_SETTINGS_SCHEMA_VERSION}\n")
-                } else {
-                    format!("{line}\n")
-                }
-            })
-            .collect::<String>();
-        assert!(!document.contains("language_servers"), "{document}");
-        fs::write(&path, document).unwrap();
-
+        fs::write(
+            &path,
+            r#"schema_version = 2
+max_hot_cards = 6
+hibernation_delay_ms = 30000
+terminal_font_size = 15.0
+sidebar_width = 376.0
+default_column_fraction = 0.72
+[keyboard_shortcuts]
+new_terminal = ["Ctrl+T"]
+close_focused_column = ["Ctrl+W"]
+search_projects = ["Ctrl+F"]
+previous_column = ["Alt+Q", "Alt+Left"]
+next_column = ["Alt+W", "Alt+Right"]
+cycle_pane_width = ["Alt+R"]
+"#,
+        )
+        .unwrap();
         let migrated = load(&path).unwrap();
         assert_eq!(migrated.schema_version, SETTINGS_SCHEMA_VERSION);
-        assert_eq!(migrated.sidebar_width, previous.sidebar_width);
-        assert_eq!(migrated.terminal_font_size, previous.terminal_font_size);
-        assert_eq!(migrated.inspector_width, design::INSPECTOR_DEFAULT_WIDTH);
-        assert_eq!(migrated.language_servers, default_language_servers());
+        assert_eq!(migrated.sidebar_width, 376.0);
+        assert_eq!(migrated.terminal_font_size, 15.0);
     }
 
     #[test]

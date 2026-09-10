@@ -335,6 +335,75 @@ pub struct PullRequestCheck {
     pub workflow: String,
 }
 
+/// Read-only inspector data. A failed section remains an error, never an empty
+/// successful section; callers can still display the independently loaded data.
+#[derive(Debug, Clone)]
+pub struct PullRequestInspection {
+    pub pull_request: PullRequest,
+    pub checks: Result<Vec<PullRequestCheck>, String>,
+    pub conversation: Result<PullRequestConversation, String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PullRequestComment {
+    pub author: Option<GitHubActor>,
+    pub body: String,
+    pub created_at: String,
+    pub url: Url,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct PullRequestReview {
+    #[serde(flatten)]
+    pub comment: PullRequestComment,
+    pub state: RemoteValue,
+}
+
+#[derive(Debug, Clone)]
+pub struct PullRequestReviewThread {
+    pub path: String,
+    pub line: Option<u64>,
+    pub outdated: bool,
+    pub resolved: bool,
+    pub comments: Vec<PullRequestComment>,
+    pub truncated: bool,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct PullRequestConversation {
+    pub threads: Vec<PullRequestReviewThread>,
+    pub comments: Vec<PullRequestComment>,
+    pub reviews: Vec<PullRequestReview>,
+    pub truncated: bool,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct Connection<T> {
+    nodes: Vec<T>,
+    page_info: PageInfo,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PageInfo {
+    has_next_page: bool,
+    end_cursor: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ReviewThreadPage {
+    id: String,
+    path: String,
+    line: Option<u64>,
+    original_line: Option<u64>,
+    is_outdated: bool,
+    is_resolved: bool,
+    comments: Connection<PullRequestComment>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum GhAuthState {
@@ -476,6 +545,8 @@ pub enum GitHubError {
         checks: Vec<PullRequestCheck>,
         process: ProcessOutput,
     },
+    #[error("{0}")]
+    Inspection(String),
 }
 
 /// Only a completed refresh grants authority. Cached presentation rows deliberately
@@ -809,6 +880,180 @@ impl<E: ProcessExecutor> GitHubService<E> {
         Ok(pull_request)
     }
 
+    /// Resolves the current branch, not a cached project-wide PR presentation row.
+    /// An ambiguous branch (for example two forks using the same name) must not
+    /// silently inspect somebody else's pull request.
+    pub fn inspect_branch(
+        &self,
+        repository: &GitHubRepoKey,
+        branch: &str,
+        head_oid: Option<&str>,
+        cancellation: &CancellationToken,
+    ) -> Result<Option<PullRequestInspection>, GitHubError> {
+        if self.auth_status(repository, cancellation)?.state != GhAuthState::Authenticated {
+            return Err(GitHubError::NoActiveAccount(repository.authority()));
+        }
+        let mut command = self.list_command(&ListPullRequestsRequest {
+            repository: repository.clone(),
+            state: PullRequestStateFilter::All,
+            limit: 100,
+        });
+        command
+            .arguments
+            .extend([OsString::from("--head"), branch.into()]);
+        let output = self.run_checked(&command, repository, cancellation)?;
+        let candidates =
+            attach_process(parse_pull_request_list(&output.stdout, repository), &output)?;
+        let Some(candidate) = select_branch_pull_request(&candidates, branch, head_oid)? else {
+            return Ok(None);
+        };
+        let key = PullRequestKey::new(repository.clone(), candidate.number)?;
+        let pull_request = self.view(&key, cancellation)?;
+        if pull_request.head_ref_name != branch
+            || pull_request.head_ref_oid != candidate.head_ref_oid
+        {
+            return Err(GitHubError::Inspection(
+                "The pull request head changed while loading. Refresh to retry.".into(),
+            ));
+        }
+        let checks = match self.checks(&key, cancellation) {
+            Ok(checks) | Err(GitHubError::ChecksPending { checks, .. }) => Ok(checks),
+            Err(error) => Err(error.to_string()),
+        };
+        let conversation = self
+            .conversation(&key, cancellation)
+            .map_err(|error| error.to_string());
+        let latest = self.view(&key, cancellation)?;
+        if latest.head_ref_oid != pull_request.head_ref_oid
+            || latest.head_ref_name != pull_request.head_ref_name
+        {
+            return Err(GitHubError::Inspection(
+                "The pull request head changed while loading. Refresh to retry.".into(),
+            ));
+        }
+        Ok(Some(PullRequestInspection {
+            pull_request: latest,
+            checks,
+            conversation,
+        }))
+    }
+
+    fn graphql(
+        &self,
+        repository: &GitHubRepoKey,
+        query: &str,
+        variables: Vec<(&str, String)>,
+        cancellation: &CancellationToken,
+    ) -> Result<serde_json::Value, GitHubError> {
+        let mut command = self.gh_command([
+            OsString::from("api"),
+            "graphql".into(),
+            "--hostname".into(),
+            repository.authority().into(),
+            "-f".into(),
+            format!("query={query}").into(),
+        ]);
+        for (name, value) in variables {
+            command
+                .arguments
+                .extend([OsString::from("-f"), format!("{name}={value}").into()]);
+        }
+        let output = self.run_checked(&command, repository, cancellation)?;
+        attach_process(parse_graphql(&output.stdout), &output)
+    }
+
+    pub fn conversation(
+        &self,
+        key: &PullRequestKey,
+        cancellation: &CancellationToken,
+    ) -> Result<PullRequestConversation, GitHubError> {
+        key.validate()?;
+        // Separate connections prevent an issue-comment page from multiplying
+        // every review-thread page. Explicit caps keep large discussions bounded.
+        let mut result = PullRequestConversation::default();
+        for section in ["reviewThreads", "comments", "reviews"] {
+            let fields = match section {
+                "reviewThreads" => {
+                    "id path line originalLine isOutdated isResolved comments(first:50){nodes{author{login} body createdAt url} pageInfo{hasNextPage endCursor}}"
+                }
+                "reviews" => "author{login} body createdAt url state",
+                _ => "author{login} body createdAt url",
+            };
+            let query = format!(
+                "query($owner:String!,$name:String!,$cursor:String){{repository(owner:$owner,name:$name){{pullRequest(number:{}){{{section}(first:50,after:$cursor){{nodes{{{fields}}} pageInfo{{hasNextPage endCursor}}}}}}}}}}",
+                key.number
+            );
+            let mut cursor: Option<String> = None;
+            for page in 0..4 {
+                let mut variables = vec![
+                    ("owner", key.repository.owner.clone()),
+                    ("name", key.repository.name.clone()),
+                ];
+                if let Some(cursor) = &cursor {
+                    variables.push(("cursor", cursor.clone()));
+                }
+                let data = self.graphql(&key.repository, &query, variables, cancellation)?;
+                let connection = data
+                    .pointer(&format!("/repository/pullRequest/{section}"))
+                    .ok_or_else(|| {
+                        GitHubError::Inspection(
+                            "GitHub returned no pull request conversation.".into(),
+                        )
+                    })?;
+                let info = if section == "reviewThreads" {
+                    let connection: Connection<ReviewThreadPage> = decode_value(connection)?;
+                    for thread in connection.nodes {
+                        let mut comments = thread.comments.nodes;
+                        let mut truncated = thread.comments.page_info.has_next_page;
+                        if truncated {
+                            let cursor = next_cursor(&thread.comments.page_info, None)?;
+                            let data = self.graphql(
+                                &key.repository,
+                                "query($id:ID!,$cursor:String!){node(id:$id){... on PullRequestReviewThread{comments(first:50,after:$cursor){nodes{author{login} body createdAt url} pageInfo{hasNextPage endCursor}}}}}",
+                                vec![("id", thread.id), ("cursor", cursor)],
+                                cancellation,
+                            )?;
+                            let more: Connection<PullRequestComment> =
+                                decode_value(data.pointer("/node/comments").ok_or_else(|| {
+                                    GitHubError::Inspection(
+                                        "GitHub returned no review thread.".into(),
+                                    )
+                                })?)?;
+                            truncated = more.page_info.has_next_page;
+                            comments.extend(more.nodes);
+                        }
+                        result.threads.push(PullRequestReviewThread {
+                            path: thread.path,
+                            line: thread.line.or(thread.original_line),
+                            outdated: thread.is_outdated,
+                            resolved: thread.is_resolved,
+                            comments,
+                            truncated,
+                        });
+                    }
+                    connection.page_info
+                } else if section == "reviews" {
+                    let connection: Connection<PullRequestReview> = decode_value(connection)?;
+                    result.reviews.extend(connection.nodes);
+                    connection.page_info
+                } else {
+                    let connection: Connection<PullRequestComment> = decode_value(connection)?;
+                    result.comments.extend(connection.nodes);
+                    connection.page_info
+                };
+                if !info.has_next_page {
+                    break;
+                }
+                if page == 3 {
+                    result.truncated = true;
+                    break;
+                }
+                cursor = Some(next_cursor(&info, cursor.as_deref())?);
+            }
+        }
+        Ok(result)
+    }
+
     pub fn checks(
         &self,
         key: &PullRequestKey,
@@ -826,6 +1071,11 @@ impl<E: ProcessExecutor> GitHubService<E> {
                 })
             }
             _ if output.success => attach_process(parse_json(&output.stdout), &output),
+            // gh uses exit 1 both for failed checks and operational errors.
+            // Only a structured checks array is evidence of the former.
+            Some(1) if !output.stdout.is_empty() => {
+                attach_process(parse_json(&output.stdout), &output)
+            }
             Some(4) => Err(GitHubError::AuthenticationRequired {
                 host: key.repository.host.clone(),
                 failure: Box::new(output.require_success(&self.gh).unwrap_err()),
@@ -1179,6 +1429,78 @@ pub fn pull_request_number(
         .ok_or_else(|| GitHubValidationError::InvalidPullRequestUrl(url.to_string()))
 }
 
+fn select_branch_pull_request<'a>(
+    candidates: &'a [PullRequest],
+    branch: &str,
+    head_oid: Option<&str>,
+) -> Result<Option<&'a PullRequest>, GitHubError> {
+    if candidates.len() >= 100 {
+        return Err(GitHubError::Inspection(
+            "This branch has too many pull requests to resolve safely. Open GitHub to inspect them.".into(),
+        ));
+    }
+    let matching: Vec<_> = candidates
+        .iter()
+        .filter(|pr| pr.head_ref_name == branch)
+        .collect();
+    let open: Vec<_> = matching
+        .iter()
+        .copied()
+        .filter(|pr| pr.state.0 == "OPEN")
+        .collect();
+    let relevant = if open.is_empty() { &matching } else { &open };
+    if relevant.len() <= 1 {
+        return Ok(relevant.first().copied());
+    }
+    let mut exact = relevant
+        .iter()
+        .copied()
+        .filter(|pr| head_oid.is_some_and(|oid| !oid.is_empty() && pr.head_ref_oid == oid));
+    if let Some(candidate) = exact.next()
+        && exact.next().is_none()
+    {
+        return Ok(Some(candidate));
+    }
+    Err(GitHubError::Inspection(
+        "Multiple pull requests match this branch. Fetch the matching head or inspect them on GitHub.".into(),
+    ))
+}
+
+fn decode_value<T: DeserializeOwned>(value: &serde_json::Value) -> Result<T, GitHubError> {
+    T::deserialize(value).map_err(|error| {
+        GitHubError::Inspection(format!("Invalid GitHub conversation response: {error}"))
+    })
+}
+
+fn parse_graphql(output: &[u8]) -> Result<serde_json::Value, GitHubError> {
+    let mut envelope: serde_json::Value = parse_json(output)?;
+    if let Some(errors) = envelope.get("errors").and_then(serde_json::Value::as_array)
+        && !errors.is_empty()
+    {
+        let messages = errors
+            .iter()
+            .filter_map(|error| error.get("message").and_then(serde_json::Value::as_str))
+            .collect::<Vec<_>>()
+            .join("; ");
+        return Err(GitHubError::Inspection(format!(
+            "GitHub GraphQL error: {messages}"
+        )));
+    }
+    envelope
+        .as_object_mut()
+        .and_then(|envelope| envelope.remove("data"))
+        .filter(|data| data.is_object())
+        .ok_or_else(|| GitHubError::Inspection("GitHub returned no GraphQL data.".into()))
+}
+
+fn next_cursor(info: &PageInfo, previous: Option<&str>) -> Result<String, GitHubError> {
+    info.end_cursor
+        .as_ref()
+        .filter(|cursor| !cursor.is_empty() && Some(cursor.as_str()) != previous)
+        .cloned()
+        .ok_or_else(|| GitHubError::Inspection("GitHub pagination did not advance.".into()))
+}
+
 fn parse_json<T: DeserializeOwned>(output: &[u8]) -> Result<T, GitHubError> {
     serde_json::from_slice(output).map_err(|error| GitHubError::InvalidJson {
         message: error.to_string(),
@@ -1469,5 +1791,96 @@ mod tests {
             service.create(&request, &CancellationToken::new()).unwrap(),
             PullRequestCreationOutcome::OutcomeUnknown { .. }
         ));
+    }
+
+    #[test]
+    fn failed_checks_are_data_but_command_errors_are_not_empty_checks() {
+        let output = |stdout: &[u8]| {
+            Ok(ProcessOutput {
+                exit_code: Some(1),
+                signal: None,
+                success: false,
+                stdout: stdout.to_vec(),
+                stderr: b"failed".to_vec(),
+            })
+        };
+        let fake = Arc::new(FakeExecutor::with_outputs(vec![
+            output(br#"[{"bucket":"fail","state":"FAILURE","name":"CI","link":"https://github.com/owner/repo/actions/runs/1"}]"#),
+            output(br#"{"message":"API unavailable"}"#),
+        ]));
+        let service = GitHubService::new("gh", fake);
+        let key = PullRequestKey::new(repository(), 7).unwrap();
+        let checks = service.checks(&key, &CancellationToken::new()).unwrap();
+        assert_eq!(checks[0].bucket.0, "fail");
+        assert_eq!(checks[0].state.0, "FAILURE");
+        assert!(service.checks(&key, &CancellationToken::new()).is_err());
+    }
+
+    #[test]
+    fn graphql_partial_errors_and_broken_pagination_do_not_look_complete() {
+        assert!(
+            parse_graphql(br#"{"data":{"repository":null},"errors":[{"message":"Forbidden"}]}"#)
+                .is_err()
+        );
+        assert!(parse_graphql(br#"{"data":null}"#).is_err());
+        let info = PageInfo {
+            has_next_page: true,
+            end_cursor: None,
+        };
+        assert!(next_cursor(&info, None).is_err());
+        let info = PageInfo {
+            has_next_page: true,
+            end_cursor: Some("same".into()),
+        };
+        assert!(next_cursor(&info, Some("same")).is_err());
+    }
+
+    #[test]
+    fn branch_lookup_never_chooses_an_ambiguous_fork_by_list_order() {
+        let first = parse_pull_request(
+            br#"{"number":7,"title":"Title","state":"OPEN","headRefName":"feature","headRefOid":"abc","baseRefName":"main","updatedAt":"now","url":"https://github.com/owner/repo/pull/7"}"#,
+            &repository(),
+        ).unwrap();
+        let mut second = first.clone();
+        second.number = 8;
+        second.head_ref_oid = "def".into();
+        let candidates = [first, second];
+        assert!(select_branch_pull_request(&candidates, "feature", None).is_err());
+        assert_eq!(
+            select_branch_pull_request(&candidates, "feature", Some("def"))
+                .unwrap()
+                .unwrap()
+                .number,
+            8
+        );
+        assert!(
+            select_branch_pull_request(&candidates, "unrelated", Some("def"))
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn conversation_paginates_replies_and_issue_comments_independently() {
+        let fake = Arc::new(FakeExecutor::with_outputs(vec![
+            success(br#"{"data":{"repository":{"pullRequest":{"reviewThreads":{"nodes":[{"id":"thread","path":"src/lib.rs","line":null,"originalLine":12,"isOutdated":true,"isResolved":false,"comments":{"nodes":[{"author":null,"body":"Root","createdAt":"now","url":"https://github.com/owner/repo/pull/7#discussion_r1"}],"pageInfo":{"hasNextPage":true,"endCursor":"reply-cursor"}}}],"pageInfo":{"hasNextPage":false,"endCursor":null}}}}}}"#),
+            success(br#"{"data":{"node":{"comments":{"nodes":[{"author":{"login":"reviewer"},"body":"Reply","createdAt":"now","url":"https://github.com/owner/repo/pull/7#discussion_r2"}],"pageInfo":{"hasNextPage":false,"endCursor":null}}}}}"#),
+            success(br#"{"data":{"repository":{"pullRequest":{"comments":{"nodes":[],"pageInfo":{"hasNextPage":true,"endCursor":"issue-cursor"}}}}}}"#),
+            success(br#"{"data":{"repository":{"pullRequest":{"comments":{"nodes":[{"author":{"login":"author"},"body":"Issue comment","createdAt":"now","url":"https://github.com/owner/repo/pull/7#issuecomment-1"}],"pageInfo":{"hasNextPage":false,"endCursor":null}}}}}}"#),
+            success(br#"{"data":{"repository":{"pullRequest":{"reviews":{"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":null}}}}}}"#),
+        ]));
+        let service = GitHubService::new("gh", fake);
+        let conversation = service
+            .conversation(
+                &PullRequestKey::new(repository(), 7).unwrap(),
+                &CancellationToken::new(),
+            )
+            .unwrap();
+        assert_eq!(conversation.threads[0].line, Some(12));
+        assert!(conversation.threads[0].outdated);
+        assert_eq!(conversation.threads[0].comments[1].body, "Reply");
+        assert_eq!(conversation.comments[0].body, "Issue comment");
+        assert!(!conversation.truncated);
+        assert!(!conversation.threads[0].truncated);
     }
 }

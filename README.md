@@ -318,11 +318,15 @@ cagents ui
   **New terminal** (`Ctrl+T`) starts in that worktree and inserts immediately to
   the right of its focused column.
   Drag a project header to reorder projects; the order survives restarts.
-- The right-hand inspector has neutral, icon-only **Files**, **Changes**, and
-  **Details** tabs; hover for tooltips. Files browses the selected worktree,
-  Changes provides diffs, staging, commits, push/publish, history, and
-  pull-request actions, and Details follows the focused card. The file list's
-  **Tree** and **Flat** icons also have tooltips. Right-click project or worktree
+  Project headers stay visible above their worktrees while scrolling. The
+  primary worktree stays first; the sort control selects newest, oldest, or
+  alphabetical order for the remaining worktrees.
+- The right-hand inspector has icon-only **Files**, **Changes**, **Pull request**,
+  and **Details** tabs; hover for tooltips. Files browses the selected worktree,
+  Changes provides diffs, staging, commits, push/publish, and history,
+  Pull request inspects the worktree's matching PR, and Details follows the
+  focused card. Both file and change lists support **Tree** and **Flat** modes.
+  Use the sidebar toggle to hide or reveal the inspector. Right-click project or worktree
   rows for their actions; there is no ellipsis menu button. Worktree rows show
   matching pull requests and their reported CI status. Icon tooltips appear
   after one second. Change rows color their status/counts and replace them with
@@ -337,8 +341,8 @@ cagents ui
   columns without a registered worktree remain accessible across worktrees.
 - Hold **Alt+Q / Alt+W** or **Alt+Left / Alt+Right** to move through columns.
   Mouse-wheel and trackpad scrolling stay inside pane content; they do not pan
-  the workspace strip. **Alt+R** cycles the focused pane through **1/3 → 2/3 →
-  1/2 → full** viewport width and repeats while held. These widths remain
+  the workspace strip. **Alt+R** cycles the focused pane through **1/3 → 1/2 →
+  2/3 → full** viewport width and repeats while held. These widths remain
   viewport-relative when the window is resized.
 - When creating a worktree, enter a branch name, a Linear issue ID such as
   `APP-42`, or an `https://linear.app/.../issue/APP-42/title-slug` URL. URLs use
@@ -363,12 +367,31 @@ cagents ui
   Images open as previews. File/view/edit/diff controls share the card's single
   toolbar; selected modes stay highlighted and unavailable comparisons are
   disabled rather than opening an empty diff.
+  File and diff views retain syntax highlighting, including CUDA sources.
+  Contextual external-editor icons open the current project, worktree, or file
+  without a separate application-picker dialog.
 - When a daemon incarnation changes, cagents authenticates the replacement and
   checks for surviving owners before recovering safe shell or exact agent
   launches. Unknown or orphaned processes block recovery rather than risking
   duplicate writers. **Retry** explicitly authorizes saved launch recipes that
   cannot be replayed automatically. Transcripts remain available; recovery
   starts or adopts a proven replacement, not the old terminal process.
+
+### Standalone editor
+
+`ceditor` is a separate native application in the same Cargo workspace. It
+shares the editor and repository UI without starting the cagents daemon,
+terminal host, or embedded browser. Its file-list mode persists independently.
+
+```sh
+scripts/run-ceditor-development /path/to/project
+scripts/run-ceditor-development /path/to/file.rs
+scripts/install-ceditor
+ceditor /path/to/project
+```
+
+The installer defaults to `~/.local`; use `--prefix /absolute/path` to install
+elsewhere. The development runner uses an isolated application/settings identity.
 
 ### Native agent chat
 
@@ -462,14 +485,28 @@ Git locks, exact checkout identity, and checkout-completion evidence. Only prove
 inspection. A Git ownership lock is retained through the durable Created commit;
 failure to release it is reported rather than hidden.
 
-Closing a live terminal card requires **Terminate terminal** confirmation.
-Pointer close and Ctrl+W share that policy; Cancel/Escape preserve the card and
-restore its focus. Confirmation revalidates terminal identity and daemon proof.
-An unreachable daemon leaves the card intact.
+Closing an idle shell card does not require confirmation. A running agent,
+foreground child, background job, or uncertain process state opens **Cancel**
+and **Close** confirmation, with Close focused. Pointer close and Ctrl+W share
+this policy; Cancel/Escape preserve the card and restore focus. The decision
+uses the process tree, not shell prompt instrumentation: a shell builtin with
+no child process can close without confirmation. **Don't ask me again** persists
+the explicit opt-out. Confirmation revalidates terminal identity and daemon
+proof; an unreachable daemon leaves the card intact.
 
-Terminal activity remains an observed PTY fact, not an agent-completion signal.
-The terminal view has no activity-status strip. Hidden terminals do not create
-periodic presentation redraws.
+Worktree rows distinguish unread output from **working** and **waiting** agent
+states. Selecting a worktree acknowledges its unread updates; another agent's
+state transition does not clear them. OMP uses its explicit terminal-title
+lifecycle, Codex uses the existing local shared-daemon API, and Claude uses
+`agents --json` from the detected CLI installation and account. Native chat
+uses provider protocol events. Unsupported or unavailable evidence remains
+unknown; output volume alone never means an agent is working, and activity
+evidence never authorizes conversation recovery.
+
+Passive Codex/Claude queries are bounded and cached, run outside the terminal
+input loop, and do not request hidden terminal snapshots. Hidden processes
+continue while their terminal presentation is suspended. The terminal view
+has no activity-status strip.
 
 ## Daemon and user data
 

@@ -84,6 +84,27 @@ impl DeliveryQueue {
         {
             return Ok(());
         }
+        if let ServerMessage::ChatActivity {
+            chat_id,
+            generation,
+            ..
+        } = &message.message
+            && let Some(existing) = state.messages.iter_mut().find(|candidate| {
+                candidate.proof == message.proof
+                    && matches!(&candidate.message,
+                    ServerMessage::ChatActivity { chat_id: existing, .. } if existing == chat_id)
+            })
+        {
+            if let ServerMessage::ChatActivity {
+                generation: previous,
+                ..
+            } = &existing.message
+                && generation >= previous
+            {
+                *existing = message;
+            }
+            return Ok(());
+        }
 
         // Native transcript pages can be several MiB. Two queued pages are
         // sufficient for the single-read-credit client; do not allow the ordinary
@@ -197,6 +218,40 @@ mod tests {
         assert!(matches!(
             delivered.message,
             ServerMessage::Redraw { generation: 11, .. }
+        ));
+    }
+
+    #[test]
+    fn native_activity_coalesces_without_consuming_unread_or_regressing_generation() {
+        use crate::agent::ActivityState;
+        let queue = DeliveryQueue::new(2);
+        let chat_id = TerminalId::new();
+        let mut envelope = redraw(chat_id, 0);
+        envelope.message = ServerMessage::ChatObserved { chat_id, epoch: 0 };
+        queue.push(envelope.clone()).unwrap();
+        for (generation, state) in [
+            (3, ActivityState::Working),
+            (5, ActivityState::Waiting),
+            (4, ActivityState::Idle),
+        ] {
+            envelope.message = ServerMessage::ChatActivity {
+                chat_id,
+                state,
+                generation,
+            };
+            queue.push(envelope.clone()).unwrap();
+        }
+        assert!(matches!(
+            queue.pop().unwrap().message,
+            ServerMessage::ChatObserved { .. }
+        ));
+        assert!(matches!(
+            queue.pop().unwrap().message,
+            ServerMessage::ChatActivity {
+                state: ActivityState::Waiting,
+                generation: 5,
+                ..
+            }
         ));
     }
 }

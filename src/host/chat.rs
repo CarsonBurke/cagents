@@ -1,6 +1,10 @@
 use super::state::{ClientId, HostState, SharedHost};
 use crate::{
-    chat::{self, Provider, Session, runtime::Handle},
+    agent::Provider,
+    chat::{
+        self, Session,
+        runtime::{Handle, Update},
+    },
     model::{HostSessionProof, TerminalId},
     terminal_ipc::{
         ClientRequest, PROTOCOL_VERSION, ProtocolError, ProtocolErrorCode, ServerEnvelope,
@@ -18,7 +22,29 @@ pub(super) struct Record {
     pub session: Session,
     pub handle: Handle,
     pub subscribers: BTreeMap<ClientId, bool>,
+    pub(super) observations: BTreeMap<ClientId, Observation>,
     pub completion_observed: bool,
+}
+
+#[derive(Default)]
+pub(super) struct Observation {
+    epoch: u64,
+    after_generation: u64,
+    notified: bool,
+}
+
+impl Observation {
+    fn acknowledge(&mut self, epoch: u64, generation: u64) {
+        if epoch > self.epoch {
+            self.epoch = epoch;
+            self.after_generation = generation;
+            self.notified = false;
+        }
+    }
+
+    fn accepts(&self, generation: u64) -> bool {
+        !self.notified && generation > self.after_generation
+    }
 }
 fn error(message: impl Into<String>) -> ProtocolError {
     ProtocolError::new(ProtocolErrorCode::InvalidRequest, message, false)
@@ -39,23 +65,61 @@ fn attached(state: &HostState, client: ClientId, id: TerminalId) -> Result<&Reco
     }
     Ok(record)
 }
-fn changed(host: &Weak<Mutex<HostState>>, id: TerminalId) {
+fn changed(host: &Weak<Mutex<HostState>>, id: TerminalId, update: Update) {
     let Some(host) = host.upgrade() else {
         return;
     };
-    let state = host.lock().unwrap_or_else(|p| p.into_inner());
-    let Some(record) = state.chats.get(&id) else {
+    let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
+    let proof = state.proof().clone();
+    let HostState { chats, clients, .. } = &mut *state;
+    let Some(record) = chats.get_mut(&id) else {
         return;
     };
     for (&client, &visible) in &record.subscribers {
-        if visible && let Some(delivery) = state.clients.get(&client) {
-            let _ = delivery.push(ServerEnvelope {
+        let message = match update {
+            Update::Activity { state, generation } => ServerMessage::ChatActivity {
+                chat_id: id,
+                state,
+                generation,
+            },
+            Update::Presentation if visible => ServerMessage::ChatChanged { chat_id: id },
+            Update::Observed { generation } if !visible => {
+                let observation = record.observations.entry(client).or_default();
+                if !observation.accepts(generation) {
+                    continue;
+                }
+                ServerMessage::ChatObserved {
+                    chat_id: id,
+                    epoch: observation.epoch,
+                }
+            }
+            _ => continue,
+        };
+        if let Some(delivery) = clients.get(&client) {
+            let delivered = delivery.push(ServerEnvelope {
                 version: PROTOCOL_VERSION,
                 request_id: None,
-                proof: state.proof().clone(),
-                message: ServerMessage::ChatChanged { chat_id: id },
+                proof: proof.clone(),
+                message,
             });
+            if matches!(update, Update::Observed { .. }) && delivered.is_ok() {
+                record.observations.entry(client).or_default().notified = true;
+            }
         }
+    }
+    // An old producer callback can consume the shared rearm after an ACK but
+    // arrive here with a pre-ACK generation. Keep waiting subscribers armed;
+    // only successful delivery in their own epoch coalesces future output.
+    if matches!(update, Update::Observed { .. })
+        && record.subscribers.iter().any(|(client, visible)| {
+            !visible
+                && record
+                    .observations
+                    .get(client)
+                    .is_none_or(|observation| !observation.notified)
+        })
+    {
+        record.handle.observe_next_update();
     }
 }
 fn session_snapshot(record: &Record) -> ServerResponse {
@@ -111,19 +175,12 @@ fn start(
             }
             thread::sleep(Duration::from_millis(100));
         };
-        let provider = match std::path::Path::new(&recipe.program)
-            .file_name()
-            .and_then(|name| name.to_str())
-        {
-            Some("omp") => Provider::Omp,
-            Some("claude") => Provider::Claude,
-            Some("codex") => Provider::Codex,
-            _ => return Err(error("The foreground process is not a supported agent")),
-        };
+        let provider = Provider::from_program(&recipe.program)
+            .ok_or_else(|| error("The foreground process is not a supported agent"))?;
         let id = recipe
             .arguments
             .windows(2)
-            .find(|pair| pair[0] == "resume" || pair[0] == "--resume")
+            .find(|pair| pair[0] == provider.resume_flag())
             .map(|pair| pair[1].clone())
             .ok_or_else(|| error("Missing process-bound conversation identity"))?;
         if provider != session.launch.provider
@@ -167,7 +224,18 @@ fn start(
                     "Retained chat does not match this exact Codex source",
                 ));
             }
-            record.subscribers.insert(client, false);
+            if let std::collections::btree_map::Entry::Vacant(entry) =
+                record.subscribers.entry(client)
+            {
+                entry.insert(false);
+                record.observations.insert(
+                    client,
+                    Observation {
+                        after_generation: record.handle.observe_next_update(),
+                        ..Observation::default()
+                    },
+                );
+            }
             return Ok(session_snapshot(record));
         }
     }
@@ -271,7 +339,7 @@ fn start(
                 let proven = exact
                     .arguments
                     .windows(2)
-                    .find(|pair| pair[0] == "--resume" || pair[0] == "resume")
+                    .find(|pair| pair[0] == session.launch.provider.resume_flag())
                     .map(|pair| pair[1].as_str());
                 if proven != Some(id) {
                     return Err(error(
@@ -356,7 +424,7 @@ fn start(
             initial,
             store,
             session.launch.session_id.clone(),
-            move || changed(&weak, id),
+            move |update| changed(&weak, id, update),
         )
         .map_err(unavailable)?;
         let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
@@ -365,10 +433,15 @@ fn start(
             let _ = handle.close();
             return Err(unavailable("Daemon shutdown cancelled chat start"));
         }
+        let observation = Observation {
+            after_generation: handle.observe_next_update(),
+            ..Observation::default()
+        };
         let record = Record {
             session,
             handle,
             subscribers: BTreeMap::from([(client, false)]),
+            observations: BTreeMap::from([(client, observation)]),
             completion_observed: false,
         };
         let response = session_snapshot(&record);
@@ -428,7 +501,18 @@ pub(super) fn process(
                     "Native chat recovery identity does not match the hosted conversation",
                 ));
             }
-            record.subscribers.entry(client).or_insert(false);
+            if let std::collections::btree_map::Entry::Vacant(entry) =
+                record.subscribers.entry(client)
+            {
+                entry.insert(false);
+                record.observations.insert(
+                    client,
+                    Observation {
+                        after_generation: record.handle.observe_next_update(),
+                        ..Observation::default()
+                    },
+                );
+            }
             Ok(session_snapshot(record))
         }
         ClientRequest::ChatDetach { chat_id } => {
@@ -436,6 +520,7 @@ pub(super) fn process(
             attached(&state, client, chat_id)?;
             let record = state.chats.get_mut(&chat_id).expect("checked chat");
             record.subscribers.remove(&client);
+            record.observations.remove(&client);
             record
                 .handle
                 .set_visible(record.subscribers.values().any(|visible| *visible));
@@ -452,17 +537,30 @@ pub(super) fn process(
             handle.command(command).map_err(unavailable)?;
             Ok(ServerResponse::Accepted)
         }
+        ClientRequest::ChatAcknowledge { chat_id, epoch } => {
+            let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
+            attached(&state, client, chat_id)?;
+            let record = state.chats.get_mut(&chat_id).expect("checked chat");
+            let observation = record.observations.entry(client).or_default();
+            if epoch > observation.epoch {
+                observation.acknowledge(epoch, record.handle.observe_next_update());
+            }
+            Ok(ServerResponse::Accepted)
+        }
         ClientRequest::ChatVisibility { chat_id, visible } => {
             let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
             attached(&state, client, chat_id)?;
             let record = state.chats.get_mut(&chat_id).expect("checked chat");
-            record.subscribers.insert(client, visible);
+            let previous = record.subscribers.insert(client, visible);
+            if previous != Some(visible) && !visible {
+                record.handle.observe_next_update();
+            }
             record
                 .handle
                 .set_visible(record.subscribers.values().any(|visible| *visible));
             drop(state);
             if visible {
-                changed(&Arc::downgrade(host), chat_id);
+                changed(&Arc::downgrade(host), chat_id, Update::Presentation);
             }
             Ok(ServerResponse::Accepted)
         }
@@ -498,5 +596,203 @@ pub(super) fn process(
             Ok(ServerResponse::ChatClosed { chat_id, snapshot })
         }
         _ => Err(error("Not a native chat request")),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        chat::{
+            Command, Event,
+            protocol::{Adapter, ProcessSpec, Step},
+        },
+        model::{BootId, HostIncarnation, HostSessionId, LaunchRecipe},
+    };
+    use serde_json::{Value, json};
+
+    struct Echo(bool);
+    impl Adapter for Echo {
+        fn initialize(&mut self) -> Result<Step, String> {
+            Ok(Step::default())
+        }
+        fn command(&mut self, _: Command) -> Result<Step, String> {
+            Ok(Step {
+                writes: vec![json!({"tick": true})],
+                events: Vec::new(),
+            })
+        }
+        fn receive(&mut self, _: Value) -> Result<Step, String> {
+            self.0 = !self.0;
+            Ok(Step {
+                writes: Vec::new(),
+                events: vec![Event::Waiting(self.0)],
+            })
+        }
+    }
+
+    #[test]
+    fn delayed_producer_callback_after_rearm_is_fenced_without_reads() {
+        acknowledgement_race(false);
+    }
+
+    #[test]
+    fn delayed_producer_callback_before_rearm_cannot_consume_new_acknowledgement() {
+        acknowledgement_race(true);
+    }
+
+    fn acknowledgement_race(before_rearm: bool) {
+        let proof = HostSessionProof {
+            host_session_id: HostSessionId::new("chat-observation"),
+            boot_id: BootId::new("boot"),
+            host_incarnation: HostIncarnation::new("incarnation"),
+        };
+        let host = Arc::new(Mutex::new(HostState::new(proof.clone())));
+        let chat_id = TerminalId::new();
+        let recipe = LaunchRecipe {
+            program: "/bin/cat".into(),
+            arguments: Vec::new(),
+            working_directory: std::env::temp_dir(),
+            environment: BTreeMap::new(),
+        };
+        let spec = ProcessSpec::from(&recipe);
+        let mut initial = Step::default();
+        let store = chat::runtime::preflight(&spec, &mut initial).unwrap();
+        let (observed, pending) = crossbeam_channel::bounded(1);
+        let (release, released) = crossbeam_channel::bounded(1);
+        let (delivered, completed) = crossbeam_channel::bounded(1);
+        let weak = Arc::downgrade(&host);
+        let handle = Handle::start(
+            spec,
+            Box::new(Echo(false)),
+            initial,
+            store,
+            None,
+            move |update| {
+                let generation = match update {
+                    Update::Activity { generation, .. } if before_rearm => Some(generation),
+                    Update::Observed { generation } if !before_rearm => Some(generation),
+                    _ => None,
+                };
+                if let Some(generation) = generation {
+                    // Pause on either side of consuming the producer rearm, always
+                    // after the semantic event and before its unread host callback.
+                    if observed.send(generation).is_ok() {
+                        let _ = released.recv_timeout(Duration::from_secs(5));
+                    }
+                }
+                changed(&weak, chat_id, update);
+                if matches!(update, Update::Observed { .. }) {
+                    let _ = delivered.try_send(());
+                }
+            },
+        )
+        .unwrap();
+        let (first, second) = {
+            let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
+            let first = state.register_client(1);
+            let second = state.register_client(2);
+            state.chats.insert(
+                chat_id,
+                Record {
+                    session: Session {
+                        id: chat_id,
+                        launch: chat::Launch {
+                            provider: Provider::Claude,
+                            recipe,
+                            session_id: None,
+                        },
+                        proof: Some(proof),
+                        terminal: None,
+                    },
+                    handle: handle.clone(),
+                    subscribers: BTreeMap::from([(1, false), (2, false)]),
+                    observations: BTreeMap::from([
+                        (1, Observation::default()),
+                        (2, Observation::default()),
+                    ]),
+                    completion_observed: false,
+                },
+            );
+            (first, second)
+        };
+        handle.command(Command::Interrupt).unwrap();
+        let old_generation = pending.recv_timeout(Duration::from_secs(2)).unwrap();
+        // This must not deadlock on the producer's snapshot lock or hydrate any
+        // transcript. Only subscriber 1 acknowledges the already-produced event.
+        process(
+            &host,
+            1,
+            ClientRequest::ChatAcknowledge { chat_id, epoch: 1 },
+        )
+        .unwrap();
+        release.send(()).unwrap();
+        completed.recv_timeout(Duration::from_secs(2)).unwrap();
+        handle.command(Command::Interrupt).unwrap();
+        let fresh_generation = pending.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert!(fresh_generation > old_generation);
+        // Reordered and duplicate ACKs cannot advance the source cutoff to this
+        // fresh event, nor clear a subscriber's already-delivered observation.
+        for epoch in [1, 0] {
+            process(&host, 1, ClientRequest::ChatAcknowledge { chat_id, epoch }).unwrap();
+        }
+        release.send(()).unwrap();
+        completed.recv_timeout(Duration::from_secs(2)).unwrap();
+        for epoch in [1, 0] {
+            process(&host, 1, ClientRequest::ChatAcknowledge { chat_id, epoch }).unwrap();
+        }
+        changed(
+            &Arc::downgrade(&host),
+            chat_id,
+            Update::Observed {
+                generation: fresh_generation + 1,
+            },
+        );
+        // Closing the queues makes missing or surplus observations deterministic.
+        first.close_after_drain();
+        second.close_after_drain();
+        let drain = |queue: &super::super::delivery::DeliveryQueue| {
+            let mut epochs = Vec::new();
+            while let Some(envelope) = queue.pop() {
+                match envelope.message {
+                    ServerMessage::ChatObserved { epoch, .. } => epochs.push(epoch),
+                    ServerMessage::ChatActivity { .. } => {}
+                    other => panic!("hidden acknowledgement requested presentation: {other:?}"),
+                }
+            }
+            epochs
+        };
+        assert_eq!(
+            drain(&first),
+            vec![1],
+            "old callback or duplicate ACK resurrected unread"
+        );
+        assert_eq!(
+            drain(&second),
+            vec![0],
+            "one subscriber's ACK must not rearm another"
+        );
+        assert!(
+            process(
+                &host,
+                1,
+                ClientRequest::ChatRead {
+                    chat_id,
+                    after_generation: None
+                }
+            )
+            .is_err()
+        );
+        process(&host, 1, ClientRequest::ChatDetach { chat_id }).unwrap();
+        {
+            let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
+            state.unregister_client(2);
+            let record = state.chats.get(&chat_id).unwrap();
+            assert!(record.subscribers.is_empty());
+            assert!(record.observations.is_empty());
+        }
+        drop(pending);
+        drop(release);
+        handle.close().unwrap();
     }
 }

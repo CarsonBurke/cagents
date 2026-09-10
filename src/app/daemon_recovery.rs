@@ -197,20 +197,10 @@ fn recovery_recipe(
 /// Recipes passed here have already been normalized by agent_resume_recipe.
 /// Only the provider's resume selector identifies the writer, never UUID-shaped
 /// values of unrelated model, profile, or configuration flags.
-fn exact_conversation(recipe: &LaunchRecipe) -> Option<(&str, uuid::Uuid)> {
-    let agent = Path::new(&recipe.program).file_name()?.to_str()?;
-    let id = match agent {
-        "codex" => match recipe.arguments.as_slice() {
-            [selector, id, ..] if selector == "resume" => id,
-            _ => return None,
-        },
-        "claude" | "omp" => match recipe.arguments.as_slice() {
-            [.., selector, id] if selector == "--resume" => id,
-            _ => return None,
-        },
-        _ => return None,
-    };
-    Some((agent, uuid::Uuid::parse_str(id).ok()?))
+fn exact_conversation(recipe: &LaunchRecipe) -> Option<(crate::agent::Provider, uuid::Uuid)> {
+    let provider = crate::agent::Provider::from_program(&recipe.program)?;
+    let id = provider.resume_id(&recipe.arguments)?;
+    Some((provider, uuid::Uuid::parse_str(id).ok()?))
 }
 
 /// The lease proves the previous daemon no longer owns this runtime. Its PTY
@@ -274,10 +264,11 @@ fn ensure_no_surviving_process(
             Err(error) => return Err(process_error(error)),
         };
         if argv.split(|byte| *byte == 0).any(|arg| {
-            exact_identity.is_some_and(|(agent, id)| {
+            exact_identity.is_some_and(|(provider, id)| {
                 std::str::from_utf8(arg).ok().is_some_and(|arg| {
                     uuid::Uuid::parse_str(arg).ok() == Some(id)
-                        || crate::model::agent_recovery::session_file_id(Path::new(arg), agent)
+                        || provider
+                            .session_file_id(Path::new(arg))
                             .and_then(|locator| uuid::Uuid::parse_str(&locator).ok())
                             == Some(id)
                 })

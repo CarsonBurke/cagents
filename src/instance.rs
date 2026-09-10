@@ -79,6 +79,14 @@ pub struct ApplicationLease {
     _lock: File,
 }
 
+impl Drop for ApplicationLease {
+    fn drop(&mut self) {
+        // A concurrently forked child can retain this description until exec.
+        // SAFETY: the lease owns the live locked descriptor throughout Drop.
+        let _ = unsafe { libc::flock(self._lock.as_raw_fd(), libc::LOCK_UN) };
+    }
+}
+
 impl ApplicationLease {
     pub fn acquire() -> Result<Self, ApplicationLeaseError> {
         if !IS_DEVELOPMENT {

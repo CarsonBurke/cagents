@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=ceditor
+GenericName=Text Editor
+Comment=Native file editing and Git diff review
+Exec=ceditor %F
+Icon=io.github.cagents.ceditor
+Terminal=false
+Categories=Development;TextEditor;
+MimeType=text/plain;text/markdown;text/x-rust;text/x-c;text/x-c++;application/json;application/toml;application/x-shellscript;inode/directory;
+StartupNotify=true
+StartupWMClass=io.github.cagents.ceditor
