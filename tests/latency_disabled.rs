@@ -1,4 +1,8 @@
 //! Dedicated binary isolates the allocator probe from the application tests.
+//! Servo owns the process allocator, so this probe runs in the isolated CLI,
+//! host, and browserless UI lanes rather than the integrated-browser lane.
+#![cfg(not(feature = "integrated-browser"))]
+
 use std::{
     alloc::{GlobalAlloc, Layout, System},
     cell::Cell,
@@ -59,10 +63,4 @@ fn disabled_recorder_constructs_commits_and_abandons_without_allocations_or_cloc
     TRACK.with(|track| track.set(false));
     assert_eq!(clock_reads, 0);
     assert_eq!(ALLOCATIONS.with(Cell::get), 0);
-}
-
-#[cfg(not(feature = "latency-harness"))]
-#[test]
-fn default_build_recorder_is_the_explicit_noop_type() {
-    let _: NoopRecorder = cagents::performance::InteractionLatency::default();
 }

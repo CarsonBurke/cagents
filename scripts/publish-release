@@ -1,0 +1,390 @@
+#!/usr/bin/env bash
+set -euo pipefail
+set +x
+
+PROGRAM=publish-release
+SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+ROOT_DIR=$(dirname -- "$SCRIPT_DIR")
+DIST_DIR=${CAGENTS_DIST_DIR:-"$ROOT_DIR/dist"}
+REPOSITORY=CarsonBurke/cagents
+TARGET=x86_64-unknown-linux-gnu
+VERSION=
+VERIFY_ONLY=false
+export LC_ALL=C
+
+fail() {
+    printf '%s: %s\n' "$PROGRAM" "$*" >&2
+    exit 1
+}
+
+usage() {
+    printf '%s\n' \
+        'Usage: scripts/publish-release [--version VERSION] [--dist DIR] [--verify-only]' \
+        'Validate an existing local bundle and publish it through authenticated gh.' \
+        'Defaults: version from Cargo manifests; dist from CAGENTS_DIST_DIR or checkout/dist.' \
+        '--verify-only validates local files and the local tag without network access.' \
+        'Publication requires the identical existing tag on github.com/CarsonBurke/cagents.' \
+        'Only drafts owned by this local publisher for this exact bundle may be resumed.' \
+        'This command never builds, runs Actions, creates tags, or changes published releases.'
+}
+
+while (($#)); do
+    case $1 in
+        --version|--dist)
+            (($# >= 2)) || fail "missing value for $1"
+            [[ -n $2 ]] || fail "empty value for $1"
+            case $1 in --version) VERSION=$2 ;; --dist) DIST_DIR=$2 ;; esac
+            shift 2
+            ;;
+        --verify-only) VERIFY_ONLY=true; shift ;;
+        --help|-h) usage; exit 0 ;;
+        *) fail "unknown argument: $1" ;;
+    esac
+done
+
+for command in git jq sed sort sha256sum tar mktemp cp cmp; do
+    command -v "$command" >/dev/null 2>&1 || fail "required command not found: $command"
+done
+
+manifest_version() {
+    sed -n '/^\[package\]/,/^\[/{s/^version = "\([^"]*\)"$/\1/p;}'
+}
+
+if [[ -z $VERSION ]]; then
+    VERSION=$(manifest_version < "$ROOT_DIR/Cargo.toml")
+    [[ $(manifest_version < "$ROOT_DIR/crates/ceditor/Cargo.toml") == "$VERSION" ]] \
+        || fail 'checkout cagents and ceditor versions differ'
+fi
+[[ $VERSION =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]] \
+    || fail 'version must be a stable semantic version without a leading v'
+TAG=v$VERSION
+SOURCE_COMMIT=$(git -C "$ROOT_DIR" rev-parse --verify "refs/tags/$TAG^{commit}") \
+    || fail "missing local commit tag: $TAG"
+TAG_OBJECT=$(git -C "$ROOT_DIR" rev-parse --verify "refs/tags/$TAG")
+for manifest in Cargo.toml crates/ceditor/Cargo.toml; do
+    tagged_version=$(git -C "$ROOT_DIR" show "$SOURCE_COMMIT:$manifest" | manifest_version)
+    [[ $tagged_version == "$VERSION" ]] || fail "$manifest at $TAG does not declare version $VERSION"
+done
+
+FULL_ARCHIVE=cagents-$VERSION-$TARGET.tar.gz
+FULL_DEB=cagents_${VERSION}_amd64.deb
+FULL_SIZES=cagents-$VERSION-sizes.txt
+COMPARISON=cagents-$VERSION-artifact-comparison.txt
+BROWSERLESS_ARCHIVE=cagents-browserless-$VERSION-$TARGET.tar.gz
+BROWSERLESS_DEB=cagents-browserless_${VERSION}_amd64.deb
+BROWSERLESS_SIZES=cagents-browserless-$VERSION-sizes.txt
+EDITOR_ARCHIVE=ceditor-$VERSION-$TARGET.tar.gz
+PAYLOADS=(
+    "$FULL_ARCHIVE" "$FULL_DEB" "$FULL_SIZES" "$COMPARISON"
+    "$BROWSERLESS_ARCHIVE" "$BROWSERLESS_DEB" "$BROWSERLESS_SIZES"
+    "$EDITOR_ARCHIVE" SHA256SUMS-browserless SHA256SUMS-ceditor
+    release-metadata.json install.sh
+)
+ASSETS=("${PAYLOADS[@]}" SHA256SUMS)
+EXPECTED_ASSETS=$(printf '%s\n' "${ASSETS[@]}" | sort)
+
+check_asset_set() {
+    local directory=$1 path actual
+    local -a names=()
+    [[ -d $directory ]] || fail "missing release directory: $directory"
+    shopt -s nullglob dotglob
+    for path in "$directory"/*; do
+        [[ -f $path && ! -L $path && -s $path ]] || fail "release asset is not a nonempty regular file: ${path##*/}"
+        names+=("${path##*/}")
+    done
+    shopt -u nullglob dotglob
+    actual=$(printf '%s\n' "${names[@]}" | sort)
+    [[ $actual == "$EXPECTED_ASSETS" ]] || fail 'release directory must contain exactly the 13 expected assets (no extra files or directories)'
+}
+
+# Parse names before sha256sum: even a valid checksum must never read outside dist.
+check_manifest() {
+    local directory=$1 manifest=$2 line digest name actual expected
+    shift 2
+    local -a names=()
+    expected=$(printf '%s\n' "$@" | sort)
+    while IFS= read -r line || [[ -n $line ]]; do
+        [[ $line =~ ^([0-9a-f]{64})\ \ ([-A-Za-z0-9_.]+)$ ]] \
+            || fail "invalid checksum record in $manifest"
+        digest=${BASH_REMATCH[1]}
+        name=${BASH_REMATCH[2]}
+        [[ -n $digest && -f $directory/$name && ! -L $directory/$name ]] \
+            || fail "missing checksum payload in $manifest: $name"
+        names+=("$name")
+    done < "$directory/$manifest"
+    actual=$(printf '%s\n' "${names[@]}" | sort)
+    [[ $actual == "$expected" ]] || fail "$manifest has missing, duplicate, or unexpected payloads"
+    (cd -- "$directory" && sha256sum --check --strict "$manifest") \
+        || fail "checksum verification failed: $manifest"
+}
+
+check_checksums() {
+    check_manifest "$1" SHA256SUMS "${PAYLOADS[@]}"
+    check_manifest "$1" SHA256SUMS-browserless "$BROWSERLESS_ARCHIVE" "$BROWSERLESS_DEB" "$BROWSERLESS_SIZES"
+    check_manifest "$1" SHA256SUMS-ceditor "$EDITOR_ARCHIVE"
+}
+
+check_metadata() {
+    jq -se --arg version "$VERSION" --arg source "$SOURCE_COMMIT" --arg target "$TARGET" '
+        length == 1 and .[0] == {
+            schema_version: 1,
+            repository: "CarsonBurke/cagents",
+            version: $version,
+            source_commit: $source,
+            targets: [{
+                target: $target, os: "linux", architecture: "x86_64", libc: "gnu",
+                minimum_glibc: "2.35",
+                products: {
+                    cagents: {
+                        archive: ("cagents-" + $version + "-" + $target + ".tar.gz"),
+                        deb: ("cagents_" + $version + "_amd64.deb"),
+                        installer: "install.sh", checksums: "SHA256SUMS"
+                    },
+                    "cagents-browserless": {
+                        archive: ("cagents-browserless-" + $version + "-" + $target + ".tar.gz"),
+                        deb: ("cagents-browserless_" + $version + "_amd64.deb"),
+                        checksums: "SHA256SUMS-browserless"
+                    },
+                    ceditor: {
+                        archive: ("ceditor-" + $version + "-" + $target + ".tar.gz"),
+                        checksums: "SHA256SUMS-ceditor"
+                    }
+                }
+            }]
+        }
+    ' "$1/release-metadata.json" >/dev/null \
+        || fail 'release metadata does not match the supported schema, target, version, products, and local tag commit'
+    [[ $(sed -n '/^DEFAULT_REPOSITORY=/p' "$1/install.sh") == "DEFAULT_REPOSITORY='$REPOSITORY'" ]] \
+        || fail 'installer is not stamped for the canonical repository'
+}
+
+# Validate the complete member set and types without extracting or running code.
+# Only the browserless command alias may be a link; all binaries must be executable.
+check_archive() {
+    local directory=$1 archive=$2 product=$3 desktop=$4
+    local root=$product-$VERSION file parent expected actual mode owner size date time name rest
+    local -a files directories executables
+    if [[ $product == ceditor ]]; then
+        files=(bin/ceditor "share/applications/$desktop.desktop"
+            "share/icons/hicolor/scalable/apps/$desktop.svg" share/doc/ceditor/LICENSE)
+        executables=(bin/ceditor)
+    else
+        files=(bin/cagents bin/cagents-ui bin/cagentsd bin/.cagents-ui-lease-v1
+            "share/applications/$desktop.desktop" "share/autostart/$desktop.Daemon.desktop"
+            "share/icons/hicolor/scalable/apps/$desktop.svg"
+            "share/icons/hicolor/128x128/apps/$desktop.png"
+            "share/metainfo/$desktop.metainfo.xml" share/doc/cagents/LICENSE)
+        executables=(bin/cagents bin/cagents-ui bin/cagentsd)
+        if [[ $product == cagents ]]; then
+            files+=(bin/cagents-uninstall)
+            executables+=(bin/cagents-uninstall)
+        else
+            files+=(bin/cagents-browserless)
+        fi
+    fi
+    directories=("$root/")
+    for file in "${files[@]}"; do
+        parent=${file%/*}
+        while [[ $parent != . ]]; do
+            directories+=("$root/$parent/")
+            if [[ $parent == */* ]]; then parent=${parent%/*}; else parent=.; fi
+        done
+    done
+    expected=$({ printf '%s\n' "${directories[@]}" | sort -u; printf "$root/%s\n" "${files[@]}"; } | sort)
+    tar -tzf "$directory/$archive" > "$WORK_DIR/archive-members" \
+        || fail "cannot read archive: $archive"
+    actual=$(sort "$WORK_DIR/archive-members")
+    [[ $actual == "$expected" ]] || fail "unexpected, missing, or duplicate archive members: $archive"
+    tar --numeric-owner --full-time -tvzf "$directory/$archive" > "$WORK_DIR/archive-types" \
+        || fail "cannot inspect archive: $archive"
+    while read -r mode owner size date time name rest; do
+        case $name in
+            */) [[ $mode == d* && -z $rest ]] || fail "invalid directory member in $archive" ;;
+            "$root/bin/cagents-browserless")
+                [[ $product == cagents-browserless && $mode == l* && $rest == '-> cagents' ]] \
+                    || fail "invalid browserless alias in $archive"
+                ;;
+            *) [[ $mode == -* && -z $rest ]] || fail "non-regular file member in $archive: $name" ;;
+        esac
+        [[ $mode != *s* && $mode != *S* && $mode != *t* && $mode != *T* ]] \
+            || fail "special permissions in $archive: $name"
+        for file in "${executables[@]}"; do
+            if [[ $name == "$root/$file" ]]; then
+                [[ ${mode:3:1} == x && ${mode:6:1} == x && ${mode:9:1} == x && $size =~ ^[1-9][0-9]*$ ]] \
+                    || fail "missing executable permissions or empty binary in $archive: $name"
+            fi
+        done
+    done < "$WORK_DIR/archive-types"
+}
+
+check_asset_set "$DIST_DIR"
+WORK_DIR=$(mktemp -d "${TMPDIR:-/tmp}/cagents-publish.XXXXXX")
+cleanup() { rm -rf -- "$WORK_DIR"; }
+trap cleanup EXIT
+trap 'exit 1' HUP INT TERM
+
+# A private snapshot keeps uploads and comparisons bound to the bytes validated here.
+mkdir "$WORK_DIR/bundle"
+for asset in "${ASSETS[@]}"; do
+    cp --reflink=auto --preserve=mode -- "$DIST_DIR/$asset" "$WORK_DIR/bundle/$asset"
+done
+DIST_DIR=$WORK_DIR/bundle
+check_asset_set "$DIST_DIR"
+check_checksums "$DIST_DIR"
+check_metadata "$DIST_DIR"
+check_archive "$DIST_DIR" "$FULL_ARCHIVE" cagents dev.cagents.Cagents
+check_archive "$DIST_DIR" "$BROWSERLESS_ARCHIVE" cagents-browserless dev.cagents.Cagents.Browserless
+check_archive "$DIST_DIR" "$EDITOR_ARCHIVE" ceditor io.github.cagents.ceditor
+printf 'Validated %s: 13 assets, checksums, archive layouts, and source %s\n' "$TAG" "$SOURCE_COMMIT"
+if "$VERIFY_ONLY"; then
+    exit 0
+fi
+
+# One lock across worktrees/bundles, retained through the final publication.
+command -v flock >/dev/null 2>&1 || fail 'required command not found: flock'
+LOCK_DIR=${XDG_CACHE_HOME:-"$HOME/.cache"}/cagents-release-publication
+umask 077
+[[ ! -L $LOCK_DIR ]] || fail 'publication lock directory must not be a symlink'
+mkdir -p -- "$LOCK_DIR"
+[[ -O $LOCK_DIR && $(stat -c %a "$LOCK_DIR") == 700 ]] \
+    || fail 'publication lock directory must be private and caller-owned'
+LOCK_FILE=$LOCK_DIR/${REPOSITORY//\//-}-$TAG.lock
+[[ ! -L $LOCK_FILE ]] || fail 'publication lock must not be a symlink'
+exec {PUBLICATION_LOCK}>"$LOCK_FILE"
+flock -n "$PUBLICATION_LOCK" || fail "another local publisher owns $REPOSITORY $TAG"
+
+command -v gh >/dev/null 2>&1 || fail 'required command not found: gh'
+export GH_HOST=github.com GH_PROMPT_DISABLED=1
+unset GH_DEBUG
+
+# API errors (including authentication failures) are fatal, never treated as absence.
+gh api --hostname github.com user --jq .login >/dev/null
+check_remote_tag() {
+    local object kind sha depth=0
+    object=$(gh api --hostname github.com "repos/$REPOSITORY/git/ref/tags/$TAG")
+    sha=$(jq -er '.object.sha' <<< "$object")
+    kind=$(jq -er '.object.type' <<< "$object")
+    [[ $sha == "$TAG_OBJECT" ]] || fail "remote $TAG is not the identical local tag object"
+    while [[ $kind == tag ]]; do
+        ((depth += 1))
+        ((depth <= 16)) || fail "remote $TAG has an excessive annotated-tag chain"
+        object=$(gh api --hostname github.com "repos/$REPOSITORY/git/tags/$sha")
+        sha=$(jq -er '.object.sha' <<< "$object")
+        kind=$(jq -er '.object.type' <<< "$object")
+    done
+    [[ $kind == commit && $sha == "$SOURCE_COMMIT" ]] \
+        || fail "remote $TAG does not resolve to the bundle source commit"
+    [[ $(git -C "$ROOT_DIR" rev-parse --verify "refs/tags/$TAG") == "$TAG_OBJECT" ]] \
+        || fail 'local release tag changed during publication'
+}
+check_remote_tag
+
+RELEASE_MARKER='<!-- cagents-local-release -->'
+BUNDLE_HASH=$(sha256sum "$DIST_DIR/SHA256SUMS")
+BUNDLE_HASH=${BUNDLE_HASH%% *}
+BUNDLE_MARKER="<!-- source_commit=$SOURCE_COMMIT SHA256SUMS=$BUNDLE_HASH -->"
+NOTES=$WORK_DIR/release-notes.txt
+cat > "$NOTES" <<EOF
+$RELEASE_MARKER
+$BUNDLE_MARKER
+
+## Linux x86_64 binaries
+
+Full cagents, browserless cagents, and the standalone ceditor are available
+for \`$TARGET\` (glibc 2.35 or newer, Wayland).
+Repository features require Git 2.36 or newer; upgrade Ubuntu 22.04's default Git separately.
+Windows and macOS binaries are not provided.
+
+Built and validated locally from \`$SOURCE_COMMIT\`; no GitHub Actions are used.
+
+Authenticate with \`gh auth login\` for private-repository access, then download
+and verify the complete release before running its installer:
+
+\`\`\`sh
+gh release download "$TAG" --repo CarsonBurke/cagents --dir "cagents-$VERSION-release"
+cd "cagents-$VERSION-release"
+sha256sum --check --strict SHA256SUMS
+CAGENTS_ARCHIVE="\$PWD/$FULL_ARCHIVE" CAGENTS_CHECKSUMS="\$PWD/SHA256SUMS" sh ./install.sh --restart-daemon
+\`\`\`
+
+The Update action performs the same verified full-package migration for
+supported self-managed installs. Debian packages must be upgraded with the
+system package manager; browserless and source installations are not
+self-replaced by Update.
+
+To install only ceditor after checksum verification (without cagents):
+
+\`\`\`sh
+mkdir -p "\$HOME/.local"
+tar -xzf "$EDITOR_ARCHIVE" --strip-components=1 -C "\$HOME/.local"
+\`\`\`
+
+Ensure \`\$HOME/.local/bin\` is on PATH. Archive desktop entries and icons
+reside under \`share/\`; \`release-metadata.json\` lists exact supported assets.
+EOF
+
+release_for_tag() {
+    gh api --hostname github.com --paginate "repos/$REPOSITORY/releases?per_page=100" |
+        jq -sce --arg tag "$TAG" '
+            [.[][] | select(.tag_name == $tag)] |
+            if length <= 1 then . else error("multiple releases for the tag") end
+        '
+}
+
+assert_owned_draft() {
+    jq -e --arg tag "$TAG" --arg marker "$RELEASE_MARKER" --arg bundle "$BUNDLE_MARKER" '
+        .tag_name == $tag and .draft == true and
+        (.body | split("\n") | index($marker) != null and index($bundle) != null)
+    ' <<< "$1" >/dev/null || fail 'refusing to modify a published release or a draft not owned by this local publisher for this exact bundle'
+}
+
+releases=$(release_for_tag)
+if [[ $(jq 'length' <<< "$releases") == 0 ]]; then
+    gh release create "$TAG" --repo "$REPOSITORY" --verify-tag --draft \
+        --title "cagents and ceditor $TAG" --notes-file "$NOTES" --generate-notes
+    releases=$(release_for_tag)
+fi
+[[ $(jq 'length' <<< "$releases") == 1 ]] || fail 'could not find the newly created draft'
+release=$(jq -c '.[0]' <<< "$releases")
+assert_owned_draft "$release"
+RELEASE_ID=$(jq -er '.id | select(type == "number")' <<< "$release")
+
+# A previous interrupted upload may contain only part of this same bundle.
+existing_assets=$(jq -r '.assets[].name' <<< "$release")
+while IFS= read -r asset; do
+    [[ -z $asset ]] && continue
+    found=false
+    for expected in "${ASSETS[@]}"; do
+        [[ $asset != "$expected" ]] || found=true
+    done
+    "$found" || fail "owned draft contains an unexpected asset: $asset"
+done <<< "$existing_assets"
+
+assert_current_draft() {
+    local current
+    current=$(gh api --hostname github.com "repos/$REPOSITORY/releases/$RELEASE_ID")
+    assert_owned_draft "$current"
+}
+assert_current_draft
+upload_assets=()
+for asset in "${ASSETS[@]}"; do upload_assets+=("$DIST_DIR/$asset"); done
+gh release upload "$TAG" "${upload_assets[@]}" --repo "$REPOSITORY" --clobber
+
+release=$(gh api --hostname github.com "repos/$REPOSITORY/releases/$RELEASE_ID")
+assert_owned_draft "$release"
+actual_assets=$(jq -r '.assets[].name' <<< "$release" | sort)
+[[ $actual_assets == "$EXPECTED_ASSETS" ]] || fail 'refusing to publish: uploaded assets do not match the exact expected set'
+mkdir "$WORK_DIR/downloaded"
+# gh uses authentication for private repositories and draft asset downloads.
+gh release download "$TAG" --repo "$REPOSITORY" --dir "$WORK_DIR/downloaded"
+check_asset_set "$WORK_DIR/downloaded"
+for asset in "${ASSETS[@]}"; do
+    cmp -- "$DIST_DIR/$asset" "$WORK_DIR/downloaded/$asset" \
+        || fail "refusing to publish: GitHub served different bytes for $asset"
+done
+check_checksums "$WORK_DIR/downloaded"
+check_remote_tag
+assert_current_draft
+gh api --hostname github.com --method PATCH "repos/$REPOSITORY/releases/$RELEASE_ID" \
+    -F draft=false --jq .html_url
+printf 'Published %s from verified local assets.\n' "$TAG"
