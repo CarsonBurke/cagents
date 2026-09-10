@@ -1,6 +1,6 @@
-mod activity_ui;
 mod chat_ui;
 mod chrome_ui;
+mod daemon_recovery;
 mod daemon_stop;
 pub(crate) mod dialog_ui;
 #[cfg(feature = "latency-harness")]
@@ -163,6 +163,13 @@ pub struct BrowserFactoryBinding {
 enum TerminalStartMode {
     Attach(HostSessionProof),
     Spawn(LaunchRecipe),
+}
+
+#[derive(Debug, Clone)]
+pub struct StartedTerminal {
+    handle: TerminalSurface,
+    session: TerminalSession,
+    spawned: bool,
 }
 
 const TOOLBAR_FOCUS_ID: &str = "cagents-workspace-toolbar";
@@ -401,16 +408,15 @@ fn transient_notice_view(notice: &TransientNotice) -> Element<'_, Message> {
             ))
             .width(Length::Fill)
             .into(),
-        Some(
+        Some(crate::interaction::tooltip(
             widget::button::icon(widget::icon::from_name("window-close-symbolic"))
                 .id(widget::Id::new("status.dismiss"))
                 .name(format!("Dismiss {} notice", severity.label()))
-                .tooltip("Dismiss notice")
                 .width(ICON_CONTROL_SIZE)
                 .height(ICON_CONTROL_SIZE)
-                .on_press(Message::DismissStatus)
-                .into(),
-        ),
+                .on_press(Message::DismissStatus),
+            "Dismiss notice",
+        )),
         true,
     )
 }
@@ -486,16 +492,15 @@ fn save_health_view(health: &SaveHealthState) -> Option<Element<'_, Message>> {
                 unix_time_label(*recovered_at_unix_ms),
             ),
             "Changes are being saved again.",
-            Some(
+            Some(crate::interaction::tooltip(
                 widget::button::icon(widget::icon::from_name("window-close-symbolic"))
                     .id(widget::Id::new("session-save.acknowledge-recovery"))
                     .name("Acknowledge session save recovery")
-                    .tooltip("Acknowledge recovery")
                     .width(ICON_CONTROL_SIZE)
                     .height(ICON_CONTROL_SIZE)
-                    .on_press(Message::AcknowledgeSessionRecovery)
-                    .into(),
-            ),
+                    .on_press(Message::AcknowledgeSessionRecovery),
+                "Acknowledge recovery",
+            )),
         ),
         SessionSaveHealth::WriterUnavailable => (
             NoticeSeverity::Error,
@@ -1855,7 +1860,8 @@ pub enum Message {
     NewTerminal,
     TerminalStarted {
         card: CardId,
-        result: Result<TerminalSurface, String>,
+        terminal: TerminalId,
+        result: Result<StartedTerminal, String>,
     },
     TerminalWake {
         card: CardId,
@@ -1909,10 +1915,6 @@ pub enum Message {
     #[cfg(feature = "latency-harness")]
     LatencyFixtureStep,
     Frame(Instant),
-    TerminalActivityExpired {
-        card: CardId,
-        timer: crate::model::TerminalActivityTimer,
-    },
     LifecycleSweep,
     /// A sweep timer fired, carrying the generation it was armed for; a
     /// generation that has since been superseded is discarded.
@@ -2418,8 +2420,7 @@ pub struct Cagents {
     terminal_close_attempts: HashSet<TerminalId>,
     closed_terminal_cards: HashSet<CardId>,
     uncertain_terminal_proofs: HashMap<CardId, HostSessionProof>,
-    terminal_activity: HashMap<CardId, activity_ui::ActivityPresentation>,
-    activity_origin: Instant,
+    terminal_recovery_attempts: HashSet<TerminalId>,
     worktree_operations:
         HashMap<crate::model::OperationId, worktree_operations::ActiveWorktreeOperation>,
     /// A source-control navigation waiting for its repository card to finish
@@ -2786,10 +2787,12 @@ impl Cagents {
         card: CardId,
         session: TerminalSession,
         visible: bool,
+        explicit_retry: bool,
     ) -> Task<Message> {
         let max_scrollback = self.settings.terminal_scrollback_lines;
         let theme = self.settings.terminal_theme;
         let sender = self.terminal_wake_tx.clone();
+        let terminal = session.id;
         cosmic::task::future(async move {
             let result = tokio::task::spawn_blocking(move || {
                 let config = TerminalConfig {
@@ -2798,7 +2801,11 @@ impl Cagents {
                     theme,
                     ..TerminalConfig::default()
                 };
+                let recovered = daemon_recovery::reconcile(session, explicit_retry)?;
+                let recovery_lease = recovered.recovery_lease;
+                let session = recovered.session;
                 let mode = terminal_start_mode(&session)?;
+                let spawned = matches!(&mode, TerminalStartMode::Spawn(_));
                 let wake = move |wake: crate::terminal::TerminalWake| {
                     // Each terminal source coalesces visual and semantic edges
                     // until the app acknowledges them. The unbounded app queue
@@ -2814,25 +2821,34 @@ impl Cagents {
                         HostedTerminalHandle::connect(session.id, Some(proof), wake)
                     }
                     TerminalStartMode::Spawn(recipe) => {
-                        let mut session = session;
+                        let mut session = session.clone();
                         session.launch = recipe;
-                        HostedTerminalHandle::attach_or_spawn(session, config, None, wake)
+                        HostedTerminalHandle::attach_or_spawn(
+                            session,
+                            config,
+                            recovered.expected_host,
+                            wake,
+                        )
                     }
                 }
                 .map_err(|error| error.to_string())?;
+                handle.wait_until_attached(Duration::from_secs(10))?;
+                drop(recovery_lease);
                 let surface = TerminalSurface::from(handle);
-                surface
-                    .set_theme(theme)
-                    .map_err(|error| error.to_string())?;
-                if !visible {
-                    surface.hide().map_err(|error| error.to_string())?;
-                }
-                Ok(surface)
+                Ok(StartedTerminal {
+                    handle: surface,
+                    session,
+                    spawned,
+                })
             })
             .await
             .map_err(|error| format!("terminal worker join failed: {error}"))
             .and_then(|result| result);
-            Message::TerminalStarted { card, result }
+            Message::TerminalStarted {
+                card,
+                terminal,
+                result,
+            }
         })
     }
 
@@ -2913,7 +2929,7 @@ impl Cagents {
         self.persist();
         Task::batch([
             scope,
-            self.start_terminal(card_id, session, true),
+            self.start_terminal(card_id, session, true, false),
             self.apply_viewport(update, true, false),
         ])
     }
@@ -3162,6 +3178,7 @@ impl Cagents {
             card,
             session,
             state.exposure == Exposure::Visible && self.workspace_surfaces_visible(),
+            false,
         )
     }
 
@@ -3361,7 +3378,9 @@ impl Cagents {
         if let CardKind::Browser(session) = &state.kind {
             return Self::open_external_url(session.current_url.clone());
         }
-        let terminal_replacement = if let CardKind::Terminal(session) = &mut state.kind {
+        let terminal_replacement = if let CardKind::Terminal(session) = &mut state.kind
+            && session.continuity.live_proof().is_none()
+        {
             let expected_terminal_id = session.id;
             let replacement = fresh_terminal_relaunch(session);
             *session = replacement.clone();
@@ -3388,11 +3407,13 @@ impl Cagents {
         let surfaces_visible = self.workspace_surfaces_visible();
         match state.kind {
             CardKind::Terminal(session) => {
+                self.terminal_recovery_attempts.remove(&session.id);
                 self.cards.insert(card, CardRuntime::Loading);
                 self.start_terminal(
                     card,
                     session,
                     state.exposure == Exposure::Visible && surfaces_visible,
+                    true,
                 )
             }
             #[cfg(feature = "integrated-browser")]
@@ -3695,6 +3716,7 @@ impl Cagents {
                             card,
                             session,
                             visible.contains(&card) && surfaces_visible,
+                            false,
                         ));
                         continue;
                     }
@@ -3829,18 +3851,19 @@ impl Cagents {
         Task::batch(tasks)
     }
 
-    fn drain_terminal(&mut self, card: CardId, _generation: u64) {
+    fn drain_terminal(&mut self, card: CardId, _generation: u64) -> Task<Message> {
         if self.chat_start_pending(card) {
-            return;
+            return Task::none();
         }
         let (proof, collected) = {
             let Some(CardRuntime::Terminal(handle)) = self.cards.get(&card) else {
-                return;
+                return Task::none();
             };
             let events = handle.events();
             (handle.host_proof(), events.try_iter().collect::<Vec<_>>())
         };
         let mut durable_changed = false;
+        let mut recovery = None;
         if let Some(proof) = proof {
             self.uncertain_terminal_proofs.remove(&card);
             let live = TerminalContinuity::Live {
@@ -3898,28 +3921,49 @@ impl Cagents {
                         self.uncertain_terminal_proofs.insert(card, proof);
                     }
                     if operation == "connect to cagents daemon"
-                        && let Some(state) = self.card_state_mut(card)
-                        && let CardKind::Terminal(session) = &mut state.kind
-                        && matches!(
-                            &session.continuity,
-                            TerminalContinuity::Live { .. }
-                                | TerminalContinuity::DetachedSameBoot { .. }
-                        )
+                        && let Some(state) = self.card_state(card)
+                        && let CardKind::Terminal(session) = &state.kind
+                        && session.continuity.live_proof().is_some()
                     {
-                        session.continuity = TerminalContinuity::RelaunchAvailable {
-                            recipe: session.launch.clone(),
-                            last_exit: None,
-                        };
+                        let session = session.clone();
+                        let visible = state.exposure == Exposure::Visible
+                            && self.workspace_surfaces_visible();
+                        if self.terminal_recovery_attempts.insert(session.id) {
+                            recovery = Some((session, visible));
+                        }
                     }
                     self.fail_runtime(card, message.clone());
                     durable_changed = true;
-                    self.status = Some(TransientNotice::error(message));
+                    if recovery.is_none() {
+                        self.status = Some(TransientNotice::error(message));
+                    }
                 }
             }
         }
         if durable_changed {
             self.persist();
         }
+        if let Some((session, visible)) = recovery {
+            let residency = Residency::Hydrating {
+                epoch: unix_millis().max(1) as u64,
+            };
+            if let Some(state) = self.card_state_mut(card) {
+                state.residency = residency.clone();
+            }
+            self.lifecycle.register(
+                card,
+                if visible {
+                    Exposure::Visible
+                } else {
+                    Exposure::Offscreen
+                },
+                residency,
+                Instant::now(),
+            );
+            self.cards.insert(card, CardRuntime::Loading);
+            return self.start_terminal(card, session, visible, false);
+        }
+        Task::none()
     }
 
     #[cfg(feature = "integrated-browser")]
@@ -4098,16 +4142,6 @@ impl Cagents {
             _ => None,
         });
         let header = self.column_header(id, focused);
-        let header: Element<'a, Message> =
-            if matches!(card.map(|card| &card.kind), Some(CardKind::Terminal(_))) {
-                widget::column::with_children(vec![
-                    header,
-                    widget::text::caption(self.terminal_activity_label(id)).into(),
-                ])
-                .into()
-            } else {
-                header
-            };
 
         #[cfg(feature = "integrated-browser")]
         let browser_toolbar: Option<Element<'a, Message>> = browser_session.map(|session| {
@@ -4132,39 +4166,42 @@ impl Cagents {
             }
             let toolbar = widget::container(
                 widget::row::with_children(vec![
-                    widget::button::icon(widget::icon::from_name("go-previous-symbolic"))
-                        .id(chrome.map_or_else(
-                            || card_control_id(id, "browser.back"),
-                            |chrome| chrome.browser_back_id.clone(),
-                        ))
-                        .name("Back")
-                        .tooltip("Back")
-                        .width(ICON_CONTROL_SIZE)
-                        .height(ICON_CONTROL_SIZE)
-                        .on_press_maybe(can_go_back.then_some(Message::BrowserBack(id)))
-                        .into(),
-                    widget::button::icon(widget::icon::from_name("go-next-symbolic"))
-                        .id(chrome.map_or_else(
-                            || card_control_id(id, "browser.forward"),
-                            |chrome| chrome.browser_forward_id.clone(),
-                        ))
-                        .name("Forward")
-                        .tooltip("Forward")
-                        .width(ICON_CONTROL_SIZE)
-                        .height(ICON_CONTROL_SIZE)
-                        .on_press_maybe(can_go_forward.then_some(Message::BrowserForward(id)))
-                        .into(),
-                    widget::button::icon(widget::icon::from_name("view-refresh-symbolic"))
-                        .id(chrome.map_or_else(
-                            || card_control_id(id, "browser.reload"),
-                            |chrome| chrome.browser_reload_id.clone(),
-                        ))
-                        .name("Reload")
-                        .tooltip("Reload")
-                        .width(ICON_CONTROL_SIZE)
-                        .height(ICON_CONTROL_SIZE)
-                        .on_press_maybe(active.then_some(Message::BrowserReload(id)))
-                        .into(),
+                    crate::interaction::tooltip(
+                        widget::button::icon(widget::icon::from_name("go-previous-symbolic"))
+                            .id(chrome.map_or_else(
+                                || card_control_id(id, "browser.back"),
+                                |chrome| chrome.browser_back_id.clone(),
+                            ))
+                            .name("Back")
+                            .width(ICON_CONTROL_SIZE)
+                            .height(ICON_CONTROL_SIZE)
+                            .on_press_maybe(can_go_back.then_some(Message::BrowserBack(id))),
+                        "Back",
+                    ),
+                    crate::interaction::tooltip(
+                        widget::button::icon(widget::icon::from_name("go-next-symbolic"))
+                            .id(chrome.map_or_else(
+                                || card_control_id(id, "browser.forward"),
+                                |chrome| chrome.browser_forward_id.clone(),
+                            ))
+                            .name("Forward")
+                            .width(ICON_CONTROL_SIZE)
+                            .height(ICON_CONTROL_SIZE)
+                            .on_press_maybe(can_go_forward.then_some(Message::BrowserForward(id))),
+                        "Forward",
+                    ),
+                    crate::interaction::tooltip(
+                        widget::button::icon(widget::icon::from_name("view-refresh-symbolic"))
+                            .id(chrome.map_or_else(
+                                || card_control_id(id, "browser.reload"),
+                                |chrome| chrome.browser_reload_id.clone(),
+                            ))
+                            .name("Reload")
+                            .width(ICON_CONTROL_SIZE)
+                            .height(ICON_CONTROL_SIZE)
+                            .on_press_maybe(active.then_some(Message::BrowserReload(id))),
+                        "Reload",
+                    ),
                     address_input.into(),
                 ])
                 .align_y(Alignment::Center)
@@ -5355,7 +5392,6 @@ impl Cagents {
             || self.dirty_repository_close.is_some()
             || self.terminal_close.is_some()
             || self.project_ui.modal_open()
-            || self.chat_modal()
             // Mounted by `dialog` from the sidebar's own state, so nothing
             // beneath it can learn about it any other way. Leaving it out is
             // how the one dialog that is on screen *because* it is about to
@@ -6296,8 +6332,7 @@ impl Application for Cagents {
             terminal_close_attempts: HashSet::new(),
             closed_terminal_cards: HashSet::new(),
             uncertain_terminal_proofs: HashMap::new(),
-            terminal_activity: HashMap::new(),
-            activity_origin: Instant::now(),
+            terminal_recovery_attempts: HashSet::new(),
             worktree_operations: HashMap::new(),
             pending_panel_open: None,
             deferred_navigation: VecDeque::new(),
@@ -6329,6 +6364,8 @@ impl Application for Cagents {
             lifecycle_sweep_deadline: None,
             lifecycle_sweep_generation: 0,
         };
+        app.sidebar_model
+            .apply_project_order(&app.durable.project_order);
         // `view` lays the strip out against the width `Workspace` holds, which
         // starts at zero, and `PanSurface` only publishes its real bounds once
         // it has been mounted and redrawn. A strip projected against zero
@@ -6450,30 +6487,53 @@ impl Application for Cagents {
                     None => cosmic::task::message(Message::OpenRepository),
                 }
             }
-            Message::TerminalStarted { card, result } => {
+            Message::TerminalStarted {
+                card,
+                terminal,
+                result,
+            } => {
                 let accept = can_accept_terminal_start(
                     self.durable.cards.iter().find(|state| state.id == card),
                     self.lifecycle.state(card).is_some(),
                     matches!(self.cards.get(&card), Some(CardRuntime::Loading)),
-                );
+                ) && self.card_state(card).is_some_and(|state|
+                    matches!(&state.kind, CardKind::Terminal(session) if session.id == terminal));
                 if !accept {
-                    if let Ok(handle) = result {
-                        self.begin_terminal_teardown(handle);
+                    if let Ok(started) = result
+                        && started.spawned
+                    {
+                        self.begin_terminal_teardown(started.handle);
                     }
                     return Task::none();
                 }
 
                 let mut tasks = Vec::new();
                 match result {
-                    Ok(handle) => {
+                    Ok(started) => {
+                        self.terminal_recovery_attempts.remove(&terminal);
+                        self.terminal_recovery_attempts.remove(&started.session.id);
+                        if started.session.id != terminal
+                            && let Some(writer) = &self.session
+                        {
+                            writer.replace_terminal_identity(
+                                card,
+                                terminal,
+                                started.session.clone(),
+                            );
+                        }
+                        if let Some(state) = self.card_state_mut(card) {
+                            state.kind = CardKind::Terminal(started.session);
+                        }
+                        let handle = started.handle;
                         // A worker can publish its first event before this start
                         // result reaches the UI. Adopt and drain it before sending
                         // commands, which could otherwise mask a permanent failure
                         // as a closed visibility channel.
                         self.cards.insert(card, CardRuntime::Terminal(handle));
-                        self.drain_terminal(card, 0);
+                        tasks.push(self.drain_terminal(card, 0));
                         let Some(CardRuntime::Terminal(handle)) = self.cards.get(&card) else {
-                            return cosmic::task::message(Message::LifecycleSweep);
+                            tasks.push(cosmic::task::message(Message::LifecycleSweep));
+                            return Task::batch(tasks);
                         };
                         if let Err(error) = handle.set_theme(self.settings.terminal_theme) {
                             self.status = Some(TransientNotice::error(format!(
@@ -6523,14 +6583,11 @@ impl Application for Cagents {
                 self.persist();
                 Task::batch(tasks)
             }
-            Message::TerminalActivityExpired { card, timer } => {
-                self.expire_terminal_activity(card, timer)
-            }
             Message::TerminalWake { card, generation } => {
                 let started =
                     tracing::enabled!(target: "cagents::terminal_pipeline", tracing::Level::DEBUG)
                         .then(Instant::now);
-                self.drain_terminal(card, generation);
+                let task = self.drain_terminal(card, generation);
                 if let Some(started) = started {
                     let activity_sequence = match self.cards.get(&card) {
                         Some(CardRuntime::Terminal(handle)) => {
@@ -6540,7 +6597,7 @@ impl Application for Cagents {
                     };
                     tracing::debug!(target: "cagents::terminal_pipeline", stage = "ui_apply", elapsed_ns = started.elapsed().as_nanos() as u64, generation, activity_sequence);
                 }
-                Task::none()
+                task
             }
             Message::TerminalError { card: _, message } => {
                 self.status = Some(TransientNotice::error(message));
@@ -6663,10 +6720,18 @@ impl Application for Cagents {
                         sidebar_project.github_status = loaded.github.label().into();
                         self.github_availability
                             .insert(project_id, loaded.github.clone());
-                        self.sidebar_model
+                        if let Some(existing) = self
+                            .sidebar_model
                             .projects
-                            .retain(|project| project.id != loaded.project.id);
-                        self.sidebar_model.projects.push(sidebar_project);
+                            .iter_mut()
+                            .find(|project| project.id == loaded.project.id)
+                        {
+                            *existing = sidebar_project;
+                        } else {
+                            self.sidebar_model.projects.push(sidebar_project);
+                        }
+                        self.sidebar_model
+                            .apply_project_order(&self.durable.project_order);
                         self.sync_worktree_operation_rows();
                         self.sidebar_model.data_state = SidebarDataState::Ready;
                         let worktree = loaded
@@ -6731,6 +6796,37 @@ impl Application for Cagents {
                 };
                 path.map_or_else(Task::none, |path| self.open_file_in_editor(path))
             }
+            Message::Repository(RepositoryAction::StageSelected { card, stage }) => {
+                if self.modal_is_open() {
+                    return Task::none();
+                }
+                let Some(CardRuntime::Repository(runtime)) = self.cards.get(&card) else {
+                    return Task::none();
+                };
+                let Some(source) = self
+                    .sidebar_model
+                    .source_control
+                    .as_ref()
+                    .filter(|source| source.key.canonical_path == runtime.descriptor.worktree)
+                else {
+                    return Task::none();
+                };
+                let Some(selection) = runtime.selected_staging_selection(stage) else {
+                    return Task::none();
+                };
+                let key = source.key.clone();
+                self.update(Message::Sidebar(if stage {
+                    SidebarAction::Stage {
+                        key,
+                        selection: vec![selection],
+                    }
+                } else {
+                    SidebarAction::Unstage {
+                        key,
+                        selection: vec![selection],
+                    }
+                }))
+            }
             Message::Repository(action) => {
                 if self.modal_is_open() && !repository_action_allowed_while_modal(&action) {
                     return Task::none();
@@ -6783,6 +6879,14 @@ impl Application for Cagents {
                 }
                 self.sidebar_state.apply(&action);
                 match action {
+                    SidebarAction::ReorderProject { project, before } => {
+                        if self.sidebar_model.reorder_project(project, before) {
+                            Arc::make_mut(&mut self.durable).project_order =
+                                self.sidebar_model.projects.iter().map(|project| project.id).collect();
+                            self.persist();
+                        }
+                        Task::none()
+                    }
                     SidebarAction::CancelWorktreeOperation(id) => self.cancel_worktree_operation(id),
                     SidebarAction::OpenRepositoryPicker => {
                         cosmic::task::message(Message::OpenRepository)
@@ -7673,9 +7777,6 @@ impl Application for Cagents {
                 if let keyboard::Event::ModifiersChanged(modifiers) = &event {
                     self.keyboard_modifiers = *modifiers;
                 }
-                if self.chat_modal() {
-                    return self.chat_modal_key(&event);
-                }
                 if is_escape_press(&event) {
                     if self.terminal_close.is_some() {
                         return self.cancel_terminal_close();
@@ -7904,8 +8005,16 @@ impl Application for Cagents {
                 report,
                 committed,
             } => {
+                let mut refreshes = Vec::new();
+                for (&card, runtime) in &mut self.cards {
+                    if let CardRuntime::Repository(runtime) = runtime
+                        && runtime.descriptor.worktree == key.canonical_path
+                    {
+                        refreshes.push(repository_task(runtime.refresh_after_mutation(card)));
+                    }
+                }
                 if !self.source_control_is_bound(&key) {
-                    return Task::none();
+                    return Task::batch(refreshes);
                 }
                 if committed {
                     self.sidebar_state.clear_commit_message();
@@ -7920,13 +8029,13 @@ impl Application for Cagents {
                 let _ = kind;
                 // Whatever Git did, the index is the authority on the result,
                 // so the panel re-reads rather than guessing.
-                self.reload_source_control(&key)
+                refreshes.push(self.reload_source_control(&key));
+                Task::batch(refreshes)
             }
         };
         if self.latency_focus != self.workspace.focused() {
             self.latency.abandon_pending();
         }
-        self.refresh_terminal_activity();
         if camera_only {
             return Task::batch([task, self.release_deferred_navigation_if_unblocked()]);
         }
@@ -7988,7 +8097,6 @@ impl Application for Cagents {
             .map(Message::Lsp),
         );
         subscriptions.extend(operation_subscriptions);
-        subscriptions.extend(self.activity_subscriptions());
         if let Some(window) = self.core.main_window_id()
             && (self.workspace.camera().is_animating() || self.inspector_transition.is_some())
         {
@@ -8010,14 +8118,6 @@ impl Application for Cagents {
     }
 
     fn dialog(&self) -> Option<Element<'_, Message>> {
-        if let Some(surface) = self.chat_switch_dialog() {
-            return Some(dialog_ui::overlay(
-                surface,
-                (!self.chat_modal_pending())
-                    .then_some(Message::ChatUi(chat_ui::Action::DismissSwitch)),
-                1.0,
-            ));
-        }
         if let Some(intent) = &self.terminal_close {
             return self.terminal_close_dialog().map(|surface| {
                 dialog_ui::overlay(
@@ -10620,7 +10720,7 @@ mod tests {
     }
 
     #[test]
-    fn daemon_rejection_before_terminal_started_remains_relaunchable() {
+    fn daemon_rejection_preserves_identity_until_safe_recovery() {
         use crate::{
             model::{BootId, HostIncarnation, HostSessionId},
             terminal::ipc::{
@@ -10676,6 +10776,7 @@ mod tests {
             boot_id: old_proof.boot_id.clone(),
             host_incarnation: old_proof.host_incarnation.clone(),
         };
+        let original = session.clone();
         app.lifecycle.register(
             card,
             Exposure::Visible,
@@ -10697,26 +10798,31 @@ mod tests {
         });
         let _ = app.update(Message::TerminalStarted {
             card,
-            result: Ok(TerminalSurface::from(handle)),
+            terminal: old_id,
+            result: Ok(StartedTerminal {
+                handle: TerminalSurface::from(handle),
+                session: original.clone(),
+                spawned: false,
+            }),
         });
-        assert!(matches!(
+        assert_eq!(
             &app.card_state(card).unwrap().kind,
-            CardKind::Terminal(TerminalSession {
-                continuity: TerminalContinuity::RelaunchAvailable { .. },
-                ..
-            })
-        ));
+            &CardKind::Terminal(original.clone())
+        );
+        // Discovery has been scheduled, but no unauthenticated replacement
+        // identity or replay recipe may enter the durable state.
+        assert!(matches!(app.cards.get(&card), Some(CardRuntime::Loading)));
+        let _ = app.update(Message::TerminalStarted {
+            card,
+            terminal: old_id,
+            result: Err("replacement ownership cannot be established".into()),
+        });
         assert!(matches!(app.cards.get(&card), Some(CardRuntime::Failed(_))));
-
         let _ = app.retry_card(card);
-        let CardKind::Terminal(replacement) = &app.card_state(card).unwrap().kind else {
-            panic!("retry must preserve the terminal card");
-        };
-        assert_ne!(replacement.id, old_id);
-        assert!(matches!(
-            terminal_start_mode(replacement),
-            Ok(TerminalStartMode::Spawn(_))
-        ));
+        assert_eq!(
+            &app.card_state(card).unwrap().kind,
+            &CardKind::Terminal(original)
+        );
     }
 
     #[test]
@@ -11622,6 +11728,7 @@ mod tests {
             core,
             settings_path: None,
             uncertain_terminal_proofs: HashMap::new(),
+            terminal_recovery_attempts: HashSet::new(),
             settings_write_blocked: true,
             sidebar_model: SidebarModel::ready(SidebarMode::Expanded, Vec::new()),
             sidebar_state: SidebarState::default(),
@@ -11641,8 +11748,6 @@ mod tests {
             terminal_close: None,
             terminal_close_attempts: HashSet::new(),
             closed_terminal_cards: HashSet::new(),
-            terminal_activity: HashMap::new(),
-            activity_origin: Instant::now(),
             worktree_operations: HashMap::new(),
             pending_panel_open: None,
             deferred_navigation: VecDeque::new(),

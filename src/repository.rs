@@ -70,6 +70,11 @@ pub const MAX_DIFF_SIDE_BYTES: u64 = 16 * 1024 * 1024;
 /// also refuses to diff as text.
 const BINARY_SNIFF_BYTES: usize = 8000;
 
+/// One status refresh may inspect many untracked files. Bound aggregate reads
+/// and path lookups as well as each file, leaving excess entries unmeasured.
+const MAX_UNTRACKED_STATUS_BYTES: u64 = 64 * 1024 * 1024;
+const MAX_UNTRACKED_STATUS_FILES: usize = 4096;
+
 /// A command invocation. `program` and every argument are passed directly to
 /// [`Command`]; this type never accepts a shell command line.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1548,8 +1553,8 @@ pub struct ChangedPath {
     pub kind: ChangeKind,
     pub conflict: Option<ConflictKind>,
     pub submodule: bool,
-    /// `None` until a text diff has actually been measured; binary, conflicted,
-    /// and untracked paths have no line counts.
+    /// `None` until text has actually been measured. Untracked text is measured
+    /// against absence; binary, conflicted, and unreadable paths stay unmeasured.
     pub added_lines: Option<u64>,
     pub removed_lines: Option<u64>,
 }
@@ -2931,9 +2936,9 @@ fn parse_numstat_count(
 
 /// Fills measured line counts into the entries of one area.
 ///
-/// Counts stay `None` where Git reported none, which is every binary file, and
-/// no conflicted or untracked entry is ever touched because neither area
-/// appears in a `git diff` comparison.
+/// Counts stay `None` where Git reported none, which is every binary file.
+/// Conflicts have no comparison; untracked text is measured separately from
+/// the worktree because it does not appear in `git diff`.
 pub fn merge_numstat(entries: &mut [ChangedPath], area: ChangeArea, records: &[NumstatRecord]) {
     let counts: BTreeMap<&[u8], (Option<u64>, Option<u64>)> = records
         .iter()
@@ -3551,6 +3556,118 @@ fn read_worktree_side(worktree: &Path, path: &RepoPath) -> DiffSide {
         Ok(bytes) => classify_bytes(bytes),
         Err(error) => unreadable(&error),
     }
+}
+
+/// Measures untracked text without one Git process (or allocation) per file.
+/// The same descriptor-relative resolver and per-side limit as the diff reader
+/// apply; failed, changing, and budget-exhausted reads leave honest unknowns.
+fn measure_untracked(
+    worktree: &Path,
+    entries: &mut [ChangedPath],
+    cancellation: &CancellationToken,
+) {
+    let mut untracked = entries
+        .iter_mut()
+        .filter(|entry| entry.area == ChangeArea::Untracked && !entry.submodule)
+        .take(MAX_UNTRACKED_STATUS_FILES)
+        .peekable();
+    if cancellation.is_cancelled() || untracked.peek().is_none() {
+        return;
+    }
+    let Ok(root) = fs_safety::Root::open(worktree) else {
+        return;
+    };
+    let mut remaining = MAX_UNTRACKED_STATUS_BYTES;
+    let mut bytes = Vec::new();
+    for entry in untracked {
+        if cancellation.is_cancelled() || remaining == 0 {
+            break;
+        }
+        if let Some(lines) =
+            untracked_line_count(&root, &entry.path, cancellation, &mut remaining, &mut bytes)
+        {
+            entry.added_lines = Some(lines);
+            entry.removed_lines = Some(0);
+        }
+    }
+}
+
+fn untracked_line_count(
+    root: &fs_safety::Root,
+    path: &RepoPath,
+    cancellation: &CancellationToken,
+    remaining: &mut u64,
+    bytes: &mut Vec<u8>,
+) -> Option<u64> {
+    use std::os::unix::fs::MetadataExt;
+
+    let relative = path.as_path();
+    // Refuse known nonregular objects before opening, then classify the actual
+    // descriptor again: a name can change between these two calls.
+    let metadata = fs_safety::metadata_beneath(root, relative).ok()?;
+    if !metadata.is_file() {
+        return None;
+    }
+    let mut file = fs_safety::open_beneath(root, relative).ok()?;
+    let opened = fs_safety::metadata_of(&file).ok()?;
+    if !opened.is_file() || opened.len() > MAX_DIFF_SIDE_BYTES || opened.len() >= *remaining {
+        return None;
+    }
+    bytes.clear();
+    let mut chunk = [0; 64 * 1024];
+    loop {
+        if cancellation.is_cancelled() || *remaining == 0 {
+            return None;
+        }
+        // One extra byte distinguishes a file that grew beyond the limit.
+        let limit = (MAX_DIFF_SIDE_BYTES + 1 - bytes.len() as u64)
+            .min(*remaining)
+            .min(chunk.len() as u64) as usize;
+        let read = match file.read(&mut chunk[..limit]) {
+            Ok(read) => read,
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(_) => return None,
+        };
+        *remaining -= read as u64;
+        if read == 0 {
+            break;
+        }
+        let sniff = read.min(BINARY_SNIFF_BYTES.saturating_sub(bytes.len()));
+        if chunk[..sniff].contains(&0) {
+            return None;
+        }
+        if bytes.len() as u64 + read as u64 > MAX_DIFF_SIDE_BYTES {
+            return None;
+        }
+        bytes.extend_from_slice(&chunk[..read]);
+    }
+    // Reject concurrent writes and replacement/unlink races rather than attach
+    // counts from a different object to this path in the snapshot.
+    let identity = |metadata: &fs::Metadata| {
+        (
+            metadata.dev(),
+            metadata.ino(),
+            metadata.len(),
+            metadata.mtime(),
+            metadata.mtime_nsec(),
+            metadata.ctime(),
+            metadata.ctime_nsec(),
+        )
+    };
+    let after = fs_safety::metadata_of(&file).ok()?;
+    let named = fs_safety::metadata_beneath(root, relative).ok()?;
+    if identity(&opened) != identity(&after)
+        || identity(&after) != identity(&named)
+        || bytes.len() as u64 != after.len()
+        || cancellation.is_cancelled()
+    {
+        return None;
+    }
+    std::str::from_utf8(bytes).ok()?;
+    Some(
+        bytes.iter().filter(|byte| **byte == b'\n').count() as u64
+            + u64::from(!bytes.is_empty() && bytes.last() != Some(&b'\n')),
+    )
 }
 
 fn increment(value: &mut u32) -> Result<(), GitParseError> {
@@ -4261,6 +4378,7 @@ impl<E: ProcessExecutor> RepositoryService<E> {
             let records = invalid_output(parsed, output)?;
             merge_numstat(&mut status.entries, area, &records);
         }
+        measure_untracked(worktree, &mut status.entries, cancellation);
 
         let output = self.run_checked(&self.working_files_command(worktree), cancellation)?;
         let parsed = parse_working_files(&output.stdout);
@@ -9154,10 +9272,22 @@ mod tests {
 
     #[test]
     fn snapshot_collects_status_counts_files_remotes_and_refs() {
+        let worktree = tempfile::tempdir().unwrap();
         let mut status = status_headers();
         status.extend_from_slice(
             b"1 M. N... 100644 100644 100644 1111111111111111111111111111111111111111 2222222222222222222222222222222222222222 src/main.rs\0",
         );
+        let untracked: &[(&str, &[u8], Option<u64>)] = &[
+            ("empty.txt", b"", Some(0)),
+            ("lines.txt", b"first\nsecond\n", Some(2)),
+            ("unterminated.txt", b"first\nsecond", Some(2)),
+            ("binary.dat", b"first\0second\n", None),
+            ("invalid.txt", b"\xff\n", None),
+        ];
+        for (name, content, _) in untracked {
+            fs::write(worktree.path().join(name), content).unwrap();
+            status.extend_from_slice(format!("? {name}\0").as_bytes());
+        }
         let mut refs = Vec::new();
         refs.extend_from_slice(b"refs/heads/main\0");
         refs.extend_from_slice(oid(1).as_str().as_bytes());
@@ -9172,11 +9302,21 @@ mod tests {
             success(&refs),
         ]);
         let snapshot = service
-            .snapshot(Path::new("/repo"), &CancellationToken::new())
+            .snapshot(worktree.path(), &CancellationToken::new())
             .unwrap();
 
         assert_eq!(snapshot.status.entries[0].added_lines, Some(4));
         assert_eq!(snapshot.status.entries[0].removed_lines, Some(1));
+        for (name, _, added) in untracked {
+            let entry = snapshot
+                .status
+                .entries
+                .iter()
+                .find(|entry| entry.path == path(name))
+                .unwrap();
+            assert_eq!(entry.added_lines, *added, "{name}");
+            assert_eq!(entry.removed_lines, added.map(|_| 0), "{name}");
+        }
         assert_eq!(
             snapshot.files.paths,
             vec![path("Cargo.toml"), path("src/main.rs")]
@@ -9188,6 +9328,83 @@ mod tests {
         assert!(commands[1].arguments.contains(&OsString::from("--cached")));
         assert!(!commands[2].arguments.contains(&OsString::from("--cached")));
         assert_eq!(commands[3].arguments.last(), Some(&OsString::from("-z")));
+    }
+
+    #[test]
+    fn untracked_counts_refuse_unsafe_nonregular_and_oversize_paths() {
+        use std::os::unix::fs::symlink;
+
+        let worktree = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        fs::write(outside.path().join("secret.txt"), b"secret\n").unwrap();
+        symlink(outside.path(), worktree.path().join("link")).unwrap();
+        symlink(
+            outside.path().join("secret.txt"),
+            worktree.path().join("direct"),
+        )
+        .unwrap();
+        fs::create_dir(worktree.path().join("nested-repository")).unwrap();
+        fs::File::create(worktree.path().join("large"))
+            .unwrap()
+            .set_len(MAX_DIFF_SIDE_BYTES + 1)
+            .unwrap();
+        let mut status = parse_status(
+            b"# branch.oid (initial)\0# branch.head main\0? link/secret.txt\0? direct\0? nested-repository/\0? large\0? vanished\0",
+        )
+        .unwrap();
+        measure_untracked(
+            worktree.path(),
+            &mut status.entries,
+            &CancellationToken::new(),
+        );
+        for entry in status.entries {
+            assert_eq!(entry.added_lines, None, "{}", entry.path);
+            assert_eq!(entry.removed_lines, None, "{}", entry.path);
+        }
+    }
+
+    #[test]
+    fn untracked_counts_obey_read_budget_and_cancellation() {
+        let worktree = tempfile::tempdir().unwrap();
+        fs::write(worktree.path().join("text"), b"one\ntwo").unwrap();
+        let root = fs_safety::Root::open(worktree.path()).unwrap();
+        let cancellation = CancellationToken::new();
+        let mut bytes = Vec::new();
+        let mut remaining = 4;
+        assert_eq!(
+            untracked_line_count(
+                &root,
+                &path("text"),
+                &cancellation,
+                &mut remaining,
+                &mut bytes
+            ),
+            None
+        );
+        remaining = 16;
+        assert_eq!(
+            untracked_line_count(
+                &root,
+                &path("text"),
+                &cancellation,
+                &mut remaining,
+                &mut bytes
+            ),
+            Some(2)
+        );
+        assert_eq!(remaining, 9);
+        cancellation.cancel();
+        assert_eq!(
+            untracked_line_count(
+                &root,
+                &path("text"),
+                &cancellation,
+                &mut remaining,
+                &mut bytes
+            ),
+            None
+        );
+        assert_eq!(remaining, 9);
     }
 
     /// `git ls-files -o` lists *others*, i.e. untracked files. The combined

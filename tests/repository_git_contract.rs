@@ -324,7 +324,8 @@ fn simultaneous_staged_and_unstaged_state_is_reported_per_area() {
     // `--untracked-files=all` reports the file, not just its directory.
     let untracked = entry(&snapshot, ChangeArea::Untracked, "nested/untracked.txt");
     assert_eq!(untracked.kind, ChangeKind::Untracked);
-    assert_eq!(untracked.added_lines, None);
+    assert_eq!(untracked.added_lines, Some(1));
+    assert_eq!(untracked.removed_lines, Some(0));
 
     assert_eq!(snapshot.status.dirty.staged, 3);
     assert!(snapshot.status.dirty.is_dirty());

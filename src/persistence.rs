@@ -143,6 +143,7 @@ pub struct WorkspaceManifest {
     pub focused: Option<CardId>,
     pub active_worktree: Option<PathBuf>,
     pub worktree_focus: HashMap<PathBuf, CardId>,
+    pub project_order: Vec<ProjectId>,
     pub cards: Vec<CardSummary>,
     pub updated_at_unix_ms: i64,
 }
@@ -656,6 +657,7 @@ impl StateStore {
             focused: manifest.focused,
             active_worktree: manifest.active_worktree,
             worktree_focus: manifest.worktree_focus,
+            project_order: manifest.project_order,
         }))
     }
 
@@ -1476,6 +1478,11 @@ fn save_workspace_transaction(
         transaction,
         &format!("workspace:{workspace_id}:navigation:worktree_focus"),
         &to_json(&state.worktree_focus)?,
+    )?;
+    set_metadata(
+        transaction,
+        &format!("workspace:{workspace_id}:navigation:project_order"),
+        &to_json(&state.project_order)?,
     )?;
 
     let existing = existing_cards(transaction, &workspace_id)?;
@@ -2342,6 +2349,13 @@ fn load_workspace_manifest_connection(
         .map(|value| from_json("workspace worktree focus", &value))
         .transpose()?
         .unwrap_or_default(),
+        project_order: metadata(
+            connection,
+            &format!("workspace:{id}:navigation:project_order"),
+        )?
+        .map(|value| from_json("workspace project order", &value))
+        .transpose()?
+        .unwrap_or_default(),
         cards,
         updated_at_unix_ms: updated_at,
     }))
@@ -2774,6 +2788,7 @@ mod tests {
             focused: Some(card_id),
             active_worktree: None,
             worktree_focus: HashMap::new(),
+            project_order: Vec::new(),
         }
     }
 
@@ -3197,6 +3212,7 @@ mod tests {
             .insert(PathBuf::from("/tmp/worktree-b"), workspace.cards[0].id);
         workspace.focused = Some(browser_card.id);
         workspace.cards.push(browser_card);
+        workspace.project_order = vec![ProjectId::new(), ProjectId::new()];
         let mut lane = SaveLane::default();
         assert_eq!(lane.save(&store, &workspace).unwrap().generation, 1);
 
@@ -3205,6 +3221,7 @@ mod tests {
         assert_eq!(restored.focused, workspace.focused);
         assert_eq!(restored.active_worktree, workspace.active_worktree);
         assert_eq!(restored.worktree_focus, workspace.worktree_focus);
+        assert_eq!(restored.project_order, workspace.project_order);
         assert!(
             restored
                 .cards
@@ -3224,12 +3241,14 @@ mod tests {
         workspace
             .worktree_focus
             .insert(PathBuf::from("/tmp/worktree-b"), workspace.cards[1].id);
+        workspace.project_order.reverse();
         let commit = lane.save(&store, &workspace).unwrap();
         assert_eq!(commit.card_generations, card_generations);
         let restored = store.load_workspace(workspace.id, None).unwrap().unwrap();
         assert_eq!(restored.focused, workspace.focused);
         assert_eq!(restored.active_worktree, workspace.active_worktree);
         assert_eq!(restored.worktree_focus, workspace.worktree_focus);
+        assert_eq!(restored.project_order, workspace.project_order);
         assert_eq!(restored.generation, 2);
     }
 
@@ -3243,16 +3262,18 @@ mod tests {
         workspace
             .worktree_focus
             .insert(PathBuf::from("/tmp/worktree-b"), workspace.cards[0].id);
+        workspace.project_order = vec![ProjectId::new()];
         SaveLane::default().save(&store, &workspace).unwrap();
         {
             let inner = store.lock_inner().unwrap();
             inner
                 .connection
                 .execute(
-                    "DELETE FROM metadata WHERE key IN (?1, ?2)",
+                    "DELETE FROM metadata WHERE key IN (?1, ?2, ?3)",
                     params![
                         format!("workspace:{}:navigation:active_worktree", workspace.id),
                         format!("workspace:{}:navigation:worktree_focus", workspace.id),
+                        format!("workspace:{}:navigation:project_order", workspace.id),
                     ],
                 )
                 .unwrap();
@@ -3260,6 +3281,7 @@ mod tests {
         let restored = store.load_workspace(workspace.id, None).unwrap().unwrap();
         assert_eq!(restored.active_worktree, None);
         assert!(restored.worktree_focus.is_empty());
+        assert!(restored.project_order.is_empty());
     }
 
     #[test]

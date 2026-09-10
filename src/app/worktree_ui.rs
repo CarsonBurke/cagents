@@ -66,6 +66,7 @@ fn scope_descriptor(
         focused,
         active_worktree: None,
         worktree_focus: HashMap::new(),
+        project_order: state.project_order.clone(),
     }
 }
 

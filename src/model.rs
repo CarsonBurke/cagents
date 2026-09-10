@@ -966,6 +966,8 @@ pub struct WorkspaceState {
     pub active_worktree: Option<PathBuf>,
     #[serde(default)]
     pub worktree_focus: HashMap<PathBuf, CardId>,
+    #[serde(default)]
+    pub project_order: Vec<ProjectId>,
 }
 
 impl Default for WorkspaceState {
@@ -979,6 +981,7 @@ impl Default for WorkspaceState {
             focused: None,
             active_worktree: None,
             worktree_focus: HashMap::new(),
+            project_order: Vec::new(),
         }
     }
 }

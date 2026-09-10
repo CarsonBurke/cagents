@@ -1136,6 +1136,7 @@ mod tests {
             focused: None,
             active_worktree: None,
             worktree_focus: HashMap::new(),
+            project_order: Vec::new(),
             cards: vec![CardState {
                 id: CardId::new(),
                 generation: 0,

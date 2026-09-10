@@ -10,8 +10,6 @@ use cosmic::{
 
 use crate::interaction::tooltip;
 
-const CONTROL_SIZE: u16 = 30;
-
 /// Keep essential controls visible even when the desktop icon theme omits
 /// these nonstandard names. Static handles retain renderer cache identity.
 pub fn symbolic_icon(name: &str) -> widget::icon::Handle {
@@ -38,8 +36,8 @@ pub struct IconControl<'a, Message> {
     label: Cow<'a, str>,
 }
 
-/// A fixed-size icon target with transparent rectangular hover feedback.
-/// Selection is rendered from application state, without a separate tab model.
+/// A centered, fixed-size icon target with a filled selected state.
+/// Native buttons retain keyboard focus, accessibility, and enabled cursors.
 pub fn icon_control<'a, Message: Clone + 'a>(
     icon: widget::icon::Handle,
     label: impl Into<Cow<'a, str>>,
@@ -48,30 +46,14 @@ pub fn icon_control<'a, Message: Clone + 'a>(
     on_press: Option<Message>,
 ) -> IconControl<'a, Message> {
     let label = label.into();
-    let underline = widget::container(iced::widget::Space::new())
-        .width(Length::Fill)
-        .height(2)
-        .class(cosmic::theme::Container::custom(move |theme| {
-            iced::widget::container::Style {
-                background: selected
-                    .then(|| iced::Background::Color((*theme.cosmic().accent_color()).into())),
-                ..Default::default()
-            }
-        }));
-    let content = widget::column::with_children(vec![
-        widget::container(widget::icon(icon).size(16))
-            .center(Length::Fill)
-            .into(),
-        underline.into(),
-    ])
-    .spacing(0);
+    let content = widget::container(widget::icon(icon).size(16)).center(Length::Fill);
     IconControl {
         button: widget::button::custom(content)
             .name(label.clone())
             .selected(selected)
             .class(control_style(selected))
-            .width(CONTROL_SIZE)
-            .height(CONTROL_SIZE)
+            .width(crate::design::PRIMARY_CONTROL_SIZE)
+            .height(crate::design::PRIMARY_CONTROL_SIZE)
             .padding(0)
             .on_press_maybe(if enabled { on_press } else { None }),
         label,
@@ -91,30 +73,75 @@ impl<'a, Message: Clone + 'a> From<IconControl<'a, Message>> for Element<'a, Mes
     }
 }
 
+/// A connected mode selector using the same compact targets as toolbar actions.
+/// Pass `icon_control(...).into()` children; each retains its own focus and tooltip.
+pub fn segmented_controls<'a, Message: 'a>(
+    controls: Vec<Element<'a, Message>>,
+) -> Element<'a, Message> {
+    widget::container(
+        widget::row::with_children(controls)
+            .spacing(0)
+            .align_y(iced::Alignment::Center),
+    )
+    .padding(2)
+    .class(cosmic::theme::Container::custom(|theme| {
+        iced::widget::container::Style {
+            background: Some(iced::Background::Color(
+                theme.current_container().component.base.into(),
+            )),
+            border: iced::Border {
+                color: theme.current_container().component.divider.into(),
+                width: crate::design::BORDER_WIDTH,
+                radius: (crate::design::CONTROL_RADIUS + 2.0).into(),
+            },
+            ..Default::default()
+        }
+    }))
+    .into()
+}
+
 fn control_style(selected: bool) -> cosmic::theme::Button {
     let appearance = move |focused: bool, theme: &cosmic::Theme| widget::button::Style {
-        border_radius: 3.0.into(),
+        background: selected.then(|| iced::Background::Color(theme.cosmic().accent.base.into())),
+        border_radius: crate::design::CONTROL_RADIUS.into(),
         border_width: if focused { 1.0 } else { 0.0 },
-        border_color: (*theme.cosmic().accent_color()).into(),
-        icon_color: selected.then(|| (*theme.cosmic().accent_color()).into()),
+        border_color: if selected {
+            theme.cosmic().accent.on.into()
+        } else {
+            (*theme.cosmic().accent_color()).into()
+        },
+        icon_color: selected.then(|| theme.cosmic().accent.on.into()),
         ..widget::button::Style::new()
     };
     cosmic::theme::Button::Custom {
         active: Box::new(appearance),
         disabled: Box::new(move |theme| widget::button::Style {
+            background: selected.then(|| {
+                iced::Background::Color(
+                    theme
+                        .current_container()
+                        .component
+                        .selected_state_color()
+                        .into(),
+                )
+            }),
             icon_color: Some(theme.current_container().component.on_disabled.into()),
             ..appearance(false, theme)
         }),
         hovered: Box::new(move |focused, theme| widget::button::Style {
-            background: Some(iced::Background::Color(
-                theme.current_container().component.hover.into(),
-            )),
+            background: Some(iced::Background::Color(if selected {
+                theme.cosmic().accent.hover.into()
+            } else {
+                theme.current_container().component.hover.into()
+            })),
             ..appearance(focused, theme)
         }),
         pressed: Box::new(move |focused, theme| widget::button::Style {
-            background: Some(iced::Background::Color(
-                theme.current_container().component.pressed.into(),
-            )),
+            background: Some(iced::Background::Color(if selected {
+                theme.cosmic().accent.pressed.into()
+            } else {
+                theme.current_container().component.pressed.into()
+            })),
             ..appearance(focused, theme)
         }),
     }

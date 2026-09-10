@@ -33,9 +33,17 @@ ui = [
     "dep:blake3",
     "dep:iced_accessibility",
     "dep:image",
+    "image/jpeg",
+    "image/gif",
+    "image/webp",
+    "image/bmp",
+    "image/ico",
+    "image/tiff",
     "dep:imara-diff",
     "dep:libcosmic",
     "dep:lsp-types",
+    "dep:resvg",
+    "dep:roxmltree",
     "dep:rusqlite",
     "dep:tempfile",
     "dep:tokio",
@@ -88,7 +96,7 @@ crossbeam-channel = "0.5"
 dpi = { version = "=0.1.2", optional = true }
 directories = "6.0"
 euclid = { version = "=0.22.11", optional = true }
-image = { version = "0.25", default-features = false, features = ["png", "jpeg"], optional = true }
+image = { version = "0.25", default-features = false, features = ["png"], optional = true }
 iced_accessibility = { git = "https://github.com/pop-os/libcosmic.git", rev = "caec74c2559924443f12fc6faf97a5bcefe6271d", optional = true }
 keyboard-types = { version = "=0.8.3", features = ["serde"], optional = true }
 # `highlighter` backs the editor's syntax highlighting; it is not in libcosmic's
@@ -107,6 +115,8 @@ portable-pty = { version = "0.9", optional = true }
 # resolved dependency graph, needs no additional crates, and its externally
 # tagged enum encoding is why the wire enums below carry no `serde(tag)`.
 postcard = { version = "1.1", default-features = false, features = ["use-std"] }
+resvg = { version = "0.45.1", default-features = false, features = ["text"], optional = true }
+roxmltree = { version = "0.20", optional = true }
 rusqlite = { version = "0.37", features = ["bundled"], optional = true }
 raw-window-handle = { version = "=0.6.2", optional = true }
 serde = { version = "1.0", features = ["derive"] }

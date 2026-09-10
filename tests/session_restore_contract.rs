@@ -86,6 +86,7 @@ impl RestoreFixture {
             existence: Existence::Open,
             active_worktree: Some(worktree_path.clone()),
             worktree_focus: HashMap::from([(worktree_path.clone(), terminal_card_id)]),
+            project_order: Vec::new(),
             cards: vec![
                 CardState {
                     id: terminal_card_id,

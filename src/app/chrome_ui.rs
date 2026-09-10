@@ -16,11 +16,9 @@ fn chat_icon() -> widget::icon::Handle {
 }
 
 // The full-width title is a focus target, not a pill-shaped toolbar button.
-// Column focus is already shown by the header's one-pixel active rail.
+// The active rail supplies the focus cue without boxing the whole title.
 fn column_title_style() -> cosmic::theme::Button {
-    fn appearance(_focused: bool, _theme: &cosmic::Theme) -> widget::button::Style {
-        // The active rail is the focus cue; pane titles deliberately have no
-        // enclosing highlight rectangle.
+    fn appearance(_: bool, _: &cosmic::Theme) -> widget::button::Style {
         widget::button::Style::new()
     }
     cosmic::theme::Button::Custom {
@@ -91,28 +89,12 @@ impl Cagents {
             workspace_widget::GlobalShortcut::NewTerminal,
             &self.settings.keyboard_shortcuts,
         );
-        actions.push(
-            if self.window_width >= design::EXPANDED_NAVIGATION_BREAKPOINT {
-                tooltip(
-                    widget::button::standard("Terminal")
-                        .leading_icon(
-                            widget::icon::from_name("utilities-terminal-symbolic").size(16),
-                        )
-                        .id(widget::Id::new(TOOLBAR_FOCUS_ID))
-                        .name(new_terminal_label.clone())
-                        .height(ICON_CONTROL_SIZE)
-                        .on_press(Message::NewTerminal),
-                    new_terminal_label,
-                )
-            } else {
-                command(
-                    widget::icon::from_name("utilities-terminal-symbolic"),
-                    new_terminal_label,
-                    widget::Id::new(TOOLBAR_FOCUS_ID),
-                    Some(Message::NewTerminal),
-                )
-            },
-        );
+        actions.push(command(
+            widget::icon::from_name("utilities-terminal-symbolic"),
+            new_terminal_label,
+            widget::Id::new(TOOLBAR_FOCUS_ID),
+            Some(Message::NewTerminal),
+        ));
         actions.push(command(
             browser_icon(),
             "New browser",
@@ -125,34 +107,15 @@ impl Cagents {
             "Show sidebar"
         };
         actions.push(
-            if self.window_width >= design::EXPANDED_NAVIGATION_BREAKPOINT {
-                tooltip(
-                    widget::button::custom(
-                        widget::row::with_children(vec![
-                            widget::icon::from_name("view-list-symbolic")
-                                .size(16)
-                                .into(),
-                            design::body("Sidebar").into(),
-                        ])
-                        .spacing(design::GRID_UNIT)
-                        .align_y(Alignment::Center),
-                    )
-                    .class(cosmic::theme::Button::Text)
-                    .id(context_inspector_toggle_id())
-                    .name(panel_label)
-                    .selected(self.context_inspector_open)
-                    .height(ICON_CONTROL_SIZE)
-                    .on_press(Message::ToggleContextInspector),
-                    panel_label,
-                )
-            } else {
-                command(
-                    widget::icon::from_name("view-list-symbolic"),
-                    panel_label,
-                    context_inspector_toggle_id(),
-                    Some(Message::ToggleContextInspector),
-                )
-            },
+            crate::ui_controls::icon_control(
+                crate::ui_controls::symbolic_icon("view-list-symbolic"),
+                panel_label,
+                self.context_inspector_open,
+                true,
+                Some(Message::ToggleContextInspector),
+            )
+            .id(context_inspector_toggle_id())
+            .into(),
         );
         actions
     }
@@ -162,52 +125,71 @@ impl Cagents {
         let title = card.map_or("Column", |card| card.title.as_str());
         let labels = card_kind_labels(card.map(|card| &card.kind));
         let chrome = self.card_chrome.get(&id);
-        let caption = card.map(|card| card_kind_caption(&card.kind));
-        let icon: Element<'_, Message> = match card.map(|card| &card.kind) {
-            Some(CardKind::Browser(_)) => browser_icon().icon().size(16).into(),
-            Some(CardKind::Chat(_)) => chat_icon().icon().size(16).into(),
-            _ => widget::icon::from_name(labels.icon).size(16).into(),
+        let file_toolbar = match self.cards.get(&id) {
+            Some(CardRuntime::Repository(runtime)) => {
+                repository_widget::selected_file_toolbar(id, runtime)
+            }
+            _ => None,
         };
-        let title_control = widget::button::custom(
-            widget::row::with_children(vec![
-                icon,
-                design::body(title)
-                    .wrapping(iced::widget::text::Wrapping::None)
-                    .ellipsize(iced::widget::text::Ellipsize::End(
-                        EllipsizeHeightLimit::Lines(1),
-                    ))
-                    .width(Length::Fill)
-                    .into(),
-            ])
-            .spacing(8)
-            .align_y(Alignment::Center)
-            .height(Length::Fill),
-        )
-        .id(chrome.map_or_else(
+        let focus_id = chrome.map_or_else(
             || workspace_widget::card_focus_id(id),
             |chrome| chrome.focus_id.clone(),
-        ))
-        .name(chrome.map_or_else(
-            || {
-                Cow::Owned(card_accessible_name(
-                    labels.type_label,
-                    title,
-                    caption.as_deref().unwrap_or(""),
-                    focused,
-                ))
-            },
-            |chrome| Cow::Borrowed(chrome.accessible_name(focused)),
-        ))
-        .class(column_title_style())
-        .padding([0, 8])
-        .width(Length::Fill)
-        .height(Length::Fill)
-        .on_press(Message::FocusCard(id));
-        let tip = match caption {
-            Some(caption) => format!("{title}\n{caption}"),
-            None => title.to_owned(),
+        );
+        let mut children = if let Some(toolbar) = file_toolbar {
+            vec![
+                command(
+                    widget::icon::from_name(labels.icon),
+                    format!("Focus {title} column"),
+                    focus_id,
+                    Some(Message::FocusCard(id)),
+                ),
+                toolbar.map(Message::Repository),
+            ]
+        } else {
+            let caption = card.map(|card| card_kind_caption(&card.kind));
+            let icon: Element<'_, Message> = match card.map(|card| &card.kind) {
+                Some(CardKind::Browser(_)) => browser_icon().icon().size(16).into(),
+                Some(CardKind::Chat(_)) => chat_icon().icon().size(16).into(),
+                _ => widget::icon::from_name(labels.icon).size(16).into(),
+            };
+            let title_control = widget::button::custom(
+                widget::row::with_children(vec![
+                    icon,
+                    design::body(title)
+                        .wrapping(iced::widget::text::Wrapping::None)
+                        .ellipsize(iced::widget::text::Ellipsize::End(
+                            EllipsizeHeightLimit::Lines(1),
+                        ))
+                        .width(Length::Fill)
+                        .into(),
+                ])
+                .spacing(8)
+                .align_y(Alignment::Center)
+                .height(Length::Fill),
+            )
+            .id(focus_id)
+            .name(chrome.map_or_else(
+                || {
+                    Cow::Owned(card_accessible_name(
+                        labels.type_label,
+                        title,
+                        caption.as_deref().unwrap_or(""),
+                        focused,
+                    ))
+                },
+                |chrome| Cow::Borrowed(chrome.accessible_name(focused)),
+            ))
+            .class(column_title_style())
+            .padding([0, 8])
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .on_press(Message::FocusCard(id));
+            let tip = match caption {
+                Some(caption) => format!("{title}\n{caption}"),
+                None => title.to_owned(),
+            };
+            vec![tooltip(crate::interaction::hover(title_control), tip)]
         };
-        let mut children = vec![tooltip(title_control, tip)];
         let status = match self.cards.get(&id) {
             None | Some(CardRuntime::Loading) => Some((labels.starting, true)),
             Some(CardRuntime::Failed(_)) => Some(("Unavailable", false)),
@@ -350,9 +332,14 @@ impl Cagents {
                             .wrapping(iced::widget::text::Wrapping::Word)
                             .width(Length::Fill)
                             .into(),
-                            widget::button::text("Browse files")
-                                .on_press(Message::SelectContextTab(ContextTab::Files))
-                                .into(),
+                            crate::interaction::tooltip(
+                                crate::interaction::hover(
+                                    widget::button::text("Browse files")
+                                        .name("Browse files")
+                                        .on_press(Message::SelectContextTab(ContextTab::Files)),
+                                ),
+                                "Browse files",
+                            ),
                         ])
                         .spacing(8),
                     )

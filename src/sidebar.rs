@@ -36,6 +36,7 @@ use crate::{
     },
     splitter::{Edge as SplitterEdge, Splitter},
 };
+use row_interaction::RowInteraction;
 
 /// The rendered bounds of the expanded pane, and the only bounds it has:
 /// `crate::settings` validates persisted widths against these, so a width can
@@ -141,6 +142,37 @@ pub struct SidebarModel {
 }
 
 impl SidebarModel {
+    /// Known projects follow the durable order; newly discovered projects keep
+    /// their relative order at the end until the next persisted reorder.
+    pub fn apply_project_order(&mut self, order: &[ProjectId]) {
+        self.projects.sort_by_key(|project| {
+            order
+                .iter()
+                .position(|id| *id == project.id)
+                .unwrap_or(usize::MAX)
+        });
+    }
+
+    pub fn reorder_project(&mut self, project: ProjectId, before: Option<ProjectId>) -> bool {
+        let Some(from) = self.projects.iter().position(|entry| entry.id == project) else {
+            return false;
+        };
+        let target = match before {
+            Some(id) => match self.projects.iter().position(|entry| entry.id == id) {
+                Some(index) => index,
+                None => return false,
+            },
+            None => self.projects.len(),
+        };
+        let to = target.saturating_sub(usize::from(from < target));
+        if from == to {
+            return false;
+        }
+        let project = self.projects.remove(from);
+        self.projects.insert(to, project);
+        true
+    }
+
     pub fn ready(mode: SidebarMode, projects: Vec<SidebarProject>) -> Self {
         Self {
             mode,
@@ -941,7 +973,7 @@ impl ChangeRow {
             // Both halves are required: Git reports `-` for a binary side, and
             // a missing count is not a count of zero.
             (Some(added), Some(removed)) => format!("+{added} −{removed}"),
-            _ => "±unknown".to_owned(),
+            _ => String::new(),
         };
         let status = entry
             .conflict
@@ -955,12 +987,18 @@ impl ChangeRow {
         // but its name and has no head to spare.
         let ellipsize_start = entry.old_path.is_some() || label.contains('/');
         let chrome = ChangeRowChrome {
-            accessible_name: format!("{status} {label}, {counts}").into_boxed_str(),
+            accessible_name: if counts.is_empty() {
+                format!("{status} {label}")
+            } else {
+                format!("{status} {label}, {counts}")
+            }
+            .into_boxed_str(),
             stage_name: format!("Stage {label}").into_boxed_str(),
             unstage_name: format!("Unstage {label}").into_boxed_str(),
             discard_name: format!("Discard {label}").into_boxed_str(),
             label: label.into_boxed_str(),
             status: status.into_boxed_str(),
+            counts_split: counts.find(' '),
             counts: counts.into_boxed_str(),
             ellipsize_start,
             stage_id: stable_id(format!("panel.change.stage.{key}")),
@@ -977,8 +1015,7 @@ impl ChangeRow {
         PathSelection::from_changed_path(&self.entry)
     }
 
-    /// The added/removed summary. An unmeasured count renders as unknown
-    /// rather than as zero.
+    /// The added/removed summary. Unmeasured counts are omitted, not invented.
     pub fn counts_label(&self) -> &str {
         &self.chrome.counts
     }
@@ -993,6 +1030,7 @@ struct ChangeRowChrome {
     label: Box<str>,
     status: Box<str>,
     counts: Box<str>,
+    counts_split: Option<usize>,
     /// True when the label's tail is what identifies it; see
     /// [`ChangeRow::new`].
     ellipsize_start: bool,
@@ -1958,6 +1996,7 @@ impl SidebarState {
             | SidebarAction::CancelWorktreeOperation(_)
             | SidebarAction::ProjectCommand { .. }
             | SidebarAction::NewWorktree { .. }
+            | SidebarAction::ReorderProject { .. }
             | SidebarAction::Refresh
             | SidebarAction::RefreshWorktree { .. }
             | SidebarAction::CreatePullRequest { .. }
@@ -1980,6 +2019,10 @@ impl SidebarState {
 /// Not `Eq`: the resize request carries a width, and widths are measurements.
 #[derive(Debug, Clone, PartialEq)]
 pub enum SidebarAction {
+    ReorderProject {
+        project: ProjectId,
+        before: Option<ProjectId>,
+    },
     ProjectCommand {
         project_id: ProjectId,
         worktree_id: Option<WorktreeId>,
@@ -2554,6 +2597,11 @@ fn project_list<'a>(
         ));
     }
 
+    let column = RowInteraction::projects(
+        column.into(),
+        projects.iter().map(|project| project.project.id).collect(),
+        !modal_open && !compact,
+    );
     widget::scrollable(column)
         .class(cosmic::style::iced::Scrollable::Minimal)
         .width(Length::Fill)
@@ -2979,6 +3027,7 @@ fn worktree_view<'a>(
     let mut row = widget::row::with_capacity(8)
         .align_y(Alignment::Center)
         .spacing(spacing.space_xxxs)
+        .height(Length::Fill)
         .push(
             widget::container(worktree_icon().icon().size(ROW_ICON_SIZE))
                 .center_x(Length::Fixed(ROW_ICON_WIDTH)),
@@ -3058,7 +3107,7 @@ fn worktree_view<'a>(
             modal_open,
         ));
     context_controls(
-        crate::interaction::tooltip(action, &*chrome.tooltip),
+        crate::interaction::tooltip(crate::interaction::hover(action), &*chrome.tooltip),
         project_id,
         Some(worktree.id),
         modal_open,
@@ -3568,7 +3617,8 @@ fn panel_section<'a>(
                 .into(),
         ])
         .align_y(Alignment::Center)
-        .spacing(spacing.space_xxxs),
+        .spacing(spacing.space_xxxs)
+        .height(Length::Fill),
     )
     .class(sidebar_button_style(false))
     .id(id)
@@ -3823,7 +3873,8 @@ fn change_group_view<'a>(
         widget::container(
             widget::row::with_children(header_children)
                 .align_y(Alignment::Center)
-                .spacing(0),
+                .spacing(0)
+                .height(PANEL_ROW_HEIGHT),
         )
         .padding([0, spacing.space_xxxs]),
     );
@@ -3847,13 +3898,43 @@ fn change_row_view<'a>(
     modal_open: bool,
 ) -> Element<'a, SidebarAction> {
     let spacing = cosmic::theme::spacing();
-    let key = &source.key;
     let chrome = &row.chrome;
     let selected = matches!(
         state.panel_selection.as_ref(),
         Some(PanelSelection::Change { path, area: selected })
             if *path == row.entry.path && *selected == area
     );
+    let tone = if row.entry.conflict.is_some() {
+        BadgeTone::Danger
+    } else {
+        match row.entry.kind {
+            ChangeKind::Added | ChangeKind::Untracked => BadgeTone::Success,
+            ChangeKind::Deleted | ChangeKind::Unmerged => BadgeTone::Danger,
+            _ => BadgeTone::Warning,
+        }
+    };
+    let mut status = widget::row::with_capacity(3)
+        .align_y(Alignment::Center)
+        .spacing(spacing.space_xxxs)
+        .push(semantic_caption(
+            if row.entry.conflict.is_some() {
+                "U"
+            } else {
+                &chrome.status
+            },
+            tone,
+        ));
+    if let Some(split) = chrome.counts_split {
+        status = status
+            .push(semantic_caption(
+                &chrome.counts[..split],
+                BadgeTone::Success,
+            ))
+            .push(semantic_caption(
+                &chrome.counts[split + 1..],
+                BadgeTone::Danger,
+            ));
+    }
     let identity = panel_row(
         &*chrome.accessible_name,
         0,
@@ -3870,30 +3951,75 @@ fn change_row_view<'a>(
                 })
                 .width(Length::Fill)
                 .into(),
-            widget::container(widget::text::caption(&*chrome.status))
-                .center_x(Length::Fixed(ROW_ICON_WIDTH))
+            widget::container(status)
+                .align_right(CHANGE_STATUS_WIDTH)
+                .center_y(Length::Fill)
                 .into(),
-            widget::text::caption(&*chrome.counts).into(),
         ])
         .align_y(Alignment::Center)
         .spacing(spacing.space_xxxs),
         SidebarAction::OpenChange {
-            key: key.clone(),
+            key: source.key.clone(),
             path: row.entry.path.clone(),
             area,
         },
         selected,
         modal_open,
     );
-    let mut children: Vec<Element<'a, SidebarAction>> = vec![identity];
-    children.extend(
-        row_commands(source, area, row, modal_open)
-            .into_iter()
-            .map(IconCommand::into_element),
-    );
-    widget::row::with_children(children)
-        .align_y(Alignment::Center)
-        .spacing(0)
+    let commands = row_commands(source, area, row, modal_open);
+    if commands.is_empty() {
+        return identity;
+    }
+    let actions = widget::container(
+        widget::row::with_children(commands.into_iter().map(IconCommand::into_element))
+            .align_y(Alignment::Center)
+            .spacing(0),
+    )
+    .align_right(CHANGE_STATUS_WIDTH)
+    .height(PANEL_ROW_HEIGHT)
+    .class(theme::Container::Custom(Box::new(|theme| {
+        cosmic::iced::widget::container::Style {
+            background: Some(cosmic::iced::Background::Color(
+                theme.current_container().base.into(),
+            )),
+            ..Default::default()
+        }
+    })));
+    RowInteraction::actions(
+        identity,
+        widget::container(actions)
+            .padding([0, spacing.space_xxxs])
+            .align_right(Length::Fill)
+            .into(),
+    )
+}
+
+const CHANGE_STATUS_WIDTH: f32 = 100.0;
+
+fn semantic_caption<'a>(
+    label: impl Into<Cow<'a, str>> + 'a,
+    tone: BadgeTone,
+) -> Element<'a, SidebarAction> {
+    widget::text::caption(label)
+        .wrapping(cosmic::iced::widget::text::Wrapping::None)
+        .class(theme::Text::Custom(match tone {
+            BadgeTone::Success => |theme| cosmic::iced::widget::text::Style {
+                color: Some(theme.cosmic().success.base.into()),
+                ..Default::default()
+            },
+            BadgeTone::Warning => |theme| cosmic::iced::widget::text::Style {
+                color: Some(theme.cosmic().warning.base.into()),
+                ..Default::default()
+            },
+            BadgeTone::Danger => |theme| cosmic::iced::widget::text::Style {
+                color: Some(theme.cosmic().destructive.base.into()),
+                ..Default::default()
+            },
+            BadgeTone::Neutral => |theme| cosmic::iced::widget::text::Style {
+                color: Some(theme.current_container().on.into()),
+                ..Default::default()
+            },
+        }))
         .into()
 }
 
@@ -4466,24 +4592,26 @@ fn panel_row<'a>(
 ) -> Element<'a, SidebarAction> {
     let spacing = cosmic::theme::spacing();
     let indent = u16::try_from(depth).unwrap_or(u16::MAX).saturating_mul(12);
-    button::custom(
-        widget::row::with_children(vec![
-            cosmic::iced::widget::Space::new()
-                .width(Length::Fixed(f32::from(indent)))
-                .into(),
-            content.into(),
-        ])
-        .align_y(Alignment::Center)
-        .spacing(0),
+    crate::interaction::hover(
+        button::custom(
+            widget::row::with_children(vec![
+                cosmic::iced::widget::Space::new()
+                    .width(Length::Fixed(f32::from(indent)))
+                    .into(),
+                content.into(),
+            ])
+            .align_y(Alignment::Center)
+            .spacing(0)
+            .height(Length::Fill),
+        )
+        .class(sidebar_button_style(selected))
+        .name(name)
+        .selected(selected)
+        .padding([0, spacing.space_xxxs])
+        .height(Length::Fixed(PANEL_ROW_HEIGHT))
+        .width(Length::Fill)
+        .on_press_maybe(gated(action, modal_open)),
     )
-    .class(sidebar_button_style(selected))
-    .name(name)
-    .selected(selected)
-    .padding([0, spacing.space_xxxs])
-    .height(Length::Fixed(PANEL_ROW_HEIGHT))
-    .width(Length::Fill)
-    .on_press_maybe(gated(action, modal_open))
-    .into()
 }
 
 /// The confirmation the application mounts before any discard runs.
@@ -4938,6 +5066,466 @@ fn filter_id(filter: SidebarFilter) -> Id {
     })
 }
 
+/// Event decorators keep native buttons, focus operations, menus and accessible
+/// names intact instead of replacing rows with mouse-only hit targets.
+mod row_interaction {
+    use super::{ICON_CONTROL_SIZE, PROJECT_HEADER_HEIGHT, ProjectId, SidebarAction};
+    use cosmic::iced::advanced::Renderer as _;
+    use cosmic::iced::{
+        Event, Length, Point, Rectangle, Size, Vector,
+        advanced::{
+            Clipboard, Layout, Shell, Widget, layout, overlay, renderer,
+            widget::{Id, Operation, Tree, operation, tree},
+        },
+        keyboard, mouse, window,
+    };
+    use cosmic::{Element, Renderer, Theme};
+
+    enum Kind {
+        Projects { ids: Vec<ProjectId>, enabled: bool },
+        Actions,
+    }
+
+    #[derive(Default)]
+    struct State {
+        origin: Option<(ProjectId, Point)>,
+        dragging: bool,
+        drop: Option<(Option<ProjectId>, f32)>,
+        hovered: bool,
+        focused: bool,
+    }
+
+    pub(super) struct RowInteraction<'a> {
+        children: Vec<Element<'a, SidebarAction>>,
+        kind: Kind,
+    }
+
+    #[derive(Default)]
+    struct FocusWithin(bool);
+
+    impl Operation for FocusWithin {
+        fn traverse(&mut self, operate: &mut dyn FnMut(&mut dyn Operation)) {
+            operate(self);
+        }
+
+        fn focusable(
+            &mut self,
+            _id: Option<&Id>,
+            _bounds: Rectangle,
+            state: &mut dyn operation::Focusable,
+        ) {
+            self.0 |= state.is_focused();
+        }
+    }
+
+    impl<'a> RowInteraction<'a> {
+        pub(super) fn projects(
+            content: Element<'a, SidebarAction>,
+            ids: Vec<ProjectId>,
+            enabled: bool,
+        ) -> Element<'a, SidebarAction> {
+            Element::new(Self {
+                children: vec![content],
+                kind: Kind::Projects { ids, enabled },
+            })
+        }
+
+        pub(super) fn actions(
+            base: Element<'a, SidebarAction>,
+            actions: Element<'a, SidebarAction>,
+        ) -> Element<'a, SidebarAction> {
+            Element::new(Self {
+                children: vec![base, actions],
+                kind: Kind::Actions,
+            })
+        }
+
+        fn focus(&mut self, tree: &mut Tree, layout: Layout<'_>, renderer: &Renderer) {
+            let mut focus = FocusWithin::default();
+            if !matches!(self.kind, Kind::Actions) {
+                return;
+            }
+            for ((child, tree), layout) in self
+                .children
+                .iter_mut()
+                .zip(&mut tree.children)
+                .zip(layout.children())
+            {
+                child
+                    .as_widget_mut()
+                    .operate(tree, layout, renderer, &mut focus);
+            }
+            tree.state.downcast_mut::<State>().focused = focus.0;
+        }
+
+        fn header_at(&self, layout: Layout<'_>, point: Point) -> Option<ProjectId> {
+            let Kind::Projects { ids, enabled: true } = &self.kind else {
+                return None;
+            };
+            ids.iter()
+                .zip(layout.children().next()?.children())
+                .find_map(|(id, row)| {
+                    let bounds = row.bounds();
+                    // Leave expansion and new-worktree buttons as ordinary controls.
+                    let header = Rectangle {
+                        x: bounds.x + ICON_CONTROL_SIZE,
+                        y: bounds.y,
+                        width: (bounds.width - 2.0 * ICON_CONTROL_SIZE).max(0.0),
+                        height: PROJECT_HEADER_HEIGHT,
+                    };
+                    header.contains(point).then_some(*id)
+                })
+        }
+
+        fn drop_at(&self, layout: Layout<'_>, point: Point) -> (Option<ProjectId>, f32) {
+            let Kind::Projects { ids, .. } = &self.kind else {
+                unreachable!();
+            };
+            for (id, row) in ids.iter().zip(layout.children().next().unwrap().children()) {
+                if point.y < row.bounds().y + PROJECT_HEADER_HEIGHT / 2.0 {
+                    return (Some(*id), row.bounds().y);
+                }
+            }
+            (None, layout.bounds().y + layout.bounds().height)
+        }
+    }
+
+    impl Widget<SidebarAction, Theme, Renderer> for RowInteraction<'_> {
+        fn tag(&self) -> tree::Tag {
+            tree::Tag::of::<State>()
+        }
+
+        fn state(&self) -> tree::State {
+            tree::State::new(State::default())
+        }
+
+        fn children(&self) -> Vec<Tree> {
+            self.children.iter().map(Tree::new).collect()
+        }
+
+        fn diff(&mut self, tree: &mut Tree) {
+            tree.diff_children(&mut self.children);
+            if let Kind::Projects { ids, enabled } = &self.kind {
+                let state = tree.state.downcast_mut::<State>();
+                if !enabled || state.origin.is_some_and(|(id, _)| !ids.contains(&id)) {
+                    *state = State::default();
+                }
+            }
+        }
+
+        fn size(&self) -> Size<Length> {
+            self.children[0].as_widget().size()
+        }
+
+        fn layout(
+            &mut self,
+            tree: &mut Tree,
+            renderer: &Renderer,
+            limits: &layout::Limits,
+        ) -> layout::Node {
+            let base =
+                self.children[0]
+                    .as_widget_mut()
+                    .layout(&mut tree.children[0], renderer, limits);
+            let size = base.size();
+            let mut nodes = vec![base];
+            if self.children.len() == 2 {
+                nodes.push(self.children[1].as_widget_mut().layout(
+                    &mut tree.children[1],
+                    renderer,
+                    &layout::Limits::new(Size::ZERO, size),
+                ));
+            }
+            layout::Node::with_children(size, nodes)
+        }
+
+        fn operate(
+            &mut self,
+            tree: &mut Tree,
+            layout: Layout<'_>,
+            renderer: &Renderer,
+            operation: &mut dyn Operation,
+        ) {
+            operation.container(None, layout.bounds());
+            operation.traverse(&mut |operation| {
+                for ((child, tree), layout) in self
+                    .children
+                    .iter_mut()
+                    .zip(&mut tree.children)
+                    .zip(layout.children())
+                {
+                    child
+                        .as_widget_mut()
+                        .operate(tree, layout, renderer, operation);
+                }
+            });
+            self.focus(tree, layout, renderer);
+        }
+
+        fn update(
+            &mut self,
+            tree: &mut Tree,
+            event: &Event,
+            layout: Layout<'_>,
+            cursor: mouse::Cursor,
+            renderer: &Renderer,
+            clipboard: &mut dyn Clipboard,
+            shell: &mut Shell<'_, SidebarAction>,
+            viewport: &Rectangle,
+        ) {
+            let state = tree.state.downcast_mut::<State>();
+            let hovered = cursor.is_over(layout.bounds()) && cursor.is_over(*viewport);
+            if hovered != state.hovered {
+                state.hovered = hovered;
+                shell.request_redraw();
+            }
+            if matches!(self.kind, Kind::Projects { enabled: true, .. }) {
+                match event {
+                    Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)) if hovered => {
+                        if let Some(point) = cursor.position() {
+                            state.origin = self.header_at(layout, point).map(|id| (id, point));
+                        }
+                    }
+                    Event::Mouse(mouse::Event::CursorMoved { .. }) => {
+                        if let (Some((_, origin)), Some(position)) =
+                            (state.origin, cursor.position())
+                        {
+                            if !state.dragging && origin.distance(position) >= 6.0 {
+                                state.dragging = true;
+                                // Cancel the native button press before swallowing the drag.
+                                // An unavailable cursor cannot activate the pressed button.
+                                self.children[0].as_widget_mut().update(
+                                    &mut tree.children[0],
+                                    &Event::Mouse(mouse::Event::ButtonReleased(
+                                        mouse::Button::Left,
+                                    )),
+                                    layout.children().next().unwrap(),
+                                    mouse::Cursor::Unavailable,
+                                    renderer,
+                                    clipboard,
+                                    shell,
+                                    viewport,
+                                );
+                            }
+                            if state.dragging {
+                                state.drop = hovered.then(|| self.drop_at(layout, position));
+                                shell.request_redraw();
+                                shell.capture_event();
+                                return;
+                            }
+                        }
+                    }
+                    Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)) => {
+                        if let Some((project, _)) = state.origin.take() {
+                            if state.dragging {
+                                if let Some((before, _)) = state.drop.take().filter(|_| hovered) {
+                                    shell
+                                        .publish(SidebarAction::ReorderProject { project, before });
+                                }
+                                state.dragging = false;
+                                shell.request_redraw();
+                                shell.capture_event();
+                                return;
+                            }
+                        }
+                    }
+                    Event::Window(window::Event::Unfocused)
+                    | Event::Keyboard(keyboard::Event::KeyPressed {
+                        key: keyboard::Key::Named(keyboard::key::Named::Escape),
+                        ..
+                    }) => {
+                        if state.origin.is_some() {
+                            self.children[0].as_widget_mut().update(
+                                &mut tree.children[0],
+                                &Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)),
+                                layout.children().next().unwrap(),
+                                mouse::Cursor::Unavailable,
+                                renderer,
+                                clipboard,
+                                shell,
+                                viewport,
+                            );
+                        }
+                        state.origin = None;
+                        state.dragging = false;
+                        state.drop = None;
+                        shell.request_redraw();
+                    }
+                    _ => {}
+                }
+                if state.dragging {
+                    shell.capture_event();
+                    return;
+                }
+            }
+            let show_actions = state.hovered || state.focused;
+            for (index, ((child, tree), layout)) in self
+                .children
+                .iter_mut()
+                .zip(&mut tree.children)
+                .zip(layout.children())
+                .enumerate()
+                .rev()
+            {
+                let cursor = if index == 1 && !show_actions {
+                    mouse::Cursor::Unavailable
+                } else {
+                    cursor
+                };
+                child.as_widget_mut().update(
+                    tree, event, layout, cursor, renderer, clipboard, shell, viewport,
+                );
+                if shell.is_event_captured() {
+                    break;
+                }
+            }
+            self.focus(tree, layout, renderer);
+        }
+
+        fn mouse_interaction(
+            &self,
+            tree: &Tree,
+            layout: Layout<'_>,
+            cursor: mouse::Cursor,
+            viewport: &Rectangle,
+            renderer: &Renderer,
+        ) -> mouse::Interaction {
+            let state = tree.state.downcast_ref::<State>();
+            if state.dragging {
+                return mouse::Interaction::Grabbing;
+            }
+            if cursor.is_over(*viewport)
+                && cursor
+                    .position()
+                    .and_then(|point| self.header_at(layout, point))
+                    .is_some()
+            {
+                return mouse::Interaction::Grab;
+            }
+            self.children
+                .iter()
+                .zip(&tree.children)
+                .zip(layout.children())
+                .map(|((child, tree), layout)| {
+                    child
+                        .as_widget()
+                        .mouse_interaction(tree, layout, cursor, viewport, renderer)
+                })
+                .find(|interaction| *interaction != mouse::Interaction::None)
+                .unwrap_or_default()
+        }
+
+        fn draw(
+            &self,
+            tree: &Tree,
+            renderer: &mut Renderer,
+            theme: &Theme,
+            style: &renderer::Style,
+            layout: Layout<'_>,
+            cursor: mouse::Cursor,
+            viewport: &Rectangle,
+        ) {
+            let state = tree.state.downcast_ref::<State>();
+            for (index, ((child, tree), layout)) in self
+                .children
+                .iter()
+                .zip(&tree.children)
+                .zip(layout.children())
+                .enumerate()
+            {
+                if index == 1 && !(state.hovered || state.focused) {
+                    continue;
+                }
+                if index == 1 {
+                    // A separate renderer layer paints the opaque action strip
+                    // after base-row text instead of batching its quad below it.
+                    renderer.with_layer(*viewport, |renderer| {
+                        child
+                            .as_widget()
+                            .draw(tree, renderer, theme, style, layout, cursor, viewport);
+                    });
+                } else {
+                    child
+                        .as_widget()
+                        .draw(tree, renderer, theme, style, layout, cursor, viewport);
+                }
+            }
+            if let Some((_, y)) = state.drop {
+                if let Some(clip) = layout.bounds().intersection(viewport) {
+                    renderer.with_layer(clip, |renderer| {
+                        renderer.fill_quad(
+                            renderer::Quad {
+                                bounds: Rectangle {
+                                    x: layout.bounds().x,
+                                    y: y - 1.0,
+                                    width: layout.bounds().width,
+                                    height: 2.0,
+                                },
+                                ..Default::default()
+                            },
+                            cosmic::iced::Color::from(*theme.cosmic().accent_color()),
+                        );
+                    });
+                }
+            }
+        }
+
+        fn overlay<'a>(
+            &'a mut self,
+            tree: &'a mut Tree,
+            layout: Layout<'a>,
+            renderer: &Renderer,
+            viewport: &Rectangle,
+            translation: Vector,
+        ) -> Option<overlay::Element<'a, SidebarAction, Theme, Renderer>> {
+            overlay::from_children(
+                &mut self.children,
+                tree,
+                layout,
+                renderer,
+                viewport,
+                translation,
+            )
+        }
+
+        fn a11y_nodes(
+            &self,
+            layout: Layout<'_>,
+            tree: &Tree,
+            cursor: mouse::Cursor,
+        ) -> iced_accessibility::A11yTree {
+            iced_accessibility::A11yTree::join(
+                self.children
+                    .iter()
+                    .zip(&tree.children)
+                    .zip(layout.children())
+                    .map(|((child, tree), layout)| {
+                        child.as_widget().a11y_nodes(layout, tree, cursor)
+                    }),
+            )
+        }
+
+        fn drag_destinations(
+            &self,
+            tree: &Tree,
+            layout: Layout<'_>,
+            renderer: &Renderer,
+            destinations: &mut cosmic::iced::advanced::clipboard::DndDestinationRectangles,
+        ) {
+            for ((child, tree), layout) in self
+                .children
+                .iter()
+                .zip(&tree.children)
+                .zip(layout.children())
+            {
+                child
+                    .as_widget()
+                    .drag_destinations(tree, layout, renderer, destinations);
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -5018,6 +5606,42 @@ mod tests {
         )
     }
 
+    #[test]
+    fn project_reorder_preserves_new_projects_and_handles_forward_moves() {
+        let projects = (1..=4)
+            .map(|id| {
+                let mut entry = project();
+                entry.id = project_id(id);
+                entry
+            })
+            .collect();
+        let mut model = SidebarModel::ready(SidebarMode::Expanded, projects);
+        model.apply_project_order(&[project_id(3), project_id(1)]);
+        let ids = |model: &SidebarModel| {
+            model
+                .projects
+                .iter()
+                .map(|entry| entry.id)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            ids(&model),
+            vec![project_id(3), project_id(1), project_id(2), project_id(4)]
+        );
+        assert!(model.reorder_project(project_id(3), Some(project_id(4))));
+        assert_eq!(
+            ids(&model),
+            vec![project_id(1), project_id(2), project_id(3), project_id(4)]
+        );
+        assert!(!model.reorder_project(project_id(3), Some(project_id(3))));
+        assert!(!model.reorder_project(project_id(3), Some(project_id(99))));
+        assert!(model.reorder_project(project_id(1), None));
+        assert_eq!(
+            ids(&model),
+            vec![project_id(2), project_id(3), project_id(4), project_id(1)]
+        );
+    }
+
     /// The widget identities of the controls an element renders, in tree
     /// order.
     ///
@@ -5033,6 +5657,122 @@ mod tests {
         let mut ids = Vec::new();
         collect(&Tree::new(element), &mut ids);
         ids
+    }
+
+    #[test]
+    fn project_drag_does_not_activate_the_pressed_header() {
+        use cosmic::iced::{
+            Event, Point, Rectangle,
+            advanced::{Shell, clipboard},
+            mouse,
+        };
+        let renderer = headless_renderer();
+        let content = widget::column::with_children((1..=2).map(|id| {
+            button::custom(widget::text::body("Project"))
+                .height(PROJECT_HEADER_HEIGHT)
+                .width(240)
+                .on_press(SidebarAction::ToggleProject(project_id(id)))
+                .into()
+        }));
+        let mut element =
+            RowInteraction::projects(content.into(), vec![project_id(1), project_id(2)], true);
+        let mut tree = Tree::new(&element);
+        let viewport = Rectangle::with_size(Size::new(240.0, 2.0 * PROJECT_HEADER_HEIGHT));
+        let node = element.as_widget_mut().layout(
+            &mut tree,
+            &renderer,
+            &layout::Limits::new(Size::ZERO, viewport.size()),
+        );
+        let origin = Point::new(100.0, PROJECT_HEADER_HEIGHT / 2.0);
+        let end = Point::new(100.0, 1.9 * PROJECT_HEADER_HEIGHT);
+        let mut dispatch = |event: Event, point: Point| {
+            let mut messages = Vec::new();
+            element.as_widget_mut().update(
+                &mut tree,
+                &event,
+                Layout::new(&node),
+                mouse::Cursor::Available(point),
+                &renderer,
+                &mut clipboard::Null,
+                &mut Shell::new(&mut messages),
+                &viewport,
+            );
+            messages
+        };
+        // A scrollable translates the cursor but not CursorMoved's raw position.
+        // Jitter below the threshold must remain a click even after scrolling.
+        assert!(
+            dispatch(
+                Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)),
+                origin
+            )
+            .is_empty()
+        );
+        let jitter = Point::new(origin.x + 3.0, origin.y);
+        let raw_jitter = Point::new(jitter.x, jitter.y - 100.0);
+        assert!(
+            dispatch(
+                Event::Mouse(mouse::Event::CursorMoved {
+                    position: raw_jitter
+                }),
+                jitter
+            )
+            .is_empty()
+        );
+        assert_eq!(
+            dispatch(
+                Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)),
+                jitter
+            ),
+            vec![SidebarAction::ToggleProject(project_id(1))],
+        );
+        assert!(
+            dispatch(
+                Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)),
+                origin
+            )
+            .is_empty()
+        );
+        let raw_end = Point::new(end.x, end.y - 100.0);
+        assert!(
+            dispatch(
+                Event::Mouse(mouse::Event::CursorMoved { position: raw_end }),
+                end
+            )
+            .is_empty()
+        );
+        assert_eq!(
+            dispatch(
+                Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)),
+                end
+            ),
+            vec![SidebarAction::ReorderProject {
+                project: project_id(1),
+                before: None
+            }],
+        );
+        // A release outside the pane cancels instead of using a stale target.
+        assert!(
+            dispatch(
+                Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)),
+                origin
+            )
+            .is_empty()
+        );
+        assert!(
+            dispatch(
+                Event::Mouse(mouse::Event::CursorMoved { position: end }),
+                end
+            )
+            .is_empty()
+        );
+        assert!(
+            dispatch(
+                Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)),
+                Point::new(-10.0, end.y),
+            )
+            .is_empty()
+        );
     }
 
     #[test]
