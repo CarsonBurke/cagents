@@ -1,0 +1,192 @@
+#!/bin/bash
+set -euo pipefail
+
+PROGRAM=build-release-linux
+ROOT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+CACHE=${CAGENTS_RELEASE_CACHE:-"$HOME/.cache/cagents-release/ubuntu-22.04-amd64"}
+OUTPUT=${CAGENTS_DIST_DIR:-"$ROOT_DIR/dist"}
+REF=
+BASE_URL=https://cdimage.ubuntu.com/ubuntu-base/releases/22.04/release/ubuntu-base-22.04.5-base-amd64.tar.gz
+BASE_SHA256=242cd8898b33ea806ef5f13b1076ed7c76f9f989d18384452f7166692438ff1a
+CACHE_ID="cagents-local-release-v1 ubuntu-22.04.5 amd64 rust-1.93.0 zig-0.15.2 $BASE_SHA256"
+
+fail() {
+    printf '%s: %s\n' "$PROGRAM" "$*" >&2
+    exit 1
+}
+
+while (($#)); do
+    case $1 in
+        --ref|--output)
+            (($# >= 2)) && [[ -n $2 ]] || fail "$1 requires a value"
+            case $1 in --ref) REF=$2 ;; --output) OUTPUT=$2 ;; esac
+            shift 2
+            ;;
+        --help)
+            printf '%s\n' \
+                'Usage: scripts/build-release-linux [--ref REF] [--output DIR]' \
+                'Build and verify Linux releases locally in rootless Ubuntu 22.04.' \
+                'REF defaults to v<Cargo.toml version>; only committed source is exported.' \
+                'DIR defaults to CAGENTS_DIST_DIR or dist and must be empty.' \
+                'Requires Linux x86_64, unprivileged user namespaces, bubblewrap, Bash,' \
+                'Git, curl, GNU tar/coreutils, flock, network access, and ample disk space.' \
+                'CAGENTS_RELEASE_CACHE selects a private, marked cache (default:' \
+                '~/.cache/cagents-release/ubuntu-22.04-amd64). CARGO_BUILD_JOBS defaults to 2.' \
+                'No root, Docker, host toolchain, credentials, or publication is used.'
+            exit 0
+            ;;
+        *) fail "unknown argument: $1 (see --help)" ;;
+    esac
+done
+
+[[ $(uname -s) == Linux && $(uname -m) == x86_64 ]] || fail 'Linux x86_64 is required'
+CALLER_UID=$(id -u)
+CALLER_GID=$(id -g)
+[[ $CALLER_UID != 0 ]] || fail 'run as your ordinary nonroot user, not root'
+for command in bwrap git curl tar sha256sum flock realpath stat mktemp install; do
+    command -v "$command" >/dev/null || fail "required command not found: $command"
+done
+JOBS=${CARGO_BUILD_JOBS:-2}
+[[ $JOBS =~ ^[1-9][0-9]*$ ]] || fail 'CARGO_BUILD_JOBS must be a positive integer'
+if [[ -z $REF ]]; then
+    version=$(sed -n '/^\[package\]/,/^\[/{s/^version = "\([^"]*\)"/\1/p;}' "$ROOT_DIR/Cargo.toml")
+    [[ $version =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]] || fail 'expected a stable Cargo.toml version'
+    REF=v$version
+fi
+SOURCE_COMMIT=$(git -C "$ROOT_DIR" rev-parse --verify --end-of-options "$REF^{commit}") \
+    || fail "not a committed Git ref: $REF"
+SOURCE_DATE_EPOCH=$(git -C "$ROOT_DIR" show -s --format=%ct "$SOURCE_COMMIT")
+git -C "$ROOT_DIR" cat-file -e "$SOURCE_COMMIT:Cargo.lock" || fail 'source ref must include Cargo.lock'
+for manifest in Cargo.toml crates/ceditor/Cargo.toml; do
+    source_version=$(git -C "$ROOT_DIR" show "$SOURCE_COMMIT:$manifest" \
+        | sed -n '/^\[package\]/,/^\[/{s/^version = "\([^"]*\)"/\1/p;}')
+    [[ $source_version =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]] \
+        || fail "expected a stable version in source $manifest"
+    if [[ $manifest == Cargo.toml ]]; then
+        version=$source_version
+    else
+        [[ $source_version == "$version" ]] || fail 'source product versions do not match'
+    fi
+done
+case $REF in
+    v[0-9]*|refs/tags/v[0-9]*)
+        [[ ${REF#refs/tags/} == "v$version" ]] || fail 'source tag and manifest versions do not match'
+        ;;
+esac
+for file in scripts/package-linux.sh scripts/package-ceditor-linux.sh install.sh; do
+    git -C "$ROOT_DIR" cat-file -e "$SOURCE_COMMIT:$file" || fail "missing source file: $file"
+done
+# A source-only export must not silently omit submodule contents.
+while read -r mode type object path; do
+    [[ $mode != 160000 ]] || fail 'source ref contains submodules; source-only export is unsupported'
+done < <(git -C "$ROOT_DIR" ls-tree -r "$SOURCE_COMMIT")
+
+umask 077
+[[ ! -L $CACHE ]] || fail 'cache root must not be a symlink'
+mkdir -p -- "$CACHE"
+CACHE=$(realpath -- "$CACHE")
+[[ $(stat -c %u "$CACHE") == "$CALLER_UID" && $(stat -c %a "$CACHE") == 700 ]] \
+    || fail 'cache root must be owned by the caller with mode 0700'
+[[ ! -L $CACHE/.lock && ( ! -e $CACHE/.lock || -f $CACHE/.lock ) ]] \
+    || fail 'cache lock must be a regular file'
+if [[ -e $CACHE/.cagents-release-cache ]]; then
+    [[ ! -L $CACHE/.cagents-release-cache && $(cat "$CACHE/.cagents-release-cache") == "$CACHE_ID" ]] \
+        || fail 'cache marker does not match this builder; use a different cache directory'
+else
+    shopt -s nullglob dotglob
+    contents=("$CACHE"/*)
+    ((${#contents[@]} == 0)) \
+        || fail 'refusing to adopt an unmarked nonempty cache'
+    # Never create even a lock file in an unmarked, nonempty directory.
+    shopt -u nullglob dotglob
+fi
+exec 9>"$CACHE/.lock"
+flock -n 9 || fail 'another release build is using this cache'
+if [[ ! -e $CACHE/.cagents-release-cache ]]; then
+    printf '%s\n' "$CACHE_ID" > "$CACHE/.cagents-release-cache"
+fi
+[[ ! -L $OUTPUT ]] || fail 'output directory must not be a symlink'
+mkdir -p -- "$OUTPUT"
+OUTPUT=$(realpath -- "$OUTPUT")
+[[ $OUTPUT != "$CACHE" && $OUTPUT != "$CACHE/"* ]] || fail 'output must be outside the cache'
+shopt -s nullglob dotglob
+assets=("$OUTPUT"/*)
+((${#assets[@]} == 0)) || fail 'output directory must be empty; existing assets are never overwritten'
+shopt -u nullglob dotglob
+
+WORK=$(mktemp -d "$CACHE/run.XXXXXX")
+cleanup() {
+    rm -rf -- "$WORK"
+}
+trap cleanup EXIT
+trap 'exit 1' HUP INT TERM
+# Freeze the entrypoint for this run, including its provisioning phase.
+cp -- "$ROOT_DIR/packaging/release-build" "$WORK/release-build"
+# Copy only DNS configuration, never host HOME, Git configuration or credentials.
+cat /etc/resolv.conf > "$WORK/resolv.conf"
+if [[ ! -f $CACHE/ubuntu-base.tar.gz ]]; then
+    curl --disable --proto '=https' --tlsv1.2 --fail --location "$BASE_URL" --output "$WORK/ubuntu-base.tar.gz"
+    printf '%s  %s\n' "$BASE_SHA256" "$WORK/ubuntu-base.tar.gz" | sha256sum --check --strict
+    mv -- "$WORK/ubuntu-base.tar.gz" "$CACHE/ubuntu-base.tar.gz"
+fi
+printf '%s  %s\n' "$BASE_SHA256" "$CACHE/ubuntu-base.tar.gz" | sha256sum --check --strict
+if [[ ! -e $CACHE/rootfs ]]; then
+    mkdir "$WORK/rootfs"
+    tar --extract --gzip --file "$CACHE/ubuntu-base.tar.gz" --directory "$WORK/rootfs" \
+        --no-same-owner --exclude='dev/*' --exclude='./dev/*'
+    mv -- "$WORK/rootfs" "$CACHE/rootfs"
+fi
+[[ -d $CACHE/rootfs && ! -L $CACHE/rootfs ]] || fail 'invalid cached rootfs'
+
+# This namespace maps the host caller to root, not a subordinate UID range.
+# Ubuntu fakeroot handles package ownership for otherwise unmapped system users.
+# A separate namespace below maps that same caller to their ordinary nonzero UID.
+if [[ ! -f $CACHE/rootfs/opt/.cagents-release-provisioned-v2 ]]; then
+    bwrap --unshare-user --uid 0 --gid 0 --unshare-pid --unshare-ipc --unshare-uts \
+        --die-with-parent --new-session --clearenv \
+        --bind "$CACHE/rootfs" / --proc /proc --dev /dev --tmpfs /tmp --tmpfs /run \
+        --ro-bind "$WORK/resolv.conf" /etc/resolv.conf \
+        --ro-bind "$WORK/release-build" /release-build \
+        --setenv PATH /usr/sbin:/usr/bin:/sbin:/bin --setenv HOME /root \
+        --setenv LANG C.UTF-8 --chdir / -- /bin/bash /release-build --provision
+fi
+# Mount destinations must exist before making the base rootfs read-only.
+mkdir -p "$CACHE/rootfs"/{source,dist,cargo,target}
+
+for directory in cargo target; do
+    [[ ! -L $CACHE/$directory ]] || fail "cache $directory must not be a symlink"
+    mkdir -p -- "$CACHE/$directory"
+done
+mkdir "$WORK/source" "$WORK/dist"
+# Fresh source mtimes prevent Cargo reusing newer binaries for an older ref.
+git -C "$ROOT_DIR" archive --format=tar "$SOURCE_COMMIT" | tar -xmf - -C "$WORK/source" --no-same-owner
+# User lookup must work without importing the host's account database.
+printf 'root:x:0:0:root:/root:/bin/bash\nbuilder:x:%s:%s:Release builder:/home/builder:/bin/bash\n' \
+    "$CALLER_UID" "$CALLER_GID" > "$WORK/passwd"
+printf 'root:x:0:\nbuilder:x:%s:\n' "$CALLER_GID" > "$WORK/group"
+printf 'Building %s (%s) locally in Ubuntu 22.04; assets: %s\n' "$REF" "$SOURCE_COMMIT" "$OUTPUT"
+bwrap --unshare-user --uid "$CALLER_UID" --gid "$CALLER_GID" \
+    --unshare-pid --unshare-ipc --unshare-uts --die-with-parent --new-session --clearenv \
+    --ro-bind "$CACHE/rootfs" / --proc /proc --dev /dev --tmpfs /tmp --tmpfs /run \
+    --tmpfs /home --dir /home/builder \
+    --ro-bind "$WORK/resolv.conf" /etc/resolv.conf \
+    --ro-bind "$WORK/passwd" /etc/passwd --ro-bind "$WORK/group" /etc/group \
+    --bind "$WORK/source" /source --bind "$WORK/dist" /dist \
+    --bind "$CACHE/cargo" /cargo --bind "$CACHE/target" /target \
+    --ro-bind "$WORK/release-build" /release-build \
+    --setenv PATH /opt/rust/bin:/opt/zig:/opt/git/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+    --setenv HOME /home/builder --setenv USER builder --setenv LOGNAME builder \
+    --setenv LANG C.UTF-8 --setenv TMPDIR /tmp \
+    --setenv XDG_CONFIG_HOME /home/builder/.config --setenv XDG_DATA_HOME /home/builder/.local/share \
+    --setenv XDG_CACHE_HOME /home/builder/.cache --setenv XDG_STATE_HOME /home/builder/.local/state \
+    --setenv XDG_RUNTIME_DIR /run/user/$CALLER_UID \
+    --setenv CARGO_HOME /cargo --setenv CARGO_TARGET_DIR /target \
+    --setenv CARGO_BUILD_JOBS "$JOBS" --setenv CAGENTS_DIST_DIR /dist \
+    --setenv CAGENTS_RELEASE_TARGET x86_64-unknown-linux-gnu \
+    --setenv SOURCE_COMMIT "$SOURCE_COMMIT" --setenv SOURCE_REF "$REF" \
+    --setenv SOURCE_DATE_EPOCH "$SOURCE_DATE_EPOCH" \
+    --setenv CC /usr/bin/clang --setenv CXX /usr/bin/clang++ --setenv LIBCLANG_PATH /usr/lib/llvm-14/lib \
+    --chdir /source -- /bin/bash /release-build
+# Build failures leave the public output empty. Only verified assets cross out.
+cp -- "$WORK/dist/"* "$OUTPUT/"
+printf 'Verified local release assets: %s\n' "$OUTPUT"

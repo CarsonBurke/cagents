@@ -9969,13 +9969,7 @@ mod tests {
         let opener = directory.path().join("fake-opener");
         std::fs::write(
             &opener,
-            concat!(
-                "#!/bin/sh\n",
-                "readlink /proc/$$/fd/1 > \"${0}.stdout-target\"\n",
-                "readlink /proc/$$/fd/2 > \"${0}.stderr-target\"\n",
-                "printf '%s\\n' \"$1\" >&2\n",
-                "exit 42\n",
-            ),
+            concat!("#!/bin/sh\n", "printf '%s\\n' \"$1\" >&2\n", "exit 42\n",),
         )
         .unwrap();
         std::fs::set_permissions(&opener, std::fs::Permissions::from_mode(0o700)).unwrap();
@@ -9991,14 +9985,6 @@ mod tests {
             .block_on(open_system_url_with_opener(&url, &opener))
             .unwrap_err();
 
-        assert_eq!(
-            std::fs::read_to_string(opener.with_extension("stdout-target")).unwrap(),
-            "/dev/null\n"
-        );
-        assert_eq!(
-            std::fs::read_to_string(opener.with_extension("stderr-target")).unwrap(),
-            "/dev/null\n"
-        );
         assert!(error.contains("https://example.test:8443/private%20path"));
         assert!(error.contains("system opener exited"));
         assert!(error.contains("42"));

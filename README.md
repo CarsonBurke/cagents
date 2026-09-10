@@ -9,7 +9,7 @@ cagents is a native Wayland desktop application for organizing coding-agent sess
 
 The initial supported release target is **Linux x86_64 with glibc**, built on Ubuntu 22.04, in a **Wayland** session. X11, musl, ARM, and other operating systems or package formats are not currently supported. A normal graphical login should provide an absolute `XDG_RUNTIME_DIR`; cagents uses it for the private daemon socket.
 
-The `.deb` declares `git`, `libc6 (>= 2.35)`, Fontconfig, FreeType, GCC/libstdc++, Wayland client, xkbcommon, and zlib runtime dependencies. The portable archive needs equivalent libraries. A shell, PTY support, and Linux `/proc` are required for hosted terminals.
+The `.deb` declares `git (>= 2.36)`, `libc6 (>= 2.35)`, Fontconfig, FreeType, GCC/libstdc++, Wayland client, xkbcommon, and zlib runtime dependencies. The portable archive needs equivalent libraries and Git 2.36 or newer for NUL-delimited worktree discovery. Ubuntu 22.04's default Git 2.34 must be upgraded separately. A shell, PTY support, and Linux `/proc` are required for hosted terminals.
 
 The GitHub CLI, `gh`, is optional for local-only use but required for cagents GitHub and pull-request operations. Install it with your distribution, then authenticate as the same desktop user:
 
@@ -201,7 +201,7 @@ repository, then choose a published version:
 gh auth login --hostname github.com
 gh auth status --hostname github.com
 REPOSITORY='CarsonBurke/cagents'
-VERSION='0.1.0'
+VERSION='0.1.1'
 ```
 
 ### Recommended: download, verify, inspect, then install
@@ -281,7 +281,7 @@ Append `--restart-daemon` only when an explicit full daemon update is intended:
 ```sh
 (
   gh auth status --hostname github.com || exit 1
-  VERSION=0.1.0
+  VERSION=0.1.1
   download_dir="$(mktemp -d)" || exit 1
   trap 'rm -rf "$download_dir"' 0
   trap 'exit 1' HUP INT TERM
@@ -775,13 +775,13 @@ signal the host daemon or install a package on the host.
 
 ## Releases
 
-Pushing a canonical `v*` tag runs `.github/workflows/release.yml` on Ubuntu 22.04
-with Rust 1.93 and Zig 0.15.2. The tag must match the stable version in both the
-cagents and ceditor manifests. Publication requires locked release-profile tests
-for the isolated CLI, host, browserless UI, integrated UI, and editor boundaries,
-followed by sequential packaging and shipped-binary checks. The workflow
-validates desktop/AppStream metadata, stamps the private repository into
-`install.sh`, seals the asset set with checksums, and publishes these artifacts:
+Release builds and publication run **locally**, never in GitHub Actions. Use
+`scripts/build-release-linux` to build an exact Git tag in a private, rootless
+Ubuntu 22.04 environment with Rust 1.93, Zig 0.15.2, and Git 2.55. This keeps the Linux
+glibc 2.35 baseline instead of inheriting a newer workstation's libc.
+The builder runs locked release-profile tests for isolated CLI, host, browserless
+UI, integrated UI, and editor boundaries, then packages and checks the shipped
+binaries and desktop metadata. It produces these checksummed artifacts:
 
 - `cagents-${VERSION}-x86_64-unknown-linux-gnu.tar.gz`
 - `cagents_${VERSION}_amd64.deb`
@@ -800,7 +800,7 @@ validates desktop/AppStream metadata, stamps the private repository into
 Artifact selection is explicitly platform-aware. Only Linux x86_64 GNU has a
 supported build/package lane today. Windows and macOS require their own native
 ports, validation, packaging, and signing before their targets can be enabled;
-the workflow does not publish placeholder binaries for them.
+the release tooling does not publish placeholder binaries for them.
 
 The package script keeps the existing full package as its default and writes browserless build outputs to a separate Cargo target directory. Run both variants to compare their generated measurement reports without either artifact overwriting the other:
 
@@ -811,7 +811,22 @@ cat dist/cagents-"${VERSION}"-sizes.txt \
   dist/cagents-browserless-"${VERSION}"-sizes.txt
 ```
 
-The workflow uses its least-privilege GitHub token for publication through the preinstalled `gh` CLI; it does not require a maintainer's personal `gh` login.
+For a release, install `bubblewrap`, `curl`, `git`, and the standard archive tools
+locally, then build and publish explicitly:
+
+```sh
+./scripts/build-release-linux --ref v0.1.1 --output /tmp/cagents-v0.1.1
+./scripts/publish-release --version 0.1.1 --dist /tmp/cagents-v0.1.1 --verify-only
+gh auth login --hostname github.com
+./scripts/publish-release --version 0.1.1 --dist /tmp/cagents-v0.1.1
+```
+
+Both manifests and the existing tag must agree on the release version. The
+publisher verifies local and remote tag identity, uploads a private snapshot to
+its own draft, downloads and verifies the served bytes, then publishes. It never
+moves tags or overwrites a published release. Authentication stays in the local
+`gh` configuration, outside the build environment. Pushing a tag does not start
+a hosted build.
 
 ### In-app updates
 

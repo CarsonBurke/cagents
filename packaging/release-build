@@ -1,0 +1,254 @@
+#!/bin/bash
+# Invoked only by scripts/build-release-linux inside its Ubuntu rootfs.
+set -euo pipefail
+
+fail() {
+    printf 'release-build: %s\n' "$*" >&2
+    exit 1
+}
+
+case ${1:-} in
+    --help)
+        printf '%s\n' 'Internal Ubuntu entrypoint. Use scripts/build-release-linux --help on the host.'
+        exit 0
+        ;;
+    ''|--provision) [[ $# -le 1 ]] || fail 'unexpected arguments' ;;
+    *) fail 'unexpected argument; use scripts/build-release-linux' ;;
+esac
+. /etc/os-release
+[[ $ID == ubuntu && $VERSION_ID == 22.04 ]] || fail 'Ubuntu 22.04 is required'
+[[ $(uname -m) == x86_64 && $(getconf GNU_LIBC_VERSION) == 'glibc 2.35' ]] \
+    || fail 'native x86_64 glibc 2.35 is required'
+
+if [[ ${1:-} == --provision ]]; then
+    [[ $(id -u) == 0 ]] || fail 'provisioning requires namespace root'
+    export DEBIAN_FRONTEND=noninteractive
+    mkdir -p /etc/apt/apt.conf.d /opt /tmp/bootstrap
+    # There is only one mapped UID/GID. Apt cannot setuid to _apt; dpkg's
+    # ownership calls must be simulated for unmapped package system accounts.
+    printf 'APT::Sandbox::User "root";\n' > /etc/apt/apt.conf.d/99cagents-rootless
+    printf '#!/bin/sh\nexit 101\n' > /usr/sbin/policy-rc.d
+    chmod 0755 /usr/sbin/policy-rc.d
+    apt-get update
+    (
+        cd /tmp/bootstrap
+        apt-get download fakeroot libfakeroot
+        for package in ./*.deb; do
+            dpkg-deb --fsys-tarfile "$package" | tar -x -C / --no-same-owner
+        done
+    )
+    # Apt sanitizes LD_PRELOAD before invoking dpkg, so wrap dpkg itself.
+    printf '#!/bin/sh\nexec /usr/bin/fakeroot-sysv -- /usr/bin/dpkg "$@"\n' \
+        > /usr/local/sbin/cagents-dpkg
+    chmod 0755 /usr/local/sbin/cagents-dpkg
+    apt-get -o Dir::Bin::dpkg=/usr/local/sbin/cagents-dpkg install --yes --no-install-recommends \
+        ca-certificates build-essential clang cmake curl git libclang-dev \
+        libdbus-1-dev libegl1-mesa-dev libfontconfig1-dev libfreetype6-dev \
+        libgbm-dev libgl1-mesa-dev libssl-dev libudev-dev libwayland-dev \
+        libxkbcommon-dev ninja-build pkg-config python3 xz-utils \
+        appstream desktop-file-utils dpkg-dev jq fakeroot libfakeroot libcurl4-openssl-dev
+    [[ -x /usr/bin/clang && -x /usr/bin/clang++ && -d /usr/lib/llvm-14/lib ]]
+    # Install the three official, version-pinned Rust components directly;
+    # no mutable rustup bootstrap or host toolchain is involved.
+    for component in rustc cargo rust-std; do
+        archive="$component-1.93.0-x86_64-unknown-linux-gnu.tar.xz"
+        curl --proto '=https' --tlsv1.2 --fail --location \
+            "https://static.rust-lang.org/dist/$archive" --output "/tmp/$archive"
+        curl --proto '=https' --tlsv1.2 --fail --location \
+            "https://static.rust-lang.org/dist/$archive.sha256" --output "/tmp/$archive.sha256"
+        (cd /tmp && sha256sum --check --strict "$archive.sha256")
+        tar -xJf "/tmp/$archive" -C /tmp --no-same-owner
+        "/tmp/${archive%.tar.xz}/install.sh" --prefix=/opt/rust --disable-ldconfig
+    done
+    curl --proto '=https' --tlsv1.2 --fail --location \
+        https://ziglang.org/download/0.15.2/zig-x86_64-linux-0.15.2.tar.xz \
+        --output /tmp/zig.tar.xz
+    printf '%s  %s\n' 02aa270f183da276e5b5920b1dac44a63f1a49e55050ebde3aecc9eb82f93239 /tmp/zig.tar.xz \
+        | sha256sum --check --strict
+    mkdir -p /opt/zig
+    tar -xJf /tmp/zig.tar.xz -C /opt/zig --strip-components=1 --no-same-owner
+    [[ $(/opt/rust/bin/rustc --version) == 'rustc 1.93.0 '* ]]
+    [[ $(/opt/rust/bin/cargo --version) == 'cargo 1.93.0 '* ]]
+    [[ $(/opt/zig/zig version) == 0.15.2 ]]
+    # Jammy's Git 2.34 lacks NUL-delimited worktree discovery (requires 2.36).
+    curl --proto '=https' --tlsv1.2 --fail --location \
+        https://www.kernel.org/pub/software/scm/git/git-2.55.0.tar.xz \
+        --output /tmp/git.tar.xz
+    printf '%s  %s\n' 457fdb04dc8728e007d4688695e6912e6f680727920f2a40bf11eacc17505357 /tmp/git.tar.xz \
+        | sha256sum --check --strict
+    tar -xJf /tmp/git.tar.xz -C /tmp --no-same-owner
+    PATH=/opt/rust/bin:$PATH make -C /tmp/git-2.55.0 -j2 \
+        prefix=/opt/git NO_GETTEXT=YesPlease NO_TCLTK=YesPlease install
+    [[ $(/opt/git/bin/git --version) == 'git version 2.55.0' ]]
+    printf '%s\n' 'Ubuntu 22.04; Rust 1.93.0; Zig 0.15.2; Git 2.55.0' > /opt/.cagents-release-provisioned-v2
+    exit 0
+fi
+
+[[ $(id -u) != 0 ]] || fail 'builds and tests must run as the nonroot caller'
+[[ $PWD == /source && $CAGENTS_DIST_DIR == /dist && $CARGO_TARGET_DIR == /target ]] \
+    || fail 'use the isolated host wrapper'
+[[ $CAGENTS_RELEASE_TARGET == x86_64-unknown-linux-gnu ]]
+[[ $(rustc -vV | sed -n 's/^host: //p') == "$CAGENTS_RELEASE_TARGET" ]]
+[[ $(rustc --version) == 'rustc 1.93.0 '* && $(cargo --version) == 'cargo 1.93.0 '* ]]
+[[ $(zig version) == 0.15.2 ]]
+[[ $(git --version) == 'git version 2.55.0' ]]
+[[ $SOURCE_COMMIT =~ ^[0-9a-f]{40}$ && $SOURCE_DATE_EPOCH =~ ^[0-9]+$ ]]
+mkdir -p "$HOME" "$XDG_CONFIG_HOME" "$XDG_DATA_HOME" "$XDG_CACHE_HOME" "$XDG_STATE_HOME" "$XDG_RUNTIME_DIR"
+chmod 0700 "$XDG_RUNTIME_DIR"
+metadata=$(cargo metadata --locked --no-deps --format-version 1)
+VERSION=$(jq -er '.packages[] | select(.name == "cagents") | .version' <<< "$metadata")
+editor_version=$(jq -er '.packages[] | select(.name == "ceditor") | .version' <<< "$metadata")
+[[ $VERSION =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]] || fail 'expected a stable version'
+[[ $editor_version == "$VERSION" ]] || fail 'cagents and ceditor versions must match'
+# Explicit commits and branches are useful for pre-release verification, while
+# a selected version tag may never disagree with the exported manifests.
+case $SOURCE_REF in
+    v[0-9]*|refs/tags/v[0-9]*)
+        [[ ${SOURCE_REF#refs/tags/} == "v$VERSION" ]] || fail 'tag and manifest versions do not match'
+        ;;
+esac
+export VERSION
+DEB_ARCH=amd64
+# Use conventional build permissions; the host wrapper's cache remains private.
+umask 022
+export RUST_TEST_THREADS=${CARGO_BUILD_JOBS:-2}
+
+# Each command resolves its own feature graph; never use --workspace or combine
+# these features. All native artifacts are produced inside this Ubuntu rootfs.
+cargo test --locked --release --no-default-features --all-targets
+cargo test --locked --release --no-default-features --features host --all-targets
+cargo test --locked --release --no-default-features --features ui --all-targets
+cargo test --locked --release --package ceditor --all-targets
+cargo test --locked --release --features integrated-browser --all-targets
+./scripts/package-linux.sh --variant full
+./scripts/package-linux.sh --variant browserless
+./scripts/package-ceditor-linux.sh
+
+metric() {
+    local value
+    value=$(sed -n "s/^$2=//p" "$1")
+    [[ $value =~ ^[0-9]+$ ]] || fail "invalid $2 measurement in $1"
+    printf '%s' "$value"
+}
+full_report="/dist/cagents-$VERSION-sizes.txt"
+browserless_report="/dist/cagents-browserless-$VERSION-sizes.txt"
+comparison="/dist/cagents-$VERSION-artifact-comparison.txt"
+: > "$comparison"
+for measurement in resolved_package_ids build_seconds installed_binary_bytes portable_archive_bytes debian_package_bytes; do
+    full=$(metric "$full_report" "$measurement")
+    browserless=$(metric "$browserless_report" "$measurement")
+    case $measurement in
+        resolved_package_ids) reduction=resolved_package_id_reduction ;;
+        build_seconds) reduction=build_seconds_reduction ;;
+        installed_binary_bytes) reduction=installed_binary_byte_reduction ;;
+        portable_archive_bytes) reduction=portable_archive_byte_reduction ;;
+        debian_package_bytes) reduction=debian_package_byte_reduction ;;
+    esac
+    printf 'full_%s=%s\nbrowserless_%s=%s\n%s=%s\n' \
+        "$measurement" "$full" "$measurement" "$browserless" "$reduction" "$((full - browserless))" >> "$comparison"
+done
+
+jq -n --arg version "$VERSION" --arg target "$CAGENTS_RELEASE_TARGET" \
+    --arg deb_arch "$DEB_ARCH" --arg source_commit "$SOURCE_COMMIT" '{
+    schema_version: 1,
+    repository: "CarsonBurke/cagents",
+    version: $version,
+    source_commit: $source_commit,
+    targets: [{
+        target: $target, os: "linux", architecture: "x86_64", libc: "gnu", minimum_glibc: "2.35",
+        products: {
+            cagents: {
+                archive: ("cagents-" + $version + "-" + $target + ".tar.gz"),
+                deb: ("cagents_" + $version + "_" + $deb_arch + ".deb"),
+                installer: "install.sh", checksums: "SHA256SUMS"
+            },
+            "cagents-browserless": {
+                archive: ("cagents-browserless-" + $version + "-" + $target + ".tar.gz"),
+                deb: ("cagents-browserless_" + $version + "_" + $deb_arch + ".deb"),
+                checksums: "SHA256SUMS-browserless"
+            },
+            ceditor: {
+                archive: ("ceditor-" + $version + "-" + $target + ".tar.gz"),
+                checksums: "SHA256SUMS-ceditor"
+            }
+        }
+    }]
+}' > /dist/release-metadata.json
+sed -i "s|^DEFAULT_REPOSITORY='<OWNER>/<REPO>'$|DEFAULT_REPOSITORY='CarsonBurke/cagents'|" /dist/install.sh
+grep -Fqx "DEFAULT_REPOSITORY='CarsonBurke/cagents'" /dist/install.sh
+
+staging=$(mktemp -d)
+trap 'rm -rf -- "$staging"' EXIT
+trap 'exit 1' HUP INT TERM
+check_glibc() {
+    local binary=$1 required
+    # The linker must never introduce a requirement newer than the baseline.
+    required=$(readelf --version-info "$binary" | grep -oE 'GLIBC_[0-9]+\.[0-9]+' | sort -Vu | sed -n '$p')
+    [[ -n $required ]] || fail "no glibc version information in $binary"
+    [[ $(printf '%s\n' GLIBC_2.35 "$required" | sort -V | sed -n '$p') == GLIBC_2.35 ]] \
+        || fail "$binary requires $required, above glibc 2.35"
+}
+for product in cagents cagents-browserless; do
+    case $product in
+        cagents) desktop=dev.cagents.Cagents ;;
+        cagents-browserless) desktop=dev.cagents.Cagents.Browserless ;;
+    esac
+    tar -xzf "/dist/$product-$VERSION-$CAGENTS_RELEASE_TARGET.tar.gz" -C "$staging"
+    root="$staging/$product-$VERSION"
+    desktop-file-validate "$root/share/applications/$desktop.desktop"
+    grep -Fqx "Exec=$product ui" "$root/share/applications/$desktop.desktop"
+    grep -Fqx "TryExec=$product" "$root/share/applications/$desktop.desktop"
+    grep -Fqx "StartupWMClass=$desktop" "$root/share/applications/$desktop.desktop"
+    [[ -x $root/bin/$product && -s $root/share/icons/hicolor/scalable/apps/$desktop.svg ]]
+    for binary in cagents cagents-ui cagentsd; do
+        [[ -x $root/bin/$binary ]]
+        check_glibc "$root/bin/$binary"
+    done
+    [[ $("$root/bin/$product" --version) == "cagents $VERSION" ]]
+    appstreamcli validate --no-net "$root/share/metainfo/$desktop.metainfo.xml"
+    dpkg-deb --info "/dist/${product}_${VERSION}_${DEB_ARCH}.deb" >/dev/null
+    [[ $(dpkg-deb -f "/dist/${product}_${VERSION}_${DEB_ARCH}.deb" Version) == "$VERSION" ]]
+    [[ $(dpkg-deb -f "/dist/${product}_${VERSION}_${DEB_ARCH}.deb" Architecture) == "$DEB_ARCH" ]]
+    debian_root="$staging/$product-deb"
+    mkdir "$debian_root"
+    dpkg-deb --extract "/dist/${product}_${VERSION}_${DEB_ARCH}.deb" "$debian_root"
+    desktop-file-validate "$debian_root/usr/share/applications/$desktop.desktop"
+    grep -Fqx "Exec=/usr/bin/$product ui" "$debian_root/usr/share/applications/$desktop.desktop"
+    grep -Fqx "TryExec=/usr/bin/$product" "$debian_root/usr/share/applications/$desktop.desktop"
+    grep -Fqx "StartupWMClass=$desktop" "$debian_root/usr/share/applications/$desktop.desktop"
+    appstreamcli validate --no-net "$debian_root/usr/share/metainfo/$desktop.metainfo.xml"
+    [[ $("$debian_root/usr/bin/$product" --version) == "cagents $VERSION" ]]
+done
+
+tar -xzf "/dist/ceditor-$VERSION-$CAGENTS_RELEASE_TARGET.tar.gz" -C "$staging"
+editor_root="$staging/ceditor-$VERSION"
+desktop=io.github.cagents.ceditor
+desktop-file-validate "$editor_root/share/applications/$desktop.desktop"
+grep -Fqx 'Exec=ceditor %F' "$editor_root/share/applications/$desktop.desktop"
+grep -Fqx "Icon=$desktop" "$editor_root/share/applications/$desktop.desktop"
+grep -Fqx "StartupWMClass=$desktop" "$editor_root/share/applications/$desktop.desktop"
+[[ -x $editor_root/bin/ceditor && -s $editor_root/share/icons/hicolor/scalable/apps/$desktop.svg ]]
+check_glibc "$editor_root/bin/ceditor"
+[[ $("$editor_root/bin/ceditor" --version) == "ceditor $VERSION" ]]
+editor_config="$staging/editor-config"
+settings_path=$(XDG_CONFIG_HOME="$editor_config" "$editor_root/bin/ceditor" --settings-path)
+[[ $settings_path == "$editor_config/ceditor/settings.toml" && ! -e $editor_config ]]
+
+(
+    cd /dist
+    sha256sum \
+        "cagents-$VERSION-$CAGENTS_RELEASE_TARGET.tar.gz" \
+        "cagents_${VERSION}_${DEB_ARCH}.deb" "cagents-$VERSION-sizes.txt" \
+        "cagents-$VERSION-artifact-comparison.txt" \
+        "cagents-browserless-$VERSION-$CAGENTS_RELEASE_TARGET.tar.gz" \
+        "cagents-browserless_${VERSION}_${DEB_ARCH}.deb" "cagents-browserless-$VERSION-sizes.txt" \
+        "ceditor-$VERSION-$CAGENTS_RELEASE_TARGET.tar.gz" \
+        SHA256SUMS-browserless SHA256SUMS-ceditor release-metadata.json install.sh > SHA256SUMS
+    sha256sum --check --strict SHA256SUMS
+    sha256sum --check --strict SHA256SUMS-browserless
+    sha256sum --check --strict SHA256SUMS-ceditor
+    shopt -s nullglob dotglob
+    assets=(*)
+    ((${#assets[@]} == 13)) || fail 'expected exactly 13 release assets'
+)
+printf 'Verified all local release assets for %s at source %s\n' "$VERSION" "$SOURCE_COMMIT"

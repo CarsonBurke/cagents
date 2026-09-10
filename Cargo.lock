@@ -1161,7 +1161,7 @@ checksum = "fc652a48c352aef3ea3aed32080501cf3ef6ed5da78602a020c991775b0aff04"
 
 [[package]]
 name = "cagents"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "arc-swap",
  "ashpd 0.12.3",
@@ -1268,7 +1268,7 @@ dependencies = [
 
 [[package]]
 name = "ceditor"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "cagents",
  "clap",
