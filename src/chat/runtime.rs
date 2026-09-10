@@ -48,6 +48,7 @@ struct Inner {
     commands: crossbeam_channel::Sender<CommandRequest>,
     wake: Mutex<UnixStream>,
     state: Arc<Mutex<Snapshot>>,
+    confirmed_session: Arc<Mutex<Option<String>>>,
     visible: Arc<AtomicBool>,
     observe_next: Arc<AtomicBool>,
     stop: Arc<AtomicBool>,
@@ -100,11 +101,13 @@ impl Handle {
         let completed = Arc::new(AtomicBool::new(false));
         let failure = Arc::new(Mutex::new(None));
         let store = Arc::new(Mutex::new(store));
+        let confirmed_session = Arc::new(Mutex::new(None));
         let notify: Arc<dyn Fn(Update) + Send + Sync> = Arc::new(notify);
         let inner = Arc::new(Inner {
             commands,
             wake: Mutex::new(wake),
             state: state.clone(),
+            confirmed_session: confirmed_session.clone(),
             visible: visible.clone(),
             observe_next: observe_next.clone(),
             stop: stop.clone(),
@@ -121,6 +124,7 @@ impl Handle {
                     child,
                     adapter,
                     state,
+                    confirmed_session,
                     store,
                     visible,
                     observe_next,
@@ -265,6 +269,14 @@ impl Handle {
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .session_id
+            .clone()
+    }
+    /// Identity received from the provider, not the speculative launch selector.
+    pub(crate) fn confirmed_session_id(&self) -> Option<String> {
+        self.0
+            .confirmed_session
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
             .clone()
     }
     pub fn is_completed(&self) -> bool {
@@ -446,6 +458,7 @@ struct Actor {
     child: Option<ChildGuard>,
     adapter: Box<dyn Adapter>,
     state: Arc<Mutex<Snapshot>>,
+    confirmed_session: Arc<Mutex<Option<String>>>,
     store: Arc<Mutex<Store>>,
     visible: Arc<AtomicBool>,
     observe_next: Arc<AtomicBool>,
@@ -768,7 +781,18 @@ impl Actor {
     }
     fn provider_step(&mut self, step: Step) -> Result<(), String> {
         let observed = !step.events.is_empty();
+        let identity = step.events.iter().rev().find_map(|event| match event {
+            Event::Session { id, .. } => Some(Some(id.clone())),
+            Event::Reset { .. } => Some(None),
+            _ => None,
+        });
         self.step(step)?;
+        if let Some(identity) = identity {
+            *self
+                .confirmed_session
+                .lock()
+                .unwrap_or_else(|p| p.into_inner()) = identity;
+        }
         if observed {
             self.observe_update();
         }
@@ -825,6 +849,12 @@ impl Actor {
         Ok(())
     }
     fn apply(&mut self, event: Event) {
+        if matches!(&event, Event::Reset { .. }) {
+            *self
+                .confirmed_session
+                .lock()
+                .unwrap_or_else(|p| p.into_inner()) = None;
+        }
         let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
         apply_event(&mut state, &mut self.indices, event);
         // Only metadata is resident independently of the disk-backed window.

@@ -140,6 +140,12 @@ impl Default for State {
     }
 }
 
+impl State {
+    pub(super) fn transition_pending(&self) -> bool {
+        !self.attempts.is_empty() || !self.handoffs.is_empty() || !self.closing.is_empty()
+    }
+}
+
 struct CachedItem {
     content: ItemContent,
     markdown: Vec<markdown::Item>,
@@ -327,14 +333,20 @@ impl Runtime {
             self.refresh();
         }
     }
-    fn terminal_return_blocker(&self) -> Option<&'static str> {
+    pub(super) fn transition_blocker(&self) -> Option<&'static str> {
         if self.attachment_chooser_pending {
-            Some("Finish or cancel the file chooser before returning to the terminal.")
+            Some("Finish or cancel the file chooser before leaving the chat.")
         } else if self.pending.is_some() {
-            Some("Wait for the pending chat command to finish before returning to the terminal.")
-        } else if !self.composer.is_empty() || !self.attachments.is_empty() {
+            Some("Wait for the pending chat command to finish before leaving the chat.")
+        } else if !self.composer.is_empty()
+            || !self.attachments.is_empty()
+            || self
+                .answers
+                .values()
+                .any(|answers| answers.iter().any(|answer| !answer.is_empty()))
+        {
             Some(
-                "Your unsent draft and attachments cannot be transferred to the terminal. Send them, or copy the draft and clear it and remove the attachments, then return.",
+                "Submit unsent chat input and attachments, or copy and clear the input and remove attachments before leaving the chat.",
             )
         } else {
             None
@@ -659,7 +671,7 @@ impl Cagents {
                         let Some(CardRuntime::Chat(runtime)) = self.cards.get(&card) else {
                             return Task::none();
                         };
-                        if let Some(reason) = runtime.terminal_return_blocker() {
+                        if let Some(reason) = runtime.transition_blocker() {
                             self.status = Some(TransientNotice::error(reason));
                             return Task::none();
                         }
@@ -1221,7 +1233,7 @@ impl Cagents {
                 let Some(runtime) = self.chat_runtime_mut(target) else {
                     return Task::none();
                 };
-                if let Some(reason) = runtime.terminal_return_blocker() {
+                if let Some(reason) = runtime.transition_blocker() {
                     self.status = Some(TransientNotice::error(reason));
                     return Task::none();
                 }

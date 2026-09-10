@@ -898,8 +898,76 @@ pub fn default_path() -> Result<PathBuf, SettingsError> {
         .ok_or(SettingsError::DirectoryUnavailable)
 }
 
+fn settings_lock(path: &Path) -> Result<File, SettingsError> {
+    use std::os::fd::AsRawFd;
+    let parent = settings_parent(path)?;
+    prepare_private_directory(parent)?;
+    let lock_path = path.with_extension("toml.lock");
+    let lock = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(PRIVATE_FILE_MODE)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(&lock_path)?;
+    validate_owned_regular_file(&lock_path, &lock.metadata()?)?;
+    // SAFETY: the returned file owns the locked descriptor until dropped.
+    if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX) } != 0 {
+        return Err(io::Error::last_os_error().into());
+    }
+    Ok(lock)
+}
+
+/// Applies only fields this window changed since its last successful save.
+/// Nested shortcut tables merge by action; list-valued preferences are atomic.
+pub fn save_merged(
+    path: impl AsRef<Path>,
+    base: &AppSettings,
+    desired: &AppSettings,
+) -> Result<(), SettingsError> {
+    let path = path.as_ref();
+    let _lock = settings_lock(path)?;
+    let current = load_unlocked(path)?;
+    let mut current = toml::Value::try_from(current)?;
+    merge_changed_fields(
+        &toml::Value::try_from(base)?,
+        &toml::Value::try_from(desired)?,
+        &mut current,
+    );
+    save_unlocked(path, &current.try_into::<AppSettings>()?.validate()?)
+}
+
+fn merge_changed_fields(base: &toml::Value, desired: &toml::Value, current: &mut toml::Value) {
+    if base == desired {
+        return;
+    }
+    if let (Some(base), Some(desired), Some(current)) =
+        (base.as_table(), desired.as_table(), current.as_table_mut())
+    {
+        for (key, value) in desired {
+            match (base.get(key), current.get_mut(key)) {
+                (Some(previous), Some(current)) => merge_changed_fields(previous, value, current),
+                _ => {
+                    current.insert(key.clone(), value.clone());
+                }
+            }
+        }
+        for key in base.keys().filter(|key| !desired.contains_key(*key)) {
+            current.remove(key);
+        }
+    } else {
+        *current = desired.clone();
+    }
+}
+
 pub fn load(path: impl AsRef<Path>) -> Result<AppSettings, SettingsError> {
     let path = path.as_ref();
+    let _lock = settings_lock(path)?;
+    load_unlocked(path)
+}
+
+fn load_unlocked(path: &Path) -> Result<AppSettings, SettingsError> {
     reject_symlink_components(path)?;
     match fs::symlink_metadata(path) {
         Ok(_) => load_toml(path),
@@ -910,6 +978,11 @@ pub fn load(path: impl AsRef<Path>) -> Result<AppSettings, SettingsError> {
 
 pub fn save(path: impl AsRef<Path>, settings: &AppSettings) -> Result<(), SettingsError> {
     let path = path.as_ref();
+    let _lock = settings_lock(path)?;
+    save_unlocked(path, settings)
+}
+
+fn save_unlocked(path: &Path, settings: &AppSettings) -> Result<(), SettingsError> {
     let settings = settings.clone().validate()?;
     let parent = settings_parent(path)?;
     prepare_private_directory(parent)?;
@@ -967,7 +1040,7 @@ fn migrate_legacy(path: &Path) -> Result<AppSettings, SettingsError> {
                 return Err(SettingsError::UnsupportedSchema(legacy.schema_version));
             }
             let settings = AppSettings::from(legacy).validate()?;
-            save(path, &settings)?;
+            save_unlocked(path, &settings)?;
             let _ = fs::remove_file(legacy_path);
             Ok(settings)
         }
@@ -1110,6 +1183,37 @@ mod tests {
 
     fn path_in(directory: &tempfile::TempDir) -> PathBuf {
         directory.path().join("settings.toml")
+    }
+
+    #[test]
+    fn concurrent_windows_merge_unrelated_preferences_and_stale_close_is_inert() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = path_in(&directory);
+        let base = AppSettings::default();
+        save(&path, &base).unwrap();
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        std::thread::scope(|scope| {
+            for (font, theme) in [(Some(19.0), None), (None, Some(AppTheme::Light))] {
+                let base = &base;
+                let path = &path;
+                let barrier = barrier.clone();
+                scope.spawn(move || {
+                    let mut edited = base.clone();
+                    if let Some(font) = font {
+                        edited.terminal_font_size = font;
+                    }
+                    if let Some(theme) = theme {
+                        edited.app_theme = theme;
+                    }
+                    barrier.wait();
+                    save_merged(path, base, &edited).unwrap();
+                });
+            }
+        });
+        save_merged(&path, &base, &base).unwrap();
+        let restored = load(&path).unwrap();
+        assert_eq!(restored.terminal_font_size, 19.0);
+        assert_eq!(restored.app_theme, AppTheme::Light);
     }
 
     #[test]

@@ -599,6 +599,142 @@ pub(super) fn process(
     }
 }
 
+pub(super) fn resolve_upgrade(
+    host: &SharedHost,
+    source: &Session,
+) -> Result<Session, ProtocolError> {
+    let state = host.lock().unwrap_or_else(|p| p.into_inner());
+    let sources = state
+        .upgrade_chats
+        .get(&source.id)
+        .ok_or_else(|| unavailable("No durable upgrade replacement exists for this native chat"))?;
+    if !sources.iter().any(|previous| {
+        let saved = &previous.source;
+        !(source.proof.is_none()
+        || saved.proof != source.proof
+        // Presentation identities can be stale on hidden cards. The old proof,
+        // actor ID and immutable launch bind that descriptor to this lineage;
+        // only the daemon's checkpoint chooses the replacement conversation.
+        || saved.launch.provider != source.launch.provider
+        || saved.launch.recipe != source.launch.recipe
+        || saved.terminal.as_ref().map(|terminal| {
+            (
+                &terminal.id,
+                &terminal.launch,
+                terminal.continuity.live_proof(),
+            )
+        }) != source.terminal.as_ref().map(|terminal| {
+            (
+                &terminal.id,
+                &terminal.launch,
+                terminal.continuity.live_proof(),
+            )
+        }))
+    }) {
+        return Err(error(
+            "Native upgrade source does not match the exact former daemon conversation",
+        ));
+    }
+    let record = state
+        .chats
+        .get(&source.id)
+        .ok_or_else(|| unavailable("Restored native chat is no longer hosted"))?;
+    if !record.handle.owns_work() {
+        return Err(unavailable(
+            "Restored native provider has closed; no writer was restarted",
+        ));
+    }
+    let mut session = record.session.clone();
+    session.launch.session_id = record.handle.session_id();
+    Ok(session)
+}
+
+pub(super) fn restore_upgrade(
+    host: &SharedHost,
+    saved: &crate::upgrade::handoff::Chat,
+) -> Result<(), String> {
+    let mut session = saved.source.clone();
+    session.launch = saved.launch.clone();
+    let source = {
+        let state = host.lock().unwrap_or_else(|p| p.into_inner());
+        session.proof = Some(state.proof().clone());
+        if let Some(terminal) = session.terminal.as_mut() {
+            if state.terminals.contains_key(&terminal.id) {
+                *terminal = state
+                    .descriptor(0, terminal.id)
+                    .map_err(|error| error.message)?
+                    .session;
+            } else {
+                terminal.continuity = crate::model::TerminalContinuity::RelaunchAvailable {
+                    recipe: session
+                        .launch
+                        .terminal_recipe()
+                        .ok_or("Native exact recipe unavailable")?,
+                    last_exit: None,
+                };
+            }
+        }
+        state
+            .terminals
+            .contains_key(&session.id)
+            .then(|| state.proof().clone())
+    };
+    let response = start(host, 0, session, source, false).map_err(|error| error.message)?;
+    let id = match response {
+        ServerResponse::ChatAttached { session, .. } => session.id,
+        _ => return Err("Native restore did not attach its exact session".into()),
+    };
+    let handle = host
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .chats
+        .get(&id)
+        .expect("restored chat")
+        .handle
+        .clone();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let snapshot = handle.snapshot(None).expect("unconditional snapshot");
+        if let Some(error) = snapshot.error {
+            return Err(error);
+        }
+        if handle.is_completed() {
+            return Err(
+                "Restored native provider exited before confirming its exact conversation".into(),
+            );
+        }
+        if let Some(actual) = handle.confirmed_session_id() {
+            if Some(&actual) != saved.launch.session_id.as_ref() {
+                return Err(
+                    "Restored provider confirmed a different conversation; checkpoint retained"
+                        .into(),
+                );
+            }
+            break;
+        }
+        if Instant::now() >= deadline {
+            return Err(
+                "Native provider did not confirm its exact conversation within 30 seconds".into(),
+            );
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+    let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
+    let record = state
+        .chats
+        .get_mut(&saved.source.id)
+        .expect("restored chat");
+    record.subscribers.remove(&0);
+    record.observations.remove(&0);
+    let mut sources = saved.previous_sources.clone();
+    sources.push(crate::upgrade::handoff::ChatSource {
+        source: saved.source.clone(),
+        launch: saved.launch.clone(),
+    });
+    state.upgrade_chats.insert(saved.source.id, sources);
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -610,6 +746,97 @@ mod tests {
         model::{BootId, HostIncarnation, HostSessionId, LaunchRecipe},
     };
     use serde_json::{Value, json};
+
+    fn upgrade_fixture() -> (tempfile::TempDir, SharedHost, crate::upgrade::handoff::Chat) {
+        use std::os::unix::fs::PermissionsExt;
+        let directory = tempfile::tempdir().unwrap();
+        let executable = directory.path().join("omp");
+        std::fs::write(&executable, r#"#!/usr/bin/env python3
+import json, os, sys
+identity = sys.argv[sys.argv.index("--resume") + 1]
+print(json.dumps({"type": "ready"}), flush=True)
+for line in sys.stdin:
+    request = json.loads(line)
+    command = request["type"]
+    if command not in ("negotiate_protocol", "get_state", "get_available_models", "get_available_commands", "get_session_stats", "get_messages_page"):
+        sys.exit(7)
+    data = {"sessionId": os.environ.get("REPORTED_SESSION", identity), "messages": []}
+    print(json.dumps({"type": "response", "id": request["id"], "command": command, "success": True, "data": data}), flush=True)
+"#).unwrap();
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let old = HostSessionProof {
+            host_session_id: HostSessionId::new("old-session"),
+            boot_id: BootId::new("boot"),
+            host_incarnation: HostIncarnation::new("old-incarnation"),
+        };
+        let current = HostSessionProof {
+            host_session_id: HostSessionId::new("new-session"),
+            boot_id: BootId::new("boot"),
+            host_incarnation: HostIncarnation::new("new-incarnation"),
+        };
+        let launch = chat::Launch {
+            provider: Provider::Omp,
+            recipe: LaunchRecipe {
+                program: executable.to_string_lossy().into_owned(),
+                arguments: Vec::new(),
+                working_directory: directory.path().to_owned(),
+                environment: BTreeMap::new(),
+            },
+            session_id: Some("12345678-1234-4234-8234-123456789abc".into()),
+        };
+        let source = Session {
+            id: TerminalId::new(),
+            launch: launch.clone(),
+            proof: Some(old),
+            terminal: None,
+        };
+        (
+            directory,
+            Arc::new(Mutex::new(HostState::new(current))),
+            crate::upgrade::handoff::Chat {
+                source,
+                launch,
+                previous_sources: Vec::new(),
+            },
+        )
+    }
+
+    #[test]
+    fn native_upgrade_restores_exact_provider_session_and_only_resolves_proven_source() {
+        let (_directory, host, saved) = upgrade_fixture();
+        restore_upgrade(&host, &saved).unwrap();
+        let restored = resolve_upgrade(&host, &saved.source).unwrap();
+        assert_eq!(restored.id, saved.source.id);
+        assert_eq!(restored.launch.session_id, saved.launch.session_id);
+        assert_eq!(
+            restored.proof.as_ref(),
+            Some(host.lock().unwrap_or_else(|p| p.into_inner()).proof())
+        );
+        assert_ne!(restored.proof, saved.source.proof);
+        let mut wrong_source = saved.source.clone();
+        wrong_source.proof = restored.proof;
+        assert!(resolve_upgrade(&host, &wrong_source).is_err());
+        assert!(restore_upgrade(&host, &saved).is_err());
+        let handle = host.lock().unwrap_or_else(|p| p.into_inner()).chats[&saved.source.id]
+            .handle
+            .clone();
+        handle.close().unwrap();
+    }
+
+    #[test]
+    fn native_upgrade_rejects_provider_substituting_another_conversation() {
+        let (_directory, host, mut saved) = upgrade_fixture();
+        saved.launch.recipe.environment.insert(
+            "REPORTED_SESSION".into(),
+            "98765432-1234-4234-8234-123456789abc".into(),
+        );
+        assert!(restore_upgrade(&host, &saved).is_err());
+        assert!(resolve_upgrade(&host, &saved.source).is_err());
+        let handle = host.lock().unwrap_or_else(|p| p.into_inner()).chats[&saved.source.id]
+            .handle
+            .clone();
+        assert!(handle.close().is_err());
+    }
 
     struct Echo(bool);
     impl Adapter for Echo {

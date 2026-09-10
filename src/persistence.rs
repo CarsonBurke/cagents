@@ -1,6 +1,6 @@
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
-    fs::OpenOptions,
+    fs::{File, OpenOptions},
     io,
     os::unix::fs::OpenOptionsExt,
     path::{Path, PathBuf},
@@ -243,6 +243,51 @@ pub struct StateStore {
 }
 
 impl StateStore {
+    /// Copies a live store through SQLite's transactionally consistent VACUUM
+    /// snapshot. The source is never startup-reconciled or checkpointed here.
+    pub fn copy_snapshot(source: &Path, destination: &Path) -> Result<()> {
+        drop(open_existing_private_file(source)?);
+        let parent = destination
+            .parent()
+            .ok_or_else(|| StoreError::InvalidState("window database has no parent".into()))?;
+        prepare_private_directory(parent)?;
+        let temporary = tempfile::Builder::new()
+            .prefix(".window-")
+            .tempfile_in(parent)?;
+        // VACUUM INTO accepts an existing empty file; tempfile keeps it private.
+        let connection = Connection::open_with_flags(
+            source,
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NOFOLLOW,
+        )?;
+        connection.busy_timeout(DEFAULT_BUSY_TIMEOUT)?;
+        connection.execute(
+            "VACUUM INTO ?1",
+            [temporary.path().to_string_lossy().as_ref()],
+        )?;
+        temporary.as_file().sync_all()?;
+        temporary
+            .persist_noclobber(destination)
+            .map_err(|error| StoreError::Io(error.error))?;
+        File::open(parent)?.sync_all()?;
+        Ok(())
+    }
+
+    pub fn load_window_view(&self) -> Result<Option<String>> {
+        let inner = self.lock_inner()?;
+        ensure_open(&inner)?;
+        metadata(&inner.connection, "window_view_v1")
+    }
+
+    pub fn save_window_view(&self, value: &str) -> Result<()> {
+        let mut inner = self.lock_inner()?;
+        ensure_open(&inner)?;
+        let transaction = inner
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        set_metadata(&transaction, "window_view_v1", value)?;
+        transaction.commit()?;
+        Ok(())
+    }
     pub fn open(path: impl AsRef<Path>, boot_id: BootId) -> Result<Self> {
         Self::open_with_options(path, boot_id, StoreOptions::default())
     }

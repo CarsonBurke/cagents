@@ -43,7 +43,6 @@ pub mod persistence;
 pub mod repository;
 #[cfg(feature = "ui")]
 pub mod repository_widget;
-#[cfg(any(feature = "host", feature = "ui"))]
 mod secure_file;
 #[cfg(feature = "ui")]
 pub mod session;
@@ -58,6 +57,8 @@ pub mod terminal;
 pub mod tray;
 #[cfg(feature = "ui")]
 pub mod ui_controls;
+pub mod update;
+pub mod upgrade;
 pub use terminal::ipc as terminal_ipc;
 #[cfg(feature = "ui")]
 pub mod workspace;

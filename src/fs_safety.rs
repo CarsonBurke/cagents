@@ -435,6 +435,35 @@ pub fn rename_within(directory: &Root, from: &OsStr, to: &OsStr) -> Result<(), R
     Ok(())
 }
 
+/// Atomically moves a durable recovery record without ever replacing evidence
+/// already stored at the destination. Both names stay relative to the open root.
+///
+/// # Errors
+///
+/// Returns an error for invalid names, an existing destination, or a failed
+/// filesystem operation. Existing recovery evidence is never replaced.
+pub fn rename_new_within(directory: &Root, from: &OsStr, to: &OsStr) -> Result<(), ResolveError> {
+    let source = c_component(from, &directory.path)?;
+    let destination = c_component(to, &directory.path)?;
+    // SAFETY: both names and the owned directory descriptor outlive this call.
+    let status = unsafe {
+        libc::renameat2(
+            directory.descriptor(),
+            source.as_ptr(),
+            directory.descriptor(),
+            destination.as_ptr(),
+            libc::RENAME_NOREPLACE,
+        )
+    };
+    if status < 0 {
+        return Err(ResolveError::io(
+            &directory.path.join(to),
+            &io::Error::last_os_error(),
+        ));
+    }
+    Ok(())
+}
+
 /// Unlinks `name` directly inside `directory`.
 ///
 /// A symbolic link is removed as itself: `unlinkat` with no flags never

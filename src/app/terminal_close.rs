@@ -135,18 +135,15 @@ impl Cagents {
         }
         // The opt-out is committed only by Close, never by toggling or Cancel.
         // Do not persist a stale target's dialog either.
-        if (target_matches(intent, self.card_state(intent.card))
+        let save = if (target_matches(intent, self.card_state(intent.card))
             || exited_target_matches(intent, self.card_state(intent.card)))
             && intent.dont_ask_again
         {
-            let _ = self.apply_setting_input(SettingsField::ConfirmTerminalClose, "false".into());
-            if let Some(error) = &self.settings_save_error {
-                self.status = Some(TransientNotice::warning(format!(
-                    "Could not save terminal close preference: {error}"
-                )));
-            }
-        }
-        self.start_terminal_close(true)
+            self.apply_setting_input(SettingsField::ConfirmTerminalClose, "false".into())
+        } else {
+            Task::none()
+        };
+        Task::batch([save, self.start_terminal_close(true)])
     }
 
     fn start_terminal_close(&mut self, allow_active: bool) -> Task<Message> {

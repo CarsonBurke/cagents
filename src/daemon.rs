@@ -330,14 +330,13 @@ impl Drop for RecoveryLease {
     }
 }
 
-#[cfg(feature = "host")]
 pub(crate) struct HostLease {
     socket_path: PathBuf,
     lock: File,
 }
 
-#[cfg(feature = "host")]
 impl HostLease {
+    #[cfg(feature = "host")]
     pub(crate) fn acquire(
         paths: &RuntimePaths,
         proof: &HostSessionProof,
@@ -370,9 +369,68 @@ impl HostLease {
             lock,
         })
     }
+
+    /// A closed listening socket is not proof that process shutdown completed.
+    /// The inventory lease remains held until writers and the checkpoint drain.
+    pub(crate) fn is_held(paths: &RuntimePaths) -> Result<bool, PlatformError> {
+        Self::is_lock_held(&paths.lock)
+    }
+
+    pub(crate) fn is_held_at(socket: &Path) -> Result<bool, PlatformError> {
+        Self::is_lock_held(&socket.with_file_name("cagentsd.lock"))
+    }
+
+    fn is_lock_held(path: &Path) -> Result<bool, PlatformError> {
+        let lock = match OpenOptions::new()
+            .read(true)
+            .custom_flags(O_NOFOLLOW)
+            .open(path)
+        {
+            Ok(lock) => lock,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+            Err(error) => return Err(error.into()),
+        };
+        validate_lock_file(path, &lock.metadata()?, current_uid())?;
+        // SAFETY: flock receives a live, validated descriptor and scalar flags.
+        if unsafe { flock(lock.as_raw_fd(), LOCK_EX | LOCK_NB) } != 0 {
+            let error = io::Error::last_os_error();
+            return if error.kind() == io::ErrorKind::WouldBlock {
+                Ok(true)
+            } else {
+                Err(error.into())
+            };
+        }
+        // Explicit release also covers copies inherited by a concurrent fork.
+        // SAFETY: this descriptor owns the exclusive lock acquired above.
+        if unsafe { flock(lock.as_raw_fd(), LOCK_UN) } != 0 {
+            return Err(io::Error::last_os_error().into());
+        }
+        Ok(false)
+    }
+
+    /// Holds the daemon's exclusive inventory lease without claiming a serving
+    /// incarnation. Used only by explicit checkpoint maintenance while stopped.
+    pub(crate) fn acquire_for_maintenance(paths: &RuntimePaths) -> Result<Self, PlatformError> {
+        let lock = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .custom_flags(O_NOFOLLOW)
+            .open(&paths.lock)?;
+        validate_lock_file(&paths.lock, &lock.metadata()?, current_uid())?;
+        // SAFETY: the validated descriptor is owned through the guard lifetime.
+        if unsafe { flock(lock.as_raw_fd(), LOCK_EX | LOCK_NB) } != 0 {
+            return Err(PlatformError::AlreadyRunning {
+                path: paths.socket.clone(),
+            });
+        }
+        recover_stale_socket(&paths.socket)?;
+        Ok(Self {
+            socket_path: paths.socket.clone(),
+            lock,
+        })
+    }
 }
 
-#[cfg(feature = "host")]
 impl Drop for HostLease {
     fn drop(&mut self) {
         match fs::remove_file(&self.socket_path) {
@@ -416,7 +474,7 @@ struct StoredLockMetadata {
 /// Authenticate the current socket against the daemon's exclusive lease before
 /// using a new incarnation as evidence that an old owner has been replaced.
 /// Merely reaching a socket (or receiving a proof mismatch) is not authority.
-#[cfg(feature = "ui")]
+#[cfg(any(feature = "host", feature = "ui"))]
 pub(crate) fn replacement_owner(
     socket: &Path,
     proof: &HostSessionProof,
@@ -676,6 +734,16 @@ pub(crate) fn current_uid() -> u32 {
     unsafe { libc::geteuid() }
 }
 
+/// Called only in a child's pre-exec hook. Long-lived sibling processes must
+/// not retain installer assets, update leases, or other inherited descriptors.
+pub(crate) fn seal_inherited_descriptors() -> io::Result<()> {
+    // SAFETY: close_range takes scalar bounds and only changes descriptor flags.
+    if unsafe { libc::close_range(3, u32::MAX, libc::CLOSE_RANGE_CLOEXEC as libc::c_int) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
 #[cfg(feature = "host")]
 pub(crate) fn peer_uid(stream: &UnixStream) -> io::Result<u32> {
     let mut credentials = UCred::default();
@@ -784,6 +852,34 @@ mod tests {
         }
     }
 
+    #[test]
+    fn child_exec_seals_inherited_assets_without_closing_standard_output() {
+        use std::os::unix::process::CommandExt;
+
+        let asset = tempfile::tempfile().unwrap();
+        let fd = asset.as_raw_fd();
+        let mut child = std::process::Command::new("/bin/sh");
+        child.args([
+            "-c",
+            "if [ -e \"/proc/self/fd/$1\" ]; then exit 42; fi; printf ready",
+            "descriptor-probe",
+            &fd.to_string(),
+        ]);
+        // SAFETY: this child-only hook calls async-signal-safe descriptor syscalls.
+        // Clearing CLOEXEC models installer assets intentionally passed to a worker.
+        unsafe {
+            child.pre_exec(move || {
+                if libc::fcntl(fd, libc::F_SETFD, 0) == -1 {
+                    return Err(io::Error::last_os_error());
+                }
+                seal_inherited_descriptors()
+            });
+        }
+        let output = child.output().unwrap();
+        assert!(output.status.success(), "{output:?}");
+        assert_eq!(output.stdout, b"ready");
+    }
+
     #[cfg(feature = "host")]
     fn mode(path: &Path) -> u32 {
         fs::symlink_metadata(path).unwrap().permissions().mode() & 0o777
@@ -846,6 +942,21 @@ mod tests {
 
     #[cfg(feature = "host")]
     #[test]
+    fn shutdown_remains_running_after_the_listening_socket_closes() {
+        let root = tempdir().unwrap();
+        let paths = paths(root.path().join("runtime"));
+        let lease = HostLease::acquire(&paths, &proof()).unwrap();
+        let listener = UnixListener::bind(&paths.socket).unwrap();
+        drop(listener);
+        fs::remove_file(&paths.socket).unwrap();
+
+        assert!(HostLease::is_held(&paths).unwrap());
+        drop(lease);
+        assert!(!HostLease::is_held(&paths).unwrap());
+    }
+
+    #[cfg(feature = "host")]
+    #[test]
     fn existing_runtime_and_lock_paths_are_made_private() {
         let root = tempdir().unwrap();
         let directory = root.path().join("runtime");
@@ -872,12 +983,21 @@ mod tests {
         assert!(pidfd.metadata().is_ok());
     }
 
+    fn leave_stale_socket(path: &Path) {
+        let listener = UnixListener::bind(path).unwrap();
+        // Concurrent tests may fork before CLOEXEC closes an inherited copy.
+        // Shut down the shared socket so dropping this owner is deterministic.
+        assert_eq!(
+            unsafe { libc::shutdown(listener.as_raw_fd(), libc::SHUT_RDWR) },
+            0
+        );
+    }
+
     #[test]
     fn dead_daemon_lock_recovers_its_stale_socket() {
         let root = tempdir().unwrap();
         let paths = paths(root.path().to_path_buf());
-        let listener = UnixListener::bind(&paths.socket).unwrap();
-        drop(listener);
+        leave_stale_socket(&paths.socket);
         let lock = File::create(&paths.lock).unwrap();
 
         let pidfd = open_daemon_pidfd_or_recover(&lock, &paths, u32::MAX).unwrap();
@@ -890,8 +1010,7 @@ mod tests {
     fn unheld_corrupt_lock_recovers_without_parsing_metadata() {
         let root = tempdir().unwrap();
         let paths = paths(root.path().to_path_buf());
-        let listener = UnixListener::bind(&paths.socket).unwrap();
-        drop(listener);
+        leave_stale_socket(&paths.socket);
         fs::write(&paths.lock, b"truncated").unwrap();
         fs::set_permissions(&paths.lock, fs::Permissions::from_mode(PRIVATE_FILE_MODE)).unwrap();
         let mut lock = File::open(&paths.lock).unwrap();

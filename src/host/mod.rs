@@ -113,12 +113,13 @@ pub fn run() -> Result<(), HostError> {
     };
     let paths = RuntimePaths::discover()?;
     let _lease = HostLease::acquire(&paths, &proof)?;
+    let host: SharedHost = Arc::new(Mutex::new(HostState::new(proof)));
+    state::restore_upgrade(&host).map_err(io::Error::other)?;
     let listener = UnixListener::bind(&paths.socket)?;
     fs::set_permissions(&paths.socket, fs::Permissions::from_mode(0o600))?;
     listener.set_nonblocking(true)?;
     let _tray = crate::tray::start();
 
-    let host: SharedHost = Arc::new(Mutex::new(HostState::new(proof)));
     let next_client_id = AtomicU64::new(1);
     let client_capacity = ClientCapacity::new(MAX_ACTIVE_CLIENTS);
     let mut clients = Vec::new();
@@ -215,6 +216,10 @@ pub fn run() -> Result<(), HostError> {
         .values()
         .map(|record| record.handle.clone())
         .collect::<Vec<_>>();
+    if let Err(error) = state::finish_upgrade(&host) {
+        tracing::error!(%error, "upgrade handoff remains unconfirmed; checkpoint retained");
+        runtime_error = Some(io::Error::other(error));
+    }
     for chat in chats {
         if let Err(error) = chat.close() {
             tracing::warn!(%error, "provider shutdown was not confirmed");

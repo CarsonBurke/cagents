@@ -4,7 +4,7 @@ use std::{
     net::Shutdown,
     os::unix::{net::UnixStream, process::CommandExt},
     path::{Path, PathBuf},
-    process::{Command, Stdio},
+    process::{Command, ExitStatus, Stdio},
     sync::{
         Arc, Condvar, Mutex, OnceLock,
         atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering},
@@ -111,6 +111,10 @@ pub enum HostedTerminalStartError {
     },
     #[error("cagents daemon did not become ready at {path} within {timeout:?}")]
     HostReadyTimeout { path: PathBuf, timeout: Duration },
+    #[error("could not complete cagents daemon startup: {0}")]
+    HostStartup(String),
+    #[error("cagents daemon exited before becoming ready at {path}: {status}")]
+    HostExited { path: PathBuf, status: ExitStatus },
     #[error("could not connect to the cagents daemon socket at {path}: {source}")]
     HostSocket {
         path: PathBuf,
@@ -942,8 +946,9 @@ enum PendingRequest {
 }
 /// Returns the per-user daemon socket, starting the sibling `cagentsd` if necessary.
 ///
-/// Startup is bounded to five seconds. The daemon is placed in its own process group
-/// so closing the launching CLI, GUI, or terminal does not terminate it.
+/// Ordinary startup is bounded to five seconds; upgrade restoration receives a
+/// bounded per-session allowance. The daemon gets its own process group so closing
+/// the launching CLI, GUI, or terminal does not terminate it.
 pub fn ensure_daemon_ready() -> Result<PathBuf, HostedTerminalStartError> {
     let socket = daemon_socket_path().map_err(HostedTerminalStartError::SocketPath)?;
     ensure_daemon_ready_at(&socket)?;
@@ -970,6 +975,8 @@ fn ensure_daemon_ready_at(socket: &Path) -> Result<(), HostedTerminalStartError>
         Err(_) => {}
     }
 
+    let timeout = crate::upgrade::handoff::startup_timeout()
+        .map_err(HostedTerminalStartError::HostStartup)?;
     let current_exe =
         std::env::current_exe().map_err(HostedTerminalStartError::CurrentExecutable)?;
     let Some(binary_directory) = current_exe.parent() else {
@@ -980,38 +987,83 @@ fn ensure_daemon_ready_at(socket: &Path) -> Result<(), HostedTerminalStartError>
         return Err(HostedTerminalStartError::HostBinaryMissing(daemon_binary));
     }
 
-    let mut child = Command::new(&daemon_binary)
+    let mut command = Command::new(&daemon_binary);
+    command
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
-        .process_group(0)
+        .process_group(0);
+    // SAFETY: the hook performs only the close_range syscall before exec.
+    unsafe {
+        command.pre_exec(crate::daemon::seal_inherited_descriptors);
+    }
+    let mut child = command
         .spawn()
         .map_err(|source| HostedTerminalStartError::LaunchHost {
             path: daemon_binary,
             source,
         })?;
+    let started = Instant::now();
+    let result = loop {
+        let status = match child.try_wait() {
+            Ok(status) => status,
+            Err(error) => break Err(HostedTerminalStartError::HostStartup(error.to_string())),
+        };
+        match daemon_startup_ready(socket, timeout, started.elapsed(), status) {
+            Ok(true) => break Ok(()),
+            Ok(false) => thread::sleep(
+                DAEMON_READY_POLL_INTERVAL.min(timeout.saturating_sub(started.elapsed())),
+            ),
+            Err(error) => break Err(error),
+        }
+    };
     let _ = thread::Builder::new()
         .name("cagentsd-reaper".into())
         .spawn(move || {
             let _ = child.wait();
         });
+    result
+}
 
-    let deadline = Instant::now() + DAEMON_READY_TIMEOUT;
-    loop {
-        match UnixStream::connect(socket) {
-            Ok(stream) => {
-                drop(stream);
-                return Ok(());
-            }
-            Err(_) if Instant::now() < deadline => thread::sleep(DAEMON_READY_POLL_INTERVAL),
-            Err(_) => {
-                return Err(HostedTerminalStartError::HostReadyTimeout {
-                    path: socket.to_owned(),
-                    timeout: DAEMON_READY_TIMEOUT,
-                });
-            }
+fn daemon_startup_ready(
+    socket: &Path,
+    timeout: Duration,
+    elapsed: Duration,
+    child_status: Option<ExitStatus>,
+) -> Result<bool, HostedTerminalStartError> {
+    match UnixStream::connect(socket) {
+        Ok(_) => return Ok(true),
+        Err(error)
+            if matches!(
+                error.kind(),
+                io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused
+            ) => {}
+        Err(source) => {
+            return Err(HostedTerminalStartError::HostSocket {
+                path: socket.to_owned(),
+                source,
+            });
         }
     }
+    if let Some(status) = child_status {
+        // A concurrent launch can win the lease while our child exits. Its
+        // listener is deliberately absent until every session has restored.
+        if !crate::daemon::HostLease::is_held_at(socket)
+            .map_err(|error| HostedTerminalStartError::HostStartup(error.to_string()))?
+        {
+            return Err(HostedTerminalStartError::HostExited {
+                path: socket.to_owned(),
+                status,
+            });
+        }
+    }
+    if elapsed >= timeout {
+        return Err(HostedTerminalStartError::HostReadyTimeout {
+            path: socket.to_owned(),
+            timeout,
+        });
+    }
+    Ok(false)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2006,6 +2058,78 @@ mod tests {
     };
 
     use super::*;
+    #[test]
+    fn startup_waits_for_six_second_restoration_before_accepting_listener() {
+        let directory = tempfile::tempdir().unwrap();
+        let socket = directory.path().join("daemon.sock");
+        let timeout = Duration::from_secs(35);
+        assert!(!daemon_startup_ready(&socket, timeout, Duration::from_secs(6), None).unwrap());
+        let _listener = UnixListener::bind(&socket).unwrap();
+        assert!(daemon_startup_ready(&socket, timeout, Duration::from_secs(6), None).unwrap());
+    }
+
+    fn hold_startup_lease(socket: &Path) -> std::fs::File {
+        use std::os::{fd::AsRawFd, unix::fs::OpenOptionsExt};
+
+        let lock = std::fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .mode(0o600)
+            .open(socket.with_file_name("cagentsd.lock"))
+            .unwrap();
+        // SAFETY: the fixture owns this live descriptor until the file drops.
+        assert_eq!(
+            unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+            0
+        );
+        lock
+    }
+
+    #[test]
+    fn exited_launcher_waits_for_winners_sequential_restoration() {
+        use std::os::unix::process::ExitStatusExt;
+
+        let directory = tempfile::tempdir().unwrap();
+        let socket = directory.path().join("daemon.sock");
+        let _lease = hold_startup_lease(&socket);
+        let timeout = Duration::from_secs(65);
+        let loser = Some(ExitStatus::from_raw(1 << 8));
+        // Two providers may each consume thirty seconds. The winner owns the
+        // inventory throughout; even incomplete lease metadata is not failure.
+        assert!(!daemon_startup_ready(&socket, timeout, Duration::from_secs(30), loser).unwrap());
+        assert!(!daemon_startup_ready(&socket, timeout, Duration::from_secs(60), loser).unwrap());
+        let _listener = UnixListener::bind(&socket).unwrap();
+        assert!(daemon_startup_ready(&socket, timeout, Duration::from_secs(61), loser).unwrap());
+    }
+
+    #[test]
+    fn exited_startup_fails_without_owner_and_owner_cannot_extend_deadline() {
+        use std::os::unix::process::ExitStatusExt;
+
+        let directory = tempfile::tempdir().unwrap();
+        let socket = directory.path().join("daemon.sock");
+        let timeout = Duration::from_secs(35);
+        let exited = Some(ExitStatus::from_raw(1 << 8));
+        assert!(matches!(
+            daemon_startup_ready(&socket, timeout, Duration::from_secs(1), exited),
+            Err(HostedTerminalStartError::HostExited { .. })
+        ));
+        let lease = hold_startup_lease(&socket);
+        assert!(matches!(
+            daemon_startup_ready(&socket, timeout, timeout, exited),
+            Err(HostedTerminalStartError::HostReadyTimeout { .. })
+        ));
+        drop(lease);
+        // A stale lock file must not disguise a failed restoration as a winner.
+        assert!(matches!(
+            daemon_startup_ready(&socket, timeout, Duration::from_secs(2), exited),
+            Err(HostedTerminalStartError::HostExited { .. })
+        ));
+        assert!(matches!(
+            daemon_startup_ready(&socket, DAEMON_READY_TIMEOUT, DAEMON_READY_TIMEOUT, None,),
+            Err(HostedTerminalStartError::HostReadyTimeout { .. })
+        ));
+    }
 
     fn published_state(visible: bool) -> (HostedPublishedState, Arc<AtomicUsize>) {
         let wake_count = Arc::new(AtomicUsize::new(0));
@@ -2298,6 +2422,7 @@ mod tests {
                 event_sequence: 0,
                 activity: None,
                 agent_activity: None,
+                upgrade_sources: Vec::new(),
                 oldest_event_sequence: 1,
                 attached: true,
                 transcript: None,
@@ -2767,6 +2892,7 @@ mod tests {
                         event_sequence: 0,
                         activity: None,
                         agent_activity: None,
+                        upgrade_sources: Vec::new(),
                         oldest_event_sequence: 1,
                         attached: true,
                         transcript: None,

@@ -2,7 +2,7 @@ use std::{
     io::{self, Read},
     net::Shutdown,
     os::unix::net::UnixStream,
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, RwLock},
     thread,
     time::{Duration, Instant},
 };
@@ -63,10 +63,7 @@ pub(crate) fn serve(stream: UnixStream, client_id: ClientId, host: SharedHost) {
     let writer_stream = match stream.try_clone() {
         Ok(stream) => stream,
         Err(_) => {
-            let _ = host
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .unregister_client(client_id);
+            disconnect_client(&host, client_id);
             return;
         }
     };
@@ -74,10 +71,7 @@ pub(crate) fn serve(stream: UnixStream, client_id: ClientId, host: SharedHost) {
         .set_write_timeout(Some(Duration::from_secs(5)))
         .is_err()
     {
-        let _ = host
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .unregister_client(client_id);
+        disconnect_client(&host, client_id);
         return;
     }
     let writer_delivery = Arc::clone(&delivery);
@@ -88,10 +82,7 @@ pub(crate) fn serve(stream: UnixStream, client_id: ClientId, host: SharedHost) {
         Ok(writer) => writer,
         Err(_) => {
             delivery.abort();
-            let _ = host
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .unregister_client(client_id);
+            disconnect_client(&host, client_id);
             return;
         }
     };
@@ -159,7 +150,13 @@ pub(crate) fn serve(stream: UnixStream, client_id: ClientId, host: SharedHost) {
                 break;
             }
             connected = true;
-            let (resumed, replay) = prepare_resume(&host, client_id, resume);
+            let (resumed, replay) = match prepare_resume(&host, client_id, resume) {
+                Ok(prepared) => prepared,
+                Err(error) => {
+                    let _ = push_error(&delivery, &host, envelope.request_id, error);
+                    break;
+                }
+            };
             if push_response(
                 &delivery,
                 &proof,
@@ -244,19 +241,48 @@ pub(crate) fn serve(stream: UnixStream, client_id: ClientId, host: SharedHost) {
     // Stop publication before removing this delivery identity. Joining below
     // waits only for the already-running bounded probe, never queued work.
     activity_job.cancel();
-    let handles = host
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .unregister_client(client_id);
-    // A GUI may disconnect after receiving an edge but before acknowledging
-    // it. Clear the process-global edge so a later attaching GUI is not starved
-    // of future redraw notifications; immutable snapshots preserve the state.
-    for handle in handles {
-        handle.acknowledge_redraw(handle.generation());
-    }
+    disconnect_client(&host, client_id);
     delivery.close_after_drain();
     drop(activity_job);
     let _ = writer.join();
+}
+
+fn control_gate(host: &SharedHost) -> Arc<RwLock<()>> {
+    // Never wait for admission while holding HostState: admitted operations
+    // need to reacquire it after synchronous provider/PTY work.
+    Arc::clone(&host.lock().unwrap_or_else(|p| p.into_inner()).control_gate)
+}
+
+fn ensure_control_open(host: &SharedHost) -> Result<(), ProtocolError> {
+    if host.lock().unwrap_or_else(|p| p.into_inner()).shutting_down {
+        return Err(ProtocolError::new(
+            ProtocolErrorCode::TerminalUnavailable,
+            "Daemon upgrade/shutdown is committed; no further control mutations are accepted",
+            false,
+        ));
+    }
+    Ok(())
+}
+
+fn disconnect_client(host: &SharedHost, client_id: ClientId) {
+    let gate = control_gate(host);
+    let _control = gate.read().unwrap_or_else(|p| p.into_inner());
+    let handles = {
+        let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
+        if state.shutting_down {
+            // Shutdown owns the remaining session state. Removing delivery is
+            // safe, but unregistering would enqueue visibility/redraw effects
+            // after the upgrade's terminal snapshots have been committed.
+            state.clients.remove(&client_id);
+            Vec::new()
+        } else {
+            state.unregister_client(client_id)
+        }
+    };
+    // Clear a disconnected GUI's outstanding redraw edge outside HostState.
+    for handle in handles {
+        handle.acknowledge_redraw(handle.generation());
+    }
 }
 
 /// At most one query is admitted per connection, with no pending backlog.
@@ -320,6 +346,15 @@ impl AgentActivityJob {
             thread::Builder::new()
                 .name(format!("cagentsd-activity-{client_id}"))
                 .spawn(move || {
+                    let gate = control_gate(&host);
+                    let _control = gate.read().unwrap_or_else(|p| p.into_inner());
+                    // Scheduling and worker admission are separate: an upgrade
+                    // may commit before this thread starts. Once admitted, keep
+                    // observation and its eventual apply inside the same barrier.
+                    if ensure_control_open(&host).is_err() {
+                        delivery.abort();
+                        return;
+                    }
                     let process = {
                         let cancelled = cancelled.lock().unwrap_or_else(|error| error.into_inner());
                         if *cancelled {
@@ -414,7 +449,35 @@ fn process_request(
     client_id: ClientId,
     request: ClientRequest,
 ) -> Result<RequestOutcome, ProtocolError> {
+    let gate = control_gate(host);
+    // Inventory decisions and commit must wait for all previously admitted
+    // effects, including provider closes that finish outside HostState.
+    let exclusive = matches!(
+        &request,
+        ClientRequest::PrepareUpgrade { .. }
+            | ClientRequest::Shutdown
+            | ClientRequest::ShutdownV1 { .. }
+    );
+    let _exclusive = exclusive.then(|| gate.write().unwrap_or_else(|p| p.into_inner()));
+    let _shared = (!exclusive).then(|| gate.read().unwrap_or_else(|p| p.into_inner()));
+    ensure_control_open(host)?;
     match request {
+        ClientRequest::PrepareUpgrade { capability } => {
+            let (terminals, chats) = super::state::prepare_upgrade(host, capability)?;
+            Ok((
+                ServerResponse::UpgradePrepared { terminals, chats },
+                Vec::new(),
+                true,
+            ))
+        }
+        ClientRequest::ResolveUpgradeChat { source } => {
+            let session = super::chat::resolve_upgrade(host, &source)?;
+            Ok((
+                ServerResponse::UpgradeChatResolved { session },
+                Vec::new(),
+                false,
+            ))
+        }
         ClientRequest::RefreshAgentActivity { .. } => Err(ProtocolError::new(
             ProtocolErrorCode::Internal,
             "agent activity requests require asynchronous scheduling",
@@ -792,10 +855,16 @@ fn prepare_resume(
     host: &SharedHost,
     client_id: ClientId,
     cursors: Vec<ResumeCursor>,
-) -> (
-    Vec<crate::terminal_ipc::TerminalDescriptor>,
-    Vec<ServerMessage>,
-) {
+) -> Result<
+    (
+        Vec<crate::terminal_ipc::TerminalDescriptor>,
+        Vec<ServerMessage>,
+    ),
+    ProtocolError,
+> {
+    let gate = control_gate(host);
+    let _control = gate.read().unwrap_or_else(|p| p.into_inner());
+    ensure_control_open(host)?;
     let mut resumed = Vec::new();
     let mut replay = Vec::new();
     for cursor in cursors {
@@ -822,7 +891,7 @@ fn prepare_resume(
         resumed.push(prepared.0);
         replay.extend(prepared.1);
     }
-    (resumed, replay)
+    Ok((resumed, replay))
 }
 
 fn replay_messages(
@@ -907,6 +976,179 @@ fn writer_loop(mut stream: UnixStream, delivery: Arc<DeliveryQueue>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn slow_chat_close_allows_list_but_fences_upgrade_and_shutdown() {
+        use crate::{
+            agent::Provider,
+            chat::{
+                self, Command,
+                protocol::{Adapter, ProcessSpec, Step},
+                runtime::Handle,
+            },
+            model::{BootId, HostIncarnation, HostSessionId, LaunchRecipe},
+        };
+        use std::collections::BTreeMap;
+
+        struct DelayedCommand {
+            entered: crossbeam_channel::Sender<()>,
+            release: crossbeam_channel::Receiver<()>,
+        }
+        impl Adapter for DelayedCommand {
+            fn initialize(&mut self) -> Result<Step, String> {
+                Ok(Step::default())
+            }
+            fn command(&mut self, _: Command) -> Result<Step, String> {
+                self.entered.send(()).map_err(|error| error.to_string())?;
+                self.release
+                    .recv_timeout(Duration::from_secs(5))
+                    .map_err(|error| error.to_string())?;
+                Ok(Step::default())
+            }
+            fn receive(&mut self, _: serde_json::Value) -> Result<Step, String> {
+                Ok(Step::default())
+            }
+        }
+
+        let directory = tempfile::tempdir().unwrap();
+        let proof = HostSessionProof {
+            host_session_id: HostSessionId::new("control-barrier"),
+            boot_id: BootId::new("boot"),
+            host_incarnation: HostIncarnation::new("incarnation"),
+        };
+        let host = Arc::new(Mutex::new(super::super::state::HostState::new(
+            proof.clone(),
+        )));
+        let recipe = LaunchRecipe {
+            program: "/bin/cat".into(),
+            arguments: Vec::new(),
+            working_directory: directory.path().to_path_buf(),
+            environment: BTreeMap::new(),
+        };
+        let spec = ProcessSpec::from(&recipe);
+        let mut initial = Step::default();
+        let store = chat::runtime::preflight(&spec, &mut initial).unwrap();
+        let (entered, pending) = crossbeam_channel::bounded(1);
+        let (release, released) = crossbeam_channel::bounded(1);
+        let handle = Handle::start(
+            spec,
+            Box::new(DelayedCommand {
+                entered,
+                release: released,
+            }),
+            initial,
+            store,
+            None,
+            |_| {},
+        )
+        .unwrap();
+        let chat_id = TerminalId::new();
+        let capability = {
+            let mut state = host.lock().unwrap();
+            state.register_client(1);
+            state.register_client(2);
+            state.chats.insert(
+                chat_id,
+                super::super::chat::Record {
+                    session: chat::Session {
+                        id: chat_id,
+                        launch: chat::Launch {
+                            provider: Provider::Claude,
+                            recipe,
+                            session_id: None,
+                        },
+                        proof: Some(proof),
+                        terminal: None,
+                    },
+                    handle: handle.clone(),
+                    subscribers: BTreeMap::from([(1, false)]),
+                    observations: BTreeMap::new(),
+                    completion_observed: false,
+                },
+            );
+            state.shutdown_preflight(Instant::now()).unwrap().capability
+        };
+        let command_handle = handle.clone();
+        let command = thread::spawn(move || command_handle.command(Command::Interrupt));
+        pending.recv_timeout(Duration::from_secs(2)).unwrap();
+        let close_host = Arc::clone(&host);
+        let close = thread::spawn(move || {
+            process_request(&close_host, 1, ClientRequest::ChatClose { chat_id })
+        });
+        let gate = control_gate(&host);
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            match gate.try_write() {
+                Err(std::sync::TryLockError::WouldBlock) => break,
+                Ok(guard) => drop(guard),
+                Err(error) => panic!("control gate poisoned: {error}"),
+            }
+            assert!(Instant::now() < deadline, "chat close was not admitted");
+            thread::yield_now();
+        }
+
+        // The actual close is joining the blocked provider worker. A separate
+        // client's ordinary request must complete before that worker is released.
+        let list_host = Arc::clone(&host);
+        let (listed, listing) = crossbeam_channel::bounded(1);
+        let list = thread::spawn(move || {
+            listed
+                .send(process_request(&list_host, 2, ClientRequest::List))
+                .unwrap();
+        });
+        assert!(matches!(
+            listing
+                .recv_timeout(Duration::from_secs(1))
+                .unwrap()
+                .unwrap()
+                .0,
+            ServerResponse::Listed { .. }
+        ));
+        list.join().unwrap();
+
+        let upgrade_host = Arc::clone(&host);
+        let (upgraded, upgrading) = crossbeam_channel::bounded(1);
+        let upgrade = thread::spawn(move || {
+            upgraded
+                .send(process_request(
+                    &upgrade_host,
+                    2,
+                    ClientRequest::PrepareUpgrade { capability },
+                ))
+                .unwrap();
+        });
+        assert!(matches!(
+            upgrading.recv_timeout(Duration::from_millis(100)),
+            Err(crossbeam_channel::RecvTimeoutError::Timeout)
+        ));
+        release.send(()).unwrap();
+        let _ = command.join().unwrap();
+        assert!(matches!(
+            close.join().unwrap().unwrap().0,
+            ServerResponse::ChatClosed { chat_id: id, .. } if id == chat_id
+        ));
+        let error = upgrading
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap()
+            .unwrap_err();
+        assert!(error.message.contains("inventory changed"));
+        upgrade.join().unwrap();
+        assert!(!host.lock().unwrap().shutting_down);
+        assert!(!host.lock().unwrap().chats.contains_key(&chat_id));
+
+        // A successful exclusive shutdown commits the same admission fence,
+        // without persisting an upgrade checkpoint in the user's runtime path.
+        assert!(matches!(
+            process_request(&host, 2, ClientRequest::Shutdown)
+                .unwrap()
+                .0,
+            ServerResponse::ShutdownAccepted
+        ));
+        let error = process_request(&host, 2, ClientRequest::List).unwrap_err();
+        assert_eq!(error.code, ProtocolErrorCode::TerminalUnavailable);
+        assert!(!error.retryable);
+        assert!(prepare_resume(&host, 2, Vec::new()).is_err());
+    }
 
     #[test]
     fn slow_agent_probe_does_not_block_ipc_and_disconnect_reaps_it() {

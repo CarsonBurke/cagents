@@ -3,7 +3,7 @@
 cagents is a native Wayland desktop application for organizing coding-agent sessions, repositories, Git worktrees, terminals, and embedded browser surfaces in one workspace. It also provides a scriptable CLI for the persistent terminal daemon.
 
 > [!IMPORTANT]
-> This repository is hosted privately at `CarsonBurke/cagents`. Release downloads and the curl installer require access to that private repository; tagged release builds stamp the repository into the released copy of `install.sh` automatically.
+> This repository is hosted privately at `CarsonBurke/cagents`. Release downloads require an authenticated GitHub CLI account with access to that repository; tagged release builds stamp the repository into the released copy of `install.sh` automatically.
 
 ## Platform and runtime requirements
 
@@ -194,9 +194,12 @@ and no measurable UI CPU ticks in a three-second observation.
 
 ## Install a release
 
-All examples in this section become usable only after canonical hosting exists. Set the real repository and choose a published version:
+Authenticate the GitHub CLI as your desktop user with access to the private
+repository, then choose a published version:
 
 ```sh
+gh auth login --hostname github.com
+gh auth status --hostname github.com
 REPOSITORY='CarsonBurke/cagents'
 VERSION='0.1.0'
 ```
@@ -206,16 +209,16 @@ VERSION='0.1.0'
 This flow pins an exact release, verifies both downloaded files against its checksum manifest, lets you read the installer before executing it, and supplies the already-verified archive back to the installer:
 
 ```sh
+(
+set -eu
 download_dir="$(mktemp -d)"
-base_url="https://github.com/${REPOSITORY}/releases/download/v${VERSION}"
+trap 'rm -rf "$download_dir"' 0
+trap 'exit 1' HUP INT TERM
 archive="cagents-${VERSION}-x86_64-unknown-linux-gnu.tar.gz"
 
-curl --proto '=https' --tlsv1.2 --fail --location \
-  "${base_url}/install.sh" --output "${download_dir}/install.sh"
-curl --proto '=https' --tlsv1.2 --fail --location \
-  "${base_url}/SHA256SUMS" --output "${download_dir}/SHA256SUMS"
-curl --proto '=https' --tlsv1.2 --fail --location \
-  "${base_url}/${archive}" --output "${download_dir}/${archive}"
+gh release download "v${VERSION}" --repo "github.com/${REPOSITORY}" \
+  --pattern install.sh --pattern SHA256SUMS --pattern "$archive" \
+  --dir "$download_dir"
 
 (
   cd "$download_dir"
@@ -227,40 +230,64 @@ CAGENTS_REPOSITORY="$REPOSITORY" \
 CAGENTS_ARCHIVE="${download_dir}/${archive}" \
 CAGENTS_CHECKSUMS="${download_dir}/SHA256SUMS" \
   sh "${download_dir}/install.sh" --version "$VERSION"
-rm -rf "$download_dir"
+)
 ```
 
 SHA-256 confirms that the files match the release manifest; it does not protect against compromise of the GitHub repository or release itself. Inspect the tag, release, and installer according to your trust requirements.
 
+The installer uses that existing `gh` authentication for both latest-release
+selection and pinned asset downloads; it never copies tokens into its state,
+URLs, or command arguments. Missing authentication for the canonical private
+repository fails before changing the installation. Supplying both local
+`CAGENTS_ARCHIVE` and `CAGENTS_CHECKSUMS` keeps installation offline. Anonymous
+HTTPS downloads are only a fallback for explicitly selected public repositories,
+not for the private canonical release.
+
 The installer never uses `sudo` and refuses to run as root. It installs an immutable version below `${XDG_DATA_HOME:-$HOME/.local/share}/cagents-install/`, switches the `current` symlink atomically, creates desktop metadata links under `${XDG_DATA_HOME:-$HOME/.local/share}`, and exposes only `$HOME/.local/bin/cagents` on `PATH`. The application menu entry uses that installed binary and icon by absolute path, so launching from the desktop does not depend on `PATH`. Terminal use of the `cagents` command still requires `$HOME/.local/bin` on `PATH`.
 
-### Convenience curl install
+Rerun the installer normally for a compatible UI update: the existing daemon and
+its live PTYs stay running. To explicitly replace the daemon as well, append
+`--restart-daemon` to the verified installer invocation above. That opt-in requires
+checkpoint support in the **currently installed** CLI and daemon; it resumes
+supported shells and exact agent conversations in new processes, not the old PTYs.
+See [Daemon and user data](#daemon-and-user-data) for the recovery and legacy
+bootstrap restrictions. `--restart-daemon` cannot be combined with uninstall or
+purge.
 
-This is shorter but executes downloaded code without inspecting or independently authenticating it. Use it only if you trust the GitHub repository and release:
+### Convenience authenticated install
+
+This shorter flow uses the same GitHub account but executes the downloaded
+installer without inspecting it or independently verifying its checksum. Use it
+only if you trust the GitHub repository and release. It resolves latest once and
+uses that exact tag for both the installer and archive:
 
 ```sh
 (
-  installer="$(mktemp)" || exit 1
-  trap 'rm -f "$installer"' 0
+  gh auth status --hostname github.com || exit 1
+  tag="$(gh release view --repo github.com/CarsonBurke/cagents --json tagName --jq .tagName)" || exit 1
+  case "$tag" in v*) ;; *) exit 1 ;; esac
+  download_dir="$(mktemp -d)" || exit 1
+  trap 'rm -rf "$download_dir"' 0
   trap 'exit 1' HUP INT TERM
-  curl --proto '=https' --tlsv1.2 --fail --silent --show-error --location \
-    "https://github.com/CarsonBurke/cagents/releases/latest/download/install.sh" \
-    --output "$installer" &&
-    sh "$installer"
+  gh release download "$tag" --repo github.com/CarsonBurke/cagents \
+    --pattern install.sh --dir "$download_dir" &&
+    sh "$download_dir/install.sh" --version "${tag#v}"
 )
 ```
 
-A released installer is stamped with its actual GitHub repository. To pin a version through the convenience flow, pass installer arguments to `sh`:
+To pin a version, download its installer and pass the same version to `sh`.
+Append `--restart-daemon` only when an explicit full daemon update is intended:
 
 ```sh
 (
-  installer="$(mktemp)" || exit 1
-  trap 'rm -f "$installer"' 0
+  gh auth status --hostname github.com || exit 1
+  VERSION=0.1.0
+  download_dir="$(mktemp -d)" || exit 1
+  trap 'rm -rf "$download_dir"' 0
   trap 'exit 1' HUP INT TERM
-  curl --proto '=https' --tlsv1.2 --fail --silent --show-error --location \
-    "https://github.com/CarsonBurke/cagents/releases/latest/download/install.sh" \
-    --output "$installer" &&
-    sh "$installer" --version 0.1.0
+  gh release download "v${VERSION}" --repo github.com/CarsonBurke/cagents \
+    --pattern install.sh --dir "$download_dir" &&
+    sh "$download_dir/install.sh" --version "$VERSION"
 )
 ```
 
@@ -269,10 +296,8 @@ A released installer is stamped with its actual GitHub repository. To pin a vers
 Download the release package and checksum manifest, verify the package, then let APT resolve its shared-library dependencies:
 
 ```sh
-curl --proto '=https' --tlsv1.2 --fail --location --remote-name \
-  "https://github.com/${REPOSITORY}/releases/download/v${VERSION}/cagents_${VERSION}_amd64.deb"
-curl --proto '=https' --tlsv1.2 --fail --location --remote-name \
-  "https://github.com/${REPOSITORY}/releases/download/v${VERSION}/SHA256SUMS"
+gh release download "v${VERSION}" --repo "github.com/${REPOSITORY}" \
+  --pattern "cagents_${VERSION}_amd64.deb" --pattern SHA256SUMS
 sha256sum --ignore-missing --strict --check SHA256SUMS
 sudo apt install git "./cagents_${VERSION}_amd64.deb"
 ```
@@ -282,10 +307,8 @@ The Debian package installs the three executables together under `/usr/libexec/c
 The separately named browserless package can be installed alongside the full package. It uses `/usr/libexec/cagents-browserless`, exposes `/usr/bin/cagents-browserless`, and installs separately identified desktop and AppStream metadata:
 
 ```sh
-curl --proto '=https' --tlsv1.2 --fail --location --remote-name \
-  "https://github.com/${REPOSITORY}/releases/download/v${VERSION}/cagents-browserless_${VERSION}_amd64.deb"
-curl --proto '=https' --tlsv1.2 --fail --location --remote-name \
-  "https://github.com/${REPOSITORY}/releases/download/v${VERSION}/SHA256SUMS-browserless"
+gh release download "v${VERSION}" --repo "github.com/${REPOSITORY}" \
+  --pattern "cagents-browserless_${VERSION}_amd64.deb" --pattern SHA256SUMS-browserless
 sha256sum --ignore-missing --strict --check SHA256SUMS-browserless
 sudo apt install git "./cagents-browserless_${VERSION}_amd64.deb"
 cagents-browserless ui
@@ -296,10 +319,8 @@ cagents-browserless ui
 The archive is self-contained as a directory layout, not as a static executable. Keep its `bin` directory intact:
 
 ```sh
-curl --proto '=https' --tlsv1.2 --fail --location --remote-name \
-  "https://github.com/${REPOSITORY}/releases/download/v${VERSION}/cagents-${VERSION}-x86_64-unknown-linux-gnu.tar.gz"
-curl --proto '=https' --tlsv1.2 --fail --location --remote-name \
-  "https://github.com/${REPOSITORY}/releases/download/v${VERSION}/SHA256SUMS"
+gh release download "v${VERSION}" --repo "github.com/${REPOSITORY}" \
+  --pattern "cagents-${VERSION}-x86_64-unknown-linux-gnu.tar.gz" --pattern SHA256SUMS
 sha256sum --ignore-missing --strict --check SHA256SUMS
 tar -xzf "cagents-${VERSION}-x86_64-unknown-linux-gnu.tar.gz"
 "./cagents-${VERSION}/bin/cagents" ui
@@ -334,11 +355,21 @@ cagents ui
   binary, unsafe, oversized, or budget-limited files retain unknown counts.
 - Switching worktrees remembers each strip's horizontal scroll position and
   focused column. Hidden terminal presentation is released while hosted PTYs
-  keep running, and editor buffers remain intact. Scroll positions are remembered
-  during the current UI session; worktree selection and column focus also survive
-  restarts, including when a shared browser column has focus. Application close
+  keep running, and editor buffers remain intact. Scroll positions, worktree
+  selection, and column focus survive restarts independently in each window,
+  including when a shared browser column has focus. Application close
   checks unsaved editors in every worktree, not only the visible one. Legacy
   columns without a registered worktree remain accessible across worktrees.
+- Use **New window** in the application header or `cagents ui --new-window` for
+  another independently movable window. `cagents ui --window monitor-two`
+  opens or activates a named durable window; plain `cagents ui` activates the
+  primary window. New windows copy the source workspace once, then save their
+  own selection, pane widths, inspector, and scroll positions. Existing terminal
+  and native-chat IDs still refer to the same daemon-owned processes: input and
+  explicit process closure affect every window displaying that session. Closing
+  only a window leaves those processes running.
+  Closed windows retain recovery lineage across successive full upgrades; they
+  do not need to be opened for every release.
 - Hold **Alt+Q / Alt+W** or **Alt+Left / Alt+Right** to move through columns.
   Mouse-wheel and trackpad scrolling stay inside pane content; they do not pan
   the workspace strip. **Alt+R** cycles the focused pane through **1/3 → 1/2 →
@@ -465,6 +496,13 @@ terminal, shows the exact count, and commits a daemon-bound confirmation valid f
 means **termination requested**, not that every PTY has exited. The explicit
 `daemon stop` command without these flags remains a force-stop operation.
 
+`cagents daemon prepare-upgrade --yes` is the explicit durable full-update handoff.
+Without `--yes` it refuses before contacting the daemon. Its JSON success command
+is `daemon.prepare_upgrade`, with `terminals` and `chats` checkpoint counts; success
+means checkpoint persisted and shutdown requested, so callers must still wait for
+`daemon status` to report stopped. Prefer the installer's `--restart-daemon` flow
+when replacing an installed release.
+
 If pull-request creation fails, cagents restores the submitted title, description,
 branches, and draft setting. If the remote outcome is uncertain, the form remains
 editable but another creation attempt is blocked until you check GitHub and confirm
@@ -513,22 +551,69 @@ has no activity-status strip.
 There is no system daemon or service unit. The standard production installation starts its per-user sibling `cagentsd` immediately and registers it for graphical-login autostart. While that daemon is running, cagents exposes a system-tray item that opens the UI and can stop the daemon. The daemon remains independent of the UI so terminals survive window and UI-process restarts.
 
 Full and browserless production builds share the established daemon socket and
-session store. Protocol **6** deliberately retains that namespace, preventing a
+session store. Protocol **8** deliberately retains that namespace, preventing a
 second daemon owner while an incompatible older process is still running;
 the handshake rejects incompatible clients without terminating their PTYs. Upgrade
-the three companion executables together. One shared application lease prevents
-their UI processes from racing writes, and startup rejects an older running UI
-or Debian peer package that predates the lease marker. Upgrade that peer before
-switching variants.
+the three companion executables together. Each window holds an exclusive slot
+lease and its own session database; a shared compatibility fence excludes older
+single-window UIs. Startup rejects an older running UI or Debian peer package
+that predates the lease marker. Upgrade that peer before switching variants.
 
-`install.sh` verifies the staged CLI against the running daemon before switching
-`current`. Compatible upgrades preserve the daemon PID, session proof, and PTYs.
-An incompatible upgrade can stop only an atomically empty daemon. Otherwise it
-leaves the current installation intact: finish the terminals, or explicitly
-confirm their termination using the installed CLI, then retry. Older CLIs without
-the atomic shutdown operation fail closed; there is no force-stop fallback.
-If publishing launchers fails, the installer restores the previous version
-without stopping compatible sessions. Existing version directories are retained.
+By default, `install.sh` verifies the staged CLI against the running daemon before
+switching `current`. Compatible upgrades preserve the daemon PID, session proof,
+and PTYs. An incompatible default upgrade can stop only an atomically empty
+daemon. Otherwise it leaves the current installation intact: finish the terminals,
+or explicitly confirm their termination using the installed CLI, then retry.
+Older CLIs without the atomic shutdown operation fail closed; there is no
+force-stop fallback. If publishing launchers fails, the installer restores the
+previous version without stopping compatible sessions. Existing version
+directories are retained.
+
+For an explicit full update from the command line, close the application windows,
+then run the verified installer with `--restart-daemon`. The in-app **Update**
+action coordinates window saving and closing automatically.
+Before switching any executable, it checks that the old installed CLI advertises
+`daemon prepare-upgrade`, calls that CLI with
+`--json daemon prepare-upgrade --yes`, and waits for the old daemon to report that
+it has stopped. Preparation is daemon-owned: it validates recovery authority,
+freezes mutations, durably checkpoints supported sessions, and only then requests
+shutdown. Unsupported sessions, in-flight reservations, or stale authorization
+reject preparation rather than terminating sessions. The installer never builds a
+checkpoint from `terminal list` and never falls back to ordinary `daemon stop`.
+
+The replacement restores supported shell launches and the same provider-backed
+agent conversations, including native chats, only after proving that previous
+writers are gone. These are **new processes and PTYs**, not preservation of shell
+memory, foreground jobs, or arbitrary commands. Unknown conversation identity,
+unsupported command recipes, and surviving or ambiguous owners block recovery;
+the durable checkpoint remains available instead of inventing a fresh
+conversation or replaying commands. Keep the matching provider session storage.
+An old shell's unsaved in-memory variables or jobs are not a resumable shell
+snapshot.
+Daemon startup waiting scales with the checkpoint inventory, including the
+provider-confirmation allowance for each native chat. A missing listening socket
+does not mean shutdown is complete while the daemon still holds its inventory
+lease.
+
+If publication fails after checkpointing, the installer restores the previous
+version and starts its daemon against the durable handoff. A replacement startup
+failure rolls back only when its status proves it stopped; if startup state is
+ambiguous, the installer retains the new installation and recovery state rather
+than risking a second writer. Inspect `cagents daemon status` before retrying.
+
+An interrupted checkpoint is not blindly replayed. After confirming that every
+previous provider writer has stopped, `cagents daemon abandon-upgrade --yes`
+archives the retained checkpoint without resuming any process. It requires a
+stopped daemon and refuses to overwrite an earlier archive. Reopen the exact
+conversations manually using their provider session storage; do not delete
+checkpoint evidence merely to bypass an ownership error.
+
+Legacy installations without `daemon prepare-upgrade` cannot provide this
+handoff. `--restart-daemon` refuses without changing the active installation or
+stopping sessions. For the one-time bootstrap, finish those sessions or explicitly
+terminate only disposable sessions with the installed CLI, wait for its daemon
+to exit, and then install the new release normally. This bootstrap does **not**
+preserve legacy PTYs or manufacture conversation recovery.
 
 Debian upgrades never send signals to daemons. The package records its protocol
 and retains root-private executable-digest evidence under
@@ -547,6 +632,8 @@ cagents follows the XDG base-directory convention. Production paths are:
 
 - Settings: `${XDG_CONFIG_HOME:-$HOME/.config}/cagents/settings.toml`
 - Session database: `${XDG_DATA_HOME:-$HOME/.local/share}/cagents/sessions.sqlite3`
+- Named-window databases: `${XDG_DATA_HOME:-$HOME/.local/share}/cagents/windows/<name>/sessions.sqlite3`
+- Full-upgrade checkpoint: `${XDG_DATA_HOME:-$HOME/.local/share}/cagents/daemon-upgrade/`
 - Terminal transcripts: `${XDG_DATA_HOME:-$HOME/.local/share}/cagents/transcripts/`
 - Cache, when present: `${XDG_CACHE_HOME:-$HOME/.cache}/cagents/`
 - Daemon socket and lock: `$XDG_RUNTIME_DIR/cagents/` (shared by full and browserless builds; protocol changes do not create a second owner)
@@ -688,7 +775,13 @@ signal the host daemon or install a package on the host.
 
 ## Releases
 
-Once a canonical GitHub repository is configured, pushing a `v*` tag runs `.github/workflows/release.yml` on Ubuntu 22.04 with Rust 1.93 and Zig 0.15.2. The tag must exactly equal `v` plus the version in `Cargo.toml`; a mismatch fails before package publication. A successful release runs locked, all-target tests for both feature configurations in the release profile, then packages the full and browserless builds while reusing their release-profile dependency artifacts. The workflow records resolved-package counts, build times, stripped installed sizes, and compressed sizes; validates both sets of desktop and AppStream metadata; stamps the canonical repository into `dist/install.sh`; regenerates checksums; and creates a non-draft GitHub release containing:
+Pushing a canonical `v*` tag runs `.github/workflows/release.yml` on Ubuntu 22.04
+with Rust 1.93 and Zig 0.15.2. The tag must match the stable version in both the
+cagents and ceditor manifests. Publication requires locked release-profile tests
+for the isolated CLI, host, browserless UI, integrated UI, and editor boundaries,
+followed by sequential packaging and shipped-binary checks. The workflow
+validates desktop/AppStream metadata, stamps the private repository into
+`install.sh`, seals the asset set with checksums, and publishes these artifacts:
 
 - `cagents-${VERSION}-x86_64-unknown-linux-gnu.tar.gz`
 - `cagents_${VERSION}_amd64.deb`
@@ -700,6 +793,14 @@ Once a canonical GitHub repository is configured, pushing a `v*` tag runs `.gith
 - `cagents-browserless_${VERSION}_amd64.deb`
 - `cagents-browserless-${VERSION}-sizes.txt`
 - `SHA256SUMS-browserless`
+- `ceditor-${VERSION}-x86_64-unknown-linux-gnu.tar.gz`
+- `SHA256SUMS-ceditor`
+- `release-metadata.json`
+
+Artifact selection is explicitly platform-aware. Only Linux x86_64 GNU has a
+supported build/package lane today. Windows and macOS require their own native
+ports, validation, packaging, and signing before their targets can be enabled;
+the workflow does not publish placeholder binaries for them.
 
 The package script keeps the existing full package as its default and writes browserless build outputs to a separate Cargo target directory. Run both variants to compare their generated measurement reports without either artifact overwriting the other:
 
@@ -711,6 +812,27 @@ cat dist/cagents-"${VERSION}"-sizes.txt \
 ```
 
 The workflow uses its least-privilege GitHub token for publication through the preinstalled `gh` CLI; it does not require a maintainer's personal `gh` login.
+
+### In-app updates
+
+Full self-managed installations check authenticated GitHub releases at startup
+and every six hours. When a newer stable version is available, an update icon
+appears in the top-right application controls; its tooltip names the version.
+Clicking it starts an explicit update, not an automatic background installation.
+Source, browserless, and OS-package installations retain their original update
+method instead of being replaced by the application.
+
+The detached updater rechecks the selected release, verifies and seals downloaded
+bytes, and asks every open window to save. Dirty editors, unsent native-chat
+input or attachments, pending chat transitions, active repository mutations,
+and save failures veto the update. Prepared windows reject new user mutations
+but still process outstanding completions and recheck blockers before closing.
+After a final durable flush,
+the updater closes windows, runs the installer's full-upgrade handoff, and reopens
+the same named windows from the current installed executable. Failure status and
+the private installer log remain under the installation's `.update/` directory.
+After resolving a veto or failure, the warning offers **Retry update** while
+the selected release remains available; diagnostic files are retained.
 
 ## License
 

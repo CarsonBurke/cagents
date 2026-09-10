@@ -3,8 +3,9 @@ use std::{
     io,
     os::{
         fd::{AsRawFd, FromRawFd},
-        unix::fs::MetadataExt,
+        unix::{ffi::OsStrExt, fs::MetadataExt},
     },
+    path::{Component, Path},
     time::{Duration, Instant},
 };
 
@@ -24,14 +25,13 @@ pub(super) struct CloseProcess {
 pub(super) struct RootIdentity {
     pub process: CloseProcess,
     pidfd: File,
-    executable: (u64, u64),
+    executable: Option<(u64, u64)>,
 }
 
 impl RootIdentity {
-    pub(super) fn capture(pid: libc::pid_t) -> io::Result<Self> {
+    pub(super) fn capture(pid: libc::pid_t, executable: Option<(u64, u64)>) -> io::Result<Self> {
         let process = read_process(pid)?;
         let pidfd = open_target(&process)?;
-        let executable = executable_identity(pid)?;
         if !same_identity(&process, &read_process(pid)?) {
             return Err(changed());
         }
@@ -43,7 +43,35 @@ impl RootIdentity {
     }
 
     pub(super) fn original_executable(&self) -> bool {
-        executable_identity(self.process.pid).ok() == Some(self.executable)
+        self.executable
+            .is_some_and(|expected| executable_identity(self.process.pid).ok() == Some(expected))
+    }
+
+    /// Match portable-pty's executable lookup before spawning. Its exec-error
+    /// pipe can close before /proc exposes the child's new executable image.
+    pub(super) fn launch_executable(command: &portable_pty::CommandBuilder) -> Option<(u64, u64)> {
+        let program = Path::new(command.get_argv().first()?);
+        let cwd = Path::new(command.get_cwd()?);
+        if !cwd.is_dir() {
+            return None;
+        }
+        let identity = |path: &Path| {
+            let metadata = fs::metadata(path).ok()?;
+            let path = std::ffi::CString::new(path.as_os_str().as_bytes()).ok()?;
+            // SAFETY: path is NUL-terminated and remains live for access.
+            (metadata.is_file() && unsafe { libc::access(path.as_ptr(), libc::X_OK) } == 0)
+                .then_some((metadata.dev(), metadata.ino()))
+        };
+        if program.is_absolute()
+            || matches!(
+                program.components().next(),
+                Some(Component::CurDir | Component::ParentDir)
+            )
+        {
+            return identity(&cwd.join(program));
+        }
+        std::env::split_paths(command.get_env("PATH")?)
+            .find_map(|directory| identity(&cwd.join(directory).join(program)))
     }
 }
 
@@ -169,6 +197,48 @@ impl FrozenFamily {
 
     pub(super) fn has_jobs(&self) -> bool {
         self.targets.len() > 1
+    }
+
+    /// A foreground agent cannot authorize discarding unrelated background jobs.
+    /// Permit its ancestry (shell/wrapper) and descendants, never sibling trees.
+    pub(super) fn only_agent_tree(&self, agent: libc::pid_t) -> bool {
+        let parents = self
+            .targets
+            .iter()
+            .map(|target| (target.identity.pid, target.identity.parent))
+            .collect::<std::collections::HashMap<_, _>>();
+        if !parents.contains_key(&agent) {
+            return false;
+        }
+        let mut ancestors = std::collections::HashSet::new();
+        let mut current = agent;
+        while let Some(&parent) = parents.get(&current) {
+            if !ancestors.insert(current) {
+                return false;
+            }
+            current = parent;
+        }
+        let mut descendants = std::collections::HashSet::from([agent]);
+        let mut chain = Vec::new();
+        for &pid in parents.keys() {
+            if ancestors.contains(&pid) || descendants.contains(&pid) {
+                continue;
+            }
+            chain.clear();
+            current = pid;
+            while !descendants.contains(&current) {
+                if ancestors.contains(&current) || chain.len() >= parents.len() {
+                    return false;
+                }
+                chain.push(current);
+                let Some(&parent) = parents.get(&current) else {
+                    return false;
+                };
+                current = parent;
+            }
+            descendants.extend(chain.iter().copied());
+        }
+        true
     }
 
     pub(super) fn kill(&mut self, deadline: Instant) -> Result<(), String> {
@@ -368,6 +438,34 @@ fn signal(pidfd: &File, signal: libc::c_int) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn upgrade_agent_authority_excludes_unrelated_background_jobs() {
+        let target = |pid, parent| FrozenProcess {
+            identity: CloseProcess {
+                pid,
+                parent,
+                group: pid,
+                session: 10,
+                state: b'T',
+                start: 1,
+            },
+            pidfd: File::open("/dev/null").unwrap(),
+            resume: false,
+        };
+        let mut family = FrozenFamily {
+            targets: vec![
+                target(10, 1),
+                target(11, 10),
+                target(12, 11),
+                target(14, 12),
+            ],
+        };
+        assert!(family.only_agent_tree(11));
+        family.targets.push(target(13, 10));
+        assert!(!family.only_agent_tree(11));
+        assert!(!family.only_agent_tree(99));
+    }
     #[test]
     fn census_keeps_other_sessions_out_but_includes_background_and_detached_descendants() {
         let root = CloseProcess {
@@ -492,9 +590,32 @@ mod tests {
     }
 
     #[test]
+    fn launch_identity_is_not_the_transient_pre_exec_image() {
+        let mut command = portable_pty::CommandBuilder::new("/bin/sleep");
+        command.cwd("/");
+        let expected = RootIdentity::launch_executable(&command).unwrap();
+        let child = isolated_child("kill -STOP $$; exec /bin/sleep 60");
+        wait_child_state(&child, libc::WSTOPPED);
+        let root = RootIdentity::capture(child.0.id() as libc::pid_t, Some(expected)).unwrap();
+        assert!(
+            !root.original_executable(),
+            "the intermediate shell is not the launch image"
+        );
+        signal(&root.pidfd, libc::SIGCONT).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !root.original_executable() {
+            assert!(
+                Instant::now() < deadline,
+                "launch image never became visible"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    #[test]
     fn dropping_census_releases_its_stops_but_preserves_existing_stopped_jobs() {
         let running = isolated_child("exec sleep 60");
-        let root = RootIdentity::capture(running.0.id() as libc::pid_t).unwrap();
+        let root = RootIdentity::capture(running.0.id() as libc::pid_t, None).unwrap();
         let family = FrozenFamily::capture(&root, Instant::now() + Duration::from_secs(2)).unwrap();
         assert_eq!(read_process(root.process.pid).unwrap().state, b'T');
         drop(family);
@@ -502,7 +623,7 @@ mod tests {
 
         let stopped = isolated_child("kill -STOP $$; exec sleep 60");
         wait_child_state(&stopped, libc::WSTOPPED);
-        let root = RootIdentity::capture(stopped.0.id() as libc::pid_t).unwrap();
+        let root = RootIdentity::capture(stopped.0.id() as libc::pid_t, None).unwrap();
         let family = FrozenFamily::capture(&root, Instant::now() + Duration::from_secs(2)).unwrap();
         drop(family);
         assert_eq!(read_process(root.process.pid).unwrap().state, b'T');
@@ -511,7 +632,7 @@ mod tests {
     #[test]
     fn expired_census_does_not_leave_its_child_stopped() {
         let child = isolated_child("exec sleep 60");
-        let root = RootIdentity::capture(child.0.id() as libc::pid_t).unwrap();
+        let root = RootIdentity::capture(child.0.id() as libc::pid_t, None).unwrap();
         assert!(FrozenFamily::capture(&root, Instant::now()).is_err());
         assert!(!quiescent(read_process(root.process.pid).unwrap().state));
     }

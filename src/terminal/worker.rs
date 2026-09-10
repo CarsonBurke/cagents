@@ -63,6 +63,7 @@ enum Command {
         visible: bool,
     },
     ObserveAgent(Sender<Option<String>>),
+    PrepareUpgrade(Sender<Result<UpgradeSnapshot, String>>),
     ObserveAgentProcess(Sender<Option<AgentProcess>>),
     ApplyAgentActivity {
         process: AgentProcess,
@@ -76,6 +77,23 @@ enum Command {
         reply: Sender<super::ipc::TerminalCloseResult>,
     },
     Shutdown,
+}
+
+/// Reversible process freeze. Dropping an uncommitted snapshot resumes its
+/// exact pidfd-bound family; only committed handoff is allowed to kill it.
+pub(crate) struct UpgradeSnapshot {
+    pub(crate) hint: Option<String>,
+    pub(crate) active: bool,
+    pub(crate) size: TerminalSize,
+    pub(crate) theme: TerminalTheme,
+    family: FrozenFamily,
+}
+
+impl UpgradeSnapshot {
+    pub(crate) fn stop(&mut self) -> Result<(), String> {
+        self.family
+            .kill(std::time::Instant::now() + std::time::Duration::from_secs(10))
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -504,6 +522,15 @@ impl TerminalHandle {
             .map_err(|error| format!("Cannot inspect the active agent: {error}"))
     }
 
+    pub(crate) fn prepare_upgrade(&self) -> Result<UpgradeSnapshot, String> {
+        let (sender, receiver) = crossbeam_channel::bounded(1);
+        self.try_command(Command::PrepareUpgrade(sender))
+            .map_err(|error| error.to_string())?;
+        receiver
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .map_err(|error| format!("Cannot freeze terminal for upgrade: {error}"))?
+    }
+
     /// Inspection and the close decision are one serialized PTY-owner command.
     pub(crate) fn close_checked(&self, allow_active: bool) -> super::ipc::TerminalCloseResult {
         use super::ipc::TerminalCloseResult;
@@ -668,13 +695,16 @@ impl Worker {
             .map_err(|error| format!("open PTY: {error:#}"))?;
         let mut command = command_from_recipe(&session.launch);
         command.env("CAGENTS_TERMINAL_ID", session.id.to_string());
+        let executable = interactive_shell_launch(&session.launch)
+            .then(|| RootIdentity::launch_executable(&command))
+            .flatten();
         let mut child = pair
             .slave
             .spawn_command(command)
             .map_err(|error| format!("spawn {}: {error:#}", session.launch.program))?;
         let child_identity = child
             .process_id()
-            .and_then(|pid| RootIdentity::capture(pid as libc::pid_t).ok());
+            .and_then(|pid| RootIdentity::capture(pid as libc::pid_t, executable).ok());
         drop(pair.slave);
         let mut reader = pair
             .master
@@ -993,6 +1023,27 @@ impl Worker {
                 let close = outcome == TerminalCloseResult::Closed;
                 let _ = reply.send(outcome);
                 return close;
+            }
+            Command::PrepareUpgrade(reply) => {
+                let result = self
+                    .inspect_close(std::time::Instant::now() + std::time::Duration::from_secs(3))
+                    .and_then(|(active, family)| {
+                        self.refresh_resume_hint(true);
+                        if active && self.resume_hint.as_deref()
+                            .and_then(crate::model::agent_recovery::recipe_from_hint).is_some()
+                            && !self.agent_process.as_ref().is_some_and(|process| family.only_agent_tree(process.pid))
+                        {
+                            return Err("Terminal also owns unrelated background jobs; finish or close them before upgrading".into());
+                        }
+                        Ok(UpgradeSnapshot {
+                            hint: self.resume_hint.clone(),
+                            size: self.current_size,
+                            theme: self.theme.get(),
+                            active,
+                            family,
+                        })
+                    });
+                let _ = reply.send(result);
             }
             Command::ObserveAgent(sender) => {
                 self.refresh_resume_hint(true);
@@ -2150,6 +2201,7 @@ mod tests {
     #[test]
     fn activity_application_rejects_replaced_processes_and_expired_results() {
         use crate::agent::{Activity, ActivityState, Provider};
+        use std::time::Instant;
         let directory = tempdir().unwrap();
         let executable = directory.path().join("claude");
         // A harmless native executable with recognizable argv; no provider I/O.
@@ -2160,7 +2212,17 @@ mod tests {
             working_directory: directory.path().into(),
             environment: BTreeMap::new(),
         });
-        let process = worker.observe_agent_process().cloned().unwrap();
+        let startup_deadline = Instant::now() + Duration::from_secs(3);
+        let process = loop {
+            if let Some(process) = worker.observe_agent_process().cloned() {
+                break process;
+            }
+            assert!(
+                Instant::now() < startup_deadline,
+                "PTY foreground never became Claude"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        };
         let working = Some(Activity {
             provider: Provider::Claude,
             state: ActivityState::Working,

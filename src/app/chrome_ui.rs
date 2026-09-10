@@ -135,7 +135,12 @@ impl Cagents {
                 + design::PRIMARY_CONTROL_SIZE
                 + 12.0
         };
-        let width = navigator + 2.0 * design::PRIMARY_CONTROL_SIZE + controls + 32.0;
+        let update = if self.has_update_control() {
+            design::PRIMARY_CONTROL_SIZE + 4.0
+        } else {
+            0.0
+        };
+        let width = navigator + 3.0 * design::PRIMARY_CONTROL_SIZE + controls + update + 32.0;
         if self.workspace.viewport_width() > 0.0 {
             width.min(self.workspace.viewport_width())
         } else {
@@ -168,7 +173,7 @@ impl Cagents {
         if self.context_inspector_is_overlay() {
             return Vec::new();
         }
-        let mut actions = Vec::with_capacity(7);
+        let mut actions = Vec::with_capacity(8);
         let total = self.workspace.cards().len();
         if should_show_card_navigator(total) {
             let current = self
@@ -215,6 +220,15 @@ impl Cagents {
             widget::Id::new("command.new-browser"),
             Some(Message::NewBrowser),
         ));
+        actions.push(command(
+            widget::icon::from_name("window-new-symbolic"),
+            "New window",
+            widget::Id::new("command.new-window"),
+            (!self.modal_is_open()).then_some(Message::NewWindow),
+        ));
+        if let Some(update) = self.update_control() {
+            actions.push(update);
+        }
         if !self.context_inspector_open {
             actions.push(self.sidebar_toggle());
         }
@@ -444,7 +458,16 @@ impl Cagents {
             .into()
         }))
         .spacing(0);
-        let heading = self.native_header(tabs.into(), Some(self.sidebar_toggle()), true);
+        let mut end = self.sidebar_toggle();
+        if self.context_inspector_is_overlay()
+            && let Some(update) = self.update_control()
+        {
+            end = widget::row::with_children(vec![update, end])
+                .spacing(4)
+                .align_y(Alignment::Center)
+                .into();
+        }
+        let heading = self.native_header(tabs.into(), Some(end), true);
         let body = match self.context_tab {
             ContextTab::Files => sidebar::file_panel(
                 &self.sidebar_model,
