@@ -54,6 +54,7 @@ enum Command {
     Reveal,
     Hibernate,
     Restore { visible: bool },
+    ObserveAgent(Sender<Option<String>>),
     Shutdown,
 }
 
@@ -384,6 +385,17 @@ impl TerminalHandle {
         self.try_command(Command::Restore { visible })
     }
 
+    /// Resolve fresh foreground evidence on the PTY owner thread. This never
+    /// sends terminal input or starts a provider process.
+    pub(crate) fn observe_agent(&self) -> Result<Option<String>, String> {
+        let (sender, receiver) = crossbeam_channel::bounded(1);
+        self.try_command(Command::ObserveAgent(sender))
+            .map_err(|error| error.to_string())?;
+        receiver
+            .recv_timeout(std::time::Duration::from_secs(3))
+            .map_err(|error| format!("Cannot inspect the active agent: {error}"))
+    }
+
     pub fn shutdown(&self) -> Result<(), TerminalSendError> {
         self.send_command(Command::Shutdown)?;
         if let Ok(mut worker) = self.inner.worker.lock()
@@ -505,7 +517,8 @@ impl Worker {
         let pair = pty_system
             .openpty(pty_size(current_size))
             .map_err(|error| format!("open PTY: {error:#}"))?;
-        let command = command_from_recipe(&session.launch);
+        let mut command = command_from_recipe(&session.launch);
+        command.env("CAGENTS_TERMINAL_ID", session.id.to_string());
         let mut child = pair
             .slave
             .spawn_command(command)
@@ -760,10 +773,17 @@ impl Worker {
     /// Returns true when shutdown was requested.
     fn handle_command(&mut self, command: Command) -> bool {
         match command {
+            Command::ObserveAgent(sender) => {
+                self.refresh_resume_hint(true);
+                let _ = sender.send(self.resume_hint.clone());
+            }
             Command::Input(bytes) => self.write_pty(&bytes, "write terminal input"),
             Command::Key(input) => self.encode_key(input),
             Command::Mouse(input) => self.encode_mouse(input),
             Command::Focus(focused) => {
+                if focused {
+                    self.refresh_resume_hint(true);
+                }
                 match self.terminal.mode(Mode::FOCUS_EVENT) {
                     Ok(true) => {}
                     Ok(false) => return false,
@@ -1063,8 +1083,8 @@ fn apply_theme(
 ) -> Result<(), libghostty_vt::Error> {
     let (foreground, background, ansi) = match theme {
         TerminalTheme::Dark => (
-            0xd8dee9,
-            0x20242b,
+            0xd8d8d8,
+            0x101010,
             [
                 0x3b4252, 0xbf616a, 0xa3be8c, 0xebcb8b, 0x81a1c1, 0xb48ead, 0x88c0d0, 0xe5e9f0,
                 0x4c566a, 0xd08770, 0xb1d196, 0xf0d399, 0x8fbcdb, 0xc5a0c0, 0x93ccdc, 0xeceff4,
@@ -1231,6 +1251,7 @@ const INHERITED_TERMINAL_MARKERS: &[&str] = &[
 /// watch them go, rather than observing that a host which never set them does
 /// not have them.
 fn scrub_inherited_markers(command: &mut CommandBuilder) {
+    command.env_remove("CAGENTS_TERMINAL_ID");
     for name in INHERITED_TERMINAL_MARKERS {
         command.env_remove(name);
     }
