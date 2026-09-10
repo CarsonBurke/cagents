@@ -1,5 +1,4 @@
-//! Event-transparent shell effects. These retain the child's widget tree and
-//! accessibility nodes; they never create a second interactive surface.
+//! Shell effects and input layers that retain native accessibility trees.
 
 use std::{borrow::Cow, cell::RefCell, sync::Arc, time::Duration};
 
@@ -12,7 +11,7 @@ use cosmic::iced::advanced::{
 use cosmic::iced::{
     Animation, Color, Event, Length, Point, Rectangle, Size, Vector, mouse, time::Instant, window,
 };
-use cosmic::{Element, Renderer, Theme};
+use cosmic::{Element, Renderer, Theme, widget};
 use serde::Deserialize;
 
 const HOVER_DURATION: Duration = Duration::from_millis(120);
@@ -85,12 +84,260 @@ pub fn tooltip<'a, Message: 'a>(
     .into()
 }
 
+/// The pinned context menu changes its overlay state without requesting a
+/// frame. Schedule that frame explicitly so a stationary right click opens it.
+pub fn context_menu<'a, Message: Clone + 'static>(
+    content: impl Into<Element<'a, Message>>,
+    menu: Vec<widget::menu::Tree<Message>>,
+) -> Element<'a, Message> {
+    Effect {
+        content: widget::context_menu(content, Some(menu)).into(),
+        kind: Kind::ContextMenu,
+        tip: None,
+    }
+    .into()
+}
+
+/// Blocks click-through without hiding the child's accessibility tree.
+pub fn opaque<'a, Message: 'a>(content: impl Into<Element<'a, Message>>) -> Element<'a, Message> {
+    Effect {
+        content: content.into(),
+        kind: Kind::Opaque,
+        tip: None,
+    }
+    .into()
+}
+
+/// Two visual layers with front-first input and complete accessibility traversal.
+/// The pinned upstream Stack drops accessibility nodes for all descendants.
+pub fn layer<'a, Message: 'a>(
+    base: Element<'a, Message>,
+    front: Element<'a, Message>,
+) -> Element<'a, Message> {
+    Element::new(Layers {
+        children: [base, front],
+    })
+}
+
+struct Layers<'a, Message> {
+    children: [Element<'a, Message>; 2],
+}
+
+impl<Message> Widget<Message, Theme, Renderer> for Layers<'_, Message> {
+    fn children(&self) -> Vec<Tree> {
+        self.children.iter().map(Tree::new).collect()
+    }
+    fn diff(&mut self, tree: &mut Tree) {
+        tree.diff_children(&mut self.children);
+    }
+    fn size(&self) -> Size<Length> {
+        self.children[0].as_widget().size()
+    }
+    fn layout(
+        &mut self,
+        tree: &mut Tree,
+        renderer: &Renderer,
+        limits: &layout::Limits,
+    ) -> layout::Node {
+        let base = self.children[0]
+            .as_widget_mut()
+            .layout(&mut tree.children[0], renderer, limits);
+        let size = base.size();
+        let front = self.children[1].as_widget_mut().layout(
+            &mut tree.children[1],
+            renderer,
+            &layout::Limits::new(Size::ZERO, size),
+        );
+        layout::Node::with_children(size, vec![base, front])
+    }
+    fn operate(
+        &mut self,
+        tree: &mut Tree,
+        layout: Layout<'_>,
+        renderer: &Renderer,
+        operation: &mut dyn Operation,
+    ) {
+        operation.container(None, layout.bounds());
+        operation.traverse(&mut |operation| {
+            for ((child, tree), layout) in self
+                .children
+                .iter_mut()
+                .zip(&mut tree.children)
+                .zip(layout.children())
+            {
+                child
+                    .as_widget_mut()
+                    .operate(tree, layout, renderer, operation);
+            }
+        });
+    }
+    fn update(
+        &mut self,
+        tree: &mut Tree,
+        event: &Event,
+        layout: Layout<'_>,
+        mut cursor: mouse::Cursor,
+        renderer: &Renderer,
+        clipboard: &mut dyn Clipboard,
+        shell: &mut Shell<'_, Message>,
+        viewport: &Rectangle,
+    ) {
+        let over = cursor.is_over(layout.bounds());
+        for ((child, tree), layout) in self
+            .children
+            .iter_mut()
+            .rev()
+            .zip(tree.children.iter_mut().rev())
+            .zip(layout.children().rev())
+        {
+            child.as_widget_mut().update(
+                tree, event, layout, cursor, renderer, clipboard, shell, viewport,
+            );
+            if shell.is_event_captured() {
+                return;
+            }
+            if over
+                && !cursor.is_levitating()
+                && child
+                    .as_widget()
+                    .mouse_interaction(tree, layout, cursor, viewport, renderer)
+                    != mouse::Interaction::None
+            {
+                cursor = cursor.levitate();
+            }
+        }
+    }
+    fn mouse_interaction(
+        &self,
+        tree: &Tree,
+        layout: Layout<'_>,
+        cursor: mouse::Cursor,
+        viewport: &Rectangle,
+        renderer: &Renderer,
+    ) -> mouse::Interaction {
+        self.children
+            .iter()
+            .rev()
+            .zip(tree.children.iter().rev())
+            .zip(layout.children().rev())
+            .map(|((child, tree), layout)| {
+                child
+                    .as_widget()
+                    .mouse_interaction(tree, layout, cursor, viewport, renderer)
+            })
+            .find(|interaction| *interaction != mouse::Interaction::None)
+            .unwrap_or_default()
+    }
+    fn draw(
+        &self,
+        tree: &Tree,
+        renderer: &mut Renderer,
+        theme: &Theme,
+        style: &renderer::Style,
+        layout: Layout<'_>,
+        cursor: mouse::Cursor,
+        viewport: &Rectangle,
+    ) {
+        if layout.bounds().intersection(viewport).is_none() {
+            return;
+        }
+        let mut layouts = layout.children();
+        let base = layouts.next().expect("base layer");
+        let front = layouts.next().expect("front layer");
+        let front_active = self.children[1].as_widget().mouse_interaction(
+            &tree.children[1],
+            front,
+            cursor,
+            viewport,
+            renderer,
+        ) != mouse::Interaction::None;
+        self.children[0].as_widget().draw(
+            &tree.children[0],
+            renderer,
+            theme,
+            style,
+            base,
+            if front_active {
+                mouse::Cursor::Unavailable
+            } else {
+                cursor
+            },
+            viewport,
+        );
+        renderer.with_layer(*viewport, |renderer| {
+            self.children[1].as_widget().draw(
+                &tree.children[1],
+                renderer,
+                theme,
+                style,
+                front,
+                cursor,
+                viewport,
+            )
+        });
+    }
+    fn overlay<'a>(
+        &'a mut self,
+        tree: &'a mut Tree,
+        layout: Layout<'a>,
+        renderer: &Renderer,
+        viewport: &Rectangle,
+        translation: Vector,
+    ) -> Option<overlay::Element<'a, Message, Theme, Renderer>> {
+        overlay::from_children(
+            &mut self.children,
+            tree,
+            layout,
+            renderer,
+            viewport,
+            translation,
+        )
+    }
+    fn a11y_nodes(
+        &self,
+        layout: Layout<'_>,
+        tree: &Tree,
+        cursor: mouse::Cursor,
+    ) -> iced_accessibility::A11yTree {
+        iced_accessibility::A11yTree::join(
+            self.children
+                .iter()
+                .zip(&tree.children)
+                .zip(layout.children())
+                .map(|((child, tree), layout)| child.as_widget().a11y_nodes(layout, tree, cursor)),
+        )
+    }
+    fn drag_destinations(
+        &self,
+        tree: &Tree,
+        layout: Layout<'_>,
+        renderer: &Renderer,
+        destinations: &mut cosmic::iced::advanced::clipboard::DndDestinationRectangles,
+    ) {
+        for ((child, tree), child_layout) in self
+            .children
+            .iter()
+            .zip(&tree.children)
+            .zip(layout.children())
+        {
+            child.as_widget().drag_destinations(
+                tree,
+                child_layout.with_virtual_offset(layout.virtual_offset()),
+                renderer,
+                destinations,
+            );
+        }
+    }
+}
+
 #[derive(Clone, Copy)]
 enum Kind {
     Hover,
+    ContextMenu,
     Fade(f32),
     Tooltip,
     DriveAnimation(bool),
+    Opaque,
 }
 
 struct Effect<'a, Message> {
@@ -110,6 +357,8 @@ struct HoverTag;
 struct FadeTag;
 struct TooltipTag;
 struct AnimationDriverTag;
+struct OpaqueTag;
+struct ContextMenuTag;
 
 struct State {
     hover: Animation<bool>,
@@ -148,6 +397,8 @@ impl<Message> Widget<Message, Theme, Renderer> for Effect<'_, Message> {
             Kind::Fade(_) => tree::Tag::of::<FadeTag>(),
             Kind::Tooltip => tree::Tag::of::<TooltipTag>(),
             Kind::DriveAnimation(_) => tree::Tag::of::<AnimationDriverTag>(),
+            Kind::Opaque => tree::Tag::of::<OpaqueTag>(),
+            Kind::ContextMenu => tree::Tag::of::<ContextMenuTag>(),
         }
     }
     fn state(&self) -> tree::State {
@@ -230,6 +481,25 @@ impl<Message> Widget<Message, Theme, Renderer> for Effect<'_, Message> {
             shell,
             viewport,
         );
+        if matches!(self.kind, Kind::ContextMenu) {
+            if matches!(
+                event,
+                Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Right))
+            ) && cursor.is_over(layout.bounds())
+            {
+                shell.invalidate_layout();
+                shell.request_redraw();
+            }
+            return;
+        }
+        if matches!(self.kind, Kind::Opaque) {
+            if matches!(event, Event::Mouse(mouse::Event::ButtonPressed(_)))
+                && cursor.is_over(layout.bounds())
+            {
+                shell.capture_event();
+            }
+            return;
+        }
         if let Kind::DriveAnimation(active) = self.kind {
             if active {
                 shell.request_redraw();
@@ -314,13 +584,21 @@ impl<Message> Widget<Message, Theme, Renderer> for Effect<'_, Message> {
         viewport: &Rectangle,
         renderer: &Renderer,
     ) -> mouse::Interaction {
-        self.content.as_widget().mouse_interaction(
+        let interaction = self.content.as_widget().mouse_interaction(
             &tree.children[0],
             layout,
             cursor,
             viewport,
             renderer,
-        )
+        );
+        if matches!(self.kind, Kind::Opaque)
+            && interaction == mouse::Interaction::None
+            && cursor.is_over(layout.bounds())
+        {
+            mouse::Interaction::Idle
+        } else {
+            interaction
+        }
     }
     fn draw(
         &self,

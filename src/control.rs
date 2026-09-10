@@ -235,6 +235,13 @@ impl ControlClient {
         }
     }
 
+    pub fn list_chats(&mut self) -> Result<Vec<crate::chat::Session>, ControlError> {
+        match self.request_strict(ClientRequest::ChatList)? {
+            ServerResponse::ChatListed { sessions } => Ok(sessions),
+            response => Err(unexpected_response("a native chat list", &response)),
+        }
+    }
+
     pub fn spawn(
         &mut self,
         session: TerminalSession,
@@ -754,6 +761,7 @@ fn message_targets(message: &ServerMessage, expected: TerminalId) -> bool {
         ServerMessage::Response { .. }
         | ServerMessage::Synchronized { .. }
         | ServerMessage::HostShuttingDown
+        | ServerMessage::ChatChanged { .. }
         | ServerMessage::Error(_) => false,
     }
 }
@@ -767,6 +775,7 @@ fn message_name(message: &ServerMessage) -> &'static str {
         ServerMessage::Synchronized { .. } => "synchronized",
         ServerMessage::HostShuttingDown => "host_shutting_down",
         ServerMessage::Error(_) => "error",
+        ServerMessage::ChatChanged { .. } => "chat_changed",
     }
 }
 
@@ -782,6 +791,10 @@ fn response_name(response: &ServerResponse) -> &'static str {
         ServerResponse::ShutdownAccepted => "shutdown_accepted",
         ServerResponse::ShutdownPreflight(_) => "shutdown_preflight",
         ServerResponse::ShutdownOutcome(_) => "shutdown_outcome",
+        ServerResponse::ChatAttached { .. } => "chat_attached",
+        ServerResponse::ChatSnapshot { .. } => "chat_snapshot",
+        ServerResponse::ChatListed { .. } => "chat_listed",
+        ServerResponse::ChatClosed { .. } => "chat_closed",
     }
 }
 
@@ -1088,7 +1101,7 @@ fn execute_daemon(command: DaemonCommand) -> Result<CommandOutput, AppError> {
                 }
                 let preflight = client.shutdown_preflight().map_err(protocol_error)?;
                 eprint!(
-                    "Stop daemon and terminate {} hosted terminals (including pending spawns)? Type yes to confirm: ",
+                    "Stop daemon and terminate {} hosted terminal/chat sessions (including pending spawns and unconfirmed provider work)? Type yes to confirm: ",
                     preflight.capability.live_terminals
                 );
                 io::stderr()

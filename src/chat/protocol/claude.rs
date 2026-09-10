@@ -1,0 +1,2740 @@
+//! Claude Code's bidirectional stream-json protocol (not terminal output).
+//! Wire reference: anthropics/claude-agent-sdk-python, _internal/query.py,
+//! _internal/transport/subprocess_cli.py and types.py; matched SDK 0.3.236.
+//! https://unpkg.com/@anthropic-ai/claude-agent-sdk@0.3.236/sdk.d.ts
+use super::{Adapter, ProcessSpec, Step};
+use crate::chat::{
+    Answer, Attachment, Capabilities, Choice, Command, Event, Field, Item, ItemContent, Launch,
+    Model, PromptMode, Request, Role, SlashCommand, ToolStatus, Usage,
+};
+use base64::Engine as _;
+use serde_json::{Value, json};
+use std::{
+    collections::{HashMap, VecDeque},
+    fs::File,
+    io::{Read, Seek, SeekFrom},
+    path::{Path, PathBuf},
+};
+
+const MAX_PENDING: usize = 64;
+const MAX_TOOLS: usize = 512;
+const MAX_IMAGE: u64 = 5 * 1024 * 1024;
+const MAX_DOCUMENT: u64 = 20 * 1024 * 1024;
+const MAX_PAYLOAD: usize = 30 * 1024 * 1024;
+const HISTORY_PAGE: u64 = 4 * 1024 * 1024;
+const MAX_TEXT: usize = 1024 * 1024;
+const MODES: &[&str] = &["default", "acceptEdits", "plan", "dontAsk"];
+
+pub fn create(launch: &Launch) -> Result<(ProcessSpec, Box<dyn Adapter>), String> {
+    let mut spec = ProcessSpec::from(&launch.recipe);
+    spec.arguments = arguments(launch)?;
+    let history = launch
+        .session_id
+        .as_deref()
+        .map(|id| History::open(launch, id))
+        .transpose()?;
+    let session_id = launch
+        .session_id
+        .clone()
+        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+    if launch.session_id.is_none() {
+        spec.arguments.push(format!("--session-id={session_id}"));
+    }
+    Ok((
+        spec,
+        Box::new(Claude {
+            session_id: Some(session_id),
+            cwd: launch.recipe.working_directory.clone(),
+            history,
+            ..Claude::default()
+        }),
+    ))
+}
+
+fn arguments(launch: &Launch) -> Result<Vec<String>, String> {
+    if launch.recipe.arguments.len() > 128
+        || launch
+            .recipe
+            .arguments
+            .iter()
+            .map(String::len)
+            .sum::<usize>()
+            > 64 * 1024
+    {
+        return Err("Claude launch arguments exceed the native transport limit".into());
+    }
+    if launch.recipe.arguments.iter().any(|arg| arg.contains('\0')) {
+        return Err("Claude arguments contain a NUL byte".into());
+    }
+    if let Some(id) = &launch.session_id {
+        validate_id(id)?;
+    }
+    let mut result = Vec::new();
+    let mut args = launch.recipe.arguments.iter().peekable();
+    while let Some(arg) = args.next() {
+        let (flag, inline) = arg
+            .split_once('=')
+            .map_or((arg.as_str(), None), |(k, v)| (k, Some(v)));
+        if matches!(flag, "--resume" | "-r" | "--session-id") {
+            let value = inline
+                .or_else(|| args.next().map(String::as_str))
+                .ok_or("Claude resume requires an exact session ID")?;
+            validate_id(value)?;
+            if launch.session_id.as_deref() != Some(value) {
+                return Err("Claude launch identity differs from the selected session".into());
+            }
+        } else if matches!(
+            flag,
+            "--input-format" | "--output-format" | "--permission-prompt-tool"
+        ) {
+            let value = inline
+                .or_else(|| args.next().map(String::as_str))
+                .ok_or("Missing Claude transport argument value")?;
+            if (flag == "--permission-prompt-tool" && value != "stdio")
+                || (flag != "--permission-prompt-tool"
+                    && value != "stream-json"
+                    && value != "text"
+                    && value != "json")
+            {
+                return Err(format!(
+                    "Unsupported Claude transport option {flag}={value}"
+                ));
+            }
+        } else if matches!(
+            flag,
+            "--print"
+                | "-p"
+                | "--verbose"
+                | "--include-partial-messages"
+                | "--replay-user-messages"
+        ) && inline.is_none()
+        {
+            // Replaced below; never replay the positional prompt from the TUI recipe.
+        } else if matches!(
+            flag,
+            "--model"
+                | "--agent"
+                | "--permission-mode"
+                | "--settings"
+                | "--setting-sources"
+                | "--effort"
+                | "--system-prompt"
+                | "--append-system-prompt"
+                | "--max-turns"
+                | "--max-budget-usd"
+                | "--fallback-model"
+        ) {
+            let value = inline
+                .or_else(|| args.next().map(String::as_str))
+                .ok_or_else(|| format!("Missing value for Claude {flag}"))?;
+            if value.is_empty() || value.contains('\0') {
+                return Err(format!("Invalid value for Claude {flag}"));
+            }
+            if flag == "--permission-mode"
+                && !matches!(value, "manual" | "auto" | "bypassPermissions")
+                && !MODES.contains(&value)
+            {
+                return Err(format!("Unknown Claude launch permission mode {value}"));
+            }
+            result.extend([flag.into(), value.into()]);
+        } else if matches!(
+            flag,
+            "--add-dir"
+                | "--mcp-config"
+                | "--plugin-dir"
+                | "--allowedTools"
+                | "--allowed-tools"
+                | "--disallowedTools"
+                | "--disallowed-tools"
+                | "--tools"
+        ) {
+            result.push(flag.into());
+            if let Some(value) = inline {
+                result.push(value.into());
+            } else {
+                let start = result.len();
+                while args.peek().is_some_and(|value| !value.starts_with('-')) {
+                    result.push(args.next().unwrap().clone());
+                }
+                if result.len() == start {
+                    return Err(format!("Missing value for Claude {flag}"));
+                }
+            }
+        } else if matches!(
+            flag,
+            "--bare"
+                | "--no-chrome"
+                | "--chrome"
+                | "--strict-mcp-config"
+                | "--disable-slash-commands"
+                | "--dangerously-skip-permissions"
+                | "--allow-dangerously-skip-permissions"
+        ) && inline.is_none()
+        {
+            result.push(arg.clone());
+        } else if !flag.starts_with('-') {
+            // Original one-shot prompt, intentionally not resubmitted.
+        } else {
+            return Err(format!(
+                "Claude option {flag} cannot safely transfer to native chat; remove it before connecting"
+            ));
+        }
+    }
+    result.extend(
+        [
+            "--print",
+            "--verbose",
+            "--input-format",
+            "stream-json",
+            "--output-format",
+            "stream-json",
+            "--include-partial-messages",
+            "--replay-user-messages",
+            "--permission-prompt-tool",
+            "stdio",
+        ]
+        .map(str::to_owned),
+    );
+    if let Some(id) = &launch.session_id {
+        result.push(format!("--resume={id}"));
+    }
+    Ok(result)
+}
+
+fn validate_id(id: &str) -> Result<(), String> {
+    uuid::Uuid::parse_str(id).map_err(|_| {
+        "Claude requires an exact UUID session ID (not a path or latest selector)".to_owned()
+    })?;
+    if id.len() != 36 || id.bytes().any(|byte| byte.is_ascii_uppercase()) {
+        return Err("Claude session ID must be a canonical lowercase UUID".into());
+    }
+    Ok(())
+}
+
+#[derive(Default)]
+struct Claude {
+    session_id: Option<String>,
+    cwd: PathBuf,
+    ready: bool,
+    busy: bool,
+    pending: HashMap<String, Value>,
+    retired: VecDeque<String>,
+    controls: HashMap<String, Value>,
+    streams: HashMap<String, String>,
+    blocks: HashMap<(String, u64), Item>,
+    stream_events: VecDeque<String>,
+    carrier_offsets: HashMap<String, usize>,
+    message_offsets: HashMap<String, usize>,
+    carrier_items: HashMap<String, Vec<String>>,
+    carrier_order: VecDeque<String>,
+    retracted: std::collections::HashSet<String>,
+    tools: HashMap<String, Item>,
+    tool_order: VecDeque<String>,
+    tasks: std::collections::HashSet<String>,
+    models: Vec<Model>,
+    selected: Option<String>,
+    cache_read_tokens: u64,
+    cache_write_tokens: u64,
+    reasoning: Option<String>,
+    commands: Vec<SlashCommand>,
+    usage: Usage,
+    history: Option<History>,
+}
+impl Claude {
+    fn control(&mut self, mut request: Value) -> Result<Step, String> {
+        if self.controls.len() >= MAX_PENDING {
+            return Err("Too many pending Claude control operations".into());
+        }
+        let id = uuid::Uuid::new_v4().to_string();
+        self.controls.insert(id.clone(), request.clone());
+        request
+            .as_object_mut()
+            .ok_or("Malformed native Claude control operation")?
+            .remove("_cagents_reasoning");
+        Ok(Step {
+            writes: vec![json!({"type":"control_request","request_id":id,"request":request})],
+            events: vec![],
+        })
+    }
+    fn capabilities(&self) -> Capabilities {
+        Capabilities {
+            attachments: true,
+            compact: self.commands.iter().any(|c| c.name == "compact"),
+            model_selection: !self.models.is_empty(),
+            reasoning_selection: self.models.iter().any(|m| !m.reasoning.is_empty()),
+            permission_modes: MODES.iter().map(|s| (*s).into()).collect(),
+            ..Capabilities::default()
+        }
+    }
+    fn status(&mut self, busy: bool, detail: impl Into<String>, step: &mut Step) {
+        self.busy = busy;
+        step.events.push(Event::Status {
+            busy,
+            detail: detail.into(),
+        });
+    }
+    fn retire(&mut self, id: String, step: &mut Step) {
+        self.pending.remove(&id);
+        step.events.push(Event::RequestResolved { id: id.clone() });
+        self.retired.push_back(id);
+        if self.retired.len() > 512 {
+            self.retired.pop_front();
+        }
+    }
+    fn tool(&mut self, item: Item) {
+        if !self.tools.contains_key(&item.id) {
+            self.tool_order.push_back(item.id.clone());
+        }
+        self.tools.insert(item.id.clone(), item);
+        while self.tool_order.len() > MAX_TOOLS {
+            if let Some(id) = self.tool_order.pop_front() {
+                self.tools.remove(&id);
+            }
+        }
+    }
+    fn send_prompt(&mut self, text: String, attachments: Vec<Attachment>) -> Result<Step, String> {
+        if !self.ready {
+            return Err("Claude is still initializing".into());
+        }
+        if self.busy {
+            return Err("Claude is busy; interrupt or wait before sending another prompt".into());
+        }
+        if text.len() > MAX_TEXT || attachments.len() > 8 {
+            return Err("Claude prompt exceeds the native transport limit".into());
+        }
+        if text.trim().is_empty() && attachments.is_empty() {
+            return Err("A Claude prompt cannot be empty".into());
+        }
+        if matches!(
+            text.trim().split_whitespace().next(),
+            Some("/resume" | "/fork")
+        ) {
+            return Err(
+                "Claude resume/fork commands require opening a separate native session".into(),
+            );
+        }
+        let mut content = vec![json!({"type":"text", "text":text})];
+        let mut payload_size = encoded_len(&content)?;
+        for attachment in attachments {
+            let block = attachment_block(&self.cwd, &attachment.path)?;
+            payload_size = payload_size.saturating_add(encoded_len(&block)? + 1);
+            if payload_size >= MAX_PAYLOAD {
+                return Err(
+                    "Combined Claude prompt and attachments must be smaller than 30 MiB".into(),
+                );
+            }
+            content.push(block);
+        }
+        let id = uuid::Uuid::new_v4().to_string();
+        let mut frame = json!({"type":"user", "uuid":id, "parent_tool_use_id":null, "origin":{"kind":"human"}, "message":{"role":"user", "content":content}});
+        if let Some(session) = &self.session_id {
+            frame["session_id"] = json!(session);
+        }
+        if encoded_len(&frame)? >= MAX_PAYLOAD {
+            return Err("Serialized Claude prompt must be smaller than 30 MiB".into());
+        }
+        let mut step = Step::default();
+        self.message(&frame, &mut step)?;
+        step.writes.push(frame);
+        self.status(true, "Claude is working", &mut step);
+        Ok(step)
+    }
+    fn answer(&mut self, id: String, action: String, answers: Vec<Answer>) -> Result<Step, String> {
+        if answers.len() > 32
+            || answers.iter().any(|a| a.values.len() > 64)
+            || answers
+                .iter()
+                .flat_map(|a| &a.values)
+                .map(String::len)
+                .sum::<usize>()
+                > MAX_TEXT
+        {
+            return Err("Claude form response exceeds its bounded transport limit".into());
+        }
+        let raw = self
+            .pending
+            .get(&id)
+            .ok_or("Claude request is stale, cancelled, or already answered")?;
+        let request = &raw["request"];
+        if string(request, "subtype") == "elicitation" {
+            return self.answer_elicitation(id, action, answers);
+        }
+        if string(request, "subtype") != "can_use_tool"
+            || (request["requires_user_interaction"].as_bool() == Some(true)
+                && string(request, "tool_name") != "AskUserQuestion")
+        {
+            return Err("This Claude request requires an unsupported local consent dialog; it cannot be generically approved or denied".into());
+        }
+        let response = match action.as_str() {
+            "deny" => json!({"behavior":"deny", "message":"The user denied this request"}),
+            "allow" => {
+                let mut input = request["input"].clone();
+                if string(request, "tool_name") == "AskUserQuestion" {
+                    let fields = question_fields(&input)?;
+                    if answers.len() != fields.len() {
+                        return Err("Answer every Claude question before submitting".into());
+                    }
+                    let mut result = serde_json::Map::new();
+                    for field in fields {
+                        let matching: Vec<_> =
+                            answers.iter().filter(|a| a.field == field.id).collect();
+                        if matching.len() != 1 {
+                            return Err(format!("Missing or duplicate answer for {}", field.label));
+                        }
+                        let values = &matching[0].values;
+                        if values.is_empty()
+                            || (!field.multiple && values.len() != 1)
+                            || values.iter().any(|s| s.trim().is_empty())
+                        {
+                            return Err(format!("Invalid answer for {}", field.label));
+                        }
+                        result.insert(field.id, Value::String(values.join(", ")));
+                    }
+                    input
+                        .as_object_mut()
+                        .ok_or("Claude question input is not an object")?
+                        .insert("answers".into(), Value::Object(result));
+                } else if !answers.is_empty() {
+                    return Err("This Claude approval does not accept form answers".into());
+                }
+                json!({"behavior":"allow", "updatedInput":input})
+            }
+            _ => return Err("Unsupported Claude decision; explicitly allow or deny".into()),
+        };
+        if encoded_len(&response)? >= MAX_PAYLOAD {
+            return Err("Claude permission response must be smaller than 30 MiB".into());
+        }
+        let mut step = Step {
+            writes: vec![
+                json!({"type":"control_response", "response":{"subtype":"success", "request_id":id, "response":response}}),
+            ],
+            events: vec![],
+        };
+        self.retire(id, &mut step);
+        Ok(step)
+    }
+    fn permission(&mut self, raw: Value) -> Result<Step, String> {
+        let id = required(&raw, "request_id")?.to_owned();
+        if self.retired.contains(&id) || self.pending.contains_key(&id) {
+            return Ok(Step::default());
+        }
+        if self.pending.len() >= MAX_PENDING {
+            return Err("Too many pending Claude permission requests".into());
+        }
+        let request = &raw["request"];
+        if string(request, "subtype") == "elicitation" {
+            return self.elicitation(raw);
+        }
+        if string(request, "subtype") == "request_user_dialog"
+            || (request["requires_user_interaction"].as_bool() == Some(true)
+                && string(request, "tool_name") != "AskUserQuestion")
+        {
+            let message = "Claude requested a local-only or unsupported consent dialog. It remains pending; interrupt to cancel this turn.";
+            let prompt = Request {
+                id: id.clone(),
+                title: "Unsupported Claude consent dialog".into(),
+                description: format!("{message}\n{request}"),
+                fields: vec![],
+                actions: vec![],
+            };
+            self.pending.insert(id, raw);
+            return Ok(Step {
+                events: vec![
+                    Event::Request(prompt),
+                    Event::Error {
+                        message: message.into(),
+                        fatal: false,
+                    },
+                ],
+                ..Step::default()
+            });
+        }
+        if string(request, "subtype") != "can_use_tool" {
+            let error = format!(
+                "Unsupported Claude control request: {}",
+                string(request, "subtype")
+            );
+            return Ok(Step {
+                writes: vec![
+                    json!({"type":"control_response", "response":{"subtype":"error", "request_id":id, "error":error}}),
+                ],
+                events: vec![Event::Error {
+                    message: error,
+                    fatal: false,
+                }],
+            });
+        }
+        let name = required(request, "tool_name")?;
+        if !request["input"].is_object() {
+            return Err("Claude permission request has malformed input".into());
+        }
+        let fields = if name == "AskUserQuestion" {
+            question_fields(&request["input"])?
+        } else {
+            vec![]
+        };
+        let description = format!("{}\n{}", string(request, "description"), request["input"]);
+        let event = Request {
+            id: id.clone(),
+            title: format!("Claude: {name}"),
+            description,
+            fields,
+            actions: vec![choice("allow", "Allow once"), choice("deny", "Deny")],
+        };
+        self.pending.insert(id, raw);
+        Ok(Step {
+            events: vec![Event::Request(event)],
+            ..Step::default()
+        })
+    }
+    fn metadata(&mut self, data: &Value, step: &mut Step) {
+        if let Some(models) = data["models"].as_array() {
+            self.models = models
+                .iter()
+                .filter_map(|m| {
+                    Some(Model {
+                        id: m["value"].as_str()?.into(),
+                        label: m["displayName"]
+                            .as_str()
+                            .unwrap_or(m["value"].as_str()?)
+                            .into(),
+                        reasoning: m["supportedEffortLevels"]
+                            .as_array()
+                            .map(|values| {
+                                values
+                                    .iter()
+                                    .filter_map(Value::as_str)
+                                    .map(str::to_owned)
+                                    .collect()
+                            })
+                            .unwrap_or_default(),
+                    })
+                })
+                .collect();
+        }
+        if let Some(commands) = data["commands"].as_array() {
+            self.commands = commands
+                .iter()
+                .filter_map(|c| {
+                    Some(SlashCommand {
+                        name: c["name"].as_str()?.trim_start_matches('/').into(),
+                        description: string(c, "description").into(),
+                    })
+                })
+                .collect();
+        } else if let Some(commands) = data["slash_commands"].as_array() {
+            self.commands = commands
+                .iter()
+                .filter_map(|c| {
+                    c.as_str().map(|s| SlashCommand {
+                        name: s.trim_start_matches('/').into(),
+                        description: String::new(),
+                    })
+                })
+                .collect();
+        }
+        let terminal = data["terminal_slash_commands"].as_array();
+        self.commands.retain(|c| {
+            !matches!(c.name.as_str(), "resume" | "fork")
+                && !terminal.is_some_and(|commands| {
+                    commands.iter().any(|v| v.as_str() == Some(c.name.as_str()))
+                })
+        });
+        if let Some(model) = data["model"].as_str() {
+            self.selected = Some(model.into());
+        }
+        step.events.extend([
+            Event::Models {
+                models: self.models.clone(),
+                selected: self.selected.clone(),
+                reasoning: self.reasoning.clone(),
+            },
+            Event::Commands(self.commands.clone()),
+            Event::Capabilities(self.capabilities()),
+        ]);
+    }
+    fn message(&mut self, frame: &Value, step: &mut Step) -> Result<(), String> {
+        let carrier = required(frame, "uuid")?;
+        if self.retracted.contains(carrier) {
+            return Ok(());
+        }
+        self.retract(&frame["supersedes"], step)?;
+        let event_start = step.events.len();
+        let role = if string(frame, "type") == "user" {
+            Role::User
+        } else {
+            Role::Assistant
+        };
+        let message = &frame["message"];
+        let id = message["id"]
+            .as_str()
+            .or_else(|| frame["uuid"].as_str())
+            .ok_or("Claude message is missing its stable identifier")?;
+        if let Some(parent) = frame["parent_tool_use_id"].as_str() {
+            step.events.push(Event::Item(text_item(
+                format!("{id}:subagent"),
+                Role::System,
+                format!(
+                    "Subagent {} · parent tool {parent} · {}",
+                    string(frame, "subagent_type"),
+                    string(frame, "task_description")
+                ),
+                false,
+            )));
+        }
+        if let Some(content) = message["content"].as_str() {
+            step.events.push(Event::Item(text_item(
+                format!("{id}:0"),
+                role,
+                content.into(),
+                false,
+            )));
+        } else if let Some(content) = message["content"].as_array() {
+            let base = frame["_cagents_block_base"]
+                .as_u64()
+                .map(|v| v as usize)
+                .or_else(|| self.carrier_offsets.get(carrier).copied())
+                .unwrap_or_else(|| self.message_offsets.get(id).copied().unwrap_or(0));
+            if !self.carrier_offsets.contains_key(carrier) {
+                if self.carrier_offsets.len() >= 2048 {
+                    self.carrier_offsets.clear();
+                    self.message_offsets.clear();
+                }
+                self.carrier_offsets.insert(carrier.into(), base);
+                self.message_offsets.insert(id.into(), base + content.len());
+            }
+            for (index, block) in content.iter().enumerate() {
+                let index = self
+                    .blocks
+                    .iter()
+                    .filter(|((message, block_index), item)| {
+                        message == id
+                            && *block_index >= base as u64
+                            && match (&item.content, string(block, "type")) {
+                                (
+                                    ItemContent::Text {
+                                        text,
+                                        thinking: false,
+                                    },
+                                    "text",
+                                ) => text == string(block, "text"),
+                                (
+                                    ItemContent::Text {
+                                        text,
+                                        thinking: true,
+                                    },
+                                    "thinking",
+                                ) => text == string(block, "thinking"),
+                                (ItemContent::Tool { .. }, "tool_use" | "server_tool_use") => {
+                                    item.id == string(block, "id")
+                                }
+                                _ => false,
+                            }
+                    })
+                    .map(|((_, index), _)| *index as usize)
+                    .min()
+                    .unwrap_or(base + index);
+                match string(block, "type") {
+                    "text" | "thinking" | "redacted_thinking" => {
+                        let thinking = string(block, "type") != "text";
+                        let text = if string(block, "type") == "redacted_thinking" {
+                            "[Redacted thinking]"
+                        } else {
+                            string(block, if thinking { "thinking" } else { "text" })
+                        };
+                        step.events.push(Event::Item(text_item(
+                            format!("{id}:{index}"),
+                            role,
+                            text.into(),
+                            thinking,
+                        )));
+                    }
+                    "tool_use" | "server_tool_use" => {
+                        let tool_id = required(block, "id")?.to_owned();
+                        let item = Item {
+                            id: tool_id,
+                            role: Role::Assistant,
+                            content: ItemContent::Tool {
+                                name: required(block, "name")?.into(),
+                                input: block["input"].to_string(),
+                                output: String::new(),
+                                status: ToolStatus::Running,
+                            },
+                        };
+                        // Replayed assistant envelopes must not reset a completed tool result.
+                        if !self.tools.get(&item.id).is_some_and(|old| matches!(&old.content, ItemContent::Tool { status, .. } if *status != ToolStatus::Running)) {
+                            self.tool(item.clone()); step.events.push(Event::Item(item));
+                        }
+                    }
+                    "tool_result" => {
+                        let tool_id = required(block, "tool_use_id")?.to_owned();
+                        let mut item = self.tools.get(&tool_id).cloned().unwrap_or(Item {
+                            id: tool_id,
+                            role: Role::Assistant,
+                            content: ItemContent::Tool {
+                                name: "Tool".into(),
+                                input: String::new(),
+                                output: String::new(),
+                                status: ToolStatus::Running,
+                            },
+                        });
+                        if let ItemContent::Tool { output, status, .. } = &mut item.content {
+                            *output = content_text(&block["content"]);
+                            *status = if block["is_error"].as_bool() == Some(true) {
+                                ToolStatus::Failed
+                            } else {
+                                ToolStatus::Succeeded
+                            };
+                        }
+                        if let Some(content) = block["content"].as_array() {
+                            for (index, attachment) in content
+                                .iter()
+                                .enumerate()
+                                .filter(|(_, value)| string(value, "type") == "image")
+                            {
+                                step.events.push(Event::Item(Item {
+                                    id: format!("{}:image:{index}", item.id),
+                                    role: Role::Assistant,
+                                    content: image_content(attachment),
+                                }));
+                            }
+                        }
+                        self.tool(item.clone());
+                        step.events.push(Event::Item(item));
+                    }
+                    "image" => step.events.push(Event::Item(Item {
+                        id: format!("{id}:{index}"),
+                        role,
+                        content: image_content(block),
+                    })),
+                    "document" => step.events.push(Event::Item(Item {
+                        id: format!("{id}:{index}"),
+                        role,
+                        content: ItemContent::Image {
+                            path: String::new(),
+                            description: format!("Claude document: {}", string(block, "title")),
+                        },
+                    })),
+                    other => step.events.push(Event::Item(text_item(
+                        format!("{id}:{index}"),
+                        role,
+                        format!("Unsupported Claude content block {other}: {block}"),
+                        false,
+                    ))),
+                }
+            }
+        }
+        if role == Role::Assistant {
+            if let Some(usage) = frame["context_usage"].as_object() {
+                self.usage.context_tokens = usage
+                    .get("totalTokens")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(self.usage.context_tokens);
+                self.usage.context_limit = usage
+                    .get("maxTokens")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(self.usage.context_limit);
+                step.events.push(Event::Usage(self.usage.clone()));
+            }
+            if let Some(error) = frame["error"].as_str() {
+                step.events.push(Event::Error {
+                    message: format!("Claude: {error}"),
+                    fatal: false,
+                });
+            }
+            self.update_usage(&message["usage"], step);
+        }
+        let ids = step.events[event_start..]
+            .iter()
+            .filter_map(|event| match event {
+                Event::Item(item) => Some(item.id.clone()),
+                _ => None,
+            })
+            .collect();
+        if !self.carrier_items.contains_key(carrier) {
+            self.carrier_order.push_back(carrier.into());
+        }
+        self.carrier_items.insert(carrier.into(), ids);
+        while self.carrier_order.len() > 2048 {
+            if let Some(old) = self.carrier_order.pop_front() {
+                self.carrier_items.remove(&old);
+                self.carrier_offsets.remove(&old);
+            }
+        }
+        Ok(())
+    }
+    fn update_usage(&mut self, value: &Value, step: &mut Step) {
+        if !value.is_object() {
+            return;
+        }
+        if let Some(n) = value["input_tokens"].as_u64() {
+            self.usage.input_tokens = n;
+            self.cache_read_tokens = value["cache_read_input_tokens"].as_u64().unwrap_or(0);
+            self.cache_write_tokens = value["cache_creation_input_tokens"].as_u64().unwrap_or(0);
+        }
+        if let Some(n) = value["output_tokens"].as_u64() {
+            self.usage.output_tokens = n;
+        }
+        self.usage.context_tokens = self
+            .usage
+            .input_tokens
+            .saturating_add(self.cache_read_tokens)
+            .saturating_add(self.cache_write_tokens);
+        step.events.push(Event::Usage(self.usage.clone()));
+    }
+    fn retract(&mut self, value: &Value, step: &mut Step) -> Result<(), String> {
+        let Some(carriers) = value.as_array() else {
+            return Ok(());
+        };
+        let mut ids = Vec::new();
+        for carrier in carriers {
+            let carrier = carrier
+                .as_str()
+                .ok_or("Claude supersedes contains a non-string ID")?;
+            if self.retracted.contains(carrier) {
+                continue;
+            }
+            let items = self.carrier_items.get(carrier).ok_or("Claude retracted a message outside the retained correlation window; reconnect to reload canonical history")?;
+            ids.extend(items.iter().cloned());
+            if self.retracted.len() >= 2048 {
+                return Err("Claude retraction ledger exceeds its bounded limit".into());
+            }
+            self.retracted.insert(carrier.into());
+        }
+        for id in &ids {
+            self.tools.remove(id);
+            self.blocks.retain(|_, item| &item.id != id);
+        }
+        if !ids.is_empty() {
+            step.events.push(Event::ItemsRemoved { ids });
+        }
+        Ok(())
+    }
+}
+
+impl Adapter for Claude {
+    fn initialize(&mut self) -> Result<Step, String> {
+        let mut step = self.control(
+            json!({"subtype":"initialize", "forwardSubagentText":true, "supportedDialogKinds":[]}),
+        )?;
+        if let Some(mut history) = self.history.take() {
+            let frames = history.page()?;
+            let mut history_step = Step::default();
+            for frame in frames {
+                self.message(&frame, &mut history_step)?;
+            }
+            let items = history_step
+                .events
+                .into_iter()
+                .filter_map(|e| {
+                    if let Event::Item(i) = e {
+                        Some(i)
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            step.events.push(Event::History {
+                items,
+                has_earlier: history.offset > 0,
+            });
+            self.history = Some(history);
+        }
+        self.status(false, "Initializing Claude stream-json", &mut step);
+        Ok(step)
+    }
+    fn command(&mut self, command: Command) -> Result<Step, String> {
+        match command {
+            Command::Prompt {
+                text,
+                attachments,
+                mode: PromptMode::Send,
+            } => self.send_prompt(text, attachments),
+            Command::Prompt { .. } => {
+                Err("Claude stream-json does not expose native steer or queue controls".into())
+            }
+            Command::Answer {
+                request_id,
+                action,
+                answers,
+            } => self.answer(request_id, action, answers),
+            Command::Interrupt => self.control(json!({"subtype":"interrupt"})),
+            Command::SetModel { model, reasoning } => {
+                if !self.ready {
+                    return Err("Claude is still initializing".into());
+                }
+                let advertised = self
+                    .models
+                    .iter()
+                    .find(|m| m.id == model)
+                    .ok_or("Model is not advertised by this Claude session")?;
+                if reasoning
+                    .as_ref()
+                    .is_some_and(|effort| !advertised.reasoning.contains(effort))
+                {
+                    return Err("Reasoning effort is not advertised for this Claude model".into());
+                }
+                self.control(
+                    json!({"subtype":"set_model", "model":model, "_cagents_reasoning":reasoning}),
+                )
+            }
+            Command::SetPermissionMode { mode } => {
+                if !MODES.contains(&mode.as_str()) {
+                    return Err(
+                        "Unsupported Claude permission mode; permission bypass is not offered"
+                            .into(),
+                    );
+                }
+                self.control(json!({"subtype":"set_permission_mode", "mode":mode}))
+            }
+            Command::Compact => {
+                if !self.capabilities().compact {
+                    return Err("This Claude session does not advertise /compact".into());
+                }
+                self.send_prompt("/compact".into(), vec![])
+            }
+            Command::Slash { command } => {
+                let name = command
+                    .trim()
+                    .trim_start_matches('/')
+                    .split_whitespace()
+                    .next()
+                    .unwrap_or("");
+                if !self.commands.iter().any(|c| c.name == name) {
+                    return Err("Slash command is not advertised by this Claude session".into());
+                }
+                self.send_prompt(
+                    format!("/{}", command.trim().trim_start_matches('/')),
+                    vec![],
+                )
+            }
+            Command::Refresh => self.control(json!({"subtype":"get_context_usage"})),
+            Command::LoadEarlier => {
+                let Some(mut history) = self.history.take() else {
+                    return Err("Claude has no earlier persisted history".into());
+                };
+                let frames = history.page();
+                let has_earlier = history.offset > 0;
+                self.history = Some(history);
+                let mut step = Step::default();
+                for frame in frames? {
+                    self.message(&frame, &mut step)?;
+                }
+                let items = step
+                    .events
+                    .into_iter()
+                    .filter_map(|e| {
+                        if let Event::Item(i) = e {
+                            Some(i)
+                        } else {
+                            None
+                        }
+                    })
+                    .collect();
+                Ok(Step {
+                    events: vec![Event::History { items, has_earlier }],
+                    ..Step::default()
+                })
+            }
+        }
+    }
+    fn receive(&mut self, frame: Value) -> Result<Step, String> {
+        let mut step = Step::default();
+        if let Some(id) = frame["session_id"].as_str().filter(|id| !id.is_empty()) {
+            validate_id(id)?;
+            if self
+                .session_id
+                .as_deref()
+                .is_some_and(|expected| expected != id)
+            {
+                return Err("Claude emitted a different session ID; refusing to join a different conversation".into());
+            }
+            if self.session_id.is_none() {
+                self.session_id = Some(id.into());
+            }
+            step.events.push(Event::Session {
+                id: id.into(),
+                title: None,
+            });
+        }
+        match string(&frame, "type") {
+            "control_request" => return self.permission(frame),
+            "control_cancel_request" => {
+                self.retire(required(&frame, "request_id")?.into(), &mut step);
+            }
+            "conversation_reset" => {
+                self.session_id = None;
+                self.history = None;
+                self.pending.clear();
+                self.retired.clear();
+                self.streams.clear();
+                self.blocks.clear();
+                self.carrier_offsets.clear();
+                self.message_offsets.clear();
+                self.tools.clear();
+                self.tool_order.clear();
+                self.tasks.clear();
+                self.stream_events.clear();
+                self.carrier_items.clear();
+                self.carrier_order.clear();
+                self.retracted.clear();
+                self.usage = Usage::default();
+                self.cache_read_tokens = 0;
+                self.cache_write_tokens = 0;
+                step.events.push(Event::Reset {
+                    reason: "Claude reset the conversation".into(),
+                });
+            }
+            "control_response" => {
+                let response = &frame["response"];
+                let id = required(response, "request_id")?;
+                let Some(request) = self.controls.remove(id) else {
+                    return Ok(step);
+                };
+                if string(response, "subtype") == "error" {
+                    step.events.push(Event::Error {
+                        message: format!(
+                            "Claude {}: {}",
+                            string(&request, "subtype"),
+                            string(response, "error")
+                        ),
+                        fatal: string(&request, "subtype") == "initialize",
+                    });
+                } else if string(response, "subtype") != "success" {
+                    return Err("Unsupported Claude control response subtype".into());
+                } else {
+                    match string(&request, "subtype") {
+                        "initialize" => {
+                            self.ready = true;
+                            self.metadata(&response["response"], &mut step);
+                            self.status(self.busy, "Claude connected", &mut step);
+                            for key in [
+                                "pending_permission_requests",
+                                "pending_user_dialog_requests",
+                            ] {
+                                if let Some(requests) = response[key].as_array() {
+                                    for pending in requests {
+                                        let replay = self.permission(pending.clone())?;
+                                        step.writes.extend(replay.writes);
+                                        step.events.extend(replay.events);
+                                    }
+                                }
+                            }
+                        }
+                        "set_model" => {
+                            self.selected = request["model"].as_str().map(str::to_owned);
+                            self.metadata(&Value::Null, &mut step);
+                            let next = self.control(json!({"subtype":"apply_flag_settings", "settings":{"effortLevel":request["_cagents_reasoning"]}}))?;
+                            step.writes.extend(next.writes);
+                        }
+                        "apply_flag_settings" => {
+                            self.reasoning = request["settings"]["effortLevel"]
+                                .as_str()
+                                .map(str::to_owned);
+                            self.metadata(&Value::Null, &mut step);
+                        }
+                        "set_permission_mode" => {
+                            step.events.push(Event::Status {
+                                busy: self.busy,
+                                detail: format!(
+                                    "Claude permission mode: {}",
+                                    string(&request, "mode")
+                                ),
+                            });
+                        }
+                        "interrupt" => {
+                            step.events.push(Event::Status {
+                                busy: self.busy,
+                                detail:
+                                    "Claude acknowledged interruption; waiting for turn settlement"
+                                        .into(),
+                            });
+                        }
+                        "get_context_usage" => {
+                            self.usage.context_tokens = response["response"]["totalTokens"]
+                                .as_u64()
+                                .unwrap_or(self.usage.context_tokens);
+                            self.usage.context_limit = response["response"]["maxTokens"]
+                                .as_u64()
+                                .unwrap_or(self.usage.context_limit);
+                            step.events.push(Event::Usage(self.usage.clone()));
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            "assistant" | "user" => self.message(&frame, &mut step)?,
+            "stream_event" => {
+                if let Some(id) = frame["uuid"].as_str() {
+                    if self.stream_events.iter().any(|seen| seen == id) {
+                        return Ok(step);
+                    }
+                    self.stream_events.push_back(id.into());
+                    if self.stream_events.len() > 2048 {
+                        self.stream_events.pop_front();
+                    }
+                }
+                self.stream(&frame, &mut step)?;
+            }
+            "result" => {
+                let busy = !self.tasks.is_empty() || !self.pending.is_empty();
+                self.status(
+                    busy,
+                    if busy {
+                        "Claude turn ended; background work or decisions remain"
+                    } else {
+                        "Claude turn complete"
+                    },
+                    &mut step,
+                );
+                self.streams.clear();
+                self.blocks.clear();
+                // Result input totals span multiple API calls; they are not the
+                // context occupancy of the last individual model call.
+                if let Some(tokens) = frame["usage"]["input_tokens"].as_u64() {
+                    self.usage.input_tokens = tokens;
+                }
+                if let Some(tokens) = frame["usage"]["output_tokens"].as_u64() {
+                    self.usage.output_tokens = tokens;
+                }
+                if let Some(cost) = frame["total_cost_usd"]
+                    .as_f64()
+                    .filter(|v| v.is_finite() && *v >= 0.0)
+                {
+                    self.usage.cost_microusd = Some((cost * 1_000_000.0).round() as u64);
+                }
+                if let Some(models) = frame["modelUsage"].as_object() {
+                    let data = self
+                        .selected
+                        .as_ref()
+                        .and_then(|m| models.get(m))
+                        .or_else(|| {
+                            if models.len() == 1 {
+                                models.values().next()
+                            } else {
+                                None
+                            }
+                        });
+                    if let Some(data) = data {
+                        self.usage.context_limit = data["contextWindow"]
+                            .as_u64()
+                            .unwrap_or(self.usage.context_limit);
+                    }
+                }
+                step.events.push(Event::Usage(self.usage.clone()));
+                if frame["is_error"].as_bool() == Some(true) {
+                    let errors = content_text(&frame["errors"]);
+                    let message = if !errors.is_empty() {
+                        errors
+                    } else if !string(&frame, "result").is_empty() {
+                        string(&frame, "result").into()
+                    } else {
+                        format!("Claude result: {}", string(&frame, "subtype"))
+                    };
+                    step.events.push(Event::Error {
+                        message,
+                        fatal: false,
+                    });
+                }
+            }
+            "system" => self.system(&frame, &mut step)?,
+            "auth_status" => {
+                let output = content_text(&frame["output"]);
+                step.events.push(Event::Status {
+                    busy: self.busy,
+                    detail: format!("Claude authentication: {output}"),
+                });
+                if let Some(error) = frame["error"].as_str() {
+                    step.events.push(Event::Error {
+                        message: error.into(),
+                        fatal: false,
+                    });
+                }
+                for token in output.split_whitespace() {
+                    if token.starts_with("https://") {
+                        step.events.push(Event::OpenUrl { url:token.into(), instructions:"Complete Claude authentication in your browser; never share authentication codes in chat".into() });
+                    }
+                }
+            }
+            "command_lifecycle" => {
+                // UUID-tagged user messages receive these transport lifecycle
+                // notifications. Only result settles a turn and its decisions.
+                step.events.push(Event::Status {
+                    busy: self.busy,
+                    detail: format!("Claude command {}", required(&frame, "state")?),
+                });
+            }
+            "tool_progress" => {
+                step.events.push(Event::Status {
+                    busy: self.busy,
+                    detail: format!(
+                        "{} running ({} seconds)",
+                        string(&frame, "tool_name"),
+                        frame["elapsed_time_seconds"]
+                    ),
+                });
+            }
+            "tool_use_summary" => {
+                step.events.push(Event::Item(text_item(
+                    required(&frame, "uuid")?.into(),
+                    Role::System,
+                    string(&frame, "summary").into(),
+                    false,
+                )));
+            }
+            "rate_limit_event" => {
+                step.events.push(Event::Status {
+                    busy: self.busy,
+                    detail: format!("Claude rate limit: {}", frame["rate_limit_info"]),
+                });
+            }
+            "keep_alive" => {}
+            other => return Err(format!("Unsupported Claude stream-json frame type {other}")),
+        }
+        Ok(step)
+    }
+}
+
+fn choice(id: &str, label: &str) -> Choice {
+    Choice {
+        id: id.into(),
+        label: label.into(),
+        description: String::new(),
+    }
+}
+fn string<'a>(value: &'a Value, key: &str) -> &'a str {
+    value[key].as_str().unwrap_or("")
+}
+fn required<'a>(value: &'a Value, key: &str) -> Result<&'a str, String> {
+    value[key]
+        .as_str()
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| format!("Claude protocol frame is missing {key}"))
+}
+fn text_item(id: String, role: Role, text: String, thinking: bool) -> Item {
+    Item {
+        id,
+        role,
+        content: ItemContent::Text { text, thinking },
+    }
+}
+fn image_content(block: &Value) -> ItemContent {
+    let source = &block["source"];
+    let path = match string(source, "type") {
+        "base64"
+            if matches!(
+                string(source, "media_type"),
+                "image/png" | "image/jpeg" | "image/gif" | "image/webp"
+            ) =>
+        {
+            format!(
+                "data:{};base64,{}",
+                string(source, "media_type"),
+                string(source, "data")
+            )
+        }
+        "url" => string(source, "url").to_owned(),
+        _ => String::new(),
+    };
+    ItemContent::Image {
+        path,
+        description: "Claude image attachment".into(),
+    }
+}
+fn content_text(value: &Value) -> String {
+    if let Some(s) = value.as_str() {
+        s.into()
+    } else if let Some(blocks) = value.as_array() {
+        blocks
+            .iter()
+            .map(|b| {
+                if matches!(string(b, "type"), "image" | "document") {
+                    format!("[{} attachment]", string(b, "type"))
+                } else {
+                    b.as_str()
+                        .or_else(|| b["text"].as_str())
+                        .map(str::to_owned)
+                        .unwrap_or_else(|| b.to_string())
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    } else if value.is_null() {
+        String::new()
+    } else {
+        value.to_string()
+    }
+}
+fn question_fields(input: &Value) -> Result<Vec<Field>, String> {
+    let questions = input["questions"]
+        .as_array()
+        .ok_or("Claude AskUserQuestion has no questions array")?;
+    if questions.is_empty() || questions.len() > 4 {
+        return Err("Claude AskUserQuestion has an invalid question count".into());
+    }
+    let mut fields = Vec::<Field>::new();
+    for question in questions {
+        let text = required(question, "question")?;
+        if fields.iter().any(|f| f.id == text) {
+            return Err("Claude AskUserQuestion has duplicate question keys".into());
+        }
+        let choices = question["options"]
+            .as_array()
+            .ok_or("Claude question is missing options")?
+            .iter()
+            .map(|o| {
+                Ok(Choice {
+                    id: required(o, "label")?.into(),
+                    label: required(o, "label")?.into(),
+                    description: string(o, "description").into(),
+                })
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+        if !(2..=4).contains(&choices.len()) {
+            return Err("Claude question must have two to four options".into());
+        }
+        fields.push(Field {
+            id: text.into(),
+            label: text.into(),
+            description: string(question, "header").into(),
+            choices,
+            multiple: question["multiSelect"].as_bool().unwrap_or(false),
+            secret: false,
+            initial: String::new(),
+        });
+    }
+    Ok(fields)
+}
+fn attachment_block(cwd: &Path, path: &Path) -> Result<Value, String> {
+    let path = if path.is_absolute() {
+        path.to_owned()
+    } else {
+        cwd.join(path)
+    };
+    use std::os::unix::fs::OpenOptionsExt as _;
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK)
+        .open(&path)
+        .map_err(|e| format!("Cannot open attachment {}: {e}", path.display()))?;
+    let metadata = file.metadata().map_err(|e| e.to_string())?;
+    if !metadata.is_file() || metadata.len() > MAX_DOCUMENT {
+        return Err(
+            "Claude attachments must be regular files: images up to 5 MiB, documents up to 20 MiB"
+                .into(),
+        );
+    }
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    file.take(MAX_DOCUMENT + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|e| e.to_string())?;
+    if bytes.len() as u64 > MAX_DOCUMENT {
+        return Err("Claude attachment grew beyond the 20 MiB document limit".into());
+    }
+    let media = if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+        Some("image/png")
+    } else if bytes.starts_with(&[0xff, 0xd8, 0xff]) {
+        Some("image/jpeg")
+    } else if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
+        Some("image/gif")
+    } else if bytes.starts_with(b"RIFF") && bytes.get(8..12) == Some(b"WEBP") {
+        Some("image/webp")
+    } else {
+        None
+    };
+    if let Some(media) = media {
+        if bytes.len() as u64 > MAX_IMAGE {
+            return Err("Claude images must be no larger than 5 MiB".into());
+        }
+        Ok(
+            json!({"type":"image", "source":{"type":"base64", "media_type":media, "data":base64::engine::general_purpose::STANDARD.encode(bytes)}}),
+        )
+    } else if bytes.starts_with(b"%PDF-") {
+        Ok(
+            json!({"type":"document", "source":{"type":"base64", "media_type":"application/pdf", "data":base64::engine::general_purpose::STANDARD.encode(bytes)}}),
+        )
+    } else {
+        let text = String::from_utf8(bytes).map_err(|_| {
+            "Unsupported Claude attachment; use PNG, JPEG, GIF, WebP, PDF, or UTF-8 text".to_owned()
+        })?;
+        Ok(
+            json!({"type":"document", "title":path.file_name().unwrap_or_default().to_string_lossy(), "source":{"type":"text", "media_type":"text/plain", "data":text}}),
+        )
+    }
+}
+
+/// Count encoded bytes without allocating another copy of a large attachment.
+fn encoded_len(value: &impl serde::Serialize) -> Result<usize, String> {
+    struct Counter(usize);
+    impl std::io::Write for Counter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0 = self.0.saturating_add(bytes.len());
+            if self.0 >= MAX_PAYLOAD {
+                return Err(std::io::Error::other(
+                    "Claude serialized payload must be smaller than 30 MiB",
+                ));
+            }
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut counter = Counter(0);
+    serde_json::to_writer(&mut counter, value).map_err(|e| e.to_string())?;
+    Ok(counter.0)
+}
+
+impl Claude {
+    fn stream(&mut self, frame: &Value, step: &mut Step) -> Result<(), String> {
+        let event = &frame["event"];
+        let parent = string(frame, "parent_tool_use_id").to_owned();
+        match string(event, "type") {
+            "message_start" => {
+                if self.streams.len() >= MAX_PENDING && !self.streams.contains_key(&parent) {
+                    return Err("Too many simultaneous Claude streams".into());
+                }
+                let id = required(&event["message"], "id")?.to_owned();
+                self.streams.insert(parent, id);
+                self.update_usage(&event["message"]["usage"], step);
+                self.status(true, "Claude is working", step);
+            }
+            "content_block_start" => {
+                let message = self
+                    .streams
+                    .get(&parent)
+                    .ok_or("Claude block arrived before message_start")?
+                    .clone();
+                let index = event["index"].as_u64().ok_or("Claude block has no index")?;
+                if self.blocks.len() >= MAX_TOOLS {
+                    return Err("Claude message has too many streaming blocks".into());
+                }
+                let block = &event["content_block"];
+                let item = match string(block, "type") {
+                    "text" => text_item(
+                        format!("{message}:{index}"),
+                        Role::Assistant,
+                        string(block, "text").into(),
+                        false,
+                    ),
+                    "thinking" => text_item(
+                        format!("{message}:{index}"),
+                        Role::Assistant,
+                        string(block, "thinking").into(),
+                        true,
+                    ),
+                    "redacted_thinking" => text_item(
+                        format!("{message}:{index}"),
+                        Role::Assistant,
+                        "[Redacted thinking]".into(),
+                        true,
+                    ),
+                    "tool_use" | "server_tool_use" => Item {
+                        id: required(block, "id")?.into(),
+                        role: Role::Assistant,
+                        content: ItemContent::Tool {
+                            name: required(block, "name")?.into(),
+                            input: String::new(),
+                            output: String::new(),
+                            status: ToolStatus::Running,
+                        },
+                    },
+                    other => {
+                        step.events.push(Event::Error {
+                            message: format!("Unsupported Claude streaming content block {other}"),
+                            fatal: false,
+                        });
+                        return Ok(());
+                    }
+                };
+                step.events.push(Event::Item(item.clone()));
+                self.blocks.insert((message, index), item);
+            }
+            "content_block_delta" => {
+                let message = self
+                    .streams
+                    .get(&parent)
+                    .ok_or("Claude delta arrived before message_start")?
+                    .clone();
+                let index = event["index"].as_u64().ok_or("Claude delta has no index")?;
+                let delta = &event["delta"];
+                if matches!(string(delta, "type"), "signature_delta" | "citations_delta") {
+                    return Ok(());
+                }
+                let Some(item) = self.blocks.get_mut(&(message, index)) else {
+                    return Err("Claude delta arrived without its content block".into());
+                };
+                match (&mut item.content, string(delta, "type")) {
+                    (ItemContent::Text { text, thinking }, "text_delta" | "thinking_delta") => {
+                        let value = delta[if *thinking { "thinking" } else { "text" }]
+                            .as_str()
+                            .ok_or("Claude text delta has no string payload")?;
+                        if text.len().saturating_add(value.len()) > MAX_PAYLOAD {
+                            return Err("Claude streamed text exceeds the 30 MiB item limit".into());
+                        }
+                        text.push_str(value);
+                        step.events.push(Event::TextDelta {
+                            id: item.id.clone(),
+                            role: Role::Assistant,
+                            thinking: *thinking,
+                            delta: value.into(),
+                        });
+                    }
+                    (ItemContent::Tool { input, .. }, "input_json_delta") => {
+                        let value = string(delta, "partial_json");
+                        if input.len().saturating_add(value.len()) > MAX_PAYLOAD {
+                            return Err(
+                                "Claude streamed tool input exceeds the 30 MiB item limit".into()
+                            );
+                        }
+                        input.push_str(value);
+                        step.events.push(Event::Item(item.clone()));
+                    }
+                    (_, other) => step.events.push(Event::Error {
+                        message: format!("Unsupported Claude stream delta {other}"),
+                        fatal: false,
+                    }),
+                }
+            }
+            "content_block_stop" => {
+                let message = self
+                    .streams
+                    .get(&parent)
+                    .ok_or("Claude block stop arrived before message_start")?
+                    .clone();
+                let index = event["index"]
+                    .as_u64()
+                    .ok_or("Claude block stop has no index")?;
+                if let Some(item) = self.blocks.get(&(message, index)).cloned() {
+                    if let ItemContent::Tool { input, .. } = &item.content {
+                        if !input.is_empty() {
+                            serde_json::from_str::<Value>(input).map_err(|e| {
+                                format!("Malformed completed Claude tool input: {e}")
+                            })?;
+                        }
+                        self.tool(item);
+                    }
+                }
+            }
+            "message_delta" => self.update_usage(&event["usage"], step),
+            "message_stop" | "ping" => {}
+            "error" => step.events.push(Event::Error {
+                message: content_text(&event["error"]),
+                fatal: false,
+            }),
+            other => step.events.push(Event::Error {
+                message: format!("Unsupported Claude API stream event {other}"),
+                fatal: false,
+            }),
+        }
+        Ok(())
+    }
+
+    fn system(&mut self, frame: &Value, step: &mut Step) -> Result<(), String> {
+        match string(frame, "subtype") {
+            "init" | "commands_changed" => self.metadata(frame, step),
+            "model_refusal_fallback" => {
+                self.retract(&frame["retracted_message_uuids"], step)?;
+                step.events.push(Event::Item(text_item(
+                    required(frame, "uuid")?.into(),
+                    Role::System,
+                    frame.to_string(),
+                    false,
+                )));
+            }
+            "session_state_changed" => match string(frame, "state") {
+                "idle" => self.status(false, "Claude is idle", step),
+                "requires_action" => self.status(true, "Claude is waiting for your response", step),
+                state => self.status(true, format!("Claude: {state}"), step),
+            },
+            "status" => step.events.push(Event::Status {
+                busy: self.busy,
+                detail: format!("Claude: {}", string(frame, "status")),
+            }),
+            "local_command_output" => step.events.push(Event::Item(text_item(
+                required(frame, "uuid")?.into(),
+                Role::System,
+                content_text(&frame["content"]),
+                false,
+            ))),
+            "task_started" | "task_progress" | "task_notification" | "task_updated" => {
+                let task = required(frame, "task_id")?;
+                let id = format!("claude-task:{task}");
+                let previous = self.tools.get(&id).cloned();
+                let mut item = previous.unwrap_or(Item {
+                    id,
+                    role: Role::Assistant,
+                    content: ItemContent::Tool {
+                        name: "Subagent task".into(),
+                        input: String::new(),
+                        output: String::new(),
+                        status: ToolStatus::Running,
+                    },
+                });
+                let patch = if frame["patch"].is_object() {
+                    &frame["patch"]
+                } else {
+                    frame
+                };
+                if string(frame, "subtype") == "task_started"
+                    && matches!(string(frame, "task_type"), "local_agent" | "local_workflow")
+                {
+                    if self.tasks.len() >= MAX_TOOLS {
+                        return Err("Claude background task count exceeds its limit".into());
+                    }
+                    self.tasks.insert(task.into());
+                }
+                if string(frame, "subtype") == "task_notification"
+                    || matches!(string(patch, "status"), "completed" | "failed" | "stopped")
+                {
+                    self.tasks.remove(task);
+                }
+                if let ItemContent::Tool {
+                    input,
+                    output,
+                    status,
+                    ..
+                } = &mut item.content
+                {
+                    if let Some(description) = patch["description"].as_str() {
+                        *input = description.into();
+                    }
+                    if let Some(summary) = patch["summary"].as_str() {
+                        *output = summary.into();
+                    }
+                    *status = match string(patch, "status") {
+                        "completed" => ToolStatus::Succeeded,
+                        "failed" | "stopped" => ToolStatus::Failed,
+                        _ => *status,
+                    };
+                }
+                self.tool(item.clone());
+                step.events.push(Event::Item(item));
+            }
+            "compact_boundary"
+            | "informational"
+            | "notification"
+            | "hook_started"
+            | "hook_progress"
+            | "hook_response"
+            | "api_retry"
+            | "thinking_tokens"
+            | "background_tasks_changed"
+            | "elicitation_complete" => {
+                let id = frame["uuid"]
+                    .as_str()
+                    .map(str::to_owned)
+                    .unwrap_or_else(|| format!("claude-system:{}", string(frame, "subtype")));
+                step.events.push(Event::Item(text_item(
+                    id,
+                    Role::System,
+                    frame.to_string(),
+                    false,
+                )));
+            }
+            other => step.events.push(Event::Error {
+                message: format!("Unsupported Claude system event {other}: {frame}"),
+                fatal: false,
+            }),
+        }
+        Ok(())
+    }
+}
+
+// Port of the official SDK's _build_conversation_chain, with a bounded offset
+// index rather than retaining the full transcript. Never scan other sessions.
+struct History {
+    file: File,
+    chain: Vec<(u64, u64, usize)>,
+    offset: usize,
+}
+struct HistoryNode {
+    parent: Option<String>,
+    visible: bool,
+    message: bool,
+    range: (u64, u64, usize),
+    order: usize,
+}
+impl History {
+    fn open(launch: &Launch, id: &str) -> Result<Self, String> {
+        validate_id(id)?;
+        let cwd = launch
+            .recipe
+            .working_directory
+            .canonicalize()
+            .map_err(|e| format!("Cannot resolve Claude session directory: {e}"))?;
+        let cwd_text = cwd
+            .to_str()
+            .ok_or("Claude history directory is not UTF-8")?;
+        let config = launch
+            .recipe
+            .environment
+            .get("CLAUDE_CONFIG_DIR")
+            .cloned()
+            .or_else(|| std::env::var("CLAUDE_CONFIG_DIR").ok())
+            .filter(|s| !s.is_empty());
+        let config = match config {
+            Some(config) => {
+                let path = PathBuf::from(config);
+                if path.is_absolute() {
+                    path
+                } else {
+                    cwd.join(path)
+                }
+            }
+            None => {
+                let home = launch
+                    .recipe
+                    .environment
+                    .get("HOME")
+                    .cloned()
+                    .or_else(|| std::env::var("HOME").ok())
+                    .ok_or("Cannot locate Claude config without HOME")?;
+                PathBuf::from(home).join(".claude")
+            }
+        };
+        let root = config
+            .join("projects")
+            .canonicalize()
+            .map_err(|e| format!("Claude history project directory is unavailable: {e}"))?;
+        let sanitized: String = cwd_text
+            .chars()
+            .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+            .collect();
+        let filename = format!("{id}.jsonl");
+        let project = if sanitized.len() <= 200 {
+            root.join(sanitized)
+        } else {
+            let prefix = format!("{}-", &sanitized[..200]);
+            let mut candidates = std::fs::read_dir(&root)
+                .map_err(|e| e.to_string())?
+                .filter_map(Result::ok)
+                .filter(|entry| entry.file_name().to_string_lossy().starts_with(&prefix))
+                .map(|entry| entry.path())
+                .filter(|path| path.join(&filename).is_file());
+            let candidate = candidates
+                .next()
+                .ok_or("Exact Claude transcript not found for this long project path")?;
+            if candidates.next().is_some() {
+                return Err(
+                    "Ambiguous Claude project hash; refusing to choose a history directory".into(),
+                );
+            }
+            candidate
+        };
+        let project = project
+            .canonicalize()
+            .map_err(|e| format!("Claude project history is unavailable: {e}"))?;
+        if !project.starts_with(&root) {
+            return Err("Claude project history escapes its configuration directory".into());
+        }
+        let path = project.join(filename);
+        if std::fs::symlink_metadata(&path)
+            .map_err(|e| format!("Exact Claude session history is unavailable: {e}"))?
+            .file_type()
+            .is_symlink()
+        {
+            return Err("Refusing a symlinked Claude session transcript".into());
+        }
+        let mut options = std::fs::OpenOptions::new();
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+        let file = options
+            .open(path)
+            .map_err(|e| format!("Cannot open exact Claude transcript: {e}"))?;
+        Self::index(file, id)
+    }
+    fn index(mut file: File, id: &str) -> Result<Self, String> {
+        use std::io::BufRead as _;
+        let metadata = file.metadata().map_err(|e| e.to_string())?;
+        if !metadata.is_file() || metadata.len() > 256 * 1024 * 1024 {
+            return Err("Claude transcript must be a regular file smaller than 256 MiB".into());
+        }
+        let mut reader = std::io::BufReader::new(&mut file);
+        let mut nodes = HashMap::<String, HistoryNode>::new();
+        let mut parents = std::collections::HashSet::new();
+        let mut message_offsets = HashMap::<String, usize>::new();
+        let mut retracted = std::collections::HashSet::<String>::new();
+        let mut position = 0;
+        let mut line = Vec::new();
+        while position < metadata.len() {
+            line.clear();
+            let count = std::io::Read::by_ref(&mut reader)
+                .take(MAX_PAYLOAD as u64 + 1)
+                .read_until(b'\n', &mut line)
+                .map_err(|e| e.to_string())?;
+            if count == 0 {
+                break;
+            }
+            if count > MAX_PAYLOAD {
+                return Err("Claude transcript contains a record larger than 30 MiB".into());
+            }
+            let record_offset = position;
+            position += count as u64;
+            if line.iter().all(u8::is_ascii_whitespace) {
+                continue;
+            }
+            let value: Value = serde_json::from_slice(&line)
+                .map_err(|e| format!("Malformed exact Claude transcript: {e}"))?;
+            if value["sessionId"].as_str().is_some_and(|value| value != id) {
+                return Err("Claude transcript contains another session identity".into());
+            }
+            for field in ["supersedes", "retracted_message_uuids"] {
+                if let Some(ids) = value[field].as_array() {
+                    retracted.extend(ids.iter().filter_map(Value::as_str).map(str::to_owned));
+                }
+            }
+            if !matches!(
+                string(&value, "type"),
+                "user" | "assistant" | "progress" | "system" | "attachment"
+            ) {
+                continue;
+            }
+            let Some(uuid) = value["uuid"].as_str() else {
+                continue;
+            };
+            if nodes.len() >= 200_000 {
+                return Err("Claude transcript exceeds the history index limit".into());
+            }
+            let parent = value["parentUuid"].as_str().map(str::to_owned);
+            if let Some(parent) = &parent {
+                parents.insert(parent.clone());
+            }
+            let message = matches!(string(&value, "type"), "user" | "assistant");
+            let visible = message
+                && value["isMeta"].as_bool() != Some(true)
+                && value["isSidechain"].as_bool() != Some(true)
+                && value["teamName"].as_str().is_none_or(str::is_empty);
+            let message_id = value["message"]["id"].as_str().unwrap_or(uuid);
+            let base = nodes
+                .get(uuid)
+                .map(|node| node.range.2)
+                .unwrap_or_else(|| *message_offsets.get(message_id).unwrap_or(&0));
+            message_offsets.insert(
+                message_id.into(),
+                base + value["message"]["content"].as_array().map_or(1, Vec::len),
+            );
+            let range = (record_offset, count as u64, base);
+            let order = record_offset as usize;
+            nodes.insert(
+                uuid.into(),
+                HistoryNode {
+                    parent,
+                    visible,
+                    message,
+                    range,
+                    order,
+                },
+            );
+        }
+        for id in retracted {
+            if let Some(node) = nodes.get_mut(&id) {
+                node.visible = false;
+            }
+        }
+        let mut leaf: Option<&str> = None;
+        let mut fallback: Option<&str> = None;
+        for terminal in nodes.keys().filter(|key| !parents.contains(*key)) {
+            let mut current = Some(terminal.as_str());
+            let mut seen = std::collections::HashSet::new();
+            while let Some(id) = current {
+                if !seen.insert(id) {
+                    break;
+                }
+                let Some(node) = nodes.get(id) else {
+                    break;
+                };
+                if node.message {
+                    if fallback.is_none_or(|leaf| nodes[leaf].order < node.order) {
+                        fallback = Some(id);
+                    }
+                    if node.visible && leaf.is_none_or(|leaf| nodes[leaf].order < node.order) {
+                        leaf = Some(id);
+                    }
+                    break;
+                }
+                current = node.parent.as_deref();
+            }
+        }
+        leaf = leaf.or(fallback);
+        let mut chain = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        while let Some(id) = leaf {
+            if !seen.insert(id) {
+                return Err("Claude transcript contains a cyclic parent chain".into());
+            }
+            let Some(node) = nodes.get(id) else {
+                break;
+            };
+            if node.visible {
+                chain.push(node.range);
+            }
+            leaf = node.parent.as_deref();
+        }
+        chain.reverse();
+        let offset = chain.len();
+        Ok(Self {
+            file,
+            chain,
+            offset,
+        })
+    }
+    fn page(&mut self) -> Result<Vec<Value>, String> {
+        let mut start = self.offset;
+        let mut total = 0;
+        while start > 0 && self.offset - start < 100 {
+            let len = self.chain[start - 1].1;
+            // Large individual records remain loadable; the runtime externalizes
+            // their image/text payloads rather than discarding the conversation.
+            if total + len > HISTORY_PAGE && start != self.offset {
+                break;
+            }
+            total += len;
+            start -= 1;
+        }
+        let mut result = Vec::new();
+        for &(offset, len, base) in &self.chain[start..self.offset] {
+            self.file
+                .seek(SeekFrom::Start(offset))
+                .map_err(|e| e.to_string())?;
+            let mut bytes = vec![0; len as usize];
+            self.file
+                .read_exact(&mut bytes)
+                .map_err(|e| e.to_string())?;
+            let mut frame: Value = serde_json::from_slice(&bytes)
+                .map_err(|e| format!("Claude history changed while reading: {e}"))?;
+            frame["_cagents_block_base"] = json!(base);
+            // The index has already removed superseded carriers across all pages.
+            frame
+                .as_object_mut()
+                .ok_or("Claude history message is not an object")?
+                .remove("supersedes");
+            result.push(frame);
+        }
+        self.offset = start;
+        Ok(result)
+    }
+}
+
+impl Claude {
+    fn elicitation(&mut self, raw: Value) -> Result<Step, String> {
+        let id = required(&raw, "request_id")?.to_owned();
+        let request = &raw["request"];
+        let mut step = Step::default();
+        let fields = match string(request, "mode") {
+            "url" => {
+                let url = required(request, "url")?;
+                let parsed = url::Url::parse(url)
+                    .map_err(|_| "Claude elicitation supplied an invalid URL")?;
+                if !matches!(parsed.scheme(), "http" | "https") {
+                    return Err("Claude elicitation URL must use HTTP(S)".into());
+                }
+                step.events.push(Event::OpenUrl {
+                    url: url.into(),
+                    instructions: string(request, "message").into(),
+                });
+                Ok(vec![])
+            }
+            "form" | "" => elicitation_fields(&request["requested_schema"]),
+            mode => Err(format!("Unsupported Claude elicitation mode {mode}")),
+        };
+        let (fields, actions) = match fields {
+            Ok(fields) => (
+                fields,
+                vec![
+                    choice("accept", "Submit"),
+                    choice("decline", "Decline"),
+                    choice("cancel", "Cancel"),
+                ],
+            ),
+            Err(message) => {
+                step.events.push(Event::Error {
+                    message,
+                    fatal: false,
+                });
+                (
+                    vec![],
+                    vec![choice("decline", "Decline"), choice("cancel", "Cancel")],
+                )
+            }
+        };
+        step.events.push(Event::Request(Request {
+            id: id.clone(),
+            title: format!("Claude MCP: {}", string(request, "mcp_server_name")),
+            description: string(request, "message").into(),
+            fields,
+            actions,
+        }));
+        self.pending.insert(id, raw);
+        Ok(step)
+    }
+    fn answer_elicitation(
+        &mut self,
+        id: String,
+        action: String,
+        answers: Vec<Answer>,
+    ) -> Result<Step, String> {
+        let request = &self
+            .pending
+            .get(&id)
+            .ok_or("Claude elicitation is no longer pending")?["request"];
+        let response = match action.as_str() {
+            "decline" | "cancel" => json!({"action":action}),
+            "accept" => {
+                if string(request, "mode") == "url" {
+                    if !answers.is_empty() {
+                        return Err("Claude URL elicitation does not accept form fields".into());
+                    }
+                    json!({"action":"accept"})
+                } else {
+                    let schema = &request["requested_schema"];
+                    let fields = elicitation_fields(schema)?;
+                    let mut content = serde_json::Map::new();
+                    for answer in &answers {
+                        if !fields.iter().any(|field| field.id == answer.field)
+                            || content.contains_key(&answer.field)
+                        {
+                            return Err(
+                                "Claude elicitation answer has an unknown or duplicate field"
+                                    .into(),
+                            );
+                        }
+                        let field_schema = &schema["properties"][&answer.field];
+                        let value = elicitation_value(field_schema, &answer.values)?;
+                        content.insert(answer.field.clone(), value);
+                    }
+                    if let Some(required) = schema["required"].as_array() {
+                        for key in required {
+                            if !content.contains_key(
+                                key.as_str().ok_or("Malformed Claude required field")?,
+                            ) {
+                                return Err(format!("Missing required Claude field {key}"));
+                            }
+                        }
+                    }
+                    json!({"action":"accept", "content":content})
+                }
+            }
+            _ => return Err("Claude elicitation expects accept, decline, or cancel".into()),
+        };
+        if encoded_len(&response)? >= MAX_PAYLOAD {
+            return Err("Claude elicitation response must be smaller than 30 MiB".into());
+        }
+        let mut step = Step {
+            writes: vec![
+                json!({"type":"control_response", "response":{"subtype":"success", "request_id":id, "response":response}}),
+            ],
+            events: vec![],
+        };
+        self.retire(id, &mut step);
+        Ok(step)
+    }
+}
+
+fn elicitation_fields(schema: &Value) -> Result<Vec<Field>, String> {
+    let object = schema
+        .as_object()
+        .ok_or("Claude elicitation schema is not an object")?;
+    if string(schema, "type") != "object"
+        || object.keys().any(|k| {
+            !matches!(
+                k.as_str(),
+                "type"
+                    | "properties"
+                    | "required"
+                    | "additionalProperties"
+                    | "title"
+                    | "description"
+                    | "$schema"
+            )
+        })
+    {
+        return Err("Claude elicitation uses an unsupported object schema; decline or use a supported surface".into());
+    }
+    let properties = schema["properties"]
+        .as_object()
+        .ok_or("Claude elicitation has no properties")?;
+    if properties.len() > 32 {
+        return Err("Claude elicitation has too many fields".into());
+    }
+    if let Some(required) = object.get("required") {
+        let required = required
+            .as_array()
+            .ok_or("Claude elicitation required must be an array")?;
+        if required
+            .iter()
+            .any(|key| key.as_str().is_none_or(|key| !properties.contains_key(key)))
+        {
+            return Err("Claude elicitation names an unknown required field".into());
+        }
+    }
+    let mut fields = Vec::new();
+    for (id, property) in properties {
+        let fields_schema = property
+            .as_object()
+            .ok_or("Claude elicitation property is not an object")?;
+        if fields_schema.keys().any(|k| {
+            !matches!(
+                k.as_str(),
+                "type" | "title" | "description" | "enum" | "enumNames" | "items" | "default"
+            )
+        }) {
+            return Err(format!(
+                "Claude elicitation field {id} uses unsupported validation constraints"
+            ));
+        }
+        let kind = string(property, "type");
+        if !matches!(kind, "string" | "boolean" | "number" | "integer" | "array") {
+            return Err(format!(
+                "Claude elicitation field {id} has unsupported type {kind}"
+            ));
+        }
+        if kind == "array"
+            && (string(&property["items"], "type") != "string"
+                || property["items"].as_object().is_none_or(|items| {
+                    items.keys().any(|k| !matches!(k.as_str(), "type" | "enum"))
+                }))
+        {
+            return Err("Claude elicitation supports arrays of strings only".into());
+        }
+        let enum_schema = if kind == "array" {
+            &property["items"]
+        } else {
+            property
+        };
+        if enum_schema
+            .get("enum")
+            .is_some_and(|value| !value.is_array())
+        {
+            return Err("Claude elicitation enum must be an array".into());
+        }
+        let choices = if let Some(values) = enum_schema["enum"].as_array() {
+            values
+                .iter()
+                .map(|value| {
+                    let text = value
+                        .as_str()
+                        .map(str::to_owned)
+                        .unwrap_or_else(|| value.to_string());
+                    choice(&text, &text)
+                })
+                .collect()
+        } else if kind == "boolean" {
+            vec![choice("true", "Yes"), choice("false", "No")]
+        } else {
+            vec![]
+        };
+        fields.push(Field {
+            id: id.clone(),
+            label: property["title"].as_str().unwrap_or(id).into(),
+            description: string(property, "description").into(),
+            choices,
+            multiple: kind == "array",
+            secret: false,
+            initial: property["default"].as_str().unwrap_or("").into(),
+        });
+    }
+    Ok(fields)
+}
+fn elicitation_value(schema: &Value, values: &[String]) -> Result<Value, String> {
+    let kind = string(schema, "type");
+    if kind != "array" && values.len() != 1 {
+        return Err("Claude elicitation expects one value for this field".into());
+    }
+    let value = match kind {
+        "string" => json!(values[0]),
+        "boolean" => match values[0].as_str() {
+            "true" => json!(true),
+            "false" => json!(false),
+            _ => return Err("Claude elicitation expects true or false".into()),
+        },
+        "integer" => json!(
+            values[0]
+                .parse::<i64>()
+                .map_err(|_| "Claude elicitation expects an integer")?
+        ),
+        "number" => {
+            let number = values[0]
+                .parse::<f64>()
+                .map_err(|_| "Claude elicitation expects a number")?;
+            if !number.is_finite() {
+                return Err("Claude elicitation expects a finite number".into());
+            }
+            json!(number)
+        }
+        "array" => {
+            let enum_values = schema["items"]["enum"].as_array();
+            if values
+                .iter()
+                .any(|v| enum_values.is_some_and(|allowed| !allowed.contains(&json!(v))))
+            {
+                return Err("Claude elicitation array contains a value outside its enum".into());
+            }
+            json!(values)
+        }
+        _ => return Err("Unsupported Claude elicitation field type".into()),
+    };
+    if schema["enum"]
+        .as_array()
+        .is_some_and(|allowed| !allowed.contains(&value))
+    {
+        return Err("Claude elicitation answer is outside its enum".into());
+    }
+    Ok(value)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::chat::Provider;
+    use std::io::Write as _;
+
+    fn approval(id: &str, tool: &str, input: Value) -> Value {
+        json!({"type":"control_request", "request_id":id, "request":{"subtype":"can_use_tool", "tool_name":tool, "tool_use_id":"tool-1", "input":input}})
+    }
+    fn reply(id: &str, data: Value) -> Value {
+        json!({"type":"control_response", "response":{"subtype":"success", "request_id":id, "response":data}})
+    }
+    fn stream(event: Value) -> Value {
+        json!({"type":"stream_event", "parent_tool_use_id":null, "event":event})
+    }
+
+    #[test]
+    fn command_completion_does_not_settle_the_turn_before_result() {
+        let mut adapter = Claude {
+            ready: true,
+            ..Default::default()
+        };
+        adapter.send_prompt("hello".into(), Vec::new()).unwrap();
+        for state in ["queued", "started", "completed"] {
+            let step = adapter
+                .receive(json!({"type":"command_lifecycle","command_uuid":"request","state":state}))
+                .unwrap();
+            assert!(
+                step.events
+                    .iter()
+                    .any(|event| matches!(event, Event::Status { busy: true, .. }))
+            );
+            assert!(adapter.send_prompt("too soon".into(), Vec::new()).is_err());
+        }
+        let settled = adapter
+            .receive(json!({"type":"result","subtype":"success","is_error":false}))
+            .unwrap();
+        assert!(
+            settled
+                .events
+                .iter()
+                .any(|event| matches!(event, Event::Status { busy: false, .. }))
+        );
+        assert!(adapter.send_prompt("next turn".into(), Vec::new()).is_ok());
+    }
+
+    #[test]
+    fn approval_is_explicit_preserves_input_and_cannot_be_answered_twice() {
+        let mut adapter = Claude::default();
+        let input = json!({"command":"pwd", "future_option":{"enabled":false}});
+        adapter
+            .receive(approval("p1", "Bash", input.clone()))
+            .unwrap();
+        let allow = adapter
+            .command(Command::Answer {
+                request_id: "p1".into(),
+                action: "allow".into(),
+                answers: vec![],
+            })
+            .unwrap();
+        assert_eq!(
+            allow.writes,
+            vec![reply(
+                "p1",
+                json!({"behavior":"allow","updatedInput":input})
+            )]
+        );
+        assert!(
+            adapter
+                .command(Command::Answer {
+                    request_id: "p1".into(),
+                    action: "allow".into(),
+                    answers: vec![]
+                })
+                .is_err()
+        );
+        assert!(
+            adapter
+                .receive(approval("p1", "Bash", json!({})))
+                .unwrap()
+                .events
+                .is_empty()
+        );
+        adapter.receive(approval("p2", "Bash", json!({}))).unwrap();
+        let deny = adapter
+            .command(Command::Answer {
+                request_id: "p2".into(),
+                action: "deny".into(),
+                answers: vec![],
+            })
+            .unwrap();
+        assert_eq!(deny.writes[0]["response"]["subtype"], "success");
+        assert_eq!(deny.writes[0]["response"]["response"]["behavior"], "deny");
+    }
+
+    #[test]
+    fn cancelled_and_local_only_requests_never_receive_generic_approval() {
+        let mut adapter = Claude::default();
+        adapter.receive(approval("p1", "Bash", json!({}))).unwrap();
+        let cancel = adapter
+            .receive(json!({"type":"control_cancel_request","request_id":"p1"}))
+            .unwrap();
+        assert!(cancel.writes.is_empty());
+        assert!(adapter.answer("p1".into(), "allow".into(), vec![]).is_err());
+        let mut local = approval(
+            "local",
+            "ExitPlanMode",
+            json!({"plan":"sensitive local consent"}),
+        );
+        local["request"]["requires_user_interaction"] = json!(true);
+        let step = adapter.receive(local).unwrap();
+        assert!(step.writes.is_empty());
+        assert!(
+            step.events
+                .iter()
+                .any(|e| matches!(e, Event::Request(r) if r.actions.is_empty()))
+        );
+        assert!(
+            adapter
+                .answer("local".into(), "allow".into(), vec![])
+                .is_err()
+        );
+        let dialog = adapter.receive(json!({"type":"control_request","request_id":"dialog","request":{"subtype":"request_user_dialog","dialog_kind":"unknown","payload":{}}})).unwrap();
+        assert!(dialog.writes.is_empty());
+    }
+
+    #[test]
+    fn questions_use_exact_question_keys_and_string_multiselect() {
+        let mut adapter = Claude::default();
+        let input = json!({"unknown":"preserved","questions":[{"question":"Which sections?","header":"Sections","multiSelect":true,"options":[{"label":"Introduction","description":"Intro"},{"label":"Conclusion","description":"End"}]}]});
+        adapter
+            .receive(approval("q1", "AskUserQuestion", input.clone()))
+            .unwrap();
+        assert!(
+            adapter
+                .answer(
+                    "q1".into(),
+                    "allow".into(),
+                    vec![Answer {
+                        field: "Sections".into(),
+                        values: vec!["Introduction".into()]
+                    }]
+                )
+                .is_err()
+        );
+        let step = adapter
+            .answer(
+                "q1".into(),
+                "allow".into(),
+                vec![Answer {
+                    field: "Which sections?".into(),
+                    values: vec!["Introduction".into(), "Conclusion".into()],
+                }],
+            )
+            .unwrap();
+        let mut expected = input;
+        expected["answers"] = json!({"Which sections?":"Introduction, Conclusion"});
+        assert_eq!(
+            step.writes,
+            vec![reply(
+                "q1",
+                json!({"behavior":"allow","updatedInput":expected})
+            )]
+        );
+    }
+
+    #[test]
+    fn completed_carriers_upsert_each_streamed_block_not_message_zero() {
+        let mut adapter = Claude::default();
+        adapter
+            .receive(stream(
+                json!({"type":"message_start","message":{"id":"msg-1"}}),
+            ))
+            .unwrap();
+        adapter.receive(stream(json!({"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}))).unwrap();
+        adapter.receive(stream(json!({"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"Consider"}}))).unwrap();
+        adapter.receive(stream(json!({"type":"content_block_start","index":1,"content_block":{"type":"text","text":""}}))).unwrap();
+        let delta = adapter.receive(stream(json!({"type":"content_block_delta","index":1,"delta":{"type":"text_delta","text":"Answer"}}))).unwrap();
+        assert!(delta.events.iter().any(|e| matches!(e, Event::TextDelta { id, delta, .. } if id == "msg-1:1" && delta == "Answer")));
+        let thinking = adapter.receive(json!({"type":"assistant","uuid":"a1","message":{"id":"msg-1","content":[{"type":"thinking","thinking":"Consider"}]}})).unwrap();
+        let text = adapter.receive(json!({"type":"assistant","uuid":"a2","message":{"id":"msg-1","content":[{"type":"text","text":"Answer"}]}})).unwrap();
+        assert!(
+            thinking
+                .events
+                .iter()
+                .any(|e| matches!(e, Event::Item(i) if i.id == "msg-1:0"))
+        );
+        assert!(
+            text.events
+                .iter()
+                .any(|e| matches!(e, Event::Item(i) if i.id == "msg-1:1"))
+        );
+    }
+
+    #[test]
+    fn interrupted_ack_does_not_claim_turn_or_background_task_finished() {
+        let mut adapter = Claude {
+            busy: true,
+            ..Claude::default()
+        };
+        let interrupt = adapter.command(Command::Interrupt).unwrap();
+        adapter
+            .receive(reply(
+                interrupt.writes[0]["request_id"].as_str().unwrap(),
+                json!({"still_queued":[]}),
+            ))
+            .unwrap();
+        assert!(adapter.busy);
+        adapter.receive(json!({"type":"system","subtype":"task_started","task_id":"agent1","task_type":"local_agent","description":"Review"})).unwrap();
+        adapter
+            .receive(json!({"type":"result","subtype":"success","is_error":false}))
+            .unwrap();
+        assert!(adapter.busy);
+        adapter
+            .receive(json!({"type":"system","subtype":"session_state_changed","state":"idle"}))
+            .unwrap();
+        assert!(!adapter.busy);
+    }
+
+    #[test]
+    fn model_effort_is_applied_only_after_successful_model_change() {
+        let model = Model {
+            id: "sonnet".into(),
+            label: "Sonnet".into(),
+            reasoning: vec!["high".into()],
+        };
+        let mut adapter = Claude {
+            ready: true,
+            models: vec![model],
+            selected: Some("old".into()),
+            ..Claude::default()
+        };
+        let step = adapter
+            .command(Command::SetModel {
+                model: "sonnet".into(),
+                reasoning: Some("high".into()),
+            })
+            .unwrap();
+        assert!(
+            step.writes[0]["request"]
+                .get("_cagents_reasoning")
+                .is_none()
+        );
+        let next = adapter
+            .receive(reply(
+                step.writes[0]["request_id"].as_str().unwrap(),
+                json!({}),
+            ))
+            .unwrap();
+        assert_eq!(
+            next.writes[0]["request"],
+            json!({"subtype":"apply_flag_settings","settings":{"effortLevel":"high"}})
+        );
+        assert_eq!(adapter.reasoning, None);
+        adapter
+            .receive(reply(
+                next.writes[0]["request_id"].as_str().unwrap(),
+                json!({}),
+            ))
+            .unwrap();
+        assert_eq!(adapter.reasoning.as_deref(), Some("high"));
+    }
+
+    #[test]
+    fn default_effort_clears_override_only_after_settings_success() {
+        let model = Model {
+            id: "sonnet".into(),
+            label: "Sonnet".into(),
+            reasoning: vec!["high".into()],
+        };
+        let mut adapter = Claude {
+            ready: true,
+            models: vec![model],
+            selected: Some("old".into()),
+            reasoning: Some("high".into()),
+            ..Claude::default()
+        };
+        let change = adapter
+            .command(Command::SetModel {
+                model: "sonnet".into(),
+                reasoning: None,
+            })
+            .unwrap();
+        let settings = adapter
+            .receive(reply(
+                change.writes[0]["request_id"].as_str().unwrap(),
+                json!({}),
+            ))
+            .unwrap();
+        assert_eq!(
+            settings.writes[0]["request"],
+            json!({"subtype":"apply_flag_settings","settings":{"effortLevel":null}})
+        );
+        assert!(settings.events.iter().any(|event| matches!(event, Event::Models { selected, reasoning, .. } if selected.as_deref() == Some("sonnet") && reasoning.as_deref() == Some("high"))));
+        let failed = adapter.receive(json!({"type":"control_response","response":{"subtype":"error","request_id":settings.writes[0]["request_id"],"error":"Settings rejected"}})).unwrap();
+        assert!(
+            failed
+                .events
+                .iter()
+                .any(|event| matches!(event, Event::Error { fatal: false, .. }))
+        );
+        assert!(
+            !failed
+                .events
+                .iter()
+                .any(|event| matches!(event, Event::Models { .. }))
+        );
+        assert_eq!(adapter.reasoning.as_deref(), Some("high"));
+        let retry = adapter
+            .command(Command::SetModel {
+                model: "sonnet".into(),
+                reasoning: None,
+            })
+            .unwrap();
+        let settings = adapter
+            .receive(reply(
+                retry.writes[0]["request_id"].as_str().unwrap(),
+                json!({}),
+            ))
+            .unwrap();
+        let applied = adapter
+            .receive(reply(
+                settings.writes[0]["request_id"].as_str().unwrap(),
+                json!({}),
+            ))
+            .unwrap();
+        assert!(applied.events.iter().any(|event| matches!(event, Event::Models { selected, reasoning:None, .. } if selected.as_deref() == Some("sonnet"))));
+        assert_eq!(adapter.reasoning, None);
+    }
+
+    #[test]
+    fn rejected_model_change_does_not_apply_or_report_effort() {
+        let model = Model {
+            id: "sonnet".into(),
+            label: "Sonnet".into(),
+            reasoning: vec!["high".into()],
+        };
+        let mut adapter = Claude {
+            ready: true,
+            models: vec![model],
+            selected: Some("old".into()),
+            reasoning: Some("high".into()),
+            ..Claude::default()
+        };
+        let change = adapter
+            .command(Command::SetModel {
+                model: "sonnet".into(),
+                reasoning: None,
+            })
+            .unwrap();
+        let failed = adapter.receive(json!({"type":"control_response","response":{"subtype":"error","request_id":change.writes[0]["request_id"],"error":"Model rejected"}})).unwrap();
+        assert!(failed.writes.is_empty());
+        assert!(
+            failed
+                .events
+                .iter()
+                .any(|event| matches!(event, Event::Error { fatal: false, .. }))
+        );
+        assert!(
+            !failed
+                .events
+                .iter()
+                .any(|event| matches!(event, Event::Models { .. }))
+        );
+        assert_eq!(adapter.selected.as_deref(), Some("old"));
+        assert_eq!(adapter.reasoning.as_deref(), Some("high"));
+    }
+
+    #[test]
+    fn elicitation_answers_preserve_boolean_and_numeric_types() {
+        let mut adapter = Claude::default();
+        adapter.receive(json!({"type":"control_request","request_id":"e1","request":{"subtype":"elicitation","mode":"form","mcp_server_name":"fixture","requested_schema":{"type":"object","properties":{"enabled":{"type":"boolean"},"count":{"type":"integer"}},"required":["enabled","count"]}}})).unwrap();
+        let step = adapter
+            .answer(
+                "e1".into(),
+                "accept".into(),
+                vec![
+                    Answer {
+                        field: "enabled".into(),
+                        values: vec!["false".into()],
+                    },
+                    Answer {
+                        field: "count".into(),
+                        values: vec!["7".into()],
+                    },
+                ],
+            )
+            .unwrap();
+        assert_eq!(
+            step.writes[0]["response"]["response"],
+            json!({"action":"accept","content":{"enabled":false,"count":7}})
+        );
+    }
+
+    #[test]
+    fn history_follows_current_parent_chain_without_precompaction_or_sidechain() {
+        let id = "00000000-0000-4000-8000-000000000001";
+        let mut file = tempfile::tempfile().unwrap();
+        for value in [
+            json!({"type":"user","uuid":"old","parentUuid":null,"sessionId":id,"message":{"content":"old"}}),
+            json!({"type":"system","uuid":"compact","parentUuid":null,"logicalParentUuid":"old","sessionId":id}),
+            json!({"type":"user","uuid":"summary","parentUuid":"compact","isCompactSummary":true,"sessionId":id,"message":{"content":"summary"}}),
+            json!({"type":"assistant","uuid":"a1","parentUuid":"summary","sessionId":id,"message":{"id":"m1","content":[{"type":"thinking","thinking":"Consider"}]}}),
+            json!({"type":"assistant","uuid":"a2","parentUuid":"a1","sessionId":id,"message":{"id":"m1","content":[{"type":"text","text":"Answer"}]}}),
+            json!({"type":"assistant","uuid":"side","parentUuid":"summary","isSidechain":true,"sessionId":id,"message":{"content":"private sidechain"}}),
+        ] {
+            writeln!(file, "{value}").unwrap();
+        }
+        file.rewind().unwrap();
+        let mut history = History::index(file, id).unwrap();
+        let page = history.page().unwrap();
+        assert_eq!(
+            page.iter()
+                .map(|v| v["uuid"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            vec!["summary", "a1", "a2"]
+        );
+        assert_eq!(page[2]["_cagents_block_base"], 1);
+    }
+
+    #[test]
+    fn metadata_leaf_falls_back_to_latest_chain_and_filters_invisible_ancestors() {
+        let id = "00000000-0000-4000-8000-000000000001";
+        let mut file = tempfile::tempfile().unwrap();
+        for value in [
+            json!({"type":"user","uuid":"root","parentUuid":null,"sessionId":id,"message":{"content":"Question"}}),
+            json!({"type":"assistant","uuid":"side","parentUuid":"root","isSidechain":true,"sessionId":id,"message":{"content":"Side branch"}}),
+            json!({"type":"user","uuid":"hidden","parentUuid":"root","isMeta":true,"sessionId":id,"message":{"content":"Internal"}}),
+            json!({"type":"assistant","uuid":"answer","parentUuid":"hidden","sessionId":id,"message":{"content":"Answer"}}),
+            json!({"type":"user","uuid":"meta","parentUuid":"answer","isMeta":true,"sessionId":id,"message":{"content":"Internal tail"}}),
+            json!({"type":"progress","uuid":"progress","parentUuid":"meta","sessionId":id}),
+        ] {
+            writeln!(file, "{value}").unwrap();
+        }
+        file.rewind().unwrap();
+        let mut history = History::index(file, id).unwrap();
+        assert_eq!(
+            history
+                .page()
+                .unwrap()
+                .iter()
+                .map(|value| value["uuid"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            vec!["root", "answer"]
+        );
+    }
+
+    #[test]
+    fn launch_preserves_explicit_policy_without_replaying_or_implicitly_resuming() {
+        let id = "00000000-0000-4000-8000-000000000001";
+        let mut launch = Launch {
+            provider: Provider::Claude,
+            session_id: Some(id.into()),
+            recipe: crate::model::LaunchRecipe {
+                program: "claude".into(),
+                arguments: vec![
+                    "--model".into(),
+                    "sonnet".into(),
+                    "old prompt".into(),
+                    "--resume".into(),
+                    id.into(),
+                ],
+                working_directory: PathBuf::from("/tmp"),
+                environment: Default::default(),
+            },
+        };
+        let args = arguments(&launch).unwrap();
+        assert!(!args.contains(&"old prompt".into()));
+        assert!(args.contains(&format!("--resume={id}")));
+        for option in ["--continue", "--fork-session", "--unknown"] {
+            launch.recipe.arguments = vec![option.into()];
+            assert!(arguments(&launch).is_err());
+        }
+        launch.recipe.arguments = vec![
+            "--dangerously-skip-permissions".into(),
+            "--allow-dangerously-skip-permissions".into(),
+            "--permission-mode".into(),
+            "bypassPermissions".into(),
+        ];
+        let preserved = arguments(&launch).unwrap();
+        assert_eq!(&preserved[..4], &launch.recipe.arguments);
+    }
+
+    #[test]
+    fn upstream_reset_clears_identity_but_does_not_adopt_conversation_id() {
+        let old = "00000000-0000-4000-8000-000000000001";
+        let new = "00000000-0000-4000-8000-000000000002";
+        let mut adapter = Claude {
+            session_id: Some(old.into()),
+            ..Claude::default()
+        };
+        let step = adapter.receive(json!({"type":"conversation_reset","session_id":old,"new_conversation_id":"not-a-session-id"})).unwrap();
+        assert!(
+            step.events
+                .iter()
+                .any(|event| matches!(event, Event::Reset { .. }))
+        );
+        assert_eq!(adapter.session_id, None);
+        adapter
+            .receive(json!({"type":"system","subtype":"init","session_id":new}))
+            .unwrap();
+        assert_eq!(adapter.session_id.as_deref(), Some(new));
+    }
+
+    #[test]
+    fn supersedes_removes_correlated_items_and_ignores_replayed_retracted_carrier() {
+        let mut adapter = Claude::default();
+        let old = json!({"type":"assistant","uuid":"old-carrier","message":{"id":"old-message","content":[{"type":"text","text":"Withdrawn"}]}});
+        adapter.receive(old.clone()).unwrap();
+        let replacement = adapter.receive(json!({"type":"assistant","uuid":"new-carrier","supersedes":["old-carrier"],"message":{"id":"new-message","content":[{"type":"text","text":"Canonical"}]}})).unwrap();
+        assert!(replacement.events.iter().any(|event| matches!(event,Event::ItemsRemoved {ids} if ids == &vec!["old-message:0".to_owned()])));
+        assert!(adapter.receive(old).unwrap().events.is_empty());
+    }
+
+    #[test]
+    fn documents_exceeding_the_old_frame_limit_are_supported() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("notes.txt");
+        let text = "a".repeat(2 * 1024 * 1024);
+        std::fs::write(&path, &text).unwrap();
+        let block = attachment_block(directory.path(), &path).unwrap();
+        assert_eq!(block["type"], "document");
+        assert_eq!(block["source"]["media_type"], "text/plain");
+        assert_eq!(block["source"]["data"].as_str(), Some(text.as_str()));
+        let file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+        file.set_len(MAX_DOCUMENT + 1).unwrap();
+        assert!(attachment_block(directory.path(), &path).is_err());
+    }
+
+    #[test]
+    fn history_pages_one_large_record_without_losing_earlier_messages() {
+        let id = "00000000-0000-4000-8000-000000000001";
+        let mut file = tempfile::tempfile().unwrap();
+        for value in [
+            json!({"type":"user","uuid":"earlier","parentUuid":null,"sessionId":id,"message":{"content":"Earlier"}}),
+            json!({"type":"assistant","uuid":"large","parentUuid":"earlier","sessionId":id,"message":{"content":"x".repeat(5 * 1024 * 1024)}}),
+        ] {
+            writeln!(file, "{value}").unwrap();
+        }
+        file.rewind().unwrap();
+        let mut history = History::index(file, id).unwrap();
+        let page = history.page().unwrap();
+        assert_eq!(
+            page.iter()
+                .map(|value| value["uuid"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            vec!["large"]
+        );
+        assert_eq!(history.offset, 1);
+        assert_eq!(history.page().unwrap()[0]["uuid"], "earlier");
+        assert_eq!(history.offset, 0);
+    }
+}

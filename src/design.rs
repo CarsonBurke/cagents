@@ -1,8 +1,8 @@
 //! Shared geometry and responsive projections for the native workbench shell.
 //!
 //! Color remains owned by COSMIC's semantic theme classes. These tokens cover
-//! only dimensions and shell mounting decisions that must stay consistent
-//! across the header, navigation, inspector, dock, and task surfaces.
+//! typography, dimensions, and shell mounting decisions shared by the header,
+//! navigation, inspector, dock, and task surfaces.
 
 pub const GRID_UNIT: f32 = 4.0;
 
@@ -11,6 +11,35 @@ pub const ROW_HEIGHT: f32 = 32.0;
 pub const DENSE_ROW_HEIGHT: f32 = 28.0;
 pub const PRIMARY_CONTROL_SIZE: f32 = 32.0;
 pub const SECONDARY_CONTROL_MIN_SIZE: f32 = 28.0;
+
+pub const TEXT_BODY: f32 = 13.0;
+pub const TEXT_CAPTION: f32 = 12.0;
+pub const TEXT_HEADING: f32 = 13.0;
+
+pub fn body<'a>(
+    text: impl Into<std::borrow::Cow<'a, str>> + 'a,
+) -> cosmic::widget::text::Text<'a, cosmic::Theme, cosmic::Renderer> {
+    cosmic::widget::text::body(text)
+        .size(TEXT_BODY)
+        .line_height(cosmic::iced::widget::text::LineHeight::Absolute(
+            18.0.into(),
+        ))
+}
+
+pub fn caption<'a>(
+    text: impl Into<std::borrow::Cow<'a, str>> + 'a,
+) -> cosmic::widget::text::Text<'a, cosmic::Theme, cosmic::Renderer> {
+    cosmic::widget::text::caption(text).size(TEXT_CAPTION)
+}
+
+pub fn heading<'a>(
+    text: impl Into<std::borrow::Cow<'a, str>> + 'a,
+) -> cosmic::widget::text::Text<'a, cosmic::Theme, cosmic::Renderer> {
+    body(text).size(TEXT_HEADING).font(cosmic::font::Font {
+        weight: cosmic::iced::font::Weight::Medium,
+        ..cosmic::font::default()
+    })
+}
 
 pub const NAVIGATION_DEFAULT_WIDTH: f32 = 260.0;
 pub const NAVIGATION_MIN_WIDTH: f32 = 220.0;

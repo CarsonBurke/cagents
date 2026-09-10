@@ -201,6 +201,26 @@ pub struct CursorSnapshot {
     pub blinking: bool,
 }
 
+/// Ghostty's exact viewport position, captured only with visible snapshots.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ScrollSnapshot {
+    pub total: u64,
+    pub offset: u64,
+    pub len: u64,
+    pub alternate_screen: bool,
+    pub mouse_tracking: bool,
+}
+
+impl ScrollSnapshot {
+    pub fn max_offset(self) -> u64 {
+        self.total.saturating_sub(self.len)
+    }
+
+    pub fn scrollable(self) -> bool {
+        !self.alternate_screen && self.len > 0 && self.max_offset() > 0
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RenderSnapshot {
     pub generation: u64,
@@ -210,6 +230,7 @@ pub struct RenderSnapshot {
     pub foreground: Rgb,
     pub background: Rgb,
     pub cursor: Option<CursorSnapshot>,
+    pub scroll: ScrollSnapshot,
     pub lines: Arc<[Arc<RowSnapshot>]>,
     pub detached: bool,
 }
@@ -224,6 +245,7 @@ impl RenderSnapshot {
             foreground: Rgb::default(),
             background: Rgb::default(),
             cursor: None,
+            scroll: ScrollSnapshot::default(),
             lines: Vec::<Arc<RowSnapshot>>::new().into(),
             detached: false,
         }
@@ -271,6 +293,14 @@ impl VisualResources {
         force: bool,
         activity: Option<crate::model::TerminalOutputActivity>,
     ) -> Result<Option<Arc<RenderSnapshot>>, libghostty_vt::Error> {
+        let scrollbar = terminal.scrollbar()?;
+        let scroll = ScrollSnapshot {
+            total: scrollbar.total,
+            offset: scrollbar.offset,
+            len: scrollbar.len,
+            alternate_screen: terminal.active_screen()? == libghostty_vt::screen::Screen::Alternate,
+            mouse_tracking: terminal.is_mouse_tracking()?,
+        };
         let snapshot = self.render_state.update(terminal)?;
         let damage = snapshot.dirty()?;
         let mut should_publish = damage != Dirty::Clean
@@ -278,7 +308,7 @@ impl VisualResources {
             || self
                 .previous
                 .as_ref()
-                .is_some_and(|previous| previous.activity != activity);
+                .is_some_and(|previous| previous.activity != activity || previous.scroll != scroll);
 
         let columns = snapshot.cols()?;
         let rows = snapshot.rows()?;
@@ -395,6 +425,7 @@ impl VisualResources {
             foreground,
             background,
             cursor,
+            scroll,
             lines: Arc::from(lines),
             detached: false,
         });
@@ -431,6 +462,42 @@ fn map_cursor(value: CursorVisualStyle) -> CursorShape {
 mod tests {
     use super::*;
     use libghostty_vt::TerminalOptions;
+
+    #[test]
+    fn scroll_metadata_tracks_output_absolute_boundaries_and_alternate_screen() {
+        use libghostty_vt::terminal::ScrollViewport;
+        let mut terminal = Terminal::new(TerminalOptions {
+            cols: 8,
+            rows: 3,
+            max_scrollback: 32,
+        })
+        .unwrap();
+        let mut visual = VisualResources::new().unwrap();
+        let initial = visual.capture(&terminal, 1, true, None).unwrap().unwrap();
+        assert!(!initial.scroll.scrollable());
+        for _ in 0..10 {
+            terminal.vt_write(b"line\r\n");
+        }
+        let bottom = visual.capture(&terminal, 2, false, None).unwrap().unwrap();
+        assert!(bottom.scroll.scrollable());
+        assert_eq!(bottom.scroll.len, 3);
+        assert_eq!(bottom.scroll.offset, bottom.scroll.max_offset());
+        terminal.scroll_viewport(ScrollViewport::Row(0));
+        let top = visual.capture(&terminal, 3, false, None).unwrap().unwrap();
+        assert_eq!(top.scroll.offset, 0);
+        terminal.scroll_viewport(ScrollViewport::Row(usize::MAX));
+        let clamped = visual.capture(&terminal, 4, false, None).unwrap().unwrap();
+        assert_eq!(clamped.scroll.offset, bottom.scroll.max_offset());
+        terminal.vt_write(b"\x1b[?1049h\x1b[?1000h");
+        let alternate = visual.capture(&terminal, 5, false, None).unwrap().unwrap();
+        assert!(alternate.scroll.alternate_screen);
+        assert!(alternate.scroll.mouse_tracking);
+        assert!(!alternate.scroll.scrollable());
+        terminal.vt_write(b"\x1b[?1000l\x1b[?1049l");
+        let restored = visual.capture(&terminal, 6, false, None).unwrap().unwrap();
+        assert_eq!(restored.scroll, bottom.scroll);
+        assert!(visual.capture(&terminal, 7, false, None).unwrap().is_none());
+    }
 
     #[test]
     fn terminal_parse_produces_owned_styled_cells() {

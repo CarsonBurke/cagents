@@ -15,14 +15,18 @@ latency-harness = ["ui"]
 # implementation so the CLI and daemon do not resolve Servo.
 full = []
 host = [
+    "dep:base64",
     "dep:image",
     "dep:ksni",
     "dep:libghostty-vt",
     "dep:portable-pty",
+    "dep:rusqlite",
     "dep:tokio",
     "dep:tracing-subscriber",
+    "dep:tungstenite",
 ]
 ui = [
+    "dep:base64",
     "dep:ashpd",
     "dep:async-channel",
     "dep:async-lsp",
@@ -76,6 +80,7 @@ arc-swap = "1.7"
 async-channel = { version = "2.5", optional = true }
 ashpd = { version = "0.12.3", default-features = false, features = ["tokio", "wayland"], optional = true }
 async-lsp = { version = "0.2.4", default-features = false, features = ["omni-trait", "tracing"], optional = true }
+base64 = { version = "0.22", optional = true }
 bitflags = { version = "2.9", features = ["serde"] }
 blake3 = { version = "1.8", optional = true }
 clap = { version = "4.5", features = ["derive"] }
@@ -83,7 +88,7 @@ crossbeam-channel = "0.5"
 dpi = { version = "=0.1.2", optional = true }
 directories = "6.0"
 euclid = { version = "=0.22.11", optional = true }
-image = { version = "0.25", default-features = false, features = ["png"], optional = true }
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"], optional = true }
 iced_accessibility = { git = "https://github.com/pop-os/libcosmic.git", rev = "caec74c2559924443f12fc6faf97a5bcefe6271d", optional = true }
 keyboard-types = { version = "=0.8.3", features = ["serde"], optional = true }
 # `highlighter` backs the editor's syntax highlighting; it is not in libcosmic's
@@ -115,6 +120,7 @@ tokio-util = { version = "0.7", features = ["compat"], optional = true }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"], optional = true }
 toml = { version = "1.1.4", optional = true }
+tungstenite = { version = "=0.29.0", default-features = false, features = ["handshake"], optional = true }
 url = { version = "2.5", features = ["serde"] }
 uuid = { version = "1.18", features = ["serde", "v4"] }
 wayland-client = { version = "=0.31.15", features = ["system"], optional = true }

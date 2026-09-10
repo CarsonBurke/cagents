@@ -253,6 +253,18 @@ fn process_request(
     request: ClientRequest,
 ) -> Result<RequestOutcome, ProtocolError> {
     match request {
+        request @ (ClientRequest::ChatStart { .. }
+        | ClientRequest::ChatAttach { .. }
+        | ClientRequest::ChatDetach { .. }
+        | ClientRequest::ChatCommand { .. }
+        | ClientRequest::ChatVisibility { .. }
+        | ClientRequest::ChatRead { .. }
+        | ClientRequest::ChatClose { .. }
+        | ClientRequest::ChatList) => Ok((
+            super::chat::process(host, client_id, request)?,
+            Vec::new(),
+            false,
+        )),
         ClientRequest::Connect { .. } => Err(ProtocolError::new(
             ProtocolErrorCode::AlreadyConnected,
             "this client stream already completed its handshake",
@@ -386,6 +398,14 @@ fn process_request(
             handle.focus(focused).map_err(send_error)?;
             Ok((ServerResponse::Accepted, Vec::new(), false))
         }
+        ClientRequest::SetTheme { terminal_id, theme } => {
+            let handle = host
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .handle(client_id, terminal_id)?;
+            handle.set_theme(theme).map_err(send_error)?;
+            Ok((ServerResponse::Accepted, Vec::new(), false))
+        }
         ClientRequest::Scroll {
             terminal_id,
             scroll,
@@ -417,6 +437,16 @@ fn process_request(
                 }
                 TerminalScroll::Top => handle.scroll_to_top(),
                 TerminalScroll::Bottom => handle.scroll_to_bottom(),
+                TerminalScroll::Row(row) => {
+                    let row = usize::try_from(row).map_err(|_| {
+                        ProtocolError::new(
+                            ProtocolErrorCode::InvalidRequest,
+                            "terminal scroll row is outside supported bounds",
+                            false,
+                        )
+                    })?;
+                    handle.scroll_to_row(row)
+                }
             }
             .map_err(send_error)?;
             Ok((ServerResponse::Accepted, Vec::new(), false))
@@ -510,7 +540,8 @@ fn process_request(
             Ok((ServerResponse::Accepted, Vec::new(), false))
         }
         ClientRequest::Shutdown => {
-            host.lock()
+            let outcome = host
+                .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .shutdown(
                     ShutdownOperation::Stop {
@@ -519,7 +550,11 @@ fn process_request(
                     },
                     Instant::now(),
                 );
-            Ok((ServerResponse::ShutdownAccepted, Vec::new(), true))
+            if matches!(outcome, ShutdownOutcome::Accepted { .. }) {
+                Ok((ServerResponse::ShutdownAccepted, Vec::new(), true))
+            } else {
+                Ok((ServerResponse::ShutdownOutcome(outcome), Vec::new(), false))
+            }
         }
         ClientRequest::ShutdownV1 { version, operation } => {
             if version != SHUTDOWN_VERSION {

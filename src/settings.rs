@@ -37,9 +37,9 @@ pub enum AppTheme {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TerminalCursorStyle {
-    #[default]
     Application,
     Block,
+    #[default]
     Beam,
     Underline,
 }
@@ -104,6 +104,7 @@ pub struct KeyboardShortcuts {
     pub search_projects: Vec<String>,
     pub previous_column: Vec<String>,
     pub next_column: Vec<String>,
+    pub cycle_pane_width: Vec<String>,
 }
 
 impl Default for KeyboardShortcuts {
@@ -114,6 +115,7 @@ impl Default for KeyboardShortcuts {
             search_projects: vec!["Ctrl+F".to_owned()],
             previous_column: vec!["Alt+Q".to_owned(), "Alt+Left".to_owned()],
             next_column: vec!["Alt+W".to_owned(), "Alt+Right".to_owned()],
+            cycle_pane_width: vec!["Alt+R".to_owned()],
         }
     }
 }
@@ -123,20 +125,21 @@ pub const CHORD_SEPARATOR: &str = ", ";
 
 impl KeyboardShortcuts {
     /// Every action's chord list, in the order the dialog presents them.
-    fn actions(&self) -> [&Vec<String>; 5] {
+    fn actions(&self) -> [&Vec<String>; 6] {
         [
             &self.new_terminal,
             &self.close_focused_column,
             &self.search_projects,
             &self.previous_column,
             &self.next_column,
+            &self.cycle_pane_width,
         ]
     }
 
     fn validate(&self) -> Result<(), SettingsError> {
         let mut parsed = Vec::new();
-        for chords in self.actions() {
-            if chords.is_empty() {
+        for (index, chords) in self.actions().into_iter().enumerate() {
+            if chords.is_empty() && index != 5 {
                 // An action with no chord would be silently unreachable, and
                 // its label would advertise a gesture that does nothing.
                 return Err(SettingsError::InvalidShortcut(
@@ -277,6 +280,14 @@ const fn default_terminal_scrollback_lines() -> usize {
     10_000
 }
 
+fn default_managed_worktree_directory() -> String {
+    "worktrees/".to_owned()
+}
+
+const fn default_editor_auto_save() -> bool {
+    true
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AppSettings {
@@ -293,6 +304,8 @@ pub struct AppSettings {
     pub terminal_padding: f32,
     #[serde(default)]
     pub terminal_cursor_style: TerminalCursorStyle,
+    #[serde(default)]
+    pub terminal_theme: crate::terminal::TerminalTheme,
     pub terminal_font_size: f32,
     /// The terminal font family, or empty for the system monospace default.
     #[serde(default)]
@@ -306,6 +319,11 @@ pub struct AppSettings {
     pub link_open_destination: LinkOpenDestination,
     #[serde(default)]
     pub link_open_gesture: LinkOpenGesture,
+    /// Absolute, or resolved relative to the repository root.
+    #[serde(default = "default_managed_worktree_directory")]
+    pub managed_worktree_directory: String,
+    #[serde(default = "default_editor_auto_save")]
+    pub editor_auto_save: bool,
     /// External language servers, in declaration order. The first server whose
     /// language claims a file extension handles that file. An empty list
     /// disables LSP entirely.
@@ -317,7 +335,7 @@ pub struct AppSettings {
     /// header would read as a key inside that table.
     #[serde(default = "default_language_servers")]
     pub language_servers: Vec<LanguageServerSettings>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_keyboard_shortcuts")]
     pub keyboard_shortcuts: KeyboardShortcuts,
 }
 
@@ -332,6 +350,7 @@ impl Default for AppSettings {
             terminal_line_height: default_terminal_line_height(),
             terminal_padding: default_terminal_padding(),
             terminal_cursor_style: TerminalCursorStyle::default(),
+            terminal_theme: crate::terminal::TerminalTheme::default(),
             terminal_font_size: 14.0,
             terminal_font_family: String::new(),
             sidebar_width: design::NAVIGATION_DEFAULT_WIDTH,
@@ -340,6 +359,8 @@ impl Default for AppSettings {
             terminal_scrollback_lines: 10_000,
             link_open_destination: LinkOpenDestination::default(),
             link_open_gesture: LinkOpenGesture::default(),
+            managed_worktree_directory: default_managed_worktree_directory(),
+            editor_auto_save: default_editor_auto_save(),
             language_servers: default_language_servers(),
             keyboard_shortcuts: KeyboardShortcuts::default(),
         }
@@ -498,6 +519,35 @@ struct V2TomlSettings {
     keyboard_shortcuts: KeyboardShortcuts,
 }
 
+fn preserve_existing_width_chord(shortcuts: &mut toml::Table) {
+    if shortcuts.contains_key("cycle_pane_width") {
+        return;
+    }
+    let reserved = parse_shortcut("Alt+R").expect("built-in shortcut");
+    let occupied = shortcuts
+        .values()
+        .filter_map(toml::Value::as_array)
+        .flatten()
+        .filter_map(toml::Value::as_str)
+        .any(|chord| parse_shortcut(chord).is_ok_and(|binding| binding == reserved));
+    if occupied {
+        // A new default must not invalidate or steal an existing custom chord.
+        // Leave only this newly introduced action unbound until configured.
+        shortcuts.insert("cycle_pane_width".into(), toml::Value::Array(Vec::new()));
+    }
+}
+
+fn deserialize_keyboard_shortcuts<'de, D>(deserializer: D) -> Result<KeyboardShortcuts, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let mut shortcuts = toml::Table::deserialize(deserializer)?;
+    preserve_existing_width_chord(&mut shortcuts);
+    toml::Value::Table(shortcuts)
+        .try_into()
+        .map_err(serde::de::Error::custom)
+}
+
 fn deserialize_v2_keyboard_shortcuts<'de, D>(deserializer: D) -> Result<KeyboardShortcuts, D::Error>
 where
     D: serde::Deserializer<'de>,
@@ -508,6 +558,7 @@ where
             *binding = toml::Value::Array(vec![toml::Value::String(std::mem::take(chord))]);
         }
     }
+    preserve_existing_width_chord(&mut shortcuts);
     toml::Value::Table(shortcuts)
         .try_into()
         .map_err(serde::de::Error::custom)
@@ -672,6 +723,16 @@ impl AppSettings {
         if self.terminal_scrollback_lines > MAX_TERMINAL_SCROLLBACK_LINES {
             return Err(SettingsError::Invalid(
                 "terminal_scrollback_lines must be between 0 and 1000000",
+            ));
+        }
+        if self.managed_worktree_directory.trim().is_empty()
+            || self
+                .managed_worktree_directory
+                .chars()
+                .any(char::is_control)
+        {
+            return Err(SettingsError::Invalid(
+                "managed_worktree_directory must be a nonempty path without control characters",
             ));
         }
         self.keyboard_shortcuts.validate()?;
@@ -1052,11 +1113,13 @@ mod tests {
             terminal_line_height: 1.5,
             terminal_padding: 12.0,
             terminal_cursor_style: TerminalCursorStyle::Beam,
+            terminal_theme: crate::terminal::TerminalTheme::Light,
             terminal_font_size: 16.5,
             terminal_font_family: "Fira Code".to_owned(),
             sidebar_width: 360.0,
             inspector_width: 404.0,
             default_column_fraction: 0.55,
+            managed_worktree_directory: "../managed trees/".to_owned(),
             ..AppSettings::default()
         };
 
@@ -1065,6 +1128,35 @@ mod tests {
         assert_eq!(load(&path).unwrap(), settings);
         let decoded: AppSettings = toml::from_str(&fs::read_to_string(path).unwrap()).unwrap();
         assert_eq!(decoded, settings);
+    }
+
+    #[test]
+    fn managed_directory_remains_backward_compatible_and_rejects_unusable_paths() {
+        let defaults = AppSettings::default();
+        let mut old = toml::Value::try_from(&defaults).unwrap();
+        old.as_table_mut()
+            .unwrap()
+            .remove("managed_worktree_directory");
+        let decoded: AppSettings = old.try_into().unwrap();
+        assert_eq!(decoded.managed_worktree_directory, "worktrees/");
+        for path in ["", "  ", "trees\nelsewhere", "trees\0elsewhere"] {
+            assert!(
+                AppSettings {
+                    managed_worktree_directory: path.into(),
+                    ..defaults.clone()
+                }
+                .validate()
+                .is_err()
+            );
+        }
+        let absolute = AppSettings {
+            managed_worktree_directory: "/srv/managed trees/".into(),
+            ..defaults
+        }
+        .validate()
+        .unwrap();
+        let encoded = toml::to_string(&absolute).unwrap();
+        assert_eq!(toml::from_str::<AppSettings>(&encoded).unwrap(), absolute);
     }
 
     #[test]
@@ -1102,6 +1194,7 @@ mod tests {
                     "terminal_line_height",
                     "terminal_padding",
                     "terminal_cursor_style",
+                    "terminal_theme",
                 ]
                 .iter()
                 .any(|key| line.starts_with(key))
@@ -1203,6 +1296,9 @@ mod tests {
                         "terminal_line_height",
                         "terminal_padding",
                         "terminal_cursor_style",
+                        "terminal_theme",
+                        "managed_worktree_directory",
+                        "editor_auto_save",
                     ]
                     .iter()
                     .any(|key| line.starts_with(key))
@@ -1252,8 +1348,29 @@ next_column = ["Alt+W", "Alt+Right"]
             migrated.keyboard_shortcuts.next_column,
             ["Alt+W", "Alt+Right"]
         );
+        assert!(migrated.editor_auto_save);
+        assert_eq!(migrated.keyboard_shortcuts.cycle_pane_width, ["Alt+R"]);
         save(&path, &migrated).unwrap();
         assert_eq!(load(&path).unwrap(), migrated);
+    }
+
+    #[test]
+    fn introducing_pane_cycling_preserves_an_existing_alt_r_binding() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("settings.toml");
+        for (version, binding) in [(2, "\"Alt+R\""), (3, "[\"Alt+R\"]")] {
+            let inspector = if version == 3 {
+                "inspector_width = 380.0\n"
+            } else {
+                ""
+            };
+            fs::write(&path, format!("schema_version = {version}\nmax_hot_cards = 6\nhibernation_delay_ms = 30000\nterminal_font_size = 14.0\nsidebar_width = 280.0\ndefault_column_fraction = 0.72\n{inspector}[keyboard_shortcuts]\nnew_terminal = {binding}\n")).unwrap();
+            let migrated = load(&path).unwrap();
+            assert_eq!(migrated.keyboard_shortcuts.new_terminal, ["Alt+R"]);
+            assert!(migrated.keyboard_shortcuts.cycle_pane_width.is_empty());
+            save(&path, &migrated).unwrap();
+            assert_eq!(load(&path).unwrap(), migrated);
+        }
     }
 
     #[test]

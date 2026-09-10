@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, HashMap, VecDeque},
     path::{Path, PathBuf},
     sync::{Arc, Condvar, Mutex},
     thread,
@@ -170,6 +170,12 @@ struct TerminalIdentityReplacement {
     replacement: TerminalSession,
 }
 
+#[derive(Debug)]
+enum ConversionCheckpoint {
+    Snapshot(Arc<WorkspaceState>),
+    TerminalReplacement(TerminalIdentityReplacement),
+}
+
 fn merge_terminal_replacement(
     replacements: &mut HashMap<CardId, TerminalIdentityReplacement>,
     incoming: TerminalIdentityReplacement,
@@ -196,6 +202,8 @@ struct QueueState {
     /// change costs one `Arc` bump on this lane rather than a second deep clone
     /// of every card, title, and browser history.
     latest: Option<Arc<WorkspaceState>>,
+    conversions: VecDeque<ConversionCheckpoint>,
+    ordered_identities: bool,
     projects: HashMap<ProjectId, ProjectState>,
     worktrees: HashMap<WorktreeId, WorktreeState>,
     terminal_replacements: HashMap<CardId, TerminalIdentityReplacement>,
@@ -325,6 +333,32 @@ impl SessionRuntime {
         }
     }
 
+    /// Preserve a kind transition and all preceding metadata on the writer
+    /// lane. Unlike autosave, conversions cannot coalesce: a fast return to a
+    /// terminal still needs the exact chat identity committed before it.
+    pub fn snapshot_conversion(&self, state: Arc<WorkspaceState>) {
+        let (lock, changed) = &*self.queue;
+        if let Ok(mut queue) = lock.lock()
+            && !queue.shutdown
+        {
+            queue.ordered_identities = true;
+            for replacement in std::mem::take(&mut queue.terminal_replacements).into_values() {
+                queue
+                    .conversions
+                    .push_back(ConversionCheckpoint::TerminalReplacement(replacement));
+            }
+            if let Some(previous) = queue.latest.take() {
+                queue
+                    .conversions
+                    .push_back(ConversionCheckpoint::Snapshot(previous));
+            }
+            queue
+                .conversions
+                .push_back(ConversionCheckpoint::Snapshot(state));
+            changed.notify_one();
+        }
+    }
+
     pub fn save_project(&self, project: ProjectState) {
         let (lock, changed) = &*self.queue;
         if let Ok(mut queue) = lock.lock()
@@ -357,14 +391,23 @@ impl SessionRuntime {
         if let Ok(mut queue) = lock.lock()
             && !queue.shutdown
         {
-            merge_terminal_replacement(
-                &mut queue.terminal_replacements,
-                TerminalIdentityReplacement {
-                    card_id,
-                    expected_terminal_id,
-                    replacement,
-                },
-            );
+            let replacement = TerminalIdentityReplacement {
+                card_id,
+                expected_terminal_id,
+                replacement,
+            };
+            if queue.ordered_identities {
+                if let Some(previous) = queue.latest.take() {
+                    queue
+                        .conversions
+                        .push_back(ConversionCheckpoint::Snapshot(previous));
+                }
+                queue
+                    .conversions
+                    .push_back(ConversionCheckpoint::TerminalReplacement(replacement));
+            } else {
+                merge_terminal_replacement(&mut queue.terminal_replacements, replacement);
+            }
             changed.notify_one();
         }
     }
@@ -433,6 +476,7 @@ impl Drop for SessionRuntime {
 #[derive(Debug)]
 struct PendingWrites {
     workspace: Option<Arc<WorkspaceState>>,
+    conversions: VecDeque<ConversionCheckpoint>,
     projects: HashMap<ProjectId, ProjectState>,
     worktrees: HashMap<WorktreeId, WorktreeState>,
     terminal_replacements: HashMap<CardId, TerminalIdentityReplacement>,
@@ -528,6 +572,7 @@ impl PendingWrites {
     ) -> Self {
         Self {
             workspace: None,
+            conversions: VecDeque::new(),
             projects: HashMap::new(),
             worktrees: HashMap::new(),
             terminal_replacements: HashMap::new(),
@@ -540,6 +585,7 @@ impl PendingWrites {
 
     fn is_empty(&self) -> bool {
         self.workspace.is_none()
+            && self.conversions.is_empty()
             && self.projects.is_empty()
             && self.worktrees.is_empty()
             && self.terminal_replacements.is_empty()
@@ -568,24 +614,52 @@ impl PendingWrites {
             }
         }
 
-        // A snapshot still names the pre-replacement terminal identity until
-        // every queued replacement has landed, so it waits for them.
-        if self.terminal_replacements.is_empty()
-            && let Some(snapshot) = self.workspace.as_deref()
-        {
-            match store.save_workspace(
-                snapshot,
-                SnapshotBase {
-                    workspace: self.workspace_generation,
-                    cards: &self.card_generations,
-                },
-            ) {
-                Ok(commit) => {
-                    self.workspace_generation = commit.generation;
-                    self.card_generations = commit.card_generations;
-                    self.workspace = None;
+        // Conversion checkpoints precede later autosaves, and failed writes
+        // stay at the front so neither a retry nor shutdown can reorder them.
+        if self.terminal_replacements.is_empty() {
+            loop {
+                let snapshot = match self.conversions.front() {
+                    Some(ConversionCheckpoint::Snapshot(snapshot)) => snapshot,
+                    Some(ConversionCheckpoint::TerminalReplacement(replacement)) => {
+                        match store.replace_terminal_identity(
+                            replacement.card_id,
+                            replacement.expected_terminal_id,
+                            &replacement.replacement,
+                        ) {
+                            Ok(()) => {
+                                self.conversions.pop_front();
+                            }
+                            Err(error) => {
+                                errors.push(error);
+                                break;
+                            }
+                        }
+                        continue;
+                    }
+                    None => match self.workspace.as_ref() {
+                        Some(snapshot) => snapshot,
+                        None => break,
+                    },
+                };
+                match store.save_workspace(
+                    snapshot,
+                    SnapshotBase {
+                        workspace: self.workspace_generation,
+                        cards: &self.card_generations,
+                    },
+                ) {
+                    Ok(commit) => {
+                        self.workspace_generation = commit.generation;
+                        self.card_generations = commit.card_generations;
+                        if self.conversions.pop_front().is_none() {
+                            self.workspace = None;
+                        }
+                    }
+                    Err(error) => {
+                        errors.push(error);
+                        break;
+                    }
                 }
-                Err(error) => errors.push(error),
             }
         }
 
@@ -784,6 +858,7 @@ fn persistence_loop(
             Err(_) => return WriterExit::Unavailable,
         };
         while state.latest.is_none()
+            && state.conversions.is_empty()
             && state.projects.is_empty()
             && state.worktrees.is_empty()
             && state.terminal_replacements.is_empty()
@@ -811,9 +886,18 @@ fn persistence_loop(
         }
 
         let received_changes = state.latest.is_some()
+            || !state.conversions.is_empty()
             || !state.projects.is_empty()
             || !state.worktrees.is_empty()
             || !state.terminal_replacements.is_empty();
+        if !state.conversions.is_empty() {
+            if let Some(previous) = writes.workspace.take() {
+                writes
+                    .conversions
+                    .push_back(ConversionCheckpoint::Snapshot(previous));
+            }
+            writes.conversions.append(&mut state.conversions);
+        }
         if let Some(latest) = state.latest.take() {
             writes.workspace = Some(latest);
         }
@@ -1358,6 +1442,59 @@ mod tests {
                 .collect::<HashSet<_>>(),
             latest.cards.iter().map(|card| card.id).collect()
         );
+        reopened.shutdown();
+    }
+
+    #[test]
+    fn conversion_checkpoints_preserve_discovered_identity_before_fast_cli_return() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("chat-conversions.sqlite3");
+        let boot = BootId::new("chat-conversions");
+        let (mut runtime, _) = SessionRuntime::open(&path, boot.clone()).unwrap();
+        let mut state = workspace();
+        let CardKind::Terminal(mut terminal) = state.cards[0].kind.clone() else {
+            unreachable!()
+        };
+        terminal.launch.program = "omp".into();
+        terminal.launch.arguments.clear();
+        terminal.transcript_path = None;
+        let mut chat = crate::chat::Session {
+            id: terminal.id,
+            launch: crate::chat::Launch {
+                provider: crate::chat::Provider::Omp,
+                recipe: terminal.launch.clone(),
+                session_id: None,
+            },
+            proof: None,
+            terminal: None,
+        };
+        state.cards[0].kind = CardKind::Chat(chat.clone());
+        runtime.snapshot_conversion(Arc::new(state.clone()));
+        let exact_id = "77777777-1111-4111-8111-111111111111";
+        chat.launch.session_id = Some(exact_id.into());
+        state.cards[0].kind = CardKind::Chat(chat);
+        runtime.snapshot(Arc::new(state.clone()));
+        terminal.id = TerminalId::new();
+        terminal.launch.arguments = vec!["--resume".into(), exact_id.into()];
+        terminal.continuity = TerminalContinuity::RelaunchAvailable {
+            recipe: terminal.launch.clone(),
+            last_exit: None,
+        };
+        state.cards[0].kind = CardKind::Terminal(terminal.clone());
+        runtime.snapshot_conversion(Arc::new(state.clone()));
+        // Even an immediate CLI retry must run after the return checkpoint.
+        let previous_id = terminal.id;
+        terminal.id = TerminalId::new();
+        runtime.replace_terminal_identity(state.cards[0].id, previous_id, terminal.clone());
+        state.cards[0].kind = CardKind::Terminal(terminal.clone());
+        state.cards[0].title = "Latest terminal title".into();
+        runtime.snapshot(Arc::new(state));
+        runtime.shutdown();
+        assert_eq!(runtime.last_error(), None);
+        let (mut reopened, restored) = SessionRuntime::open(&path, boot).unwrap();
+        let restored = restored.unwrap();
+        assert_eq!(restored.cards[0].kind, CardKind::Terminal(terminal));
+        assert_eq!(restored.cards[0].title, "Latest terminal title");
         reopened.shutdown();
     }
 

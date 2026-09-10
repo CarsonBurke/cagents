@@ -31,8 +31,8 @@ pub(crate) type ClientId = u64;
 pub(crate) type SharedHost = Arc<Mutex<HostState>>;
 
 pub(crate) struct TerminalRecord {
-    session: TerminalSession,
-    handle: TerminalHandle,
+    pub(super) session: TerminalSession,
+    pub(super) handle: TerminalHandle,
     running: bool,
     completion_observed: bool,
     last_exit: Option<TerminalExit>,
@@ -167,14 +167,16 @@ impl Subscriptions {
 
 pub(crate) struct HostState {
     proof: HostSessionProof,
-    terminals: BTreeMap<TerminalId, TerminalRecord>,
+    pub(super) terminals: BTreeMap<TerminalId, TerminalRecord>,
     spawning: BTreeSet<TerminalId>,
-    clients: BTreeMap<ClientId, Arc<DeliveryQueue>>,
+    pub(super) clients: BTreeMap<ClientId, Arc<DeliveryQueue>>,
     subscriptions: Subscriptions,
-    shutting_down: bool,
+    pub(super) shutting_down: bool,
     shutdown_requested: bool,
-    inventory_generation: u64,
+    pub(super) inventory_generation: u64,
     shutdown_capabilities: VecDeque<(ShutdownCapability, Instant)>,
+    pub(super) chats: BTreeMap<TerminalId, super::chat::Record>,
+    pub(super) chat_spawning: BTreeMap<TerminalId, crate::chat::Launch>,
 }
 
 impl HostState {
@@ -189,6 +191,8 @@ impl HostState {
             shutdown_requested: false,
             inventory_generation: 0,
             shutdown_capabilities: VecDeque::new(),
+            chats: BTreeMap::new(),
+            chat_spawning: BTreeMap::new(),
         }
     }
 
@@ -203,6 +207,12 @@ impl HostState {
     }
 
     pub(crate) fn unregister_client(&mut self, client_id: ClientId) -> Vec<TerminalHandle> {
+        for record in self.chats.values_mut() {
+            record.subscribers.remove(&client_id);
+            record
+                .handle
+                .set_visible(record.subscribers.values().any(|visible| *visible));
+        }
         let terminal_ids = self
             .subscriptions
             .by_client
@@ -246,8 +256,7 @@ impl HostState {
         self.subscriptions
             .attach(client_id, terminal_id, TerminalVisibility::Hidden);
         let new_visibility = self.subscriptions.visibility(terminal_id);
-        if record.running
-            && old_visibility != new_visibility
+        if old_visibility != new_visibility
             && let Err(error) = apply_visibility(&record.handle, new_visibility)
         {
             self.subscriptions.detach(client_id, terminal_id);
@@ -277,8 +286,7 @@ impl HostState {
         let old_visibility = self.subscriptions.visibility(terminal_id);
         self.subscriptions.detach(client_id, terminal_id);
         let new_visibility = self.subscriptions.visibility(terminal_id);
-        if record.running
-            && old_visibility != new_visibility
+        if old_visibility != new_visibility
             && let Err(error) = apply_visibility(&record.handle, new_visibility)
         {
             self.subscriptions
@@ -298,13 +306,6 @@ impl HostState {
             .terminals
             .get(&terminal_id)
             .ok_or_else(|| not_found(terminal_id))?;
-        if !record.running {
-            return Err(ProtocolError::new(
-                ProtocolErrorCode::TerminalUnavailable,
-                format!("terminal {terminal_id} has exited and can only be relaunched"),
-                true,
-            ));
-        }
         let Some(old_requested) = self
             .subscriptions
             .by_client
@@ -328,6 +329,22 @@ impl HostState {
             self.subscriptions
                 .set_visibility(client_id, terminal_id, old_requested);
             return Err(send_error(error));
+        }
+        // Another subscriber may already be visible, or the worker may have
+        // completed. Neither case creates a new capture when this view returns.
+        // Offer the retained generation so the returning view can catch up.
+        if requested == TerminalVisibility::Visible
+            && let Some(delivery) = self.clients.get(&client_id)
+        {
+            let _ = delivery.push(ServerEnvelope {
+                version: PROTOCOL_VERSION,
+                request_id: None,
+                proof: self.proof.clone(),
+                message: ServerMessage::Redraw {
+                    terminal_id,
+                    generation: record.handle.generation(),
+                },
+            });
         }
         Ok(())
     }
@@ -391,6 +408,18 @@ impl HostState {
                 true,
             ));
         }
+        if self.chat_spawning.contains_key(&terminal_id)
+            || self
+                .chats
+                .get(&terminal_id)
+                .is_some_and(|record| record.handle.owns_work())
+        {
+            return Err(ProtocolError::new(
+                ProtocolErrorCode::TerminalAlreadyExists,
+                "Native chat still owns this session; explicitly close it before CLI handoff",
+                false,
+            ));
+        }
         if self.terminals.len() + self.spawning.len() >= MAX_TERMINALS {
             return Err(ProtocolError::new(
                 ProtocolErrorCode::TerminalUnavailable,
@@ -418,7 +447,7 @@ impl HostState {
     pub(crate) fn finish_spawn(
         &mut self,
         client_id: ClientId,
-        session: TerminalSession,
+        mut session: TerminalSession,
         handle: TerminalHandle,
         initially_visible: bool,
     ) -> Result<TerminalDescriptor, ProtocolError> {
@@ -431,6 +460,8 @@ impl HostState {
                 false,
             ));
         }
+        session.resume_hint =
+            crate::model::agent_recovery::observed_hint_from_launch(&session.launch);
         self.inventory_generation += 1;
         self.terminals.insert(
             terminal_id,
@@ -569,7 +600,16 @@ impl HostState {
     }
 
     fn inventory_count(&mut self) -> u64 {
-        let mut count = self.spawning.len() as u64;
+        let mut count = (self.spawning.len() + self.chat_spawning.len()) as u64;
+        for record in self.chats.values_mut() {
+            if !record.completion_observed && !record.handle.owns_work() {
+                record.completion_observed = true;
+                self.inventory_generation += 1;
+            }
+            if !record.completion_observed {
+                count += 1;
+            }
+        }
         for record in self.terminals.values_mut() {
             if !record.completion_observed && record.handle.is_completed() {
                 record.completion_observed = true;
@@ -612,6 +652,14 @@ impl HostState {
         now: Instant,
     ) -> ShutdownOutcome {
         let count = self.inventory_count();
+        if matches!(operation, ShutdownOperation::Stop { .. })
+            && (!self.chat_spawning.is_empty()
+                || self.chats.values().any(|record| record.handle.owns_work()))
+        {
+            return ShutdownOutcome::EmptyRequired {
+                current_count: count,
+            };
+        }
         let (require_empty, expected_generation) = match operation {
             ShutdownOperation::Stop {
                 require_empty,
@@ -705,6 +753,7 @@ pub(crate) fn spawn_terminal(
         cell_height_px: options.cell_height_px,
         max_scrollback: options.max_scrollback,
         initially_visible: options.initially_visible,
+        theme: options.theme,
         ..TerminalConfig::default()
     };
     let handle = match TerminalHandle::spawn(session.clone(), config, move |wake| {
@@ -742,12 +791,17 @@ pub(crate) fn spawn_terminal(
     // and later generations can now produce a fresh wake.
     redraw_handle.acknowledge_redraw(redraw_handle.generation());
     let event_host = Arc::downgrade(shared);
+    let completion_handle = redraw_handle.clone();
     let event_thread = thread::Builder::new()
         .name(format!("cagentsd-events-{terminal_id}"))
         .spawn(move || {
             while let Ok(event) = event_rx.recv() {
                 record_event(&event_host, terminal_id, event);
             }
+            // The final grid is captured after the exit event and may race a
+            // reveal queued just as the worker stops accepting commands.
+            // Notify only visible subscribers once teardown has preserved it.
+            broadcast_redraw(&event_host, terminal_id, completion_handle.generation());
         });
     if let Err(error) = event_thread {
         let _ = redraw_handle.shutdown();
@@ -775,6 +829,12 @@ fn apply_visibility(
         TerminalVisibility::Hidden => handle.hide(),
         TerminalVisibility::Hibernated => handle.hibernate(),
     }
+    .or_else(|error| match error {
+        // Visibility is presentation-only. A completed worker retains its
+        // final snapshot and must not require restarting its process to view it.
+        TerminalSendError::Closed => Ok(()),
+        error => Err(error),
+    })
 }
 
 pub(crate) fn send_error(error: TerminalSendError) -> ProtocolError {
@@ -834,14 +894,19 @@ fn broadcast_redraw(host: &Weak<Mutex<HostState>>, terminal_id: TerminalId, gene
         let state = host.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         let deliveries = state
             .subscriptions
-            .clients(terminal_id)
+            .by_terminal
+            .get(&terminal_id)
             .into_iter()
-            .filter_map(|client_id| state.clients.get(&client_id).cloned())
+            .flat_map(|clients| clients.iter())
+            .filter(|(_, visibility)| **visibility == TerminalVisibility::Visible)
+            .filter_map(|(client_id, _)| state.clients.get(client_id).cloned())
             .collect::<Vec<_>>();
         if deliveries.is_empty() {
             // Serialize visibility commands with attachment/reveal changes.
             // Otherwise this Hide could overtake a newly attached UI's Reveal.
-            if let Some(record) = state.terminals.get(&terminal_id) {
+            if state.subscriptions.visibility(terminal_id) == TerminalVisibility::Hidden
+                && let Some(record) = state.terminals.get(&terminal_id)
+            {
                 let _ = record.handle.hide();
             }
             return;
@@ -874,6 +939,9 @@ fn record_event(host: &Weak<Mutex<HostState>>, terminal_id: TerminalId, event: T
         let Some(record) = state.terminals.get_mut(&terminal_id) else {
             return;
         };
+        if let WireTerminalEvent::ResumeHintChanged { hint } = &wire_event {
+            record.session.resume_hint = hint.clone();
+        }
         record.event_sequence = record.event_sequence.saturating_add(1);
         let sequence = record.event_sequence;
         if let WireTerminalEvent::Exited { exit_code, .. } = &wire_event {
@@ -956,6 +1024,128 @@ mod tests {
             host_incarnation: HostIncarnation::new("test-incarnation"),
         })
     }
+    #[test]
+    fn disconnected_ui_reattaches_the_same_shell_without_relaunching() {
+        let directory = tempfile::tempdir().unwrap();
+        let starts = directory.path().join("starts");
+        let recipe = crate::model::LaunchRecipe {
+            program: "/bin/sh".into(),
+            arguments: vec![
+                "-c".into(),
+                "printf '%s\\n' \"$$\" >> \"$1\"; while IFS= read -r line; do printf '\\033]2;reply:%s:%s\\007' \"$$\" \"$line\"; done".into(),
+                "continuity-test".into(),
+                starts.to_str().unwrap().into(),
+            ],
+            working_directory: directory.path().into(),
+            environment: BTreeMap::new(),
+        };
+        let session = TerminalSession {
+            id: TerminalId::new(),
+            launch: recipe.clone(),
+            transcript_path: None,
+            resume_hint: None,
+            continuity: TerminalContinuity::RelaunchAvailable {
+                recipe,
+                last_exit: None,
+            },
+        };
+        let id = session.id;
+        let mut host = test_host();
+        host.register_client(1);
+        host.reserve_spawn(id).unwrap();
+        let handle =
+            TerminalHandle::spawn(session.clone(), TerminalConfig::default(), |_| {}).unwrap();
+        let events = handle.events();
+        host.finish_spawn(1, session, handle.clone(), false)
+            .unwrap();
+        let reply = |value: &str| {
+            handle.input(format!("{value}\n").into_bytes()).unwrap();
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            loop {
+                let event = events
+                    .recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()))
+                    .unwrap();
+                if let TerminalEvent::TitleChanged(title) = event
+                    && title.ends_with(&format!(":{value}"))
+                {
+                    break title;
+                }
+            }
+        };
+        let before = reply("before");
+        let proof = host
+            .descriptor(1, id)
+            .unwrap()
+            .session
+            .continuity
+            .live_proof()
+            .unwrap();
+        drop(host.unregister_client(1));
+        host.register_client(2);
+        let inventory = host.list(2);
+        assert_eq!(
+            inventory
+                .iter()
+                .map(|terminal| terminal.session.id)
+                .collect::<Vec<_>>(),
+            [id]
+        );
+        let reattached = host.attach(2, id).unwrap();
+        assert!(reattached.session.continuity.can_resume_live(&proof));
+        assert!(
+            host.reserve_spawn(id).is_err(),
+            "reopening cannot duplicate a live terminal"
+        );
+        let after = reply("after");
+        assert_eq!(
+            before.trim_end_matches(":before"),
+            after.trim_end_matches(":after")
+        );
+        let pids = fs::read_to_string(starts).unwrap();
+        assert_eq!(
+            pids.lines().count(),
+            1,
+            "the launch recipe ran exactly once"
+        );
+        assert_eq!(before, format!("reply:{}:before", pids.trim()));
+        handle.shutdown().unwrap();
+    }
+
+    #[test]
+    fn redraw_delivery_excludes_hidden_and_hibernated_subscribers() {
+        let shared = Arc::new(Mutex::new(test_host()));
+        let terminal_id = TerminalId::new();
+        let deliveries = {
+            let mut state = shared.lock().unwrap_or_else(|error| error.into_inner());
+            [
+                TerminalVisibility::Visible,
+                TerminalVisibility::Hidden,
+                TerminalVisibility::Hibernated,
+            ]
+            .into_iter()
+            .enumerate()
+            .map(|(index, visibility)| {
+                let client_id = index as u64 + 1;
+                let delivery = state.register_client(client_id);
+                state
+                    .subscriptions
+                    .attach(client_id, terminal_id, visibility);
+                delivery
+            })
+            .collect::<Vec<_>>()
+        };
+
+        broadcast_redraw(&Arc::downgrade(&shared), terminal_id, 7);
+        for delivery in &deliveries {
+            delivery.close_after_drain();
+        }
+        assert!(matches!(
+            deliveries[0].pop().unwrap().message,
+            ServerMessage::Redraw { generation: 7, .. }
+        ));
+        assert!(deliveries[1].pop().is_none());
+        assert!(deliveries[2].pop().is_none());
+    }
 
     fn empty_stop() -> ShutdownOperation {
         ShutdownOperation::Stop {
@@ -1004,6 +1194,9 @@ mod tests {
         );
         let capability = {
             let mut state = shared.lock().unwrap_or_else(|error| error.into_inner());
+            state
+                .set_visibility(1, id, TerminalVisibility::Visible)
+                .unwrap();
             let generation = handle.generation();
             assert!(state.redraw_ack_handle(1, id, generation).is_ok());
             assert_eq!(
@@ -1030,6 +1223,12 @@ mod tests {
         };
         handle.shutdown().unwrap();
         let mut state = shared.lock().unwrap_or_else(|error| error.into_inner());
+        state
+            .set_visibility(1, id, TerminalVisibility::Hidden)
+            .unwrap();
+        state
+            .set_visibility(1, id, TerminalVisibility::Visible)
+            .unwrap();
         assert_eq!(
             state.shutdown(ShutdownOperation::Confirm { capability }, Instant::now()),
             ShutdownOutcome::InventoryChanged { current_count: 0 }

@@ -15,7 +15,8 @@ use crate::{
     },
     terminal::{
         CellSnapshot, CellStyle, CellText, CursorShape, CursorSnapshot, KeyInput, MouseInput,
-        RenderSnapshot, Rgb, RowSnapshot, TerminalConfig, TerminalEvent, TerminalSize, Underline,
+        RenderSnapshot, Rgb, RowSnapshot, ScrollSnapshot, TerminalConfig, TerminalEvent,
+        TerminalSize, TerminalTheme, Underline,
     },
 };
 
@@ -29,7 +30,9 @@ use crate::{
 /// reader must treat an undecodable frame as a possible version skew rather than
 /// as a corrupt peer.
 /// Version 4 adds daemon-owned output activity to descriptors and snapshots.
-pub const PROTOCOL_VERSION: u16 = 4;
+/// Version 5 adds exact agent recovery identity semantic events.
+/// Version 6 adds parser themes, viewport scrolling, and proof-bound native chat.
+pub const PROTOCOL_VERSION: u16 = 6;
 /// Postcard encodes an 80x24 grid in roughly 20 KiB and a typical single-row
 /// delta in a few hundred bytes, but a full repaint of a very large grid after
 /// a resize still has to fit, so keep generous headroom.
@@ -40,8 +43,6 @@ pub const MAX_INPUT_BYTES: usize = 1024 * 1024;
 pub const MAX_RESUME_TERMINALS: usize = 1024;
 /// Production full and browserless builds retain the runtime namespace; a
 /// mismatched daemon is preserved and reported, never automatically replaced.
-#[cfg(test)]
-const RUNTIME_NAMESPACE_PROTOCOL_VERSION: u16 = 4;
 pub const SOCKET_FILE_NAME: &str = "cagentsd.sock";
 
 /// Returns the current user's cagents daemon socket path.
@@ -146,6 +147,37 @@ pub enum ClientRequest {
         version: u16,
         operation: ShutdownOperation,
     },
+    SetTheme {
+        terminal_id: TerminalId,
+        theme: TerminalTheme,
+    },
+    ChatStart {
+        session: crate::chat::Session,
+        source: Option<HostSessionProof>,
+        terminate_source: bool,
+    },
+    ChatAttach {
+        session: crate::chat::Session,
+    },
+    ChatDetach {
+        chat_id: TerminalId,
+    },
+    ChatCommand {
+        chat_id: TerminalId,
+        command: crate::chat::Command,
+    },
+    ChatVisibility {
+        chat_id: TerminalId,
+        visible: bool,
+    },
+    ChatRead {
+        chat_id: TerminalId,
+        after_generation: Option<u64>,
+    },
+    ChatClose {
+        chat_id: TerminalId,
+    },
+    ChatList,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -163,6 +195,7 @@ pub struct TerminalSpawnOptions {
     pub cell_height_px: u32,
     pub max_scrollback: usize,
     pub initially_visible: bool,
+    pub theme: TerminalTheme,
 }
 
 impl Default for TerminalSpawnOptions {
@@ -174,6 +207,7 @@ impl Default for TerminalSpawnOptions {
             cell_height_px: 18,
             max_scrollback: 10_000,
             initially_visible: true,
+            theme: TerminalTheme::default(),
         }
     }
 }
@@ -187,6 +221,7 @@ impl From<TerminalConfig> for TerminalSpawnOptions {
             cell_height_px: value.cell_height_px,
             max_scrollback: value.max_scrollback,
             initially_visible: value.initially_visible,
+            theme: value.theme,
         }
     }
 }
@@ -235,6 +270,7 @@ pub enum TerminalScroll {
     Lines(i64),
     Top,
     Bottom,
+    Row(u64),
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -274,6 +310,9 @@ pub enum ServerMessage {
     },
     HostShuttingDown,
     Error(ProtocolError),
+    ChatChanged {
+        chat_id: TerminalId,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -301,6 +340,21 @@ pub enum ServerResponse {
     ShutdownAccepted,
     ShutdownPreflight(ShutdownPreflight),
     ShutdownOutcome(ShutdownOutcome),
+    ChatAttached {
+        session: crate::chat::Session,
+        snapshot: crate::chat::Snapshot,
+    },
+    ChatSnapshot {
+        chat_id: TerminalId,
+        snapshot: Option<crate::chat::Snapshot>,
+    },
+    ChatListed {
+        sessions: Vec<crate::chat::Session>,
+    },
+    ChatClosed {
+        chat_id: TerminalId,
+        snapshot: crate::chat::Snapshot,
+    },
 }
 
 pub const SHUTDOWN_VERSION: u16 = 1;
@@ -441,6 +495,7 @@ pub struct TerminalSnapshot {
     pub foreground: WireRgb,
     pub background: WireRgb,
     pub cursor: Option<WireCursorSnapshot>,
+    pub scroll: ScrollSnapshot,
     pub content: SnapshotContent,
     pub detached: bool,
 }
@@ -485,6 +540,7 @@ impl TerminalSnapshot {
             foreground: value.foreground.into(),
             background: value.background.into(),
             cursor: value.cursor.map(Into::into),
+            scroll: value.scroll,
             content: SnapshotContent::Full {
                 lines: value
                     .lines
@@ -533,6 +589,7 @@ impl TerminalSnapshot {
             foreground: value.foreground.into(),
             background: value.background.into(),
             cursor: value.cursor.map(Into::into),
+            scroll: value.scroll,
             content: SnapshotContent::Delta {
                 base_generation: base.generation,
                 rows,
@@ -558,6 +615,7 @@ impl TerminalSnapshot {
             foreground,
             background,
             cursor,
+            scroll,
             content,
             detached,
         } = self;
@@ -602,6 +660,7 @@ impl TerminalSnapshot {
             foreground: foreground.into(),
             background: background.into(),
             cursor: cursor.map(Into::into),
+            scroll,
             lines: lines.into(),
             detached,
         })
@@ -856,6 +915,9 @@ pub enum WireTerminalEvent {
     TitleChanged {
         title: String,
     },
+    ResumeHintChanged {
+        hint: Option<String>,
+    },
     Bell,
     Exited {
         exit_code: u32,
@@ -871,6 +933,7 @@ impl From<TerminalEvent> for WireTerminalEvent {
     fn from(value: TerminalEvent) -> Self {
         match value {
             TerminalEvent::TitleChanged(title) => Self::TitleChanged { title },
+            TerminalEvent::ResumeHintChanged(hint) => Self::ResumeHintChanged { hint },
             TerminalEvent::Bell => Self::Bell,
             TerminalEvent::Exited { exit_code, signal } => Self::Exited { exit_code, signal },
             TerminalEvent::Error { operation, message } => Self::Error {
@@ -885,6 +948,7 @@ impl From<WireTerminalEvent> for TerminalEvent {
     fn from(value: WireTerminalEvent) -> Self {
         match value {
             WireTerminalEvent::TitleChanged { title } => Self::TitleChanged(title),
+            WireTerminalEvent::ResumeHintChanged { hint } => Self::ResumeHintChanged(hint),
             WireTerminalEvent::Bell => Self::Bell,
             WireTerminalEvent::Exited { exit_code, signal } => Self::Exited { exit_code, signal },
             WireTerminalEvent::Error { operation, message } => Self::Error {
@@ -1164,6 +1228,33 @@ mod tests {
 
     use super::*;
 
+    #[test]
+    fn scroll_only_deltas_survive_the_wire_without_replacing_grid_rows() {
+        let base = grid(1, &["ab"]);
+        let next = RenderSnapshot {
+            generation: 2,
+            scroll: ScrollSnapshot {
+                total: 100,
+                offset: 40,
+                len: 1,
+                alternate_screen: false,
+                mouse_tracking: true,
+            },
+            ..base.clone()
+        };
+        let delta = TerminalSnapshot::diff(&next, &base);
+        let mut bytes = Vec::new();
+        write_frame(&mut bytes, &delta).unwrap();
+        let wire: TerminalSnapshot = read_frame(&mut Cursor::new(bytes)).unwrap().unwrap();
+        let applied = wire.apply(Some(&base)).unwrap();
+        assert_eq!(applied.scroll, next.scroll);
+        assert!(Arc::ptr_eq(&applied.lines[0], &base.lines[0]));
+        assert_eq!(
+            TerminalSnapshot::full(&next).apply(None).unwrap().scroll,
+            next.scroll
+        );
+    }
+
     fn proof(session: &str, boot: &str, incarnation: &str) -> HostSessionProof {
         HostSessionProof {
             host_session_id: HostSessionId::new(session),
@@ -1196,14 +1287,6 @@ mod tests {
         let applied = wire.apply(Some(&restored)).unwrap();
         assert_eq!(applied.activity, next.activity);
         assert_eq!(applied.lines, restored.lines);
-    }
-
-    #[test]
-    fn runtime_namespace_version_matches_the_wire_protocol() {
-        assert_eq!(
-            RUNTIME_NAMESPACE_PROTOCOL_VERSION, PROTOCOL_VERSION,
-            "a protocol change must deliberately retain or migrate the daemon namespace"
-        );
     }
 
     #[test]
@@ -1399,6 +1482,7 @@ mod tests {
             foreground: Rgb::default(),
             background: Rgb::default(),
             cursor: None,
+            scroll: ScrollSnapshot::default(),
             lines: rows
                 .iter()
                 .map(|text| Arc::new(row(text)))

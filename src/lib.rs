@@ -4,6 +4,7 @@ pub mod app;
 pub mod browser;
 #[cfg(feature = "ui")]
 pub mod capability;
+pub mod chat;
 pub mod control;
 pub(crate) mod daemon;
 #[cfg(feature = "ui")]
@@ -12,6 +13,8 @@ pub mod design;
 pub mod diff_view;
 #[cfg(feature = "ui")]
 pub mod editor;
+#[cfg(feature = "ui")]
+pub mod file_icon;
 pub mod fs_safety;
 #[cfg(feature = "ui")]
 pub mod github;
@@ -50,6 +53,8 @@ pub mod splitter;
 pub mod terminal;
 #[cfg(feature = "host")]
 pub mod tray;
+#[cfg(feature = "ui")]
+pub mod ui_controls;
 pub use terminal::ipc as terminal_ipc;
 #[cfg(feature = "ui")]
 pub mod workspace;

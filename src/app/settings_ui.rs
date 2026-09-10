@@ -49,27 +49,7 @@ fn setting_input<'a>(
         label,
         detail,
         widget::text_input(label, value)
-            .on_input(move |value| Message::SettingsChanged { field, value })
-            .width(Length::Fill)
-            .style(settings_input_style(progress))
-            .into(),
-    )
-}
-
-// Font names and shortcut bindings must not be applied while partly typed.
-fn setting_input_on_submit<'a>(
-    label: &'static str,
-    detail: impl Into<Cow<'a, str>> + 'a,
-    value: &'a str,
-    field: SettingsField,
-    progress: f32,
-) -> Element<'a, Message> {
-    setting_field(
-        label,
-        detail,
-        widget::text_input(label, value)
             .on_input(move |value| Message::SettingsDraftChanged { field, value })
-            .on_submit(move |value| Message::SettingsChanged { field, value })
             .width(Length::Fill)
             .style(settings_input_style(progress))
             .into(),
@@ -207,8 +187,7 @@ fn settings_group<'a>(
             .spacing(4.0 * design::GRID_UNIT)
             .width(Length::Fill),
     )
-    .class(cosmic::theme::Container::Card)
-    .padding(4.0 * design::GRID_UNIT)
+    .padding([design::GRID_UNIT, 0.0])
     .width(Length::Fill)
     .into()
 }
@@ -224,6 +203,13 @@ fn settings_category_controls<'a>(
             "Control how many live columns cagents keeps active and when background work is suspended.",
             vec![
                 setting_input(
+                    "Managed worktree directory",
+                    "Absolute path, or relative to the repository root. Defaults to worktrees/. Each new worktree gets its own subdirectory.",
+                    &draft.managed_worktree_directory,
+                    SettingsField::ManagedWorktreeDirectory,
+                    progress,
+                ),
+                setting_input(
                     "Maximum hot columns",
                     "Applies immediately; extra background columns may hibernate.",
                     &draft.max_hot_cards,
@@ -236,6 +222,17 @@ fn settings_category_controls<'a>(
                     &draft.hibernation_delay_ms,
                     SettingsField::HibernationDelayMs,
                     progress,
+                ),
+                setting_field(
+                    "Editor auto-save",
+                    "Save edited files after a pause. Conflicts and save errors still require your attention.",
+                    widget::toggler(draft.editor_auto_save)
+                        .label("Save files automatically".to_owned())
+                        .on_toggle(|enabled| Message::SettingsChanged {
+                            field: SettingsField::EditorAutoSave,
+                            value: enabled.to_string(),
+                        })
+                        .into(),
                 ),
             ],
         )],
@@ -271,41 +268,17 @@ fn settings_category_controls<'a>(
             settings_group(
                 "Workspace layout",
                 "Keep navigation and context readable without giving up working space.",
-                vec![
-                    setting_stepper(
-                        "Projects pane width",
-                        "Also adjustable by dragging the pane edge.",
-                        &draft.sidebar_width,
-                        SettingsField::SidebarWidth,
-                        design::NAVIGATION_MIN_WIDTH,
-                        design::NAVIGATION_MAX_WIDTH,
-                        20.0,
-                        design::NAVIGATION_DEFAULT_WIDTH,
-                        " px",
-                    ),
-                    setting_stepper(
-                        "Context panel width",
-                        "Used when docked; the panel fits the available width when overlaid.",
-                        &draft.inspector_width,
-                        SettingsField::InspectorWidth,
-                        design::INSPECTOR_MIN_WIDTH,
-                        design::INSPECTOR_MAX_WIDTH,
-                        20.0,
-                        design::INSPECTOR_DEFAULT_WIDTH,
-                        " px",
-                    ),
-                    setting_stepper(
-                        "New column width",
-                        "Fraction of the workspace. Existing column widths are preserved.",
-                        &draft.default_column_fraction,
-                        SettingsField::DefaultColumnFraction,
-                        0.25,
-                        1.0,
-                        0.05,
-                        0.72,
-                        "×",
-                    ),
-                ],
+                vec![setting_stepper(
+                    "New column width",
+                    "Fraction of the workspace. Existing column widths are preserved.",
+                    &draft.default_column_fraction,
+                    SettingsField::DefaultColumnFraction,
+                    0.25,
+                    1.0,
+                    0.05,
+                    0.72,
+                    "×",
+                )],
             ),
         ],
         SettingsCategory::Terminal => vec![
@@ -324,9 +297,9 @@ fn settings_category_controls<'a>(
                         14.0,
                         " px",
                     ),
-                    setting_input_on_submit(
+                    setting_input(
                         "Font family",
-                        "Leave empty for system monospace. Use an installed fixed-pitch family, including a Nerd Font for Powerline glyphs. Proportional families fall back to monospace. Press Enter to apply.",
+                        "Leave empty for system monospace. Use an installed fixed-pitch family, including a Nerd Font for Powerline glyphs. Saves after you pause typing.",
                         &draft.terminal_font_family,
                         SettingsField::TerminalFontFamily,
                         progress,
@@ -365,8 +338,23 @@ fn settings_category_controls<'a>(
                         " px",
                     ),
                     settings_choice(
+                        "Color theme",
+                        "Live parser colors, independent of the interface theme. Programs retain their own truecolor and palette overrides.",
+                        SettingsField::TerminalTheme,
+                        [
+                            ("Dark", "dark", draft.terminal_theme == "dark"),
+                            ("Light", "light", draft.terminal_theme == "light"),
+                            (
+                                "Solarized dark",
+                                "solarized_dark",
+                                draft.terminal_theme == "solarized_dark",
+                            ),
+                        ],
+                        progress,
+                    ),
+                    settings_choice(
                         "Cursor shape",
-                        "Application lets the running program choose its cursor; other choices override the shape.",
+                        "Bar is the default. Application follows program cursor requests; explicit shapes override requests without forcing a hidden cursor visible.",
                         SettingsField::TerminalCursorStyle,
                         [
                             (
@@ -375,7 +363,7 @@ fn settings_category_controls<'a>(
                                 draft.terminal_cursor_style == "application",
                             ),
                             ("Block", "block", draft.terminal_cursor_style == "block"),
-                            ("Beam", "beam", draft.terminal_cursor_style == "beam"),
+                            ("Bar", "beam", draft.terminal_cursor_style == "beam"),
                             (
                                 "Underline",
                                 "underline",
@@ -389,9 +377,9 @@ fn settings_category_controls<'a>(
             settings_group(
                 "History",
                 "Keep enough output to investigate a task without retaining unlimited terminal history.",
-                vec![setting_input_on_submit(
+                vec![setting_input(
                     "Scrollback lines",
-                    "0–1,000,000 lines per newly started terminal. Press Enter to apply; existing history is preserved.",
+                    "0–1,000,000 lines per newly started terminal. Existing history is preserved.",
                     &draft.terminal_scrollback_lines,
                     SettingsField::TerminalScrollbackLines,
                     progress,
@@ -442,46 +430,48 @@ fn settings_category_controls<'a>(
         )],
         SettingsCategory::Keyboard => vec![settings_group(
             "Keyboard shortcuts",
-            "Each row takes one or more chords separated by commas, and applies when you press Enter. Use Ctrl, Alt, or Super, optionally with Shift, plus A-Z, 0-9, Left, or Right. Every chord in the table must be unique.",
+            "Each row takes one or more chords separated by commas and saves after you pause typing. Use Ctrl, Alt, or Super, optionally with Shift, plus A-Z, 0-9, Left, or Right. Every chord must be unique.",
             vec![
-                // Applied on submit, not per keystroke: a partly typed list
-                // parses on its way to the one the user means - "Alt+A" is a
-                // valid chord while "Alt+A, Alt+Left" is being typed - and
-                // adopting each prefix would rebind the action and rewrite the
-                // settings file at typing speed.
-                setting_input_on_submit(
+                setting_input(
                     "New terminal",
                     "Creates a terminal column.",
                     &draft.keyboard_shortcuts.new_terminal,
                     SettingsField::ShortcutNewTerminal,
                     progress,
                 ),
-                setting_input_on_submit(
+                setting_input(
                     "Close focused column",
                     "Closes the active workspace column.",
                     &draft.keyboard_shortcuts.close_focused_column,
                     SettingsField::ShortcutCloseFocusedColumn,
                     progress,
                 ),
-                setting_input_on_submit(
+                setting_input(
                     "Search projects",
                     "Moves keyboard focus to project search.",
                     &draft.keyboard_shortcuts.search_projects,
                     SettingsField::ShortcutSearchProjects,
                     progress,
                 ),
-                setting_input_on_submit(
+                setting_input(
                     "Previous column",
                     "Moves focus left and may repeat while held.",
                     &draft.keyboard_shortcuts.previous_column,
                     SettingsField::ShortcutPreviousColumn,
                     progress,
                 ),
-                setting_input_on_submit(
+                setting_input(
                     "Next column",
                     "Moves focus right and may repeat while held.",
                     &draft.keyboard_shortcuts.next_column,
                     SettingsField::ShortcutNextColumn,
+                    progress,
+                ),
+                setting_input(
+                    "Cycle pane width",
+                    "Cycles the active pane through 1/3, 2/3, 1/2, and full viewport width; may repeat while held.",
+                    &draft.keyboard_shortcuts.cycle_pane_width,
+                    SettingsField::ShortcutCyclePaneWidth,
                     progress,
                 ),
             ],
@@ -599,7 +589,7 @@ pub(super) fn settings_dialog<'a>(
     let body: Element<'a, Message> = if narrow {
         widget::column::with_children(vec![
             navigation,
-            widget::divider::horizontal::light().into(),
+            widget::divider::horizontal::default().into(),
             content,
         ])
         .width(Length::Fill)
@@ -608,7 +598,7 @@ pub(super) fn settings_dialog<'a>(
     } else {
         widget::row::with_children(vec![
             navigation,
-            widget::divider::vertical::light().into(),
+            widget::divider::vertical::default().into(),
             content,
         ])
         .width(Length::Fill)
@@ -619,6 +609,10 @@ pub(super) fn settings_dialog<'a>(
     let feedback: Element<'a, Message> = if let Some(feedback) = feedback {
         let (icon, message): (_, Cow<'a, str>) = match feedback {
             SettingsFeedback::Saved => ("emblem-ok-symbolic", "Saved to settings.toml".into()),
+            SettingsFeedback::Pending => (
+                "document-save-symbolic",
+                "Saving after you pause typing…".into(),
+            ),
             SettingsFeedback::Invalid(message) => {
                 ("dialog-warning-symbolic", message.as_str().into())
             }
@@ -639,12 +633,10 @@ pub(super) fn settings_dialog<'a>(
         .width(Length::Fill)
         .into()
     } else {
-        widget::text::caption(
-            "Changes save automatically. Font family and shortcuts apply on Enter.",
-        )
-        .wrapping(iced::widget::text::Wrapping::Word)
-        .width(Length::Fill)
-        .into()
+        widget::text::caption("Valid changes save automatically after you pause typing.")
+            .wrapping(iced::widget::text::Wrapping::Word)
+            .width(Length::Fill)
+            .into()
     };
     let reset: Element<'a, Message> = widget::button::custom(
         widget::row::with_children(vec![
@@ -686,12 +678,12 @@ pub(super) fn settings_dialog<'a>(
     )
     .padding([2.0 * design::GRID_UNIT, gutter])
     .width(Length::Fill);
-    let surface: Element<'a, Message> = widget::container(
+    let surface = dialog_ui::surface(
         widget::column::with_children(vec![
             header.into(),
-            widget::divider::horizontal::light().into(),
+            widget::divider::horizontal::default().into(),
             body,
-            widget::divider::horizontal::light().into(),
+            widget::divider::horizontal::default().into(),
             widget::container(footer)
                 .padding([3.0 * design::GRID_UNIT, gutter])
                 .width(Length::Fill)
@@ -699,51 +691,11 @@ pub(super) fn settings_dialog<'a>(
         ])
         .width(Length::Fill)
         .height(Length::Fill),
-    )
-    .class(cosmic::theme::Container::Dialog(false))
-    .width(Length::Fill)
-    .height(Length::Fill)
-    .max_width(900.0)
-    .max_height(760.0)
-    .into();
-
-    let progress = progress.clamp(0.0, 1.0);
-    let margin = if narrow { 3.0 } else { 6.0 } * design::GRID_UNIT;
-    let offset = 2.0 * design::GRID_UNIT * (1.0 - progress);
-    let centered: Element<'a, Message> =
-        widget::container(crate::interaction::fade(surface, progress))
-            .center(Length::Fill)
-            .padding(Padding {
-                top: margin + offset,
-                right: margin,
-                bottom: margin - offset,
-                left: margin,
-            })
-            .width(Length::Fill)
-            .height(Length::Fill)
-            .into();
-    // This is an overlay, not another themed card. It dims both light and dark
-    // workspaces, and captures pointer events outside the dialog without closing
-    // it or discarding a partially entered draft.
-    let scrim: Element<'a, Message> = iced::widget::opaque(
-        widget::container(iced::widget::Space::new())
-            .class(cosmic::theme::Container::custom(move |_| {
-                iced::widget::container::Style {
-                    background: Some(iced::Background::Color(iced::Color::from_rgba(
-                        0.0,
-                        0.0,
-                        0.0,
-                        0.48 * progress,
-                    ))),
-                    ..Default::default()
-                }
-            }))
-            .width(Length::Fill)
-            .height(Length::Fill),
-    )
-    .into();
-    iced::widget::Stack::with_children(vec![scrim, centered])
-        .width(Length::Fill)
+        900.0,
+    );
+    let surface = widget::container(surface)
         .height(Length::Fill)
-        .into()
+        .max_height(760.0);
+
+    dialog_ui::overlay(surface.into(), Some(Message::CloseInspector), progress)
 }

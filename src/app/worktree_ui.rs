@@ -14,6 +14,7 @@ fn worktree_root<'a>(
 fn card_directory(card: &CardState) -> Option<&Path> {
     match &card.kind {
         CardKind::Terminal(session) => Some(&session.launch.working_directory),
+        CardKind::Chat(session) => Some(&session.launch.recipe.working_directory),
         CardKind::Repository(view) => Some(&view.worktree),
         CardKind::Browser(_) | CardKind::PullRequests(_) => None,
     }
@@ -22,8 +23,8 @@ fn card_directory(card: &CardState) -> Option<&Path> {
 fn belongs_to_scope(card: &CardState, scope: &Path, roots: &[&Path]) -> bool {
     card.existence.is_open()
         && card_directory(card).is_none_or(|directory| {
-            // Older sessions could launch outside Git repositories. Keep those
-            // cards reachable until closed or their owning worktree is registered.
+            // Legacy directories have no sidebar scope until registered. Keep
+            // them reachable without making them owners of new worktrees.
             worktree_root(directory, roots.iter().copied()).is_none_or(|root| root == scope)
         })
 }
@@ -47,7 +48,7 @@ fn scope_descriptor(
         .or_else(|| {
             cards
                 .iter()
-                .find(|card| matches!(&card.kind, CardKind::Terminal(_)))
+                .find(|card| matches!(&card.kind, CardKind::Terminal(_) | CardKind::Chat(_)))
                 .map(|card| card.id)
         })
         .or_else(|| {
@@ -97,10 +98,35 @@ impl Cagents {
         let path = worktree_root(&path, roots.iter().copied())
             .unwrap_or(&path)
             .to_path_buf();
-        if let Some(previous) = &self.active_workspace
-            && let Some(focused) = self.workspace.focused()
+        let has_terminal = self.durable.cards.iter().any(|card| {
+            card.existence.is_open()
+                && matches!(&card.kind, CardKind::Terminal(_) | CardKind::Chat(_))
+                && card_directory(card).is_some_and(|directory| {
+                    worktree_root(directory, roots.iter().copied()).unwrap_or(directory) == path
+                })
+        });
+        if self.active_workspace.as_ref() == Some(&path)
+            && self.workspace.order().eq(self
+                .durable
+                .cards
+                .iter()
+                .filter(|card| belongs_to_scope(card, &path, &roots))
+                .map(|card| card.id))
         {
-            self.worktree_focus.insert(previous.clone(), focused);
+            return if create_if_empty && !has_terminal {
+                self.add_terminal(path)
+            } else {
+                Task::none()
+            };
+        }
+        if let Some(previous) = &self.active_workspace {
+            self.worktree_offsets
+                .insert(previous.clone(), self.workspace.camera().offset());
+            if let Some(focused) = self.workspace.focused() {
+                self.worktree_focus.insert(previous.clone(), focused);
+            } else {
+                self.worktree_focus.remove(previous);
+            }
         }
         let scoped = scope_descriptor(
             &self.durable,
@@ -108,24 +134,28 @@ impl Cagents {
             &roots,
             self.worktree_focus.get(&path).copied(),
         );
-        let has_terminal = scoped.cards.iter().any(|card| match &card.kind {
-            CardKind::Terminal(session) => {
-                let directory = session.launch.working_directory.as_path();
-                worktree_root(directory, roots.iter().copied()).unwrap_or(directory) == path
-            }
-            _ => false,
-        });
         let width = self.workspace.viewport_width();
         // Hide before replacing the strip: its former widgets no longer get a
         // chance to send native-surface visibility updates after unmounting.
         self.set_workspace_surfaces_visible(false);
         self.active_workspace = Some(path.clone());
+        self.workspace_view_generation = self.workspace_view_generation.wrapping_add(1);
+        // Iced inherits old anonymous IDs during diff. A named generation ID
+        // forces a new scroll state so operations address this worktree's strip.
+        self.workspace_scroll_id = widget::Id::new(format!(
+            "workspace-strip-{}",
+            self.workspace_view_generation
+        ));
         self.workspace = Self::rebuild_workspace(&scoped);
         self.workspace.resize_viewport(width);
-        // Rebuilding starts a fresh camera. Jump directly to its focus target
-        // instead of briefly presenting another worktree's first column.
-        let target = self.workspace.camera().target();
-        self.workspace.native_scroll(target, width);
+        // Focus selects the initial position only on the first visit. Returning
+        // to a strip restores its actual offset, even if focus is offscreen.
+        let offset = self
+            .worktree_offsets
+            .get(&path)
+            .copied()
+            .unwrap_or_else(|| self.workspace.camera().target());
+        self.workspace.native_scroll(offset, width);
         let transitions = self
             .durable
             .cards
@@ -315,6 +345,271 @@ mod tests {
                 .collect(),
             Vec::new(),
         )];
+    }
+
+    #[test]
+    fn chat_owns_nested_scope_and_prevents_duplicate_terminal_creation() {
+        let mut app = super::super::tests::context_inspector_test_app(false);
+        register_worktrees(&mut app, &["/repo", "/repo/nested", "/other"]);
+        let mut card = terminal("/repo/nested/src");
+        let CardKind::Terminal(source) = card.kind else {
+            unreachable!()
+        };
+        card.kind = CardKind::Chat(crate::chat::Session {
+            id: source.id,
+            launch: crate::chat::Launch {
+                provider: crate::chat::Provider::Omp,
+                recipe: source.launch.clone(),
+                session_id: None,
+            },
+            proof: None,
+            terminal: Some(source),
+        });
+        app.durable = Arc::new(WorkspaceState {
+            cards: vec![card.clone()],
+            ..WorkspaceState::default()
+        });
+        let _ = app.select_worktree("/repo/nested".into(), true);
+        assert_eq!(app.durable.cards.len(), 1);
+        assert_eq!(app.workspace.focused(), Some(card.id));
+        assert!(app.workspace.order().any(|id| id == card.id));
+        let _ = app.select_worktree("/repo".into(), false);
+        assert!(!app.workspace.order().any(|id| id == card.id));
+        let _ = app.select_worktree("/repo/nested".into(), true);
+        assert_eq!(app.durable.cards.len(), 1);
+        assert_eq!(app.workspace.focused(), Some(card.id));
+    }
+
+    #[test]
+    fn switched_strip_accepts_scroll_operations_after_native_tree_diff() {
+        use cosmic::iced::advanced::widget::{Operation, Tree};
+        use cosmic::iced::advanced::{Layout, layout, renderer::Headless, widget::operation};
+        use cosmic::iced::{Rectangle, Size, Vector};
+        let renderer = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(cosmic::Renderer::new(
+                cosmic::iced::Font::default(),
+                cosmic::iced::Pixels(14.0),
+                Some("tiny-skia"),
+            ))
+            .unwrap();
+        let mut app = super::super::tests::context_inspector_test_app(false);
+        register_worktrees(&mut app, &["/a", "/b"]);
+        let a = terminal("/a");
+        let b = terminal("/b");
+        app.durable = Arc::new(WorkspaceState {
+            cards: vec![a, b],
+            ..WorkspaceState::default()
+        });
+        let mut workspace = Workspace::default();
+        workspace.resize_viewport(300.0);
+        for index in 0..3 {
+            workspace
+                .add_card(
+                    WorkspaceCard::new(
+                        CardId::new(),
+                        format!("Pane {index}"),
+                        crate::workspace::CardWidth::Fixed(500.0),
+                    )
+                    .unwrap(),
+                    index,
+                    false,
+                )
+                .unwrap();
+        }
+        let shortcuts = app.settings.keyboard_shortcuts.clone();
+        let make = |id| -> Element<'_, ()> {
+            workspace_widget::view(
+                &workspace,
+                &shortcuts,
+                300.0,
+                id,
+                |_| {
+                    iced::widget::Space::new()
+                        .width(Length::Fill)
+                        .height(Length::Fill)
+                        .into()
+                },
+                workspace_widget::card_widget_id,
+                workspace_widget::Events { viewport: |_| () },
+            )
+        };
+        let _ = app.select_worktree("/a".into(), false);
+        let mut element = make(app.workspace_scroll_id.clone());
+        let mut tree = Tree::new(&element);
+        let limits = layout::Limits::new(Size::ZERO, Size::new(300.0, 100.0));
+        element
+            .as_widget_mut()
+            .layout(&mut tree, &renderer, &limits);
+        let _ = app.select_worktree("/b".into(), false);
+        cosmic::iced::advanced::widget::tree::NAMED
+            .with(|cache| *cache.borrow_mut() = tree.take_all_named());
+        element = make(app.workspace_scroll_id.clone());
+        tree.diff(&mut element);
+        let node = element
+            .as_widget_mut()
+            .layout(&mut tree, &renderer, &limits);
+        element.as_widget_mut().operate(
+            &mut tree,
+            Layout::new(&node),
+            &renderer,
+            &mut operation::scrollable::scroll_to::<()>(
+                app.workspace_scroll_id.clone(),
+                operation::scrollable::AbsoluteOffset {
+                    x: Some(240.0),
+                    y: None,
+                },
+            ),
+        );
+        #[derive(Default)]
+        struct Offset(f32);
+        impl Operation for Offset {
+            fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
+                visit(self);
+            }
+            fn scrollable(
+                &mut self,
+                _: Option<&widget::Id>,
+                _: Rectangle,
+                _: Rectangle,
+                translation: Vector,
+                _: &mut dyn operation::Scrollable,
+            ) {
+                self.0 = translation.x;
+            }
+        }
+        let mut offset = Offset::default();
+        element
+            .as_widget_mut()
+            .operate(&mut tree, Layout::new(&node), &renderer, &mut offset);
+        assert_eq!(offset.0, 240.0);
+        cosmic::iced::advanced::widget::tree::NAMED.with(|cache| cache.borrow_mut().clear());
+    }
+
+    #[test]
+    fn switching_strips_restores_exact_scroll_and_ignores_stale_native_feedback() {
+        let mut app = super::super::tests::context_inspector_test_app(false);
+        register_worktrees(&mut app, &["/a", "/b"]);
+        let a = [terminal("/a"), terminal("/a/src"), terminal("/a")];
+        let b = terminal("/b");
+        app.durable = Arc::new(WorkspaceState {
+            cards: vec![a[0].clone(), b.clone(), a[1].clone(), a[2].clone()],
+            focused: Some(a[2].id),
+            ..WorkspaceState::default()
+        });
+        app.workspace.resize_viewport(1_000.0);
+        let _ = app.restore_worktree_scope();
+        app.workspace.native_scroll(237.5, 1_000.0);
+        let a_generation = app.workspace_view_generation;
+
+        let _ = app.select_worktree("/b".into(), true);
+        let b_generation = app.workspace_view_generation;
+        assert_eq!(app.workspace.order().collect::<Vec<_>>(), vec![b.id]);
+        assert_eq!(app.workspace.camera().offset(), 0.0);
+        assert!(
+            a.iter()
+                .all(|card| app.card_state(card.id).unwrap().exposure == Exposure::Offscreen)
+        );
+        let _ = app.update(Message::Viewport {
+            generation: a_generation,
+            event: WorkspaceViewportEvent::Resized(400.0),
+        });
+        assert_eq!(app.workspace.viewport_width(), 1_000.0);
+
+        let _ = app.select_worktree("/a".into(), true);
+        assert_eq!(
+            app.workspace.order().collect::<Vec<_>>(),
+            a.iter().map(|card| card.id).collect::<Vec<_>>()
+        );
+        assert_eq!(app.workspace.focused(), Some(a[2].id));
+        assert_eq!(app.workspace.camera().offset(), 237.5);
+        for generation in [a_generation, b_generation] {
+            let _ = app.update(Message::Viewport {
+                generation,
+                event: WorkspaceViewportEvent::Scrolled(workspace_widget::ViewportSample {
+                    offset: 0.0,
+                    width: 1_000.0,
+                }),
+            });
+        }
+        assert_eq!(app.workspace.camera().offset(), 237.5);
+        let _ = app.select_worktree("/a/src".into(), true);
+        assert_eq!(app.workspace.camera().offset(), 237.5);
+        assert_eq!(app.workspace.focused(), Some(a[2].id));
+        assert_eq!(app.durable.cards.len(), 4);
+        assert!(
+            app.durable
+                .cards
+                .iter()
+                .all(|card| card.existence.is_open())
+        );
+
+        let generation = app.workspace_view_generation;
+        let _ = app.update(Message::Viewport {
+            generation,
+            event: WorkspaceViewportEvent::Scrolled(workspace_widget::ViewportSample {
+                offset: 319.0,
+                width: 1_000.0,
+            }),
+        });
+        assert_eq!(app.workspace.camera().offset(), 319.0);
+    }
+
+    #[test]
+    fn registering_legacy_directories_rescopes_the_current_strip_without_losing_position() {
+        let mut app = super::super::tests::context_inspector_test_app(false);
+        let a = [terminal("/a"), terminal("/a"), terminal("/a")];
+        let b = terminal("/b");
+        app.durable = Arc::new(WorkspaceState {
+            cards: vec![a[0].clone(), a[1].clone(), a[2].clone(), b.clone()],
+            focused: Some(a[0].id),
+            ..WorkspaceState::default()
+        });
+        app.workspace.resize_viewport(1_000.0);
+        let _ = app.restore_worktree_scope();
+        app.workspace.native_scroll(250.0, 1_000.0);
+        assert!(app.workspace.card(b.id).is_some());
+
+        register_worktrees(&mut app, &["/a", "/b"]);
+        let _ = app.select_worktree("/a".into(), false);
+        assert!(app.workspace.card(b.id).is_none());
+        assert_eq!(app.card_state(b.id).unwrap().exposure, Exposure::Offscreen);
+        assert_eq!(app.workspace.camera().offset(), 250.0);
+        assert_eq!(app.workspace.focused(), Some(a[0].id));
+    }
+
+    #[test]
+    fn file_selection_focuses_its_pane_and_only_dismisses_an_overlay_sidebar() {
+        for width in [1_600.0, design::WIDE_BREAKPOINT - 1.0] {
+            let mut app = super::super::tests::context_inspector_test_app(false);
+            register_worktrees(&mut app, &["/a", "/b"]);
+            let editor = repository("/a");
+            let shell = terminal("/a");
+            app.durable = Arc::new(WorkspaceState {
+                cards: vec![editor.clone(), shell.clone()],
+                focused: Some(shell.id),
+                ..WorkspaceState::default()
+            });
+            app.window_width = width;
+            app.context_tab = ContextTab::Changes;
+            let _ = app.restore_worktree_scope();
+            let key = app.sidebar_state.active_worktree().unwrap().clone();
+            let was_overlay = app.context_inspector_is_overlay();
+            let _ = app.route_panel_open(&key, &RepoPath::parse("src/main.rs").unwrap(), None);
+            assert_eq!(app.workspace.focused(), Some(editor.id));
+            assert_eq!(app.context_tab, ContextTab::Changes);
+            assert_eq!(app.context_inspector_open, !was_overlay);
+            assert!(!app.workspace_inputs_blocked());
+
+            let _ = app.select_worktree("/b".into(), false);
+            app.pending_panel_open = None;
+            let _ =
+                app.route_panel_open(&key, &RepoPath::parse("src/main.rs").unwrap(), Some(false));
+            assert!(app.pending_panel_open.is_none());
+            assert!(app.workspace.cards().is_empty());
+        }
     }
 
     #[test]

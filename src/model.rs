@@ -202,6 +202,7 @@ pub struct CardState {
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum CardKind {
     Terminal(TerminalSession),
+    Chat(crate::chat::Session),
     Browser(BrowserSession),
     PullRequests(PullRequestView),
     Repository(RepositoryView),
@@ -846,6 +847,9 @@ mod activity_tests {
     }
 }
 
+#[path = "agent_recovery.rs"]
+pub mod agent_recovery;
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TerminalSession {
     pub id: TerminalId,
@@ -853,6 +857,16 @@ pub struct TerminalSession {
     pub transcript_path: Option<PathBuf>,
     pub resume_hint: Option<String>,
     pub continuity: TerminalContinuity,
+}
+
+impl TerminalSession {
+    /// An exact saved agent identity, never a newest-session guess.
+    pub fn agent_resume_recipe(&self) -> Option<LaunchRecipe> {
+        self.resume_hint
+            .as_deref()
+            .and_then(agent_recovery::recipe_from_hint)
+            .or_else(|| agent_recovery::resume_recipe(&self.launch))
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

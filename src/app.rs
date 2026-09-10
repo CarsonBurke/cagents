@@ -1,8 +1,11 @@
 mod activity_ui;
+mod chat_ui;
 mod chrome_ui;
 mod daemon_stop;
+pub(crate) mod dialog_ui;
 #[cfg(feature = "latency-harness")]
 mod latency_ui;
+mod project_ui;
 #[cfg(test)]
 mod safety_tests;
 mod settings_ui;
@@ -59,11 +62,11 @@ use crate::{
         TerminalExit, TerminalId, TerminalSession, WorkspaceState, WorktreeState,
     },
     repository::{
-        BaseRevision, CancellationToken, ChangeArea, CommitOutcome, CommitRequest, CommitSummary,
+        CancellationToken, ChangeArea, CommitOutcome, CommitRequest, CommitSummary,
         CreateWorktreeRequest, DiffBasis, HistoryRequest, HistoryRevision, MutationOutcome,
         PushOutcome, PushRequest, RepoPath, RepositoryId, RepositoryInfo, RepositoryService,
-        RepositorySnapshot, StageRequest, StatusSnapshot, UnstageRequest, ValidatedBranchName,
-        WorktreeCreationOutcome, WorktreeRecord,
+        RepositorySnapshot, StageRequest, StatusSnapshot, UnstageRequest, WorktreeCreationOutcome,
+        WorktreeRecord,
     },
     repository_widget::{
         self, LspIntent, RepositoryAction, RepositoryRuntime, RepositoryRuntimeStatus,
@@ -83,10 +86,10 @@ use crate::{
         HostedTerminalHandle, TerminalConfig, TerminalEvent, TerminalSurface, TerminalWidget,
     },
     workspace::{
-        CardWidth, ViewportUpdate, VisibilityClass, VisibilityTransition, WheelDelta, Workspace,
-        WorkspaceCard, WorkspaceConfig, normalize_card_name,
+        CardWidth, ViewportUpdate, VisibilityClass, VisibilityTransition, Workspace, WorkspaceCard,
+        WorkspaceConfig, normalize_card_name,
     },
-    workspace_widget::{self, FrameClock, PanGesture, WorkspaceViewportEvent},
+    workspace_widget::{self, FrameClock, WorkspaceViewportEvent},
 };
 
 #[cfg(not(feature = "integrated-browser"))]
@@ -678,7 +681,12 @@ fn restored_terminal_failure(session: &TerminalSession) -> Option<String> {
     } else {
         "terminal exited".into()
     };
-    Some(format!("{outcome}; Retry starts a new terminal"))
+    let recovery = if session.agent_resume_recipe().is_some() {
+        "Retry resumes the saved agent session in a new terminal"
+    } else {
+        "Retry starts a new terminal; no exact agent session is available"
+    };
+    Some(format!("{outcome}; {recovery}"))
 }
 
 fn restored_runtime_residency(
@@ -698,6 +706,7 @@ fn restored_runtime_residency(
             },
         ),
         CardKind::Browser(_) => Residency::Hibernated,
+        CardKind::Chat(_) => Residency::Hibernated,
         CardKind::Repository(_) | CardKind::PullRequests(_) => durable_residency.clone(),
     }
 }
@@ -883,6 +892,12 @@ fn card_kind_labels(kind: Option<&CardKind>) -> CardLabels {
             starting: "Starting terminal…",
             unavailable: "Terminal unavailable",
         },
+        Some(CardKind::Chat(_)) => CardLabels {
+            type_label: "Chat",
+            icon: "chat-bubbles-symbolic",
+            starting: "Connecting to agent…",
+            unavailable: "Agent connection unavailable",
+        },
         Some(CardKind::Browser(_)) => CardLabels {
             type_label: "Browser",
             icon: "internet-web-browser-symbolic",
@@ -913,6 +928,7 @@ fn card_kind_labels(kind: Option<&CardKind>) -> CardLabels {
 fn card_kind_caption(kind: &CardKind) -> Cow<'_, str> {
     match kind {
         CardKind::Terminal(session) => display_path(&session.launch.working_directory),
+        CardKind::Chat(session) => display_path(&session.launch.recipe.working_directory),
         CardKind::Browser(session) => {
             Cow::Owned(SanitizedLocation::from(&session.current_url).into_inner())
         }
@@ -981,12 +997,17 @@ fn fresh_terminal_relaunch(session: &TerminalSession) -> TerminalSession {
         | TerminalContinuity::DetachedSameBoot { .. }
         | TerminalContinuity::Failed { .. } => (session.launch.clone(), None),
     };
+    let resume_recipe = session.agent_resume_recipe();
+    let resume_hint = resume_recipe
+        .as_ref()
+        .and_then(|_| session.resume_hint.clone());
+    let recipe = resume_recipe.unwrap_or(recipe);
     let id = TerminalId::new();
     TerminalSession {
         id,
         launch: recipe.clone(),
         transcript_path: terminal_transcript_path(id),
-        resume_hint: None,
+        resume_hint,
         continuity: TerminalContinuity::RelaunchAvailable { recipe, last_exit },
     }
 }
@@ -1011,6 +1032,15 @@ fn update_workspace_viewport(
             (workspace.native_scroll(sample.offset, sample.width), false)
         }
         WorkspaceViewportEvent::Resized(width) => (workspace.resize_viewport(width), true),
+        WorkspaceViewportEvent::PointerFocused(card) => {
+            let update = workspace
+                .focus(card)
+                .unwrap_or_else(|_| ViewportUpdate::unchanged());
+            // The clicked child already placed its caret/selection. Activating
+            // its pane must not move keyboard focus back to the pane title.
+            workspace.take_widget_focus_request();
+            (update, true)
+        }
     }
 }
 
@@ -1063,6 +1093,9 @@ struct WorktreeDialog {
     branch: String,
     base: String,
     destination: String,
+    advanced: bool,
+    resolving: Option<crate::model::OperationId>,
+    error: Option<String>,
 }
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PullRequestDialog {
@@ -1086,19 +1119,19 @@ enum Inspector {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum ContextTab {
     #[default]
-    Context,
+    Files,
     Changes,
-    Code,
+    Details,
 }
 
 impl ContextTab {
-    const ALL: [Self; 3] = [Self::Context, Self::Changes, Self::Code];
+    const ALL: [Self; 3] = [Self::Files, Self::Changes, Self::Details];
 
     const fn label(self) -> &'static str {
         match self {
-            Self::Context => "Context",
+            Self::Files => "Files",
             Self::Changes => "Changes",
-            Self::Code => "Code",
+            Self::Details => "Details",
         }
     }
 }
@@ -1222,6 +1255,7 @@ fn repository_action_allowed_while_modal(action: &RepositoryAction) -> bool {
             | RepositoryAction::FileLoaded { .. }
             | RepositoryAction::DiffLoaded { .. }
             | RepositoryAction::SaveFinished { .. }
+            | RepositoryAction::AutoSaveDue { .. }
     )
 }
 
@@ -1315,9 +1349,8 @@ fn user_workspace_message_blocked_while_modal(message: &Message) -> bool {
         | Message::FocusCard(_)
         | Message::ResizeCard { .. }
         | Message::ResizeCardFinished(_)
+        | Message::CyclePaneWidth
         | Message::CloseCard(_)
-        | Message::Pan(PanGesture::Begin { .. } | PanGesture::Update { .. })
-        | Message::Wheel(_)
         | Message::OpenBrowser(_)
         | Message::NewBrowser
         | Message::RetryCard(_)
@@ -1328,6 +1361,7 @@ fn user_workspace_message_blocked_while_modal(message: &Message) -> bool {
         | Message::ContextInspector(_)
         | Message::DismissStatus => true,
         Message::Repository(action) => !repository_action_allowed_while_modal(action),
+        Message::ChatUi(action) => !action.allowed_while_modal(),
         Message::Sidebar(action) => !answers_discard_confirmation(action),
         #[cfg(feature = "integrated-browser")]
         Message::BrowserBack(_)
@@ -1362,8 +1396,10 @@ fn workspace_navigation_blocked_during_save(message: &Message) -> bool {
             | Message::OpenBrowser(_)
             | Message::FocusCard(_)
             | Message::FocusAdjacent(_)
-            | Message::Wheel(_)
-            | Message::Pan(PanGesture::Begin { .. } | PanGesture::Update { .. })
+            | Message::Viewport {
+                event: WorkspaceViewportEvent::PointerFocused(_),
+                ..
+            }
             | Message::ToggleContextInspector
             | Message::Repository(RepositoryAction::NewTerminal { .. })
             | Message::Repository(RepositoryAction::MarkdownLink { .. })
@@ -1445,33 +1481,36 @@ fn repository_task(task: iced::Task<RepositoryAction>) -> Task<Message> {
     task.map(Message::Repository).map(cosmic::Action::App)
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum SettingsField {
     AppTheme,
     UiScale,
     TerminalLineHeight,
     TerminalPadding,
     TerminalCursorStyle,
-    InspectorWidth,
+    TerminalTheme,
     MaxHotCards,
     HibernationDelayMs,
     TerminalFontSize,
     TerminalFontFamily,
     TerminalScrollbackLines,
-    SidebarWidth,
+    ManagedWorktreeDirectory,
     DefaultColumnFraction,
     LinkOpenDestination,
+    EditorAutoSave,
     LinkOpenGesture,
     ShortcutNewTerminal,
     ShortcutCloseFocusedColumn,
     ShortcutSearchProjects,
     ShortcutPreviousColumn,
     ShortcutNextColumn,
+    ShortcutCyclePaneWidth,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum SettingsFeedback {
     Saved,
+    Pending,
     Invalid(String),
     Error(String),
 }
@@ -1488,6 +1527,7 @@ struct ShortcutDraft {
     search_projects: String,
     previous_column: String,
     next_column: String,
+    cycle_pane_width: String,
 }
 
 impl ShortcutDraft {
@@ -1498,6 +1538,7 @@ impl ShortcutDraft {
             search_projects: settings::format_chords(&shortcuts.search_projects),
             previous_column: settings::format_chords(&shortcuts.previous_column),
             next_column: settings::format_chords(&shortcuts.next_column),
+            cycle_pane_width: settings::format_chords(&shortcuts.cycle_pane_width),
         }
     }
 }
@@ -1509,14 +1550,15 @@ struct SettingsDraft {
     terminal_line_height: String,
     terminal_padding: String,
     terminal_cursor_style: String,
-    inspector_width: String,
+    terminal_theme: String,
     max_hot_cards: String,
     hibernation_delay_ms: String,
     terminal_font_size: String,
     terminal_font_family: String,
     terminal_scrollback_lines: String,
-    sidebar_width: String,
+    managed_worktree_directory: String,
     default_column_fraction: String,
+    editor_auto_save: bool,
     link_open_destination: LinkOpenDestination,
     link_open_gesture: LinkOpenGesture,
     keyboard_shortcuts: ShortcutDraft,
@@ -1541,14 +1583,20 @@ impl SettingsDraft {
                 TerminalCursorStyle::Underline => "underline",
             }
             .into(),
-            inspector_width: settings.inspector_width.to_string(),
+            terminal_theme: match settings.terminal_theme {
+                crate::terminal::TerminalTheme::Dark => "dark",
+                crate::terminal::TerminalTheme::Light => "light",
+                crate::terminal::TerminalTheme::SolarizedDark => "solarized_dark",
+            }
+            .into(),
             max_hot_cards: settings.max_hot_cards.to_string(),
             hibernation_delay_ms: settings.hibernation_delay_ms.to_string(),
             terminal_font_size: settings.terminal_font_size.to_string(),
             terminal_font_family: settings.terminal_font_family.clone(),
             terminal_scrollback_lines: settings.terminal_scrollback_lines.to_string(),
-            sidebar_width: settings.sidebar_width.to_string(),
+            managed_worktree_directory: settings.managed_worktree_directory.clone(),
             default_column_fraction: settings.default_column_fraction.to_string(),
+            editor_auto_save: settings.editor_auto_save,
             link_open_destination: settings.link_open_destination,
             link_open_gesture: settings.link_open_gesture,
             keyboard_shortcuts: ShortcutDraft::from_shortcuts(&settings.keyboard_shortcuts),
@@ -1562,14 +1610,15 @@ impl SettingsDraft {
             SettingsField::TerminalLineHeight => self.terminal_line_height = value,
             SettingsField::TerminalPadding => self.terminal_padding = value,
             SettingsField::TerminalCursorStyle => self.terminal_cursor_style = value,
-            SettingsField::InspectorWidth => self.inspector_width = value,
+            SettingsField::TerminalTheme => self.terminal_theme = value,
             SettingsField::MaxHotCards => self.max_hot_cards = value,
             SettingsField::HibernationDelayMs => self.hibernation_delay_ms = value,
             SettingsField::TerminalFontSize => self.terminal_font_size = value,
             SettingsField::TerminalFontFamily => self.terminal_font_family = value,
             SettingsField::TerminalScrollbackLines => self.terminal_scrollback_lines = value,
-            SettingsField::SidebarWidth => self.sidebar_width = value,
+            SettingsField::ManagedWorktreeDirectory => self.managed_worktree_directory = value,
             SettingsField::DefaultColumnFraction => self.default_column_fraction = value,
+            SettingsField::EditorAutoSave => self.editor_auto_save = value == "true",
             SettingsField::LinkOpenDestination => {
                 self.link_open_destination = if value == LinkOpenDestination::SystemDefault.as_str()
                 {
@@ -1596,6 +1645,9 @@ impl SettingsDraft {
                 self.keyboard_shortcuts.previous_column = value;
             }
             SettingsField::ShortcutNextColumn => self.keyboard_shortcuts.next_column = value,
+            SettingsField::ShortcutCyclePaneWidth => {
+                self.keyboard_shortcuts.cycle_pane_width = value;
+            }
         }
     }
 }
@@ -1607,19 +1659,6 @@ enum SettingsDecision {
     Persist(AppSettings),
 }
 
-/// The accepted sidebar widths, worded for a person.
-///
-/// The bounds belong to the pane that renders at them, so the validation error
-/// and the settings dialog's help text both derive from its constants rather
-/// than restating numbers that would silently drift.
-fn sidebar_width_range() -> String {
-    format!(
-        "between {} and {} pixels",
-        sidebar::EXPANDED_WIDTH_MIN,
-        sidebar::EXPANDED_WIDTH_MAX
-    )
-}
-
 fn settings_update(
     current: &AppSettings,
     field: SettingsField,
@@ -1628,6 +1667,10 @@ fn settings_update(
     let value = raw_value.trim();
     let mut next = current.clone();
     let parsed = match field {
+        SettingsField::EditorAutoSave => value
+            .parse::<bool>()
+            .map(|enabled| next.editor_auto_save = enabled)
+            .map_err(|_| "Choose whether editor auto-save is enabled.".to_owned()),
         SettingsField::AppTheme => match value {
             "system" => {
                 next.app_theme = AppTheme::System;
@@ -1662,6 +1705,21 @@ fn settings_update(
             }
             _ => Err("Choose an application, block, beam, or underline cursor.".into()),
         },
+        SettingsField::TerminalTheme => match value {
+            "dark" => {
+                next.terminal_theme = crate::terminal::TerminalTheme::Dark;
+                Ok(())
+            }
+            "light" => {
+                next.terminal_theme = crate::terminal::TerminalTheme::Light;
+                Ok(())
+            }
+            "solarized_dark" => {
+                next.terminal_theme = crate::terminal::TerminalTheme::SolarizedDark;
+                Ok(())
+            }
+            _ => Err("Choose Dark, Light, or Solarized Dark.".into()),
+        },
         SettingsField::UiScale => value
             .parse::<f32>()
             .map(|value| next.ui_scale = value)
@@ -1674,10 +1732,6 @@ fn settings_update(
             .parse::<f32>()
             .map(|value| next.terminal_padding = value)
             .map_err(|_| "Terminal padding must be a number.".to_owned()),
-        SettingsField::InspectorWidth => value
-            .parse::<f32>()
-            .map(|value| next.inspector_width = value)
-            .map_err(|_| "Context panel width must be a number.".to_owned()),
         SettingsField::MaxHotCards => value
             .parse::<usize>()
             .map(|value| next.max_hot_cards = value)
@@ -1698,18 +1752,10 @@ fn settings_update(
             .parse::<usize>()
             .map(|value| next.terminal_scrollback_lines = value)
             .map_err(|_| "Terminal scrollback must be a whole number.".to_owned()),
-        SettingsField::SidebarWidth => value
-            .parse::<f32>()
-            .map_err(|_| ())
-            .and_then(|value| {
-                if (sidebar::EXPANDED_WIDTH_MIN..=sidebar::EXPANDED_WIDTH_MAX).contains(&value) {
-                    Ok(value)
-                } else {
-                    Err(())
-                }
-            })
-            .map(|value| next.sidebar_width = value)
-            .map_err(|_| format!("Sidebar width must be {}.", sidebar_width_range())),
+        SettingsField::ManagedWorktreeDirectory => {
+            next.managed_worktree_directory = value.to_owned();
+            Ok(())
+        }
         SettingsField::DefaultColumnFraction => value
             .parse::<f32>()
             .map(|value| next.default_column_fraction = value)
@@ -1754,6 +1800,10 @@ fn settings_update(
         }
         SettingsField::ShortcutNextColumn => {
             next.keyboard_shortcuts.next_column = settings::parse_chords(value);
+            Ok(())
+        }
+        SettingsField::ShortcutCyclePaneWidth => {
+            next.keyboard_shortcuts.cycle_pane_width = settings::parse_chords(value);
             Ok(())
         }
     };
@@ -1831,6 +1881,7 @@ pub enum Message {
         width: f32,
     },
     ResizeCardFinished(CardId),
+    CyclePaneWidth,
     CloseCard(CardId),
     WindowCloseRequested(window::Id),
     CommitClose(CardId),
@@ -1846,8 +1897,10 @@ pub enum Message {
     OverwriteAndCloseRepository(CardId),
     DiscardAndCloseRepository(CardId),
     CancelRepositoryClose,
-    Viewport(WorkspaceViewportEvent),
-    Pan(PanGesture),
+    Viewport {
+        generation: u64,
+        event: WorkspaceViewportEvent,
+    },
     #[cfg(feature = "latency-harness")]
     LatencyRedraw {
         generation: crate::performance::Generation,
@@ -1855,7 +1908,6 @@ pub enum Message {
     },
     #[cfg(feature = "latency-harness")]
     LatencyFixtureStep,
-    Wheel(WheelDelta),
     Frame(Instant),
     TerminalActivityExpired {
         card: CardId,
@@ -1918,6 +1970,12 @@ pub enum Message {
     WorktreeBranchChanged(String),
     WorktreeBaseChanged(String),
     WorktreeDestinationChanged(String),
+    ToggleWorktreeAdvanced,
+    WorktreeInputResolved {
+        project_id: ProjectId,
+        operation_id: crate::model::OperationId,
+        result: Result<CreateWorktreeRequest, String>,
+    },
     SubmitWorktree,
     WorktreeProgress(crate::repository::WorktreeProgressEvent),
     WorktreeElapsed,
@@ -1957,11 +2015,17 @@ pub enum Message {
         field: SettingsField,
         value: String,
     },
-    /// Records typing without adopting it; see [`setting_input_on_submit`].
+    /// Retains the typed draft until its per-field debounce expires.
     SettingsDraftChanged {
         field: SettingsField,
         value: String,
     },
+    SettingsAutosave {
+        field: SettingsField,
+        generation: u64,
+    },
+    ProjectUi(project_ui::Action),
+    ChatUi(chat_ui::Action),
     ResetSettings,
     SessionSaveHealthChanged(SessionSaveHealthEvent),
     Lsp(LspEvent),
@@ -2108,6 +2172,7 @@ enum CardRuntime {
     Loading,
     Failed(String),
     Terminal(TerminalSurface),
+    Chat(Box<chat_ui::Runtime>),
     #[cfg(feature = "integrated-browser")]
     Browser(BrowserRuntime),
     Repository(Box<RepositoryRuntime>),
@@ -2334,9 +2399,14 @@ pub struct Cagents {
     settings_path: Option<PathBuf>,
     settings_write_blocked: bool,
     sidebar_model: SidebarModel,
+    project_ui: project_ui::State,
+    chat_ui: chat_ui::State,
     sidebar_state: SidebarState,
     active_workspace: Option<PathBuf>,
     worktree_focus: HashMap<PathBuf, CardId>,
+    worktree_offsets: HashMap<PathBuf, f32>,
+    workspace_view_generation: u64,
+    workspace_scroll_id: widget::Id,
     github_availability: HashMap<ProjectId, GitHubAvailability>,
     repository_generations: HashMap<ProjectId, u64>,
     worktree_dialog: Option<WorktreeDialog>,
@@ -2383,6 +2453,10 @@ pub struct Cagents {
     keyboard_modifiers: keyboard::Modifiers,
     settings_draft: SettingsDraft,
     settings_feedback: Option<SettingsFeedback>,
+    settings_pending: HashMap<SettingsField, (u64, String)>,
+    settings_generation: u64,
+    settings_invalid: HashMap<SettingsField, String>,
+    settings_save_error: Option<String>,
     status: Option<TransientNotice>,
 }
 
@@ -2660,6 +2734,9 @@ impl Cagents {
                         self.cards.insert(card.id, CardRuntime::Loading);
                     }
                 }
+                CardKind::Chat(session) => {
+                    repository_tasks.push(self.start_chat(card.id, session, false, None, false));
+                }
                 #[cfg(feature = "integrated-browser")]
                 CardKind::Browser(_) => {
                     if let Some(state) = self.card_state_mut(card.id) {
@@ -2683,6 +2760,7 @@ impl Cagents {
                 }
                 CardKind::Repository(view) => {
                     let mut runtime = RepositoryRuntime::new(view);
+                    runtime.set_auto_save(self.settings.editor_auto_save);
                     repository_tasks.push(repository_task(runtime.initial_load(card.id)));
                     self.cards
                         .insert(card.id, CardRuntime::Repository(Box::new(runtime)));
@@ -2710,12 +2788,14 @@ impl Cagents {
         visible: bool,
     ) -> Task<Message> {
         let max_scrollback = self.settings.terminal_scrollback_lines;
+        let theme = self.settings.terminal_theme;
         let sender = self.terminal_wake_tx.clone();
         cosmic::task::future(async move {
             let result = tokio::task::spawn_blocking(move || {
                 let config = TerminalConfig {
                     initially_visible: visible,
                     max_scrollback,
+                    theme,
                     ..TerminalConfig::default()
                 };
                 let mode = terminal_start_mode(&session)?;
@@ -2741,6 +2821,9 @@ impl Cagents {
                 }
                 .map_err(|error| error.to_string())?;
                 let surface = TerminalSurface::from(handle);
+                surface
+                    .set_theme(theme)
+                    .map_err(|error| error.to_string())?;
                 if !visible {
                     surface.hide().map_err(|error| error.to_string())?;
                 }
@@ -2754,6 +2837,9 @@ impl Cagents {
     }
 
     fn add_terminal(&mut self, working_directory: PathBuf) -> Task<Message> {
+        if self.project_ui.deleting() {
+            return Task::none();
+        }
         let launch = match LaunchRecipe::shell(working_directory.clone()) {
             Ok(launch) => launch,
             Err(error) => {
@@ -2862,6 +2948,7 @@ impl Cagents {
         durable.cards.push(card);
         durable.focused = Some(card_id);
         let mut runtime = RepositoryRuntime::new(view);
+        runtime.set_auto_save(self.settings.editor_auto_save);
         let load = repository_task(runtime.initial_load(card_id));
         self.cards
             .insert(card_id, CardRuntime::Repository(Box::new(runtime)));
@@ -3018,6 +3105,64 @@ impl Cagents {
         if let Some(session) = &self.session {
             session.snapshot(Arc::clone(&self.durable));
         }
+    }
+    fn commit_chat_session(&mut self, card: CardId, session: crate::chat::Session) {
+        let unchanged = self.card_state(card).is_some_and(
+            |state| matches!(&state.kind, CardKind::Chat(current) if current == &session),
+        );
+        if unchanged {
+            return;
+        }
+        let conversion = self
+            .card_state(card)
+            .is_some_and(|state| !matches!(state.kind, CardKind::Chat(_)));
+        self.lifecycle.remove(card);
+        if let Some(state) = self.card_state_mut(card) {
+            state.kind = CardKind::Chat(session);
+            state.residency = Residency::Hot;
+        }
+        self.card_chrome.remove(&card);
+        if conversion {
+            if let Some(writer) = &self.session {
+                writer.snapshot_conversion(Arc::clone(&self.durable));
+            }
+        } else {
+            self.persist();
+        }
+    }
+
+    fn finish_chat_terminal_handoff(
+        &mut self,
+        card: CardId,
+        session: TerminalSession,
+    ) -> Task<Message> {
+        let Some(state) = self
+            .card_state(card)
+            .filter(|state| state.existence.is_open())
+            .cloned()
+        else {
+            return Task::none();
+        };
+        let residency = Residency::Hydrating {
+            epoch: unix_millis().max(1) as u64,
+        };
+        self.lifecycle
+            .register(card, state.exposure, residency.clone(), Instant::now());
+        if let Some(state) = self.card_state_mut(card) {
+            state.kind = CardKind::Terminal(session.clone());
+            state.residency = residency;
+        }
+        self.closed_terminal_cards.remove(&card);
+        self.cards.insert(card, CardRuntime::Loading);
+        self.card_chrome.remove(&card);
+        if let Some(writer) = &self.session {
+            writer.snapshot_conversion(Arc::clone(&self.durable));
+        }
+        self.start_terminal(
+            card,
+            session,
+            state.exposure == Exposure::Visible && self.workspace_surfaces_visible(),
+        )
     }
 
     fn card_state(&self, id: CardId) -> Option<&CardState> {
@@ -3188,6 +3333,7 @@ impl Cagents {
                 CardRuntime::Loading
                 | CardRuntime::Failed(_)
                 | CardRuntime::Repository(_)
+                | CardRuntime::Chat(_)
                 | CardRuntime::PullRequests(_),
             )
             | None => {}
@@ -3277,6 +3423,7 @@ impl Cagents {
             }
             CardKind::Repository(view) => {
                 let mut runtime = RepositoryRuntime::new(view);
+                runtime.set_auto_save(self.settings.editor_auto_save);
                 let task = repository_task(runtime.initial_load(card));
                 self.cards
                     .insert(card, CardRuntime::Repository(Box::new(runtime)));
@@ -3287,6 +3434,7 @@ impl Cagents {
                     .insert(card, CardRuntime::PullRequests(view.repository));
                 Task::none()
             }
+            CardKind::Chat(session) => self.start_chat(card, session, false, None, false),
         }
     }
 
@@ -3349,7 +3497,7 @@ impl Cagents {
     fn synchronize_workspace_scroll(&mut self) -> Task<Message> {
         let offset = self.workspace.camera().offset();
         self.workspace.record_programmatic_scroll(offset);
-        workspace_widget::scroll_to(workspace_widget::workspace_scroll_id(), offset)
+        workspace_widget::scroll_to(self.workspace_scroll_id.clone(), offset)
             .map(cosmic::Action::App)
     }
 
@@ -3387,6 +3535,10 @@ impl Cagents {
                     } else {
                         let _ = handle.hide();
                     }
+                }
+                Some(CardRuntime::Chat(runtime)) => {
+                    let _ = runtime
+                        .set_visible(transition.to == VisibilityClass::Visible && surfaces_visible);
                 }
                 #[cfg(feature = "integrated-browser")]
                 Some(CardRuntime::Browser(browser)) => {
@@ -3483,6 +3635,9 @@ impl Cagents {
     }
 
     fn lifecycle_sweep(&mut self) -> Task<Message> {
+        if self.project_ui.deleting() {
+            return Task::none();
+        }
         let mut visible = HashSet::new();
         let mut prefetch = HashSet::new();
         for (id, visibility) in self.workspace.mounted_visibility() {
@@ -3675,6 +3830,9 @@ impl Cagents {
     }
 
     fn drain_terminal(&mut self, card: CardId, _generation: u64) {
+        if self.chat_start_pending(card) {
+            return;
+        }
         let (proof, collected) = {
             let Some(CardRuntime::Terminal(handle)) = self.cards.get(&card) else {
                 return;
@@ -3706,6 +3864,15 @@ impl Cagents {
             match event {
                 TerminalEvent::TitleChanged(title) => {
                     durable_changed |= self.apply_reported_title(card, title);
+                }
+                TerminalEvent::ResumeHintChanged(hint) => {
+                    if let Some(state) = self.card_state_mut(card)
+                        && let CardKind::Terminal(session) = &mut state.kind
+                        && session.resume_hint != hint
+                    {
+                        session.resume_hint = hint;
+                        durable_changed = true;
+                    }
                 }
                 TerminalEvent::Bell => {}
                 TerminalEvent::Exited { exit_code, signal } => {
@@ -4014,8 +4181,10 @@ impl Cagents {
                 Some(CardRuntime::Loading) | None => true,
                 _ => false,
             };
-            let mut rows: Vec<Element<'a, Message>> =
-                vec![widget::divider::horizontal::light().into(), toolbar.into()];
+            let mut rows: Vec<Element<'a, Message>> = vec![
+                widget::divider::horizontal::default().into(),
+                toolbar.into(),
+            ];
             if browser_loading {
                 rows.push(
                     widget::container(iced::widget::Space::new())
@@ -4066,7 +4235,7 @@ impl Cagents {
             .padding([0, spacing.space_xxs])
             .class(cosmic::theme::Container::Background);
             widget::column::with_children(vec![
-                widget::divider::horizontal::light().into(),
+                widget::divider::horizontal::default().into(),
                 toolbar.into(),
             ])
             .spacing(0)
@@ -4080,6 +4249,7 @@ impl Cagents {
             "Retry"
         };
         let content: Element<'a, Message> = match self.cards.get(&id) {
+            Some(CardRuntime::Chat(_)) => self.chat_view(id),
             Some(CardRuntime::Terminal(handle)) => TerminalWidget::new(handle.clone())
                 .font_size(self.settings.terminal_font_size)
                 .font_family(&self.settings.terminal_font_family)
@@ -4216,8 +4386,6 @@ impl Cagents {
         let mut rows: Vec<Element<'a, Message>> = vec![header.into()];
         if let Some(toolbar) = browser_toolbar {
             rows.push(toolbar);
-        } else {
-            rows.push(widget::divider::horizontal::default().into());
         }
         rows.push(content);
         let surface: Element<'a, Message> = widget::container(
@@ -4229,45 +4397,47 @@ impl Cagents {
         .width(Length::Fill)
         .height(Length::Fill)
         .into();
-        let edge: Element<'a, Message> =
-            if card.is_some_and(|state| matches!(&state.kind, CardKind::Terminal(_))) {
-                let limits = self.workspace.fractional_width_limits();
-                let width = self
-                    .workspace
-                    .geometry()
-                    .card(id)
-                    .map_or(limits.minimum, |card| card.width());
-                let maximum = limits.maximum;
-                let minimum = limits.minimum;
-                Splitter::new(
-                    chrome.map_or_else(
-                        || card_control_id(id, "resize"),
-                        |chrome| chrome.resize_id.clone(),
-                    ),
-                    chrome.map_or_else(
-                        || card.map_or("Resize terminal column", |state| state.title.as_str()),
-                        |chrome| chrome.resize_name.as_str(),
-                    ),
-                    width,
-                    minimum,
-                    maximum,
-                    SplitterEdge::Trailing,
-                    self.modal_is_open(),
-                    move |width| Message::ResizeCard { card: id, width },
-                    move || Message::ResizeCardFinished(id),
-                )
-                .into()
-            } else {
-                widget::container(widget::divider::vertical::default())
-                    .center_x(Length::Fixed(crate::splitter::WIDTH))
-                    .height(Length::Fill)
-                    .into()
-            };
-        widget::row::with_children(vec![surface, edge])
-            .spacing(0)
-            .width(Length::Fill)
-            .height(Length::Fill)
+        let edge: Element<'a, Message> = if card.is_some() {
+            let limits = self.workspace.fractional_width_limits();
+            let width = self
+                .workspace
+                .geometry()
+                .card(id)
+                .map_or(limits.minimum, |card| card.width());
+            let maximum = limits.maximum;
+            let minimum = limits.minimum;
+            Splitter::new(
+                chrome.map_or_else(
+                    || card_control_id(id, "resize"),
+                    |chrome| chrome.resize_id.clone(),
+                ),
+                chrome.map_or_else(
+                    || card.map_or("Resize terminal column", |state| state.title.as_str()),
+                    |chrome| chrome.resize_name.as_str(),
+                ),
+                width,
+                minimum,
+                maximum,
+                SplitterEdge::Trailing,
+                self.modal_is_open(),
+                move |width| Message::ResizeCard { card: id, width },
+                move || Message::ResizeCardFinished(id),
+            )
             .into()
+        } else {
+            widget::container(widget::divider::vertical::default())
+                .center_x(Length::Fixed(crate::splitter::WIDTH))
+                .height(Length::Fill)
+                .into()
+        };
+        crate::interaction::layer(
+            surface,
+            widget::container(edge)
+                .align_x(Alignment::End)
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .into(),
+        )
     }
 
     fn synchronize_sidebar_selection(&mut self) {
@@ -4302,6 +4472,17 @@ impl Cagents {
                     .worktrees
                     .iter()
                     .find(|worktree| worktree.path == session.launch.working_directory)
+                    .map(|worktree| SidebarAction::OpenWorktree {
+                        project_id: project.id,
+                        worktree_id: worktree.id,
+                        path: worktree.path.clone(),
+                    })
+            }),
+            CardKind::Chat(session) => self.sidebar_model.projects.iter().find_map(|project| {
+                project
+                    .worktrees
+                    .iter()
+                    .find(|worktree| worktree.path == session.launch.recipe.working_directory)
                     .map(|worktree| SidebarAction::OpenWorktree {
                         project_id: project.id,
                         worktree_id: worktree.id,
@@ -4361,6 +4542,9 @@ impl Cagents {
             },
             CardKind::Terminal(session) => SidebarFocus::Terminal {
                 working_directory: session.launch.working_directory.clone(),
+            },
+            CardKind::Chat(session) => SidebarFocus::Terminal {
+                working_directory: session.launch.recipe.working_directory.clone(),
             },
             CardKind::Browser(_) | CardKind::PullRequests(_) => SidebarFocus::None,
         }
@@ -4430,16 +4614,36 @@ impl Cagents {
         path: &RepoPath,
         diff_staged: Option<bool>,
     ) -> Task<Message> {
+        if self.sidebar_state.active_worktree() != Some(key) {
+            return Task::none();
+        }
         self.show_workspace_for_action();
+        // A narrow inspector overlays the strip. Selecting a file dismisses
+        // only that overlay so the editor is visible; docked browsing stays put.
+        let overlay = if self.context_inspector_is_overlay() {
+            self.set_context_inspector_open(false)
+        } else {
+            Task::none()
+        };
         let path = path.as_path().to_path_buf();
-        match self.repository_card_for(&key.canonical_path) {
+        let task = match self.repository_card_for(&key.canonical_path) {
             Some(card) => {
                 self.pending_panel_open = Some(PendingPanelOpen {
                     card,
                     path,
                     diff_staged,
                 });
-                cosmic::task::message(Message::Repository(RepositoryAction::RefreshFiles { card }))
+                let focus = self
+                    .workspace
+                    .focus(card)
+                    .map(|update| self.apply_viewport(update, true, false))
+                    .unwrap_or_else(|_| Task::none());
+                Task::batch([
+                    focus,
+                    cosmic::task::message(Message::Repository(RepositoryAction::RefreshFiles {
+                        card,
+                    })),
+                ])
             }
             None => {
                 // `add_repository_card` runs the card's own initial load, so
@@ -4459,7 +4663,8 @@ impl Cagents {
                 }
                 task
             }
-        }
+        };
+        overlay.chain(task)
     }
 
     /// Performs a parked navigation now that `card` has listed its files.
@@ -4475,14 +4680,17 @@ impl Cagents {
     /// `Open` that is never drained leaves a document the server has not been
     /// told about while the application shows results for it.
     fn drain_lsp_intents(&mut self, card: CardId) -> Task<Message> {
-        let intents = match self.cards.get_mut(&card) {
-            Some(CardRuntime::Repository(runtime)) => runtime.take_lsp_intents(),
-            _ => Vec::new(),
+        let (intents, auto_save) = match self.cards.get_mut(&card) {
+            Some(CardRuntime::Repository(runtime)) => (
+                runtime.take_lsp_intents(),
+                repository_task(runtime.auto_save_task(card)),
+            ),
+            _ => return Task::none(),
         };
         if intents.is_empty() {
-            return Task::none();
+            return auto_save;
         }
-        let mut tasks = Vec::new();
+        let mut tasks = vec![auto_save];
         for intent in intents {
             match intent {
                 LspIntent::Open {
@@ -5102,6 +5310,7 @@ impl Cagents {
                     surface.hide()
                 }
                 .map_err(|error| error.to_string()),
+                CardRuntime::Chat(runtime) => runtime.set_visible(visible),
                 #[cfg(feature = "integrated-browser")]
                 CardRuntime::Browser(browser) => browser
                     .handle
@@ -5145,6 +5354,8 @@ impl Cagents {
             || self.pull_request_dialog.is_some()
             || self.dirty_repository_close.is_some()
             || self.terminal_close.is_some()
+            || self.project_ui.modal_open()
+            || self.chat_modal()
             // Mounted by `dialog` from the sidebar's own state, so nothing
             // beneath it can learn about it any other way. Leaving it out is
             // how the one dialog that is on screen *because* it is about to
@@ -5245,6 +5456,7 @@ impl Cagents {
                     InspectorRuntimeStatus::Ready
                 }
             },
+            Some(CardRuntime::Chat(_)) => InspectorRuntimeStatus::Ready,
             Some(CardRuntime::Terminal(_)) | Some(CardRuntime::PullRequests(_)) => {
                 InspectorRuntimeStatus::Ready
             }
@@ -5262,7 +5474,6 @@ impl Cagents {
             InspectorAction::Resize { width } => {
                 self.settings.inspector_width =
                     width.clamp(design::INSPECTOR_MIN_WIDTH, design::INSPECTOR_MAX_WIDTH);
-                self.settings_draft.inspector_width = self.settings.inspector_width.to_string();
                 Task::none()
             }
             InspectorAction::ResizeFinished => {
@@ -5718,7 +5929,20 @@ impl Cagents {
         }
     }
 
+    fn synchronize_terminal_theme(&mut self) {
+        for runtime in self.cards.values() {
+            if let CardRuntime::Terminal(surface) = runtime {
+                if let Err(error) = surface.set_theme(self.settings.terminal_theme) {
+                    self.status = Some(TransientNotice::error(format!(
+                        "Could not apply terminal theme: {error}"
+                    )));
+                }
+            }
+        }
+    }
+
     fn synchronize_appearance(&mut self, previous_scale: f32) -> Task<Message> {
+        self.synchronize_terminal_theme();
         // COSMIC applies its scale action asynchronously. Use the previous
         // persisted preference, not Core's possibly not-yet-updated value.
         self.window_width *= previous_scale / self.settings.ui_scale;
@@ -5748,25 +5972,82 @@ impl Cagents {
         ])
     }
 
+    fn refresh_settings_feedback(&mut self) {
+        self.settings_feedback = if let Some(error) = &self.settings_save_error {
+            Some(SettingsFeedback::Error(error.clone()))
+        } else if !self.settings_invalid.is_empty() {
+            let mut errors: Vec<_> = self.settings_invalid.values().cloned().collect();
+            errors.sort();
+            Some(SettingsFeedback::Invalid(errors.join(" ")))
+        } else if !self.settings_pending.is_empty() {
+            Some(SettingsFeedback::Pending)
+        } else {
+            Some(SettingsFeedback::Saved)
+        };
+    }
+
+    fn queue_setting_input(&mut self, field: SettingsField, value: String) -> Task<Message> {
+        self.settings_draft.set(field, value.clone());
+        self.settings_generation = self.settings_generation.wrapping_add(1);
+        let generation = self.settings_generation;
+        self.settings_pending.insert(field, (generation, value));
+        self.refresh_settings_feedback();
+        cosmic::task::future(async move {
+            tokio::time::sleep(Duration::from_millis(600)).await;
+            Message::SettingsAutosave { field, generation }
+        })
+    }
+
+    fn autosave_setting(&mut self, field: SettingsField, generation: u64) -> Task<Message> {
+        if !self
+            .settings_pending
+            .get(&field)
+            .is_some_and(|pending| pending.0 == generation)
+        {
+            return Task::none();
+        }
+        let (_, value) = self
+            .settings_pending
+            .remove(&field)
+            .expect("matched pending draft");
+        self.apply_setting_input(field, value)
+    }
+
+    fn flush_settings_drafts(&mut self) -> Task<Message> {
+        let mut pending: Vec<_> = self.settings_pending.drain().collect();
+        pending.sort_by_key(|(_, (generation, _))| *generation);
+        Task::batch(
+            pending
+                .into_iter()
+                .map(|(field, (_, value))| self.apply_setting_input(field, value))
+                .collect::<Vec<_>>(),
+        )
+    }
+
     fn apply_setting_input(&mut self, field: SettingsField, value: String) -> Task<Message> {
+        self.settings_pending.remove(&field);
         self.settings_draft.set(field, value.clone());
         let previous_scale = self.settings.ui_scale;
         match settings_update(&self.settings, field, &value) {
             SettingsDecision::Invalid(message) => {
-                self.settings_feedback = Some(SettingsFeedback::Invalid(message));
+                self.settings_invalid.insert(field, message);
+                self.refresh_settings_feedback();
                 Task::none()
             }
             SettingsDecision::Unchanged => {
-                self.settings_feedback = None;
+                self.settings_invalid.remove(&field);
+                if self.settings_save_error.is_some() {
+                    self.settings_save_error = self.save_settings_now().err();
+                }
+                self.refresh_settings_feedback();
                 Task::none()
             }
             SettingsDecision::Persist(settings) => {
                 self.settings = settings;
                 self.synchronize_lifecycle_budget();
-                self.settings_feedback = Some(match self.save_settings_now() {
-                    Ok(()) => SettingsFeedback::Saved,
-                    Err(error) => SettingsFeedback::Error(error),
-                });
+                self.settings_invalid.remove(&field);
+                self.settings_save_error = self.save_settings_now().err();
+                self.refresh_settings_feedback();
                 if matches!(
                     field,
                     SettingsField::ShortcutNewTerminal
@@ -5774,10 +6055,25 @@ impl Cagents {
                         | SettingsField::ShortcutSearchProjects
                         | SettingsField::ShortcutPreviousColumn
                         | SettingsField::ShortcutNextColumn
+                        | SettingsField::ShortcutCyclePaneWidth
                 ) {
                     self.card_chrome.clear();
                 }
                 match field {
+                    SettingsField::TerminalTheme => {
+                        self.synchronize_terminal_theme();
+                        Task::none()
+                    }
+                    SettingsField::EditorAutoSave => {
+                        Task::batch(self.cards.iter_mut().filter_map(|(&card, runtime)| {
+                            if let CardRuntime::Repository(runtime) = runtime {
+                                runtime.set_auto_save(self.settings.editor_auto_save);
+                                Some(repository_task(runtime.auto_save_task(card)))
+                            } else {
+                                None
+                            }
+                        }))
+                    }
                     SettingsField::AppTheme | SettingsField::UiScale => {
                         self.synchronize_appearance(previous_scale)
                     }
@@ -5795,8 +6091,7 @@ impl Cagents {
                     | SettingsField::TerminalLineHeight
                     | SettingsField::TerminalPadding
                     | SettingsField::TerminalCursorStyle
-                    | SettingsField::InspectorWidth
-                    | SettingsField::SidebarWidth
+                    | SettingsField::ManagedWorktreeDirectory
                     | SettingsField::DefaultColumnFraction
                     | SettingsField::LinkOpenDestination
                     | SettingsField::LinkOpenGesture
@@ -5804,7 +6099,8 @@ impl Cagents {
                     | SettingsField::ShortcutCloseFocusedColumn
                     | SettingsField::ShortcutSearchProjects
                     | SettingsField::ShortcutPreviousColumn
-                    | SettingsField::ShortcutNextColumn => Task::none(),
+                    | SettingsField::ShortcutNextColumn
+                    | SettingsField::ShortcutCyclePaneWidth => Task::none(),
                 }
             }
         }
@@ -5848,22 +6144,31 @@ impl Cagents {
         let previous_scale = self.settings.ui_scale;
         self.settings = AppSettings::default();
         self.settings_draft = SettingsDraft::from_settings(&self.settings);
+        self.settings_pending.clear();
+        self.settings_invalid.clear();
         self.card_chrome.clear();
         self.synchronize_lifecycle_budget();
         // Reset restores the built-in server list, which is a different set of
         // processes whenever the user had configured their own.
         let resync = self.synchronize_language_servers();
         self.settings_write_blocked = false;
-        self.settings_feedback = Some(match self.save_settings_now() {
-            Ok(()) => SettingsFeedback::Saved,
-            Err(error) => SettingsFeedback::Error(error),
-        });
+        self.settings_save_error = self.save_settings_now().err();
+        self.refresh_settings_feedback();
         let sweep = self.lifecycle_sweep();
         let appearance = self.synchronize_appearance(previous_scale);
+        let auto_save = Task::batch(self.cards.iter_mut().filter_map(|(&card, runtime)| {
+            if let CardRuntime::Repository(runtime) = runtime {
+                runtime.set_auto_save(self.settings.editor_auto_save);
+                Some(repository_task(runtime.auto_save_task(card)))
+            } else {
+                None
+            }
+        }));
         Task::batch([
             resync,
             sweep,
             appearance,
+            auto_save,
             self.reschedule_offscreen_lifecycle_sweep(),
         ])
     }
@@ -5974,8 +6279,13 @@ impl Application for Cagents {
             settings_write_blocked,
             sidebar_model: SidebarModel::ready(SidebarMode::Expanded, sidebar_projects),
             sidebar_state: SidebarState::default(),
+            project_ui: project_ui::State::default(),
+            chat_ui: chat_ui::State::default(),
             active_workspace: None,
             worktree_focus: HashMap::new(),
+            worktree_offsets: HashMap::new(),
+            workspace_view_generation: 0,
+            workspace_scroll_id: widget::Id::new("workspace-strip-0"),
             github_availability: HashMap::new(),
             repository_generations: HashMap::new(),
             worktree_dialog: None,
@@ -6011,6 +6321,10 @@ impl Application for Cagents {
             keyboard_modifiers: keyboard::Modifiers::empty(),
             settings_draft,
             settings_feedback: None,
+            settings_pending: HashMap::new(),
+            settings_generation: 0,
+            settings_invalid: HashMap::new(),
+            settings_save_error: None,
             status: status.map(TransientNotice::error),
             lifecycle_sweep_deadline: None,
             lifecycle_sweep_generation: 0,
@@ -6037,7 +6351,7 @@ impl Application for Cagents {
                 design::ShellLayout::for_width(app.window_width).inspector,
                 InspectorLayout::Docked
             ) {
-            app.settings.inspector_width + crate::splitter::WIDTH
+            app.settings.inspector_width
         } else {
             0.0
         };
@@ -6122,7 +6436,11 @@ impl Application for Cagents {
         // columns rather than rebuilding every card's chrome.
         let camera_only = matches!(
             &message,
-            Message::Frame(_) | Message::Viewport(_) | Message::Pan(_) | Message::Wheel(_)
+            Message::Frame(_)
+                | Message::Viewport {
+                    event: WorkspaceViewportEvent::Scrolled(_) | WorkspaceViewportEvent::Resized(_),
+                    ..
+                }
         );
         let task = match message {
             Message::NewTerminal => {
@@ -6157,6 +6475,11 @@ impl Application for Cagents {
                         let Some(CardRuntime::Terminal(handle)) = self.cards.get(&card) else {
                             return cosmic::task::message(Message::LifecycleSweep);
                         };
+                        if let Err(error) = handle.set_theme(self.settings.terminal_theme) {
+                            self.status = Some(TransientNotice::error(format!(
+                                "Could not apply terminal theme: {error}"
+                            )));
+                        }
                         let visible = terminal_start_visibility(
                             self.durable.cards.iter().find(|state| state.id == card),
                         )
@@ -6353,7 +6676,12 @@ impl Application for Cagents {
                             .unwrap_or_else(|| loaded.repository.selected_path.clone());
                         if open_cards {
                             task = self.select_worktree(worktree, true);
+                        } else if let Some(active) = self.active_workspace.clone() {
+                            // Discovery can resolve legacy launch directories
+                            // into distinct worktrees after session restoration.
+                            task = self.select_worktree(active, false);
                         }
+                        task = Task::batch([task, self.project_avatar_task(project_id)]);
                     }
                     Err(error) => {
                         let unavailable = GitHubAvailability::Failed {
@@ -6393,6 +6721,15 @@ impl Application for Cagents {
                         Task::none()
                     }
                 }
+            }
+            Message::Repository(RepositoryAction::OpenExternalEditor { card }) => {
+                let path = match self.cards.get(&card) {
+                    Some(CardRuntime::Repository(runtime)) => runtime
+                        .selected_path()
+                        .map(|path| runtime.descriptor.worktree.join(path)),
+                    _ => None,
+                };
+                path.map_or_else(Task::none, |path| self.open_file_in_editor(path))
             }
             Message::Repository(action) => {
                 if self.modal_is_open() && !repository_action_allowed_while_modal(&action) {
@@ -6450,6 +6787,9 @@ impl Application for Cagents {
                     SidebarAction::OpenRepositoryPicker => {
                         cosmic::task::message(Message::OpenRepository)
                     }
+                    SidebarAction::ProjectCommand { project_id, worktree_id, command } => {
+                        self.handle_project_action(project_ui::Action::Command { project_id, worktree_id, command })
+                    }
                     SidebarAction::OpenRepository {
                         project_id,
                         repository,
@@ -6470,16 +6810,15 @@ impl Application for Cagents {
                         project_id,
                         repository,
                     } => {
-                        let root = repository
-                            .parent()
-                            .unwrap_or_else(|| Path::new("/"))
-                            .join("worktrees");
                         self.worktree_dialog = Some(WorktreeDialog {
                             project_id,
                             repository,
                             branch: String::new(),
-                            base: "main".into(),
-                            destination: root.display().to_string(),
+                            base: String::new(),
+                            destination: String::new(),
+                            advanced: false,
+                            resolving: None,
+                            error: None,
                         });
                         iced::widget::operation::focus(worktree_dialog_focus_id())
                             .map(cosmic::Action::App)
@@ -6528,8 +6867,6 @@ impl Application for Cagents {
                     }
                     SidebarAction::OpenSettings => {
                         self.settings_category = SettingsCategory::Appearance;
-                        self.settings_draft = SettingsDraft::from_settings(&self.settings);
-                        self.settings_feedback = None;
                         self.open_inspector(Inspector::Settings)
                     }
                     // The handle clamps to its own rendered bounds, and the
@@ -6538,14 +6875,11 @@ impl Application for Cagents {
                     SidebarAction::Resize { width } => {
                         self.settings.sidebar_width =
                             width.clamp(sidebar::EXPANDED_WIDTH_MIN, sidebar::EXPANDED_WIDTH_MAX);
-                        self.settings_draft.sidebar_width = self.settings.sidebar_width.to_string();
                         Task::none()
                     }
                     SidebarAction::ResizeFinished => {
-                        self.settings_feedback = Some(match self.save_settings_now() {
-                            Ok(()) => SettingsFeedback::Saved,
-                            Err(error) => SettingsFeedback::Error(error),
-                        });
+                        self.settings_save_error = self.save_settings_now().err();
+                        self.refresh_settings_feedback();
                         Task::none()
                     }
                     // Expanding `History` is the only thing that asks for the
@@ -6554,6 +6888,7 @@ impl Application for Cagents {
                     SidebarAction::ToggleSection { .. }
                     | SidebarAction::ToggleSourceControlPanel { .. }
                     | SidebarAction::FilesQueryChanged { .. }
+                    | SidebarAction::SetFileListMode { .. }
                     | SidebarAction::ToggleDirectory { .. }
                     | SidebarAction::CommitMessageChanged { .. }
                     | SidebarAction::PublishRemoteChanged { .. }
@@ -6714,6 +7049,32 @@ impl Application for Cagents {
                     }
                 }
             }
+            Message::CyclePaneWidth => {
+                let Some(card) = self.workspace.focused() else {
+                    return Task::none();
+                };
+                let Some(width) = self
+                    .workspace
+                    .card(card)
+                    .map(|card| card.width.next_preset())
+                else {
+                    return Task::none();
+                };
+                match self.workspace.set_card_width(card, width) {
+                    Ok(update) => {
+                        if let Some(state) = self.card_state_mut(card)
+                            && let CardWidth::Fraction(fraction) = width
+                        {
+                            state.width_fraction = fraction;
+                        }
+                        self.apply_viewport(update, true, true)
+                    }
+                    Err(error) => {
+                        self.status = Some(TransientNotice::error(error.to_string()));
+                        Task::none()
+                    }
+                }
+            }
             Message::ResizeCardFinished(card) => {
                 if self.card_state(card).is_some() {
                     self.persist();
@@ -6739,6 +7100,13 @@ impl Application for Cagents {
                     })
                     .collect::<VecDeque<_>>();
                 self.begin_dirty_close(DirtyCloseIntent::Application(window), dirty)
+            }
+            Message::CloseCard(id)
+                if self
+                    .card_state(id)
+                    .is_some_and(|state| matches!(state.kind, CardKind::Chat(_))) =>
+            {
+                self.begin_chat_close(id)
             }
             Message::CloseCard(id) => self.begin_card_close(id),
             Message::ConfirmTerminalClose => self.confirm_terminal_close(),
@@ -6792,6 +7160,13 @@ impl Application for Cagents {
             Message::CommitClose(id) => {
                 if self
                     .card_state(id)
+                    .is_some_and(|state| matches!(state.kind, CardKind::Chat(_)))
+                    && !self.chat_close_approved(id)
+                {
+                    return self.begin_chat_close(id);
+                }
+                if self
+                    .card_state(id)
                     .is_none_or(|card| !card.existence.is_open())
                 {
                     return Task::none();
@@ -6807,6 +7182,7 @@ impl Application for Cagents {
                     return self.begin_card_close(id);
                 }
                 self.retire_lsp_card(id);
+                self.chat_forget(id);
                 if let Some(runtime) = self.cards.remove(&id) {
                     match runtime {
                         CardRuntime::Terminal(_handle) => {
@@ -6820,6 +7196,7 @@ impl Application for Cagents {
                         CardRuntime::Loading
                         | CardRuntime::Failed(_)
                         | CardRuntime::Repository(_)
+                        | CardRuntime::Chat(_)
                         | CardRuntime::PullRequests(_) => {}
                     }
                 }
@@ -6841,7 +7218,17 @@ impl Application for Cagents {
                     }
                 }
             }
-            Message::Viewport(event) => {
+            Message::Viewport { generation, event } => {
+                // Native callbacks already queued by an unmounted worktree
+                // must never mutate the newly selected strip.
+                if generation != self.workspace_view_generation {
+                    return Task::none();
+                }
+                if matches!(event, WorkspaceViewportEvent::PointerFocused(_))
+                    && self.workspace_inputs_blocked()
+                {
+                    return Task::none();
+                }
                 let (update, synchronize_scroll) =
                     update_workspace_viewport(&mut self.workspace, event);
                 let task = self.apply_viewport(update, false, false);
@@ -6850,24 +7237,6 @@ impl Application for Cagents {
                 } else {
                     task
                 }
-            }
-            Message::Pan(gesture) => match gesture {
-                PanGesture::Begin { pointer_x } => {
-                    self.workspace.begin_pan(pointer_x);
-                    Task::none()
-                }
-                PanGesture::Update { pointer_x } => {
-                    let update = self.workspace.update_pan(pointer_x);
-                    self.apply_viewport(update, true, false)
-                }
-                PanGesture::End => {
-                    self.workspace.end_pan();
-                    Task::none()
-                }
-            },
-            Message::Wheel(delta) => {
-                let update = self.workspace.scroll_wheel(delta);
-                self.apply_viewport(update, true, false)
             }
             Message::Frame(frame) => {
                 let inspector_task = self.advance_inspector_transition(frame);
@@ -7042,23 +7411,40 @@ impl Application for Cagents {
                 Task::none()
             }
             Message::WorktreeBranchChanged(value) => {
-                if let Some(dialog) = &mut self.worktree_dialog {
+                if let Some(dialog) = &mut self.worktree_dialog
+                    && dialog.resolving.is_none()
+                {
                     dialog.branch = value;
                 }
                 Task::none()
             }
             Message::WorktreeBaseChanged(value) => {
-                if let Some(dialog) = &mut self.worktree_dialog {
+                if let Some(dialog) = &mut self.worktree_dialog
+                    && dialog.resolving.is_none()
+                {
                     dialog.base = value;
                 }
                 Task::none()
             }
             Message::WorktreeDestinationChanged(value) => {
-                if let Some(dialog) = &mut self.worktree_dialog {
+                if let Some(dialog) = &mut self.worktree_dialog
+                    && dialog.resolving.is_none()
+                {
                     dialog.destination = value;
                 }
                 Task::none()
             }
+            Message::ToggleWorktreeAdvanced => {
+                if let Some(dialog) = &mut self.worktree_dialog {
+                    dialog.advanced = !dialog.advanced;
+                }
+                Task::none()
+            }
+            Message::WorktreeInputResolved {
+                project_id,
+                operation_id,
+                result,
+            } => self.finish_worktree_input(project_id, operation_id, result),
             Message::WorktreeProgress(event) => self.worktree_progress(event),
             Message::WorktreeElapsed => {
                 self.sync_worktree_operation_rows();
@@ -7073,37 +7459,18 @@ impl Application for Cagents {
                 self.restore_worktree_operations(result)
             }
             Message::SubmitWorktree => {
-                let Some(dialog) = self.worktree_dialog.take() else {
+                let Some(dialog) = self.worktree_dialog.as_ref() else {
                     return Task::none();
                 };
-                let request =
-                    ValidatedBranchName::parse(dialog.branch.clone()).and_then(|branch| {
-                        let base = ValidatedBranchName::parse(dialog.base.clone())
-                            .map(BaseRevision::LocalBranch)?;
-                        let destination = PathBuf::from(&dialog.destination)
-                            .join(branch_destination_component(branch.as_str()));
-                        Ok(CreateWorktreeRequest {
-                            repository: dialog.repository.clone(),
-                            managed_root: PathBuf::from(&dialog.destination),
-                            destination,
-                            branch,
-                            base,
-                            track: false,
-                            operation_id: crate::model::OperationId::new(),
-                        })
-                    });
-                match request {
-                    Ok(request) => {
-                        let submit = self.start_worktree_operation(dialog.project_id, request);
-                        Task::batch([submit, self.focus_context_overlay_if_exposed()])
-                    }
-                    Err(error) => {
-                        self.status = Some(TransientNotice::error(error.to_string()));
-                        self.worktree_dialog = Some(dialog);
-                        iced::widget::operation::focus(worktree_dialog_focus_id())
-                            .map(cosmic::Action::App)
-                    }
-                }
+                let input = crate::repository::WorktreeInput {
+                    repository: dialog.repository.clone(),
+                    input: dialog.branch.clone(),
+                    base: dialog.base.clone(),
+                    managed_directory: self.settings.managed_worktree_directory.clone(),
+                    destination: dialog.destination.clone(),
+                    operation_id: crate::model::OperationId::new(),
+                };
+                self.start_worktree_input(dialog.project_id, input)
             }
             Message::WorktreeCreated {
                 project_id,
@@ -7306,9 +7673,20 @@ impl Application for Cagents {
                 if let keyboard::Event::ModifiersChanged(modifiers) = &event {
                     self.keyboard_modifiers = *modifiers;
                 }
+                if self.chat_modal() {
+                    return self.chat_modal_key(&event);
+                }
                 if is_escape_press(&event) {
                     if self.terminal_close.is_some() {
                         return self.cancel_terminal_close();
+                    }
+                    if self.sidebar_state.pending_discard().is_some() {
+                        return cosmic::task::message(Message::Sidebar(
+                            SidebarAction::CancelDiscard,
+                        ));
+                    }
+                    if self.project_ui.modal_open() {
+                        return self.handle_project_action(project_ui::Action::Dismiss);
                     }
                     if self.dirty_repository_close.is_some() {
                         if self.dirty_repository_close.as_ref().is_some_and(|close| {
@@ -7369,6 +7747,9 @@ impl Application for Cagents {
                     }
                     Some(workspace_widget::GlobalShortcut::FocusAdjacent(direction)) => {
                         cosmic::task::message(Message::FocusAdjacent(direction))
+                    }
+                    Some(workspace_widget::GlobalShortcut::CyclePaneWidth) => {
+                        cosmic::task::message(Message::CyclePaneWidth)
                     }
                     None => Task::none(),
                 }
@@ -7434,7 +7815,7 @@ impl Application for Cagents {
             Message::ContextInspector(action) => self.handle_context_inspector_action(action),
             Message::CloseInspector => {
                 self.close_inspector();
-                Task::none()
+                self.flush_settings_drafts()
             }
             Message::SelectSettingsCategory(category) => {
                 self.settings_category = category;
@@ -7442,10 +7823,13 @@ impl Application for Cagents {
             }
             Message::SettingsChanged { field, value } => self.apply_setting_input(field, value),
             Message::SettingsDraftChanged { field, value } => {
-                self.settings_draft.set(field, value);
-                self.settings_feedback = None;
-                Task::none()
+                self.queue_setting_input(field, value)
             }
+            Message::SettingsAutosave { field, generation } => {
+                self.autosave_setting(field, generation)
+            }
+            Message::ProjectUi(action) => self.handle_project_action(action),
+            Message::ChatUi(action) => self.handle_chat_ui(action),
             Message::ResetSettings => self.reset_settings(),
             Message::Lsp(event) => {
                 self.apply_lsp_event(event);
@@ -7557,6 +7941,7 @@ impl Application for Cagents {
     fn subscription(&self) -> Subscription<Message> {
         let operation_subscriptions = self.worktree_progress_subscriptions();
         let mut subscriptions = vec![
+            self.chat_subscription(),
             Subscription::run_with(
                 TerminalWakeSource(self.terminal_wake_rx.clone()),
                 terminal_wake_stream,
@@ -7625,14 +8010,32 @@ impl Application for Cagents {
     }
 
     fn dialog(&self) -> Option<Element<'_, Message>> {
-        if self.terminal_close.is_some() {
-            return self.terminal_close_dialog();
+        if let Some(surface) = self.chat_switch_dialog() {
+            return Some(dialog_ui::overlay(
+                surface,
+                (!self.chat_modal_pending())
+                    .then_some(Message::ChatUi(chat_ui::Action::DismissSwitch)),
+                1.0,
+            ));
+        }
+        if let Some(intent) = &self.terminal_close {
+            return self.terminal_close_dialog().map(|surface| {
+                dialog_ui::overlay(
+                    surface,
+                    (!intent.pending).then_some(Message::CancelTerminalClose),
+                    1.0,
+                )
+            });
         }
         let spacing = cosmic::theme::spacing();
         // First, because a discard is the one dialog on screen precisely
         // because it is about to destroy work that exists nowhere else.
         if let Some(pending) = self.sidebar_state.pending_discard() {
-            return Some(sidebar::discard_confirmation_dialog(pending).map(Message::Sidebar));
+            return Some(dialog_ui::overlay(
+                sidebar::discard_confirmation_dialog(pending).map(Message::Sidebar),
+                Some(Message::Sidebar(SidebarAction::CancelDiscard)),
+                1.0,
+            ));
         }
         if let Some(close) = self.dirty_repository_close.as_ref() {
             let card = close.card;
@@ -7705,65 +8108,97 @@ impl Application for Cagents {
                     .spacing(spacing.space_xxs)
                     .into(),
             );
-            return Some(
-                widget::container(widget::column::with_children(rows).spacing(spacing.space_xs))
-                    .id(widget::Id::new(format!("dialog.dirty-close.{card}")))
-                    .class(cosmic::theme::Container::Dialog(false))
-                    .padding(spacing.space_m)
-                    .max_width(560)
-                    .into(),
-            );
+            return Some(dialog_ui::overlay(
+                dialog_ui::surface(
+                    widget::container(
+                        widget::column::with_children(rows).spacing(3.0 * design::GRID_UNIT),
+                    )
+                    .id(widget::Id::new(format!("dialog.dirty-close.{card}"))),
+                    560.0,
+                ),
+                (!runtime.is_saving()).then_some(Message::CancelRepositoryClose),
+                1.0,
+            ));
+        }
+        if let Some(surface) = self.project_dialog_view() {
+            return Some(dialog_ui::overlay(
+                surface,
+                Some(Message::ProjectUi(project_ui::Action::Dismiss)),
+                1.0,
+            ));
         }
         if let Some(dialog) = self.worktree_dialog.as_ref() {
-            return Some(
-                widget::container(
-                    widget::column::with_children(vec![
-                        widget::text::title3("Create worktree").into(),
-                        widget::column::with_children(vec![
-                            widget::text::caption("Branch").into(),
-                            widget::text_input("Branch", &dialog.branch)
-                                .id(worktree_dialog_focus_id())
-                                .on_input(Message::WorktreeBranchChanged)
-                                .into(),
-                        ])
-                        .spacing(spacing.space_xxxs)
-                        .into(),
-                        widget::column::with_children(vec![
-                            widget::text::caption("Base branch").into(),
-                            widget::text_input("Base branch", &dialog.base)
-                                .id(widget::Id::new("dialog.worktree.base"))
-                                .on_input(Message::WorktreeBaseChanged)
-                                .into(),
-                        ])
-                        .spacing(spacing.space_xxxs)
-                        .into(),
-                        widget::column::with_children(vec![
-                            widget::text::caption("Managed directory").into(),
-                            widget::text_input("Managed directory", &dialog.destination)
-                                .id(widget::Id::new("dialog.worktree.destination"))
-                                .on_input(Message::WorktreeDestinationChanged)
-                                .into(),
-                        ])
-                        .spacing(spacing.space_xxxs)
-                        .into(),
-                        widget::row::with_children(vec![
-                            widget::button::standard("Cancel")
-                                .on_press(Message::CancelDialog)
-                                .into(),
-                            widget::button::suggested("Create")
-                                .on_press(Message::SubmitWorktree)
-                                .into(),
-                        ])
-                        .spacing(spacing.space_xxs)
-                        .into(),
-                    ])
-                    .spacing(spacing.space_xs),
+            let mut rows: Vec<Element<'_, Message>> = vec![
+                widget::text::title3("Create worktree").into(),
+                widget::text::caption(
+                    "Enter a branch name, a Linear issue ID, or paste a Linear issue URL.",
                 )
-                .class(cosmic::theme::Container::Dialog(false))
-                .padding(spacing.space_m)
-                .max_width(520)
+                .into(),
+                widget::text_input("Branch or Linear issue", &dialog.branch)
+                    .id(worktree_dialog_focus_id())
+                    .on_input(Message::WorktreeBranchChanged)
+                    .into(),
+                widget::button::text(if dialog.advanced {
+                    "Hide options"
+                } else {
+                    "Base branch & destination"
+                })
+                .on_press(Message::ToggleWorktreeAdvanced)
+                .into(),
+            ];
+            if dialog.advanced {
+                rows.extend([
+                    widget::text::caption("Base branch (optional)").into(),
+                    widget::text_input("Automatic repository default", &dialog.base)
+                        .id(widget::Id::new("dialog.worktree.base"))
+                        .on_input(Message::WorktreeBaseChanged)
+                        .into(),
+                    widget::text::caption("Destination (optional)").into(),
+                    widget::text_input("Automatic managed directory", &dialog.destination)
+                        .id(widget::Id::new("dialog.worktree.destination"))
+                        .on_input(Message::WorktreeDestinationChanged)
+                        .into(),
+                    widget::text::caption(format!(
+                        "Default parent: {}. Relative paths start at the repository root.",
+                        self.settings.managed_worktree_directory
+                    ))
+                    .into(),
+                ]);
+            }
+            if let Some(error) = &dialog.error {
+                rows.push(
+                    widget::text::body(error.as_str())
+                        .wrapping(iced::widget::text::Wrapping::Word)
+                        .into(),
+                );
+            }
+            rows.push(
+                widget::row::with_children(vec![
+                    widget::button::standard("Cancel")
+                        .on_press(Message::CancelDialog)
+                        .into(),
+                    widget::button::suggested(if dialog.resolving.is_some() {
+                        "Resolving…"
+                    } else {
+                        "Create"
+                    })
+                    .on_press_maybe(
+                        (dialog.resolving.is_none() && !dialog.branch.trim().is_empty())
+                            .then_some(Message::SubmitWorktree),
+                    )
+                    .into(),
+                ])
+                .spacing(2.0 * design::GRID_UNIT)
                 .into(),
             );
+            return Some(dialog_ui::overlay(
+                dialog_ui::surface(
+                    widget::column::with_children(rows).spacing(3.0 * design::GRID_UNIT),
+                    560.0,
+                ),
+                Some(Message::CancelDialog),
+                1.0,
+            ));
         }
 
         if let Some(inspector) = self.inspector {
@@ -7862,13 +8297,14 @@ impl Application for Cagents {
             .spacing(spacing.space_xxs)
             .into(),
         );
-        Some(
-            widget::container(widget::column::with_children(rows).spacing(spacing.space_xs))
-                .class(cosmic::theme::Container::Dialog(false))
-                .padding(spacing.space_m)
-                .max_width(620)
-                .into(),
-        )
+        Some(dialog_ui::overlay(
+            dialog_ui::surface(
+                widget::column::with_children(rows).spacing(3.0 * design::GRID_UNIT),
+                620.0,
+            ),
+            Some(Message::CancelDialog),
+            1.0,
+        ))
     }
 
     /// The workspace commands, drawn in the window's own header bar.
@@ -7976,7 +8412,7 @@ impl Application for Cagents {
                 &self.workspace,
                 &self.settings.keyboard_shortcuts,
                 self.workspace.viewport_width(),
-                workspace_widget::workspace_scroll_id(),
+                self.workspace_scroll_id.clone(),
                 |context| self.card_view(context.id, context.focused),
                 // `sync_chrome` keeps an entry for every durable card, so
                 // the fallback is only reachable for a card the workspace holds
@@ -7988,9 +8424,10 @@ impl Application for Cagents {
                     )
                 },
                 workspace_widget::Events {
-                    viewport: Message::Viewport,
-                    pan: Message::Pan,
-                    wheel: Message::Wheel,
+                    viewport: {
+                        let generation = self.workspace_view_generation;
+                        move |event| Message::Viewport { generation, event }
+                    },
                 },
             )
         };
@@ -8012,22 +8449,13 @@ impl Application for Cagents {
             .into();
 
         let context_model = (self.context_inspector_open
-            && self.context_tab != ContextTab::Changes)
+            && self.context_tab == ContextTab::Details)
             .then(|| self.workspace.focused())
             .flatten()
             .and_then(|card| {
                 self.card_state(card).and_then(|state| {
-                    if self.context_tab == ContextTab::Code
-                        && !matches!(state.kind, CardKind::Repository(_))
-                    {
-                        return None;
-                    }
                     let repository = match self.cards.get(&card) {
-                        Some(CardRuntime::Repository(runtime))
-                            if self.context_tab == ContextTab::Code =>
-                        {
-                            Some(runtime.inspector_context())
-                        }
+                        Some(CardRuntime::Repository(runtime)) => Some(runtime.inspector_context()),
                         _ => None,
                     };
                     let model = inspector::model_for_card(
@@ -8036,13 +8464,9 @@ impl Application for Cagents {
                         &self.sidebar_model.projects,
                         repository.as_ref(),
                     );
-                    Some(if self.context_tab == ContextTab::Code {
-                        match self.lsp_context(card) {
-                            Some(lsp) => inspector::with_lsp(model, card, lsp),
-                            None => model,
-                        }
-                    } else {
-                        model
+                    Some(match self.lsp_context(card) {
+                        Some(lsp) => inspector::with_lsp(model, card, lsp),
+                        None => model,
                     })
                 })
             });
@@ -8053,7 +8477,7 @@ impl Application for Cagents {
                 .settings
                 .inspector_width
                 .clamp(design::INSPECTOR_MIN_WIDTH, design::INSPECTOR_MAX_WIDTH)
-                .min((window_width - crate::splitter::WIDTH).max(0.0));
+                .min(window_width.max(0.0));
             let splitter: Element<'_, Message> = Splitter::new(
                 widget::Id::new("context-inspector.resize-handle"),
                 inspector::RESIZE_HANDLE_NAME,
@@ -8067,27 +8491,40 @@ impl Application for Cagents {
             )
             .into();
             let pane = self.context_panel(context_model, width);
-            let inspector_surface: Element<'_, Message> =
-                widget::row::with_children(vec![splitter, pane])
-                    .spacing(0)
-                    .height(Length::Fill)
-                    .into();
             match inspector::mount_for_width(window_width, true, true)
                 .expect("an open contextual inspector with a model has a mount")
             {
                 InspectorLayout::Docked => {
-                    widget::row::with_children(vec![sidebar, main_content, inspector_surface])
-                        .spacing(0)
+                    let content: Element<'_, Message> =
+                        widget::row::with_children(vec![sidebar, main_content, pane])
+                            .spacing(0)
+                            .width(Length::Fill)
+                            .height(Length::Fill)
+                            .into();
+                    let edge = widget::container(splitter)
+                        .padding(Padding {
+                            right: width,
+                            ..Padding::ZERO
+                        })
+                        .align_x(Alignment::End)
                         .width(Length::Fill)
-                        .height(Length::Fill)
-                        .into()
+                        .height(Length::Fill);
+                    crate::interaction::layer(content, edge.into())
                 }
                 InspectorLayout::Overlay => {
+                    let inspector_surface = crate::interaction::layer(
+                        pane,
+                        widget::container(splitter)
+                            .align_x(Alignment::Start)
+                            .width(Length::Fill)
+                            .height(Length::Fill)
+                            .into(),
+                    );
                     let background = widget::row::with_children(vec![sidebar, main_content])
                         .spacing(0)
                         .width(Length::Fill)
                         .height(Length::Fill);
-                    let dismiss = iced::widget::opaque(
+                    let dismiss = crate::interaction::opaque(
                         widget::mouse_area(
                             widget::container(iced::widget::Space::new())
                                 .width(Length::Fill)
@@ -8107,10 +8544,7 @@ impl Application for Cagents {
                         .align_x(Alignment::End)
                         .width(Length::Fill)
                         .height(Length::Fill);
-                    let foreground =
-                        iced::widget::Stack::with_children(vec![dismiss, aligned.into()])
-                            .width(Length::Fill)
-                            .height(Length::Fill);
+                    let foreground = crate::interaction::layer(dismiss, aligned.into());
                     inspector::ModalOverlay::new(background, foreground).into()
                 }
             }
@@ -8353,9 +8787,11 @@ fn terminal_start_mode(session: &TerminalSession) -> Result<TerminalStartMode, S
                 ))
             }
         }
-        TerminalContinuity::RelaunchAvailable { recipe, .. } => {
-            Ok(TerminalStartMode::Spawn(recipe.clone()))
-        }
+        TerminalContinuity::RelaunchAvailable { recipe, .. } => Ok(TerminalStartMode::Spawn(
+            session
+                .agent_resume_recipe()
+                .unwrap_or_else(|| recipe.clone()),
+        )),
         TerminalContinuity::Exited { .. } => Err(format!(
             "terminal {} has exited; explicit relaunch is required",
             session.id
@@ -8365,21 +8801,6 @@ fn terminal_start_mode(session: &TerminalSession) -> Result<TerminalStartMode, S
             session.id, typed_error.message
         )),
     }
-}
-
-fn branch_destination_component(branch: &str) -> String {
-    const HEX: &[u8; 16] = b"0123456789ABCDEF";
-    let mut component = String::with_capacity(branch.len());
-    for byte in branch.bytes() {
-        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.') {
-            component.push(char::from(byte));
-        } else {
-            component.push('%');
-            component.push(char::from(HEX[usize::from(byte >> 4)]));
-            component.push(char::from(HEX[usize::from(byte & 0x0f)]));
-        }
-    }
-    component
 }
 
 fn close_focused_message(workspace: &Workspace) -> Option<Message> {
@@ -8803,6 +9224,261 @@ mod tests {
                 Some("tiny-skia"),
             ))
             .expect("a headless renderer")
+    }
+
+    #[test]
+    fn settings_autosave_rejects_stale_debounce_and_flushes_each_valid_field() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("settings.toml");
+        let mut app = context_inspector_test_app(false);
+        app.settings_path = Some(path.clone());
+        app.settings_write_blocked = false;
+        let field = SettingsField::TerminalFontFamily;
+        let _ = app.queue_setting_input(field, "Fira".into());
+        let stale = app.settings_generation;
+        let _ = app.queue_setting_input(field, "Fira Code".into());
+        let latest = app.settings_generation;
+        let _ = app.autosave_setting(field, stale);
+        assert!(!path.exists());
+        assert!(app.settings.terminal_font_family.is_empty());
+        let _ = app.autosave_setting(field, latest);
+        assert_eq!(
+            settings::load(&path).unwrap().terminal_font_family,
+            "Fira Code"
+        );
+        let _ =
+            app.queue_setting_input(SettingsField::ManagedWorktreeDirectory, "../trees/".into());
+        let _ = app.update(Message::CloseInspector);
+        assert_eq!(
+            settings::load(&path).unwrap().managed_worktree_directory,
+            "../trees/"
+        );
+    }
+
+    #[test]
+    fn invalid_autosaved_draft_survives_dismissal_and_other_valid_edits() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("settings.toml");
+        let mut app = context_inspector_test_app(false);
+        app.settings_path = Some(path.clone());
+        app.settings_write_blocked = false;
+        app.save_settings_now().unwrap();
+        let before = std::fs::read(&path).unwrap();
+        let field = SettingsField::ShortcutNewTerminal;
+        let _ = app.queue_setting_input(field, "Ctrl+".into());
+        let _ = app.autosave_setting(field, app.settings_generation);
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        let _ = app.apply_setting_input(SettingsField::TerminalFontSize, "18".into());
+        assert!(matches!(
+            app.settings_feedback,
+            Some(SettingsFeedback::Invalid(_))
+        ));
+        let _ = app.update(Message::CloseInspector);
+        let _ = app.update(Message::Sidebar(SidebarAction::OpenSettings));
+        assert_eq!(app.settings_draft.keyboard_shortcuts.new_terminal, "Ctrl+");
+        assert_eq!(
+            settings::load(&path).unwrap().keyboard_shortcuts,
+            KeyboardShortcuts::default()
+        );
+        assert_eq!(settings::load(&path).unwrap().terminal_font_size, 18.0);
+    }
+
+    #[test]
+    fn corrupt_settings_protection_retains_save_error_and_reset_cancels_pending_drafts() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("settings.toml");
+        std::fs::write(&path, "not valid toml").unwrap();
+        let mut app = context_inspector_test_app(false);
+        app.settings_path = Some(path.clone());
+        let _ = app.apply_setting_input(SettingsField::TerminalFontSize, "18".into());
+        assert!(matches!(
+            app.settings_feedback,
+            Some(SettingsFeedback::Error(_))
+        ));
+        let _ = app.queue_setting_input(SettingsField::TerminalFontFamily, "Unfinished".into());
+        let stale = app.settings_generation;
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "not valid toml");
+        assert!(matches!(
+            app.settings_feedback,
+            Some(SettingsFeedback::Error(_))
+        ));
+        let _ = app.reset_settings();
+        let _ = app.autosave_setting(SettingsField::TerminalFontFamily, stale);
+        assert_eq!(settings::load(&path).unwrap(), AppSettings::default());
+    }
+
+    #[test]
+    fn resetting_settings_restores_autosave_for_an_already_open_editor() {
+        async fn settle_repository_tasks(app: &mut Cagents, task: Task<Message>) {
+            let mut pending = VecDeque::from([task]);
+            while let Some(task) = pending.pop_front() {
+                let Some(mut stream) = iced::runtime::task::into_stream(task) else {
+                    continue;
+                };
+                while let Some(action) = stream.next().await {
+                    if let iced::runtime::Action::Output(cosmic::Action::App(
+                        Message::Repository(action),
+                    )) = action
+                    {
+                        pending.push_back(app.update(Message::Repository(action)));
+                    }
+                }
+            }
+        }
+
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let directory = tempfile::tempdir().unwrap();
+                let path = directory.path().join("notes.txt");
+                std::fs::write(&path, "").unwrap();
+                let mut app = context_inspector_test_app(false);
+                app.settings_path = Some(directory.path().join("settings.toml"));
+                app.settings_write_blocked = false;
+                let card = CardId::new();
+                app.cards.insert(
+                    card,
+                    CardRuntime::Repository(Box::new(RepositoryRuntime::file_list_fixture(
+                        RepositoryView {
+                            project: ProjectId::new(),
+                            repository: directory.path().to_path_buf(),
+                            worktree: directory.path().to_path_buf(),
+                        },
+                        &["notes.txt"],
+                    ))),
+                );
+                let task = app.update(Message::Repository(RepositoryAction::OpenFile {
+                    card,
+                    path: PathBuf::from("notes.txt"),
+                }));
+                settle_repository_tasks(&mut app, task).await;
+
+                let task = app.apply_setting_input(SettingsField::EditorAutoSave, "false".into());
+                settle_repository_tasks(&mut app, task).await;
+                let task = app.update(Message::Repository(RepositoryAction::EditorAction {
+                    card,
+                    action: cosmic::widget::text_editor::Action::Edit(
+                        cosmic::widget::text_editor::Edit::Insert('a'),
+                    ),
+                }));
+                settle_repository_tasks(&mut app, task).await;
+                assert_eq!(std::fs::read_to_string(&path).unwrap(), "");
+
+                // Reset schedules the dirty buffer without requiring another edit.
+                let task = app.reset_settings();
+                settle_repository_tasks(&mut app, task).await;
+                assert_eq!(std::fs::read_to_string(&path).unwrap(), "a");
+                assert!(
+                    settings::load(app.settings_path.as_ref().unwrap())
+                        .unwrap()
+                        .editor_auto_save
+                );
+
+                // The same open editor must keep saving subsequent changes.
+                let task = app.update(Message::Repository(RepositoryAction::EditorAction {
+                    card,
+                    action: cosmic::widget::text_editor::Action::Edit(
+                        cosmic::widget::text_editor::Edit::Insert('b'),
+                    ),
+                }));
+                settle_repository_tasks(&mut app, task).await;
+                assert_eq!(std::fs::read_to_string(&path).unwrap(), "ab");
+            });
+    }
+
+    #[test]
+    fn modal_backdrop_dismisses_without_leaking_clicks_or_dismissing_surface_padding() {
+        use cosmic::iced::advanced::{Layout, Shell, clipboard, layout, mouse, widget::Tree};
+        use cosmic::iced::{Event, Point, Rectangle, Size};
+        let renderer = headless_renderer();
+        for (point, enabled, dismisses) in [
+            (Point::new(4.0, 4.0), true, true),
+            (Point::new(400.0, 300.0), true, false),
+            (Point::new(4.0, 4.0), false, false),
+        ] {
+            let underlying: Element<'_, Message> = widget::mouse_area(
+                widget::container(iced::widget::Space::new())
+                    .width(Length::Fill)
+                    .height(Length::Fill),
+            )
+            .on_press(Message::NewTerminal)
+            .into();
+            let modal = dialog_ui::overlay(
+                dialog_ui::surface(iced::widget::Space::new().height(120), 320.0),
+                enabled.then_some(Message::CancelDialog),
+                1.0,
+            );
+            let mut element: Element<'_, Message> = crate::interaction::layer(underlying, modal);
+            let mut tree = Tree::new(element.as_widget());
+            let viewport = Rectangle::with_size(Size::new(800.0, 600.0));
+            let node = element.as_widget_mut().layout(
+                &mut tree,
+                &renderer,
+                &layout::Limits::new(Size::ZERO, viewport.size()),
+            );
+            let mut messages = Vec::new();
+            let mut shell = Shell::new(&mut messages);
+            element.as_widget_mut().update(
+                &mut tree,
+                &Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)),
+                Layout::new(&node),
+                mouse::Cursor::Available(point),
+                &renderer,
+                &mut clipboard::Null,
+                &mut shell,
+                &viewport,
+            );
+            drop(shell);
+            assert_eq!(
+                messages
+                    .iter()
+                    .filter(|message| matches!(message, Message::CancelDialog))
+                    .count(),
+                usize::from(dismisses)
+            );
+            assert!(
+                !messages
+                    .iter()
+                    .any(|message| matches!(message, Message::NewTerminal))
+            );
+        }
+    }
+
+    #[test]
+    fn modal_controls_remain_available_to_assistive_technology() {
+        use cosmic::iced::Size;
+        use cosmic::iced::advanced::{Layout, layout, mouse, widget::Tree};
+        let renderer = headless_renderer();
+        let mut element = dialog_ui::overlay(
+            dialog_ui::surface(
+                widget::button::text("Confirm").on_press(Message::CancelDialog),
+                320.0,
+            ),
+            Some(Message::CancelDialog),
+            1.0,
+        );
+        let mut tree = Tree::new(element.as_widget());
+        let node = element.as_widget_mut().layout(
+            &mut tree,
+            &renderer,
+            &layout::Limits::new(Size::ZERO, Size::new(800.0, 600.0)),
+        );
+        let accessible =
+            element
+                .as_widget()
+                .a11y_nodes(Layout::new(&node), &tree, mouse::Cursor::Unavailable);
+        assert!(
+            accessible
+                .root()
+                .iter()
+                .chain(accessible.children())
+                .any(|node| {
+                    node.node().role() == iced_accessibility::accesskit::Role::Button
+                        && node.node().label() == Some("Confirm")
+                })
+        );
     }
 
     /// The frame the runtime actually builds: libcosmic composes the header,
@@ -9281,9 +9957,6 @@ mod tests {
             Message::NewBrowser,
             Message::FocusCard(CardId::new()),
             Message::FocusAdjacent(crate::workspace::FocusDirection::Right),
-            Message::Pan(PanGesture::Begin { pointer_x: 10.0 }),
-            Message::Pan(PanGesture::Update { pointer_x: 20.0 }),
-            Message::Wheel(WheelDelta::Pixels { x: 1.0, y: 0.0 }),
             Message::ToggleContextInspector,
             Message::Repository(RepositoryAction::NewTerminal { card: focused }),
         ];
@@ -9292,9 +9965,6 @@ mod tests {
                 .iter()
                 .all(workspace_navigation_blocked_during_save)
         );
-        assert!(!workspace_navigation_blocked_during_save(&Message::Pan(
-            PanGesture::End
-        )));
 
         let repository = GitHubRepoKey::new("github.com", None, "owner", "repo").unwrap();
         let key = crate::github::PullRequestKey::new(repository, 45).unwrap();
@@ -9690,6 +10360,9 @@ mod tests {
             branch: String::new(),
             base: "main".into(),
             destination: "/worktrees".into(),
+            advanced: false,
+            resolving: None,
+            error: None,
         });
         assert_eq!(
             app.nested_modal_focus_target().unwrap().to_string(),
@@ -9795,7 +10468,7 @@ mod tests {
         // boundary, and remain available in production builds.
         let focused = app.workspace.focused();
         let _ = app.update(Message::ToggleContextInspector);
-        for tab in [ContextTab::Changes, ContextTab::Code, ContextTab::Context] {
+        for tab in [ContextTab::Changes, ContextTab::Files, ContextTab::Details] {
             let _ = app.update(Message::SelectContextTab(tab));
             assert_eq!(app.context_tab, tab);
             assert_eq!(app.workspace.focused(), focused);
@@ -9803,8 +10476,8 @@ mod tests {
             assert_eq!(app.core.window.show_headerbar, headerbar_enabled);
         }
         let _ = app.open_inspector(Inspector::Settings);
-        let _ = app.update(Message::SelectContextTab(ContextTab::Code));
-        assert_eq!(app.context_tab, ContextTab::Context);
+        let _ = app.update(Message::SelectContextTab(ContextTab::Files));
+        assert_eq!(app.context_tab, ContextTab::Details);
         app.inspector = None;
         app.inspector_transition = None;
         let _ = app.update(Message::ContextInspector(InspectorAction::Close));
@@ -9904,13 +10577,6 @@ mod tests {
             rgba.len(),
             (APPLICATION_ICON_SIZE * APPLICATION_ICON_SIZE * 4) as usize
         );
-    }
-
-    #[test]
-    fn branch_destination_is_one_safe_component() {
-        let component = branch_destination_component("feature/security/fix%2F");
-        assert_eq!(component, "feature%2Fsecurity%2Ffix%252F");
-        assert_eq!(Path::new(&component).components().count(), 1);
     }
 
     #[test]
@@ -10120,10 +10786,6 @@ mod tests {
             },
         };
 
-        assert_eq!(
-            restored_terminal_failure(&session).as_deref(),
-            Some("terminal exited with status 17; Retry starts a new terminal")
-        );
         assert!(matches!(
             restored_runtime_residency(
                 &CardKind::Terminal(session),
@@ -10133,11 +10795,10 @@ mod tests {
             Residency::Failed {
                 typed_error: RuntimeError {
                     code,
-                    message,
+                    ..
                 },
                 retryable: true,
             } if code == "terminal_exited"
-                && message == "terminal exited with status 17; Retry starts a new terminal"
         ));
     }
 
@@ -10201,10 +10862,7 @@ mod tests {
 
         let (_, synchronize_scroll) =
             update_workspace_viewport(&mut workspace, WorkspaceViewportEvent::Resized(600.0));
-        let expected_target = workspace
-            .geometry()
-            .focus_offset(cards[2], 600.0, config.reveal_margin)
-            .unwrap();
+        let expected_target = workspace.geometry().focus_offset(cards[2], 600.0).unwrap();
 
         assert!(synchronize_scroll);
         assert_eq!(workspace.focused(), Some(cards[2]));
@@ -10967,8 +11625,13 @@ mod tests {
             settings_write_blocked: true,
             sidebar_model: SidebarModel::ready(SidebarMode::Expanded, Vec::new()),
             sidebar_state: SidebarState::default(),
+            project_ui: project_ui::State::default(),
+            chat_ui: chat_ui::State::default(),
             active_workspace: None,
             worktree_focus: HashMap::new(),
+            worktree_offsets: HashMap::new(),
+            workspace_view_generation: 0,
+            workspace_scroll_id: widget::Id::new("workspace-strip-0"),
             github_availability: HashMap::new(),
             repository_generations: HashMap::new(),
             worktree_dialog: None,
@@ -10999,6 +11662,10 @@ mod tests {
             settings_category: SettingsCategory::Appearance,
             keyboard_modifiers: keyboard::Modifiers::empty(),
             settings_feedback: None,
+            settings_pending: HashMap::new(),
+            settings_generation: 0,
+            settings_invalid: HashMap::new(),
+            settings_save_error: None,
             status: None,
         }
     }
@@ -11066,6 +11733,72 @@ mod tests {
             app.card_state(card).unwrap().width_fraction,
             limits.maximum / 1_000.0
         );
+    }
+
+    #[test]
+    fn pane_width_cycle_survives_serialization_and_scope_rebuilds_for_every_kind() {
+        let mut app = context_inspector_test_app(true);
+        let card = app.workspace.focused().unwrap();
+        let terminal = app.card_state(card).unwrap().kind.clone();
+        let url = Url::parse("about:blank").unwrap();
+        let kinds = [
+            terminal,
+            CardKind::Repository(RepositoryView {
+                project: ProjectId::new(),
+                repository: PathBuf::from("/repo"),
+                worktree: PathBuf::from("/repo"),
+            }),
+            CardKind::Browser(crate::model::BrowserSession {
+                id: crate::model::BrowserId::new(),
+                current_url: url.clone(),
+                history: vec![url],
+                history_index: 0,
+                scroll_x: 0.0,
+                scroll_y: 0.0,
+                fidelity: crate::model::BrowserRestoreFidelity::ExactLive,
+            }),
+            CardKind::PullRequests(crate::model::PullRequestView {
+                repository: PathBuf::from("/repo"),
+                selected_number: None,
+            }),
+        ];
+        for kind in kinds {
+            app.card_state_mut(card).unwrap().kind = kind;
+            app.card_state_mut(card).unwrap().width_fraction = 0.61;
+            app.workspace = Cagents::rebuild_workspace(&app.durable);
+            app.workspace.resize_viewport(900.0);
+            for fraction in [1.0 / 3.0, 2.0 / 3.0, 0.5, 1.0, 1.0 / 3.0] {
+                let _ = app.update(Message::CyclePaneWidth);
+                let saved = serde_json::to_vec(app.durable.as_ref()).unwrap();
+                app.durable = Arc::new(serde_json::from_slice(&saved).unwrap());
+                let _ = app.select_worktree(PathBuf::from("/other"), false);
+                let _ = app.select_worktree(PathBuf::from("/repo"), false);
+                assert_eq!(app.workspace.focused(), Some(card));
+                assert_eq!(app.card_state(card).unwrap().width_fraction, fraction);
+                assert!(
+                    (app.workspace.geometry().card(card).unwrap().width() - 900.0 * fraction).abs()
+                        < 0.001
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn pointer_activation_keeps_the_clicked_child_keyboard_focus() {
+        let mut app = context_inspector_test_app(true);
+        let first = app.workspace.focused().unwrap();
+        let second = WorkspaceCard::new(CardId::new(), "Editor", CardWidth::Fraction(0.5)).unwrap();
+        let id = second.id;
+        app.workspace.add_card(second, 1, false).unwrap();
+        app.workspace.take_widget_focus_request();
+        let (update, _) = update_workspace_viewport(
+            &mut app.workspace,
+            WorkspaceViewportEvent::PointerFocused(id),
+        );
+        assert_eq!(app.workspace.focused(), Some(id));
+        assert_eq!(app.workspace.take_widget_focus_request(), None);
+        let _ = app.apply_viewport(update, true, false);
+        assert_ne!(app.workspace.focused(), Some(first));
     }
 
     fn task_app_message(task: Task<Message>) -> Message {
@@ -11492,14 +12225,9 @@ mod tests {
             settings_update(&settings, SettingsField::MaxHotCards, "0"),
             SettingsDecision::Invalid(message) if message.contains("max_hot_cards")
         ));
-        let out_of_range = sidebar::EXPANDED_WIDTH_MAX + 1.0;
         assert!(matches!(
-            settings_update(
-                &settings,
-                SettingsField::SidebarWidth,
-                &out_of_range.to_string()
-            ),
-            SettingsDecision::Invalid(message) if message.contains(&sidebar_width_range())
+            settings_update(&settings, SettingsField::ManagedWorktreeDirectory, " "),
+            SettingsDecision::Invalid(_)
         ));
         assert!(matches!(
             settings_update(&settings, SettingsField::DefaultColumnFraction, "not a number"),

@@ -19,7 +19,9 @@ use cosmic::{
     widget,
 };
 
-pub const WIDTH: f32 = 4.0;
+/// Only the shared rule participates in layout; the pointer target overlaps it.
+pub const WIDTH: f32 = crate::design::BORDER_WIDTH;
+const HIT_WIDTH: f32 = 8.0;
 pub const KEYBOARD_STEP: f32 = 16.0;
 
 /// The pane edge occupied by the splitter.
@@ -81,6 +83,14 @@ impl<'a, Message: 'a> Splitter<'a, Message> {
             .next()
             .expect("splitter content layout")
             .with_virtual_offset(layout.virtual_offset())
+    }
+
+    fn hit_bounds(bounds: Rectangle) -> Rectangle {
+        Rectangle {
+            x: bounds.center_x() - HIT_WIDTH / 2.0,
+            width: HIT_WIDTH,
+            ..bounds
+        }
     }
 
     fn resize(&self, width: f32) -> Message {
@@ -242,10 +252,10 @@ impl<'view, Message: 'view> Widget<Message, Theme, Renderer> for Splitter<'view,
         shell: &mut Shell<'_, Message>,
         viewport: &Rectangle,
     ) {
-        let bounds = layout.bounds();
+        let bounds = Self::hit_bounds(layout.bounds());
         let state = tree.state.downcast_mut::<SplitterState>();
         match event {
-            Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)) => {
+            Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)) if !self.modal_open => {
                 state.is_focused = cursor.is_over(bounds);
                 if let Some(position) = cursor.position().filter(|_| state.is_focused) {
                     state.begin_drag(position.x, self.width);
@@ -334,7 +344,7 @@ impl<'view, Message: 'view> Widget<Message, Theme, Renderer> for Splitter<'view,
         _renderer: &Renderer,
     ) -> mouse::Interaction {
         if tree.state.downcast_ref::<SplitterState>().drag.is_some()
-            || cursor.is_over(layout.bounds())
+            || (!self.modal_open && cursor.is_over(Self::hit_bounds(layout.bounds())))
         {
             mouse::Interaction::ResizingHorizontally
         } else {

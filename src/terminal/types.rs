@@ -5,6 +5,16 @@ const DEFAULT_COMMAND_CAPACITY: usize = 256;
 const DEFAULT_PTY_CAPACITY: usize = 64;
 const DEFAULT_TRANSCRIPT_CAPACITY: usize = 64;
 
+/// Parser-owned default colors; application OSC overrides remain authoritative.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TerminalTheme {
+    #[default]
+    Dark,
+    Light,
+    SolarizedDark,
+}
+
 #[derive(Clone, Debug)]
 pub struct TerminalConfig {
     pub columns: u16,
@@ -13,6 +23,7 @@ pub struct TerminalConfig {
     pub cell_height_px: u32,
     pub max_scrollback: usize,
     pub initially_visible: bool,
+    pub theme: TerminalTheme,
     pub command_capacity: usize,
     pub pty_capacity: usize,
     pub transcript_capacity: usize,
@@ -27,6 +38,7 @@ impl Default for TerminalConfig {
             cell_height_px: 18,
             max_scrollback: 10_000,
             initially_visible: true,
+            theme: TerminalTheme::default(),
             command_capacity: DEFAULT_COMMAND_CAPACITY,
             pty_capacity: DEFAULT_PTY_CAPACITY,
             transcript_capacity: DEFAULT_TRANSCRIPT_CAPACITY,
@@ -42,6 +54,7 @@ pub struct TerminalWake {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum TerminalEvent {
     TitleChanged(String),
+    ResumeHintChanged(Option<String>),
     Bell,
     Exited {
         exit_code: u32,
@@ -113,6 +126,8 @@ pub enum MouseButton {
     Middle,
     Back,
     Forward,
+    WheelUp,
+    WheelDown,
     Other(u16),
 }
 

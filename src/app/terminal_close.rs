@@ -207,7 +207,7 @@ impl Cagents {
 
     pub(super) fn terminal_close_dialog(&self) -> Option<Element<'_, Message>> {
         let intent = self.terminal_close.as_ref()?;
-        Some(widget::container(widget::column::with_children(vec![
+        Some(super::dialog_ui::surface(widget::column::with_children(vec![
             widget::text::title3("Terminate terminal?").into(),
             widget::text::body("This closes the terminal and terminates its running process. Cancel keeps the terminal card.").into(),
             widget::text::body(intent.detail.as_deref().unwrap_or(if intent.pending { "Revalidating the daemon and requesting termination…" } else { "The terminal identity and daemon proof will be checked again before termination." })).into(),
@@ -219,7 +219,7 @@ impl Cagents {
                     .id(widget::Id::new("dialog.terminal-close.confirm"))
                     .on_press_maybe((!intent.pending && intent.detail.is_none()).then_some(Message::ConfirmTerminalClose)).into(),
             ]).spacing(8).into(),
-        ]).spacing(12)).class(cosmic::theme::Container::Dialog(false)).padding(24).max_width(560).into())
+        ]).spacing(12), 560.0))
     }
 }
 

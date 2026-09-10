@@ -29,7 +29,7 @@ use crate::{
     },
 };
 
-pub const CURRENT_SCHEMA_VERSION: u32 = 3;
+pub const CURRENT_SCHEMA_VERSION: u32 = 4;
 pub const DEFAULT_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 pub const MAX_BUSY_TIMEOUT: Duration = Duration::from_secs(10);
 const PRIVATE_FILE_MODE: u32 = 0o600;
@@ -92,6 +92,7 @@ pub struct RecoveryReport {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PersistedCardKind {
     Terminal,
+    Chat,
     Browser,
     PullRequests,
     Repository,
@@ -101,6 +102,7 @@ impl PersistedCardKind {
     fn as_str(self) -> &'static str {
         match self {
             Self::Terminal => "terminal",
+            Self::Chat => "chat",
             Self::Browser => "browser",
             Self::PullRequests => "pull_requests",
             Self::Repository => "repository",
@@ -110,6 +112,7 @@ impl PersistedCardKind {
     fn parse(value: &str) -> Result<Self> {
         match value {
             "terminal" => Ok(Self::Terminal),
+            "chat" => Ok(Self::Chat),
             "browser" => Ok(Self::Browser),
             "pull_requests" => Ok(Self::PullRequests),
             "repository" => Ok(Self::Repository),
@@ -1028,18 +1031,40 @@ fn migrate(connection: &mut Connection) -> Result<()> {
         return Ok(());
     }
 
-    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-    if current < 1 {
-        migrate_to_v1(&transaction)?;
-    }
-    if current < 2 {
-        migrate_to_v2(&transaction)?;
-    }
-    if current < 3 {
-        migrate_to_v3(&transaction)?;
-    }
-    transaction.pragma_update(None, "user_version", CURRENT_SCHEMA_VERSION)?;
-    transaction.commit()?;
+    // SQLite cannot alter a CHECK constraint. Rebuild its parent table with
+    // foreign keys temporarily disabled outside the transaction, preserving
+    // every child row and checking the complete graph before commit.
+    connection.pragma_update(None, "foreign_keys", false)?;
+    let result = (|| -> Result<()> {
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if current < 1 {
+            migrate_to_v1(&transaction)?;
+        }
+        if current < 2 {
+            migrate_to_v2(&transaction)?;
+        }
+        if current < 3 {
+            migrate_to_v3(&transaction)?;
+        }
+        if current < 4 {
+            migrate_to_v4(&transaction)?;
+        }
+        let violation = transaction
+            .prepare("PRAGMA foreign_key_check")?
+            .query([])?
+            .next()?
+            .is_some();
+        if violation {
+            return Err(StoreError::InvalidState(
+                "migration violates foreign keys".into(),
+            ));
+        }
+        transaction.pragma_update(None, "user_version", CURRENT_SCHEMA_VERSION)?;
+        transaction.commit()?;
+        Ok(())
+    })();
+    connection.pragma_update(None, "foreign_keys", true)?;
+    result?;
     Ok(())
 }
 
@@ -1162,6 +1187,31 @@ fn migrate_to_v3(transaction: &Transaction<'_>) -> Result<()> {
     // computed fingerprint, so an upgraded database simply rewrites each card
     // once and is then in the fast path.
     transaction.execute_batch("ALTER TABLE cards ADD COLUMN content_hash INTEGER;")?;
+    Ok(())
+}
+
+fn migrate_to_v4(transaction: &Transaction<'_>) -> Result<()> {
+    transaction.execute_batch(
+        "CREATE TABLE cards_v4 (
+            card_id TEXT PRIMARY KEY NOT NULL,
+            workspace_id TEXT NOT NULL REFERENCES workspaces(workspace_id),
+            ordinal INTEGER NOT NULL CHECK (ordinal >= 0),
+            generation INTEGER NOT NULL CHECK (generation >= 0),
+            title TEXT NOT NULL,
+            width_fraction REAL NOT NULL CHECK (width_fraction > 0.0),
+            existence_json TEXT NOT NULL,
+            kind_tag TEXT NOT NULL CHECK (
+                kind_tag IN ('terminal', 'chat', 'browser', 'pull_requests', 'repository')
+            ),
+            content_json TEXT,
+            updated_at_unix_ms INTEGER NOT NULL,
+            content_hash INTEGER
+         ) STRICT;
+         INSERT INTO cards_v4 SELECT * FROM cards;
+         DROP TABLE cards;
+         ALTER TABLE cards_v4 RENAME TO cards;
+         CREATE INDEX cards_workspace_order_idx ON cards(workspace_id, ordinal);",
+    )?;
     Ok(())
 }
 
@@ -1304,6 +1354,7 @@ const UPSERT_CARD: &str = "INSERT INTO cards (
         title = excluded.title,
         width_fraction = excluded.width_fraction,
         existence_json = excluded.existence_json,
+        kind_tag = excluded.kind_tag,
         content_json = excluded.content_json,
         content_hash = excluded.content_hash,
         updated_at_unix_ms = excluded.updated_at_unix_ms";
@@ -1459,13 +1510,6 @@ fn save_workspace_transaction(
         }
 
         if let Some(stored) = stored {
-            if stored.kind != kind {
-                return Err(StoreError::InvalidState(format!(
-                    "card {card_id} cannot change kind from {} to {}",
-                    stored.kind.as_str(),
-                    kind.as_str()
-                )));
-            }
             if matches!(stored.existence, Existence::Closed { .. })
                 && !matches!(card.existence, Existence::Closed { .. })
             {
@@ -1480,12 +1524,23 @@ fn save_workspace_transaction(
                     actual: stored.generation,
                 });
             }
+            if stored.kind != kind {
+                validate_card_conversion(transaction, card, stored.kind)?;
+            }
         } else if expected != 0 {
             return Err(StoreError::StaleGeneration {
                 entity: format!("new card {card_id}"),
                 expected,
                 actual: 0,
             });
+        }
+        if let CardKind::Chat(session) = &card.kind {
+            validate_chat_identity(
+                transaction,
+                card.id,
+                session,
+                stored.map(|stored| stored.kind),
+            )?;
         }
 
         let write = CardWrite::build(&workspace_id, &card_id, ordinal, card, kind)?;
@@ -1550,6 +1605,153 @@ fn save_workspace_transaction(
     })
 }
 
+/// Kind changes are restricted to an exact conversation handoff, within the
+/// same workspace/card CAS transaction as the following payload write.
+fn validate_card_conversion(
+    transaction: &Transaction<'_>,
+    card: &CardState,
+    previous: PersistedCardKind,
+) -> Result<()> {
+    let invalid = || {
+        StoreError::InvalidState(format!(
+            "card {} has an invalid chat/terminal conversion",
+            card.id
+        ))
+    };
+    match (previous, &card.kind) {
+        (PersistedCardKind::Terminal, CardKind::Chat(session)) => {
+            let source = session.terminal.as_ref().ok_or_else(invalid)?;
+            let (id, recipe): (String, String) = transaction.query_row(
+                "SELECT terminal_id, recipe_json FROM terminal_recipes WHERE card_id = ?1",
+                [card.id.to_string()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )?;
+            if source.id != session.id
+                || id != source.id.to_string()
+                || from_json::<crate::model::LaunchRecipe>("terminal recipe", &recipe)?
+                    != source.launch
+                || !source_chat_launch_matches(source, session)
+                || exact_chat_resume(session).is_none()
+            {
+                return Err(invalid());
+            }
+        }
+        (PersistedCardKind::Chat, CardKind::Terminal(terminal)) => {
+            let content: String = transaction.query_row(
+                "SELECT content_json FROM cards WHERE card_id = ?1",
+                [card.id.to_string()],
+                |row| row.get(0),
+            )?;
+            let session: crate::chat::Session = from_json("chat card", &content)?;
+            let reattach = session.launch.provider == crate::chat::Provider::Codex
+                && session.terminal.as_ref().is_some_and(|source| {
+                    terminal.id == source.id
+                        && terminal.launch == source.launch
+                        && terminal.continuity.live_proof().is_some()
+                        && terminal.continuity.live_proof() == source.continuity.live_proof()
+                });
+            if !reattach
+                && (terminal.id == session.id
+                    || exact_chat_resume(&session).as_ref() != Some(&terminal.launch))
+            {
+                return Err(invalid());
+            }
+            if session
+                .terminal
+                .as_ref()
+                .is_some_and(|source| source.transcript_path != terminal.transcript_path)
+            {
+                return Err(invalid());
+            }
+            if terminal.id != session.id {
+                let owned: Option<String> = transaction
+                    .query_row(
+                        "SELECT card_id FROM terminal_recipes WHERE terminal_id = ?1",
+                        [terminal.id.to_string()],
+                        |row| row.get(0),
+                    )
+                    .optional()?;
+                if owned.is_some() {
+                    return Err(invalid());
+                }
+                // Move the terminal key and its transcript metadata together.
+                // Deferral preserves offsets instead of deleting transcript evidence.
+                transaction.pragma_update(None, "defer_foreign_keys", true)?;
+                transaction.execute(
+                    "UPDATE terminal_recipes SET terminal_id = ?1 WHERE card_id = ?2 AND terminal_id = ?3",
+                    params![terminal.id.to_string(), card.id.to_string(), session.id.to_string()],
+                )?;
+                transaction.execute(
+                    "UPDATE transcript_metadata SET terminal_id = ?1 WHERE terminal_id = ?2",
+                    params![terminal.id.to_string(), session.id.to_string()],
+                )?;
+            }
+        }
+        _ => return Err(invalid()),
+    }
+    Ok(())
+}
+
+fn source_chat_launch_matches(source: &TerminalSession, session: &crate::chat::Session) -> bool {
+    if let Some(recipe) = source.agent_resume_recipe() {
+        return recipe == session.launch.recipe
+            && crate::model::agent_recovery::resume_recipe(&recipe)
+                == session.launch.terminal_recipe();
+    }
+    source
+        .resume_hint
+        .as_deref()
+        .and_then(crate::model::agent_recovery::observed_launch_from_hint)
+        .as_ref()
+        == Some(&session.launch.recipe)
+        || source.launch == session.launch.recipe
+}
+
+fn exact_chat_resume(session: &crate::chat::Session) -> Option<crate::model::LaunchRecipe> {
+    session.launch.terminal_recipe()
+}
+
+fn validate_chat_identity(
+    transaction: &Transaction<'_>,
+    card: CardId,
+    session: &crate::chat::Session,
+    previous: Option<PersistedCardKind>,
+) -> Result<()> {
+    if session
+        .terminal
+        .as_ref()
+        .is_some_and(|source| source.id != session.id)
+    {
+        return Err(StoreError::InvalidState(format!(
+            "chat card {card} changed source identity"
+        )));
+    }
+    if previous == Some(PersistedCardKind::Chat) {
+        let content: String = transaction.query_row(
+            "SELECT content_json FROM cards WHERE card_id = ?1",
+            [card.to_string()],
+            |row| row.get(0),
+        )?;
+        let stored: crate::chat::Session = from_json("chat card", &content)?;
+        if stored.id != session.id
+            || stored.launch.provider != session.launch.provider
+            || stored.launch.recipe != session.launch.recipe
+            || stored.terminal != session.terminal
+            || (stored
+                .launch
+                .session_id
+                .as_ref()
+                .is_some_and(|id| Some(id) != session.launch.session_id.as_ref())
+                && (stored.proof.is_none() || stored.proof != session.proof))
+        {
+            return Err(StoreError::InvalidState(format!(
+                "chat card {card} changed conversation identity"
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// Everything a card write binds, materialized once.
 ///
 /// The content fingerprint is derived from exactly these values, which is what
@@ -1582,7 +1784,7 @@ enum CardPayloadWrite<'card> {
         scroll_y: f64,
         fidelity: &'static str,
     },
-    /// Pull-request and repository cards keep their whole payload in the
+    /// Chat, pull-request and repository cards keep their whole payload in the
     /// `cards.content_json` column, so there is no side table to write.
     Inline,
 }
@@ -1598,6 +1800,7 @@ impl<'card> CardWrite<'card> {
         let ordinal = usize_to_i64(ordinal, "card ordinal")?;
         let existence_json = to_json(&card.existence)?;
         let content_json = match &card.kind {
+            CardKind::Chat(session) => Some(to_json(session)?),
             CardKind::PullRequests(view) => Some(to_json(view)?),
             CardKind::Repository(view) => Some(to_json(view)?),
             CardKind::Terminal(_) | CardKind::Browser(_) => None,
@@ -1631,7 +1834,9 @@ impl<'card> CardWrite<'card> {
                     },
                 }
             }
-            CardKind::PullRequests(_) | CardKind::Repository(_) => CardPayloadWrite::Inline,
+            CardKind::Chat(_) | CardKind::PullRequests(_) | CardKind::Repository(_) => {
+                CardPayloadWrite::Inline
+            }
         };
 
         let mut hasher = ContentHasher::new();
@@ -2172,6 +2377,12 @@ fn load_card_connection(
         PersistedCardKind::Terminal => {
             CardKind::Terminal(load_terminal(connection, id, current_boot, proof)?)
         }
+        PersistedCardKind::Chat => CardKind::Chat(from_json(
+            "chat card",
+            content.as_deref().ok_or_else(|| {
+                StoreError::InvalidState(format!("chat card {id} has no payload"))
+            })?,
+        )?),
         PersistedCardKind::Browser => CardKind::Browser(load_browser(connection, id)?),
         PersistedCardKind::PullRequests => CardKind::PullRequests(from_json(
             "pull request card",
@@ -2366,6 +2577,7 @@ fn validate_browser_descriptor(browser: &BrowserSession) -> Result<()> {
 fn card_kind(kind: &CardKind) -> PersistedCardKind {
     match kind {
         CardKind::Terminal(_) => PersistedCardKind::Terminal,
+        CardKind::Chat(_) => PersistedCardKind::Chat,
         CardKind::Browser(_) => PersistedCardKind::Browser,
         CardKind::PullRequests(_) => PersistedCardKind::PullRequests,
         CardKind::Repository(_) => PersistedCardKind::Repository,
@@ -2586,6 +2798,215 @@ mod tests {
             self.cards.clone_from(&commit.card_generations);
             Ok(commit)
         }
+    }
+
+    fn agent_workspace(provider: crate::chat::Provider) -> (WorkspaceState, crate::chat::Session) {
+        let mut workspace = workspace_with_terminal(&boot("chat-boot"));
+        let CardKind::Terminal(source) = &mut workspace.cards[0].kind else {
+            unreachable!()
+        };
+        let id = "77777777-1111-4111-8111-111111111111";
+        source.launch.program = provider.executable().into();
+        source.launch.arguments = vec![
+            if provider == crate::chat::Provider::Codex {
+                "resume"
+            } else {
+                "--resume"
+            }
+            .into(),
+            id.into(),
+        ];
+        source.resume_hint = crate::model::agent_recovery::hint_from_launch(&source.launch);
+        let chat = crate::chat::Session {
+            id: source.id,
+            launch: crate::chat::Launch {
+                provider,
+                recipe: source.launch.clone(),
+                session_id: Some(id.into()),
+            },
+            proof: None,
+            terminal: Some(source.clone()),
+        };
+        (workspace, chat)
+    }
+
+    #[test]
+    fn chat_conversion_round_trip_preserves_transcript_and_rejects_stale_card_cas() {
+        let directory = tempdir().unwrap();
+        let store =
+            StateStore::open(directory.path().join("chat.sqlite3"), boot("chat-boot")).unwrap();
+        let (mut workspace, chat) = agent_workspace(crate::chat::Provider::Omp);
+        let mut lane = SaveLane::default();
+        lane.save(&store, &workspace).unwrap();
+        let terminal_generation = lane.cards.clone();
+        let metadata = TranscriptMetadata {
+            path: chat
+                .terminal
+                .as_ref()
+                .unwrap()
+                .transcript_path
+                .clone()
+                .unwrap(),
+            byte_len: 128,
+            durable_offset: 96,
+            updated_at_unix_ms: 1,
+        };
+        store
+            .save_transcript_metadata(chat.id, &metadata, 0)
+            .unwrap();
+        workspace.cards[0].kind = CardKind::Chat(chat.clone());
+        lane.save(&store, &workspace).unwrap();
+        let restored = store.load_workspace(workspace.id, None).unwrap().unwrap();
+        assert_eq!(restored.cards[0].kind, CardKind::Chat(chat.clone()));
+        let mut terminal = chat.terminal.clone().unwrap();
+        terminal.id = TerminalId::new();
+        terminal.continuity = TerminalContinuity::RelaunchAvailable {
+            recipe: terminal.launch.clone(),
+            last_exit: None,
+        };
+        workspace.cards[0].kind = CardKind::Terminal(terminal.clone());
+        assert!(matches!(
+            store.save_workspace(
+                &workspace,
+                SnapshotBase {
+                    workspace: lane.workspace,
+                    cards: &terminal_generation,
+                }
+            ),
+            Err(StoreError::StaleGeneration { .. })
+        ));
+        assert_eq!(
+            store
+                .load_card(workspace.cards[0].id, None)
+                .unwrap()
+                .unwrap()
+                .kind,
+            CardKind::Chat(chat.clone())
+        );
+        lane.save(&store, &workspace).unwrap();
+        assert_eq!(
+            store
+                .load_card(workspace.cards[0].id, None)
+                .unwrap()
+                .unwrap()
+                .kind,
+            CardKind::Terminal(terminal.clone())
+        );
+        let (_, restored_metadata) = store
+            .load_transcript_metadata(terminal.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(restored_metadata.path, metadata.path);
+        assert_eq!(restored_metadata.byte_len, 128);
+        assert_eq!(restored_metadata.durable_offset, 96);
+        assert!(store.load_transcript_metadata(chat.id).unwrap().is_none());
+    }
+
+    #[test]
+    fn chat_conversion_rejects_wrong_conversation_and_allows_codex_live_return() {
+        let directory = tempdir().unwrap();
+        let store =
+            StateStore::open(directory.path().join("chat.sqlite3"), boot("chat-boot")).unwrap();
+        let (mut workspace, chat) = agent_workspace(crate::chat::Provider::Codex);
+        let mut lane = SaveLane::default();
+        lane.save(&store, &workspace).unwrap();
+        let mut wrong = chat.clone();
+        wrong.launch.session_id = Some("88888888-1111-4111-8111-111111111111".into());
+        workspace.cards[0].kind = CardKind::Chat(wrong);
+        assert!(matches!(
+            lane.save(&store, &workspace),
+            Err(StoreError::InvalidState(_))
+        ));
+        workspace.cards[0].kind = CardKind::Chat(chat.clone());
+        lane.save(&store, &workspace).unwrap();
+        let mut wrong = chat.clone();
+        wrong.id = TerminalId::new();
+        workspace.cards[0].kind = CardKind::Chat(wrong);
+        assert!(matches!(
+            lane.save(&store, &workspace),
+            Err(StoreError::InvalidState(_))
+        ));
+        let terminal = chat.terminal.unwrap();
+        workspace.cards[0].kind = CardKind::Terminal(terminal.clone());
+        lane.save(&store, &workspace).unwrap();
+        let proof = terminal.continuity.live_proof().unwrap();
+        assert_eq!(
+            store
+                .load_card(workspace.cards[0].id, Some(&proof))
+                .unwrap()
+                .unwrap()
+                .kind,
+            CardKind::Terminal(terminal)
+        );
+    }
+
+    #[test]
+    fn v4_migration_preserves_populated_terminal_and_browser_children() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("legacy.sqlite3");
+        let mut connection = Connection::open(&path).unwrap();
+        configure_connection(&connection, DEFAULT_BUSY_TIMEOUT).unwrap();
+        let transaction = connection.transaction().unwrap();
+        migrate_to_v1(&transaction).unwrap();
+        migrate_to_v2(&transaction).unwrap();
+        migrate_to_v3(&transaction).unwrap();
+        let (mut workspace, chat) = agent_workspace(crate::chat::Provider::Omp);
+        let mut browser = workspace.cards[0].clone();
+        browser.id = CardId::new();
+        let url = Url::parse("https://example.com/retained").unwrap();
+        browser.kind = CardKind::Browser(BrowserSession {
+            id: BrowserId::new(),
+            current_url: url.clone(),
+            history: vec![url],
+            history_index: 0,
+            scroll_x: 12.0,
+            scroll_y: 90.0,
+            fidelity: BrowserRestoreFidelity::HistoryAndScroll,
+        });
+        workspace.cards.push(browser.clone());
+        let commit = save_workspace_transaction(
+            &transaction,
+            &workspace,
+            SnapshotBase {
+                workspace: 0,
+                cards: &BTreeMap::new(),
+            },
+        )
+        .unwrap();
+        transaction.pragma_update(None, "user_version", 3).unwrap();
+        transaction.commit().unwrap();
+        drop(connection);
+        let store = StateStore::open(&path, boot("chat-boot")).unwrap();
+        let restored = store.load_workspace(workspace.id, None).unwrap().unwrap();
+        assert_eq!(restored.cards[1].kind, browser.kind);
+        assert_eq!(
+            store
+                .load_transcript_metadata(chat.id)
+                .unwrap()
+                .unwrap()
+                .1
+                .path,
+            chat.terminal
+                .as_ref()
+                .unwrap()
+                .transcript_path
+                .clone()
+                .unwrap()
+        );
+        let mut lane = SaveLane {
+            workspace: commit.generation,
+            cards: commit.card_generations,
+        };
+        workspace.cards[0].kind = CardKind::Chat(chat.clone());
+        lane.save(&store, &workspace).unwrap();
+        assert_eq!(
+            store
+                .load_card(workspace.cards[0].id, None)
+                .unwrap()
+                .unwrap()
+                .kind,
+            CardKind::Chat(chat)
+        );
     }
 
     fn stored_card_row(store: &StateStore, card_id: CardId) -> (i64, i64, Option<i64>) {
@@ -2810,7 +3231,6 @@ mod tests {
         assert_eq!(restored.active_worktree, workspace.active_worktree);
         assert_eq!(restored.worktree_focus, workspace.worktree_focus);
         assert_eq!(restored.generation, 2);
-        assert_eq!(store.schema_version().unwrap(), 3);
     }
 
     #[test]

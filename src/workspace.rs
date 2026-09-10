@@ -27,29 +27,25 @@ impl CardWidth {
     }
 
     pub fn resolve(self, viewport_width: f32, limits: WidthLimits) -> f32 {
-        let requested = match self {
-            Self::Fraction(fraction) => viewport_width * fraction,
-            Self::Fixed(logical_pixels) => logical_pixels,
-        };
-
-        requested.clamp(limits.minimum, limits.maximum)
+        match self {
+            // Fractions describe the actual strip viewport, including the full
+            // width preset. Drag bounds are enforced before storing a fraction.
+            Self::Fraction(fraction) if viewport_width > 0.0 => viewport_width * fraction,
+            Self::Fraction(_) => limits.minimum,
+            Self::Fixed(logical_pixels) => logical_pixels.clamp(limits.minimum, limits.maximum),
+        }
     }
 
-    fn resolve_for_strip(
-        self,
-        viewport_width: f32,
-        limits: WidthLimits,
-        maximum_fraction_width: f32,
-    ) -> f32 {
-        let resolved = self.resolve(viewport_width, limits);
-        match self {
-            // A fractional column should not consume the final gap and reveal
-            // edge. Fixed columns are an explicit request and may overflow.
-            Self::Fraction(_) if maximum_fraction_width > 0.0 => {
-                resolved.min(maximum_fraction_width)
-            }
-            Self::Fraction(_) | Self::Fixed(_) => resolved,
-        }
+    pub fn next_preset(self) -> Self {
+        const PRESETS: [f32; 4] = [1.0 / 3.0, 2.0 / 3.0, 0.5, 1.0];
+        let next = match self {
+            Self::Fraction(fraction) => PRESETS
+                .iter()
+                .position(|preset| (fraction - preset).abs() <= f32::EPSILON)
+                .map_or(0, |index| (index + 1) % PRESETS.len()),
+            Self::Fixed(_) => 0,
+        };
+        Self::Fraction(PRESETS[next])
     }
 
     fn validate(self) -> Result<Self, WorkspaceError> {
@@ -192,7 +188,6 @@ pub struct WorkspaceConfig {
     pub trailing_padding: f32,
     pub overscan: f32,
     pub reveal_margin: f32,
-    pub line_scroll_pixels: f32,
     pub animation_omega: f32,
     pub width_limits: WidthLimits,
 }
@@ -200,13 +195,12 @@ pub struct WorkspaceConfig {
 impl Default for WorkspaceConfig {
     fn default() -> Self {
         Self {
-            gap: 4.0,
+            gap: 0.0,
             leading_padding: 0.0,
-            trailing_padding: 4.0,
+            trailing_padding: 0.0,
             overscan: 360.0,
             reveal_margin: 12.0,
-            line_scroll_pixels: 48.0,
-            animation_omega: 18.0,
+            animation_omega: 30.0,
             width_limits: WidthLimits::default(),
         }
     }
@@ -219,7 +213,6 @@ impl WorkspaceConfig {
         validate_nonnegative_finite(self.trailing_padding, "trailing padding")?;
         validate_nonnegative_finite(self.overscan, "overscan")?;
         validate_nonnegative_finite(self.reveal_margin, "reveal margin")?;
-        validate_positive_finite(self.line_scroll_pixels, "line scroll distance")?;
         validate_positive_finite(self.animation_omega, "animation frequency")?;
         WidthLimits::new(self.width_limits.minimum, self.width_limits.maximum)?;
         Ok(self)
@@ -250,19 +243,13 @@ pub struct StripGeometry {
 impl StripGeometry {
     pub fn build(cards: &[WorkspaceCard], viewport_width: f32, config: WorkspaceConfig) -> Self {
         let viewport_width = finite_nonnegative(viewport_width);
-        let maximum_fraction_width =
-            viewport_width - config.leading_padding - config.gap - config.reveal_margin;
         let mut cursor = config.leading_padding;
         let mut geometry = Vec::with_capacity(cards.len());
         let mut prefix_ends = Vec::with_capacity(cards.len());
 
         for (index, card) in cards.iter().enumerate() {
             let start = cursor;
-            let width = card.width.resolve_for_strip(
-                viewport_width,
-                config.width_limits,
-                maximum_fraction_width,
-            );
+            let width = card.width.resolve(viewport_width, config.width_limits);
             let end = start + width;
             geometry.push(CardGeometry {
                 id: card.id,
@@ -326,18 +313,9 @@ impl StripGeometry {
         (self.total_width - finite_nonnegative(viewport_width)).max(0.0)
     }
 
-    pub fn focus_offset(&self, id: CardId, viewport_width: f32, margin: f32) -> Option<f32> {
+    pub fn focus_offset(&self, id: CardId, viewport_width: f32) -> Option<f32> {
         let card = self.card(id)?;
-        let viewport_width = finite_nonnegative(viewport_width);
-        let margin = finite_nonnegative(margin).min(viewport_width / 2.0);
-        let fitting_width = (viewport_width - margin * 2.0).max(0.0);
-        let target = if card.width() > fitting_width {
-            card.start - margin
-        } else {
-            card.start + card.width() / 2.0 - viewport_width / 2.0
-        };
-
-        Some(target.clamp(0.0, self.max_offset(viewport_width)))
+        Some(card.start.clamp(0.0, self.max_offset(viewport_width)))
     }
 }
 
@@ -448,35 +426,6 @@ pub enum FocusTarget {
 pub struct FocusHandoff {
     pub unmounting: CardId,
     pub target: FocusTarget,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub enum WheelDelta {
-    Lines { x: f32, y: f32 },
-    Pixels { x: f32, y: f32 },
-}
-
-impl WheelDelta {
-    pub fn logical_x(self, line_pixels: f32) -> f32 {
-        match self {
-            Self::Lines { x, .. } => x * line_pixels,
-            Self::Pixels { x, .. } => x,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RelevantInput {
-    KeyboardNavigation,
-    WheelOrTrackpad,
-    PointerPan,
-    Scrollbar,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq)]
-struct PanState {
-    pointer_start: f32,
-    offset_start: f32,
 }
 
 /// Allocation-free ring of exact programmatic scroll offsets that the native
@@ -650,7 +599,6 @@ pub struct Workspace {
     viewport_width: f32,
     geometry: StripGeometry,
     camera: Camera,
-    pan: Option<PanState>,
     scroll_sync: Option<ScrollSync>,
     visibility: HashMap<CardId, VisibilityClass>,
     visibility_bands: Option<VisibilityBands>,
@@ -669,7 +617,6 @@ impl Workspace {
             viewport_width: 0.0,
             geometry: StripGeometry::build(&[], 0.0, config),
             camera: Camera::new(config.animation_omega)?,
-            pan: None,
             scroll_sync: None,
             visibility: HashMap::new(),
             visibility_bands: None,
@@ -743,10 +690,6 @@ impl Workspace {
 
     pub(crate) fn card_indices(&self) -> &Arc<HashMap<CardId, usize>> {
         &self.card_indices
-    }
-
-    pub fn is_panning(&self) -> bool {
-        self.pan.is_some()
     }
 
     pub fn pending_close(&self) -> Option<FocusHandoff> {
@@ -855,7 +798,7 @@ impl Workspace {
             return Err(WorkspaceError::CardClosing(id));
         }
 
-        self.interrupt_for(RelevantInput::KeyboardNavigation);
+        // Retarget the running spring without restarting on held-key repeats.
         self.focused = Some(id);
         self.pending_widget_focus = Some(id);
         self.reveal_focused();
@@ -1032,56 +975,9 @@ impl Workspace {
         }
 
         self.scroll_sync = None;
-        self.interrupt_for(RelevantInput::Scrollbar);
+        self.camera.interrupt();
         self.camera.jump_to(offset);
         self.refresh_visibility((self.camera.offset() - old_offset).abs() > f32::EPSILON)
-    }
-
-    pub fn scroll_wheel(&mut self, delta: WheelDelta) -> ViewportUpdate {
-        let old_offset = self.camera.offset();
-        self.interrupt_for(RelevantInput::WheelOrTrackpad);
-        let requested = self.camera.offset() - delta.logical_x(self.config.line_scroll_pixels);
-        self.camera
-            .jump_to(requested.clamp(0.0, self.geometry.max_offset(self.viewport_width)));
-        self.refresh_visibility((self.camera.offset() - old_offset).abs() > f32::EPSILON)
-    }
-
-    pub fn begin_pan(&mut self, pointer_x: f32) {
-        self.interrupt_for(RelevantInput::PointerPan);
-        self.pan = Some(PanState {
-            pointer_start: pointer_x,
-            offset_start: self.camera.offset(),
-        });
-    }
-
-    pub fn update_pan(&mut self, pointer_x: f32) -> ViewportUpdate {
-        let Some(pan) = self.pan else {
-            return ViewportUpdate::unchanged();
-        };
-        let old_offset = self.camera.offset();
-        let maximum = self.geometry.max_offset(self.viewport_width);
-        let requested = pan.offset_start + pan.pointer_start - pointer_x;
-        self.camera.jump_to(requested.clamp(0.0, maximum));
-        self.refresh_visibility((self.camera.offset() - old_offset).abs() > f32::EPSILON)
-    }
-
-    pub fn end_pan(&mut self) {
-        self.pan = None;
-    }
-
-    pub fn interrupt_for(&mut self, input: RelevantInput) {
-        match input {
-            RelevantInput::KeyboardNavigation => {
-                self.camera.interrupt();
-            }
-            RelevantInput::WheelOrTrackpad | RelevantInput::PointerPan => {
-                self.scroll_sync = None;
-                self.camera.interrupt();
-            }
-            RelevantInput::Scrollbar => {
-                self.camera.interrupt();
-            }
-        }
     }
 
     pub fn tick(&mut self, elapsed: Duration) -> ViewportUpdate {
@@ -1185,10 +1081,7 @@ impl Workspace {
         let Some(focused) = self.focused else {
             return;
         };
-        if let Some(target) =
-            self.geometry
-                .focus_offset(focused, self.viewport_width, self.config.reveal_margin)
-        {
+        if let Some(target) = self.geometry.focus_offset(focused, self.viewport_width) {
             self.camera.animate_to(target);
         }
     }
@@ -1371,6 +1264,29 @@ mod tests {
         }
         workspace
     }
+    #[test]
+    fn held_navigation_reaches_the_strip_edge_without_restarting_the_camera() {
+        let mut workspace = workspace_with_widths(&[CardWidth::Fixed(300.0); 4], 400.0);
+        for _ in 0..3 {
+            workspace.focus_adjacent(FocusDirection::Right).unwrap();
+            workspace.tick(Duration::from_millis(20));
+        }
+        let target = workspace.camera().target();
+        for _ in 0..20 {
+            workspace.focus_adjacent(FocusDirection::Right).unwrap();
+            workspace.tick(Duration::from_millis(20));
+        }
+        assert_eq!(workspace.focused_index(), Some(3));
+        assert!((workspace.camera().offset() - target).abs() < 1.0);
+
+        workspace.native_scroll(0.0, 400.0);
+        assert!(!workspace.camera().is_animating());
+        // A boundary key must still reveal its focused column after manual
+        // scrolling away, including a restored worktree's offscreen focus.
+        workspace.focus_adjacent(FocusDirection::Right).unwrap();
+        assert!(workspace.camera().is_animating());
+        assert_eq!(workspace.camera().target(), target);
+    }
 
     #[test]
     fn visibility_tracks_identity_when_reordering_inside_the_same_bands() {
@@ -1536,7 +1452,7 @@ mod tests {
     }
 
     #[test]
-    fn focus_offset_centers_fitting_columns_and_clamps_strip_edges() {
+    fn focus_offset_left_aligns_fitting_columns_and_clamps_strip_edges() {
         let workspace = workspace_with_widths(
             &[
                 CardWidth::Fixed(480.0),
@@ -1547,30 +1463,33 @@ mod tests {
         );
         let geometry = workspace.geometry();
         let ids: Vec<_> = workspace.order().collect();
-        assert_eq!(geometry.focus_offset(ids[0], 700.0, 12.0), Some(0.0));
+        assert_eq!(geometry.focus_offset(ids[0], 700.0), Some(0.0));
         let middle = geometry.card(ids[1]).unwrap();
+        assert_eq!(geometry.focus_offset(ids[1], 700.0), Some(middle.start));
         assert_eq!(
-            geometry.focus_offset(ids[1], 700.0, 12.0),
-            Some(middle.start + middle.width() / 2.0 - 350.0)
-        );
-        assert_eq!(
-            geometry.focus_offset(ids[2], 700.0, 12.0),
+            geometry.focus_offset(ids[2], 700.0),
             Some(geometry.max_offset(700.0))
         );
     }
 
     #[test]
-    fn fractional_columns_reserve_the_neighbor_peek_at_every_width() {
-        for viewport in [320.0, 800.0, 1_920.0] {
-            let workspace = workspace_with_widths(&[CardWidth::Fraction(1.0); 3], viewport);
-            let cards = workspace.geometry().cards();
-            let expected_width = viewport
-                - workspace.config.leading_padding
-                - workspace.config.gap
-                - workspace.config.reveal_margin;
-            assert_eq!(cards[0].width(), expected_width);
-            assert_eq!(cards[1].start, viewport - workspace.config.reveal_margin);
-            assert_eq!(viewport - cards[1].start, workspace.config.reveal_margin);
+    fn cycled_fractional_columns_use_the_actual_viewport_without_peek_or_width_clamps() {
+        let mut workspace = workspace_with_widths(&[CardWidth::Fraction(0.61)], 320.0);
+        let id = workspace.focused().unwrap();
+        for viewport in [320.0, 800.0, 3_840.0] {
+            workspace.resize_viewport(viewport);
+            workspace
+                .set_card_width(id, CardWidth::Fraction(0.61))
+                .unwrap();
+            for fraction in [1.0 / 3.0, 2.0 / 3.0, 0.5, 1.0, 1.0 / 3.0] {
+                let next = workspace.card(id).unwrap().width.next_preset();
+                workspace.set_card_width(id, next).unwrap();
+                assert!(
+                    (workspace.geometry().card(id).unwrap().width() - viewport * fraction).abs()
+                        < 0.001
+                );
+                assert_eq!(workspace.focused(), Some(id));
+            }
         }
     }
 
@@ -1646,10 +1565,7 @@ mod tests {
             workspace_with_widths(&[CardWidth::Fixed(900.0), CardWidth::Fixed(900.0)], 700.0);
         let geometry = workspace.geometry();
         let target = geometry.card_at(1).unwrap();
-        assert_eq!(
-            geometry.focus_offset(target.id, 700.0, 12.0),
-            Some(target.start - 12.0)
-        );
+        assert_eq!(geometry.focus_offset(target.id, 700.0), Some(target.start));
     }
 
     #[test]
@@ -1769,22 +1685,6 @@ mod tests {
         }));
         let unchanged = workspace.native_scroll(1_248.0, 400.0);
         assert!(unchanged.transitions.is_empty());
-    }
-
-    #[test]
-    fn wheel_and_pan_interrupt_animation_and_stay_bounded() {
-        let mut workspace = workspace_with_widths(&[CardWidth::Fixed(500.0); 4], 600.0);
-        let last = workspace.order().last().unwrap();
-        workspace.focus(last).unwrap();
-        assert!(workspace.camera().is_animating());
-        workspace.scroll_wheel(WheelDelta::Pixels { x: -80.0, y: 0.0 });
-        assert!(!workspace.camera().is_animating());
-        workspace.begin_pan(200.0);
-        workspace.update_pan(-10_000.0);
-        assert_eq!(
-            workspace.camera().offset(),
-            workspace.geometry().max_offset(workspace.viewport_width())
-        );
     }
 
     #[test]

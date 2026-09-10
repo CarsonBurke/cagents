@@ -1,5 +1,5 @@
 use super::*;
-use crate::interaction::{hover, tooltip};
+use crate::interaction::tooltip;
 
 fn browser_icon() -> widget::icon::Handle {
     static ICON: LazyLock<widget::icon::Handle> = LazyLock::new(|| {
@@ -8,24 +8,48 @@ fn browser_icon() -> widget::icon::Handle {
     ICON.clone()
 }
 
+fn chat_icon() -> widget::icon::Handle {
+    static ICON: LazyLock<widget::icon::Handle> = LazyLock::new(|| {
+        widget::icon::from_svg_bytes(&br#"<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24"><path fill="none" stroke="black" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" d="M5 4h14a2 2 0 0 1 2 2v10a2 2 0 0 1-2 2h-9l-5 3v-3a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2Zm2 5h10M7 13h7"/></svg>"#[..]).symbolic(true)
+    });
+    ICON.clone()
+}
+
+// The full-width title is a focus target, not a pill-shaped toolbar button.
+// Column focus is already shown by the header's one-pixel active rail.
+fn column_title_style() -> cosmic::theme::Button {
+    fn appearance(_focused: bool, _theme: &cosmic::Theme) -> widget::button::Style {
+        // The active rail is the focus cue; pane titles deliberately have no
+        // enclosing highlight rectangle.
+        widget::button::Style::new()
+    }
+    cosmic::theme::Button::Custom {
+        active: Box::new(appearance),
+        disabled: Box::new(|_| widget::button::Style::new()),
+        hovered: Box::new(|focused, theme| widget::button::Style {
+            background: Some(iced::Background::Color(
+                theme.current_container().component.hover.into(),
+            )),
+            ..appearance(focused, theme)
+        }),
+        pressed: Box::new(|focused, theme| widget::button::Style {
+            background: Some(iced::Background::Color(
+                theme.current_container().component.pressed.into(),
+            )),
+            ..appearance(focused, theme)
+        }),
+    }
+}
+
 fn command<'a>(
     icon: impl Into<widget::icon::Handle>,
     label: impl Into<Cow<'a, str>>,
     id: widget::Id,
     action: Option<Message>,
 ) -> Element<'a, Message> {
-    let label = label.into();
-    tooltip(
-        hover(
-            widget::button::icon(icon)
-                .id(id)
-                .name(label.clone())
-                .width(ICON_CONTROL_SIZE)
-                .height(ICON_CONTROL_SIZE)
-                .on_press_maybe(action),
-        ),
-        label,
-    )
+    crate::ui_controls::icon_control(icon.into(), label, false, action.is_some(), action)
+        .id(id)
+        .into()
 }
 
 impl Cagents {
@@ -96,9 +120,9 @@ impl Cagents {
             Some(Message::NewBrowser),
         ));
         let panel_label = if self.context_inspector_open {
-            "Hide context panel"
+            "Hide sidebar"
         } else {
-            "Show context panel"
+            "Show sidebar"
         };
         actions.push(
             if self.window_width >= design::EXPANDED_NAVIGATION_BREAKPOINT {
@@ -108,7 +132,7 @@ impl Cagents {
                             widget::icon::from_name("view-list-symbolic")
                                 .size(16)
                                 .into(),
-                            widget::text::body("Context").into(),
+                            design::body("Sidebar").into(),
                         ])
                         .spacing(design::GRID_UNIT)
                         .align_y(Alignment::Center),
@@ -139,17 +163,15 @@ impl Cagents {
         let labels = card_kind_labels(card.map(|card| &card.kind));
         let chrome = self.card_chrome.get(&id);
         let caption = card.map(|card| card_kind_caption(&card.kind));
-        let icon: Element<'_, Message> =
-            if card.is_some_and(|card| matches!(card.kind, CardKind::Browser(_))) {
-                browser_icon().icon().size(16).into()
-            } else {
-                widget::icon::from_name(labels.icon).size(16).into()
-            };
+        let icon: Element<'_, Message> = match card.map(|card| &card.kind) {
+            Some(CardKind::Browser(_)) => browser_icon().icon().size(16).into(),
+            Some(CardKind::Chat(_)) => chat_icon().icon().size(16).into(),
+            _ => widget::icon::from_name(labels.icon).size(16).into(),
+        };
         let title_control = widget::button::custom(
             widget::row::with_children(vec![
                 icon,
-                widget::text::body(title)
-                    .size(13)
+                design::body(title)
                     .wrapping(iced::widget::text::Wrapping::None)
                     .ellipsize(iced::widget::text::Ellipsize::End(
                         EllipsizeHeightLimit::Lines(1),
@@ -176,7 +198,7 @@ impl Cagents {
             },
             |chrome| Cow::Borrowed(chrome.accessible_name(focused)),
         ))
-        .class(cosmic::theme::Button::Text)
+        .class(column_title_style())
         .padding([0, 8])
         .width(Length::Fill)
         .height(Length::Fill)
@@ -213,6 +235,18 @@ impl Cagents {
             };
             children.push(tooltip(indicator, label));
         }
+        if self.chat_switch_available(id) {
+            children.push(command(
+                if card.is_some_and(|card| matches!(card.kind, CardKind::Chat(_))) {
+                    widget::icon::from_name("utilities-terminal-symbolic").into()
+                } else {
+                    chat_icon()
+                },
+                self.chat_switch_label(id),
+                card_control_id(id, "chat"),
+                (!self.modal_is_open()).then_some(Message::ChatUi(chat_ui::Action::Switch(id))),
+            ));
+        }
         children.push(command(
             widget::icon::from_name("window-close-symbolic"),
             chrome.map_or_else(
@@ -247,11 +281,11 @@ impl Cagents {
                     ..Default::default()
                 }
             }));
-        hover(
-            widget::column::with_children(vec![row.into(), rail.into()])
-                .spacing(0)
-                .height(CARD_HEADER_HEIGHT),
-        )
+        widget::column::with_children(vec![row.into(), rail.into()])
+            .spacing(0)
+            .width(Length::Fill)
+            .height(CARD_HEADER_HEIGHT)
+            .into()
     }
 
     pub(super) fn context_panel(
@@ -260,63 +294,70 @@ impl Cagents {
         width: f32,
     ) -> Element<'_, Message> {
         let tabs = widget::row::with_children(ContextTab::ALL.into_iter().map(|tab| {
-            widget::button::custom(widget::text::body(tab.label()))
-                .class(if self.context_tab == tab {
-                    cosmic::theme::Button::Suggested
-                } else {
-                    cosmic::theme::Button::Text
-                })
-                .name(format!("{} panel tab", tab.label()))
-                .selected(self.context_tab == tab)
-                .height(design::ROW_HEIGHT)
-                .width(Length::Fill)
-                .padding([4, 8])
-                .on_press_maybe((!self.modal_is_open()).then_some(Message::SelectContextTab(tab)))
-                .into()
+            let selected = self.context_tab == tab;
+            let icon = match tab {
+                ContextTab::Files => "folder-symbolic",
+                ContextTab::Changes => "document-edit-symbolic",
+                ContextTab::Details => "dialog-information-symbolic",
+            };
+            crate::ui_controls::icon_control(
+                crate::ui_controls::symbolic_icon(icon),
+                format!("{} panel tab", tab.label()),
+                selected,
+                !self.modal_is_open(),
+                (!self.modal_is_open()).then_some(Message::SelectContextTab(tab)),
+            )
+            .into()
         }))
-        .spacing(design::GRID_UNIT)
-        .width(Length::Fill);
+        .spacing(0);
         let heading = widget::row::with_children(vec![
             tabs.into(),
+            iced::widget::Space::new().width(Length::Fill).into(),
             command(
                 widget::icon::from_name("window-close-symbolic"),
-                "Close context panel",
+                "Close sidebar",
                 inspector::close_focus_id(),
                 Some(Message::ContextInspector(InspectorAction::Close)),
             ),
         ])
-        .spacing(design::GRID_UNIT)
-        .align_y(Alignment::Center);
+        .spacing(0)
+        .align_y(Alignment::Center)
+        .width(Length::Fill)
+        .height(design::HEADER_HEIGHT - design::BORDER_WIDTH);
         let body = match self.context_tab {
+            ContextTab::Files => sidebar::file_panel(
+                &self.sidebar_model,
+                &self.sidebar_state,
+                width,
+                self.modal_is_open(),
+            )
+            .map(Message::Sidebar),
             ContextTab::Changes => sidebar::git_panel(
-                &self.sidebar_model, &self.sidebar_state, width, self.modal_is_open(),
-            ).map(Message::Sidebar),
-            ContextTab::Context | ContextTab::Code => model.map_or_else(
+                &self.sidebar_model,
+                &self.sidebar_state,
+                width,
+                self.modal_is_open(),
+            )
+            .map(Message::Sidebar),
+            ContextTab::Details => model.map_or_else(
                 || {
-                    let (title, detail) = if self.context_tab == ContextTab::Code {
-                        ("No code column selected", "Open a file from Changes → Files to see editor actions, diagnostics, and language-server results here.")
-                    } else {
-                        ("Workspace context", "Select a terminal, browser, or repository column to see its details and available actions.")
-                    };
-                    widget::container(widget::column::with_children(vec![
-                        widget::icon::from_name(if self.context_tab == ContextTab::Code {
-                            "text-x-generic-symbolic"
-                        } else { "dialog-information-symbolic" }).size(28).into(),
-                        widget::text::heading(title).into(),
-                        widget::text::body(detail)
+                    widget::container(
+                        widget::column::with_children(vec![
+                            design::heading("No column selected").into(),
+                            widget::text::caption(
+                                "Select a column for details, or browse files to open an editor.",
+                            )
                             .wrapping(iced::widget::text::Wrapping::Word)
-                            .width(Length::Fill).into(),
-                        if self.context_tab == ContextTab::Code && self.sidebar_state.active_worktree().is_some() {
-                            widget::button::standard("Browse files")
-                                .on_press(Message::SelectContextTab(ContextTab::Changes)).into()
-                        } else {
-                            widget::button::standard("Open repository")
-                                .on_press(Message::OpenRepository).into()
-                        },
-                    ]).spacing(12).width(Length::Fill))
-                    .padding(20)
+                            .width(Length::Fill)
+                            .into(),
+                            widget::button::text("Browse files")
+                                .on_press(Message::SelectContextTab(ContextTab::Files))
+                                .into(),
+                        ])
+                        .spacing(8),
+                    )
+                    .padding(12)
                     .width(Length::Fill)
-                    .height(Length::Fill)
                     .into()
                 },
                 |model| inspector::view(model, width).map(Message::ContextInspector),
@@ -324,11 +365,8 @@ impl Cagents {
         };
         widget::container(
             widget::column::with_children(vec![
-                widget::container(heading)
-                    .padding([8, 8])
-                    .width(Length::Fill)
-                    .into(),
-                widget::divider::horizontal::light().into(),
+                heading.into(),
+                widget::divider::horizontal::default().into(),
                 body,
             ])
             .spacing(0)

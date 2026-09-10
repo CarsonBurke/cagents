@@ -443,6 +443,7 @@ pub fn model_for_card(
 ) -> InspectorModel {
     let (kind, icon) = match &card.kind {
         CardKind::Terminal(_) => ("Terminal", "utilities-terminal-symbolic"),
+        CardKind::Chat(_) => ("Chat", "chat-bubble-text-symbolic"),
         CardKind::Browser(_) => ("Browser", "internet-web-browser-symbolic"),
         CardKind::PullRequests(_) => ("Pull requests", "vcs-merge-request-symbolic"),
         CardKind::Repository(_) => ("Repository", "folder-symbolic"),
@@ -480,6 +481,41 @@ pub fn model_for_card(
                 )
                 .primary(),
             );
+        }
+        CardKind::Chat(session) => {
+            sections.push(Section::new(
+                "Chat",
+                vec![
+                    Fact::new("Provider", session.launch.provider.label()),
+                    Fact::new(
+                        "Conversation ID",
+                        session
+                            .launch
+                            .session_id
+                            .as_deref()
+                            .and_then(crate::workspace::normalize_card_name)
+                            .unwrap_or_else(|| "Not established".into()),
+                    ),
+                    Fact::new(
+                        "Working directory",
+                        crate::workspace::normalize_card_name(
+                            &session
+                                .launch
+                                .recipe
+                                .working_directory
+                                .display()
+                                .to_string(),
+                        )
+                        .unwrap_or_else(|| "Unavailable".into()),
+                    ),
+                    Fact::new("Session ID", session.id.to_string()),
+                ],
+            ));
+            actions.push(Action::new(
+                "New terminal here",
+                "utilities-terminal-symbolic",
+                InspectorAction::NewTerminalAt(session.launch.recipe.working_directory.clone()),
+            ));
         }
         CardKind::Browser(session) => {
             let presented_location = SanitizedLocation::from(&session.current_url);
@@ -1183,6 +1219,22 @@ fn repository_context<'a>(
             })
             .filter(|(_, worktree)| session.launch.working_directory.starts_with(&worktree.path))
             .max_by_key(|(_, worktree)| worktree.path.components().count()),
+        CardKind::Chat(session) => projects
+            .iter()
+            .flat_map(|project| {
+                project
+                    .worktrees
+                    .iter()
+                    .map(move |worktree| (project, worktree))
+            })
+            .filter(|(_, worktree)| {
+                session
+                    .launch
+                    .recipe
+                    .working_directory
+                    .starts_with(&worktree.path)
+            })
+            .max_by_key(|(_, worktree)| worktree.path.components().count()),
         CardKind::Browser(session) => projects.iter().find_map(|project| {
             project
                 .pull_requests
@@ -1310,7 +1362,7 @@ impl<'a, Message: 'a> InspectorSection<'a, Message> {
     pub fn view(self) -> Element<'a, Message> {
         let spacing = cosmic::theme::spacing();
         let mut children = Vec::with_capacity(self.content.len() + 1);
-        children.push(widget::text::caption_heading(self.title).into());
+        children.push(design::heading(self.title).into());
         children.extend(self.content);
         widget::column::with_children(children)
             .spacing(spacing.space_xxs)
@@ -1408,13 +1460,17 @@ fn fact_body(value: String, markdown: bool, selectable: bool) -> Element<'static
         markdown_body(&value)
     } else if selectable {
         widget::selectable_text(value)
+            .size(design::TEXT_BODY)
+            .line_height(cosmic::iced::widget::text::LineHeight::Absolute(
+                18.0.into(),
+            ))
             .wrapping(cosmic::iced::widget::text::Wrapping::Word)
             .width(Length::Fill)
             .into()
     } else {
         // Selectable text inside a button consumes the press that would
         // activate the row.
-        widget::text::body(value)
+        design::body(value)
             .wrapping(cosmic::iced::widget::text::Wrapping::Word)
             .width(Length::Fill)
             .into()
@@ -1433,7 +1489,7 @@ fn fact_body(value: String, markdown: bool, selectable: bool) -> Element<'static
 /// document's Markdown lives in durable widget state; a hover answer does not.
 fn markdown_body(source: &str) -> Element<'static, InspectorAction> {
     let settings = widget::markdown::Settings::with_text_size(
-        14.0,
+        design::TEXT_BODY,
         widget::markdown::Style::from(cosmic::iced::Theme::Dark),
     );
     let items: Vec<widget::markdown::Item> = widget::markdown::parse(source).collect();
@@ -1585,12 +1641,12 @@ fn markdown_item(
         .width(Length::Fill)
         .into(),
         Item::Quote(quote) => widget::row::with_children(vec![
-            widget::divider::vertical::light().into(),
+            widget::divider::vertical::default().into(),
             markdown_items(quote, settings, depth + 1),
         ])
         .spacing(settings.spacing.0 / 2.0)
         .into(),
-        Item::Rule => widget::divider::horizontal::light().into(),
+        Item::Rule => widget::divider::horizontal::default().into(),
         Item::Table { columns, rows } => {
             let width = columns.len().min(MARKDOWN_BLOCK_LIMIT);
             let mut table = vec![
@@ -1651,7 +1707,7 @@ pub fn view(model: InspectorModel, width: f32) -> Element<'static, InspectorActi
     let heading = widget::row::with_children(vec![
         widget::icon::from_name(model.icon).size(16).into(),
         widget::column::with_children(vec![
-            widget::text::heading(model.title)
+            design::heading(model.title)
                 .wrapping(cosmic::iced::widget::text::Wrapping::None)
                 .ellipsize(cosmic::iced::widget::text::Ellipsize::End(
                     cosmic::iced::advanced::text::EllipsizeHeightLimit::Lines(1),
@@ -1670,7 +1726,7 @@ pub fn view(model: InspectorModel, width: f32) -> Element<'static, InspectorActi
     let mut sections = Vec::with_capacity(model.sections.len() * 2);
     for (index, section) in model.sections.into_iter().enumerate() {
         if index > 0 {
-            sections.push(widget::divider::horizontal::light().into());
+            sections.push(widget::divider::horizontal::default().into());
         }
         let facts = section
             .facts
@@ -1682,7 +1738,7 @@ pub fn view(model: InspectorModel, width: f32) -> Element<'static, InspectorActi
     // Keep actions in the same scroll surface as details. A rich editor or
     // language server can offer many actions; a fixed footer used to consume
     // all available height and make the document details unreachable.
-    sections.push(widget::divider::horizontal::light().into());
+    sections.push(widget::divider::horizontal::default().into());
     sections.push(SegmentedActions::new(model.actions).view());
     let content = widget::scrollable(
         widget::column::with_children(sections)
@@ -1750,6 +1806,57 @@ mod tests {
                 },
             }),
         }
+    }
+
+    #[test]
+    fn chat_identity_facts_strip_display_controls_without_exposing_launch_environment() {
+        let mut card = terminal_card();
+        let CardKind::Terminal(mut source) = card.kind else {
+            unreachable!()
+        };
+        source.launch.working_directory = "/repo/\u{202e}worktree".into();
+        source
+            .launch
+            .environment
+            .insert("API_KEY".into(), "private-secret".into());
+        card.kind = CardKind::Chat(crate::chat::Session {
+            id: source.id,
+            launch: crate::chat::Launch {
+                provider: crate::chat::Provider::Claude,
+                recipe: source.launch.clone(),
+                session_id: Some("exact\u{202e}\u{1b}-id".into()),
+            },
+            proof: None,
+            terminal: Some(source),
+        });
+        let model = model_for_card(&card, RuntimeStatus::Ready, &[], None);
+        let facts = &model
+            .sections
+            .iter()
+            .find(|section| section.title == "Chat")
+            .unwrap()
+            .facts;
+        assert_eq!(
+            facts
+                .iter()
+                .find(|fact| fact.label == "Conversation ID")
+                .unwrap()
+                .value,
+            "exact-id"
+        );
+        assert_eq!(
+            facts
+                .iter()
+                .find(|fact| fact.label == "Working directory")
+                .unwrap()
+                .value,
+            "/repo/worktree"
+        );
+        assert!(
+            facts
+                .iter()
+                .all(|fact| !fact.value.contains("private-secret"))
+        );
     }
 
     fn browser_card(raw: &str) -> CardState {
