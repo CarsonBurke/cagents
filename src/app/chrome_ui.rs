@@ -192,13 +192,7 @@ impl Cagents {
             }
             Action::DismissNotice => {
                 self.status = None;
-                if self.has_chrome_notices() {
-                    Task::none()
-                } else {
-                    self.chrome_ui.close();
-                    iced::widget::operation::focus(context_inspector_toggle_id())
-                        .map(cosmic::Action::App)
-                }
+                self.reconcile_notice_popup()
             }
             Action::Launch(kind) => {
                 self.chrome_ui.close();
@@ -271,6 +265,15 @@ impl Cagents {
                 .save_health
                 .as_ref()
                 .is_some_and(SaveHealthState::is_visible)
+    }
+
+    pub(super) fn reconcile_notice_popup(&mut self) -> Task<Message> {
+        if self.chrome_ui.popup == Some(Popup::Notices) && !self.has_chrome_notices() {
+            self.chrome_ui.close();
+            iced::widget::operation::focus(context_inspector_toggle_id()).map(cosmic::Action::App)
+        } else {
+            Task::none()
+        }
     }
 
     fn notice_control(&self) -> Option<Element<'_, Message>> {
@@ -469,7 +472,8 @@ impl Cagents {
     fn tab_strip_geometry(&self) -> (f32, f32) {
         let available = (self.workspace.viewport_width() - self.workspace_header_width()).max(0.0);
         let width = ((available - design::PRIMARY_CONTROL_SIZE - 2.0).max(0.0)
-            / self.workspace.cards().len().max(1) as f32)
+            / (self.workspace.cards().len() + self.hidden_unregistered_tabs().count()).max(1)
+                as f32)
             .clamp(96.0, 200.0);
         (available, width)
     }
@@ -499,7 +503,13 @@ impl Cagents {
         let tabs = widget::row::with_children(
             self.workspace
                 .order()
-                .map(|id| self.column_header(id, self.workspace.focused() == Some(id), tab_width)),
+                .map(|id| {
+                    self.column_header(id, self.workspace.focused() == Some(id), tab_width, true)
+                })
+                .chain(
+                    self.hidden_unregistered_tabs()
+                        .map(|id| self.column_header(id, false, tab_width, false)),
+                ),
         )
         .push(self.new_tab_control())
         .spacing(2)
@@ -579,7 +589,13 @@ impl Cagents {
         actions
     }
 
-    fn column_header(&self, id: CardId, focused: bool, width: f32) -> Element<'_, Message> {
+    fn column_header(
+        &self,
+        id: CardId,
+        focused: bool,
+        width: f32,
+        active_scope: bool,
+    ) -> Element<'_, Message> {
         let card = self.card_state(id);
         let title = card.map_or("Column", |card| card.title.as_str());
         let labels = card_kind_labels(card.map(|card| &card.kind));
@@ -701,7 +717,7 @@ impl Cagents {
                 ));
             }
         }
-        if self.chat_switch_available(id) {
+        if active_scope && self.chat_switch_available(id) {
             children.push(command(
                 if card.is_some_and(|card| matches!(card.kind, CardKind::Chat(_))) {
                     widget::icon::from_name("utilities-terminal-symbolic").into()
@@ -713,18 +729,20 @@ impl Cagents {
                 (!self.modal_is_open()).then_some(Message::ChatUi(chat_ui::Action::Switch(id))),
             ));
         }
-        children.push(command(
-            widget::icon::from_name("window-close-symbolic"),
-            chrome.map_or_else(
-                || Cow::Owned(card_close_name(labels.type_label, title)),
-                |chrome| Cow::Borrowed(chrome.close_name.as_str()),
-            ),
-            chrome.map_or_else(
-                || card_control_id(id, "close"),
-                |chrome| chrome.close_id.clone(),
-            ),
-            Some(Message::CloseCard(id)),
-        ));
+        if active_scope {
+            children.push(command(
+                widget::icon::from_name("window-close-symbolic"),
+                chrome.map_or_else(
+                    || Cow::Owned(card_close_name(labels.type_label, title)),
+                    |chrome| Cow::Borrowed(chrome.close_name.as_str()),
+                ),
+                chrome.map_or_else(
+                    || card_control_id(id, "close"),
+                    |chrome| chrome.close_id.clone(),
+                ),
+                Some(Message::CloseCard(id)),
+            ));
+        }
         widget::container(
             widget::row::with_children(children)
                 .align_y(Alignment::Center)

@@ -230,6 +230,10 @@ pub enum ClientRequest {
     ChatReturnTerminal {
         chat_id: TerminalId,
     },
+    /// GUI acknowledgement after the replacement terminal is durably saved.
+    ChatCommitTerminal {
+        terminal_id: TerminalId,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

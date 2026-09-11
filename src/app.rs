@@ -2109,6 +2109,10 @@ pub enum Message {
         terminal: TerminalId,
         result: Result<StartedTerminal, String>,
     },
+    TerminalHandoffsCommitted {
+        terminals: Vec<TerminalSession>,
+        result: Result<(), String>,
+    },
     TerminalWake {
         card: CardId,
         generation: u64,
@@ -2717,6 +2721,8 @@ pub struct Cagents {
     closed_terminal_cards: HashSet<CardId>,
     uncertain_terminal_proofs: HashMap<CardId, HostSessionProof>,
     terminal_recovery_attempts: HashSet<TerminalId>,
+    pending_terminal_handoffs: HashMap<TerminalId, TerminalSession>,
+    terminal_handoff_commit_inflight: bool,
     worktree_operations:
         HashMap<crate::model::OperationId, worktree_operations::ActiveWorktreeOperation>,
     /// A source-control navigation waiting for its repository card to finish
@@ -3507,12 +3513,66 @@ impl Cagents {
         if let Some(writer) = &self.session {
             writer.snapshot_conversion(Arc::clone(&self.durable));
         }
-        self.start_terminal(
+        self.pending_terminal_handoffs
+            .insert(session.id, session.clone());
+        let commit = self.commit_terminal_handoffs();
+        let attach = self.start_terminal(
             card,
             session,
             state.exposure == Exposure::Visible && self.workspace_surfaces_visible(),
             false,
-        )
+        );
+        Task::batch([commit, attach])
+    }
+
+    /// The flush is ordered after conversion snapshots. Never release daemon
+    /// replay evidence based only on receiving or attaching its replacement.
+    fn commit_terminal_handoffs(&mut self) -> Task<Message> {
+        if self.terminal_handoff_commit_inflight
+            || self.pending_terminal_handoffs.is_empty()
+            || self.save_health.as_ref().is_some_and(|health| {
+                !matches!(
+                    health.health,
+                    SessionSaveHealth::Healthy | SessionSaveHealth::Recovered { .. }
+                )
+            })
+        {
+            return Task::none();
+        }
+        let Some(writer) = &self.session else {
+            return Task::none();
+        };
+        let Ok(flush) = writer.request_flush() else {
+            return Task::none();
+        };
+        let terminals = self
+            .pending_terminal_handoffs
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        self.terminal_handoff_commit_inflight = true;
+        cosmic::task::future(async move {
+            let joined = tokio::task::spawn_blocking(move || {
+                let result: Result<(), String> = (|| {
+                    flush
+                        .recv_timeout(Duration::from_secs(30))
+                        .map_err(|error| format!("session flush: {error}"))??;
+                    for terminal in &terminals {
+                        crate::chat::client::acknowledge_terminal_handoff(terminal)?;
+                    }
+                    Ok(())
+                })();
+                (terminals, result)
+            })
+            .await;
+            let (terminals, result) = joined.unwrap_or_else(|error| {
+                (
+                    Vec::new(),
+                    Err(format!("handoff acknowledgement worker: {error}")),
+                )
+            });
+            Message::TerminalHandoffsCommitted { terminals, result }
+        })
     }
 
     fn agent_worktree(&self, card: CardId) -> Option<ActiveWorktreeKey> {
@@ -6980,6 +7040,8 @@ impl Application for Cagents {
             closed_terminal_cards: HashSet::new(),
             uncertain_terminal_proofs: HashMap::new(),
             terminal_recovery_attempts: HashSet::new(),
+            pending_terminal_handoffs: HashMap::new(),
+            terminal_handoff_commit_inflight: false,
             worktree_operations: HashMap::new(),
             pending_panel_open: None,
             deferred_navigation: VecDeque::new(),
@@ -7074,9 +7136,22 @@ impl Application for Cagents {
             return (app, chrome);
         }
         let scope = app.restore_worktree_scope();
+        // Closed/exited replacements can still owe a lost durable acknowledgement.
+        for card in &app.durable.cards {
+            let terminal = match &card.kind {
+                CardKind::Terminal(terminal) => Some(terminal),
+                CardKind::Chat(chat) => chat.terminal.as_ref(),
+                _ => None,
+            };
+            if let Some(terminal) = terminal {
+                app.pending_terminal_handoffs
+                    .insert(terminal.id, terminal.clone());
+            }
+        }
         app.refresh_sidebar_threads();
         let mut tasks = vec![
             scope,
+            app.commit_terminal_handoffs(),
             Self::editor_discovery_task(),
             app.rehydrate_worktree_operations(),
             app.initialize_runtimes(),
@@ -7165,6 +7240,25 @@ impl Application for Cagents {
                     None => cosmic::task::message(Message::OpenRepository),
                 }
             }
+            Message::TerminalHandoffsCommitted { terminals, result } => {
+                self.terminal_handoff_commit_inflight = false;
+                match result {
+                    Ok(()) => {
+                        for terminal in terminals {
+                            if self.pending_terminal_handoffs.get(&terminal.id) == Some(&terminal) {
+                                self.pending_terminal_handoffs.remove(&terminal.id);
+                            }
+                        }
+                        self.commit_terminal_handoffs()
+                    }
+                    Err(error) => {
+                        self.status = Some(TransientNotice::error(format!(
+                            "Terminal handoff acknowledgement is pending; it will retry after saving recovers or the window refreshes: {error}"
+                        )));
+                        Task::none()
+                    }
+                }
+            }
             Message::TerminalStarted {
                 card,
                 terminal,
@@ -7188,6 +7282,18 @@ impl Application for Cagents {
                 let mut tasks = Vec::new();
                 match result {
                     Ok(started) => {
+                        if let Some(proof) = started.session.continuity.live_proof() {
+                            // A replacement daemon cannot own the previous
+                            // daemon's in-memory receipts.
+                            self.pending_terminal_handoffs.retain(|_, pending| {
+                                pending
+                                    .continuity
+                                    .live_proof()
+                                    .is_none_or(|stored| stored == proof)
+                            });
+                            self.pending_terminal_handoffs
+                                .insert(started.session.id, started.session.clone());
+                        }
                         self.terminal_recovery_attempts.remove(&terminal);
                         self.terminal_recovery_attempts.remove(&started.session.id);
                         if started.session.id != terminal
@@ -7259,6 +7365,7 @@ impl Application for Cagents {
                     tasks.push(self.reconcile_scoped_lifecycle());
                 }
                 self.persist();
+                tasks.push(self.commit_terminal_handoffs());
                 Task::batch(tasks)
             }
             Message::TerminalWake { card, generation } => {
@@ -7916,6 +8023,9 @@ impl Application for Cagents {
                     | SidebarAction::SetFilter(_)
                     | SidebarAction::ToggleProject(_) => Task::none(),
                 }
+            }
+            Message::FocusCard(id) if !self.workspace.order().any(|visible| visible == id) => {
+                self.focus_unregistered_tab(id)
             }
             Message::FocusCard(id) => match self.workspace.focus(id) {
                 Ok(update) => self.apply_viewport(update, true, false),
@@ -9125,6 +9235,7 @@ impl Application for Cagents {
         if camera_only {
             return Task::batch([task, self.release_deferred_navigation_if_unblocked()]);
         }
+        let notices = self.reconcile_notice_popup();
         self.synchronize_sidebar_selection();
         self.refresh_sidebar_threads();
         let binding = self.rebind_source_control();
@@ -9146,7 +9257,7 @@ impl Application for Cagents {
         // `view` cannot rebuild the chrome cache itself, so refresh it here.
         let chrome = self.sync_chrome();
         let deferred = self.release_deferred_navigation_if_unblocked();
-        Task::batch([task, binding, chrome, deferred, pull_request])
+        Task::batch([task, binding, chrome, deferred, pull_request, notices])
     }
 
     fn subscription(&self) -> Subscription<Message> {
@@ -9936,16 +10047,37 @@ fn load_repository(
         if auth.state != crate::github::GhAuthState::Authenticated {
             return Err(GitHubAvailability::Unauthenticated);
         }
-        let pull_requests = github
+        let mut pull_requests = github
             .list(
                 &ListPullRequestsRequest {
                     repository: key.clone(),
-                    state: PullRequestStateFilter::All,
+                    state: PullRequestStateFilter::Open,
                     limit: sidebar::PULL_REQUEST_LIST_LIMIT,
                 },
                 &cancellation,
             )
             .map_err(GitHubAvailability::from_error)?;
+        // Closed history must not consume the open-PR page. Its failure also
+        // must not discard successfully refreshed open conversation authority.
+        if let Ok(history) = github.list(
+            &ListPullRequestsRequest {
+                repository: key.clone(),
+                state: PullRequestStateFilter::All,
+                limit: sidebar::PULL_REQUEST_LIST_LIMIT,
+            },
+            &cancellation,
+        ) {
+            for entry in history {
+                if let Some(current) = pull_requests
+                    .iter_mut()
+                    .find(|current| current.number == entry.number)
+                {
+                    *current = entry;
+                } else {
+                    pull_requests.push(entry);
+                }
+            }
+        }
         Ok(GitHubAvailability::Ready {
             repository_key: key,
             pull_requests: pull_requests
@@ -10224,6 +10356,30 @@ mod tests {
             );
             assert_eq!(stream.next().await, None);
         });
+    }
+
+    #[test]
+    fn acknowledging_the_last_recovery_notice_releases_workspace_input() {
+        for other_notice in [false, true] {
+            let mut app = context_inspector_test_app(false);
+            let mut health = SaveHealthState::new("/session.sqlite3".into());
+            health.apply(health_event(
+                1,
+                SessionSaveHealth::Recovered {
+                    recovered_at_unix_ms: 1,
+                },
+                Some(1),
+            ));
+            app.save_health = Some(health);
+            app.status = other_notice.then(|| TransientNotice::error("another failure"));
+            let _ = app.update(Message::ChromeUi(chrome_ui::Action::ToggleNotices));
+            assert!(app.chrome_ui.is_open());
+            let _ = app.update(Message::AcknowledgeSessionRecovery);
+            assert_eq!(app.chrome_ui.is_open(), other_notice);
+            if !other_notice {
+                assert!(!app.workspace_inputs_blocked());
+            }
+        }
     }
 
     #[test]
@@ -13041,6 +13197,8 @@ mod tests {
             settings_path: None,
             uncertain_terminal_proofs: HashMap::new(),
             terminal_recovery_attempts: HashSet::new(),
+            pending_terminal_handoffs: HashMap::new(),
+            terminal_handoff_commit_inflight: false,
             settings_write_blocked: true,
             sidebar_model: SidebarModel::ready(SidebarMode::Expanded, Vec::new()),
             sidebar_state: SidebarState::default(),

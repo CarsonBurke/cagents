@@ -334,6 +334,43 @@ impl Cagents {
         ))
     }
 
+    /// Unregistered panes have no sidebar row, so keep their tabs reachable
+    /// without reintroducing a separate "Other sessions" workspace.
+    pub(super) fn hidden_unregistered_tabs(&self) -> impl Iterator<Item = CardId> + '_ {
+        self.durable
+            .cards
+            .iter()
+            .filter(|card| {
+                card.existence.is_open()
+                    && self
+                        .card_worktree(card)
+                        .is_some_and(|root| self.sidebar_model.worktree_at(root).is_none())
+                    && !self.workspace.order().any(|id| id == card.id)
+            })
+            .map(|card| card.id)
+    }
+
+    pub(super) fn focus_unregistered_tab(&mut self, id: CardId) -> Task<Message> {
+        if !self
+            .hidden_unregistered_tabs()
+            .any(|candidate| candidate == id)
+        {
+            return Task::none();
+        }
+        let path = self
+            .card_state(id)
+            .and_then(|card| self.card_worktree(card))
+            .expect("unregistered tab has a scope")
+            .to_path_buf();
+        self.show_workspace_for_action();
+        let scope = self.select_worktree(path, false);
+        let focus = match self.workspace.focus(id) {
+            Ok(update) => self.apply_viewport(update, true, false),
+            Err(_) => Task::none(),
+        };
+        Task::batch([scope, focus])
+    }
+
     pub(super) fn select_worktree(
         &mut self,
         path: PathBuf,
@@ -551,6 +588,7 @@ impl Cagents {
                     .iter()
                     .find(|card| card.existence.is_open() && self.card_worktree(card).is_some())
             });
+
         let Some(owner) = owner else {
             return Task::none();
         };
@@ -579,6 +617,35 @@ mod tests {
     use super::*;
     use crate::model::{BrowserId, BrowserRestoreFidelity, ProjectThread};
 
+    #[test]
+    fn unregistered_panes_remain_reachable_after_selecting_a_project() {
+        let mut app = super::super::tests::context_inspector_test_app(false);
+        register_worktrees(&mut app, &["/repo"]);
+        let project = terminal("/repo");
+        let loose = terminal("/tmp");
+        app.durable = Arc::new(WorkspaceState {
+            cards: vec![project.clone(), loose.clone()],
+            active_worktree: Some("/repo".into()),
+            ..WorkspaceState::default()
+        });
+        let _ = app.restore_worktree_scope();
+        assert_eq!(app.workspace.order().collect::<Vec<_>>(), vec![project.id]);
+        assert_eq!(
+            app.hidden_unregistered_tabs().collect::<Vec<_>>(),
+            vec![loose.id]
+        );
+        let _ = app.update(Message::FocusCard(loose.id));
+        assert_eq!(app.workspace.focused(), Some(loose.id));
+        assert_eq!(app.workspace.order().collect::<Vec<_>>(), vec![loose.id]);
+        assert_eq!(app.terminal_directory(), Some(PathBuf::from("/tmp")));
+        assert!(app.hidden_unregistered_tabs().next().is_none());
+        let _ = app.select_worktree("/repo".into(), false);
+        assert_eq!(
+            app.hidden_unregistered_tabs().collect::<Vec<_>>(),
+            vec![loose.id]
+        );
+        assert_eq!(app.durable.cards.len(), 2);
+    }
     #[test]
     fn same_directory_threads_restore_focus_without_entering_main_panes() {
         let mut app = super::super::tests::context_inspector_test_app(false);

@@ -190,6 +190,7 @@ pub(crate) struct HostState {
     pub(super) inventory_generation: u64,
     shutdown_capabilities: VecDeque<(ShutdownCapability, Instant)>,
     pub(super) chats: BTreeMap<TerminalId, super::chat::Record>,
+    pub(super) chat_handoffs: BTreeMap<TerminalId, super::chat::TerminalHandoff>,
     pub(super) chat_spawning: BTreeMap<TerminalId, crate::chat::Launch>,
     pub(super) chat_bindings: BTreeMap<TerminalId, super::chat::PendingBinding>,
     pub(crate) agent_observer: Arc<crate::agent::observe::Observer>,
@@ -216,6 +217,7 @@ impl HostState {
             inventory_generation: 0,
             shutdown_capabilities: VecDeque::new(),
             chats: BTreeMap::new(),
+            chat_handoffs: BTreeMap::new(),
             chat_spawning: BTreeMap::new(),
             chat_bindings: BTreeMap::new(),
             agent_observer: Arc::new(crate::agent::observe::Observer::new()),
@@ -236,6 +238,9 @@ impl HostState {
     }
 
     pub(crate) fn unregister_client(&mut self, client_id: ClientId) -> Vec<TerminalHandle> {
+        for receipt in self.chat_handoffs.values_mut() {
+            receipt.detach(client_id);
+        }
         for record in self.chats.values_mut() {
             record.subscribers.remove(&client_id);
             record.observations.remove(&client_id);
@@ -710,7 +715,10 @@ impl HostState {
     fn inventory_count(&mut self) -> u64 {
         let mut count = (self.spawning.len() + self.chat_spawning.len()) as u64;
         for record in self.chats.values_mut() {
-            if !record.completion_observed && !record.handle.owns_work() {
+            if !record.completion_observed
+                && !record.handle.owns_work()
+                && !record.returning_terminal
+            {
                 record.completion_observed = true;
                 self.inventory_generation += 1;
             }
@@ -797,7 +805,10 @@ impl HostState {
         let count = self.inventory_count();
         if matches!(operation, ShutdownOperation::Stop { .. })
             && (!self.chat_spawning.is_empty()
-                || self.chats.values().any(|record| record.handle.owns_work()))
+                || self
+                    .chats
+                    .values()
+                    .any(|record| record.handle.owns_work() || record.returning_terminal))
         {
             return ShutdownOutcome::EmptyRequired {
                 current_count: count,
@@ -912,6 +923,16 @@ fn prepare_upgrade_with(
         state
             .validate_upgrade_capability(&capability, Instant::now())
             .map_err(upgrade_error)?;
+        if !state.chat_handoffs.is_empty() {
+            return Err(upgrade_error(
+                "A native-to-terminal handoff is not durably acknowledged; save its replacement before upgrading",
+            ));
+        }
+        if state.chats.values().any(|record| record.returning_terminal) {
+            return Err(upgrade_error(
+                "A native-to-terminal replacement is still pending; retry or explicitly close it before upgrading",
+            ));
+        }
         let terminals = state
             .terminals
             .iter()

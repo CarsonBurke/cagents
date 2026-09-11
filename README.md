@@ -346,6 +346,8 @@ cagents ui
   select a thread again to return to the same conversation.
   Editor tabs use the ceditor mark; recognized agent terminals and native chats
   use their OMP, Claude, or Codex provider mark.
+  Panes outside registered worktrees remain reachable through their own tabs,
+  without a separate Other sessions section.
   Drag a project header to reorder projects; the order survives restarts.
   Project headers stay visible above their worktrees while scrolling. The
   primary worktree stays first; the sort control selects newest, oldest, or
@@ -481,6 +483,9 @@ That context remains in daemon memory when returning to a terminal and switching
 back. A full daemon upgrade refuses before shutdown if its supported recovery
 path cannot reproduce the same execution environment; it does not serialize
 credentials into the upgrade checkpoint or silently choose another account.
+A successful return retains only a lightweight replay receipt. The GUI releases
+it after its terminal replacement is durably saved, including retries after
+restart or early terminal exit; unresolved handoffs block a full upgrade.
 
 - **OMP and Claude:** switching performs a stop-and-resume handoff. Active work
   is interrupted, the CLI stops, and native chat resumes the same conversation.

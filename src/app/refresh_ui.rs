@@ -66,6 +66,7 @@ impl Cagents {
             return Task::none();
         }
         let mut tasks = Vec::new();
+        tasks.push(self.commit_terminal_handoffs());
         for (&card, runtime) in &mut self.cards {
             if self.workspace.visibility(card) == Some(VisibilityClass::Visible)
                 && let CardRuntime::Repository(runtime) = runtime

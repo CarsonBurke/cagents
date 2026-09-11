@@ -3,7 +3,7 @@ use cagents::{
     lsp::{LspCompletionItem, LspDiagnostic, LspDocumentId, LspEvent, LspManager, LspPosition},
     model::{CardId, ProjectId, RepositoryView, WorktreeId},
     repository::{
-        CancellationToken, MutationOutcome, RepoPath, RepositoryId, RepositoryService,
+        CancellationToken, DiffBasis, MutationOutcome, RepoPath, RepositoryId, RepositoryService,
         RepositorySnapshot, StageRequest, UnstageRequest,
     },
     repository_widget::{self, LspIntent, RepositoryAction, RepositoryRuntime},
@@ -93,6 +93,7 @@ pub enum Message {
     WindowFocused(window::Id, bool),
     RefreshVisible,
     Repository(RepositoryAction),
+    ResolvedDiffBasis { card: CardId, basis: DiffBasis },
     Sidebar(SidebarAction),
     Snapshot(CardId, Result<RepositorySnapshot, String>),
     Mutation(CardId, Result<MutationOutcome, String>),
@@ -1205,6 +1206,15 @@ impl Application for Editor {
                     self.resume_pending_files()
                 }
                 Message::Reaped => iced::exit().map(cosmic::Action::App),
+                Message::ResolvedDiffBasis { card, basis } => {
+                    let task = self.tab_mut(card).map_or_else(Task::none, |tab| {
+                        repository_task(
+                            tab.runtime
+                                .update(RepositoryAction::ApplyDiffBasis { card, basis }),
+                        )
+                    });
+                    Task::batch([task, self.drain(card)])
+                }
                 Message::Repository(action) => {
                     let id = action.card();
                     if self.modal_open() {
@@ -1213,6 +1223,7 @@ impl Application for Editor {
                             RepositoryAction::FilesLoaded { .. }
                                 | RepositoryAction::FileLoaded { .. }
                                 | RepositoryAction::DiffLoaded { .. }
+                                | RepositoryAction::DiffBasisResolved { .. }
                                 | RepositoryAction::WorkingDiffDue { .. }
                                 | RepositoryAction::WorkingDiffLoaded { .. }
                                 | RepositoryAction::SaveFinished { .. }
@@ -1261,6 +1272,8 @@ impl Application for Editor {
                             )
                         });
                     }
+                    let basis_resolved =
+                        matches!(action, RepositoryAction::DiffBasisResolved { .. });
                     let loaded = matches!(action, RepositoryAction::FilesLoaded { .. });
                     let focus_loaded = matches!(action, RepositoryAction::FileLoaded { .. })
                         && self.active == Some(id)
@@ -1285,7 +1298,17 @@ impl Application for Editor {
                             }
                         }
                     }
-                    let mut tasks = vec![repository_task(tab.runtime.update(action))];
+                    let task = tab
+                        .runtime
+                        .update(action)
+                        .map(move |action| match action {
+                            RepositoryAction::ApplyDiffBasis { card, basis } if basis_resolved => {
+                                Message::ResolvedDiffBasis { card, basis }
+                            }
+                            action => Message::Repository(action),
+                        })
+                        .map(cosmic::Action::App);
+                    let mut tasks = vec![task];
                     if back_to_files && tab.runtime.selected_path().is_none() {
                         tab.owned_file = None;
                         tab.pending_file = None;

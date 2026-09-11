@@ -683,6 +683,79 @@ impl ClientHandle {
     }
 }
 
+/// Retire replay evidence only after every durable reference owned by this GUI
+/// has been replaced and saved. This never starts a daemon or a provider process.
+/// Retrying a lost acknowledgement is harmless.
+pub fn acknowledge_terminal_handoff(
+    terminal: &crate::model::TerminalSession,
+) -> Result<(), String> {
+    let socket = ipc::daemon_socket_path().map_err(|error| error.to_string())?;
+    let stream = UnixStream::connect(socket).map_err(|error| error.to_string())?;
+    acknowledge_terminal_handoff_on(stream, terminal)
+}
+
+fn acknowledge_terminal_handoff_on(
+    stream: UnixStream,
+    terminal: &crate::model::TerminalSession,
+) -> Result<(), String> {
+    // Exited/closed durable descriptors no longer carry a live proof. Their
+    // saved UUID can retire only a matching receipt, never authorize execution.
+    let expected = terminal.continuity.live_proof();
+    if expected.as_ref().is_some_and(|proof| !proof.is_complete()) {
+        return Err("Terminal handoff acknowledgement has an incomplete daemon proof".into());
+    }
+    stream
+        .set_read_timeout(Some(Duration::from_secs(20)))
+        .map_err(|error| error.to_string())?;
+    stream
+        .set_write_timeout(Some(Duration::from_secs(5)))
+        .map_err(|error| error.to_string())?;
+    let mut wire = Wire {
+        stream,
+        codec: FrameCodec::new(ipc::MAX_FRAME_BYTES),
+    };
+    wire.codec
+        .write(
+            &mut wire.stream,
+            &ClientEnvelope {
+                version: PROTOCOL_VERSION,
+                request_id: 1,
+                proof: None,
+                request: ClientRequest::Connect {
+                    expected_host: expected.clone(),
+                    resume: Vec::new(),
+                },
+            },
+        )
+        .map_err(|error| error.to_string())?;
+    let proof = match receive(&mut wire.stream, &mut wire.codec, 1, expected.as_ref())? {
+        ServerResponse::Connected { proof, .. }
+            if proof.is_complete()
+                && expected.as_ref().is_none_or(|expected| expected == &proof) =>
+        {
+            proof
+        }
+        _ => return Err("Daemon did not prove terminal handoff ownership".into()),
+    };
+    let wire = Mutex::new(wire);
+    transmit(
+        &wire,
+        &proof,
+        2,
+        ClientRequest::ChatCommitTerminal {
+            terminal_id: terminal.id,
+        },
+    )?;
+    let Wire {
+        mut stream,
+        mut codec,
+    } = wire.into_inner().unwrap_or_else(|p| p.into_inner());
+    match receive(&mut stream, &mut codec, 2, Some(&proof))? {
+        ServerResponse::Accepted => Ok(()),
+        _ => Err("Daemon did not acknowledge the durable terminal handoff".into()),
+    }
+}
+
 /// Running and starting daemon chats, including detached sessions. Never starts a daemon.
 pub fn inventory() -> Result<Vec<Session>, String> {
     let socket = ipc::daemon_socket_path().map_err(|e| e.to_string())?;
@@ -730,6 +803,92 @@ impl Drop for Inner {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn exited_terminal_commit_discovers_host_but_pins_the_acknowledgement() {
+        use crate::model::{
+            BootId, HostIncarnation, HostSessionId, LaunchRecipe, TerminalContinuity,
+            TerminalSession,
+        };
+        let proof = HostSessionProof {
+            host_session_id: HostSessionId::new("session"),
+            boot_id: BootId::new("boot"),
+            host_incarnation: HostIncarnation::new("incarnation"),
+        };
+        let recipe = LaunchRecipe {
+            program: "unused".into(),
+            arguments: Vec::new(),
+            working_directory: "/".into(),
+            environment: BTreeMap::new(),
+        };
+        let terminal = TerminalSession {
+            id: TerminalId::new(),
+            launch: recipe.clone(),
+            continuity: TerminalContinuity::RelaunchAvailable {
+                recipe,
+                last_exit: None,
+            },
+            resume_hint: None,
+            transcript_path: None,
+        };
+        // A persisted descriptor with no live proof still commits on the
+        // discovered host. An incarnation change after discovery must fail.
+        for changed in [false, true] {
+            let (client, mut server) = UnixStream::pair().unwrap();
+            let proof = proof.clone();
+            let worker = thread::spawn(move || {
+                server
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                server
+                    .set_write_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                let mut codec = FrameCodec::new(ipc::MAX_FRAME_BYTES);
+                let connect: ClientEnvelope = codec.read(&mut server).unwrap().unwrap();
+                codec
+                    .write(
+                        &mut server,
+                        &ServerEnvelope {
+                            version: PROTOCOL_VERSION,
+                            request_id: Some(connect.request_id),
+                            proof: proof.clone(),
+                            message: ServerMessage::Response {
+                                response: ServerResponse::Connected {
+                                    proof: proof.clone(),
+                                    resumed: Vec::new(),
+                                },
+                            },
+                        },
+                    )
+                    .unwrap();
+                let commit: ClientEnvelope = codec.read(&mut server).unwrap().unwrap();
+                let response_proof = if changed {
+                    HostSessionProof {
+                        host_incarnation: HostIncarnation::new("replacement"),
+                        ..proof
+                    }
+                } else {
+                    proof
+                };
+                codec
+                    .write(
+                        &mut server,
+                        &ServerEnvelope {
+                            version: PROTOCOL_VERSION,
+                            request_id: Some(commit.request_id),
+                            proof: response_proof,
+                            message: ServerMessage::Response {
+                                response: ServerResponse::Accepted,
+                            },
+                        },
+                    )
+                    .unwrap();
+            });
+            let result = acknowledge_terminal_handoff_on(client, &terminal);
+            worker.join().unwrap();
+            assert_eq!(result.is_err(), changed);
+        }
+    }
 
     #[test]
     fn selecting_then_leaving_fences_queued_wakes_and_old_wire_observations() {

@@ -495,6 +495,7 @@ fn process_request(
         | ClientRequest::ChatRead { .. }
         | ClientRequest::ChatClose { .. }
         | ClientRequest::ChatReturnTerminal { .. }
+        | ClientRequest::ChatCommitTerminal { .. }
         | ClientRequest::ChatList) => Ok((
             super::chat::process(host, client_id, request)?,
             Vec::new(),
@@ -1069,7 +1070,7 @@ mod tests {
                     subscribers: BTreeMap::from([(1, false)]),
                     observations: BTreeMap::new(),
                     completion_observed: false,
-                    terminal_handoff: None,
+                    returning_terminal: false,
                 },
             );
             state.shutdown_preflight(Instant::now()).unwrap().capability

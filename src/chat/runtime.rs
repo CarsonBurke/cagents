@@ -305,6 +305,11 @@ impl Handle {
                 .unwrap_or_else(|p| p.into_inner())
                 .is_some()
     }
+    #[cfg(test)]
+    pub(crate) fn resource_lifetime(&self) -> impl Fn() -> bool + use<> {
+        let inner = Arc::downgrade(&self.0);
+        move || inner.upgrade().is_some()
+    }
     pub fn close(&self) -> Result<(), String> {
         self.0.stop.store(true, Ordering::Release);
         self.wake();
