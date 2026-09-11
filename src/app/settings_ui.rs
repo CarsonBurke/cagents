@@ -516,6 +516,13 @@ fn settings_category_controls<'a>(
                     progress,
                 ),
                 setting_input(
+                    "Clone focused pane",
+                    "Opens an independent terminal or conversation, or the same browser or repository location. Leave blank to unbind.",
+                    &draft.keyboard_shortcuts.clone_pane,
+                    SettingsField::ShortcutClonePane,
+                    progress,
+                ),
+                setting_input(
                     "Close focused column",
                     "Closes the active workspace column.",
                     &draft.keyboard_shortcuts.close_focused_column,

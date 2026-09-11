@@ -101,6 +101,7 @@ impl LinkOpenGesture {
 pub struct KeyboardShortcuts {
     pub new_terminal: Vec<String>,
     pub new_thread: Vec<String>,
+    pub clone_pane: Vec<String>,
     pub close_focused_column: Vec<String>,
     pub search_projects: Vec<String>,
     pub previous_column: Vec<String>,
@@ -112,7 +113,8 @@ impl Default for KeyboardShortcuts {
     fn default() -> Self {
         Self {
             new_terminal: vec!["Ctrl+T".to_owned()],
-            new_thread: vec!["Ctrl+Shift+T".to_owned()],
+            new_thread: vec!["Alt+G".to_owned()],
+            clone_pane: vec!["Alt+E".to_owned()],
             close_focused_column: vec!["Ctrl+W".to_owned()],
             search_projects: vec!["Ctrl+F".to_owned()],
             previous_column: vec!["Alt+Q".to_owned(), "Alt+Left".to_owned()],
@@ -127,10 +129,11 @@ pub const CHORD_SEPARATOR: &str = ", ";
 
 impl KeyboardShortcuts {
     /// Every action's chord list, in the order the dialog presents them.
-    fn actions(&self) -> [&Vec<String>; 7] {
+    fn actions(&self) -> [&Vec<String>; 8] {
         [
             &self.new_terminal,
             &self.new_thread,
+            &self.clone_pane,
             &self.close_focused_column,
             &self.search_projects,
             &self.previous_column,
@@ -142,7 +145,7 @@ impl KeyboardShortcuts {
     fn validate(&self) -> Result<(), SettingsError> {
         let mut parsed = Vec::new();
         for (index, chords) in self.actions().into_iter().enumerate() {
-            if chords.is_empty() && !matches!(index, 1 | 6) {
+            if chords.is_empty() && !matches!(index, 1 | 2 | 7) {
                 // Newly introduced actions may remain unbound so migration
                 // never steals a user's existing custom chord.
                 return Err(SettingsError::InvalidShortcut(
@@ -576,7 +579,8 @@ where
 {
     let mut shortcuts = toml::Table::deserialize(deserializer)?;
     preserve_existing_shortcut(&mut shortcuts, "cycle_pane_width", "Alt+R");
-    preserve_existing_shortcut(&mut shortcuts, "new_thread", "Ctrl+Shift+T");
+    preserve_existing_shortcut(&mut shortcuts, "new_thread", "Alt+G");
+    preserve_existing_shortcut(&mut shortcuts, "clone_pane", "Alt+E");
     toml::Value::Table(shortcuts)
         .try_into()
         .map_err(serde::de::Error::custom)
@@ -593,7 +597,8 @@ where
         }
     }
     preserve_existing_shortcut(&mut shortcuts, "cycle_pane_width", "Alt+R");
-    preserve_existing_shortcut(&mut shortcuts, "new_thread", "Ctrl+Shift+T");
+    preserve_existing_shortcut(&mut shortcuts, "new_thread", "Alt+G");
+    preserve_existing_shortcut(&mut shortcuts, "clone_pane", "Alt+E");
     toml::Value::Table(shortcuts)
         .try_into()
         .map_err(serde::de::Error::custom)
@@ -1492,7 +1497,8 @@ next_column = ["Alt+W", "Alt+Right"]
         .unwrap();
         let migrated = load(&path).unwrap();
         assert_eq!(migrated.keyboard_shortcuts.new_terminal, ["Ctrl+Shift+T"]);
-        assert!(migrated.keyboard_shortcuts.new_thread.is_empty());
+        assert_eq!(migrated.keyboard_shortcuts.new_thread, ["Alt+G"]);
+        assert_eq!(migrated.keyboard_shortcuts.clone_pane, ["Alt+E"]);
         assert_eq!(migrated.keyboard_shortcuts.previous_column, ["Alt+Q"]);
         assert_eq!(
             migrated.keyboard_shortcuts.next_column,
@@ -1532,24 +1538,67 @@ next_column = ["Alt+W", "Alt+Right"]
         shortcuts.remove("new_thread");
         shortcuts.insert(
             "new_terminal".into(),
-            toml::Value::Array(vec![toml::Value::String("Shift+Control+T".into())]),
+            toml::Value::Array(vec![toml::Value::String("Alt+g".into())]),
         );
         fs::write(&path, toml::to_string(&table).unwrap()).unwrap();
         let migrated = load(&path).unwrap();
-        assert_eq!(
-            migrated.keyboard_shortcuts.new_terminal,
-            ["Shift+Control+T"]
-        );
+        assert_eq!(migrated.keyboard_shortcuts.new_terminal, ["Alt+g"]);
         assert!(migrated.keyboard_shortcuts.new_thread.is_empty());
         save(&path, &migrated).unwrap();
         assert_eq!(load(&path).unwrap(), migrated);
 
         let mut conflicting = migrated;
-        conflicting.keyboard_shortcuts.new_thread = vec!["Ctrl+Shift+T".into()];
+        conflicting.keyboard_shortcuts.new_thread = vec!["Alt+G".into()];
         assert!(matches!(
             conflicting.validate(),
             Err(SettingsError::InvalidShortcut(message)) if message.contains("conflict")
         ));
+    }
+
+    #[test]
+    fn clone_pane_migration_preserves_owned_chords_and_existing_thread_bindings() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("settings.toml");
+        for (version, terminal, thread) in [
+            (2, "\"Alt+e\"", "\"Ctrl+Shift+T\""),
+            (3, "[\"Alt+e\"]", "[\"Ctrl+Shift+T\"]"),
+        ] {
+            let inspector = if version == 3 {
+                "inspector_width = 380.0\n"
+            } else {
+                ""
+            };
+            fs::write(&path, format!("schema_version = {version}\nmax_hot_cards = 6\nhibernation_delay_ms = 30000\nterminal_font_size = 14.0\nsidebar_width = 280.0\ndefault_column_fraction = 0.72\n{inspector}[keyboard_shortcuts]\nnew_terminal = {terminal}\nnew_thread = {thread}\n")).unwrap();
+            let migrated = load(&path).unwrap();
+            assert_eq!(migrated.keyboard_shortcuts.new_terminal, ["Alt+e"]);
+            assert_eq!(migrated.keyboard_shortcuts.new_thread, ["Ctrl+Shift+T"]);
+            assert!(migrated.keyboard_shortcuts.clone_pane.is_empty());
+            save(&path, &migrated).unwrap();
+            assert_eq!(load(&path).unwrap(), migrated);
+
+            let mut conflicting = migrated;
+            conflicting.keyboard_shortcuts.clone_pane = vec!["Alt+E".into()];
+            assert!(matches!(
+                conflicting.validate(),
+                Err(SettingsError::InvalidShortcut(message)) if message.contains("conflict")
+            ));
+        }
+    }
+
+    #[test]
+    fn explicit_creation_shortcuts_survive_loading_even_when_defaults_are_free() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("settings.toml");
+        for (clone_pane, new_thread) in [
+            (vec!["Alt+Shift+E".into()], vec!["Ctrl+Shift+T".into()]),
+            (Vec::new(), Vec::new()),
+        ] {
+            let mut settings = AppSettings::default();
+            settings.keyboard_shortcuts.clone_pane = clone_pane;
+            settings.keyboard_shortcuts.new_thread = new_thread;
+            save(&path, &settings).unwrap();
+            assert_eq!(load(&path).unwrap(), settings);
+        }
     }
 
     #[test]

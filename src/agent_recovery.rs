@@ -38,6 +38,29 @@ fn exact_id(value: &str) -> bool {
 /// Rebuild an interactive resume invocation without replaying an initial prompt,
 /// forking a conversation, or carrying an implicit latest-session selector.
 pub fn resume_recipe(launch: &LaunchRecipe) -> Option<LaunchRecipe> {
+    interactive_recipe(launch, true)
+}
+
+/// Start an independent conversation with the same supported configuration,
+/// never a second writer to the source conversation or a replayed prompt.
+pub fn fresh_recipe(launch: &LaunchRecipe) -> Option<LaunchRecipe> {
+    let mut recipe = interactive_recipe(launch, false)?;
+    if Provider::from_program(&recipe.program)? == Provider::Omp
+        && !recipe.arguments.iter().any(|arg| arg == "--session-dir")
+    {
+        let root = Provider::Omp.session_root(&recipe)?;
+        recipe.arguments.extend([
+            "--session-dir".into(),
+            root.join("sessions")
+                .join("native")
+                .to_string_lossy()
+                .into_owned(),
+        ]);
+    }
+    Some(recipe)
+}
+
+fn interactive_recipe(launch: &LaunchRecipe, resume: bool) -> Option<LaunchRecipe> {
     let provider = Provider::from_program(&launch.program)?;
     if launch.arguments.len() > 128
         || launch.arguments.iter().map(String::len).sum::<usize>() > MAX_ARGV_BYTES
@@ -88,8 +111,9 @@ pub fn resume_recipe(launch: &LaunchRecipe) -> Option<LaunchRecipe> {
             return None;
         }
     }
-    let id = id?;
-    provider.append_resume(&mut arguments, id);
+    if resume {
+        provider.append_resume(&mut arguments, id?);
+    }
     Some(LaunchRecipe {
         arguments,
         working_directory,
@@ -1058,6 +1082,25 @@ fn recovery_observation(
 mod tests {
     use super::*;
     use std::collections::BTreeMap;
+
+    #[test]
+    fn cloned_agent_launch_drops_identity_without_dropping_configuration() {
+        let id = "a1b2c3d4-1111-4111-8111-123456789abc";
+        let original = launch("claude", &["--resume", id, "--model", "sonnet", "--bare"]);
+        let fresh = fresh_recipe(&original).unwrap();
+        assert_eq!(fresh.arguments, ["--model", "sonnet", "--bare"]);
+        assert_eq!(resume_recipe(&original).unwrap().arguments[3], "--resume");
+        assert!(fresh_recipe(&launch("claude", &["--continue"])).is_none());
+        assert!(fresh_recipe(&launch("claude", &["send this prompt again"])).is_none());
+        assert!(fresh_recipe(&launch("claude", &["--unknown-permission-mode"])).is_none());
+        let mut omp_launch = launch("omp", &[]);
+        omp_launch
+            .environment
+            .insert("HOME".into(), "/home/test".into());
+        let omp = fresh_recipe(&omp_launch).unwrap();
+        assert_eq!(omp.arguments[0], "--session-dir");
+        assert!(omp.arguments[1].ends_with("/sessions/native"));
+    }
 
     #[cfg(feature = "host")]
     #[test]
