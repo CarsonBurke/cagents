@@ -3666,7 +3666,10 @@ fn worktree_view<'a>(
                 theme::Text::Custom(|theme| {
                     let mut color: cosmic::iced::Color = theme.current_container().on.into();
                     color.a *= 0.6;
-                    cosmic::iced::widget::text::Style { color: Some(color) }
+                    cosmic::iced::widget::text::Style {
+                        color: Some(color),
+                        ..Default::default()
+                    }
                 })
             } else {
                 theme::Text::default()
