@@ -15,5 +15,38 @@ cargo build --locked --profile dev-runtime --package ceditor --features developm
 # It does not build or start any cagents binary.
 target=$(cargo metadata --no-deps --format-version 1 | sed -n 's/.*"target_directory":"\([^"]*\)".*/\1/p')
 [ -n "$target" ] || { printf '%s\n' 'Cargo did not report its target directory' >&2; exit 1; }
+# Wayland task switchers resolve icons through the application ID's desktop entry.
+# Keep development separate without maintaining a second copy of the artwork.
+data_home=${XDG_DATA_HOME:-"${HOME:?HOME must be set}/.local/share"}
+desktop_id=io.github.cagents.ceditor.Development
+install -d "$data_home/applications"
+install -Dm644 "$root/packaging/io.github.cagents.ceditor.svg" \
+    "$data_home/icons/hicolor/scalable/apps/$desktop_id.svg"
+desktop_exec=$(printf '%s' "$target/dev-runtime/ceditor" | sed \
+    -e 's/\\/\\\\/g' \
+    -e 's/"/\\"/g' \
+    -e 's/`/\\`/g' \
+    -e 's/\$/\\$/g' \
+    -e 's/%/%%/g' \
+    -e 's/\\/\\\\/g')
+{
+    while IFS= read -r line || [ -n "$line" ]; do
+        case $line in
+            Name=*) printf '%s\n' 'Name=ceditor Development' ;;
+            Exec=*) printf 'Exec="%s" %%F\n' "$desktop_exec" ;;
+            Icon=*) printf 'Icon=%s\n' "$desktop_id" ;;
+            StartupWMClass=*) printf 'StartupWMClass=%s\n' "$desktop_id" ;;
+            MimeType=*) ;;
+            *) printf '%s\n' "$line" ;;
+        esac
+    done < "$root/packaging/io.github.cagents.ceditor.desktop"
+    printf '%s\n' 'NoDisplay=true'
+} > "$data_home/applications/$desktop_id.desktop"
+if command -v gtk-update-icon-cache >/dev/null 2>&1; then
+    gtk-update-icon-cache --force --ignore-theme-index "$data_home/icons/hicolor" >/dev/null 2>&1 || :
+fi
+if command -v update-desktop-database >/dev/null 2>&1; then
+    update-desktop-database "$data_home/applications" >/dev/null 2>&1 || :
+fi
 cd "$caller_cwd"
 exec "$target/dev-runtime/ceditor" "$@"
