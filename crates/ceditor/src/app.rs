@@ -2032,8 +2032,13 @@ impl Application for Editor {
         .into_iter()
         .map(|(label, theme)| {
             let selected = self.settings.app_theme == theme;
-            widget::button::text(label)
-                .class(sidebar::sidebar_button_style(selected))
+            widget::button::custom(design::body(label))
+                .name(label)
+                .class(if selected {
+                    cosmic::theme::Button::Suggested
+                } else {
+                    cosmic::theme::Button::Text
+                })
                 .selected(selected)
                 .width(Length::Fill)
                 .on_press(Message::Theme(theme))

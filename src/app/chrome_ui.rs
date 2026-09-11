@@ -214,7 +214,7 @@ impl Cagents {
                             .to_owned(),
                             arguments: Vec::new(),
                             working_directory,
-                            environment: BTreeMap::new(),
+                            environment: Default::default(),
                         })
                     }
                 }
