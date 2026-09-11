@@ -21,6 +21,8 @@ use std::{
 pub(super) struct Record {
     pub session: Session,
     pub handle: Handle,
+    // Retain the exact CLI/account that authorized a shared Codex attachment.
+    pub(super) source_process: Option<crate::model::agent_recovery::AgentProcess>,
     pub subscribers: BTreeMap<ClientId, bool>,
     pub(super) observations: BTreeMap<ClientId, Observation>,
     pub completion_observed: bool,
@@ -606,6 +608,7 @@ fn start(
         let record = Record {
             session,
             handle,
+            source_process,
             subscribers: BTreeMap::from([(client, false)]),
             observations: BTreeMap::from([(client, observation)]),
             completion_observed: false,
@@ -840,10 +843,83 @@ pub(super) fn resolve_upgrade(
     Ok(session)
 }
 
+pub(super) fn paired_upgrade_recipe(
+    selected: &crate::model::agent_recovery::AgentProcess,
+    current: &crate::model::agent_recovery::AgentProcess,
+    launch: &chat::Launch,
+    confirmed_id: Option<&str>,
+) -> Result<crate::model::LaunchRecipe, String> {
+    if selected != current
+        || current.provider != Provider::Codex
+        || launch.provider != Provider::Codex
+        || confirmed_id.is_none()
+        || confirmed_id != launch.session_id.as_deref()
+    {
+        return Err("The confirmed Codex source or conversation changed before upgrade".into());
+    }
+    let recipe = crate::model::agent_recovery::bind_session(
+        &current.recovery,
+        confirmed_id.expect("checked identity"),
+    )
+    .ok_or("The confirmed Codex source no longer has a safe exact resume recipe")?;
+    if launch.terminal_recipe().as_ref() != Some(&recipe) {
+        return Err("The confirmed Codex source account or launch changed before upgrade".into());
+    }
+    Ok(recipe)
+}
+
+fn restore_selection(
+    handle: &crate::terminal::TerminalHandle,
+    launch: &chat::Launch,
+    deadline: Instant,
+) -> Result<PendingBinding, String> {
+    let expected = launch
+        .terminal_recipe()
+        .ok_or("Restored Codex conversation has no exact recipe")?;
+    let id = launch
+        .session_id
+        .as_deref()
+        .ok_or("Missing restored Codex thread")?;
+    loop {
+        if handle.is_completed() {
+            return Err("Restored Codex CLI exited before loading its exact thread".into());
+        }
+        if Instant::now() >= deadline {
+            return Err(
+                "Restored Codex CLI did not load its exact thread within 30 seconds".into(),
+            );
+        }
+        // Launchers can briefly expose no native child, and a running child
+        // need not have loaded its shared thread yet. Neither is readiness.
+        if let Some(process) = handle.observe_agent_process()
+            && process.provider == Provider::Codex
+            && crate::model::agent_recovery::resume_recipe(&process.recovery).as_ref()
+                == Some(&expected)
+            && let Ok((title, working_directory)) =
+                crate::agent::observe::codex_preview(&process.recovery, id)
+            && handle.observe_agent_process().as_ref() == Some(&process)
+            && Instant::now() < deadline
+        {
+            return Ok(PendingBinding {
+                preview: chat::BindingPreview {
+                    token: uuid::Uuid::new_v4().to_string(),
+                    session_id: id.to_owned(),
+                    title,
+                    working_directory,
+                },
+                process,
+                expires: deadline,
+            });
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+}
+
 pub(super) fn restore_upgrade(
     host: &SharedHost,
     saved: &crate::upgrade::handoff::Chat,
 ) -> Result<(), String> {
+    let deadline = Instant::now() + Duration::from_secs(30);
     let mut session = saved.source.clone();
     session.launch = saved.launch.clone();
     let source = {
@@ -873,14 +949,16 @@ pub(super) fn restore_upgrade(
     // A durable native-chat checkpoint already records the user's selection.
     // Re-verify its loaded thread and new source process rather than requiring
     // another UI confirmation or treating its cwd as identity.
-    let selection = if session.launch.provider == Provider::Codex
-        && let Some(proof) = source.as_ref()
-    {
-        preview(host, session.clone(), proof.clone()).map_err(|error| error.message)?;
-        host.lock()
+    let selection = if session.launch.provider == Provider::Codex && source.is_some() {
+        let handle = host
+            .lock()
             .unwrap_or_else(|p| p.into_inner())
-            .chat_bindings
-            .remove(&session.id)
+            .terminals
+            .get(&session.id)
+            .ok_or("Restored Codex source disappeared")?
+            .handle
+            .clone();
+        Some(restore_selection(&handle, &session.launch, deadline)?)
     } else {
         None
     };
@@ -898,7 +976,7 @@ pub(super) fn restore_upgrade(
         .expect("restored chat")
         .handle
         .clone();
-    let deadline = Instant::now() + Duration::from_secs(30);
+    // Startup, loaded-thread verification, and native confirmation share one deadline.
     loop {
         let snapshot = handle.snapshot(None).expect("unconditional snapshot");
         if let Some(error) = snapshot.error {
@@ -952,6 +1030,58 @@ mod tests {
         model::{BootId, HostIncarnation, HostSessionId, LaunchRecipe},
     };
     use serde_json::{Value, json};
+
+    #[test]
+    fn paired_codex_upgrade_preserves_confirmed_fresh_or_switched_thread() {
+        use crate::model::agent_recovery::{AgentProcess, bind_session};
+        const SELECTED: &str = "12345678-1234-4234-8234-123456789abc";
+        const ORIGINAL: &str = "98765432-1234-4234-8234-123456789abc";
+        let recipe = LaunchRecipe {
+            program: "codex".into(),
+            arguments: vec!["--profile".into(), "work".into()],
+            working_directory: "/project".into(),
+            environment: BTreeMap::from([("CODEX_HOME".into(), "/account".into())]),
+        };
+        let expected = bind_session(&recipe, SELECTED).unwrap();
+        let launch = chat::Launch {
+            provider: Provider::Codex,
+            recipe: expected.clone(),
+            session_id: Some(SELECTED.into()),
+        };
+        for source in [recipe.clone(), bind_session(&recipe, ORIGINAL).unwrap()] {
+            let process = AgentProcess {
+                pid: 42,
+                start: 100,
+                provider: Provider::Codex,
+                launch: source.clone(),
+                recovery: source,
+            };
+            assert_eq!(
+                paired_upgrade_recipe(&process, &process, &launch, Some(SELECTED)).unwrap(),
+                expected,
+            );
+            assert!(paired_upgrade_recipe(&process, &process, &launch, Some(ORIGINAL)).is_err());
+            assert!(paired_upgrade_recipe(&process, &process, &launch, None).is_err());
+            let mut replacement = process.clone();
+            replacement.start += 1;
+            assert!(
+                paired_upgrade_recipe(&process, &replacement, &launch, Some(SELECTED)).is_err()
+            );
+            let mut other_account = process.clone();
+            other_account
+                .recovery
+                .environment
+                .insert("CODEX_HOME".into(), "/other".into());
+            assert!(
+                paired_upgrade_recipe(&process, &other_account, &launch, Some(SELECTED)).is_err()
+            );
+            // Matching process evidence alone cannot bless a stale native launch.
+            assert!(
+                paired_upgrade_recipe(&other_account, &other_account, &launch, Some(SELECTED))
+                    .is_err()
+            );
+        }
+    }
 
     #[test]
     fn confirmed_selection_is_bound_to_process_account_identity_and_expiration() {
@@ -1180,6 +1310,7 @@ for line in sys.stdin:
                         terminal: None,
                     },
                     handle: handle.clone(),
+                    source_process: None,
                     subscribers: BTreeMap::from([(1, false), (2, false)]),
                     observations: BTreeMap::from([
                         (1, Observation::default()),

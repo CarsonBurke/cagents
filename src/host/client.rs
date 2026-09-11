@@ -1063,6 +1063,7 @@ mod tests {
                         terminal: None,
                     },
                     handle: handle.clone(),
+                    source_process: None,
                     subscribers: BTreeMap::from([(1, false)]),
                     observations: BTreeMap::new(),
                     completion_observed: false,

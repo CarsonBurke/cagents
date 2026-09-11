@@ -72,7 +72,12 @@ pub fn resume_recipe(launch: &LaunchRecipe) -> Option<LaunchRecipe> {
         }
         if provider.is_value_option(flag) {
             let value = inline.or_else(|| args.next().map(String::as_str))?;
-            if value.is_empty() || value.starts_with('-') || value.contains('\0') {
+            // Claude explicitly uses an empty source list to disable settings.
+            // Dropping it would re-enable configuration on native/CLI resume.
+            if (value.is_empty() && !(provider == Provider::Claude && flag == "--setting-sources"))
+                || value.starts_with('-')
+                || value.contains('\0')
+            {
                 return None;
             }
             arguments.extend([flag.to_owned(), value.to_owned()]);
@@ -624,7 +629,6 @@ fn read_process_launch(
     let bytes = bytes.strip_suffix(&[0]).unwrap_or(&bytes);
     let mut argv = bytes
         .split(|byte| *byte == 0)
-        .filter(|arg| base.is_none() || !arg.is_empty())
         .map(|arg| std::str::from_utf8(arg).map(str::to_owned));
     let program = argv.next()?.ok()?;
     let arguments = argv.collect::<Result<Vec<_>, _>>().ok()?;
@@ -1021,7 +1025,13 @@ mod tests {
         let script = "/opt/node_modules/@anthropic-ai/claude-code/cli.js";
         let mut raw = launch(
             "node",
-            &[script, "--resume", "a1b2c3d4-1111-4111-8111-123456789abc"],
+            &[
+                script,
+                "--setting-sources",
+                "",
+                "--resume",
+                "a1b2c3d4-1111-4111-8111-123456789abc",
+            ],
         );
         raw.environment = BTreeMap::from([
             ("HOME".into(), "/home/actual".into()),
@@ -1040,6 +1050,15 @@ mod tests {
         let recovered = observed_launch_from_hint(&recovery).unwrap();
         assert_eq!(recovered.program, "claude");
         assert_eq!(recovered.environment["CLAUDE_CONFIG_DIR"], "/stale/claude");
+        assert_eq!(
+            recovered.arguments,
+            [
+                "--setting-sources",
+                "",
+                "--resume",
+                "a1b2c3d4-1111-4111-8111-123456789abc"
+            ]
+        );
 
         let process = inspect_agent_process(directory.path(), 100, 100, &mut 64)
             .unwrap()
@@ -1399,13 +1418,29 @@ mod tests {
     fn live_binding_preserves_permissions_without_replaying_consumed_prompts() {
         let id = "a1b2c3d4-1111-4111-8111-123456789abc";
         let claude = bind_session(
-            &launch("claude", &["--permission-mode", "plan", "already sent"]),
+            &launch(
+                "claude",
+                &[
+                    "--permission-mode",
+                    "plan",
+                    "--setting-sources",
+                    "",
+                    "already sent",
+                ],
+            ),
             id,
         )
         .unwrap();
         assert_eq!(
             claude.arguments,
-            ["--permission-mode", "plan", "--resume", id]
+            [
+                "--permission-mode",
+                "plan",
+                "--setting-sources",
+                "",
+                "--resume",
+                id
+            ]
         );
         let codex = bind_session(
             &launch(
@@ -1511,9 +1546,12 @@ mod tests {
         );
         let base = launch("/bin/sh", &[]);
         let deadline = Instant::now() + Duration::from_secs(2);
-        let hint = loop {
-            if let Some(hint) = foreground_hint(child.0.id() as libc::pid_t, &base) {
-                break hint;
+        let recipe = loop {
+            if let Some(recipe) = foreground_hint(child.0.id() as libc::pid_t, &base)
+                .as_deref()
+                .and_then(recipe_from_hint)
+            {
+                break recipe;
             }
             assert!(
                 Instant::now() < deadline,
@@ -1521,7 +1559,6 @@ mod tests {
             );
             std::thread::yield_now();
         };
-        let recipe = recipe_from_hint(&hint).unwrap();
         assert_eq!(Path::new(&recipe.program), native);
         assert_eq!(recipe.arguments, ["resume", id]);
         assert_eq!(recipe.working_directory, directory.path());
