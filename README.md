@@ -572,7 +572,7 @@ has no activity-status strip.
 There is no system daemon or service unit. The standard production installation starts its per-user sibling `cagentsd` immediately and registers it for graphical-login autostart. While that daemon is running, cagents exposes a system-tray item that opens the UI and can stop the daemon. The daemon remains independent of the UI so terminals survive window and UI-process restarts.
 
 Full and browserless production builds share the established daemon socket and
-session store. Protocol **8** deliberately retains that namespace, preventing a
+session store. Protocol **9** deliberately retains that namespace, preventing a
 second daemon owner while an incompatible older process is still running;
 the handshake rejects incompatible clients without terminating their PTYs. Upgrade
 the three companion executables together. Each window holds an exclusive slot
