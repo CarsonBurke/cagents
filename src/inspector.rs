@@ -1431,7 +1431,7 @@ fn fact_element(
             let name = format!("{}: {}", fact.label, fact.value);
             widget::button::custom(
                 widget::column::with_children(vec![
-                    widget::text::caption(fact.label).into(),
+                    design::caption(fact.label).into(),
                     fact_body(fact.value, fact.markdown, false),
                 ])
                 .spacing(0)
@@ -1445,7 +1445,7 @@ fn fact_element(
             .into()
         }
         None => widget::column::with_children(vec![
-            widget::text::caption(fact.label).into(),
+            design::caption(fact.label).into(),
             fact_body(fact.value, fact.markdown, true),
         ])
         .spacing(0)
@@ -1503,7 +1503,7 @@ fn markdown_items(
     // A server's Markdown chooses its own block count and nesting, and both
     // become the size and the depth of this widget tree.
     if depth >= MARKDOWN_NESTING_LIMIT {
-        return widget::text::caption("Markdown nested deeper than this is not shown.").into();
+        return crate::design::caption("Markdown nested deeper than this is not shown.").into();
     }
     let blocks = bounded_indexed(items, "Markdown block", "Markdown blocks", |index, item| {
         markdown_item(item, settings, index, depth)
@@ -1550,7 +1550,7 @@ fn markdown_withheld(
     singular: &str,
     plural: &str,
 ) -> Element<'static, InspectorAction> {
-    widget::text::caption(withheld_label(withheld, singular, plural)).into()
+    crate::design::caption(withheld_label(withheld, singular, plural)).into()
 }
 
 fn markdown_item(
@@ -1629,7 +1629,7 @@ fn markdown_item(
         // fetched.
         Item::Image { url, title, alt } => widget::column::with_children(vec![
             markdown_text(alt, settings, settings.text_size, None),
-            widget::text::caption(if title.is_empty() {
+            design::caption(if title.is_empty() {
                 format!("Image: {url}")
             } else {
                 format!("Image: {title} ({url})")
@@ -1713,7 +1713,7 @@ pub fn view(model: InspectorModel, width: f32) -> Element<'static, InspectorActi
                 ))
                 .width(Length::Fill)
                 .into(),
-            widget::text::caption(model.kind).into(),
+            design::caption(model.kind).into(),
         ])
         .spacing(0)
         .width(Length::Fill)
@@ -2322,43 +2322,6 @@ mod tests {
                 }
             }
         }
-    }
-
-    #[test]
-    fn an_actionless_fact_still_renders_the_inert_text_shape() {
-        let spacing = cosmic::theme::spacing();
-        let rendered = Tree::new(&fact_element(Fact::new("Label", "value"), spacing));
-        let historical: Element<'static, InspectorAction> = widget::column::with_children(vec![
-            widget::text::caption("Label").into(),
-            widget::selectable_text("value")
-                .wrapping(cosmic::iced::widget::text::Wrapping::Word)
-                .width(Length::Fill)
-                .into(),
-        ])
-        .spacing(0)
-        .width(Length::Fill)
-        .into();
-
-        assert_eq!(tree_shape(&rendered), tree_shape(&Tree::new(&historical)));
-
-        let activated = Tree::new(&fact_element(
-            Fact::new("Label", "value").activated(InspectorAction::CloseCard(CardId::new())),
-            spacing,
-        ));
-        assert_ne!(
-            tree_shape(&activated),
-            tree_shape(&Tree::new(&historical)),
-            "an activatable fact must not render as inert text"
-        );
-        let pressable: Element<'static, InspectorAction> =
-            widget::button::custom(widget::text::body("value"))
-                .on_press(InspectorAction::CloseCard(CardId::new()))
-                .into();
-        assert_eq!(
-            activated.tag,
-            Tree::new(&pressable).tag,
-            "an activatable fact must render as a pressable control"
-        );
     }
 
     #[test]

@@ -269,7 +269,7 @@ fn comment<'a>(comment: &'a PullRequestComment, reply: bool) -> Element<'a, Acti
         .as_ref()
         .map_or("Deleted account", |author| author.login.as_str());
     widget::column::with_children(vec![
-        widget::text::caption(format!(
+        design::caption(format!(
             "{}{} · {}",
             if reply { "Reply · " } else { "" },
             author,
@@ -311,7 +311,7 @@ pub fn view(state: &State) -> Element<'_, Action> {
     ];
     if let Some(target) = &state.target {
         children.push(
-            widget::text::caption(format!(
+            crate::design::caption(format!(
                 "{} · {}",
                 target.repository.gh_selector(),
                 target.branch
@@ -331,7 +331,7 @@ pub fn view(state: &State) -> Element<'_, Action> {
     }
     if state.loading {
         children.push(
-            widget::text::caption(if state.pull_request.is_some() {
+            crate::design::caption(if state.pull_request.is_some() {
                 "Refreshing checks and discussion…"
             } else {
                 "Loading pull request…"
@@ -348,7 +348,7 @@ pub fn view(state: &State) -> Element<'_, Action> {
     if state.pull_request.is_none()
         && let Some(pr) = &state.preview
     {
-        children.push(widget::text::caption("Cached pull request · refreshing").into());
+        children.push(crate::design::caption("Cached pull request · refreshing").into());
         children.push(widget::text::title4(&pr.title).into());
         children.push(link("Open pull request on GitHub", &pr.url));
     }
@@ -358,7 +358,7 @@ pub fn view(state: &State) -> Element<'_, Action> {
     if let Some(pr) = state.pull_request.as_deref() {
         children.push(widget::text::title4(format!("#{} {}", pr.number, pr.title)).into());
         children.push(
-            widget::text::caption(format!(
+            crate::design::caption(format!(
                 "{}{} · {} → {}",
                 pr.state.0,
                 if pr.is_draft { " · Draft" } else { "" },
@@ -377,7 +377,7 @@ pub fn view(state: &State) -> Element<'_, Action> {
             children.push(widget::text::body("Local HEAD differs from the pull request head. Checks below apply to the remote pull request commit.").into());
         }
         children.push(
-            widget::text::caption(format!(
+            crate::design::caption(format!(
                 "Review decision: {}",
                 pr.review_decision
                     .as_ref()
@@ -408,7 +408,7 @@ pub fn view(state: &State) -> Element<'_, Action> {
                 for check in checks {
                     let mut check_rows = vec![
                         widget::text::body(format!("{} · {}", check.name, check.state.0)).into(),
-                        widget::text::caption(format!(
+                        design::caption(format!(
                             "{}{}{}",
                             check.bucket.0,
                             if check.workflow.is_empty() {
@@ -492,14 +492,14 @@ pub fn view(state: &State) -> Element<'_, Action> {
                         children.push(comment(item, index != 0));
                     }
                     if thread.truncated {
-                        children.push(widget::text::caption("Showing the first 100 comments in this thread. Open its comment link for the full discussion.").into());
+                        children.push(crate::design::caption("Showing the first 100 comments in this thread. Open its comment link for the full discussion.").into());
                     }
                 }
                 children.push(widget::text::title4("Reviews").into());
                 for review in &conversation.reviews {
                     if comment_matches(&review.comment, &filter) {
                         shown += 1;
-                        children.push(widget::text::caption(&review.state.0).into());
+                        children.push(crate::design::caption(&review.state.0).into());
                         children.push(comment(&review.comment, false));
                     }
                 }
@@ -521,7 +521,7 @@ pub fn view(state: &State) -> Element<'_, Action> {
                     );
                 }
                 if conversation.truncated {
-                    children.push(widget::text::caption("Showing up to 200 review threads, 200 reviews, and 200 issue comments. Open the pull request for the full discussion.").into());
+                    children.push(crate::design::caption("Showing up to 200 review threads, 200 reviews, and 200 issue comments. Open the pull request for the full discussion.").into());
                 }
             }
         }

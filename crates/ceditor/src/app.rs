@@ -174,8 +174,14 @@ fn chosen_path(
 }
 
 fn tab_title_style() -> cosmic::theme::Button {
-    fn appearance(_focused: bool, _theme: &cosmic::Theme) -> widget::button::Style {
-        widget::button::Style::new()
+    fn appearance(focused: bool, theme: &cosmic::Theme) -> widget::button::Style {
+        widget::button::Style {
+            border_radius: theme.cosmic().corner_radii.radius_s.into(),
+            background: focused
+                .then(|| iced::Background::Color(theme.current_container().component.hover.into())),
+            border_width: 0.0,
+            ..widget::button::Style::new()
+        }
     }
     cosmic::theme::Button::Custom {
         active: Box::new(appearance),
@@ -947,7 +953,8 @@ impl Application for Editor {
     type Message = Message;
     const APP_ID: &'static str = crate::APPLICATION_ID;
 
-    fn init(core: Core, flags: Flags) -> (Self, Task<Message>) {
+    fn init(mut core: Core, flags: Flags) -> (Self, Task<Message>) {
+        core.window.border_padding = Some(0);
         let (settings, mut notice, settings_writable) = match settings::load(&flags.settings_path) {
             Ok(settings) => (settings, None, true),
             Err(error) => (AppSettings::default(), Some(error.to_string()), false),
@@ -1726,10 +1733,7 @@ impl Application for Editor {
                         cagents::interaction::tooltip(
                             widget::button::custom(
                                 widget::row::with_children(vec![
-                                    widget::icon(cagents::ui_controls::ceditor_icon())
-                                        .size(16)
-                                        .into(),
-                                    widget::text::body(title.clone())
+                                    design::body(title.clone())
                                         .wrapping(iced::widget::text::Wrapping::None)
                                         .ellipsize(iced::widget::text::Ellipsize::End(
                                             iced::advanced::text::EllipsizeHeightLimit::Lines(1),
@@ -1737,7 +1741,7 @@ impl Application for Editor {
                                         .width(Length::Fill)
                                         .into(),
                                 ])
-                                .spacing(8)
+                                .height(Length::Fill)
                                 .align_y(iced::Alignment::Center)
                                 .width(Length::Fill),
                             )
@@ -1759,10 +1763,11 @@ impl Application for Editor {
                         .into(),
                     ])
                     .align_y(iced::Alignment::Center)
+                    .spacing(2)
                     .height(Length::Fill),
                 )
                 .width(184)
-                .height(design::PRIMARY_CONTROL_SIZE + 4.0)
+                .height(design::PRIMARY_CONTROL_SIZE)
                 .class(cosmic::theme::Container::custom(move |theme| {
                     iced::widget::container::Style {
                         background: selected.then(|| {
@@ -1774,6 +1779,10 @@ impl Application for Editor {
                                     .into(),
                             )
                         }),
+                        border: iced::Border {
+                            radius: theme.cosmic().corner_radii.radius_s.into(),
+                            ..Default::default()
+                        },
                         ..Default::default()
                     }
                 }))
@@ -1783,14 +1792,20 @@ impl Application for Editor {
         let mut body = Vec::new();
         if !tabs.is_empty() {
             body.push(
-                widget::scrollable(widget::row::with_children(tabs).spacing(0))
-                    .id(widget::Id::new("ceditor.tabs"))
-                    .direction(iced::widget::scrollable::Direction::Horizontal(
-                        cagents::design::scrollbar(),
-                    ))
-                    .width(Length::Fill)
-                    .into(),
+                widget::scrollable::horizontal(
+                    widget::row::with_children(tabs)
+                        .spacing(2)
+                        .height(design::PRIMARY_CONTROL_SIZE),
+                )
+                .id(widget::Id::new("ceditor.tabs"))
+                .direction(iced::widget::scrollable::Direction::Horizontal(
+                    iced::widget::scrollable::Scrollbar::hidden(),
+                ))
+                .width(Length::Fill)
+                .height(design::PRIMARY_CONTROL_SIZE)
+                .into(),
             );
+            body.push(widget::divider::horizontal::default().into());
         }
         if let Some(notice) = &self.notice {
             body.push(
@@ -1808,6 +1823,7 @@ impl Application for Editor {
                 .padding(8)
                 .into(),
             );
+            body.push(widget::divider::horizontal::default().into());
         }
         if let Some(tab) = self.current() {
             let mut editor = Vec::new();
@@ -1852,11 +1868,13 @@ impl Application for Editor {
                     .width(Length::Fill)
                     .into(),
                 );
+                editor.push(widget::divider::horizontal::default().into());
             }
             editor.push(repository_widget::view(tab.id, &tab.runtime).map(Message::Repository));
             if tab.runtime.lsp_document().is_some() {
+                editor.push(widget::divider::horizontal::default().into());
                 editor.push(
-                    widget::container(widget::text::caption(&tab.lsp_status))
+                    widget::container(design::caption(&tab.lsp_status))
                         .padding([2, 8])
                         .width(Length::Fill)
                         .into(),
@@ -1886,6 +1904,7 @@ impl Application for Editor {
                         .into(),
                     );
                 }
+                editor.push(widget::divider::horizontal::default().into());
                 editor.push(
                     widget::scrollable(widget::column::with_children(results).spacing(4))
                         .direction(iced::widget::scrollable::Direction::Vertical(
@@ -1899,6 +1918,7 @@ impl Application for Editor {
                 widget::row::with_children(vec![
                     sidebar::file_panel(&tab.sidebar, &tab.navigation, 280.0, self.modal_open())
                         .map(Message::Sidebar),
+                    widget::divider::vertical::default().into(),
                     widget::column::with_children(editor)
                         .width(Length::Fill)
                         .height(Length::Fill)
@@ -1932,7 +1952,7 @@ impl Application for Editor {
             let mut content = vec![
                 widget::text::title3(title).into(),
                 widget::text::body(dialog.source.to_string_lossy()).into(),
-                widget::text::caption(if dialog.duplicate {
+                design::caption(if dialog.duplicate {
                     "Copies the saved file on disk, not unsaved editor changes. Existing files are never replaced."
                 } else {
                     "Rename in the same directory. Existing files are never replaced."
@@ -2051,14 +2071,14 @@ impl Application for Editor {
                 .label("Save files automatically".to_owned())
                 .on_toggle(Message::AutoSave)
                 .into(),
-            widget::text::caption("Save after a pause. Conflicts and save errors still require your attention.")
+            design::caption("Save after a pause. Conflicts and save errors still require your attention.")
                 .wrapping(iced::widget::text::Wrapping::Word)
                 .into(),
             widget::toggler(self.settings.editor_wrap_lines)
                 .label("Wrap long lines".to_owned())
                 .on_toggle(Message::WrapLines)
                 .into(),
-            widget::text::caption("Fit long lines to the editor width. Off keeps each line on one row.")
+            design::caption("Fit long lines to the editor width. Off keeps each line on one row.")
                 .wrapping(iced::widget::text::Wrapping::Word)
                 .into(),
             widget::text::title4("Appearance").into(),
@@ -2079,17 +2099,17 @@ impl Application for Editor {
                     .into(),
             ]).spacing(12).align_y(iced::Alignment::Center).into(),
             widget::text::title4("Language servers").into(),
-            widget::text::caption("Edit language_servers in the preferences file, then restart ceditor to apply server changes.")
+            design::caption("Edit language_servers in the preferences file, then restart ceditor to apply server changes.")
                 .wrapping(iced::widget::text::Wrapping::Word)
                 .into(),
-            widget::text::caption(self.settings_path.to_string_lossy())
+            design::caption(self.settings_path.to_string_lossy())
                 .wrapping(iced::widget::text::Wrapping::WordOrGlyph)
                 .into(),
         ]).spacing(12).width(Length::Fill);
         Some(cagents::interaction::opaque(
             widget::container(widget::column::with_children(vec![
                 widget::text::title3("Editor settings").into(),
-                widget::text::caption(if self.settings_writable {
+                design::caption(if self.settings_writable {
                     "Changes apply immediately and save automatically."
                 } else {
                     "Changes apply now, but cannot be saved until the preferences file is repaired."

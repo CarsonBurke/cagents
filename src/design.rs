@@ -16,6 +16,20 @@ pub const TEXT_BODY: f32 = 13.0;
 pub const TEXT_CAPTION: f32 = 12.0;
 pub const TEXT_HEADING: f32 = 13.0;
 
+/// Secondary labels stay readable without competing with active content.
+pub fn muted_color(theme: &cosmic::Theme) -> cosmic::iced::Color {
+    let mut color: cosmic::iced::Color = theme.current_container().on.into();
+    color.a *= 0.55;
+    color
+}
+
+pub fn muted_text(theme: &cosmic::Theme) -> cosmic::iced::widget::text::Style {
+    cosmic::iced::widget::text::Style {
+        color: Some(muted_color(theme)),
+        ..Default::default()
+    }
+}
+
 pub fn body<'a>(
     text: impl Into<std::borrow::Cow<'a, str>> + 'a,
 ) -> cosmic::widget::text::Text<'a, cosmic::Theme, cosmic::Renderer> {
@@ -29,7 +43,9 @@ pub fn body<'a>(
 pub fn caption<'a>(
     text: impl Into<std::borrow::Cow<'a, str>> + 'a,
 ) -> cosmic::widget::text::Text<'a, cosmic::Theme, cosmic::Renderer> {
-    cosmic::widget::text::caption(text).size(TEXT_CAPTION)
+    cosmic::widget::text::caption(text)
+        .size(TEXT_CAPTION)
+        .class(cosmic::theme::Text::Custom(muted_text))
 }
 
 pub fn heading<'a>(

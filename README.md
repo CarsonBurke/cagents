@@ -344,16 +344,22 @@ cagents ui
   starts an independent native conversation in the project's main worktree.
   Threads have their own sidebar rows and panes, separate from worktree panes;
   select a thread again to return to the same conversation.
-  Editor tabs use the ceditor mark; recognized agent terminals and native chats
-  use their OMP, Claude, or Codex provider mark.
-  Panes outside registered worktrees remain reachable through their own tabs,
-  without a separate Other sessions section.
+  In cagents, editor tabs use the ceditor mark; recognized agent terminals and
+  native chats use their OMP, Claude, or Codex provider mark.
+  Each tab strip contains only its selected worktree or thread. The **Workspaces**
+  dropdown opens directories outside registered projects without mixing their
+  panes into other worktrees or adding an Other sessions section.
   Drag a project header to reorder projects; the order survives restarts.
   Project headers stay visible above their worktrees while scrolling. The
   primary worktree stays first; the sort control selects newest, oldest, or
   alphabetical order for the remaining worktrees.
+  Worktree labels prefer the matching pull request title, falling back to a
+  readable branch basename without account prefixes. Tooltips and search retain
+  the full Git branch. Quiet worktree names and icons are muted; unread updates
+  and agents waiting for input remain emphasized.
 - The right-hand inspector has icon-only **Files**, **Changes**, **Pull request**,
-  and **Details** tabs; hover for tooltips. Files browses the selected worktree,
+  and **Details** tabs below the window header, separated from its content by a
+  border; hover for tooltips. Files browses the selected worktree,
   Changes provides diffs, staging, commits, push/publish, and history,
   Pull request inspects the worktree's matching PR, and Details follows the
   focused card. Both file and change lists support **Tree** and **Flat** modes.
@@ -442,6 +448,8 @@ shares the editor and repository UI without starting the cagents daemon,
 terminal host, or embedded browser. File-list mode and settings persist independently.
 Open tabs, order, and the active tab restore on launch; explicit paths are also
 opened, and a new session with no paths browses the current directory.
+Standalone tabs omit the redundant application icon and use the same compact
+geometry and pane separators as cagents.
 
 ```sh
 scripts/run-ceditor-development /path/to/project

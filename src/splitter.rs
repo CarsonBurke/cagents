@@ -382,13 +382,6 @@ impl<'view, Message: 'view> Widget<Message, Theme, Renderer> for Splitter<'view,
         if !layout.bounds().intersects(viewport) {
             return;
         }
-        // The enclosing sidebar owns the rule at the viewport edge. Keep this
-        // handle interactive, but do not paint a second coincident pane rule.
-        if self.edge == Edge::Trailing
-            && layout.bounds().x + layout.bounds().width >= viewport.x + viewport.width - WIDTH
-        {
-            return;
-        }
         let scale = style.scale_factor as f32;
         let bounds =
             pixel_aligned_rule(layout.bounds(), layout.virtual_offset().x, scale, self.edge);

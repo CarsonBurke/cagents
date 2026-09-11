@@ -178,7 +178,7 @@ impl Runtime {
         if self.disconnected || snapshot.exited {
             content.push(
                 widget::row::with_children(vec![
-                    widget::text::caption(if snapshot.exited {
+                    crate::design::caption(if snapshot.exited {
                         "Agent process exited. The transcript and draft are retained."
                     } else {
                         "Disconnected. The daemon may still be working; your draft is retained."
@@ -370,7 +370,7 @@ impl Runtime {
         for (index, attachment) in self.attachments.iter().enumerate() {
             content.push(
                 widget::row::with_children(vec![
-                    widget::text::caption(attachment.path.display().to_string())
+                    crate::design::caption(attachment.path.display().to_string())
                         .width(Length::Fill)
                         .into(),
                     icon(
@@ -538,12 +538,12 @@ impl Runtime {
             )
             .into()
         } else {
-            widget::text::caption(detail).into()
+            crate::design::caption(detail).into()
         };
         content.push(
             widget::row::with_children(vec![
                 status,
-                widget::text::caption(format!(
+                crate::design::caption(format!(
                     "{} in / {} out{}{}",
                     usage.input_tokens, usage.output_tokens, context, cost
                 ))
@@ -611,7 +611,7 @@ impl Runtime {
                         .into(),
                 );
                 if *thinking {
-                    rows.push(widget::text::caption("Thinking").into());
+                    rows.push(crate::design::caption("Thinking").into());
                 }
                 if !thinking || self.expanded.contains(&item.id) {
                     if self.raw.contains(&item.id) {
@@ -656,7 +656,7 @@ impl Runtime {
                     chat::ToolStatus::Failed => "Failed",
                     chat::ToolStatus::Denied => "Denied",
                 };
-                heading.push(widget::text::caption(format!("{name} · {status}")).into());
+                heading.push(crate::design::caption(format!("{name} · {status}")).into());
                 heading.push(icon(
                     "pan-down-symbolic",
                     "Expand or collapse tool details",
@@ -672,7 +672,7 @@ impl Runtime {
                 if self.expanded.contains(&item.id) {
                     rows.push(
                         widget::row::with_children(vec![
-                            widget::text::caption("Input").width(Length::Fill).into(),
+                            crate::design::caption("Input").width(Length::Fill).into(),
                             icon(
                                 "edit-copy-symbolic",
                                 "Copy tool input",
@@ -685,7 +685,7 @@ impl Runtime {
                     rows.push(body(input.as_str()));
                     rows.push(
                         widget::row::with_children(vec![
-                            widget::text::caption("Output").width(Length::Fill).into(),
+                            crate::design::caption("Output").width(Length::Fill).into(),
                             icon(
                                 "edit-copy-symbolic",
                                 "Copy tool output",
@@ -719,14 +719,14 @@ impl Runtime {
                 } else if path.starts_with("data:") {
                     if cached.image.is_none() {
                         rows.push(
-                            widget::text::caption(
+                            crate::design::caption(
                                 "Image could not be decoded or exceeds the display size bound.",
                             )
                             .into(),
                         );
                     }
                 } else if !path.is_empty() {
-                    rows.push(widget::text::caption(path.as_str()).into());
+                    rows.push(crate::design::caption(path.as_str()).into());
                 }
             }
         }
@@ -747,7 +747,7 @@ impl Runtime {
             body(request.description.as_str()),
         ];
         for field in &request.fields {
-            rows.push(widget::text::caption(field.label.as_str()).into());
+            rows.push(crate::design::caption(field.label.as_str()).into());
             if !field.description.is_empty() {
                 rows.push(body(field.description.as_str()));
             }
@@ -806,7 +806,7 @@ impl Runtime {
                             .into(),
                     );
                     if !choice.description.is_empty() {
-                        rows.push(widget::text::caption(choice.description.as_str()).into());
+                        rows.push(crate::design::caption(choice.description.as_str()).into());
                     }
                 }
             }
@@ -822,7 +822,7 @@ impl Runtime {
                     .into(),
             );
             if !choice.description.is_empty() {
-                rows.push(widget::text::caption(choice.description.as_str()).into());
+                rows.push(crate::design::caption(choice.description.as_str()).into());
             }
         }
         widget::container(
