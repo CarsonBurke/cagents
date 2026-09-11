@@ -190,6 +190,7 @@ pub(crate) struct HostState {
     shutdown_capabilities: VecDeque<(ShutdownCapability, Instant)>,
     pub(super) chats: BTreeMap<TerminalId, super::chat::Record>,
     pub(super) chat_spawning: BTreeMap<TerminalId, crate::chat::Launch>,
+    pub(super) chat_bindings: BTreeMap<TerminalId, super::chat::PendingBinding>,
     pub(crate) agent_observer: Arc<crate::agent::observe::Observer>,
     /// Exclusive upgrade barrier; ordinary client operations remain concurrent.
     pub(super) control_gate: Arc<RwLock<()>>,
@@ -215,6 +216,7 @@ impl HostState {
             shutdown_capabilities: VecDeque::new(),
             chats: BTreeMap::new(),
             chat_spawning: BTreeMap::new(),
+            chat_bindings: BTreeMap::new(),
             agent_observer: Arc::new(crate::agent::observe::Observer::new()),
             control_gate: Arc::new(RwLock::new(())),
             upgrade: None,

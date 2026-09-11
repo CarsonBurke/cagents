@@ -155,11 +155,64 @@ fn receive(
     }
 }
 impl ClientHandle {
+    /// Read-only metadata lookup. Does not subscribe, resume, or write a turn.
+    pub fn preview(
+        session: Session,
+        source: HostSessionProof,
+    ) -> Result<super::BindingPreview, String> {
+        let socket = ipc::daemon_socket_path().map_err(|error| error.to_string())?;
+        let mut stream = UnixStream::connect(socket).map_err(|error| error.to_string())?;
+        stream
+            .set_read_timeout(Some(Duration::from_secs(20)))
+            .map_err(|error| error.to_string())?;
+        stream
+            .set_write_timeout(Some(Duration::from_secs(5)))
+            .map_err(|error| error.to_string())?;
+        let mut codec = FrameCodec::new(ipc::MAX_FRAME_BYTES);
+        codec
+            .write(
+                &mut stream,
+                &ClientEnvelope {
+                    version: PROTOCOL_VERSION,
+                    request_id: 1,
+                    proof: None,
+                    request: ClientRequest::Connect {
+                        expected_host: Some(source.clone()),
+                        resume: Vec::new(),
+                    },
+                },
+            )
+            .map_err(|error| error.to_string())?;
+        match receive(&mut stream, &mut codec, 1, Some(&source))? {
+            ServerResponse::Connected { proof, .. } if proof == source => {}
+            _ => return Err("The source daemon did not confirm its identity".into()),
+        }
+        codec
+            .write(
+                &mut stream,
+                &ClientEnvelope {
+                    version: PROTOCOL_VERSION,
+                    request_id: 2,
+                    proof: Some(source.clone()),
+                    request: ClientRequest::ChatPreview {
+                        session,
+                        source: source.clone(),
+                    },
+                },
+            )
+            .map_err(|error| error.to_string())?;
+        match receive(&mut stream, &mut codec, 2, Some(&source))? {
+            ServerResponse::ChatPreviewed { preview } => Ok(preview),
+            _ => Err("The daemon did not return a verified conversation preview".into()),
+        }
+    }
+
     pub fn connect(
         mut session: Session,
         spawn: bool,
         source: Option<HostSessionProof>,
         terminate_source: bool,
+        selection: Option<String>,
         wake: impl Fn(Wake) + Send + Sync + 'static,
     ) -> Result<Self, String> {
         let wake: Arc<dyn Fn(Wake) + Send + Sync> = Arc::new(wake);
@@ -240,7 +293,17 @@ impl ClientHandle {
             attach_request += 1;
         }
         let id = session.id;
-        let request = if spawn {
+        let request = if let Some(token) = selection {
+            if !spawn || terminate_source {
+                return Err("Selected conversation activation requires a non-destructive shared-server attachment".into());
+            }
+            ClientRequest::ChatStartSelected {
+                session,
+                source: source
+                    .ok_or("Selected conversation activation requires a proven source terminal")?,
+                token,
+            }
+        } else if spawn {
             ClientRequest::ChatStart {
                 session,
                 source,

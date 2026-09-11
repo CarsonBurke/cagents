@@ -34,7 +34,8 @@ use crate::{
 /// Version 6 adds parser themes, viewport scrolling, and proof-bound native chat.
 /// Version 7 adds PTY-owner-checked terminal close decisions.
 /// Version 8 adds durable upgrade preparation and restored source linkage.
-pub const PROTOCOL_VERSION: u16 = 8;
+/// Version 9 adds read-only conversation preview and explicit bound activation.
+pub const PROTOCOL_VERSION: u16 = 9;
 /// Postcard encodes an 80x24 grid in roughly 20 KiB and a typical single-row
 /// delta in a few hundred bytes, but a full repaint of a very large grid after
 /// a resize still has to fit, so keep generous headroom.
@@ -203,6 +204,15 @@ pub enum ClientRequest {
     },
     ResolveUpgradeChat {
         source: crate::chat::Session,
+    },
+    ChatPreview {
+        session: crate::chat::Session,
+        source: HostSessionProof,
+    },
+    ChatStartSelected {
+        session: crate::chat::Session,
+        source: HostSessionProof,
+        token: String,
     },
 }
 
@@ -413,6 +423,9 @@ pub enum ServerResponse {
     },
     UpgradeChatResolved {
         session: crate::chat::Session,
+    },
+    ChatPreviewed {
+        preview: crate::chat::BindingPreview,
     },
 }
 

@@ -94,13 +94,11 @@ pub fn create(launch: &Launch) -> Result<(ProcessSpec, Box<dyn Adapter>), String
         .environment
         .get("CODEX_HOME")
         .cloned()
-        .or_else(|| std::env::var("CODEX_HOME").ok())
         .map(PathBuf::from)
         .or_else(|| {
             spec.environment
                 .get("HOME")
                 .cloned()
-                .or_else(|| std::env::var("HOME").ok())
                 .map(|home| PathBuf::from(home).join(".codex"))
         })
         .ok_or("Cannot locate the existing Codex daemon: CODEX_HOME/HOME are unavailable")?;

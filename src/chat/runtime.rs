@@ -73,6 +73,7 @@ impl Handle {
                 process
                     .args(&spec.arguments)
                     .current_dir(&spec.working_directory)
+                    .env_clear()
                     .envs(&spec.environment)
                     .stdin(Stdio::piped())
                     .stdout(Stdio::piped())
@@ -346,7 +347,6 @@ pub(crate) fn preflight(spec: &ProcessSpec, initial: &mut Step) -> Result<Store,
                 .environment
                 .get("PATH")
                 .cloned()
-                .or_else(|| std::env::var("PATH").ok())
                 .unwrap_or_else(|| "/usr/bin:/bin".into());
             std::env::split_paths(&path)
                 .map(|directory| spec.working_directory.join(directory).join(&spec.program))
@@ -1308,6 +1308,35 @@ mod tests {
             assert!(Instant::now() < deadline, "fixture timed out: {snapshot:?}");
             thread::sleep(Duration::from_millis(10));
         }
+    }
+
+    #[test]
+    fn native_child_receives_only_the_preserved_source_environment() {
+        let environment = BTreeMap::from([
+            ("HOME".into(), "/source-account".into()),
+            ("ANTHROPIC_API_KEY".into(), "explicit-fixture-key".into()),
+            ("LC_ALL".into(), "C.UTF-8".into()),
+        ]);
+        let spec = ProcessSpec {
+            transport: TransportSpec::JsonLines,
+            program: "/usr/bin/python3".into(),
+            arguments: vec!["-c".into(), "import json,os,sys; sys.stdin.readline(); print(json.dumps({'text':json.dumps(dict(os.environ))}),flush=True); sys.stdin.read()".into()],
+            working_directory: std::env::temp_dir(),
+            environment: environment.clone(),
+        };
+        let mut adapter: Box<dyn Adapter> = Box::new(Echo);
+        let mut initial = adapter.initialize().unwrap();
+        let store = preflight(&spec, &mut initial).unwrap();
+        let handle = Handle::start(spec, adapter, initial, store, None, |_| {}).unwrap();
+        let snapshot = until(&handle, |snapshot| !snapshot.items.is_empty());
+        let ItemContent::Text { text, .. } = &snapshot.items[0].content else {
+            panic!("environment fixture did not return text");
+        };
+        assert_eq!(
+            serde_json::from_str::<BTreeMap<String, String>>(text).unwrap(),
+            environment
+        );
+        handle.close().unwrap();
     }
     #[test]
     fn real_json_lines_pipe_keeps_hidden_state_without_presentation() {

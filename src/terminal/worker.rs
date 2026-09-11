@@ -90,6 +90,10 @@ pub(crate) struct UpgradeSnapshot {
 }
 
 impl UpgradeSnapshot {
+    pub(crate) fn only_agent_tree(&self, pid: i32) -> bool {
+        self.family.only_agent_tree(pid)
+    }
+
     pub(crate) fn stop(&mut self) -> Result<(), String> {
         self.family
             .kill(std::time::Instant::now() + std::time::Duration::from_secs(10))
@@ -1595,8 +1599,10 @@ fn child_exit_event(exited: &mut bool, result: ChildExit) -> Option<TerminalEven
 /// channel, because a channel is only reachable once and an identity is only
 /// misleading once.
 ///
-/// Grouped by the emulator that sets them, with the names any of them may set
-/// first and `COLORTERM` - which we go on to set ourselves - last.
+/// Color policy from a noninteractive launcher is not the policy of this PTY:
+/// inherited NO_COLOR/CLICOLOR can disable ANSI despite TERM and COLORTERM, and
+/// COLORFGBG describes the launcher's background rather than our OSC defaults.
+/// Explicit recipe entries are restored after this scrub.
 const INHERITED_TERMINAL_MARKERS: &[&str] = &[
     "TERM_PROGRAM",
     "TERM_PROGRAM_VERSION",
@@ -1604,6 +1610,11 @@ const INHERITED_TERMINAL_MARKERS: &[&str] = &[
     "TERMINAL_EMULATOR",
     "TERMINFO",
     "TERMINFO_DIRS",
+    "NO_COLOR",
+    "FORCE_COLOR",
+    "CLICOLOR",
+    "CLICOLOR_FORCE",
+    "COLORFGBG",
     "KITTY_WINDOW_ID",
     "KITTY_PID",
     "KITTY_INSTALLATION_DIR",
@@ -2170,7 +2181,14 @@ mod tests {
         let generation = worker.generation;
         for title in ["π ⠋ fresh", "π ⠙ fresh", "π ! fresh", "π > fresh"] {
             worker.process_output(format!("\x1b]2;{title}\x07").into_bytes());
-            assert!(worker.resume_hint.is_none());
+            assert!(
+                worker
+                    .resume_hint
+                    .as_deref()
+                    .and_then(crate::model::agent_recovery::recipe_from_hint)
+                    .is_none(),
+                "recognizing a fresh agent must not grant resume authority"
+            );
         }
         let activity = events
             .try_iter()
@@ -2773,14 +2791,50 @@ mod tests {
     }
 
     #[test]
+    fn inherited_color_policy_does_not_disable_or_misidentify_the_pty() {
+        let mut command = CommandBuilder::new("/bin/sh");
+        command.env_clear();
+        for (name, value) in [
+            ("NO_COLOR", "1"),
+            ("FORCE_COLOR", "0"),
+            ("CLICOLOR", "0"),
+            ("CLICOLOR_FORCE", "1"),
+            ("COLORFGBG", "0;15"),
+        ] {
+            command.env(name, value);
+        }
+        scrub_inherited_markers(&mut command);
+        for name in [
+            "NO_COLOR",
+            "FORCE_COLOR",
+            "CLICOLOR",
+            "CLICOLOR_FORCE",
+            "COLORFGBG",
+        ] {
+            assert_eq!(command.get_env(name), None, "{name} reached the PTY");
+        }
+    }
+
+    #[test]
     fn explicit_recipe_environment_overrides_terminal_defaults() {
         let command = command_from_recipe(&env_recipe(BTreeMap::from([
             ("TERM".to_owned(), "dumb".to_owned()),
             ("KITTY_WINDOW_ID".to_owned(), "3".to_owned()),
+            ("NO_COLOR".to_owned(), "1".to_owned()),
+            ("FORCE_COLOR".to_owned(), "0".to_owned()),
+            ("CLICOLOR".to_owned(), "0".to_owned()),
+            ("CLICOLOR_FORCE".to_owned(), "1".to_owned()),
+            ("COLORFGBG".to_owned(), "0;15".to_owned()),
+            ("COLORTERM".to_owned(), "24bit".to_owned()),
         ])));
 
         assert_eq!(command.get_env("TERM"), Some(OsStr::new("dumb")));
         assert_eq!(command.get_env("KITTY_WINDOW_ID"), Some(OsStr::new("3")));
-        assert_eq!(command.get_env("COLORTERM"), Some(OsStr::new("truecolor")));
+        assert_eq!(command.get_env("COLORTERM"), Some(OsStr::new("24bit")));
+        assert_eq!(command.get_env("NO_COLOR"), Some(OsStr::new("1")));
+        assert_eq!(command.get_env("FORCE_COLOR"), Some(OsStr::new("0")));
+        assert_eq!(command.get_env("CLICOLOR"), Some(OsStr::new("0")));
+        assert_eq!(command.get_env("CLICOLOR_FORCE"), Some(OsStr::new("1")));
+        assert_eq!(command.get_env("COLORFGBG"), Some(OsStr::new("0;15")));
     }
 }

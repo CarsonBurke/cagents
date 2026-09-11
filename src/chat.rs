@@ -72,6 +72,16 @@ pub struct Session {
     pub terminal: Option<crate::model::TerminalSession>,
 }
 
+/// Read-only provider metadata plus an expiring, single-use daemon capability.
+/// The token binds explicit user confirmation to the observed source process.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BindingPreview {
+    pub token: String,
+    pub session_id: String,
+    pub title: String,
+    pub working_directory: std::path::PathBuf,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Snapshot {
     pub generation: u64,

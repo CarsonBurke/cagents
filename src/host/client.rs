@@ -484,6 +484,8 @@ fn process_request(
             false,
         )),
         request @ (ClientRequest::ChatStart { .. }
+        | ClientRequest::ChatPreview { .. }
+        | ClientRequest::ChatStartSelected { .. }
         | ClientRequest::ChatAttach { .. }
         | ClientRequest::ChatDetach { .. }
         | ClientRequest::ChatCommand { .. }

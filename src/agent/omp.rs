@@ -27,6 +27,19 @@ pub(super) const ADAPTER: ProviderAdapter = ProviderAdapter {
         "--config",
         "--add-dir",
         "--approval-mode",
+        "--smol",
+        "--slow",
+        "--plan",
+        "--models",
+        "--service-tier",
+        "--tools",
+        "--skills",
+        "--extension",
+        "-e",
+        "--hook",
+        "--plugin-dir",
+        "--append-system-prompt",
+        "--system-prompt",
     ],
     switches: &[
         "--no-lsp",
@@ -35,6 +48,10 @@ pub(super) const ADAPTER: ProviderAdapter = ProviderAdapter {
         "--no-skills",
         "--no-rules",
         "--auto-approve",
+        "--no-pty",
+        "--no-title",
+        "--hide-thinking",
+        "--advisor",
     ],
     resume_flag: "--resume",
     resume_precedes_options: false,
@@ -44,6 +61,14 @@ pub(super) const ADAPTER: ProviderAdapter = ProviderAdapter {
 };
 
 fn session_root(launch: &LaunchRecipe, home: &Path) -> Option<PathBuf> {
+    storage_root(launch, home, "XDG_DATA_HOME")
+}
+
+pub(super) fn state_root(launch: &LaunchRecipe, home: &Path) -> Option<PathBuf> {
+    storage_root(launch, home, "XDG_STATE_HOME")
+}
+
+fn storage_root(launch: &LaunchRecipe, home: &Path, category: &str) -> Option<PathBuf> {
     let profile = launch
         .arguments
         .iter()
@@ -55,21 +80,55 @@ fn session_root(launch: &LaunchRecipe, home: &Path) -> Option<PathBuf> {
                     .flatten()
             })
         })
-        .or_else(|| launch.environment.get("OMP_PROFILE").map(String::as_str));
-    if let Some(profile) = profile {
-        if profile.is_empty() || profile == "." || profile == ".." || profile.contains('/') {
-            return None;
-        }
-        Some(home.join(".omp/profiles").join(profile).join("agent"))
-    } else {
-        Some(
+        .or_else(|| {
             launch
                 .environment
-                .get("PI_CODING_AGENT_DIR")
-                .map(PathBuf::from)
-                .unwrap_or_else(|| home.join(".omp/agent")),
-        )
+                .get("OMP_PROFILE")
+                .or_else(|| launch.environment.get("PI_PROFILE"))
+                .map(String::as_str)
+        })
+        .map(str::trim)
+        .filter(|profile| !profile.is_empty() && *profile != "default");
+    let config = home.join(
+        launch
+            .environment
+            .get("PI_CONFIG_DIR")
+            .map(String::as_str)
+            .unwrap_or(".omp"),
+    );
+    let default = if let Some(profile) = profile {
+        if profile == "." || profile == ".." || profile.contains(['/', '\\']) {
+            return None;
+        }
+        config.join("profiles").join(profile).join("agent")
+    } else {
+        config.join("agent")
+    };
+    let root = if profile.is_none() {
+        launch
+            .environment
+            .get("PI_CODING_AGENT_DIR")
+            .filter(|value| !value.is_empty())
+            .map(|value| launch.working_directory.join(value))
+            .unwrap_or_else(|| default.clone())
+    } else {
+        default.clone()
+    };
+    if root == default
+        && let Some(xdg) = launch
+            .environment
+            .get(category)
+            .filter(|value| !value.is_empty())
+    {
+        let mut path = launch.working_directory.join(xdg).join("omp");
+        if let Some(profile) = profile {
+            path = path.join("profiles").join(profile);
+        }
+        if path.is_dir() {
+            return Some(path);
+        }
     }
+    Some(root)
 }
 
 fn activity_from_title(title: &str) -> Option<ActivityState> {
@@ -94,6 +153,49 @@ fn activity_from_title(title: &str) -> Option<ActivityState> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn storage_uses_the_observed_xdg_profile_and_respects_explicit_agent_override() {
+        let directory = tempfile::tempdir().unwrap();
+        let home = directory.path();
+        let data = home.join("data/omp");
+        let state = home.join("state/omp");
+        std::fs::create_dir_all(&data).unwrap();
+        std::fs::create_dir_all(&state).unwrap();
+        let mut recipe = LaunchRecipe {
+            program: "omp".into(),
+            arguments: Vec::new(),
+            working_directory: home.into(),
+            environment: std::collections::BTreeMap::from([
+                ("HOME".into(), home.to_string_lossy().into_owned()),
+                (
+                    "XDG_DATA_HOME".into(),
+                    home.join("data").to_string_lossy().into_owned(),
+                ),
+                (
+                    "XDG_STATE_HOME".into(),
+                    home.join("state").to_string_lossy().into_owned(),
+                ),
+            ]),
+        };
+        assert_eq!(session_root(&recipe, home), Some(data.clone()));
+        assert_eq!(state_root(&recipe, home), Some(state));
+        recipe.arguments = vec!["--profile".into(), "work".into()];
+        assert_eq!(
+            session_root(&recipe, home),
+            Some(home.join(".omp/profiles/work/agent"))
+        );
+        std::fs::create_dir_all(data.join("profiles/work")).unwrap();
+        assert_eq!(
+            session_root(&recipe, home),
+            Some(data.join("profiles/work"))
+        );
+        recipe.arguments.clear();
+        recipe
+            .environment
+            .insert("PI_CODING_AGENT_DIR".into(), "custom-agent".into());
+        assert_eq!(session_root(&recipe, home), Some(home.join("custom-agent")));
+    }
 
     #[test]
     fn lifecycle_separator_owns_state_not_label_content() {

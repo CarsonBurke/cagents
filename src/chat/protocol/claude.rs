@@ -1680,7 +1680,6 @@ impl History {
             .environment
             .get("CLAUDE_CONFIG_DIR")
             .cloned()
-            .or_else(|| std::env::var("CLAUDE_CONFIG_DIR").ok())
             .filter(|s| !s.is_empty());
         let config = match config {
             Some(config) => {
@@ -1697,7 +1696,6 @@ impl History {
                     .environment
                     .get("HOME")
                     .cloned()
-                    .or_else(|| std::env::var("HOME").ok())
                     .ok_or("Cannot locate Claude config without HOME")?;
                 PathBuf::from(home).join(".claude")
             }

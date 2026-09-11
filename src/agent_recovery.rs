@@ -1,5 +1,6 @@
 //! Exact, opt-in agent recovery evidence. Never searches a session directory or
 //! selects a recent conversation; unknown launches retain their shell fallback.
+#[cfg(feature = "host")]
 use std::path::Path;
 #[cfg(feature = "host")]
 use std::{fs, io::Read};
@@ -20,6 +21,7 @@ pub(crate) struct AgentProcess {
     pub start: u64,
     pub provider: Provider,
     pub launch: LaunchRecipe,
+    pub recovery: LaunchRecipe,
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -88,6 +90,46 @@ pub fn resume_recipe(launch: &LaunchRecipe) -> Option<LaunchRecipe> {
         working_directory,
         ..launch.clone()
     })
+}
+
+/// Bind provider-confirmed identity while discarding already-consumed prompts.
+/// Unknown options remain a hard refusal, especially permission/account flags.
+pub fn bind_session(launch: &LaunchRecipe, id: &str) -> Option<LaunchRecipe> {
+    if !exact_id(id) {
+        return None;
+    }
+    let provider = Provider::from_program(&launch.program)?;
+    let mut recipe = launch.clone();
+    let mut arguments = Vec::new();
+    let mut args = launch.arguments.iter().peekable();
+    while let Some(argument) = args.next() {
+        let (flag, inline) = argument
+            .split_once('=')
+            .map_or((argument.as_str(), None), |(flag, value)| {
+                (flag, Some(value))
+            });
+        if matches!(flag, "--continue" | "-c") && provider != Provider::Codex {
+            continue;
+        }
+        if provider.is_identity_option(flag) {
+            if inline.is_none() && args.peek().is_some_and(|value| !value.starts_with('-')) {
+                args.next();
+            }
+        } else if provider.is_cwd_option(flag) || provider.is_value_option(flag) {
+            arguments.push(argument.clone());
+            if inline.is_none() {
+                arguments.push(args.next()?.clone());
+            }
+        } else if provider.is_switch(flag) && inline.is_none() {
+            arguments.push(argument.clone());
+        } else if flag.starts_with('-') {
+            return None;
+        }
+        // Positional text/images were consumed by the live CLI, not replayed.
+    }
+    provider.append_resume(&mut arguments, id.to_owned());
+    recipe.arguments = arguments;
+    resume_recipe(&recipe)
 }
 
 pub fn hint_from_launch(launch: &LaunchRecipe) -> Option<String> {
@@ -170,6 +212,11 @@ enum SessionIdentity {
 fn runtime_identity(root: &Path, launch: &LaunchRecipe, start: u64) -> Option<SessionIdentity> {
     let provider = Provider::from_program(&launch.program)?;
     let session_root = provider.session_root(launch)?;
+    if provider == Provider::Omp
+        && let Some(identity) = omp_terminal_identity(root, launch, start)
+    {
+        return Some(identity);
+    }
     let mut identity = None;
     let expected = session_root.join(provider.session_directory());
     let entries = match fs::read_dir(root.join("fd")) {
@@ -209,14 +256,23 @@ fn runtime_identity(root: &Path, launch: &LaunchRecipe, start: u64) -> Option<Se
             identity = Some(id);
         }
     }
-    if identity.is_some() || provider != Provider::Omp {
-        return identity.map(SessionIdentity::Exact);
-    }
+    identity.map(SessionIdentity::Exact)
+}
+
+#[cfg(feature = "host")]
+fn omp_terminal_identity(
+    root: &Path,
+    launch: &LaunchRecipe,
+    start: u64,
+) -> Option<SessionIdentity> {
+    let provider = Provider::Omp;
+    let session_root = provider.session_root(launch)?;
     // OMP publishes the exact active session by controlling terminal, including
     // fresh launches whose argv has no --resume. Never enumerate saved sessions.
     let tty = fs::read_link(root.join("fd/0")).ok()?;
     let tty = tty.strip_prefix("/dev/pts").ok()?.file_name()?.to_str()?;
-    let marker = session_root
+    let marker = provider
+        .session_state_root(launch)?
         .join("terminal-sessions")
         .join(format!("pts-{tty}"));
     let modified = fs::metadata(&marker).ok()?.modified().ok()?;
@@ -237,31 +293,325 @@ fn runtime_identity(root: &Path, launch: &LaunchRecipe, start: u64) -> Option<Se
     if modified < started {
         return None;
     }
-    let bytes = bounded_read(&marker, MAX_HINT_BYTES)?;
-    let text = std::str::from_utf8(&bytes).ok()?;
-    let mut lines = text.lines();
-    if Path::new(lines.next()?) != launch.working_directory {
-        return None;
-    }
-    let session = Path::new(lines.next()?);
-    session
-        .starts_with(session_root.join("sessions"))
-        .then_some(())?;
-    // A fresh OMP terminal publishes its ID before writing a resumable session.
-    // Do not authorize a stop-and-resume handoff until that file exists.
-    if !fs::metadata(session).is_ok_and(|metadata| metadata.is_file() && metadata.len() > 0) {
-        // Current binding is a refusal, not absence of evidence: otherwise a
-        // prior --resume argument could select the old conversation.
-        return Some(SessionIdentity::Ambiguous);
-    }
-    provider
-        .session_file_id(session)
-        .map(SessionIdentity::Exact)
+    let identity = (|| {
+        let bytes = bounded_read(&marker, MAX_HINT_BYTES)?;
+        let text = std::str::from_utf8(&bytes).ok()?;
+        let mut lines = text.lines();
+        if Path::new(lines.next()?) != launch.working_directory {
+            return None;
+        }
+        let session = Path::new(lines.next()?);
+        let mut session_directory = session_root.join("sessions");
+        for (index, arg) in launch.arguments.iter().enumerate() {
+            if let Some(directory) = arg.strip_prefix("--session-dir=").or_else(|| {
+                (arg == "--session-dir")
+                    .then(|| launch.arguments.get(index + 1).map(String::as_str))
+                    .flatten()
+            }) {
+                session_directory = launch.working_directory.join(directory);
+            }
+        }
+        session.starts_with(&session_directory).then_some(())?;
+        // Fresh sessions are published before a resumable JSONL exists.
+        fs::metadata(session)
+            .is_ok_and(|metadata| metadata.is_file() && metadata.len() > 0)
+            .then_some(())?;
+        provider.session_file_id(session)
+    })();
+    // A current but unusable marker must block stale resume argv and open files.
+    Some(
+        identity
+            .map(SessionIdentity::Exact)
+            .unwrap_or(SessionIdentity::Ambiguous),
+    )
 }
 
 #[cfg(feature = "host")]
 fn process_launch(root: &Path, base: &LaunchRecipe) -> Option<(LaunchRecipe, u64, i32)> {
     read_process_launch(root, Some(base))
+}
+
+#[cfg(feature = "host")]
+fn observation_environment_key(name: &str) -> bool {
+    matches!(
+        name,
+        "HOME"
+            | "PATH"
+            | "CODEX_HOME"
+            | "CLAUDE_CONFIG_DIR"
+            | "PI_CODING_AGENT_DIR"
+            | "OMP_PROFILE"
+            | "PI_PROFILE"
+            | "PI_CONFIG_DIR"
+            | "XDG_DATA_HOME"
+            | "XDG_STATE_HOME"
+            | "XDG_CACHE_HOME"
+    )
+}
+
+#[cfg(feature = "host")]
+fn native_runtime_environment_key(name: &str) -> bool {
+    observation_environment_key(name)
+        || matches!(
+            name,
+            "LANG"
+                | "LANGUAGE"
+                | "USER"
+                | "LOGNAME"
+                | "SHELL"
+                | "TMPDIR"
+                | "TMP"
+                | "TEMP"
+                | "LC_ALL"
+                | "LC_CTYPE"
+                | "LC_MESSAGES"
+                | "LC_COLLATE"
+                | "LC_MONETARY"
+                | "LC_NUMERIC"
+                | "LC_TIME"
+                | "LC_PAPER"
+                | "LC_NAME"
+                | "LC_ADDRESS"
+                | "LC_TELEPHONE"
+                | "LC_MEASUREMENT"
+                | "LC_IDENTIFICATION"
+                | "XDG_CONFIG_HOME"
+                | "XDG_RUNTIME_DIR"
+                | "DISPLAY"
+                | "WAYLAND_DISPLAY"
+                | "BUN_INSTALL"
+                | "SSL_CERT_FILE"
+                | "SSL_CERT_DIR"
+                | "NODE_EXTRA_CA_CERTS"
+                | "LD_LIBRARY_PATH"
+                | "DBUS_SESSION_BUS_ADDRESS"
+                | "SSH_AUTH_SOCK"
+                | "SSH_AGENT_PID"
+        )
+}
+
+#[cfg(feature = "host")]
+fn provider_setting_environment_key(name: &str) -> bool {
+    const PREFIXES: &[&str] = &[
+        "ANTHROPIC",
+        "CLAUDE",
+        "CODEX",
+        "OMP_",
+        "PI_",
+        "OPENAI",
+        "AZURE",
+        "AWS_",
+        "GOOGLE_",
+        "GCLOUD",
+        "GEMINI",
+        "VERTEX",
+        "BEDROCK",
+        "FOUNDRY",
+        "COPILOT",
+        "GROQ",
+        "CEREBRAS",
+        "XAI_",
+        "OPENROUTER",
+        "KILO_",
+        "MISTRAL",
+        "ZAI_",
+        "UMANS",
+        "MINIMAX",
+        "OPENCODE",
+        "CURSOR_",
+        "CLINE",
+        "COMMAND_CODE",
+        "AI_GATEWAY",
+        "WAFER",
+        "YOLO_",
+        "NODE_",
+        "BUN_",
+        "SSL_",
+        "CURL_",
+        "GIT_CONFIG",
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "ALL_PROXY",
+        "NO_PROXY",
+    ];
+    PREFIXES.iter().any(|prefix| {
+        name.get(..prefix.len())
+            .is_some_and(|head| head.eq_ignore_ascii_case(prefix))
+    }) || [
+        "TOKEN",
+        "SECRET",
+        "PASSWORD",
+        "API_KEY",
+        "PRIVATE_KEY",
+        "CREDENTIAL",
+        "AUTHENTICATION",
+        "AUTHORIZATION",
+        "BASE_URL",
+        "ENDPOINT",
+    ]
+    .iter()
+    .any(|part| {
+        name.as_bytes()
+            .windows(part.len())
+            .any(|window| window.eq_ignore_ascii_case(part.as_bytes()))
+    }) || name
+        .split('_')
+        .any(|part| part.eq_ignore_ascii_case("AUTH"))
+}
+
+#[cfg(feature = "host")]
+fn return_environment_key(provider: Provider, name: &str) -> bool {
+    if [
+        "HOME",
+        "PATH",
+        "NODE_OPTIONS",
+        "NODE_EXTRA_CA_CERTS",
+        "NODE_TLS_REJECT_UNAUTHORIZED",
+        "SSL_CERT_FILE",
+        "SSL_CERT_DIR",
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "ALL_PROXY",
+        "NO_PROXY",
+        "LD_PRELOAD",
+        "LD_LIBRARY_PATH",
+    ]
+    .iter()
+    .any(|key| name.eq_ignore_ascii_case(key))
+    {
+        return true;
+    }
+    let prefixes: &[&str] = match provider {
+        Provider::Claude => &[
+            "ANTHROPIC",
+            "CLAUDE",
+            "AWS_",
+            "GOOGLE_",
+            "GCLOUD",
+            "FOUNDRY",
+            "AZURE",
+        ],
+        Provider::Codex => &["CODEX", "OPENAI"],
+        Provider::Omp => {
+            return (provider_setting_environment_key(name)
+                && !native_runtime_environment_key(name))
+                || matches!(
+                    name,
+                    "OMP_PROFILE"
+                        | "PI_PROFILE"
+                        | "PI_CONFIG_DIR"
+                        | "PI_CODING_AGENT_DIR"
+                        | "XDG_CONFIG_HOME"
+                        | "XDG_DATA_HOME"
+                        | "XDG_STATE_HOME"
+                        | "XDG_CACHE_HOME"
+                );
+        }
+    };
+    prefixes.iter().any(|prefix| {
+        name.get(..prefix.len())
+            .is_some_and(|head| head.eq_ignore_ascii_case(prefix))
+    })
+}
+
+#[cfg(feature = "host")]
+fn check_return_environment_variable(
+    provider: Provider,
+    environment: &std::collections::BTreeMap<String, String>,
+    name: &str,
+    inherited: &str,
+) -> Result<(), String> {
+    if return_environment_key(provider, name)
+        && !environment.contains_key(name)
+        && (!inherited.is_empty() || name == "PATH")
+    {
+        return Err(format!(
+            "The source leaves {name} unset, but the daemon configures it. A later return to the CLI could change accounts or execution settings. Align the source and daemon configuration before converting; the source has not been stopped."
+        ));
+    }
+    Ok(())
+}
+
+/// Construct durable native execution configuration without copying arbitrary
+/// process secrets into a session descriptor. New environment-only credentials
+/// require explicit configuration before the source may be stopped.
+#[cfg(feature = "host")]
+fn preserved_native_environment(
+    bytes: &[u8],
+    explicit: &std::collections::BTreeMap<String, String>,
+) -> Result<std::collections::BTreeMap<String, String>, String> {
+    let mut environment = std::collections::BTreeMap::new();
+    for entry in bytes
+        .split(|byte| *byte == 0)
+        .filter(|entry| !entry.is_empty())
+    {
+        let index = entry
+            .iter()
+            .position(|byte| *byte == b'=')
+            .ok_or("The source environment contains an invalid entry")?;
+        let name = std::str::from_utf8(&entry[..index])
+            .map_err(|_| "The source environment contains an unsupported variable name")?;
+        let value = std::str::from_utf8(&entry[index + 1..])
+            .map_err(|_| "The source environment contains a non-UTF-8 value")?;
+        if environment
+            .get(name)
+            .is_some_and(|previous| previous != value)
+        {
+            return Err("The source environment contains conflicting duplicate variables".into());
+        }
+        if native_runtime_environment_key(name) {
+            environment.insert(name.to_owned(), value.to_owned());
+        } else if let Some(original) = explicit.get(name) {
+            if original != value {
+                return Err(format!(
+                    "Source environment variable {name} changed after its explicit launch. Update the explicit launch configuration before converting; the source has not been stopped."
+                ));
+            }
+            environment.insert(name.to_owned(), original.clone());
+        } else if provider_setting_environment_key(name) {
+            return Err(format!(
+                "The source uses environment-only setting {name}, which cannot be safely saved for native resume. Configure it in the provider account or the explicit terminal launch before converting; the source has not been stopped."
+            ));
+        }
+    }
+    // Absent explicit variables stay absent; never restore stale launch values.
+    Ok(environment)
+}
+
+#[cfg(feature = "host")]
+pub(crate) fn native_environment(
+    process: &AgentProcess,
+    explicit: &std::collections::BTreeMap<String, String>,
+) -> Result<std::collections::BTreeMap<String, String>, String> {
+    let root = std::path::PathBuf::from(format!("/proc/{}", process.pid));
+    let before = bounded_read(root.join("stat"), 4096)
+        .and_then(|bytes| process_identity(&bytes))
+        .filter(|(_, start)| *start == process.start)
+        .ok_or("The source process changed before reading its execution environment")?;
+    let bytes = bounded_read(root.join("environ"), 128 * 1024)
+        .ok_or("Cannot read the exact source execution environment; no source was stopped")?;
+    let environment = preserved_native_environment(&bytes, explicit)?;
+    // Native execution clears inheritance, but terminal recipes historically
+    // inherit the daemon environment on return. Refuse unrepresentable absences
+    // before changing the source rather than adding secrets or a recipe schema.
+    for (name, value) in std::env::vars_os() {
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        if !return_environment_key(process.provider, name) {
+            continue;
+        }
+        let value = value
+            .to_str()
+            .ok_or("Daemon execution configuration is not UTF-8; no source was stopped")?;
+        check_return_environment_variable(process.provider, &environment, name, value)?;
+    }
+    if bounded_read(root.join("stat"), 4096).and_then(|bytes| process_identity(&bytes))
+        != Some(before)
+    {
+        return Err("The source process changed while reading its execution environment".into());
+    }
+    Ok(environment)
 }
 
 #[cfg(feature = "host")]
@@ -299,15 +649,7 @@ fn read_process_launch(
             let Ok(name) = std::str::from_utf8(&entry[..index]) else {
                 continue;
             };
-            if matches!(
-                name,
-                "HOME"
-                    | "PATH"
-                    | "CODEX_HOME"
-                    | "CLAUDE_CONFIG_DIR"
-                    | "PI_CODING_AGENT_DIR"
-                    | "OMP_PROFILE"
-            ) {
+            if observation_environment_key(name) {
                 let value = match std::str::from_utf8(&entry[index + 1..]) {
                     Ok(value) => value,
                     Err(_) if base.is_some() => continue,
@@ -368,6 +710,7 @@ fn inspect_agent_process(
         &|root| read_process_launch(root, None),
         &|root, pid, mut launch, start| {
             let provider = Provider::recognize_launch(&launch).ok_or(())?;
+            let recovery = Provider::normalize_launch(launch.clone()).ok_or(())?;
             // Recognition uses argv, execution uses the actual installation.
             // Native Claude installations can have a version-only exe basename.
             launch.program = fs::read_link(root.join("exe"))
@@ -380,6 +723,7 @@ fn inspect_agent_process(
                 start,
                 provider,
                 launch,
+                recovery,
             }))
         },
     )
@@ -481,27 +825,15 @@ fn recovery_observation(
     let mut launch = Provider::normalize_launch(raw).ok_or(())?;
     if let Some(identity) = runtime_identity(root, &launch, start) {
         let SessionIdentity::Exact(id) = identity else {
-            return Err(());
+            // Recognition still exposes activation, but never stale resume authority.
+            let hint = serde_json::to_string(&AgentResumeHint {
+                version: 2,
+                recipe: launch,
+            })
+            .map_err(|_| ())?;
+            return Ok((hint.len() <= MAX_HINT_BYTES).then_some(hint));
         };
-        // Runtime binding is current; stale resume argv must not win after an
-        // in-process session switch. Never replay a prompt or unknown option.
-        if let Some(mut recipe) = resume_recipe(&launch) {
-            let flag = Provider::from_program(&recipe.program)
-                .ok_or(())?
-                .resume_flag();
-            let index = recipe
-                .arguments
-                .iter()
-                .position(|arg| arg == flag)
-                .ok_or(())?;
-            recipe.arguments[index + 1] = id;
-            launch = recipe;
-        } else {
-            let flag = Provider::from_program(&launch.program)
-                .ok_or(())?
-                .resume_flag();
-            launch.arguments.extend([flag.into(), id]);
-        }
+        launch = bind_session(&launch, &id).ok_or(())?;
     }
     observed_hint_from_launch(&launch).map(Some).ok_or(())
 }
@@ -510,6 +842,134 @@ fn recovery_observation(
 mod tests {
     use super::*;
     use std::collections::BTreeMap;
+
+    #[cfg(feature = "host")]
+    #[test]
+    fn credential_detection_distinguishes_authentication_from_author_metadata() {
+        assert!(!provider_setting_environment_key("CARGO_PKG_AUTHORS"));
+        assert!(!provider_setting_environment_key("GIT_AUTHOR_NAME"));
+        for key in [
+            "CUSTOM_AUTH",
+            "CUSTOM_AUTHORIZATION",
+            "CUSTOM_AUTHENTICATION",
+        ] {
+            assert!(provider_setting_environment_key(key));
+        }
+    }
+
+    #[cfg(feature = "host")]
+    #[test]
+    fn native_environment_preserves_explicit_credentials_but_not_stale_or_new_secrets() {
+        let explicit = BTreeMap::from([
+            ("ANTHROPIC_API_KEY".into(), "explicit-key".into()),
+            ("ANTHROPIC_BASE_URL".into(), "https://source.invalid".into()),
+            ("CLAUDE_CONFIG_DIR".into(), "/old-account".into()),
+            ("SSL_CERT_DIR".into(), "/old-ca".into()),
+            ("REMOVED_SETTING".into(), "stale".into()),
+        ]);
+        let environment = preserved_native_environment(
+            b"HOME=/source\0PATH=/source/bin\0ANTHROPIC_API_KEY=explicit-key\0ANTHROPIC_BASE_URL=https://source.invalid\0CLAUDE_CONFIG_DIR=/current-account\0SSL_CERT_DIR=/current-ca\0LD_LIBRARY_PATH=/source/lib\0",
+            &explicit,
+        ).unwrap();
+        assert_eq!(environment["ANTHROPIC_API_KEY"], "explicit-key");
+        assert_eq!(environment["ANTHROPIC_BASE_URL"], "https://source.invalid");
+        assert_eq!(environment["CLAUDE_CONFIG_DIR"], "/current-account");
+        assert_eq!(environment["SSL_CERT_DIR"], "/current-ca");
+        assert_eq!(environment["LD_LIBRARY_PATH"], "/source/lib");
+        assert!(!environment.contains_key("REMOVED_SETTING"));
+        let unset = preserved_native_environment(b"HOME=/source\0", &explicit).unwrap();
+        assert!(!unset.contains_key("ANTHROPIC_API_KEY"));
+        assert!(!unset.contains_key("ANTHROPIC_BASE_URL"));
+        assert!(!unset.contains_key("SSL_CERT_DIR"));
+        let new_secret = preserved_native_environment(
+            b"HOME=/source\0ANTHROPIC_API_KEY=new-shell-secret\0",
+            &BTreeMap::new(),
+        )
+        .unwrap_err();
+        assert!(!new_secret.contains("new-shell-secret"));
+        assert!(
+            preserved_native_environment(
+                b"HOME=/source\0ANTHROPIC_API_KEY=changed-secret\0",
+                &explicit
+            )
+            .is_err()
+        );
+        assert!(
+            preserved_native_environment(
+                b"HOME=/source\0CLAUDE_CODE_PERMISSION_MODE=bypassPermissions\0",
+                &BTreeMap::new()
+            )
+            .is_err()
+        );
+        assert!(
+            preserved_native_environment(b"HOME=/source\0HOME=/other\0", &BTreeMap::new()).is_err()
+        );
+    }
+
+    #[cfg(feature = "host")]
+    #[test]
+    fn return_to_cli_refuses_missing_account_overrides_but_not_unrelated_runtime_variables() {
+        let mut source = BTreeMap::from([("HOME".into(), "/source".into())]);
+        assert!(
+            check_return_environment_variable(
+                Provider::Claude,
+                &source,
+                "ANTHROPIC_API_KEY",
+                "daemon-key"
+            )
+            .is_err()
+        );
+        assert!(
+            check_return_environment_variable(
+                Provider::Claude,
+                &source,
+                "ANTHROPIC_BASE_URL",
+                "https://daemon.invalid"
+            )
+            .is_err()
+        );
+        assert!(
+            check_return_environment_variable(
+                Provider::Claude,
+                &source,
+                "CLAUDE_CODE_PERMISSION_MODE",
+                "bypassPermissions"
+            )
+            .is_err()
+        );
+        assert!(
+            check_return_environment_variable(
+                Provider::Claude,
+                &source,
+                "BUN_INSTALL",
+                "/daemon/bun"
+            )
+            .is_ok()
+        );
+        assert!(
+            check_return_environment_variable(
+                Provider::Claude,
+                &source,
+                "OPENAI_API_KEY",
+                "other-provider-key"
+            )
+            .is_ok()
+        );
+        source.insert("ANTHROPIC_API_KEY".into(), "explicit-source-key".into());
+        assert!(
+            check_return_environment_variable(
+                Provider::Claude,
+                &source,
+                "ANTHROPIC_API_KEY",
+                "different-daemon-key"
+            )
+            .is_ok()
+        );
+        assert!(
+            check_return_environment_variable(Provider::Omp, &source, "OMP_PROFILE", "other")
+                .is_err()
+        );
+    }
 
     #[cfg(feature = "host")]
     fn process_fixture(proc_root: &Path, pid: i32, recipe: &LaunchRecipe, children: &[i32]) {
@@ -707,9 +1167,13 @@ mod tests {
             )
             .unwrap();
         }
+        let ambiguous = inspect_process(directory.path(), 100, 100, &parent, &mut 64)
+            .unwrap()
+            .unwrap();
+        assert!(recipe_from_hint(&ambiguous).is_none());
         assert_eq!(
-            inspect_process(directory.path(), 100, 100, &parent, &mut 64),
-            Err(())
+            observed_launch_from_hint(&ambiguous).unwrap().program,
+            "codex"
         );
         // An unreadable/exited child is incomplete inspection, not proof that
         // the launcher has no native child.
@@ -794,10 +1258,17 @@ mod tests {
         let proc_root = root.parent().unwrap();
         process_fixture(proc_root, 100, &recipe, &[]);
         fs::write(&marker, format!("/tmp\n{}\nfresh\n", session.display())).unwrap();
-        assert!(inspect_process(proc_root, 100, 100, &recipe, &mut 64).is_err());
+        let fresh = inspect_process(proc_root, 100, 100, &recipe, &mut 64)
+            .unwrap()
+            .unwrap();
+        assert!(recipe_from_hint(&fresh).is_none());
+        assert_eq!(observed_launch_from_hint(&fresh).unwrap().program, "omp");
         fs::create_dir_all(session.parent().unwrap()).unwrap();
         fs::write(&session, "").unwrap();
-        assert!(inspect_process(proc_root, 100, 100, &recipe, &mut 64).is_err());
+        let empty = inspect_process(proc_root, 100, 100, &recipe, &mut 64)
+            .unwrap()
+            .unwrap();
+        assert!(recipe_from_hint(&empty).is_none());
         fs::write(
             &session,
             format!("{{\"type\":\"session\",\"id\":\"{id}\"}}\n"),
@@ -823,7 +1294,10 @@ mod tests {
             format!("/another-worktree\n{}\n", session.display()),
         )
         .unwrap();
-        assert!(runtime_identity(&root, &recipe, 0).is_none());
+        assert_eq!(
+            runtime_identity(&root, &recipe, 0),
+            Some(SessionIdentity::Ambiguous)
+        );
         fs::remove_file(&marker).unwrap();
         // A different terminal's valid marker is not a fallback.
         fs::write(
@@ -919,6 +1393,80 @@ mod tests {
         assert!(hint_from_launch(&launch("codex", &["resume", "--last"])).is_none());
         assert!(recipe_from_hint("tmux:old-compatible-hint").is_none());
         assert!(hint_from_launch(&launch("sh", &["-c", "claude --continue"])).is_none());
+    }
+
+    #[test]
+    fn live_binding_preserves_permissions_without_replaying_consumed_prompts() {
+        let id = "a1b2c3d4-1111-4111-8111-123456789abc";
+        let claude = bind_session(
+            &launch("claude", &["--permission-mode", "plan", "already sent"]),
+            id,
+        )
+        .unwrap();
+        assert_eq!(
+            claude.arguments,
+            ["--permission-mode", "plan", "--resume", id]
+        );
+        let codex = bind_session(
+            &launch(
+                "codex",
+                &[
+                    "--remote",
+                    "unix:///tmp/account.sock",
+                    "--sandbox",
+                    "read-only",
+                    "already sent",
+                ],
+            ),
+            id,
+        )
+        .unwrap();
+        assert_eq!(
+            codex.arguments,
+            [
+                "resume",
+                id,
+                "--remote",
+                "unix:///tmp/account.sock",
+                "--sandbox",
+                "read-only"
+            ]
+        );
+        let omp = bind_session(
+            &launch(
+                "omp",
+                &[
+                    "--approval-mode",
+                    "always-ask",
+                    "--model",
+                    "model",
+                    "@prompt.md",
+                    "already sent",
+                ],
+            ),
+            id,
+        )
+        .unwrap();
+        assert_eq!(
+            omp.arguments,
+            [
+                "--approval-mode",
+                "always-ask",
+                "--model",
+                "model",
+                "--resume",
+                id
+            ]
+        );
+        assert!(
+            bind_session(
+                &launch("claude", &["--unknown-permission-mode", "open"]),
+                id
+            )
+            .is_none()
+        );
+        assert!(bind_session(&launch("claude", &["--fork-session"]), id).is_none());
+        assert!(bind_session(&launch("omp", &[]), "a1b2c3d4").is_none());
     }
 
     #[cfg(feature = "host")]

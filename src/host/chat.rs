@@ -26,6 +26,92 @@ pub(super) struct Record {
     pub completion_observed: bool,
 }
 
+pub(super) struct PendingBinding {
+    preview: chat::BindingPreview,
+    process: crate::model::agent_recovery::AgentProcess,
+    expires: Instant,
+}
+
+impl PendingBinding {
+    fn authorizes(
+        &self,
+        process: &crate::model::agent_recovery::AgentProcess,
+        id: &str,
+        now: Instant,
+    ) -> bool {
+        self.expires > now
+            && self.process == *process
+            && process.provider == Provider::Codex
+            && self.preview.session_id == id
+    }
+}
+
+fn preview(
+    host: &SharedHost,
+    session: Session,
+    source: HostSessionProof,
+) -> Result<ServerResponse, ProtocolError> {
+    let id = session
+        .launch
+        .session_id
+        .as_deref()
+        .filter(|id| id.len() == 36 && uuid::Uuid::parse_str(id).is_ok())
+        .ok_or_else(|| error("Enter the complete conversation UUID, not a name or prefix"))?;
+    if session.launch.provider != Provider::Codex {
+        return Err(error(
+            "Explicit shared-server selection is only supported for Codex",
+        ));
+    }
+    let handle = {
+        let state = host.lock().unwrap_or_else(|p| p.into_inner());
+        validate_proof(Some(&source), state.proof())?;
+        state
+            .terminals
+            .get(&session.id)
+            .filter(|record| !record.handle.is_completed())
+            .ok_or_else(|| unavailable("The source terminal is no longer running"))?
+            .handle
+            .clone()
+    };
+    let process = handle
+        .observe_agent_process()
+        .filter(|process| process.provider == Provider::Codex)
+        .ok_or_else(|| unavailable("The source is no longer a foreground Codex CLI"))?;
+    let (title, working_directory) =
+        crate::agent::observe::codex_preview(&process.recovery, id).map_err(unavailable)?;
+    // Cwd is displayed to the user, not used to infer a conversation binding.
+    if handle.observe_agent_process().as_ref() != Some(&process) {
+        return Err(error(
+            "The foreground process changed during preview; retry",
+        ));
+    }
+    let preview = chat::BindingPreview {
+        token: uuid::Uuid::new_v4().to_string(),
+        session_id: id.to_owned(),
+        title,
+        working_directory,
+    };
+    let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
+    validate_proof(Some(&source), state.proof())?;
+    state
+        .chat_bindings
+        .retain(|_, binding| binding.expires > Instant::now());
+    if state.chat_bindings.len() >= 128 && !state.chat_bindings.contains_key(&session.id) {
+        return Err(unavailable(
+            "Too many pending conversation selections; retry after they expire",
+        ));
+    }
+    state.chat_bindings.insert(
+        session.id,
+        PendingBinding {
+            preview: preview.clone(),
+            process,
+            expires: Instant::now() + Duration::from_secs(120),
+        },
+    );
+    Ok(ServerResponse::ChatPreviewed { preview })
+}
+
 #[derive(Default)]
 pub(super) struct Observation {
     epoch: u64,
@@ -134,18 +220,110 @@ fn session_snapshot(record: &Record) -> ServerResponse {
 fn same_conversation(a: &chat::Launch, b: &chat::Launch) -> bool {
     a.provider == b.provider && a.session_id.is_some() && a.session_id == b.session_id
 }
+
+fn resolve_source(
+    handle: &crate::terminal::TerminalHandle,
+    provider: Provider,
+    selected: Option<&str>,
+    selection_authorized: bool,
+    explicit_environment: &BTreeMap<String, String>,
+) -> Result<
+    (
+        crate::model::agent_recovery::AgentProcess,
+        crate::model::LaunchRecipe,
+        String,
+        Option<String>,
+    ),
+    ProtocolError,
+> {
+    use crate::model::agent_recovery::{bind_session, recipe_from_hint};
+    let process = handle.observe_agent_process().ok_or_else(|| {
+        unavailable(
+            "No supported foreground agent is running in this terminal. Focus its CLI and retry.",
+        )
+    })?;
+    if process.provider != provider {
+        return Err(error(
+            "The foreground provider changed; retry from the current terminal",
+        ));
+    }
+    let hint = handle.observe_agent().map_err(unavailable)?;
+    let public_id = crate::agent::observe::exact_session(&process).map_err(unavailable)?;
+    let observed_id = public_id.or_else(|| {
+        // A shared-server TUI can switch threads without changing argv or PID.
+        // Even an original `resume ID` is only a preview suggestion, not current
+        // authority. Codex activation requires confirmed shared-thread selection.
+        if provider == Provider::Codex {
+            return None;
+        }
+        let recipe = hint.as_deref().and_then(recipe_from_hint)?;
+        provider.resume_id(&recipe.arguments).map(str::to_owned)
+    });
+    if observed_id
+        .as_deref()
+        .zip(selected)
+        .is_some_and(|(actual, selected)| actual != selected)
+    {
+        return Err(error(
+            "The active conversation changed before handoff; select the current conversation again",
+        ));
+    }
+    // Codex's public shared server confirms the selected thread on attachment.
+    // This is explicit selection, not a claim that cwd binds this TUI to a thread;
+    // the source TUI stays alive and no second provider writer is spawned.
+    let id = observed_id.or_else(|| {
+        (provider == Provider::Codex && selection_authorized).then(|| selected.map(str::to_owned)).flatten()
+    }).ok_or_else(|| unavailable(match provider {
+        Provider::Codex => "Choose the exact Codex thread ID shown by /status in the source CLI, then attach the selected conversation. No recent thread is selected automatically.",
+        Provider::Claude => "Claude has not published an exact live session. Use /status to identify it, then resume that exact UUID in this terminal and retry.",
+        Provider::Omp => "OMP has not published a saved conversation for this terminal yet. Finish its first exchange, or explicitly resume a saved conversation in this terminal, then retry.",
+    }))?;
+    let mut recipe = bind_session(&process.recovery, &id).ok_or_else(|| error(
+        "The active launch contains options that cannot be safely preserved. Resume the exact conversation with supported account and permission options, then retry.",
+    ))?;
+    if provider != Provider::Codex {
+        recipe.environment =
+            crate::model::agent_recovery::native_environment(&process, explicit_environment)
+                .map_err(unavailable)?;
+    }
+    // Persist the same exact launch we are about to execute, including the
+    // verified source environment. The earlier observation is only identity
+    // evidence; retaining it would make the card's durable conversion disagree
+    // with the native launch.
+    let hint = crate::model::agent_recovery::hint_from_launch(&recipe)
+        .ok_or_else(|| unavailable("The exact native launch cannot be saved as a bounded recovery hint; the source has not been stopped"))?;
+    if handle.observe_agent_process().as_ref() != Some(&process) {
+        return Err(error(
+            "The foreground process changed while resolving its conversation; retry",
+        ));
+    }
+    Ok((process, recipe, id, Some(hint)))
+}
 fn start(
     host: &SharedHost,
     client: ClientId,
     mut session: Session,
     source: Option<HostSessionProof>,
     terminate_source: bool,
+    selection: Option<PendingBinding>,
 ) -> Result<ServerResponse, ProtocolError> {
     let reservation_id = session.id;
+    let mut source_process = None;
+    let mut source_environment = BTreeMap::new();
+    let mut selection_authorized = selection.is_some();
     if let Some(proof) = source.as_ref() {
         let handle = {
             let state = host.lock().unwrap_or_else(|p| p.into_inner());
             validate_proof(Some(proof), state.proof())?;
+            if let Some(record) = state.chats.get(&session.id) {
+                selection_authorized |= record.handle.owns_work()
+                    && record.session.launch == session.launch
+                    && record
+                        .session
+                        .terminal
+                        .as_ref()
+                        .is_some_and(|terminal| terminal.id == session.id);
+            }
             let record = state
                 .terminals
                 .get(&session.id)
@@ -155,45 +333,35 @@ fn start(
                     "The source agent has exited; resume its exact conversation in the terminal first",
                 ));
             }
+            source_environment = record.session.launch.environment.clone();
             record.handle.clone()
         };
-        // ChatStart already runs off the UI thread. Ask the PTY owner for fresh
-        // evidence, rather than trusting a saved hint or a user-entered UUID.
-        let deadline = Instant::now() + Duration::from_secs(2);
-        let (hint, recipe) = loop {
-            let hint = handle.observe_agent().map_err(unavailable)?;
-            if let Some(recipe) = hint
-                .as_deref()
-                .and_then(crate::model::agent_recovery::recipe_from_hint)
-            {
-                break (hint, recipe);
-            }
-            if Instant::now() >= deadline || handle.is_completed() {
-                return Err(unavailable(
-                    "The active agent has no process-bound conversation identity. Resume this exact conversation in the provider CLI, then retry. Shared Codex servers do not expose a TUI-to-thread binding; no recent session or private backend is selected.",
+        let (process, recipe, id, hint) = resolve_source(
+            &handle,
+            session.launch.provider,
+            if session.launch.provider == Provider::Codex {
+                session.launch.session_id.as_deref()
+            } else {
+                None
+            },
+            selection_authorized,
+            &source_environment,
+        )?;
+        if let Some(binding) = &selection {
+            if !binding.authorizes(&process, &id, Instant::now()) {
+                return Err(error(
+                    "Conversation preview expired or its source changed; preview the intended conversation again",
                 ));
             }
-            thread::sleep(Duration::from_millis(100));
-        };
-        let provider = Provider::from_program(&recipe.program)
-            .ok_or_else(|| error("The foreground process is not a supported agent"))?;
-        let id = recipe
-            .arguments
-            .windows(2)
-            .find(|pair| pair[0] == provider.resume_flag())
-            .map(|pair| pair[1].clone())
-            .ok_or_else(|| error("Missing process-bound conversation identity"))?;
-        if provider != session.launch.provider
-            || session
-                .launch
-                .session_id
-                .as_ref()
-                .is_some_and(|expected| expected != &id)
-        {
-            return Err(error(
-                "The active conversation changed before the handoff; retry from the current terminal",
-            ));
+            let (title, cwd) = crate::agent::observe::codex_preview(&process.recovery, &id)
+                .map_err(unavailable)?;
+            if cwd != binding.preview.working_directory || title != binding.preview.title {
+                return Err(error(
+                    "Conversation metadata changed; review a fresh preview before attaching",
+                ));
+            }
         }
+        source_process = Some(process);
         session.launch.recipe = recipe;
         session.launch.session_id = Some(id);
         let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
@@ -318,39 +486,6 @@ fn start(
             let record = state.terminals.get(&session.id).ok_or_else(|| {
                 error("Exact source terminal does not exist on the proven daemon")
             })?;
-            let hint = record
-                .session
-                .resume_hint
-                .as_deref()
-                .and_then(crate::model::agent_recovery::observed_launch_from_hint);
-            let recipe = hint.as_ref().unwrap_or(&record.session.launch);
-            if recipe != &session.launch.recipe {
-                return Err(error(
-                    "Source launch identity changed; refresh the exact recovery evidence before converting",
-                ));
-            }
-            let id = session
-                .launch
-                .session_id
-                .as_deref()
-                .filter(|id| !id.is_empty())
-                .ok_or_else(|| error("Conversion requires an exact provider conversation ID"))?;
-            if let Some(exact) = crate::model::agent_recovery::resume_recipe(recipe) {
-                let proven = exact
-                    .arguments
-                    .windows(2)
-                    .find(|pair| pair[0] == session.launch.provider.resume_flag())
-                    .map(|pair| pair[1].as_str());
-                if proven != Some(id) {
-                    return Err(error(
-                        "Requested conversation differs from the source's exact resume identity",
-                    ));
-                }
-            } else {
-                return Err(error(
-                    "The source no longer has an exact process-bound conversation identity",
-                ));
-            }
             if session.launch.provider != Provider::Codex
                 && !terminate_source
                 && !record.handle.is_completed()
@@ -385,18 +520,49 @@ fn start(
     drop(retired);
     let result = (|| {
         if let Some(handle) = source_handle {
-            let current = handle
-                .observe_agent()
-                .map_err(unavailable)?
-                .as_deref()
-                .and_then(crate::model::agent_recovery::recipe_from_hint);
-            if current.as_ref() != Some(&session.launch.recipe) {
+            let (current_process, current_recipe, _, _) = resolve_source(
+                &handle,
+                session.launch.provider,
+                session.launch.session_id.as_deref(),
+                selection_authorized,
+                &source_environment,
+            )?;
+            if source_process.as_ref() != Some(&current_process)
+                || current_recipe != session.launch.recipe
+            {
                 return Err(error(
                     "The foreground conversation changed during handoff; no native writer was started",
                 ));
             }
             if session.launch.provider != Provider::Codex && !handle.is_completed() {
-                handle.shutdown().map_err(super::state::send_error)?;
+                // Freeze the exact source family before the final identity check.
+                // Dropping the guard on any error resumes it without losing work.
+                let mut frozen = handle.prepare_upgrade().map_err(unavailable)?;
+                if !frozen.only_agent_tree(current_process.pid) {
+                    return Err(unavailable(
+                        "This terminal also owns unrelated jobs. Finish or move those jobs before converting the agent.",
+                    ));
+                }
+                let (frozen_process, frozen_recipe, _, _) = resolve_source(
+                    &handle,
+                    session.launch.provider,
+                    session.launch.session_id.as_deref(),
+                    false,
+                    &source_environment,
+                )?;
+                if frozen_process != current_process || frozen_recipe != current_recipe {
+                    return Err(error(
+                        "The source changed before it was frozen; no native writer was started",
+                    ));
+                }
+                frozen.stop().map_err(unavailable)?;
+                if !handle.is_completed()
+                    && let Err(failure) = handle.shutdown()
+                {
+                    if !handle.is_completed() {
+                        return Err(super::state::send_error(failure));
+                    }
+                }
                 let deadline = Instant::now() + Duration::from_secs(10);
                 while !handle.is_completed() {
                     if Instant::now() >= deadline {
@@ -461,6 +627,31 @@ pub(super) fn process(
     request: ClientRequest,
 ) -> Result<ServerResponse, ProtocolError> {
     match request {
+        ClientRequest::ChatPreview { session, source } => preview(host, session, source),
+        ClientRequest::ChatStartSelected {
+            session,
+            source,
+            token,
+        } => {
+            let selection = {
+                let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
+                validate_proof(Some(&source), state.proof())?;
+                if !state
+                    .chat_bindings
+                    .get(&session.id)
+                    .is_some_and(|binding| binding.preview.token == token)
+                {
+                    return Err(error(
+                        "This selection has no matching preview; preview the conversation again",
+                    ));
+                }
+                state
+                    .chat_bindings
+                    .remove(&session.id)
+                    .expect("matched binding")
+            };
+            start(host, client, session, Some(source), false, Some(selection))
+        }
         ClientRequest::ChatList => {
             let state = host.lock().unwrap_or_else(|p| p.into_inner());
             let mut sessions = state
@@ -485,7 +676,7 @@ pub(super) fn process(
             session,
             source,
             terminate_source,
-        } => start(host, client, session, source, terminate_source),
+        } => start(host, client, session, source, terminate_source, None),
         ClientRequest::ChatAttach { session } => {
             let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
             validate_proof(session.proof.as_ref(), state.proof())?;
@@ -679,7 +870,22 @@ pub(super) fn restore_upgrade(
             .contains_key(&session.id)
             .then(|| state.proof().clone())
     };
-    let response = start(host, 0, session, source, false).map_err(|error| error.message)?;
+    // A durable native-chat checkpoint already records the user's selection.
+    // Re-verify its loaded thread and new source process rather than requiring
+    // another UI confirmation or treating its cwd as identity.
+    let selection = if session.launch.provider == Provider::Codex
+        && let Some(proof) = source.as_ref()
+    {
+        preview(host, session.clone(), proof.clone()).map_err(|error| error.message)?;
+        host.lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .chat_bindings
+            .remove(&session.id)
+    } else {
+        None
+    };
+    let response =
+        start(host, 0, session, source, false, selection).map_err(|error| error.message)?;
     let id = match response {
         ServerResponse::ChatAttached { session, .. } => session.id,
         _ => return Err("Native restore did not attach its exact session".into()),
@@ -746,6 +952,47 @@ mod tests {
         model::{BootId, HostIncarnation, HostSessionId, LaunchRecipe},
     };
     use serde_json::{Value, json};
+
+    #[test]
+    fn confirmed_selection_is_bound_to_process_account_identity_and_expiration() {
+        let now = Instant::now();
+        let id = "12345678-1234-4234-8234-123456789abc";
+        let recipe = LaunchRecipe {
+            program: "codex".into(),
+            arguments: Vec::new(),
+            working_directory: "/same".into(),
+            environment: BTreeMap::from([("HOME".into(), "/account".into())]),
+        };
+        let process = crate::model::agent_recovery::AgentProcess {
+            pid: 42,
+            start: 100,
+            provider: Provider::Codex,
+            launch: recipe.clone(),
+            recovery: recipe,
+        };
+        let binding = PendingBinding {
+            preview: chat::BindingPreview {
+                token: "single-use".into(),
+                session_id: id.into(),
+                title: "Chosen".into(),
+                working_directory: "/same".into(),
+            },
+            process: process.clone(),
+            expires: now + Duration::from_secs(1),
+        };
+        assert!(binding.authorizes(&process, id, now));
+        assert!(!binding.authorizes(&process, "98765432-1234-4234-8234-123456789abc", now));
+        assert!(!binding.authorizes(&process, id, binding.expires));
+        let mut replacement = process.clone();
+        replacement.start += 1;
+        assert!(!binding.authorizes(&replacement, id, now));
+        let mut other_account = process;
+        other_account
+            .recovery
+            .environment
+            .insert("HOME".into(), "/other-account".into());
+        assert!(!binding.authorizes(&other_account, id, now));
+    }
 
     fn upgrade_fixture() -> (tempfile::TempDir, SharedHost, crate::upgrade::handoff::Chat) {
         use std::os::unix::fs::PermissionsExt;
