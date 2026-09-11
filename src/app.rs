@@ -1,4 +1,5 @@
 mod agent_ui;
+mod branch_ui;
 mod chat_ui;
 mod chrome_ui;
 mod daemon_recovery;
@@ -8,10 +9,12 @@ pub(crate) mod dialog_ui;
 mod latency_ui;
 mod project_ui;
 mod pull_request_ui;
+mod refresh_ui;
 #[cfg(test)]
 mod safety_tests;
 mod settings_ui;
 mod terminal_close;
+mod thread_ui;
 mod update_ui;
 mod worktree_operations;
 mod worktree_ui;
@@ -397,30 +400,6 @@ fn notice_surface<'a>(
         surface = surface.height(Length::Fixed(NOTICE_ROW_HEIGHT));
     }
     surface.into()
-}
-
-fn transient_notice_view(notice: &TransientNotice) -> Element<'_, Message> {
-    let severity = notice.severity;
-    notice_surface(
-        severity,
-        widget::text::body(&notice.message)
-            .wrapping(cosmic::iced::widget::text::Wrapping::None)
-            .ellipsize(cosmic::iced::widget::text::Ellipsize::End(
-                EllipsizeHeightLimit::Lines(1),
-            ))
-            .width(Length::Fill)
-            .into(),
-        Some(crate::interaction::tooltip(
-            widget::button::icon(widget::icon::from_name("window-close-symbolic"))
-                .id(widget::Id::new("status.dismiss"))
-                .name(format!("Dismiss {} notice", severity.label()))
-                .width(ICON_CONTROL_SIZE)
-                .height(ICON_CONTROL_SIZE)
-                .on_press(Message::DismissStatus),
-            "Dismiss notice",
-        )),
-        true,
-    )
 }
 
 fn save_health_view(health: &SaveHealthState) -> Option<Element<'_, Message>> {
@@ -1415,6 +1394,8 @@ fn repository_action_allowed_while_modal(action: &RepositoryAction) -> bool {
             | RepositoryAction::DiffLoaded { .. }
             | RepositoryAction::DiffBasisResolved { .. }
             | RepositoryAction::SaveFinished { .. }
+            | RepositoryAction::WorkingDiffDue { .. }
+            | RepositoryAction::WorkingDiffLoaded { .. }
             | RepositoryAction::AutoSaveDue { .. }
     )
 }
@@ -1518,11 +1499,12 @@ fn user_workspace_message_blocked_while_modal(message: &Message) -> bool {
         | Message::FocusProjectSearch
         | Message::ToggleContextInspector
         | Message::SelectContextTab(_)
-        | Message::SelectWorkspaceScope(_)
         | Message::ContextInspector(_)
         | Message::DismissStatus => true,
         Message::Repository(action) => !repository_action_allowed_while_modal(action),
         Message::ChatUi(action) => !action.allowed_while_modal(),
+        Message::ChromeUi(action) => !matches!(action, chrome_ui::Action::Close),
+        Message::ThreadUi(_) => true,
         Message::UpdateUi(update_ui::Action::Apply) => true,
         Message::PullRequestUi(action) => !action.allowed_while_modal(),
         Message::Sidebar(action) => !answers_discard_confirmation(action),
@@ -1600,9 +1582,10 @@ fn workspace_navigation_blocked_during_save(message: &Message) -> bool {
         Message::NewTerminal
             | Message::NewBrowser
             | Message::OpenBrowser(_)
+            | Message::ChromeUi(chrome_ui::Action::Launch(_))
+            | Message::ThreadUi(_)
             | Message::FocusCard(_)
             | Message::FocusAdjacent(_)
-            | Message::SelectWorkspaceScope(_)
             | Message::Viewport {
                 event: WorkspaceViewportEvent::PointerFocused(_)
                     | WorkspaceViewportEvent::PointerEntered(_),
@@ -1617,6 +1600,8 @@ fn workspace_navigation_blocked_during_save(message: &Message) -> bool {
                     | SidebarAction::OpenWorktree { .. }
                     | SidebarAction::OpenPullRequest { .. }
                     | SidebarAction::NewWorktree { .. }
+                    | SidebarAction::NewThread { .. }
+                    | SidebarAction::OpenThread { .. }
                     | SidebarAction::CreatePullRequest { .. }
                     | SidebarAction::OpenSettings
             )
@@ -1707,10 +1692,12 @@ pub enum SettingsField {
     DefaultColumnFraction,
     LinkOpenDestination,
     EditorAutoSave,
+    EditorWrapLines,
     ConfirmTerminalClose,
     FocusFollowsMouse,
     LinkOpenGesture,
     ShortcutNewTerminal,
+    ShortcutNewThread,
     ShortcutCloseFocusedColumn,
     ShortcutSearchProjects,
     ShortcutPreviousColumn,
@@ -1734,6 +1721,7 @@ enum SettingsFeedback {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ShortcutDraft {
     new_terminal: String,
+    new_thread: String,
     close_focused_column: String,
     search_projects: String,
     previous_column: String,
@@ -1745,6 +1733,7 @@ impl ShortcutDraft {
     fn from_shortcuts(shortcuts: &KeyboardShortcuts) -> Self {
         Self {
             new_terminal: settings::format_chords(&shortcuts.new_terminal),
+            new_thread: settings::format_chords(&shortcuts.new_thread),
             close_focused_column: settings::format_chords(&shortcuts.close_focused_column),
             search_projects: settings::format_chords(&shortcuts.search_projects),
             previous_column: settings::format_chords(&shortcuts.previous_column),
@@ -1771,6 +1760,7 @@ struct SettingsDraft {
     worktree_sort: String,
     default_column_fraction: String,
     editor_auto_save: bool,
+    editor_wrap_lines: bool,
     confirm_terminal_close: bool,
     focus_follows_mouse: bool,
     link_open_destination: LinkOpenDestination,
@@ -1817,6 +1807,7 @@ impl SettingsDraft {
             .into(),
             default_column_fraction: settings.default_column_fraction.to_string(),
             editor_auto_save: settings.editor_auto_save,
+            editor_wrap_lines: settings.editor_wrap_lines,
             confirm_terminal_close: settings.confirm_terminal_close,
             focus_follows_mouse: settings.focus_follows_mouse,
             link_open_destination: settings.link_open_destination,
@@ -1842,6 +1833,7 @@ impl SettingsDraft {
             SettingsField::WorktreeSort => self.worktree_sort = value,
             SettingsField::DefaultColumnFraction => self.default_column_fraction = value,
             SettingsField::EditorAutoSave => self.editor_auto_save = value == "true",
+            SettingsField::EditorWrapLines => self.editor_wrap_lines = value == "true",
             SettingsField::ConfirmTerminalClose => self.confirm_terminal_close = value == "true",
             SettingsField::FocusFollowsMouse => self.focus_follows_mouse = value == "true",
             SettingsField::LinkOpenDestination => {
@@ -1860,6 +1852,7 @@ impl SettingsDraft {
                 };
             }
             SettingsField::ShortcutNewTerminal => self.keyboard_shortcuts.new_terminal = value,
+            SettingsField::ShortcutNewThread => self.keyboard_shortcuts.new_thread = value,
             SettingsField::ShortcutCloseFocusedColumn => {
                 self.keyboard_shortcuts.close_focused_column = value;
             }
@@ -1919,6 +1912,10 @@ fn settings_update(
             .parse::<bool>()
             .map(|enabled| next.editor_auto_save = enabled)
             .map_err(|_| "Choose whether editor auto-save is enabled.".to_owned()),
+        SettingsField::EditorWrapLines => value
+            .parse::<bool>()
+            .map(|enabled| next.editor_wrap_lines = enabled)
+            .map_err(|_| "Choose whether long editor lines wrap.".to_owned()),
         SettingsField::AppTheme => match value {
             "system" => {
                 next.app_theme = AppTheme::System;
@@ -2034,6 +2031,10 @@ fn settings_update(
             next.keyboard_shortcuts.new_terminal = settings::parse_chords(value);
             Ok(())
         }
+        SettingsField::ShortcutNewThread => {
+            next.keyboard_shortcuts.new_thread = settings::parse_chords(value);
+            Ok(())
+        }
         SettingsField::ShortcutCloseFocusedColumn => {
             next.keyboard_shortcuts.close_focused_column = settings::parse_chords(value);
             Ok(())
@@ -2079,6 +2080,7 @@ pub enum Message {
     /// and is dropped rather than rendered.
     SourceControlLoaded {
         key: ActiveWorktreeKey,
+        request: u64,
         result: Result<Box<RepositorySnapshot>, String>,
     },
     /// One page of the bound worktree's history.
@@ -2106,6 +2108,10 @@ pub enum Message {
         card: CardId,
         terminal: TerminalId,
         result: Result<StartedTerminal, String>,
+    },
+    TerminalHandoffsCommitted {
+        terminals: Vec<TerminalSession>,
+        result: Result<(), String>,
     },
     TerminalWake {
         card: CardId,
@@ -2280,7 +2286,6 @@ pub enum Message {
     FocusProjectSearch,
     ToggleContextInspector,
     SelectContextTab(ContextTab),
-    SelectWorkspaceScope(PathBuf),
     ContextInspector(InspectorAction),
     CloseInspector,
     SelectSettingsCategory(SettingsCategory),
@@ -2302,6 +2307,10 @@ pub enum Message {
     NativeWindowAction(cosmic::app::Action),
     ChatUi(chat_ui::Action),
     UpdateUi(update_ui::Action),
+    ChromeUi(chrome_ui::Action),
+    ThreadUi(thread_ui::Action),
+    BranchUi(branch_ui::Action),
+    RefreshUi(refresh_ui::Action),
     ResetSettings,
     SessionSaveHealthChanged(SessionSaveHealthEvent),
     Lsp(LspEvent),
@@ -2686,11 +2695,15 @@ pub struct Cagents {
     project_ui: project_ui::State,
     chat_ui: chat_ui::State,
     update_ui: update_ui::State,
+    branch_ui: branch_ui::State,
+    refresh_ui: refresh_ui::State,
+    chrome_ui: chrome_ui::State,
     pull_request_inspector: pull_request_ui::State,
     sidebar_state: SidebarState,
     active_workspace: Option<PathBuf>,
     worktree_focus: HashMap<PathBuf, CardId>,
     worktree_offsets: HashMap<PathBuf, f32>,
+    thread_offsets: HashMap<crate::model::ThreadId, f32>,
     worktree_owners: HashMap<CardId, PathBuf>,
     known_worktree_roots: HashSet<PathBuf>,
     workspace_view_generation: u64,
@@ -2708,6 +2721,8 @@ pub struct Cagents {
     closed_terminal_cards: HashSet<CardId>,
     uncertain_terminal_proofs: HashMap<CardId, HostSessionProof>,
     terminal_recovery_attempts: HashSet<TerminalId>,
+    pending_terminal_handoffs: HashMap<TerminalId, TerminalSession>,
+    terminal_handoff_commit_inflight: bool,
     worktree_operations:
         HashMap<crate::model::OperationId, worktree_operations::ActiveWorktreeOperation>,
     /// A source-control navigation waiting for its repository card to finish
@@ -2731,6 +2746,7 @@ pub struct Cagents {
     inspector: Option<Inspector>,
     inspector_transition: Option<InspectorTransition>,
     context_inspector_open: bool,
+    context_inspector_transition: Option<InspectorTransition>,
     context_tab: ContextTab,
     /// The overlay state whose focus and native-surface transition has already
     /// been applied. The rendered mount also depends on workspace focus, so it
@@ -2931,20 +2947,7 @@ impl Cagents {
             project.github_status = GitHubAvailability::Loading.label().into();
             project.revoke_github();
         }
-        cosmic::task::future(async move {
-            let result =
-                tokio::task::spawn_blocking(move || load_repository(&path, Some(project_id)))
-                    .await
-                    .map_err(|error| format!("repository loader join failed: {error}"))
-                    .and_then(|result| result)
-                    .map(Box::new);
-            Message::RepositoryLoaded {
-                open_cards,
-                project_id,
-                generation,
-                result,
-            }
-        })
+        self.repository_read_task(path, project_id, generation, open_cards)
     }
 
     #[cfg(feature = "integrated-browser")]
@@ -3068,7 +3071,10 @@ impl Cagents {
                     }
                 }
                 CardKind::Chat(session) => {
-                    repository_tasks.push(self.start_chat(card.id, session, false, None, false));
+                    let spawn = session.proof.is_none()
+                        && session.terminal.is_none()
+                        && session.launch.session_id.is_none();
+                    repository_tasks.push(self.start_chat(card.id, session, spawn, None, false));
                 }
                 #[cfg(feature = "integrated-browser")]
                 CardKind::Browser(_) => {
@@ -3094,6 +3100,7 @@ impl Cagents {
                 CardKind::Repository(view) => {
                     let mut runtime = RepositoryRuntime::new(view);
                     runtime.set_auto_save(self.settings.editor_auto_save);
+                    runtime.set_wrap_lines(self.settings.editor_wrap_lines);
                     runtime.set_external_editors(self.sidebar_model.external_editors.clone());
                     repository_tasks.push(repository_task(runtime.initial_load(card.id)));
                     self.cards
@@ -3186,9 +3193,6 @@ impl Cagents {
     }
 
     fn add_terminal(&mut self, working_directory: PathBuf) -> Task<Message> {
-        if self.project_ui.deleting() {
-            return Task::none();
-        }
         let launch = match LaunchRecipe::shell(working_directory.clone()) {
             Ok(launch) => launch,
             Err(error) => {
@@ -3198,6 +3202,14 @@ impl Cagents {
                 return Task::none();
             }
         };
+        self.add_terminal_recipe(launch)
+    }
+
+    fn add_terminal_recipe(&mut self, launch: LaunchRecipe) -> Task<Message> {
+        if self.project_ui.deleting() {
+            return Task::none();
+        }
+        let working_directory = launch.working_directory.clone();
         let card_id = CardId::new();
         let terminal_id = TerminalId::new();
         let transcript_path = terminal_transcript_path(terminal_id);
@@ -3236,6 +3248,7 @@ impl Cagents {
         let durable = Arc::make_mut(&mut self.durable);
         durable.cards.insert(durable_index, card.clone());
         durable.focused = Some(card_id);
+        self.register_thread_card(card_id);
         let update = self
             .workspace
             .add_card(
@@ -3296,8 +3309,10 @@ impl Cagents {
         let durable = Arc::make_mut(&mut self.durable);
         durable.cards.push(card);
         durable.focused = Some(card_id);
+        self.register_thread_card(card_id);
         let mut runtime = RepositoryRuntime::new(view);
         runtime.set_auto_save(self.settings.editor_auto_save);
+        runtime.set_wrap_lines(self.settings.editor_wrap_lines);
         runtime.set_external_editors(self.sidebar_model.external_editors.clone());
         let load = repository_task(runtime.initial_load(card_id));
         self.cards
@@ -3397,6 +3412,7 @@ impl Cagents {
             kind: CardKind::Browser(session),
         });
         durable.focused = Some(card_id);
+        self.register_thread_card(card_id);
         self.lifecycle.register(
             card_id,
             Exposure::Visible,
@@ -3440,18 +3456,7 @@ impl Cagents {
     }
 
     fn persist(&mut self) {
-        if let Some(scope) = &self.active_workspace
-            && let Some(focused) = self.workspace.focused()
-        {
-            self.worktree_focus.insert(scope.clone(), focused);
-        }
-        if self.durable.active_worktree != self.active_workspace
-            || self.durable.worktree_focus != self.worktree_focus
-        {
-            let durable = Arc::make_mut(&mut self.durable);
-            durable.active_worktree.clone_from(&self.active_workspace);
-            durable.worktree_focus.clone_from(&self.worktree_focus);
-        }
+        self.snapshot_workspace_scope();
         if let Some(session) = &self.session {
             session.snapshot(Arc::clone(&self.durable));
         }
@@ -3508,12 +3513,66 @@ impl Cagents {
         if let Some(writer) = &self.session {
             writer.snapshot_conversion(Arc::clone(&self.durable));
         }
-        self.start_terminal(
+        self.pending_terminal_handoffs
+            .insert(session.id, session.clone());
+        let commit = self.commit_terminal_handoffs();
+        let attach = self.start_terminal(
             card,
             session,
             state.exposure == Exposure::Visible && self.workspace_surfaces_visible(),
             false,
-        )
+        );
+        Task::batch([commit, attach])
+    }
+
+    /// The flush is ordered after conversion snapshots. Never release daemon
+    /// replay evidence based only on receiving or attaching its replacement.
+    fn commit_terminal_handoffs(&mut self) -> Task<Message> {
+        if self.terminal_handoff_commit_inflight
+            || self.pending_terminal_handoffs.is_empty()
+            || self.save_health.as_ref().is_some_and(|health| {
+                !matches!(
+                    health.health,
+                    SessionSaveHealth::Healthy | SessionSaveHealth::Recovered { .. }
+                )
+            })
+        {
+            return Task::none();
+        }
+        let Some(writer) = &self.session else {
+            return Task::none();
+        };
+        let Ok(flush) = writer.request_flush() else {
+            return Task::none();
+        };
+        let terminals = self
+            .pending_terminal_handoffs
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        self.terminal_handoff_commit_inflight = true;
+        cosmic::task::future(async move {
+            let joined = tokio::task::spawn_blocking(move || {
+                let result: Result<(), String> = (|| {
+                    flush
+                        .recv_timeout(Duration::from_secs(30))
+                        .map_err(|error| format!("session flush: {error}"))??;
+                    for terminal in &terminals {
+                        crate::chat::client::acknowledge_terminal_handoff(terminal)?;
+                    }
+                    Ok(())
+                })();
+                (terminals, result)
+            })
+            .await;
+            let (terminals, result) = joined.unwrap_or_else(|error| {
+                (
+                    Vec::new(),
+                    Err(format!("handoff acknowledgement worker: {error}")),
+                )
+            });
+            Message::TerminalHandoffsCommitted { terminals, result }
+        })
     }
 
     fn agent_worktree(&self, card: CardId) -> Option<ActiveWorktreeKey> {
@@ -3862,6 +3921,7 @@ impl Cagents {
             CardKind::Repository(view) => {
                 let mut runtime = RepositoryRuntime::new(view);
                 runtime.set_auto_save(self.settings.editor_auto_save);
+                runtime.set_wrap_lines(self.settings.editor_wrap_lines);
                 runtime.set_external_editors(self.sidebar_model.external_editors.clone());
                 let task = repository_task(runtime.initial_load(card));
                 self.cards
@@ -3873,7 +3933,12 @@ impl Cagents {
                     .insert(card, CardRuntime::PullRequests(view.repository));
                 Task::none()
             }
-            CardKind::Chat(session) => self.start_chat(card, session, false, None, false),
+            CardKind::Chat(session) => {
+                let spawn = session.proof.is_none()
+                    && session.terminal.is_none()
+                    && session.launch.session_id.is_none();
+                self.start_chat(card, session, spawn, None, false)
+            }
         }
     }
 
@@ -4324,19 +4389,25 @@ impl Cagents {
                     }
                 }
                 TerminalEvent::Bell => {}
-                TerminalEvent::Exited { exit_code, signal } => {
-                    let message = match signal {
-                        Some(signal) => format!("terminal exited with {signal}"),
-                        None => format!("terminal exited with status {exit_code}"),
-                    };
+                TerminalEvent::Exited {
+                    exit_code,
+                    signal,
+                    intentional,
+                } => {
                     if let Some(state) = self.card_state_mut(card)
                         && let CardKind::Terminal(session) = &mut state.kind
                     {
                         transition_terminal_to_relaunchable(session, terminal_exit(exit_code));
                     }
-                    self.fail_runtime(card, message.clone());
                     durable_changed = true;
-                    self.status = Some(TransientNotice::error(message));
+                    if !intentional {
+                        let message = match signal {
+                            Some(signal) => format!("terminal exited with {signal}"),
+                            None => format!("terminal exited with status {exit_code}"),
+                        };
+                        self.fail_runtime(card, message.clone());
+                        self.status = Some(TransientNotice::error(message));
+                    }
                 }
                 TerminalEvent::Error { operation, message } => {
                     let message = format!("terminal {operation}: {message}");
@@ -4931,6 +5002,9 @@ impl Cagents {
     }
 
     fn synchronize_sidebar_selection(&mut self) {
+        if self.durable.active_thread.is_some() {
+            return;
+        }
         let Some(card) = self.workspace.focused().and_then(|id| self.card_state(id)) else {
             return;
         };
@@ -5055,12 +5129,14 @@ impl Cagents {
         {
             return self.load_pending_history();
         }
+        self.cancel_source_read();
+        self.cancel_branch_changes();
         let Some(key) = self.sidebar_state.active_worktree().cloned() else {
             self.sidebar_model.source_control = None;
             return Task::none();
         };
         self.sidebar_model.source_control = Some(SourceControlModel::loading(key.clone()));
-        Self::source_control_snapshot_task(key)
+        self.source_control_snapshot_task(key)
     }
 
     /// Asks for the first page of history once, and only once the `History`
@@ -5087,6 +5163,13 @@ impl Cagents {
             .iter()
             .find(|card| {
                 card.existence.is_open()
+                    && self
+                        .durable
+                        .threads
+                        .iter()
+                        .find(|thread| thread.cards.contains(&card.id))
+                        .map(|thread| thread.id)
+                        == self.durable.active_thread
                     && matches!(&card.kind, CardKind::Repository(view) if view.worktree == worktree)
             })
             .map(|card| card.id)
@@ -5173,7 +5256,10 @@ impl Cagents {
         let (intents, auto_save) = match self.cards.get_mut(&card) {
             Some(CardRuntime::Repository(runtime)) => (
                 runtime.take_lsp_intents(),
-                repository_task(runtime.auto_save_task(card)),
+                Task::batch([
+                    repository_task(runtime.auto_save_task(card)),
+                    repository_task(runtime.working_diff_task(card)),
+                ]),
             ),
             _ => return Task::none(),
         };
@@ -5693,22 +5779,30 @@ impl Cagents {
         if let Some(source) = self.sidebar_model.source_control.as_mut() {
             source.set_reloading(true);
         }
-        Self::source_control_snapshot_task(key.clone())
+        self.source_control_snapshot_task(key.clone())
     }
 
-    fn source_control_snapshot_task(key: ActiveWorktreeKey) -> Task<Message> {
+    fn source_control_snapshot_task(&mut self, key: ActiveWorktreeKey) -> Task<Message> {
+        self.cancel_source_read();
+        let request = self.refresh_ui.source_generation;
+        let cancellation = CancellationToken::default();
+        self.refresh_ui.source_cancel = Some(cancellation.clone());
         let worktree = key.canonical_path.clone();
         cosmic::task::future(async move {
             let result = tokio::task::spawn_blocking(move || {
                 RepositoryService::system("git")
-                    .snapshot(&worktree, &CancellationToken::default())
+                    .snapshot(&worktree, &cancellation)
                     .map_err(|error| error.to_string())
             })
             .await
             .map_err(|error| format!("source-control reader join failed: {error}"))
             .and_then(|result| result)
             .map(Box::new);
-            Message::SourceControlLoaded { key, result }
+            Message::SourceControlLoaded {
+                key,
+                request,
+                result,
+            }
         })
     }
 
@@ -5853,15 +5947,30 @@ impl Cagents {
             || self.sidebar_state.pending_discard().is_some()
     }
 
+    fn context_inspector_visible(&self) -> bool {
+        self.context_inspector_open || self.context_inspector_transition.is_some()
+    }
+
+    fn context_inspector_progress(&self) -> f32 {
+        self.context_inspector_transition.map_or(
+            if self.context_inspector_open {
+                1.0
+            } else {
+                0.0
+            },
+            |transition| transition.progress(Instant::now()),
+        )
+    }
+
     fn context_inspector_is_overlay(&self) -> bool {
         matches!(
-            inspector::mount_for_width(self.window_width, self.context_inspector_open, true,),
+            inspector::mount_for_width(self.window_width, self.context_inspector_visible(), true,),
             Some(InspectorLayout::Overlay)
         )
     }
 
     fn workspace_inputs_blocked(&self) -> bool {
-        self.modal_is_open() || self.context_inspector_is_overlay()
+        self.modal_is_open() || self.context_inspector_is_overlay() || self.chrome_ui.is_open()
     }
 
     fn workspace_surfaces_visible(&self) -> bool {
@@ -5918,8 +6027,27 @@ impl Cagents {
         if self.context_inspector_open == open {
             return Task::none();
         }
+        let from = self.context_inspector_progress();
         self.context_inspector_open = open;
+        self.context_inspector_transition = Some(InspectorTransition {
+            started_at: Instant::now(),
+            from,
+            to: if open { 1.0 } else { 0.0 },
+        });
+        self.frame_clock.reset();
         self.sync_context_overlay_state()
+    }
+
+    fn advance_context_inspector_transition(&mut self, now: Instant) -> Task<Message> {
+        if self
+            .context_inspector_transition
+            .is_some_and(|transition| transition.is_complete(now))
+        {
+            self.context_inspector_transition = None;
+            let sync = self.sync_context_overlay_state();
+            return Task::batch([sync, self.focus_context_overlay_if_exposed()]);
+        }
+        Task::none()
     }
 
     fn inspector_runtime_status(&self, card: CardId) -> InspectorRuntimeStatus {
@@ -6393,7 +6521,9 @@ impl Cagents {
             sidebar: self.sidebar_state.saved_view(),
             worktree_offsets: self.worktree_offsets.clone(),
         };
-        if let Some(path) = &self.active_workspace {
+        if self.durable.active_thread.is_none()
+            && let Some(path) = &self.active_workspace
+        {
             view.worktree_offsets
                 .insert(path.clone(), self.workspace.camera().offset());
         }
@@ -6612,6 +6742,7 @@ impl Cagents {
                 if matches!(
                     field,
                     SettingsField::ShortcutNewTerminal
+                        | SettingsField::ShortcutNewThread
                         | SettingsField::ShortcutCloseFocusedColumn
                         | SettingsField::ShortcutSearchProjects
                         | SettingsField::ShortcutPreviousColumn
@@ -6640,6 +6771,14 @@ impl Cagents {
                             }
                         }))
                     }
+                    SettingsField::EditorWrapLines => {
+                        for runtime in self.cards.values_mut() {
+                            if let CardRuntime::Repository(runtime) = runtime {
+                                runtime.set_wrap_lines(self.settings.editor_wrap_lines);
+                            }
+                        }
+                        Task::none()
+                    }
                     SettingsField::AppTheme | SettingsField::UiScale => {
                         self.synchronize_appearance(previous_scale)
                     }
@@ -6664,6 +6803,7 @@ impl Cagents {
                     | SettingsField::LinkOpenDestination
                     | SettingsField::LinkOpenGesture
                     | SettingsField::ShortcutNewTerminal
+                    | SettingsField::ShortcutNewThread
                     | SettingsField::ShortcutCloseFocusedColumn
                     | SettingsField::ShortcutSearchProjects
                     | SettingsField::ShortcutPreviousColumn
@@ -6730,6 +6870,7 @@ impl Cagents {
         let auto_save = Task::batch(self.cards.iter_mut().filter_map(|(&card, runtime)| {
             if let CardRuntime::Repository(runtime) = runtime {
                 runtime.set_auto_save(self.settings.editor_auto_save);
+                runtime.set_wrap_lines(self.settings.editor_wrap_lines);
                 Some(repository_task(runtime.auto_save_task(card)))
             } else {
                 None
@@ -6872,10 +7013,14 @@ impl Application for Cagents {
             project_ui: project_ui::State::default(),
             chat_ui: chat_ui::State::default(),
             update_ui: update_ui::State::default(),
+            branch_ui: branch_ui::State::default(),
+            refresh_ui: refresh_ui::State::default(),
+            chrome_ui: chrome_ui::State::default(),
             pull_request_inspector: pull_request_ui::State::default(),
             active_workspace: None,
             worktree_focus: HashMap::new(),
             worktree_offsets: HashMap::new(),
+            thread_offsets: HashMap::new(),
             worktree_owners: HashMap::new(),
             known_worktree_roots: worktrees
                 .iter()
@@ -6895,6 +7040,8 @@ impl Application for Cagents {
             closed_terminal_cards: HashSet::new(),
             uncertain_terminal_proofs: HashMap::new(),
             terminal_recovery_attempts: HashSet::new(),
+            pending_terminal_handoffs: HashMap::new(),
+            terminal_handoff_commit_inflight: false,
             worktree_operations: HashMap::new(),
             pending_panel_open: None,
             deferred_navigation: VecDeque::new(),
@@ -6907,6 +7054,7 @@ impl Application for Cagents {
             latency_fixture_started: false,
             inspector: None,
             inspector_transition: None,
+            context_inspector_transition: None,
             context_inspector_open: window_view
                 .as_ref()
                 .is_none_or(|view| view.context_inspector_open),
@@ -6988,8 +7136,22 @@ impl Application for Cagents {
             return (app, chrome);
         }
         let scope = app.restore_worktree_scope();
+        // Closed/exited replacements can still owe a lost durable acknowledgement.
+        for card in &app.durable.cards {
+            let terminal = match &card.kind {
+                CardKind::Terminal(terminal) => Some(terminal),
+                CardKind::Chat(chat) => chat.terminal.as_ref(),
+                _ => None,
+            };
+            if let Some(terminal) = terminal {
+                app.pending_terminal_handoffs
+                    .insert(terminal.id, terminal.clone());
+            }
+        }
+        app.refresh_sidebar_threads();
         let mut tasks = vec![
             scope,
+            app.commit_terminal_handoffs(),
             Self::editor_discovery_task(),
             app.rehydrate_worktree_operations(),
             app.initialize_runtimes(),
@@ -7029,6 +7191,14 @@ impl Application for Cagents {
         if self.update_prepared && user_message_blocked_during_update(&message) {
             return Task::none();
         }
+        if self.modal_is_open() {
+            self.chrome_ui.close();
+        } else if self.chrome_ui.is_open()
+            && !matches!(&message, Message::ChromeUi(_))
+            && user_workspace_message_blocked_while_modal(&message)
+        {
+            return Task::none();
+        }
         if self.modal_is_open() && user_workspace_message_blocked_while_modal(&message) {
             return Task::none();
         }
@@ -7042,7 +7212,10 @@ impl Application for Cagents {
             self.deferred_navigation.push_back(message);
             return Task::none();
         }
-        if !self.workspace.is_animating() && self.inspector_transition.is_none() {
+        if !self.workspace.is_animating()
+            && self.inspector_transition.is_none()
+            && self.context_inspector_transition.is_none()
+        {
             // A new animation starts from its first frame, not from time spent
             // idle while the window-frame subscription was disconnected.
             self.frame_clock.reset();
@@ -7065,6 +7238,25 @@ impl Application for Cagents {
                 match self.terminal_directory() {
                     Some(directory) => self.add_terminal(directory),
                     None => cosmic::task::message(Message::OpenRepository),
+                }
+            }
+            Message::TerminalHandoffsCommitted { terminals, result } => {
+                self.terminal_handoff_commit_inflight = false;
+                match result {
+                    Ok(()) => {
+                        for terminal in terminals {
+                            if self.pending_terminal_handoffs.get(&terminal.id) == Some(&terminal) {
+                                self.pending_terminal_handoffs.remove(&terminal.id);
+                            }
+                        }
+                        self.commit_terminal_handoffs()
+                    }
+                    Err(error) => {
+                        self.status = Some(TransientNotice::error(format!(
+                            "Terminal handoff acknowledgement is pending; it will retry after saving recovers or the window refreshes: {error}"
+                        )));
+                        Task::none()
+                    }
                 }
             }
             Message::TerminalStarted {
@@ -7090,6 +7282,18 @@ impl Application for Cagents {
                 let mut tasks = Vec::new();
                 match result {
                     Ok(started) => {
+                        if let Some(proof) = started.session.continuity.live_proof() {
+                            // A replacement daemon cannot own the previous
+                            // daemon's in-memory receipts.
+                            self.pending_terminal_handoffs.retain(|_, pending| {
+                                pending
+                                    .continuity
+                                    .live_proof()
+                                    .is_none_or(|stored| stored == proof)
+                            });
+                            self.pending_terminal_handoffs
+                                .insert(started.session.id, started.session.clone());
+                        }
                         self.terminal_recovery_attempts.remove(&terminal);
                         self.terminal_recovery_attempts.remove(&started.session.id);
                         if started.session.id != terminal
@@ -7161,6 +7365,7 @@ impl Application for Cagents {
                     tasks.push(self.reconcile_scoped_lifecycle());
                 }
                 self.persist();
+                tasks.push(self.commit_terminal_handoffs());
                 Task::batch(tasks)
             }
             Message::TerminalWake { card, generation } => {
@@ -7240,6 +7445,7 @@ impl Application for Cagents {
                 if self.repository_generations.get(&project_id) != Some(&generation) {
                     return Task::none();
                 }
+                self.refresh_ui.projects.remove(&project_id);
                 let mut task = Task::none();
                 match result {
                     Ok(loaded) => {
@@ -7358,6 +7564,9 @@ impl Application for Cagents {
                             pull_requests,
                         );
                         sidebar_project.github_ready = loaded.github.repository_key().is_some();
+                        if let Some(repository) = loaded.github.repository_key() {
+                            sidebar_project.set_branch_namespace(&repository.owner);
+                        }
                         if !sidebar_project.github_ready {
                             sidebar_project.revoke_github();
                         }
@@ -7383,7 +7592,11 @@ impl Application for Cagents {
                         } else if let Some(active) = self.active_workspace.clone() {
                             // Discovery can resolve legacy launch directories
                             // into distinct worktrees after session restoration.
-                            task = self.select_worktree(active, false);
+                            task = if let Some(thread) = self.durable.active_thread {
+                                self.select_thread(thread)
+                            } else {
+                                self.select_worktree(active, false)
+                            };
                         }
                         task = Task::batch([task, self.project_avatar_task(project_id)]);
                     }
@@ -7484,6 +7697,10 @@ impl Application for Cagents {
                 let card = action.card();
                 let basis_resolved = matches!(action, RepositoryAction::DiffBasisResolved { .. });
                 let save_finished = matches!(action, RepositoryAction::SaveFinished { .. });
+                let saved = matches!(
+                    &action,
+                    RepositoryAction::SaveFinished { result: Ok(_), .. }
+                );
                 // A parked source-control navigation is answered by the very
                 // file list it is waiting on, and only after the card has taken
                 // that list.
@@ -7508,6 +7725,12 @@ impl Application for Cagents {
                 let mut tasks = vec![task, self.drain_lsp_intents(card)];
                 if files_loaded {
                     tasks.push(self.flush_pending_panel_open(card));
+                }
+                if saved
+                    && let Some(key) = self.sidebar_state.active_worktree().cloned()
+                    && self.repository_card_for(&key.canonical_path) == Some(card)
+                {
+                    tasks.push(self.reload_source_control(&key));
                 }
                 if save_finished && closing_card == Some(card) {
                     tasks.push(self.advance_dirty_close());
@@ -7629,6 +7852,20 @@ impl Application for Cagents {
                         iced::widget::operation::focus(pull_request_dialog_focus_id())
                             .map(cosmic::Action::App)
                     }
+                    SidebarAction::NewThread { project_id } => {
+                        self.handle_thread_ui(thread_ui::Action::Create(project_id))
+                    }
+                    SidebarAction::OpenThread { thread_id } => {
+                        self.handle_thread_ui(thread_ui::Action::Open(thread_id))
+                    }
+                    SidebarAction::ToggleFilesFilter { key } => {
+                        if self.source_control_is_bound(&key) && self.sidebar_state.files_filter_open() {
+                            widget::text_input::focus(sidebar::files_filter_focus_id(&key))
+                                .map(cosmic::Action::App)
+                        } else {
+                            Task::none()
+                        }
+                    }
                     SidebarAction::OpenSettings => {
                         self.settings_category = SettingsCategory::Appearance;
                         self.open_inspector(Inspector::Settings)
@@ -7642,6 +7879,9 @@ impl Application for Cagents {
                         Task::none()
                     }
                     SidebarAction::ResizeFinished => self.save_settings_task(false),
+                    SidebarAction::OpenBranchFile { key, path, old_path, base_ref, head, merge_base } => {
+                        self.open_branch_file(key, path, old_path, base_ref, head, merge_base)
+                    }
                     // Expanding `History` is the only thing that asks for the
                     // first page; the tail of `update` sees the new toggle and
                     // issues the walk.
@@ -7783,6 +8023,9 @@ impl Application for Cagents {
                     | SidebarAction::SetFilter(_)
                     | SidebarAction::ToggleProject(_) => Task::none(),
                 }
+            }
+            Message::FocusCard(id) if !self.workspace.order().any(|visible| visible == id) => {
+                self.focus_unregistered_tab(id)
             }
             Message::FocusCard(id) => match self.workspace.focus(id) {
                 Ok(update) => self.apply_viewport(update, true, false),
@@ -8248,7 +8491,10 @@ impl Application for Cagents {
                 }
             }
             Message::Frame(frame) => {
-                let inspector_task = self.advance_inspector_transition(frame);
+                let inspector_task = Task::batch([
+                    self.advance_inspector_transition(frame),
+                    self.advance_context_inspector_transition(frame),
+                ]);
                 let Some(elapsed) = self.frame_clock.elapsed(frame) else {
                     let deferred = self.release_deferred_navigation_if_unblocked();
                     return Task::batch([inspector_task, deferred]);
@@ -8311,6 +8557,7 @@ impl Application for Cagents {
                 }
                 if self.focused_repository_is_saving() && self.context_inspector_is_overlay() {
                     self.context_inspector_open = false;
+                    self.context_inspector_transition = None;
                 }
                 self.sync_context_overlay_state()
             }
@@ -8682,6 +8929,9 @@ impl Application for Cagents {
                 if let keyboard::Event::ModifiersChanged(modifiers) = &event {
                     self.keyboard_modifiers = *modifiers;
                 }
+                if let Some(task) = self.chrome_key_event(&event) {
+                    return task;
+                }
                 if is_escape_press(&event) {
                     if self.terminal_close.is_some() {
                         return self.cancel_terminal_close();
@@ -8748,6 +8998,7 @@ impl Application for Cagents {
                     Some(workspace_widget::GlobalShortcut::NewTerminal) => {
                         cosmic::task::message(Message::NewTerminal)
                     }
+                    Some(workspace_widget::GlobalShortcut::NewThread) => self.new_project_thread(),
                     Some(workspace_widget::GlobalShortcut::CloseFocusedCard) => {
                         match close_focused_message(&self.workspace) {
                             Some(message) => cosmic::task::message(message),
@@ -8823,10 +9074,6 @@ impl Application for Cagents {
                 self.context_tab = tab;
                 Task::none()
             }
-            Message::SelectWorkspaceScope(path) => {
-                self.show_workspace_for_action();
-                self.select_worktree(path, false)
-            }
             Message::ContextInspector(_) if self.modal_is_open() => Task::none(),
             Message::ContextInspector(action) => self.handle_context_inspector_action(action),
             Message::CloseInspector => {
@@ -8846,6 +9093,10 @@ impl Application for Cagents {
             }
             Message::ProjectUi(action) => self.handle_project_action(action),
             Message::PullRequestUi(action) => self.handle_pull_request_ui(action),
+            Message::ChromeUi(action) => self.update_chrome(action),
+            Message::ThreadUi(action) => self.handle_thread_ui(action),
+            Message::BranchUi(action) => self.update_branch_ui(action),
+            Message::RefreshUi(action) => self.update_refresh(action),
             Message::NativeWindowAction(action) => Task::done(cosmic::Action::Cosmic(action)),
             Message::ChatUi(action) => self.handle_chat_ui(action),
             Message::ResetSettings => self.reset_settings(),
@@ -8876,13 +9127,35 @@ impl Application for Cagents {
                 self.status = None;
                 Task::none()
             }
-            Message::SourceControlLoaded { key, result } => {
-                if !self.source_control_is_bound(&key) {
+            Message::SourceControlLoaded {
+                key,
+                request,
+                result,
+            } => {
+                if request != self.refresh_ui.source_generation
+                    || !self.source_control_is_bound(&key)
+                {
                     return Task::none();
                 }
-                let mut next = match result {
-                    Ok(snapshot) => SourceControlModel::ready(key, &snapshot),
-                    Err(error) => SourceControlModel::failed(key, error),
+                self.refresh_ui.source_cancel = None;
+                if let Ok(snapshot) = &result
+                    && let Some(worktree) = self
+                        .sidebar_model
+                        .projects
+                        .iter_mut()
+                        .find(|project| project.id == key.project_id)
+                        .and_then(|project| {
+                            project
+                                .worktrees
+                                .iter_mut()
+                                .find(|worktree| worktree.id == key.worktree_id)
+                        })
+                {
+                    worktree.apply_status(&snapshot.status);
+                }
+                let mut next = match &result {
+                    Ok(snapshot) => SourceControlModel::ready(key, snapshot),
+                    Err(error) => SourceControlModel::failed(key, error.clone()),
                 };
                 // The reload replaces the rows and nothing else: an in-flight
                 // mutation, its last failure, and the history already walked
@@ -8891,7 +9164,13 @@ impl Application for Cagents {
                     previous.carry_mutation_into(&mut next);
                 }
                 self.sidebar_model.source_control = Some(next);
-                Task::none()
+                match result {
+                    Ok(snapshot) => self.refresh_branch_changes(&snapshot),
+                    Err(_) => {
+                        self.cancel_branch_changes();
+                        Task::none()
+                    }
+                }
             }
             Message::SourceControlHistory { key, page, result } => {
                 if !self.source_control_is_bound(&key) {
@@ -8956,7 +9235,9 @@ impl Application for Cagents {
         if camera_only {
             return Task::batch([task, self.release_deferred_navigation_if_unblocked()]);
         }
+        let notices = self.reconcile_notice_popup();
         self.synchronize_sidebar_selection();
+        self.refresh_sidebar_threads();
         let binding = self.rebind_source_control();
         if let Some(source) = self.sidebar_model.source_control.as_ref() {
             let selected = self
@@ -8976,13 +9257,14 @@ impl Application for Cagents {
         // `view` cannot rebuild the chrome cache itself, so refresh it here.
         let chrome = self.sync_chrome();
         let deferred = self.release_deferred_navigation_if_unblocked();
-        Task::batch([task, binding, chrome, deferred, pull_request])
+        Task::batch([task, binding, chrome, deferred, pull_request, notices])
     }
 
     fn subscription(&self) -> Subscription<Message> {
         let operation_subscriptions = self.worktree_progress_subscriptions();
         let mut subscriptions = vec![
             self.chat_subscription(),
+            self.refresh_subscription(),
             self.terminal_agent_activity_subscription(),
             self.update_subscription(),
             Subscription::run_with(
@@ -9014,6 +9296,12 @@ impl Application for Cagents {
                 iced::Event::Window(window::Event::CloseRequested) => {
                     Some(Message::WindowCloseRequested(event_window))
                 }
+                iced::Event::Window(window::Event::Focused) => Some(Message::RefreshUi(
+                    refresh_ui::Action::Focused(event_window, true),
+                )),
+                iced::Event::Window(window::Event::Unfocused) => Some(Message::RefreshUi(
+                    refresh_ui::Action::Focused(event_window, false),
+                )),
                 _ => None,
             }),
         ];
@@ -9035,7 +9323,9 @@ impl Application for Cagents {
         );
         subscriptions.extend(operation_subscriptions);
         if let Some(window) = self.core.main_window_id()
-            && (self.workspace.is_animating() || self.inspector_transition.is_some())
+            && (self.workspace.is_animating()
+                || self.inspector_transition.is_some()
+                || self.context_inspector_transition.is_some())
         {
             subscriptions.push(workspace_widget::animation_frames(window, Message::Frame));
         }
@@ -9356,20 +9646,10 @@ impl Application for Cagents {
             self.modal_is_open(),
         )
         .map(Message::Sidebar);
-        let sidebar = if let Some(folders) = self.standalone_worktree_navigation() {
-            widget::column::with_children(vec![sidebar, folders])
-                .height(Length::Fill)
-                .into()
-        } else {
-            sidebar
-        };
 
         // The focused card's own name and path are the card header's job, and
         // the window's header bar already carries the name; see
         // `sync_window_title`.
-
-        let save_health = self.save_health.as_ref().and_then(save_health_view);
-        let notice = self.status.as_ref().map(transient_notice_view);
 
         let workspace: Element<'_, Message> = if self.workspace.cards().is_empty() {
             let directory = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/"));
@@ -9468,23 +9748,9 @@ impl Application for Cagents {
             )
         };
 
-        let mut main_children: Vec<Element<'_, Message>> = Vec::with_capacity(5);
-        main_children.push(self.workspace_chrome(workspace));
-        if let Some(save_health) = save_health {
-            main_children.push(save_health);
-            main_children.push(widget::divider::horizontal::default().into());
-        }
-        if let Some(notice) = notice {
-            main_children.push(notice);
-            main_children.push(widget::divider::horizontal::default().into());
-        }
-        let main_content: Element<'_, Message> = widget::column::with_children(main_children)
-            .spacing(0)
-            .width(Length::Fill)
-            .height(Length::Fill)
-            .into();
+        let main_content = self.workspace_chrome(workspace);
 
-        let context_model = (self.context_inspector_open
+        let context_model = (self.context_inspector_visible()
             && self.context_tab == ContextTab::Details)
             .then(|| self.workspace.focused())
             .flatten()
@@ -9506,12 +9772,14 @@ impl Application for Cagents {
                     })
                 })
             });
-        let surface: Element<'_, Message> = if self.context_inspector_open {
+        let surface: Element<'_, Message> = if self.context_inspector_visible() {
             let width = self
                 .settings
                 .inspector_width
                 .clamp(design::INSPECTOR_MIN_WIDTH, design::INSPECTOR_MAX_WIDTH)
                 .min(window_width.max(0.0));
+            let progress = self.context_inspector_progress();
+            let visible_width = width * progress;
             let splitter: Element<'_, Message> = Splitter::new(
                 widget::Id::new("context-inspector.resize-handle"),
                 inspector::RESIZE_HANDLE_NAME,
@@ -9524,7 +9792,11 @@ impl Application for Cagents {
                 || Message::ContextInspector(InspectorAction::ResizeFinished),
             )
             .into();
-            let pane = self.context_panel(context_model, width);
+            let pane = crate::interaction::reveal_width(
+                self.context_panel(context_model, width),
+                width,
+                progress,
+            );
             match inspector::mount_for_width(window_width, true, true)
                 .expect("an open contextual inspector with a model has a mount")
             {
@@ -9537,7 +9809,7 @@ impl Application for Cagents {
                             .into();
                     let edge = widget::container(splitter)
                         .padding(Padding {
-                            right: width,
+                            right: visible_width,
                             ..Padding::ZERO
                         })
                         .align_x(Alignment::End)
@@ -9590,7 +9862,9 @@ impl Application for Cagents {
         };
         let surface = crate::interaction::drive_animation(
             surface,
-            self.workspace.is_animating() || self.inspector_transition.is_some(),
+            self.workspace.is_animating()
+                || self.inspector_transition.is_some()
+                || self.context_inspector_transition.is_some(),
         );
         #[cfg(feature = "latency-harness")]
         return latency_ui::instrument(
@@ -9725,9 +9999,12 @@ fn browser_command(
     Task::none()
 }
 
-fn load_repository(path: &Path, project_id: Option<ProjectId>) -> Result<LoadedRepository, String> {
+fn load_repository(
+    path: &Path,
+    project_id: Option<ProjectId>,
+    cancellation: CancellationToken,
+) -> Result<LoadedRepository, String> {
     let service = RepositoryService::system("git");
-    let cancellation = CancellationToken::default();
     // Git discovery and stable worktree identities must see the real checkout,
     // not a spelling introduced by a picker symlink or a relative launch path.
     let path = path
@@ -9770,7 +10047,7 @@ fn load_repository(path: &Path, project_id: Option<ProjectId>) -> Result<LoadedR
         if auth.state != crate::github::GhAuthState::Authenticated {
             return Err(GitHubAvailability::Unauthenticated);
         }
-        let pull_requests = github
+        let mut pull_requests = github
             .list(
                 &ListPullRequestsRequest {
                     repository: key.clone(),
@@ -9780,10 +10057,36 @@ fn load_repository(path: &Path, project_id: Option<ProjectId>) -> Result<LoadedR
                 &cancellation,
             )
             .map_err(GitHubAvailability::from_error)?;
-        let checks = github.checks_for_pull_requests(&key, &pull_requests, &cancellation);
+        // Closed history must not consume the open-PR page. Its failure also
+        // must not discard successfully refreshed open conversation authority.
+        if let Ok(history) = github.list(
+            &ListPullRequestsRequest {
+                repository: key.clone(),
+                state: PullRequestStateFilter::All,
+                limit: sidebar::PULL_REQUEST_LIST_LIMIT,
+            },
+            &cancellation,
+        ) {
+            for entry in history {
+                if let Some(current) = pull_requests
+                    .iter_mut()
+                    .find(|current| current.number == entry.number)
+                {
+                    *current = entry;
+                } else {
+                    pull_requests.push(entry);
+                }
+            }
+        }
         Ok(GitHubAvailability::Ready {
             repository_key: key,
-            pull_requests: pull_requests.into_iter().zip(checks).collect(),
+            pull_requests: pull_requests
+                .into_iter()
+                .map(|pull_request| {
+                    let checks = pull_request.check_summaries();
+                    (pull_request, checks)
+                })
+                .collect(),
             refreshed_at: unix_millis(),
         })
     })()
@@ -10053,6 +10356,30 @@ mod tests {
             );
             assert_eq!(stream.next().await, None);
         });
+    }
+
+    #[test]
+    fn acknowledging_the_last_recovery_notice_releases_workspace_input() {
+        for other_notice in [false, true] {
+            let mut app = context_inspector_test_app(false);
+            let mut health = SaveHealthState::new("/session.sqlite3".into());
+            health.apply(health_event(
+                1,
+                SessionSaveHealth::Recovered {
+                    recovered_at_unix_ms: 1,
+                },
+                Some(1),
+            ));
+            app.save_health = Some(health);
+            app.status = other_notice.then(|| TransientNotice::error("another failure"));
+            let _ = app.update(Message::ChromeUi(chrome_ui::Action::ToggleNotices));
+            assert!(app.chrome_ui.is_open());
+            let _ = app.update(Message::AcknowledgeSessionRecovery);
+            assert_eq!(app.chrome_ui.is_open(), other_notice);
+            if !other_notice {
+                assert!(!app.workspace_inputs_blocked());
+            }
+        }
     }
 
     #[test]
@@ -12870,15 +13197,21 @@ mod tests {
             settings_path: None,
             uncertain_terminal_proofs: HashMap::new(),
             terminal_recovery_attempts: HashSet::new(),
+            pending_terminal_handoffs: HashMap::new(),
+            terminal_handoff_commit_inflight: false,
             settings_write_blocked: true,
             sidebar_model: SidebarModel::ready(SidebarMode::Expanded, Vec::new()),
             sidebar_state: SidebarState::default(),
             project_ui: project_ui::State::default(),
             chat_ui: chat_ui::State::default(),
             update_ui: update_ui::State::default(),
+            chrome_ui: chrome_ui::State::default(),
             pull_request_inspector: pull_request_ui::State::default(),
+            branch_ui: branch_ui::State::default(),
+            refresh_ui: refresh_ui::State::default(),
             active_workspace: None,
             worktree_focus: HashMap::new(),
+            thread_offsets: HashMap::new(),
             worktree_offsets: HashMap::new(),
             worktree_owners: HashMap::new(),
             known_worktree_roots: HashSet::new(),
@@ -12906,6 +13239,7 @@ mod tests {
             latency_fixture_started: false,
             inspector: None,
             inspector_transition: None,
+            context_inspector_transition: None,
             context_inspector_open: true,
             context_tab: ContextTab::default(),
             context_inspector_overlay_active: false,
@@ -13038,9 +13372,10 @@ mod tests {
 
         // These independent requests all finish before any result is accepted,
         // as when two picker loads race while another add is still in flight.
-        let first = load_repository(&root, None).unwrap();
-        let aliased = load_repository(&alias.join("subdir"), None).unwrap();
-        let linked_load = load_repository(&linked, None).unwrap();
+        let first = load_repository(&root, None, CancellationToken::default()).unwrap();
+        let aliased =
+            load_repository(&alias.join("subdir"), None, CancellationToken::default()).unwrap();
+        let linked_load = load_repository(&linked, None, CancellationToken::default()).unwrap();
         assert_eq!(first.repository.id, aliased.repository.id);
         assert_eq!(first.repository.id, linked_load.repository.id);
         let canonical_root = root.canonicalize().unwrap();

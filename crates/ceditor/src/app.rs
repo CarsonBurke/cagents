@@ -3,7 +3,7 @@ use cagents::{
     lsp::{LspCompletionItem, LspDiagnostic, LspDocumentId, LspEvent, LspManager, LspPosition},
     model::{CardId, ProjectId, RepositoryView, WorktreeId},
     repository::{
-        CancellationToken, MutationOutcome, RepoPath, RepositoryId, RepositoryService,
+        CancellationToken, DiffBasis, MutationOutcome, RepoPath, RepositoryId, RepositoryService,
         RepositorySnapshot, StageRequest, UnstageRequest,
     },
     repository_widget::{self, LspIntent, RepositoryAction, RepositoryRuntime},
@@ -62,6 +62,8 @@ struct Tab {
     hover: Option<String>,
     lsp_status: String,
     mutation: bool,
+    snapshot_loading: bool,
+    snapshot_refresh_pending: bool,
 }
 
 struct FileOperationDialog {
@@ -78,6 +80,7 @@ pub enum Message {
     Choose(bool),
     Chosen(u64, Result<Option<PathBuf>, String>),
     Opened(u64, Result<Opened, String>),
+    SessionOpened(u64, Vec<(bool, Result<Opened, String>)>),
     FileResolved(CardId, u64, Result<PathBuf, String>),
     Select(CardId),
     CloseTab(CardId),
@@ -87,7 +90,10 @@ pub enum Message {
     ConfirmClose,
     CancelClose,
     Reaped,
+    WindowFocused(window::Id, bool),
+    RefreshVisible,
     Repository(RepositoryAction),
+    ResolvedDiffBasis { card: CardId, basis: DiffBasis },
     Sidebar(SidebarAction),
     Snapshot(CardId, Result<RepositorySnapshot, String>),
     Mutation(CardId, Result<MutationOutcome, String>),
@@ -97,6 +103,7 @@ pub enum Message {
     FileOperationFinished(Result<PathBuf, String>),
     Settings,
     AutoSave(bool),
+    WrapLines(bool),
     Theme(AppTheme),
     Scale(f32),
     SettingsSaved(Result<(), String>),
@@ -123,9 +130,12 @@ pub struct Editor {
     closing: Option<CardId>,
     close_confirmed: bool,
     exiting: bool,
+    window_focused: bool,
     lsp: LspManager,
     next_document: u64,
     file_list_mode: FileListMode,
+    restoring_session: bool,
+    saved_session: crate::preferences::Session,
 }
 
 fn repository_task(task: iced::Task<RepositoryAction>) -> Task<Message> {
@@ -164,12 +174,8 @@ fn chosen_path(
 }
 
 fn tab_title_style() -> cosmic::theme::Button {
-    fn appearance(focused: bool, theme: &cosmic::Theme) -> widget::button::Style {
-        widget::button::Style {
-            border_width: if focused { design::BORDER_WIDTH } else { 0.0 },
-            border_color: theme.current_container().component.on_disabled.into(),
-            ..widget::button::Style::new()
-        }
+    fn appearance(_focused: bool, _theme: &cosmic::Theme) -> widget::button::Style {
+        widget::button::Style::new()
     }
     cosmic::theme::Button::Custom {
         active: Box::new(appearance),
@@ -342,7 +348,7 @@ impl Editor {
         for (id, reopened) in refresh {
             tasks.push(self.drain(id));
             tasks.push(if reopened {
-                self.refresh_snapshot(id)
+                self.refresh_snapshot(id, true)
             } else {
                 self.refresh(id)
             });
@@ -381,48 +387,107 @@ impl Editor {
         self.active.and_then(|id| self.tab(id))
     }
 
+    fn resolve_open(path: PathBuf) -> Result<Opened, String> {
+        let path = path
+            .canonicalize()
+            .map_err(|error| format!("{}: {error}", path.display()))?;
+        let directory = if path.is_dir() {
+            path.clone()
+        } else {
+            if !path.is_file() {
+                return Err(format!("{} is not a regular file", path.display()));
+            }
+            std::fs::File::open(&path).map_err(|error| format!("{}: {error}", path.display()))?;
+            path.parent()
+                .ok_or("File has no parent directory")?
+                .to_path_buf()
+        };
+        let service = RepositoryService::system("git");
+        let token = CancellationToken::default();
+        // Discovery failure does not prevent editing an ordinary folder.
+        let repository = service.discover(&directory, &token).ok();
+        let repository_root = repository.and_then(|info| info.worktree_root);
+        let snapshot = repository_root
+            .as_ref()
+            .map(|root| {
+                service
+                    .snapshot(root, &token)
+                    .map_err(|error| error.to_string())
+            })
+            .transpose()?;
+        let root = repository_root.unwrap_or(directory);
+        let file = (!path.is_dir())
+            .then(|| path.strip_prefix(&root).map(Path::to_path_buf))
+            .transpose()
+            .map_err(|error| error.to_string())?;
+        Ok(Opened {
+            root,
+            file,
+            snapshot,
+        })
+    }
+
     fn open(path: PathBuf, selection_epoch: u64) -> Task<Message> {
         cosmic::task::future(async move {
-            let result = tokio::task::spawn_blocking(move || {
-                let path = path
-                    .canonicalize()
-                    .map_err(|error| format!("{}: {error}", path.display()))?;
-                let directory = if path.is_dir() {
-                    path.clone()
-                } else {
-                    path.parent()
-                        .ok_or("File has no parent directory")?
-                        .to_path_buf()
-                };
-                let service = RepositoryService::system("git");
-                let token = CancellationToken::default();
-                // Discovery failure does not prevent editing an ordinary folder.
-                let repository = service.discover(&directory, &token).ok();
-                let repository_root = repository.and_then(|info| info.worktree_root);
-                let snapshot = repository_root
-                    .as_ref()
-                    .map(|root| {
-                        service
-                            .snapshot(root, &token)
-                            .map_err(|error| error.to_string())
-                    })
-                    .transpose()?;
-                let root = repository_root.unwrap_or(directory);
-                let file = (!path.is_dir())
-                    .then(|| path.strip_prefix(&root).map(Path::to_path_buf))
-                    .transpose()
-                    .map_err(|error| error.to_string())?;
-                Ok(Opened {
-                    root,
-                    file,
-                    snapshot,
-                })
-            })
-            .await
-            .map_err(|error| error.to_string())
-            .and_then(|result| result);
+            let result = tokio::task::spawn_blocking(move || Self::resolve_open(path))
+                .await
+                .map_err(|error| error.to_string())
+                .and_then(|result| result);
             Message::Opened(selection_epoch, result)
         })
+    }
+
+    fn restore_session(paths: Vec<(PathBuf, bool)>) -> Task<Message> {
+        cosmic::task::future(async move {
+            // Resolve in durable order, not background-task completion order.
+            // An unavailable entry never prevents the remaining files opening.
+            let opened = tokio::task::spawn_blocking(move || {
+                paths
+                    .into_iter()
+                    .map(|(path, focus)| (focus, Self::resolve_open(path)))
+                    .collect()
+            })
+            .await
+            .unwrap_or_else(|error| vec![(false, Err(error.to_string()))]);
+            Message::SessionOpened(0, opened)
+        })
+    }
+
+    fn session(&self) -> crate::preferences::Session {
+        crate::preferences::Session {
+            paths: self
+                .tabs
+                .iter()
+                .map(|tab| {
+                    tab.pending_file
+                        .as_ref()
+                        .map(|pending| tab.runtime.descriptor.worktree.join(&pending.path))
+                        .or_else(|| tab.owned_file.clone())
+                        .unwrap_or_else(|| tab.runtime.descriptor.worktree.clone())
+                })
+                .collect(),
+            active: self.tabs.iter().position(|tab| Some(tab.id) == self.active),
+        }
+    }
+
+    fn save_session(&mut self) {
+        if self.exiting || self.restoring_session || !self.settings_writable {
+            return;
+        }
+        let session = self.session();
+        if session == self.saved_session {
+            return;
+        }
+        // These ordered atomic writes run only on navigation changes, never edits.
+        // The shared writer validates the private directory without overwriting
+        // preferences another window changed.
+        let result = settings::save_merged(&self.settings_path, &self.settings, &self.settings)
+            .map_err(|error| error.to_string())
+            .and_then(|()| crate::preferences::save_session(&self.settings_path, &session));
+        match result {
+            Ok(()) => self.saved_session = session,
+            Err(error) => self.notice = Some(error),
+        }
     }
 
     fn add(&mut self, opened: Opened, focus: bool) -> Task<Message> {
@@ -463,6 +528,7 @@ impl Editor {
         };
         runtime.set_standalone(true);
         runtime.set_auto_save(self.settings.editor_auto_save);
+        runtime.set_wrap_lines(self.settings.editor_wrap_lines);
         let mut sidebar = SidebarModel::ready(
             SidebarMode::Expanded,
             vec![SidebarProject::new(
@@ -518,6 +584,8 @@ impl Editor {
             hover: None,
             lsp_status: String::new(),
             mutation: false,
+            snapshot_loading: false,
+            snapshot_refresh_pending: false,
         });
         if self.active.is_none() || (focus && !self.modal_open()) {
             self.active = Some(id);
@@ -648,6 +716,7 @@ impl Editor {
         };
         let intents = tab.runtime.take_lsp_intents();
         let autosave = repository_task(tab.runtime.auto_save_task(id));
+        let working_diff = repository_task(tab.runtime.working_diff_task(id));
         for intent in intents {
             match intent {
                 LspIntent::Open {
@@ -691,7 +760,7 @@ impl Editor {
                 LspIntent::Close => self.close_document(id),
             }
         }
-        autosave
+        Task::batch([autosave, working_diff])
     }
 
     fn close_document(&mut self, id: CardId) {
@@ -785,18 +854,37 @@ impl Editor {
         ])
     }
 
+    fn can_refresh_visible(&self) -> bool {
+        self.window_focused && !self.modal_open() && !self.exiting && self.current().is_some()
+    }
+
+    fn refresh_visible(&mut self) -> Task<Message> {
+        if !self.can_refresh_visible() {
+            return Task::none();
+        }
+        let id = self.active.unwrap();
+        let tab = self.tab_mut(id).unwrap();
+        let files = repository_task(tab.runtime.refresh_visible(id));
+        Task::batch([files, self.refresh_snapshot(id, false)])
+    }
+
     fn refresh(&mut self, id: CardId) -> Task<Message> {
         let Some(tab) = self.tab_mut(id) else {
             return Task::none();
         };
         let files = repository_task(tab.runtime.refresh_after_mutation(id));
-        Task::batch([files, self.refresh_snapshot(id)])
+        Task::batch([files, self.refresh_snapshot(id, true)])
     }
 
-    fn refresh_snapshot(&self, id: CardId) -> Task<Message> {
-        let Some(tab) = self.tab(id).filter(|tab| tab.git) else {
+    fn refresh_snapshot(&mut self, id: CardId, force: bool) -> Task<Message> {
+        let Some(tab) = self.tab_mut(id).filter(|tab| tab.git) else {
             return Task::none();
         };
+        if tab.snapshot_loading {
+            tab.snapshot_refresh_pending |= force;
+            return Task::none();
+        }
+        tab.snapshot_loading = true;
         let root = tab.runtime.descriptor.worktree.clone();
         cosmic::task::future(async move {
             let result = tokio::task::spawn_blocking(move || {
@@ -869,6 +957,24 @@ impl Application for Editor {
                 notice = Some(error);
                 FileListMode::Tree
             });
+        let saved_session =
+            crate::preferences::load_session(&flags.settings_path).unwrap_or_else(|error| {
+                notice = Some(error);
+                crate::preferences::Session::default()
+            });
+        let mut startup_paths = saved_session.startup_paths(flags.paths);
+        if startup_paths.is_empty() {
+            match std::env::current_dir() {
+                Ok(path) => startup_paths.push((path, true)),
+                Err(error) => {
+                    let error = format!("Could not open the current directory: {error}");
+                    notice = Some(match notice {
+                        Some(previous) => format!("{previous}\n{error}"),
+                        None => error,
+                    });
+                }
+            }
+        }
         let lsp = LspManager::new(settings.language_servers.clone());
         let mut app = Self {
             core,
@@ -884,15 +990,20 @@ impl Application for Editor {
             closing: None,
             close_confirmed: false,
             exiting: false,
+            window_focused: false,
             lsp,
             next_document: 1,
             file_list_mode,
+            restoring_session: !startup_paths.is_empty(),
+            saved_session,
         };
         let mut tasks = vec![app.appearance(), app.lsp_next()];
         if let Some(window) = app.core.main_window_id() {
             tasks.push(app.set_window_title("ceditor".to_owned(), window));
         }
-        tasks.extend(flags.paths.into_iter().map(|path| Self::open(path, 0)));
+        if !startup_paths.is_empty() {
+            tasks.push(Self::restore_session(startup_paths));
+        }
         (app, Task::batch(tasks))
     }
     fn core(&self) -> &Core {
@@ -910,6 +1021,18 @@ impl Application for Editor {
 
     fn update(&mut self, message: Message) -> Task<Message> {
         let previous_tabs = (self.active, self.tabs.len());
+        let was_refresh_visible = self.can_refresh_visible();
+        let navigation_changed = matches!(
+            &message,
+            Message::Opened(..)
+                | Message::SessionOpened(..)
+                | Message::FileResolved(..)
+                | Message::FileOperationFinished(..)
+                | Message::CancelClose
+                | Message::Sidebar(_)
+                | Message::Repository(RepositoryAction::BackToFiles { .. })
+                | Message::Repository(RepositoryAction::FilesLoaded { .. })
+        );
         let task = (|| {
             if let Message::Key(keyboard::Event::KeyPressed {
                 key: keyboard::Key::Named(keyboard::key::Named::Escape),
@@ -937,6 +1060,13 @@ impl Application for Editor {
                 return Task::none();
             }
             match message {
+                Message::WindowFocused(window, focused) => {
+                    if self.core.main_window_id() == Some(window) {
+                        self.window_focused = focused;
+                    }
+                    Task::none()
+                }
+                Message::RefreshVisible => self.refresh_visible(),
                 Message::FileNameChanged(name) => {
                     if let Some(dialog) = self.file_dialog.as_mut().filter(|dialog| !dialog.busy) {
                         dialog.name = name;
@@ -976,6 +1106,22 @@ impl Application for Editor {
                     self.notice = Some(error);
                     Task::none()
                 }
+                Message::SessionOpened(epoch, opened) => {
+                    self.restoring_session = false;
+                    if self.exiting {
+                        return Task::none();
+                    }
+                    let mut tasks = Vec::new();
+                    for (focus, result) in opened {
+                        match result {
+                            Ok(opened) => {
+                                tasks.push(self.add(opened, focus && epoch == self.selection_epoch))
+                            }
+                            Err(error) => self.notice = Some(error),
+                        }
+                    }
+                    Task::batch(tasks)
+                }
                 Message::Opened(epoch, Ok(opened)) => {
                     if self.exiting {
                         Task::none()
@@ -1009,6 +1155,9 @@ impl Application for Editor {
                 }
                 Message::CloseTab(id) => self.request_close(id),
                 Message::CloseWindow => {
+                    // Shutdown removes runtime tabs to honor dirty-buffer guards;
+                    // keep the user's pre-shutdown tab order and selection.
+                    self.save_session();
                     if self.file_dialog.as_ref().is_some_and(|dialog| dialog.busy) {
                         self.exiting = true;
                         return Task::none();
@@ -1057,6 +1206,15 @@ impl Application for Editor {
                     self.resume_pending_files()
                 }
                 Message::Reaped => iced::exit().map(cosmic::Action::App),
+                Message::ResolvedDiffBasis { card, basis } => {
+                    let task = self.tab_mut(card).map_or_else(Task::none, |tab| {
+                        repository_task(
+                            tab.runtime
+                                .update(RepositoryAction::ApplyDiffBasis { card, basis }),
+                        )
+                    });
+                    Task::batch([task, self.drain(card)])
+                }
                 Message::Repository(action) => {
                     let id = action.card();
                     if self.modal_open() {
@@ -1065,6 +1223,9 @@ impl Application for Editor {
                             RepositoryAction::FilesLoaded { .. }
                                 | RepositoryAction::FileLoaded { .. }
                                 | RepositoryAction::DiffLoaded { .. }
+                                | RepositoryAction::DiffBasisResolved { .. }
+                                | RepositoryAction::WorkingDiffDue { .. }
+                                | RepositoryAction::WorkingDiffLoaded { .. }
                                 | RepositoryAction::SaveFinished { .. }
                                 | RepositoryAction::AutoSaveDue { .. }
                                 | RepositoryAction::Save { .. }
@@ -1111,6 +1272,8 @@ impl Application for Editor {
                             )
                         });
                     }
+                    let basis_resolved =
+                        matches!(action, RepositoryAction::DiffBasisResolved { .. });
                     let loaded = matches!(action, RepositoryAction::FilesLoaded { .. });
                     let focus_loaded = matches!(action, RepositoryAction::FileLoaded { .. })
                         && self.active == Some(id)
@@ -1135,7 +1298,17 @@ impl Application for Editor {
                             }
                         }
                     }
-                    let mut tasks = vec![repository_task(tab.runtime.update(action))];
+                    let task = tab
+                        .runtime
+                        .update(action)
+                        .map(move |action| match action {
+                            RepositoryAction::ApplyDiffBasis { card, basis } if basis_resolved => {
+                                Message::ResolvedDiffBasis { card, basis }
+                            }
+                            action => Message::Repository(action),
+                        })
+                        .map(cosmic::Action::App);
+                    let mut tasks = vec![task];
                     if back_to_files && tab.runtime.selected_path().is_none() {
                         tab.owned_file = None;
                         tab.pending_file = None;
@@ -1159,7 +1332,10 @@ impl Application for Editor {
                         {
                             tasks.push(self.request_close(id));
                         } else if self.closing.is_none() {
-                            tasks.push(self.refresh(id));
+                            if let Some(tab) = self.tab_mut(id) {
+                                tasks.push(repository_task(tab.runtime.refresh_visible(id)));
+                            }
+                            tasks.push(self.refresh_snapshot(id, true));
                         }
                     }
                     Task::batch(tasks)
@@ -1245,6 +1421,15 @@ impl Application for Editor {
                 }
                 Message::Snapshot(id, result) => {
                     if let Some(tab) = self.tab_mut(id) {
+                        if !tab.snapshot_loading {
+                            return Task::none();
+                        }
+                        tab.snapshot_loading = false;
+                        if std::mem::take(&mut tab.snapshot_refresh_pending) {
+                            // A mutation completed during this read. Discard its
+                            // stale result and run exactly one fresh snapshot.
+                            return self.refresh_snapshot(id, false);
+                        }
                         match result {
                             Ok(snapshot) => {
                                 if let Some(key) = tab.navigation.active_worktree().cloned() {
@@ -1309,6 +1494,13 @@ impl Application for Editor {
                         .collect();
                     tasks.push(self.save_settings());
                     Task::batch(tasks)
+                }
+                Message::WrapLines(enabled) => {
+                    self.settings.editor_wrap_lines = enabled;
+                    for tab in &mut self.tabs {
+                        tab.runtime.set_wrap_lines(enabled);
+                    }
+                    self.save_settings()
                 }
                 Message::Theme(theme) => {
                     self.settings.app_theme = theme;
@@ -1445,19 +1637,45 @@ impl Application for Editor {
                 Message::Key(_) => Task::none(),
             }
         })();
-        if previous_tabs != (self.active, self.tabs.len()) {
-            Task::batch([task, self.reveal_active_tab()])
-        } else {
-            task
+        if navigation_changed || previous_tabs != (self.active, self.tabs.len()) {
+            self.save_session();
         }
+        let tabs_changed = previous_tabs != (self.active, self.tabs.len());
+        let refresh =
+            self.can_refresh_visible() && (previous_tabs.0 != self.active || !was_refresh_visible);
+        Task::batch([
+            task,
+            if tabs_changed {
+                self.reveal_active_tab()
+            } else {
+                Task::none()
+            },
+            if refresh {
+                self.refresh_visible()
+            } else {
+                Task::none()
+            },
+        ])
     }
 
     fn subscription(&self) -> Subscription<Message> {
-        iced::event::listen_with(|event, _, _| match event {
+        let events = iced::event::listen_with(|event, _, window| match event {
             iced::Event::Keyboard(event) => Some(Message::Key(event)),
             iced::Event::Window(window::Event::CloseRequested) => Some(Message::CloseWindow),
+            iced::Event::Window(window::Event::Focused) => {
+                Some(Message::WindowFocused(window, true))
+            }
+            iced::Event::Window(window::Event::Unfocused) => {
+                Some(Message::WindowFocused(window, false))
+            }
             _ => None,
-        })
+        });
+        let refresh = if self.can_refresh_visible() {
+            iced::time::every(std::time::Duration::from_secs(10)).map(|_| Message::RefreshVisible)
+        } else {
+            Subscription::none()
+        };
+        Subscription::batch([events, refresh])
     }
 
     fn header_start(&self) -> Vec<Element<'_, Message>> {
@@ -1507,12 +1725,21 @@ impl Application for Editor {
                     widget::row::with_children(vec![
                         cagents::interaction::tooltip(
                             widget::button::custom(
-                                widget::text::body(title.clone())
-                                    .wrapping(iced::widget::text::Wrapping::None)
-                                    .ellipsize(iced::widget::text::Ellipsize::End(
-                                        iced::advanced::text::EllipsizeHeightLimit::Lines(1),
-                                    ))
-                                    .width(Length::Fill),
+                                widget::row::with_children(vec![
+                                    widget::icon(cagents::ui_controls::ceditor_icon())
+                                        .size(16)
+                                        .into(),
+                                    widget::text::body(title.clone())
+                                        .wrapping(iced::widget::text::Wrapping::None)
+                                        .ellipsize(iced::widget::text::Ellipsize::End(
+                                            iced::advanced::text::EllipsizeHeightLimit::Lines(1),
+                                        ))
+                                        .width(Length::Fill)
+                                        .into(),
+                                ])
+                                .spacing(8)
+                                .align_y(iced::Alignment::Center)
+                                .width(Length::Fill),
                             )
                             .name(title.clone())
                             .class(tab_title_style())
@@ -1547,11 +1774,6 @@ impl Application for Editor {
                                     .into(),
                             )
                         }),
-                        border: iced::Border {
-                            color: theme.current_container().component.divider.into(),
-                            width: design::BORDER_WIDTH,
-                            ..Default::default()
-                        },
                         ..Default::default()
                     }
                 }))
@@ -1564,7 +1786,7 @@ impl Application for Editor {
                 widget::scrollable(widget::row::with_children(tabs).spacing(0))
                     .id(widget::Id::new("ceditor.tabs"))
                     .direction(iced::widget::scrollable::Direction::Horizontal(
-                        Default::default(),
+                        cagents::design::scrollbar(),
                     ))
                     .width(Length::Fill)
                     .into(),
@@ -1594,33 +1816,39 @@ impl Application for Editor {
                 toolbar_controls.push(toolbar.map(Message::Repository));
             }
             if tab.runtime.lsp_document().is_some() {
-                toolbar_controls.extend([
-                    icon_control(
-                        widget::icon::from_name("insert-text-symbolic").handle(),
-                        "Complete (Ctrl+Space)",
-                        false,
-                        !self.modal_open(),
-                        Some(Message::Complete),
-                    )
+                toolbar_controls.push(
+                    widget::row::with_children(vec![
+                        icon_control(
+                            widget::icon::from_name("insert-text-symbolic").handle(),
+                            "Complete (Ctrl+Space)",
+                            false,
+                            !self.modal_open(),
+                            Some(Message::Complete),
+                        )
+                        .into(),
+                        icon_control(
+                            widget::icon::from_name("dialog-information-symbolic").handle(),
+                            "Show symbol information",
+                            false,
+                            !self.modal_open(),
+                            Some(Message::Hover),
+                        )
+                        .into(),
+                    ])
+                    .spacing(2)
+                    .align_y(iced::Alignment::Center)
                     .into(),
-                    icon_control(
-                        widget::icon::from_name("dialog-information-symbolic").handle(),
-                        "Show symbol information",
-                        false,
-                        !self.modal_open(),
-                        Some(Message::Hover),
-                    )
-                    .into(),
-                ]);
+                );
             }
             if !toolbar_controls.is_empty() {
                 editor.push(
                     widget::container(
                         widget::row::with_children(toolbar_controls)
+                            .spacing(8)
                             .align_y(iced::Alignment::Center)
                             .width(Length::Fill),
                     )
-                    .padding([2, 8])
+                    .padding([8, 12])
                     .width(Length::Fill)
                     .into(),
                 );
@@ -1660,6 +1888,9 @@ impl Application for Editor {
                 }
                 editor.push(
                     widget::scrollable(widget::column::with_children(results).spacing(4))
+                        .direction(iced::widget::scrollable::Direction::Vertical(
+                            cagents::design::scrollbar(),
+                        ))
                         .height(150)
                         .into(),
                 );
@@ -1793,14 +2024,84 @@ impl Application for Editor {
         if !self.settings_open {
             return None;
         }
-        Some(cagents::interaction::opaque(widget::container(widget::column::with_children(vec![
-            widget::text::title3("Editor settings").into(),
-            widget::checkbox(self.settings.editor_auto_save).label("Autosave after editing").on_toggle(Message::AutoSave).into(),
-            widget::row::with_children(vec![widget::button::standard("System theme").on_press(Message::Theme(AppTheme::System)).into(), widget::button::standard("Light").on_press(Message::Theme(AppTheme::Light)).into(), widget::button::standard("Dark").on_press(Message::Theme(AppTheme::Dark)).into()]).spacing(8).into(),
-            widget::row::with_children(vec![widget::button::standard("Smaller UI").on_press(Message::Scale((self.settings.ui_scale - 0.1).max(0.75))).into(), widget::text::body(format!("{:.0}%", self.settings.ui_scale * 100.0)).into(), widget::button::standard("Larger UI").on_press(Message::Scale((self.settings.ui_scale + 0.1).min(2.0))).into()]).spacing(8).into(),
-            widget::text::body(format!("Language servers and preferences: {}\nEdit language_servers in this file and restart ceditor to apply server changes.", self.settings_path.display())).into(),
-            widget::button::suggested("Done").on_press(Message::Settings).into(),
-        ]).spacing(16)).class(cosmic::theme::Container::Dialog(false)).padding(24).width(600)))
+        let theme_choices = [
+            ("System", AppTheme::System),
+            ("Light", AppTheme::Light),
+            ("Dark", AppTheme::Dark),
+        ]
+        .into_iter()
+        .map(|(label, theme)| {
+            let selected = self.settings.app_theme == theme;
+            widget::button::text(label)
+                .class(sidebar::sidebar_button_style(selected))
+                .selected(selected)
+                .width(Length::Fill)
+                .on_press(Message::Theme(theme))
+                .into()
+        })
+        .collect();
+        let content = widget::column::with_children(vec![
+            widget::text::title4("Editing").into(),
+            widget::toggler(self.settings.editor_auto_save)
+                .label("Save files automatically".to_owned())
+                .on_toggle(Message::AutoSave)
+                .into(),
+            widget::text::caption("Save after a pause. Conflicts and save errors still require your attention.")
+                .wrapping(iced::widget::text::Wrapping::Word)
+                .into(),
+            widget::toggler(self.settings.editor_wrap_lines)
+                .label("Wrap long lines".to_owned())
+                .on_toggle(Message::WrapLines)
+                .into(),
+            widget::text::caption("Fit long lines to the editor width. Off keeps each line on one row.")
+                .wrapping(iced::widget::text::Wrapping::Word)
+                .into(),
+            widget::text::title4("Appearance").into(),
+            widget::text::body("Color scheme").into(),
+            widget::row::with_children(theme_choices).spacing(8).into(),
+            widget::row::with_children(vec![
+                widget::text::body("Interface scale").width(Length::Fill).into(),
+                widget::button::text("Smaller")
+                    .on_press_maybe((self.settings.ui_scale > 0.75).then_some(
+                        Message::Scale((self.settings.ui_scale - 0.1).max(0.75)),
+                    ))
+                    .into(),
+                widget::text::body(format!("{:.0}%", self.settings.ui_scale * 100.0)).into(),
+                widget::button::text("Larger")
+                    .on_press_maybe((self.settings.ui_scale < 2.0).then_some(
+                        Message::Scale((self.settings.ui_scale + 0.1).min(2.0)),
+                    ))
+                    .into(),
+            ]).spacing(12).align_y(iced::Alignment::Center).into(),
+            widget::text::title4("Language servers").into(),
+            widget::text::caption("Edit language_servers in the preferences file, then restart ceditor to apply server changes.")
+                .wrapping(iced::widget::text::Wrapping::Word)
+                .into(),
+            widget::text::caption(self.settings_path.to_string_lossy())
+                .wrapping(iced::widget::text::Wrapping::WordOrGlyph)
+                .into(),
+        ]).spacing(12).width(Length::Fill);
+        Some(cagents::interaction::opaque(
+            widget::container(widget::column::with_children(vec![
+                widget::text::title3("Editor settings").into(),
+                widget::text::caption(if self.settings_writable {
+                    "Changes apply immediately and save automatically."
+                } else {
+                    "Changes apply now, but cannot be saved until the preferences file is repaired."
+                }).wrapping(iced::widget::text::Wrapping::Word).into(),
+                widget::scrollable(content)
+                    .direction(iced::widget::scrollable::Direction::Vertical(cagents::design::scrollbar()))
+                    .height(Length::Shrink).into(),
+                widget::row::with_children(vec![
+                    iced::widget::Space::new().width(Length::Fill).into(),
+                    widget::button::suggested("Done").on_press(Message::Settings).into(),
+                ]).into(),
+            ]).spacing(20))
+                .class(cosmic::theme::Container::Dialog(false))
+                .padding(24)
+                .width(560)
+                .max_height(680),
+        ))
     }
 }
 
@@ -1824,10 +2125,120 @@ mod tests {
             closing: None,
             close_confirmed: false,
             exiting: false,
+            window_focused: false,
             lsp: LspManager::new(Vec::new()),
             next_document: 1,
             file_list_mode: FileListMode::Tree,
+            restoring_session: false,
+            saved_session: crate::preferences::Session::default(),
         }
+    }
+
+    #[test]
+    fn mutation_refresh_discards_superseded_snapshot_results() {
+        let mut app = editor();
+        let id = add(&mut app, "/workspace", None);
+        app.tab_mut(id).unwrap().git = true;
+        drop(app.refresh_snapshot(id, false));
+        drop(app.refresh_snapshot(id, true));
+        drop(app.refresh_snapshot(id, true));
+
+        // The old read must not publish even an error after a mutation has
+        // requested a replacement.
+        drop(app.update(Message::Snapshot(id, Err("superseded".into()))));
+        assert!(app.notice.is_none());
+        drop(app.update(Message::Snapshot(id, Err("current".into()))));
+        assert_eq!(app.notice.as_deref(), Some("current"));
+
+        // Several forced requests coalesce to one replacement, not a queue
+        // that can keep publishing results after that replacement completes.
+        drop(app.update(Message::Snapshot(id, Err("unexpected".into()))));
+        assert_eq!(app.notice.as_deref(), Some("current"));
+    }
+
+    #[test]
+    fn restoring_tabs_skips_missing_files_without_losing_order_or_selection() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let first = root.join("z.txt");
+        let last = root.join("a.txt");
+        std::fs::write(&first, "first").unwrap();
+        std::fs::write(&last, "last").unwrap();
+        let session = crate::preferences::Session {
+            paths: vec![first.clone(), root.join("missing.txt"), last.clone()],
+            active: Some(2),
+        };
+        let opened = session
+            .startup_paths(Vec::new())
+            .into_iter()
+            .map(|(path, focus)| (focus, Editor::resolve_open(path)))
+            .collect();
+        let mut app = editor();
+        app.restoring_session = true;
+        drop(app.update(Message::SessionOpened(0, opened)));
+        assert_eq!(
+            app.session(),
+            crate::preferences::Session {
+                paths: vec![first, last],
+                active: Some(1),
+            }
+        );
+    }
+
+    #[test]
+    fn explicit_startup_file_is_selected_without_duplicating_a_restored_tab() {
+        let mut app = editor();
+        let opened = |file: &str| {
+            Ok(Opened {
+                root: "/workspace".into(),
+                file: Some(file.into()),
+                snapshot: None,
+            })
+        };
+        drop(app.update(Message::SessionOpened(
+            0,
+            vec![
+                (false, opened("a.rs")),
+                (false, opened("b.rs")),
+                (true, opened("a.rs")),
+            ],
+        )));
+        assert_eq!(
+            app.session(),
+            crate::preferences::Session {
+                paths: vec!["/workspace/a.rs".into(), "/workspace/b.rs".into()],
+                active: Some(0),
+            }
+        );
+    }
+
+    #[test]
+    fn window_shutdown_keeps_tabs_but_individual_close_removes_them_from_session() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut app = editor();
+        app.settings_path = directory.path().join("settings.toml");
+        app.settings_writable = true;
+        let first = add(&mut app, "/workspace", Some("a.rs"));
+        let second = add(&mut app, "/workspace", Some("b.rs"));
+        drop(app.update(Message::Select(first)));
+        let initial = crate::preferences::load_session(&app.settings_path).unwrap();
+        assert_eq!(
+            initial.paths,
+            vec![
+                PathBuf::from("/workspace/a.rs"),
+                PathBuf::from("/workspace/b.rs")
+            ]
+        );
+        drop(app.update(Message::CloseTab(second)));
+        let remaining = crate::preferences::load_session(&app.settings_path).unwrap();
+        assert_eq!(remaining.paths, vec![PathBuf::from("/workspace/a.rs")]);
+        assert_eq!(remaining.active, Some(0));
+        drop(app.update(Message::CloseWindow));
+        assert!(app.tabs.is_empty());
+        assert_eq!(
+            crate::preferences::load_session(&app.settings_path).unwrap(),
+            remaining
+        );
     }
 
     #[test]

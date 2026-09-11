@@ -84,6 +84,9 @@ impl Cagents {
         Some(
             widget::container(
                 widget::scrollable(widget::column::with_children(rows).spacing(8).padding(12))
+                    .direction(cosmic::iced::widget::scrollable::Direction::Vertical(
+                        crate::design::scrollbar(),
+                    ))
                     .height(Length::Shrink),
             )
             .max_height(320)
@@ -145,6 +148,9 @@ impl Runtime {
                     .spacing(16)
                     .width(Length::Fill),
             )
+            .direction(iced::widget::scrollable::Direction::Vertical(
+                design::scrollbar(),
+            ))
             .id(card_control_id(target.card, "chat-transcript"))
             .anchor_bottom()
             .height(Length::Fill)
@@ -209,16 +215,23 @@ impl Runtime {
         // No action is synthesized from a default, a timeout, or closing a pane.
         if !snapshot.requests.is_empty() {
             content.push(
-                widget::container(widget::scrollable(
-                    widget::column::with_children(
-                        snapshot
-                            .requests
-                            .iter()
-                            .map(|request| self.request_view(request, available))
-                            .collect::<Vec<_>>(),
+                widget::container(
+                    widget::scrollable(
+                        widget::column::with_children(
+                            snapshot
+                                .requests
+                                .iter()
+                                .map(|request| self.request_view(request, available))
+                                .collect::<Vec<_>>(),
+                        )
+                        .spacing(12),
                     )
-                    .spacing(12),
-                ))
+                    .direction(
+                        cosmic::iced::widget::scrollable::Direction::Vertical(
+                            crate::design::scrollbar(),
+                        ),
+                    ),
+                )
                 .max_height(260)
                 .into(),
             );
@@ -343,9 +356,12 @@ impl Runtime {
                 .collect::<Vec<Element<'_, Message>>>();
             if !commands.is_empty() {
                 content.push(
-                    widget::container(widget::scrollable(
-                        widget::column::with_children(commands).spacing(0),
-                    ))
+                    widget::container(
+                        widget::scrollable(widget::column::with_children(commands).spacing(0))
+                            .direction(cosmic::iced::widget::scrollable::Direction::Vertical(
+                                crate::design::scrollbar(),
+                            )),
+                    )
                     .max_height(120)
                     .into(),
                 );
@@ -379,11 +395,13 @@ impl Runtime {
                 .into(),
         ];
         content.push(if transitioning {
-            widget::container(widget::scrollable(body(draft.clone())))
-                .height(104)
-                .width(Length::Fill)
-                .padding(8)
-                .into()
+            widget::container(widget::scrollable(body(draft.clone())).direction(
+                cosmic::iced::widget::scrollable::Direction::Vertical(crate::design::scrollbar()),
+            ))
+            .height(104)
+            .width(Length::Fill)
+            .padding(8)
+            .into()
         } else {
             iced::widget::text_editor::TextEditor::new(&self.composer)
                 .id(card_control_id(target.card, "chat-composer"))

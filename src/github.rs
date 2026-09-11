@@ -8,10 +8,7 @@ use std::{
     collections::{BTreeMap, HashMap},
     ffi::OsString,
     path::{Path, PathBuf},
-    sync::{
-        Arc, Condvar, LazyLock, Mutex, MutexGuard,
-        atomic::{AtomicUsize, Ordering},
-    },
+    sync::{Arc, Condvar, LazyLock, Mutex, MutexGuard},
     thread,
     time::{Duration, Instant},
 };
@@ -28,17 +25,10 @@ use crate::repository::{
 #[cfg(feature = "ui")]
 pub mod avatar;
 
-const PR_LIST_FIELDS: &str = "number,title,state,isDraft,headRefName,headRefOid,baseRefName,author,updatedAt,url,mergeable,mergeStateStatus,reviewDecision,labels";
-const PR_VIEW_FIELDS: &str = "number,title,body,state,isDraft,headRefName,headRefOid,baseRefName,author,createdAt,updatedAt,url,mergeable,mergeStateStatus,reviewDecision,labels,additions,deletions,changedFiles";
+const PR_LIST_FIELDS: &str = "number,title,state,isDraft,headRefName,headRefOid,baseRefName,author,updatedAt,url,mergeable,mergeStateStatus,reviewDecision,labels,statusCheckRollup";
+const PR_VIEW_FIELDS: &str = "number,title,body,state,isDraft,headRefName,headRefOid,baseRefName,author,createdAt,updatedAt,url,mergeable,mergeStateStatus,reviewDecision,labels,additions,deletions,changedFiles,statusCheckRollup";
 const PR_CHECK_FIELDS: &str =
     "bucket,completedAt,description,event,link,name,startedAt,state,workflow";
-
-/// How many `gh pr checks` invocations one refresh may have in flight.
-///
-/// Each one is a network round trip, and a refresh needs one per open pull
-/// request, so running them serially made refresh latency scale with the pull
-/// request count.
-const CHECK_CONCURRENCY: usize = 6;
 
 /// How many may be in flight across the whole process.
 ///
@@ -62,6 +52,8 @@ const CHECKS_CACHE_TTL: Duration = Duration::from_secs(30);
 /// refresh, so an instance-local cache would never see a second lookup.
 static CHECKS_CACHE: LazyLock<Mutex<HashMap<ChecksCacheKey, CachedChecks>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
+static CHECKS_FLIGHTS: LazyLock<Mutex<HashMap<ChecksCacheKey, Arc<Mutex<()>>>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
 
 /// Permits shared by every concurrent refresh; see [`CHECK_PROCESS_CONCURRENCY`].
 static CHECK_PERMITS: LazyLock<CheckPermits> =
@@ -73,10 +65,12 @@ struct ChecksCacheKey {
     /// `gh` reports this for every pull request it lists, and it changes whenever
     /// the pull request record does, so it is the version half of the key.
     updated_at: String,
+    head_oid: String,
 }
 
 #[derive(Debug, Clone)]
 struct CachedChecks {
+    ttl: Duration,
     fetched_at: Instant,
     checks: Vec<PullRequestCheck>,
 }
@@ -314,6 +308,104 @@ pub struct PullRequest {
     pub deletions: Option<u64>,
     #[serde(default)]
     pub changed_files: Option<u64>,
+    #[serde(default)]
+    pub status_check_rollup: Option<Vec<PullRequestCheckRollup>>,
+}
+
+/// The two real GraphQL check variants returned in `gh pr list`'s rollup.
+/// Keep conclusions distinct from execution status so a completed failure
+/// cannot accidentally become a passing check.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "__typename")]
+pub enum PullRequestCheckRollup {
+    #[serde(rename_all = "camelCase")]
+    CheckRun {
+        name: String,
+        status: RemoteValue,
+        #[serde(default)]
+        conclusion: Option<RemoteValue>,
+        #[serde(default)]
+        details_url: Option<String>,
+        #[serde(default)]
+        started_at: Option<String>,
+        #[serde(default)]
+        completed_at: Option<String>,
+    },
+    #[serde(rename_all = "camelCase")]
+    StatusContext {
+        context: String,
+        state: RemoteValue,
+        #[serde(default)]
+        target_url: Option<String>,
+        #[serde(default)]
+        created_at: Option<String>,
+    },
+}
+
+impl PullRequest {
+    /// Local projection only: the list response already contains every check.
+    /// Detailed workflow/description data remains an inspector-only request.
+    pub fn check_summaries(&self) -> Vec<PullRequestCheck> {
+        self.status_check_rollup
+            .as_deref()
+            .unwrap_or_default()
+            .iter()
+            .map(|check| {
+                let (name, state, link, started_at, completed_at) = match check {
+                    PullRequestCheckRollup::CheckRun {
+                        name,
+                        status,
+                        conclusion,
+                        details_url,
+                        started_at,
+                        completed_at,
+                    } => (
+                        name,
+                        if status.0 == "COMPLETED" {
+                            conclusion
+                                .as_ref()
+                                .filter(|value| !value.0.is_empty())
+                                .unwrap_or(status)
+                        } else {
+                            status
+                        },
+                        details_url,
+                        started_at.clone(),
+                        completed_at.clone(),
+                    ),
+                    PullRequestCheckRollup::StatusContext {
+                        context,
+                        state,
+                        target_url,
+                        created_at,
+                    } => (context, state, target_url, created_at.clone(), None),
+                };
+                let bucket = match state.0.as_str() {
+                    "SUCCESS" | "NEUTRAL" | "SKIPPED" => "pass",
+                    "FAILURE" | "ERROR" | "CANCELLED" | "TIMED_OUT" | "ACTION_REQUIRED"
+                    | "STARTUP_FAILURE" | "STALE" => "fail",
+                    "PENDING" | "EXPECTED" | "QUEUED" | "IN_PROGRESS" | "WAITING" | "REQUESTED" => {
+                        "pending"
+                    }
+                    _ => "unknown",
+                };
+                PullRequestCheck {
+                    bucket: RemoteValue(bucket.into()),
+                    completed_at,
+                    description: String::new(),
+                    event: String::new(),
+                    link: link
+                        .as_deref()
+                        .and_then(|link| Url::parse(link).ok())
+                        .unwrap_or_else(|| self.url.clone()),
+                    name: name.clone(),
+                    started_at,
+                    state: state.clone(),
+                    workflow: String::new(),
+                }
+            })
+            .collect()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -880,49 +972,60 @@ impl<E: ProcessExecutor> GitHubService<E> {
         Ok(pull_request)
     }
 
-    /// Resolves the current branch, not a cached project-wide PR presentation row.
-    /// An ambiguous branch (for example two forks using the same name) must not
-    /// silently inspect somebody else's pull request.
-    pub fn inspect_branch(
+    pub fn invalidate_checks(repository: &GitHubRepoKey, number: u64) {
+        lock_checks_cache().retain(|key, _| {
+            key.pull_request.repository != *repository || key.pull_request.number != number
+        });
+    }
+
+    /// Resolve branch identity before fetching auxiliary checks and discussion.
+    /// Ambiguous fork branches must never borrow another pull request's facts.
+    pub fn resolve_branch(
         &self,
         repository: &GitHubRepoKey,
         branch: &str,
         head_oid: Option<&str>,
         cancellation: &CancellationToken,
-    ) -> Result<Option<PullRequestInspection>, GitHubError> {
-        if self.auth_status(repository, cancellation)?.state != GhAuthState::Authenticated {
-            return Err(GitHubError::NoActiveAccount(repository.authority()));
-        }
+    ) -> Result<Option<PullRequest>, GitHubError> {
         let mut command = self.list_command(&ListPullRequestsRequest {
             repository: repository.clone(),
             state: PullRequestStateFilter::All,
             limit: 100,
         });
+        // pr list supports the detail fields: one request supplies the initial UI.
+        // The repository selection already established authentication, and the
+        // real request still reports revoked credentials through run_checked.
+        *command.arguments.last_mut().expect("JSON fields argument") = PR_VIEW_FIELDS.into();
         command
             .arguments
             .extend([OsString::from("--head"), branch.into()]);
         let output = self.run_checked(&command, repository, cancellation)?;
         let candidates =
             attach_process(parse_pull_request_list(&output.stdout, repository), &output)?;
-        let Some(candidate) = select_branch_pull_request(&candidates, branch, head_oid)? else {
-            return Ok(None);
-        };
-        let key = PullRequestKey::new(repository.clone(), candidate.number)?;
-        let pull_request = self.view(&key, cancellation)?;
-        if pull_request.head_ref_name != branch
-            || pull_request.head_ref_oid != candidate.head_ref_oid
-        {
-            return Err(GitHubError::Inspection(
-                "The pull request head changed while loading. Refresh to retry.".into(),
-            ));
-        }
-        let checks = match self.checks(&key, cancellation) {
-            Ok(checks) | Err(GitHubError::ChecksPending { checks, .. }) => Ok(checks),
-            Err(error) => Err(error.to_string()),
-        };
-        let conversation = self
-            .conversation(&key, cancellation)
-            .map_err(|error| error.to_string());
+        Ok(select_branch_pull_request(&candidates, branch, head_oid)?.cloned())
+    }
+
+    pub fn inspect_pull_request(
+        &self,
+        repository: &GitHubRepoKey,
+        pull_request: PullRequest,
+        cancellation: &CancellationToken,
+    ) -> Result<PullRequestInspection, GitHubError> {
+        let key = PullRequestKey::new(repository.clone(), pull_request.number)?;
+        let (checks, conversation) = thread::scope(|scope| {
+            let checks =
+                scope.spawn(|| self.cached_checks(repository, &pull_request, cancellation));
+            let conversation = self
+                .conversation(&key, cancellation)
+                .map_err(|error| error.to_string());
+            (
+                checks
+                    .join()
+                    .unwrap_or_else(|_| Err("Checks worker failed.".into())),
+                conversation,
+            )
+        });
+        // Do not attach checks fetched across a remote HEAD transition.
         let latest = self.view(&key, cancellation)?;
         if latest.head_ref_oid != pull_request.head_ref_oid
             || latest.head_ref_name != pull_request.head_ref_name
@@ -931,11 +1034,11 @@ impl<E: ProcessExecutor> GitHubService<E> {
                 "The pull request head changed while loading. Refresh to retry.".into(),
             ));
         }
-        Ok(Some(PullRequestInspection {
+        Ok(PullRequestInspection {
             pull_request: latest,
             checks,
             conversation,
-        }))
+        })
     }
 
     fn graphql(
@@ -1084,118 +1187,65 @@ impl<E: ProcessExecutor> GitHubService<E> {
         }
     }
 
-    /// Fetches the checks of every pull request in `pull_requests`, all of which
-    /// must belong to `repository`.
-    ///
-    /// Results keep the order of the input, and a pull request whose checks could
-    /// not be fetched yields an empty list — exactly what a caller asking one
-    /// pull request at a time observes. Two things make this cheaper than that
-    /// serial loop: a completed result is reused while the pull request is
-    /// unchanged and the result is fresh, and the remaining fetches run
-    /// concurrently up to [`CHECK_CONCURRENCY`].
-    pub fn checks_for_pull_requests(
+    /// Inspector refreshes share a versioned cache and a per-key in-flight lock.
+    /// Failed/cancelled results are never cached. Expiry covers rerun workflows
+    /// that change checks without changing updatedAt or the head commit.
+    fn cached_checks(
         &self,
         repository: &GitHubRepoKey,
-        pull_requests: &[PullRequest],
+        pr: &PullRequest,
         cancellation: &CancellationToken,
-    ) -> Vec<Vec<PullRequestCheck>> {
-        let keys = pull_requests
-            .iter()
-            .map(|pull_request| ChecksCacheKey {
-                pull_request: PullRequestKey {
-                    repository: repository.clone(),
-                    number: pull_request.number,
-                },
-                updated_at: pull_request.updated_at.clone(),
-            })
-            .collect::<Vec<_>>();
-        let mut results = vec![Vec::new(); pull_requests.len()];
-        let mut missing = Vec::new();
+    ) -> Result<Vec<PullRequestCheck>, String> {
+        let key = ChecksCacheKey {
+            pull_request: PullRequestKey {
+                repository: repository.clone(),
+                number: pr.number,
+            },
+            updated_at: pr.updated_at.clone(),
+            head_oid: pr.head_ref_oid.clone(),
+        };
+        let flight = {
+            let mut flights = CHECKS_FLIGHTS
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            flights.retain(|_, flight| Arc::strong_count(flight) > 1);
+            flights
+                .entry(key.clone())
+                .or_insert_with(|| Arc::new(Mutex::new(())))
+                .clone()
+        };
+        let _flight = flight.lock().unwrap_or_else(|error| error.into_inner());
+        if cancellation.is_cancelled() {
+            return Err("Checks request cancelled.".into());
+        }
         {
             let now = Instant::now();
             let mut cache = lock_checks_cache();
-            // Two rules bound the cache. An entry expires, which is what keeps a
-            // repository nobody refreshes any more from living forever; and a new
-            // version of a pull request supersedes the entry cached for the old
-            // one. Eviction is deliberately not scoped to "everything for this
-            // repository that the caller did not list", because that would make a
-            // caller refreshing a single pull request wipe the rest.
-            let versions = keys
-                .iter()
-                .map(|key| (&key.pull_request, &key.updated_at))
-                .collect::<HashMap<_, _>>();
-            cache.retain(|key, entry| {
-                now.duration_since(entry.fetched_at) < CHECKS_CACHE_TTL
-                    && versions
-                        .get(&key.pull_request)
-                        .is_none_or(|updated_at| **updated_at == key.updated_at)
+            cache.retain(|cached_key, entry| {
+                now.duration_since(entry.fetched_at) < entry.ttl
+                    && (cached_key.pull_request != key.pull_request || cached_key == &key)
             });
-            for (index, key) in keys.iter().enumerate() {
-                match cache.get(key) {
-                    Some(entry) => results[index] = entry.checks.clone(),
-                    None => missing.push(index),
-                }
+            if let Some(entry) = cache.get(&key) {
+                return Ok(entry.checks.clone());
             }
         }
-        if missing.is_empty() {
-            return results;
+        let _permit = CHECK_PERMITS.acquire();
+        let (checks, ttl) = match self.checks(&key.pull_request, cancellation) {
+            Ok(checks) => (checks, CHECKS_CACHE_TTL),
+            Err(GitHubError::ChecksPending { checks, .. }) => (checks, Duration::from_secs(2)),
+            Err(error) => return Err(error.to_string()),
+        };
+        if !cancellation.is_cancelled() {
+            lock_checks_cache().insert(
+                key,
+                CachedChecks {
+                    fetched_at: Instant::now(),
+                    ttl,
+                    checks: checks.clone(),
+                },
+            );
         }
-
-        let next = AtomicUsize::new(0);
-        let fetched = Mutex::new(Vec::with_capacity(missing.len()));
-        thread::scope(|scope| {
-            for _ in 0..CHECK_CONCURRENCY.min(missing.len()) {
-                scope.spawn(|| {
-                    loop {
-                        let position = next.fetch_add(1, Ordering::Relaxed);
-                        let Some(&index) = missing.get(position) else {
-                            break;
-                        };
-                        // The executor already fails a cancelled command before
-                        // launch; stopping here only avoids the pointless spawn.
-                        if cancellation.is_cancelled() {
-                            break;
-                        }
-                        let (checks, complete) = {
-                            // Held only around the subprocess, so a refresh
-                            // waiting for a permit holds no other resource.
-                            let _permit = CHECK_PERMITS.acquire();
-                            match self.checks(&keys[index].pull_request, cancellation) {
-                                Ok(checks) => (checks, true),
-                                // Pending checks are worth showing, but caching
-                                // them would pin the display to a state that
-                                // changes without the pull request changing.
-                                Err(GitHubError::ChecksPending { checks, .. }) => (checks, false),
-                                Err(_) => (Vec::new(), false),
-                            }
-                        };
-                        fetched
-                            .lock()
-                            .unwrap_or_else(|poisoned| poisoned.into_inner())
-                            .push((index, checks, complete));
-                    }
-                });
-            }
-        });
-
-        let fetched_at = Instant::now();
-        let mut cache = lock_checks_cache();
-        for (index, checks, complete) in fetched
-            .into_inner()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-        {
-            if complete {
-                cache.insert(
-                    keys[index].clone(),
-                    CachedChecks {
-                        fetched_at,
-                        checks: checks.clone(),
-                    },
-                );
-            }
-            results[index] = checks;
-        }
-        results
+        Ok(checks)
     }
 
     pub fn create(
@@ -1641,6 +1691,30 @@ mod tests {
         let pull_requests = parse_pull_request_list(output, &repository()).unwrap();
         assert_eq!(pull_requests[0].state.0, "FUTURE_STATE");
         assert_eq!(pull_requests[0].mergeable.as_ref().unwrap().0, "FUTURE");
+    }
+
+    #[test]
+    fn rollup_preserves_running_completed_failures_and_legacy_statuses() {
+        let output = br#"[{"number":7,"title":"Title","state":"OPEN","headRefName":"feature","baseRefName":"main","updatedAt":"now","url":"https://github.com/owner/repo/pull/7","statusCheckRollup":[
+            {"__typename":"CheckRun","name":"running","status":"IN_PROGRESS","conclusion":"SUCCESS","detailsUrl":""},
+            {"__typename":"CheckRun","name":"failed","status":"COMPLETED","conclusion":"FAILURE","detailsUrl":null},
+            {"__typename":"StatusContext","context":"legacy","state":"SUCCESS","targetUrl":"https://ci.example/check/1"}
+        ]}]"#;
+        let prs = parse_pull_request_list(output, &repository()).unwrap();
+        let checks = prs[0].check_summaries();
+        assert_eq!(
+            checks
+                .iter()
+                .map(|check| (check.name.as_str(), check.bucket.0.as_str()))
+                .collect::<Vec<_>>(),
+            vec![
+                ("running", "pending"),
+                ("failed", "fail"),
+                ("legacy", "pass")
+            ]
+        );
+        assert_eq!(checks[0].link, prs[0].url);
+        assert_eq!(checks[2].link.as_str(), "https://ci.example/check/1");
     }
 
     #[test]

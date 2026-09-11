@@ -35,7 +35,8 @@ use crate::{
 /// Version 7 adds PTY-owner-checked terminal close decisions.
 /// Version 8 adds durable upgrade preparation and restored source linkage.
 /// Version 9 adds read-only conversation preview and explicit bound activation.
-pub const PROTOCOL_VERSION: u16 = 9;
+/// Version 10 adds intentional exits, transient native environments and host-owned CLI returns.
+pub const PROTOCOL_VERSION: u16 = 10;
 /// Postcard encodes an 80x24 grid in roughly 20 KiB and a typical single-row
 /// delta in a few hundred bytes, but a full repaint of a very large grid after
 /// a resize still has to fit, so keep generous headroom.
@@ -70,6 +71,16 @@ pub struct ClientEnvelope {
     pub request_id: u64,
     pub proof: Option<HostSessionProof>,
     pub request: ClientRequest,
+}
+
+/// Transport-only execution settings; never embed this in a durable session.
+#[derive(Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct ChatExecutionEnvironment(pub std::collections::BTreeMap<String, String>);
+
+impl std::fmt::Debug for ChatExecutionEnvironment {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("ChatExecutionEnvironment(<redacted>)")
+    }
 }
 
 // Boxing the large payload would change this public wire type's construction and
@@ -158,6 +169,7 @@ pub enum ClientRequest {
         session: crate::chat::Session,
         source: Option<HostSessionProof>,
         terminate_source: bool,
+        execution_environment: ChatExecutionEnvironment,
     },
     ChatAttach {
         session: crate::chat::Session,
@@ -213,6 +225,14 @@ pub enum ClientRequest {
         session: crate::chat::Session,
         source: HostSessionProof,
         token: String,
+    },
+    /// Replace an attached native actor using its host-retained execution context.
+    ChatReturnTerminal {
+        chat_id: TerminalId,
+    },
+    /// GUI acknowledgement after the replacement terminal is durably saved.
+    ChatCommitTerminal {
+        terminal_id: TerminalId,
     },
 }
 
@@ -426,6 +446,11 @@ pub enum ServerResponse {
     },
     ChatPreviewed {
         preview: crate::chat::BindingPreview,
+    },
+    ChatTerminal {
+        chat_id: TerminalId,
+        session: TerminalSession,
+        snapshot: crate::chat::Snapshot,
     },
 }
 
@@ -1007,6 +1032,8 @@ pub enum WireTerminalEvent {
     Exited {
         exit_code: u32,
         signal: Option<String>,
+        #[serde(default)]
+        intentional: bool,
     },
     Error {
         operation: String,
@@ -1026,7 +1053,15 @@ impl From<TerminalEvent> for WireTerminalEvent {
                 Self::AgentActivityChanged { activity }
             }
             TerminalEvent::Bell => Self::Bell,
-            TerminalEvent::Exited { exit_code, signal } => Self::Exited { exit_code, signal },
+            TerminalEvent::Exited {
+                exit_code,
+                signal,
+                intentional,
+            } => Self::Exited {
+                exit_code,
+                signal,
+                intentional,
+            },
             TerminalEvent::Error { operation, message } => Self::Error {
                 operation: operation.to_owned(),
                 message,
@@ -1044,7 +1079,15 @@ impl From<WireTerminalEvent> for TerminalEvent {
                 Self::AgentActivityChanged(activity)
             }
             WireTerminalEvent::Bell => Self::Bell,
-            WireTerminalEvent::Exited { exit_code, signal } => Self::Exited { exit_code, signal },
+            WireTerminalEvent::Exited {
+                exit_code,
+                signal,
+                intentional,
+            } => Self::Exited {
+                exit_code,
+                signal,
+                intentional,
+            },
             WireTerminalEvent::Error { operation, message } => Self::Error {
                 operation: match operation.as_str() {
                     "read PTY" => "read PTY",
@@ -1321,6 +1364,34 @@ mod tests {
     use crate::model::{BootId, HostIncarnation, HostSessionId};
 
     use super::*;
+
+    #[test]
+    fn intentional_exit_provenance_survives_a_framed_daemon_event() {
+        for intentional in [false, true] {
+            let event = TerminalEvent::Exited {
+                exit_code: 1,
+                signal: Some("Killed".into()),
+                intentional,
+            };
+            let message = ServerEnvelope {
+                version: PROTOCOL_VERSION,
+                request_id: None,
+                proof: proof("session", "boot", "incarnation"),
+                message: ServerMessage::Event {
+                    terminal_id: TerminalId::new(),
+                    sequence: 1,
+                    event: event.clone().into(),
+                },
+            };
+            let mut bytes = Vec::new();
+            write_frame(&mut bytes, &message).unwrap();
+            let decoded: ServerEnvelope = read_frame(&mut Cursor::new(bytes)).unwrap().unwrap();
+            let ServerMessage::Event { event: decoded, .. } = decoded.message else {
+                panic!("exit event changed kind");
+            };
+            assert_eq!(TerminalEvent::from(decoded), event);
+        }
+    }
 
     #[test]
     fn scroll_only_deltas_survive_the_wire_without_replacing_grid_rows() {

@@ -50,10 +50,17 @@ pub const INSPECTOR_DEFAULT_WIDTH: f32 = 380.0;
 pub const INSPECTOR_MAX_WIDTH: f32 = 480.0;
 
 /// Shared gutter geometry for native scrollables and custom-rendered content.
-pub const SCROLLBAR_GUTTER: f32 = 14.0;
-pub const SCROLLBAR_THUMB_WIDTH: f32 = 10.0;
-pub const SCROLLBAR_MARGIN: f32 = 2.0;
+pub const SCROLLBAR_GUTTER: f32 = 10.5;
+pub const SCROLLBAR_THUMB_WIDTH: f32 = 7.5;
+pub const SCROLLBAR_MARGIN: f32 = 1.5;
 pub const BORDER_WIDTH: f32 = 1.0;
+
+pub fn scrollbar() -> cosmic::iced::widget::scrollable::Scrollbar {
+    cosmic::iced::widget::scrollable::Scrollbar::default()
+        .width(SCROLLBAR_THUMB_WIDTH)
+        .scroller_width(SCROLLBAR_THUMB_WIDTH)
+        .margin(SCROLLBAR_MARGIN)
+}
 
 pub const WIDE_BREAKPOINT: f32 = 1_440.0;
 pub const EXPANDED_NAVIGATION_BREAKPOINT: f32 = 1_200.0;

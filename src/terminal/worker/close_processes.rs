@@ -3,9 +3,13 @@ use std::{
     io,
     os::{
         fd::{AsRawFd, FromRawFd},
-        unix::{ffi::OsStrExt, fs::MetadataExt},
+        unix::{
+            ffi::OsStrExt,
+            fs::{MetadataExt, OpenOptionsExt},
+        },
     },
     path::{Component, Path},
+    sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
 
@@ -25,11 +29,12 @@ pub(super) struct CloseProcess {
 pub(super) struct RootIdentity {
     pub process: CloseProcess,
     pidfd: File,
-    executable: Option<(u64, u64)>,
+    executable: Option<File>,
+    kill_receipt: Arc<Mutex<bool>>,
 }
 
 impl RootIdentity {
-    pub(super) fn capture(pid: libc::pid_t, executable: Option<(u64, u64)>) -> io::Result<Self> {
+    pub(super) fn capture(pid: libc::pid_t, executable: Option<File>) -> io::Result<Self> {
         let process = read_process(pid)?;
         let pidfd = open_target(&process)?;
         if !same_identity(&process, &read_process(pid)?) {
@@ -39,28 +44,47 @@ impl RootIdentity {
             process,
             pidfd,
             executable,
+            kill_receipt: Arc::new(Mutex::new(false)),
         })
     }
 
     pub(super) fn original_executable(&self) -> bool {
-        self.executable
-            .is_some_and(|expected| executable_identity(self.process.pid).ok() == Some(expected))
+        self.executable.as_ref().is_some_and(|executable| {
+            executable.metadata().ok().is_some_and(|expected| {
+                executable_identity(self.process.pid).ok() == Some((expected.dev(), expected.ino()))
+            })
+        })
     }
 
-    /// Match portable-pty's executable lookup before spawning. Its exec-error
-    /// pipe can close before /proc exposes the child's new executable image.
-    pub(super) fn launch_executable(command: &portable_pty::CommandBuilder) -> Option<(u64, u64)> {
+    pub(super) fn intentionally_killed(&self) -> bool {
+        *self
+            .kill_receipt
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+    }
+
+    /// Pin the resolved launch image, not its pathname or an unowned inode
+    /// number. Package replacement may unlink it while this shell keeps running;
+    /// holding the file prevents recycling its identity for a different image.
+    /// Do not capture /proc immediately after spawn: the exec-error pipe can
+    /// close before the kernel exposes the child's new executable image.
+    pub(super) fn launch_executable(command: &portable_pty::CommandBuilder) -> Option<File> {
         let program = Path::new(command.get_argv().first()?);
         let cwd = Path::new(command.get_cwd()?);
         if !cwd.is_dir() {
             return None;
         }
         let identity = |path: &Path| {
-            let metadata = fs::metadata(path).ok()?;
+            let file = fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_PATH | libc::O_CLOEXEC)
+                .open(path)
+                .ok()?;
+            let metadata = file.metadata().ok()?;
             let path = std::ffi::CString::new(path.as_os_str().as_bytes()).ok()?;
             // SAFETY: path is NUL-terminated and remains live for access.
             (metadata.is_file() && unsafe { libc::access(path.as_ptr(), libc::X_OK) } == 0)
-                .then_some((metadata.dev(), metadata.ino()))
+                .then_some(file)
         };
         if program.is_absolute()
             || matches!(
@@ -102,6 +126,7 @@ impl Drop for FrozenProcess {
 
 pub(super) struct FrozenFamily {
     targets: Vec<FrozenProcess>,
+    root_kill_receipt: Arc<Mutex<bool>>,
 }
 
 impl FrozenFamily {
@@ -112,6 +137,7 @@ impl FrozenFamily {
         }
         let mut family = Self {
             targets: Vec::new(),
+            root_kill_receipt: Arc::clone(&root.kill_receipt),
         };
         family.freeze(
             current,
@@ -145,7 +171,7 @@ impl FrozenFamily {
             // A complete census after every discovered member was stopped is
             // the fixed point: no member can now fork a job outside this set.
             if family.targets.len() == before {
-                for target in &family.targets {
+                for target in &mut family.targets {
                     let process =
                         read_process(target.identity.pid).map_err(|error| error.to_string())?;
                     if !same_identity(&process, &target.identity)
@@ -154,6 +180,7 @@ impl FrozenFamily {
                     {
                         return Err("Terminal process changed while its family was stopped".into());
                     }
+                    target.identity.state = process.state;
                 }
                 return Ok(family);
             }
@@ -187,6 +214,7 @@ impl FrozenFamily {
                 return Err("Terminal job identity changed".into());
             }
             if quiescent(current.state) && threads_quiescent(current.pid, deadline)? {
+                target.identity.state = current.state;
                 break;
             }
             std::thread::sleep(Duration::from_millis(1));
@@ -196,7 +224,13 @@ impl FrozenFamily {
     }
 
     pub(super) fn has_jobs(&self) -> bool {
-        self.targets.len() > 1
+        // Stopping the shell can delay reaping an already-finished prompt or
+        // startup helper. Such zombies are ancestry, not active work. Keep
+        // them in the census so live descendants still require confirmation.
+        self.targets
+            .iter()
+            .skip(1)
+            .any(|target| !matches!(target.identity.state, b'Z' | b'X'))
     }
 
     /// A foreground agent cannot authorize discarding unrelated background jobs.
@@ -245,9 +279,26 @@ impl FrozenFamily {
         check_deadline(deadline)?;
         // All targets remain stopped until every signal has been issued. No
         // numeric PID is ever signaled, even after a job exits or is reparented.
-        for target in &mut self.targets {
+        for (index, target) in self.targets.iter_mut().enumerate() {
+            // The root is always first. Serialize receipt publication with
+            // exit observation, including upgrades which kill off-worker.
+            let mut receipt = (index == 0).then(|| {
+                self.root_kill_receipt
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+            });
+            let live_root = receipt.is_some()
+                && read_process(target.identity.pid).is_ok_and(|process| {
+                    same_identity(&process, &target.identity)
+                        && matches!(process.state, b'T' | b't')
+                });
             match signal(&target.pidfd, libc::SIGKILL) {
-                Ok(()) => target.resume = false,
+                Ok(()) => {
+                    target.resume = false;
+                    if live_root && let Some(receipt) = receipt.as_mut() {
+                        **receipt = true;
+                    }
+                }
                 Err(error) if error.raw_os_error() == Some(libc::ESRCH) => target.resume = false,
                 Err(error) => return Err(format!("Could not close terminal process: {error}")),
             }
@@ -460,11 +511,58 @@ mod tests {
                 target(12, 11),
                 target(14, 12),
             ],
+            root_kill_receipt: Arc::new(Mutex::new(false)),
         };
         assert!(family.only_agent_tree(11));
         family.targets.push(target(13, 10));
         assert!(!family.only_agent_tree(11));
         assert!(!family.only_agent_tree(99));
+    }
+
+    #[test]
+    fn finished_helpers_are_not_work_but_live_descendants_and_stopped_jobs_are() {
+        let root = CloseProcess {
+            pid: 10,
+            parent: 1,
+            group: 10,
+            session: 10,
+            state: b'T',
+            start: 1,
+        };
+        let helper = CloseProcess {
+            pid: 11,
+            parent: 10,
+            group: 11,
+            session: 11,
+            state: b'Z',
+            ..root.clone()
+        };
+        let job = CloseProcess {
+            pid: 12,
+            parent: 11,
+            group: 12,
+            session: 12,
+            state: b'T',
+            ..root.clone()
+        };
+        let frozen = |processes: &[CloseProcess]| FrozenFamily {
+            targets: process_family(&root, processes, &[])
+                .into_iter()
+                .map(|identity| FrozenProcess {
+                    identity,
+                    pidfd: File::open("/dev/null").unwrap(),
+                    resume: false,
+                })
+                .collect(),
+            root_kill_receipt: Arc::new(Mutex::new(false)),
+        };
+        assert!(!frozen(&[helper.clone()]).has_jobs());
+        assert!(frozen(&[helper.clone(), job.clone()]).has_jobs());
+        let background = CloseProcess {
+            parent: root.pid,
+            ..job
+        };
+        assert!(frozen(&[helper, background]).has_jobs());
     }
     #[test]
     fn census_keeps_other_sessions_out_but_includes_background_and_detached_descendants() {
@@ -635,5 +733,34 @@ mod tests {
         let root = RootIdentity::capture(child.0.id() as libc::pid_t, None).unwrap();
         assert!(FrozenFamily::capture(&root, Instant::now()).is_err());
         assert!(!quiescent(read_process(root.process.pid).unwrap().state));
+    }
+
+    #[test]
+    fn kill_receipt_requires_a_live_root_and_a_successful_signal() {
+        let child = isolated_child("kill -STOP $$; exec sleep 60");
+        wait_child_state(&child, libc::WSTOPPED);
+        let root = RootIdentity::capture(child.0.id() as libc::pid_t, None).unwrap();
+        let mut family =
+            FrozenFamily::capture(&root, Instant::now() + Duration::from_secs(2)).unwrap();
+        assert!(family.kill(Instant::now()).is_err());
+        assert!(!root.intentionally_killed());
+        family
+            .kill(Instant::now() + Duration::from_secs(2))
+            .unwrap();
+        assert!(root.intentionally_killed());
+
+        let exited = isolated_child("kill -STOP $$; exec sleep 60");
+        wait_child_state(&exited, libc::WSTOPPED);
+        let root = RootIdentity::capture(exited.0.id() as libc::pid_t, None).unwrap();
+        // An unrelated killer wins before close inspection. Leave the child
+        // unreaped, so pidfd SIGKILL may succeed without causing its exit.
+        signal(&root.pidfd, libc::SIGKILL).unwrap();
+        wait_child_state(&exited, libc::WEXITED | libc::WNOWAIT);
+        let mut family =
+            FrozenFamily::capture(&root, Instant::now() + Duration::from_secs(2)).unwrap();
+        family
+            .kill(Instant::now() + Duration::from_secs(2))
+            .unwrap();
+        assert!(!root.intentionally_killed());
     }
 }

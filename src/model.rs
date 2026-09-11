@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, HashMap, HashSet},
     ffi::{CStr, CString},
     fmt,
     mem::MaybeUninit,
@@ -72,6 +72,7 @@ id_type!(WorkspaceId);
 id_type!(CardId);
 id_type!(ProjectId);
 id_type!(WorktreeId);
+id_type!(ThreadId);
 id_type!(TerminalId);
 id_type!(BrowserId);
 id_type!(OperationId);
@@ -954,6 +955,38 @@ pub struct WorktreeState {
     pub existence: Existence,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProjectThread {
+    pub id: ThreadId,
+    pub project_id: ProjectId,
+    pub title: String,
+    pub cards: Vec<CardId>,
+    pub focused: Option<CardId>,
+}
+
+/// Repair navigation references without deleting any durable card. First
+/// ownership wins for malformed imports; empty threads remain usable scopes.
+pub(crate) fn normalize_project_threads(
+    threads: &mut Vec<ProjectThread>,
+    active: &mut Option<ThreadId>,
+    open_cards: &HashSet<CardId>,
+) {
+    let mut ids = HashSet::new();
+    let mut owned = HashSet::new();
+    threads.retain(|thread| ids.insert(thread.id));
+    for thread in threads.iter_mut() {
+        thread
+            .cards
+            .retain(|id| open_cards.contains(id) && owned.insert(*id));
+        if !thread.focused.is_some_and(|id| thread.cards.contains(&id)) {
+            thread.focused = thread.cards.first().copied();
+        }
+    }
+    if active.is_some_and(|id| !ids.contains(&id)) {
+        *active = None;
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct WorkspaceState {
     pub schema_version: u32,
@@ -968,6 +1001,10 @@ pub struct WorkspaceState {
     pub worktree_focus: HashMap<PathBuf, CardId>,
     #[serde(default)]
     pub project_order: Vec<ProjectId>,
+    #[serde(default)]
+    pub threads: Vec<ProjectThread>,
+    #[serde(default)]
+    pub active_thread: Option<ThreadId>,
 }
 
 impl Default for WorkspaceState {
@@ -982,11 +1019,23 @@ impl Default for WorkspaceState {
             active_worktree: None,
             worktree_focus: HashMap::new(),
             project_order: Vec::new(),
+            threads: Vec::new(),
+            active_thread: None,
         }
     }
 }
 
 impl WorkspaceState {
+    pub fn normalize_threads(&mut self) {
+        let open_cards = self
+            .cards
+            .iter()
+            .filter(|card| card.existence.is_open())
+            .map(|card| card.id)
+            .collect();
+        normalize_project_threads(&mut self.threads, &mut self.active_thread, &open_cards);
+    }
+
     pub fn focused_index(&self) -> Option<usize> {
         let focused = self.focused?;
         self.cards
@@ -1025,6 +1074,47 @@ mod tests {
         assert_eq!(restored.id, id);
         assert_eq!(restored.active_worktree, None);
         assert!(restored.worktree_focus.is_empty());
+        assert!(restored.threads.is_empty());
+        assert_eq!(restored.active_thread, None);
+    }
+
+    #[test]
+    fn thread_reference_repair_keeps_empty_scopes_and_exclusive_card_ownership() {
+        let first = CardId::new();
+        let second = CardId::new();
+        let missing = CardId::new();
+        let project_id = ProjectId::new();
+        let a = ThreadId::new();
+        let b = ThreadId::new();
+        let mut threads = vec![
+            ProjectThread {
+                id: a,
+                project_id,
+                title: "A".into(),
+                cards: vec![first, first, missing],
+                focused: Some(missing),
+            },
+            ProjectThread {
+                id: b,
+                project_id,
+                title: "B".into(),
+                cards: vec![first, second],
+                focused: Some(first),
+            },
+        ];
+        let mut active = Some(b);
+        normalize_project_threads(&mut threads, &mut active, &HashSet::from([first, second]));
+        assert_eq!(threads[0].cards, vec![first]);
+        assert_eq!(threads[0].focused, Some(first));
+        assert_eq!(threads[1].cards, vec![second]);
+        assert_eq!(threads[1].focused, Some(second));
+        normalize_project_threads(&mut threads, &mut active, &HashSet::from([first]));
+        assert!(threads[1].cards.is_empty());
+        assert_eq!(threads[1].focused, None);
+        assert_eq!(active, Some(b));
+        active = Some(ThreadId::new());
+        normalize_project_threads(&mut threads, &mut active, &HashSet::from([first]));
+        assert_eq!(active, None);
     }
 
     #[test]

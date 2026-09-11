@@ -100,6 +100,7 @@ impl LinkOpenGesture {
 #[serde(default, deny_unknown_fields)]
 pub struct KeyboardShortcuts {
     pub new_terminal: Vec<String>,
+    pub new_thread: Vec<String>,
     pub close_focused_column: Vec<String>,
     pub search_projects: Vec<String>,
     pub previous_column: Vec<String>,
@@ -111,6 +112,7 @@ impl Default for KeyboardShortcuts {
     fn default() -> Self {
         Self {
             new_terminal: vec!["Ctrl+T".to_owned()],
+            new_thread: vec!["Ctrl+Shift+T".to_owned()],
             close_focused_column: vec!["Ctrl+W".to_owned()],
             search_projects: vec!["Ctrl+F".to_owned()],
             previous_column: vec!["Alt+Q".to_owned(), "Alt+Left".to_owned()],
@@ -125,9 +127,10 @@ pub const CHORD_SEPARATOR: &str = ", ";
 
 impl KeyboardShortcuts {
     /// Every action's chord list, in the order the dialog presents them.
-    fn actions(&self) -> [&Vec<String>; 6] {
+    fn actions(&self) -> [&Vec<String>; 7] {
         [
             &self.new_terminal,
+            &self.new_thread,
             &self.close_focused_column,
             &self.search_projects,
             &self.previous_column,
@@ -139,9 +142,9 @@ impl KeyboardShortcuts {
     fn validate(&self) -> Result<(), SettingsError> {
         let mut parsed = Vec::new();
         for (index, chords) in self.actions().into_iter().enumerate() {
-            if chords.is_empty() && index != 5 {
-                // An action with no chord would be silently unreachable, and
-                // its label would advertise a gesture that does nothing.
+            if chords.is_empty() && !matches!(index, 1 | 6) {
+                // Newly introduced actions may remain unbound so migration
+                // never steals a user's existing custom chord.
                 return Err(SettingsError::InvalidShortcut(
                     "every keyboard shortcut needs at least one chord",
                 ));
@@ -346,6 +349,8 @@ pub struct AppSettings {
     pub worktree_sort: WorktreeSort,
     #[serde(default = "default_editor_auto_save")]
     pub editor_auto_save: bool,
+    #[serde(default)]
+    pub editor_wrap_lines: bool,
     #[serde(default = "default_confirm_terminal_close")]
     pub confirm_terminal_close: bool,
     /// External language servers, in declaration order. The first server whose
@@ -376,7 +381,7 @@ impl Default for AppSettings {
             terminal_padding: default_terminal_padding(),
             terminal_cursor_style: TerminalCursorStyle::default(),
             terminal_theme: crate::terminal::TerminalTheme::default(),
-            terminal_font_size: 14.0,
+            terminal_font_size: 13.0,
             terminal_font_family: String::new(),
             sidebar_width: design::NAVIGATION_DEFAULT_WIDTH,
             inspector_width: design::INSPECTOR_DEFAULT_WIDTH,
@@ -387,6 +392,7 @@ impl Default for AppSettings {
             managed_worktree_directory: default_managed_worktree_directory(),
             worktree_sort: WorktreeSort::default(),
             editor_auto_save: default_editor_auto_save(),
+            editor_wrap_lines: false,
             confirm_terminal_close: default_confirm_terminal_close(),
             language_servers: default_language_servers(),
             keyboard_shortcuts: KeyboardShortcuts::default(),
@@ -546,11 +552,11 @@ struct V2TomlSettings {
     keyboard_shortcuts: KeyboardShortcuts,
 }
 
-fn preserve_existing_width_chord(shortcuts: &mut toml::Table) {
-    if shortcuts.contains_key("cycle_pane_width") {
+fn preserve_existing_shortcut(shortcuts: &mut toml::Table, action: &str, default: &str) {
+    if shortcuts.contains_key(action) {
         return;
     }
-    let reserved = parse_shortcut("Alt+R").expect("built-in shortcut");
+    let reserved = parse_shortcut(default).expect("built-in shortcut");
     let occupied = shortcuts
         .values()
         .filter_map(toml::Value::as_array)
@@ -560,7 +566,7 @@ fn preserve_existing_width_chord(shortcuts: &mut toml::Table) {
     if occupied {
         // A new default must not invalidate or steal an existing custom chord.
         // Leave only this newly introduced action unbound until configured.
-        shortcuts.insert("cycle_pane_width".into(), toml::Value::Array(Vec::new()));
+        shortcuts.insert(action.into(), toml::Value::Array(Vec::new()));
     }
 }
 
@@ -569,7 +575,8 @@ where
     D: serde::Deserializer<'de>,
 {
     let mut shortcuts = toml::Table::deserialize(deserializer)?;
-    preserve_existing_width_chord(&mut shortcuts);
+    preserve_existing_shortcut(&mut shortcuts, "cycle_pane_width", "Alt+R");
+    preserve_existing_shortcut(&mut shortcuts, "new_thread", "Ctrl+Shift+T");
     toml::Value::Table(shortcuts)
         .try_into()
         .map_err(serde::de::Error::custom)
@@ -585,7 +592,8 @@ where
             *binding = toml::Value::Array(vec![toml::Value::String(std::mem::take(chord))]);
         }
     }
-    preserve_existing_width_chord(&mut shortcuts);
+    preserve_existing_shortcut(&mut shortcuts, "cycle_pane_width", "Alt+R");
+    preserve_existing_shortcut(&mut shortcuts, "new_thread", "Ctrl+Shift+T");
     toml::Value::Table(shortcuts)
         .try_into()
         .map_err(serde::de::Error::custom)
@@ -1310,6 +1318,22 @@ mod tests {
     }
 
     #[test]
+    fn old_settings_keep_lines_unwrapped_and_wrap_choice_survives_restart() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = path_in(&directory);
+        let defaults = AppSettings::default();
+        save(&path, &defaults).unwrap();
+        let mut old = toml::Value::try_from(&defaults).unwrap();
+        old.as_table_mut().unwrap().remove("editor_wrap_lines");
+        fs::write(&path, toml::to_string(&old).unwrap()).unwrap();
+        let mut settings = load(&path).unwrap();
+        assert!(!settings.editor_wrap_lines);
+        settings.editor_wrap_lines = true;
+        save(&path, &settings).unwrap();
+        assert!(load(&path).unwrap().editor_wrap_lines);
+    }
+
+    #[test]
     fn a_file_written_before_the_font_family_key_existed_loads_with_the_default() {
         let directory = tempfile::tempdir().unwrap();
         let path = path_in(&directory);
@@ -1468,6 +1492,7 @@ next_column = ["Alt+W", "Alt+Right"]
         .unwrap();
         let migrated = load(&path).unwrap();
         assert_eq!(migrated.keyboard_shortcuts.new_terminal, ["Ctrl+Shift+T"]);
+        assert!(migrated.keyboard_shortcuts.new_thread.is_empty());
         assert_eq!(migrated.keyboard_shortcuts.previous_column, ["Alt+Q"]);
         assert_eq!(
             migrated.keyboard_shortcuts.next_column,
@@ -1496,6 +1521,35 @@ next_column = ["Alt+W", "Alt+Right"]
             save(&path, &migrated).unwrap();
             assert_eq!(load(&path).unwrap(), migrated);
         }
+    }
+
+    #[test]
+    fn new_thread_migration_preserves_a_custom_chord_but_rejects_explicit_conflicts() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("settings.toml");
+        let mut table = toml::Value::try_from(AppSettings::default()).unwrap();
+        let shortcuts = table["keyboard_shortcuts"].as_table_mut().unwrap();
+        shortcuts.remove("new_thread");
+        shortcuts.insert(
+            "new_terminal".into(),
+            toml::Value::Array(vec![toml::Value::String("Shift+Control+T".into())]),
+        );
+        fs::write(&path, toml::to_string(&table).unwrap()).unwrap();
+        let migrated = load(&path).unwrap();
+        assert_eq!(
+            migrated.keyboard_shortcuts.new_terminal,
+            ["Shift+Control+T"]
+        );
+        assert!(migrated.keyboard_shortcuts.new_thread.is_empty());
+        save(&path, &migrated).unwrap();
+        assert_eq!(load(&path).unwrap(), migrated);
+
+        let mut conflicting = migrated;
+        conflicting.keyboard_shortcuts.new_thread = vec!["Ctrl+Shift+T".into()];
+        assert!(matches!(
+            conflicting.validate(),
+            Err(SettingsError::InvalidShortcut(message)) if message.contains("conflict")
+        ));
     }
 
     #[test]

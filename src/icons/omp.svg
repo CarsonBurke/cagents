@@ -1,0 +1,5 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">
+  <!-- OMP homepage mark (omp.sh); original OKLCH stops converted to sRGB. -->
+  <defs><linearGradient id="omp" x1="0" y1="0" x2="1" y2="1"><stop stop-color="#f84fcc"/><stop offset=".5" stop-color="#9362f4"/><stop offset="1" stop-color="#00dbe4"/></linearGradient></defs>
+  <path fill="url(#omp)" d="M10 14h44v9H43v33h-9V23h-9v22h-9V23H10z"/>
+</svg>

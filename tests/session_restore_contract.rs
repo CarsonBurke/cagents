@@ -87,6 +87,8 @@ impl RestoreFixture {
             active_worktree: Some(worktree_path.clone()),
             worktree_focus: HashMap::from([(worktree_path.clone(), terminal_card_id)]),
             project_order: Vec::new(),
+            threads: Vec::new(),
+            active_thread: None,
             cards: vec![
                 CardState {
                     id: terminal_card_id,

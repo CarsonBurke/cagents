@@ -63,9 +63,28 @@ impl<Message: Clone + 'static> Widget<Message, Theme, Renderer> for MenuSurface<
         shell: &mut Shell<'_, Message>,
         viewport: &Rectangle,
     ) {
+        // A freshly mounted row may be right-clicked before a view diff. The
+        // native widget initializes its *real* menu item tree only in diff(),
+        // not in state()/children(); opening first otherwise leaves an empty
+        // tree for the overlay. Reconcile at the opening boundary as well.
+        let opening = matches!(
+            event,
+            Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Right))
+                | Event::Touch(cosmic::iced::touch::Event::FingerLifted { .. })
+        ) && layout
+            .bounds()
+            .intersection(viewport)
+            .is_some_and(|bounds| cursor.is_over(bounds));
+        if opening {
+            self.0.diff(tree);
+        }
         self.0.update(
             tree, event, layout, cursor, renderer, clipboard, shell, viewport,
         );
+        if opening {
+            shell.invalidate_layout();
+            shell.request_redraw();
+        }
     }
 
     fn draw(

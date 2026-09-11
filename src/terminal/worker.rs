@@ -697,7 +697,21 @@ impl Worker {
         let pair = pty_system
             .openpty(pty_size(current_size))
             .map_err(|error| format!("open PTY: {error:#}"))?;
-        let mut command = command_from_recipe(&session.launch);
+        let mut command = match &config.execution_environment {
+            Some(environment) => {
+                let mut command = CommandBuilder::new(&session.launch.program);
+                command.args(&session.launch.arguments);
+                command.cwd(&session.launch.working_directory);
+                command.env_clear();
+                for (name, value) in &environment.0 {
+                    command.env(name, value);
+                }
+                scrub_inherited_markers(&mut command);
+                terminal_environment(&mut command);
+                command
+            }
+            None => command_from_recipe(&session.launch),
+        };
         command.env("CAGENTS_TERMINAL_ID", session.id.to_string());
         let executable = interactive_shell_launch(&session.launch)
             .then(|| RootIdentity::launch_executable(&command))
@@ -891,7 +905,11 @@ impl Worker {
     }
 
     fn handle_child_exit(&mut self, exited: &mut bool, result: ChildExit) {
-        if let Some(event) = child_exit_event(exited, result) {
+        let intentional = self
+            .child_identity
+            .as_ref()
+            .is_some_and(RootIdentity::intentionally_killed);
+        if let Some(event) = child_exit_event(exited, result, intentional) {
             self.agent_exited = true;
             self.agent_provider = None;
             self.agent_process = None;
@@ -1563,7 +1581,13 @@ fn wait_for_worker_event(
     }
 }
 
-fn child_exit_event(exited: &mut bool, result: ChildExit) -> Option<TerminalEvent> {
+fn child_exit_event(
+    exited: &mut bool,
+    result: ChildExit,
+    kill_requested: bool,
+) -> Option<TerminalEvent> {
+    use std::os::unix::process::ExitStatusExt;
+
     if *exited {
         return None;
     }
@@ -1572,6 +1596,12 @@ fn child_exit_event(exited: &mut bool, result: ChildExit) -> Option<TerminalEven
         Ok(status) => TerminalEvent::Exited {
             exit_code: status.exit_code(),
             signal: status.signal().map(str::to_owned),
+            // A successful close request must not hide a crash already waiting
+            // in the reaper channel, nor turn wait/reaper failures into success.
+            intentional: kill_requested
+                && status.signal().is_some()
+                && status.signal()
+                    == ExitStatus::from(std::process::ExitStatus::from_raw(libc::SIGKILL)).signal(),
         },
         Err(message) => TerminalEvent::Error {
             operation: "wait for child",
@@ -1728,17 +1758,20 @@ fn command_from_recipe(recipe: &LaunchRecipe) -> CommandBuilder {
     command.args(&recipe.arguments);
     command.cwd(&recipe.working_directory);
     scrub_inherited_markers(&mut command);
-    // `xterm-256color` rather than a cagents-specific entry: we ship no
-    // terminfo database, and a name the host lacks breaks every curses program.
-    command.env("TERM", "xterm-256color");
-    command.env("COLORTERM", "truecolor");
-    command.env("TERM_PROGRAM", "cagents");
-    command.env("TERM_PROGRAM_VERSION", env!("CARGO_PKG_VERSION"));
+    terminal_environment(&mut command);
     // Last, so an explicit per-session entry still wins over our defaults.
     for (name, value) in &recipe.environment {
         command.env(name, value);
     }
     command
+}
+
+fn terminal_environment(command: &mut CommandBuilder) {
+    // We ship no private terminfo entry; advertise the emulator we implement.
+    command.env("TERM", "xterm-256color");
+    command.env("COLORTERM", "truecolor");
+    command.env("TERM_PROGRAM", "cagents");
+    command.env("TERM_PROGRAM_VERSION", env!("CARGO_PKG_VERSION"));
 }
 
 fn pty_size(size: TerminalSize) -> PtySize {
@@ -2694,7 +2727,7 @@ mod tests {
 
         for status in [7, 8] {
             if let Some(event) =
-                child_exit_event(&mut exited, Ok(ExitStatus::with_exit_code(status)))
+                child_exit_event(&mut exited, Ok(ExitStatus::with_exit_code(status)), false)
             {
                 deliveries.fetch_add(1, Ordering::SeqCst);
                 event_tx.send(event).unwrap();
@@ -2706,10 +2739,56 @@ mod tests {
             event_rx.try_recv(),
             Ok(TerminalEvent::Exited {
                 exit_code: 7,
-                signal: None
+                signal: None,
+                intentional: false,
             })
         ));
         assert!(event_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn close_receipt_suppresses_only_its_requested_kill_not_crashes_or_wait_errors() {
+        use std::os::unix::process::ExitStatusExt;
+
+        let killed = || ExitStatus::from(std::process::ExitStatus::from_raw(libc::SIGKILL));
+        assert!(matches!(
+            child_exit_event(&mut false, Ok(killed()), true),
+            Some(TerminalEvent::Exited {
+                intentional: true,
+                signal: Some(_),
+                ..
+            })
+        ));
+        assert!(matches!(
+            child_exit_event(&mut false, Ok(killed()), false),
+            Some(TerminalEvent::Exited {
+                intentional: false,
+                ..
+            })
+        ));
+        let crashed = ExitStatus::from(std::process::ExitStatus::from_raw(libc::SIGSEGV));
+        assert!(matches!(
+            child_exit_event(&mut false, Ok(crashed), true),
+            Some(TerminalEvent::Exited {
+                intentional: false,
+                ..
+            })
+        ));
+        assert!(matches!(
+            child_exit_event(&mut false, Ok(ExitStatus::with_exit_code(7)), true),
+            Some(TerminalEvent::Exited {
+                exit_code: 7,
+                intentional: false,
+                ..
+            })
+        ));
+        assert!(matches!(
+            child_exit_event(&mut false, Err("reaper failed".into()), true),
+            Some(TerminalEvent::Error {
+                operation: "wait for child",
+                ..
+            })
+        ));
     }
 
     fn env_recipe(environment: BTreeMap<String, String>) -> LaunchRecipe {

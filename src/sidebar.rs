@@ -13,7 +13,7 @@ use std::{
     borrow::Cow,
     collections::{BTreeMap, BTreeSet},
     path::{Path, PathBuf},
-    sync::LazyLock,
+    sync::{Arc, LazyLock},
 };
 
 use cosmic::{
@@ -27,12 +27,13 @@ use url::Url;
 use crate::{
     design::{self, NavigationLayout},
     github::{PullRequest, PullRequestCheck},
-    model::{CardId, ProjectId, ProjectState, WorktreeId},
+    model::{CardId, ProjectId, ProjectState, ThreadId, WorktreeId},
     repository::{
-        ChangeArea, ChangeKind, ChangedPath, CommitIdentity, CommitSummary, ConflictKind,
-        DirtyState, DiscardRequest, HISTORY_PAGE_SIZE, HeadState, Oid, PathSelection, PushTarget,
-        RemoteRecord, RepoPath, RepositoryId, RepositoryInfo, RepositorySnapshot, StatusSnapshot,
-        TrackingState, ValidatedBranchName, ValidatedRefName, WorktreeRecord, build_file_tree,
+        BranchComparison, ChangeArea, ChangeKind, ChangedPath, CommitIdentity, CommitSummary,
+        ConflictKind, DirtyState, DiscardRequest, HISTORY_PAGE_SIZE, HeadState, Oid, PathSelection,
+        PushTarget, RemoteRecord, RepoPath, RepositoryId, RepositoryInfo, RepositorySnapshot,
+        StatusSnapshot, TrackingState, ValidatedBranchName, ValidatedRefName, WorktreeRecord,
+        build_file_tree,
     },
     splitter::{Edge as SplitterEdge, Splitter},
 };
@@ -306,6 +307,7 @@ pub struct SidebarProject {
     pub name: String,
     pub repository: PathBuf,
     pub worktrees: Vec<SidebarWorktree>,
+    pub threads: Vec<SidebarThread>,
     pub pull_requests: Vec<SidebarPullRequest>,
     pub github_status: String,
     pub github_ready: bool,
@@ -314,6 +316,43 @@ pub struct SidebarProject {
     pub operations: Vec<WorktreeOperationRow>,
     pub avatar: Option<cosmic::iced::advanced::image::Handle>,
     chrome: ProjectChrome,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SidebarThread {
+    pub id: ThreadId,
+    pub title: String,
+    pub selected: bool,
+    pub activity: Option<crate::agent::ActivityState>,
+    pub unread: bool,
+    folded_title: Box<str>,
+    open_id: Id,
+    accessible_name: Box<str>,
+}
+
+impl SidebarThread {
+    pub fn new(
+        id: ThreadId,
+        title: String,
+        selected: bool,
+        activity: Option<crate::agent::ActivityState>,
+        unread: bool,
+    ) -> Self {
+        Self {
+            id,
+            selected,
+            activity,
+            unread,
+            folded_title: fold(&title),
+            open_id: entity_id("thread.open", id),
+            accessible_name: format!(
+                "Open thread {title}{}",
+                if unread { ", unread agent update" } else { "" }
+            )
+            .into_boxed_str(),
+            title,
+        }
+    }
 }
 
 impl SidebarProject {
@@ -327,39 +366,10 @@ impl SidebarProject {
     ) -> Self {
         let chrome = ProjectChrome::new(id, &name, &repository);
         for worktree in &mut worktrees {
-            worktree.pull_request_state = None;
-            if worktree.chrome.pull_request.take().is_some() {
-                let status = status_summary(
-                    worktree.detached,
-                    worktree.locked,
-                    worktree.dirty.as_ref(),
-                    worktree.ahead,
-                    worktree.behind,
-                );
-                worktree.chrome.accessible_name =
-                    format!("Open worktree {}, {status}", worktree.chrome.label).into_boxed_str();
-                worktree.chrome.tooltip = format!(
-                    "{} — {} — {status}",
-                    worktree.chrome.label,
-                    worktree.path.display(),
-                )
-                .into_boxed_str();
-            }
             if let Some(pull_request) = matching_pull_request(worktree, &pull_requests) {
-                worktree.pull_request_state = pull_request.state;
-                worktree.chrome.pull_request = Some((
-                    format!("#{}", pull_request.number).into_boxed_str(),
-                    pull_request.checks,
-                ));
-                let description = format!(
-                    "pull request #{}, checks {}",
-                    pull_request.number,
-                    check_description(pull_request.checks),
-                );
-                worktree.chrome.accessible_name =
-                    format!("{}, {description}", worktree.chrome.accessible_name).into_boxed_str();
-                worktree.chrome.tooltip =
-                    format!("{} — {description}", worktree.chrome.tooltip).into_boxed_str();
+                worktree.set_pull_request(pull_request.clone());
+            } else {
+                worktree.clear_pull_request();
             }
         }
         Self {
@@ -368,6 +378,7 @@ impl SidebarProject {
             name,
             repository,
             worktrees,
+            threads: Vec::new(),
             pull_requests,
             github_status: "GitHub has not been refreshed.".into(),
             github_ready: false,
@@ -376,6 +387,19 @@ impl SidebarProject {
             operations: Vec::new(),
             avatar: None,
             chrome,
+        }
+    }
+
+    /// Strip only a known account namespace, retaining nested branch names.
+    pub fn set_branch_namespace(&mut self, account: &str) {
+        for worktree in &mut self.worktrees {
+            let Some(branch) = worktree.branch.as_deref().filter(|_| !worktree.detached) else {
+                continue;
+            };
+            let label = concise_branch_name(branch, account);
+            if label != worktree.chrome.label.as_ref() {
+                worktree.chrome.label = label.into();
+            }
         }
     }
 
@@ -430,11 +454,13 @@ struct ProjectChrome {
     open_id: Id,
     toggle_id: Id,
     new_worktree_id: Id,
+    new_thread_id: Id,
     open_name: Box<str>,
     compact_open_name: Box<str>,
     collapse_name: Box<str>,
     expand_name: Box<str>,
     new_worktree_name: Box<str>,
+    new_thread_name: Box<str>,
 }
 
 impl ProjectChrome {
@@ -445,11 +471,13 @@ impl ProjectChrome {
             open_id: entity_id("project.open", id),
             toggle_id: entity_id("project.toggle", id),
             new_worktree_id: entity_id("project.new_worktree", id),
+            new_thread_id: entity_id("project.new_thread", id),
             open_name: format!("Open project {name}").into_boxed_str(),
             compact_open_name: format!("Open {name}").into_boxed_str(),
             collapse_name: format!("Collapse {name} project").into_boxed_str(),
             expand_name: format!("Expand {name} project").into_boxed_str(),
             new_worktree_name: format!("New worktree for {name}").into_boxed_str(),
+            new_thread_name: format!("New thread for {name}").into_boxed_str(),
         }
     }
 }
@@ -558,6 +586,24 @@ impl SidebarWorktree {
         row
     }
 
+    /// Apply each authoritative read, including the transition back to clean.
+    pub fn apply_status(&mut self, status: &StatusSnapshot) {
+        let (ahead, behind) = match &status.tracking {
+            TrackingState::Compared { ahead, behind, .. } => (Some(*ahead), Some(*behind)),
+            _ => (None, None),
+        };
+        if self.dirty.as_ref() == Some(&status.dirty)
+            && self.ahead == ahead
+            && self.behind == behind
+        {
+            return;
+        }
+        self.dirty = Some(status.dirty.clone());
+        self.ahead = ahead;
+        self.behind = behind;
+        self.refresh_status_chrome();
+    }
+
     fn matches(&self, folded_query: &str) -> bool {
         self.chrome
             .folded_branch
@@ -565,6 +611,61 @@ impl SidebarWorktree {
             .is_some_and(|branch| branch.contains(folded_query))
             || self.chrome.folded_path.contains(folded_query)
     }
+
+    pub fn set_pull_request(&mut self, pull_request: SidebarPullRequest) {
+        self.pull_request_state = pull_request.state;
+        if let Some(author) = pull_request.author.as_deref()
+            && let Some(branch) = self.branch.as_deref().filter(|_| !self.detached)
+        {
+            self.chrome.label = concise_branch_name(branch, author).into();
+        }
+        self.chrome.pull_request = Some(pull_request);
+        self.refresh_status_chrome();
+    }
+
+    pub fn clear_pull_request(&mut self) {
+        let changed =
+            self.pull_request_state.take().is_some() || self.chrome.pull_request.is_some();
+        self.chrome.pull_request = None;
+        if changed {
+            self.refresh_status_chrome();
+        }
+    }
+
+    fn refresh_status_chrome(&mut self) {
+        self.chrome.dirty_badge = self
+            .dirty
+            .as_ref()
+            .filter(|dirty| dirty.is_dirty())
+            .map(|dirty| format!("{} changes", dirty_count(dirty)).into_boxed_str());
+        let mut status = status_summary(
+            self.detached,
+            self.locked,
+            self.dirty.as_ref(),
+            self.ahead,
+            self.behind,
+        );
+        if let Some(pr) = &self.chrome.pull_request {
+            use std::fmt::Write as _;
+            let _ = write!(
+                status,
+                ", pull request #{}, checks {}",
+                pr.number,
+                check_description(pr.checks)
+            );
+        }
+        self.chrome.accessible_name =
+            format!("Open worktree {}, {status}", self.chrome.label).into_boxed_str();
+        self.chrome.tooltip =
+            format!("{} — {} — {status}", self.chrome.label, self.path.display()).into_boxed_str();
+    }
+}
+
+fn concise_branch_name<'a>(branch: &'a str, account: &str) -> &'a str {
+    branch
+        .split_once('/')
+        .filter(|(namespace, suffix)| namespace.eq_ignore_ascii_case(account) && !suffix.is_empty())
+        .map_or(branch, |(_, suffix)| suffix)
 }
 
 /// Branch names are case-sensitive and only attached worktrees can own a PR.
@@ -594,7 +695,7 @@ struct WorktreeChrome {
     accessible_name: Box<str>,
     tooltip: Box<str>,
     dirty_badge: Option<Box<str>>,
-    pull_request: Option<(Box<str>, CheckStatus)>,
+    pull_request: Option<SidebarPullRequest>,
 }
 
 /// Aggregate check state for a pull request.
@@ -668,6 +769,8 @@ pub struct SidebarPullRequest {
     pub draft: bool,
     pub checks: CheckStatus,
     pub state: Option<WorktreePullRequestState>,
+    pub needs_review: bool,
+    pub head_oid: Option<String>,
 }
 
 impl SidebarPullRequest {
@@ -691,6 +794,8 @@ impl SidebarPullRequest {
             draft,
             checks,
             state: None,
+            needs_review: false,
+            head_oid: None,
         }
     }
 
@@ -710,11 +815,56 @@ impl SidebarPullRequest {
                 .as_ref()
                 .map(|author| author.login.clone()),
             pull_request.is_draft,
-            CheckStatus::from_checks(checks),
+            if checks.is_empty() {
+                CheckStatus::from_checks(&pull_request.check_summaries())
+            } else {
+                CheckStatus::from_checks(checks)
+            },
         );
         row.state = WorktreePullRequestState::from_github(pull_request);
+        row.head_oid = Some(pull_request.head_ref_oid.clone());
+        row.needs_review = pull_request
+            .review_decision
+            .as_ref()
+            .is_some_and(|decision| {
+                matches!(decision.0.as_str(), "REVIEW_REQUIRED" | "CHANGES_REQUESTED")
+            });
         row
     }
+}
+
+/// One semantic mapping for navigation, the inspector and its tab.
+pub fn pull_request_visual(pr: &SidebarPullRequest) -> (widget::icon::Handle, cosmic::iced::Color) {
+    let theme = cosmic::theme::active();
+    let cosmic = theme.cosmic();
+    let (name, color) = match pr.state {
+        Some(WorktreePullRequestState::Merged) => (
+            "merged-pull-request-symbolic",
+            cosmic::iced::Color::from_rgb8(163, 113, 247),
+        ),
+        Some(WorktreePullRequestState::Closed) => (
+            "closed-pull-request-symbolic",
+            cosmic.destructive.base.into(),
+        ),
+        _ if pr.checks == CheckStatus::Failing || pr.needs_review => {
+            ("pull-request-symbolic", cosmic.destructive.base.into())
+        }
+        _ if pr.checks == CheckStatus::Pending => {
+            ("pull-request-symbolic", cosmic.warning.base.into())
+        }
+        _ if pr.draft => (
+            "pull-request-symbolic",
+            theme.current_container().component.on_disabled.into(),
+        ),
+        _ if pr.checks == CheckStatus::Passing => {
+            ("pull-request-symbolic", cosmic.success.base.into())
+        }
+        _ => (
+            "pull-request-symbolic",
+            theme.current_container().component.on.into(),
+        ),
+    };
+    (crate::ui_controls::symbolic_icon(name), color)
 }
 
 /// Exact number of rows in a section.
@@ -1177,6 +1327,78 @@ struct CommitRowChrome {
     accessible_name: Box<str>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BranchChangeRow {
+    pub entry: crate::repository::DiffEntry,
+    label: Box<str>,
+    status: Box<str>,
+    counts: Box<str>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BranchChangesModel {
+    pub base_ref: ValidatedRefName,
+    pub head: Oid,
+    pub merge_base: Oid,
+    pub rows: Vec<BranchChangeRow>,
+    tree: Vec<FileRow>,
+    title: Box<str>,
+    base_label: Box<str>,
+}
+
+impl BranchChangesModel {
+    pub fn new(comparison: BranchComparison) -> Self {
+        let mut rows: Vec<_> = comparison
+            .entries
+            .into_iter()
+            .map(|entry| {
+                let label = match &entry.old_path {
+                    Some(old) => format!("{} → {}", old.display(), entry.path.display()),
+                    None => entry.path.display().into_owned(),
+                }
+                .into_boxed_str();
+                let status = change_kind_label(entry.kind).into_boxed_str();
+                let counts =
+                    crate::repository::line_change_counts(entry.added_lines, entry.removed_lines)
+                        .into_boxed_str();
+                BranchChangeRow {
+                    entry,
+                    label,
+                    status,
+                    counts,
+                }
+            })
+            .collect();
+        rows.sort_unstable_by(|left, right| left.entry.path.cmp(&right.entry.path));
+        let paths: Vec<_> = rows
+            .iter()
+            .take(MAX_VISIBLE_CHANGE_ROWS)
+            .map(|row| row.entry.path.clone())
+            .collect();
+        Self {
+            title: format!("Branch changes ({})", rows.len()).into_boxed_str(),
+            base_label: format!("Since branching from {}", comparison.base_ref.short_name())
+                .into_boxed_str(),
+            base_ref: comparison.base_ref,
+            head: comparison.head,
+            merge_base: comparison.merge_base,
+            rows,
+            tree: file_rows(&paths),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BranchChanges {
+    Unavailable(&'static str),
+    Loading(ValidatedRefName),
+    Ready(Arc<BranchChangesModel>),
+    Error {
+        base_ref: ValidatedRefName,
+        message: String,
+    },
+}
+
 /// Immutable source-control data for one worktree.
 ///
 /// Everything a frame needs is derived once, here: filter keys, widget
@@ -1221,6 +1443,7 @@ pub struct SourceControlModel {
     pub staged_count: usize,
     pub files: Vec<FileRow>,
     groups: Vec<ChangeGroup>,
+    pub branch_changes: BranchChanges,
     pub history: Vec<CommitRow>,
     /// False until a page has landed. Without it an empty `history` is
     /// indistinguishable from a branch that has no commits.
@@ -1304,6 +1527,7 @@ impl SourceControlModel {
             staged_count: 0,
             files: Vec::new(),
             groups: Vec::new(),
+            branch_changes: BranchChanges::Unavailable("No branch comparison available."),
             history: Vec::new(),
             history_loaded: false,
             history_requested: false,
@@ -1378,6 +1602,7 @@ impl SourceControlModel {
             staged_count,
             files,
             groups,
+            branch_changes: BranchChanges::Unavailable("No branch comparison available."),
             history: Vec::new(),
             history_loaded: false,
             history_requested: false,
@@ -1523,6 +1748,11 @@ impl SourceControlModel {
         &self.groups
     }
 
+    pub fn has_changes(&self) -> bool {
+        self.groups.iter().any(|group| !group.is_empty())
+            || matches!(&self.branch_changes, BranchChanges::Ready(branch) if !branch.rows.is_empty())
+    }
+
     pub fn group(&self, area: ChangeArea) -> Option<&ChangeGroup> {
         self.groups.iter().find(|group| group.area == area)
     }
@@ -1599,13 +1829,7 @@ impl SourceControlModel {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct SourceControlChrome {
     subheading: Box<str>,
-    refresh_id: Id,
-    refresh_name: Box<str>,
-    /// The `Try again` button of the failed panel, which cannot reuse
-    /// [`Self::refresh_id`]: the header's refresh icon is pushed on every
-    /// frame, including the failed ones, so both buttons exist together and
-    /// the one iced visits second is handed the emptied state the first left
-    /// behind.
+    files_filter_id: Id,
     retry_id: Id,
     files_query_id: Id,
     commit_input_id: Id,
@@ -1637,10 +1861,9 @@ impl SourceControlChrome {
         Self {
             subheading: match label {
                 Some(label) => label.to_owned().into_boxed_str(),
-                None => "detached HEAD".into(),
+                None => format!("{name} (detached)").into_boxed_str(),
             },
-            refresh_id: entity_id("panel.refresh", worktree_id),
-            refresh_name: format!("Reload source control for {name}").into_boxed_str(),
+            files_filter_id: entity_id("panel.files.filter", worktree_id),
             retry_id: entity_id("panel.retry", worktree_id),
             files_query_id: entity_id("panel.files.query", worktree_id),
             commit_input_id: entity_id("panel.commit.message", worktree_id),
@@ -1816,6 +2039,7 @@ enum SidebarSelection {
 enum PanelSelection {
     File(RepoPath),
     Change { path: RepoPath, area: ChangeArea },
+    Branch(RepoPath),
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -1859,6 +2083,7 @@ pub struct SidebarState {
     /// Compact mode only: whether the source-control popover is showing.
     panel_open: bool,
     files_query: String,
+    files_filter_open: bool,
     file_list_mode: FileListMode,
     change_list_mode: FileListMode,
     worktree_sort: crate::settings::WorktreeSort,
@@ -1889,6 +2114,16 @@ impl SidebarState {
     }
     pub fn set_worktree_sort(&mut self, order: crate::settings::WorktreeSort) {
         self.worktree_sort = order;
+    }
+
+    pub fn files_filter_open(&self) -> bool {
+        self.files_filter_open
+    }
+
+    pub fn reveal_project(&mut self, project: ProjectId) {
+        self.collapsed_projects.remove(&project);
+        self.query.clear();
+        self.filter = SidebarFilter::All;
     }
 
     /// Records unread attention without requiring a repository-owned pane.
@@ -1980,7 +2215,9 @@ impl SidebarState {
             .panel_selection
             .as_ref()
             .map(|selection| match selection {
-                PanelSelection::File(path) | PanelSelection::Change { path, .. } => path.as_path(),
+                PanelSelection::File(path)
+                | PanelSelection::Branch(path)
+                | PanelSelection::Change { path, .. } => path.as_path(),
             });
         if current != path {
             self.panel_selection = path
@@ -2059,6 +2296,7 @@ impl SidebarState {
         self.active_worktree = next;
         // Every panel-local draft belongs to the worktree it was typed for.
         self.files_query.clear();
+        self.files_filter_open = false;
         self.commit_message.clear();
         self.collapsed_directories.clear();
         self.publish = None;
@@ -2111,7 +2349,16 @@ impl SidebarState {
                 toggle_membership(&mut self.toggled_sections, *section);
             }
             SidebarAction::ToggleSourceControlPanel { .. } => self.panel_open = !self.panel_open,
-            SidebarAction::FilesQueryChanged { query, .. } => self.files_query.clone_from(query),
+            SidebarAction::FilesQueryChanged { query, .. } => {
+                self.files_query.clone_from(query);
+                self.files_filter_open = true;
+            }
+            SidebarAction::ToggleFilesFilter { .. } => {
+                self.files_filter_open = !self.files_filter_open;
+                if !self.files_filter_open {
+                    self.files_query.clear();
+                }
+            }
             SidebarAction::SetFileListMode { mode, .. } => self.file_list_mode = *mode,
             SidebarAction::SetChangeListMode { mode, .. } => self.change_list_mode = *mode,
             SidebarAction::ToggleDirectory { path, .. } => {
@@ -2127,6 +2374,9 @@ impl SidebarState {
                     path: path.clone(),
                     area: *area,
                 });
+            }
+            SidebarAction::OpenBranchFile { path, .. } => {
+                self.panel_selection = Some(PanelSelection::Branch(path.clone()));
             }
             SidebarAction::CommitMessageChanged { message, .. } => {
                 self.commit_message.clone_from(message);
@@ -2164,6 +2414,8 @@ impl SidebarState {
             | SidebarAction::OpenFileInEditor { .. }
             | SidebarAction::FileCommand { .. }
             | SidebarAction::NewWorktree { .. }
+            | SidebarAction::NewThread { .. }
+            | SidebarAction::OpenThread { .. }
             | SidebarAction::ReorderProject { .. }
             | SidebarAction::DragWindow
             | SidebarAction::MaximizeWindow
@@ -2217,6 +2469,12 @@ pub enum SidebarAction {
     ToggleControls,
     ToggleProject(ProjectId),
     OpenRepositoryPicker,
+    NewThread {
+        project_id: ProjectId,
+    },
+    OpenThread {
+        thread_id: ThreadId,
+    },
     OpenRepository {
         project_id: ProjectId,
         repository: PathBuf,
@@ -2257,6 +2515,9 @@ pub enum SidebarAction {
     RefreshWorktree {
         key: ActiveWorktreeKey,
     },
+    ToggleFilesFilter {
+        key: ActiveWorktreeKey,
+    },
     FilesQueryChanged {
         key: ActiveWorktreeKey,
         query: String,
@@ -2294,6 +2555,15 @@ pub enum SidebarAction {
         key: ActiveWorktreeKey,
         path: RepoPath,
         area: ChangeArea,
+    },
+    /// Opens exactly the committed comparison, including paths absent from disk.
+    OpenBranchFile {
+        key: ActiveWorktreeKey,
+        path: RepoPath,
+        old_path: Option<RepoPath>,
+        base_ref: ValidatedRefName,
+        head: Oid,
+        merge_base: Oid,
     },
     Stage {
         key: ActiveWorktreeKey,
@@ -2399,12 +2669,7 @@ pub fn clamp_expanded_width(width: f32) -> f32 {
 }
 
 fn sidebar_scroll_direction() -> cosmic::iced::widget::scrollable::Direction {
-    cosmic::iced::widget::scrollable::Direction::Vertical(
-        cosmic::iced::widget::scrollable::Scrollbar::default()
-            .width(design::SCROLLBAR_THUMB_WIDTH)
-            .scroller_width(design::SCROLLBAR_THUMB_WIDTH)
-            .spacing(design::SCROLLBAR_GUTTER - design::SCROLLBAR_THUMB_WIDTH),
-    )
+    cosmic::iced::widget::scrollable::Direction::Vertical(design::scrollbar())
 }
 
 /// The left project/worktree navigation.
@@ -2429,7 +2694,6 @@ pub fn view<'a>(
     let compact = mode == SidebarMode::Compact;
     let width = effective_width(mode, persisted_width);
     let loading = matches!(&model.data_state, SidebarDataState::Loading);
-    let refresh_enabled = !model.projects.is_empty() && !loading;
     let header_loading = loading && !model.projects.is_empty();
     let mut content = widget::column::with_capacity(7)
         .push(
@@ -2440,16 +2704,20 @@ pub fn view<'a>(
 
     if !compact && state.controls_expanded && search_is_reachable(model, mode) {
         content = content.push(
-            widget::container(controls(state, refresh_enabled, modal_open))
+            widget::container(controls(state, modal_open))
                 .class(theme::Container::Primary)
                 .padding(spacing.space_xxs),
         );
     }
 
-    content = content.push(body(model, state, compact, modal_open));
+    content = content.push(
+        widget::container(body(model, state, compact, modal_open))
+            .width(Length::Fill)
+            .height(Length::Fill),
+    );
     content = content
         .push(widget::divider::horizontal::default())
-        .push(footer(model, state, compact, modal_open))
+        .push(footer(compact, modal_open))
         .spacing(0)
         .width(Length::Fill)
         .height(Length::Fill);
@@ -2537,7 +2805,7 @@ fn header<'a>(
                 .on_close(SidebarAction::ToggleControls);
             if state.controls_expanded && !modal_open {
                 popover = popover.popup(
-                    widget::container(controls(state, !loading, false))
+                    widget::container(controls(state, false))
                         .class(theme::Container::Primary)
                         .padding(spacing.space_xxs)
                         .width(DEFAULT_EXPANDED_WIDTH),
@@ -2571,11 +2839,10 @@ fn header<'a>(
             .into(),
     );
     if loading {
-        children.push(
-            widget::progress_bar::circular::Circular::new()
-                .size(f32::from(ROW_ICON_SIZE))
-                .into(),
-        );
+        children.push(crate::ui_controls::activity_spinner(
+            f32::from(ROW_ICON_SIZE),
+            cosmic::theme::active().cosmic().warning.base.into(),
+        ));
     }
     children.extend(actions);
 
@@ -2595,7 +2862,7 @@ fn header<'a>(
     }
 }
 
-fn selected_project<'a>(
+pub(crate) fn selected_project<'a>(
     model: &'a SidebarModel,
     state: &SidebarState,
 ) -> Option<&'a SidebarProject> {
@@ -2615,11 +2882,11 @@ fn selected_project<'a>(
         .find(|project| project.id == project_id)
 }
 
-fn controls<'a>(
-    state: &'a SidebarState,
-    refresh_enabled: bool,
-    modal_open: bool,
-) -> Element<'a, SidebarAction> {
+pub fn files_filter_focus_id(key: &ActiveWorktreeKey) -> Id {
+    entity_id("panel.files.query", key.worktree_id)
+}
+
+fn controls<'a>(state: &'a SidebarState, modal_open: bool) -> Element<'a, SidebarAction> {
     let spacing = cosmic::theme::spacing();
     let mut actions: Vec<Element<'a, SidebarAction>> = Vec::with_capacity(3);
     actions.push(filters(state.filter, modal_open));
@@ -2628,14 +2895,6 @@ fn controls<'a>(
             .width(Length::Fill)
             .into(),
     );
-    if refresh_enabled {
-        actions.push(icon_action(
-            "view-refresh-symbolic",
-            "Refresh projects",
-            gated(SidebarAction::Refresh, modal_open),
-            stable_id("refresh"),
-        ));
-    }
     widget::column::with_children(vec![
         search(state, modal_open),
         widget::row::with_children(actions)
@@ -2648,12 +2907,7 @@ fn controls<'a>(
     .into()
 }
 
-fn footer<'a>(
-    model: &'a SidebarModel,
-    state: &SidebarState,
-    compact: bool,
-    modal_open: bool,
-) -> Element<'a, SidebarAction> {
+fn footer<'a>(compact: bool, modal_open: bool) -> Element<'a, SidebarAction> {
     let spacing = cosmic::theme::spacing();
     let settings = icon_action(
         "emblem-system-symbolic",
@@ -2662,23 +2916,7 @@ fn footer<'a>(
         stable_id("settings"),
     );
     if compact {
-        // The rail has no project header, so retain its worktree command here.
-        let mut children: Vec<Element<'a, SidebarAction>> = Vec::with_capacity(3);
-        if let Some(project) = selected_project(model, state) {
-            children.push(icon_action(
-                "list-add-symbolic",
-                &*project.chrome.new_worktree_name,
-                gated(
-                    SidebarAction::NewWorktree {
-                        project_id: project.id,
-                        repository: project.repository.clone(),
-                    },
-                    modal_open,
-                ),
-                project.chrome.new_worktree_id.clone(),
-            ));
-        }
-        children.push(settings);
+        let children: Vec<Element<'a, SidebarAction>> = vec![settings];
         return widget::column::with_children(children)
             .align_x(Alignment::Center)
             .spacing(spacing.space_xxxs)
@@ -2820,9 +3058,10 @@ fn project_list<'a>(
 fn loading(compact: bool) -> Element<'static, SidebarAction> {
     let spacing = cosmic::theme::spacing();
     let content = widget::column::with_children(vec![
-        widget::progress_bar::circular::Circular::new()
-            .size(f32::from(STATUS_ICON_SIZE))
-            .into(),
+        crate::ui_controls::activity_spinner(
+            f32::from(STATUS_ICON_SIZE),
+            cosmic::theme::active().cosmic().warning.base.into(),
+        ),
         widget::text::caption(if compact {
             "Loading"
         } else {
@@ -2965,13 +3204,18 @@ fn project_view<'a>(
     let entity = project.project;
     let chrome = &entity.chrome;
     let project_id = entity.id;
+    let selection = if entity.threads.iter().any(|thread| thread.selected) {
+        None
+    } else {
+        selection
+    };
     if compact {
         return compact_project(project, selection, modal_open, sticky_viewport);
     }
 
     let spacing = cosmic::theme::spacing();
     let worktree_count = project.worktrees.len();
-    let has_children = worktree_count > 0;
+    let has_children = worktree_count > 0 || !project.threads.is_empty();
     let project_identity = button::custom(
         widget::row::with_children(vec![
             widget::container(project_icon(entity, ROW_ICON_SIZE))
@@ -3030,7 +3274,7 @@ fn project_view<'a>(
             .into()
     };
     let add_worktree = icon_action(
-        "list-add-symbolic",
+        "worktree-add-symbolic",
         &*chrome.new_worktree_name,
         gated(
             SidebarAction::NewWorktree {
@@ -3041,10 +3285,16 @@ fn project_view<'a>(
         ),
         chrome.new_worktree_id.clone(),
     );
+    let add_thread = icon_action(
+        "thread-add-symbolic",
+        &*chrome.new_thread_name,
+        gated(SidebarAction::NewThread { project_id }, modal_open),
+        chrome.new_thread_id.clone(),
+    );
     let identity = widget::row::with_children(vec![
         project_identity,
         cosmic::iced::widget::Space::new()
-            .width(2.0 * ICON_CONTROL_SIZE)
+            .width(3.0 * ICON_CONTROL_SIZE)
             .into(),
     ])
     .align_y(Alignment::Center)
@@ -3052,7 +3302,7 @@ fn project_view<'a>(
     let header = RowInteraction::actions(
         identity.into(),
         widget::container(
-            widget::row::with_children(vec![disclosure, add_worktree])
+            widget::row::with_children(vec![disclosure, add_thread, add_worktree])
                 .align_y(Alignment::Center)
                 .spacing(0)
                 .height(PROJECT_HEADER_HEIGHT),
@@ -3093,6 +3343,16 @@ fn project_view<'a>(
     }
 
     if expanded {
+        for thread in &project.threads {
+            column = column.push(
+                widget::container(thread_view(thread, modal_open, false)).padding([
+                    0.0,
+                    0.0,
+                    0.0,
+                    ICON_CONTROL_SIZE,
+                ]),
+            );
+        }
         for &worktree in &project.worktrees {
             column = column.push(
                 widget::container(worktree_view(
@@ -3114,7 +3374,7 @@ fn project_view<'a>(
     RowInteraction::group(header, column.into(), sticky_viewport)
 }
 
-fn is_primary_worktree(repository: &Path, worktree: &Path) -> bool {
+pub(crate) fn is_primary_worktree(repository: &Path, worktree: &Path) -> bool {
     repository == worktree
         || (repository.file_name().is_some_and(|name| name == ".git")
             && repository.parent() == Some(worktree))
@@ -3158,6 +3418,11 @@ fn compact_project<'a>(
         project.editors,
     ))
     .center_x(Length::Fill);
+    let selection = if entity.threads.iter().any(|thread| thread.selected) {
+        None
+    } else {
+        selection
+    };
     let mut column = widget::column::with_capacity(project.worktrees.len() + 1)
         .align_x(Alignment::Center)
         .width(Length::Fill);
@@ -3182,6 +3447,9 @@ fn compact_project<'a>(
                 .then_some(SidebarAction::CancelWorktreeOperation(operation.id)),
         );
         column = column.push(crate::interaction::tooltip(action, &operation.label));
+    }
+    for thread in &project.threads {
+        column = column.push(thread_view(thread, modal_open, true));
     }
     for &worktree in &project.worktrees {
         let selected = selection
@@ -3217,8 +3485,24 @@ fn compact_project<'a>(
                 action,
                 &*worktree.chrome.tooltip,
             ));
-        if let Some((_, checks)) = &worktree.chrome.pull_request {
-            row = row.push(check_indicator(*checks));
+        let activity = project.state.agent_activity(entity.id, worktree.id);
+        if activity == Some(crate::agent::ActivityState::Working)
+            || worktree
+                .chrome
+                .pull_request
+                .as_ref()
+                .is_some_and(|pr| pr.checks == CheckStatus::Pending)
+        {
+            row = row.push(crate::ui_controls::activity_spinner(
+                f32::from(ROW_ICON_SIZE),
+                cosmic::theme::active().cosmic().warning.base.into(),
+            ));
+        } else if activity == Some(crate::agent::ActivityState::Waiting) {
+            row = row.push(status_icon(
+                "agent-waiting-symbolic",
+                "An agent needs input",
+                BadgeTone::Danger,
+            ));
         } else if let Some(label) = worktree.chrome.dirty_badge.as_deref() {
             row = row.push(status_icon(
                 "document-edit-symbolic",
@@ -3235,6 +3519,29 @@ fn compact_project<'a>(
             project.editors,
         ));
     }
+    column = column.push(icon_action(
+        "thread-add-symbolic",
+        &*chrome.new_thread_name,
+        gated(
+            SidebarAction::NewThread {
+                project_id: entity.id,
+            },
+            modal_open,
+        ),
+        chrome.new_thread_id.clone(),
+    ));
+    column = column.push(icon_action(
+        "worktree-add-symbolic",
+        &*chrome.new_worktree_name,
+        gated(
+            SidebarAction::NewWorktree {
+                project_id: entity.id,
+                repository: entity.repository.clone(),
+            },
+            modal_open,
+        ),
+        chrome.new_worktree_id.clone(),
+    ));
     widget::container(RowInteraction::group(
         header.into(),
         column.into(),
@@ -3243,6 +3550,79 @@ fn compact_project<'a>(
     .padding([cosmic::theme::spacing().space_xxxs, 0])
     .width(Length::Fill)
     .into()
+}
+
+fn thread_view(
+    thread: &SidebarThread,
+    modal_open: bool,
+    compact: bool,
+) -> Element<'_, SidebarAction> {
+    let activity = thread.activity;
+    let unread = thread.unread;
+    let mut content = widget::row::with_capacity(4)
+        .align_y(Alignment::Center)
+        .spacing(4)
+        .push(
+            widget::container(
+                widget::icon(crate::ui_controls::symbolic_icon("thread-symbolic"))
+                    .size(ROW_ICON_SIZE),
+            )
+            .class(theme::Container::custom(move |theme| {
+                cosmic::iced::widget::container::Style {
+                    icon_color: Some(
+                        if activity == Some(crate::agent::ActivityState::Waiting) || unread {
+                            theme.cosmic().destructive.base.into()
+                        } else if activity == Some(crate::agent::ActivityState::Working) {
+                            theme.cosmic().warning.base.into()
+                        } else {
+                            theme.current_container().on.into()
+                        },
+                    ),
+                    ..Default::default()
+                }
+            })),
+        );
+    if !compact {
+        content = content.push(
+            design::body(&thread.title)
+                .wrapping(cosmic::iced::widget::text::Wrapping::None)
+                .ellipsize(cosmic::iced::widget::text::Ellipsize::End(
+                    EllipsizeHeightLimit::Lines(1),
+                ))
+                .width(Length::Fill),
+        );
+        if thread.activity == Some(crate::agent::ActivityState::Working) {
+            content = content.push(crate::ui_controls::activity_spinner(
+                f32::from(ROW_ICON_SIZE),
+                cosmic::theme::active().cosmic().warning.base.into(),
+            ));
+        } else if thread.activity == Some(crate::agent::ActivityState::Waiting) || thread.unread {
+            content = content.push(status_icon(
+                "agent-waiting-symbolic",
+                "Thread needs attention",
+                BadgeTone::Danger,
+            ));
+        }
+    }
+    let action = button::custom(content)
+        .id(thread.open_id.clone())
+        .name(&*thread.accessible_name)
+        .class(sidebar_button_style(thread.selected))
+        .selected(thread.selected)
+        .padding([0, cosmic::theme::spacing().space_xxxs])
+        .height(WORKTREE_ROW_HEIGHT)
+        .width(if compact {
+            Length::Fixed(ICON_CONTROL_SIZE)
+        } else {
+            Length::Fill
+        })
+        .on_press_maybe(gated(
+            SidebarAction::OpenThread {
+                thread_id: thread.id,
+            },
+            modal_open,
+        ));
+    crate::interaction::tooltip(action, &thread.title)
 }
 
 fn worktree_accessible_name(
@@ -3282,6 +3662,15 @@ fn worktree_view<'a>(
         .push(worktree_status_icon(worktree, agent_update));
     row = row.push(
         design::body(&*chrome.label)
+            .class(if primary && !agent_update && activity.is_none() {
+                theme::Text::Custom(|theme| {
+                    let mut color: cosmic::iced::Color = theme.current_container().on.into();
+                    color.a *= 0.6;
+                    cosmic::iced::widget::text::Style { color: Some(color) }
+                })
+            } else {
+                theme::Text::default()
+            })
             .wrapping(cosmic::iced::widget::text::Wrapping::None)
             .ellipsize(cosmic::iced::widget::text::Ellipsize::End(
                 EllipsizeHeightLimit::Lines(1),
@@ -3293,16 +3682,26 @@ fn worktree_view<'a>(
             crate::agent::ActivityState::Working => (
                 "agent-working-symbolic",
                 "An agent is actively working",
-                BadgeTone::Success,
+                BadgeTone::Warning,
             ),
             crate::agent::ActivityState::Waiting => (
                 "agent-waiting-symbolic",
                 "An agent needs input",
-                BadgeTone::Warning,
+                BadgeTone::Danger,
             ),
             _ => unreachable!("only active agent states are displayed"),
         };
-        row = row.push(status_icon(icon, detail, tone));
+        row = row.push(if activity == crate::agent::ActivityState::Working {
+            crate::interaction::tooltip(
+                crate::ui_controls::activity_spinner(
+                    f32::from(ROW_ICON_SIZE),
+                    cosmic::theme::active().cosmic().warning.base.into(),
+                ),
+                detail,
+            )
+        } else {
+            status_icon(icon, detail, tone)
+        });
     }
     if let Some(label) = chrome.dirty_badge.as_deref() {
         row = row.push(status_icon(
@@ -3311,9 +3710,13 @@ fn worktree_view<'a>(
             BadgeTone::Warning,
         ));
     }
-    if let Some((number, checks)) = &chrome.pull_request {
-        row = row.push(badge(number.as_ref(), BadgeTone::Neutral));
-        row = row.push(check_indicator(*checks));
+    if chrome
+        .pull_request
+        .as_ref()
+        .is_some_and(|pr| pr.checks == CheckStatus::Pending)
+        && activity != Some(crate::agent::ActivityState::Working)
+    {
+        row = row.push(check_indicator(CheckStatus::Pending));
     }
     if primary {
         row = row.push(status_icon(
@@ -3563,33 +3966,25 @@ fn editor_icon(editor: &SidebarEditor) -> icon::Handle {
 }
 
 fn worktree_status_icon(worktree: &SidebarWorktree, update: bool) -> Element<'_, SidebarAction> {
-    let glyph: Element<'_, SidebarAction> = match worktree.pull_request_state {
-        None => worktree_icon().icon().size(ROW_ICON_SIZE).into(),
-        Some(state) => {
-            let (name, label, tone) = match state {
-                WorktreePullRequestState::Open => (
-                    "pull-request-symbolic",
-                    "Open pull request",
-                    BadgeTone::Success,
-                ),
-                WorktreePullRequestState::Draft => (
-                    "pull-request-symbolic",
-                    "Draft pull request",
-                    BadgeTone::Neutral,
-                ),
-                WorktreePullRequestState::Closed => (
-                    "window-close-symbolic",
-                    "Closed pull request",
-                    BadgeTone::Danger,
-                ),
-                WorktreePullRequestState::Merged => (
-                    "merged-pull-request-symbolic",
-                    "Merged pull request",
-                    BadgeTone::Success,
-                ),
-            };
-            status_icon(name, label, tone)
-        }
+    let glyph: Element<'_, SidebarAction> = if let Some(pr) = &worktree.chrome.pull_request {
+        let (handle, color) = pull_request_visual(pr);
+        widget::container(widget::icon(handle).size(ROW_ICON_SIZE))
+            .class(theme::Container::custom(move |_| {
+                cosmic::iced::widget::container::Style {
+                    icon_color: Some(color),
+                    ..Default::default()
+                }
+            }))
+            .into()
+    } else {
+        widget::container(worktree_icon().icon().size(ROW_ICON_SIZE))
+            .class(theme::Container::custom(|theme| {
+                cosmic::iced::widget::container::Style {
+                    icon_color: Some(theme.current_container().component.on_disabled.into()),
+                    ..Default::default()
+                }
+            }))
+            .into()
     };
     let dot = widget::container(cosmic::iced::widget::Space::new().width(4).height(4)).class(
         theme::Container::Custom(Box::new(move |theme| {
@@ -3742,24 +4137,36 @@ fn source_control_panel<'a>(
         ))
         .width(Length::Fill)
         .into(),
-        panel_icon_action(
-            "view-refresh-symbolic",
-            &*chrome.refresh_name,
-            gated(
-                SidebarAction::RefreshWorktree { key: key.clone() },
-                modal_open,
-            ),
-            chrome.refresh_id.clone(),
-        ),
     ]);
     if matches!(panel, WorktreePanel::Files) {
-        header = header.push(list_mode_controls(
-            key,
-            state.file_list_mode,
-            false,
-            modal_open,
-        ));
+        header = header.push(
+            crate::ui_controls::icon_control(
+                crate::ui_controls::symbolic_icon("system-search-symbolic"),
+                if state.files_filter_open {
+                    "Hide file filter"
+                } else {
+                    "Filter files"
+                },
+                state.files_filter_open,
+                !modal_open,
+                gated(
+                    SidebarAction::ToggleFilesFilter { key: key.clone() },
+                    modal_open,
+                ),
+            )
+            .id(chrome.files_filter_id.clone()),
+        );
     }
+    header = header.push(list_mode_controls(
+        key,
+        if matches!(panel, WorktreePanel::Files) {
+            state.file_list_mode
+        } else {
+            state.change_list_mode
+        },
+        matches!(panel, WorktreePanel::Changes),
+        modal_open,
+    ));
     column = column.push(
         header
             .align_y(Alignment::Center)
@@ -3776,9 +4183,10 @@ fn source_control_panel<'a>(
     // all and disappeared from the one frame that was asking for a press.
     column = column.push(slot(source.progress_label().map(|label| {
         widget::row::with_children(vec![
-            widget::progress_bar::circular::Circular::new()
-                .size(14.0)
-                .into(),
+            crate::ui_controls::activity_spinner(
+                14.0,
+                cosmic::theme::active().cosmic().warning.base.into(),
+            ),
             widget::text::caption(label).into(),
         ])
         .align_y(Alignment::Center)
@@ -3834,8 +4242,9 @@ fn source_control_panel<'a>(
         .into();
     }
 
-    let mut sections = widget::column::with_capacity(2).spacing(spacing.space_xxxs);
+    let mut sections = widget::column::with_capacity(3).spacing(spacing.space_xxxs);
     sections = sections.push(changes_section(state, source, modal_open));
+    sections = sections.push(branch_changes_section(state, source, modal_open));
     sections = sections.push(panel_section(
         key,
         PanelSection::History,
@@ -4088,7 +4497,7 @@ fn files_section<'a>(
     widget::column::with_children(vec![
         widget::container(
             widget::column::with_children(vec![
-                filter.into(),
+                slot(state.files_filter_open.then(|| filter.into())),
                 slot(notice.map(|notice| widget::text::caption(notice).into())),
             ])
             .spacing(spacing.space_xxxs),
@@ -4212,17 +4621,8 @@ fn changes_section<'a>(
     let spacing = cosmic::theme::spacing();
     let mut column =
         widget::column::with_capacity(source.groups().len() + 2).spacing(spacing.space_xxxs);
-    column = column.push(
-        widget::container(list_mode_controls(
-            &source.key,
-            state.change_list_mode,
-            true,
-            modal_open,
-        ))
-        .align_right(Length::Fill),
-    );
     if source.groups().iter().all(ChangeGroup::is_empty) {
-        column = column.push(widget::text::caption("No changes in this worktree."));
+        column = column.push(widget::text::caption("No uncommitted changes."));
     }
     for group in source.groups() {
         if group.is_empty() {
@@ -4233,6 +4633,137 @@ fn changes_section<'a>(
     column = column.push(widget::divider::horizontal::default());
     column = column.push(changes_footer(state, source, modal_open));
     column.into()
+}
+
+fn branch_changes_section<'a>(
+    state: &'a SidebarState,
+    source: &'a SourceControlModel,
+    modal_open: bool,
+) -> Element<'a, SidebarAction> {
+    let spacing = cosmic::theme::spacing();
+    let mut column = widget::column::with_capacity(4).spacing(spacing.space_xxxs);
+    let branch = match &source.branch_changes {
+        BranchChanges::Ready(branch) => branch,
+        other => {
+            column = column.push(design::heading("Branch changes"));
+            return match other {
+                BranchChanges::Unavailable(reason) => {
+                    column.push(widget::text::caption(*reason)).into()
+                }
+                BranchChanges::Loading(base_ref) => column
+                    .push(
+                        widget::row::with_children(vec![
+                            crate::ui_controls::activity_spinner(
+                                14.0,
+                                cosmic::theme::active().cosmic().warning.base.into(),
+                            ),
+                            widget::text::caption(format!(
+                                "Comparing with {}…",
+                                base_ref.short_name()
+                            ))
+                            .into(),
+                        ])
+                        .spacing(spacing.space_xxs)
+                        .align_y(Alignment::Center),
+                    )
+                    .into(),
+                BranchChanges::Error { base_ref, message } => column
+                    .push(
+                        widget::text::caption(format!(
+                            "Could not compare with {}: {message}",
+                            base_ref.short_name()
+                        ))
+                        .wrapping(cosmic::iced::widget::text::Wrapping::Word),
+                    )
+                    .push(button::standard("Try again").on_press_maybe(gated(
+                        SidebarAction::RefreshWorktree {
+                            key: source.key.clone(),
+                        },
+                        modal_open,
+                    )))
+                    .into(),
+                BranchChanges::Ready(_) => unreachable!(),
+            };
+        }
+    };
+    column = column
+        .push(design::heading(&*branch.title))
+        .push(widget::text::caption(&*branch.base_label));
+    if branch.rows.is_empty() {
+        return column
+            .push(widget::text::caption(
+                "No committed changes relative to this base.",
+            ))
+            .into();
+    }
+    let flat = state.change_list_mode == FileListMode::Flat;
+    let (tree, hidden) = visible_file_rows(&branch.tree, &state.collapsed_directories, "", flat);
+    let mut rows = widget::column::with_capacity(tree.len()).spacing(0);
+    for file in tree {
+        if file.directory {
+            let collapsed = state.collapsed_directories.contains(&file.path);
+            rows = rows.push(panel_row(
+                &*file.chrome.accessible_name,
+                file.depth,
+                widget::row::with_children(vec![
+                    crate::file_icon::folder(!collapsed).into(),
+                    design::body(&*file.chrome.label).into(),
+                ])
+                .spacing(4)
+                .align_y(Alignment::Center),
+                SidebarAction::ToggleDirectory {
+                    key: source.key.clone(),
+                    path: file.path.clone(),
+                },
+                false,
+                modal_open,
+            ));
+            continue;
+        }
+        let Ok(index) = branch
+            .rows
+            .binary_search_by(|row| row.entry.path.cmp(&file.path))
+        else {
+            continue;
+        };
+        let row = &branch.rows[index];
+        let tone = match row.entry.kind {
+            ChangeKind::Added => BadgeTone::Success,
+            ChangeKind::Deleted => BadgeTone::Danger,
+            _ => BadgeTone::Warning,
+        };
+        rows = rows.push(panel_row(
+            &*row.label, if flat { 0 } else { file.depth },
+            widget::row::with_children(vec![
+                crate::file_icon::icon(row.entry.path.as_path()).into(),
+                design::body(if !flat && row.entry.old_path.is_none() {
+                    row.entry.path.file_name()
+                } else { Cow::Borrowed(&*row.label) })
+                    .wrapping(cosmic::iced::widget::text::Wrapping::None)
+                    .ellipsize(cosmic::iced::widget::text::Ellipsize::Start(EllipsizeHeightLimit::Lines(1)))
+                    .width(Length::Fill).into(),
+                semantic_caption(&*row.status, tone),
+                widget::text::caption(&*row.counts).into(),
+            ]).spacing(spacing.space_xxxs).align_y(Alignment::Center),
+            SidebarAction::OpenBranchFile {
+                key: source.key.clone(),
+                path: row.entry.path.clone(),
+                old_path: row.entry.old_path.clone(),
+                base_ref: branch.base_ref.clone(),
+                head: branch.head.clone(),
+                merge_base: branch.merge_base.clone(),
+            },
+            matches!(&state.panel_selection, Some(PanelSelection::Branch(path)) if path == &row.entry.path),
+            modal_open,
+        ));
+    }
+    column = column.push(rows);
+    let hidden = hidden + branch.rows.len().saturating_sub(MAX_VISIBLE_CHANGE_ROWS);
+    column
+        .push(slot((hidden > 0).then(|| {
+            widget::text::caption(format!("{hidden} more branch rows not shown")).into()
+        })))
+        .into()
 }
 
 fn change_group_view<'a>(
@@ -4412,11 +4943,17 @@ fn change_row_view<'a>(
     )
     .align_right(CHANGE_STATUS_WIDTH)
     .height(PANEL_ROW_HEIGHT)
-    .class(theme::Container::Custom(Box::new(|theme| {
+    .class(theme::Container::Custom(Box::new(move |theme| {
+        let base: cosmic::iced::Color = theme.current_container().base.into();
+        let foreground: cosmic::iced::Color = theme.current_container().on.into();
+        let alpha = if selected { 0.16 } else { 0.06 };
         cosmic::iced::widget::container::Style {
-            background: Some(cosmic::iced::Background::Color(
-                theme.current_container().base.into(),
-            )),
+            background: Some(cosmic::iced::Background::Color(cosmic::iced::Color {
+                r: foreground.r * alpha + base.r * (1.0 - alpha),
+                g: foreground.g * alpha + base.g * (1.0 - alpha),
+                b: foreground.b * alpha + base.b * (1.0 - alpha),
+                a: 1.0,
+            })),
             ..Default::default()
         }
     })));
@@ -5085,9 +5622,6 @@ pub(crate) fn sidebar_button_style(selected: bool) -> theme::Button {
         let mut style = button::Style::new();
         let foreground: cosmic::iced::Color = theme.current_container().on.into();
         let mut text = foreground;
-        if !selected {
-            text.a *= 0.78;
-        }
         if disabled {
             text.a *= 0.5;
         }
@@ -5300,7 +5834,7 @@ fn status_icon<'a>(
                 BadgeTone::Success => cosmic.success.base.into(),
                 BadgeTone::Warning => cosmic.warning.base.into(),
                 BadgeTone::Danger => cosmic.destructive.base.into(),
-                _ => cosmic.on_bg_color().into(),
+                _ => theme.current_container().component.on_disabled.into(),
             }),
             ..Default::default()
         }
@@ -5311,7 +5845,10 @@ fn status_icon<'a>(
 fn check_indicator(status: CheckStatus) -> Element<'static, SidebarAction> {
     if status == CheckStatus::Pending {
         return crate::interaction::tooltip(
-            widget::progress_bar::circular::Circular::new().size(f32::from(ROW_ICON_SIZE)),
+            crate::ui_controls::activity_spinner(
+                f32::from(ROW_ICON_SIZE),
+                cosmic::theme::active().cosmic().warning.base.into(),
+            ),
             "CI checks pending or running",
         );
     }
@@ -5330,6 +5867,7 @@ fn check_indicator(status: CheckStatus) -> Element<'static, SidebarAction> {
 struct FilteredProject<'a> {
     project: &'a SidebarProject,
     worktrees: Vec<&'a SidebarWorktree>,
+    threads: Vec<&'a SidebarThread>,
     editors: &'a [SidebarEditor],
     state: &'a SidebarState,
 }
@@ -5351,6 +5889,21 @@ fn filtered_projects<'a>(
         .iter()
         .filter_map(|project| {
             let project_matches = query.is_empty() || project.matches(&query);
+            let threads = project
+                .threads
+                .iter()
+                .filter(|thread| {
+                    (project_matches || thread.folded_title.contains(&query))
+                        && match state.filter {
+                            SidebarFilter::All => true,
+                            SidebarFilter::Attention => {
+                                thread.unread
+                                    || thread.activity == Some(crate::agent::ActivityState::Waiting)
+                            }
+                            SidebarFilter::PullRequests => false,
+                        }
+                })
+                .collect::<Vec<_>>();
             let mut worktrees = project
                 .worktrees
                 .iter()
@@ -5393,12 +5946,17 @@ fn filtered_projects<'a>(
                     .then_with(|| left.path.cmp(&right.path))
             });
             let visible = match state.filter {
-                SidebarFilter::All => project_matches || !worktrees.is_empty(),
-                SidebarFilter::Attention | SidebarFilter::PullRequests => !worktrees.is_empty(),
+                SidebarFilter::All => {
+                    project_matches || !worktrees.is_empty() || !threads.is_empty()
+                }
+                SidebarFilter::Attention | SidebarFilter::PullRequests => {
+                    !worktrees.is_empty() || !threads.is_empty()
+                }
             };
             visible.then_some(FilteredProject {
                 project,
                 worktrees,
+                threads,
                 editors: &model.external_editors,
                 state,
             })
@@ -5613,7 +6171,7 @@ mod row_interaction {
                     let header = Rectangle {
                         x: bounds.x,
                         y: bounds.y,
-                        width: (bounds.width - 2.0 * ICON_CONTROL_SIZE).max(0.0),
+                        width: (bounds.width - 3.0 * ICON_CONTROL_SIZE).max(0.0),
                         height: PROJECT_HEADER_HEIGHT,
                     };
                     header.contains(point).then_some(*id)
@@ -6304,6 +6862,62 @@ mod tests {
         assert_eq!(order(&state), vec![id(10), id(11), id(12), id(13)]);
         state.set_worktree_sort(crate::settings::WorktreeSort::Alphabetical);
         assert_eq!(order(&state), vec![id(10), id(12), id(13), id(11)]);
+    }
+
+    #[test]
+    fn account_namespace_preserves_nested_branches_and_detached_identity() {
+        let mut entry = project();
+        let attached = worktree(11, "CarsonBurke/feature/editor/wrap", false);
+        let mut detached = worktree(12, "CarsonBurke/detached-unique", false);
+        detached.detached = true;
+        let original_detached = detached.chrome.label.clone();
+        entry.worktrees = vec![
+            attached,
+            detached,
+            worktree(13, "feature/editor/wrap", false),
+        ];
+        entry.set_branch_namespace("CarsonBurke");
+        assert_eq!(&*entry.worktrees[0].chrome.label, "feature/editor/wrap");
+        assert_eq!(
+            entry.worktrees[0].branch.as_deref(),
+            Some("CarsonBurke/feature/editor/wrap")
+        );
+        assert_eq!(entry.worktrees[1].chrome.label, original_detached);
+        assert_eq!(&*entry.worktrees[2].chrome.label, "feature/editor/wrap");
+    }
+
+    #[test]
+    fn thread_attention_keeps_its_project_visible_without_unread_worktrees() {
+        let mut entry = project();
+        let thread_id = ThreadId::from_uuid(Uuid::from_u128(20));
+        entry.threads.push(SidebarThread::new(
+            thread_id,
+            "Investigate login".into(),
+            true,
+            None,
+            true,
+        ));
+        let model = SidebarModel::ready(SidebarMode::Expanded, vec![entry]);
+        let mut state = SidebarState::default();
+        state.apply(&SidebarAction::SetFilter(SidebarFilter::Attention));
+        state.apply(&SidebarAction::SearchChanged("login".into()));
+        let projects = filtered_projects(&model, &state, false);
+        assert_eq!(projects.len(), 1);
+        assert!(projects[0].worktrees.is_empty());
+        assert_eq!(projects[0].threads[0].id, thread_id);
+    }
+
+    #[test]
+    fn hiding_file_filter_does_not_leave_an_invisible_query() {
+        let mut state = SidebarState::default();
+        let key = main_key();
+        state.apply(&SidebarAction::FilesQueryChanged {
+            key: key.clone(),
+            query: "missing".into(),
+        });
+        state.apply(&SidebarAction::ToggleFilesFilter { key });
+        assert!(!state.files_filter_open());
+        assert_eq!(state.files_query(), "");
     }
 
     #[test]
@@ -7648,6 +8262,75 @@ mod tests {
 
     fn source_control() -> SourceControlModel {
         SourceControlModel::ready(main_key(), &snapshot())
+    }
+
+    #[test]
+    fn worktree_change_badge_clears_after_clean_status_read() {
+        let mut worktree =
+            SidebarWorktree::from_durable(WorktreeId::new(), "/repo".into(), Some("main".into()));
+        let mut status = StatusSnapshot::default();
+        status.dirty.unstaged = 1;
+        worktree.apply_status(&status);
+        assert!(worktree.chrome.dirty_badge.is_some());
+        worktree.apply_status(&StatusSnapshot::default());
+        assert!(worktree.chrome.dirty_badge.is_none());
+        status.dirty.unstaged = 0;
+        status.dirty.untracked = 1;
+        worktree.apply_status(&status);
+        assert!(worktree.chrome.dirty_badge.is_some());
+        worktree.apply_status(&StatusSnapshot::default());
+        assert!(worktree.chrome.dirty_badge.is_none());
+    }
+
+    #[test]
+    fn branch_only_changes_keep_historical_paths_and_accent() {
+        let mut source = SourceControlModel::ready(
+            main_key(),
+            &RepositorySnapshot {
+                status: StatusSnapshot::default(),
+                files: WorkingFiles::default(),
+                remotes: Vec::new(),
+                local_refs: Vec::new(),
+                remote_refs: Vec::new(),
+                remote_heads: Vec::new(),
+            },
+        );
+        assert!(!source.has_changes());
+        let comparison = BranchComparison {
+            base_ref: ref_name("refs/heads/trunk"),
+            base_oid: oid_of(0x22),
+            head: oid_of(0x11),
+            merge_base: oid_of(0x22),
+            entries: vec![
+                crate::repository::DiffEntry {
+                    path: repo_path("deleted.txt"),
+                    old_path: None,
+                    kind: ChangeKind::Deleted,
+                    added_lines: Some(0),
+                    removed_lines: Some(4),
+                },
+                crate::repository::DiffEntry {
+                    path: repo_path("new name.txt"),
+                    old_path: Some(repo_path("old name.txt")),
+                    kind: ChangeKind::Renamed,
+                    added_lines: Some(0),
+                    removed_lines: Some(0),
+                },
+            ],
+        };
+        let branch = Arc::new(BranchChangesModel::new(comparison));
+        assert_eq!(
+            branch.rows[1].entry.old_path,
+            Some(repo_path("old name.txt"))
+        );
+        assert!(
+            branch
+                .tree
+                .iter()
+                .any(|file| file.path == repo_path("deleted.txt"))
+        );
+        source.branch_changes = BranchChanges::Ready(branch);
+        assert!(source.has_changes());
     }
 
     #[test]

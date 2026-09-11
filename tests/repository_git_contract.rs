@@ -511,6 +511,8 @@ fn every_diff_basis_reads_the_matching_pair_of_sides() {
 
     let (old, new, ..) = sides(DiffBasis::MergeBaseToHead {
         base_ref: ValidatedRefName::parse("refs/heads/main").unwrap(),
+        head: feature.clone(),
+        merge_base: root.clone(),
     });
     // The merge base is the root commit, not the tip of `main`.
     assert_eq!(text_side(&old), "one\n");

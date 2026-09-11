@@ -32,6 +32,27 @@ pub fn symbolic_icon(name: &str) -> widget::icon::Handle {
     static MERGED_PULL_REQUEST: LazyLock<widget::icon::Handle> = LazyLock::new(|| {
         widget::icon::from_svg_bytes(br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16"><g fill="none" stroke="black" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><circle cx="4" cy="3" r="1.5"/><circle cx="4" cy="13" r="1.5"/><circle cx="12" cy="3" r="1.5"/><path d="M4 4.5v7M12 4.5V6a3 3 0 0 1-3 3H4"/></g></svg>"#.as_slice()).symbolic(true)
     });
+    static CLOSED_PULL_REQUEST: LazyLock<widget::icon::Handle> = LazyLock::new(|| {
+        widget::icon::from_svg_bytes(br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16"><g fill="none" stroke="black" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><circle cx="4" cy="3" r="1.5"/><circle cx="4" cy="13" r="1.5"/><circle cx="12" cy="13" r="1.5"/><path d="M4 4.5v7M12 11.5V9M9 2l5 5M14 2l-5 5"/></g></svg>"#.as_slice()).symbolic(true)
+    });
+    static CHEVRON_DOWN: LazyLock<widget::icon::Handle> = LazyLock::new(|| {
+        widget::icon::from_svg_bytes(br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16"><path d="m4 6 4 4 4-4" fill="none" stroke="black" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>"#.as_slice()).symbolic(true)
+    });
+    static CHEVRON_RIGHT: LazyLock<widget::icon::Handle> = LazyLock::new(|| {
+        widget::icon::from_svg_bytes(br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16"><path d="m6 4 4 4-4 4" fill="none" stroke="black" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>"#.as_slice()).symbolic(true)
+    });
+    static PLUS: LazyLock<widget::icon::Handle> = LazyLock::new(|| {
+        widget::icon::from_svg_bytes(br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16"><path d="M4 8h8M8 4v8" fill="none" stroke="black" stroke-width="1.5" stroke-linecap="round"/></svg>"#.as_slice()).symbolic(true)
+    });
+    static THREAD: LazyLock<widget::icon::Handle> = LazyLock::new(|| {
+        widget::icon::from_svg_bytes(br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16"><path d="M2 2.5h12v9H7l-4 3v-3H2zM5 6h6M5 8.5h4" fill="none" stroke="black" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/></svg>"#.as_slice()).symbolic(true)
+    });
+    static THREAD_ADD: LazyLock<widget::icon::Handle> = LazyLock::new(|| {
+        widget::icon::from_svg_bytes(br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16"><path d="M8 2.5H2v9h1v3l4-3h7V9M12 1v6M9 4h6" fill="none" stroke="black" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/></svg>"#.as_slice()).symbolic(true)
+    });
+    static WORKTREE_ADD: LazyLock<widget::icon::Handle> = LazyLock::new(|| {
+        widget::icon::from_svg_bytes(br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16"><g fill="none" stroke="black" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><circle cx="4" cy="3" r="1.5"/><circle cx="4" cy="13" r="1.5"/><path d="M4 4.5v7M4 9h5a3 3 0 0 0 3-3M12 1v5M9.5 3.5h5"/></g></svg>"#.as_slice()).symbolic(true)
+    });
     static ATTENTION: LazyLock<widget::icon::Handle> = LazyLock::new(|| {
         widget::icon::from_svg_bytes(br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16"><g fill="none" stroke="black" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><path d="M3 11.5h10l-1.5-2V6a3.5 3.5 0 0 0-7 0v3.5zM6.5 13.5a1.7 1.7 0 0 0 3 0M8 1v1"/></g></svg>"#.as_slice()).symbolic(true)
     });
@@ -51,6 +72,13 @@ pub fn symbolic_icon(name: &str) -> widget::icon::Handle {
         "view-split-right-symbolic" => SPLIT_PANEL.clone(),
         "pull-request-symbolic" => PULL_REQUEST.clone(),
         "merged-pull-request-symbolic" => MERGED_PULL_REQUEST.clone(),
+        "closed-pull-request-symbolic" => CLOSED_PULL_REQUEST.clone(),
+        "go-down-symbolic" => CHEVRON_DOWN.clone(),
+        "go-next-symbolic" => CHEVRON_RIGHT.clone(),
+        "list-add-symbolic" => PLUS.clone(),
+        "thread-symbolic" => THREAD.clone(),
+        "thread-add-symbolic" => THREAD_ADD.clone(),
+        "worktree-add-symbolic" => WORKTREE_ADD.clone(),
         "notifications-symbolic" => ATTENTION.clone(),
         "agent-working-symbolic" => WORKING.clone(),
         "agent-waiting-symbolic" => WAITING.clone(),
@@ -59,9 +87,40 @@ pub fn symbolic_icon(name: &str) -> widget::icon::Handle {
     }
 }
 
+/// Embedded application artwork does not depend on the installed icon theme.
+pub fn ceditor_icon() -> widget::icon::Handle {
+    static ICON: std::sync::LazyLock<widget::icon::Handle> = std::sync::LazyLock::new(|| {
+        widget::icon::from_svg_bytes(
+            include_bytes!("../packaging/io.github.cagents.ceditor.svg").as_slice(),
+        )
+        .symbolic(false)
+    });
+    ICON.clone()
+}
+
+/// Provider identity is shared by terminal and native-chat tab presentations.
+pub fn provider_icon(provider: crate::agent::Provider) -> widget::icon::Handle {
+    use std::sync::LazyLock;
+    static OMP: LazyLock<widget::icon::Handle> = LazyLock::new(|| {
+        widget::icon::from_svg_bytes(include_bytes!("icons/omp.svg").as_slice()).symbolic(false)
+    });
+    static CLAUDE: LazyLock<widget::icon::Handle> = LazyLock::new(|| {
+        widget::icon::from_svg_bytes(include_bytes!("icons/claude.svg").as_slice()).symbolic(false)
+    });
+    static CODEX: LazyLock<widget::icon::Handle> = LazyLock::new(|| {
+        widget::icon::from_svg_bytes(include_bytes!("icons/codex.svg").as_slice()).symbolic(true)
+    });
+    match provider {
+        crate::agent::Provider::Omp => OMP.clone(),
+        crate::agent::Provider::Claude => CLAUDE.clone(),
+        crate::agent::Provider::Codex => CODEX.clone(),
+    }
+}
+
 pub struct IconControl<'a, Message> {
     button: widget::button::Button<'a, Message>,
     label: Cow<'a, str>,
+    selected: bool,
 }
 
 /// A centered, fixed-size icon target with a quiet surface selected state.
@@ -79,18 +138,24 @@ pub fn icon_control<'a, Message: Clone + 'a>(
         button: widget::button::custom(content)
             .name(label.clone())
             .selected(selected)
-            .class(control_style(selected))
+            .class(control_style(selected, None))
             .width(crate::design::PRIMARY_CONTROL_SIZE)
             .height(crate::design::PRIMARY_CONTROL_SIZE)
             .padding(0)
             .on_press_maybe(if enabled { on_press } else { None }),
         label,
+        selected,
     }
 }
 
 impl<'a, Message: Clone + 'a> IconControl<'a, Message> {
     pub fn id(mut self, id: widget::Id) -> Self {
         self.button = self.button.id(id);
+        self
+    }
+
+    pub fn icon_color(mut self, color: iced::Color) -> Self {
+        self.button = self.button.class(control_style(self.selected, Some(color)));
         self
     }
 }
@@ -128,9 +193,9 @@ pub fn segmented_controls<'a, Message: 'a>(
     .into()
 }
 
-fn control_style(selected: bool) -> cosmic::theme::Button {
+fn control_style(selected: bool, color: Option<iced::Color>) -> cosmic::theme::Button {
     let appearance = move |focused: bool, theme: &cosmic::Theme| widget::button::Style {
-        background: selected.then(|| {
+        background: (selected || focused).then(|| {
             iced::Background::Color(
                 theme
                     .current_container()
@@ -140,9 +205,9 @@ fn control_style(selected: bool) -> cosmic::theme::Button {
             )
         }),
         border_radius: theme.cosmic().corner_radii.radius_s.into(),
-        border_width: if focused { 1.0 } else { 0.0 },
+        border_width: 0.0,
         border_color: theme.current_container().component.on_disabled.into(),
-        icon_color: Some(theme.current_container().component.on.into()),
+        icon_color: Some(color.unwrap_or_else(|| theme.current_container().component.on.into())),
         ..widget::button::Style::new()
     };
     cosmic::theme::Button::Custom {
@@ -163,5 +228,152 @@ fn control_style(selected: bool) -> cosmic::theme::Button {
             )),
             ..appearance(focused, theme)
         }),
+    }
+}
+
+/// A small activity glyph that redraws only while mounted, visible and focused.
+/// The widget owns its clock: there is no application subscription or view rebuild.
+pub fn activity_spinner<'a, Message: 'a>(size: f32, color: iced::Color) -> Element<'a, Message> {
+    Element::new(activity::Spinner { size, color })
+}
+
+mod activity {
+    use cosmic::iced::{
+        self, Event, Length, Rectangle, Size,
+        advanced::{
+            Clipboard, Layout, Shell, Widget, layout, renderer,
+            widget::{Tree, tree},
+        },
+        mouse, window,
+    };
+    use cosmic::{Renderer, Theme};
+    use std::time::{Duration, Instant};
+
+    pub(super) struct Spinner {
+        pub size: f32,
+        pub color: iced::Color,
+    }
+
+    struct State {
+        focused: bool,
+        phase: u8,
+        last_frame: Option<Instant>,
+    }
+
+    impl<Message> Widget<Message, Theme, Renderer> for Spinner {
+        fn tag(&self) -> tree::Tag {
+            tree::Tag::of::<State>()
+        }
+
+        fn state(&self) -> tree::State {
+            tree::State::new(State {
+                focused: true,
+                phase: 0,
+                last_frame: None,
+            })
+        }
+
+        fn size(&self) -> Size<Length> {
+            Size::new(Length::Fixed(self.size), Length::Fixed(self.size))
+        }
+
+        fn layout(
+            &mut self,
+            _tree: &mut Tree,
+            _renderer: &Renderer,
+            limits: &layout::Limits,
+        ) -> layout::Node {
+            layout::atomic(limits, self.size, self.size)
+        }
+
+        fn update(
+            &mut self,
+            tree: &mut Tree,
+            event: &Event,
+            layout: Layout<'_>,
+            _cursor: mouse::Cursor,
+            _renderer: &Renderer,
+            _clipboard: &mut dyn Clipboard,
+            shell: &mut Shell<'_, Message>,
+            viewport: &Rectangle,
+        ) {
+            let state = tree.state.downcast_mut::<State>();
+            match event {
+                Event::Window(window::Event::Unfocused) => state.focused = false,
+                Event::Window(window::Event::Focused) => {
+                    state.focused = true;
+                    state.last_frame = None;
+                    if layout.bounds().intersection(viewport).is_some() {
+                        shell.request_redraw();
+                    }
+                }
+                Event::Window(window::Event::RedrawRequested(now))
+                    if state.focused && layout.bounds().intersection(viewport).is_some() =>
+                {
+                    let interval = Duration::from_millis(80);
+                    if state
+                        .last_frame
+                        .is_none_or(|last| now.duration_since(last) >= interval)
+                    {
+                        state.phase = (state.phase + 1) % 8;
+                        state.last_frame = Some(*now);
+                    }
+                    shell.request_redraw_at(state.last_frame.unwrap() + interval);
+                }
+                _ => {}
+            }
+        }
+
+        fn draw(
+            &self,
+            tree: &Tree,
+            renderer: &mut Renderer,
+            _theme: &Theme,
+            _style: &renderer::Style,
+            layout: Layout<'_>,
+            _cursor: mouse::Cursor,
+            viewport: &Rectangle,
+        ) {
+            use cosmic::iced::advanced::Renderer as _;
+            let Some(clip) = layout.bounds().intersection(viewport) else {
+                return;
+            };
+            let bounds = layout.bounds();
+            let phase = tree.state.downcast_ref::<State>().phase;
+            let dot = self.size / 6.0;
+            let radius = (self.size - dot) / 2.0;
+            const POSITIONS: [(f32, f32); 8] = [
+                (0.0, -1.0),
+                (0.707, -0.707),
+                (1.0, 0.0),
+                (0.707, 0.707),
+                (0.0, 1.0),
+                (-0.707, 0.707),
+                (-1.0, 0.0),
+                (-0.707, -0.707),
+            ];
+            renderer.with_layer(clip, |renderer| {
+                for (index, (x, y)) in POSITIONS.into_iter().enumerate() {
+                    let mut color = self.color;
+                    color.a *= 1.0 - f32::from((phase + 8 - index as u8) % 8) * 0.1;
+                    renderer.fill_quad(
+                        renderer::Quad {
+                            bounds: Rectangle {
+                                x: bounds.center_x() + x * radius - dot / 2.0,
+                                y: bounds.center_y() + y * radius - dot / 2.0,
+                                width: dot,
+                                height: dot,
+                            },
+                            border: iced::Border {
+                                radius: (dot / 2.0).into(),
+                                ..Default::default()
+                            },
+                            ..Default::default()
+                        },
+                        color,
+                    );
+                }
+            });
+        }
     }
 }

@@ -33,6 +33,7 @@ pub(crate) type SharedHost = Arc<Mutex<HostState>>;
 pub(crate) struct TerminalRecord {
     pub(super) session: TerminalSession,
     pub(super) handle: TerminalHandle,
+    pub(super) execution_environment: Option<crate::terminal_ipc::ChatExecutionEnvironment>,
     options: TerminalSpawnOptions,
     upgrade_sources: Vec<TerminalSession>,
     running: bool,
@@ -189,6 +190,7 @@ pub(crate) struct HostState {
     pub(super) inventory_generation: u64,
     shutdown_capabilities: VecDeque<(ShutdownCapability, Instant)>,
     pub(super) chats: BTreeMap<TerminalId, super::chat::Record>,
+    pub(super) chat_handoffs: BTreeMap<TerminalId, super::chat::TerminalHandoff>,
     pub(super) chat_spawning: BTreeMap<TerminalId, crate::chat::Launch>,
     pub(super) chat_bindings: BTreeMap<TerminalId, super::chat::PendingBinding>,
     pub(crate) agent_observer: Arc<crate::agent::observe::Observer>,
@@ -215,6 +217,7 @@ impl HostState {
             inventory_generation: 0,
             shutdown_capabilities: VecDeque::new(),
             chats: BTreeMap::new(),
+            chat_handoffs: BTreeMap::new(),
             chat_spawning: BTreeMap::new(),
             chat_bindings: BTreeMap::new(),
             agent_observer: Arc::new(crate::agent::observe::Observer::new()),
@@ -235,6 +238,9 @@ impl HostState {
     }
 
     pub(crate) fn unregister_client(&mut self, client_id: ClientId) -> Vec<TerminalHandle> {
+        for receipt in self.chat_handoffs.values_mut() {
+            receipt.detach(client_id);
+        }
         for record in self.chats.values_mut() {
             record.subscribers.remove(&client_id);
             record.observations.remove(&client_id);
@@ -565,6 +571,7 @@ impl HostState {
                 session,
                 handle,
                 options: TerminalSpawnOptions::default(),
+                execution_environment: None,
                 upgrade_sources: Vec::new(),
                 running: true,
                 completion_observed: false,
@@ -708,7 +715,10 @@ impl HostState {
     fn inventory_count(&mut self) -> u64 {
         let mut count = (self.spawning.len() + self.chat_spawning.len()) as u64;
         for record in self.chats.values_mut() {
-            if !record.completion_observed && !record.handle.owns_work() {
+            if !record.completion_observed
+                && !record.handle.owns_work()
+                && !record.returning_terminal
+            {
                 record.completion_observed = true;
                 self.inventory_generation += 1;
             }
@@ -795,7 +805,10 @@ impl HostState {
         let count = self.inventory_count();
         if matches!(operation, ShutdownOperation::Stop { .. })
             && (!self.chat_spawning.is_empty()
-                || self.chats.values().any(|record| record.handle.owns_work()))
+                || self
+                    .chats
+                    .values()
+                    .any(|record| record.handle.owns_work() || record.returning_terminal))
         {
             return ShutdownOutcome::EmptyRequired {
                 current_count: count,
@@ -882,6 +895,23 @@ pub(super) fn prepare_upgrade(
     prepare_upgrade_with(host, capability, crate::upgrade::handoff::Store::discover)
 }
 
+fn validate_terminal_upgrade_environment(
+    recipe: &crate::model::LaunchRecipe,
+    execution: &crate::terminal_ipc::ChatExecutionEnvironment,
+) -> Result<(), ProtocolError> {
+    let provider = crate::agent::Provider::from_program(&recipe.program).ok_or_else(|| {
+        upgrade_error("Cannot verify the returned terminal's execution environment for upgrade")
+    })?;
+    let mut restored = crate::model::agent_recovery::fresh_native_environment(provider, false);
+    restored.extend(recipe.environment.clone());
+    if execution.0 != restored {
+        return Err(upgrade_error(
+            "Terminal execution environment cannot survive daemon upgrade without losing selected credentials or account settings. Align the daemon configuration or finish and close this terminal before upgrading; no source was stopped",
+        ));
+    }
+    Ok(())
+}
+
 fn prepare_upgrade_with(
     host: &SharedHost,
     capability: ShutdownCapability,
@@ -893,16 +923,30 @@ fn prepare_upgrade_with(
         state
             .validate_upgrade_capability(&capability, Instant::now())
             .map_err(upgrade_error)?;
+        if !state.chat_handoffs.is_empty() {
+            return Err(upgrade_error(
+                "A native-to-terminal handoff is not durably acknowledged; save its replacement before upgrading",
+            ));
+        }
+        if state.chats.values().any(|record| record.returning_terminal) {
+            return Err(upgrade_error(
+                "A native-to-terminal replacement is still pending; retry or explicitly close it before upgrading",
+            ));
+        }
         let terminals = state
             .terminals
             .iter()
             .filter(|(_, record)| !record.handle.is_completed())
             .map(|(&id, record)| {
+                if let Some(execution) = &record.execution_environment {
+                    validate_terminal_upgrade_environment(&record.session.launch, execution)?;
+                }
                 Ok((
                     state.descriptor(0, id)?.session,
                     record.handle.clone(),
                     record.options.clone(),
                     record.upgrade_sources.clone(),
+                    record.execution_environment.clone(),
                 ))
             })
             .collect::<Result<Vec<_>, ProtocolError>>()?;
@@ -927,6 +971,8 @@ fn prepare_upgrade_with(
                     source.id
                 )));
             }
+            super::chat::validate_upgrade_environment(&source, &launch, &record.handle)
+                .map_err(upgrade_error)?;
             if launch.provider == crate::agent::Provider::Codex
                 && state.terminals.contains_key(&source.id)
             {
@@ -972,7 +1018,7 @@ fn prepare_upgrade_with(
     }
     let mut frozen = Vec::with_capacity(terminals.len());
     let mut saved = Vec::with_capacity(terminals.len());
-    for (mut source, handle, mut options, previous_sources) in terminals {
+    for (mut source, handle, mut options, previous_sources, execution_environment) in terminals {
         let snapshot = handle.prepare_upgrade().map_err(upgrade_error)?;
         source.resume_hint = if let Some((selected, native)) = paired_codex.get(&source.id) {
             // The worker's argv hint can be fresh or name an older TUI thread.
@@ -1020,6 +1066,9 @@ fn prepare_upgrade_with(
             )));
         }
         let recipe = crate::upgrade::recovery_recipe(&source).map_err(upgrade_error)?;
+        if let Some(execution) = execution_environment {
+            validate_terminal_upgrade_environment(&recipe, &execution)?;
+        }
         options.columns = snapshot.size.columns;
         options.rows = snapshot.size.rows;
         options.cell_width_px = snapshot.size.cell_width_px;
@@ -1236,9 +1285,21 @@ pub(crate) fn spawn_terminal(
     session: TerminalSession,
     options: TerminalSpawnOptions,
 ) -> Result<TerminalDescriptor, ProtocolError> {
+    spawn_terminal_with_environment(shared, client_id, session, options, None)
+}
+
+pub(super) fn spawn_terminal_with_environment(
+    shared: &SharedHost,
+    client_id: ClientId,
+    session: TerminalSession,
+    options: TerminalSpawnOptions,
+    execution_environment: Option<crate::terminal_ipc::ChatExecutionEnvironment>,
+) -> Result<TerminalDescriptor, ProtocolError> {
     validate_launch(&session)?;
     validate_spawn_options(&options)?;
     let terminal_id = session.id;
+    let native_handoff = execution_environment.is_some();
+    let retained_environment = execution_environment.clone();
     {
         let mut state = shared
             .lock()
@@ -1255,6 +1316,7 @@ pub(crate) fn spawn_terminal(
         max_scrollback: options.max_scrollback,
         initially_visible: options.initially_visible,
         theme: options.theme,
+        execution_environment,
         ..TerminalConfig::default()
     };
     let handle = match TerminalHandle::spawn(session.clone(), config, move |wake| {
@@ -1279,10 +1341,25 @@ pub(crate) fn spawn_terminal(
 
     let event_rx = handle.events();
     let redraw_handle = handle.clone();
-    let descriptor = shared
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .finish_spawn(client_id, session, handle, options.initially_visible);
+    let descriptor = {
+        let mut state = shared
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let descriptor = state.finish_spawn(client_id, session, handle, options.initially_visible);
+        if descriptor.is_ok() {
+            state
+                .terminals
+                .get_mut(&terminal_id)
+                .expect("finished spawn")
+                .execution_environment = retained_environment;
+        }
+        if native_handoff {
+            // A chat connection cannot consume PTY events. The GUI attaches a
+            // terminal connection after checkpointing the returned live proof.
+            state.subscriptions.detach(client_id, terminal_id);
+        }
+        descriptor
+    };
     let descriptor = match descriptor {
         Ok(descriptor) => descriptor,
         Err(error) => {
@@ -1664,6 +1741,7 @@ for line in sys.stdin:
                 session: source.clone(),
                 source: None,
                 terminate_source: false,
+                execution_environment: Default::default(),
             },
         )
         .unwrap();
@@ -2244,6 +2322,7 @@ for line in sys.stdin:
             TerminalEvent::Exited {
                 exit_code: 0,
                 signal: None,
+                intentional: false,
             },
         );
         let capability = {

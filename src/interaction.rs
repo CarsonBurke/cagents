@@ -43,6 +43,23 @@ pub fn drive_animation<'a, Message: 'a>(
     .into()
 }
 
+/// Reveal a right-anchored pane without reflowing its contents on every frame.
+pub fn reveal_width<'a, Message: 'a>(
+    content: impl Into<Element<'a, Message>>,
+    width: f32,
+    progress: f32,
+) -> Element<'a, Message> {
+    Effect {
+        content: content.into(),
+        kind: Kind::RevealWidth {
+            width: width.max(0.0),
+            progress: progress.clamp(0.0, 1.0),
+        },
+        tip: None,
+    }
+    .into()
+}
+
 /// Fades semantic COSMIC surfaces and text without moving them.
 ///
 /// This is not a renderer opacity group: the pinned renderer has no group-alpha
@@ -355,6 +372,7 @@ enum Kind {
     Fade(f32),
     Tooltip,
     DriveAnimation(bool),
+    RevealWidth { width: f32, progress: f32 },
     Opaque,
 }
 
@@ -376,6 +394,19 @@ struct TooltipTag;
 struct AnimationDriverTag;
 struct OpaqueTag;
 struct ContextMenuTag;
+struct RevealWidthTag;
+
+fn effect_layout(kind: Kind, layout: Layout<'_>) -> Layout<'_> {
+    if matches!(kind, Kind::RevealWidth { .. }) {
+        layout
+            .children()
+            .next()
+            .expect("revealed pane layout")
+            .with_virtual_offset(layout.virtual_offset())
+    } else {
+        layout
+    }
+}
 
 struct State {
     hover: Animation<bool>,
@@ -414,6 +445,7 @@ impl<Message> Widget<Message, Theme, Renderer> for Effect<'_, Message> {
             Kind::DriveAnimation(_) => tree::Tag::of::<AnimationDriverTag>(),
             Kind::Opaque => tree::Tag::of::<OpaqueTag>(),
             Kind::ContextMenu => tree::Tag::of::<ContextMenuTag>(),
+            Kind::RevealWidth { .. } => tree::Tag::of::<RevealWidthTag>(),
         }
     }
     fn state(&self) -> tree::State {
@@ -441,10 +473,18 @@ impl<Message> Widget<Message, Theme, Renderer> for Effect<'_, Message> {
         }
     }
     fn size(&self) -> Size<Length> {
-        self.content.as_widget().size()
+        let mut size = self.content.as_widget().size();
+        if let Kind::RevealWidth { width, progress } = self.kind {
+            size.width = Length::Fixed(width * progress);
+        }
+        size
     }
     fn size_hint(&self) -> Size<Length> {
-        self.content.as_widget().size_hint()
+        if matches!(self.kind, Kind::RevealWidth { .. }) {
+            self.size()
+        } else {
+            self.content.as_widget().size_hint()
+        }
     }
     fn layout(
         &mut self,
@@ -452,6 +492,19 @@ impl<Message> Widget<Message, Theme, Renderer> for Effect<'_, Message> {
         renderer: &Renderer,
         limits: &layout::Limits,
     ) -> layout::Node {
+        if let Kind::RevealWidth { width, progress } = self.kind {
+            let visible = (width * progress).min(limits.max().width);
+            let child = self.content.as_widget_mut().layout(
+                &mut tree.children[0],
+                renderer,
+                &layout::Limits::new(Size::new(width, 0.0), Size::new(width, limits.max().height)),
+            );
+            let height = child.size().height;
+            return layout::Node::with_children(
+                Size::new(visible, height),
+                vec![child.move_to(Point::new(visible - width, 0.0))],
+            );
+        }
         self.content
             .as_widget_mut()
             .layout(&mut tree.children[0], renderer, limits)
@@ -463,9 +516,12 @@ impl<Message> Widget<Message, Theme, Renderer> for Effect<'_, Message> {
         renderer: &Renderer,
         operation: &mut dyn Operation,
     ) {
-        self.content
-            .as_widget_mut()
-            .operate(&mut tree.children[0], layout, renderer, operation);
+        self.content.as_widget_mut().operate(
+            &mut tree.children[0],
+            effect_layout(self.kind, layout),
+            renderer,
+            operation,
+        );
     }
     fn update(
         &mut self,
@@ -478,6 +534,28 @@ impl<Message> Widget<Message, Theme, Renderer> for Effect<'_, Message> {
         shell: &mut Shell<'_, Message>,
         viewport: &Rectangle,
     ) {
+        if let Kind::RevealWidth { progress, .. } = self.kind {
+            let clipped = layout.bounds().intersection(viewport).unwrap_or_default();
+            let cursor = if progress < 1.0 || !cursor.is_over(clipped) {
+                mouse::Cursor::Unavailable
+            } else {
+                cursor
+            };
+            if progress < 1.0 && !matches!(event, Event::Window(_)) {
+                return;
+            }
+            self.content.as_widget_mut().update(
+                &mut tree.children[0],
+                event,
+                effect_layout(self.kind, layout),
+                cursor,
+                renderer,
+                clipboard,
+                shell,
+                &clipped,
+            );
+            return;
+        }
         self.content.as_widget_mut().update(
             &mut tree.children[0],
             event,
@@ -591,9 +669,14 @@ impl<Message> Widget<Message, Theme, Renderer> for Effect<'_, Message> {
         viewport: &Rectangle,
         renderer: &Renderer,
     ) -> mouse::Interaction {
+        if let Kind::RevealWidth { progress, .. } = self.kind {
+            if progress < 1.0 || !cursor.is_over(layout.bounds()) {
+                return mouse::Interaction::None;
+            }
+        }
         let interaction = self.content.as_widget().mouse_interaction(
             &tree.children[0],
-            layout,
+            effect_layout(self.kind, layout),
             cursor,
             viewport,
             renderer,
@@ -617,6 +700,22 @@ impl<Message> Widget<Message, Theme, Renderer> for Effect<'_, Message> {
         cursor: mouse::Cursor,
         viewport: &Rectangle,
     ) {
+        if matches!(self.kind, Kind::RevealWidth { .. }) {
+            if let Some(clipped) = layout.bounds().intersection(viewport) {
+                renderer.with_layer(clipped, |renderer| {
+                    self.content.as_widget().draw(
+                        &tree.children[0],
+                        renderer,
+                        theme,
+                        style,
+                        effect_layout(self.kind, layout),
+                        cursor,
+                        &clipped,
+                    );
+                });
+            }
+            return;
+        }
         let state = tree.state.downcast_ref::<State>();
         if let Kind::Fade(progress) = self.kind {
             if progress <= 0.0 {
@@ -688,10 +787,13 @@ impl<Message> Widget<Message, Theme, Renderer> for Effect<'_, Message> {
         viewport: &Rectangle,
         translation: Vector,
     ) -> Option<overlay::Element<'a, Message, Theme, Renderer>> {
+        if matches!(self.kind, Kind::RevealWidth { progress, .. } if progress < 1.0) {
+            return None;
+        }
         let (content_state, tip_state) = tree.children.split_at_mut(1);
         let child = self.content.as_widget_mut().overlay(
             &mut content_state[0],
-            layout,
+            effect_layout(self.kind, layout),
             renderer,
             viewport,
             translation,
@@ -720,9 +822,11 @@ impl<Message> Widget<Message, Theme, Renderer> for Effect<'_, Message> {
         tree: &Tree,
         cursor: mouse::Cursor,
     ) -> iced_accessibility::A11yTree {
-        self.content
-            .as_widget()
-            .a11y_nodes(layout, &tree.children[0], cursor)
+        self.content.as_widget().a11y_nodes(
+            effect_layout(self.kind, layout),
+            &tree.children[0],
+            cursor,
+        )
     }
     fn drag_destinations(
         &self,
@@ -731,9 +835,12 @@ impl<Message> Widget<Message, Theme, Renderer> for Effect<'_, Message> {
         renderer: &Renderer,
         destinations: &mut cosmic::iced::advanced::clipboard::DndDestinationRectangles,
     ) {
+        if matches!(self.kind, Kind::RevealWidth { progress, .. } if progress < 1.0) {
+            return;
+        }
         self.content.as_widget().drag_destinations(
             &tree.children[0],
-            layout,
+            effect_layout(self.kind, layout),
             renderer,
             destinations,
         );

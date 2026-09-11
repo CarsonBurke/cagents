@@ -1,5 +1,5 @@
 use super::*;
-use crate::github::{PullRequestComment, PullRequestInspection};
+use crate::github::{PullRequest, PullRequestComment, PullRequestInspection};
 use crate::repository::HeadState;
 
 type ActionTask = iced::Task<Action>;
@@ -16,6 +16,7 @@ pub struct Target {
 #[derive(Debug, Clone)]
 pub enum Action {
     Refresh,
+    Resolved(Target, u64, Result<Option<Arc<PullRequest>>, String>),
     Loaded(
         Target,
         u64,
@@ -29,7 +30,10 @@ pub enum Action {
 
 impl Action {
     pub(super) fn allowed_while_modal(&self) -> bool {
-        matches!(self, Self::Loaded(..) | Self::UrlFinished(..))
+        matches!(
+            self,
+            Self::Resolved(..) | Self::Loaded(..) | Self::UrlFinished(..)
+        )
     }
 }
 
@@ -42,6 +46,8 @@ pub struct State {
     loading: bool,
     loaded: bool,
     inspection: Option<Arc<PullRequestInspection>>,
+    pull_request: Option<Arc<PullRequest>>,
+    preview: Option<SidebarPullRequest>,
     error: Option<String>,
     link_error: Option<String>,
     filter: String,
@@ -68,6 +74,8 @@ impl State {
         self.generation = self.generation.wrapping_add(1);
         self.target = target;
         self.inspection = None;
+        self.pull_request = None;
+        self.preview = None;
         self.error = None;
         self.link_error = None;
         self.loaded = false;
@@ -96,7 +104,7 @@ impl State {
                 let result = tokio::task::spawn_blocking(move || {
                     verify_local_head(&work, &cancellation)?;
                     let result = GitHubService::system("gh")
-                        .inspect_branch(
+                        .resolve_branch(
                             &work.repository,
                             &work.branch,
                             work.head_oid.as_deref(),
@@ -109,7 +117,7 @@ impl State {
                 .await
                 .map_err(|error| format!("Pull request loader failed: {error}"))
                 .and_then(|result| result);
-                Action::Loaded(target, generation, result)
+                Action::Resolved(target, generation, result)
             },
             |action| action,
         )
@@ -117,7 +125,61 @@ impl State {
 
     pub fn update(&mut self, action: Action) -> ActionTask {
         match action {
-            Action::Refresh => return self.refresh(),
+            Action::Refresh => {
+                if let Some(target) = &self.target {
+                    if let Some(pr) = self.pull_request.as_ref() {
+                        GitHubService::<crate::repository::SystemProcessExecutor>::invalidate_checks(&target.repository, pr.number);
+                    } else if let Some(pr) = &self.preview {
+                        GitHubService::<crate::repository::SystemProcessExecutor>::invalidate_checks(&target.repository, pr.number);
+                    }
+                }
+                return self.refresh();
+            }
+            Action::Resolved(target, generation, result) => {
+                if !self.accepts(&target, generation) {
+                    return ActionTask::none();
+                }
+                let pull_request = match result {
+                    Ok(Some(pr)) => pr,
+                    Ok(None) => {
+                        self.preview = None;
+                        self.pull_request = None;
+                        self.loading = false;
+                        self.loaded = true;
+                        return ActionTask::none();
+                    }
+                    Err(error) => {
+                        self.loading = false;
+                        self.error = Some(error);
+                        return ActionTask::none();
+                    }
+                };
+                self.pull_request = Some(Arc::clone(&pull_request));
+                self.preview = None;
+                let cancellation = self.cancellation.clone();
+                return ActionTask::perform(
+                    async move {
+                        let work = target.clone();
+                        let result = tokio::task::spawn_blocking(move || {
+                            verify_local_head(&work, &cancellation)?;
+                            let inspection = GitHubService::system("gh")
+                                .inspect_pull_request(
+                                    &work.repository,
+                                    (*pull_request).clone(),
+                                    &cancellation,
+                                )
+                                .map_err(|error| error.to_string())?;
+                            verify_local_head(&work, &cancellation)?;
+                            Ok(Some(Arc::new(inspection)))
+                        })
+                        .await
+                        .map_err(|error| format!("Pull request loader failed: {error}"))
+                        .and_then(|result| result);
+                        Action::Loaded(target, generation, result)
+                    },
+                    |action| action,
+                );
+            }
             Action::Loaded(target, generation, result) => {
                 if !self.accepts(&target, generation) {
                     return ActionTask::none();
@@ -125,7 +187,12 @@ impl State {
                 self.loading = false;
                 self.loaded = true;
                 match result {
-                    Ok(inspection) => self.inspection = inspection,
+                    Ok(inspection) => {
+                        self.pull_request = inspection
+                            .as_ref()
+                            .map(|inspection| Arc::new(inspection.pull_request.clone()));
+                        self.inspection = inspection;
+                    }
                     Err(error) => self.error = Some(error),
                 }
             }
@@ -263,7 +330,14 @@ pub fn view(state: &State) -> Element<'_, Action> {
         );
     }
     if state.loading {
-        children.push(widget::text::body("Loading pull request, checks, and discussion…").into());
+        children.push(
+            widget::text::caption(if state.pull_request.is_some() {
+                "Refreshing checks and discussion…"
+            } else {
+                "Loading pull request…"
+            })
+            .into(),
+        );
     }
     if let Some(error) = &state.error {
         children.push(widget::text::body(format!("Unable to load pull request: {error}")).into());
@@ -271,11 +345,17 @@ pub fn view(state: &State) -> Element<'_, Action> {
     if let Some(error) = &state.link_error {
         children.push(widget::text::body(format!("Unable to open link: {error}")).into());
     }
+    if state.pull_request.is_none()
+        && let Some(pr) = &state.preview
+    {
+        children.push(widget::text::caption("Cached pull request · refreshing").into());
+        children.push(widget::text::title4(&pr.title).into());
+        children.push(link("Open pull request on GitHub", &pr.url));
+    }
     if state.loaded && !state.loading && state.error.is_none() && state.inspection.is_none() {
         children.push(widget::text::body("No pull request matches this worktree branch.").into());
     }
-    if let Some(inspection) = &state.inspection {
-        let pr = &inspection.pull_request;
+    if let Some(pr) = state.pull_request.as_deref() {
         children.push(widget::text::title4(format!("#{} {}", pr.number, pr.title)).into());
         children.push(
             widget::text::caption(format!(
@@ -317,6 +397,8 @@ pub fn view(state: &State) -> Element<'_, Action> {
             .width(Length::Fill)
             .into(),
         );
+    }
+    if let Some(inspection) = &state.inspection {
         children.push(widget::text::title4("Checks").into());
         match &inspection.checks {
             Ok(checks) if checks.is_empty() => {
@@ -450,6 +532,9 @@ pub fn view(state: &State) -> Element<'_, Action> {
             .padding(12)
             .width(Length::Fill),
     )
+    .direction(cosmic::iced::widget::scrollable::Direction::Vertical(
+        crate::design::scrollbar(),
+    ))
     .height(Length::Fill)
     .width(Length::Fill)
     .into()
@@ -457,13 +542,15 @@ pub fn view(state: &State) -> Element<'_, Action> {
 
 impl Cagents {
     pub(super) fn handle_pull_request_ui(&mut self, action: Action) -> Task<Message> {
-        let accepted = matches!(&action, Action::Loaded(target, generation, Ok(_))
-            if self.pull_request_inspector.accepts(target, *generation));
+        let accepted = match &action {
+            Action::Resolved(target, generation, Ok(_))
+            | Action::Loaded(target, generation, Ok(_)) => {
+                self.pull_request_inspector.accepts(target, *generation)
+            }
+            _ => false,
+        };
         let task = self.pull_request_inspector.update(action);
-        if accepted
-            && let Some(target) = self.pull_request_inspector.target.as_ref()
-            && let Some(inspection) = self.pull_request_inspector.inspection.as_ref()
-        {
+        if accepted && let Some(target) = self.pull_request_inspector.target.as_ref() {
             for project in &mut self.sidebar_model.projects {
                 if self
                     .github_availability
@@ -475,8 +562,42 @@ impl Cagents {
                         .iter_mut()
                         .find(|worktree| worktree.path == target.worktree)
                 {
-                    worktree.pull_request_state =
-                        sidebar::WorktreePullRequestState::from_github(&inspection.pull_request);
+                    let Some(pr) = self.pull_request_inspector.pull_request.as_ref() else {
+                        worktree.clear_pull_request();
+                        project
+                            .pull_requests
+                            .retain(|pr| pr.head_ref != target.branch);
+                        continue;
+                    };
+                    let checks = self
+                        .pull_request_inspector
+                        .inspection
+                        .as_ref()
+                        .and_then(|inspection| inspection.checks.as_ref().ok());
+                    let mut row = SidebarPullRequest::from_github(
+                        project.id,
+                        pr,
+                        checks.map_or(&[], Vec::as_slice),
+                    );
+                    if checks.is_none()
+                        && pr.status_check_rollup.is_none()
+                        && let Some(previous) = project.pull_requests.iter().find(|row| {
+                            row.number == pr.number
+                                && row.head_oid.as_deref() == Some(pr.head_ref_oid.as_str())
+                        })
+                    {
+                        row.checks = previous.checks;
+                    }
+                    worktree.set_pull_request(row.clone());
+                    if let Some(previous) = project
+                        .pull_requests
+                        .iter_mut()
+                        .find(|previous| previous.number == row.number)
+                    {
+                        *previous = row;
+                    } else {
+                        project.pull_requests.push(row);
+                    }
                 }
             }
         }
@@ -553,8 +674,40 @@ impl Cagents {
             head_oid: head_oid.map(str::to_owned),
             repository: repository.clone(),
         };
+        let preview = self
+            .sidebar_model
+            .projects
+            .iter()
+            .find(|project| {
+                self.github_availability
+                    .get(&project.id)
+                    .and_then(GitHubAvailability::repository_key)
+                    == Some(repository)
+            })
+            .and_then(|project| {
+                let mut candidates = project
+                    .pull_requests
+                    .iter()
+                    .filter(|pr| pr.head_ref == branch);
+                let candidate = candidates.next()?;
+                candidates.next().is_none().then(|| candidate.clone())
+            });
+        let task = self.pull_request_inspector.synchronize(Some(target), None);
+        self.pull_request_inspector.preview = preview;
+        task.map(Message::PullRequestUi).map(cosmic::Action::App)
+    }
+
+    /// The application supplies the visible/focused 30-second cadence.
+    pub(super) fn maybe_refresh_pull_request(&mut self) -> Task<Message> {
+        if !self.context_inspector_open
+            || self.context_tab != ContextTab::PullRequest
+            || self.pull_request_inspector.loading
+            || self.pull_request_inspector.target.is_none()
+        {
+            return Task::none();
+        }
         self.pull_request_inspector
-            .synchronize(Some(target), None)
+            .refresh()
             .map(Message::PullRequestUi)
             .map(cosmic::Action::App)
     }
@@ -587,6 +740,9 @@ mod tests {
         state.target = Some(target.clone());
         state.generation = 2;
         state.loading = true;
+        let _ = state.update(Action::Resolved(target.clone(), 1, Ok(None)));
+        assert!(state.loading);
+        assert!(!state.loaded);
         let _ = state.update(Action::Loaded(target.clone(), 1, Err("old request".into())));
         assert!(state.loading);
         assert!(state.error.is_none());
@@ -612,5 +768,19 @@ mod tests {
         assert!(!state.loaded);
         assert!(!state.loading);
         assert!(state.target.is_none());
+    }
+
+    #[test]
+    fn resolved_absence_finishes_without_launching_auxiliary_requests() {
+        let target = target();
+        let mut state = State::default();
+        state.target = Some(target.clone());
+        state.generation = 1;
+        state.loading = true;
+        let _ = state.update(Action::Resolved(target, 1, Ok(None)));
+        assert!(state.loaded);
+        assert!(!state.loading);
+        assert!(state.inspection.is_none());
+        assert!(state.preview.is_none());
     }
 }
