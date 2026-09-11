@@ -166,6 +166,71 @@ impl<'a, Message: Clone + 'a> From<IconControl<'a, Message>> for Element<'a, Mes
     }
 }
 
+/// Shared anchored popup surface. COSMIC owns placement, outside-click dismissal
+/// and overlay hit testing; all application popovers share the same frame.
+pub fn popover<'a, Message: Clone + 'static>(
+    anchor: impl Into<Element<'a, Message>>,
+    content: Option<Element<'a, Message>>,
+    position: widget::popover::Position,
+    on_close: Message,
+) -> Element<'a, Message> {
+    let mut popup = widget::popover(anchor)
+        .position(position)
+        .on_close(on_close);
+    if let Some(content) = content {
+        popup = popup.popup(widget::container(content).padding(6).class(
+            cosmic::theme::Container::custom(|theme| iced::widget::container::Style {
+                background: Some(iced::Background::Color(
+                    theme.current_container().component.base.into(),
+                )),
+                border: iced::Border {
+                    color: theme.current_container().component.divider.into(),
+                    width: crate::design::BORDER_WIDTH,
+                    radius: theme.cosmic().corner_radii.radius_s.into(),
+                },
+                shadow: iced::Shadow {
+                    color: iced::Color::from_rgba(0.0, 0.0, 0.0, 0.24),
+                    offset: iced::Vector::new(0.0, 4.0),
+                    blur_radius: 16.0,
+                },
+                ..Default::default()
+            }),
+        ));
+    }
+    popup.into()
+}
+
+/// A full-width menu action with a stable icon column and a secondary description.
+pub fn popover_item<'a, Message: Clone + 'a>(
+    icon: widget::icon::Handle,
+    title: &'a str,
+    description: &'a str,
+    on_press: Message,
+) -> widget::button::Button<'a, Message> {
+    widget::button::custom(
+        widget::row::with_children(vec![
+            widget::container(widget::icon(icon).size(20))
+                .center_x(28)
+                .center_y(36)
+                .into(),
+            widget::column::with_children(vec![
+                crate::design::body(title).into(),
+                crate::design::caption(description).into(),
+            ])
+            .spacing(2)
+            .width(Length::Fill)
+            .into(),
+        ])
+        .spacing(8)
+        .align_y(iced::Alignment::Center),
+    )
+    .name(title)
+    .class(control_style(false, None))
+    .padding([6, 8])
+    .width(Length::Fill)
+    .on_press(on_press)
+}
+
 /// A connected mode selector using the same compact targets as toolbar actions.
 /// Pass `icon_control(...).into()` children; each retains its own focus and tooltip.
 pub fn segmented_controls<'a, Message: 'a>(

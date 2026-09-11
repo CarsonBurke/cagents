@@ -1,6 +1,9 @@
 use cagents::{
     design,
-    lsp::{LspCompletionItem, LspDiagnostic, LspDocumentId, LspEvent, LspManager, LspPosition},
+    lsp::{
+        LspCompletionItem, LspDiagnostic, LspDocumentId, LspEvent, LspManager, LspPosition,
+        LspStatus,
+    },
     model::{CardId, ProjectId, RepositoryView, WorktreeId},
     repository::{
         CancellationToken, DiffBasis, MutationOutcome, RepoPath, RepositoryId, RepositoryService,
@@ -13,7 +16,7 @@ use cagents::{
         SidebarMode, SidebarModel, SidebarProject, SidebarState, SidebarWorktree,
         SourceControlModel,
     },
-    ui_controls::icon_control,
+    ui_controls::{icon_control, popover},
 };
 use cosmic::app::ApplicationExt;
 use cosmic::{
@@ -60,7 +63,7 @@ struct Tab {
     diagnostics: Vec<LspDiagnostic>,
     completions: Vec<LspCompletionItem>,
     hover: Option<String>,
-    lsp_status: String,
+    lsp_error: Option<String>,
     mutation: bool,
     snapshot_loading: bool,
     snapshot_refresh_pending: bool,
@@ -104,15 +107,18 @@ pub enum Message {
     Settings,
     AutoSave(bool),
     WrapLines(bool),
+    LanguageServerAssistance(bool),
     Theme(AppTheme),
     Scale(f32),
     SettingsSaved(Result<(), String>),
-    Lsp(Option<LspEvent>),
+    Lsp(u64, Option<LspEvent>),
     Complete,
     Hover,
     Completion(CardId, usize),
     Jump(CardId, LspPosition),
     Key(keyboard::Event),
+    Notices,
+    CloseNotices,
     Dismiss,
 }
 
@@ -126,12 +132,14 @@ pub struct Editor {
     settings_open: bool,
     settings_writable: bool,
     notice: Option<String>,
+    notices_open: bool,
     file_dialog: Option<FileOperationDialog>,
     closing: Option<CardId>,
     close_confirmed: bool,
     exiting: bool,
     window_focused: bool,
     lsp: LspManager,
+    language_server_assistance: bool,
     next_document: u64,
     file_list_mode: FileListMode,
     restoring_session: bool,
@@ -140,6 +148,26 @@ pub struct Editor {
 
 fn repository_task(task: iced::Task<RepositoryAction>) -> Task<Message> {
     task.map(Message::Repository).map(cosmic::Action::App)
+}
+
+fn language_server_failure(status: LspStatus) -> Option<String> {
+    match status {
+        LspStatus::Unavailable { reason } => Some(reason),
+        LspStatus::Failed {
+            reason,
+            stderr_tail,
+        } => {
+            if stderr_tail.is_empty() {
+                Some(reason)
+            } else {
+                Some(format!(
+                    "{reason}\n\nServer stderr:\n{}",
+                    stderr_tail.join("\n")
+                ))
+            }
+        }
+        LspStatus::Disabled | LspStatus::Starting | LspStatus::Ready => None,
+    }
 }
 
 fn file_operation_destination(source: &Path, name: &str) -> Result<PathBuf, String> {
@@ -203,7 +231,10 @@ fn tab_title_style() -> cosmic::theme::Button {
 
 impl Editor {
     fn modal_open(&self) -> bool {
-        self.settings_open || self.closing.is_some() || self.file_dialog.is_some()
+        self.settings_open
+            || self.closing.is_some()
+            || self.file_dialog.is_some()
+            || self.notices_open
     }
 
     fn rename_blocked(&self, absolute: &Path) -> bool {
@@ -588,7 +619,7 @@ impl Editor {
             diagnostics: Vec::new(),
             completions: Vec::new(),
             hover: None,
-            lsp_status: String::new(),
+            lsp_error: None,
             mutation: false,
             snapshot_loading: false,
             snapshot_refresh_pending: false,
@@ -713,7 +744,8 @@ impl Editor {
 
     fn lsp_next(&self) -> Task<Message> {
         let events = self.lsp.events();
-        cosmic::task::future(async move { Message::Lsp(events.recv().await.ok()) })
+        let generation = self.lsp.generation();
+        cosmic::task::future(async move { Message::Lsp(generation, events.recv().await.ok()) })
     }
 
     fn drain(&mut self, id: CardId) -> Task<Message> {
@@ -736,6 +768,9 @@ impl Editor {
                         continue;
                     };
                     self.close_document(id);
+                    if !self.language_server_assistance {
+                        continue;
+                    }
                     if let Some(language) = self.lsp.language_for(&absolute_path) {
                         let doc = LspDocumentId(self.next_document);
                         self.next_document += 1;
@@ -744,7 +779,9 @@ impl Editor {
                                 .open(doc, &absolute_path, &worktree, language, version, &text);
                         if let Some(tab) = self.tab_mut(id) {
                             tab.runtime.set_lsp_document(Some(doc));
-                            tab.lsp_status = format!("{status:?}");
+                            if let Some(error) = language_server_failure(status) {
+                                tab.lsp_error = Some(error);
+                            }
                         }
                     }
                 }
@@ -778,7 +815,6 @@ impl Editor {
             tab.diagnostics.clear();
             tab.completions.clear();
             tab.hover = None;
-            tab.lsp_status.clear();
         }
     }
 
@@ -842,6 +878,144 @@ impl Editor {
             self.notice = Some(error);
         }
         Task::none()
+    }
+
+    fn set_language_server_assistance(&mut self, enabled: bool) -> Task<Message> {
+        if self.language_server_assistance == enabled {
+            return Task::none();
+        }
+        self.language_server_assistance = enabled;
+        let ids: Vec<_> = self.tabs.iter().map(|tab| tab.id).collect();
+        let mut tasks = Vec::new();
+        if enabled {
+            for id in ids {
+                self.tab_mut(id).unwrap().runtime.resync_lsp();
+                tasks.push(self.drain(id));
+            }
+        } else {
+            for id in ids {
+                self.close_document(id);
+            }
+            // The manager's shutdown owns its reaper even when this future is dropped.
+            drop(self.lsp.begin_shutdown());
+            self.lsp = LspManager::new(self.settings.language_servers.clone());
+            tasks.push(self.lsp_next());
+        }
+        if self.settings_writable {
+            let result = settings::save(&self.settings_path, &self.settings)
+                .map_err(|error| error.to_string())
+                .and_then(|()| {
+                    crate::preferences::save_language_server_assistance(
+                        &self.settings_path,
+                        enabled,
+                    )
+                });
+            if let Err(error) = result {
+                self.notice = Some(error);
+            }
+        } else {
+            self.notice = Some(
+                "Repair the settings file before saving the language-server assistance preference."
+                    .into(),
+            );
+        }
+        Task::batch(tasks)
+    }
+
+    fn close_notices(&mut self) -> Task<Message> {
+        if !self.notices_open {
+            return Task::none();
+        }
+        self.notices_open = false;
+        let focus = self.current().map_or_else(Task::none, |tab| {
+            tab.runtime.focus_editor(tab.id).map(cosmic::Action::App)
+        });
+        Task::batch([focus, self.resume_pending_files()])
+    }
+
+    fn notices_control(&self) -> Element<'_, Message> {
+        let has_notices =
+            self.notice.is_some() || self.tabs.iter().any(|tab| tab.lsp_error.is_some());
+        let anchor = icon_control(
+            widget::icon::from_name(if has_notices {
+                "dialog-warning-symbolic"
+            } else {
+                "dialog-information-symbolic"
+            })
+            .handle(),
+            if has_notices {
+                "Notices — errors need attention"
+            } else {
+                "Notices"
+            },
+            self.notices_open,
+            self.notices_open || !self.modal_open(),
+            Some(Message::Notices),
+        );
+        let content = self.notices_open.then(|| {
+            let mut details = Vec::new();
+            if let Some(notice) = &self.notice {
+                details.push(widget::text::title4("Editor notice").into());
+                details.push(
+                    widget::text::body(notice)
+                        .wrapping(iced::widget::text::Wrapping::WordOrGlyph)
+                        .into(),
+                );
+            }
+            for tab in &self.tabs {
+                if let Some(error) = &tab.lsp_error {
+                    details.push(
+                        widget::text::title4(format!("Language-server error: {}", tab.title))
+                            .wrapping(iced::widget::text::Wrapping::WordOrGlyph)
+                            .into(),
+                    );
+                    details.push(
+                        widget::text::body(error)
+                            .wrapping(iced::widget::text::Wrapping::WordOrGlyph)
+                            .into(),
+                    );
+                }
+            }
+            if !has_notices {
+                details.push(widget::text::body("No notices.").into());
+            }
+            widget::column::with_children(vec![
+                widget::row::with_children(vec![
+                    widget::text::title3("Notices").width(Length::Fill).into(),
+                    icon_control(
+                        widget::icon::from_name("window-close-symbolic").handle(),
+                        "Close notices (Escape)",
+                        false,
+                        true,
+                        Some(Message::CloseNotices),
+                    )
+                    .id(widget::Id::new("ceditor.notices.close"))
+                    .into(),
+                ])
+                .align_y(iced::Alignment::Center)
+                .into(),
+                widget::scrollable(widget::column::with_children(details).spacing(10))
+                    .id(widget::Id::new("ceditor.notices.details"))
+                    .direction(iced::widget::scrollable::Direction::Vertical(
+                        design::scrollbar(),
+                    ))
+                    .height(280)
+                    .into(),
+                widget::button::standard("Dismiss notices")
+                    .on_press_maybe(has_notices.then_some(Message::Dismiss))
+                    .into(),
+            ])
+            .spacing(12)
+            .padding(10)
+            .width(420)
+            .into()
+        });
+        popover(
+            anchor,
+            content,
+            widget::popover::Position::Bottom,
+            Message::CloseNotices,
+        )
     }
 
     fn appearance(&self) -> Task<Message> {
@@ -969,6 +1143,12 @@ impl Application for Editor {
                 notice = Some(error);
                 crate::preferences::Session::default()
             });
+        let language_server_assistance =
+            crate::preferences::load_language_server_assistance(&flags.settings_path)
+                .unwrap_or_else(|error| {
+                    notice = Some(error);
+                    false
+                });
         let mut startup_paths = saved_session.startup_paths(flags.paths);
         if startup_paths.is_empty() {
             match std::env::current_dir() {
@@ -993,12 +1173,14 @@ impl Application for Editor {
             settings_open: false,
             settings_writable,
             notice,
+            notices_open: false,
             file_dialog: None,
             closing: None,
             close_confirmed: false,
             exiting: false,
             window_focused: false,
             lsp,
+            language_server_assistance,
             next_document: 1,
             file_list_mode,
             restoring_session: !startup_paths.is_empty(),
@@ -1046,6 +1228,9 @@ impl Application for Editor {
                 ..
             }) = &message
             {
+                if self.notices_open {
+                    return self.close_notices();
+                }
                 if self.file_dialog.is_some() {
                     return self.update(Message::CancelFileOperation);
                 }
@@ -1171,6 +1356,7 @@ impl Application for Editor {
                     }
                     self.file_dialog = None;
                     self.settings_open = false;
+                    self.notices_open = false;
                     self.exiting = true;
                     self.continue_exit()
                 }
@@ -1482,6 +1668,7 @@ impl Application for Editor {
                 }
                 Message::Settings => {
                     if self.closing.is_none() && self.file_dialog.is_none() {
+                        self.notices_open = false;
                         self.settings_open = !self.settings_open;
                         if self.settings_open {
                             return self.save_settings();
@@ -1509,6 +1696,9 @@ impl Application for Editor {
                     }
                     self.save_settings()
                 }
+                Message::LanguageServerAssistance(enabled) => {
+                    self.set_language_server_assistance(enabled)
+                }
                 Message::Theme(theme) => {
                     self.settings.app_theme = theme;
                     Task::batch([self.save_settings(), self.appearance()])
@@ -1523,11 +1713,31 @@ impl Application for Editor {
                     }
                     Task::none()
                 }
-                Message::Dismiss => {
-                    self.notice = None;
+                Message::Notices => {
+                    if self.notices_open {
+                        return self.close_notices();
+                    }
+                    if !self.modal_open() {
+                        self.notices_open = true;
+                        return iced::widget::operation::focus(widget::Id::new(
+                            "ceditor.notices.close",
+                        ))
+                        .map(cosmic::Action::App);
+                    }
                     Task::none()
                 }
-                Message::Lsp(event) => {
+                Message::CloseNotices => self.close_notices(),
+                Message::Dismiss => {
+                    self.notice = None;
+                    for tab in &mut self.tabs {
+                        tab.lsp_error = None;
+                    }
+                    self.close_notices()
+                }
+                Message::Lsp(generation, event) => {
+                    if generation != self.lsp.generation() {
+                        return Task::none();
+                    }
                     if let Some(event) = event {
                         let doc = match &event {
                             LspEvent::Diagnostics { doc, .. }
@@ -1549,18 +1759,20 @@ impl Application for Editor {
                                 LspEvent::Completion { items, .. } => tab.completions = items,
                                 LspEvent::Hover { markdown, .. } => tab.hover = markdown,
                                 LspEvent::Status { status, .. } => {
-                                    tab.lsp_status = format!("{status:?}")
+                                    if let Some(error) = language_server_failure(status) {
+                                        tab.lsp_error = Some(error);
+                                    }
                                 }
                                 LspEvent::RequestFailed { error, .. }
                                     if !matches!(error, cagents::lsp::LspError::Cancelled) =>
                                 {
-                                    tab.lsp_status = error.to_string()
+                                    tab.lsp_error = Some(error.to_string())
                                 }
                                 LspEvent::DocumentDesynced { error, .. } => {
                                     tab.completions.clear();
                                     tab.hover = None;
                                     tab.diagnostics.clear();
-                                    tab.lsp_status = error.to_string();
+                                    tab.lsp_error = Some(error.to_string());
                                 }
                                 _ => {}
                             }
@@ -1707,6 +1919,7 @@ impl Application for Editor {
     }
     fn header_end(&self) -> Vec<Element<'_, Message>> {
         vec![
+            self.notices_control(),
             icon_control(
                 widget::icon::from_name("emblem-system-symbolic").handle(),
                 "Settings",
@@ -1807,24 +2020,6 @@ impl Application for Editor {
             );
             body.push(widget::divider::horizontal::default().into());
         }
-        if let Some(notice) = &self.notice {
-            body.push(
-                widget::row::with_children(vec![
-                    widget::text::body(notice).width(Length::Fill).into(),
-                    icon_control(
-                        widget::icon::from_name("window-close-symbolic").handle(),
-                        "Dismiss notice",
-                        false,
-                        true,
-                        Some(Message::Dismiss),
-                    )
-                    .into(),
-                ])
-                .padding(8)
-                .into(),
-            );
-            body.push(widget::divider::horizontal::default().into());
-        }
         if let Some(tab) = self.current() {
             let mut editor = Vec::new();
             let mut toolbar_controls = Vec::new();
@@ -1833,26 +2028,32 @@ impl Application for Editor {
             }
             if tab.runtime.lsp_document().is_some() {
                 toolbar_controls.push(
-                    widget::row::with_children(vec![
-                        icon_control(
-                            widget::icon::from_name("insert-text-symbolic").handle(),
-                            "Complete (Ctrl+Space)",
-                            false,
-                            !self.modal_open(),
-                            Some(Message::Complete),
-                        )
-                        .into(),
-                        icon_control(
-                            widget::icon::from_name("dialog-information-symbolic").handle(),
-                            "Show symbol information",
-                            false,
-                            !self.modal_open(),
-                            Some(Message::Hover),
-                        )
-                        .into(),
-                    ])
-                    .spacing(2)
-                    .align_y(iced::Alignment::Center)
+                    widget::container(
+                        widget::row::with_children(vec![
+                            icon_control(
+                                widget::icon::from_name("insert-text-symbolic").handle(),
+                                "Complete (Ctrl+Space)",
+                                false,
+                                !self.modal_open(),
+                                Some(Message::Complete),
+                            )
+                            .into(),
+                            icon_control(
+                                widget::icon::from_name("dialog-information-symbolic").handle(),
+                                "Show symbol information",
+                                false,
+                                !self.modal_open(),
+                                Some(Message::Hover),
+                            )
+                            .into(),
+                        ])
+                        .spacing(2)
+                        .align_y(iced::Alignment::Center),
+                    )
+                    .padding(iced::Padding {
+                        right: 12.0,
+                        ..iced::Padding::ZERO
+                    })
                     .into(),
                 );
             }
@@ -1864,22 +2065,13 @@ impl Application for Editor {
                             .align_y(iced::Alignment::Center)
                             .width(Length::Fill),
                     )
-                    .padding([8, 12])
+                    .height(design::HEADER_HEIGHT)
                     .width(Length::Fill)
                     .into(),
                 );
                 editor.push(widget::divider::horizontal::default().into());
             }
             editor.push(repository_widget::view(tab.id, &tab.runtime).map(Message::Repository));
-            if tab.runtime.lsp_document().is_some() {
-                editor.push(widget::divider::horizontal::default().into());
-                editor.push(
-                    widget::container(design::caption(&tab.lsp_status))
-                        .padding([2, 8])
-                        .width(Length::Fill)
-                        .into(),
-                );
-            }
             if !tab.completions.is_empty() || !tab.diagnostics.is_empty() || tab.hover.is_some() {
                 let mut results = Vec::new();
                 for (index, item) in tab.completions.iter().enumerate() {
@@ -2099,6 +2291,13 @@ impl Application for Editor {
                     .into(),
             ]).spacing(12).align_y(iced::Alignment::Center).into(),
             widget::text::title4("Language servers").into(),
+            widget::checkbox(self.language_server_assistance)
+                .label("Language-server assistance")
+                .on_toggle(Message::LanguageServerAssistance)
+                .into(),
+            design::caption("Opt in to semantic diagnostics, completion, and symbol information. Syntax highlighting, saving, and Git work without a language server.")
+                .wrapping(iced::widget::text::Wrapping::Word)
+                .into(),
             design::caption("Edit language_servers in the preferences file, then restart ceditor to apply server changes.")
                 .wrapping(iced::widget::text::Wrapping::Word)
                 .into(),
@@ -2146,17 +2345,124 @@ mod tests {
             settings_open: false,
             settings_writable: false,
             notice: None,
+            notices_open: false,
             file_dialog: None,
             closing: None,
             close_confirmed: false,
             exiting: false,
             window_focused: false,
             lsp: LspManager::new(Vec::new()),
+            language_server_assistance: false,
             next_document: 1,
             file_list_mode: FileListMode::Tree,
             restoring_session: false,
             saved_session: crate::preferences::Session::default(),
         }
+    }
+
+    #[test]
+    fn assistance_opt_in_and_disable_leave_the_open_buffer_intact() {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(directory.path().join("a.rs"), "fn main() {}\n").unwrap();
+        let mut app = editor();
+        app.settings_path = directory.path().join("settings.toml");
+        assert!(!crate::preferences::load_language_server_assistance(&app.settings_path).unwrap());
+        app.settings_writable = true;
+        for server in &mut app.settings.language_servers {
+            server.command = vec![
+                directory
+                    .path()
+                    .join("missing-server")
+                    .to_string_lossy()
+                    .into_owned(),
+            ];
+        }
+        app.lsp = LspManager::new(app.settings.language_servers.clone());
+        let id = add(&mut app, directory.path().to_str().unwrap(), Some("a.rs"));
+        files_loaded(&mut app, id);
+        drop(
+            app.update(Message::Repository(RepositoryAction::FileLoaded {
+                identity: AsyncIdentity {
+                    card: id,
+                    worktree: directory.path().to_path_buf(),
+                    path: "a.rs".into(),
+                    generation: 1,
+                },
+                result: cagents::editor::load_file(directory.path(), Path::new("a.rs")),
+            })),
+        );
+        assert!(app.tab(id).unwrap().runtime.lsp_document().is_none());
+        assert!(app.tab(id).unwrap().lsp_error.is_none());
+        drop(
+            app.update(Message::Repository(RepositoryAction::EditorAction {
+                card: id,
+                action: widget::text_editor::Action::Edit(widget::text_editor::Edit::Paste(
+                    Arc::new("// unsaved\n".into()),
+                )),
+            })),
+        );
+        drop(app.update(Message::LanguageServerAssistance(true)));
+        let first_document = app.tab(id).unwrap().runtime.lsp_document().unwrap();
+        assert!(app.tab(id).unwrap().lsp_error.is_some());
+        assert!(crate::preferences::load_language_server_assistance(&app.settings_path).unwrap());
+        drop(app.update(Message::LanguageServerAssistance(false)));
+        assert!(app.tab(id).unwrap().runtime.lsp_document().is_none());
+        assert!(!crate::preferences::load_language_server_assistance(&app.settings_path).unwrap());
+        assert!(app.tab(id).unwrap().runtime.is_dirty());
+        assert_eq!(
+            app.tab(id).unwrap().runtime.selected_path(),
+            Some(Path::new("a.rs"))
+        );
+        drop(app.update(Message::LanguageServerAssistance(true)));
+        assert_ne!(
+            app.tab(id).unwrap().runtime.lsp_document(),
+            Some(first_document)
+        );
+        assert!(app.tab(id).unwrap().runtime.lsp_document().is_some());
+        assert!(app.tab(id).unwrap().runtime.is_dirty());
+        drop(app.update(Message::LanguageServerAssistance(false)));
+    }
+
+    #[test]
+    fn closing_notices_preserves_failure_evidence_until_dismissal() {
+        let mut app = editor();
+        let id = add(&mut app, "/workspace", Some("a.rs"));
+        let doc = LspDocumentId(1);
+        app.tab_mut(id).unwrap().runtime.set_lsp_document(Some(doc));
+        let generation = app.lsp.generation();
+        drop(app.update(Message::Lsp(
+            generation,
+            Some(LspEvent::Status {
+                doc,
+                status: LspStatus::Failed {
+                    reason: "initialize failed".into(),
+                    stderr_tail: vec![
+                        "toolchain unavailable".into(),
+                        "infinite recursion detected".into(),
+                    ],
+                },
+            }),
+        )));
+        let evidence = app.tab(id).unwrap().lsp_error.clone().unwrap();
+        assert!(evidence.contains("initialize failed"));
+        assert!(evidence.contains("toolchain unavailable\ninfinite recursion detected"));
+        drop(app.update(Message::Notices));
+        assert!(app.modal_open());
+        drop(app.update(Message::CloseNotices));
+        assert!(!app.modal_open());
+        assert_eq!(app.tab(id).unwrap().lsp_error.as_ref(), Some(&evidence));
+        drop(app.update(Message::Notices));
+        drop(app.update(Message::Dismiss));
+        assert!(app.tab(id).unwrap().lsp_error.is_none());
+        assert!(!app.modal_open());
+        drop(app.update(Message::Lsp(
+            generation,
+            Some(LspEvent::Status {
+                doc,
+                status: LspStatus::Ready,
+            }),
+        )));
+        assert!(app.tab(id).unwrap().lsp_error.is_none());
     }
 
     #[test]

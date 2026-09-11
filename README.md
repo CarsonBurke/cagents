@@ -346,17 +346,19 @@ cagents ui
   select a thread again to return to the same conversation.
   In cagents, editor tabs use the ceditor mark; recognized agent terminals and
   native chats use their OMP, Claude, or Codex provider mark.
-  Each tab strip contains only its selected worktree or thread. The **Workspaces**
-  dropdown opens directories outside registered projects without mixing their
-  panes into other worktrees or adding an Other sessions section.
+  Each tab strip contains only its selected worktree or thread. The **New tab**
+  menu offers a terminal, native chat, OMP, Claude Code, Codex, or browser tab,
+  with provider icons and keyboard navigation; there is no Workspaces dropdown.
   Drag a project header to reorder projects; the order survives restarts.
   Project headers stay visible above their worktrees while scrolling. The
   primary worktree stays first; the sort control selects newest, oldest, or
   alphabetical order for the remaining worktrees.
   Worktree labels prefer the matching pull request title, falling back to a
   readable branch basename without account prefixes. Tooltips and search retain
-  the full Git branch. Quiet worktree names and icons are muted; unread updates
-  and agents waiting for input remain emphasized.
+  the full Git branch. Quiet worktree names are muted; pull-request icons retain
+  their semantic state colors. Unread updates remain emphasized until acknowledged;
+  viewing a waiting agent clears its attention badge without changing its activity.
+  The All, Attention, and Pull requests views retain independent sidebar scroll positions.
 - The right-hand inspector has icon-only **Files**, **Changes**, **Pull request**,
   and **Details** tabs below the window header, separated from its content by a
   border; hover for tooltips. Files browses the selected worktree,
@@ -421,11 +423,11 @@ cagents ui
   autosave does not silently overwrite external changes. Disable **Save files
   automatically** in Settings for manual saving.
   **Wrap long lines** is off by default. Editor and terminal text default to
-  13 logical pixels; saved terminal font preferences remain unchanged.
+  14 logical pixels; saved terminal font preferences remain unchanged.
   Images open as previews. File/view/edit/diff controls occupy a separate
   toolbar above the content; unavailable save and comparison actions are
-  disabled. Editable content has a line-number gutter and draggable scrollbar,
-  including for long wrapped lines. Working-tree diffs edit the real file buffer
+  disabled. Editable content has a line-number gutter; its draggable scrollbar
+  appears only when content overflows, including long wrapped lines. Working-tree diffs edit the real file buffer
   with the same selection, IME, and safe-save behavior; removed content is
   selectable read-only context. Staged and historical content remain read-only.
   File/mode switches retain bounded, in-memory viewport coordinates without
@@ -450,6 +452,15 @@ Open tabs, order, and the active tab restore on launch; explicit paths are also
 opened, and a new session with no paths browses the current directory.
 Standalone tabs omit the redundant application icon and use the same compact
 geometry and pane separators as cagents.
+
+Language-server assistance is off by default in ceditor. Syntax highlighting,
+editing, saving, and Git work without rust-analyzer or another language server.
+Enable **Language-server assistance** in Editor settings for semantic diagnostics,
+completion, and symbol information; disabling it shuts down the editor's services.
+The choice persists independently of the `language_servers` configuration.
+Service failures appear in the header's **Notices** tray, with readable error
+details and server stderr rather than a log block below the buffer. Closing the
+tray preserves the evidence; **Dismiss notices** clears it.
 
 ```sh
 scripts/run-ceditor-development /path/to/project

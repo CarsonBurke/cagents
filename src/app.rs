@@ -1583,7 +1583,6 @@ fn workspace_navigation_blocked_during_save(message: &Message) -> bool {
             | Message::NewBrowser
             | Message::OpenBrowser(_)
             | Message::ChromeUi(chrome_ui::Action::Launch(_))
-            | Message::ChromeUi(chrome_ui::Action::SelectWorkspace(_))
             | Message::ThreadUi(_)
             | Message::FocusCard(_)
             | Message::FocusAdjacent(_)

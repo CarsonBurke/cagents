@@ -381,7 +381,7 @@ impl Default for AppSettings {
             terminal_padding: default_terminal_padding(),
             terminal_cursor_style: TerminalCursorStyle::default(),
             terminal_theme: crate::terminal::TerminalTheme::default(),
-            terminal_font_size: 13.0,
+            terminal_font_size: 14.0,
             terminal_font_family: String::new(),
             sidebar_width: design::NAVIGATION_DEFAULT_WIDTH,
             inspector_width: design::INSPECTOR_DEFAULT_WIDTH,
