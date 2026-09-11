@@ -390,19 +390,6 @@ impl SidebarProject {
         }
     }
 
-    /// Strip only a known account namespace, retaining nested branch names.
-    pub fn set_branch_namespace(&mut self, account: &str) {
-        for worktree in &mut self.worktrees {
-            let Some(branch) = worktree.branch.as_deref().filter(|_| !worktree.detached) else {
-                continue;
-            };
-            let label = concise_branch_name(branch, account);
-            if label != worktree.chrome.label.as_ref() {
-                worktree.chrome.label = label.into();
-            }
-        }
-    }
-
     pub fn from_repository(
         project: &ProjectState,
         repository: &RepositoryInfo,
@@ -518,19 +505,24 @@ impl SidebarWorktree {
         ahead: Option<u64>,
         behind: Option<u64>,
     ) -> Self {
-        let label = branch.clone().unwrap_or_else(|| {
-            path.file_name()
-                .map(|name| name.to_string_lossy().into_owned())
-                .unwrap_or_else(|| path.display().to_string())
-        });
+        let label = worktree_display_name(&path, branch.as_deref(), detached);
         let path_label = path.display().to_string();
         let status = status_summary(detached, locked, dirty.as_ref(), ahead, behind);
         let chrome = WorktreeChrome {
+            folded_label: fold(&label),
             folded_branch: branch.as_deref().map(fold),
             folded_path: fold(&path.to_string_lossy()),
             open_id: entity_id("worktree.open", id),
-            accessible_name: format!("Open worktree {label}, {status}").into_boxed_str(),
-            tooltip: format!("{label} — {path_label} — {status}").into_boxed_str(),
+            accessible_name: format!(
+                "Open worktree {label}, {}, {status}",
+                branch.as_deref().unwrap_or(&path_label)
+            )
+            .into_boxed_str(),
+            tooltip: format!(
+                "{label} — {} — {path_label} — {status}",
+                branch.as_deref().unwrap_or("Detached HEAD")
+            )
+            .into_boxed_str(),
             dirty_badge: dirty
                 .as_ref()
                 .filter(|dirty| dirty.is_dirty())
@@ -605,6 +597,9 @@ impl SidebarWorktree {
     }
 
     fn matches(&self, folded_query: &str) -> bool {
+        if self.chrome.folded_label.contains(folded_query) {
+            return true;
+        }
         self.chrome
             .folded_branch
             .as_deref()
@@ -614,11 +609,6 @@ impl SidebarWorktree {
 
     pub fn set_pull_request(&mut self, pull_request: SidebarPullRequest) {
         self.pull_request_state = pull_request.state;
-        if let Some(author) = pull_request.author.as_deref()
-            && let Some(branch) = self.branch.as_deref().filter(|_| !self.detached)
-        {
-            self.chrome.label = concise_branch_name(branch, author).into();
-        }
         self.chrome.pull_request = Some(pull_request);
         self.refresh_status_chrome();
     }
@@ -633,6 +623,20 @@ impl SidebarWorktree {
     }
 
     fn refresh_status_chrome(&mut self) {
+        let label = self
+            .chrome
+            .pull_request
+            .as_ref()
+            .map(|pr| pr.title.trim())
+            .filter(|title| !title.is_empty())
+            .map_or_else(
+                || worktree_display_name(&self.path, self.branch.as_deref(), self.detached),
+                str::to_owned,
+            );
+        if label != self.chrome.label.as_ref() {
+            self.chrome.folded_label = fold(&label);
+            self.chrome.label = label.into();
+        }
         self.chrome.dirty_badge = self
             .dirty
             .as_ref()
@@ -654,18 +658,29 @@ impl SidebarWorktree {
                 check_description(pr.checks)
             );
         }
+        let branch = self.branch.as_deref().unwrap_or("Detached HEAD");
         self.chrome.accessible_name =
-            format!("Open worktree {}, {status}", self.chrome.label).into_boxed_str();
-        self.chrome.tooltip =
-            format!("{} — {} — {status}", self.chrome.label, self.path.display()).into_boxed_str();
+            format!("Open worktree {}, {branch}, {status}", self.chrome.label).into_boxed_str();
+        self.chrome.tooltip = format!(
+            "{} — {branch} — {} — {status}",
+            self.chrome.label,
+            self.path.display()
+        )
+        .into_boxed_str();
     }
 }
 
-fn concise_branch_name<'a>(branch: &'a str, account: &str) -> &'a str {
-    branch
-        .split_once('/')
-        .filter(|(namespace, suffix)| namespace.eq_ignore_ascii_case(account) && !suffix.is_empty())
-        .map_or(branch, |(_, suffix)| suffix)
+fn worktree_display_name(path: &Path, branch: Option<&str>, detached: bool) -> String {
+    let name = branch
+        .filter(|_| !detached)
+        .and_then(|branch| branch.rsplit('/').next())
+        .filter(|name| !name.is_empty())
+        .map(Cow::Borrowed)
+        .unwrap_or_else(|| {
+            path.file_name()
+                .map_or_else(|| path.to_string_lossy(), |name| name.to_string_lossy())
+        });
+    name.replace(['-', '_'], " ")
 }
 
 /// Branch names are case-sensitive and only attached worktrees can own a PR.
@@ -688,6 +703,7 @@ fn matching_pull_request<'a>(
 /// once in `SidebarWorktree::new`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct WorktreeChrome {
+    folded_label: Box<str>,
     folded_branch: Option<Box<str>>,
     folded_path: Box<str>,
     open_id: Id,
@@ -830,6 +846,14 @@ impl SidebarPullRequest {
                 matches!(decision.0.as_str(), "REVIEW_REQUIRED" | "CHANGES_REQUESTED")
             });
         row
+    }
+
+    fn has_pending_checks(&self) -> bool {
+        self.checks == CheckStatus::Pending
+            && !matches!(
+                self.state,
+                Some(WorktreePullRequestState::Merged | WorktreePullRequestState::Closed)
+            )
     }
 }
 
@@ -2967,7 +2991,7 @@ fn filters(filter: SidebarFilter, modal_open: bool) -> Element<'static, SidebarA
         .align_y(Alignment::Center);
     for (value, visible_label, accessible_label) in FILTER_CHOICES {
         row = row.push(
-            button::custom(widget::text::caption(visible_label))
+            button::custom(design::caption(visible_label))
                 .class(sidebar_button_style(filter == value))
                 .id(filter_id(value))
                 .name(accessible_label)
@@ -3062,7 +3086,7 @@ fn loading(compact: bool) -> Element<'static, SidebarAction> {
             f32::from(STATUS_ICON_SIZE),
             cosmic::theme::active().cosmic().warning.base.into(),
         ),
-        widget::text::caption(if compact {
+        design::caption(if compact {
             "Loading"
         } else {
             "Loading projects…"
@@ -3107,7 +3131,7 @@ fn error<'a>(message: &'a str, compact: bool, modal_open: bool) -> Element<'a, S
                 .size(STATUS_ICON_SIZE)
                 .into(),
             design::heading("Couldn’t load projects").into(),
-            widget::text::caption(message)
+            design::caption(message)
                 .wrapping(cosmic::iced::widget::text::Wrapping::Word)
                 .into(),
             button::standard("Try again")
@@ -3181,7 +3205,7 @@ fn empty(state: &SidebarState, compact: bool, modal_open: bool) -> Element<'stat
                 .size(STATUS_ICON_SIZE)
                 .into(),
             design::heading(title).into(),
-            widget::text::caption(detail)
+            design::caption(detail)
                 .wrapping(cosmic::iced::widget::text::Wrapping::Word)
                 .into(),
             action_button,
@@ -3321,16 +3345,14 @@ fn project_view<'a>(
     let mut column = widget::column::with_capacity(worktree_count + 2).spacing(0);
     // GitHub availability belongs in the Changes panel, not between navigation rows.
     if entity.github_stale {
-        column = column.push(widget::text::caption(
+        column = column.push(design::caption(
             "Cached pull requests — stale; not authorized for mutations.",
         ));
     }
     for operation in &entity.operations {
         column = column.push(
             widget::row::with_children(vec![
-                widget::text::caption(&operation.label)
-                    .width(Length::Fill)
-                    .into(),
+                design::caption(&operation.label).width(Length::Fill).into(),
                 button::standard("Cancel")
                     .on_press_maybe(
                         (operation.cancellable && !modal_open)
@@ -3460,6 +3482,7 @@ fn compact_project<'a>(
         let action = button::custom(worktree_status_icon(
             worktree,
             project.state.has_agent_update(entity.id, worktree.id),
+            project.state.agent_activity(entity.id, worktree.id),
         ))
         .id(worktree.chrome.open_id.clone())
         .name(worktree_accessible_name(
@@ -3487,11 +3510,12 @@ fn compact_project<'a>(
             ));
         let activity = project.state.agent_activity(entity.id, worktree.id);
         if activity == Some(crate::agent::ActivityState::Working)
-            || worktree
-                .chrome
-                .pull_request
-                .as_ref()
-                .is_some_and(|pr| pr.checks == CheckStatus::Pending)
+            || (activity != Some(crate::agent::ActivityState::Waiting)
+                && worktree
+                    .chrome
+                    .pull_request
+                    .as_ref()
+                    .is_some_and(SidebarPullRequest::has_pending_checks))
         {
             row = row.push(crate::ui_controls::activity_spinner(
                 f32::from(ROW_ICON_SIZE),
@@ -3659,18 +3683,11 @@ fn worktree_view<'a>(
         .align_y(Alignment::Center)
         .spacing(spacing.space_xxxs)
         .height(Length::Fill)
-        .push(worktree_status_icon(worktree, agent_update));
+        .push(worktree_status_icon(worktree, agent_update, activity));
     row = row.push(
         design::body(&*chrome.label)
-            .class(if primary && !agent_update && activity.is_none() {
-                theme::Text::Custom(|theme| {
-                    let mut color: cosmic::iced::Color = theme.current_container().on.into();
-                    color.a *= 0.6;
-                    cosmic::iced::widget::text::Style {
-                        color: Some(color),
-                        ..Default::default()
-                    }
-                })
+            .class(if worktree_is_quiet(agent_update, activity) {
+                theme::Text::Custom(design::muted_text)
             } else {
                 theme::Text::default()
             })
@@ -3716,7 +3733,7 @@ fn worktree_view<'a>(
     if chrome
         .pull_request
         .as_ref()
-        .is_some_and(|pr| pr.checks == CheckStatus::Pending)
+        .is_some_and(SidebarPullRequest::has_pending_checks)
         && activity != Some(crate::agent::ActivityState::Working)
     {
         row = row.push(check_indicator(CheckStatus::Pending));
@@ -3968,27 +3985,35 @@ fn editor_icon(editor: &SidebarEditor) -> icon::Handle {
     }
 }
 
-fn worktree_status_icon(worktree: &SidebarWorktree, update: bool) -> Element<'_, SidebarAction> {
-    let glyph: Element<'_, SidebarAction> = if let Some(pr) = &worktree.chrome.pull_request {
-        let (handle, color) = pull_request_visual(pr);
-        widget::container(widget::icon(handle).size(ROW_ICON_SIZE))
-            .class(theme::Container::custom(move |_| {
-                cosmic::iced::widget::container::Style {
-                    icon_color: Some(color),
-                    ..Default::default()
-                }
-            }))
-            .into()
-    } else {
-        widget::container(worktree_icon().icon().size(ROW_ICON_SIZE))
-            .class(theme::Container::custom(|theme| {
-                cosmic::iced::widget::container::Style {
-                    icon_color: Some(theme.current_container().component.on_disabled.into()),
-                    ..Default::default()
-                }
-            }))
-            .into()
-    };
+fn worktree_is_quiet(update: bool, activity: Option<crate::agent::ActivityState>) -> bool {
+    !update && activity != Some(crate::agent::ActivityState::Waiting)
+}
+
+fn worktree_status_icon(
+    worktree: &SidebarWorktree,
+    update: bool,
+    activity: Option<crate::agent::ActivityState>,
+) -> Element<'_, SidebarAction> {
+    let quiet = worktree_is_quiet(update, activity);
+    let (handle, color) = worktree
+        .chrome
+        .pull_request
+        .as_ref()
+        .map(|pr| {
+            let (handle, color) = pull_request_visual(pr);
+            (handle, Some(color))
+        })
+        .unwrap_or_else(|| (worktree_icon(), None));
+    let glyph = widget::container(widget::icon(handle).size(ROW_ICON_SIZE)).class(
+        theme::Container::custom(move |theme| cosmic::iced::widget::container::Style {
+            icon_color: Some(if quiet {
+                design::muted_color(theme)
+            } else {
+                color.unwrap_or_else(|| theme.current_container().on.into())
+            }),
+            ..Default::default()
+        }),
+    );
     let dot = widget::container(cosmic::iced::widget::Space::new().width(4).height(4)).class(
         theme::Container::Custom(Box::new(move |theme| {
             cosmic::iced::widget::container::Style {
@@ -4004,7 +4029,7 @@ fn worktree_status_icon(worktree: &SidebarWorktree, update: bool) -> Element<'_,
         })),
     );
     crate::interaction::tooltip(
-        widget::row::with_children(vec![glyph, dot.into()])
+        widget::row::with_children(vec![glyph.into(), dot.into()])
             .align_y(Alignment::Center)
             .spacing(0),
         if update {
@@ -4075,7 +4100,7 @@ fn worktree_panel<'a>(
                     "No worktree selected"
                 })
                 .into(),
-                widget::text::caption(if state.active_worktree().is_some() {
+                design::caption(if state.active_worktree().is_some() {
                     "Reading files, working-tree changes, and branch history."
                 } else {
                     "Choose a worktree in Projects, or open a repository."
@@ -4190,21 +4215,21 @@ fn source_control_panel<'a>(
                 14.0,
                 cosmic::theme::active().cosmic().warning.base.into(),
             ),
-            widget::text::caption(label).into(),
+            design::caption(label).into(),
         ])
         .align_y(Alignment::Center)
         .spacing(spacing.space_xxs)
         .into()
     })));
     column = column.push(slot(source.error.as_deref().map(|error| {
-        widget::text::caption(error)
+        design::caption(error)
             .wrapping(cosmic::iced::widget::text::Wrapping::Word)
             .into()
     })));
 
     match &source.data_state {
         SidebarDataState::Loading => {
-            column = column.push(widget::text::caption("Loading source control…"));
+            column = column.push(design::caption("Loading source control…"));
             return widget::container(column)
                 .padding([spacing.space_xxxs, spacing.space_xxs])
                 .width(Length::Fill)
@@ -4213,7 +4238,7 @@ fn source_control_panel<'a>(
         SidebarDataState::Error(message) => {
             column = column
                 .push(
-                    widget::text::caption(format!("Couldn’t read this worktree. {message}"))
+                    design::caption(format!("Couldn’t read this worktree. {message}"))
                         .wrapping(cosmic::iced::widget::text::Wrapping::Word),
                 )
                 .push(
@@ -4492,7 +4517,7 @@ fn files_section<'a>(
     let list = widget::column::with_children(vec![
         rows.into(),
         slot((hidden > 0).then(|| {
-            widget::text::caption(format!("{hidden} more files not shown — narrow the filter"))
+            design::caption(format!("{hidden} more files not shown — narrow the filter"))
                 .wrapping(cosmic::iced::widget::text::Wrapping::Word)
                 .into()
         })),
@@ -4501,7 +4526,7 @@ fn files_section<'a>(
         widget::container(
             widget::column::with_children(vec![
                 slot(state.files_filter_open.then(|| filter.into())),
-                slot(notice.map(|notice| widget::text::caption(notice).into())),
+                slot(notice.map(|notice| design::caption(notice).into())),
             ])
             .spacing(spacing.space_xxxs),
         )
@@ -4625,7 +4650,7 @@ fn changes_section<'a>(
     let mut column =
         widget::column::with_capacity(source.groups().len() + 2).spacing(spacing.space_xxxs);
     if source.groups().iter().all(ChangeGroup::is_empty) {
-        column = column.push(widget::text::caption("No uncommitted changes."));
+        column = column.push(design::caption("No uncommitted changes."));
     }
     for group in source.groups() {
         if group.is_empty() {
@@ -4650,9 +4675,7 @@ fn branch_changes_section<'a>(
         other => {
             column = column.push(design::heading("Branch changes"));
             return match other {
-                BranchChanges::Unavailable(reason) => {
-                    column.push(widget::text::caption(*reason)).into()
-                }
+                BranchChanges::Unavailable(reason) => column.push(design::caption(*reason)).into(),
                 BranchChanges::Loading(base_ref) => column
                     .push(
                         widget::row::with_children(vec![
@@ -4660,11 +4683,8 @@ fn branch_changes_section<'a>(
                                 14.0,
                                 cosmic::theme::active().cosmic().warning.base.into(),
                             ),
-                            widget::text::caption(format!(
-                                "Comparing with {}…",
-                                base_ref.short_name()
-                            ))
-                            .into(),
+                            design::caption(format!("Comparing with {}…", base_ref.short_name()))
+                                .into(),
                         ])
                         .spacing(spacing.space_xxs)
                         .align_y(Alignment::Center),
@@ -4672,7 +4692,7 @@ fn branch_changes_section<'a>(
                     .into(),
                 BranchChanges::Error { base_ref, message } => column
                     .push(
-                        widget::text::caption(format!(
+                        design::caption(format!(
                             "Could not compare with {}: {message}",
                             base_ref.short_name()
                         ))
@@ -4691,10 +4711,10 @@ fn branch_changes_section<'a>(
     };
     column = column
         .push(design::heading(&*branch.title))
-        .push(widget::text::caption(&*branch.base_label));
+        .push(design::caption(&*branch.base_label));
     if branch.rows.is_empty() {
         return column
-            .push(widget::text::caption(
+            .push(design::caption(
                 "No committed changes relative to this base.",
             ))
             .into();
@@ -4746,7 +4766,7 @@ fn branch_changes_section<'a>(
                     .ellipsize(cosmic::iced::widget::text::Ellipsize::Start(EllipsizeHeightLimit::Lines(1)))
                     .width(Length::Fill).into(),
                 semantic_caption(&*row.status, tone),
-                widget::text::caption(&*row.counts).into(),
+                design::caption(&*row.counts).into(),
             ]).spacing(spacing.space_xxxs).align_y(Alignment::Center),
             SidebarAction::OpenBranchFile {
                 key: source.key.clone(),
@@ -4764,7 +4784,7 @@ fn branch_changes_section<'a>(
     let hidden = hidden + branch.rows.len().saturating_sub(MAX_VISIBLE_CHANGE_ROWS);
     column
         .push(slot((hidden > 0).then(|| {
-            widget::text::caption(format!("{hidden} more branch rows not shown")).into()
+            design::caption(format!("{hidden} more branch rows not shown")).into()
         })))
         .into()
 }
@@ -4829,7 +4849,7 @@ fn change_group_view<'a>(
     }
     let hidden = group.hidden() + tree_hidden;
     if hidden > 0 {
-        column = column.push(widget::text::caption(format!(
+        column = column.push(design::caption(format!(
             "{hidden} more rows not shown; group actions apply only to visible files"
         )));
     }
@@ -4975,7 +4995,7 @@ fn semantic_caption<'a>(
     label: impl Into<Cow<'a, str>> + 'a,
     tone: BadgeTone,
 ) -> Element<'a, SidebarAction> {
-    widget::text::caption(label)
+    design::caption(label)
         .wrapping(cosmic::iced::widget::text::Wrapping::None)
         .class(theme::Text::Custom(match tone {
             BadgeTone::Success => |theme| cosmic::iced::widget::text::Style {
@@ -5211,7 +5231,7 @@ fn changes_footer<'a>(
         });
     }
 
-    let mut commit = button::custom(widget::text::caption("Commit"))
+    let mut commit = button::custom(design::caption("Commit"))
         .class(sidebar_button_style(true))
         .id(chrome.commit_id.clone())
         .padding([0, 8])
@@ -5229,7 +5249,7 @@ fn changes_footer<'a>(
     buttons = buttons.push(commit);
     match (&source.branch, &source.upstream) {
         (Some(branch), Some(target)) => {
-            let mut push = button::custom(widget::text::caption("Push"))
+            let mut push = button::custom(design::caption("Push"))
                 .class(sidebar_button_style(false))
                 .id(chrome.push_id.clone())
                 .padding([0, 8])
@@ -5244,7 +5264,7 @@ fn changes_footer<'a>(
             buttons = buttons.push(push);
         }
         (Some(branch), None) if !source.upstream_reported() => {
-            let mut publish = button::custom(widget::text::caption("Publish Branch"))
+            let mut publish = button::custom(design::caption("Publish Branch"))
                 .class(sidebar_button_style(false))
                 .id(chrome.push_id.clone())
                 .padding([0, 8])
@@ -5262,14 +5282,14 @@ fn changes_footer<'a>(
             // `git status` reported an upstream this panel could not name, so
             // publishing would re-point the branch at whatever remote the
             // picker offered rather than push to the upstream it has.
-            buttons = buttons.push(widget::text::caption(
+            buttons = buttons.push(design::caption(
                 "Upstream could not be read — nothing to push",
             ));
         }
         (None, _) => {
             // A branch this panel cannot name is not one it may invent a
             // mutation for, and each reason is stated as itself.
-            buttons = buttons.push(widget::text::caption(source.no_branch_reason()));
+            buttons = buttons.push(design::caption(source.no_branch_reason()));
         }
     }
     column = column.push(buttons);
@@ -5306,7 +5326,7 @@ fn publish_picker<'a>(
             .get(index)
             .map_or(remote.as_str(), |name| name);
         remotes = remotes.push(
-            button::custom(widget::text::caption(remote.as_str()))
+            button::custom(design::caption(remote.as_str()))
                 .class(sidebar_button_style(publish.remote == *remote))
                 .id(id)
                 .name(name)
@@ -5342,13 +5362,13 @@ fn publish_picker<'a>(
         confirm = confirm.on_press(push);
     }
     widget::column::with_children(vec![
-        widget::text::caption("Publish to").into(),
+        design::caption("Publish to").into(),
         remotes.into(),
         branch_input.into(),
         // A permanent slot: the reason comes and goes as the picker is filled
         // in, and the named controls below it must not move when it does.
         slot(blocked.map(|reason| {
-            widget::text::caption(reason)
+            design::caption(reason)
                 .wrapping(cosmic::iced::widget::text::Wrapping::Word)
                 .into()
         })),
@@ -5384,7 +5404,7 @@ fn history_section<'a>(
     // button.
     let mut column = widget::column::with_capacity(3).spacing(spacing.space_xxxs);
     column = column.push(slot(history_notice(source).map(|notice| {
-        widget::text::caption(notice)
+        design::caption(notice)
             .wrapping(cosmic::iced::widget::text::Wrapping::Word)
             .into()
     })));
@@ -5405,7 +5425,7 @@ fn history_section<'a>(
                             ))
                             .width(Length::Fill)
                             .into(),
-                        widget::text::caption(&*chrome.metadata)
+                        design::caption(&*chrome.metadata)
                             .wrapping(cosmic::iced::widget::text::Wrapping::None)
                             .ellipsize(cosmic::iced::widget::text::Ellipsize::End(
                                 EllipsizeHeightLimit::Lines(1),
@@ -5428,7 +5448,7 @@ fn history_section<'a>(
     column = column.push(slot(source.can_load_history().then(|| {
         // The first page is not "more": labelling it that way while the list is
         // empty hides that nothing has been asked for yet.
-        button::custom(widget::text::caption(if source.history.is_empty() {
+        button::custom(design::caption(if source.history.is_empty() {
             format!("Load {HISTORY_PAGE_SIZE} commits")
         } else {
             format!("Load {HISTORY_PAGE_SIZE} more commits")
@@ -5546,7 +5566,7 @@ pub fn discard_confirmation_dialog(pending: &DiscardConfirmation) -> Element<'_,
             widget::text::body(detail.join(". "))
                 .wrapping(cosmic::iced::widget::text::Wrapping::Word)
                 .into(),
-            widget::text::caption("Discarded work is not recoverable from Git.").into(),
+            design::caption("Discarded work is not recoverable from Git.").into(),
             widget::row::with_children(vec![
                 button::standard("Cancel")
                     .id(discard_cancel_id())
@@ -5737,7 +5757,9 @@ enum BadgeTone {
 fn badge<'a>(label: impl Into<Cow<'a, str>> + 'a, tone: BadgeTone) -> Element<'a, SidebarAction> {
     let spacing = cosmic::theme::spacing();
     widget::container(
-        widget::text::caption(label).wrapping(cosmic::iced::widget::text::Wrapping::None),
+        design::caption(label)
+            .class(theme::Text::default())
+            .wrapping(cosmic::iced::widget::text::Wrapping::None),
     )
     .class(theme::Container::custom(move |theme| {
         let cosmic = theme.cosmic();
@@ -6868,25 +6890,21 @@ mod tests {
     }
 
     #[test]
-    fn account_namespace_preserves_nested_branches_and_detached_identity() {
-        let mut entry = project();
-        let attached = worktree(11, "CarsonBurke/feature/editor/wrap", false);
-        let mut detached = worktree(12, "CarsonBurke/detached-unique", false);
-        detached.detached = true;
-        let original_detached = detached.chrome.label.clone();
-        entry.worktrees = vec![
-            attached,
-            detached,
-            worktree(13, "feature/editor/wrap", false),
-        ];
-        entry.set_branch_namespace("CarsonBurke");
-        assert_eq!(&*entry.worktrees[0].chrome.label, "feature/editor/wrap");
-        assert_eq!(
-            entry.worktrees[0].branch.as_deref(),
-            Some("CarsonBurke/feature/editor/wrap")
-        );
-        assert_eq!(entry.worktrees[1].chrome.label, original_detached);
-        assert_eq!(&*entry.worktrees[2].chrome.label, "feature/editor/wrap");
+    fn worktree_titles_follow_pr_lifecycle_without_changing_git_identity() {
+        let branch = "CarsonBurke/claws-turnstile-fix";
+        let mut row = worktree(11, branch, false);
+        assert_eq!(&*row.chrome.label, "claws turnstile fix");
+        assert!(row.matches("carsonburke/"));
+        let mut pr = project().pull_requests.remove(0);
+        pr.title = "Fix browser challenge handling".into();
+        row.set_pull_request(pr);
+        assert_eq!(&*row.chrome.label, "Fix browser challenge handling");
+        assert!(row.matches("challenge"));
+        assert!(row.chrome.tooltip.contains(branch));
+        row.clear_pull_request();
+        assert_eq!(&*row.chrome.label, "claws turnstile fix");
+        assert!(!row.matches("challenge"));
+        assert_eq!(row.branch.as_deref(), Some(branch));
     }
 
     #[test]
@@ -7922,6 +7940,22 @@ mod tests {
             CheckStatus::Failing
         );
         assert_eq!(CheckStatus::from_checks(&[]), CheckStatus::Unknown);
+    }
+
+    #[test]
+    fn completed_pull_requests_do_not_present_stale_checks_as_activity() {
+        let mut pr = project().pull_requests.remove(0);
+        pr.checks = CheckStatus::Pending;
+        pr.state = Some(WorktreePullRequestState::Open);
+        assert!(pr.has_pending_checks());
+
+        pr.state = Some(WorktreePullRequestState::Merged);
+        assert!(!pr.has_pending_checks());
+        pr.state = Some(WorktreePullRequestState::Closed);
+        assert!(!pr.has_pending_checks());
+
+        pr.state = Some(WorktreePullRequestState::Open);
+        assert!(pr.has_pending_checks(), "reopening restores ongoing checks");
     }
 
     #[test]

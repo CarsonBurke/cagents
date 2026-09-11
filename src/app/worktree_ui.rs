@@ -334,41 +334,16 @@ impl Cagents {
         ))
     }
 
-    /// Unregistered panes have no sidebar row, so keep their tabs reachable
-    /// without reintroducing a separate "Other sessions" workspace.
-    pub(super) fn hidden_unregistered_tabs(&self) -> impl Iterator<Item = CardId> + '_ {
-        self.durable
-            .cards
-            .iter()
-            .filter(|card| {
-                card.existence.is_open()
-                    && self
-                        .card_worktree(card)
-                        .is_some_and(|root| self.sidebar_model.worktree_at(root).is_none())
-                    && !self.workspace.order().any(|id| id == card.id)
-            })
-            .map(|card| card.id)
-    }
-
-    pub(super) fn focus_unregistered_tab(&mut self, id: CardId) -> Task<Message> {
-        if !self
-            .hidden_unregistered_tabs()
-            .any(|candidate| candidate == id)
-        {
-            return Task::none();
-        }
-        let path = self
-            .card_state(id)
-            .and_then(|card| self.card_worktree(card))
-            .expect("unregistered tab has a scope")
-            .to_path_buf();
-        self.show_workspace_for_action();
-        let scope = self.select_worktree(path, false);
-        let focus = match self.workspace.focus(id) {
-            Ok(update) => self.apply_viewport(update, true, false),
-            Err(_) => Task::none(),
-        };
-        Task::batch([scope, focus])
+    /// Directory scopes without a project row are offered by the workspace
+    /// selector, never mixed into the selected workspace's tabs.
+    pub(super) fn unregistered_workspace_scopes(&self) -> impl Iterator<Item = &Path> {
+        self.durable.cards.iter().filter_map(|card| {
+            if !card.existence.is_open() {
+                return None;
+            }
+            self.card_worktree(card)
+                .filter(|root| self.sidebar_model.worktree_at(root).is_none())
+        })
     }
 
     pub(super) fn select_worktree(
@@ -618,33 +593,60 @@ mod tests {
     use crate::model::{BrowserId, BrowserRestoreFidelity, ProjectThread};
 
     #[test]
-    fn unregistered_panes_remain_reachable_after_selecting_a_project() {
+    fn unregistered_workspaces_are_reachable_without_leaking_tabs() {
         let mut app = super::super::tests::context_inspector_test_app(false);
-        register_worktrees(&mut app, &["/repo"]);
+        register_worktrees(&mut app, &["/repo", "/repo/worktree"]);
         let project = terminal("/repo");
+        let worktree = terminal("/repo/worktree");
+        let home = terminal("/home/user");
         let loose = terminal("/tmp");
+        let companion = terminal("/tmp");
+        let threaded = terminal("/home/user");
+        let thread = ThreadId::new();
         app.durable = Arc::new(WorkspaceState {
-            cards: vec![project.clone(), loose.clone()],
+            cards: vec![
+                project.clone(),
+                worktree.clone(),
+                home.clone(),
+                loose.clone(),
+                companion.clone(),
+                threaded.clone(),
+            ],
             active_worktree: Some("/repo".into()),
+            threads: vec![ProjectThread {
+                id: thread,
+                project_id: app.sidebar_model.projects[0].id,
+                title: "Thread".into(),
+                cards: vec![threaded.id],
+                focused: Some(threaded.id),
+            }],
             ..WorkspaceState::default()
         });
         let _ = app.restore_worktree_scope();
         assert_eq!(app.workspace.order().collect::<Vec<_>>(), vec![project.id]);
+        let scopes = app
+            .unregistered_workspace_scopes()
+            .collect::<std::collections::BTreeSet<_>>();
         assert_eq!(
-            app.hidden_unregistered_tabs().collect::<Vec<_>>(),
-            vec![loose.id]
+            scopes.into_iter().collect::<Vec<_>>(),
+            vec![Path::new("/home/user"), Path::new("/tmp")]
         );
-        let _ = app.update(Message::FocusCard(loose.id));
-        assert_eq!(app.workspace.focused(), Some(loose.id));
-        assert_eq!(app.workspace.order().collect::<Vec<_>>(), vec![loose.id]);
+        let _ = app.select_worktree("/repo/worktree".into(), false);
+        assert_eq!(app.workspace.order().collect::<Vec<_>>(), vec![worktree.id]);
+        let _ = app.select_thread(thread);
+        assert_eq!(app.workspace.order().collect::<Vec<_>>(), vec![threaded.id]);
+        let _ = app.update_chrome(chrome_ui::Action::SelectWorkspace("/tmp".into()));
+        assert_eq!(app.durable.active_thread, None);
+        assert_eq!(
+            app.workspace.order().collect::<Vec<_>>(),
+            vec![loose.id, companion.id]
+        );
         assert_eq!(app.terminal_directory(), Some(PathBuf::from("/tmp")));
-        assert!(app.hidden_unregistered_tabs().next().is_none());
+        let _ = app.update_chrome(chrome_ui::Action::SelectWorkspace("/home/user".into()));
+        assert_eq!(app.workspace.order().collect::<Vec<_>>(), vec![home.id]);
         let _ = app.select_worktree("/repo".into(), false);
-        assert_eq!(
-            app.hidden_unregistered_tabs().collect::<Vec<_>>(),
-            vec![loose.id]
-        );
-        assert_eq!(app.durable.cards.len(), 2);
+        assert_eq!(app.workspace.order().collect::<Vec<_>>(), vec![project.id]);
+        assert_eq!(app.durable.cards.len(), 6);
     }
     #[test]
     fn same_directory_threads_restore_focus_without_entering_main_panes() {
@@ -1074,6 +1076,13 @@ mod tests {
             assert_eq!(app.workspace.focused(), Some(editor.id));
             assert_eq!(app.context_tab, ContextTab::Changes);
             assert_eq!(app.context_inspector_open, !was_overlay);
+            if was_overlay {
+                assert!(app.workspace_inputs_blocked());
+                let transition = app.context_inspector_transition.unwrap();
+                let _ = app.advance_context_inspector_transition(
+                    transition.started_at + transition.duration(),
+                );
+            }
             assert!(!app.workspace_inputs_blocked());
 
             let _ = app.select_worktree("/b".into(), false);

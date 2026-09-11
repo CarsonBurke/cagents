@@ -3801,7 +3801,7 @@ fn file_list_view(card: CardId, runtime: &RepositoryRuntime) -> Element<'_, Repo
                     ))
                     .width(Length::Fill)
                     .into(),
-                widget::text::caption(runtime.descriptor.worktree.display().to_string())
+                crate::design::caption(runtime.descriptor.worktree.display().to_string())
                     .wrapping(iced::widget::text::Wrapping::None)
                     .ellipsize(iced::widget::text::Ellipsize::Start(
                         iced::advanced::text::EllipsizeHeightLimit::Lines(1),
@@ -3866,7 +3866,7 @@ fn file_list_view(card: CardId, runtime: &RepositoryRuntime) -> Element<'_, Repo
                         .into(),
                 ];
                 if let Some(status) = &file.status {
-                    children.push(widget::text::caption(status.clone()).into());
+                    children.push(crate::design::caption(status.clone()).into());
                 }
                 widget::button::custom(
                     widget::row::with_children(children)
@@ -4454,7 +4454,7 @@ fn diff_review_controls(
         )
         .into(),
         crate::interaction::tooltip(
-            widget::text::caption(if change_count == 0 {
+            crate::design::caption(if change_count == 0 {
                 "0/0".into()
             } else {
                 format!("{}/{change_count}", runtime.diff_change + 1)
@@ -4490,7 +4490,7 @@ fn diff_review_controls(
         && !counts.is_empty()
     {
         controls.push(crate::interaction::tooltip(
-            widget::text::caption(counts),
+            crate::design::caption(counts),
             match runtime.diff_state(&runtime.diff_basis) {
                 Some(DiffState::Ready(RenderedDiff::Text {
                     old_label,
@@ -4583,7 +4583,7 @@ fn working_diff_view<'a>(
         }
     });
     let editor = widget::column::with_children([
-        widget::text::caption(status).into(),
+        crate::design::caption(status).into(),
         editable_document_view(card, runtime, document),
     ])
     .width(Length::Fill)
@@ -4621,7 +4621,7 @@ fn removed_context_view<'a>(
     let removed = &rows[..rows.partition_point(|row| row.kind == DiffRowKind::Deletion)];
     let native_split = runtime.editable_working_diff() && runtime.diff_mode == DiffMode::Split;
     let mut children: Vec<Element<'a, RepositoryAction>> = vec![
-        widget::text::caption(
+        crate::design::caption(
             if runtime.editable_working_diff() && !runtime.working_annotations_current() {
                 "Removed content · last computed change · read-only"
             } else {
@@ -4631,7 +4631,7 @@ fn removed_context_view<'a>(
         .into(),
     ];
     if removed.is_empty() {
-        children.push(widget::text::caption("No removed lines in this change.").into());
+        children.push(crate::design::caption("No removed lines in this change.").into());
     } else {
         let visible = visible_rows(removed.len(), runtime.removed_viewport, DIFF_ROW_HEIGHT);
         let mut lines = Vec::with_capacity(visible.end - visible.start + 2);
@@ -5022,7 +5022,7 @@ fn diff_half<'a>(
 
 fn diff_gutter(line: Option<u32>, width: f32) -> Element<'static, RepositoryAction> {
     widget::container(
-        widget::text::caption(line.map_or_else(String::new, |line| line.to_string()))
+        crate::design::caption(line.map_or_else(String::new, |line| line.to_string()))
             .font(Font::MONOSPACE)
             .size(12)
             .align_x(Alignment::End)
@@ -5701,10 +5701,11 @@ mod tests {
         previous.unstaged = false;
         previous.status = None;
         let mut refreshed = files.clone();
-        *refreshed
+        let refreshed_file = refreshed
             .iter_mut()
             .find(|file| file.path == selected.path)
-            .unwrap() = selected;
+            .unwrap();
+        *refreshed_file = selected;
         drop(runtime.refresh_visible(card));
         let identity = AsyncIdentity {
             card,

@@ -39,6 +39,7 @@ pub(super) enum Action {
     Close,
     DismissNotice,
     Launch(NewTab),
+    SelectWorkspace(PathBuf),
 }
 
 fn browser_icon() -> widget::icon::Handle {
@@ -193,6 +194,11 @@ impl Cagents {
             Action::DismissNotice => {
                 self.status = None;
                 self.reconcile_notice_popup()
+            }
+            Action::SelectWorkspace(path) => {
+                self.chrome_ui.close();
+                self.show_workspace_for_action();
+                self.select_worktree(path, false)
             }
             Action::Launch(kind) => {
                 self.chrome_ui.close();
@@ -461,7 +467,12 @@ impl Cagents {
         } else {
             0.0
         };
-        let width = navigator + controls + update + notice + 16.0;
+        let scope_selector = if self.unregistered_workspace_scopes().next().is_some() {
+            152.0
+        } else {
+            0.0
+        };
+        let width = navigator + controls + update + notice + scope_selector + 16.0;
         if self.workspace.viewport_width() > 0.0 {
             width.min(self.workspace.viewport_width())
         } else {
@@ -472,8 +483,7 @@ impl Cagents {
     fn tab_strip_geometry(&self) -> (f32, f32) {
         let available = (self.workspace.viewport_width() - self.workspace_header_width()).max(0.0);
         let width = ((available - design::PRIMARY_CONTROL_SIZE - 2.0).max(0.0)
-            / (self.workspace.cards().len() + self.hidden_unregistered_tabs().count()).max(1)
-                as f32)
+            / self.workspace.cards().len().max(1) as f32)
             .clamp(96.0, 200.0);
         (available, width)
     }
@@ -503,13 +513,7 @@ impl Cagents {
         let tabs = widget::row::with_children(
             self.workspace
                 .order()
-                .map(|id| {
-                    self.column_header(id, self.workspace.focused() == Some(id), tab_width, true)
-                })
-                .chain(
-                    self.hidden_unregistered_tabs()
-                        .map(|id| self.column_header(id, false, tab_width, false)),
-                ),
+                .map(|id| self.column_header(id, self.workspace.focused() == Some(id), tab_width)),
         )
         .push(self.new_tab_control())
         .spacing(2)
@@ -521,14 +525,49 @@ impl Cagents {
             ))
             .width(Length::Fill)
             .height(design::PRIMARY_CONTROL_SIZE);
+        let scopes = self
+            .unregistered_workspace_scopes()
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .map(Path::to_path_buf)
+            .collect::<Vec<_>>();
+        let tabs: Element<'_, Message> = if scopes.is_empty() {
+            tabs.into()
+        } else {
+            let selected = self
+                .durable
+                .active_thread
+                .is_none()
+                .then(|| {
+                    scopes
+                        .iter()
+                        .position(|path| self.active_workspace.as_ref() == Some(path))
+                })
+                .flatten();
+            let labels = scopes
+                .iter()
+                .map(|path| display_path(path).into_owned())
+                .collect::<Vec<_>>();
+            let selector = widget::dropdown(labels, selected, move |index| {
+                Message::ChromeUi(Action::SelectWorkspace(scopes[index].clone()))
+            })
+            .id(widget::Id::new("workspace.scope"))
+            .placeholder("Workspaces")
+            .text_size(design::TEXT_BODY)
+            .padding([5, 8])
+            .width(150);
+            widget::row::with_children(vec![
+                tooltip(selector, "Open a workspace outside registered projects"),
+                tabs.into(),
+            ])
+            .spacing(2)
+            .align_y(Alignment::Center)
+            .into()
+        };
         let actions = widget::row::with_children(self.workflow_header())
             .spacing(2)
             .align_y(Alignment::Center);
-        let header = self.native_header(
-            tabs.into(),
-            Some(actions.into()),
-            !self.context_inspector_open,
-        );
+        let header = self.native_header(tabs, Some(actions.into()), !self.context_inspector_open);
         widget::column::with_children(vec![
             header,
             widget::divider::horizontal::default().into(),
@@ -561,7 +600,7 @@ impl Cagents {
                 )),
             ));
             actions.push(
-                widget::container(widget::text::caption(format!("{current} / {total}")))
+                widget::container(crate::design::caption(format!("{current} / {total}")))
                     .center_y(ICON_CONTROL_SIZE)
                     .center_x(42)
                     .into(),
@@ -589,13 +628,7 @@ impl Cagents {
         actions
     }
 
-    fn column_header(
-        &self,
-        id: CardId,
-        focused: bool,
-        width: f32,
-        active_scope: bool,
-    ) -> Element<'_, Message> {
+    fn column_header(&self, id: CardId, focused: bool, width: f32) -> Element<'_, Message> {
         let card = self.card_state(id);
         let title = card.map_or("Column", |card| card.title.as_str());
         let labels = card_kind_labels(card.map(|card| &card.kind));
@@ -717,7 +750,7 @@ impl Cagents {
                 ));
             }
         }
-        if active_scope && self.chat_switch_available(id) {
+        if self.chat_switch_available(id) {
             children.push(command(
                 if card.is_some_and(|card| matches!(card.kind, CardKind::Chat(_))) {
                     widget::icon::from_name("utilities-terminal-symbolic").into()
@@ -729,20 +762,18 @@ impl Cagents {
                 (!self.modal_is_open()).then_some(Message::ChatUi(chat_ui::Action::Switch(id))),
             ));
         }
-        if active_scope {
-            children.push(command(
-                widget::icon::from_name("window-close-symbolic"),
-                chrome.map_or_else(
-                    || Cow::Owned(card_close_name(labels.type_label, title)),
-                    |chrome| Cow::Borrowed(chrome.close_name.as_str()),
-                ),
-                chrome.map_or_else(
-                    || card_control_id(id, "close"),
-                    |chrome| chrome.close_id.clone(),
-                ),
-                Some(Message::CloseCard(id)),
-            ));
-        }
+        children.push(command(
+            widget::icon::from_name("window-close-symbolic"),
+            chrome.map_or_else(
+                || Cow::Owned(card_close_name(labels.type_label, title)),
+                |chrome| Cow::Borrowed(chrome.close_name.as_str()),
+            ),
+            chrome.map_or_else(
+                || card_control_id(id, "close"),
+                |chrome| chrome.close_id.clone(),
+            ),
+            Some(Message::CloseCard(id)),
+        ));
         widget::container(
             widget::row::with_children(children)
                 .align_y(Alignment::Center)
@@ -852,7 +883,11 @@ impl Cagents {
                 .align_y(Alignment::Center)
                 .into();
         }
-        let heading = self.native_header(tabs.into(), Some(end), true);
+        let heading = self.native_header(iced::widget::Space::new().into(), Some(end), true);
+        let tabs = widget::container(tabs)
+            .padding([0, 8])
+            .center_y(design::HEADER_HEIGHT - design::BORDER_WIDTH)
+            .width(Length::Fill);
         let body = match self.context_tab {
             ContextTab::Files => sidebar::file_panel(
                 &self.sidebar_model,
@@ -874,7 +909,7 @@ impl Cagents {
                     widget::container(
                         widget::column::with_children(vec![
                             design::heading("No column selected").into(),
-                            widget::text::caption(
+                            design::caption(
                                 "Select a column for details, or browse files to open an editor.",
                             )
                             .wrapping(iced::widget::text::Wrapping::Word)
@@ -901,6 +936,8 @@ impl Cagents {
         widget::container(
             widget::column::with_children(vec![
                 heading.into(),
+                widget::divider::horizontal::default().into(),
+                tabs.into(),
                 widget::divider::horizontal::default().into(),
                 body,
             ])

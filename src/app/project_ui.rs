@@ -465,7 +465,7 @@ impl Cagents {
             .spacing(12)
             .push(widget::text::title3("Delete worktree?"))
             .push(widget::text::body(&target.label))
-            .push(widget::text::caption(target.path.display().to_string()))
+            .push(crate::design::caption(target.path.display().to_string()))
             .push(widget::button::standard("Cancel")
                 .id(widget::Id::new("dialog.project.close"))
                 .on_press_maybe((!dialog.pending).then_some(Message::ProjectUi(Action::Dismiss))))

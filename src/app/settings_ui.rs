@@ -64,7 +64,7 @@ fn setting_field<'a>(
     widget::column::with_children(vec![
         widget::text::caption_heading(label).into(),
         control,
-        widget::text::caption(detail)
+        design::caption(detail)
             .wrapping(iced::widget::text::Wrapping::Word)
             .width(Length::Fill)
             .into(),
@@ -126,7 +126,7 @@ fn setting_stepper<'a>(
     .into();
     widget::column::with_children(vec![
         widget::text::caption_heading(label).into(),
-        widget::text::caption(detail)
+        design::caption(detail)
             .wrapping(iced::widget::text::Wrapping::Word)
             .width(Length::Fill)
             .into(),
@@ -190,7 +190,7 @@ fn settings_group<'a>(
     children.push(
         widget::column::with_children(vec![
             widget::text::title4(title).into(),
-            widget::text::caption(description)
+            design::caption(description)
                 .wrapping(iced::widget::text::Wrapping::Word)
                 .width(Length::Fill)
                 .into(),
@@ -706,7 +706,7 @@ pub(super) fn settings_dialog<'a>(
         };
         widget::row::with_children(vec![
             settings_icon(icon, progress).into(),
-            widget::text::caption(message)
+            design::caption(message)
                 .wrapping(iced::widget::text::Wrapping::Word)
                 .width(Length::Fill)
                 .into(),
@@ -716,7 +716,7 @@ pub(super) fn settings_dialog<'a>(
         .width(Length::Fill)
         .into()
     } else {
-        widget::text::caption("Valid changes save automatically after you pause typing.")
+        crate::design::caption("Valid changes save automatically after you pause typing.")
             .wrapping(iced::widget::text::Wrapping::Word)
             .width(Length::Fill)
             .into()

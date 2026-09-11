@@ -498,10 +498,10 @@ fn save_health_view(health: &SaveHealthState) -> Option<Element<'_, Message>> {
             widget::text::body(title)
                 .wrapping(cosmic::iced::widget::text::Wrapping::WordOrGlyph)
                 .into(),
-            widget::text::caption(detail)
+            design::caption(detail)
                 .wrapping(cosmic::iced::widget::text::Wrapping::WordOrGlyph)
                 .into(),
-            widget::text::caption(guidance)
+            design::caption(guidance)
                 .wrapping(cosmic::iced::widget::text::Wrapping::WordOrGlyph)
                 .into(),
         ])
@@ -1583,6 +1583,7 @@ fn workspace_navigation_blocked_during_save(message: &Message) -> bool {
             | Message::NewBrowser
             | Message::OpenBrowser(_)
             | Message::ChromeUi(chrome_ui::Action::Launch(_))
+            | Message::ChromeUi(chrome_ui::Action::SelectWorkspace(_))
             | Message::ThreadUi(_)
             | Message::FocusCard(_)
             | Message::FocusAdjacent(_)
@@ -4839,7 +4840,7 @@ impl Cagents {
                         )
                         .wrapping(cosmic::iced::widget::text::Wrapping::Word)
                         .into(),
-                        widget::text::caption(repository.to_string_lossy()).into(),
+                        design::caption(repository.to_string_lossy()).into(),
                         widget::button::standard("Search projects")
                             // Disabled rather than dead: the pane does not always
                             // give the search a control to focus.
@@ -4908,7 +4909,7 @@ impl Cagents {
                             .size(24.0)
                             .into(),
                         widget::text::title3(labels.starting).into(),
-                        widget::text::caption("Preparing this workspace column…")
+                        design::caption("Preparing this workspace column…")
                             .wrapping(cosmic::iced::widget::text::Wrapping::Word)
                             .into(),
                     ])
@@ -7564,9 +7565,6 @@ impl Application for Cagents {
                             pull_requests,
                         );
                         sidebar_project.github_ready = loaded.github.repository_key().is_some();
-                        if let Some(repository) = loaded.github.repository_key() {
-                            sidebar_project.set_branch_namespace(&repository.owner);
-                        }
                         if !sidebar_project.github_ready {
                             sidebar_project.revoke_github();
                         }
@@ -8023,9 +8021,6 @@ impl Application for Cagents {
                     | SidebarAction::SetFilter(_)
                     | SidebarAction::ToggleProject(_) => Task::none(),
                 }
-            }
-            Message::FocusCard(id) if !self.workspace.order().any(|visible| visible == id) => {
-                self.focus_unregistered_tab(id)
             }
             Message::FocusCard(id) => match self.workspace.focus(id) {
                 Ok(update) => self.apply_viewport(update, true, false),
@@ -9457,7 +9452,7 @@ impl Application for Cagents {
         if let Some(dialog) = self.worktree_dialog.as_ref() {
             let mut rows: Vec<Element<'_, Message>> = vec![
                 widget::text::title3("Create worktree").into(),
-                widget::text::caption(
+                design::caption(
                     "Enter a branch name, a Linear issue ID, or paste a Linear issue URL.",
                 )
                 .into(),
@@ -9475,17 +9470,17 @@ impl Application for Cagents {
             ];
             if dialog.advanced {
                 rows.extend([
-                    widget::text::caption("Base branch (optional)").into(),
+                    crate::design::caption("Base branch (optional)").into(),
                     widget::text_input("Automatic repository default", &dialog.base)
                         .id(widget::Id::new("dialog.worktree.base"))
                         .on_input(Message::WorktreeBaseChanged)
                         .into(),
-                    widget::text::caption("Destination (optional)").into(),
+                    crate::design::caption("Destination (optional)").into(),
                     widget::text_input("Automatic managed directory", &dialog.destination)
                         .id(widget::Id::new("dialog.worktree.destination"))
                         .on_input(Message::WorktreeDestinationChanged)
                         .into(),
-                    widget::text::caption(format!(
+                    crate::design::caption(format!(
                         "Default parent: {}. Relative paths start at the repository root.",
                         self.settings.managed_worktree_directory
                     ))
@@ -9546,9 +9541,9 @@ impl Application for Cagents {
         let dialog = self.pull_request_dialog.as_ref()?;
         let mut rows: Vec<Element<'_, Message>> = vec![
             widget::text::title3("Create pull request").into(),
-            widget::text::caption(dialog.repository.gh_selector()).into(),
+            design::caption(dialog.repository.gh_selector()).into(),
             widget::column::with_children(vec![
-                widget::text::caption("Title").into(),
+                design::caption("Title").into(),
                 widget::text_input("Title", &dialog.title)
                     .id(pull_request_dialog_focus_id())
                     .on_input(Message::PullRequestTitleChanged)
@@ -9557,7 +9552,7 @@ impl Application for Cagents {
             .spacing(spacing.space_xxxs)
             .into(),
             widget::column::with_children(vec![
-                widget::text::caption("Head branch").into(),
+                design::caption("Head branch").into(),
                 widget::text_input("Head branch", &dialog.head)
                     .id(widget::Id::new("dialog.pull-request.head"))
                     .on_input(Message::PullRequestHeadChanged)
@@ -9566,7 +9561,7 @@ impl Application for Cagents {
             .spacing(spacing.space_xxxs)
             .into(),
             widget::column::with_children(vec![
-                widget::text::caption("Base branch").into(),
+                design::caption("Base branch").into(),
                 widget::text_input("Base branch", &dialog.base)
                     .id(widget::Id::new("dialog.pull-request.base"))
                     .on_input(Message::PullRequestBaseChanged)
@@ -9575,7 +9570,7 @@ impl Application for Cagents {
             .spacing(spacing.space_xxxs)
             .into(),
             widget::column::with_children(vec![
-                widget::text::caption("Description").into(),
+                design::caption("Description").into(),
                 widget::text_input("Description", &dialog.body)
                     .id(widget::Id::new("dialog.pull-request.description"))
                     .on_input(Message::PullRequestBodyChanged)
@@ -9703,12 +9698,9 @@ impl Application for Cagents {
                     )
                     .wrapping(cosmic::iced::widget::text::Wrapping::Word)
                     .into(),
-                    widget::text::caption(format!(
-                        "Starting directory: {}",
-                        display_path(&directory)
-                    ))
-                    .wrapping(cosmic::iced::widget::text::Wrapping::Word)
-                    .into(),
+                    design::caption(format!("Starting directory: {}", display_path(&directory)))
+                        .wrapping(cosmic::iced::widget::text::Wrapping::Word)
+                        .into(),
                     actions,
                 ])
                 .spacing(spacing.space_s)

@@ -1716,7 +1716,7 @@ mod tests {
     #[test]
     fn source_rows_map_bare_carriage_returns_without_changing_saved_bytes() {
         let source = "one\rtwo\r\nthree\n";
-        let content = Content::with_text(source);
+        let content: Content = Content::with_text(source);
         assert_eq!(content.text(), source);
         assert_eq!(content.source_line_ranges(), vec![0..2, 2..3, 3..4]);
     }
