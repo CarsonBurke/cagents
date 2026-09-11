@@ -8,6 +8,8 @@ use std::{
 
 use thiserror::Error;
 
+use crate::fs_safety::{self, ResolveError, Root};
+
 /// Files above this size are never loaded into an editable buffer.
 pub const MAX_EDITABLE_FILE_BYTES: u64 = 8 * 1024 * 1024;
 
@@ -394,6 +396,130 @@ fn save_file_with_atomic_replace(
     })
 }
 
+/// Moves a regular file to a new repository-relative name without replacing
+/// any existing entry. Symlinks in either path are refused.
+///
+/// An error means publication did not succeed. Once the move succeeds, a
+/// directory-sync failure is logged rather than reported as a failed move.
+pub fn rename_file(worktree: &Path, source: &Path, destination: &Path) -> Result<(), FileIoError> {
+    let root = file_operation_root(worktree, source, destination)?;
+    let (source_parent, source_name) =
+        fs_safety::open_parent_beneath(&root, source).map_err(resolve_error)?;
+    let (destination_parent, destination_name) =
+        fs_safety::open_parent_beneath(&root, destination).map_err(resolve_error)?;
+    let source_file = regular_source(&source_parent, Path::new(&source_name))?;
+    require_new_destination(&destination_parent, Path::new(&destination_name))?;
+    source_file.sync_all().map_err(io_error)?;
+    fs_safety::rename_new_between(
+        &source_parent,
+        &source_name,
+        &destination_parent,
+        &destination_name,
+    )
+    .map_err(resolve_error)?;
+    sync_published_directory(&destination_parent);
+    if source.parent() != destination.parent() {
+        sync_published_directory(&source_parent);
+    }
+    Ok(())
+}
+
+/// Streams a regular file into a temporary sibling, preserves its permissions
+/// and access ACL, syncs the bytes, then atomically publishes the copy without
+/// replacing any entry. The source is never modified. Symlinks are refused.
+///
+/// As with `rename_file`, errors precede publication; directory-sync failures
+/// after publication are logged because the new file already exists.
+pub fn copy_file(worktree: &Path, source: &Path, destination: &Path) -> Result<(), FileIoError> {
+    copy_file_before_publish(worktree, source, destination, || Ok(()))
+}
+
+fn copy_file_before_publish(
+    worktree: &Path,
+    source: &Path,
+    destination: &Path,
+    before_publish: impl FnOnce() -> io::Result<()>,
+) -> Result<(), FileIoError> {
+    let root = file_operation_root(worktree, source, destination)?;
+    let mut source_file = regular_source(&root, source)?;
+    let permissions = source_file.metadata().map_err(io_error)?.permissions();
+    let (parent, name) =
+        fs_safety::open_parent_beneath(&root, destination).map_err(resolve_error)?;
+    require_new_destination(&parent, Path::new(&name))?;
+    let (mut temporary, temporary_name) =
+        fs_safety::create_temporary_in(&parent, 0o600).map_err(resolve_error)?;
+    let result = (|| {
+        // Establish access rules before any sensitive bytes exist: otherwise
+        // the final chmod could briefly expose a mode-only view of an ACL.
+        fs_safety::copy_access_acl(&source_file, &temporary).map_err(io_error)?;
+        io::copy(&mut source_file, &mut temporary).map_err(io_error)?;
+        // Set the mode after writing: writing can clear set-ID permission bits.
+        temporary.set_permissions(permissions).map_err(io_error)?;
+        fs_safety::copy_access_acl(&source_file, &temporary).map_err(io_error)?;
+        temporary.sync_all().map_err(io_error)?;
+        before_publish().map_err(io_error)?;
+        fs_safety::rename_new_within(&parent, &temporary_name, &name).map_err(resolve_error)
+    })();
+    if let Err(error) = result {
+        if let Err(cleanup_error) = fs_safety::unlink_within(&parent, &temporary_name) {
+            return Err(FileIoError::Io(format!(
+                "{error}; could not remove partial copy: {cleanup_error}"
+            )));
+        }
+        return Err(error);
+    }
+    sync_published_directory(&parent);
+    Ok(())
+}
+
+fn file_operation_root(
+    worktree: &Path,
+    source: &Path,
+    destination: &Path,
+) -> Result<Root, FileIoError> {
+    validate_repo_path(source)?;
+    validate_repo_path(destination)?;
+    if source == destination {
+        return Err(FileIoError::Io(
+            "source and destination must be different paths".into(),
+        ));
+    }
+    Root::open(worktree).map_err(|error| FileIoError::InvalidRepositoryRoot(error.to_string()))
+}
+
+fn regular_source(root: &Root, source: &Path) -> Result<File, FileIoError> {
+    let file = fs_safety::open_beneath(root, source).map_err(resolve_error)?;
+    if !file.metadata().map_err(io_error)?.is_file() {
+        return Err(FileIoError::Io("the source is not a regular file".into()));
+    }
+    Ok(file)
+}
+
+fn require_new_destination(parent: &Root, name: &Path) -> Result<(), FileIoError> {
+    match fs_safety::metadata_beneath(parent, name) {
+        Ok(_) => Err(FileIoError::Io("the destination already exists".into())),
+        Err(error) if error.is_not_found() => Ok(()),
+        Err(error) => Err(resolve_error(error)),
+    }
+}
+
+fn sync_published_directory(parent: &Root) {
+    if let Err(error) = fs_safety::sync_directory(parent) {
+        tracing::warn!(
+            path = %parent.path().display(),
+            %error,
+            "file operation succeeded but directory durability is unconfirmed"
+        );
+    }
+}
+
+fn resolve_error(error: ResolveError) -> FileIoError {
+    match error {
+        ResolveError::Escaped { .. } => FileIoError::OutsideWorktree,
+        error => FileIoError::Io(error.to_string()),
+    }
+}
+
 fn checked_path(worktree: &Path, relative_path: &Path) -> Result<PathBuf, FileIoError> {
     validate_repo_path(relative_path)?;
     let root = fs::canonicalize(worktree)
@@ -672,6 +798,241 @@ mod tests {
                 && error.contains("injected parent sync failure")
         ));
         assert_eq!(fs::read_to_string(path).unwrap(), "after\n");
+    }
+
+    #[test]
+    fn file_operations_preserve_binary_contents_and_permissions_across_directories() {
+        let root = tempdir().unwrap();
+        fs::create_dir(root.path().join("copies")).unwrap();
+        fs::create_dir(root.path().join("renamed")).unwrap();
+        let contents = [0, 255, 1, 128].repeat(65_536);
+        fs::write(root.path().join("source.bin"), &contents).unwrap();
+        fs::set_permissions(
+            root.path().join("source.bin"),
+            Permissions::from_mode(0o751),
+        )
+        .unwrap();
+
+        copy_file(
+            root.path(),
+            Path::new("source.bin"),
+            Path::new("copies/file.bin"),
+        )
+        .unwrap();
+        assert_eq!(fs::read(root.path().join("source.bin")).unwrap(), contents);
+        assert_eq!(
+            fs::read(root.path().join("copies/file.bin")).unwrap(),
+            contents
+        );
+        rename_file(
+            root.path(),
+            Path::new("source.bin"),
+            Path::new("renamed/file.bin"),
+        )
+        .unwrap();
+        assert!(!root.path().join("source.bin").exists());
+        for path in ["copies/file.bin", "renamed/file.bin"] {
+            assert_eq!(fs::read(root.path().join(path)).unwrap(), contents);
+            assert_eq!(
+                fs::metadata(root.path().join(path))
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o7777,
+                0o751
+            );
+        }
+        fs::write(root.path().join("copies/file.bin"), b"independent").unwrap();
+        assert_eq!(
+            fs::read(root.path().join("renamed/file.bin")).unwrap(),
+            contents
+        );
+    }
+
+    type FileOperation = fn(&Path, &Path, &Path) -> Result<(), FileIoError>;
+    const FILE_OPERATIONS: [FileOperation; 2] = [rename_file, copy_file];
+
+    #[test]
+    fn file_operations_never_replace_existing_entries() {
+        for operation in FILE_OPERATIONS {
+            let root = tempdir().unwrap();
+            fs::write(root.path().join("source"), b"source").unwrap();
+            fs::write(root.path().join("existing"), b"original destination").unwrap();
+            symlink("absent", root.path().join("dangling")).unwrap();
+            symlink("existing", root.path().join("link")).unwrap();
+            fs::create_dir(root.path().join("directory")).unwrap();
+            for destination in ["existing", "dangling", "link", "directory", "source"] {
+                assert!(
+                    operation(root.path(), Path::new("source"), Path::new(destination)).is_err()
+                );
+                assert_eq!(fs::read(root.path().join("source")).unwrap(), b"source");
+                assert_eq!(
+                    fs::read(root.path().join("existing")).unwrap(),
+                    b"original destination"
+                );
+            }
+            assert_eq!(
+                fs::read_link(root.path().join("dangling")).unwrap(),
+                Path::new("absent")
+            );
+            assert_eq!(
+                fs::read_link(root.path().join("link")).unwrap(),
+                Path::new("existing")
+            );
+            assert!(root.path().join("directory").is_dir());
+            assert_eq!(fs::read_dir(root.path()).unwrap().count(), 5);
+        }
+    }
+
+    #[test]
+    fn file_operations_reject_traversal_and_symlink_boundaries() {
+        for operation in FILE_OPERATIONS {
+            let root = tempdir().unwrap();
+            let outside = tempdir().unwrap();
+            fs::write(root.path().join("source"), b"inside").unwrap();
+            fs::write(outside.path().join("source"), b"outside").unwrap();
+            fs::create_dir(root.path().join("real")).unwrap();
+            symlink(outside.path(), root.path().join("escape")).unwrap();
+            symlink("real", root.path().join("internal")).unwrap();
+            symlink("source", root.path().join("source-link")).unwrap();
+            for path in ["../source", "/source"] {
+                assert_eq!(
+                    operation(root.path(), Path::new(path), Path::new("destination")),
+                    Err(FileIoError::InvalidRepositoryPath)
+                );
+                assert_eq!(
+                    operation(root.path(), Path::new("source"), Path::new(path)),
+                    Err(FileIoError::InvalidRepositoryPath)
+                );
+            }
+            for source in ["source-link", "escape/source"] {
+                assert_eq!(
+                    operation(root.path(), Path::new(source), Path::new("destination")),
+                    Err(FileIoError::OutsideWorktree)
+                );
+            }
+            for destination in ["escape/destination", "internal/destination"] {
+                assert_eq!(
+                    operation(root.path(), Path::new("source"), Path::new(destination)),
+                    Err(FileIoError::OutsideWorktree)
+                );
+            }
+            assert_eq!(fs::read(root.path().join("source")).unwrap(), b"inside");
+            assert_eq!(fs::read(outside.path().join("source")).unwrap(), b"outside");
+            assert!(!outside.path().join("destination").exists());
+            assert!(!root.path().join("destination").exists());
+            assert!(!root.path().join("real/destination").exists());
+        }
+    }
+
+    #[test]
+    fn file_operations_fail_without_creating_parents_or_moving_non_files() {
+        for operation in FILE_OPERATIONS {
+            let root = tempdir().unwrap();
+            fs::write(root.path().join("source"), b"untouched").unwrap();
+            fs::create_dir(root.path().join("directory")).unwrap();
+            for (source, destination) in [
+                ("missing", "destination"),
+                ("directory", "destination"),
+                ("source", "missing/destination"),
+            ] {
+                assert!(operation(root.path(), Path::new(source), Path::new(destination)).is_err());
+            }
+            assert_eq!(fs::read(root.path().join("source")).unwrap(), b"untouched");
+            assert!(root.path().join("directory").is_dir());
+            assert!(!root.path().join("missing").exists());
+            assert!(!root.path().join("destination").exists());
+            assert_eq!(fs::read_dir(root.path()).unwrap().count(), 2);
+        }
+    }
+
+    #[test]
+    fn copy_collision_at_publication_preserves_both_files_and_removes_temporary() {
+        let root = tempdir().unwrap();
+        fs::write(root.path().join("source"), b"source").unwrap();
+        let result = copy_file_before_publish(
+            root.path(),
+            Path::new("source"),
+            Path::new("destination"),
+            || fs::write(root.path().join("destination"), b"concurrent creation"),
+        );
+        assert!(result.is_err());
+        assert_eq!(fs::read(root.path().join("source")).unwrap(), b"source");
+        assert_eq!(
+            fs::read(root.path().join("destination")).unwrap(),
+            b"concurrent creation"
+        );
+        assert_eq!(fs::read_dir(root.path()).unwrap().count(), 2);
+    }
+
+    #[test]
+    fn copy_failure_after_streaming_removes_partial_output() {
+        let root = tempdir().unwrap();
+        fs::write(root.path().join("source"), b"source").unwrap();
+        let result = copy_file_before_publish(
+            root.path(),
+            Path::new("source"),
+            Path::new("destination"),
+            || Err(io::Error::other("injected publication failure")),
+        );
+        assert!(matches!(result, Err(FileIoError::Io(error)) if error.contains("injected")));
+        assert_eq!(fs::read(root.path().join("source")).unwrap(), b"source");
+        assert!(!root.path().join("destination").exists());
+        assert_eq!(fs::read_dir(root.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn rename_publication_is_no_replace_between_pinned_parents() {
+        let root = tempdir().unwrap();
+        let outside = tempdir().unwrap();
+        fs::create_dir(root.path().join("destination")).unwrap();
+        fs::write(root.path().join("source"), b"source").unwrap();
+        fs::write(root.path().join("destination/file"), b"existing").unwrap();
+        let source_parent = Root::open(root.path()).unwrap();
+        let destination_parent = Root::open(&root.path().join("destination")).unwrap();
+        fs::rename(root.path().join("destination"), root.path().join("pinned")).unwrap();
+        symlink(outside.path(), root.path().join("destination")).unwrap();
+
+        assert!(
+            fs_safety::rename_new_between(
+                &source_parent,
+                std::ffi::OsStr::new("source"),
+                &destination_parent,
+                std::ffi::OsStr::new("file"),
+            )
+            .is_err()
+        );
+        assert_eq!(fs::read(root.path().join("source")).unwrap(), b"source");
+        assert_eq!(
+            fs::read(root.path().join("pinned/file")).unwrap(),
+            b"existing"
+        );
+        assert!(!outside.path().join("file").exists());
+    }
+
+    #[test]
+    fn copy_publication_cannot_follow_a_replaced_parent_symlink() {
+        let root = tempdir().unwrap();
+        let outside = tempdir().unwrap();
+        fs::write(root.path().join("source"), b"source").unwrap();
+        fs::create_dir(root.path().join("destination")).unwrap();
+        copy_file_before_publish(
+            root.path(),
+            Path::new("source"),
+            Path::new("destination/file"),
+            || {
+                fs::rename(root.path().join("destination"), root.path().join("pinned"))?;
+                symlink(outside.path(), root.path().join("destination"))
+            },
+        )
+        .unwrap();
+        assert_eq!(fs::read(root.path().join("source")).unwrap(), b"source");
+        assert_eq!(
+            fs::read(root.path().join("pinned/file")).unwrap(),
+            b"source"
+        );
+        assert!(!outside.path().join("file").exists());
+        assert_eq!(fs::read_dir(root.path().join("pinned")).unwrap().count(), 1);
     }
 
     #[test]

@@ -876,6 +876,7 @@ fn response_name(response: &ServerResponse) -> &'static str {
         ServerResponse::ChatSnapshot { .. } => "chat_snapshot",
         ServerResponse::ChatListed { .. } => "chat_listed",
         ServerResponse::ChatClosed { .. } => "chat_closed",
+        ServerResponse::ChatPreviewed { .. } => "chat_previewed",
         ServerResponse::TerminalCloseChecked { .. } => "terminal_close_checked",
         ServerResponse::AgentActivity { .. } => "agent_activity",
         ServerResponse::UpgradePrepared { .. } => "upgrade_prepared",

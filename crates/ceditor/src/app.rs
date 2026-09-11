@@ -1,4 +1,5 @@
 use cagents::{
+    design,
     lsp::{LspCompletionItem, LspDiagnostic, LspDocumentId, LspEvent, LspManager, LspPosition},
     model::{CardId, ProjectId, RepositoryView, WorktreeId},
     repository::{
@@ -8,9 +9,11 @@ use cagents::{
     repository_widget::{self, LspIntent, RepositoryAction, RepositoryRuntime},
     settings::{self, AppSettings, AppTheme},
     sidebar::{
-        self, ActiveWorktreeKey, FileListMode, SidebarAction, SidebarFocus, SidebarMode,
-        SidebarModel, SidebarProject, SidebarState, SidebarWorktree, SourceControlModel,
+        self, ActiveWorktreeKey, FileCommand, FileListMode, SidebarAction, SidebarFocus,
+        SidebarMode, SidebarModel, SidebarProject, SidebarState, SidebarWorktree,
+        SourceControlModel,
     },
+    ui_controls::icon_control,
 };
 use cosmic::app::ApplicationExt;
 use cosmic::{
@@ -61,10 +64,19 @@ struct Tab {
     mutation: bool,
 }
 
+struct FileOperationDialog {
+    root: PathBuf,
+    source: PathBuf,
+    name: String,
+    duplicate: bool,
+    busy: bool,
+    error: Option<String>,
+}
+
 #[derive(Debug, Clone)]
 pub enum Message {
     Choose(bool),
-    Chosen(u64, Result<PathBuf, String>),
+    Chosen(u64, Result<Option<PathBuf>, String>),
     Opened(u64, Result<Opened, String>),
     FileResolved(CardId, u64, Result<PathBuf, String>),
     Select(CardId),
@@ -79,6 +91,10 @@ pub enum Message {
     Sidebar(SidebarAction),
     Snapshot(CardId, Result<RepositorySnapshot, String>),
     Mutation(CardId, Result<MutationOutcome, String>),
+    FileNameChanged(String),
+    SubmitFileOperation,
+    CancelFileOperation,
+    FileOperationFinished(Result<PathBuf, String>),
     Settings,
     AutoSave(bool),
     Theme(AppTheme),
@@ -103,6 +119,7 @@ pub struct Editor {
     settings_open: bool,
     settings_writable: bool,
     notice: Option<String>,
+    file_dialog: Option<FileOperationDialog>,
     closing: Option<CardId>,
     close_confirmed: bool,
     exiting: bool,
@@ -115,7 +132,245 @@ fn repository_task(task: iced::Task<RepositoryAction>) -> Task<Message> {
     task.map(Message::Repository).map(cosmic::Action::App)
 }
 
+fn file_operation_destination(source: &Path, name: &str) -> Result<PathBuf, String> {
+    let mut components = Path::new(name).components();
+    if !matches!(components.next(), Some(std::path::Component::Normal(leaf)) if leaf == name)
+        || components.next().is_some()
+    {
+        return Err("Enter a file name, not a path.".into());
+    }
+    let destination = source.parent().unwrap_or(Path::new("")).join(name);
+    if destination == source {
+        return Err("Choose a different file name.".into());
+    }
+    Ok(destination)
+}
+
+fn chosen_path(
+    response: Result<
+        cosmic::dialog::file_chooser::open::FileResponse,
+        cosmic::dialog::file_chooser::Error,
+    >,
+) -> Result<Option<PathBuf>, String> {
+    match response {
+        Ok(response) => response
+            .url()
+            .to_file_path()
+            .map(Some)
+            .map_err(|()| "Only local files are supported".into()),
+        Err(cosmic::dialog::file_chooser::Error::Cancelled) => Ok(None),
+        Err(error) => Err(error.to_string()),
+    }
+}
+
+fn tab_title_style() -> cosmic::theme::Button {
+    fn appearance(focused: bool, theme: &cosmic::Theme) -> widget::button::Style {
+        widget::button::Style {
+            border_width: if focused { design::BORDER_WIDTH } else { 0.0 },
+            border_color: theme.current_container().component.on_disabled.into(),
+            ..widget::button::Style::new()
+        }
+    }
+    cosmic::theme::Button::Custom {
+        active: Box::new(appearance),
+        disabled: Box::new(|_| widget::button::Style::new()),
+        hovered: Box::new(|focused, theme| widget::button::Style {
+            background: Some(iced::Background::Color(
+                theme.current_container().component.hover.into(),
+            )),
+            ..appearance(focused, theme)
+        }),
+        pressed: Box::new(|focused, theme| widget::button::Style {
+            background: Some(iced::Background::Color(
+                theme.current_container().component.pressed.into(),
+            )),
+            ..appearance(focused, theme)
+        }),
+    }
+}
+
 impl Editor {
+    fn modal_open(&self) -> bool {
+        self.settings_open || self.closing.is_some() || self.file_dialog.is_some()
+    }
+
+    fn rename_blocked(&self, absolute: &Path) -> bool {
+        self.tabs.iter().any(|tab| {
+            if !absolute.starts_with(&tab.runtime.descriptor.worktree) {
+                return false;
+            }
+            tab.mutation
+                || tab.pending_file.is_some()
+                || (tab.owned_file.as_deref() == Some(absolute) && tab.runtime.blocks_navigation())
+        })
+    }
+
+    fn begin_file_operation(
+        &mut self,
+        id: CardId,
+        source: PathBuf,
+        duplicate: bool,
+    ) -> Task<Message> {
+        let Some(tab) = self.tab(id) else {
+            return Task::none();
+        };
+        let root = tab.runtime.descriptor.worktree.clone();
+        if !duplicate && self.rename_blocked(&root.join(&source)) {
+            self.notice = Some(
+                "Save this file and wait for pending file or Git operations before renaming it."
+                    .into(),
+            );
+            return Task::none();
+        }
+        let name = source
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .into_owned();
+        self.file_dialog = Some(FileOperationDialog {
+            root,
+            source,
+            name,
+            duplicate,
+            busy: false,
+            error: None,
+        });
+        self.selection_epoch = self.selection_epoch.wrapping_add(1);
+        iced::widget::operation::focus(widget::Id::new("ceditor.file.name"))
+            .map(cosmic::Action::App)
+    }
+
+    fn submit_file_operation(&mut self) -> Task<Message> {
+        let Some(dialog) = self.file_dialog.as_ref().filter(|dialog| !dialog.busy) else {
+            return Task::none();
+        };
+        let destination = match file_operation_destination(&dialog.source, &dialog.name) {
+            Ok(destination) => destination,
+            Err(error) => {
+                self.file_dialog.as_mut().unwrap().error = Some(error);
+                return Task::none();
+            }
+        };
+        if !dialog.duplicate && self.rename_blocked(&dialog.root.join(&dialog.source)) {
+            self.file_dialog.as_mut().unwrap().error = Some(
+                "Save this file and wait for pending file or Git operations before renaming it."
+                    .into(),
+            );
+            return Task::none();
+        }
+        let dialog = self.file_dialog.as_mut().unwrap();
+        dialog.busy = true;
+        dialog.error = None;
+        let root = dialog.root.clone();
+        let source = dialog.source.clone();
+        let duplicate = dialog.duplicate;
+        cosmic::task::future(async move {
+            let result = tokio::task::spawn_blocking(move || {
+                let operation = if duplicate {
+                    cagents::editor::copy_file
+                } else {
+                    cagents::editor::rename_file
+                };
+                operation(&root, &source, &destination)
+                    .map(|()| destination)
+                    .map_err(|error| error.to_string())
+            })
+            .await
+            .map_err(|error| error.to_string())
+            .and_then(|result| result);
+            Message::FileOperationFinished(result)
+        })
+    }
+
+    fn finish_file_operation(&mut self, result: Result<PathBuf, String>) -> Task<Message> {
+        if !self.file_dialog.as_ref().is_some_and(|dialog| dialog.busy) {
+            return Task::none();
+        }
+        let Some(mut dialog) = self.file_dialog.take() else {
+            return Task::none();
+        };
+        let destination = match result {
+            Ok(destination) => destination,
+            Err(error) => {
+                dialog.busy = false;
+                dialog.error = Some(error);
+                self.file_dialog = Some(dialog);
+                self.exiting = false;
+                return Task::none();
+            }
+        };
+        let source = dialog.root.join(&dialog.source);
+        let destination = dialog.root.join(destination);
+        let mut tasks = Vec::new();
+        let mut refresh = Vec::new();
+        for tab in &mut self.tabs {
+            let root = &tab.runtime.descriptor.worktree;
+            if !source.starts_with(root) {
+                continue;
+            }
+            let pending_source = tab.pending_file.as_ref().is_some_and(|pending| {
+                pending.canonical.as_deref() == Some(source.as_path())
+                    || root.join(&pending.path) == source
+            });
+            let reopen =
+                !dialog.duplicate && (tab.owned_file.as_ref() == Some(&source) || pending_source);
+            refresh.push((tab.id, reopen));
+            if reopen {
+                tasks.push(repository_task(
+                    tab.runtime
+                        .update(RepositoryAction::BackToFiles { card: tab.id }),
+                ));
+                tab.owned_file = None;
+                let path = destination
+                    .strip_prefix(&tab.runtime.descriptor.worktree)
+                    .expect("a same-directory rename stays in every containing root")
+                    .to_path_buf();
+                tab.title = path
+                    .file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .into_owned();
+                tab.pending_file = Some(PendingFile {
+                    path,
+                    canonical: Some(destination.clone()),
+                    request: tab.next_open,
+                });
+                tab.next_open = tab.next_open.wrapping_add(1);
+                tab.files_loaded = false;
+            }
+        }
+        for (id, reopened) in refresh {
+            tasks.push(self.drain(id));
+            tasks.push(if reopened {
+                self.refresh_snapshot(id)
+            } else {
+                self.refresh(id)
+            });
+        }
+        if self.exiting {
+            tasks.push(self.continue_exit());
+        } else {
+            tasks.push(self.resume_pending_files());
+        }
+        Task::batch(tasks)
+    }
+
+    fn reveal_active_tab(&self) -> Task<Message> {
+        let Some(index) = self.tabs.iter().position(|tab| Some(tab.id) == self.active) else {
+            return Task::none();
+        };
+        // Equal-width tabs place the active tab between the viewport edges at
+        // this fraction, including the first and last tab.
+        iced::widget::scrollable::snap_to(
+            widget::Id::new("ceditor.tabs"),
+            iced::widget::scrollable::RelativeOffset {
+                x: Some(index as f32 / self.tabs.len().saturating_sub(1).max(1) as f32),
+                y: None,
+            },
+        )
+        .map(cosmic::Action::App)
+    }
+
     fn tab(&self, id: CardId) -> Option<&Tab> {
         self.tabs.iter().find(|tab| tab.id == id)
     }
@@ -173,7 +428,7 @@ impl Editor {
     fn add(&mut self, opened: Opened, focus: bool) -> Task<Message> {
         if let Some(file) = &opened.file {
             if let Some(owner) = self.file_owner(&opened.root.join(file)) {
-                if focus && !self.settings_open && self.closing.is_none() {
+                if focus && !self.modal_open() {
                     self.active = Some(owner);
                 }
                 return self.resume_pending_files();
@@ -223,6 +478,7 @@ impl Editor {
                 Vec::new(),
             )],
         );
+        sidebar.file_management = true;
         sidebar.source_control = Some(match &opened.snapshot {
             Some(snapshot) => SourceControlModel::ready(key, snapshot),
             None => SourceControlModel::loading(key),
@@ -263,7 +519,7 @@ impl Editor {
             lsp_status: String::new(),
             mutation: false,
         });
-        if self.active.is_none() || (focus && !self.settings_open && self.closing.is_none()) {
+        if self.active.is_none() || (focus && !self.modal_open()) {
             self.active = Some(id);
         }
         task
@@ -323,7 +579,7 @@ impl Editor {
     }
 
     fn resume_pending_files(&mut self) -> Task<Message> {
-        if self.settings_open || self.closing.is_some() || self.exiting {
+        if self.modal_open() || self.exiting {
             return Task::none();
         }
         let pending: Vec<_> = self
@@ -534,11 +790,15 @@ impl Editor {
             return Task::none();
         };
         let files = repository_task(tab.runtime.refresh_after_mutation(id));
-        if !tab.git {
-            return files;
-        }
+        Task::batch([files, self.refresh_snapshot(id)])
+    }
+
+    fn refresh_snapshot(&self, id: CardId) -> Task<Message> {
+        let Some(tab) = self.tab(id).filter(|tab| tab.git) else {
+            return Task::none();
+        };
         let root = tab.runtime.descriptor.worktree.clone();
-        let snapshot = cosmic::task::future(async move {
+        cosmic::task::future(async move {
             let result = tokio::task::spawn_blocking(move || {
                 RepositoryService::system("git")
                     .snapshot(&root, &CancellationToken::default())
@@ -548,8 +808,7 @@ impl Editor {
             .map_err(|error| error.to_string())
             .and_then(|result| result);
             Message::Snapshot(id, result)
-        });
-        Task::batch([files, snapshot])
+        })
     }
 
     fn stage(&mut self, id: CardId, stage: bool) -> Task<Message> {
@@ -621,6 +880,7 @@ impl Application for Editor {
             settings_open: false,
             settings_writable,
             notice,
+            file_dialog: None,
             closing: None,
             close_confirmed: false,
             exiting: false,
@@ -649,495 +909,546 @@ impl Application for Editor {
     }
 
     fn update(&mut self, message: Message) -> Task<Message> {
-        if (self.settings_open || self.closing.is_some())
-            && matches!(
-                &message,
-                Message::Choose(_)
-                    | Message::Select(_)
-                    | Message::CloseTab(_)
-                    | Message::Complete
-                    | Message::Hover
-                    | Message::Completion(..)
-                    | Message::Jump(..)
-                    | Message::Sidebar(_)
-                    | Message::Key(_)
-            )
-        {
-            return Task::none();
-        }
-        match message {
-            Message::Choose(folder) => {
-                if self.closing.is_some() {
-                    return Task::none();
+        let previous_tabs = (self.active, self.tabs.len());
+        let task = (|| {
+            if let Message::Key(keyboard::Event::KeyPressed {
+                key: keyboard::Key::Named(keyboard::key::Named::Escape),
+                ..
+            }) = &message
+            {
+                if self.file_dialog.is_some() {
+                    return self.update(Message::CancelFileOperation);
                 }
-                self.selection_epoch = self.selection_epoch.wrapping_add(1);
-                let selection_epoch = self.selection_epoch;
-                cosmic::task::future(async move {
-                    let dialog = cosmic::dialog::file_chooser::open::Dialog::new()
-                        .title(if folder { "Open folder" } else { "Open file" });
-                    let response = if folder {
-                        dialog.open_folder().await
-                    } else {
-                        dialog.open_file().await
-                    };
-                    Message::Chosen(
-                        selection_epoch,
-                        response
-                            .map_err(|error| error.to_string())
-                            .and_then(|response| {
-                                response
-                                    .url()
-                                    .to_file_path()
-                                    .map_err(|()| "Only local files are supported".into())
-                            }),
-                    )
-                })
             }
-            Message::Chosen(epoch, Ok(path)) => Self::open(path, epoch),
-            Message::Chosen(_, Err(error)) | Message::Opened(_, Err(error)) => {
-                self.notice = Some(error);
-                Task::none()
+            if self.modal_open()
+                && matches!(
+                    &message,
+                    Message::Choose(_)
+                        | Message::Select(_)
+                        | Message::CloseTab(_)
+                        | Message::Complete
+                        | Message::Hover
+                        | Message::Completion(..)
+                        | Message::Jump(..)
+                        | Message::Sidebar(_)
+                        | Message::Key(_)
+                )
+            {
+                return Task::none();
             }
-            Message::Opened(epoch, Ok(opened)) => {
-                if self.exiting {
+            match message {
+                Message::FileNameChanged(name) => {
+                    if let Some(dialog) = self.file_dialog.as_mut().filter(|dialog| !dialog.busy) {
+                        dialog.name = name;
+                        dialog.error = None;
+                    }
                     Task::none()
-                } else {
-                    self.add(opened, epoch == self.selection_epoch)
                 }
-            }
-            Message::FileResolved(id, request, result) => {
-                let Some(pending) = self
-                    .tab_mut(id)
-                    .and_then(|tab| tab.pending_file.as_mut())
-                    .filter(|pending| pending.request == request)
-                else {
-                    return Task::none();
-                };
-                match result {
-                    Ok(canonical) => pending.canonical = Some(canonical),
-                    Err(error) => {
-                        if let Some(tab) = self.tab_mut(id) {
-                            tab.pending_file = None;
-                        }
-                        self.notice = Some(error);
+                Message::SubmitFileOperation => self.submit_file_operation(),
+                Message::CancelFileOperation => {
+                    if self.file_dialog.as_ref().is_some_and(|dialog| !dialog.busy) {
+                        self.file_dialog = None;
+                        return self.resume_pending_files();
+                    }
+                    Task::none()
+                }
+                Message::FileOperationFinished(result) => self.finish_file_operation(result),
+                Message::Choose(folder) => {
+                    if self.closing.is_some() {
+                        return Task::none();
+                    }
+                    self.selection_epoch = self.selection_epoch.wrapping_add(1);
+                    let selection_epoch = self.selection_epoch;
+                    cosmic::task::future(async move {
+                        let dialog = cosmic::dialog::file_chooser::open::Dialog::new()
+                            .title(if folder { "Open folder" } else { "Open file" });
+                        let response = if folder {
+                            dialog.open_folder().await
+                        } else {
+                            dialog.open_file().await
+                        };
+                        Message::Chosen(selection_epoch, chosen_path(response))
+                    })
+                }
+                Message::Chosen(epoch, Ok(Some(path))) => Self::open(path, epoch),
+                Message::Chosen(_, Ok(None)) => Task::none(),
+                Message::Chosen(_, Err(error)) | Message::Opened(_, Err(error)) => {
+                    self.notice = Some(error);
+                    Task::none()
+                }
+                Message::Opened(epoch, Ok(opened)) => {
+                    if self.exiting {
+                        Task::none()
+                    } else {
+                        self.add(opened, epoch == self.selection_epoch)
                     }
                 }
-                self.resume_pending_files()
-            }
-            Message::Select(id) => {
-                self.selection_epoch = self.selection_epoch.wrapping_add(1);
-                self.active = Some(id);
-                Task::none()
-            }
-            Message::CloseTab(id) => self.request_close(id),
-            Message::CloseWindow => {
-                self.settings_open = false;
-                self.exiting = true;
-                self.continue_exit()
-            }
-            Message::SaveClose => {
-                let Some(card) = self
-                    .closing
-                    .filter(|id| self.tab(*id).is_some_and(|tab| tab.runtime.can_save()))
-                else {
-                    return Task::none();
-                };
-                self.close_confirmed = true;
-                self.update(Message::Repository(RepositoryAction::Save {
-                    card,
-                    overwrite: false,
-                }))
-            }
-            Message::DiscardClose => {
-                if let Some(id) = self.closing {
-                    if self
+                Message::FileResolved(id, request, result) => {
+                    let Some(pending) = self
                         .tab_mut(id)
-                        .is_some_and(|tab| !tab.mutation && tab.runtime.abandon_unsaved_changes())
-                    {
+                        .and_then(|tab| tab.pending_file.as_mut())
+                        .filter(|pending| pending.request == request)
+                    else {
+                        return Task::none();
+                    };
+                    match result {
+                        Ok(canonical) => pending.canonical = Some(canonical),
+                        Err(error) => {
+                            if let Some(tab) = self.tab_mut(id) {
+                                tab.pending_file = None;
+                            }
+                            self.notice = Some(error);
+                        }
+                    }
+                    self.resume_pending_files()
+                }
+                Message::Select(id) => {
+                    self.selection_epoch = self.selection_epoch.wrapping_add(1);
+                    self.active = Some(id);
+                    Task::none()
+                }
+                Message::CloseTab(id) => self.request_close(id),
+                Message::CloseWindow => {
+                    if self.file_dialog.as_ref().is_some_and(|dialog| dialog.busy) {
+                        self.exiting = true;
+                        return Task::none();
+                    }
+                    self.file_dialog = None;
+                    self.settings_open = false;
+                    self.exiting = true;
+                    self.continue_exit()
+                }
+                Message::SaveClose => {
+                    let Some(card) = self
+                        .closing
+                        .filter(|id| self.tab(*id).is_some_and(|tab| tab.runtime.can_save()))
+                    else {
+                        return Task::none();
+                    };
+                    self.close_confirmed = true;
+                    self.update(Message::Repository(RepositoryAction::Save {
+                        card,
+                        overwrite: false,
+                    }))
+                }
+                Message::DiscardClose => {
+                    if let Some(id) = self.closing {
+                        if self.tab_mut(id).is_some_and(|tab| {
+                            !tab.mutation && tab.runtime.abandon_unsaved_changes()
+                        }) {
+                            return self.request_close(id);
+                        }
+                    }
+                    Task::none()
+                }
+                Message::ConfirmClose => {
+                    if let Some(id) = self.closing.filter(|id| {
+                        self.tab(*id)
+                            .is_some_and(|tab| !tab.mutation && !tab.runtime.blocks_navigation())
+                    }) {
                         return self.request_close(id);
                     }
+                    Task::none()
                 }
-                Task::none()
-            }
-            Message::ConfirmClose => {
-                if let Some(id) = self.closing.filter(|id| {
-                    self.tab(*id)
-                        .is_some_and(|tab| !tab.mutation && !tab.runtime.blocks_navigation())
-                }) {
-                    return self.request_close(id);
+                Message::CancelClose => {
+                    self.closing = None;
+                    self.close_confirmed = false;
+                    self.exiting = false;
+                    self.resume_pending_files()
                 }
-                Task::none()
-            }
-            Message::CancelClose => {
-                self.closing = None;
-                self.close_confirmed = false;
-                self.exiting = false;
-                self.resume_pending_files()
-            }
-            Message::Reaped => iced::exit().map(cosmic::Action::App),
-            Message::Repository(action) => {
-                let id = action.card();
-                if self.settings_open || self.closing.is_some() {
-                    if !matches!(
-                        action,
-                        RepositoryAction::FilesLoaded { .. }
-                            | RepositoryAction::FileLoaded { .. }
-                            | RepositoryAction::DiffLoaded { .. }
-                            | RepositoryAction::SaveFinished { .. }
-                            | RepositoryAction::AutoSaveDue { .. }
-                            | RepositoryAction::Save { .. }
-                            | RepositoryAction::Reload { .. }
-                    ) {
-                        return Task::none();
-                    }
-                }
-                if let RepositoryAction::OpenFile { path, .. } = action {
-                    return self.request_file(id, path);
-                }
-                if let RepositoryAction::StageSelected { stage, .. } = action {
-                    return self.stage(id, stage);
-                }
-                if let RepositoryAction::RefreshFiles { .. } = action {
-                    return self.refresh(id);
-                }
-                if let RepositoryAction::MarkdownLink { uri, .. } = &action {
-                    let uri = uri.to_string();
-                    if !["https://", "http://", "mailto:"]
-                        .iter()
-                        .any(|scheme| uri.starts_with(scheme))
-                    {
-                        self.notice = Some("Only HTTP, HTTPS, and mail links can be opened from document previews.".into());
-                        return Task::none();
-                    }
-                    return cosmic::task::future(async move {
-                        let result = tokio::task::spawn_blocking(move || {
-                            let status =
-                                std::process::Command::new("xdg-open").arg(uri).status()?;
-                            if status.success() {
-                                Ok(())
-                            } else {
-                                Err(std::io::Error::other(format!(
-                                    "Link opener exited with {status}"
-                                )))
-                            }
-                        })
-                        .await;
-                        Message::SettingsSaved(
-                            result
-                                .map_err(|error| error.to_string())
-                                .and_then(|result| result.map_err(|error| error.to_string())),
-                        )
-                    });
-                }
-                let loaded = matches!(action, RepositoryAction::FilesLoaded { .. });
-                let focus_loaded = matches!(action, RepositoryAction::FileLoaded { .. })
-                    && self.active == Some(id)
-                    && !self.settings_open
-                    && self.closing.is_none();
-                let saved = matches!(action, RepositoryAction::SaveFinished { .. });
-                let back_to_files = matches!(action, RepositoryAction::BackToFiles { .. });
-                let Some(tab) = self.tab_mut(id) else {
-                    return Task::none();
-                };
-                if let RepositoryAction::FilesLoaded {
-                    result: Ok(files), ..
-                } = &action
-                {
-                    if !tab.git {
-                        let paths: Vec<_> = files
-                            .iter()
-                            .filter_map(|file| RepoPath::parse(&file.path).ok())
-                            .collect();
-                        if let Some(key) = tab.navigation.active_worktree().cloned() {
-                            tab.sidebar.source_control =
-                                Some(SourceControlModel::directory(key, &paths));
+                Message::Reaped => iced::exit().map(cosmic::Action::App),
+                Message::Repository(action) => {
+                    let id = action.card();
+                    if self.modal_open() {
+                        if !matches!(
+                            action,
+                            RepositoryAction::FilesLoaded { .. }
+                                | RepositoryAction::FileLoaded { .. }
+                                | RepositoryAction::DiffLoaded { .. }
+                                | RepositoryAction::SaveFinished { .. }
+                                | RepositoryAction::AutoSaveDue { .. }
+                                | RepositoryAction::Save { .. }
+                                | RepositoryAction::Reload { .. }
+                        ) {
+                            return Task::none();
                         }
                     }
+                    if let RepositoryAction::OpenFile { path, .. } = action {
+                        return self.request_file(id, path);
+                    }
+                    if let RepositoryAction::StageSelected { stage, .. } = action {
+                        return self.stage(id, stage);
+                    }
+                    if let RepositoryAction::RefreshFiles { .. } = action {
+                        return self.refresh(id);
+                    }
+                    if let RepositoryAction::MarkdownLink { uri, .. } = &action {
+                        let uri = uri.to_string();
+                        if !["https://", "http://", "mailto:"]
+                            .iter()
+                            .any(|scheme| uri.starts_with(scheme))
+                        {
+                            self.notice = Some("Only HTTP, HTTPS, and mail links can be opened from document previews.".into());
+                            return Task::none();
+                        }
+                        return cosmic::task::future(async move {
+                            let result = tokio::task::spawn_blocking(move || {
+                                let status =
+                                    std::process::Command::new("xdg-open").arg(uri).status()?;
+                                if status.success() {
+                                    Ok(())
+                                } else {
+                                    Err(std::io::Error::other(format!(
+                                        "Link opener exited with {status}"
+                                    )))
+                                }
+                            })
+                            .await;
+                            Message::SettingsSaved(
+                                result
+                                    .map_err(|error| error.to_string())
+                                    .and_then(|result| result.map_err(|error| error.to_string())),
+                            )
+                        });
+                    }
+                    let loaded = matches!(action, RepositoryAction::FilesLoaded { .. });
+                    let focus_loaded = matches!(action, RepositoryAction::FileLoaded { .. })
+                        && self.active == Some(id)
+                        && !self.modal_open();
+                    let saved = matches!(action, RepositoryAction::SaveFinished { .. });
+                    let back_to_files = matches!(action, RepositoryAction::BackToFiles { .. });
+                    let Some(tab) = self.tab_mut(id) else {
+                        return Task::none();
+                    };
+                    if let RepositoryAction::FilesLoaded {
+                        result: Ok(files), ..
+                    } = &action
+                    {
+                        if !tab.git {
+                            let paths: Vec<_> = files
+                                .iter()
+                                .filter_map(|file| RepoPath::parse(&file.path).ok())
+                                .collect();
+                            if let Some(key) = tab.navigation.active_worktree().cloned() {
+                                tab.sidebar.source_control =
+                                    Some(SourceControlModel::directory(key, &paths));
+                            }
+                        }
+                    }
+                    let mut tasks = vec![repository_task(tab.runtime.update(action))];
+                    if back_to_files && tab.runtime.selected_path().is_none() {
+                        tab.owned_file = None;
+                        tab.pending_file = None;
+                    }
+                    if loaded {
+                        tab.files_loaded = true;
+                    }
+                    if focus_loaded {
+                        tasks.push(tab.runtime.focus_editor(id).map(cosmic::Action::App));
+                    }
+                    tasks.push(self.drain(id));
+                    if loaded || saved {
+                        tasks.push(self.resume_pending_files());
+                    }
+                    if saved {
+                        if self.close_confirmed
+                            && self.closing == Some(id)
+                            && self.tab(id).is_some_and(|tab| {
+                                !tab.mutation && !tab.runtime.blocks_navigation()
+                            })
+                        {
+                            tasks.push(self.request_close(id));
+                        } else if self.closing.is_none() {
+                            tasks.push(self.refresh(id));
+                        }
+                    }
+                    Task::batch(tasks)
                 }
-                let mut tasks = vec![repository_task(tab.runtime.update(action))];
-                if back_to_files && tab.runtime.selected_path().is_none() {
-                    tab.owned_file = None;
-                    tab.pending_file = None;
+                Message::Sidebar(action) => {
+                    if self.modal_open() {
+                        return Task::none();
+                    }
+                    if let SidebarAction::SetFileListMode { mode, .. } = &action {
+                        self.file_list_mode = *mode;
+                        for tab in &mut self.tabs {
+                            if let Some(key) = tab.navigation.active_worktree().cloned() {
+                                tab.navigation
+                                    .apply(&SidebarAction::SetFileListMode { key, mode: *mode });
+                            }
+                        }
+                        if self.settings_writable {
+                            let result = settings::save(&self.settings_path, &self.settings)
+                                .map_err(|error| error.to_string())
+                                .and_then(|()| {
+                                    crate::preferences::save(&self.settings_path, *mode)
+                                });
+                            if let Err(error) = result {
+                                self.notice = Some(error);
+                            }
+                        } else {
+                            self.notice = Some(
+                                "Repair the settings file before saving the file-list preference."
+                                    .into(),
+                            );
+                        }
+                        return Task::none();
+                    }
+                    let Some(id) = self.active else {
+                        return Task::none();
+                    };
+                    let Some(tab) = self.tab_mut(id) else {
+                        return Task::none();
+                    };
+                    let key = match &action {
+                        SidebarAction::OpenFile { key, .. }
+                        | SidebarAction::FileCommand { key, .. }
+                        | SidebarAction::RefreshWorktree { key }
+                        | SidebarAction::FilesQueryChanged { key, .. }
+                        | SidebarAction::ToggleDirectory { key, .. }
+                        | SidebarAction::ToggleSection { key, .. } => Some(key),
+                        _ => None,
+                    };
+                    if key.is_some_and(|key| tab.navigation.active_worktree() != Some(key)) {
+                        return Task::none();
+                    }
+                    tab.navigation.apply(&action);
+                    match action {
+                        SidebarAction::FileCommand { path, command, .. } => match command {
+                            FileCommand::CopyPath => iced::clipboard::write(
+                                tab.runtime
+                                    .descriptor
+                                    .worktree
+                                    .join(path.as_path())
+                                    .to_string_lossy()
+                                    .into_owned(),
+                            )
+                            .map(cosmic::Action::App),
+                            FileCommand::CopyRelativePath => iced::clipboard::write(
+                                path.as_path().to_string_lossy().into_owned(),
+                            )
+                            .map(cosmic::Action::App),
+                            FileCommand::Rename | FileCommand::CopyFile => self
+                                .begin_file_operation(
+                                    id,
+                                    path.as_path().to_path_buf(),
+                                    command == FileCommand::CopyFile,
+                                ),
+                        },
+                        SidebarAction::OpenFile { path, .. } => {
+                            self.request_file(id, path.as_path().to_path_buf())
+                        }
+                        SidebarAction::RefreshWorktree { .. } | SidebarAction::Refresh => {
+                            self.refresh(id)
+                        }
+                        _ => Task::none(),
+                    }
                 }
-                if loaded {
-                    tab.files_loaded = true;
+                Message::Snapshot(id, result) => {
+                    if let Some(tab) = self.tab_mut(id) {
+                        match result {
+                            Ok(snapshot) => {
+                                if let Some(key) = tab.navigation.active_worktree().cloned() {
+                                    tab.sidebar.source_control =
+                                        Some(SourceControlModel::ready(key, &snapshot));
+                                }
+                            }
+                            Err(error) => self.notice = Some(error),
+                        }
+                    }
+                    Task::none()
                 }
-                if focus_loaded {
-                    tasks.push(tab.runtime.focus_editor(id).map(cosmic::Action::App));
-                }
-                tasks.push(self.drain(id));
-                if loaded || saved {
-                    tasks.push(self.resume_pending_files());
-                }
-                if saved {
+                Message::Mutation(id, result) => {
+                    if let Some(tab) = self.tab_mut(id) {
+                        tab.mutation = false;
+                    }
+                    self.notice = match result {
+                        Ok(MutationOutcome::Applied { .. }) => None,
+                        Ok(MutationOutcome::NotApplied { failure }) => Some(failure.to_string()),
+                        Ok(MutationOutcome::OutcomeUnknown { failure }) => {
+                            Some(format!("Git outcome is uncertain: {failure}"))
+                        }
+                        Ok(MutationOutcome::PartiallyApplied { failures, .. }) => Some(format!(
+                            "Some paths were not changed: {}",
+                            failures
+                                .iter()
+                                .map(ToString::to_string)
+                                .collect::<Vec<_>>()
+                                .join("; ")
+                        )),
+                        Err(error) => Some(error),
+                    };
                     if self.close_confirmed
                         && self.closing == Some(id)
                         && self
                             .tab(id)
-                            .is_some_and(|tab| !tab.mutation && !tab.runtime.blocks_navigation())
+                            .is_some_and(|tab| !tab.runtime.blocks_navigation())
                     {
-                        tasks.push(self.request_close(id));
-                    } else if self.closing.is_none() {
-                        tasks.push(self.refresh(id));
-                    }
-                }
-                Task::batch(tasks)
-            }
-            Message::Sidebar(action) => {
-                if self.closing.is_some() || self.settings_open {
-                    return Task::none();
-                }
-                if let SidebarAction::SetFileListMode { mode, .. } = &action {
-                    self.file_list_mode = *mode;
-                    for tab in &mut self.tabs {
-                        if let Some(key) = tab.navigation.active_worktree().cloned() {
-                            tab.navigation
-                                .apply(&SidebarAction::SetFileListMode { key, mode: *mode });
-                        }
-                    }
-                    if self.settings_writable {
-                        let result = settings::save(&self.settings_path, &self.settings)
-                            .map_err(|error| error.to_string())
-                            .and_then(|()| crate::preferences::save(&self.settings_path, *mode));
-                        if let Err(error) = result {
-                            self.notice = Some(error);
-                        }
+                        self.request_close(id)
                     } else {
-                        self.notice = Some(
-                            "Repair the settings file before saving the file-list preference."
-                                .into(),
-                        );
-                    }
-                    return Task::none();
-                }
-                let Some(id) = self.active else {
-                    return Task::none();
-                };
-                let Some(tab) = self.tab_mut(id) else {
-                    return Task::none();
-                };
-                let key = match &action {
-                    SidebarAction::OpenFile { key, .. }
-                    | SidebarAction::RefreshWorktree { key }
-                    | SidebarAction::FilesQueryChanged { key, .. }
-                    | SidebarAction::ToggleDirectory { key, .. }
-                    | SidebarAction::ToggleSection { key, .. } => Some(key),
-                    _ => None,
-                };
-                if key.is_some_and(|key| tab.navigation.active_worktree() != Some(key)) {
-                    return Task::none();
-                }
-                tab.navigation.apply(&action);
-                match action {
-                    SidebarAction::OpenFile { path, .. } => {
-                        self.request_file(id, path.as_path().to_path_buf())
-                    }
-                    SidebarAction::RefreshWorktree { .. } | SidebarAction::Refresh => {
                         self.refresh(id)
                     }
-                    _ => Task::none(),
                 }
-            }
-            Message::Snapshot(id, result) => {
-                if let Some(tab) = self.tab_mut(id) {
-                    match result {
-                        Ok(snapshot) => {
-                            if let Some(key) = tab.navigation.active_worktree().cloned() {
-                                tab.sidebar.source_control =
-                                    Some(SourceControlModel::ready(key, &snapshot));
-                            }
+                Message::Settings => {
+                    if self.closing.is_none() && self.file_dialog.is_none() {
+                        self.settings_open = !self.settings_open;
+                        if self.settings_open {
+                            return self.save_settings();
                         }
-                        Err(error) => self.notice = Some(error),
                     }
+                    self.resume_pending_files()
                 }
-                Task::none()
-            }
-            Message::Mutation(id, result) => {
-                if let Some(tab) = self.tab_mut(id) {
-                    tab.mutation = false;
-                }
-                self.notice = match result {
-                    Ok(MutationOutcome::Applied { .. }) => None,
-                    Ok(MutationOutcome::NotApplied { failure }) => Some(failure.to_string()),
-                    Ok(MutationOutcome::OutcomeUnknown { failure }) => {
-                        Some(format!("Git outcome is uncertain: {failure}"))
-                    }
-                    Ok(MutationOutcome::PartiallyApplied { failures, .. }) => Some(format!(
-                        "Some paths were not changed: {}",
-                        failures
-                            .iter()
-                            .map(ToString::to_string)
-                            .collect::<Vec<_>>()
-                            .join("; ")
-                    )),
-                    Err(error) => Some(error),
-                };
-                if self.close_confirmed
-                    && self.closing == Some(id)
-                    && self
-                        .tab(id)
-                        .is_some_and(|tab| !tab.runtime.blocks_navigation())
-                {
-                    self.request_close(id)
-                } else {
-                    self.refresh(id)
-                }
-            }
-            Message::Settings => {
-                if self.closing.is_none() {
-                    self.settings_open = !self.settings_open;
-                    if self.settings_open {
-                        return self.save_settings();
-                    }
-                }
-                self.resume_pending_files()
-            }
-            Message::AutoSave(enabled) => {
-                self.settings.editor_auto_save = enabled;
-                let mut tasks: Vec<_> = self
-                    .tabs
-                    .iter_mut()
-                    .map(|tab| {
-                        tab.runtime.set_auto_save(enabled);
-                        repository_task(tab.runtime.auto_save_task(tab.id))
-                    })
-                    .collect();
-                tasks.push(self.save_settings());
-                Task::batch(tasks)
-            }
-            Message::Theme(theme) => {
-                self.settings.app_theme = theme;
-                Task::batch([self.save_settings(), self.appearance()])
-            }
-            Message::Scale(scale) => {
-                self.settings.ui_scale = scale;
-                Task::batch([self.save_settings(), self.appearance()])
-            }
-            Message::SettingsSaved(result) => {
-                if let Err(error) = result {
-                    self.notice = Some(error);
-                }
-                Task::none()
-            }
-            Message::Dismiss => {
-                self.notice = None;
-                Task::none()
-            }
-            Message::Lsp(event) => {
-                if let Some(event) = event {
-                    let doc = match &event {
-                        LspEvent::Diagnostics { doc, .. }
-                        | LspEvent::Completion { doc, .. }
-                        | LspEvent::Hover { doc, .. }
-                        | LspEvent::Locations { doc, .. }
-                        | LspEvent::Status { doc, .. }
-                        | LspEvent::Progress { doc, .. }
-                        | LspEvent::RequestFailed { doc, .. }
-                        | LspEvent::DocumentDesynced { doc, .. } => *doc,
-                    };
-                    if let Some(tab) = self
+                Message::AutoSave(enabled) => {
+                    self.settings.editor_auto_save = enabled;
+                    let mut tasks: Vec<_> = self
                         .tabs
                         .iter_mut()
-                        .find(|tab| tab.runtime.lsp_document() == Some(doc))
-                    {
-                        match event {
-                            LspEvent::Diagnostics { items, .. } => tab.diagnostics = items,
-                            LspEvent::Completion { items, .. } => tab.completions = items,
-                            LspEvent::Hover { markdown, .. } => tab.hover = markdown,
-                            LspEvent::Status { status, .. } => {
-                                tab.lsp_status = format!("{status:?}")
-                            }
-                            LspEvent::RequestFailed { error, .. }
-                                if !matches!(error, cagents::lsp::LspError::Cancelled) =>
-                            {
-                                tab.lsp_status = error.to_string()
-                            }
-                            LspEvent::DocumentDesynced { error, .. } => {
-                                tab.completions.clear();
-                                tab.hover = None;
-                                tab.diagnostics.clear();
-                                tab.lsp_status = error.to_string();
-                            }
-                            _ => {}
-                        }
+                        .map(|tab| {
+                            tab.runtime.set_auto_save(enabled);
+                            repository_task(tab.runtime.auto_save_task(tab.id))
+                        })
+                        .collect();
+                    tasks.push(self.save_settings());
+                    Task::batch(tasks)
+                }
+                Message::Theme(theme) => {
+                    self.settings.app_theme = theme;
+                    Task::batch([self.save_settings(), self.appearance()])
+                }
+                Message::Scale(scale) => {
+                    self.settings.ui_scale = scale;
+                    Task::batch([self.save_settings(), self.appearance()])
+                }
+                Message::SettingsSaved(result) => {
+                    if let Err(error) = result {
+                        self.notice = Some(error);
                     }
-                    self.lsp_next()
-                } else {
                     Task::none()
                 }
-            }
-            Message::Complete | Message::Hover => {
-                if self.closing.is_some() || self.settings_open {
-                    return Task::none();
+                Message::Dismiss => {
+                    self.notice = None;
+                    Task::none()
                 }
-                if let Some(tab) = self.current() {
-                    if let (Some(doc), Some(at)) =
-                        (tab.runtime.lsp_document(), tab.runtime.cursor_position())
-                    {
-                        if matches!(message, Message::Complete) {
-                            self.lsp.request_completion(doc, at);
-                        } else {
-                            self.lsp.request_hover(doc, at);
+                Message::Lsp(event) => {
+                    if let Some(event) = event {
+                        let doc = match &event {
+                            LspEvent::Diagnostics { doc, .. }
+                            | LspEvent::Completion { doc, .. }
+                            | LspEvent::Hover { doc, .. }
+                            | LspEvent::Locations { doc, .. }
+                            | LspEvent::Status { doc, .. }
+                            | LspEvent::Progress { doc, .. }
+                            | LspEvent::RequestFailed { doc, .. }
+                            | LspEvent::DocumentDesynced { doc, .. } => *doc,
+                        };
+                        if let Some(tab) = self
+                            .tabs
+                            .iter_mut()
+                            .find(|tab| tab.runtime.lsp_document() == Some(doc))
+                        {
+                            match event {
+                                LspEvent::Diagnostics { items, .. } => tab.diagnostics = items,
+                                LspEvent::Completion { items, .. } => tab.completions = items,
+                                LspEvent::Hover { markdown, .. } => tab.hover = markdown,
+                                LspEvent::Status { status, .. } => {
+                                    tab.lsp_status = format!("{status:?}")
+                                }
+                                LspEvent::RequestFailed { error, .. }
+                                    if !matches!(error, cagents::lsp::LspError::Cancelled) =>
+                                {
+                                    tab.lsp_status = error.to_string()
+                                }
+                                LspEvent::DocumentDesynced { error, .. } => {
+                                    tab.completions.clear();
+                                    tab.hover = None;
+                                    tab.diagnostics.clear();
+                                    tab.lsp_status = error.to_string();
+                                }
+                                _ => {}
+                            }
+                        }
+                        self.lsp_next()
+                    } else {
+                        Task::none()
+                    }
+                }
+                Message::Complete | Message::Hover => {
+                    if self.modal_open() {
+                        return Task::none();
+                    }
+                    if let Some(tab) = self.current() {
+                        if let (Some(doc), Some(at)) =
+                            (tab.runtime.lsp_document(), tab.runtime.cursor_position())
+                        {
+                            if matches!(message, Message::Complete) {
+                                self.lsp.request_completion(doc, at);
+                            } else {
+                                self.lsp.request_hover(doc, at);
+                            }
                         }
                     }
+                    Task::none()
                 }
-                Task::none()
-            }
-            Message::Completion(id, index) => {
-                if self.closing.is_some() || self.settings_open {
-                    return Task::none();
-                }
-                if let Some(tab) = self.tab_mut(id) {
-                    if let Some(item) = tab.completions.get(index).cloned() {
-                        tab.runtime.apply_completion(&item);
-                        tab.completions.clear();
+                Message::Completion(id, index) => {
+                    if self.modal_open() {
+                        return Task::none();
                     }
-                }
-                self.drain(id)
-            }
-            Message::Jump(id, at) => {
-                if let Some(tab) = self.tab_mut(id) {
-                    tab.runtime.move_cursor_to(at);
-                    return tab.runtime.focus_editor(id).map(cosmic::Action::App);
-                }
-                Task::none()
-            }
-            Message::Key(keyboard::Event::KeyPressed {
-                key,
-                modifiers,
-                repeat: false,
-                ..
-            }) => {
-                if self.closing.is_some() || self.settings_open {
-                    return Task::none();
-                }
-                if modifiers.control() {
-                    if let keyboard::Key::Character(key) = key {
-                        match key.as_str().to_ascii_lowercase().as_str() {
-                            "o" => return self.update(Message::Choose(modifiers.shift())),
-                            "s" => {
-                                if let Some(card) = self.active {
-                                    return self.update(Message::Repository(
-                                        RepositoryAction::Save {
-                                            card,
-                                            overwrite: false,
-                                        },
-                                    ));
-                                }
-                            }
-                            "w" => {
-                                if let Some(card) = self.active {
-                                    return self.request_close(card);
-                                }
-                            }
-                            " " => return self.update(Message::Complete),
-                            _ => {}
+                    if let Some(tab) = self.tab_mut(id) {
+                        if let Some(item) = tab.completions.get(index).cloned() {
+                            tab.runtime.apply_completion(&item);
+                            tab.completions.clear();
                         }
                     }
+                    self.drain(id)
                 }
-                Task::none()
+                Message::Jump(id, at) => {
+                    if let Some(tab) = self.tab_mut(id) {
+                        tab.runtime.move_cursor_to(at);
+                        return tab.runtime.focus_editor(id).map(cosmic::Action::App);
+                    }
+                    Task::none()
+                }
+                Message::Key(keyboard::Event::KeyPressed {
+                    key,
+                    modifiers,
+                    repeat: false,
+                    ..
+                }) => {
+                    if self.modal_open() {
+                        return Task::none();
+                    }
+                    if modifiers.control() {
+                        if let keyboard::Key::Character(key) = key {
+                            match key.as_str().to_ascii_lowercase().as_str() {
+                                "o" => return self.update(Message::Choose(modifiers.shift())),
+                                "s" => {
+                                    if let Some(card) = self.active {
+                                        return self.update(Message::Repository(
+                                            RepositoryAction::Save {
+                                                card,
+                                                overwrite: false,
+                                            },
+                                        ));
+                                    }
+                                }
+                                "w" => {
+                                    if let Some(card) = self.active {
+                                        return self.request_close(card);
+                                    }
+                                }
+                                " " => return self.update(Message::Complete),
+                                _ => {}
+                            }
+                        }
+                    }
+                    Task::none()
+                }
+                Message::Key(_) => Task::none(),
             }
-            Message::Key(_) => Task::none(),
+        })();
+        if previous_tabs != (self.active, self.tabs.len()) {
+            Task::batch([task, self.reveal_active_tab()])
+        } else {
+            task
         }
     }
 
@@ -1151,20 +1462,34 @@ impl Application for Editor {
 
     fn header_start(&self) -> Vec<Element<'_, Message>> {
         vec![
-            widget::text::title3("ceditor").into(),
-            widget::button::text("Open file")
-                .on_press(Message::Choose(false))
-                .into(),
-            widget::button::text("Open folder")
-                .on_press(Message::Choose(true))
-                .into(),
+            icon_control(
+                widget::icon::from_name("document-open-symbolic").handle(),
+                "Open file (Ctrl+O)",
+                false,
+                !self.modal_open(),
+                Some(Message::Choose(false)),
+            )
+            .into(),
+            icon_control(
+                widget::icon::from_name("folder-open-symbolic").handle(),
+                "Open folder (Ctrl+Shift+O)",
+                false,
+                !self.modal_open(),
+                Some(Message::Choose(true)),
+            )
+            .into(),
         ]
     }
     fn header_end(&self) -> Vec<Element<'_, Message>> {
         vec![
-            widget::button::text("Settings")
-                .on_press(Message::Settings)
-                .into(),
+            icon_control(
+                widget::icon::from_name("emblem-system-symbolic").handle(),
+                "Settings",
+                self.settings_open,
+                self.closing.is_none() && self.file_dialog.is_none(),
+                Some(Message::Settings),
+            )
+            .into(),
         ]
     }
     fn view(&self) -> Element<'_, Message> {
@@ -1172,38 +1497,91 @@ impl Application for Editor {
             .tabs
             .iter()
             .map(|tab| {
-                widget::row::with_children(vec![
-                    widget::button::custom(widget::text::body(format!(
-                        "{}{}",
-                        if tab.runtime.is_dirty() { "• " } else { "" },
-                        tab.title
-                    )))
-                    .class(cosmic::theme::Button::Text)
-                    .selected(self.active == Some(tab.id))
-                    .on_press(Message::Select(tab.id))
-                    .into(),
-                    widget::button::text("×")
-                        .on_press(Message::CloseTab(tab.id))
+                let selected = self.active == Some(tab.id);
+                let title = format!(
+                    "{}{}",
+                    if tab.runtime.is_dirty() { "• " } else { "" },
+                    tab.title
+                );
+                widget::container(
+                    widget::row::with_children(vec![
+                        cagents::interaction::tooltip(
+                            widget::button::custom(
+                                widget::text::body(title.clone())
+                                    .wrapping(iced::widget::text::Wrapping::None)
+                                    .ellipsize(iced::widget::text::Ellipsize::End(
+                                        iced::advanced::text::EllipsizeHeightLimit::Lines(1),
+                                    ))
+                                    .width(Length::Fill),
+                            )
+                            .name(title.clone())
+                            .class(tab_title_style())
+                            .padding([0, 8])
+                            .width(Length::Fill)
+                            .height(Length::Fill)
+                            .on_press(Message::Select(tab.id)),
+                            title,
+                        ),
+                        icon_control(
+                            widget::icon::from_name("window-close-symbolic").handle(),
+                            "Close tab",
+                            false,
+                            !self.modal_open(),
+                            Some(Message::CloseTab(tab.id)),
+                        )
                         .into(),
-                ])
-                .spacing(2)
+                    ])
+                    .align_y(iced::Alignment::Center)
+                    .height(Length::Fill),
+                )
+                .width(184)
+                .height(design::PRIMARY_CONTROL_SIZE + 4.0)
+                .class(cosmic::theme::Container::custom(move |theme| {
+                    iced::widget::container::Style {
+                        background: selected.then(|| {
+                            iced::Background::Color(
+                                theme
+                                    .current_container()
+                                    .component
+                                    .selected_state_color()
+                                    .into(),
+                            )
+                        }),
+                        border: iced::Border {
+                            color: theme.current_container().component.divider.into(),
+                            width: design::BORDER_WIDTH,
+                            ..Default::default()
+                        },
+                        ..Default::default()
+                    }
+                }))
                 .into()
             })
             .collect();
-        let mut body = vec![
-            widget::scrollable(widget::row::with_children(tabs).spacing(4))
-                .direction(iced::widget::scrollable::Direction::Horizontal(
-                    Default::default(),
-                ))
-                .into(),
-        ];
+        let mut body = Vec::new();
+        if !tabs.is_empty() {
+            body.push(
+                widget::scrollable(widget::row::with_children(tabs).spacing(0))
+                    .id(widget::Id::new("ceditor.tabs"))
+                    .direction(iced::widget::scrollable::Direction::Horizontal(
+                        Default::default(),
+                    ))
+                    .width(Length::Fill)
+                    .into(),
+            );
+        }
         if let Some(notice) = &self.notice {
             body.push(
                 widget::row::with_children(vec![
                     widget::text::body(notice).width(Length::Fill).into(),
-                    widget::button::text("Dismiss")
-                        .on_press(Message::Dismiss)
-                        .into(),
+                    icon_control(
+                        widget::icon::from_name("window-close-symbolic").handle(),
+                        "Dismiss notice",
+                        false,
+                        true,
+                        Some(Message::Dismiss),
+                    )
+                    .into(),
                 ])
                 .padding(8)
                 .into(),
@@ -1211,25 +1589,49 @@ impl Application for Editor {
         }
         if let Some(tab) = self.current() {
             let mut editor = Vec::new();
+            let mut toolbar_controls = Vec::new();
             if let Some(toolbar) = repository_widget::selected_file_toolbar(tab.id, &tab.runtime) {
-                editor.push(toolbar.map(Message::Repository));
+                toolbar_controls.push(toolbar.map(Message::Repository));
+            }
+            if tab.runtime.lsp_document().is_some() {
+                toolbar_controls.extend([
+                    icon_control(
+                        widget::icon::from_name("insert-text-symbolic").handle(),
+                        "Complete (Ctrl+Space)",
+                        false,
+                        !self.modal_open(),
+                        Some(Message::Complete),
+                    )
+                    .into(),
+                    icon_control(
+                        widget::icon::from_name("dialog-information-symbolic").handle(),
+                        "Show symbol information",
+                        false,
+                        !self.modal_open(),
+                        Some(Message::Hover),
+                    )
+                    .into(),
+                ]);
+            }
+            if !toolbar_controls.is_empty() {
+                editor.push(
+                    widget::container(
+                        widget::row::with_children(toolbar_controls)
+                            .align_y(iced::Alignment::Center)
+                            .width(Length::Fill),
+                    )
+                    .padding([2, 8])
+                    .width(Length::Fill)
+                    .into(),
+                );
             }
             editor.push(repository_widget::view(tab.id, &tab.runtime).map(Message::Repository));
             if tab.runtime.lsp_document().is_some() {
                 editor.push(
-                    widget::row::with_children(vec![
-                        widget::text::caption(&tab.lsp_status)
-                            .width(Length::Fill)
-                            .into(),
-                        widget::button::text("Complete")
-                            .on_press(Message::Complete)
-                            .into(),
-                        widget::button::text("Hover")
-                            .on_press(Message::Hover)
-                            .into(),
-                    ])
-                    .spacing(8)
-                    .into(),
+                    widget::container(widget::text::caption(&tab.lsp_status))
+                        .padding([2, 8])
+                        .width(Length::Fill)
+                        .into(),
                 );
             }
             if !tab.completions.is_empty() || !tab.diagnostics.is_empty() || tab.hover.is_some() {
@@ -1264,13 +1666,8 @@ impl Application for Editor {
             }
             body.push(
                 widget::row::with_children(vec![
-                    sidebar::file_panel(
-                        &tab.sidebar,
-                        &tab.navigation,
-                        280.0,
-                        self.settings_open || self.closing.is_some(),
-                    )
-                    .map(Message::Sidebar),
+                    sidebar::file_panel(&tab.sidebar, &tab.navigation, 280.0, self.modal_open())
+                        .map(Message::Sidebar),
                     widget::column::with_children(editor)
                         .width(Length::Fill)
                         .height(Length::Fill)
@@ -1288,6 +1685,51 @@ impl Application for Editor {
     }
 
     fn dialog(&self) -> Option<Element<'_, Message>> {
+        if let Some(dialog) = &self.file_dialog {
+            let title = if dialog.duplicate {
+                "Duplicate file"
+            } else {
+                "Rename file"
+            };
+            let mut name = widget::text_input("File name", &dialog.name)
+                .id(widget::Id::new("ceditor.file.name"));
+            if !dialog.busy {
+                name = name
+                    .on_input(Message::FileNameChanged)
+                    .on_submit(|_| Message::SubmitFileOperation);
+            }
+            let mut content = vec![
+                widget::text::title3(title).into(),
+                widget::text::body(dialog.source.to_string_lossy()).into(),
+                widget::text::caption(if dialog.duplicate {
+                    "Copies the saved file on disk, not unsaved editor changes. Existing files are never replaced."
+                } else {
+                    "Rename in the same directory. Existing files are never replaced."
+                }).into(),
+                name.into(),
+            ];
+            if let Some(error) = &dialog.error {
+                content.push(widget::text::body(error).into());
+            }
+            content.push(
+                widget::row::with_children(vec![
+                    widget::button::standard("Cancel")
+                        .on_press_maybe((!dialog.busy).then_some(Message::CancelFileOperation))
+                        .into(),
+                    widget::button::standard(if dialog.busy { "Working…" } else { title })
+                        .on_press_maybe((!dialog.busy).then_some(Message::SubmitFileOperation))
+                        .into(),
+                ])
+                .spacing(8)
+                .into(),
+            );
+            return Some(cagents::interaction::opaque(
+                widget::container(widget::column::with_children(content).spacing(12))
+                    .class(cosmic::theme::Container::Dialog(false))
+                    .padding(20)
+                    .width(480),
+            ));
+        }
         if let Some(id) = self.closing {
             let tab = self.tab(id)?;
             let ready = !tab.runtime.blocks_navigation() && !tab.mutation;
@@ -1299,7 +1741,7 @@ impl Application for Editor {
             ];
             if ready {
                 controls.push(
-                    widget::button::suggested("Close")
+                    widget::button::standard("Close")
                         .id(widget::Id::new("ceditor.close.confirm"))
                         .on_press(Message::ConfirmClose)
                         .into(),
@@ -1315,7 +1757,7 @@ impl Application for Editor {
                 }
                 if tab.runtime.can_save() {
                     controls.push(
-                        widget::button::suggested("Save and close")
+                        widget::button::standard("Save and close")
                             .id(widget::Id::new("ceditor.close.save"))
                             .on_press(Message::SaveClose)
                             .into(),
@@ -1378,6 +1820,7 @@ mod tests {
             settings_open: false,
             settings_writable: false,
             notice: None,
+            file_dialog: None,
             closing: None,
             close_confirmed: false,
             exiting: false,
@@ -1385,6 +1828,24 @@ mod tests {
             next_document: 1,
             file_list_mode: FileListMode::Tree,
         }
+    }
+
+    #[test]
+    fn cancelling_a_chooser_preserves_the_document_and_existing_notice() {
+        let mut app = editor();
+        let id = add(&mut app, "/workspace", Some("a.rs"));
+        app.notice = Some("An earlier save failed".into());
+        let result = chosen_path(Err(cosmic::dialog::file_chooser::Error::Cancelled));
+        assert_eq!(result, Ok(None));
+        drop(app.update(Message::Chosen(app.selection_epoch, result)));
+        assert_eq!(app.active, Some(id));
+        assert_eq!(app.tabs.len(), 1);
+        assert_eq!(app.notice.as_deref(), Some("An earlier save failed"));
+
+        let failure = chosen_path(Err(cosmic::dialog::file_chooser::Error::UrlAbsolute));
+        assert!(failure.is_err());
+        drop(app.update(Message::Chosen(app.selection_epoch, failure)));
+        assert_ne!(app.notice.as_deref(), Some("An earlier save failed"));
     }
 
     fn add(app: &mut Editor, root: &str, file: Option<&str>) -> CardId {
@@ -1414,6 +1875,107 @@ mod tests {
         );
     }
 
+    #[test]
+    fn file_operation_names_stay_in_the_source_directory() {
+        let source = Path::new("src/original.txt");
+        for name in [
+            "",
+            ".",
+            "..",
+            "../outside.txt",
+            "/outside.txt",
+            "nested/file.txt",
+            "file.txt/",
+        ] {
+            assert!(file_operation_destination(source, name).is_err());
+        }
+        assert!(file_operation_destination(source, "original.txt").is_err());
+        assert_eq!(
+            file_operation_destination(source, " renamed λ.txt ").unwrap(),
+            Path::new("src/ renamed λ.txt "),
+        );
+    }
+
+    #[test]
+    fn dirty_file_cannot_be_renamed_but_can_be_duplicated_from_disk() {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(directory.path().join("a.txt"), "saved").unwrap();
+        let mut app = editor();
+        let id = add(&mut app, directory.path().to_str().unwrap(), Some("a.txt"));
+        files_loaded(&mut app, id);
+        drop(
+            app.update(Message::Repository(RepositoryAction::FileLoaded {
+                identity: AsyncIdentity {
+                    card: id,
+                    worktree: directory.path().to_path_buf(),
+                    path: "a.txt".into(),
+                    generation: 1,
+                },
+                result: cagents::editor::load_file(directory.path(), Path::new("a.txt")),
+            })),
+        );
+        drop(
+            app.update(Message::Repository(RepositoryAction::EditorAction {
+                card: id,
+                action: widget::text_editor::Action::Edit(widget::text_editor::Edit::Paste(
+                    Arc::new("unsaved".into()),
+                )),
+            })),
+        );
+        assert!(app.tab(id).unwrap().runtime.is_dirty());
+        drop(app.begin_file_operation(id, "a.txt".into(), false));
+        assert!(app.file_dialog.is_none());
+        assert!(app.tab(id).unwrap().runtime.is_dirty());
+        assert_eq!(
+            std::fs::read_to_string(directory.path().join("a.txt")).unwrap(),
+            "saved"
+        );
+
+        drop(app.begin_file_operation(id, "a.txt".into(), true));
+        assert!(app.file_dialog.as_ref().unwrap().duplicate);
+        drop(app.update(Message::CancelFileOperation));
+        assert!(app.tab(id).unwrap().runtime.is_dirty());
+        assert_eq!(
+            app.tab(id).unwrap().runtime.selected_path(),
+            Some(Path::new("a.txt"))
+        );
+    }
+
+    #[test]
+    fn renamed_file_reopens_under_its_new_path_and_releases_the_old_owner() {
+        let mut app = editor();
+        let owner = add(&mut app, "/workspace", Some("src/old.txt"));
+        files_loaded(&mut app, owner);
+        let folder = add(&mut app, "/workspace/src", None);
+        files_loaded(&mut app, folder);
+        drop(app.begin_file_operation(folder, "old.txt".into(), false));
+        app.file_dialog.as_mut().unwrap().busy = true;
+        drop(app.finish_file_operation(Ok("new.txt".into())));
+        assert_eq!(app.active, Some(folder));
+        assert_eq!(app.file_owner(Path::new("/workspace/src/old.txt")), None);
+        assert_eq!(
+            app.file_owner(Path::new("/workspace/src/new.txt")),
+            Some(owner)
+        );
+        assert_eq!(app.tab(owner).unwrap().runtime.selected_path(), None);
+
+        // A refreshed file list permits the renamed document to reopen.
+        drop(
+            app.update(Message::Repository(RepositoryAction::FilesLoaded {
+                identity: AsyncIdentity {
+                    card: owner,
+                    worktree: "/workspace".into(),
+                    path: ".".into(),
+                    generation: 2,
+                },
+                result: Ok(Vec::new()),
+            })),
+        );
+        assert_eq!(
+            app.tab(owner).unwrap().runtime.selected_path(),
+            Some(Path::new("src/new.txt")),
+        );
+    }
     #[test]
     fn repeated_opens_and_overlapping_folder_tabs_reuse_the_buffer_owner() {
         let mut app = editor();

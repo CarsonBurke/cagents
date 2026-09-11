@@ -190,6 +190,7 @@ pub(crate) struct HostState {
     shutdown_capabilities: VecDeque<(ShutdownCapability, Instant)>,
     pub(super) chats: BTreeMap<TerminalId, super::chat::Record>,
     pub(super) chat_spawning: BTreeMap<TerminalId, crate::chat::Launch>,
+    pub(super) chat_bindings: BTreeMap<TerminalId, super::chat::PendingBinding>,
     pub(crate) agent_observer: Arc<crate::agent::observe::Observer>,
     /// Exclusive upgrade barrier; ordinary client operations remain concurrent.
     pub(super) control_gate: Arc<RwLock<()>>,
@@ -215,6 +216,7 @@ impl HostState {
             shutdown_capabilities: VecDeque::new(),
             chats: BTreeMap::new(),
             chat_spawning: BTreeMap::new(),
+            chat_bindings: BTreeMap::new(),
             agent_observer: Arc::new(crate::agent::observe::Observer::new()),
             control_gate: Arc::new(RwLock::new(())),
             upgrade: None,
@@ -886,7 +888,7 @@ fn prepare_upgrade_with(
     discover: impl FnOnce() -> Result<crate::upgrade::handoff::Store, String>,
 ) -> Result<(u64, u64), ProtocolError> {
     use crate::upgrade::handoff::{Chat, Checkpoint, Phase, Terminal};
-    let (proof, terminals, chats) = {
+    let (proof, terminals, chats, paired_codex) = {
         let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
         state
             .validate_upgrade_capability(&capability, Instant::now())
@@ -905,6 +907,7 @@ fn prepare_upgrade_with(
             })
             .collect::<Result<Vec<_>, ProtocolError>>()?;
         let mut chats = Vec::new();
+        let mut paired_codex = BTreeMap::new();
         for record in state
             .chats
             .values()
@@ -924,6 +927,28 @@ fn prepare_upgrade_with(
                     source.id
                 )));
             }
+            if launch.provider == crate::agent::Provider::Codex
+                && state.terminals.contains_key(&source.id)
+            {
+                if source.proof.as_ref() != Some(state.proof())
+                    || source
+                        .terminal
+                        .as_ref()
+                        .map(|terminal| (terminal.id, terminal.continuity.live_proof()))
+                        != Some((source.id, Some(state.proof().clone())))
+                {
+                    return Err(upgrade_error("The paired Codex terminal ownership changed"));
+                }
+                paired_codex.insert(
+                    source.id,
+                    (
+                        record.source_process.clone().ok_or_else(|| {
+                            upgrade_error("The paired Codex chat has no confirmed source process")
+                        })?,
+                        record.handle.clone(),
+                    ),
+                );
+            }
             chats.push(Chat {
                 previous_sources: state
                     .upgrade_chats
@@ -934,7 +959,7 @@ fn prepare_upgrade_with(
                 launch,
             });
         }
-        (state.proof.clone(), terminals, chats)
+        (state.proof.clone(), terminals, chats, paired_codex)
     };
     let store = discover().map_err(upgrade_error)?;
     if let Some(previous) = store.load().map_err(upgrade_error)?
@@ -949,7 +974,40 @@ fn prepare_upgrade_with(
     let mut saved = Vec::with_capacity(terminals.len());
     for (mut source, handle, mut options, previous_sources) in terminals {
         let snapshot = handle.prepare_upgrade().map_err(upgrade_error)?;
-        source.resume_hint = snapshot.hint.clone();
+        source.resume_hint = if let Some((selected, native)) = paired_codex.get(&source.id) {
+            // The worker's argv hint can be fresh or name an older TUI thread.
+            // Only the still-confirmed attachment may supersede it, and only
+            // after freezing and revalidating its exact process/account.
+            let current = handle.observe_agent_process().ok_or_else(|| {
+                upgrade_error("The paired Codex source disappeared before upgrade")
+            })?;
+            if !snapshot.only_agent_tree(current.pid)
+                || native.is_completed()
+                || !native.owns_work()
+            {
+                return Err(upgrade_error(
+                    "The paired Codex source has unrelated jobs or lost its native attachment",
+                ));
+            }
+            let chat = chats
+                .iter()
+                .find(|chat| chat.source.id == source.id)
+                .expect("paired chat collected with source");
+            let recipe = super::chat::paired_upgrade_recipe(
+                selected,
+                &current,
+                &chat.launch,
+                native.confirmed_session_id().as_deref(),
+            )
+            .map_err(upgrade_error)?;
+            Some(
+                crate::model::agent_recovery::hint_from_launch(&recipe).ok_or_else(|| {
+                    upgrade_error("The paired Codex exact recipe cannot be saved")
+                })?,
+            )
+        } else {
+            snapshot.hint.clone()
+        };
         let exact = source
             .resume_hint
             .as_deref()

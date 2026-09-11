@@ -34,7 +34,12 @@ pub(super) fn endpoint(recipe: &LaunchRecipe, home: &Path) -> ProbeResult<PathBu
             _ => None,
         };
         if let Some(remote) = remote {
-            endpoint = absolute(recipe, remote.strip_prefix("unix://").ok_or(())?)?;
+            let path = remote.strip_prefix("unix://").ok_or(())?;
+            endpoint = if path.is_empty() {
+                home.join("app-server-control/app-server-control.sock")
+            } else {
+                absolute(recipe, path)?
+            };
         }
     }
     // An exact endpoint only: no discovery, server startup, TCP or fallback.
@@ -195,6 +200,34 @@ impl Client {
         }
         Err(())
     }
+}
+
+pub(super) fn preview(key: &Key, id: &str) -> ProbeResult<(String, PathBuf)> {
+    let mut client = Client::connect(key)?;
+    let result = client.call("initialize", json!({
+        "clientInfo":{"name":"cagents_selection","title":"cagents conversation selection","version":env!("CARGO_PKG_VERSION")},
+        "capabilities":{"experimentalApi":true}
+    }))?;
+    socket::verify_account(&result, &key.home).map_err(|_| ())?;
+    client.send(json!({"method":"initialized","params":{}}))?;
+    if !client.loaded()?.contains(id) {
+        return Err(());
+    }
+    let result = client.call("thread/read", json!({"threadId":id,"includeTurns":false}))?;
+    let thread = &result["thread"];
+    if thread["id"].as_str() != Some(id) || !client.loaded()?.contains(id) {
+        return Err(());
+    }
+    let cwd = PathBuf::from(thread["cwd"].as_str().ok_or(())?);
+    if !cwd.is_absolute() {
+        return Err(());
+    }
+    let title = thread["name"]
+        .as_str()
+        .filter(|name| !name.is_empty())
+        .or_else(|| thread["preview"].as_str())
+        .unwrap_or("Untitled conversation");
+    Ok((title.chars().take(240).collect(), cwd))
 }
 
 pub(super) fn census(key: &Key) -> ProbeResult<Census> {

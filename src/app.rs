@@ -177,7 +177,6 @@ pub struct StartedTerminal {
 
 const TOOLBAR_FOCUS_ID: &str = "cagents-workspace-toolbar";
 const NOTICE_ROW_HEIGHT: f32 = design::ROW_HEIGHT;
-const CARD_HEADER_HEIGHT: f32 = design::HEADER_HEIGHT;
 const BROWSER_TOOLBAR_HEIGHT: f32 = design::ROW_HEIGHT;
 #[cfg(feature = "integrated-browser")]
 const BROWSER_PROGRESS_HEIGHT: f32 = 2.0;
@@ -920,7 +919,7 @@ fn card_kind_labels(kind: Option<&CardKind>) -> CardLabels {
         },
         Some(CardKind::PullRequests(_)) => CardLabels {
             type_label: "Pull requests",
-            icon: "vcs-merge-request-symbolic",
+            icon: "pull-request-symbolic",
             starting: "Loading pull requests…",
             unavailable: "Pull requests unavailable",
         },
@@ -1027,6 +1026,48 @@ fn repository_refresh_targets(projects: &[SidebarProject]) -> Vec<(PathBuf, Proj
         .collect()
 }
 
+/// Older releases could persist several project IDs for one common Git
+/// directory and move stable worktree IDs between them. Reconcile the startup
+/// snapshot before building rows or scheduling refreshes; never delete the
+/// underlying records or reset their optimistic writer generations.
+fn reconcile_restored_projects(
+    projects: &mut Vec<ProjectState>,
+    worktrees: &mut [WorktreeState],
+    order: &[ProjectId],
+) {
+    projects.sort_by_key(|project| {
+        order
+            .iter()
+            .position(|id| *id == project.id)
+            .unwrap_or(usize::MAX)
+    });
+    let mut repositories = HashMap::new();
+    let mut aliases = HashMap::new();
+    projects.retain_mut(|project| {
+        if !project.existence.is_open() {
+            return true;
+        }
+        if let Ok(canonical) = project.repository.canonicalize() {
+            project.repository = canonical;
+        }
+        match repositories.entry(project.repository.clone()) {
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(project.id);
+                true
+            }
+            std::collections::hash_map::Entry::Occupied(entry) => {
+                aliases.insert(project.id, *entry.get());
+                false
+            }
+        }
+    });
+    for worktree in worktrees {
+        if let Some(project_id) = aliases.get(&worktree.project_id) {
+            worktree.project_id = *project_id;
+        }
+    }
+}
+
 fn finish_repository_load_failure(data_state: &mut SidebarDataState, error: String) {
     *data_state = SidebarDataState::Error(error);
 }
@@ -1040,6 +1081,12 @@ fn update_workspace_viewport(
             (workspace.native_scroll(sample.offset, sample.width), false)
         }
         WorkspaceViewportEvent::Resized(width) => (workspace.resize_viewport(width), true),
+        WorkspaceViewportEvent::PointerEntered(card) => (
+            workspace
+                .focus_without_scrolling(card)
+                .unwrap_or_else(|_| ViewportUpdate::unchanged()),
+            false,
+        ),
         WorkspaceViewportEvent::PointerFocused(card) => {
             let update = workspace
                 .focus(card)
@@ -1471,6 +1518,7 @@ fn user_workspace_message_blocked_while_modal(message: &Message) -> bool {
         | Message::FocusProjectSearch
         | Message::ToggleContextInspector
         | Message::SelectContextTab(_)
+        | Message::SelectWorkspaceScope(_)
         | Message::ContextInspector(_)
         | Message::DismissStatus => true,
         Message::Repository(action) => !repository_action_allowed_while_modal(action),
@@ -1554,8 +1602,10 @@ fn workspace_navigation_blocked_during_save(message: &Message) -> bool {
             | Message::OpenBrowser(_)
             | Message::FocusCard(_)
             | Message::FocusAdjacent(_)
+            | Message::SelectWorkspaceScope(_)
             | Message::Viewport {
-                event: WorkspaceViewportEvent::PointerFocused(_),
+                event: WorkspaceViewportEvent::PointerFocused(_)
+                    | WorkspaceViewportEvent::PointerEntered(_),
                 ..
             }
             | Message::ToggleContextInspector
@@ -1658,6 +1708,7 @@ pub enum SettingsField {
     LinkOpenDestination,
     EditorAutoSave,
     ConfirmTerminalClose,
+    FocusFollowsMouse,
     LinkOpenGesture,
     ShortcutNewTerminal,
     ShortcutCloseFocusedColumn,
@@ -1721,6 +1772,7 @@ struct SettingsDraft {
     default_column_fraction: String,
     editor_auto_save: bool,
     confirm_terminal_close: bool,
+    focus_follows_mouse: bool,
     link_open_destination: LinkOpenDestination,
     link_open_gesture: LinkOpenGesture,
     keyboard_shortcuts: ShortcutDraft,
@@ -1766,6 +1818,7 @@ impl SettingsDraft {
             default_column_fraction: settings.default_column_fraction.to_string(),
             editor_auto_save: settings.editor_auto_save,
             confirm_terminal_close: settings.confirm_terminal_close,
+            focus_follows_mouse: settings.focus_follows_mouse,
             link_open_destination: settings.link_open_destination,
             link_open_gesture: settings.link_open_gesture,
             keyboard_shortcuts: ShortcutDraft::from_shortcuts(&settings.keyboard_shortcuts),
@@ -1790,6 +1843,7 @@ impl SettingsDraft {
             SettingsField::DefaultColumnFraction => self.default_column_fraction = value,
             SettingsField::EditorAutoSave => self.editor_auto_save = value == "true",
             SettingsField::ConfirmTerminalClose => self.confirm_terminal_close = value == "true",
+            SettingsField::FocusFollowsMouse => self.focus_follows_mouse = value == "true",
             SettingsField::LinkOpenDestination => {
                 self.link_open_destination = if value == LinkOpenDestination::SystemDefault.as_str()
                 {
@@ -1838,6 +1892,10 @@ fn settings_update(
     let value = raw_value.trim();
     let mut next = current.clone();
     let parsed = match field {
+        SettingsField::FocusFollowsMouse => value
+            .parse::<bool>()
+            .map(|enabled| next.focus_follows_mouse = enabled)
+            .map_err(|_| "Choose whether hovering activates panes.".to_owned()),
         SettingsField::ConfirmTerminalClose => value
             .parse::<bool>()
             .map(|enabled| next.confirm_terminal_close = enabled)
@@ -2222,6 +2280,7 @@ pub enum Message {
     FocusProjectSearch,
     ToggleContextInspector,
     SelectContextTab(ContextTab),
+    SelectWorkspaceScope(PathBuf),
     ContextInspector(InspectorAction),
     CloseInspector,
     SelectSettingsCategory(SettingsCategory),
@@ -2632,6 +2691,8 @@ pub struct Cagents {
     active_workspace: Option<PathBuf>,
     worktree_focus: HashMap<PathBuf, CardId>,
     worktree_offsets: HashMap<PathBuf, f32>,
+    worktree_owners: HashMap<CardId, PathBuf>,
+    known_worktree_roots: HashSet<PathBuf>,
     workspace_view_generation: u64,
     workspace_scroll_id: widget::Id,
     github_availability: HashMap<ProjectId, GitHubAvailability>,
@@ -2828,7 +2889,7 @@ impl Cagents {
             let width = if card.width_fraction.is_finite() && card.width_fraction > 0.0 {
                 CardWidth::Fraction(card.width_fraction.min(1.0))
             } else {
-                CardWidth::Fraction(0.7)
+                CardWidth::Fraction(0.5)
             };
             let index = workspace.cards().len();
             let _ = workspace.add_card(
@@ -2836,7 +2897,7 @@ impl Cagents {
                     WorkspaceCard {
                         id: card.id,
                         accessible_name: "Workspace card".into(),
-                        width: CardWidth::Fraction(0.7),
+                        width: CardWidth::Fraction(0.5),
                     }
                 }),
                 index,
@@ -3459,36 +3520,31 @@ impl Cagents {
         let state = self
             .card_state(card)
             .filter(|state| state.existence.is_open())?;
-        let directory = match &state.kind {
-            CardKind::Terminal(session) => &session.launch.working_directory,
-            CardKind::Chat(session) => &session.launch.recipe.working_directory,
-            _ => return None,
-        };
-        let root = worktree_ui::worktree_root(
-            directory,
-            self.sidebar_model.projects.iter().flat_map(|project| {
-                project
-                    .worktrees
-                    .iter()
-                    .map(|worktree| worktree.path.as_path())
-            }),
-        )?;
-        self.sidebar_model.worktree_at(root)
+        if !matches!(state.kind, CardKind::Terminal(_) | CardKind::Chat(_)) {
+            return None;
+        }
+        self.sidebar_model.worktree_at(self.card_worktree(state)?)
     }
 
-    fn unobserved_agent_worktree(&self, card: CardId) -> Option<ActiveWorktreeKey> {
-        let key = self.agent_worktree(card)?;
-        (self.active_workspace.as_deref() != Some(key.canonical_path.as_path())
-            && !self
-                .sidebar_state
-                .has_agent_update(key.project_id, key.worktree_id))
-        .then_some(key)
+    fn pane_is_active(&self, card: CardId) -> bool {
+        self.workspace.focused() == Some(card)
+            && self.workspace_surfaces_visible()
+            && !self.modal_is_open()
     }
 
     pub(super) fn observe_agent_update_for_card(&mut self, card: CardId) {
-        if let Some(key) = self.unobserved_agent_worktree(card) {
+        if self.pane_is_active(card)
+            || !self
+                .card_state(card)
+                .is_some_and(|state| state.existence.is_open())
+        {
+            return;
+        }
+        if let Some(key) = self.agent_worktree(card) {
             self.sidebar_state
-                .observe_agent_update(key.project_id, key.worktree_id);
+                .observe_agent_update(card, key.project_id, key.worktree_id);
+        } else {
+            self.sidebar_state.observe_card_update(card);
         }
     }
 
@@ -3497,43 +3553,49 @@ impl Cagents {
         card: CardId,
         activity: Option<crate::agent::Activity>,
     ) {
+        let previous = self
+            .sidebar_state
+            .card_activity(card)
+            .map(|activity| activity.state);
+        let next = activity.map(|activity| activity.state);
+        if (next == Some(crate::agent::ActivityState::Waiting) && previous != next)
+            || (previous == Some(crate::agent::ActivityState::Working)
+                && next == Some(crate::agent::ActivityState::Idle))
+        {
+            self.observe_agent_update_for_card(card);
+        }
         if let Some((key, activity)) =
             activity.and_then(|activity| self.agent_worktree(card).map(|key| (key, activity)))
         {
             self.sidebar_state
                 .set_agent_activity(card, key.project_id, key.worktree_id, activity);
+        } else if let Some(activity) = activity {
+            self.sidebar_state.set_card_activity(card, activity);
         } else {
             self.sidebar_state.clear_agent_activity(card);
         }
     }
 
-    fn observe_terminal_agent_update(&mut self, card: CardId) {
-        let Some(CardRuntime::Terminal(handle)) = self.cards.get(&card) else {
-            return;
-        };
-        if !handle.take_observed_output() {
-            return;
-        }
-        let Some(key) = self.unobserved_agent_worktree(card) else {
-            return;
-        };
-        let Some(CardState {
-            kind: CardKind::Terminal(session),
-            ..
-        }) = self.card_state(card)
+    fn acknowledge_active_pane(&mut self) -> Task<Message> {
+        let Some(card) = self
+            .workspace
+            .focused()
+            .filter(|&card| self.pane_is_active(card))
         else {
-            return;
+            return Task::none();
         };
-        let agent = crate::agent::Provider::from_program(&session.launch.program).is_some()
-            || session
-                .resume_hint
-                .as_deref()
-                .and_then(crate::model::agent_recovery::observed_launch_from_hint)
-                .is_some();
-        if agent {
-            self.sidebar_state
-                .observe_agent_update(key.project_id, key.worktree_id);
+        if !self.sidebar_state.has_card_update(card) {
+            return Task::none();
         }
+        self.sidebar_state.acknowledge_agent_update(card);
+        if let Some(CardRuntime::Terminal(handle)) = self.cards.get(&card)
+            && let Err(error) = handle.acknowledge_updates()
+        {
+            self.status = Some(TransientNotice::error(format!(
+                "Could not acknowledge terminal output: {error}"
+            )));
+        }
+        self.acknowledge_chat_updates(card)
     }
 
     fn card_state(&self, id: CardId) -> Option<&CardState> {
@@ -3886,6 +3948,7 @@ impl Cagents {
     ) -> Task<Message> {
         let context_overlay_task = self.sync_context_overlay_state();
         let focused = self.workspace.focused();
+        let focus_changed = self.durable.focused != focused;
         let viewport_durable_changed =
             durable_viewport_update_pending(&self.durable, focused, &update.transitions)
                 && apply_durable_viewport_update(
@@ -3895,6 +3958,10 @@ impl Cagents {
                 );
         let durable_changed = additional_durable_change || viewport_durable_changed;
         let mut tasks = Vec::new();
+        tasks.push(self.acknowledge_active_pane());
+        if focus_changed {
+            tasks.push(self.reveal_active_tab());
+        }
         let mut schedule_delayed_sweep = false;
         let mut reconcile_now = false;
         let surfaces_visible = self.workspace_surfaces_visible();
@@ -4304,7 +4371,7 @@ impl Cagents {
             _ => None,
         });
         self.observe_agent_activity_for_card(card, activity);
-        self.observe_terminal_agent_update(card);
+        // Attention follows semantic agent transitions, not ordinary terminal output.
         if durable_changed {
             self.persist();
         }
@@ -4493,6 +4560,7 @@ impl Cagents {
     fn card_view<'a>(&'a self, id: CardId, focused: bool) -> Element<'a, Message> {
         let spacing = cosmic::theme::spacing();
         let card = self.card_state(id);
+        let attention = self.sidebar_state.has_card_update(id) && !focused;
         let labels = card_kind_labels(card.map(|card| &card.kind));
         // `sync_chrome` keeps an entry for every durable card; a miss can
         // only be a card that is not durable, which renders degenerate chrome.
@@ -4506,7 +4574,6 @@ impl Cagents {
             CardKind::Browser(session) => Some(session),
             _ => None,
         });
-        let header = self.column_header(id, focused);
 
         #[cfg(feature = "integrated-browser")]
         let browser_toolbar: Option<Element<'a, Message>> = browser_session.map(|session| {
@@ -4691,7 +4758,8 @@ impl Cagents {
             Some(CardRuntime::PullRequests(repository)) => widget::container(
                 widget::container(
                     widget::column::with_children(vec![
-                        widget::icon::from_name("vcs-merge-request-symbolic")
+                        crate::ui_controls::symbolic_icon("pull-request-symbolic")
+                            .icon()
                             .size(32)
                             .into(),
                         widget::text::title3("No pull request selected").into(),
@@ -4785,9 +4853,17 @@ impl Cagents {
             .into(),
         };
 
-        let mut rows: Vec<Element<'a, Message>> = vec![header.into()];
+        let mut rows: Vec<Element<'a, Message>> = Vec::with_capacity(3);
+        if let Some(CardRuntime::Repository(runtime)) = self.cards.get(&id)
+            && let Some(toolbar) = repository_widget::selected_file_toolbar(id, runtime)
+        {
+            rows.push(toolbar.map(Message::Repository));
+        }
         if let Some(toolbar) = browser_toolbar {
             rows.push(toolbar);
+        }
+        if focused && let Some(binding) = self.chat_binding_view(id) {
+            rows.push(binding);
         }
         rows.push(content);
         let surface: Element<'a, Message> = widget::container(
@@ -4795,7 +4871,19 @@ impl Cagents {
                 .spacing(0)
                 .height(Length::Fill),
         )
-        .class(cosmic::theme::Container::Background)
+        .class(cosmic::theme::Container::custom(move |theme| {
+            let mut accent = iced::Color::from(*theme.cosmic().accent_color());
+            accent.a = 0.35;
+            iced::widget::container::Style {
+                background: Some(iced::Background::Color(theme.cosmic().bg_color().into())),
+                border: iced::Border {
+                    color: accent,
+                    width: if attention { design::BORDER_WIDTH } else { 0.0 },
+                    ..Default::default()
+                },
+                ..Default::default()
+            }
+        }))
         .width(Length::Fill)
         .height(Length::Fill)
         .into();
@@ -6571,6 +6659,7 @@ impl Cagents {
                     | SettingsField::TerminalCursorStyle
                     | SettingsField::ManagedWorktreeDirectory
                     | SettingsField::ConfirmTerminalClose
+                    | SettingsField::FocusFollowsMouse
                     | SettingsField::DefaultColumnFraction
                     | SettingsField::LinkOpenDestination
                     | SettingsField::LinkOpenGesture
@@ -6685,14 +6774,15 @@ impl Application for Cagents {
         let (
             durable,
             session,
-            projects,
-            worktrees,
+            mut projects,
+            mut worktrees,
             mut settings,
             settings_path,
             settings_write_blocked,
             status,
             save_health,
         ) = startup.bootstrap;
+        reconcile_restored_projects(&mut projects, &mut worktrees, &durable.project_order);
         let window_view = startup.window_view;
         if let Some(view) = &window_view {
             settings.sidebar_width = sidebar::clamp_expanded_width(view.sidebar_width);
@@ -6715,7 +6805,9 @@ impl Application for Cagents {
                     worktrees
                         .iter()
                         .filter(|worktree| {
-                            worktree.project_id == project.id && worktree.existence.is_open()
+                            worktree.project_id == project.id
+                                && worktree.existence.is_open()
+                                && worktree_ui::worktree_directory_available(&worktree.path)
                         })
                         .map(|worktree| {
                             SidebarWorktree::from_durable(
@@ -6784,6 +6876,11 @@ impl Application for Cagents {
             active_workspace: None,
             worktree_focus: HashMap::new(),
             worktree_offsets: HashMap::new(),
+            worktree_owners: HashMap::new(),
+            known_worktree_roots: worktrees
+                .iter()
+                .map(|worktree| worktree.path.clone())
+                .collect(),
             workspace_view_generation: 0,
             workspace_scroll_id: widget::Id::new("workspace-strip-0"),
             github_availability: HashMap::new(),
@@ -7118,14 +7215,14 @@ impl Application for Cagents {
             }
             Message::RepositorySelected(result) => match result {
                 Ok(path) => {
-                    self.sidebar_model.data_state = SidebarDataState::Loading;
-                    let project_id = self
-                        .sidebar_model
-                        .projects
-                        .iter()
-                        .find(|project| project.repository == path)
-                        .map(|project| project.id);
-                    self.repository_load_task(path, project_id, true)
+                    if self.sidebar_model.projects.is_empty() {
+                        self.sidebar_model.data_state = SidebarDataState::Loading;
+                    }
+                    // A picker path is not a repository identity: it may be a
+                    // checkout, subdirectory, symlink, or linked worktree. Do
+                    // not revoke an existing project's data as though this
+                    // selection were an explicit refresh.
+                    self.repository_load_task(path, None, true)
                 }
                 Err(error) => {
                     if !error.to_ascii_lowercase().contains("cancel") {
@@ -7146,6 +7243,70 @@ impl Application for Cagents {
                 let mut task = Task::none();
                 match result {
                     Ok(loaded) => {
+                        let worktree = loaded
+                            .repository
+                            .worktree_root
+                            .clone()
+                            .or_else(|| {
+                                loaded
+                                    .worktrees
+                                    .first()
+                                    .map(|(record, _)| record.path.clone())
+                            })
+                            .unwrap_or_else(|| loaded.repository.selected_path.clone());
+                        // Reconcile before publishing either durable records or
+                        // widget IDs. Concurrent adds have independent request
+                        // IDs but still describe the same repository.
+                        if let Some(existing) =
+                            self.sidebar_model.projects.iter_mut().find(|project| {
+                                project.id != project_id
+                                    && (project.repository == loaded.project.repository
+                                        || project.repository_id == loaded.repository.id
+                                        || project.worktrees.iter().any(|known| {
+                                            loaded
+                                                .worktrees
+                                                .iter()
+                                                .any(|(record, _)| record.id == known.id)
+                                        }))
+                            })
+                        {
+                            for (record, status) in &loaded.worktrees {
+                                if existing.worktrees.iter().any(|known| known.id == record.id) {
+                                    continue;
+                                }
+                                // A newly created linked worktree can be added
+                                // without replacing fresher status/PR data,
+                                // pending operations, or cached project chrome.
+                                if let Some(session) = &self.session {
+                                    session.save_worktrees([WorktreeState {
+                                        id: record.id,
+                                        project_id: existing.id,
+                                        generation: 0,
+                                        path: record.path.clone(),
+                                        branch: record.branch.as_deref().map(|branch| {
+                                            branch
+                                                .strip_prefix("refs/heads/")
+                                                .unwrap_or(branch)
+                                                .to_owned()
+                                        }),
+                                        existence: Existence::Open,
+                                    }]);
+                                }
+                                existing.worktrees.push(SidebarWorktree::from_repository(
+                                    record,
+                                    status.as_ref(),
+                                ));
+                            }
+                            self.repository_generations.remove(&project_id);
+                            self.github_availability.remove(&project_id);
+                            self.sync_worktree_operation_rows();
+                            self.sidebar_model.data_state = SidebarDataState::Ready;
+                            return if open_cards {
+                                self.select_worktree(worktree, true)
+                            } else {
+                                Task::none()
+                            };
+                        }
                         if let Some(session) = &self.session {
                             session.save_project(loaded.project.clone());
                             session.save_worktrees(loaded.worktrees.iter().map(|(record, _)| {
@@ -7217,11 +7378,6 @@ impl Application for Cagents {
                             .apply_project_order(&self.durable.project_order);
                         self.sync_worktree_operation_rows();
                         self.sidebar_model.data_state = SidebarDataState::Ready;
-                        let worktree = loaded
-                            .worktrees
-                            .first()
-                            .map(|(record, _)| record.path.clone())
-                            .unwrap_or_else(|| loaded.repository.selected_path.clone());
                         if open_cards {
                             task = self.select_worktree(worktree, true);
                         } else if let Some(active) = self.active_workspace.clone() {
@@ -7272,9 +7428,11 @@ impl Application for Cagents {
             }
             Message::Repository(RepositoryAction::OpenExternal { card, editor_id }) => {
                 let path = match self.cards.get(&card) {
-                    Some(CardRuntime::Repository(runtime)) => runtime
-                        .selected_path()
-                        .map(|path| runtime.descriptor.worktree.join(path)),
+                    Some(CardRuntime::Repository(runtime)) if runtime.can_open_external() => {
+                        runtime
+                            .selected_path()
+                            .map(|path| runtime.descriptor.worktree.join(path))
+                    }
                     _ => None,
                 };
                 path.map_or_else(Task::none, |path| self.open_file_in_editor(path, editor_id))
@@ -7610,9 +7768,19 @@ impl Application for Cagents {
                         }
                         Self::source_control_history_task(key, page)
                     }
+                    SidebarAction::ToggleControls => {
+                        if self.sidebar_state.controls_expanded() {
+                            iced::widget::operation::focus(sidebar::search_focus_id())
+                                .map(cosmic::Action::App)
+                        } else {
+                            Task::none()
+                        }
+                    }
+                    // File management belongs to standalone ceditor; this model
+                    // never enables these menu items.
+                    SidebarAction::FileCommand { .. } => Task::none(),
                     SidebarAction::SearchChanged(_)
                     | SidebarAction::SetFilter(_)
-                    | SidebarAction::ToggleControls
                     | SidebarAction::ToggleProject(_) => Task::none(),
                 }
             }
@@ -8014,6 +8182,7 @@ impl Application for Cagents {
                 }
                 self.retire_lsp_card(id);
                 self.sidebar_state.clear_agent_activity(id);
+                self.sidebar_state.acknowledge_agent_update(id);
                 self.chat_forget(id);
                 if let Some(runtime) = self.cards.remove(&id) {
                     match runtime {
@@ -8056,8 +8225,16 @@ impl Application for Cagents {
                 if generation != self.workspace_view_generation {
                     return Task::none();
                 }
-                if matches!(event, WorkspaceViewportEvent::PointerFocused(_))
-                    && self.workspace_inputs_blocked()
+                if matches!(
+                    event,
+                    WorkspaceViewportEvent::PointerFocused(_)
+                        | WorkspaceViewportEvent::PointerEntered(_)
+                ) && self.workspace_inputs_blocked()
+                {
+                    return Task::none();
+                }
+                if matches!(event, WorkspaceViewportEvent::PointerEntered(_))
+                    && !self.settings.focus_follows_mouse
                 {
                     return Task::none();
                 }
@@ -8531,6 +8708,10 @@ impl Application for Cagents {
                     if self.worktree_dialog.is_some() || self.pull_request_dialog.is_some() {
                         return cosmic::task::message(Message::CancelDialog);
                     }
+                    if self.sidebar_state.controls_expanded() {
+                        self.sidebar_state.apply(&SidebarAction::ToggleControls);
+                        return Task::none();
+                    }
                     if self.context_inspector_is_overlay() {
                         return cosmic::task::message(Message::ContextInspector(
                             InspectorAction::Close,
@@ -8641,6 +8822,10 @@ impl Application for Cagents {
             Message::SelectContextTab(tab) => {
                 self.context_tab = tab;
                 Task::none()
+            }
+            Message::SelectWorkspaceScope(path) => {
+                self.show_workspace_for_action();
+                self.select_worktree(path, false)
             }
             Message::ContextInspector(_) if self.modal_is_open() => Task::none(),
             Message::ContextInspector(action) => self.handle_context_inspector_action(action),
@@ -9171,6 +9356,13 @@ impl Application for Cagents {
             self.modal_is_open(),
         )
         .map(Message::Sidebar);
+        let sidebar = if let Some(folders) = self.standalone_worktree_navigation() {
+            widget::column::with_children(vec![sidebar, folders])
+                .height(Length::Fill)
+                .into()
+        } else {
+            sidebar
+        };
 
         // The focused card's own name and path are the card header's job, and
         // the window's header bar already carries the name; see
@@ -9254,6 +9446,7 @@ impl Application for Cagents {
             workspace_widget::view(
                 &self.workspace,
                 &self.settings.keyboard_shortcuts,
+                self.settings.focus_follows_mouse,
                 self.workspace.viewport_width(),
                 self.workspace_scroll_id.clone(),
                 |context| self.card_view(context.id, context.focused),
@@ -9535,13 +9728,19 @@ fn browser_command(
 fn load_repository(path: &Path, project_id: Option<ProjectId>) -> Result<LoadedRepository, String> {
     let service = RepositoryService::system("git");
     let cancellation = CancellationToken::default();
+    // Git discovery and stable worktree identities must see the real checkout,
+    // not a spelling introduced by a picker symlink or a relative launch path.
+    let path = path
+        .canonicalize()
+        .map_err(|error| format!("could not resolve repository {}: {error}", path.display()))?;
     let repository = service
-        .discover(path, &cancellation)
+        .discover(&path, &cancellation)
         .map_err(|error| error.to_string())?;
     let worktrees = service
         .list_worktrees(&repository.common_dir, &cancellation)
         .map_err(|error| error.to_string())?
         .into_iter()
+        .filter(|worktree| worktree_ui::worktree_directory_available(&worktree.path))
         .map(|worktree| {
             let status = (!worktree.bare)
                 .then(|| service.status(&worktree.path, &cancellation).ok())
@@ -11313,6 +11512,69 @@ mod tests {
     }
 
     #[test]
+    fn switching_inactive_codex_terminal_reveals_and_focuses_conversation_binding() {
+        use crate::model::{BootId, HostIncarnation, HostSessionId};
+
+        let mut app = context_inspector_test_app(false);
+        app.context_inspector_open = false;
+        let mut cards: Vec<_> = (0..4).map(|_| terminal_card_state()).collect();
+        let first = cards[0].id;
+        let unrelated = cards[1].id;
+        let target = cards[3].id;
+        let CardKind::Terminal(terminal) = &mut cards[3].kind else {
+            unreachable!();
+        };
+        terminal.launch.program = "codex".into();
+        terminal.continuity = TerminalContinuity::Live {
+            host_session_id: HostSessionId::new("codex-host"),
+            boot_id: BootId::new("boot"),
+            host_incarnation: HostIncarnation::new("incarnation"),
+        };
+        let source = terminal.clone();
+        app.durable = Arc::new(WorkspaceState {
+            focused: Some(first),
+            cards,
+            ..WorkspaceState::default()
+        });
+        app.workspace = Cagents::rebuild_workspace(&app.durable);
+        app.workspace.resize_viewport(600.0);
+        app.workspace.native_scroll(0.0, 600.0);
+        app.observe_agent_update_for_card(target);
+        app.observe_agent_update_for_card(unrelated);
+        assert_eq!(app.workspace.focused(), Some(first));
+        assert_eq!(
+            app.workspace.visibility(target),
+            Some(VisibilityClass::Offscreen)
+        );
+        assert!(app.sidebar_state.has_card_update(target));
+        assert!(app.chat_binding_view(target).is_none());
+
+        let _ = app.update(Message::ChatUi(chat_ui::Action::Switch(target)));
+
+        assert_eq!(app.workspace.focused(), Some(target));
+        assert_eq!(app.durable.focused, Some(target));
+        assert!(app.workspace.camera().target() > app.workspace.camera().offset());
+        assert!(app.chat_binding_view(target).is_some());
+        assert!(!app.sidebar_state.has_card_update(target));
+        assert!(app.sidebar_state.has_card_update(unrelated));
+        let update = app.workspace.tick(Duration::from_secs(1));
+        let _ = app.apply_viewport(update, true, false);
+        assert_eq!(
+            app.workspace.visibility(target),
+            Some(VisibilityClass::Visible)
+        );
+
+        // Opening the selector must not choose a conversation or replace its source terminal.
+        let _ = app.update(Message::ChatUi(chat_ui::Action::BindingConfirm(target)));
+        assert_eq!(
+            app.card_state(target).unwrap().kind,
+            CardKind::Terminal(source)
+        );
+        assert!(!app.chat_start_pending(target));
+        assert!(app.chat_binding_view(target).is_some());
+    }
+
+    #[test]
     fn dirty_close_restores_the_actual_underlying_modal_focus_target() {
         let mut app = context_inspector_test_app(true);
         let project = ProjectId::new();
@@ -11833,7 +12095,10 @@ mod tests {
 
         let (_, synchronize_scroll) =
             update_workspace_viewport(&mut workspace, WorkspaceViewportEvent::Resized(600.0));
-        let expected_target = workspace.geometry().focus_offset(cards[2], 600.0).unwrap();
+        let expected_target = workspace
+            .geometry()
+            .focus_offset(cards[2], 600.0, workspace.camera().offset())
+            .unwrap();
 
         assert!(synchronize_scroll);
         assert_eq!(workspace.focused(), Some(cards[2]));
@@ -12615,6 +12880,8 @@ mod tests {
             active_workspace: None,
             worktree_focus: HashMap::new(),
             worktree_offsets: HashMap::new(),
+            worktree_owners: HashMap::new(),
+            known_worktree_roots: HashSet::new(),
             workspace_view_generation: 0,
             workspace_scroll_id: widget::Id::new("workspace-strip-0"),
             github_availability: HashMap::new(),
@@ -12652,6 +12919,195 @@ mod tests {
             settings_save_error: None,
             status: None,
         }
+    }
+
+    #[test]
+    fn pane_attention_tracks_semantic_events_and_hover_acknowledges_only_its_pane() {
+        use crate::agent::{Activity, ActivityState, Provider};
+        let mut app = context_inspector_test_app(true);
+        app.context_inspector_open = false;
+        let first = app.workspace.focused().unwrap();
+        let second = terminal_card_state();
+        let third = terminal_card_state();
+        let (second_id, third_id) = (second.id, third.id);
+        Arc::make_mut(&mut app.durable)
+            .cards
+            .extend([second, third]);
+        app.workspace = Cagents::rebuild_workspace(&app.durable);
+        app.workspace.resize_viewport(1_000.0);
+        app.workspace.native_scroll(120.5, 1_000.0);
+        let activity = |state| {
+            Some(Activity {
+                provider: Provider::Omp,
+                state,
+            })
+        };
+        app.observe_agent_activity_for_card(first, activity(ActivityState::Working));
+        app.observe_agent_activity_for_card(first, activity(ActivityState::Idle));
+        assert!(!app.sidebar_state.has_card_update(first));
+        app.observe_agent_activity_for_card(second_id, activity(ActivityState::Waiting));
+        app.observe_agent_activity_for_card(third_id, activity(ActivityState::Working));
+        app.observe_agent_activity_for_card(third_id, activity(ActivityState::Idle));
+        assert!(app.sidebar_state.has_card_update(second_id));
+        assert!(app.sidebar_state.has_card_update(third_id));
+        let offset = app.workspace.camera().offset();
+        let _ = app.update(Message::Viewport {
+            generation: app.workspace_view_generation,
+            event: WorkspaceViewportEvent::PointerEntered(second_id),
+        });
+        assert_eq!(app.workspace.focused(), Some(second_id));
+        assert_eq!(app.workspace.camera().offset(), offset);
+        assert!(!app.sidebar_state.has_card_update(second_id));
+        assert!(app.sidebar_state.has_card_update(third_id));
+        app.observe_agent_activity_for_card(second_id, activity(ActivityState::Waiting));
+        assert!(!app.sidebar_state.has_card_update(second_id));
+        app.settings.focus_follows_mouse = false;
+        let _ = app.update(Message::Viewport {
+            generation: app.workspace_view_generation,
+            event: WorkspaceViewportEvent::PointerEntered(third_id),
+        });
+        assert_eq!(app.workspace.focused(), Some(second_id));
+        assert!(app.sidebar_state.has_card_update(third_id));
+    }
+    #[test]
+    fn restored_duplicate_projects_preserve_worktrees_and_writer_generations() {
+        let directory = tempfile::tempdir().unwrap();
+        let common = directory.path().join(".git");
+        let alias = directory.path().join("alias");
+        std::fs::create_dir(&common).unwrap();
+        std::os::unix::fs::symlink(&common, &alias).unwrap();
+        let original = ProjectState {
+            id: ProjectId::new(),
+            generation: 7,
+            name: "original".into(),
+            repository: common.canonicalize().unwrap(),
+            existence: Existence::Open,
+        };
+        let duplicate = ProjectState {
+            id: ProjectId::new(),
+            generation: 3,
+            repository: alias,
+            ..original.clone()
+        };
+        let mut projects = vec![duplicate.clone(), original.clone()];
+        let mut worktrees = [original.id, duplicate.id].map(|project_id| WorktreeState {
+            id: crate::model::WorktreeId::new(),
+            project_id,
+            generation: 9,
+            path: directory.path().join(project_id.to_string()),
+            branch: Some("main".into()),
+            existence: Existence::Open,
+        });
+        let expected = worktrees.clone().map(|mut worktree| {
+            worktree.project_id = original.id;
+            worktree
+        });
+        reconcile_restored_projects(&mut projects, &mut worktrees, &[original.id]);
+        assert_eq!(projects, vec![original]);
+        assert_eq!(worktrees, expected);
+    }
+
+    #[test]
+    fn repeated_repository_add_reconciles_aliases_and_concurrent_linked_loads() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("checkout");
+        let linked = directory.path().join("linked");
+        let alias = directory.path().join("alias");
+        let git = |cwd: &Path, args: &[&str]| {
+            let output = std::process::Command::new("git")
+                .arg("-C")
+                .arg(cwd)
+                .args(["-c", "user.name=Test", "-c", "user.email=test@example.com"])
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+        git(directory.path(), &["init", "-b", "main", "checkout"]);
+        git(&root, &["commit", "--allow-empty", "-m", "initial"]);
+        git(
+            &root,
+            &["worktree", "add", "-b", "linked", linked.to_str().unwrap()],
+        );
+        std::fs::create_dir(root.join("subdir")).unwrap();
+        std::os::unix::fs::symlink(&root, &alias).unwrap();
+
+        // These independent requests all finish before any result is accepted,
+        // as when two picker loads race while another add is still in flight.
+        let first = load_repository(&root, None).unwrap();
+        let aliased = load_repository(&alias.join("subdir"), None).unwrap();
+        let linked_load = load_repository(&linked, None).unwrap();
+        assert_eq!(first.repository.id, aliased.repository.id);
+        assert_eq!(first.repository.id, linked_load.repository.id);
+        let canonical_root = root.canonicalize().unwrap();
+        let canonical_linked = linked.canonicalize().unwrap();
+        assert_eq!(
+            aliased.repository.worktree_root.as_ref(),
+            Some(&canonical_root)
+        );
+        assert_eq!(
+            linked_load.repository.worktree_root.as_ref(),
+            Some(&canonical_linked)
+        );
+
+        let mut app = context_inspector_test_app(false);
+        let cards = [&canonical_root, &canonical_linked]
+            .into_iter()
+            .map(|path| {
+                let mut card = terminal_card_state();
+                if let CardKind::Terminal(session) = &mut card.kind {
+                    session.launch.working_directory = path.clone();
+                    session.continuity = TerminalContinuity::RelaunchAvailable {
+                        recipe: session.launch.clone(),
+                        last_exit: None,
+                    };
+                }
+                app.cards.insert(card.id, CardRuntime::Loading);
+                card
+            })
+            .collect::<Vec<_>>();
+        let card_ids = cards.iter().map(|card| card.id).collect::<Vec<_>>();
+        Arc::make_mut(&mut app.durable).cards = cards;
+        let first_id = first.project.id;
+        for loaded in [&first, &aliased, &linked_load] {
+            app.repository_generations.insert(loaded.project.id, 1);
+        }
+        let complete = |loaded: LoadedRepository, generation| Message::RepositoryLoaded {
+            open_cards: true,
+            project_id: loaded.project.id,
+            generation,
+            result: Ok(Box::new(loaded)),
+        };
+        drop(app.update(complete(first.clone(), 1)));
+        app.sidebar_model.projects[0].github_status = "newer pending refresh".into();
+        let expected_project = app.sidebar_model.projects[0].clone();
+        for loaded in [aliased, linked_load] {
+            drop(app.update(complete(loaded, 1)));
+            assert_eq!(app.sidebar_model.projects, vec![expected_project.clone()]);
+            assert_eq!(
+                app.durable
+                    .cards
+                    .iter()
+                    .map(|card| card.id)
+                    .collect::<Vec<_>>(),
+                card_ids
+            );
+        }
+        assert_eq!(app.active_workspace.as_ref(), Some(&canonical_linked));
+        assert_eq!(app.workspace.order().collect::<Vec<_>>(), vec![card_ids[1]]);
+
+        // Re-adding is selection, not refresh; neither it nor a stale explicit
+        // refresh may clear newer project data or change its generation fence.
+        app.repository_generations.insert(first_id, 2);
+        drop(app.update(Message::RepositorySelected(Ok(root))));
+        assert_eq!(app.repository_generations[&first_id], 2);
+        drop(app.update(complete(first, 1)));
+        assert_eq!(app.sidebar_model.projects, vec![expected_project]);
+        assert_eq!(app.active_workspace.as_ref(), Some(&canonical_linked));
     }
 
     #[test]
@@ -12723,7 +13179,14 @@ mod tests {
     fn pane_width_cycle_survives_serialization_and_scope_rebuilds_for_every_kind() {
         let mut app = context_inspector_test_app(true);
         let card = app.workspace.focused().unwrap();
-        let terminal = app.card_state(card).unwrap().kind.clone();
+        let mut terminal = app.card_state(card).unwrap().kind.clone();
+        if let CardKind::Terminal(session) = &mut terminal {
+            session.launch.working_directory = PathBuf::from("/repo");
+            session.continuity = TerminalContinuity::RelaunchAvailable {
+                recipe: session.launch.clone(),
+                last_exit: None,
+            };
+        }
         let url = Url::parse("about:blank").unwrap();
         let kinds = [
             terminal,

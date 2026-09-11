@@ -520,6 +520,45 @@ mod tests {
     }
 
     #[test]
+    fn osc_color_changes_repaint_defaults_and_indexed_cells_but_preserve_truecolor() {
+        let mut terminal = Terminal::new(TerminalOptions {
+            cols: 8,
+            rows: 2,
+            max_scrollback: 0,
+        })
+        .unwrap();
+        terminal.vt_write(
+            b"\x1b]10;#c0c0c0\x07\x1b]11;#101010\x07\
+              \x1b]4;1;#aa0000;200;#aa00aa\x07\
+              D\x1b[31mA\x1b[38;5;200mI\x1b[38;2;18;52;86mT\
+              \x1b[0;48;5;200mB\x1b[0;7mR\x1b[0m",
+        );
+        let mut visual = VisualResources::new().unwrap();
+        let first = visual.capture(&terminal, 1, true, None).unwrap().unwrap();
+        let rgb = |red, green, blue| Rgb { red, green, blue };
+        assert_eq!(first.lines[0].cells[1].foreground, rgb(0xaa, 0, 0));
+        assert_eq!(first.lines[0].cells[2].foreground, rgb(0xaa, 0, 0xaa));
+        assert_eq!(first.lines[0].cells[4].background, rgb(0xaa, 0, 0xaa));
+        terminal.vt_write(
+            b"\x1b]10;#eeeeee\x07\x1b]11;#222222\x07\
+              \x1b]4;1;#00bb00;200;#00bbbb\x07",
+        );
+        // No text is written and no forced capture is requested: palette/default
+        // changes still have to invalidate previously resolved, cached rows.
+        let changed = visual.capture(&terminal, 2, false, None).unwrap().unwrap();
+        let cells = &changed.lines[0].cells;
+        assert_eq!(cells[0].foreground, rgb(0xee, 0xee, 0xee));
+        assert_eq!(cells[0].background, rgb(0x22, 0x22, 0x22));
+        assert_eq!(cells[1].foreground, rgb(0, 0xbb, 0));
+        assert_eq!(cells[2].foreground, rgb(0, 0xbb, 0xbb));
+        assert_eq!(cells[3].foreground, rgb(18, 52, 86));
+        assert_eq!(cells[4].background, rgb(0, 0xbb, 0xbb));
+        assert_eq!(cells[5].foreground, rgb(0x22, 0x22, 0x22));
+        assert_eq!(cells[5].background, rgb(0xee, 0xee, 0xee));
+        assert!(visual.capture(&terminal, 3, false, None).unwrap().is_none());
+    }
+
+    #[test]
     fn incremental_repaints_preserve_untouched_rows_and_publish_late_output() {
         let mut terminal = Terminal::new(TerminalOptions {
             cols: 8,

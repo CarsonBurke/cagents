@@ -336,6 +336,8 @@ cagents ui
 
 - Open repositories from the **Projects** pane on the left. Select a worktree to
   restore its terminals; selecting it again does not create another terminal.
+  Opening an already registered repository selects it without duplicating its
+  project or disturbing existing sessions.
   **New terminal** (`Ctrl+T`) starts in that worktree and inserts immediately to
   the right of its focused column.
   Drag a project header to reorder projects; the order survives restarts.
@@ -358,8 +360,10 @@ cagents ui
   keep running, and editor buffers remain intact. Scroll positions, worktree
   selection, and column focus survive restarts independently in each window,
   including when a shared browser column has focus. Application close
-  checks unsaved editors in every worktree, not only the visible one. Legacy
-  columns without a registered worktree remain accessible across worktrees.
+  checks unsaved editors in every worktree, not only the visible one. Unowned
+  columns are grouped under **Other sessions** rather than appearing in every
+  worktree. Deleted worktrees disappear from the sidebar without transferring
+  their panes to a parent worktree.
 - Use **New window** in the application header or `cagents ui --new-window` for
   another independently movable window. `cagents ui --window monitor-two`
   opens or activates a named durable window; plain `cagents ui` activates the
@@ -375,6 +379,10 @@ cagents ui
   the workspace strip. **Alt+R** cycles the focused pane through **1/3 → 1/2 →
   2/3 → full** viewport width and repeats while held. These widths remain
   viewport-relative when the window is resized.
+  Navigation scrolls only far enough to reveal the target pane. New panes
+  default to half the viewport width. **Activate panes on hover** is enabled
+  by default and changes focus without scrolling; disable it in Settings
+  to require a click.
 - When creating a worktree, enter a branch name, a Linear issue ID such as
   `APP-42`, or an `https://linear.app/.../issue/APP-42/title-slug` URL. URLs use
   the issue ID and supplied title slug, without fetching Linear metadata.
@@ -395,9 +403,11 @@ cagents ui
   errors, and durability warnings stop automatic saving and remain visible;
   autosave does not silently overwrite external changes. Disable **Save files
   automatically** in Settings for manual saving.
-  Images open as previews. File/view/edit/diff controls share the card's single
-  toolbar; selected modes stay highlighted and unavailable comparisons are
-  disabled rather than opening an empty diff.
+  Images open as previews. File/view/edit/diff controls occupy a separate
+  toolbar above the content; unavailable save and comparison actions are
+  disabled. Editable content has a line-number gutter and draggable scrollbar,
+  including for long wrapped lines. Comparisons load on demand and cancelled
+  jobs stop; subtle diff backgrounds preserve readable syntax contrast.
   File and diff views retain syntax highlighting, including CUDA sources.
   Contextual external-editor icons open the current project, worktree, or file
   without a separate application-picker dialog.
@@ -424,16 +434,27 @@ ceditor /path/to/project
 The installer defaults to `~/.local`; use `--prefix /absolute/path` to install
 elsewhere. The development runner uses an isolated application/settings identity.
 
+Right-click a file to rename, duplicate, or copy its absolute or relative path.
+Rename and duplicate never overwrite an existing destination. Unsaved changes
+are resolved before switching files, and cancelling a file chooser leaves the
+current document and error state unchanged.
+
 ### Native agent chat
 
 Supported OMP, Claude, and Codex terminal sessions offer **Switch to chat**.
 The switch uses an exact provider conversation identity, not terminal-text
 scraping, a most-recent-session lookup, or a fork. The switch opens the detected
-conversation directly, without a session-picker dialog. If process-bound exact
-identity is unavailable, the terminal remains intact: resume that exact
-conversation in the provider CLI and retry. Fresh OMP sessions must first have a
-saved session file; fresh Codex sessions without an observable exact identity
-cannot be selected safely from the shared daemon's other conversations.
+conversation directly when process-bound exact identity is available. Otherwise,
+OMP and Claude leave the terminal intact: resume the exact conversation in the
+provider CLI and retry. Fresh OMP sessions must first have a saved session file.
+For Codex's shared server, copy the full conversation UUID from the intended
+CLI's `/status`, preview its title and directory read-only, then explicitly
+confirm attachment. The source terminal remains running; cagents does not choose
+the most recent conversation or infer its identity from the working directory.
+Native handoff preserves the source process's explicit provider account,
+environment, and trust-store paths. If credentials or provider settings cannot
+be transferred safely, the switch refuses before stopping the live terminal;
+it never silently substitutes the daemon's account.
 
 - **OMP and Claude:** switching performs a stop-and-resume handoff. Active work
   is interrupted, the CLI stops, and native chat resumes the same conversation.
@@ -532,9 +553,9 @@ no child process can close without confirmation. **Don't ask me again** persists
 the explicit opt-out. Confirmation revalidates terminal identity and daemon
 proof; an unreachable daemon leaves the card intact.
 
-Worktree rows distinguish unread output from **working** and **waiting** agent
-states. Selecting a worktree acknowledges its unread updates; another agent's
-state transition does not clear them. OMP uses its explicit terminal-title
+Worktree rows distinguish unread updates from **working** and **waiting** agent
+states. Attention is tracked per pane: activating a pane acknowledges only
+that pane, not every session in the selected worktree. OMP uses its explicit terminal-title
 lifecycle, Codex uses the existing local shared-daemon API, and Claude uses
 `agents --json` from the detected CLI installation and account. Native chat
 uses provider protocol events. Unsupported or unavailable evidence remains
@@ -658,6 +679,7 @@ are rejected.
 schema_version = 3
 max_hot_cards = 6
 hibernation_delay_ms = 30000
+focus_follows_mouse = true
 app_theme = "system"
 ui_scale = 1.0
 terminal_font_size = 14.0
@@ -668,7 +690,7 @@ terminal_cursor_style = "beam"
 terminal_theme = "dark"
 sidebar_width = 260.0
 inspector_width = 380.0
-default_column_fraction = 0.72
+default_column_fraction = 0.5
 terminal_scrollback_lines = 10000
 link_open_destination = "integrated_browser"
 link_open_gesture = "control_click"
@@ -689,6 +711,7 @@ cycle_pane_width = ["Alt+R"]
 | `schema_version` | integer | `3` | exactly `3` |
 | `max_hot_cards` | non-negative integer | `6` | `1` through `9223372036854775807` |
 | `hibernation_delay_ms` | non-negative integer | `30000` | `0` through `9223372036854775807` milliseconds |
+| `focus_follows_mouse` | boolean | `true` | activate the pane under the pointer without scrolling |
 | `app_theme` | string | `"system"` | `"system"`, `"dark"`, or `"light"` |
 | `ui_scale` | float | `1.0` | finite values from `0.8` through `1.5`, inclusive; multiplies display scaling |
 | `terminal_font_size` | float | `14.0` | finite values from `8.0` through `40.0`, inclusive |
@@ -700,7 +723,7 @@ cycle_pane_width = ["Alt+R"]
 | `terminal_scrollback_lines` | non-negative integer | `10000` | `0` through `1000000` lines for newly started terminals |
 | `sidebar_width` | float | `260.0` | finite values from `220.0` through `420.0`, inclusive |
 | `inspector_width` | float | `380.0` | finite values from `320.0` through `480.0`, inclusive |
-| `default_column_fraction` | float | `0.72` | finite values from `0.25` through `1.0`, inclusive |
+| `default_column_fraction` | float | `0.5` | finite values from `0.25` through `1.0`, inclusive |
 | `link_open_destination` | string | `"integrated_browser"` | `"integrated_browser"` or `"system_default"` |
 | `link_open_gesture` | string | `"control_click"` | `"control_click"` or `"control_shift_click"` |
 | `managed_worktree_directory` | string | `"worktrees/"` | nonempty path without control characters; absolute or relative to the repository root |

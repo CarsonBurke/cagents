@@ -1204,6 +1204,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "tungstenite",
+ "two-face",
  "url",
  "uuid",
  "wayland-client",

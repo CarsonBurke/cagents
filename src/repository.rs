@@ -2938,6 +2938,22 @@ fn parse_numstat_count(
         .map_err(|_| malformed(format, index, "count is not a number"))
 }
 
+/// Compact measured line changes, omitting zero and unavailable sides.
+///
+/// A missing count is never promoted to zero: binary or unreadable paths can
+/// remain unmeasured even when their change status is known.
+pub fn line_change_counts(added: Option<u64>, removed: Option<u64>) -> String {
+    match (
+        added.filter(|count| *count != 0),
+        removed.filter(|count| *count != 0),
+    ) {
+        (Some(added), Some(removed)) => format!("+{added} −{removed}"),
+        (Some(added), None) => format!("+{added}"),
+        (None, Some(removed)) => format!("−{removed}"),
+        (None, None) => String::new(),
+    }
+}
+
 /// Fills measured line counts into the entries of one area.
 ///
 /// Counts stay `None` where Git reported none, which is every binary file.
@@ -9281,6 +9297,16 @@ mod tests {
         assert!(entered.load(Ordering::Acquire));
         // Released keys are not retained for the life of the session.
         assert_eq!(locks.tracked_keys(), 0);
+    }
+
+    #[test]
+    fn compact_line_counts_only_display_measured_nonzero_sides() {
+        assert_eq!(line_change_counts(Some(881), Some(0)), "+881");
+        assert_eq!(line_change_counts(Some(0), Some(3)), "−3");
+        assert_eq!(line_change_counts(Some(12), Some(4)), "+12 −4");
+        assert_eq!(line_change_counts(Some(0), Some(0)), "");
+        assert_eq!(line_change_counts(None, None), "");
+        assert_eq!(line_change_counts(Some(7), None), "+7");
     }
 
     #[test]

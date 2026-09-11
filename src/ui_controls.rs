@@ -32,6 +32,18 @@ pub fn symbolic_icon(name: &str) -> widget::icon::Handle {
     static MERGED_PULL_REQUEST: LazyLock<widget::icon::Handle> = LazyLock::new(|| {
         widget::icon::from_svg_bytes(br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16"><g fill="none" stroke="black" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><circle cx="4" cy="3" r="1.5"/><circle cx="4" cy="13" r="1.5"/><circle cx="12" cy="3" r="1.5"/><path d="M4 4.5v7M12 4.5V6a3 3 0 0 1-3 3H4"/></g></svg>"#.as_slice()).symbolic(true)
     });
+    static ATTENTION: LazyLock<widget::icon::Handle> = LazyLock::new(|| {
+        widget::icon::from_svg_bytes(br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16"><g fill="none" stroke="black" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><path d="M3 11.5h10l-1.5-2V6a3.5 3.5 0 0 0-7 0v3.5zM6.5 13.5a1.7 1.7 0 0 0 3 0M8 1v1"/></g></svg>"#.as_slice()).symbolic(true)
+    });
+    static WORKING: LazyLock<widget::icon::Handle> = LazyLock::new(|| {
+        widget::icon::from_svg_bytes(br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16"><g fill="none" stroke="black" stroke-width="1.4" stroke-linecap="round"><circle cx="8" cy="8" r="4.5"/><circle cx="8" cy="8" r="1.5"/><path d="M8 1v2M8 13v2M1 8h2M13 8h2M3 3l1.5 1.5M11.5 11.5 13 13M3 13l1.5-1.5M11.5 4.5 13 3"/></g></svg>"#.as_slice()).symbolic(true)
+    });
+    static WAITING: LazyLock<widget::icon::Handle> = LazyLock::new(|| {
+        widget::icon::from_svg_bytes(br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16"><g fill="none" stroke="black" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><path d="M3 2.5h10a1 1 0 0 1 1 1v7a1 1 0 0 1-1 1H7l-4 3v-3H2V3.5a1 1 0 0 1 1-1ZM8 5v2.5"/><path d="M8 9.5h0"/></g></svg>"#.as_slice()).symbolic(true)
+    });
+    static ADDED_FILE: LazyLock<widget::icon::Handle> = LazyLock::new(|| {
+        widget::icon::from_svg_bytes(br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16"><g fill="none" stroke="black" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><path d="M3 1.5h6l4 4v9H3zM9 1.5v4h4M5.5 10h5M8 7.5v5"/></g></svg>"#.as_slice()).symbolic(true)
+    });
     match name {
         "document-edit-symbolic" => CHANGES.clone(),
         "view-list-tree-symbolic" => TREE.clone(),
@@ -39,6 +51,10 @@ pub fn symbolic_icon(name: &str) -> widget::icon::Handle {
         "view-split-right-symbolic" => SPLIT_PANEL.clone(),
         "pull-request-symbolic" => PULL_REQUEST.clone(),
         "merged-pull-request-symbolic" => MERGED_PULL_REQUEST.clone(),
+        "notifications-symbolic" => ATTENTION.clone(),
+        "agent-working-symbolic" => WORKING.clone(),
+        "agent-waiting-symbolic" => WAITING.clone(),
+        "document-new-symbolic" => ADDED_FILE.clone(),
         _ => widget::icon::from_name(name).handle(),
     }
 }
@@ -48,7 +64,7 @@ pub struct IconControl<'a, Message> {
     label: Cow<'a, str>,
 }
 
-/// A centered, fixed-size icon target with a filled selected state.
+/// A centered, fixed-size icon target with a quiet surface selected state.
 /// Native buttons retain keyboard focus, accessibility, and enabled cursors.
 pub fn icon_control<'a, Message: Clone + 'a>(
     icon: widget::icon::Handle,
@@ -63,7 +79,7 @@ pub fn icon_control<'a, Message: Clone + 'a>(
         button: widget::button::custom(content)
             .name(label.clone())
             .selected(selected)
-            .class(control_style(selected, false))
+            .class(control_style(selected))
             .width(crate::design::PRIMARY_CONTROL_SIZE)
             .height(crate::design::PRIMARY_CONTROL_SIZE)
             .padding(0)
@@ -75,12 +91,6 @@ pub fn icon_control<'a, Message: Clone + 'a>(
 impl<'a, Message: Clone + 'a> IconControl<'a, Message> {
     pub fn id(mut self, id: widget::Id) -> Self {
         self.button = self.button.id(id);
-        self
-    }
-
-    /// Pane selectors are flat tabs, unlike standalone toolbar controls.
-    pub fn tab(mut self, selected: bool) -> Self {
-        self.button = self.button.class(control_style(selected, true));
         self
     }
 }
@@ -118,52 +128,39 @@ pub fn segmented_controls<'a, Message: 'a>(
     .into()
 }
 
-fn control_style(selected: bool, tab: bool) -> cosmic::theme::Button {
+fn control_style(selected: bool) -> cosmic::theme::Button {
     let appearance = move |focused: bool, theme: &cosmic::Theme| widget::button::Style {
-        background: selected.then(|| iced::Background::Color(theme.cosmic().accent.base.into())),
-        border_radius: if tab {
-            0.0.into()
-        } else {
-            theme.cosmic().corner_radii.radius_s.into()
-        },
+        background: selected.then(|| {
+            iced::Background::Color(
+                theme
+                    .current_container()
+                    .component
+                    .selected_state_color()
+                    .into(),
+            )
+        }),
+        border_radius: theme.cosmic().corner_radii.radius_s.into(),
         border_width: if focused { 1.0 } else { 0.0 },
-        border_color: if selected {
-            theme.cosmic().accent.on.into()
-        } else {
-            (*theme.cosmic().accent_color()).into()
-        },
-        icon_color: selected.then(|| theme.cosmic().accent.on.into()),
+        border_color: theme.current_container().component.on_disabled.into(),
+        icon_color: Some(theme.current_container().component.on.into()),
         ..widget::button::Style::new()
     };
     cosmic::theme::Button::Custom {
         active: Box::new(appearance),
         disabled: Box::new(move |theme| widget::button::Style {
-            background: selected.then(|| {
-                iced::Background::Color(
-                    theme
-                        .current_container()
-                        .component
-                        .selected_state_color()
-                        .into(),
-                )
-            }),
             icon_color: Some(theme.current_container().component.on_disabled.into()),
             ..appearance(false, theme)
         }),
         hovered: Box::new(move |focused, theme| widget::button::Style {
-            background: Some(iced::Background::Color(if selected {
-                theme.cosmic().accent.hover.into()
-            } else {
-                theme.current_container().component.hover.into()
-            })),
+            background: Some(iced::Background::Color(
+                theme.current_container().component.hover.into(),
+            )),
             ..appearance(focused, theme)
         }),
         pressed: Box::new(move |focused, theme| widget::button::Style {
-            background: Some(iced::Background::Color(if selected {
-                theme.cosmic().accent.pressed.into()
-            } else {
-                theme.current_container().component.pressed.into()
-            })),
+            background: Some(iced::Background::Color(
+                theme.current_container().component.pressed.into(),
+            )),
             ..appearance(focused, theme)
         }),
     }

@@ -18,6 +18,23 @@ const MAX_ACCOUNTS: usize = 32;
 const MAX_ROWS: usize = 256;
 const MAX_BYTES: usize = 2 * 1024 * 1024;
 type Census = BTreeMap<PathBuf, ActivityState>;
+
+/// Public provider inventory keyed by the actual foreground PID, never cwd.
+pub(crate) fn exact_session(
+    process: &crate::model::agent_recovery::AgentProcess,
+) -> Result<Option<String>, String> {
+    match process.provider {
+        Provider::Claude => claude::exact_session(&process.launch, process.pid)
+            .map_err(|_| "Claude could not report an unambiguous live session through `claude agents --json`.".into()),
+        Provider::Codex | Provider::Omp => Ok(None),
+    }
+}
+
+pub(crate) fn codex_preview(recipe: &LaunchRecipe, id: &str) -> Result<(String, PathBuf), String> {
+    let key = key(Provider::Codex, recipe)
+        .map_err(|_| "Cannot verify this Codex account and local endpoint.")?;
+    codex::preview(&key, id).map_err(|_| "The exact thread is not loaded on this account's shared Codex server, or its metadata could not be verified. Copy the full ID from the intended live CLI and retry.".into())
+}
 type ProbeResult<T> = Result<T, ()>;
 
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord)]

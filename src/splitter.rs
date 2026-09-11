@@ -183,6 +183,23 @@ fn chorded(modifiers: keyboard::Modifiers) -> bool {
     modifiers.control() || modifiers.alt() || modifiers.shift() || modifiers.logo()
 }
 
+/// Snap toward the pane interior, in physical screen coordinates. Snapping a
+/// one-unit rule independently of its fractional card clip can move its only
+/// pixel beyond that clip and make the separator disappear while scrolling.
+fn pixel_aligned_rule(bounds: Rectangle, offset: f32, scale: f32, edge: Edge) -> Rectangle {
+    let scale = if scale.is_finite() && scale > 0.0 {
+        scale
+    } else {
+        1.0
+    };
+    let width = (WIDTH * scale).round().max(1.0) / scale;
+    let x = match edge {
+        Edge::Trailing => ((bounds.x + bounds.width - offset) * scale).floor() / scale - width,
+        Edge::Leading => ((bounds.x - offset) * scale).ceil() / scale,
+    } + offset;
+    Rectangle { x, width, ..bounds }
+}
+
 impl<'view, Message: 'view> Widget<Message, Theme, Renderer> for Splitter<'view, Message> {
     fn tag(&self) -> tree::Tag {
         tree::Tag::of::<SplitterState>()
@@ -359,29 +376,29 @@ impl<'view, Message: 'view> Widget<Message, Theme, Renderer> for Splitter<'view,
         theme: &Theme,
         style: &renderer::Style,
         layout: Layout<'_>,
-        cursor: mouse::Cursor,
+        _cursor: mouse::Cursor,
         viewport: &Rectangle,
     ) {
-        self.content.as_widget().draw(
-            &tree.children[0],
-            renderer,
-            theme,
-            style,
-            Self::child_layout(layout),
-            cursor,
-            viewport,
-        );
-        if tree.state.downcast_ref::<SplitterState>().is_focused {
-            renderer.fill_quad(
-                renderer::Quad {
-                    bounds: layout.bounds(),
-                    border: Border::default(),
-                    shadow: Shadow::default(),
-                    snap: true,
-                },
-                cosmic::iced::Background::Color(theme.cosmic().accent.base.into()),
-            );
+        if !layout.bounds().intersects(viewport) {
+            return;
         }
+        let scale = style.scale_factor as f32;
+        let bounds =
+            pixel_aligned_rule(layout.bounds(), layout.virtual_offset().x, scale, self.edge);
+        let color = if tree.state.downcast_ref::<SplitterState>().is_focused {
+            theme.current_container().component.on.into()
+        } else {
+            theme.current_container().component.divider.into()
+        };
+        renderer.fill_quad(
+            renderer::Quad {
+                bounds,
+                border: Border::default(),
+                shadow: Shadow::default(),
+                snap: false,
+            },
+            cosmic::iced::Background::Color(color),
+        );
     }
 
     fn overlay<'a>(
@@ -456,6 +473,64 @@ mod tests {
         advanced::{Layout, clipboard, layout, mouse, renderer::Headless, widget::Tree},
     };
     use iced_accessibility::accesskit::{Action, Role};
+
+    #[test]
+    fn fractional_scroll_keeps_a_complete_separator_pixel_inside_the_pane_clip() {
+        let mut renderer = headless_renderer();
+        let theme = Theme::default();
+        for scale in [1.0_f32, 1.25, 1.5, 2.0] {
+            for offset in [0.125, 0.5, 0.875] {
+                let mut splitter = element(Edge::Trailing);
+                let mut tree = Tree::new(&splitter);
+                let node = splitter
+                    .as_widget_mut()
+                    .layout(
+                        &mut tree,
+                        &renderer,
+                        &layout::Limits::new(Size::ZERO, Size::new(WIDTH, 80.0)),
+                    )
+                    .move_to(Point::new(220.0 - WIDTH, 0.0));
+                let viewport =
+                    Rectangle::new(Point::new(offset, 0.0), Size::new(220.0 - offset, 80.0));
+                renderer.reset(Rectangle::with_size(Size::new(400.0, 80.0)));
+                renderer.with_layer(
+                    Rectangle::with_size(Size::new(220.0 - offset, 80.0)),
+                    |renderer| {
+                        renderer.with_translation(
+                            cosmic::iced::Vector::new(-offset, 0.0),
+                            |renderer| {
+                                splitter.as_widget().draw(
+                                    &tree,
+                                    renderer,
+                                    &theme,
+                                    &renderer::Style {
+                                        scale_factor: scale as f64,
+                                        ..Default::default()
+                                    },
+                                    Layout::new(&node).with_virtual_offset(
+                                        cosmic::iced::Vector::new(offset, 0.0),
+                                    ),
+                                    mouse::Cursor::Unavailable,
+                                    &viewport,
+                                )
+                            },
+                        )
+                    },
+                );
+                let size = Size::new((400.0 * scale) as u32, (80.0 * scale) as u32);
+                let pixels =
+                    renderer.screenshot(size, scale, cosmic::iced::Color::from_rgb(1.0, 0.0, 1.0));
+                let x = ((220.0 - offset) * scale).floor() as usize - 1;
+                let y = (40.0 * scale) as usize;
+                let pixel = (y * size.width as usize + x) * 4;
+                assert_ne!(
+                    &pixels[pixel..pixel + 3],
+                    &[255, 0, 255],
+                    "scale={scale}, offset={offset}"
+                );
+            }
+        }
+    }
 
     #[derive(Debug, Clone, PartialEq)]
     enum Message {

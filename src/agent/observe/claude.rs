@@ -61,7 +61,7 @@ fn drain(
     }
 }
 
-pub(super) fn census(recipe: &LaunchRecipe) -> ProbeResult<Census> {
+fn listing(recipe: &LaunchRecipe) -> ProbeResult<Vec<Value>> {
     let deadline = Instant::now() + TIMEOUT;
     let mut command = Command::new(executable(recipe)?);
     if Provider::is_interpreter(&recipe.program) {
@@ -116,15 +116,47 @@ pub(super) fn census(recipe: &LaunchRecipe) -> ProbeResult<Census> {
         }
         std::thread::sleep(Duration::from_millis(10));
     }
-    parse(&out)
+    let rows: Vec<Value> = serde_json::from_slice(&out).map_err(|_| ())?;
+    (rows.len() <= MAX_ROWS).then_some(rows).ok_or(())
 }
 
+pub(super) fn exact_session(recipe: &LaunchRecipe, pid: i32) -> ProbeResult<Option<String>> {
+    session_for_process(&listing(recipe)?, pid)
+}
+
+fn session_for_process(rows: &[Value], pid: i32) -> ProbeResult<Option<String>> {
+    let mut identity = None;
+    for row in rows {
+        if row["kind"] != "interactive" || row["pid"].as_i64() != Some(i64::from(pid)) {
+            continue;
+        }
+        let id = row["sessionId"]
+            .as_str()
+            .filter(|id| id.len() == 36 && uuid::Uuid::parse_str(id).is_ok())
+            .ok_or(())?;
+        if identity.as_deref().is_some_and(|previous| previous != id) {
+            return Err(());
+        }
+        identity = Some(id.to_owned());
+    }
+    Ok(identity)
+}
+
+pub(super) fn census(recipe: &LaunchRecipe) -> ProbeResult<Census> {
+    census_rows(&listing(recipe)?)
+}
+
+#[cfg(test)]
 fn parse(bytes: &[u8]) -> ProbeResult<Census> {
     let value: Value = serde_json::from_slice(bytes).map_err(|_| ())?;
     let rows = value.as_array().ok_or(())?;
     if rows.len() > MAX_ROWS {
         return Err(());
     }
+    census_rows(rows)
+}
+
+fn census_rows(rows: &[Value]) -> ProbeResult<Census> {
     let mut census = Census::new();
     for row in rows {
         let cwd = row["cwd"].as_str().ok_or(())?;
@@ -185,5 +217,22 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn exact_identity_requires_matching_interactive_pid_not_directory_or_recency() {
+        let rows = vec![
+            serde_json::json!({"kind":"interactive","pid":41,"cwd":"/same","sessionId":"11111111-1111-4111-8111-111111111111"}),
+            serde_json::json!({"kind":"interactive","pid":42,"cwd":"/same","sessionId":"22222222-2222-4222-8222-222222222222"}),
+            serde_json::json!({"kind":"background","pid":42,"sessionId":"33333333-3333-4333-8333-333333333333"}),
+        ];
+        assert_eq!(
+            session_for_process(&rows, 42).unwrap().as_deref(),
+            Some("22222222-2222-4222-8222-222222222222")
+        );
+        assert_eq!(session_for_process(&rows, 43).unwrap(), None);
+        let mut ambiguous = rows;
+        ambiguous.push(serde_json::json!({"kind":"interactive","pid":42,"sessionId":"44444444-4444-4444-8444-444444444444"}));
+        assert!(session_for_process(&ambiguous, 42).is_err());
     }
 }

@@ -195,6 +195,15 @@ impl Provider {
         (self.adapter().session_root)(launch, home)
     }
 
+    #[cfg(feature = "host")]
+    pub(crate) fn session_state_root(self, launch: &LaunchRecipe) -> Option<PathBuf> {
+        if self == Self::Omp {
+            omp::state_root(launch, Path::new(launch.environment.get("HOME")?))
+        } else {
+            self.session_root(launch)
+        }
+    }
+
     pub(crate) fn session_directory(self) -> &'static str {
         self.adapter().session_directory
     }

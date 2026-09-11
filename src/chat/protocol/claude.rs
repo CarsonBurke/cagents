@@ -127,7 +127,7 @@ fn arguments(launch: &Launch) -> Result<Vec<String>, String> {
             let value = inline
                 .or_else(|| args.next().map(String::as_str))
                 .ok_or_else(|| format!("Missing value for Claude {flag}"))?;
-            if value.is_empty() || value.contains('\0') {
+            if (value.is_empty() && flag != "--setting-sources") || value.contains('\0') {
                 return Err(format!("Invalid value for Claude {flag}"));
             }
             if flag == "--permission-mode"
@@ -163,6 +163,7 @@ fn arguments(launch: &Launch) -> Result<Vec<String>, String> {
         } else if matches!(
             flag,
             "--bare"
+                | "--safe-mode"
                 | "--no-chrome"
                 | "--chrome"
                 | "--strict-mcp-config"
@@ -1680,7 +1681,6 @@ impl History {
             .environment
             .get("CLAUDE_CONFIG_DIR")
             .cloned()
-            .or_else(|| std::env::var("CLAUDE_CONFIG_DIR").ok())
             .filter(|s| !s.is_empty());
         let config = match config {
             Some(config) => {
@@ -1697,7 +1697,6 @@ impl History {
                     .environment
                     .get("HOME")
                     .cloned()
-                    .or_else(|| std::env::var("HOME").ok())
                     .ok_or("Cannot locate Claude config without HOME")?;
                 PathBuf::from(home).join(".claude")
             }
@@ -2652,6 +2651,9 @@ mod tests {
                 arguments: vec![
                     "--model".into(),
                     "sonnet".into(),
+                    "--safe-mode".into(),
+                    "--setting-sources".into(),
+                    "".into(),
                     "old prompt".into(),
                     "--resume".into(),
                     id.into(),
@@ -2663,6 +2665,11 @@ mod tests {
         let args = arguments(&launch).unwrap();
         assert!(!args.contains(&"old prompt".into()));
         assert!(args.contains(&format!("--resume={id}")));
+        assert!(
+            args.windows(2)
+                .any(|pair| pair == ["--setting-sources", ""])
+        );
+        assert!(args.contains(&"--safe-mode".into()));
         for option in ["--continue", "--fork-session", "--unknown"] {
             launch.recipe.arguments = vec![option.into()];
             assert!(arguments(&launch).is_err());

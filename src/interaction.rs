@@ -14,6 +14,8 @@ use cosmic::iced::{
 use cosmic::{Element, Renderer, Theme, widget};
 use serde::Deserialize;
 
+mod context_menu;
+
 const HOVER_DURATION: Duration = Duration::from_millis(120);
 const TOOLTIP_DELAY: Duration = Duration::from_millis(1_000);
 
@@ -82,14 +84,17 @@ pub fn tooltip<'a, Message: 'a>(
     .into()
 }
 
-/// The pinned context menu changes its overlay state without requesting a
-/// frame. Schedule that frame explicitly so a stationary right click opens it.
+/// Keep the native menu beside its content: the pinned COSMIC ContextMenu
+/// does not forward `mouse_interaction`, so wrapping the content inside it
+/// loses every child cursor. The transparent front layer owns menu gestures;
+/// the real content retains its native input, cursor and accessibility tree.
+/// Schedule a frame when a stationary right click opens the menu.
 pub fn context_menu<'a, Message: Clone + 'static>(
     content: impl Into<Element<'a, Message>>,
     menu: Vec<widget::menu::Tree<Message>>,
 ) -> Element<'a, Message> {
     Effect {
-        content: widget::context_menu(content, Some(menu)).into(),
+        content: layer(content.into(), context_menu::surface(menu)),
         kind: Kind::ContextMenu,
         tip: None,
     }
@@ -157,12 +162,11 @@ impl<Message> Widget<Message, Theme, Renderer> for Layers<'_, Message> {
     ) {
         operation.container(None, layout.bounds());
         operation.traverse(&mut |operation| {
-            for ((child, tree), layout) in self
-                .children
-                .iter_mut()
-                .zip(&mut tree.children)
-                .zip(layout.children())
-            {
+            for ((child, tree), layout) in self.children.iter_mut().zip(&mut tree.children).zip(
+                layout
+                    .children()
+                    .map(|child| child.with_virtual_offset(layout.virtual_offset())),
+            ) {
                 child
                     .as_widget_mut()
                     .operate(tree, layout, renderer, operation);
@@ -186,7 +190,12 @@ impl<Message> Widget<Message, Theme, Renderer> for Layers<'_, Message> {
             .iter_mut()
             .rev()
             .zip(tree.children.iter_mut().rev())
-            .zip(layout.children().rev())
+            .zip(
+                layout
+                    .children()
+                    .rev()
+                    .map(|child| child.with_virtual_offset(layout.virtual_offset())),
+            )
         {
             child.as_widget_mut().update(
                 tree, event, layout, cursor, renderer, clipboard, shell, viewport,
@@ -217,7 +226,12 @@ impl<Message> Widget<Message, Theme, Renderer> for Layers<'_, Message> {
             .iter()
             .rev()
             .zip(tree.children.iter().rev())
-            .zip(layout.children().rev())
+            .zip(
+                layout
+                    .children()
+                    .rev()
+                    .map(|child| child.with_virtual_offset(layout.virtual_offset())),
+            )
             .map(|((child, tree), layout)| {
                 child
                     .as_widget()
@@ -239,7 +253,9 @@ impl<Message> Widget<Message, Theme, Renderer> for Layers<'_, Message> {
         if layout.bounds().intersection(viewport).is_none() {
             return;
         }
-        let mut layouts = layout.children();
+        let mut layouts = layout
+            .children()
+            .map(|child| child.with_virtual_offset(layout.virtual_offset()));
         let base = layouts.next().expect("base layer");
         let front = layouts.next().expect("front layer");
         let front_active = self.children[1].as_widget().mouse_interaction(
@@ -301,7 +317,11 @@ impl<Message> Widget<Message, Theme, Renderer> for Layers<'_, Message> {
             self.children
                 .iter()
                 .zip(&tree.children)
-                .zip(layout.children())
+                .zip(
+                    layout
+                        .children()
+                        .map(|child| child.with_virtual_offset(layout.virtual_offset())),
+                )
                 .map(|((child, tree), layout)| child.as_widget().a11y_nodes(layout, tree, cursor)),
         )
     }
