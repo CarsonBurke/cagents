@@ -1632,6 +1632,8 @@ fn child_exit_event(
 /// Color policy from a noninteractive launcher is not the policy of this PTY:
 /// inherited NO_COLOR/CLICOLOR can disable ANSI despite TERM and COLORTERM, and
 /// COLORFGBG describes the launcher's background rather than our OSC defaults.
+/// CI also short-circuits common ANSI capability detectors before truecolor
+/// checks; it describes the launcher, not this newly allocated interactive PTY.
 /// Explicit recipe entries are restored after this scrub.
 const INHERITED_TERMINAL_MARKERS: &[&str] = &[
     "TERM_PROGRAM",
@@ -1645,6 +1647,7 @@ const INHERITED_TERMINAL_MARKERS: &[&str] = &[
     "CLICOLOR",
     "CLICOLOR_FORCE",
     "COLORFGBG",
+    "CI",
     "KITTY_WINDOW_ID",
     "KITTY_PID",
     "KITTY_INSTALLATION_DIR",

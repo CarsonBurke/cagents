@@ -1,4 +1,4 @@
-//! Read-only live worktree census. This is view state, never resume authority.
+//! Read-only live provider census. This is view state, never resume authority.
 use super::{Activity, ActivityState, Provider};
 use crate::model::LaunchRecipe;
 use std::{
@@ -44,9 +44,14 @@ struct Key {
     endpoint: PathBuf,
 }
 
+enum Inventory {
+    Claude(claude::ProcessCensus),
+    Codex(Census),
+}
+
 struct Entry {
     updated: Option<Instant>,
-    census: Option<Census>,
+    census: Option<Inventory>,
 }
 
 /// Lazily invoked by terminal activity requests; no background thread or timer.
@@ -61,7 +66,12 @@ impl Observer {
         }
     }
 
-    pub fn activity(&self, provider: Provider, recipe: &LaunchRecipe) -> Option<Activity> {
+    pub fn activity(
+        &self,
+        process: &crate::model::agent_recovery::AgentProcess,
+    ) -> Option<Activity> {
+        let provider = process.provider;
+        let recipe = &process.launch;
         if provider == Provider::Omp || !recipe.working_directory.is_absolute() {
             return None;
         }
@@ -90,19 +100,22 @@ impl Observer {
         let mut entry = entry.lock().ok()?;
         if entry.updated.is_none_or(|updated| updated.elapsed() >= TTL) {
             entry.census = match provider {
-                Provider::Claude => claude::census(recipe),
-                Provider::Codex => codex::census(&key),
+                Provider::Claude => claude::census(recipe).map(Inventory::Claude),
+                Provider::Codex => codex::census(&key).map(Inventory::Codex),
                 Provider::Omp => unreachable!(),
             }
             .ok();
             // Failure is cached too, replacing (not retaining) previous Working.
             entry.updated = Some(Instant::now());
         }
-        let state = *entry
-            .census
-            .as_ref()?
-            .get(&recipe.working_directory)
-            .unwrap_or(&ActivityState::Idle);
+        let state = match entry.census.as_ref()? {
+            Inventory::Claude(census) => {
+                claude::activity(census, process.pid, &recipe.working_directory)?
+            }
+            Inventory::Codex(census) => *census
+                .get(&recipe.working_directory)
+                .unwrap_or(&ActivityState::Idle),
+        };
         (state != ActivityState::Unknown).then_some(Activity { provider, state })
     }
 }

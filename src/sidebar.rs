@@ -2821,21 +2821,16 @@ fn header<'a>(
             "Search projects",
         );
         if compact {
-            let mut popover = widget::popover(search_button)
-                .position(widget::popover::Position::Point(cosmic::iced::Point::new(
-                    COMPACT_WIDTH,
-                    0.0,
-                )))
-                .on_close(SidebarAction::ToggleControls);
-            if state.controls_expanded && !modal_open {
-                popover = popover.popup(
+            actions.push(crate::ui_controls::popover(
+                search_button,
+                (state.controls_expanded && !modal_open).then(|| {
                     widget::container(controls(state, false))
-                        .class(theme::Container::Primary)
-                        .padding(spacing.space_xxs)
-                        .width(DEFAULT_EXPANDED_WIDTH),
-                );
-            }
-            actions.push(popover.into());
+                        .width(DEFAULT_EXPANDED_WIDTH)
+                        .into()
+                }),
+                widget::popover::Position::Point(cosmic::iced::Point::new(COMPACT_WIDTH, 0.0)),
+                SidebarAction::ToggleControls,
+            ));
         } else {
             actions.push(search_button);
         }
@@ -3029,7 +3024,7 @@ fn project_list<'a>(
 ) -> Element<'a, SidebarAction> {
     let projects = filtered_projects(model, state, compact);
     if projects.is_empty() {
-        return empty(state, compact, modal_open);
+        return project_scroll(empty(state, compact, modal_open), state.filter);
     }
 
     // Search results are revealed while their input is available, including
@@ -3067,16 +3062,29 @@ fn project_list<'a>(
         !modal_open && !compact,
         sticky_viewport,
     );
-    widget::scrollable(
+    project_scroll(
         widget::container(column)
             .padding(spacing.space_xxxs)
-            .width(Length::Fill),
+            .width(Length::Fill)
+            .into(),
+        state.filter,
     )
-    .direction(sidebar_scroll_direction())
-    .class(cosmic::style::iced::Scrollable::Minimal)
-    .width(Length::Fill)
-    .height(Length::Fill)
-    .into()
+}
+
+fn project_scroll(
+    content: Element<'_, SidebarAction>,
+    filter: SidebarFilter,
+) -> Element<'_, SidebarAction> {
+    RowInteraction::filtered_scroll(
+        widget::scrollable(content)
+            .id(stable_id("projects.scroll"))
+            .direction(sidebar_scroll_direction())
+            .class(cosmic::style::iced::Scrollable::Minimal)
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .into(),
+        filter,
+    )
 }
 
 fn loading(compact: bool) -> Element<'static, SidebarAction> {
@@ -3482,7 +3490,6 @@ fn compact_project<'a>(
         let action = button::custom(worktree_status_icon(
             worktree,
             project.state.has_agent_update(entity.id, worktree.id),
-            project.state.agent_activity(entity.id, worktree.id),
         ))
         .id(worktree.chrome.open_id.clone())
         .name(worktree_accessible_name(
@@ -3509,8 +3516,10 @@ fn compact_project<'a>(
                 &*worktree.chrome.tooltip,
             ));
         let activity = project.state.agent_activity(entity.id, worktree.id);
+        let waiting_unread = activity == Some(crate::agent::ActivityState::Waiting)
+            && project.state.has_agent_update(entity.id, worktree.id);
         if activity == Some(crate::agent::ActivityState::Working)
-            || (activity != Some(crate::agent::ActivityState::Waiting)
+            || (!waiting_unread
                 && worktree
                     .chrome
                     .pull_request
@@ -3521,7 +3530,7 @@ fn compact_project<'a>(
                 f32::from(ROW_ICON_SIZE),
                 cosmic::theme::active().cosmic().warning.base.into(),
             ));
-        } else if activity == Some(crate::agent::ActivityState::Waiting) {
+        } else if waiting_unread {
             row = row.push(status_icon(
                 "agent-waiting-symbolic",
                 "An agent needs input",
@@ -3593,15 +3602,13 @@ fn thread_view(
             )
             .class(theme::Container::custom(move |theme| {
                 cosmic::iced::widget::container::Style {
-                    icon_color: Some(
-                        if activity == Some(crate::agent::ActivityState::Waiting) || unread {
-                            theme.cosmic().destructive.base.into()
-                        } else if activity == Some(crate::agent::ActivityState::Working) {
-                            theme.cosmic().warning.base.into()
-                        } else {
-                            theme.current_container().on.into()
-                        },
-                    ),
+                    icon_color: Some(if unread {
+                        theme.cosmic().destructive.base.into()
+                    } else if activity == Some(crate::agent::ActivityState::Working) {
+                        theme.cosmic().warning.base.into()
+                    } else {
+                        theme.current_container().on.into()
+                    }),
                     ..Default::default()
                 }
             })),
@@ -3620,7 +3627,7 @@ fn thread_view(
                 f32::from(ROW_ICON_SIZE),
                 cosmic::theme::active().cosmic().warning.base.into(),
             ));
-        } else if thread.activity == Some(crate::agent::ActivityState::Waiting) || thread.unread {
+        } else if thread.unread {
             content = content.push(status_icon(
                 "agent-waiting-symbolic",
                 "Thread needs attention",
@@ -3683,10 +3690,10 @@ fn worktree_view<'a>(
         .align_y(Alignment::Center)
         .spacing(spacing.space_xxxs)
         .height(Length::Fill)
-        .push(worktree_status_icon(worktree, agent_update, activity));
+        .push(worktree_status_icon(worktree, agent_update));
     row = row.push(
         design::body(&*chrome.label)
-            .class(if worktree_is_quiet(agent_update, activity) {
+            .class(if !agent_update {
                 theme::Text::Custom(design::muted_text)
             } else {
                 theme::Text::default()
@@ -3697,7 +3704,9 @@ fn worktree_view<'a>(
             ))
             .width(Length::Fill),
     );
-    if let Some(activity) = activity {
+    if let Some(activity) = activity
+        && (activity != crate::agent::ActivityState::Waiting || agent_update)
+    {
         let (icon, detail, tone) = match activity {
             crate::agent::ActivityState::Working => (
                 "agent-working-symbolic",
@@ -3985,16 +3994,7 @@ fn editor_icon(editor: &SidebarEditor) -> icon::Handle {
     }
 }
 
-fn worktree_is_quiet(update: bool, activity: Option<crate::agent::ActivityState>) -> bool {
-    !update && activity != Some(crate::agent::ActivityState::Waiting)
-}
-
-fn worktree_status_icon(
-    worktree: &SidebarWorktree,
-    update: bool,
-    activity: Option<crate::agent::ActivityState>,
-) -> Element<'_, SidebarAction> {
-    let quiet = worktree_is_quiet(update, activity);
+fn worktree_status_icon(worktree: &SidebarWorktree, update: bool) -> Element<'_, SidebarAction> {
     let (handle, color) = worktree
         .chrome
         .pull_request
@@ -4006,11 +4006,13 @@ fn worktree_status_icon(
         .unwrap_or_else(|| (worktree_icon(), None));
     let glyph = widget::container(widget::icon(handle).size(ROW_ICON_SIZE)).class(
         theme::Container::custom(move |theme| cosmic::iced::widget::container::Style {
-            icon_color: Some(if quiet {
-                design::muted_color(theme)
-            } else {
-                color.unwrap_or_else(|| theme.current_container().on.into())
-            }),
+            icon_color: Some(color.unwrap_or_else(|| {
+                if !update {
+                    design::muted_color(theme)
+                } else {
+                    theme.current_container().on.into()
+                }
+            })),
             ..Default::default()
         }),
     );
@@ -4086,6 +4088,16 @@ fn worktree_panel<'a>(
         Some(source) => source_control_panel(
             state,
             source,
+            model
+                .projects
+                .iter()
+                .find(|project| project.id == source.key.project_id)
+                .and_then(|project| {
+                    project
+                        .worktrees
+                        .iter()
+                        .find(|worktree| worktree.id == source.key.worktree_id)
+                }),
             &model.external_editors,
             model.file_management && matches!(model.data_state, SidebarDataState::Ready),
             modal_open,
@@ -4141,6 +4153,7 @@ fn bound_source_control<'a>(
 fn source_control_panel<'a>(
     state: &'a SidebarState,
     source: &'a SourceControlModel,
+    worktree: Option<&'a SidebarWorktree>,
     editors: &'a [SidebarEditor],
     file_management: bool,
     modal_open: bool,
@@ -4155,13 +4168,13 @@ fn source_control_panel<'a>(
             .center_x(Length::Fixed(ROW_ICON_WIDTH))
             .into(),
         widget::container(crate::interaction::tooltip(
-            design::heading(&*chrome.subheading)
+            design::heading(worktree.map_or(&*chrome.subheading, |row| &*row.chrome.label))
                 .wrapping(cosmic::iced::widget::text::Wrapping::None)
                 .ellipsize(cosmic::iced::widget::text::Ellipsize::End(
                     EllipsizeHeightLimit::Lines(1),
                 ))
                 .width(Length::Fill),
-            &*chrome.subheading,
+            worktree.map_or(&*chrome.subheading, |row| &*row.chrome.tooltip),
         ))
         .width(Length::Fill)
         .into(),
@@ -4199,7 +4212,7 @@ fn source_control_panel<'a>(
         header
             .align_y(Alignment::Center)
             .spacing(spacing.space_xxxs)
-            .height(PANEL_ROW_HEIGHT)
+            .height(design::HEADER_HEIGHT)
             .width(Length::Fill),
     );
 
@@ -4231,7 +4244,7 @@ fn source_control_panel<'a>(
         SidebarDataState::Loading => {
             column = column.push(design::caption("Loading source control…"));
             return widget::container(column)
-                .padding([spacing.space_xxxs, spacing.space_xxs])
+                .padding([0, spacing.space_xxs])
                 .width(Length::Fill)
                 .into();
         }
@@ -4250,7 +4263,7 @@ fn source_control_panel<'a>(
                         )),
                 );
             return widget::container(column)
-                .padding([spacing.space_xxxs, spacing.space_xxs])
+                .padding([0, spacing.space_xxs])
                 .width(Length::Fill)
                 .into();
         }
@@ -4260,7 +4273,7 @@ fn source_control_panel<'a>(
     if matches!(panel, WorktreePanel::Files) {
         return widget::column::with_children(vec![
             widget::container(column)
-                .padding([spacing.space_xxxs, spacing.space_xxs])
+                .padding([0, spacing.space_xxs])
                 .width(Length::Fill)
                 .into(),
             files_section(state, source, modal_open, editors, file_management),
@@ -4285,7 +4298,7 @@ fn source_control_panel<'a>(
 
     widget::column::with_children(vec![
         widget::container(column)
-            .padding([spacing.space_xxxs, spacing.space_xxs])
+            .padding([0, spacing.space_xxs])
             .width(Length::Fill)
             .into(),
         widget::scrollable(
@@ -5921,10 +5934,7 @@ fn filtered_projects<'a>(
                     (project_matches || thread.folded_title.contains(&query))
                         && match state.filter {
                             SidebarFilter::All => true,
-                            SidebarFilter::Attention => {
-                                thread.unread
-                                    || thread.activity == Some(crate::agent::ActivityState::Waiting)
-                            }
+                            SidebarFilter::Attention => thread.unread,
                             SidebarFilter::PullRequests => false,
                         }
                 })
@@ -6049,7 +6059,9 @@ fn filter_id(filter: SidebarFilter) -> Id {
 /// Event decorators keep native buttons, focus operations, menus and accessible
 /// names intact instead of replacing rows with mouse-only hit targets.
 mod row_interaction {
-    use super::{ICON_CONTROL_SIZE, PROJECT_HEADER_HEIGHT, ProjectId, SidebarAction};
+    use super::{
+        ICON_CONTROL_SIZE, PROJECT_HEADER_HEIGHT, ProjectId, SidebarAction, SidebarFilter,
+    };
     use cosmic::iced::advanced::Renderer as _;
     use cosmic::iced::{
         Event, Length, Point, Rectangle, Size, Vector,
@@ -6078,6 +6090,7 @@ mod row_interaction {
     }
 
     enum Kind {
+        FilteredScroll(SidebarFilter),
         Projects {
             ids: Vec<ProjectId>,
             enabled: bool,
@@ -6097,6 +6110,22 @@ mod row_interaction {
         hovered: bool,
         focused: bool,
         header_node: Option<layout::Node>,
+        scroll: Option<Box<FilterScrollState>>,
+    }
+
+    struct FilterScrollState {
+        active: SidebarFilter,
+        saved: [Option<tree::State>; 3],
+    }
+
+    impl FilterScrollState {
+        fn index(filter: SidebarFilter) -> usize {
+            match filter {
+                SidebarFilter::All => 0,
+                SidebarFilter::Attention => 1,
+                SidebarFilter::PullRequests => 2,
+            }
+        }
     }
 
     pub(super) struct RowInteraction<'a> {
@@ -6123,6 +6152,16 @@ mod row_interaction {
     }
 
     impl<'a> RowInteraction<'a> {
+        pub(super) fn filtered_scroll(
+            content: Element<'a, SidebarAction>,
+            filter: SidebarFilter,
+        ) -> Element<'a, SidebarAction> {
+            Element::new(Self {
+                children: vec![content],
+                kind: Kind::FilteredScroll(filter),
+            })
+        }
+
         pub(super) fn projects(
             content: Element<'a, SidebarAction>,
             ids: Vec<ProjectId>,
@@ -6250,7 +6289,16 @@ mod row_interaction {
         }
 
         fn state(&self) -> tree::State {
-            tree::State::new(State::default())
+            tree::State::new(State {
+                scroll: match self.kind {
+                    Kind::FilteredScroll(active) => Some(Box::new(FilterScrollState {
+                        active,
+                        saved: [None, None, None],
+                    })),
+                    _ => None,
+                },
+                ..State::default()
+            })
         }
 
         fn children(&self) -> Vec<Tree> {
@@ -6258,6 +6306,21 @@ mod row_interaction {
         }
 
         fn diff(&mut self, tree: &mut Tree) {
+            if let Kind::FilteredScroll(filter) = self.kind {
+                let state = tree.state.downcast_mut::<State>();
+                let scroll = state.scroll.as_mut().expect("filtered scroll state");
+                if scroll.active != filter {
+                    // Swap the native scroll state before reconciling shorter
+                    // content. No queued viewport event can overwrite another
+                    // filter's offset, and only one row subtree stays mounted.
+                    let next = scroll.saved[FilterScrollState::index(filter)]
+                        .take()
+                        .unwrap_or_else(|| self.children[0].as_widget().state());
+                    scroll.saved[FilterScrollState::index(scroll.active)] =
+                        Some(std::mem::replace(&mut tree.children[0].state, next));
+                    scroll.active = filter;
+                }
+            }
             tree.diff_children(&mut self.children);
             if let Kind::Projects { ids, enabled, .. } = &self.kind {
                 let state = tree.state.downcast_mut::<State>();
@@ -6908,6 +6971,100 @@ mod tests {
     }
 
     #[test]
+    fn project_filters_restore_native_scroll_without_viewport_messages() {
+        use cosmic::iced::{
+            Rectangle, Vector,
+            advanced::widget::{Operation, operation},
+        };
+
+        #[derive(Default)]
+        struct Offset(Option<f32>);
+        impl Operation for Offset {
+            fn traverse(&mut self, operate: &mut dyn FnMut(&mut dyn Operation)) {
+                operate(self);
+            }
+
+            fn scrollable(
+                &mut self,
+                id: Option<&Id>,
+                _bounds: Rectangle,
+                _content_bounds: Rectangle,
+                translation: Vector,
+                _state: &mut dyn operation::Scrollable,
+            ) {
+                if id == Some(&stable_id("projects.scroll")) {
+                    self.0 = Some(translation.y);
+                }
+            }
+        }
+
+        let renderer = headless_renderer();
+        let make = |filter, height| {
+            project_scroll(
+                cosmic::iced::widget::Space::new()
+                    .width(200)
+                    .height(height)
+                    .into(),
+                filter,
+            )
+        };
+        let mut element = make(SidebarFilter::All, 1_000.0);
+        let mut tree = Tree::new(&element);
+        let limits = layout::Limits::new(Size::ZERO, Size::new(240.0, 200.0));
+        let mut node = element
+            .as_widget_mut()
+            .layout(&mut tree, &renderer, &limits);
+        element.as_widget_mut().operate(
+            &mut tree,
+            Layout::new(&node),
+            &renderer,
+            &mut operation::scrollable::scroll_to::<()>(
+                stable_id("projects.scroll"),
+                operation::scrollable::AbsoluteOffset {
+                    x: None,
+                    y: Some(640.0),
+                },
+            ),
+        );
+
+        for (filter, height, expected, scroll_to) in [
+            (SidebarFilter::Attention, 500.0, 0.0, Some(170.0)),
+            (SidebarFilter::PullRequests, 1_000.0, 0.0, Some(330.0)),
+            (SidebarFilter::All, 1_000.0, 640.0, None),
+            (SidebarFilter::Attention, 500.0, 170.0, None),
+            (SidebarFilter::All, 1_000.0, 640.0, None),
+            (SidebarFilter::PullRequests, 1_000.0, 330.0, None),
+            (SidebarFilter::Attention, 0.0, 0.0, None),
+            (SidebarFilter::All, 1_000.0, 640.0, None),
+        ] {
+            element = make(filter, height);
+            tree.diff(&mut element);
+            node = element
+                .as_widget_mut()
+                .layout(&mut tree, &renderer, &limits);
+            let mut offset = Offset::default();
+            element
+                .as_widget_mut()
+                .operate(&mut tree, Layout::new(&node), &renderer, &mut offset);
+            assert_eq!(offset.0, Some(expected), "{filter:?}");
+            if let Some(y) = scroll_to {
+                element.as_widget_mut().operate(
+                    &mut tree,
+                    Layout::new(&node),
+                    &renderer,
+                    &mut operation::scrollable::scroll_to::<()>(
+                        stable_id("projects.scroll"),
+                        operation::scrollable::AbsoluteOffset {
+                            x: None,
+                            y: Some(y),
+                        },
+                    ),
+                );
+            }
+        }
+    }
+
+    #[test]
     fn thread_attention_keeps_its_project_visible_without_unread_worktrees() {
         let mut entry = project();
         let thread_id = ThreadId::from_uuid(Uuid::from_u128(20));
@@ -6915,10 +7072,10 @@ mod tests {
             thread_id,
             "Investigate login".into(),
             true,
-            None,
+            Some(crate::agent::ActivityState::Waiting),
             true,
         ));
-        let model = SidebarModel::ready(SidebarMode::Expanded, vec![entry]);
+        let mut model = SidebarModel::ready(SidebarMode::Expanded, vec![entry]);
         let mut state = SidebarState::default();
         state.apply(&SidebarAction::SetFilter(SidebarFilter::Attention));
         state.apply(&SidebarAction::SearchChanged("login".into()));
@@ -6926,6 +7083,12 @@ mod tests {
         assert_eq!(projects.len(), 1);
         assert!(projects[0].worktrees.is_empty());
         assert_eq!(projects[0].threads[0].id, thread_id);
+        model.projects[0].threads[0].unread = false;
+        assert!(filtered_projects(&model, &state, false).is_empty());
+        assert_eq!(
+            model.projects[0].threads[0].activity,
+            Some(crate::agent::ActivityState::Waiting),
+        );
     }
 
     #[test]

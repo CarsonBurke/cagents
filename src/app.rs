@@ -1583,7 +1583,6 @@ fn workspace_navigation_blocked_during_save(message: &Message) -> bool {
             | Message::NewBrowser
             | Message::OpenBrowser(_)
             | Message::ChromeUi(chrome_ui::Action::Launch(_))
-            | Message::ChromeUi(chrome_ui::Action::SelectWorkspace(_))
             | Message::ThreadUi(_)
             | Message::FocusCard(_)
             | Message::FocusAdjacent(_)
@@ -1699,6 +1698,7 @@ pub enum SettingsField {
     LinkOpenGesture,
     ShortcutNewTerminal,
     ShortcutNewThread,
+    ShortcutClonePane,
     ShortcutCloseFocusedColumn,
     ShortcutSearchProjects,
     ShortcutPreviousColumn,
@@ -1723,6 +1723,7 @@ enum SettingsFeedback {
 struct ShortcutDraft {
     new_terminal: String,
     new_thread: String,
+    clone_pane: String,
     close_focused_column: String,
     search_projects: String,
     previous_column: String,
@@ -1735,6 +1736,7 @@ impl ShortcutDraft {
         Self {
             new_terminal: settings::format_chords(&shortcuts.new_terminal),
             new_thread: settings::format_chords(&shortcuts.new_thread),
+            clone_pane: settings::format_chords(&shortcuts.clone_pane),
             close_focused_column: settings::format_chords(&shortcuts.close_focused_column),
             search_projects: settings::format_chords(&shortcuts.search_projects),
             previous_column: settings::format_chords(&shortcuts.previous_column),
@@ -1854,6 +1856,7 @@ impl SettingsDraft {
             }
             SettingsField::ShortcutNewTerminal => self.keyboard_shortcuts.new_terminal = value,
             SettingsField::ShortcutNewThread => self.keyboard_shortcuts.new_thread = value,
+            SettingsField::ShortcutClonePane => self.keyboard_shortcuts.clone_pane = value,
             SettingsField::ShortcutCloseFocusedColumn => {
                 self.keyboard_shortcuts.close_focused_column = value;
             }
@@ -2034,6 +2037,10 @@ fn settings_update(
         }
         SettingsField::ShortcutNewThread => {
             next.keyboard_shortcuts.new_thread = settings::parse_chords(value);
+            Ok(())
+        }
+        SettingsField::ShortcutClonePane => {
+            next.keyboard_shortcuts.clone_pane = settings::parse_chords(value);
             Ok(())
         }
         SettingsField::ShortcutCloseFocusedColumn => {
@@ -3279,6 +3286,126 @@ impl Cagents {
             self.start_terminal(card_id, session, true, false),
             self.apply_viewport(update, true, false),
         ])
+    }
+
+    fn clone_focused_pane(&mut self) -> Task<Message> {
+        if self.workspace_inputs_blocked()
+            || self.focused_repository_is_saving()
+            || self.project_ui.deleting()
+        {
+            return Task::none();
+        }
+        let Some(source) = self.workspace.focused().and_then(|id| self.card_state(id)) else {
+            return Task::none();
+        };
+        if !source.existence.is_open() {
+            return Task::none();
+        }
+        #[cfg(not(feature = "integrated-browser"))]
+        if let CardKind::Browser(session) = &source.kind {
+            return Self::open_external_url(session.current_url.clone());
+        }
+        let mut card = source.clone();
+        card.id = CardId::new();
+        card.generation = self.durable.generation;
+        card.exposure = Exposure::Visible;
+        card.residency = Residency::Hydrating { epoch: 1 };
+        match &mut card.kind {
+            CardKind::Terminal(session) => {
+                if crate::agent::Provider::from_program(&session.launch.program).is_some() {
+                    let Some(recipe) = crate::model::agent_recovery::fresh_recipe(&session.launch)
+                    else {
+                        self.status = Some(TransientNotice::error(
+                            "Cannot clone this agent's launch options safely.",
+                        ));
+                        return Task::none();
+                    };
+                    session.launch = recipe;
+                }
+                session.id = TerminalId::new();
+                session.continuity = TerminalContinuity::RelaunchAvailable {
+                    recipe: session.launch.clone(),
+                    last_exit: None,
+                };
+                session.resume_hint = None;
+                session.transcript_path = terminal_transcript_path(session.id);
+            }
+            CardKind::Chat(session) => {
+                let Some(recipe) =
+                    crate::model::agent_recovery::fresh_recipe(&session.launch.recipe)
+                else {
+                    self.status = Some(TransientNotice::error(
+                        "Cannot clone this conversation's launch options safely.",
+                    ));
+                    return Task::none();
+                };
+                session.id = TerminalId::new();
+                session.launch.recipe = recipe;
+                session.launch.session_id = None;
+                session.proof = None;
+                session.terminal = None;
+                card.title = "Native chat".into();
+            }
+            CardKind::Browser(session) => {
+                session.id = crate::model::BrowserId::new();
+            }
+            CardKind::Repository(_) | CardKind::PullRequests(_) => {
+                card.residency = Residency::Hot;
+            }
+        }
+        self.show_workspace_for_action();
+        let (index, durable_index) = self.terminal_insertion_indices();
+        let id = card.id;
+        let update = match self.workspace.add_card(
+            WorkspaceCard::new(
+                id,
+                card.title.clone(),
+                CardWidth::Fraction(card.width_fraction),
+            )
+            .expect("cloned pane has valid width"),
+            index,
+            true,
+        ) {
+            Ok(update) => update,
+            Err(error) => {
+                self.status = Some(TransientNotice::error(error.to_string()));
+                return Task::none();
+            }
+        };
+        let durable = Arc::make_mut(&mut self.durable);
+        durable.cards.insert(durable_index, card.clone());
+        durable.focused = Some(id);
+        self.register_thread_card(id);
+        self.lifecycle
+            .register(id, card.exposure, card.residency, Instant::now());
+        let start = match card.kind {
+            CardKind::Terminal(session) => {
+                self.cards.insert(id, CardRuntime::Loading);
+                self.start_terminal(id, session, true, false)
+            }
+            CardKind::Chat(session) => self.start_chat(id, session, true, None, false),
+            #[cfg(feature = "integrated-browser")]
+            CardKind::Browser(_) => self.retry_card(id),
+            #[cfg(not(feature = "integrated-browser"))]
+            CardKind::Browser(_) => unreachable!("browserless clones open externally"),
+            CardKind::Repository(view) => {
+                let mut runtime = RepositoryRuntime::new(view);
+                runtime.set_auto_save(self.settings.editor_auto_save);
+                runtime.set_wrap_lines(self.settings.editor_wrap_lines);
+                runtime.set_external_editors(self.sidebar_model.external_editors.clone());
+                let load = repository_task(runtime.initial_load(id));
+                self.cards
+                    .insert(id, CardRuntime::Repository(Box::new(runtime)));
+                load
+            }
+            CardKind::PullRequests(view) => {
+                self.cards
+                    .insert(id, CardRuntime::PullRequests(view.repository));
+                Task::none()
+            }
+        };
+        self.persist();
+        Task::batch([start, self.apply_viewport(update, true, false)])
     }
 
     fn add_repository_card(
@@ -6744,6 +6871,7 @@ impl Cagents {
                     field,
                     SettingsField::ShortcutNewTerminal
                         | SettingsField::ShortcutNewThread
+                        | SettingsField::ShortcutClonePane
                         | SettingsField::ShortcutCloseFocusedColumn
                         | SettingsField::ShortcutSearchProjects
                         | SettingsField::ShortcutPreviousColumn
@@ -6805,6 +6933,7 @@ impl Cagents {
                     | SettingsField::LinkOpenGesture
                     | SettingsField::ShortcutNewTerminal
                     | SettingsField::ShortcutNewThread
+                    | SettingsField::ShortcutClonePane
                     | SettingsField::ShortcutCloseFocusedColumn
                     | SettingsField::ShortcutSearchProjects
                     | SettingsField::ShortcutPreviousColumn
@@ -8994,6 +9123,7 @@ impl Application for Cagents {
                         cosmic::task::message(Message::NewTerminal)
                     }
                     Some(workspace_widget::GlobalShortcut::NewThread) => self.new_project_thread(),
+                    Some(workspace_widget::GlobalShortcut::ClonePane) => self.clone_focused_pane(),
                     Some(workspace_widget::GlobalShortcut::CloseFocusedCard) => {
                         match close_focused_message(&self.workspace) {
                             Some(message) => cosmic::task::message(message),
@@ -12448,6 +12578,66 @@ mod tests {
                 },
             }),
         }
+    }
+
+    #[test]
+    fn pane_clone_is_adjacent_and_never_shares_terminal_continuity() {
+        let mut app = context_inspector_test_app(true);
+        app.context_inspector_open = false;
+        let source = app.durable.cards[0].clone();
+        let _unpolled = app.clone_focused_pane();
+        let cloned = app.workspace.focused().unwrap();
+        assert_ne!(cloned, source.id);
+        assert_eq!(app.workspace.cards()[1].id, cloned);
+        assert_eq!(app.card_state(source.id).unwrap(), &source);
+        let copy = app.card_state(cloned).unwrap();
+        assert_eq!(copy.width_fraction, source.width_fraction);
+        let (CardKind::Terminal(original), CardKind::Terminal(copy)) = (&source.kind, &copy.kind)
+        else {
+            panic!("both panes must remain terminals");
+        };
+        assert_ne!(copy.id, original.id);
+        assert_eq!(copy.launch, original.launch);
+        assert!(copy.continuity.live_proof().is_none());
+        assert!(copy.resume_hint.is_none());
+    }
+
+    #[test]
+    fn pane_clone_starts_a_new_chat_without_reusing_source_conversation() {
+        let mut app = context_inspector_test_app(true);
+        app.context_inspector_open = false;
+        let source_id = app.workspace.focused().unwrap();
+        let mut recipe = launch_recipe("/tmp");
+        recipe.program = "claude".into();
+        let conversation = "a1b2c3d4-1111-4111-8111-123456789abc";
+        recipe.arguments = vec!["--resume".into(), conversation.into(), "--bare".into()];
+        let original = crate::chat::Session {
+            id: TerminalId::new(),
+            launch: crate::chat::Launch {
+                provider: crate::agent::Provider::Claude,
+                recipe,
+                session_id: Some(conversation.into()),
+            },
+            proof: None,
+            terminal: None,
+        };
+        app.card_state_mut(source_id).unwrap().kind = CardKind::Chat(original.clone());
+        let _unpolled = app.clone_focused_pane();
+        let cloned = app.workspace.focused().unwrap();
+        assert_ne!(cloned, source_id);
+        let CardKind::Chat(copy) = &app.card_state(cloned).unwrap().kind else {
+            panic!("cloned conversation must stay native");
+        };
+        assert_ne!(copy.id, original.id);
+        assert_eq!(copy.launch.provider, original.launch.provider);
+        assert_eq!(copy.launch.recipe.arguments, ["--bare"]);
+        assert!(copy.launch.session_id.is_none());
+        assert!(copy.proof.is_none());
+        assert!(copy.terminal.is_none());
+        assert_eq!(
+            app.card_state(source_id).unwrap().kind,
+            CardKind::Chat(original)
+        );
     }
 
     fn diagnostic(message: &str) -> crate::lsp::LspDiagnostic {

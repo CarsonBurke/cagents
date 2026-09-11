@@ -68,6 +68,35 @@ pub fn save(settings: &Path, mode: FileListMode) -> Result<(), String> {
     )
 }
 
+pub fn load_language_server_assistance(settings: &Path) -> Result<bool, String> {
+    let path = settings.with_file_name("language-server-assistance");
+    let mut value = String::new();
+    match std::fs::File::open(&path) {
+        Ok(file) => {
+            file.take(16)
+                .read_to_string(&mut value)
+                .map_err(|error| format!("{}: {error}", path.display()))?;
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(format!("{}: {error}", path.display())),
+    }
+    match value.trim() {
+        "enabled" => Ok(true),
+        "disabled" => Ok(false),
+        _ => Err(format!(
+            "Invalid language-server assistance preference in {}",
+            path.display()
+        )),
+    }
+}
+
+pub fn save_language_server_assistance(settings: &Path, enabled: bool) -> Result<(), String> {
+    save_atomic(
+        &settings.with_file_name("language-server-assistance"),
+        if enabled { b"enabled\n" } else { b"disabled\n" },
+    )
+}
+
 fn save_atomic(path: &Path, contents: &[u8]) -> Result<(), String> {
     let directory = path.parent().ok_or("Settings directory is unavailable")?;
     // The shared settings writer creates and validates this directory first.

@@ -891,6 +891,10 @@ where
     ) {
         let geometry = self.scroll_geometry(layout.bounds());
         let state = tree.state.downcast_mut::<State<Highlighter>>();
+        if !geometry.scrollable {
+            state.scrollbar_grab = None;
+            state.scrollbar_target = None;
+        }
         let pointer = cursor.position().filter(|point| _viewport.contains(*point));
         let drag = match event {
             Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left))
@@ -1424,6 +1428,9 @@ where
         }
         drop(internal);
         let geometry = self.scroll_geometry(bounds);
+        if !geometry.scrollable {
+            return;
+        }
         let mut track_color = style.value;
         track_color.a *= 0.06;
         renderer.fill_quad(

@@ -4158,13 +4158,14 @@ pub fn selected_file_toolbar(
     let actions = widget::scrollable(
         widget::row::with_children(controls)
             .spacing(12)
-            .align_y(Alignment::Center),
+            .align_y(Alignment::Center)
+            .height(Length::Fill),
     )
     .direction(iced::widget::scrollable::Direction::Horizontal(
-        crate::design::scrollbar(),
+        crate::design::scrollbar().spacing(0),
     ))
     .width(Length::FillPortion(4))
-    .height(40);
+    .height(crate::design::HEADER_HEIGHT);
     let mut header = vec![title.into(), actions.into()];
     if !secondary.is_empty() {
         header.push(toolbar_group(secondary));
@@ -4176,7 +4177,8 @@ pub fn selected_file_toolbar(
                 .align_y(Alignment::Center)
                 .width(Length::Fill),
         )
-        .padding(if runtime.standalone { [0, 0] } else { [4, 12] })
+        .padding([0, 12])
+        .height(crate::design::HEADER_HEIGHT)
         .width(Length::Fill)
         .into(),
     )
@@ -4320,7 +4322,7 @@ fn editable_document_view<'a>(
                 |highlight, _theme: &cosmic::Theme| highlight.to_format(),
             )
             .font(Font::MONOSPACE)
-            .size(13.0)
+            .size(14.0)
             .diff_lines(
                 if runtime.working_annotations_current() {
                     &runtime.working_diff.additions

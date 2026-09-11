@@ -155,6 +155,86 @@ fn snapshot_text(handle: &TerminalHandle) -> String {
 }
 
 #[test]
+fn interactive_color_survives_launcher_ci_but_respects_explicit_policy() {
+    const CHILD: &str = "CAGENTS_COLOR_CONTRACT_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        // Isolate daemon inheritance without mutating this test process's
+        // environment while other terminals/tests may be running.
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "interactive_color_survives_launcher_ci_but_respects_explicit_policy",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .env("CI", "true")
+            .env("NO_COLOR", "1")
+            .env("TERM", "dumb")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
+
+    // Common color detectors check CI/NO_COLOR before TERM/COLORTERM.
+    // Exercise that decision inside the real PTY, through parser and snapshot.
+    let script = r#"
+if [ -t 1 ] && [ "${CI+x}" != x ] && [ "${NO_COLOR+x}" != x ] &&
+   [ "$TERM" != dumb ] && [ "$COLORTERM" = truecolor ]; then
+    printf '\033[38;2;18;52;86mX\033[0m'
+else
+    printf X
+fi
+printf '\033]0;ready\007'
+IFS= read -r line
+"#;
+    for (policy, colored) in [
+        (None, true),
+        (Some(("CI", "true")), false),
+        (Some(("NO_COLOR", "1")), false),
+        (Some(("TERM", "dumb")), false),
+    ] {
+        let mut session = terminal_session(script);
+        if let Some((name, value)) = policy {
+            session.launch.environment.insert(name.into(), value.into());
+        }
+        let (wake_sender, wakes) = sync_channel(16);
+        let terminal = RunningTerminal(
+            TerminalHandle::spawn(session, TerminalConfig::default(), move |wake| {
+                let _ = wake_sender.try_send(wake);
+            })
+            .unwrap(),
+        );
+        wait_for_title(&terminal.events(), "ready");
+        let deadline = Instant::now() + FAILURE_GUARD;
+        let snapshot = loop {
+            let snapshot = terminal.snapshot();
+            if snapshot.lines[0].cells[0].text == "X" {
+                break snapshot;
+            }
+            terminal.acknowledge_redraw(snapshot.generation);
+            wakes
+                .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+                .expect("color output was not captured");
+        };
+        let foreground = snapshot.lines[0].cells[0].foreground;
+        if colored {
+            assert_eq!(
+                (foreground.red, foreground.green, foreground.blue),
+                (18, 52, 86)
+            );
+        } else {
+            assert_eq!(foreground, snapshot.foreground, "{policy:?}");
+        }
+    }
+}
+
+#[test]
 fn visible_wakes_are_bounded_until_acknowledged_and_then_rearm() {
     let (terminal, events, callbacks, wakes) = spawn_with_probe(true);
 

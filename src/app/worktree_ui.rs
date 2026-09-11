@@ -334,18 +334,6 @@ impl Cagents {
         ))
     }
 
-    /// Directory scopes without a project row are offered by the workspace
-    /// selector, never mixed into the selected workspace's tabs.
-    pub(super) fn unregistered_workspace_scopes(&self) -> impl Iterator<Item = &Path> {
-        self.durable.cards.iter().filter_map(|card| {
-            if !card.existence.is_open() {
-                return None;
-            }
-            self.card_worktree(card)
-                .filter(|root| self.sidebar_model.worktree_at(root).is_none())
-        })
-    }
-
     pub(super) fn select_worktree(
         &mut self,
         path: PathBuf,
@@ -593,7 +581,7 @@ mod tests {
     use crate::model::{BrowserId, BrowserRestoreFidelity, ProjectThread};
 
     #[test]
-    fn unregistered_workspaces_are_reachable_without_leaking_tabs() {
+    fn selected_worktrees_and_threads_never_mix_unrelated_panes() {
         let mut app = super::super::tests::context_inspector_test_app(false);
         register_worktrees(&mut app, &["/repo", "/repo/worktree"]);
         let project = terminal("/repo");
@@ -624,25 +612,18 @@ mod tests {
         });
         let _ = app.restore_worktree_scope();
         assert_eq!(app.workspace.order().collect::<Vec<_>>(), vec![project.id]);
-        let scopes = app
-            .unregistered_workspace_scopes()
-            .collect::<std::collections::BTreeSet<_>>();
-        assert_eq!(
-            scopes.into_iter().collect::<Vec<_>>(),
-            vec![Path::new("/home/user"), Path::new("/tmp")]
-        );
         let _ = app.select_worktree("/repo/worktree".into(), false);
         assert_eq!(app.workspace.order().collect::<Vec<_>>(), vec![worktree.id]);
         let _ = app.select_thread(thread);
         assert_eq!(app.workspace.order().collect::<Vec<_>>(), vec![threaded.id]);
-        let _ = app.update_chrome(chrome_ui::Action::SelectWorkspace("/tmp".into()));
+        let _ = app.select_worktree("/tmp".into(), false);
         assert_eq!(app.durable.active_thread, None);
         assert_eq!(
             app.workspace.order().collect::<Vec<_>>(),
             vec![loose.id, companion.id]
         );
         assert_eq!(app.terminal_directory(), Some(PathBuf::from("/tmp")));
-        let _ = app.update_chrome(chrome_ui::Action::SelectWorkspace("/home/user".into()));
+        let _ = app.select_worktree("/home/user".into(), false);
         assert_eq!(app.workspace.order().collect::<Vec<_>>(), vec![home.id]);
         let _ = app.select_worktree("/repo".into(), false);
         assert_eq!(app.workspace.order().collect::<Vec<_>>(), vec![project.id]);

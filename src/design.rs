@@ -12,9 +12,9 @@ pub const DENSE_ROW_HEIGHT: f32 = 28.0;
 pub const PRIMARY_CONTROL_SIZE: f32 = 30.0;
 pub const SECONDARY_CONTROL_MIN_SIZE: f32 = 30.0;
 
-pub const TEXT_BODY: f32 = 13.0;
+pub const TEXT_BODY: f32 = 14.0;
 pub const TEXT_CAPTION: f32 = 12.0;
-pub const TEXT_HEADING: f32 = 13.0;
+pub const TEXT_HEADING: f32 = 14.0;
 
 /// Secondary labels stay readable without competing with active content.
 pub fn muted_color(theme: &cosmic::Theme) -> cosmic::iced::Color {

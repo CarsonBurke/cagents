@@ -36,6 +36,7 @@ pub enum WorkspaceViewportEvent {
 pub enum GlobalShortcut {
     NewTerminal,
     NewThread,
+    ClonePane,
     CloseFocusedCard,
     FocusProjectSearch,
     FocusAdjacent(FocusDirection),
@@ -58,6 +59,11 @@ pub const GLOBAL_SHORTCUT_DESCRIPTORS: &[ShortcutDescriptor] = &[
     ShortcutDescriptor {
         action: GlobalShortcut::NewThread,
         label: "New thread",
+        repeatable: false,
+    },
+    ShortcutDescriptor {
+        action: GlobalShortcut::ClonePane,
+        label: "Clone focused pane",
         repeatable: false,
     },
     ShortcutDescriptor {
@@ -99,6 +105,7 @@ pub fn shortcut_keys(action: GlobalShortcut, shortcuts: &KeyboardShortcuts) -> &
     match action {
         GlobalShortcut::NewTerminal => &shortcuts.new_terminal,
         GlobalShortcut::NewThread => &shortcuts.new_thread,
+        GlobalShortcut::ClonePane => &shortcuts.clone_pane,
         GlobalShortcut::CloseFocusedCard => &shortcuts.close_focused_column,
         GlobalShortcut::FocusProjectSearch => &shortcuts.search_projects,
         GlobalShortcut::FocusAdjacent(FocusDirection::Left) => &shortcuts.previous_column,
@@ -1671,31 +1678,32 @@ mod tests {
             ),
             Some(GlobalShortcut::NewTerminal)
         );
-        assert_eq!(
-            global_shortcut(
-                &key_press(
-                    "T",
-                    Code::KeyT,
-                    keyboard::Modifiers::CTRL | keyboard::Modifiers::SHIFT,
-                    false,
+        for (character, code, action) in [
+            ("g", Code::KeyG, GlobalShortcut::NewThread),
+            ("e", Code::KeyE, GlobalShortcut::ClonePane),
+        ] {
+            assert_eq!(
+                global_shortcut(
+                    &key_press(character, code, keyboard::Modifiers::ALT, false),
+                    &shortcuts,
                 ),
-                &shortcuts,
-            ),
-            Some(GlobalShortcut::NewThread)
-        );
-        assert_eq!(
-            global_shortcut(
-                &key_press(
-                    "T",
-                    Code::KeyT,
-                    keyboard::Modifiers::CTRL | keyboard::Modifiers::SHIFT,
-                    true,
+                Some(action)
+            );
+            assert_eq!(
+                global_shortcut(
+                    &key_press(character, code, keyboard::Modifiers::ALT, true),
+                    &shortcuts,
                 ),
+                None,
+                "holding a creation shortcut must not create multiple panes"
+            );
+            assert!(is_global_shortcut_chord(
+                &keyboard::Key::Character(character.into()),
+                keyboard::key::Physical::Code(code),
+                keyboard::Modifiers::ALT,
                 &shortcuts,
-            ),
-            None,
-            "holding the thread shortcut must not create multiple conversations"
-        );
+            ));
+        }
         assert_eq!(
             global_shortcut(
                 &key_press("w", Code::KeyW, keyboard::Modifiers::CTRL, false),
@@ -1808,6 +1816,54 @@ mod tests {
             ),
             Some(GlobalShortcut::NewTerminal)
         );
+    }
+
+    #[test]
+    fn customized_creation_shortcuts_release_defaults_and_reserve_only_bound_chords() {
+        use keyboard::key::Code;
+
+        let mut shortcuts = KeyboardShortcuts {
+            clone_pane: vec!["Ctrl+Shift+E".into()],
+            new_thread: vec!["Ctrl+Shift+T".into()],
+            ..KeyboardShortcuts::default()
+        };
+        for (character, code, default_character, default_code, action) in [
+            ("e", Code::KeyE, "e", Code::KeyE, GlobalShortcut::ClonePane),
+            ("t", Code::KeyT, "g", Code::KeyG, GlobalShortcut::NewThread),
+        ] {
+            let modifiers = keyboard::Modifiers::CTRL | keyboard::Modifiers::SHIFT;
+            assert_eq!(
+                global_shortcut(&key_press(character, code, modifiers, false), &shortcuts),
+                Some(action)
+            );
+            assert_eq!(
+                global_shortcut(&key_press(character, code, modifiers, true), &shortcuts),
+                None
+            );
+            assert!(is_global_shortcut_chord(
+                &keyboard::Key::Character(character.into()),
+                keyboard::key::Physical::Code(code),
+                modifiers,
+                &shortcuts,
+            ));
+            assert!(!is_global_shortcut_chord(
+                &keyboard::Key::Character(default_character.into()),
+                keyboard::key::Physical::Code(default_code),
+                keyboard::Modifiers::ALT,
+                &shortcuts,
+            ));
+        }
+
+        shortcuts.clone_pane.clear();
+        shortcuts.new_thread.clear();
+        for (character, code) in [("e", Code::KeyE), ("t", Code::KeyT)] {
+            assert!(!is_global_shortcut_chord(
+                &keyboard::Key::Character(character.into()),
+                keyboard::key::Physical::Code(code),
+                keyboard::Modifiers::CTRL | keyboard::Modifiers::SHIFT,
+                &shortcuts,
+            ));
+        }
     }
 
     #[test]
