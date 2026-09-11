@@ -210,6 +210,8 @@ fn process_identity(stat: &[u8]) -> Option<(i32, u64)> {
 #[derive(Debug, PartialEq, Eq)]
 enum SessionIdentity {
     Exact(String),
+    /// The provider explicitly published a never-materialized session boundary.
+    Fresh(std::path::PathBuf),
     Ambiguous,
 }
 
@@ -317,18 +319,46 @@ fn omp_terminal_identity(
             }
         }
         session.starts_with(&session_directory).then_some(())?;
-        // Fresh sessions are published before a resumable JSONL exists.
-        fs::metadata(session)
-            .is_ok_and(|metadata| metadata.is_file() && metadata.len() > 0)
-            .then_some(())?;
-        provider.session_file_id(session)
+        if session
+            .components()
+            .any(|component| matches!(component, std::path::Component::ParentDir))
+        {
+            return None;
+        }
+        let id = provider.session_file_id(session)?;
+        match fs::metadata(session) {
+            Ok(metadata) if metadata.is_file() && metadata.len() > 0 => {
+                Some(SessionIdentity::Exact(id))
+            }
+            Err(error)
+                if error.kind() == std::io::ErrorKind::NotFound
+                    && lines.next() == Some("fresh")
+                    && lines.next().is_none() =>
+            {
+                Some(SessionIdentity::Fresh(session.to_owned()))
+            }
+            _ => None,
+        }
     })();
     // A current but unusable marker must block stale resume argv and open files.
-    Some(
-        identity
-            .map(SessionIdentity::Exact)
-            .unwrap_or(SessionIdentity::Ambiguous),
-    )
+    Some(identity.unwrap_or(SessionIdentity::Ambiguous))
+}
+
+/// Absence of a saved file alone is never evidence of a fresh conversation.
+/// Only the exact, current controlling-terminal marker can authorize this path.
+#[cfg(feature = "host")]
+pub(crate) fn fresh_omp_session(process: &AgentProcess) -> Option<std::path::PathBuf> {
+    if process.provider != Provider::Omp {
+        return None;
+    }
+    let root = std::path::PathBuf::from(format!("/proc/{}", process.pid));
+    if process_identity(&bounded_read(root.join("stat"), 4096)?)?.1 != process.start {
+        return None;
+    }
+    match omp_terminal_identity(&root, &process.recovery, process.start)? {
+        SessionIdentity::Fresh(path) => Some(path),
+        _ => None,
+    }
 }
 
 #[cfg(feature = "host")]
@@ -336,7 +366,6 @@ fn process_launch(root: &Path, base: &LaunchRecipe) -> Option<(LaunchRecipe, u64
     read_process_launch(root, Some(base))
 }
 
-#[cfg(feature = "host")]
 fn observation_environment_key(name: &str) -> bool {
     matches!(
         name,
@@ -354,8 +383,7 @@ fn observation_environment_key(name: &str) -> bool {
     )
 }
 
-#[cfg(feature = "host")]
-fn native_runtime_environment_key(name: &str) -> bool {
+pub(crate) fn native_runtime_environment_key(name: &str) -> bool {
     observation_environment_key(name)
         || matches!(
             name,
@@ -395,8 +423,24 @@ fn native_runtime_environment_key(name: &str) -> bool {
         )
 }
 
-#[cfg(feature = "host")]
-fn provider_setting_environment_key(name: &str) -> bool {
+fn provider_setting_environment_key(provider: Provider, name: &str) -> bool {
+    let starts_with = |prefix: &str| {
+        name.get(..prefix.len())
+            .is_some_and(|head| head.eq_ignore_ascii_case(prefix))
+    };
+    // CLI-specific tuning from a different agent is not this provider's policy.
+    // Shared model backends (ANTHROPIC, OPENAI, AWS, ...) remain relevant to OMP.
+    if [
+        ("CLAUDE_", Provider::Claude),
+        ("CODEX_", Provider::Codex),
+        ("OMP_", Provider::Omp),
+        ("PI_", Provider::Omp),
+    ]
+    .iter()
+    .any(|(prefix, owner)| *owner != provider && starts_with(prefix))
+    {
+        return false;
+    }
     const PREFIXES: &[&str] = &[
         "ANTHROPIC",
         "CLAUDE",
@@ -439,11 +483,48 @@ fn provider_setting_environment_key(name: &str) -> bool {
         "ALL_PROXY",
         "NO_PROXY",
     ];
-    PREFIXES.iter().any(|prefix| {
-        name.get(..prefix.len())
-            .is_some_and(|head| head.eq_ignore_ascii_case(prefix))
-    }) || [
-        "TOKEN",
+    let prefixes: &[&str] = match provider {
+        Provider::Omp => PREFIXES,
+        Provider::Claude => &[
+            "ANTHROPIC",
+            "CLAUDE",
+            "AWS_",
+            "GOOGLE_",
+            "GCLOUD",
+            "VERTEX",
+            "BEDROCK",
+            "FOUNDRY",
+            "AZURE",
+        ],
+        Provider::Codex => &["CODEX", "OPENAI"],
+    };
+    if prefixes.iter().any(|prefix| starts_with(prefix)) {
+        return true;
+    }
+    if [
+        "NODE_",
+        "BUN_",
+        "SSL_",
+        "CURL_",
+        "GIT_CONFIG",
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "ALL_PROXY",
+        "NO_PROXY",
+        "LD_PRELOAD",
+    ]
+    .iter()
+    .any(|prefix| starts_with(prefix))
+    {
+        return true;
+    }
+    // An arbitrary credential-shaped name is not proof that this provider uses
+    // it. Never copy unrelated application secrets into a newly launched agent.
+    false
+}
+
+fn credential_environment_key(name: &str) -> bool {
+    [
         "SECRET",
         "PASSWORD",
         "API_KEY",
@@ -451,8 +532,6 @@ fn provider_setting_environment_key(name: &str) -> bool {
         "CREDENTIAL",
         "AUTHENTICATION",
         "AUTHORIZATION",
-        "BASE_URL",
-        "ENDPOINT",
     ]
     .iter()
     .any(|part| {
@@ -461,7 +540,84 @@ fn provider_setting_environment_key(name: &str) -> bool {
             .any(|window| window.eq_ignore_ascii_case(part.as_bytes()))
     }) || name
         .split('_')
-        .any(|part| part.eq_ignore_ascii_case("AUTH"))
+        .any(|part| part.eq_ignore_ascii_case("AUTH") || part.eq_ignore_ascii_case("TOKEN"))
+}
+
+fn indirect_environment_key(name: &str) -> bool {
+    // Git's opaque config payloads may contain extraHeader credentials, helpers,
+    // or URL rewrites. Classify the namespace, never the payload's spelling.
+    name.get(..10)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("GIT_CONFIG"))
+}
+
+fn sensitive_environment_key(name: &str) -> bool {
+    credential_environment_key(name)
+        || indirect_environment_key(name)
+        || [
+            "BASE_URL",
+            "ENDPOINT",
+            "PERMISSION",
+            "APPROVAL",
+            "SANDBOX",
+            "BYPASS",
+            "AUTO_APPROVE",
+            "YOLO",
+        ]
+        .iter()
+        .any(|part| {
+            name.as_bytes()
+                .windows(part.len())
+                .any(|window| window.eq_ignore_ascii_case(part.as_bytes()))
+        })
+}
+
+/// A fresh native process uses the selected provider's configuration, never the
+/// launching harness's tool bridge, artifact scope, or terminal/session identity.
+pub(crate) fn fresh_environment_key(
+    provider: Provider,
+    name: &str,
+    value: &str,
+    persistable: bool,
+) -> bool {
+    if [
+        "PI_TOOL_BRIDGE_",
+        "PI_EVAL_",
+        "PI_SESSION_",
+        "PI_AGENT_",
+        "OMP_SESSION_",
+        "OMP_AGENT_",
+        "CAGENTS_",
+        "ORCA_",
+    ]
+    .iter()
+    .any(|prefix| name.starts_with(prefix))
+        || name == "PI_ARTIFACTS_DIR"
+    {
+        return false;
+    }
+    if !native_runtime_environment_key(name) && !provider_setting_environment_key(provider, name) {
+        return false;
+    }
+    if !persistable {
+        return true;
+    }
+    if credential_environment_key(name) || indirect_environment_key(name) {
+        return false;
+    }
+    // A proxy/base URL can contain credentials even when its variable name does
+    // not. Keep those values only in the host's ephemeral execution environment.
+    !url::Url::parse(value).is_ok_and(|url| {
+        !url.username().is_empty() || url.password().is_some() || url.query().is_some()
+    })
+}
+
+pub(crate) fn fresh_native_environment(
+    provider: Provider,
+    persistable: bool,
+) -> std::collections::BTreeMap<String, String> {
+    std::env::vars()
+        .filter(|(name, value)| fresh_environment_key(provider, name, value, persistable))
+        .collect()
 }
 
 #[cfg(feature = "host")]
@@ -498,7 +654,7 @@ fn return_environment_key(provider: Provider, name: &str) -> bool {
         ],
         Provider::Codex => &["CODEX", "OPENAI"],
         Provider::Omp => {
-            return (provider_setting_environment_key(name)
+            return (provider_setting_environment_key(provider, name)
                 && !native_runtime_environment_key(name))
                 || matches!(
                     name,
@@ -543,6 +699,7 @@ fn check_return_environment_variable(
 #[cfg(feature = "host")]
 fn preserved_native_environment(
     bytes: &[u8],
+    provider: Provider,
     explicit: &std::collections::BTreeMap<String, String>,
 ) -> Result<std::collections::BTreeMap<String, String>, String> {
     let mut environment = std::collections::BTreeMap::new();
@@ -573,21 +730,75 @@ fn preserved_native_environment(
                 ));
             }
             environment.insert(name.to_owned(), original.clone());
-        } else if provider_setting_environment_key(name) {
-            return Err(format!(
-                "The source uses environment-only setting {name}, which cannot be safely saved for native resume. Configure it in the provider account or the explicit terminal launch before converting; the source has not been stopped."
-            ));
+        } else if provider_setting_environment_key(provider, name) {
+            if sensitive_environment_key(name)
+                || matches!(name, "NODE_OPTIONS" | "BUN_OPTIONS" | "LD_PRELOAD")
+            {
+                return Err(format!(
+                    "The source uses credential, account, or permission setting {name}, which requires explicit launch configuration before native handoff; the source has not been stopped."
+                ));
+            }
+            // Ordinary provider configuration is safe to retain verbatim; its
+            // namespace alone does not make it a credential or permission grant.
+            environment.insert(name.to_owned(), value.to_owned());
         }
     }
     // Absent explicit variables stay absent; never restore stale launch values.
     Ok(environment)
 }
 
+/// Validate transient host authority against the actual process, then split
+/// execution from durable recovery. A returned PTY may reuse its selected
+/// credentials, but observing that PTY must never promote them into a recipe.
+#[cfg(feature = "host")]
+fn native_environment_parts(
+    bytes: &[u8],
+    provider: Provider,
+    explicit: &std::collections::BTreeMap<String, String>,
+    transient: Option<&std::collections::BTreeMap<String, String>>,
+) -> Result<
+    (
+        std::collections::BTreeMap<String, String>,
+        std::collections::BTreeMap<String, String>,
+    ),
+    String,
+> {
+    let authority;
+    let selected = if let Some(transient) = transient {
+        authority = transient
+            .iter()
+            .chain(explicit)
+            .map(|(name, value)| (name.clone(), value.clone()))
+            .collect();
+        &authority
+    } else {
+        explicit
+    };
+    let execution = preserved_native_environment(bytes, provider, selected)?;
+    let durable = execution
+        .iter()
+        .filter(|(name, value)| {
+            transient.is_none()
+                || explicit.get(*name) == Some(*value)
+                || fresh_environment_key(provider, name, value, true)
+        })
+        .map(|(name, value)| (name.clone(), value.clone()))
+        .collect();
+    Ok((durable, execution))
+}
+
 #[cfg(feature = "host")]
 pub(crate) fn native_environment(
     process: &AgentProcess,
     explicit: &std::collections::BTreeMap<String, String>,
-) -> Result<std::collections::BTreeMap<String, String>, String> {
+    transient: Option<&std::collections::BTreeMap<String, String>>,
+) -> Result<
+    (
+        std::collections::BTreeMap<String, String>,
+        std::collections::BTreeMap<String, String>,
+    ),
+    String,
+> {
     let root = std::path::PathBuf::from(format!("/proc/{}", process.pid));
     let before = bounded_read(root.join("stat"), 4096)
         .and_then(|bytes| process_identity(&bytes))
@@ -595,15 +806,15 @@ pub(crate) fn native_environment(
         .ok_or("The source process changed before reading its execution environment")?;
     let bytes = bounded_read(root.join("environ"), 128 * 1024)
         .ok_or("Cannot read the exact source execution environment; no source was stopped")?;
-    let environment = preserved_native_environment(&bytes, explicit)?;
-    // Native execution clears inheritance, but terminal recipes historically
-    // inherit the daemon environment on return. Refuse unrepresentable absences
-    // before changing the source rather than adding secrets or a recipe schema.
+    let (durable, environment) =
+        native_environment_parts(&bytes, process.provider, explicit, transient)?;
+    // A host-owned return clears daemon inheritance and carries its proven
+    // transient context. Other sources keep the existing conservative fence.
     for (name, value) in std::env::vars_os() {
         let Some(name) = name.to_str() else {
             continue;
         };
-        if !return_environment_key(process.provider, name) {
+        if transient.is_some() || !return_environment_key(process.provider, name) {
             continue;
         }
         let value = value
@@ -616,7 +827,7 @@ pub(crate) fn native_environment(
     {
         return Err("The source process changed while reading its execution environment".into());
     }
-    Ok(environment)
+    Ok((durable, environment))
 }
 
 #[cfg(feature = "host")]
@@ -850,14 +1061,14 @@ mod tests {
     #[cfg(feature = "host")]
     #[test]
     fn credential_detection_distinguishes_authentication_from_author_metadata() {
-        assert!(!provider_setting_environment_key("CARGO_PKG_AUTHORS"));
-        assert!(!provider_setting_environment_key("GIT_AUTHOR_NAME"));
+        assert!(!sensitive_environment_key("CARGO_PKG_AUTHORS"));
+        assert!(!sensitive_environment_key("GIT_AUTHOR_NAME"));
         for key in [
             "CUSTOM_AUTH",
             "CUSTOM_AUTHORIZATION",
             "CUSTOM_AUTHENTICATION",
         ] {
-            assert!(provider_setting_environment_key(key));
+            assert!(sensitive_environment_key(key));
         }
     }
 
@@ -873,6 +1084,7 @@ mod tests {
         ]);
         let environment = preserved_native_environment(
             b"HOME=/source\0PATH=/source/bin\0ANTHROPIC_API_KEY=explicit-key\0ANTHROPIC_BASE_URL=https://source.invalid\0CLAUDE_CONFIG_DIR=/current-account\0SSL_CERT_DIR=/current-ca\0LD_LIBRARY_PATH=/source/lib\0",
+            Provider::Claude,
             &explicit,
         ).unwrap();
         assert_eq!(environment["ANTHROPIC_API_KEY"], "explicit-key");
@@ -881,19 +1093,28 @@ mod tests {
         assert_eq!(environment["SSL_CERT_DIR"], "/current-ca");
         assert_eq!(environment["LD_LIBRARY_PATH"], "/source/lib");
         assert!(!environment.contains_key("REMOVED_SETTING"));
-        let unset = preserved_native_environment(b"HOME=/source\0", &explicit).unwrap();
+        let unset =
+            preserved_native_environment(b"HOME=/source\0", Provider::Claude, &explicit).unwrap();
         assert!(!unset.contains_key("ANTHROPIC_API_KEY"));
         assert!(!unset.contains_key("ANTHROPIC_BASE_URL"));
         assert!(!unset.contains_key("SSL_CERT_DIR"));
         let new_secret = preserved_native_environment(
             b"HOME=/source\0ANTHROPIC_API_KEY=new-shell-secret\0",
+            Provider::Claude,
             &BTreeMap::new(),
         )
         .unwrap_err();
         assert!(!new_secret.contains("new-shell-secret"));
+        let indirect = preserved_native_environment(
+            b"HOME=/source\0GIT_CONFIG_COUNT=1\0GIT_CONFIG_KEY_0=http.extraHeader\0GIT_CONFIG_VALUE_0=Authorization: Bearer indirect-secret\0",
+            Provider::Omp,
+            &BTreeMap::new(),
+        ).unwrap_err();
+        assert!(!indirect.contains("indirect-secret"));
         assert!(
             preserved_native_environment(
                 b"HOME=/source\0ANTHROPIC_API_KEY=changed-secret\0",
+                Provider::Claude,
                 &explicit
             )
             .is_err()
@@ -901,13 +1122,144 @@ mod tests {
         assert!(
             preserved_native_environment(
                 b"HOME=/source\0CLAUDE_CODE_PERMISSION_MODE=bypassPermissions\0",
+                Provider::Claude,
                 &BTreeMap::new()
             )
             .is_err()
         );
         assert!(
-            preserved_native_environment(b"HOME=/source\0HOME=/other\0", &BTreeMap::new()).is_err()
+            preserved_native_environment(
+                b"HOME=/source\0HOME=/other\0",
+                Provider::Claude,
+                &BTreeMap::new()
+            )
+            .is_err()
         );
+    }
+
+    #[cfg(feature = "host")]
+    #[test]
+    fn fresh_native_configuration_keeps_credentials_transient_and_private_scopes_out() {
+        for (name, value) in [
+            ("ANTHROPIC_API_KEY", "private-key"),
+            ("OPENAI_API_KEY", "other-backend-key"),
+            ("HTTPS_PROXY", "http://user:password@proxy.invalid"),
+            ("GIT_CONFIG_COUNT", "1"),
+            ("GIT_CONFIG_KEY_0", "http.extraHeader"),
+            ("GIT_CONFIG_VALUE_0", "Authorization: Bearer private-token"),
+            (
+                "GIT_CONFIG_PARAMETERS",
+                "'http.extraHeader'='Authorization: Bearer private-token'",
+            ),
+        ] {
+            assert!(fresh_environment_key(Provider::Omp, name, value, false));
+            assert!(!fresh_environment_key(Provider::Omp, name, value, true));
+        }
+        for (name, value) in [
+            ("PI_CACHE_RETENTION", "long"),
+            ("OMP_APPROVAL_MODE", "manual"),
+            ("ANTHROPIC_BASE_URL", "https://account.invalid"),
+            ("HTTPS_PROXY", "http://proxy.invalid:8080"),
+        ] {
+            assert!(fresh_environment_key(Provider::Omp, name, value, true));
+        }
+        for name in [
+            "PI_TOOL_BRIDGE_TOKEN",
+            "PI_TOOL_BRIDGE_URL",
+            "PI_ARTIFACTS_DIR",
+            "OMP_SESSION_ID",
+            "ORCA_API_TOKEN",
+            "CAGENTS_TERMINAL_ID",
+            "CLAUDE_CODE_MAX_SUBAGENTS_PER_SESSION",
+            "UNRELATED_SERVICE_API_KEY",
+        ] {
+            assert!(!fresh_environment_key(
+                Provider::Omp,
+                name,
+                "private",
+                false
+            ));
+            assert!(!fresh_environment_key(Provider::Omp, name, "private", true));
+        }
+    }
+
+    #[cfg(feature = "host")]
+    #[test]
+    fn returned_terminal_credentials_are_authorized_only_for_execution() {
+        let transient = BTreeMap::from([
+            ("ANTHROPIC_API_KEY".into(), "gui-key".into()),
+            (
+                "HTTPS_PROXY".into(),
+                "http://user:password@proxy.invalid".into(),
+            ),
+            ("GIT_CONFIG_COUNT".into(), "1".into()),
+            ("GIT_CONFIG_KEY_0".into(), "http.extraHeader".into()),
+            (
+                "GIT_CONFIG_VALUE_0".into(),
+                "Authorization: Bearer git-token".into(),
+            ),
+        ]);
+        let observed = b"HOME=/selected\0ANTHROPIC_API_KEY=gui-key\0HTTPS_PROXY=http://user:password@proxy.invalid\0GIT_CONFIG_COUNT=1\0GIT_CONFIG_KEY_0=http.extraHeader\0GIT_CONFIG_VALUE_0=Authorization: Bearer git-token\0";
+        let (durable, execution) =
+            native_environment_parts(observed, Provider::Omp, &BTreeMap::new(), Some(&transient))
+                .unwrap();
+        assert_eq!(
+            durable,
+            BTreeMap::from([("HOME".into(), "/selected".into())])
+        );
+        for (name, value) in &transient {
+            assert_eq!(execution.get(name), Some(value));
+        }
+        assert!(native_environment_parts(observed, Provider::Omp, &BTreeMap::new(), None).is_err());
+        let changed = b"HOME=/selected\0ANTHROPIC_API_KEY=another-account\0";
+        let failure =
+            native_environment_parts(changed, Provider::Omp, &BTreeMap::new(), Some(&transient))
+                .unwrap_err();
+        assert!(!failure.contains("another-account"));
+    }
+
+    #[cfg(feature = "host")]
+    #[test]
+    fn native_environment_scopes_agent_settings_and_preserves_benign_configuration() {
+        let source = b"HOME=/source\0CLAUDE_CODE_MAX_SUBAGENTS_PER_SESSION=12\0CLAUDE_CODE_PERMISSION_MODE=bypassPermissions\0CODEX_SANDBOX_MODE=read-only\0PI_CACHE_RETENTION=long\0OMP_MAX_TOKENS=8192\0";
+        let omp = preserved_native_environment(source, Provider::Omp, &BTreeMap::new()).unwrap();
+        assert_eq!(omp["PI_CACHE_RETENTION"], "long");
+        assert_eq!(omp["OMP_MAX_TOKENS"], "8192");
+        assert!(!omp.contains_key("CLAUDE_CODE_MAX_SUBAGENTS_PER_SESSION"));
+        assert!(!omp.contains_key("CLAUDE_CODE_PERMISSION_MODE"));
+        assert!(!omp.contains_key("CODEX_SANDBOX_MODE"));
+        for name in [
+            "CLAUDE_CODE_MAX_SUBAGENTS_PER_SESSION",
+            "CLAUDE_CODE_PERMISSION_MODE",
+            "CODEX_SANDBOX_MODE",
+        ] {
+            assert!(
+                check_return_environment_variable(Provider::Omp, &omp, name, "inherited").is_ok()
+            );
+        }
+        let claude = preserved_native_environment(
+            b"CLAUDE_CODE_MAX_SUBAGENTS_PER_SESSION=12\0OPENAI_API_KEY=unrelated-secret\0PI_CACHE_RETENTION=long\0",
+            Provider::Claude,
+            &BTreeMap::new(),
+        ).unwrap();
+        assert_eq!(claude["CLAUDE_CODE_MAX_SUBAGENTS_PER_SESSION"], "12");
+        assert!(!claude.contains_key("OPENAI_API_KEY"));
+        assert!(!claude.contains_key("PI_CACHE_RETENTION"));
+        assert!(preserved_native_environment(source, Provider::Claude, &BTreeMap::new()).is_err());
+        assert!(preserved_native_environment(source, Provider::Codex, &BTreeMap::new()).is_err());
+        assert!(
+            preserved_native_environment(
+                b"OMP_APPROVAL_MODE=auto\0",
+                Provider::Omp,
+                &BTreeMap::new()
+            )
+            .is_err()
+        );
+        let explicit = BTreeMap::from([("OMP_APPROVAL_MODE".into(), "auto".into())]);
+        let omp =
+            preserved_native_environment(b"OMP_APPROVAL_MODE=auto\0", Provider::Omp, &explicit)
+                .unwrap();
+        assert_eq!(omp["OMP_APPROVAL_MODE"], "auto");
     }
 
     #[cfg(feature = "host")]
@@ -1282,6 +1634,17 @@ mod tests {
             .unwrap();
         assert!(recipe_from_hint(&fresh).is_none());
         assert_eq!(observed_launch_from_hint(&fresh).unwrap().program, "omp");
+        assert_eq!(
+            runtime_identity(&root, &recipe, 0),
+            Some(SessionIdentity::Fresh(session.clone()))
+        );
+        // A deleted established session must not be replaced with an empty chat.
+        fs::write(&marker, format!("/tmp\n{}\n", session.display())).unwrap();
+        assert_eq!(
+            runtime_identity(&root, &recipe, 0),
+            Some(SessionIdentity::Ambiguous)
+        );
+        fs::write(&marker, format!("/tmp\n{}\nfresh\n", session.display())).unwrap();
         fs::create_dir_all(session.parent().unwrap()).unwrap();
         fs::write(&session, "").unwrap();
         let empty = inspect_process(proc_root, 100, 100, &recipe, &mut 64)

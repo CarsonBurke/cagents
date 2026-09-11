@@ -15,7 +15,7 @@ pub const APPLICATION_ID: &str = "io.github.cagents.ceditor";
 #[command(
     version,
     about,
-    after_help = "Open existing files or folders. With no paths, browse the current directory.\nCtrl+O opens a file; Ctrl+Shift+O opens a folder; Ctrl+S saves; Ctrl+W closes a tab.\nSettings and language-server configuration are independent of cagents."
+    after_help = "Open existing files or folders. With no paths, restore saved tabs or browse the current directory.\nCtrl+O opens a file; Ctrl+Shift+O opens a folder; Ctrl+S saves; Ctrl+W closes a tab.\nSettings and language-server configuration are independent of cagents."
 )]
 struct Arguments {
     /// Existing files or directories to open, each in its own tab
@@ -46,13 +46,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .unwrap_or_else(|_| "ceditor=info,cagents=warn,warn".into()),
         )
         .init();
-    let paths = if arguments.paths.is_empty() {
-        vec![std::env::current_dir()?]
-    } else {
-        arguments.paths
-    };
     let flags = app::Flags {
-        paths,
+        paths: arguments.paths,
         settings_path,
     };
     type Shell = Cosmic<app::Editor>;

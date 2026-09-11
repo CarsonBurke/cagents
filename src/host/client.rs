@@ -457,6 +457,7 @@ fn process_request(
         ClientRequest::PrepareUpgrade { .. }
             | ClientRequest::Shutdown
             | ClientRequest::ShutdownV1 { .. }
+            | ClientRequest::ChatReturnTerminal { .. }
     );
     let _exclusive = exclusive.then(|| gate.write().unwrap_or_else(|p| p.into_inner()));
     let _shared = (!exclusive).then(|| gate.read().unwrap_or_else(|p| p.into_inner()));
@@ -493,6 +494,7 @@ fn process_request(
         | ClientRequest::ChatAcknowledge { .. }
         | ClientRequest::ChatRead { .. }
         | ClientRequest::ChatClose { .. }
+        | ClientRequest::ChatReturnTerminal { .. }
         | ClientRequest::ChatList) => Ok((
             super::chat::process(host, client_id, request)?,
             Vec::new(),
@@ -1067,6 +1069,7 @@ mod tests {
                     subscribers: BTreeMap::from([(1, false)]),
                     observations: BTreeMap::new(),
                     completion_observed: false,
+                    terminal_handoff: None,
                 },
             );
             state.shutdown_preflight(Instant::now()).unwrap().capability

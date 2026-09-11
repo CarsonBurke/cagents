@@ -112,7 +112,9 @@ fn wait_for_title(events: &EventReceiver<TerminalEvent>, expected: &str) {
             Ok(TerminalEvent::Error { operation, message }) => {
                 panic!("terminal error during {operation}: {message}")
             }
-            Ok(TerminalEvent::Exited { exit_code, signal }) => panic!(
+            Ok(TerminalEvent::Exited {
+                exit_code, signal, ..
+            }) => panic!(
                 "terminal exited before title {expected:?}: code={exit_code}, signal={signal:?}"
             ),
             Err(error) => panic!("failed waiting for title {expected:?}: {error}"),

@@ -2692,6 +2692,7 @@ mod tests {
         let exited = TerminalEvent::Exited {
             exit_code: 1,
             signal: None,
+            intentional: false,
         };
         let error = TerminalEvent::Error {
             operation: "read hosted terminal",

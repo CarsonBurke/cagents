@@ -35,6 +35,7 @@ pub enum WorkspaceViewportEvent {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GlobalShortcut {
     NewTerminal,
+    NewThread,
     CloseFocusedCard,
     FocusProjectSearch,
     FocusAdjacent(FocusDirection),
@@ -52,6 +53,11 @@ pub const GLOBAL_SHORTCUT_DESCRIPTORS: &[ShortcutDescriptor] = &[
     ShortcutDescriptor {
         action: GlobalShortcut::NewTerminal,
         label: "New terminal",
+        repeatable: false,
+    },
+    ShortcutDescriptor {
+        action: GlobalShortcut::NewThread,
+        label: "New thread",
         repeatable: false,
     },
     ShortcutDescriptor {
@@ -88,10 +94,11 @@ pub fn shortcut_descriptor(action: GlobalShortcut) -> &'static ShortcutDescripto
         .expect("every dispatched global shortcut has a descriptor")
 }
 
-/// Every configured chord; pane-width cycling may be explicitly unbound.
+/// Every configured chord; newer actions may be explicitly unbound.
 pub fn shortcut_keys(action: GlobalShortcut, shortcuts: &KeyboardShortcuts) -> &[String] {
     match action {
         GlobalShortcut::NewTerminal => &shortcuts.new_terminal,
+        GlobalShortcut::NewThread => &shortcuts.new_thread,
         GlobalShortcut::CloseFocusedCard => &shortcuts.close_focused_column,
         GlobalShortcut::FocusProjectSearch => &shortcuts.search_projects,
         GlobalShortcut::FocusAdjacent(FocusDirection::Left) => &shortcuts.previous_column,
@@ -1663,6 +1670,31 @@ mod tests {
                 &shortcuts,
             ),
             Some(GlobalShortcut::NewTerminal)
+        );
+        assert_eq!(
+            global_shortcut(
+                &key_press(
+                    "T",
+                    Code::KeyT,
+                    keyboard::Modifiers::CTRL | keyboard::Modifiers::SHIFT,
+                    false,
+                ),
+                &shortcuts,
+            ),
+            Some(GlobalShortcut::NewThread)
+        );
+        assert_eq!(
+            global_shortcut(
+                &key_press(
+                    "T",
+                    Code::KeyT,
+                    keyboard::Modifiers::CTRL | keyboard::Modifiers::SHIFT,
+                    true,
+                ),
+                &shortcuts,
+            ),
+            None,
+            "holding the thread shortcut must not create multiple conversations"
         );
         assert_eq!(
             global_shortcut(

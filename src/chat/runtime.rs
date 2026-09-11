@@ -57,10 +57,11 @@ struct Inner {
     worker: Mutex<Option<JoinHandle<()>>>,
     store: Arc<Mutex<Store>>,
     notify: Arc<dyn Fn(Update) + Send + Sync>,
+    execution_environment: crate::terminal_ipc::ChatExecutionEnvironment,
 }
 impl Handle {
     pub(crate) fn start(
-        spec: ProcessSpec,
+        mut spec: ProcessSpec,
         adapter: Box<dyn Adapter>,
         initial: Step,
         store: Store,
@@ -117,6 +118,9 @@ impl Handle {
             worker: Mutex::new(None),
             store: store.clone(),
             notify: notify.clone(),
+            execution_environment: crate::terminal_ipc::ChatExecutionEnvironment(std::mem::take(
+                &mut spec.environment,
+            )),
         });
         let worker = thread::Builder::new()
             .name("cagents-chat".into())
@@ -279,6 +283,15 @@ impl Handle {
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .clone()
+    }
+    pub(crate) fn execution_environment(&self) -> crate::terminal_ipc::ChatExecutionEnvironment {
+        self.0.execution_environment.clone()
+    }
+    pub(crate) fn execution_environment_matches(
+        &self,
+        environment: &BTreeMap<String, String>,
+    ) -> bool {
+        &self.0.execution_environment.0 == environment
     }
     pub fn is_completed(&self) -> bool {
         self.0.completed.load(Ordering::Acquire)

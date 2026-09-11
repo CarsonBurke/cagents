@@ -117,6 +117,7 @@ impl DeliveryQueue {
                         | crate::terminal_ipc::ServerResponse::ChatSnapshot { .. }
                         | crate::terminal_ipc::ServerResponse::ChatListed { .. }
                         | crate::terminal_ipc::ServerResponse::ChatClosed { .. }
+                        | crate::terminal_ipc::ServerResponse::ChatTerminal { .. }
                 }
             )
         };

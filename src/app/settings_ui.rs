@@ -277,6 +277,17 @@ fn settings_category_controls<'a>(
                         })
                         .into(),
                 ),
+                setting_field(
+                    "Line wrapping",
+                    "Wrap long lines to the editor width instead of scrolling horizontally.",
+                    widget::toggler(draft.editor_wrap_lines)
+                        .label("Wrap long lines".to_owned())
+                        .on_toggle(|enabled| Message::SettingsChanged {
+                            field: SettingsField::EditorWrapLines,
+                            value: enabled.to_string(),
+                        })
+                        .into(),
+                ),
             ],
         )],
         SettingsCategory::Appearance => vec![
@@ -498,6 +509,13 @@ fn settings_category_controls<'a>(
                     progress,
                 ),
                 setting_input(
+                    "New thread",
+                    "Creates an independent native conversation in the project's main worktree. Leave blank to unbind.",
+                    &draft.keyboard_shortcuts.new_thread,
+                    SettingsField::ShortcutNewThread,
+                    progress,
+                ),
+                setting_input(
                     "Close focused column",
                     "Closes the active workspace column.",
                     &draft.keyboard_shortcuts.close_focused_column,
@@ -625,6 +643,9 @@ pub(super) fn settings_dialog<'a>(
             .padding([3.0 * design::GRID_UNIT, 2.0 * design::GRID_UNIT])
             .width(Length::Fill),
         )
+        .direction(cosmic::iced::widget::scrollable::Direction::Vertical(
+            crate::design::scrollbar(),
+        ))
         .class(cosmic::style::iced::Scrollable::Minimal)
         .width(Length::Fixed(42.0 * design::GRID_UNIT))
         .height(Length::Fill)
@@ -641,6 +662,9 @@ pub(super) fn settings_dialog<'a>(
         .padding([4.0 * design::GRID_UNIT, gutter])
         .width(Length::Fill),
     )
+    .direction(cosmic::iced::widget::scrollable::Direction::Vertical(
+        crate::design::scrollbar(),
+    ))
     .class(cosmic::style::iced::Scrollable::Minimal)
     .width(Length::Fill)
     .height(Length::Fill)

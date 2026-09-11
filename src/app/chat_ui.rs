@@ -64,7 +64,7 @@ pub enum Action {
     Choice(Target, String, String, String),
     Answer(Target, String, String),
     Slash(Target, String),
-    HandoffFinished(Target, Result<(), String>),
+    HandoffFinished(Target, Result<TerminalSession, String>),
     CloseFinished(Target, Result<(), String>),
     UrlFinished(Result<(), String>),
 }
@@ -467,6 +467,97 @@ fn return_terminal(session: &chat::Session) -> Result<TerminalSession, String> {
 }
 
 impl Cagents {
+    pub(super) fn new_native_chat(&mut self) -> Task<Message> {
+        if self.project_ui.deleting() {
+            return Task::none();
+        }
+        let Some(working_directory) = self.terminal_directory() else {
+            return cosmic::task::message(Message::OpenRepository);
+        };
+        let provider = Provider::Omp;
+        let mut recipe = LaunchRecipe {
+            program: provider.executable().into(),
+            arguments: Vec::new(),
+            working_directory: working_directory.clone(),
+            environment: crate::model::agent_recovery::fresh_native_environment(provider, true),
+        };
+        let Some(root) = provider.session_root(&recipe) else {
+            self.status = Some(TransientNotice::error(
+                "Cannot locate the configured OMP account for a new native chat.",
+            ));
+            return Task::none();
+        };
+        // An explicit session directory bypasses OMP's auto-resume setting.
+        // Never let a new tab select an established conversation implicitly.
+        recipe.arguments.extend([
+            "--session-dir".into(),
+            root.join("sessions")
+                .join("native")
+                .to_string_lossy()
+                .into_owned(),
+        ]);
+        let session = chat::Session {
+            id: TerminalId::new(),
+            launch: chat::Launch {
+                provider,
+                recipe,
+                session_id: None,
+            },
+            proof: None,
+            terminal: None,
+        };
+        let card_id = CardId::new();
+        let card = CardState {
+            id: card_id,
+            generation: self.durable.generation,
+            title: "Native chat".into(),
+            width_fraction: self.settings.default_column_fraction,
+            existence: Existence::Open,
+            exposure: Exposure::Visible,
+            residency: Residency::Hydrating { epoch: 1 },
+            kind: CardKind::Chat(session.clone()),
+        };
+        let scope = if self.active_workspace.as_deref() != Some(working_directory.as_path()) {
+            self.select_worktree(working_directory, false)
+        } else {
+            Task::none()
+        };
+        let (index, durable_index) = self.terminal_insertion_indices();
+        let durable = Arc::make_mut(&mut self.durable);
+        durable.focused = Some(card_id);
+        durable.cards.insert(durable_index, card.clone());
+        self.register_thread_card(card_id);
+        let update = self
+            .workspace
+            .add_card(
+                WorkspaceCard::new(
+                    card_id,
+                    card.title,
+                    CardWidth::Fraction(card.width_fraction),
+                )
+                .expect("new chat card is valid"),
+                index,
+                true,
+            )
+            .unwrap_or_else(|error| {
+                self.status = Some(TransientNotice::error(error.to_string()));
+                ViewportUpdate::unchanged()
+            });
+        self.cards.insert(card_id, CardRuntime::Loading);
+        self.lifecycle.register(
+            card_id,
+            Exposure::Visible,
+            Residency::Hydrating { epoch: 1 },
+            Instant::now(),
+        );
+        self.persist();
+        Task::batch([
+            scope,
+            self.start_chat(card_id, session, true, None, false),
+            self.apply_viewport(update, true, false),
+        ])
+    }
+
     pub(super) fn chat_subscription(&self) -> Subscription<Message> {
         Subscription::run_with(Source(self.chat_ui.receiver.clone()), stream)
             .map(|(target, wake)| Message::ChatUi(Action::Wake(target, wake)))
@@ -820,9 +911,9 @@ impl Cagents {
                         self.chat_ui.handoffs.insert(target);
                         return cosmic::task::future(async move {
                             let result = if detach {
-                                Ok(())
+                                Ok(terminal)
                             } else {
-                                tokio::task::spawn_blocking(move || handle.close())
+                                tokio::task::spawn_blocking(move || handle.return_terminal())
                                     .await
                                     .map_err(|error| error.to_string())
                                     .and_then(|result| result)
@@ -865,6 +956,7 @@ impl Cagents {
                     Ok(handle) => {
                         let mut session = handle.session();
                         session.proof = handle.proof();
+                        let title = handle.snapshot().title.clone();
                         let activity = Activity {
                             provider: session.launch.provider,
                             state: handle.take_activity(),
@@ -895,6 +987,11 @@ impl Cagents {
                             session = runtime.session.clone();
                         }
                         self.commit_chat_session(target.card, session);
+                        if let Some(title) = title
+                            && self.apply_reported_title(target.card, title)
+                        {
+                            self.persist();
+                        }
                         self.observe_agent_activity_for_card(target.card, Some(activity));
                         return iced::widget::operation::focus(card_control_id(
                             target.card,
@@ -907,6 +1004,12 @@ impl Cagents {
                             runtime.error = Some(error);
                             runtime.disconnected = true;
                             self.observe_agent_activity_for_card(target.card, None);
+                        } else if matches!(
+                            self.card_state(target.card).map(|state| &state.kind),
+                            Some(CardKind::Chat(_))
+                        ) {
+                            self.fail_runtime(target.card, error.clone());
+                            self.status = Some(TransientNotice::error(error));
                         } else {
                             // Failed recognition/attachment must never replace or
                             // tear down the user's still-running terminal.
@@ -935,8 +1038,14 @@ impl Cagents {
                             state: runtime.handle.take_activity(),
                         };
                         let session = runtime.session.clone();
+                        let title = runtime.handle.snapshot().title.clone();
                         self.observe_agent_activity_for_card(target.card, Some(activity));
                         self.commit_chat_session(target.card, session);
+                        if let Some(title) = title
+                            && self.apply_reported_title(target.card, title)
+                        {
+                            self.persist();
+                        }
                         return Task::none();
                     }
                     Wake::Observed => {
@@ -1346,10 +1455,13 @@ impl Cagents {
                 if !self.chat_ui.handoffs.remove(&target) {
                     return Task::none();
                 }
-                if let Err(error) = result {
-                    self.status = Some(TransientNotice::error(error));
-                    return Task::none();
-                }
+                let terminal = match result {
+                    Ok(terminal) => terminal,
+                    Err(error) => {
+                        self.status = Some(TransientNotice::error(error));
+                        return Task::none();
+                    }
+                };
                 let Some(runtime) = self.chat_runtime_mut(target) else {
                     return Task::none();
                 };
@@ -1359,17 +1471,12 @@ impl Cagents {
                 }
                 runtime.session.launch.session_id = runtime.handle.snapshot().session_id.clone();
                 let session = runtime.session.clone();
-                let terminal = return_terminal(&session);
                 self.commit_chat_session(target.card, session);
-                let terminal = match terminal {
-                    Ok(terminal) => terminal,
-                    Err(error) => {
-                        self.status = Some(TransientNotice::error(error));
-                        return Task::none();
-                    }
-                };
+                // Enqueue the returned live proof checkpoint. The host retains
+                // the transition receipt independently of this UI attachment.
+                let task = self.finish_chat_terminal_handoff(target.card, terminal);
                 self.chat_forget(target.card);
-                return self.finish_chat_terminal_handoff(target.card, terminal);
+                return task;
             }
             Action::CloseFinished(target, result) => {
                 if self.chat_runtime_mut(target).is_none() {

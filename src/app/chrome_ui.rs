@@ -1,6 +1,46 @@
 use super::*;
 use crate::interaction::tooltip;
 
+#[derive(Debug, Default)]
+pub(super) struct State {
+    popup: Option<Popup>,
+    focus_index: usize,
+}
+
+impl State {
+    pub(super) fn is_open(&self) -> bool {
+        self.popup.is_some()
+    }
+
+    pub(super) fn close(&mut self) {
+        self.popup = None;
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Popup {
+    NewTab,
+    Notices,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(super) enum NewTab {
+    NativeChat,
+    Omp,
+    Claude,
+    Codex,
+    Browser,
+}
+
+#[derive(Debug, Clone)]
+pub(super) enum Action {
+    ToggleNewTab,
+    ToggleNotices,
+    Close,
+    DismissNotice,
+    Launch(NewTab),
+}
+
 fn browser_icon() -> widget::icon::Handle {
     static ICON: LazyLock<widget::icon::Handle> = LazyLock::new(|| {
         widget::icon::from_svg_bytes(&br#"<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24"><g fill="none" stroke="black" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><ellipse cx="12" cy="12" rx="4" ry="9"/><path d="M3 12h18M5 6.5h14M5 17.5h14"/></g></svg>"#[..]).symbolic(true)
@@ -20,8 +60,9 @@ fn column_title_style() -> cosmic::theme::Button {
     fn appearance(focused: bool, theme: &cosmic::Theme) -> widget::button::Style {
         widget::button::Style {
             border_radius: theme.cosmic().corner_radii.radius_s.into(),
-            border_width: if focused { design::BORDER_WIDTH } else { 0.0 },
-            border_color: theme.current_container().component.on_disabled.into(),
+            background: focused
+                .then(|| iced::Background::Color(theme.current_container().component.hover.into())),
+            border_width: 0.0,
             ..widget::button::Style::new()
         }
     }
@@ -55,6 +96,278 @@ fn command<'a>(
 }
 
 impl Cagents {
+    /// Keep Tab traversal and global shortcuts inside the open popup.
+    pub(super) fn chrome_key_event(&mut self, event: &keyboard::Event) -> Option<Task<Message>> {
+        let popup = self.chrome_ui.popup?;
+        if self.modal_is_open() {
+            self.chrome_ui.close();
+            return None;
+        }
+        if is_escape_press(event) {
+            return Some(self.update_chrome(Action::Close));
+        }
+        if let Some(backwards) = is_tab_press(event) {
+            let ids = match popup {
+                Popup::NewTab => [
+                    Some("chrome.new-tab.native"),
+                    Some("chrome.new-tab.omp"),
+                    Some("chrome.new-tab.claude"),
+                    Some("chrome.new-tab.codex"),
+                    Some("chrome.new-tab.browser"),
+                ],
+                Popup::Notices => {
+                    let action =
+                        self.save_health
+                            .as_ref()
+                            .and_then(|health| match &health.health {
+                                SessionSaveHealth::RetryExhausted { .. }
+                                    if !health.retry_requested =>
+                                {
+                                    Some("session-save.retry")
+                                }
+                                SessionSaveHealth::Recovered { .. } => {
+                                    Some("session-save.acknowledge-recovery")
+                                }
+                                _ => None,
+                            });
+                    [
+                        Some("chrome.notices.close"),
+                        self.status.as_ref().map(|_| "chrome.notices.dismiss"),
+                        action,
+                        None,
+                        None,
+                    ]
+                }
+            };
+            let count = ids.iter().flatten().count();
+            self.chrome_ui.focus_index = if backwards {
+                (self.chrome_ui.focus_index + count - 1) % count
+            } else {
+                (self.chrome_ui.focus_index + 1) % count
+            };
+            return Some(
+                iced::widget::operation::focus(widget::Id::new(
+                    ids.into_iter()
+                        .flatten()
+                        .nth(self.chrome_ui.focus_index)
+                        .unwrap(),
+                ))
+                .map(cosmic::Action::App),
+            );
+        }
+        Some(Task::none())
+    }
+
+    pub(super) fn update_chrome(&mut self, action: Action) -> Task<Message> {
+        if self.modal_is_open() && !matches!(action, Action::Close) {
+            return Task::none();
+        }
+        match action {
+            Action::ToggleNewTab | Action::ToggleNotices => {
+                let popup = if matches!(action, Action::ToggleNewTab) {
+                    Popup::NewTab
+                } else {
+                    Popup::Notices
+                };
+                if self.chrome_ui.popup == Some(popup) {
+                    return self.update_chrome(Action::Close);
+                }
+                self.chrome_ui.popup = Some(popup);
+                self.chrome_ui.focus_index = 0;
+                iced::widget::operation::focus(widget::Id::new(match popup {
+                    Popup::NewTab => "chrome.new-tab.native",
+                    Popup::Notices => "chrome.notices.close",
+                }))
+                .map(cosmic::Action::App)
+            }
+            Action::Close => {
+                let popup = self.chrome_ui.popup.take();
+                popup.map_or_else(Task::none, |popup| {
+                    iced::widget::operation::focus(widget::Id::new(match popup {
+                        Popup::NewTab => TOOLBAR_FOCUS_ID,
+                        Popup::Notices => "chrome.notices",
+                    }))
+                    .map(cosmic::Action::App)
+                })
+            }
+            Action::DismissNotice => {
+                self.status = None;
+                if self.has_chrome_notices() {
+                    Task::none()
+                } else {
+                    self.chrome_ui.close();
+                    iced::widget::operation::focus(context_inspector_toggle_id())
+                        .map(cosmic::Action::App)
+                }
+            }
+            Action::Launch(kind) => {
+                self.chrome_ui.close();
+                match kind {
+                    NewTab::NativeChat => self.new_native_chat(),
+                    NewTab::Browser => cosmic::task::message(Message::NewBrowser),
+                    NewTab::Omp | NewTab::Claude | NewTab::Codex => {
+                        self.show_workspace_for_action();
+                        let Some(working_directory) = self.terminal_directory() else {
+                            return cosmic::task::message(Message::OpenRepository);
+                        };
+                        self.add_terminal_recipe(LaunchRecipe {
+                            program: match kind {
+                                NewTab::Omp => "omp",
+                                NewTab::Claude => "claude",
+                                NewTab::Codex => "codex",
+                                _ => unreachable!(),
+                            }
+                            .to_owned(),
+                            arguments: Vec::new(),
+                            working_directory,
+                            environment: BTreeMap::new(),
+                        })
+                    }
+                }
+            }
+        }
+    }
+
+    fn new_tab_control(&self) -> Element<'_, Message> {
+        let enabled = !self.modal_is_open() && !self.context_inspector_is_overlay();
+        let control = command(
+            widget::icon::from_name("list-add-symbolic"),
+            "New tab",
+            widget::Id::new(TOOLBAR_FOCUS_ID),
+            enabled.then_some(Message::ChromeUi(Action::ToggleNewTab)),
+        );
+        let mut popup = widget::popover(control)
+            .position(widget::popover::Position::Bottom)
+            .on_close(Message::ChromeUi(Action::Close));
+        if self.chrome_ui.popup == Some(Popup::NewTab) && !self.modal_is_open() {
+            let choices = [
+                ("Native chat", NewTab::NativeChat, "chrome.new-tab.native"),
+                ("OMP", NewTab::Omp, "chrome.new-tab.omp"),
+                ("Claude", NewTab::Claude, "chrome.new-tab.claude"),
+                ("Codex", NewTab::Codex, "chrome.new-tab.codex"),
+                ("Browser", NewTab::Browser, "chrome.new-tab.browser"),
+            ];
+            let items = choices.into_iter().map(|(label, kind, id)| {
+                widget::button::text(label)
+                    .id(widget::Id::new(id))
+                    .name(format!("New {label} tab"))
+                    .width(Length::Fill)
+                    .on_press(Message::ChromeUi(Action::Launch(kind)))
+                    .into()
+            });
+            popup = popup.popup(
+                widget::container(widget::column::with_children(items).spacing(2))
+                    .padding(8)
+                    .width(200)
+                    .class(cosmic::theme::Container::Primary),
+            );
+        }
+        popup.into()
+    }
+
+    fn has_chrome_notices(&self) -> bool {
+        self.status.is_some()
+            || self
+                .save_health
+                .as_ref()
+                .is_some_and(SaveHealthState::is_visible)
+    }
+
+    fn notice_control(&self) -> Option<Element<'_, Message>> {
+        if !self.has_chrome_notices() {
+            return None;
+        }
+        let error = self
+            .status
+            .as_ref()
+            .is_some_and(|notice| notice.severity == NoticeSeverity::Error)
+            || self.save_health.as_ref().is_some_and(|health| {
+                matches!(
+                    health.health,
+                    SessionSaveHealth::RetryExhausted { .. } | SessionSaveHealth::WriterUnavailable
+                )
+            });
+        let control = crate::ui_controls::icon_control(
+            crate::ui_controls::symbolic_icon(if error {
+                "dialog-error-symbolic"
+            } else {
+                "dialog-warning-symbolic"
+            }),
+            if error {
+                "Application errors"
+            } else {
+                "Application notices"
+            },
+            self.chrome_ui.popup == Some(Popup::Notices),
+            !self.modal_is_open(),
+            (!self.modal_is_open()).then_some(Message::ChromeUi(Action::ToggleNotices)),
+        )
+        .id(widget::Id::new("chrome.notices"))
+        .icon_color(if error {
+            cosmic::theme::active().cosmic().destructive.base.into()
+        } else {
+            cosmic::theme::active().cosmic().warning.base.into()
+        });
+        let mut popup = widget::popover(control)
+            .position(widget::popover::Position::Bottom)
+            .on_close(Message::ChromeUi(Action::Close));
+        if self.chrome_ui.popup == Some(Popup::Notices) && !self.modal_is_open() {
+            let mut notices = Vec::with_capacity(2);
+            if let Some(notice) = &self.status {
+                notices.push(
+                    widget::column::with_children(vec![
+                        widget::text::body(&notice.message)
+                            .wrapping(iced::widget::text::Wrapping::WordOrGlyph)
+                            .width(Length::Fill)
+                            .into(),
+                        widget::button::text("Dismiss notice")
+                            .id(widget::Id::new("chrome.notices.dismiss"))
+                            .name("Dismiss application notice")
+                            .on_press(Message::ChromeUi(Action::DismissNotice))
+                            .into(),
+                    ])
+                    .spacing(8)
+                    .into(),
+                );
+            }
+            if let Some(health) = self.save_health.as_ref().and_then(save_health_view) {
+                notices.push(health);
+            }
+            let heading = widget::row::with_children(vec![
+                design::heading("Application notices")
+                    .width(Length::Fill)
+                    .into(),
+                command(
+                    widget::icon::from_name("window-close-symbolic"),
+                    "Close application notices",
+                    widget::Id::new("chrome.notices.close"),
+                    Some(Message::ChromeUi(Action::Close)),
+                ),
+            ])
+            .align_y(Alignment::Center)
+            .spacing(8);
+            popup = popup.popup(
+                widget::container(
+                    widget::column::with_children(vec![
+                        heading.into(),
+                        widget::scrollable(widget::column::with_children(notices).spacing(12))
+                            .direction(iced::widget::scrollable::Direction::Vertical(
+                                design::scrollbar(),
+                            ))
+                            .height(Length::Shrink)
+                            .into(),
+                    ])
+                    .spacing(8),
+                )
+                .padding(12)
+                .width(420)
+                .max_height(420)
+                .class(cosmic::theme::Container::Primary),
+            );
+        }
+        Some(popup.into())
+    }
+
     fn native_header<'a>(
         &'a self,
         start: Element<'a, Message>,
@@ -140,7 +453,12 @@ impl Cagents {
         } else {
             0.0
         };
-        let width = navigator + 3.0 * design::PRIMARY_CONTROL_SIZE + controls + update + 32.0;
+        let notice = if !self.context_inspector_open && self.has_chrome_notices() {
+            design::PRIMARY_CONTROL_SIZE + 2.0
+        } else {
+            0.0
+        };
+        let width = navigator + controls + update + notice + 16.0;
         if self.workspace.viewport_width() > 0.0 {
             width.min(self.workspace.viewport_width())
         } else {
@@ -150,7 +468,9 @@ impl Cagents {
 
     fn tab_strip_geometry(&self) -> (f32, f32) {
         let available = (self.workspace.viewport_width() - self.workspace_header_width()).max(0.0);
-        let width = (available / self.workspace.cards().len().max(1) as f32).clamp(96.0, 200.0);
+        let width = ((available - design::PRIMARY_CONTROL_SIZE - 2.0).max(0.0)
+            / self.workspace.cards().len().max(1) as f32)
+            .clamp(96.0, 200.0);
         (available, width)
     }
 
@@ -181,6 +501,7 @@ impl Cagents {
                 .order()
                 .map(|id| self.column_header(id, self.workspace.focused() == Some(id), tab_width)),
         )
+        .push(self.new_tab_control())
         .spacing(2)
         .height(design::PRIMARY_CONTROL_SIZE);
         let tabs = widget::scrollable::horizontal(tabs)
@@ -191,7 +512,7 @@ impl Cagents {
             .width(Length::Fill)
             .height(design::PRIMARY_CONTROL_SIZE);
         let actions = widget::row::with_children(self.workflow_header())
-            .spacing(4)
+            .spacing(2)
             .align_y(Alignment::Center);
         let header = self.native_header(
             tabs.into(),
@@ -244,30 +565,13 @@ impl Cagents {
                 )),
             ));
         }
-        let new_terminal_label = workspace_widget::shortcut_tooltip(
-            workspace_widget::GlobalShortcut::NewTerminal,
-            &self.settings.keyboard_shortcuts,
-        );
-        actions.push(command(
-            widget::icon::from_name("utilities-terminal-symbolic"),
-            new_terminal_label,
-            widget::Id::new(TOOLBAR_FOCUS_ID),
-            Some(Message::NewTerminal),
-        ));
-        actions.push(command(
-            browser_icon(),
-            "New browser",
-            widget::Id::new("command.new-browser"),
-            Some(Message::NewBrowser),
-        ));
-        actions.push(command(
-            widget::icon::from_name("window-new-symbolic"),
-            "New window",
-            widget::Id::new("command.new-window"),
-            (!self.modal_is_open()).then_some(Message::NewWindow),
-        ));
         if let Some(update) = self.update_control() {
             actions.push(update);
+        }
+        if !self.context_inspector_open
+            && let Some(notice) = self.notice_control()
+        {
+            actions.push(notice);
         }
         if !self.context_inspector_open {
             actions.push(self.sidebar_toggle());
@@ -287,7 +591,25 @@ impl Cagents {
         let caption = card.map(|card| card_kind_caption(&card.kind));
         let icon: Element<'_, Message> = match card.map(|card| &card.kind) {
             Some(CardKind::Browser(_)) => browser_icon().icon().size(16).into(),
-            Some(CardKind::Chat(_)) => chat_icon().icon().size(16).into(),
+            Some(CardKind::Repository(_)) => {
+                crate::ui_controls::ceditor_icon().icon().size(16).into()
+            }
+            Some(CardKind::Chat(session)) => {
+                crate::ui_controls::provider_icon(session.launch.provider)
+                    .icon()
+                    .size(16)
+                    .into()
+            }
+            Some(CardKind::Terminal(session)) => self
+                .sidebar_state
+                .card_activity(id)
+                .map(|activity| activity.provider)
+                .or_else(|| crate::agent::Provider::recognize_launch(&session.launch))
+                .map(crate::ui_controls::provider_icon)
+                .unwrap_or_else(|| crate::ui_controls::symbolic_icon(labels.icon))
+                .icon()
+                .size(16)
+                .into(),
             _ => crate::ui_controls::symbolic_icon(labels.icon)
                 .icon()
                 .size(16)
@@ -448,16 +770,54 @@ impl Cagents {
                 ContextTab::PullRequest => "pull-request-symbolic",
                 ContextTab::Details => "dialog-information-symbolic",
             };
-            crate::ui_controls::icon_control(
-                crate::ui_controls::symbolic_icon(icon),
+            let visual = (tab == ContextTab::PullRequest)
+                .then(|| {
+                    let key = self.sidebar_state.active_worktree()?;
+                    let project = self
+                        .sidebar_model
+                        .projects
+                        .iter()
+                        .find(|project| project.id == key.project_id)?;
+                    let worktree = project
+                        .worktrees
+                        .iter()
+                        .find(|worktree| worktree.path == key.canonical_path)?;
+                    let branch = worktree.branch.as_deref()?;
+                    project
+                        .pull_requests
+                        .iter()
+                        .find(|pr| pr.head_ref == branch)
+                        .map(sidebar::pull_request_visual)
+                })
+                .flatten();
+            let control = crate::ui_controls::icon_control(
+                visual.as_ref().map_or_else(
+                    || crate::ui_controls::symbolic_icon(icon),
+                    |(icon, _)| icon.clone(),
+                ),
                 format!("{} panel tab", tab.label()),
                 selected,
                 enabled,
                 enabled.then_some(Message::SelectContextTab(tab)),
-            )
-            .into()
+            );
+            let changes = tab == ContextTab::Changes
+                && self
+                    .sidebar_model
+                    .source_control
+                    .as_ref()
+                    .is_some_and(|source| {
+                        self.sidebar_state.active_worktree() == Some(&source.key)
+                            && source.has_changes()
+                    });
+            match visual {
+                Some((_, color)) => control.icon_color(color).into(),
+                None if changes => control
+                    .icon_color(cosmic::theme::active().cosmic().warning.base.into())
+                    .into(),
+                None => control.into(),
+            }
         }))
-        .spacing(4)
+        .spacing(2)
         .align_y(Alignment::Center);
         let mut end = self.sidebar_toggle();
         if self.context_inspector_is_overlay()
@@ -468,12 +828,13 @@ impl Cagents {
                 .align_y(Alignment::Center)
                 .into();
         }
-        let heading = self.native_header(
-            iced::widget::Space::new().width(Length::Fill).into(),
-            Some(end),
-            true,
-        );
-        let selectors = widget::container(tabs).padding([4, 8]).width(Length::Fill);
+        if let Some(notice) = self.notice_control() {
+            end = widget::row::with_children(vec![notice, end])
+                .spacing(2)
+                .align_y(Alignment::Center)
+                .into();
+        }
+        let heading = self.native_header(tabs.into(), Some(end), true);
         let body = match self.context_tab {
             ContextTab::Files => sidebar::file_panel(
                 &self.sidebar_model,
@@ -523,7 +884,6 @@ impl Cagents {
             widget::column::with_children(vec![
                 heading.into(),
                 widget::divider::horizontal::default().into(),
-                selectors.into(),
                 body,
             ])
             .spacing(0)

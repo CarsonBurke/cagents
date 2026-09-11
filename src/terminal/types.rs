@@ -27,6 +27,9 @@ pub struct TerminalConfig {
     pub command_capacity: usize,
     pub pty_capacity: usize,
     pub transcript_capacity: usize,
+    /// Exact native execution environment for a host-owned CLI replacement.
+    /// Never serialized with the terminal's durable launch recipe.
+    pub execution_environment: Option<super::ipc::ChatExecutionEnvironment>,
 }
 
 impl Default for TerminalConfig {
@@ -42,6 +45,7 @@ impl Default for TerminalConfig {
             command_capacity: DEFAULT_COMMAND_CAPACITY,
             pty_capacity: DEFAULT_PTY_CAPACITY,
             transcript_capacity: DEFAULT_TRANSCRIPT_CAPACITY,
+            execution_environment: None,
         }
     }
 }
@@ -59,6 +63,8 @@ pub enum TerminalEvent {
     Exited {
         exit_code: u32,
         signal: Option<String>,
+        /// The PTY owner successfully requested this root's observed SIGKILL.
+        intentional: bool,
     },
     Error {
         operation: &'static str,

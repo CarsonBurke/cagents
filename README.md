@@ -340,6 +340,12 @@ cagents ui
   project or disturbing existing sessions.
   **New terminal** (`Ctrl+T`) starts in that worktree and inserts immediately to
   the right of its focused column.
+  **New thread** (`Ctrl+Shift+T` or the project header's thread-plus button)
+  starts an independent native conversation in the project's main worktree.
+  Threads have their own sidebar rows and panes, separate from worktree panes;
+  select a thread again to return to the same conversation.
+  Editor tabs use the ceditor mark; recognized agent terminals and native chats
+  use their OMP, Claude, or Codex provider mark.
   Drag a project header to reorder projects; the order survives restarts.
   Project headers stay visible above their worktrees while scrolling. The
   primary worktree stays first; the sort control selects newest, oldest, or
@@ -355,17 +361,20 @@ cagents ui
   after one second. Change rows color their status/counts and replace them with
   action buttons on hover. Untracked text files show measured additions;
   binary, unsafe, oversized, or budget-limited files retain unknown counts.
+  The Changes tab highlights local or committed branch changes; committed files
+  appear below staged and unstaged files, compared against the known default
+  branch's merge base. Visible repository views refresh automatically while
+  the application is focused. File filters open from their search icons.
 - Switching worktrees remembers each strip's horizontal scroll position and
   focused column. Hidden terminal presentation is released while hosted PTYs
   keep running, and editor buffers remain intact. Scroll positions, worktree
   selection, and column focus survive restarts independently in each window,
   including when a shared browser column has focus. Application close
-  checks unsaved editors in every worktree, not only the visible one. Unowned
-  columns are grouped under **Other sessions** rather than appearing in every
-  worktree. Deleted worktrees disappear from the sidebar without transferring
-  their panes to a parent worktree.
-- Use **New window** in the application header or `cagents ui --new-window` for
-  another independently movable window. `cagents ui --window monitor-two`
+  checks unsaved editors in every worktree, not only the visible one.
+  Deleted worktrees disappear from the sidebar without transferring their
+  panes to a parent worktree.
+- Use `cagents ui --new-window` for another independently movable window.
+  `cagents ui --window monitor-two`
   opens or activates a named durable window; plain `cagents ui` activates the
   primary window. New windows copy the source workspace once, then save their
   own selection, pane widths, inspector, and scroll positions. Existing terminal
@@ -403,11 +412,17 @@ cagents ui
   errors, and durability warnings stop automatic saving and remain visible;
   autosave does not silently overwrite external changes. Disable **Save files
   automatically** in Settings for manual saving.
+  **Wrap long lines** is off by default. Editor and terminal text default to
+  13 logical pixels; saved terminal font preferences remain unchanged.
   Images open as previews. File/view/edit/diff controls occupy a separate
   toolbar above the content; unavailable save and comparison actions are
   disabled. Editable content has a line-number gutter and draggable scrollbar,
-  including for long wrapped lines. Comparisons load on demand and cancelled
-  jobs stop; subtle diff backgrounds preserve readable syntax contrast.
+  including for long wrapped lines. Working-tree diffs edit the real file buffer
+  with the same selection, IME, and safe-save behavior; removed content is
+  selectable read-only context. Staged and historical content remain read-only.
+  File/mode switches retain bounded, in-memory viewport coordinates without
+  retaining duplicate buffers or writing each scroll to disk. Comparisons load
+  on demand and cancelled jobs stop; subtle backgrounds preserve syntax contrast.
   File and diff views retain syntax highlighting, including CUDA sources.
   Contextual external-editor icons open the current project, worktree, or file
   without a separate application-picker dialog.
@@ -422,7 +437,9 @@ cagents ui
 
 `ceditor` is a separate native application in the same Cargo workspace. It
 shares the editor and repository UI without starting the cagents daemon,
-terminal host, or embedded browser. Its file-list mode persists independently.
+terminal host, or embedded browser. File-list mode and settings persist independently.
+Open tabs, order, and the active tab restore on launch; explicit paths are also
+opened, and a new session with no paths browses the current directory.
 
 ```sh
 scripts/run-ceditor-development /path/to/project
@@ -444,9 +461,11 @@ current document and error state unchanged.
 Supported OMP, Claude, and Codex terminal sessions offer **Switch to chat**.
 The switch uses an exact provider conversation identity, not terminal-text
 scraping, a most-recent-session lookup, or a fork. The switch opens the detected
-conversation directly when process-bound exact identity is available. Otherwise,
-OMP and Claude leave the terminal intact: resume the exact conversation in the
-provider CLI and retry. Fresh OMP sessions must first have a saved session file.
+conversation directly when process-bound exact identity is available. A confirmed
+fresh OMP source can switch before publishing a saved conversation: cagents
+waits for the replacement's resumable identity before stopping the source.
+Missing or ambiguous established identities leave the terminal intact; resume
+the exact conversation in the provider CLI and retry.
 For Codex's shared server, copy the full conversation UUID from the intended
 CLI's `/status`, preview its title and directory read-only, then explicitly
 confirm attachment. The source terminal remains running; cagents does not choose
@@ -455,6 +474,13 @@ Native handoff preserves the source process's explicit provider account,
 environment, and trust-store paths. If credentials or provider settings cannot
 be transferred safely, the switch refuses before stopping the live terminal;
 it never silently substitutes the daemon's account.
+The new-tab menu also starts a native conversation without a source terminal.
+GUI-only credentials and authenticated proxy configuration travel through an
+execution-only channel rather than the saved session descriptor.
+That context remains in daemon memory when returning to a terminal and switching
+back. A full daemon upgrade refuses before shutdown if its supported recovery
+path cannot reproduce the same execution environment; it does not serialize
+credentials into the upgrade checkpoint or silently choose another account.
 
 - **OMP and Claude:** switching performs a stop-and-resume handoff. Active work
   is interrupted, the CLI stops, and native chat resumes the same conversation.
@@ -682,7 +708,7 @@ hibernation_delay_ms = 30000
 focus_follows_mouse = true
 app_theme = "system"
 ui_scale = 1.0
-terminal_font_size = 14.0
+terminal_font_size = 13.0
 terminal_font_family = ""
 terminal_line_height = 1.286
 terminal_padding = 8.0
@@ -696,9 +722,11 @@ link_open_destination = "integrated_browser"
 link_open_gesture = "control_click"
 managed_worktree_directory = "worktrees/"
 editor_auto_save = true
+editor_wrap_lines = false
 
 [keyboard_shortcuts]
 new_terminal = ["Ctrl+T"]
+new_thread = ["Ctrl+Shift+T"]
 close_focused_column = ["Ctrl+W"]
 search_projects = ["Ctrl+F"]
 previous_column = ["Alt+Q", "Alt+Left"]
@@ -714,7 +742,7 @@ cycle_pane_width = ["Alt+R"]
 | `focus_follows_mouse` | boolean | `true` | activate the pane under the pointer without scrolling |
 | `app_theme` | string | `"system"` | `"system"`, `"dark"`, or `"light"` |
 | `ui_scale` | float | `1.0` | finite values from `0.8` through `1.5`, inclusive; multiplies display scaling |
-| `terminal_font_size` | float | `14.0` | finite values from `8.0` through `40.0`, inclusive |
+| `terminal_font_size` | float | `13.0` | finite values from `8.0` through `40.0`, inclusive |
 | `terminal_font_family` | string | `""` | empty for the system monospace font, or a non-whitespace family name up to 128 bytes. The family must be fixed-pitch; one whose glyph widths differ falls back to the system monospace font, because the grid is a single pitch |
 | `terminal_line_height` | float | `1.286` | finite values from `1.0` through `2.0`, inclusive; relative to font size |
 | `terminal_padding` | float | `8.0` | finite values from `0.0` through `24.0`, inclusive; logical pixels |
@@ -728,7 +756,8 @@ cycle_pane_width = ["Alt+R"]
 | `link_open_gesture` | string | `"control_click"` | `"control_click"` or `"control_shift_click"` |
 | `managed_worktree_directory` | string | `"worktrees/"` | nonempty path without control characters; absolute or relative to the repository root |
 | `editor_auto_save` | boolean | `true` | `true` or `false`; automatically save edited files after a pause, stopping on conflicts or save errors |
-| `keyboard_shortcuts.*` | array of strings | shown above | one or more chords, each containing Ctrl, Alt, or Super and one A-Z, 0-9, Left, or Right key; Shift is optional. Every chord in the table must be distinct, and a bound chord is reserved rather than forwarded to the process inside a card. Only `cycle_pane_width` may be empty to leave it unbound |
+| `editor_wrap_lines` | boolean | `false` | wrap long native-editor lines instead of keeping a horizontally navigable line |
+| `keyboard_shortcuts.*` | array of strings | shown above | one or more chords, each containing Ctrl, Alt, or Super and one A-Z, 0-9, Left, or Right key; Shift is optional. Every chord in the table must be distinct, and a bound chord is reserved rather than forwarded to the process inside a card. `cycle_pane_width` and `new_thread` may be empty to leave them unbound |
 
 Version 1 and 2 TOML files are upgraded while loading. Sidebar widths accepted
 by version 1 are clamped to the current visible range; other values are
@@ -736,6 +765,9 @@ preserved. Version 2 files receive the default inspector width.
 Older shortcut tables receive `cycle_pane_width = ["Alt+R"]` unless another
 action already owns Alt+R. In that case the existing binding is preserved and
 pane-width cycling remains unbound (`[]`) until you assign it a free chord.
+Likewise, older shortcut tables receive `new_thread = ["Ctrl+Shift+T"]`
+unless another action already owns that chord; then only new-thread creation
+remains unbound until configured.
 An explicitly configured conflicting binding is still rejected.
 
 Settings text fields save valid edits after a short pause; closing the dialog

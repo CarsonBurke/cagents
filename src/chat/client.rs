@@ -37,7 +37,14 @@ struct Wire {
     stream: UnixStream,
     codec: FrameCodec,
 }
-type Pending = Arc<Mutex<BTreeMap<u64, crossbeam_channel::Sender<Result<(), String>>>>>;
+type Pending = Arc<
+    Mutex<
+        BTreeMap<
+            u64,
+            crossbeam_channel::Sender<Result<Option<crate::model::TerminalSession>, String>>,
+        >,
+    >,
+>;
 struct Inner {
     id: TerminalId,
     session: Session,
@@ -304,10 +311,20 @@ impl ClientHandle {
                 token,
             }
         } else if spawn {
+            let execution_environment =
+                ipc::ChatExecutionEnvironment(if source.is_none() && session.terminal.is_none() {
+                    crate::model::agent_recovery::fresh_native_environment(
+                        session.launch.provider,
+                        false,
+                    )
+                } else {
+                    BTreeMap::new()
+                });
             ClientRequest::ChatStart {
                 session,
                 source,
                 terminate_source,
+                execution_environment,
             }
         } else {
             ClientRequest::ChatAttach { session }
@@ -452,7 +469,12 @@ impl ClientHandle {
                     Err(error) => break format!("Chat daemon frame failed: {error}"),
                 };
                 if envelope.version != PROTOCOL_VERSION || envelope.proof != proof { break "Chat daemon identity/version changed; refusing replacement".into(); }
-                if let ServerMessage::Response { response: ServerResponse::ChatClosed { chat_id,snapshot:final_snapshot } }=envelope.message {
+                if matches!(&envelope.message, ServerMessage::Response { response: ServerResponse::ChatClosed { .. } | ServerResponse::ChatTerminal { .. } }) {
+                    let (chat_id, final_snapshot, terminal) = match envelope.message {
+                        ServerMessage::Response { response: ServerResponse::ChatClosed { chat_id, snapshot } } => (chat_id, snapshot, None),
+                        ServerMessage::Response { response: ServerResponse::ChatTerminal { chat_id, session, snapshot } } => (chat_id, snapshot, Some(session)),
+                        _ => unreachable!(),
+                    };
                     if chat_id!=id { break "Daemon closed a different chat".into(); }
                     *snapshot.lock().unwrap_or_else(|p|p.into_inner())=Arc::new(final_snapshot);
                     {
@@ -465,13 +487,13 @@ impl ClientHandle {
                     let _=reader_stream.shutdown(Shutdown::Both);
                     let replies=std::mem::take(&mut *pending.lock().unwrap_or_else(|p|p.into_inner()));
                     for (request,reply) in replies {
-                        let _=reply.try_send(if Some(request)==envelope.request_id { Ok(()) } else { Err("Chat was explicitly closed".into()) });
+                        let _=reply.try_send(if Some(request)==envelope.request_id { Ok(terminal.clone()) } else { Err("Chat was explicitly closed".into()) });
                     }
                     wake(Wake::Changed);
                     return;
                 }
                 if let Some(reply) = envelope.request_id.and_then(|id| pending.lock().unwrap_or_else(|p| p.into_inner()).remove(&id)) {
-                    let result = match &envelope.message { ServerMessage::Response { response: ServerResponse::Accepted | ServerResponse::Detached } => Ok(()), ServerMessage::Error(error) => Err(error.message.clone()), _ => Err("Unexpected chat command response".into()) };
+                    let result = match &envelope.message { ServerMessage::Response { response: ServerResponse::Accepted | ServerResponse::Detached } => Ok(None), ServerMessage::Error(error) => Err(error.message.clone()), _ => Err("Unexpected chat command response".into()) };
                     let _ = reply.try_send(result);
                 }
                 match envelope.message {
@@ -562,7 +584,10 @@ impl ClientHandle {
     pub fn proof(&self) -> Option<HostSessionProof> {
         Some(self.inner.proof.clone())
     }
-    fn request(&self, request: ClientRequest) -> Result<(), String> {
+    fn request_response(
+        &self,
+        request: ClientRequest,
+    ) -> Result<Option<crate::model::TerminalSession>, String> {
         if !self.inner.alive.load(Ordering::Acquire) {
             return Err("Chat is disconnected; exact reattachment is required".into());
         }
@@ -588,6 +613,23 @@ impl ClientHandle {
             .unwrap_or_else(|p| p.into_inner())
             .remove(&id);
         result
+    }
+    fn request(&self, request: ClientRequest) -> Result<(), String> {
+        self.request_response(request).map(|_| ())
+    }
+
+    /// The daemon retains and replays the resulting terminal across lost replies.
+    /// Credentials stay entirely within the host's native/PTY execution context.
+    pub fn return_terminal(&self) -> Result<crate::model::TerminalSession, String> {
+        let terminal = self
+            .request_response(ClientRequest::ChatReturnTerminal {
+                chat_id: self.inner.id,
+            })?
+            .ok_or("Daemon did not return the exact replacement terminal")?;
+        if terminal.continuity.live_proof().as_ref() != Some(&self.inner.proof) {
+            return Err("Replacement terminal has no matching daemon ownership proof".into());
+        }
+        Ok(terminal)
     }
     pub fn send(&self, command: Command) -> Result<(), String> {
         self.request(ClientRequest::ChatCommand {

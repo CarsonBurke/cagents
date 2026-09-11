@@ -18,13 +18,25 @@ pub enum TransportSpec {
     },
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct ProcessSpec {
     pub transport: TransportSpec,
     pub program: String,
     pub arguments: Vec<String>,
     pub working_directory: PathBuf,
     pub environment: BTreeMap<String, String>,
+}
+impl std::fmt::Debug for ProcessSpec {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ProcessSpec")
+            .field("transport", &self.transport)
+            .field("program", &self.program)
+            .field("arguments", &self.arguments)
+            .field("working_directory", &self.working_directory)
+            .field("environment", &"<redacted>")
+            .finish()
+    }
 }
 impl From<&crate::model::LaunchRecipe> for ProcessSpec {
     fn from(recipe: &crate::model::LaunchRecipe) -> Self {

@@ -65,6 +65,8 @@ where
     id: Option<widget::Id>,
     content: &'a Content<Renderer>,
     line_digits: u32,
+    additions: &'a [usize],
+    removal_boundaries: &'a [usize],
     placeholder: Option<text::Fragment<'a>>,
     font: Option<Renderer::Font>,
     text_size: Option<Pixels>,
@@ -95,16 +97,18 @@ where
             id: None,
             content,
             line_digits: content.line_count().max(1).ilog10() + 1,
+            additions: &[],
+            removal_boundaries: &[],
             placeholder: None,
             font: None,
-            text_size: None,
+            text_size: Some(Pixels(13.0)),
             line_height: LineHeight::default(),
             width: Length::Fill,
             height: Length::Shrink,
             min_height: 0.0,
             max_height: f32::INFINITY,
             padding: Padding::new(5.0),
-            wrapping: Wrapping::default(),
+            wrapping: Wrapping::None,
             class: <Theme as Catalog>::default(),
             ellipsize: Ellipsize::default(),
             key_binding: None,
@@ -140,6 +144,14 @@ where
     /// If this method is not called, the [`TextEditor`] will be disabled.
     pub fn on_action(mut self, on_edit: impl Fn(Action) -> Message + 'a) -> Self {
         self.on_edit = Some(Box::new(on_edit));
+        self
+    }
+
+    /// Zero-based source lines, sorted once when the diff completes. Deleted
+    /// text never enters the editor buffer; its boundary is only a decoration.
+    pub fn diff_lines(mut self, additions: &'a [usize], removals: &'a [usize]) -> Self {
+        self.additions = additions;
+        self.removal_boundaries = removals;
         self
     }
 
@@ -185,6 +197,8 @@ where
             id: self.id,
             content: self.content,
             line_digits: self.line_digits,
+            additions: self.additions,
+            removal_boundaries: self.removal_boundaries,
             placeholder: self.placeholder,
             font: self.font,
             text_size: self.text_size,
@@ -288,9 +302,10 @@ where
         let internal = self.content.0.borrow_mut();
 
         let text_bounds = bounds.shrink(self.text_padding());
-        let translation = text_bounds.position() - Point::ORIGIN;
+        let translation = text_bounds.position() - Point::ORIGIN
+            + Vector::new(internal.horizontal_translation(), 0.0);
 
-        let cursor = match internal.editor.selection() {
+        let cursor = match internal.selection() {
             Selection::Caret(position) => position,
             Selection::Range(ranges) => ranges.first().cloned().unwrap_or_default().position(),
         };
@@ -309,10 +324,18 @@ where
     }
 }
 
+/// A small logical anchor independent of the document's text allocation.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct ScrollPosition {
+    pub line: usize,
+    pub vertical: f32,
+    pub horizontal: f32,
+}
+
 #[derive(Debug, Clone, Copy)]
-struct ScrollTarget {
-    fraction: f32,
-    visible: f32,
+enum ScrollTarget {
+    Fraction { fraction: f32, visible: f32 },
+    Position(ScrollPosition),
 }
 
 /// The native renderer exposes relative visual-row scrolling, not a mutable
@@ -324,9 +347,14 @@ fn seek_scroll(
     target: ScrollTarget,
     mut shape: impl FnMut(&mut NativeEditor),
 ) {
-    let position = (editor.buffer().lines.len() as f32 - target.visible).max(0.0)
-        * target.fraction.clamp(0.0, 1.0);
-    let target_line = position.floor() as usize;
+    let position = match target {
+        ScrollTarget::Fraction { fraction, visible } => {
+            (editor.buffer().lines.len() as f32 - visible).max(0.0) * fraction.clamp(0.0, 1.0)
+        }
+        ScrollTarget::Position(position) => position.line as f32,
+    };
+    let target_line =
+        (position.floor() as usize).min(editor.buffer().lines.len().saturating_sub(1));
     let mut previous = None;
     loop {
         let buffer = editor.buffer();
@@ -340,9 +368,10 @@ fn seek_scroll(
             .and_then(|line| line.layout_opt())
             .map_or(1, Vec::len)
             .max(1) as f32;
-        let delta = if target.fraction <= 0.0 {
+        let delta = if matches!(target, ScrollTarget::Fraction { fraction, .. } if fraction <= 0.0)
+        {
             -i32::MAX
-        } else if target.fraction >= 1.0 {
+        } else if matches!(target, ScrollTarget::Fraction { fraction, .. } if fraction >= 1.0) {
             i32::MAX
         } else if scroll.line < target_line {
             // Every intervening logical line occupies at least one row.
@@ -358,7 +387,12 @@ fn seek_scroll(
                 .max(1.0)
                 .min(i32::MAX as f32) as i32
         } else {
-            let target_row = (position.fract() * rows).floor().min(rows - 1.0);
+            let target_row = match target {
+                ScrollTarget::Fraction { .. } => position.fract() * rows,
+                ScrollTarget::Position(position) => position.vertical / line_height,
+            }
+            .floor()
+            .min(rows - 1.0);
             (target_row - current_row).round() as i32
         };
         if delta == 0 {
@@ -387,6 +421,54 @@ where
     R: text::Renderer<Font = cosmic::iced::Font, Editor = NativeEditor>,
 {
     editor: R::Editor,
+    pending_scroll: Option<ScrollPosition>,
+    // Native glyphs/hit tests use document X, but its scroll setter is private.
+    // Own the viewport over a real unwrapped canvas so renderer damage bounds
+    // cover visible glyphs even when the viewport is far along a long line.
+    horizontal: f32,
+    reveal_horizontal: bool,
+    canvas_width: f32,
+    wrapping: Wrapping,
+}
+
+impl<R> Internal<R>
+where
+    R: text::Renderer<Font = cosmic::iced::Font, Editor = NativeEditor>,
+{
+    fn horizontal_translation(&self) -> f32 {
+        let displayed = if self.wrapping == Wrapping::None {
+            self.horizontal
+        } else {
+            0.0
+        };
+        -displayed
+    }
+
+    fn caret_position(&self) -> Option<Point> {
+        use cosmic::iced::advanced::graphics::text::cosmic_text;
+        let position = self.editor.cursor().position;
+        let cursor = cosmic_text::Cursor::new_with_affinity(
+            position.line,
+            position.column,
+            cosmic_text::Affinity::Before,
+        );
+        self.editor.buffer().layout_runs().find_map(|run| {
+            run.cursor_position(&cursor)
+                .map(|x| Point::new(x, run.line_top))
+        })
+    }
+
+    fn selection(&self) -> Selection {
+        let selection = self.editor.selection();
+        // Avoid upstream's viewport-width clamp; use the same raw glyph
+        // coordinate for the caret, reveal, hit testing, and IME placement.
+        if matches!(selection, Selection::Caret(_))
+            && let Some(point) = self.caret_position()
+        {
+            return Selection::Caret(point);
+        }
+        selection
+    }
 }
 
 impl<R> Content<R>
@@ -402,12 +484,30 @@ where
     pub fn with_text(text: &str) -> Self {
         Self(RefCell::new(Internal {
             editor: R::Editor::with_text(text),
+            pending_scroll: None,
+            horizontal: 0.0,
+            reveal_horizontal: true,
+            canvas_width: 0.0,
+            wrapping: Wrapping::None,
         }))
     }
 
     /// Performs an [`Action`] on the [`Content`].
-    pub fn perform(&mut self, action: Action) {
+    pub fn perform(&mut self, mut action: Action) {
         let internal = self.0.get_mut();
+        internal.pending_scroll = None;
+        match &mut action {
+            Action::Click(position) | Action::Drag(position) => {
+                position.x -= internal.horizontal_translation();
+            }
+            _ => {}
+        }
+        if matches!(
+            action,
+            Action::Move(_) | Action::Select(_) | Action::Edit(_)
+        ) {
+            internal.reveal_horizontal = true;
+        }
 
         internal.editor.perform(action);
     }
@@ -415,8 +515,41 @@ where
     /// Moves the current cursor to reflect the given one.
     pub fn move_to(&mut self, cursor: Cursor) {
         let internal = self.0.get_mut();
+        internal.pending_scroll = None;
+        internal.reveal_horizontal = true;
 
         internal.editor.move_to(cursor);
+    }
+
+    /// Reads the native viewport without copying or shaping document text.
+    pub fn scroll_position(&self) -> ScrollPosition {
+        let internal = self.0.borrow();
+        internal.pending_scroll.unwrap_or_else(|| {
+            let scroll = internal.editor.buffer().scroll();
+            ScrollPosition {
+                line: scroll.line,
+                vertical: scroll.vertical,
+                horizontal: internal.horizontal,
+            }
+        })
+    }
+
+    /// Restores after layout knows the current font, wrapping, and viewport.
+    /// A subsequent explicit edit/caret move takes precedence over restoration.
+    pub fn restore_scroll_position(&mut self, position: ScrollPosition) {
+        self.0.get_mut().pending_scroll = Some(ScrollPosition {
+            line: position.line,
+            vertical: if position.vertical.is_finite() {
+                position.vertical.max(0.0)
+            } else {
+                0.0
+            },
+            horizontal: if position.horizontal.is_finite() {
+                position.horizontal.max(0.0)
+            } else {
+                0.0
+            },
+        });
     }
 
     /// Returns the current cursor position of the [`Content`].
@@ -427,6 +560,24 @@ where
     /// Returns the amount of lines of the [`Content`].
     pub fn line_count(&self) -> usize {
         self.0.borrow().editor.line_count()
+    }
+    /// Diff rows count LF-delimited source lines; the native buffer also splits
+    /// bare CR. Map source lines without serializing or cloning line text.
+    pub fn source_line_ranges(&self) -> Vec<std::ops::Range<usize>> {
+        let internal = self.0.borrow();
+        let count = internal.editor.line_count();
+        let mut ranges = Vec::new();
+        let mut start = 0;
+        for index in 0..count {
+            let Some(line) = internal.editor.line(index) else {
+                break;
+            };
+            if index + 1 == count || line.ending.as_str().contains('\n') {
+                ranges.push(start..index + 1);
+                start = index + 1;
+            }
+        }
+        ranges
     }
 
     /// Returns the text of the line at the given index, if it exists.
@@ -450,13 +601,15 @@ where
 
     /// Returns the text of the [`Content`].
     pub fn text(&self) -> String {
+        let internal = self.0.borrow();
+        let count = internal.editor.line_count();
         let mut contents = String::new();
-        let mut lines = self.lines().peekable();
-
-        while let Some(line) = lines.next() {
+        for index in 0..count {
+            let Some(line) = internal.editor.line(index) else {
+                break;
+            };
             contents.push_str(&line.text);
-
-            if lines.peek().is_some() {
+            if index + 1 < count {
                 contents.push_str(if line.ending == LineEnding::None {
                     LineEnding::default().as_str()
                 } else {
@@ -651,10 +804,24 @@ where
             .min_height(self.min_height)
             .max_height(self.max_height);
 
-        let target = state.scrollbar_target.take();
-        let mut shape = |editor: &mut NativeEditor| {
+        let restored = internal.pending_scroll.take().map(ScrollTarget::Position);
+        let target = state.scrollbar_target.take().or(restored);
+        let viewport = limits.shrink(self.text_padding()).max();
+        let unwrapped = self.wrapping == Wrapping::None;
+        if let Some(ScrollTarget::Position(position)) = restored {
+            internal.horizontal = position.horizontal;
+            internal.reveal_horizontal = false;
+        }
+        internal.wrapping = self.wrapping;
+        let mut canvas = viewport;
+        if unwrapped {
+            canvas.width = internal
+                .canvas_width
+                .max((viewport.width + internal.horizontal).min(f32::MAX));
+        }
+        let shape = |editor: &mut NativeEditor, bounds| {
             editor.update(
-                limits.shrink(self.text_padding()).max(),
+                bounds,
                 self.font.unwrap_or_else(|| renderer.default_font()),
                 self.text_size.unwrap_or_else(|| renderer.default_size()),
                 self.line_height,
@@ -662,10 +829,37 @@ where
                 state.highlighter.borrow_mut().deref_mut(),
             );
         };
-        shape(&mut internal.editor);
+        shape(&mut internal.editor, canvas);
         if let Some(target) = target {
-            seek_scroll(&mut internal.editor, target, &mut shape);
+            seek_scroll(&mut internal.editor, target, |editor| shape(editor, canvas));
         }
+        if unwrapped {
+            // Grow only for newly visited wider lines; never scan/shape the
+            // document's unvisited prefix or copy its text to measure it.
+            let width = internal
+                .editor
+                .buffer()
+                .layout_runs()
+                .map(|run| run.line_w + 1.0)
+                .fold(canvas.width, f32::max);
+            if width > canvas.width {
+                canvas.width = width;
+                shape(&mut internal.editor, canvas);
+            }
+            internal.canvas_width = canvas.width;
+            if internal.reveal_horizontal
+                && let Some(caret) = internal.caret_position()
+            {
+                internal.horizontal = internal
+                    .horizontal
+                    .min(caret.x)
+                    .max(caret.x + 1.0 - viewport.width)
+                    .max(0.0);
+            }
+        } else if internal.reveal_horizontal {
+            internal.horizontal = 0.0;
+        }
+        internal.reveal_horizontal = false;
 
         match self.height {
             Length::Fill | Length::FillPortion(_) | Length::Fixed(_) => {
@@ -732,7 +926,7 @@ where
             _ => None,
         };
         if let Some((y, grab)) = drag {
-            state.scrollbar_target = Some(ScrollTarget {
+            state.scrollbar_target = Some(ScrollTarget::Fraction {
                 fraction: geometry.fraction_at(y, grab),
                 visible: geometry.visible,
             });
@@ -1053,6 +1247,89 @@ where
         );
 
         let text_bounds = bounds.shrink(self.text_padding());
+        // Paint changes under selection and glyphs, using only shaped visible
+        // runs. Wrapped continuations share their logical source annotation.
+        let buffer = internal.editor.buffer();
+        let scroll = buffer.scroll();
+        let mut previous_line = None;
+        let mut logical_top = 0.0;
+        for run in internal.editor.buffer().layout_runs() {
+            if previous_line != Some(run.line_i) {
+                logical_top = if run.line_i == scroll.line {
+                    -scroll.vertical
+                } else {
+                    run.line_top
+                };
+                previous_line = Some(run.line_i);
+            }
+            if self.additions.binary_search(&run.line_i).is_ok() {
+                let row = Rectangle::new(
+                    Point::new(text_bounds.x, text_bounds.y + run.line_top),
+                    Size::new(text_bounds.width, run.line_height),
+                );
+                if let Some(bounds) = text_bounds.intersection(&row) {
+                    renderer.fill_quad(
+                        renderer::Quad {
+                            bounds,
+                            ..renderer::Quad::default()
+                        },
+                        cosmic::iced::Color::from_rgba8(46, 160, 93, 0.12),
+                    );
+                }
+            }
+            let eof = run.line_i + 1 == buffer.lines.len();
+            let rows = buffer.lines[run.line_i]
+                .layout_opt()
+                .map_or(1, Vec::len)
+                .max(1);
+            let first_run = (run.line_top - logical_top).abs() < 0.1;
+            let last_run =
+                run.line_top + run.line_height >= logical_top + rows as f32 * run.line_height - 0.1;
+            let before = first_run && self.removal_boundaries.binary_search(&run.line_i).is_ok();
+            let after = eof
+                && last_run
+                && self
+                    .removal_boundaries
+                    .binary_search(&(run.line_i + 1))
+                    .is_ok();
+            for (visible, offset) in [(before, 0.0), (after, run.line_height - 2.0)] {
+                if visible {
+                    let boundary = Rectangle::new(
+                        Point::new(text_bounds.x, text_bounds.y + run.line_top + offset),
+                        Size::new(text_bounds.width, 2.0),
+                    );
+                    if let Some(bounds) = text_bounds.intersection(&boundary) {
+                        renderer.fill_quad(
+                            renderer::Quad {
+                                bounds,
+                                ..renderer::Quad::default()
+                            },
+                            cosmic::iced::Color::from_rgba8(220, 75, 75, 0.65),
+                        );
+                    }
+                }
+            }
+        }
+
+        let horizontal = Vector::new(internal.horizontal_translation(), 0.0);
+        let translation = text_bounds.position() - Point::ORIGIN + horizontal;
+        let selection = state.focus.as_ref().map(|_| internal.selection());
+        if let Some(Selection::Range(ranges)) = &selection {
+            let mut selection_color = style.selection;
+            selection_color.a *= 0.24;
+            for range in ranges
+                .iter()
+                .filter_map(|range| text_bounds.intersection(&(*range + translation)))
+            {
+                renderer.fill_quad(
+                    renderer::Quad {
+                        bounds: range,
+                        ..renderer::Quad::default()
+                    },
+                    selection_color,
+                );
+            }
+        }
 
         if internal.editor.is_empty() {
             if let Some(placeholder) = self.placeholder.clone() {
@@ -1077,16 +1354,14 @@ where
         } else {
             renderer.fill_editor(
                 &internal.editor,
-                text_bounds.position(),
+                text_bounds.position() + horizontal,
                 style.value,
                 text_bounds,
             );
         }
 
-        let translation = text_bounds.position() - Point::ORIGIN;
-
-        if let Some(focus) = state.focus.as_ref() {
-            match internal.editor.selection() {
+        if let (Some(focus), Some(selection)) = (state.focus.as_ref(), selection) {
+            match selection {
                 Selection::Caret(position) if focus.is_cursor_visible() => {
                     let cursor = Rectangle::new(
                         position + translation,
@@ -1110,21 +1385,7 @@ where
                         );
                     }
                 }
-                Selection::Range(ranges) => {
-                    for range in ranges
-                        .into_iter()
-                        .filter_map(|range| text_bounds.intersection(&(range + translation)))
-                    {
-                        renderer.fill_quad(
-                            renderer::Quad {
-                                bounds: range,
-                                ..renderer::Quad::default()
-                            },
-                            style.selection,
-                        );
-                    }
-                }
-                Selection::Caret(_) => {}
+                Selection::Range(_) | Selection::Caret(_) => {}
             }
         }
 
@@ -1402,7 +1663,8 @@ struct ScrollGeometry {
 impl ScrollGeometry {
     fn new(bounds: Rectangle, text: Rectangle, total: f32, first: f32, visible: f32) -> Self {
         let track = Rectangle {
-            x: bounds.x + bounds.width - crate::design::SCROLLBAR_GUTTER + 2.0,
+            x: bounds.x + bounds.width - crate::design::SCROLLBAR_GUTTER
+                + crate::design::SCROLLBAR_MARGIN,
             y: text.y,
             width: crate::design::SCROLLBAR_THUMB_WIDTH,
             height: text.height.max(0.0),
@@ -1439,6 +1701,25 @@ impl ScrollGeometry {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pointer_drag_and_ime_paste_preserve_unselected_source_and_line_endings() {
+        let mut content = Content::with_text("alpha beta\r\ngamma\n");
+        layout_content(&mut content, 500.0, 200.0);
+        content.perform(Action::Click(Point::new(0.0, 10.0)));
+        content.perform(Action::Drag(Point::new(500.0, 10.0)));
+        assert_eq!(content.selection().as_deref(), Some("alpha beta"));
+        content.perform(Action::Edit(Edit::Paste(Arc::new("δ".into()))));
+        assert_eq!(content.text(), "δ\r\ngamma\n");
+    }
+
+    #[test]
+    fn source_rows_map_bare_carriage_returns_without_changing_saved_bytes() {
+        let source = "one\rtwo\r\nthree\n";
+        let content = Content::with_text(source);
+        assert_eq!(content.text(), source);
+        assert_eq!(content.source_line_ranges(), vec![0..2, 2..3, 3..4]);
+    }
 
     fn layout_content(content: &mut Content, width: f32, height: f32) {
         content.0.get_mut().editor.update(
@@ -1491,7 +1772,7 @@ mod tests {
         drop(editor);
         seek_content(
             &mut content,
-            ScrollTarget {
+            ScrollTarget::Fraction {
                 fraction: 0.0,
                 visible: scrolled.visible,
             },
@@ -1513,7 +1794,7 @@ mod tests {
         drop(editor);
         seek_content(
             &mut content,
-            ScrollTarget {
+            ScrollTarget::Fraction {
                 fraction: 0.5,
                 visible: geometry.visible,
             },
@@ -1543,12 +1824,11 @@ mod tests {
             let editor: TextEditor<'_, highlighter::PlainText, ()> = TextEditor::new(&content);
             editor.scroll_geometry(Rectangle::new(Point::ORIGIN, Size::new(260.0, 210.0)))
         };
-        let target = ScrollTarget {
+        let target = ScrollTarget::Fraction {
             fraction: 0.5,
             visible: geometry.visible,
         };
-        let target_line =
-            ((content.line_count() as f32 - target.visible) * target.fraction).floor() as usize;
+        let target_line = ((content.line_count() as f32 - geometry.visible) * 0.5).floor() as usize;
         assert!(
             content.0.borrow().editor.buffer().lines[target_line]
                 .layout_opt()
@@ -1579,6 +1859,196 @@ mod tests {
             shapes <= target_line + 2,
             "every intermediate seek step must cross a logical line"
         );
+    }
+
+    #[test]
+    fn logical_scroll_anchors_restore_wrapped_rows_without_moving_selection() {
+        let source = (0..300)
+            .map(|line| format!("{line}: {}\n", "wrapped words ".repeat(24)))
+            .collect::<String>();
+        let mut content = Content::with_text(&source);
+        content.move_to(Cursor {
+            position: Position { line: 0, column: 8 },
+            selection: Some(Position { line: 0, column: 3 }),
+        });
+        layout_content(&mut content, 180.0, 200.0);
+        let cursor = content.cursor();
+        let selection = content.selection();
+        let anchor = ScrollPosition {
+            line: 120,
+            vertical: 60.0,
+            horizontal: 0.0,
+        };
+        seek_content(&mut content, ScrollTarget::Position(anchor), 180.0, 200.0);
+        assert_eq!(content.scroll_position(), anchor);
+        seek_content(
+            &mut content,
+            ScrollTarget::Fraction {
+                fraction: 0.0,
+                visible: 10.0,
+            },
+            180.0,
+            200.0,
+        );
+        seek_content(&mut content, ScrollTarget::Position(anchor), 180.0, 200.0);
+        assert_eq!(content.scroll_position(), anchor);
+        assert_eq!(content.cursor(), cursor);
+        assert_eq!(content.selection(), selection);
+        assert_eq!(content.text(), source);
+    }
+
+    #[test]
+    fn horizontal_restore_keeps_glyph_hit_testing_caret_and_wrapping_in_agreement() {
+        use cosmic::iced::advanced::renderer::Headless;
+        let renderer = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(cosmic::Renderer::new(
+                cosmic::iced::Font::MONOSPACE,
+                Pixels(16.0),
+                Some("tiny-skia"),
+            ))
+            .unwrap();
+        let layout = |content: &Content, wrapping| {
+            let mut widget: TextEditor<'_, highlighter::PlainText, ()> = TextEditor::new(content)
+                .font(cosmic::iced::Font::MONOSPACE)
+                .size(16.0)
+                .wrapping(wrapping)
+                .height(Length::Fill);
+            let mut tree =
+                widget::Tree::new(&widget as &dyn Widget<(), cosmic::Theme, cosmic::Renderer>);
+            widget.layout(
+                &mut tree,
+                &renderer,
+                &layout::Limits::new(Size::ZERO, Size::new(260.0, 200.0)),
+            );
+        };
+        let assert_damage_covers_viewport = |content: &Content| {
+            let widget: TextEditor<'_, highlighter::PlainText, ()> =
+                TextEditor::new(content).size(16.0);
+            let clip = Rectangle::new(Point::ORIGIN, Size::new(260.0, 200.0))
+                .shrink(widget.text_padding());
+            let internal = content.0.borrow();
+            let text = cosmic::iced::advanced::graphics::Text::Editor {
+                editor: internal.editor.downgrade(),
+                position: clip.position() + Vector::new(internal.horizontal_translation(), 0.0),
+                color: cosmic::iced::Color::BLACK,
+                clip_bounds: clip,
+                transformation: Default::default(),
+            };
+            assert_eq!(text.visible_bounds(), Some(clip));
+        };
+        let source = "abcdefghij".repeat(30);
+        let mut original = Content::with_text(&source);
+        original.move_to(Cursor {
+            position: Position {
+                line: 0,
+                column: 100,
+            },
+            selection: None,
+        });
+        layout(&original, Wrapping::None);
+        let anchor = original.scroll_position();
+        assert!(
+            anchor.horizontal > 260.0,
+            "caret-follow must pan beyond one viewport"
+        );
+
+        let mut restored = Content::with_text(&source);
+        restored.move_to(Cursor {
+            position: Position { line: 0, column: 3 },
+            selection: Some(Position { line: 0, column: 0 }),
+        });
+        let cursor = restored.cursor();
+        let selection = restored.selection();
+        restored.restore_scroll_position(anchor);
+        layout(&restored, Wrapping::None);
+        assert_eq!(restored.scroll_position(), anchor);
+        assert_damage_covers_viewport(&restored);
+        assert_eq!(restored.cursor(), cursor);
+        assert_eq!(restored.selection(), selection);
+        layout(&restored, Wrapping::WordOrGlyph);
+        assert_eq!(restored.0.borrow().horizontal_translation(), 0.0);
+        layout(&restored, Wrapping::None);
+        assert_eq!(restored.scroll_position(), anchor);
+
+        let (column, document_x, pointer_x, end_column, drag_x) = {
+            let internal = restored.0.borrow();
+            let run = internal.editor.buffer().layout_runs().next().unwrap();
+            let glyph = run
+                .glyphs
+                .iter()
+                .find(|glyph| glyph.x > anchor.horizontal + 20.0)
+                .unwrap();
+            let end = run
+                .glyphs
+                .iter()
+                .find(|end| end.start >= glyph.start + 3)
+                .unwrap();
+            (
+                glyph.start,
+                glyph.x,
+                glyph.x + glyph.w * 0.25 - anchor.horizontal,
+                end.start,
+                end.x + end.w * 0.25 - anchor.horizontal,
+            )
+        };
+        restored.perform(Action::Click(Point::new(pointer_x, 5.0)));
+        layout(&restored, Wrapping::None);
+        assert_eq!(restored.cursor().position.column, column);
+        assert_eq!(
+            restored.scroll_position(),
+            anchor,
+            "click must not jump the restored viewport"
+        );
+        let internal = restored.0.borrow();
+        let Selection::Caret(caret) = internal.selection() else {
+            panic!("click must leave a caret");
+        };
+        assert!((caret.x - document_x).abs() < 0.01);
+        assert!(
+            (caret.x + internal.horizontal_translation() - (document_x - anchor.horizontal)).abs()
+                < 0.01
+        );
+        drop(internal);
+        restored.perform(Action::Drag(Point::new(drag_x, 5.0)));
+        layout(&restored, Wrapping::None);
+        assert_eq!(
+            restored.selection().as_deref(),
+            Some(&source[column..end_column])
+        );
+        assert_eq!(
+            restored.scroll_position(),
+            anchor,
+            "drag must keep its starting viewport"
+        );
+        restored.perform(Action::ClearSelection);
+        restored.perform(Action::Edit(Edit::Insert('Z')));
+        layout(&restored, Wrapping::None);
+        assert_eq!(
+            restored.scroll_position(),
+            anchor,
+            "editing a visible caret must not jump X"
+        );
+        assert_damage_covers_viewport(&restored);
+        let mut edited = source.clone();
+        edited.insert(end_column, 'Z');
+        restored.perform(Action::Move(Motion::Home));
+        layout(&restored, Wrapping::None);
+        assert_eq!(
+            restored.scroll_position().horizontal,
+            0.0,
+            "keyboard navigation reveals the caret"
+        );
+        assert_eq!(restored.text(), edited);
+        restored.restore_scroll_position(ScrollPosition {
+            line: 0,
+            vertical: f32::INFINITY,
+            horizontal: f32::NAN,
+        });
+        layout(&restored, Wrapping::None);
+        assert_eq!(restored.scroll_position(), ScrollPosition::default());
     }
 
     #[test]

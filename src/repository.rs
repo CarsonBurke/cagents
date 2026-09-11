@@ -1573,6 +1573,17 @@ pub struct DiffEntry {
     pub removed_lines: Option<u64>,
 }
 
+/// A branch comparison whose entries and endpoints belong to the same range,
+/// even if HEAD or the base ref moves while Git is reading it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BranchComparison {
+    pub base_ref: ValidatedRefName,
+    pub base_oid: Oid,
+    pub head: Oid,
+    pub merge_base: Oid,
+    pub entries: Vec<DiffEntry>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct StatusSnapshot {
     pub head: HeadState,
@@ -1855,8 +1866,12 @@ pub enum DiffBasis {
     IndexToWorktree,
     /// HEAD to index — the staged view.
     HeadToIndex,
-    /// Merge base of `base_ref` and HEAD, to HEAD.
-    MergeBaseToHead { base_ref: ValidatedRefName },
+    /// An immutable merge-base-to-HEAD range; `base_ref` is its display label.
+    MergeBaseToHead {
+        base_ref: ValidatedRefName,
+        head: Oid,
+        merge_base: Oid,
+    },
     /// One commit against a chosen parent; `None` for a root commit.
     CommitToParent { oid: Oid, parent: Option<Oid> },
 }
@@ -2240,8 +2255,8 @@ enum MutationScope {
     Incremental,
     /// The command assembles its whole result in memory and commits it with a
     /// single write, so a non-zero exit means nothing was written at all:
-    /// `git restore --staged` and `git rm --cached` each write the index once,
-    /// after the last pathspec, under `index.lock`.
+    /// Path-limited `git reset --no-refresh` and `git update-index` each write
+    /// the index once, after the last selected path, under `index.lock`.
     AllOrNothing,
     /// The command resolves every pathspec before it writes anything, and
     /// then writes entry by entry.
@@ -4472,16 +4487,18 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         revision: &str,
         cancellation: &CancellationToken,
     ) -> Result<Option<Oid>, RepositoryError> {
-        let command = self.git_read(
-            worktree,
-            [
-                OsString::from("rev-parse"),
-                OsString::from("--verify"),
-                OsString::from("--quiet"),
-                OsString::from("--end-of-options"),
-                format!("{revision}^{{commit}}").into(),
-            ],
-        );
+        let command = self
+            .git_read(
+                worktree,
+                [
+                    OsString::from("rev-parse"),
+                    OsString::from("--verify"),
+                    OsString::from("--quiet"),
+                    OsString::from("--end-of-options"),
+                    format!("{revision}^{{commit}}").into(),
+                ],
+            )
+            .env("GIT_NO_LAZY_FETCH", "1");
         let output = self.run(&command, cancellation)?;
         if !output.success {
             return if output.exit_code == Some(1) {
@@ -4570,20 +4587,40 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         base_ref: &ValidatedRefName,
         cancellation: &CancellationToken,
     ) -> Result<Oid, RepositoryError> {
-        let command = self.git_read(
-            worktree,
-            [
-                OsString::from("merge-base"),
-                base_ref.as_str().into(),
-                OsString::from("HEAD"),
-            ],
-        );
+        self.resolve_branch_range(worktree, base_ref, cancellation)
+            .map(|(_, merge_base, _)| merge_base)
+    }
+
+    /// Resolves `(head, merge_base, base_tip)` for an immutable branch diff.
+    pub fn resolve_branch_range(
+        &self,
+        worktree: &Path,
+        base_ref: &ValidatedRefName,
+        cancellation: &CancellationToken,
+    ) -> Result<(Oid, Oid, Oid), RepositoryError> {
+        let head =
+            self.resolve_head(worktree, cancellation)?
+                .ok_or(RepositoryError::InvalidOutput {
+                    field: "head",
+                    reason: "an unborn branch has nothing to compare".into(),
+                })?;
+        let base = self
+            .resolve_optional_revision(worktree, base_ref.as_str(), cancellation)?
+            .ok_or_else(|| RepositoryError::InvalidOutput {
+                field: "base_ref",
+                reason: format!("{base_ref} does not resolve to a commit"),
+            })?;
+        let command = self
+            .git_read(worktree, ["merge-base", base.as_str(), head.as_str()])
+            .env("GIT_NO_LAZY_FETCH", "1");
         let output = self.run_checked(&command, cancellation)?;
         let line = parse_utf8_line(&output.stdout, "merge_base")?;
-        Oid::parse_object(line).map_err(|error| RepositoryError::InvalidOutput {
-            field: "merge_base",
-            reason: error.to_string(),
-        })
+        let merge_base =
+            Oid::parse_object(line).map_err(|error| RepositoryError::InvalidOutput {
+                field: "merge_base",
+                reason: error.to_string(),
+            })?;
+        Ok((head, merge_base, base))
     }
 
     /// Files that differ between the merge base and HEAD.
@@ -4593,14 +4630,28 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         base_ref: &ValidatedRefName,
         cancellation: &CancellationToken,
     ) -> Result<Vec<DiffEntry>, RepositoryError> {
-        let base = self.resolve_compare_base(worktree, base_ref, cancellation)?;
-        let head =
-            self.resolve_head(worktree, cancellation)?
-                .ok_or(RepositoryError::InvalidOutput {
-                    field: "head",
-                    reason: "an unborn branch has nothing to compare".into(),
-                })?;
-        self.range_entries(worktree, Some(&base), &head, cancellation)
+        self.branch_comparison(worktree, base_ref, cancellation)
+            .map(|comparison| comparison.entries)
+    }
+
+    /// Compares locally resolved immutable commits, without fetching missing
+    /// objects. The returned HEAD is the one actually used by both diff reads.
+    pub fn branch_comparison(
+        &self,
+        worktree: &Path,
+        base_ref: &ValidatedRefName,
+        cancellation: &CancellationToken,
+    ) -> Result<BranchComparison, RepositoryError> {
+        let (head, merge_base, base_oid) =
+            self.resolve_branch_range(worktree, base_ref, cancellation)?;
+        let entries = self.range_entries(worktree, Some(&merge_base), &head, cancellation)?;
+        Ok(BranchComparison {
+            base_ref: base_ref.clone(),
+            base_oid,
+            head,
+            merge_base,
+            entries,
+        })
     }
 
     /// Files a commit changed relative to `parent`, or to the empty tree when
@@ -4660,6 +4711,7 @@ impl<E: ProcessExecutor> RepositoryService<E> {
             None => arguments.extend([OsString::from("--root"), OsString::from(new.as_str())]),
         }
         self.git_read(worktree, arguments)
+            .env("GIT_NO_LAZY_FETCH", "1")
     }
 
     /// Reads both sides of one path's comparison.
@@ -4710,21 +4762,16 @@ impl<E: ProcessExecutor> RepositoryService<E> {
                     new_label: "Index".into(),
                 })
             }
-            DiffBasis::MergeBaseToHead { base_ref } => {
-                let base = self.resolve_compare_base(worktree, base_ref, cancellation)?;
-                let head = self.resolve_head(worktree, cancellation)?.ok_or(
-                    RepositoryError::InvalidOutput {
-                        field: "head",
-                        reason: "an unborn branch has nothing to compare".into(),
-                    },
-                )?;
-                Ok(DiffContent::Comparison {
-                    old: self.tree_side(worktree, &base, old_path, cancellation)?,
-                    new: self.tree_side(worktree, &head, &request.path, cancellation)?,
-                    old_label: format!("{} ({})", base_ref.short_name(), base.short()),
-                    new_label: "HEAD".into(),
-                })
-            }
+            DiffBasis::MergeBaseToHead {
+                base_ref,
+                head,
+                merge_base,
+            } => Ok(DiffContent::Comparison {
+                old: self.tree_side(worktree, merge_base, old_path, cancellation)?,
+                new: self.tree_side(worktree, head, &request.path, cancellation)?,
+                old_label: format!("{} ({})", base_ref.short_name(), merge_base.short()),
+                new_label: format!("HEAD ({})", head.short()),
+            }),
             DiffBasis::CommitToParent { oid, parent } => {
                 let old = match parent {
                     Some(parent) => self.tree_side(worktree, parent, old_path, cancellation)?,
@@ -4960,13 +5007,14 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         if paths.is_empty() {
             return Err(ValidationError::EmptySelection.into());
         }
-        if self
-            .resolve_head(&request.worktree, cancellation)?
-            .is_some()
-        {
+        if let Some(head) = self.resolve_head(&request.worktree, cancellation)? {
+            // `restore --staged` preloads worktree stat information and runs
+            // post-checkout hooks. Neither belongs in an index-only operation.
+            // A path-limited reset never moves HEAD; --no-refresh also skips
+            // the otherwise repository-wide stat refresh after updating it.
             let command = self.git_literal_mutation(
                 &request.worktree,
-                pathspec_arguments(["restore", "--staged"], &paths),
+                pathspec_arguments(["reset", "--no-refresh", "--quiet", head.as_str()], &paths),
             );
             return Ok(self.run_mutation(
                 &command,
@@ -4975,16 +5023,16 @@ impl<E: ProcessExecutor> RepositoryService<E> {
                 cancellation,
             ));
         }
-        // An unborn branch has no HEAD to restore from, so unstaging means
-        // removing the index entry — and only for paths that are really in the
-        // index, because `git rm --cached` on an unknown path is an error.
+        // An unborn branch has no HEAD to restore from. Remove only selected
+        // indexed paths without inspecting working files (`rm --cached` would
+        // refresh their stat data and refuse a file edited since staging).
         let indexed = self.indexed_paths(&request.worktree, &paths, cancellation)?;
         if indexed.is_empty() {
             return Ok(MutationOutcome::Applied { paths: Vec::new() });
         }
         let command = self.git_literal_mutation(
             &request.worktree,
-            pathspec_arguments(["rm", "--cached", "--ignore-unmatch"], &indexed),
+            pathspec_arguments(["update-index", "--force-remove"], &indexed),
         );
         Ok(self.run_mutation(&command, indexed, MutationScope::AllOrNothing, cancellation))
     }
@@ -6828,7 +6876,7 @@ mod tests {
         );
     }
 
-    mod discovery {
+    mod git_contracts {
         use super::*;
 
         struct IsolatedExecutor;
@@ -6866,6 +6914,263 @@ mod tests {
                     &CancellationToken::new(),
                 )
                 .expect("Git fixture command succeeds");
+        }
+
+        fn git_output(directory: &Path, arguments: &[&str]) -> Vec<u8> {
+            let service = service();
+            service
+                .run_checked(
+                    &service.git_read(directory, arguments.iter().copied()),
+                    &CancellationToken::new(),
+                )
+                .expect("Git fixture read succeeds")
+                .stdout
+        }
+
+        #[cfg(unix)]
+        #[test]
+        fn unstage_preserves_worktree_head_and_unselected_index_entries() {
+            use std::os::unix::fs::PermissionsExt;
+
+            let directory = tempfile::tempdir().unwrap();
+            let root = directory.path();
+            git(root, &["init", "-b", "feature"]);
+            let unusual = RepoPath::from_bytes(b":(glob)*\n\xff").unwrap();
+            for name in ["old.txt", "deleted.txt", "unselected.txt"] {
+                fs::write(root.join(name), b"base\n").unwrap();
+            }
+            fs::write(root.join(unusual.as_os_str()), b"base\n").unwrap();
+            git(root, &["add", "-A"]);
+            git(root, &["commit", "-m", "base"]);
+            let original_head = git_output(root, &["rev-parse", "HEAD"]);
+            fs::rename(root.join("old.txt"), root.join("new.txt")).unwrap();
+            fs::remove_file(root.join("deleted.txt")).unwrap();
+            fs::write(root.join(unusual.as_os_str()), b"staged\n").unwrap();
+            fs::write(root.join("unselected.txt"), b"keep staged\n").unwrap();
+            git(root, &["add", "-A"]);
+            fs::write(root.join("new.txt"), b"working rename\n").unwrap();
+            fs::write(root.join(unusual.as_os_str()), b"working unusual\n").unwrap();
+            let hook = root.join(".git/hooks/post-checkout");
+            fs::write(&hook, b"#!/bin/sh\nprintf invoked > hook-ran\nexit 1\n").unwrap();
+            fs::set_permissions(&hook, fs::Permissions::from_mode(0o755)).unwrap();
+
+            let outcome = service()
+                .unstage(
+                    &UnstageRequest {
+                        worktree: root.into(),
+                        selection: vec![
+                            PathSelection {
+                                path: path("new.txt"),
+                                old_path: Some(path("old.txt")),
+                            },
+                            PathSelection::new(path("deleted.txt")),
+                            PathSelection::new(unusual.clone()),
+                        ],
+                    },
+                    &CancellationToken::new(),
+                )
+                .unwrap();
+
+            assert!(matches!(outcome, MutationOutcome::Applied { .. }));
+            assert_eq!(git_output(root, &["rev-parse", "HEAD"]), original_head);
+            assert_eq!(
+                git_output(root, &["diff", "--cached", "--name-only", "-z"]),
+                b"unselected.txt\0"
+            );
+            assert_eq!(fs::read(root.join("new.txt")).unwrap(), b"working rename\n");
+            assert_eq!(
+                fs::read(root.join(unusual.as_os_str())).unwrap(),
+                b"working unusual\n"
+            );
+            assert!(!root.join("old.txt").exists());
+            assert!(!root.join("deleted.txt").exists());
+            assert!(!root.join("hook-ran").exists());
+        }
+
+        #[test]
+        fn unborn_unstage_does_not_require_worktree_to_match_staged_content() {
+            let directory = tempfile::tempdir().unwrap();
+            let root = directory.path();
+            git(root, &["init", "-b", "feature"]);
+            fs::write(root.join("selected.txt"), b"staged\n").unwrap();
+            fs::write(root.join("unselected.txt"), b"keep\n").unwrap();
+            git(root, &["add", "-A"]);
+            fs::write(root.join("selected.txt"), b"working\n").unwrap();
+
+            let outcome = service()
+                .unstage(
+                    &UnstageRequest {
+                        worktree: root.into(),
+                        selection: vec![
+                            PathSelection::new(path("selected.txt")),
+                            PathSelection::new(path("absent.txt")),
+                        ],
+                    },
+                    &CancellationToken::new(),
+                )
+                .unwrap();
+
+            assert_eq!(
+                outcome,
+                MutationOutcome::Applied {
+                    paths: vec![path("selected.txt")]
+                }
+            );
+            assert_eq!(git_output(root, &["ls-files", "-z"]), b"unselected.txt\0");
+            assert_eq!(fs::read(root.join("selected.txt")).unwrap(), b"working\n");
+            assert_eq!(
+                service()
+                    .resolve_head(root, &CancellationToken::new())
+                    .unwrap(),
+                None
+            );
+        }
+
+        #[test]
+        fn unstage_index_lock_refusal_preserves_staged_content() {
+            let directory = tempfile::tempdir().unwrap();
+            let root = directory.path();
+            git(root, &["init", "-b", "feature"]);
+            fs::write(root.join("file.txt"), b"base\n").unwrap();
+            git(root, &["add", "-A"]);
+            git(root, &["commit", "-m", "base"]);
+            fs::write(root.join("file.txt"), b"staged\n").unwrap();
+            git(root, &["add", "-A"]);
+            let index = fs::read(root.join(".git/index")).unwrap();
+            fs::write(root.join(".git/index.lock"), b"another writer").unwrap();
+
+            let outcome = service()
+                .unstage(
+                    &UnstageRequest {
+                        worktree: root.into(),
+                        selection: vec![PathSelection::new(path("file.txt"))],
+                    },
+                    &CancellationToken::new(),
+                )
+                .unwrap();
+
+            assert!(matches!(outcome, MutationOutcome::NotApplied { .. }));
+            assert_eq!(fs::read(root.join(".git/index")).unwrap(), index);
+            assert_eq!(fs::read(root.join("file.txt")).unwrap(), b"staged\n");
+        }
+
+        #[test]
+        fn branch_comparison_remains_pinned_when_refs_move_between_git_reads() {
+            struct AdvancingExecutor {
+                root: PathBuf,
+                next: Oid,
+            }
+
+            impl ProcessExecutor for AdvancingExecutor {
+                fn execute(
+                    &self,
+                    command: &CommandSpec,
+                    cancellation: &CancellationToken,
+                ) -> Result<ProcessOutput, ProcessFailure> {
+                    let output = IsolatedExecutor.execute(command, cancellation)?;
+                    if command
+                        .arguments
+                        .iter()
+                        .any(|argument| argument == "merge-base")
+                    {
+                        git(&self.root, &["update-ref", "HEAD", self.next.as_str()]);
+                        git(
+                            &self.root,
+                            &["update-ref", "refs/heads/base", self.next.as_str()],
+                        );
+                    }
+                    Ok(output)
+                }
+            }
+
+            let directory = tempfile::tempdir().unwrap();
+            let root = directory.path();
+            let cancellation = CancellationToken::new();
+            git(root, &["init", "-b", "base"]);
+            fs::write(root.join("old.txt"), b"rename contents\n").unwrap();
+            fs::write(root.join("deleted.txt"), b"removed\n").unwrap();
+            git(root, &["add", "-A"]);
+            git(root, &["commit", "-m", "ancestor"]);
+            let ancestor = service()
+                .resolve_head(root, &cancellation)
+                .unwrap()
+                .unwrap();
+            git(root, &["checkout", "-b", "feature"]);
+            fs::rename(root.join("old.txt"), root.join("new\nname.txt")).unwrap();
+            fs::remove_file(root.join("deleted.txt")).unwrap();
+            git(root, &["add", "-A"]);
+            git(root, &["commit", "-m", "branch changes"]);
+            let compared = service()
+                .resolve_head(root, &cancellation)
+                .unwrap()
+                .unwrap();
+            fs::write(root.join("later.txt"), b"not in comparison\n").unwrap();
+            git(root, &["add", "-A"]);
+            git(root, &["commit", "-m", "later"]);
+            let next = service()
+                .resolve_head(root, &cancellation)
+                .unwrap()
+                .unwrap();
+            git(root, &["checkout", "base"]);
+            fs::write(root.join("base-only.txt"), b"not a branch change\n").unwrap();
+            git(root, &["add", "-A"]);
+            git(root, &["commit", "-m", "base advanced"]);
+            git(root, &["checkout", "feature"]);
+            git(root, &["update-ref", "HEAD", compared.as_str()]);
+            let base_ref = ValidatedRefName::parse("refs/heads/base").unwrap();
+            let advancing = RepositoryService::new(
+                "git",
+                Arc::new(AdvancingExecutor {
+                    root: root.into(),
+                    next,
+                }),
+            );
+
+            let comparison = advancing
+                .branch_comparison(root, &base_ref, &cancellation)
+                .unwrap();
+
+            assert_eq!(comparison.head, compared);
+            assert_eq!(comparison.merge_base, ancestor);
+            assert_eq!(
+                comparison.entries,
+                vec![
+                    DiffEntry {
+                        path: path("deleted.txt"),
+                        old_path: None,
+                        kind: ChangeKind::Deleted,
+                        added_lines: Some(0),
+                        removed_lines: Some(1),
+                    },
+                    DiffEntry {
+                        path: path("new\nname.txt"),
+                        old_path: Some(path("old.txt")),
+                        kind: ChangeKind::Renamed,
+                        added_lines: Some(0),
+                        removed_lines: Some(0),
+                    },
+                ]
+            );
+            let content = advancing
+                .diff(
+                    &DiffRequest {
+                        worktree: root.into(),
+                        basis: DiffBasis::MergeBaseToHead {
+                            base_ref,
+                            head: comparison.head,
+                            merge_base: comparison.merge_base,
+                        },
+                        path: path("new\nname.txt"),
+                        old_path: Some(path("old.txt")),
+                    },
+                    &cancellation,
+                )
+                .unwrap();
+            let DiffContent::Comparison { old, new, .. } = content else {
+                panic!("committed range must be a comparison");
+            };
+            assert_eq!(old.text(), Some("rename contents\n"));
+            assert_eq!(new.text(), Some("rename contents\n"));
         }
 
         #[test]
@@ -7909,11 +8214,14 @@ mod tests {
             service.push_command(&publish_request()).unwrap(),
             service.git_literal_mutation(
                 &worktree,
-                pathspec_arguments(["restore", "--staged"], &[path("new.txt")]),
+                pathspec_arguments(
+                    ["reset", "--no-refresh", "--quiet", "HEAD"],
+                    &[path("new.txt")],
+                ),
             ),
             service.git_literal_mutation(
                 &worktree,
-                pathspec_arguments(["rm", "--cached", "--ignore-unmatch"], &[path("new.txt")]),
+                pathspec_arguments(["update-index", "--force-remove"], &[path("new.txt")]),
             ),
             service.git_literal_mutation(
                 &worktree,
@@ -8004,90 +8312,6 @@ mod tests {
 
         assert!(commits.is_empty());
         assert_eq!(service.executor.commands.lock().unwrap().len(), 1);
-    }
-
-    #[test]
-    fn unstage_restores_from_head_when_head_exists() {
-        let service = fake_service(vec![
-            success(format!("{}\n", oid(3)).as_bytes()),
-            success(b""),
-        ]);
-        let outcome = service
-            .unstage(
-                &UnstageRequest {
-                    worktree: PathBuf::from("/repo"),
-                    selection: vec![PathSelection {
-                        path: path("new.txt"),
-                        old_path: Some(path("old.txt")),
-                    }],
-                },
-                &CancellationToken::new(),
-            )
-            .unwrap();
-
-        assert!(matches!(outcome, MutationOutcome::Applied { .. }));
-        let commands = service.executor.commands.lock().unwrap();
-        assert_eq!(
-            commands[1].arguments,
-            vec![
-                OsString::from("--literal-pathspecs"),
-                OsString::from("-C"),
-                OsString::from("/repo"),
-                OsString::from("-c"),
-                OsString::from("core.fsmonitor=false"),
-                OsString::from("restore"),
-                OsString::from("--staged"),
-                OsString::from("--"),
-                OsString::from("old.txt"),
-                OsString::from("new.txt"),
-            ]
-        );
-    }
-
-    #[test]
-    fn unstage_on_an_unborn_head_removes_only_indexed_paths() {
-        let service = fake_service(vec![
-            // No HEAD.
-            exit(1, b""),
-            // Only one of the two selected paths is in the index.
-            success(b"present.txt\0"),
-            success(b""),
-        ]);
-        let outcome = service
-            .unstage(
-                &UnstageRequest {
-                    worktree: PathBuf::from("/repo"),
-                    selection: vec![
-                        PathSelection::new(path("present.txt")),
-                        PathSelection::new(path("absent.txt")),
-                    ],
-                },
-                &CancellationToken::new(),
-            )
-            .unwrap();
-
-        assert_eq!(
-            outcome,
-            MutationOutcome::Applied {
-                paths: vec![path("present.txt")]
-            }
-        );
-        let commands = service.executor.commands.lock().unwrap();
-        assert_eq!(
-            commands[2].arguments,
-            vec![
-                OsString::from("--literal-pathspecs"),
-                OsString::from("-C"),
-                OsString::from("/repo"),
-                OsString::from("-c"),
-                OsString::from("core.fsmonitor=false"),
-                OsString::from("rm"),
-                OsString::from("--cached"),
-                OsString::from("--ignore-unmatch"),
-                OsString::from("--"),
-                OsString::from("present.txt"),
-            ]
-        );
     }
 
     #[test]

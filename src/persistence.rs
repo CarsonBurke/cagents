@@ -19,9 +19,9 @@ use thiserror::Error;
 use crate::{
     model::{
         BootId, BrowserRestoreFidelity, BrowserSession, CardId, CardKind, CardState, Existence,
-        Exposure, HostSessionProof, OperationId, ProjectId, ProjectState, Residency,
-        TerminalContinuity, TerminalId, TerminalSession, Tombstone, TranscriptMetadata,
-        WorkspaceId, WorkspaceState, WorktreeId, WorktreeState,
+        Exposure, HostSessionProof, OperationId, ProjectId, ProjectState, ProjectThread, Residency,
+        TerminalContinuity, TerminalId, TerminalSession, ThreadId, Tombstone, TranscriptMetadata,
+        WorkspaceId, WorkspaceState, WorktreeId, WorktreeState, normalize_project_threads,
     },
     secure_file::{
         migrate_existing_private_file, open_existing_private_file, prepare_private_directory,
@@ -144,6 +144,8 @@ pub struct WorkspaceManifest {
     pub active_worktree: Option<PathBuf>,
     pub worktree_focus: HashMap<PathBuf, CardId>,
     pub project_order: Vec<ProjectId>,
+    pub threads: Vec<ProjectThread>,
+    pub active_thread: Option<ThreadId>,
     pub cards: Vec<CardSummary>,
     pub updated_at_unix_ms: i64,
 }
@@ -703,6 +705,8 @@ impl StateStore {
             active_worktree: manifest.active_worktree,
             worktree_focus: manifest.worktree_focus,
             project_order: manifest.project_order,
+            threads: manifest.threads,
+            active_thread: manifest.active_thread,
         }))
     }
 
@@ -1529,6 +1533,16 @@ fn save_workspace_transaction(
         &format!("workspace:{workspace_id}:navigation:project_order"),
         &to_json(&state.project_order)?,
     )?;
+    set_metadata(
+        transaction,
+        &format!("workspace:{workspace_id}:navigation:threads"),
+        &to_json(&state.threads)?,
+    )?;
+    set_metadata(
+        transaction,
+        &format!("workspace:{workspace_id}:navigation:active_thread"),
+        &to_json(&state.active_thread)?,
+    )?;
 
     let existing = existing_cards(transaction, &workspace_id)?;
     let incoming_ids = state
@@ -2237,6 +2251,42 @@ fn validate_workspace(state: &WorkspaceState) -> Result<()> {
             state.id, focused
         )));
     }
+    let mut thread_ids = BTreeSet::new();
+    let mut owned = BTreeSet::new();
+    for thread in &state.threads {
+        if !thread_ids.insert(thread.id) {
+            return Err(StoreError::InvalidState(format!(
+                "duplicate thread {}",
+                thread.id
+            )));
+        }
+        for id in &thread.cards {
+            if !ids.contains(id) || !owned.insert(*id) {
+                return Err(StoreError::InvalidState(format!(
+                    "thread {} references missing or multiply owned card {id}",
+                    thread.id
+                )));
+            }
+        }
+        if thread.focused.is_some_and(|id| {
+            !thread.cards.contains(&id)
+                || !state
+                    .cards
+                    .iter()
+                    .any(|card| card.id == id && card.existence.is_open())
+        }) {
+            return Err(StoreError::InvalidState(format!(
+                "thread {} has invalid focus",
+                thread.id
+            )));
+        }
+    }
+    if state
+        .active_thread
+        .is_some_and(|id| !thread_ids.contains(&id))
+    {
+        return Err(StoreError::InvalidState("active thread is missing".into()));
+    }
     Ok(())
 }
 
@@ -2369,6 +2419,27 @@ fn load_workspace_manifest_connection(
         });
     }
 
+    let mut threads = metadata(connection, &format!("workspace:{id}:navigation:threads"))?
+        .map(|value| from_json("workspace threads", &value))
+        .transpose()?
+        .unwrap_or_default();
+    let mut active_thread = metadata(
+        connection,
+        &format!("workspace:{id}:navigation:active_thread"),
+    )?
+    .map(|value| from_json("workspace active thread", &value))
+    .transpose()?
+    .flatten();
+    normalize_project_threads(
+        &mut threads,
+        &mut active_thread,
+        &cards
+            .iter()
+            .filter(|card| card.existence.is_open())
+            .map(|card| card.id)
+            .collect(),
+    );
+
     Ok(Some(WorkspaceManifest {
         id,
         generation: i64_to_u64(generation, "workspace generation")?,
@@ -2401,6 +2472,8 @@ fn load_workspace_manifest_connection(
         .map(|value| from_json("workspace project order", &value))
         .transpose()?
         .unwrap_or_default(),
+        threads,
+        active_thread,
         cards,
         updated_at_unix_ms: updated_at,
     }))
@@ -2834,6 +2907,8 @@ mod tests {
             active_worktree: None,
             worktree_focus: HashMap::new(),
             project_order: Vec::new(),
+            threads: Vec::new(),
+            active_thread: None,
         }
     }
 
@@ -2888,6 +2963,67 @@ mod tests {
             terminal: Some(source.clone()),
         };
         (workspace, chat)
+    }
+
+    #[test]
+    fn project_threads_round_trip_and_invalid_ownership_is_atomic() {
+        let directory = tempdir().unwrap();
+        let store =
+            StateStore::open(directory.path().join("threads.sqlite3"), boot("boot-a")).unwrap();
+        let mut workspace = workspace_with_terminal(&boot("boot-a"));
+        let card = workspace.cards[0].id;
+        let unrelated = workspace_with_terminal(&boot("boot-a")).cards.remove(0);
+        let unrelated_id = unrelated.id;
+        workspace.cards.push(unrelated);
+        let project_id = ProjectId::new();
+        let id = ThreadId::new();
+        workspace.threads.push(ProjectThread {
+            id,
+            project_id,
+            title: "Investigate startup".into(),
+            cards: vec![card],
+            focused: Some(card),
+        });
+        workspace.active_thread = Some(id);
+        workspace.active_worktree = Some("/tmp".into());
+        let mut lane = SaveLane::default();
+        lane.save(&store, &workspace).unwrap();
+        let manifest = store
+            .load_workspace_manifest(workspace.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(manifest.threads, workspace.threads);
+        assert_eq!(manifest.active_thread, Some(id));
+        let restored = store.load_workspace(workspace.id, None).unwrap().unwrap();
+        assert_eq!(restored.threads, workspace.threads);
+        assert_eq!(restored.active_thread, Some(id));
+        assert_eq!(
+            restored
+                .cards
+                .iter()
+                .map(|card| card.id)
+                .collect::<Vec<_>>(),
+            vec![card, unrelated_id]
+        );
+        workspace.threads.push(ProjectThread {
+            id: ThreadId::new(),
+            project_id,
+            title: "Conflicting owner".into(),
+            cards: vec![card],
+            focused: Some(card),
+        });
+        workspace.active_thread = None;
+        assert!(matches!(
+            lane.save(&store, &workspace),
+            Err(StoreError::InvalidState(_))
+        ));
+        let after = store
+            .load_workspace_manifest(workspace.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(after.threads, manifest.threads);
+        assert_eq!(after.active_thread, Some(id));
+        assert_eq!(after.generation, manifest.generation);
     }
 
     #[test]
@@ -3308,17 +3444,28 @@ mod tests {
             .worktree_focus
             .insert(PathBuf::from("/tmp/worktree-b"), workspace.cards[0].id);
         workspace.project_order = vec![ProjectId::new()];
+        let thread_id = ThreadId::new();
+        workspace.threads.push(ProjectThread {
+            id: thread_id,
+            project_id: workspace.project_order[0],
+            title: "Legacy".into(),
+            cards: vec![workspace.cards[0].id],
+            focused: workspace.focused,
+        });
+        workspace.active_thread = Some(thread_id);
         SaveLane::default().save(&store, &workspace).unwrap();
         {
             let inner = store.lock_inner().unwrap();
             inner
                 .connection
                 .execute(
-                    "DELETE FROM metadata WHERE key IN (?1, ?2, ?3)",
+                    "DELETE FROM metadata WHERE key IN (?1, ?2, ?3, ?4, ?5)",
                     params![
                         format!("workspace:{}:navigation:active_worktree", workspace.id),
                         format!("workspace:{}:navigation:worktree_focus", workspace.id),
                         format!("workspace:{}:navigation:project_order", workspace.id),
+                        format!("workspace:{}:navigation:threads", workspace.id),
+                        format!("workspace:{}:navigation:active_thread", workspace.id),
                     ],
                 )
                 .unwrap();
@@ -3327,6 +3474,9 @@ mod tests {
         assert_eq!(restored.active_worktree, None);
         assert!(restored.worktree_focus.is_empty());
         assert!(restored.project_order.is_empty());
+        assert!(restored.threads.is_empty());
+        assert_eq!(restored.active_thread, None);
+        assert_eq!(restored.cards[0].id, workspace.cards[0].id);
     }
 
     #[test]

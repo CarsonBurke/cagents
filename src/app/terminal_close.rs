@@ -173,6 +173,9 @@ impl Cagents {
         }
         self.terminal_close_generation = self.terminal_close_generation.wrapping_add(1);
         let intent = self.terminal_close.as_mut().unwrap();
+        // Exit events may arrive before this request completes. Only the PTY
+        // owner's kill receipt identifies an intentional exit; pending intent
+        // alone must never suppress a concurrent crash or a rejected close.
         intent.pending = true;
         intent.generation = self.terminal_close_generation;
         let intent = intent.clone();

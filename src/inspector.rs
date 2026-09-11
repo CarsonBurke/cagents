@@ -1748,6 +1748,9 @@ pub fn view(model: InspectorModel, width: f32) -> Element<'static, InspectorActi
         .padding(12)
         .width(Length::Fill),
     )
+    .direction(cosmic::iced::widget::scrollable::Direction::Vertical(
+        crate::design::scrollbar(),
+    ))
     .class(cosmic::style::iced::Scrollable::Minimal)
     .height(Length::Fill);
 

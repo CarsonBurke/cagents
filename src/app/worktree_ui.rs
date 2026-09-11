@@ -1,4 +1,5 @@
 use super::*;
+use crate::model::ThreadId;
 
 /// Ownership comes from the launch recipe, never a shell's current directory or
 /// OSC title. Component-aware matching also keeps `repo-fix` outside `repo`.
@@ -59,10 +60,30 @@ fn scope_descriptor(
     owners: &HashMap<CardId, PathBuf>,
     preferred_focus: Option<CardId>,
 ) -> WorkspaceState {
+    let selected_thread = state
+        .active_thread
+        .and_then(|id| state.threads.iter().find(|thread| thread.id == id));
+    let thread_cards = selected_thread.is_none().then(|| {
+        state
+            .threads
+            .iter()
+            .flat_map(|thread| thread.cards.iter().copied())
+            .collect::<HashSet<_>>()
+    });
     let cards = state
         .cards
         .iter()
-        .filter(|card| belongs_to_scope(card, scope, roots, owners))
+        .filter(|card| {
+            selected_thread.map_or_else(
+                || {
+                    !thread_cards
+                        .as_ref()
+                        .is_some_and(|cards| cards.contains(&card.id))
+                        && belongs_to_scope(card, scope, roots, owners)
+                },
+                |thread| card.existence.is_open() && thread.cards.contains(&card.id),
+            )
+        })
         .cloned()
         .collect::<Vec<_>>();
     let focused = preferred_focus
@@ -92,6 +113,8 @@ fn scope_descriptor(
         active_worktree: None,
         worktree_focus: HashMap::new(),
         project_order: state.project_order.clone(),
+        threads: Vec::new(),
+        active_thread: None,
     }
 }
 
@@ -109,6 +132,118 @@ fn insertion_indices(
 }
 
 impl Cagents {
+    /// Merge navigation into the full descriptor; never snapshot the projected
+    /// strip over durable cards belonging to a hidden scope.
+    pub(super) fn snapshot_workspace_scope(&mut self) {
+        if self.active_workspace.is_none() {
+            return;
+        }
+        let focused = self.workspace.focused();
+        if let Some(id) = self.durable.active_thread {
+            self.thread_offsets
+                .insert(id, self.workspace.camera().offset());
+        } else if let Some(path) = &self.active_workspace {
+            self.worktree_offsets
+                .insert(path.clone(), self.workspace.camera().offset());
+            if let Some(focused) = focused {
+                self.worktree_focus.insert(path.clone(), focused);
+            } else {
+                self.worktree_focus.remove(path);
+            }
+        }
+        let needs_update = self.durable.active_worktree != self.active_workspace
+            || self.durable.worktree_focus != self.worktree_focus
+            || self.durable.threads.iter().any(|thread| {
+                (Some(thread.id) == self.durable.active_thread && thread.focused != focused)
+                    || thread.cards.iter().any(|id| {
+                        !self
+                            .durable
+                            .cards
+                            .iter()
+                            .any(|card| card.id == *id && card.existence.is_open())
+                    })
+            });
+        if !needs_update {
+            return;
+        }
+        let durable = Arc::make_mut(&mut self.durable);
+        for thread in &mut durable.threads {
+            thread.cards.retain(|id| {
+                durable
+                    .cards
+                    .iter()
+                    .any(|card| card.id == *id && card.existence.is_open())
+            });
+            if !thread.focused.is_some_and(|id| thread.cards.contains(&id)) {
+                thread.focused = thread.cards.first().copied();
+            }
+        }
+        if let Some(id) = durable.active_thread {
+            if let Some(thread) = durable.threads.iter_mut().find(|thread| thread.id == id) {
+                thread.focused = focused.filter(|card| thread.cards.contains(card));
+            }
+        }
+        durable.active_worktree.clone_from(&self.active_workspace);
+        durable.worktree_focus.clone_from(&self.worktree_focus);
+    }
+
+    pub(super) fn register_thread_card(&mut self, card: CardId) {
+        let Some(id) = self.durable.active_thread else {
+            return;
+        };
+        let durable = Arc::make_mut(&mut self.durable);
+        if let Some(thread) = durable.threads.iter_mut().find(|thread| thread.id == id) {
+            if !thread.cards.contains(&card) {
+                thread.cards.push(card);
+            }
+            thread.focused = Some(card);
+        }
+    }
+
+    pub(super) fn select_thread(&mut self, id: ThreadId) -> Task<Message> {
+        let Some(thread) = self.durable.threads.iter().find(|thread| thread.id == id) else {
+            return Task::none();
+        };
+        let Some(project) = self.sidebar_model.project(thread.project_id) else {
+            return Task::none();
+        };
+        let path = project
+            .worktrees
+            .iter()
+            .find(|worktree| sidebar::is_primary_worktree(&project.repository, &worktree.path))
+            .map(|worktree| worktree.path.clone())
+            .unwrap_or_else(|| {
+                project
+                    .repository
+                    .parent()
+                    .filter(|parent| sidebar::is_primary_worktree(&project.repository, parent))
+                    .unwrap_or(&project.repository)
+                    .to_path_buf()
+            });
+        if self.durable.active_thread == Some(id)
+            && self.active_workspace.as_ref() == Some(&path)
+            && self.workspace.order().eq(self
+                .durable
+                .cards
+                .iter()
+                .filter(|card| card.existence.is_open() && thread.cards.contains(&card.id))
+                .map(|card| card.id))
+        {
+            return Task::none();
+        }
+        self.snapshot_workspace_scope();
+        Arc::make_mut(&mut self.durable).active_thread = Some(id);
+        let focused = self
+            .durable
+            .threads
+            .iter()
+            .find(|thread| thread.id == id)
+            .and_then(|thread| thread.focused);
+        let scoped = scope_descriptor(&self.durable, &path, &[], &self.worktree_owners, focused);
+        let offset = self.thread_offsets.get(&id).copied();
+        self.install_workspace_scope(scoped, path, offset)
+    }
+
     /// Resolve filesystem aliases only when changing/restoring scope, never in
     /// the render path or by rewriting a hosted session's durable launch recipe.
     fn refresh_worktree_owners(&mut self, selected: Option<&Path>) -> Option<PathBuf> {
@@ -170,6 +305,14 @@ impl Cagents {
     }
 
     pub(super) fn card_worktree<'a>(&'a self, card: &'a CardState) -> Option<&'a Path> {
+        if self
+            .durable
+            .threads
+            .iter()
+            .any(|thread| thread.cards.contains(&card.id))
+        {
+            return None;
+        }
         let directory = card_directory(card)?;
         Some(self.worktree_owners.get(&card.id).map_or_else(
             || {
@@ -191,58 +334,6 @@ impl Cagents {
         ))
     }
 
-    /// Unregistered launch directories are real scopes, not global cards.
-    /// Keep them reachable alongside registered worktrees without inventing
-    /// project identities or launching a replacement terminal on navigation.
-    pub(super) fn standalone_worktree_navigation(&self) -> Option<Element<'_, Message>> {
-        let mut directories = std::collections::BTreeSet::new();
-        for card in self
-            .durable
-            .cards
-            .iter()
-            .filter(|card| card.existence.is_open())
-        {
-            if let Some(directory) = self.card_worktree(card)
-                && self.sidebar_model.worktree_at(directory).is_none()
-            {
-                directories.insert(directory);
-            }
-        }
-        if directories.is_empty() {
-            return None;
-        }
-        let spacing = cosmic::theme::spacing();
-        let rows = directories
-            .into_iter()
-            .map(|directory| {
-                let label = display_path(directory);
-                widget::button::text(label)
-                    .on_press_maybe(
-                        (!self.modal_is_open())
-                            .then(|| Message::SelectWorkspaceScope(directory.to_path_buf())),
-                    )
-                    .width(Length::Fill)
-                    .class(cosmic::theme::Button::Text)
-                    .into()
-            })
-            .collect::<Vec<Element<'_, Message>>>();
-        Some(
-            widget::container(
-                widget::column::with_children(vec![
-                    widget::text::caption("Other sessions").into(),
-                    widget::scrollable(
-                        widget::column::with_children(rows).spacing(spacing.space_xxs),
-                    )
-                    .height(Length::Shrink)
-                    .into(),
-                ])
-                .spacing(spacing.space_xxs),
-            )
-            .max_height(180)
-            .into(),
-        )
-    }
-
     pub(super) fn select_worktree(
         &mut self,
         path: PathBuf,
@@ -252,11 +343,9 @@ impl Cagents {
             .refresh_worktree_owners(Some(&path))
             .expect("selected scope");
         let roots = self
-            .sidebar_model
-            .projects
+            .known_worktree_roots
             .iter()
-            .flat_map(|project| &project.worktrees)
-            .map(|worktree| worktree.path.as_path())
+            .map(PathBuf::as_path)
             .collect::<Vec<_>>();
         // Ownership and selected scope were resolved against the same canonical roots.
         let has_terminal = self.durable.cards.iter().any(|card| {
@@ -266,12 +355,21 @@ impl Cagents {
                     .card_worktree(card)
                     .is_some_and(|directory| directory == path)
         });
+        let was_thread = self.durable.active_thread.is_some();
         if self.active_workspace.as_ref() == Some(&path)
+            && !was_thread
             && self.workspace.order().eq(self
                 .durable
                 .cards
                 .iter()
-                .filter(|card| belongs_to_scope(card, &path, &roots, &self.worktree_owners))
+                .filter(|card| {
+                    !self
+                        .durable
+                        .threads
+                        .iter()
+                        .any(|thread| thread.cards.contains(&card.id))
+                        && belongs_to_scope(card, &path, &roots, &self.worktree_owners)
+                })
                 .map(|card| card.id))
         {
             if !create_if_empty {
@@ -283,7 +381,7 @@ impl Cagents {
                 Task::none()
             };
         }
-        if let Some(previous) = &self.active_workspace {
+        if !was_thread && let Some(previous) = &self.active_workspace {
             // Repository discovery can promote an unregistered launch directory
             // into its parent root. Carry its camera/focus into that same scope.
             let promoted = previous != &path
@@ -300,6 +398,16 @@ impl Cagents {
                 self.worktree_focus.remove(key);
             }
         }
+        drop(roots);
+        if was_thread {
+            self.snapshot_workspace_scope();
+        }
+        Arc::make_mut(&mut self.durable).active_thread = None;
+        let roots = self
+            .known_worktree_roots
+            .iter()
+            .map(PathBuf::as_path)
+            .collect::<Vec<_>>();
         let scoped = scope_descriptor(
             &self.durable,
             &path,
@@ -307,11 +415,27 @@ impl Cagents {
             &self.worktree_owners,
             self.worktree_focus.get(&path).copied(),
         );
+        let offset = self.worktree_offsets.get(&path).copied();
+        let scope = self.install_workspace_scope(scoped, path.clone(), offset);
+        let terminal = if create_if_empty && !has_terminal {
+            self.add_terminal(path)
+        } else {
+            Task::none()
+        };
+        Task::batch([scope, terminal])
+    }
+
+    fn install_workspace_scope(
+        &mut self,
+        scoped: WorkspaceState,
+        path: PathBuf,
+        offset: Option<f32>,
+    ) -> Task<Message> {
         let width = self.workspace.viewport_width();
         // Hide before replacing the strip: its former widgets no longer get a
         // chance to send native-surface visibility updates after unmounting.
         self.set_workspace_surfaces_visible(false);
-        self.active_workspace = Some(path.clone());
+        self.active_workspace = Some(path);
         self.workspace_view_generation = self.workspace_view_generation.wrapping_add(1);
         // Iced inherits old anonymous IDs during diff. A named generation ID
         // forces a new scroll state so operations address this worktree's strip.
@@ -323,11 +447,7 @@ impl Cagents {
         self.workspace.resize_viewport(width);
         // Focus selects the initial position only on the first visit. Returning
         // to a strip restores its actual offset, even if focus is offscreen.
-        let offset = self
-            .worktree_offsets
-            .get(&path)
-            .copied()
-            .unwrap_or_else(|| self.workspace.camera().target());
+        let offset = offset.unwrap_or_else(|| self.workspace.camera().target());
         self.workspace.native_scroll(offset, width);
         let transitions = self
             .durable
@@ -357,12 +477,7 @@ impl Cagents {
         );
         let residency = self.reconcile_scoped_lifecycle();
         let source_control = self.rebind_source_control();
-        let terminal = if create_if_empty && !has_terminal {
-            self.add_terminal(path)
-        } else {
-            Task::none()
-        };
-        Task::batch([viewport, residency, source_control, terminal])
+        Task::batch([viewport, residency, source_control])
     }
 
     pub(super) fn reconcile_scoped_lifecycle(&mut self) -> Task<Message> {
@@ -404,8 +519,21 @@ impl Cagents {
     /// Must run before initialize_runtimes so hidden restored terminals are
     /// admitted as offscreen, not with another worktree's persisted exposure.
     pub(super) fn restore_worktree_scope(&mut self) -> Task<Message> {
+        Arc::make_mut(&mut self.durable).normalize_threads();
         self.refresh_worktree_owners(None);
         self.worktree_focus.clone_from(&self.durable.worktree_focus);
+        if let Some(id) = self.durable.active_thread {
+            if self
+                .durable
+                .threads
+                .iter()
+                .find(|thread| thread.id == id)
+                .is_some_and(|thread| self.sidebar_model.project(thread.project_id).is_some())
+            {
+                return self.select_thread(id);
+            }
+            Arc::make_mut(&mut self.durable).active_thread = None;
+        }
         if let Some(scope) = self.durable.active_worktree.clone() {
             return self.select_worktree(scope, false);
         }
@@ -416,12 +544,12 @@ impl Cagents {
                 .find(|card| card.id == id && card.existence.is_open())
         });
         let owner = focused
-            .filter(|card| card_directory(card).is_some())
+            .filter(|card| self.card_worktree(card).is_some())
             .or_else(|| {
                 self.durable
                     .cards
                     .iter()
-                    .find(|card| card.existence.is_open() && card_directory(card).is_some())
+                    .find(|card| card.existence.is_open() && self.card_worktree(card).is_some())
             });
         let Some(owner) = owner else {
             return Task::none();
@@ -449,7 +577,117 @@ impl Cagents {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{BrowserId, BrowserRestoreFidelity};
+    use crate::model::{BrowserId, BrowserRestoreFidelity, ProjectThread};
+
+    #[test]
+    fn same_directory_threads_restore_focus_without_entering_main_panes() {
+        let mut app = super::super::tests::context_inspector_test_app(false);
+        register_worktrees(&mut app, &["/repo"]);
+        app.sidebar_model.projects[0].repository = "/repo/.git".into();
+        let project_id = app.sidebar_model.projects[0].id;
+        let main = terminal("/repo");
+        let first = terminal("/repo");
+        let focused = terminal("/repo");
+        let second = terminal("/repo");
+        let a = ThreadId::new();
+        let b = ThreadId::new();
+        app.durable = Arc::new(WorkspaceState {
+            cards: vec![main.clone(), first.clone(), focused.clone(), second.clone()],
+            focused: Some(focused.id),
+            active_worktree: Some("/repo".into()),
+            active_thread: Some(a),
+            threads: vec![
+                ProjectThread {
+                    id: a,
+                    project_id,
+                    title: "A".into(),
+                    cards: vec![first.id, focused.id],
+                    focused: Some(focused.id),
+                },
+                ProjectThread {
+                    id: b,
+                    project_id,
+                    title: "B".into(),
+                    cards: vec![second.id],
+                    focused: Some(second.id),
+                },
+            ],
+            ..WorkspaceState::default()
+        });
+        let _ = app.restore_worktree_scope();
+        assert_eq!(
+            app.workspace.order().collect::<Vec<_>>(),
+            vec![first.id, focused.id]
+        );
+        assert_eq!(app.workspace.focused(), Some(focused.id));
+        assert_eq!(app.terminal_directory(), Some(PathBuf::from("/repo")));
+        let _ = app.select_worktree("/repo".into(), false);
+        assert_eq!(app.durable.active_thread, None);
+        assert_eq!(app.workspace.order().collect::<Vec<_>>(), vec![main.id]);
+        let _ = app.select_thread(b);
+        assert_eq!(app.workspace.order().collect::<Vec<_>>(), vec![second.id]);
+        let _ = app.select_thread(a);
+        assert_eq!(
+            app.workspace.order().collect::<Vec<_>>(),
+            vec![first.id, focused.id]
+        );
+        assert_eq!(app.workspace.focused(), Some(focused.id));
+        assert_eq!(
+            app.durable
+                .cards
+                .iter()
+                .map(|card| card.id)
+                .collect::<Vec<_>>(),
+            vec![main.id, first.id, focused.id, second.id]
+        );
+    }
+
+    #[test]
+    fn closing_last_thread_card_keeps_empty_scope_available_for_new_cards() {
+        let mut app = super::super::tests::context_inspector_test_app(false);
+        register_worktrees(&mut app, &["/repo"]);
+        let project_id = app.sidebar_model.projects[0].id;
+        let id = ThreadId::new();
+        let closed = terminal("/repo");
+        let main = terminal("/repo");
+        app.durable = Arc::new(WorkspaceState {
+            cards: vec![main.clone(), closed.clone()],
+            threads: vec![ProjectThread {
+                id,
+                project_id,
+                title: "Thread".into(),
+                cards: vec![closed.id],
+                focused: Some(closed.id),
+            }],
+            ..WorkspaceState::default()
+        });
+        let _ = app.select_thread(id);
+        Arc::make_mut(&mut app.durable).cards[1].existence = Existence::Closing {
+            operation_id: crate::model::OperationId::new(),
+        };
+        let _ = app.select_thread(id);
+        app.snapshot_workspace_scope();
+        assert_eq!(app.durable.active_thread, Some(id));
+        assert_eq!(
+            app.workspace.order().collect::<Vec<_>>(),
+            Vec::<CardId>::new()
+        );
+        assert_eq!(app.durable.threads[0].focused, None);
+        assert!(app.durable.threads[0].cards.is_empty());
+        let replacement = terminal("/repo");
+        Arc::make_mut(&mut app.durable)
+            .cards
+            .push(replacement.clone());
+        app.register_thread_card(replacement.id);
+        let _ = app.select_worktree("/repo".into(), false);
+        assert_eq!(app.workspace.order().collect::<Vec<_>>(), vec![main.id]);
+        let _ = app.select_thread(id);
+        assert_eq!(
+            app.workspace.order().collect::<Vec<_>>(),
+            vec![replacement.id]
+        );
+        assert_eq!(app.workspace.focused(), Some(replacement.id));
+    }
 
     fn repository(path: &str) -> CardState {
         CardState {
@@ -801,10 +1039,6 @@ mod tests {
         assert!(matches!(&focused.kind, CardKind::Terminal(session)
             if session.launch.working_directory == Path::new("/other")));
         assert_ne!(focused.id, legacy.id);
-        assert!(app.standalone_worktree_navigation().is_some());
-        let _ = app.update(Message::SelectWorkspaceScope("/home/user".into()));
-        assert_eq!(app.workspace.order().collect::<Vec<_>>(), vec![legacy.id]);
-        assert_eq!(app.terminal_directory(), Some(PathBuf::from("/home/user")));
         assert_eq!(app.durable.cards.len(), 3);
     }
 
@@ -834,7 +1068,6 @@ mod tests {
         assert_eq!(app.card_state(shell.id).unwrap().kind, shell.kind);
         let _ = app.select_worktree(alias, false);
         assert_eq!(app.workspace.order().collect::<Vec<_>>(), vec![editor.id]);
-        assert!(app.standalone_worktree_navigation().is_none());
     }
 
     #[test]
@@ -851,9 +1084,6 @@ mod tests {
         });
         let _ = app.select_worktree(directory.path().into(), false);
         assert!(app.workspace.cards().is_empty());
-        assert!(app.standalone_worktree_navigation().is_some());
-        let _ = app.update(Message::SelectWorkspaceScope(missing));
-        assert_eq!(app.workspace.order().collect::<Vec<_>>(), vec![shell.id]);
         assert!(app.card_state(shell.id).unwrap().existence.is_open());
     }
 
@@ -883,11 +1113,6 @@ mod tests {
                 app.card_state(retained.id).unwrap().exposure,
                 Exposure::Offscreen
             );
-            assert!(app.standalone_worktree_navigation().is_some());
-            let _ = app.update(Message::SelectWorkspaceScope(
-                "/repo/worktrees/deleted".into(),
-            ));
-            assert_eq!(app.workspace.order().collect::<Vec<_>>(), vec![retained.id]);
             assert!(app.card_state(retained.id).unwrap().existence.is_open());
         }
     }

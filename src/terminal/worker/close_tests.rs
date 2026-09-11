@@ -195,6 +195,52 @@ fn an_idle_fish_closes_without_confirmation_from_its_daemon_owner() {
 }
 
 #[test]
+fn replacing_the_fish_package_does_not_make_its_idle_shell_active() {
+    let Some(fish) = installed_fish() else { return };
+    let package = tempdir().unwrap();
+    let installed = package.path().join("fish");
+    fs::copy(&fish, &installed).unwrap();
+    let shell = CloseSafetyShell::shell(&installed);
+    // Model a package manager replacing an executable while the old, now
+    // unlinked image is still mapped by an interactive shell.
+    let replacement = package.path().join("fish.new");
+    fs::copy(&fish, &replacement).unwrap();
+    fs::rename(replacement, &installed).unwrap();
+    assert_eq!(
+        shell.terminal.close_checked(false),
+        TerminalCloseResult::Closed
+    );
+}
+
+#[test]
+fn an_exec_replacement_cannot_inherit_the_shells_idle_close_authority() {
+    let shell = CloseSafetyShell::shell(Path::new("/bin/bash"));
+    shell.assert_child_requires_confirmation(
+        b"printf '%s' \"$$\" > child.pid; printf 'READY_%s\\n' EXEC; exec sleep 120\n",
+        "READY_EXEC",
+    );
+}
+
+#[test]
+fn checked_close_delivers_its_kill_provenance_before_reporting_completion() {
+    let shell = CloseSafetyShell::shell(Path::new("/bin/bash"));
+    assert_eq!(
+        shell.terminal.close_checked(false),
+        TerminalCloseResult::Closed
+    );
+    // close_checked joins teardown; its Exited event is already observable
+    // even though an application's async close-completion message is not.
+    assert!(shell.terminal.events().try_iter().any(|event| matches!(
+        event,
+        TerminalEvent::Exited {
+            intentional: true,
+            signal: Some(_),
+            ..
+        }
+    )));
+}
+
+#[test]
 fn a_shell_builtin_read_closes_without_confirmation_under_process_only_detection() {
     let shell = CloseSafetyShell::shell(Path::new("/bin/bash"));
     shell
