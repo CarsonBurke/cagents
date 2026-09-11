@@ -142,12 +142,19 @@ fn session_for_process(rows: &[Value], pid: i32) -> ProbeResult<Option<String>> 
     Ok(identity)
 }
 
-pub(super) fn census(recipe: &LaunchRecipe) -> ProbeResult<Census> {
+pub(super) type ProcessCensus = BTreeMap<i32, (PathBuf, ActivityState)>;
+
+pub(super) fn activity(census: &ProcessCensus, pid: i32, cwd: &Path) -> Option<ActivityState> {
+    let (observed_cwd, state) = census.get(&pid)?;
+    (observed_cwd == cwd).then_some(*state)
+}
+
+pub(super) fn census(recipe: &LaunchRecipe) -> ProbeResult<ProcessCensus> {
     census_rows(&listing(recipe)?)
 }
 
 #[cfg(test)]
-fn parse(bytes: &[u8]) -> ProbeResult<Census> {
+fn parse(bytes: &[u8]) -> ProbeResult<ProcessCensus> {
     let value: Value = serde_json::from_slice(bytes).map_err(|_| ())?;
     let rows = value.as_array().ok_or(())?;
     if rows.len() > MAX_ROWS {
@@ -156,32 +163,42 @@ fn parse(bytes: &[u8]) -> ProbeResult<Census> {
     census_rows(rows)
 }
 
-fn census_rows(rows: &[Value]) -> ProbeResult<Census> {
-    let mut census = Census::new();
+fn census_rows(rows: &[Value]) -> ProbeResult<ProcessCensus> {
+    let mut census = ProcessCensus::new();
     for row in rows {
-        let cwd = row["cwd"].as_str().ok_or(())?;
-        let state = match row["kind"].as_str() {
-            Some("background") => match row["state"].as_str() {
-                // A background job between steps is still doing requested work.
-                Some("working") => ActivityState::Working,
-                Some("blocked") => ActivityState::Waiting,
-                Some("done" | "failed" | "stopped") => ActivityState::Idle,
-                _ => return Err(()),
-            },
-            Some("interactive") => {
-                if row["pid"].as_u64().is_none_or(|pid| pid == 0) {
-                    return Err(());
-                }
-                match row["status"].as_str() {
-                    Some("busy") => ActivityState::Working,
-                    Some("waiting") => ActivityState::Waiting,
-                    Some("idle") => ActivityState::Idle,
-                    _ => return Err(()),
-                }
-            }
+        // Background jobs have no authority over an unrelated interactive pane,
+        // even when they run in the same directory.
+        if row["kind"] == "background" {
+            continue;
+        }
+        if row["kind"] != "interactive" {
+            return Err(());
+        }
+        let pid = row["pid"]
+            .as_i64()
+            .and_then(|pid| i32::try_from(pid).ok())
+            .filter(|pid| *pid > 0)
+            .ok_or(())?;
+        let cwd = PathBuf::from(row["cwd"].as_str().ok_or(())?);
+        if !cwd.is_absolute() {
+            return Err(());
+        }
+        let state = match row["status"].as_str() {
+            Some("busy") => ActivityState::Working,
+            Some("waiting") => ActivityState::Waiting,
+            Some("idle") => ActivityState::Idle,
             _ => return Err(()),
         };
-        add(&mut census, cwd, state)?;
+        match census.entry(pid) {
+            std::collections::btree_map::Entry::Vacant(entry) => {
+                entry.insert((cwd, state));
+            }
+            std::collections::btree_map::Entry::Occupied(entry) => {
+                if entry.get() != &(cwd, state) {
+                    return Err(());
+                }
+            }
+        }
     }
     Ok(census)
 }
@@ -191,19 +208,32 @@ mod tests {
     use super::*;
 
     #[test]
-    fn background_between_steps_and_exact_cwd_aggregation() {
+    fn interactive_activity_is_scoped_to_pid_not_background_jobs_or_shared_cwd() {
         let census = parse(
             br#"[
-            {"cwd":"/a","kind":"background","state":"working","status":"idle"},
-            {"cwd":"/a","kind":"interactive","pid":42,"status":"waiting"},
-            {"cwd":"/a/child","kind":"background","state":"blocked"},
-            {"cwd":"/b","kind":"background","state":"done","status":"idle"}
+            {"cwd":"/a","kind":"background","state":"blocked"},
+            {"cwd":"/a","kind":"interactive","pid":42,"status":"idle"},
+            {"cwd":"/a","kind":"interactive","pid":43,"status":"busy"},
+            {"cwd":"/a","kind":"interactive","pid":44,"status":"waiting"}
         ]"#,
         )
         .unwrap();
-        assert_eq!(census[Path::new("/a")], ActivityState::Working);
-        assert_eq!(census[Path::new("/a/child")], ActivityState::Waiting);
-        assert_eq!(census[Path::new("/b")], ActivityState::Idle);
+        assert_eq!(
+            activity(&census, 42, Path::new("/a")),
+            Some(ActivityState::Idle)
+        );
+        assert_eq!(
+            activity(&census, 43, Path::new("/a")),
+            Some(ActivityState::Working)
+        );
+        assert_eq!(
+            activity(&census, 44, Path::new("/a")),
+            Some(ActivityState::Waiting)
+        );
+        // A just-launched process absent from the cached account listing cannot
+        // inherit another pane's state, nor can a reused PID in another cwd.
+        assert_eq!(activity(&census, 45, Path::new("/a")), None);
+        assert_eq!(activity(&census, 43, Path::new("/elsewhere")), None);
     }
 
     #[test]

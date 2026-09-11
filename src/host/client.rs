@@ -364,7 +364,7 @@ impl AgentActivityJob {
                     };
                     let activity = process.as_ref().and_then(|process| {
                         (process.provider != crate::agent::Provider::Omp)
-                            .then(|| observer.activity(process.provider, &process.launch))
+                            .then(|| observer.activity(process))
                             .flatten()
                     });
                     let cancelled = cancelled.lock().unwrap_or_else(|error| error.into_inner());
