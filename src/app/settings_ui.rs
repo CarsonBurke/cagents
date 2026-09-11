@@ -159,7 +159,7 @@ fn settings_choice<'a>(
                         .align_y(Alignment::Center),
                 )
                 .name(choice)
-                .class(cosmic::theme::Button::Text)
+                .class(crate::sidebar::sidebar_button_style(selected))
                 .selected(selected)
                 .padding([design::GRID_UNIT, 2.0 * design::GRID_UNIT])
                 .height(design::ROW_HEIGHT)
@@ -241,6 +241,17 @@ fn settings_category_controls<'a>(
                     ],
                     progress,
                 ),
+                setting_field(
+                    "Pane activation",
+                    "Activate the pane under the pointer without scrolling the workspace or pane contents.",
+                    widget::toggler(draft.focus_follows_mouse)
+                        .label("Activate panes on hover".to_owned())
+                        .on_toggle(|enabled| Message::SettingsChanged {
+                            field: SettingsField::FocusFollowsMouse,
+                            value: enabled.to_string(),
+                        })
+                        .into(),
+                ),
                 setting_input(
                     "Maximum hot columns",
                     "Applies immediately; extra background columns may hibernate.",
@@ -308,7 +319,7 @@ fn settings_category_controls<'a>(
                     0.25,
                     1.0,
                     0.05,
-                    0.72,
+                    0.5,
                     "×",
                 )],
             ),
@@ -556,7 +567,7 @@ fn category_button<'a>(
             .spacing(2.0 * design::GRID_UNIT),
         )
         .name(item.label())
-        .class(cosmic::theme::Button::MenuItem)
+        .class(crate::sidebar::sidebar_button_style(item == selected))
         .selected(item == selected)
         .on_press(Message::SelectSettingsCategory(item))
         .padding([design::GRID_UNIT, 2.0 * design::GRID_UNIT])
@@ -601,35 +612,36 @@ pub(super) fn settings_dialog<'a>(
         .width(Length::Fill)
         .into()
     } else {
-        widget::container(
-            widget::column::with_children(
-                SettingsCategory::ALL
-                    .into_iter()
-                    .map(|item| category_button(item, category, progress)),
+        widget::scrollable(
+            widget::container(
+                widget::column::with_children(
+                    SettingsCategory::ALL
+                        .into_iter()
+                        .map(|item| category_button(item, category, progress)),
+                )
+                .spacing(design::GRID_UNIT)
+                .width(Length::Fill),
             )
-            .spacing(design::GRID_UNIT)
+            .padding([3.0 * design::GRID_UNIT, 2.0 * design::GRID_UNIT])
             .width(Length::Fill),
         )
-        .padding([3.0 * design::GRID_UNIT, 2.0 * design::GRID_UNIT])
+        .class(cosmic::style::iced::Scrollable::Minimal)
         .width(Length::Fixed(42.0 * design::GRID_UNIT))
         .height(Length::Fill)
         .into()
     };
 
-    let groups = settings_category_controls(category, draft, progress);
-    let controls = groups;
-    let content: Element<'a, Message> = widget::container(
-        widget::scrollable(
-            widget::column::with_children(controls)
+    let content: Element<'a, Message> = widget::scrollable(
+        widget::container(
+            widget::column::with_children(settings_category_controls(category, draft, progress))
                 .spacing(5.0 * design::GRID_UNIT)
                 .width(Length::Fill)
                 .max_width(CONTENT_MAX_WIDTH),
         )
-        .class(cosmic::style::iced::Scrollable::Minimal)
-        .width(Length::Fill)
-        .height(Length::Fill),
+        .padding([4.0 * design::GRID_UNIT, gutter])
+        .width(Length::Fill),
     )
-    .padding([4.0 * design::GRID_UNIT, gutter])
+    .class(cosmic::style::iced::Scrollable::Minimal)
     .width(Length::Fill)
     .height(Length::Fill)
     .into();

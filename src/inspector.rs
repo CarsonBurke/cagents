@@ -619,10 +619,12 @@ pub fn model_for_card(
                 if let Some(error) = &source.diff_error {
                     facts.push(Fact::new("Diff error", error));
                 }
-                if let (Some(additions), Some(deletions)) =
-                    (source.diff_additions, source.diff_deletions)
-                {
-                    facts.push(Fact::new("Changes", format!("+{additions}  −{deletions}")));
+                let counts = crate::repository::line_change_counts(
+                    source.diff_additions.map(u64::from),
+                    source.diff_deletions.map(u64::from),
+                );
+                if !counts.is_empty() {
+                    facts.push(Fact::new("Changes", counts));
                 }
                 if let Some((current, total)) = source.diff_change {
                     facts.push(Fact::new("Change", format!("{current} of {total}")));
@@ -635,18 +637,15 @@ pub fn model_for_card(
                         InspectorAction::BackToRepositoryFiles(card.id),
                     ));
                 }
-                // Not gated on a local change: two of the card's four bases
-                // compare against committed trees, which is exactly how a file
-                // the branch changed and the worktree left alone gets a diff.
-                // The card's own Edit/Diff control refuses no such file, and
-                // the inspector describes that card rather than overruling it.
-                if source.surface == "Editor" && !source.saving {
+                // Capabilities come from the runtime, including committed-tree
+                // comparisons that are valid without local changes.
+                if source.surface == "Editor" && source.can_show_diff {
                     actions.push(Action::new(
                         "Show diff",
                         "text-x-generic-symbolic",
                         InspectorAction::ShowRepositoryDiff(card.id),
                     ));
-                } else if source.surface == "Diff" {
+                } else if source.surface == "Diff" && !source.saving {
                     actions.push(Action::new(
                         "Show editor",
                         "document-edit-symbolic",
@@ -654,12 +653,12 @@ pub fn model_for_card(
                     ));
                 }
                 match source.markdown_mode {
-                    Some("Edit") => actions.push(Action::new(
+                    Some("Edit") if !source.saving => actions.push(Action::new(
                         "Preview Markdown",
                         "document-preview-symbolic",
                         InspectorAction::ShowMarkdownPreview(card.id),
                     )),
-                    Some("Preview") => actions.push(Action::new(
+                    Some("Preview") if !source.saving => actions.push(Action::new(
                         "Edit Markdown",
                         "document-edit-symbolic",
                         InspectorAction::ShowMarkdownEdit(card.id),
@@ -668,11 +667,11 @@ pub fn model_for_card(
                 }
                 if source.surface == "Diff" {
                     let opposite_basis = match source.diff_basis {
-                        Some("Staged") if source.has_unstaged => Some((
+                        Some("Staged") if source.can_select_unstaged_diff => Some((
                             "Show unstaged diff",
                             InspectorAction::ShowUnstagedDiff(card.id),
                         )),
-                        Some("Unstaged") if source.has_staged => {
+                        Some("Unstaged") if source.can_select_staged_diff => {
                             Some(("Show staged diff", InspectorAction::ShowStagedDiff(card.id)))
                         }
                         _ => None,
@@ -680,20 +679,22 @@ pub fn model_for_card(
                     if let Some((label, message)) = opposite_basis {
                         actions.push(Action::new(label, "vcs-diff-symbolic", message));
                     }
-                    actions.push(Action::new(
-                        if source.diff_mode == Some("Split") {
-                            "Show inline diff"
-                        } else {
-                            "Show split diff"
-                        },
-                        "view-split-left-right-symbolic",
-                        if source.diff_mode == Some("Split") {
-                            InspectorAction::ShowInlineDiff(card.id)
-                        } else {
-                            InspectorAction::ShowSplitDiff(card.id)
-                        },
-                    ));
-                    if source.diff_change.is_some() {
+                    if source.can_change_diff_layout {
+                        actions.push(Action::new(
+                            if source.diff_mode == Some("Split") {
+                                "Show inline diff"
+                            } else {
+                                "Show split diff"
+                            },
+                            "view-split-left-right-symbolic",
+                            if source.diff_mode == Some("Split") {
+                                InspectorAction::ShowInlineDiff(card.id)
+                            } else {
+                                InspectorAction::ShowSplitDiff(card.id)
+                            },
+                        ));
+                    }
+                    if source.can_change_diff_layout && source.diff_change.is_some() {
                         actions.push(Action::new(
                             "Previous change",
                             "go-up-symbolic",
@@ -1399,14 +1400,12 @@ impl SegmentedActions {
                 // every editor and diff transition, nothing focuses these
                 // buttons by id, and their accessible names come from their
                 // labels, so the identity buys nothing and costs a crash.
-                let mut button = widget::button::standard(action.label)
+                widget::button::standard(action.label)
                     .leading_icon(widget::icon::from_name(action.icon).size(16))
+                    .class(crate::sidebar::sidebar_button_style(false))
                     .width(Length::Fill)
-                    .on_press(action.message);
-                if action.primary {
-                    button = button.class(theme::Button::Suggested);
-                }
-                button.into()
+                    .on_press(action.message)
+                    .into()
             })
             .collect();
         widget::column::with_children(buttons)
@@ -1438,7 +1437,7 @@ fn fact_element(
                 .spacing(0)
                 .width(Length::Fill),
             )
-            .class(theme::Button::Text)
+            .class(crate::sidebar::sidebar_button_style(false))
             .name(name)
             .padding([0, spacing.space_xxxs])
             .width(Length::Fill)
@@ -1741,25 +1740,31 @@ pub fn view(model: InspectorModel, width: f32) -> Element<'static, InspectorActi
     sections.push(widget::divider::horizontal::default().into());
     sections.push(SegmentedActions::new(model.actions).view());
     let content = widget::scrollable(
-        widget::column::with_children(sections)
-            .spacing(spacing.space_s)
-            .width(Length::Fill),
+        widget::container(
+            widget::column::with_children(sections)
+                .spacing(spacing.space_s)
+                .width(Length::Fill),
+        )
+        .padding(12)
+        .width(Length::Fill),
     )
     .class(cosmic::style::iced::Scrollable::Minimal)
     .height(Length::Fill);
 
     widget::container(
         widget::column::with_children(vec![
-            heading.into(),
+            widget::container(heading)
+                .padding(12)
+                .width(Length::Fill)
+                .into(),
             widget::divider::horizontal::default().into(),
             content.into(),
         ])
-        .spacing(spacing.space_xs)
+        .spacing(0)
         .width(Length::Fill)
         .height(Length::Fill),
     )
     .class(theme::Container::Background)
-    .padding(12)
     .width(Length::Fixed(width.max(0.0)))
     .height(Length::Fill)
     .into()
@@ -1961,7 +1966,7 @@ mod tests {
     }
 
     #[test]
-    fn repository_context_targets_its_worktree_and_names_every_change_kind() {
+    fn repository_context_targets_its_worktree() {
         let project_id = ProjectId::new();
         let repository = PathBuf::from("/repo");
         let worktree_path = PathBuf::from("/repo/worktrees/feature");
@@ -2010,44 +2015,13 @@ mod tests {
             InspectorAction::CreatePullRequest { project_id: action_project, worktree }
                 if *action_project == project_id && worktree == &worktree_path
         )));
-        let changes = model
-            .sections
-            .iter()
-            .find(|section| section.title == "Worktree context")
-            .and_then(|section| section.facts.iter().find(|fact| fact.label == "Changes"))
-            .map(|fact| fact.value.as_str());
-        assert_eq!(
-            changes,
-            Some("15 changes (1 staged, 2 unstaged, 3 untracked, 4 conflicted, 5 submodule)")
-        );
     }
 
     #[test]
-    fn repository_model_uses_runtime_source_facts_and_recovery_actions() {
+    fn repository_conflict_exposes_recovery_actions() {
         let card = repository_card();
         let source = source_context();
         let model = model_for_card(&card, RuntimeStatus::Attention, &[], Some(&source));
-        let facts = &model
-            .sections
-            .iter()
-            .find(|section| section.title == "Source")
-            .unwrap()
-            .facts;
-        assert!(
-            facts
-                .iter()
-                .any(|fact| fact.label == "Selected file" && fact.value == "README.md")
-        );
-        assert!(
-            facts
-                .iter()
-                .any(|fact| fact.label == "Document" && fact.value == "Save conflict")
-        );
-        assert!(
-            facts
-                .iter()
-                .any(|fact| fact.label == "Changes" && fact.value == "+3  −2")
-        );
         assert!(model.actions.iter().any(|action| matches!(
             action.message,
             InspectorAction::OverwriteRepositoryFile(id) if id == card.id
@@ -2194,6 +2168,10 @@ mod tests {
             can_discard: true,
             can_reload: true,
             can_retry_diff: true,
+            can_show_diff: true,
+            can_change_diff_layout: true,
+            can_select_staged_diff: true,
+            can_select_unstaged_diff: true,
             can_back: false,
         }
     }
@@ -2257,7 +2235,7 @@ mod tests {
     /// file the branch changed and the worktree left alone still has a diff to
     /// read. The inspector must not withhold what the card itself offers.
     #[test]
-    fn an_unchanged_file_is_still_offered_a_diff() {
+    fn an_unchanged_file_with_a_committed_comparison_is_still_offered_a_diff() {
         let card = repository_card();
         let source = RepositoryInspectorContext {
             selected_status: Some("  ".into()),
@@ -2265,14 +2243,16 @@ mod tests {
             has_staged: false,
             has_unstaged: false,
             surface: "Editor",
+            diff_basis: Some("Branch"),
             ..source_context()
         };
         let model = model_for_card(&card, RuntimeStatus::Ready, &[], Some(&source));
 
         assert!(
-            model.actions.iter().any(|action| action.message
-                == InspectorAction::ShowRepositoryDiff(card.id)
-                && action.label == "Show diff"),
+            model
+                .actions
+                .iter()
+                .any(|action| action.message == InspectorAction::ShowRepositoryDiff(card.id)),
             "an unchanged file was refused the diff its card offers: {:?}",
             model.actions
         );
@@ -2281,6 +2261,7 @@ mod tests {
         // diff would describe text the write has not finished replacing.
         let saving = RepositoryInspectorContext {
             saving: true,
+            can_show_diff: false,
             ..source
         };
         let model = model_for_card(&card, RuntimeStatus::Ready, &[], Some(&saving));

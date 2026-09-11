@@ -29,6 +29,7 @@ pub enum WorkspaceViewportEvent {
     Scrolled(ViewportSample),
     Resized(f32),
     PointerFocused(CardId),
+    PointerEntered(CardId),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -340,6 +341,7 @@ pub struct Events<ViewportMessage> {
 pub fn view<'a, Message, BuildCard, ContainerId, ViewportMessage>(
     workspace: &'a Workspace,
     shortcuts: &'a KeyboardShortcuts,
+    focus_follows_mouse: bool,
     viewport_width: f32,
     scroll_id: widget::Id,
     build_card: BuildCard,
@@ -356,33 +358,37 @@ where
         viewport: on_viewport,
     } = events;
     let projection = workspace.projection(viewport_width);
-    let strip = VirtualStrip::new(
-        &projection,
-        Arc::clone(workspace.card_indices()),
-        projection
-            .mounted
-            .iter()
-            .filter_map(|mounted| {
-                let card = workspace.card(mounted.id)?;
-                let context = CardViewContext {
-                    id: card.id,
-                    focused: workspace.focused() == Some(card.id),
-                };
-                let content =
-                    cosmic::widget::id_container(build_card(context), container_id(card.id));
-                Some(VirtualCard {
-                    id: card.id,
-                    x: mounted.start,
-                    width: mounted.width,
-                    content: CardSurface::new(content)
-                        .on_pointer_focus(on_viewport(WorkspaceViewportEvent::PointerFocused(
-                            card.id,
-                        )))
-                        .into(),
+    let strip =
+        VirtualStrip::new(
+            &projection,
+            Arc::clone(workspace.card_indices()),
+            projection
+                .mounted
+                .iter()
+                .filter_map(|mounted| {
+                    let card = workspace.card(mounted.id)?;
+                    let context = CardViewContext {
+                        id: card.id,
+                        focused: workspace.focused() == Some(card.id),
+                    };
+                    let content =
+                        cosmic::widget::id_container(build_card(context), container_id(card.id));
+                    Some(VirtualCard {
+                        id: card.id,
+                        x: mounted.start,
+                        width: mounted.width,
+                        content: CardSurface::new(content)
+                            .on_pointer_focus(on_viewport(WorkspaceViewportEvent::PointerFocused(
+                                card.id,
+                            )))
+                            .on_pointer_enter(focus_follows_mouse.then(|| {
+                                on_viewport(WorkspaceViewportEvent::PointerEntered(card.id))
+                            }))
+                            .into(),
+                    })
                 })
-            })
-            .collect(),
-    );
+                .collect(),
+        );
     let on_viewport_for_scroll = on_viewport.clone();
     let scrollable = cosmic::widget::scrollable::horizontal(strip)
         .direction(widget::scrollable::Direction::Horizontal(
@@ -413,6 +419,7 @@ where
 struct CardSurface<'a, Message> {
     content: Element<'a, Message>,
     on_pointer_focus: Option<Message>,
+    on_pointer_enter: Option<Message>,
 }
 
 impl<'a, Message> CardSurface<'a, Message> {
@@ -420,11 +427,17 @@ impl<'a, Message> CardSurface<'a, Message> {
         Self {
             content: content.into(),
             on_pointer_focus: None,
+            on_pointer_enter: None,
         }
     }
 
     fn on_pointer_focus(mut self, message: Message) -> Self {
         self.on_pointer_focus = Some(message);
+        self
+    }
+
+    fn on_pointer_enter(mut self, message: Option<Message>) -> Self {
+        self.on_pointer_enter = message;
         self
     }
 
@@ -437,22 +450,10 @@ impl<'a, Message> CardSurface<'a, Message> {
     }
 }
 
-#[derive(Debug, Default)]
-enum SurfacePointer {
-    #[default]
-    Unseen,
-    At(Point),
-    Gone,
-}
-
-impl SurfacePointer {
-    fn shown(&self, cursor: mouse::Cursor) -> mouse::Cursor {
-        match self {
-            Self::Unseen => cursor,
-            Self::At(position) => mouse::Cursor::Available(*position),
-            Self::Gone => mouse::Cursor::Unavailable,
-        }
-    }
+#[derive(Default)]
+struct CardPointerState {
+    hovered: bool,
+    selecting: bool,
 }
 
 fn clipped_viewport(bounds: Rectangle, viewport: &Rectangle) -> Option<Rectangle> {
@@ -465,11 +466,11 @@ fn should_forward_to_raw_children(event_captured: bool) -> bool {
 
 impl<Message: Clone> Widget<Message, Theme, Renderer> for CardSurface<'_, Message> {
     fn tag(&self) -> tree::Tag {
-        tree::Tag::of::<SurfacePointer>()
+        tree::Tag::of::<CardPointerState>()
     }
 
     fn state(&self) -> tree::State {
-        tree::State::new(SurfacePointer::default())
+        tree::State::new(CardPointerState::default())
     }
 
     fn children(&self) -> Vec<Tree> {
@@ -527,18 +528,33 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for CardSurface<'_, Messag
         shell: &mut Shell<'_, Message>,
         viewport: &Rectangle,
     ) {
-        let seen = match event {
-            Event::Mouse(mouse::Event::CursorMoved { position }) => {
-                Some(SurfacePointer::At(*position))
+        let pointer = tree.state.downcast_mut::<CardPointerState>();
+        match event {
+            Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)) => {
+                pointer.selecting = true
             }
-            Event::Mouse(mouse::Event::CursorLeft) => Some(SurfacePointer::Gone),
-            _ => None,
-        };
-        if let Some(seen) = seen {
-            *tree.state.downcast_mut::<SurfacePointer>() = seen;
-            shell.request_redraw();
+            Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)) => {
+                pointer.selecting = false
+            }
+            Event::Mouse(mouse::Event::CursorLeft) => {
+                pointer.hovered = false;
+                pointer.selecting = false;
+            }
+            Event::Mouse(mouse::Event::CursorMoved { .. }) => {
+                let hovered = !pointer.selecting
+                    && !shell.is_event_captured()
+                    && clipped_viewport(layout.bounds(), viewport)
+                        .is_some_and(|clip| cursor.is_over(clip));
+                if hovered
+                    && !pointer.hovered
+                    && let Some(message) = &self.on_pointer_enter
+                {
+                    shell.publish(message.clone());
+                }
+                pointer.hovered = hovered;
+            }
+            _ => {}
         }
-
         let Some(clipped) = clipped_viewport(layout.bounds(), viewport) else {
             return;
         };
@@ -574,10 +590,13 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for CardSurface<'_, Messag
         let Some(clipped) = clipped_viewport(layout.bounds(), viewport) else {
             return mouse::Interaction::default();
         };
+        if !cursor.is_over(clipped) {
+            return mouse::Interaction::default();
+        }
         self.content.as_widget().mouse_interaction(
             &tree.children[0],
             Self::child_layout(layout),
-            tree.state.downcast_ref::<SurfacePointer>().shown(cursor),
+            cursor,
             &clipped,
             renderer,
         )
@@ -596,7 +615,6 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for CardSurface<'_, Messag
         let Some(clipped) = clipped_viewport(layout.bounds(), viewport) else {
             return;
         };
-        let shown = tree.state.downcast_ref::<SurfacePointer>().shown(cursor);
         renderer.with_layer(clipped, |renderer| {
             self.content.as_widget().draw(
                 &tree.children[0],
@@ -604,7 +622,7 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for CardSurface<'_, Messag
                 _theme,
                 style,
                 Self::child_layout(layout),
-                shown,
+                cursor,
                 &clipped,
             );
         });
@@ -852,7 +870,17 @@ impl<Message> Widget<Message, Theme, Renderer> for VirtualStrip<'_, Message> {
             .zip(&mut tree.children)
             .zip(layout.children())
         {
-            if child_layout.bounds().intersects(viewport) {
+            if child_layout.bounds().intersects(viewport)
+                || matches!(
+                    event,
+                    Event::Mouse(
+                        mouse::Event::CursorMoved { .. }
+                            | mouse::Event::CursorLeft
+                            | mouse::Event::ButtonPressed(_)
+                            | mouse::Event::ButtonReleased(_)
+                    )
+                )
+            {
                 card.content.as_widget_mut().update(
                     state,
                     event,
@@ -887,7 +915,12 @@ impl<Message> Widget<Message, Theme, Renderer> for VirtualStrip<'_, Message> {
             .iter()
             .zip(&tree.children)
             .zip(layout.children())
-            .filter(|(_, child_layout)| child_layout.bounds().intersects(viewport))
+            .filter(|(_, child_layout)| {
+                child_layout
+                    .bounds()
+                    .intersection(viewport)
+                    .is_some_and(|visible| cursor.is_over(visible))
+            })
             .map(|((card, state), child_layout)| {
                 card.content.as_widget().mouse_interaction(
                     state,
@@ -1270,6 +1303,90 @@ mod tests {
     use crate::settings::parse_chords;
     use crate::workspace::{CardWidth, WorkspaceCard};
     use std::collections::HashSet;
+
+    #[test]
+    fn card_cursor_uses_translated_child_coordinates_without_reviving_blocked_hover() {
+        use cosmic::iced::advanced::{clipboard, renderer::Headless};
+        let renderer = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(Renderer::new(
+                cosmic::iced::Font::default(),
+                cosmic::iced::Pixels(14.0),
+                Some("tiny-skia"),
+            ))
+            .unwrap();
+        let content = cosmic::widget::text_editor::Content::with_text("draft");
+        let editor = widget::text_editor::TextEditor::new(&content)
+            .width(100.0)
+            .height(Length::Fill)
+            .on_action(|_| "edit");
+        let button = cosmic::widget::button::text("Action")
+            .width(Length::Fixed(100.0))
+            .height(Length::Fill)
+            .on_press("click");
+        let row = cosmic::widget::row::with_children(vec![editor.into(), button.into()])
+            .height(Length::Fill);
+        let mut surface: Element<'_, &str> =
+            CardSurface::new(row).on_pointer_enter(Some("enter")).into();
+        let mut tree = Tree::new(&surface);
+        let node = surface
+            .as_widget_mut()
+            .layout(
+                &mut tree,
+                &renderer,
+                &layout::Limits::new(Size::new(200.0, 80.0), Size::new(200.0, 80.0)),
+            )
+            .move_to(Point::new(100.0, 0.0));
+        let viewport = Rectangle::new(Point::new(100.0, 0.0), Size::new(200.0, 80.0));
+        let mut messages = Vec::new();
+        let row_layout = Layout::new(&node).children().next().unwrap();
+        let mut controls = row_layout.children();
+        let editor_center = controls.next().unwrap().bounds().center();
+        let button_center = controls.next().unwrap().bounds().center();
+        for (position, expected) in [
+            (editor_center, mouse::Interaction::Text),
+            (button_center, mouse::Interaction::Pointer),
+        ] {
+            let cursor = mouse::Cursor::Available(position);
+            surface.as_widget_mut().update(
+                &mut tree,
+                &Event::Mouse(mouse::Event::CursorMoved {
+                    position: position - Vector::new(100.0, 0.0),
+                }),
+                Layout::new(&node),
+                cursor,
+                &renderer,
+                &mut clipboard::Null,
+                &mut Shell::new(&mut messages),
+                &viewport,
+            );
+            assert_eq!(
+                surface.as_widget().mouse_interaction(
+                    &tree,
+                    Layout::new(&node),
+                    cursor,
+                    &viewport,
+                    &renderer,
+                ),
+                expected
+            );
+            for blocked in [mouse::Cursor::Unavailable, cursor.levitate()] {
+                assert_eq!(
+                    surface.as_widget().mouse_interaction(
+                        &tree,
+                        Layout::new(&node),
+                        blocked,
+                        &viewport,
+                        &renderer,
+                    ),
+                    mouse::Interaction::None
+                );
+            }
+        }
+        assert_eq!(messages, ["enter"]);
+    }
 
     #[test]
     fn parked_editor_preserves_focus_across_named_state_extraction() {
@@ -1704,6 +1821,7 @@ mod tests {
         let mut element = view(
             &workspace,
             &shortcuts,
+            true,
             400.0,
             widget::Id::unique(),
             |_| {
@@ -1964,6 +2082,7 @@ mod tests {
         let mut composed: Element<'_, ()> = view(
             &workspace,
             &shortcuts,
+            true,
             VIEWPORT_WIDTH,
             widget::Id::unique(),
             |context| {

@@ -443,21 +443,37 @@ pub fn rename_within(directory: &Root, from: &OsStr, to: &OsStr) -> Result<(), R
 /// Returns an error for invalid names, an existing destination, or a failed
 /// filesystem operation. Existing recovery evidence is never replaced.
 pub fn rename_new_within(directory: &Root, from: &OsStr, to: &OsStr) -> Result<(), ResolveError> {
-    let source = c_component(from, &directory.path)?;
-    let destination = c_component(to, &directory.path)?;
+    rename_new_between(directory, from, directory, to)
+}
+
+/// Atomically moves an entry between already-open directories without
+/// replacing any destination entry, including a dangling symbolic link.
+///
+/// # Errors
+///
+/// Returns an error for invalid leaf names, an existing destination, a
+/// cross-filesystem move, or another failed filesystem operation.
+pub fn rename_new_between(
+    source_directory: &Root,
+    from: &OsStr,
+    destination_directory: &Root,
+    to: &OsStr,
+) -> Result<(), ResolveError> {
+    let source = c_component(from, &source_directory.path)?;
+    let destination = c_component(to, &destination_directory.path)?;
     // SAFETY: both names and the owned directory descriptor outlive this call.
     let status = unsafe {
         libc::renameat2(
-            directory.descriptor(),
+            source_directory.descriptor(),
             source.as_ptr(),
-            directory.descriptor(),
+            destination_directory.descriptor(),
             destination.as_ptr(),
             libc::RENAME_NOREPLACE,
         )
     };
     if status < 0 {
         return Err(ResolveError::io(
-            &directory.path.join(to),
+            &destination_directory.path.join(to),
             &io::Error::last_os_error(),
         ));
     }
@@ -624,6 +640,31 @@ pub fn copy_extended_attributes(source: &File, destination: &File) -> Vec<Attrib
         }
     }
     lost
+}
+
+/// Preserves the source's POSIX access ACL on a new file after its mode is set.
+/// Unlike optional content attributes, losing an ACL can grant unintended
+/// access, so every failure prevents publication. An absent source ACL removes
+/// any access ACL inherited by the destination from its parent.
+pub fn copy_access_acl(source: &File, destination: &File) -> io::Result<()> {
+    let name = c"system.posix_acl_access";
+    let value = match read_attribute(source, name) {
+        Ok(value) => value,
+        Err(error) if error.raw_os_error() == Some(libc::EOPNOTSUPP) => None,
+        Err(error) => return Err(error),
+    };
+    if let Some(value) = value {
+        return write_attribute(destination, name, &value);
+    }
+    // SAFETY: the descriptor is live and the attribute name is static.
+    let status = unsafe { libc::fremovexattr(destination.as_raw_fd(), name.as_ptr()) };
+    if status < 0 {
+        let error = io::Error::last_os_error();
+        if !matches!(error.raw_os_error(), Some(libc::ENODATA | libc::EOPNOTSUPP)) {
+            return Err(error);
+        }
+    }
+    Ok(())
 }
 
 /// Whether an attribute describes the file's content rather than the kernel's
@@ -1413,6 +1454,100 @@ mod tests {
             ),
             "{lost:?}",
         );
+    }
+
+    fn restrictive_access_acl() -> Vec<u8> {
+        // Linux POSIX ACL xattr v2: the mask is readable, but the owning group
+        // has no access. Copying st_mode alone would incorrectly grant it read.
+        let mut value = 2_u32.to_le_bytes().to_vec();
+        for (tag, permissions, id) in [
+            (0x01_u16, 6_u16, u32::MAX),
+            (0x02, 4, 12_345),
+            (0x04, 0, u32::MAX),
+            (0x10, 4, u32::MAX),
+            (0x20, 0, u32::MAX),
+        ] {
+            value.extend_from_slice(&tag.to_le_bytes());
+            value.extend_from_slice(&permissions.to_le_bytes());
+            value.extend_from_slice(&id.to_le_bytes());
+        }
+        value
+    }
+
+    fn set_test_access_acl(file: &File, value: &[u8]) -> bool {
+        match write_attribute(file, c"system.posix_acl_access", value) {
+            Ok(()) => true,
+            Err(error) if error.raw_os_error() == Some(libc::EOPNOTSUPP) => false,
+            Err(error) => panic!("could not set fixture access ACL: {error}"),
+        }
+    }
+
+    #[cfg(feature = "ui")]
+    #[test]
+    fn editor_copy_preserves_access_acl_and_removes_unwanted_inheritance() {
+        let directory = tempfile::tempdir().unwrap();
+        fs::write(directory.path().join("restricted"), b"private contents").unwrap();
+        fs::write(directory.path().join("plain"), b"plain contents").unwrap();
+        let restricted = File::open(directory.path().join("restricted")).unwrap();
+        let acl = restrictive_access_acl();
+        if !set_test_access_acl(&restricted, &acl) {
+            return;
+        }
+        assert_eq!(
+            restricted.metadata().unwrap().permissions().mode() & 0o777,
+            0o640
+        );
+        fs::create_dir(directory.path().join("copies")).unwrap();
+        let parent = File::open(directory.path().join("copies")).unwrap();
+        write_attribute(&parent, c"system.posix_acl_default", &acl).unwrap();
+        let plain = File::open(directory.path().join("plain")).unwrap();
+        plain
+            .set_permissions(fs::Permissions::from_mode(0o640))
+            .unwrap();
+
+        for name in ["restricted", "plain"] {
+            crate::editor::copy_file(
+                directory.path(),
+                Path::new(name),
+                &Path::new("copies").join(name),
+            )
+            .unwrap();
+        }
+        let restricted_copy = File::open(directory.path().join("copies/restricted")).unwrap();
+        let plain_copy = File::open(directory.path().join("copies/plain")).unwrap();
+        assert_eq!(
+            read_attribute(&restricted_copy, c"system.posix_acl_access").unwrap(),
+            Some(acl)
+        );
+        assert_eq!(
+            read_attribute(&plain_copy, c"system.posix_acl_access").unwrap(),
+            None
+        );
+        assert_eq!(
+            plain_copy.metadata().unwrap().permissions().mode() & 0o777,
+            0o640
+        );
+        assert_eq!(
+            fs::read(directory.path().join("restricted")).unwrap(),
+            b"private contents"
+        );
+        assert_eq!(
+            fs::read(directory.path().join("copies/restricted")).unwrap(),
+            b"private contents"
+        );
+    }
+
+    #[test]
+    fn access_acl_transfer_failure_is_an_error_not_optional_metadata_loss() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = File::create(directory.path().join("source")).unwrap();
+        if !set_test_access_acl(&source, &restrictive_access_acl()) {
+            return;
+        }
+        let root = Root::open(directory.path()).unwrap();
+        // An O_PATH descriptor is deliberately unable to receive an ACL.
+        let invalid_destination = File::from(root.directory.try_clone().unwrap());
+        assert!(copy_access_acl(&source, &invalid_destination).is_err());
     }
 
     #[test]

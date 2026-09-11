@@ -15,13 +15,13 @@ fn chat_icon() -> widget::icon::Handle {
     ICON.clone()
 }
 
-// Pane titles are flat intrinsic-width tabs, with native keyboard focus cues.
+// Tabs retain a neutral keyboard focus cue without an accent outline.
 fn column_title_style() -> cosmic::theme::Button {
     fn appearance(focused: bool, theme: &cosmic::Theme) -> widget::button::Style {
         widget::button::Style {
-            border_radius: 0.0.into(),
+            border_radius: theme.cosmic().corner_radii.radius_s.into(),
             border_width: if focused { design::BORDER_WIDTH } else { 0.0 },
-            border_color: (*theme.cosmic().accent_color()).into(),
+            border_color: theme.current_container().component.on_disabled.into(),
             ..widget::button::Style::new()
         }
     }
@@ -148,25 +148,65 @@ impl Cagents {
         }
     }
 
-    /// Overlays only the already-reserved header band, never another row.
+    fn tab_strip_geometry(&self) -> (f32, f32) {
+        let available = (self.workspace.viewport_width() - self.workspace_header_width()).max(0.0);
+        let width = (available / self.workspace.cards().len().max(1) as f32).clamp(96.0, 200.0);
+        (available, width)
+    }
+
+    pub(super) fn reveal_active_tab(&self) -> Task<Message> {
+        let Some(index) = self
+            .workspace
+            .focused()
+            .and_then(|focused| self.workspace.order().position(|id| id == focused))
+        else {
+            return Task::none();
+        };
+        let (available, width) = self.tab_strip_geometry();
+        workspace_widget::scroll_to(
+            widget::Id::new("workspace.tabs"),
+            ((index + 1) as f32 * (width + 2.0) - available).max(0.0),
+        )
+        .map(cosmic::Action::App)
+    }
+
+    /// One compact navigation strip, independent of pane widths and camera offset.
     pub(super) fn workspace_chrome<'a>(
         &'a self,
         content: Element<'a, Message>,
     ) -> Element<'a, Message> {
+        let (_, tab_width) = self.tab_strip_geometry();
+        let tabs = widget::row::with_children(
+            self.workspace
+                .order()
+                .map(|id| self.column_header(id, self.workspace.focused() == Some(id), tab_width)),
+        )
+        .spacing(2)
+        .height(design::PRIMARY_CONTROL_SIZE);
+        let tabs = widget::scrollable::horizontal(tabs)
+            .id(widget::Id::new("workspace.tabs"))
+            .direction(iced::widget::scrollable::Direction::Horizontal(
+                iced::widget::scrollable::Scrollbar::hidden(),
+            ))
+            .width(Length::Fill)
+            .height(design::PRIMARY_CONTROL_SIZE);
         let actions = widget::row::with_children(self.workflow_header())
             .spacing(4)
             .align_y(Alignment::Center);
-        let header = self.native_header(actions.into(), None, !self.context_inspector_open);
-        let overlay = widget::container(
-            widget::container(header)
-                .width(self.workspace_header_width())
-                .height(design::HEADER_HEIGHT),
-        )
+        let header = self.native_header(
+            tabs.into(),
+            Some(actions.into()),
+            !self.context_inspector_open,
+        );
+        widget::column::with_children(vec![
+            header,
+            widget::divider::horizontal::default().into(),
+            content,
+        ])
+        .spacing(0)
         .width(Length::Fill)
         .height(Length::Fill)
-        .align_x(Alignment::End)
-        .align_y(Alignment::Start);
-        crate::interaction::layer(content, overlay.into())
+        .into()
     }
 
     pub(super) fn workflow_header(&self) -> Vec<Element<'_, Message>> {
@@ -235,89 +275,61 @@ impl Cagents {
         actions
     }
 
-    pub(super) fn column_header(&self, id: CardId, focused: bool) -> Element<'_, Message> {
+    fn column_header(&self, id: CardId, focused: bool, width: f32) -> Element<'_, Message> {
         let card = self.card_state(id);
-        let header_width = self.workspace.presentation_geometry().card(id).map_or(
-            self.workspace.viewport_width(),
-            |geometry| {
-                let available = self.workspace.viewport_width()
-                    - self.workspace_header_width()
-                    - (geometry.start - self.workspace.camera().offset());
-                available.clamp(0.0, geometry.width())
-            },
-        );
         let title = card.map_or("Column", |card| card.title.as_str());
         let labels = card_kind_labels(card.map(|card| &card.kind));
         let chrome = self.card_chrome.get(&id);
-        let file_toolbar = match self.cards.get(&id) {
-            Some(CardRuntime::Repository(runtime)) => {
-                repository_widget::selected_file_toolbar(id, runtime)
-            }
-            _ => None,
-        };
         let focus_id = chrome.map_or_else(
             || workspace_widget::card_focus_id(id),
             |chrome| chrome.focus_id.clone(),
         );
-        let has_file_toolbar = file_toolbar.is_some();
-        let mut children = if let Some(toolbar) = file_toolbar {
-            vec![
-                command(
-                    widget::icon::from_name(labels.icon),
-                    format!("Focus {title} column"),
-                    focus_id,
-                    Some(Message::FocusCard(id)),
-                ),
-                toolbar.map(Message::Repository),
-            ]
-        } else {
-            let caption = card.map(|card| card_kind_caption(&card.kind));
-            let icon: Element<'_, Message> = match card.map(|card| &card.kind) {
-                Some(CardKind::Browser(_)) => browser_icon().icon().size(16).into(),
-                Some(CardKind::Chat(_)) => chat_icon().icon().size(16).into(),
-                _ => widget::icon::from_name(labels.icon).size(16).into(),
-            };
-            let title_control = widget::button::custom(
-                widget::row::with_children(vec![
-                    icon,
-                    design::body(title)
-                        .wrapping(iced::widget::text::Wrapping::None)
-                        .ellipsize(iced::widget::text::Ellipsize::End(
-                            EllipsizeHeightLimit::Lines(1),
-                        ))
-                        .width(Length::Shrink)
-                        .into(),
-                ])
-                .spacing(8)
-                .align_y(Alignment::Center)
-                .height(Length::Fill),
-            )
-            .id(focus_id)
-            .name(chrome.map_or_else(
-                || {
-                    Cow::Owned(card_accessible_name(
-                        labels.type_label,
-                        title,
-                        caption.as_deref().unwrap_or(""),
-                        focused,
-                    ))
-                },
-                |chrome| Cow::Borrowed(chrome.accessible_name(focused)),
-            ))
-            .class(column_title_style())
-            .padding([0, 8])
-            .width(Length::Shrink)
-            .height(Length::Fill)
-            .on_press(Message::FocusCard(id));
-            let tip = match caption {
-                Some(caption) => format!("{title}\n{caption}"),
-                None => title.to_owned(),
-            };
-            vec![tooltip(
-                widget::container(title_control).max_width(280),
-                tip,
-            )]
+        let caption = card.map(|card| card_kind_caption(&card.kind));
+        let icon: Element<'_, Message> = match card.map(|card| &card.kind) {
+            Some(CardKind::Browser(_)) => browser_icon().icon().size(16).into(),
+            Some(CardKind::Chat(_)) => chat_icon().icon().size(16).into(),
+            _ => crate::ui_controls::symbolic_icon(labels.icon)
+                .icon()
+                .size(16)
+                .into(),
         };
+        let title_control = widget::button::custom(
+            widget::row::with_children(vec![
+                icon,
+                design::body(title)
+                    .wrapping(iced::widget::text::Wrapping::None)
+                    .ellipsize(iced::widget::text::Ellipsize::End(
+                        EllipsizeHeightLimit::Lines(1),
+                    ))
+                    .width(Length::Fill)
+                    .into(),
+            ])
+            .spacing(8)
+            .align_y(Alignment::Center)
+            .height(Length::Fill),
+        )
+        .id(focus_id)
+        .name(chrome.map_or_else(
+            || {
+                Cow::Owned(card_accessible_name(
+                    labels.type_label,
+                    title,
+                    caption.as_deref().unwrap_or(""),
+                    focused,
+                ))
+            },
+            |chrome| Cow::Borrowed(chrome.accessible_name(focused)),
+        ))
+        .class(column_title_style())
+        .padding([0, 8])
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .on_press(Message::FocusCard(id));
+        let tip = match caption {
+            Some(caption) => format!("{title}\n{caption}"),
+            None => title.to_owned(),
+        };
+        let mut children = vec![tooltip(title_control, tip)];
         let status = match self.cards.get(&id) {
             None | Some(CardRuntime::Loading) => Some((labels.starting, true)),
             Some(CardRuntime::Failed(_)) => Some(("Unavailable", false)),
@@ -345,6 +357,28 @@ impl Cagents {
             };
             children.push(tooltip(indicator, label));
         }
+        if self.sidebar_state.has_card_update(id) {
+            children.push(tooltip(
+                crate::ui_controls::symbolic_icon("notifications-symbolic")
+                    .icon()
+                    .size(14),
+                "Needs attention",
+            ));
+        } else if let Some(activity) = self.sidebar_state.card_activity(id) {
+            let indicator = match activity.state {
+                crate::agent::ActivityState::Working => Some(("agent-working-symbolic", "Working")),
+                crate::agent::ActivityState::Waiting => {
+                    Some(("agent-waiting-symbolic", "Waiting for input"))
+                }
+                _ => None,
+            };
+            if let Some((icon, label)) = indicator {
+                children.push(tooltip(
+                    crate::ui_controls::symbolic_icon(icon).icon().size(14),
+                    label,
+                ));
+            }
+        }
         if self.chat_switch_available(id) {
             children.push(command(
                 if card.is_some_and(|card| matches!(card.kind, CardKind::Chat(_))) {
@@ -369,67 +403,34 @@ impl Cagents {
             ),
             Some(Message::CloseCard(id)),
         ));
-        let row = widget::container(
+        widget::container(
             widget::row::with_children(children)
                 .align_y(Alignment::Center)
                 .height(Length::Fill)
-                .spacing(4)
-                .width(if has_file_toolbar {
-                    Length::Fill
-                } else {
-                    Length::Shrink
-                }),
+                .spacing(2)
+                .width(Length::Fill),
         )
-        .height(CARD_HEADER_HEIGHT - 1.0)
-        .padding([0, 4])
-        .width(if has_file_toolbar {
-            Length::Fill
-        } else {
-            Length::Shrink
-        })
+        .height(design::PRIMARY_CONTROL_SIZE)
+        .width(width)
         .class(cosmic::theme::Container::custom(move |theme| {
             iced::widget::container::Style {
-                background: Some(iced::Background::Color(if focused {
-                    theme.current_container().component.base.into()
-                } else {
-                    theme.cosmic().background(false).base.into()
-                })),
+                background: focused.then(|| {
+                    iced::Background::Color(
+                        theme
+                            .current_container()
+                            .component
+                            .selected_state_color()
+                            .into(),
+                    )
+                }),
+                border: iced::Border {
+                    radius: theme.cosmic().corner_radii.radius_s.into(),
+                    ..Default::default()
+                },
                 ..Default::default()
             }
-        }));
-        let rail = widget::container(iced::widget::Space::new())
-            .height(1)
-            .width(Length::Fill)
-            .class(cosmic::theme::Container::custom(move |theme| {
-                iced::widget::container::Style {
-                    background: Some(iced::Background::Color(if focused {
-                        (*theme.cosmic().accent_color()).into()
-                    } else {
-                        (*theme.cosmic().bg_divider()).into()
-                    })),
-                    ..Default::default()
-                }
-            }));
-        let header_row = widget::row::with_children(vec![
-            row.into(),
-            widget::divider::vertical::default().into(),
-            iced::widget::Space::new().width(Length::Fill).into(),
-        ])
-        .height(CARD_HEADER_HEIGHT - 1.0)
-        .spacing(0)
-        .width(header_width);
-        let header_row = widget::container(header_row).width(header_width).clip(true);
-        let header_row = widget::mouse_area(header_row)
-            .on_drag(Message::NativeWindowAction(cosmic::app::Action::Drag))
-            .on_double_press(Message::NativeWindowAction(cosmic::app::Action::Maximize))
-            .on_right_press(Message::NativeWindowAction(
-                cosmic::app::Action::ShowWindowMenu,
-            ));
-        widget::column::with_children(vec![header_row.into(), rail.into()])
-            .spacing(0)
-            .width(Length::Fill)
-            .height(CARD_HEADER_HEIGHT)
-            .into()
+        }))
+        .into()
     }
 
     pub(super) fn context_panel(
@@ -454,10 +455,10 @@ impl Cagents {
                 enabled,
                 enabled.then_some(Message::SelectContextTab(tab)),
             )
-            .tab(selected)
             .into()
         }))
-        .spacing(0);
+        .spacing(4)
+        .align_y(Alignment::Center);
         let mut end = self.sidebar_toggle();
         if self.context_inspector_is_overlay()
             && let Some(update) = self.update_control()
@@ -467,7 +468,12 @@ impl Cagents {
                 .align_y(Alignment::Center)
                 .into();
         }
-        let heading = self.native_header(tabs.into(), Some(end), true);
+        let heading = self.native_header(
+            iced::widget::Space::new().width(Length::Fill).into(),
+            Some(end),
+            true,
+        );
+        let selectors = widget::container(tabs).padding([4, 8]).width(Length::Fill);
         let body = match self.context_tab {
             ContextTab::Files => sidebar::file_panel(
                 &self.sidebar_model,
@@ -517,6 +523,7 @@ impl Cagents {
             widget::column::with_children(vec![
                 heading.into(),
                 widget::divider::horizontal::default().into(),
+                selectors.into(),
                 body,
             ])
             .spacing(0)

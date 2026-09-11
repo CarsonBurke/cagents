@@ -314,9 +314,21 @@ impl StripGeometry {
         (self.total_width - finite_nonnegative(viewport_width)).max(0.0)
     }
 
-    pub fn focus_offset(&self, id: CardId, viewport_width: f32) -> Option<f32> {
+    pub fn focus_offset(
+        &self,
+        id: CardId,
+        viewport_width: f32,
+        current_offset: f32,
+    ) -> Option<f32> {
         let card = self.card(id)?;
-        Some(card.start.clamp(0.0, self.max_offset(viewport_width)))
+        let target = if card.width() > viewport_width {
+            card.start
+        } else {
+            // Keep a fully visible pane stationary; otherwise expose only its
+            // hidden edge, preserving as much of its neighbor as possible.
+            current_offset.clamp(card.end - viewport_width, card.start)
+        };
+        Some(target.clamp(0.0, self.max_offset(viewport_width)))
     }
 }
 
@@ -840,6 +852,20 @@ impl Workspace {
     }
 
     pub fn focus(&mut self, id: CardId) -> Result<ViewportUpdate, WorkspaceError> {
+        self.focus_card(id, true)
+    }
+
+    pub fn focus_without_scrolling(
+        &mut self,
+        id: CardId,
+    ) -> Result<ViewportUpdate, WorkspaceError> {
+        if self.focused == Some(id) {
+            return Ok(ViewportUpdate::unchanged());
+        }
+        self.focus_card(id, false)
+    }
+
+    fn focus_card(&mut self, id: CardId, reveal: bool) -> Result<ViewportUpdate, WorkspaceError> {
         if self.index_of(id).is_none() {
             return Err(WorkspaceError::UnknownCard(id));
         }
@@ -850,7 +876,9 @@ impl Workspace {
         // Retarget the running spring without restarting on held-key repeats.
         self.focused = Some(id);
         self.pending_widget_focus = Some(id);
-        self.reveal_focused();
+        if reveal {
+            self.reveal_focused();
+        }
         Ok(self.refresh_visibility(false))
     }
 
@@ -1217,7 +1245,10 @@ impl Workspace {
         let Some(focused) = self.focused else {
             return;
         };
-        if let Some(target) = self.geometry.focus_offset(focused, self.viewport_width) {
+        if let Some(target) =
+            self.geometry
+                .focus_offset(focused, self.viewport_width, self.camera.target())
+        {
             self.camera.animate_to(target);
         }
     }
@@ -1667,7 +1698,7 @@ mod tests {
     }
 
     #[test]
-    fn focus_offset_left_aligns_fitting_columns_and_clamps_strip_edges() {
+    fn focus_offset_moves_only_far_enough_to_expose_a_hidden_edge() {
         let workspace = workspace_with_widths(
             &[
                 CardWidth::Fixed(480.0),
@@ -1678,13 +1709,31 @@ mod tests {
         );
         let geometry = workspace.geometry();
         let ids: Vec<_> = workspace.order().collect();
-        assert_eq!(geometry.focus_offset(ids[0], 700.0), Some(0.0));
-        let middle = geometry.card(ids[1]).unwrap();
-        assert_eq!(geometry.focus_offset(ids[1], 700.0), Some(middle.start));
-        assert_eq!(
-            geometry.focus_offset(ids[2], 700.0),
-            Some(geometry.max_offset(700.0))
-        );
+        assert_eq!(geometry.focus_offset(ids[0], 700.0, 0.0), Some(0.0));
+        assert_eq!(geometry.focus_offset(ids[1], 700.0, 0.0), Some(260.0));
+        assert_eq!(geometry.focus_offset(ids[1], 700.0, 300.0), Some(300.0));
+        assert_eq!(geometry.focus_offset(ids[1], 700.0, 700.0), Some(480.0));
+        assert_eq!(geometry.focus_offset(ids[2], 700.0, 260.0), Some(740.0));
+        assert_eq!(geometry.focus_offset(ids[0], 700.0, 260.0), Some(0.0));
+    }
+
+    #[test]
+    fn hover_activation_preserves_the_camera_and_does_not_repeat_widget_focus() {
+        let mut workspace = workspace_with_widths(&[CardWidth::Fraction(0.5); 3], 1_000.0);
+        let ids = workspace.order().collect::<Vec<_>>();
+        workspace.native_scroll(125.0, 1_000.0);
+        workspace.take_widget_focus_request();
+        let camera = workspace.camera();
+        workspace.focus_without_scrolling(ids[1]).unwrap();
+        assert_eq!(workspace.camera(), camera);
+        assert_eq!(workspace.focused(), Some(ids[1]));
+        assert_eq!(workspace.take_widget_focus_request(), Some(ids[1]));
+        workspace.focus_without_scrolling(ids[1]).unwrap();
+        assert_eq!(workspace.take_widget_focus_request(), None);
+        workspace.focus(ids[2]).unwrap();
+        let moving = workspace.camera();
+        workspace.focus_without_scrolling(ids[0]).unwrap();
+        assert_eq!(workspace.camera(), moving);
     }
 
     #[test]
@@ -1780,7 +1829,10 @@ mod tests {
             workspace_with_widths(&[CardWidth::Fixed(900.0), CardWidth::Fixed(900.0)], 700.0);
         let geometry = workspace.geometry();
         let target = geometry.card_at(1).unwrap();
-        assert_eq!(geometry.focus_offset(target.id, 700.0), Some(target.start));
+        assert_eq!(
+            geometry.focus_offset(target.id, 700.0, 0.0),
+            Some(target.start)
+        );
     }
 
     #[test]

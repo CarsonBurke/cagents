@@ -11,6 +11,18 @@ pub(super) fn worktree_root<'a>(
         .max_by_key(|root| root.components().count())
 }
 
+/// Missing directories are not navigable worktrees. A permission or transient
+/// I/O failure is not evidence of deletion, so retain those rows for recovery.
+pub(super) fn worktree_directory_available(path: &Path) -> bool {
+    match path.metadata() {
+        Ok(metadata) => metadata.is_dir(),
+        Err(error) => !matches!(
+            error.kind(),
+            std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+        ),
+    }
+}
+
 fn card_directory(card: &CardState) -> Option<&Path> {
     match &card.kind {
         CardKind::Terminal(session) => Some(&session.launch.working_directory),
@@ -20,12 +32,21 @@ fn card_directory(card: &CardState) -> Option<&Path> {
     }
 }
 
-fn belongs_to_scope(card: &CardState, scope: &Path, roots: &[&Path]) -> bool {
+fn belongs_to_scope(
+    card: &CardState,
+    scope: &Path,
+    roots: &[&Path],
+    owners: &HashMap<CardId, PathBuf>,
+) -> bool {
     card.existence.is_open()
         && card_directory(card).is_none_or(|directory| {
-            // Legacy directories have no sidebar scope until registered. Keep
-            // them reachable without making them owners of new worktrees.
-            worktree_root(directory, roots.iter().copied()).is_none_or(|root| root == scope)
+            owners
+                .get(&card.id)
+                .map(PathBuf::as_path)
+                .unwrap_or_else(|| {
+                    worktree_root(directory, roots.iter().copied()).unwrap_or(directory)
+                })
+                == scope
         })
 }
 
@@ -35,12 +56,13 @@ fn scope_descriptor(
     state: &WorkspaceState,
     scope: &Path,
     roots: &[&Path],
+    owners: &HashMap<CardId, PathBuf>,
     preferred_focus: Option<CardId>,
 ) -> WorkspaceState {
     let cards = state
         .cards
         .iter()
-        .filter(|card| belongs_to_scope(card, scope, roots))
+        .filter(|card| belongs_to_scope(card, scope, roots, owners))
         .cloned()
         .collect::<Vec<_>>();
     let focused = preferred_focus
@@ -56,7 +78,10 @@ fn scope_descriptor(
                 .iter()
                 .find(|card| matches!(&card.kind, CardKind::Repository(_)))
                 .map(|card| card.id)
-        });
+        })
+        // A global-only strip still needs an active pane, without making that
+        // browser an ownership source or displacing a worktree's own panes.
+        .or_else(|| cards.first().map(|card| card.id));
     WorkspaceState {
         schema_version: state.schema_version,
         id: state.id,
@@ -84,43 +109,138 @@ fn insertion_indices(
 }
 
 impl Cagents {
-    fn acknowledge_terminal_updates(&mut self, scope: &Path) {
-        for (&card, runtime) in &self.cards {
-            let CardRuntime::Terminal(handle) = runtime else {
-                continue;
-            };
-            let Some(state) = self
-                .card_state(card)
-                .filter(|state| state.existence.is_open())
-            else {
-                continue;
-            };
-            let Some(directory) = card_directory(state) else {
-                continue;
-            };
-            let roots = self
-                .sidebar_model
-                .projects
+    /// Resolve filesystem aliases only when changing/restoring scope, never in
+    /// the render path or by rewriting a hosted session's durable launch recipe.
+    fn refresh_worktree_owners(&mut self, selected: Option<&Path>) -> Option<PathBuf> {
+        // Deleted worktree rows disappear from navigation, not from ownership.
+        // Otherwise a surviving nested session would fall into its parent repo.
+        self.known_worktree_roots
+            .extend(self.sidebar_model.projects.iter().flat_map(|project| {
+                project
+                    .worktrees
+                    .iter()
+                    .map(|worktree| worktree.path.clone())
+            }));
+        self.known_worktree_roots
+            .extend(
+                self.durable
+                    .cards
+                    .iter()
+                    .filter_map(|card| match &card.kind {
+                        CardKind::Repository(view) => Some(view.worktree.clone()),
+                        _ => None,
+                    }),
+            );
+        let roots = self
+            .known_worktree_roots
+            .iter()
+            .map(|path| {
+                (
+                    path.as_path(),
+                    path.canonicalize().unwrap_or_else(|_| path.clone()),
+                    self.sidebar_model.worktree_at(path).is_some(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let resolve = |directory: &Path| {
+            let canonical = directory
+                .canonicalize()
+                .unwrap_or_else(|_| directory.into());
+            roots
                 .iter()
-                .flat_map(|project| &project.worktrees)
-                .map(|worktree| worktree.path.as_path());
-            if worktree_root(directory, roots).unwrap_or(directory) == scope
-                && let Err(error) = handle.acknowledge_updates()
-            {
-                self.status = Some(TransientNotice::error(format!(
-                    "Could not acknowledge terminal output: {error}"
-                )));
-            }
-        }
+                .filter(|(_, root, _)| canonical.starts_with(root))
+                .max_by_key(|(_, root, visible)| (root.components().count(), *visible))
+                .map_or_else(|| canonical.clone(), |(root, _, _)| (*root).to_path_buf())
+        };
+        let mut directories = HashMap::<&Path, PathBuf>::new();
+        self.worktree_owners = self
+            .durable
+            .cards
+            .iter()
+            .filter(|card| card.existence.is_open())
+            .filter_map(|card| {
+                let directory = card_directory(card)?;
+                let owner = directories
+                    .entry(directory)
+                    .or_insert_with(|| resolve(directory));
+                Some((card.id, owner.clone()))
+            })
+            .collect();
+        selected.map(resolve)
     }
 
-    fn acknowledge_worktree_updates(&mut self, path: &Path) -> Task<Message> {
-        if let Some(key) = self.sidebar_model.worktree_at(path) {
-            self.sidebar_state
-                .acknowledge_agent_update(key.project_id, key.worktree_id);
+    pub(super) fn card_worktree<'a>(&'a self, card: &'a CardState) -> Option<&'a Path> {
+        let directory = card_directory(card)?;
+        Some(self.worktree_owners.get(&card.id).map_or_else(
+            || {
+                worktree_root(
+                    directory,
+                    self.known_worktree_roots
+                        .iter()
+                        .map(PathBuf::as_path)
+                        .chain(self.sidebar_model.projects.iter().flat_map(|project| {
+                            project
+                                .worktrees
+                                .iter()
+                                .map(|worktree| worktree.path.as_path())
+                        })),
+                )
+                .unwrap_or(directory)
+            },
+            PathBuf::as_path,
+        ))
+    }
+
+    /// Unregistered launch directories are real scopes, not global cards.
+    /// Keep them reachable alongside registered worktrees without inventing
+    /// project identities or launching a replacement terminal on navigation.
+    pub(super) fn standalone_worktree_navigation(&self) -> Option<Element<'_, Message>> {
+        let mut directories = std::collections::BTreeSet::new();
+        for card in self
+            .durable
+            .cards
+            .iter()
+            .filter(|card| card.existence.is_open())
+        {
+            if let Some(directory) = self.card_worktree(card)
+                && self.sidebar_model.worktree_at(directory).is_none()
+            {
+                directories.insert(directory);
+            }
         }
-        self.acknowledge_terminal_updates(path);
-        self.acknowledge_chat_updates(path)
+        if directories.is_empty() {
+            return None;
+        }
+        let spacing = cosmic::theme::spacing();
+        let rows = directories
+            .into_iter()
+            .map(|directory| {
+                let label = display_path(directory);
+                widget::button::text(label)
+                    .on_press_maybe(
+                        (!self.modal_is_open())
+                            .then(|| Message::SelectWorkspaceScope(directory.to_path_buf())),
+                    )
+                    .width(Length::Fill)
+                    .class(cosmic::theme::Button::Text)
+                    .into()
+            })
+            .collect::<Vec<Element<'_, Message>>>();
+        Some(
+            widget::container(
+                widget::column::with_children(vec![
+                    widget::text::caption("Other sessions").into(),
+                    widget::scrollable(
+                        widget::column::with_children(rows).spacing(spacing.space_xxs),
+                    )
+                    .height(Length::Shrink)
+                    .into(),
+                ])
+                .spacing(spacing.space_xxs),
+            )
+            .max_height(180)
+            .into(),
+        )
     }
 
     pub(super) fn select_worktree(
@@ -128,6 +248,9 @@ impl Cagents {
         path: PathBuf,
         create_if_empty: bool,
     ) -> Task<Message> {
+        let path = self
+            .refresh_worktree_owners(Some(&path))
+            .expect("selected scope");
         let roots = self
             .sidebar_model
             .projects
@@ -135,59 +258,55 @@ impl Cagents {
             .flat_map(|project| &project.worktrees)
             .map(|worktree| worktree.path.as_path())
             .collect::<Vec<_>>();
-        let path = worktree_root(&path, roots.iter().copied())
-            .unwrap_or(&path)
-            .to_path_buf();
+        // Ownership and selected scope were resolved against the same canonical roots.
         let has_terminal = self.durable.cards.iter().any(|card| {
             card.existence.is_open()
                 && matches!(&card.kind, CardKind::Terminal(_) | CardKind::Chat(_))
-                && card_directory(card).is_some_and(|directory| {
-                    worktree_root(directory, roots.iter().copied()).unwrap_or(directory) == path
-                })
+                && self
+                    .card_worktree(card)
+                    .is_some_and(|directory| directory == path)
         });
         if self.active_workspace.as_ref() == Some(&path)
             && self.workspace.order().eq(self
                 .durable
                 .cards
                 .iter()
-                .filter(|card| belongs_to_scope(card, &path, &roots))
+                .filter(|card| belongs_to_scope(card, &path, &roots, &self.worktree_owners))
                 .map(|card| card.id))
         {
             if !create_if_empty {
                 return Task::none();
             }
-            let acknowledged = self.acknowledge_worktree_updates(&path);
-            let terminal = if !has_terminal {
+            return if !has_terminal {
                 self.add_terminal(path)
             } else {
                 Task::none()
             };
-            return Task::batch([acknowledged, terminal]);
         }
         if let Some(previous) = &self.active_workspace {
+            // Repository discovery can promote an unregistered launch directory
+            // into its parent root. Carry its camera/focus into that same scope.
+            let promoted = previous != &path
+                && self.durable.cards.iter().any(|card| {
+                    card_directory(card) == Some(previous.as_path())
+                        && self.card_worktree(card) == Some(path.as_path())
+                });
+            let key = if promoted { &path } else { previous };
             self.worktree_offsets
-                .insert(previous.clone(), self.workspace.camera().offset());
+                .insert(key.clone(), self.workspace.camera().offset());
             if let Some(focused) = self.workspace.focused() {
-                self.worktree_focus.insert(previous.clone(), focused);
+                self.worktree_focus.insert(key.clone(), focused);
             } else {
-                self.worktree_focus.remove(previous);
+                self.worktree_focus.remove(key);
             }
         }
         let scoped = scope_descriptor(
             &self.durable,
             &path,
             &roots,
+            &self.worktree_owners,
             self.worktree_focus.get(&path).copied(),
         );
-        let departing = self
-            .active_workspace
-            .clone()
-            .filter(|previous| previous != &path);
-        let departed = departing.as_deref().map_or_else(Task::none, |previous| {
-            self.acknowledge_terminal_updates(previous);
-            self.acknowledge_chat_updates(previous)
-        });
-        let acknowledged = self.acknowledge_worktree_updates(&path);
         let width = self.workspace.viewport_width();
         // Hide before replacing the strip: its former widgets no longer get a
         // chance to send native-surface visibility updates after unmounting.
@@ -243,14 +362,7 @@ impl Cagents {
         } else {
             Task::none()
         };
-        Task::batch([
-            viewport,
-            residency,
-            source_control,
-            terminal,
-            departed,
-            acknowledged,
-        ])
+        Task::batch([viewport, residency, source_control, terminal])
     }
 
     pub(super) fn reconcile_scoped_lifecycle(&mut self) -> Task<Message> {
@@ -292,6 +404,7 @@ impl Cagents {
     /// Must run before initialize_runtimes so hidden restored terminals are
     /// admitted as offscreen, not with another worktree's persisted exposure.
     pub(super) fn restore_worktree_scope(&mut self) -> Task<Message> {
+        self.refresh_worktree_owners(None);
         self.worktree_focus.clone_from(&self.durable.worktree_focus);
         if let Some(scope) = self.durable.active_worktree.clone() {
             return self.select_worktree(scope, false);
@@ -313,17 +426,10 @@ impl Cagents {
         let Some(owner) = owner else {
             return Task::none();
         };
-        let directory = card_directory(owner).expect("selected card has a directory");
-        let root = worktree_root(
-            directory,
-            self.sidebar_model
-                .projects
-                .iter()
-                .flat_map(|project| &project.worktrees)
-                .map(|worktree| worktree.path.as_path()),
-        )
-        .unwrap_or(directory)
-        .to_path_buf();
+        let root = self
+            .card_worktree(owner)
+            .expect("selected card has a directory")
+            .to_path_buf();
         // A global browser may retain focus in the restored scope, but never
         // becomes an ownership source for that scope.
         self.worktree_focus
@@ -485,6 +591,7 @@ mod tests {
             workspace_widget::view(
                 &workspace,
                 &shortcuts,
+                true,
                 300.0,
                 id,
                 |_| {
@@ -621,7 +728,7 @@ mod tests {
     #[test]
     fn registering_legacy_directories_rescopes_the_current_strip_without_losing_position() {
         let mut app = super::super::tests::context_inspector_test_app(false);
-        let a = [terminal("/a"), terminal("/a"), terminal("/a")];
+        let a = [terminal("/a/src"), terminal("/a/src"), terminal("/a/src")];
         let b = terminal("/b");
         app.durable = Arc::new(WorkspaceState {
             cards: vec![a[0].clone(), a[1].clone(), a[2].clone(), b.clone()],
@@ -631,7 +738,7 @@ mod tests {
         app.workspace.resize_viewport(1_000.0);
         let _ = app.restore_worktree_scope();
         app.workspace.native_scroll(250.0, 1_000.0);
-        assert!(app.workspace.card(b.id).is_some());
+        assert!(app.workspace.card(b.id).is_none());
 
         register_worktrees(&mut app, &["/a", "/b"]);
         let _ = app.select_worktree("/a".into(), false);
@@ -686,16 +793,103 @@ mod tests {
         register_worktrees(&mut app, &["/repo", "/other"]);
 
         let _ = app.select_worktree("/repo".into(), false);
-        assert!(app.workspace.card(legacy.id).is_some());
+        assert!(app.workspace.card(legacy.id).is_none());
         let _ = app.select_worktree("/other".into(), true);
-        assert!(app.workspace.card(legacy.id).is_some());
+        assert!(app.workspace.card(legacy.id).is_none());
         assert!(app.workspace.card(owned.id).is_none());
         let focused = app.card_state(app.workspace.focused().unwrap()).unwrap();
         assert!(matches!(&focused.kind, CardKind::Terminal(session)
             if session.launch.working_directory == Path::new("/other")));
         assert_ne!(focused.id, legacy.id);
-        assert!(app.workspace.focus(legacy.id).is_ok());
-        assert_eq!(app.terminal_directory(), Some(PathBuf::from("/other")));
+        assert!(app.standalone_worktree_navigation().is_some());
+        let _ = app.update(Message::SelectWorkspaceScope("/home/user".into()));
+        assert_eq!(app.workspace.order().collect::<Vec<_>>(), vec![legacy.id]);
+        assert_eq!(app.terminal_directory(), Some(PathBuf::from("/home/user")));
+        assert_eq!(app.durable.cards.len(), 3);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn canonical_launch_aliases_use_the_nested_owner_without_changing_the_recipe() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("repo");
+        let nested = root.join("worktrees/feature");
+        std::fs::create_dir_all(nested.join("src")).unwrap();
+        let alias = directory.path().join("alias");
+        std::os::unix::fs::symlink(&root, &alias).unwrap();
+        let shell = terminal(alias.join("worktrees/feature/src").to_str().unwrap());
+        let editor = repository(alias.to_str().unwrap());
+        let mut app = super::super::tests::context_inspector_test_app(false);
+        register_worktrees(
+            &mut app,
+            &[root.to_str().unwrap(), nested.to_str().unwrap()],
+        );
+        app.durable = Arc::new(WorkspaceState {
+            cards: vec![shell.clone(), editor.clone()],
+            ..WorkspaceState::default()
+        });
+        let _ = app.select_worktree(alias.join("worktrees/feature"), false);
+        assert_eq!(app.active_workspace.as_deref(), Some(nested.as_path()));
+        assert_eq!(app.workspace.order().collect::<Vec<_>>(), vec![shell.id]);
+        assert_eq!(app.card_state(shell.id).unwrap().kind, shell.kind);
+        let _ = app.select_worktree(alias, false);
+        assert_eq!(app.workspace.order().collect::<Vec<_>>(), vec![editor.id]);
+        assert!(app.standalone_worktree_navigation().is_none());
+    }
+
+    #[test]
+    fn missing_worktree_is_not_a_navigation_row_but_its_session_remains_reachable() {
+        let directory = tempfile::tempdir().unwrap();
+        let missing = directory.path().join("deleted-worktree");
+        assert!(worktree_directory_available(directory.path()));
+        assert!(!worktree_directory_available(&missing));
+        let shell = terminal(missing.to_str().unwrap());
+        let mut app = super::super::tests::context_inspector_test_app(false);
+        app.durable = Arc::new(WorkspaceState {
+            cards: vec![shell.clone()],
+            ..WorkspaceState::default()
+        });
+        let _ = app.select_worktree(directory.path().into(), false);
+        assert!(app.workspace.cards().is_empty());
+        assert!(app.standalone_worktree_navigation().is_some());
+        let _ = app.update(Message::SelectWorkspaceScope(missing));
+        assert_eq!(app.workspace.order().collect::<Vec<_>>(), vec![shell.id]);
+        assert!(app.card_state(shell.id).unwrap().existence.is_open());
+    }
+
+    #[test]
+    fn deleted_nested_worktree_keeps_its_sessions_out_of_the_parent_scope() {
+        for restored_without_row in [false, true] {
+            let mut app = super::super::tests::context_inspector_test_app(false);
+            let parent = terminal("/repo");
+            let retained = terminal("/repo/worktrees/deleted/src");
+            app.durable = Arc::new(WorkspaceState {
+                cards: vec![parent.clone(), retained.clone()],
+                ..WorkspaceState::default()
+            });
+            if restored_without_row {
+                // Startup seeds boundaries from durable worktree records before
+                // removing missing rows from navigation.
+                app.known_worktree_roots
+                    .insert("/repo/worktrees/deleted".into());
+            } else {
+                register_worktrees(&mut app, &["/repo", "/repo/worktrees/deleted"]);
+                let _ = app.select_worktree("/repo".into(), false);
+            }
+            register_worktrees(&mut app, &["/repo"]);
+            let _ = app.select_worktree("/repo".into(), false);
+            assert_eq!(app.workspace.order().collect::<Vec<_>>(), vec![parent.id]);
+            assert_eq!(
+                app.card_state(retained.id).unwrap().exposure,
+                Exposure::Offscreen
+            );
+            assert!(app.standalone_worktree_navigation().is_some());
+            let _ = app.update(Message::SelectWorkspaceScope(
+                "/repo/worktrees/deleted".into(),
+            ));
+            assert_eq!(app.workspace.order().collect::<Vec<_>>(), vec![retained.id]);
+            assert!(app.card_state(retained.id).unwrap().existence.is_open());
+        }
     }
 
     #[test]
@@ -746,9 +940,10 @@ mod tests {
         };
         let before = state.clone();
         let roots = [Path::new("/repo"), Path::new("/repo/nested")];
-        let a_view = scope_descriptor(&state, roots[0], &roots, Some(a.id));
-        let b_view = scope_descriptor(&state, roots[1], &roots, Some(b.id));
-        let returned = scope_descriptor(&state, roots[0], &roots, a_view.focused);
+        let owners = HashMap::new();
+        let a_view = scope_descriptor(&state, roots[0], &roots, &owners, Some(a.id));
+        let b_view = scope_descriptor(&state, roots[1], &roots, &owners, Some(b.id));
+        let returned = scope_descriptor(&state, roots[0], &roots, &owners, a_view.focused);
         assert_eq!(a_view.cards, vec![a, a_editor, browser.clone()]);
         assert_eq!(b_view.cards, vec![browser, b, b_editor]);
         assert_eq!(returned, a_view);
@@ -766,14 +961,15 @@ mod tests {
             ..WorkspaceState::default()
         };
         let roots = [Path::new("/a"), Path::new("/b")];
-        let scoped = scope_descriptor(&state, roots[0], &roots, Some(a.id));
+        let scoped = scope_descriptor(&state, roots[0], &roots, &HashMap::new(), Some(a.id));
         let workspace = Cagents::rebuild_workspace(&scoped);
         let indices = insertion_indices(workspace.cards(), &state.cards, Some(a.id));
         assert_eq!(indices, (1, 1));
         let added = terminal("/a");
         let mut inserted = state.clone();
         inserted.cards.insert(indices.1, added.clone());
-        let restored = scope_descriptor(&inserted, roots[0], &roots, Some(added.id));
+        let restored =
+            scope_descriptor(&inserted, roots[0], &roots, &HashMap::new(), Some(added.id));
         assert_eq!(restored.cards, vec![a, added, next]);
         assert_eq!(inserted.cards[2], hidden);
         assert_eq!(

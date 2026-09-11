@@ -1,7 +1,9 @@
+#[cfg(any(feature = "host", feature = "ui"))]
+use std::{fs::OpenOptions, os::unix::fs::OpenOptionsExt};
 use std::{
-    fs::{self, DirBuilder, File, OpenOptions},
+    fs::{self, DirBuilder, File},
     io,
-    os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt},
+    os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt},
     path::Path,
 };
 

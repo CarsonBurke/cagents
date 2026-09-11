@@ -10,6 +10,9 @@ use std::{
     time::Duration,
 };
 
+#[path = "editor_widget.rs"]
+mod text_editor;
+
 use cosmic::iced::advanced::{
     Clipboard, Layout, Shell, Widget, layout, renderer,
     widget::{Operation, Tree},
@@ -17,7 +20,7 @@ use cosmic::iced::advanced::{
 use cosmic::{
     Element,
     iced::{self, Alignment, Font, Length, Task, highlighter},
-    widget::{self, markdown, text_editor},
+    widget::{self, markdown},
 };
 
 use crate::{
@@ -758,8 +761,19 @@ enum DocumentState {
 }
 
 enum DiffState {
-    Loading { request: u64 },
+    Loading {
+        request: u64,
+        cancellation: CancellationToken,
+    },
     Ready(RenderedDiff),
+}
+
+impl Drop for DiffState {
+    fn drop(&mut self) {
+        if let Self::Loading { cancellation, .. } = self {
+            cancellation.cancel();
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -782,8 +796,8 @@ const VISIBLE_ROW_OVERSCAN: usize = 6;
 const INITIAL_VIEWPORT_HEIGHT: f32 = 900.0;
 /// How many committed comparisons one open file keeps.
 ///
-/// The two working bases are always retained: there are only ever two of them
-/// and a save recomputes them. A committed basis is named by a ref or a commit
+/// Viewed working bases stay cached until a save or mutation invalidates them.
+/// A committed basis is named by a ref or a commit
 /// id, so its keyspace is open - stepping through history would otherwise
 /// retain one whole diff model per commit visited for as long as the file
 /// stays open, and a side is allowed to be megabytes. Four keeps stepping back
@@ -832,7 +846,7 @@ pub struct RepositoryRuntime {
     document: DocumentState,
     /// One entry per comparison this selection has been asked for.
     ///
-    /// A list rather than a map: at most four bases are live at once, and
+    /// A list rather than a map: at most six bases are live at once, and
     /// [`DiffBasis`] is deliberately neither `Ord` nor `Hash` — it owns a ref
     /// name and an object id.
     diffs: Vec<(DiffBasis, DiffState)>,
@@ -900,6 +914,10 @@ pub struct RepositoryInspectorContext {
     pub can_discard: bool,
     pub can_reload: bool,
     pub can_retry_diff: bool,
+    pub can_show_diff: bool,
+    pub can_change_diff_layout: bool,
+    pub can_select_staged_diff: bool,
+    pub can_select_unstaged_diff: bool,
     pub can_back: bool,
 }
 
@@ -1238,19 +1256,8 @@ impl RepositoryRuntime {
             self.diff_change = 0;
             self.diff_viewport = ListViewport::default();
         }
-        let identity = self.current_identity(card, path);
-        let mut tasks = Vec::new();
-        for basis in [DiffBasis::HeadToIndex, DiffBasis::IndexToWorktree] {
-            if file.has_basis(&basis) {
-                let previous_path = file.previous_path(&basis);
-                tasks.push(self.request_diff(identity.clone(), basis, previous_path));
-            }
-        }
-        if matches!(self.diff_basis, DiffBasis::MergeBaseToHead { .. }) {
-            tasks.push(self.request_diff(identity, self.diff_basis.clone(), None));
-        }
         self.selected = Some(file);
-        Task::batch(tasks)
+        self.ensure_current_diff(card)
     }
 
     /// Removes and returns every protocol notification the open buffer has
@@ -1546,9 +1553,57 @@ impl RepositoryRuntime {
     }
 
     fn can_show_diff(&self) -> bool {
-        self.selected
-            .as_ref()
-            .is_some_and(|file| file.has_basis(&self.diff_basis) || self.basis_resolution.is_some())
+        !self.is_saving()
+            && !self.directory_only
+            && self.selected.as_ref().is_some_and(|file| {
+                file.has_basis(&self.diff_basis) || self.basis_resolution.is_some()
+            })
+    }
+
+    fn can_apply_markdown_mode(&self, preview: bool) -> bool {
+        !self.is_saving()
+            && match &self.document {
+                DocumentState::Editable(document) => !preview || document.markdown,
+                DocumentState::Image { .. } => preview,
+                _ => false,
+            }
+    }
+
+    fn can_select_diff_basis(&self, basis: &DiffBasis) -> bool {
+        !self.is_saving()
+            && !self.directory_only
+            && (!self.mutation_refresh_pending || matches!(basis, DiffBasis::CommitToParent { .. }))
+            && self
+                .selected
+                .as_ref()
+                .is_some_and(|file| file.has_basis(basis))
+    }
+
+    fn can_select_committed_basis(&self, choice: CommittedChoice) -> bool {
+        !self.is_saving()
+            && !self.directory_only
+            && self.selected.is_some()
+            && self.basis_resolution != Some(BasisResolution::Resolving(choice))
+    }
+
+    fn can_change_diff_layout(&self) -> bool {
+        !self.is_saving()
+            && self.source_surface == SourceSurface::Diff
+            && self.diff_model().is_some()
+    }
+
+    fn can_navigate_diff(&self) -> bool {
+        self.can_change_diff_layout() && self.change_count() != 0
+    }
+
+    fn can_retry_diff(&self) -> bool {
+        self.source_surface == SourceSurface::Diff
+            && self.basis_resolution.is_none()
+            && self.can_select_diff_basis(&self.diff_basis)
+            && matches!(
+                self.diff_state(&self.diff_basis),
+                Some(DiffState::Ready(RenderedDiff::Error(_)))
+            )
     }
 
     pub fn is_dirty(&self) -> bool {
@@ -1557,6 +1612,14 @@ impl RepositoryRuntime {
 
     pub fn can_save(&self) -> bool {
         matches!(&self.document, DocumentState::Editable(document) if (document.dirty || document.durability_warning.is_some()) && document.active_save.is_none())
+    }
+
+    fn can_discard_edits(&self) -> bool {
+        self.is_dirty() && !self.is_saving()
+    }
+
+    pub fn can_open_external(&self) -> bool {
+        !self.standalone && self.selected.is_some() && !self.is_saving()
     }
 
     pub fn is_saving(&self) -> bool {
@@ -1673,7 +1736,7 @@ impl RepositoryRuntime {
         // A retry re-reads the comparison. A basis that never resolved has no
         // comparison to re-read, and its own surface offers the base choice,
         // so the retry control stays unarmed for it.
-        let can_retry_diff = diff_error.is_some() && self.basis_resolution.is_none();
+        let can_retry_diff = self.can_retry_diff();
         RepositoryInspectorContext {
             file_list,
             file_count,
@@ -1710,11 +1773,15 @@ impl RepositoryRuntime {
             // Discarding the local buffer is still a valid editor action when
             // a durability warning remains; it just cannot authorize closing
             // or navigation, because that disk-state fence stays installed.
-            can_discard: self.is_dirty() && !self.is_saving(),
+            can_discard: self.can_discard_edits(),
             can_reload: conflict
                 || matches!(&self.document, DocumentState::Editable(document) if document.durability_warning.is_some())
                 || matches!(&self.document, DocumentState::Failed { .. }),
             can_retry_diff,
+            can_show_diff: self.can_show_diff(),
+            can_change_diff_layout: self.can_change_diff_layout(),
+            can_select_staged_diff: self.can_select_diff_basis(&DiffBasis::HeadToIndex),
+            can_select_unstaged_diff: self.can_select_diff_basis(&DiffBasis::IndexToWorktree),
             can_back: selected && !self.blocks_navigation(),
         }
     }
@@ -1970,7 +2037,7 @@ impl RepositoryRuntime {
                 // nothing; a superseded result for the same basis is dropped.
                 let current_request = matches!(
                     self.diff_state(&basis),
-                    Some(DiffState::Loading { request: active }) if *active == request
+                    Some(DiffState::Loading { request: active, .. }) if *active == request
                 );
                 if self.accepts_selected(&identity) && current_request {
                     let current = basis == self.diff_basis;
@@ -2102,8 +2169,12 @@ impl RepositoryRuntime {
                         selected.unstaged,
                     ));
                     selected.unstaged = true;
-                    let previous_path = selected.previous_path(&DiffBasis::IndexToWorktree);
-                    self.request_diff(identity, DiffBasis::IndexToWorktree, previous_path)
+                    if !selected.has_basis(&self.diff_basis) && self.basis_resolution.is_none() {
+                        self.diff_basis = DiffBasis::IndexToWorktree;
+                    }
+                    self.diffs
+                        .retain(|(basis, _)| *basis != DiffBasis::IndexToWorktree);
+                    self.ensure_current_diff(identity.card)
                 } else {
                     Task::none()
                 }
@@ -2118,7 +2189,7 @@ impl RepositoryRuntime {
                 self.open_file(card, path)
             }
             RepositoryAction::DiscardEdits { .. } => {
-                if self.is_saving() {
+                if !self.can_discard_edits() {
                     return Task::none();
                 }
                 if let DocumentState::Editable(document) = &mut self.document {
@@ -2142,23 +2213,28 @@ impl RepositoryRuntime {
                 self.source_surface = SourceSurface::Editor;
                 self.initial_load(card)
             }
-            RepositoryAction::ApplySourceSurface { diff, .. } => {
+            RepositoryAction::ApplySourceSurface { card, diff } => {
                 let surface = if diff {
                     SourceSurface::Diff
                 } else {
                     SourceSurface::Editor
                 };
-                if self.is_saving() || (surface == SourceSurface::Diff && !self.can_show_diff()) {
+                if self.is_saving()
+                    || self.selected.is_none()
+                    || (surface == SourceSurface::Diff && !self.can_show_diff())
+                {
                     return Task::none();
                 }
                 self.source_surface = surface;
-                Task::none()
+                self.ensure_current_diff(card)
             }
             RepositoryAction::ApplyMarkdownMode { preview, .. } => {
-                if self.is_saving() {
+                if !self.can_apply_markdown_mode(preview) {
                     return Task::none();
                 }
                 self.source_surface = SourceSurface::Editor;
+                self.diffs
+                    .retain(|(_, state)| !matches!(state, DiffState::Loading { .. }));
                 self.markdown_mode = if preview {
                     MarkdownMode::Preview
                 } else {
@@ -2167,6 +2243,9 @@ impl RepositoryRuntime {
                 Task::none()
             }
             RepositoryAction::ApplyDiffMode { split, .. } => {
+                if !self.can_change_diff_layout() {
+                    return Task::none();
+                }
                 self.diff_mode = if split {
                     DiffMode::Split
                 } else {
@@ -2178,6 +2257,9 @@ impl RepositoryRuntime {
                 self.scroll_to_change()
             }
             RepositoryAction::SelectCommittedBasis { card, choice } => {
+                if !self.can_select_committed_basis(choice) {
+                    return Task::none();
+                }
                 let Some(selected) = self.selected.as_ref() else {
                     return Task::none();
                 };
@@ -2187,6 +2269,8 @@ impl RepositoryRuntime {
                 }
                 self.source_surface = SourceSurface::Diff;
                 self.basis_resolution = Some(BasisResolution::Resolving(choice));
+                self.diffs
+                    .retain(|(_, state)| !matches!(state, DiffState::Loading { .. }));
                 basis_task(identity, choice)
             }
             RepositoryAction::DiffBasisResolved {
@@ -2225,12 +2309,7 @@ impl RepositoryRuntime {
                 Task::none()
             }
             RepositoryAction::ApplyDiffBasis { card, basis } => {
-                if self.is_saving()
-                    || !self
-                        .selected
-                        .as_ref()
-                        .is_some_and(|file| file.has_basis(&basis))
-                {
+                if !self.can_select_diff_basis(&basis) {
                     return Task::none();
                 }
                 self.basis_resolution = None;
@@ -2238,27 +2317,14 @@ impl RepositoryRuntime {
                 self.diff_basis = basis;
                 self.diff_change = 0;
                 self.diff_viewport = ListViewport::default();
-                // Both working bases are read when the file is opened. A
-                // committed comparison is only named once it has been
-                // resolved, so choosing it is also what starts reading it —
-                // and the request counter makes that a new request, which
-                // supersedes any diff still in flight for the same slot.
-                let load = if self.diff_state(&self.diff_basis).is_some() {
-                    Task::none()
-                } else {
-                    let Some(selected) = self.selected.as_ref() else {
-                        return Task::none();
-                    };
-                    let path = selected.path.clone();
-                    let previous_path = selected.previous_path(&self.diff_basis);
-                    let identity = self.current_identity(card, path);
-                    let basis = self.diff_basis.clone();
-                    self.request_diff(identity, basis, previous_path)
-                };
+                let load = self.ensure_current_diff(card);
                 self.realize_current_change();
                 Task::batch([load, self.scroll_to_change()])
             }
             RepositoryAction::RetryDiff { card } => {
+                if !self.can_retry_diff() {
+                    return Task::none();
+                }
                 let Some(selected) = self.selected.as_ref() else {
                     return Task::none();
                 };
@@ -2285,6 +2351,9 @@ impl RepositoryRuntime {
                 Task::none()
             }
             RepositoryAction::PreviousChange { .. } => {
+                if !self.can_navigate_diff() {
+                    return Task::none();
+                }
                 let changes = self.change_count();
                 if changes != 0 {
                     self.diff_change = (self.diff_change + changes - 1) % changes;
@@ -2293,6 +2362,9 @@ impl RepositoryRuntime {
                 self.scroll_to_change()
             }
             RepositoryAction::NextChange { .. } => {
+                if !self.can_navigate_diff() {
+                    return Task::none();
+                }
                 let changes = self.change_count();
                 if changes != 0 {
                     self.diff_change = (self.diff_change + 1) % changes;
@@ -2330,10 +2402,9 @@ impl RepositoryRuntime {
 
     /// Drops the committed comparisons added longest ago, beyond the cap.
     ///
-    /// Never the one on screen, and never a working basis. Dropping a slot
-    /// that is still `Loading` is safe: [`RepositoryAction::DiffLoaded`]
-    /// requires its slot to still hold its own request, so the abandoned
-    /// result lands nowhere.
+    /// Never the one on screen, and never a working basis. Dropping a loading
+    /// slot cancels its worker; the completion fence also prevents an already
+    /// queued answer from recreating that abandoned slot.
     fn prune_committed_diffs(&mut self) {
         let committed =
             |basis: &DiffBasis| matches!(basis_choice(basis), BasisChoice::Committed(_));
@@ -2357,6 +2428,30 @@ impl RepositoryRuntime {
         });
     }
 
+    /// Only the visible comparison earns a worker. Completed comparisons remain
+    /// cached, but navigating away cancels unfinished work rather than merely
+    /// discarding its expensive result later.
+    fn ensure_current_diff(&mut self, card: CardId) -> Task<RepositoryAction> {
+        let showing_diff =
+            self.source_surface == SourceSurface::Diff && self.basis_resolution.is_none();
+        self.diffs.retain(|(basis, state)| {
+            !matches!(state, DiffState::Loading { .. })
+                || (showing_diff && *basis == self.diff_basis)
+        });
+        if !showing_diff || self.diff_state(&self.diff_basis).is_some() {
+            return Task::none();
+        }
+        let Some(selected) = self.selected.as_ref() else {
+            return Task::none();
+        };
+        if !selected.has_basis(&self.diff_basis) {
+            return Task::none();
+        }
+        let old_path = selected.previous_path(&self.diff_basis);
+        let identity = self.current_identity(card, selected.path.clone());
+        self.request_diff(identity, self.diff_basis.clone(), old_path)
+    }
+
     fn request_diff(
         &mut self,
         identity: AsyncIdentity,
@@ -2368,8 +2463,15 @@ impl RepositoryRuntime {
         }
         self.next_diff_request = self.next_diff_request.wrapping_add(1).max(1);
         let request = self.next_diff_request;
-        self.set_diff_state(basis.clone(), DiffState::Loading { request });
-        diff_task(identity, basis, request, old_path)
+        let cancellation = CancellationToken::new();
+        self.set_diff_state(
+            basis.clone(),
+            DiffState::Loading {
+                request,
+                cancellation: cancellation.clone(),
+            },
+        );
+        diff_task(identity, basis, request, old_path, cancellation)
     }
 
     fn open_file(&mut self, card: CardId, path: PathBuf) -> Task<RepositoryAction> {
@@ -2406,18 +2508,7 @@ impl RepositoryRuntime {
         self.markdown_mode = MarkdownMode::Edit;
         self.diff_change = 0;
         let identity = self.next_identity(card, path);
-        let file_task = file_task(identity.clone());
-        let mut tasks = vec![file_task];
-        // Only the working bases are read up front: a committed comparison
-        // cannot even be named yet, and reading one nobody asked for would
-        // spend a `git log` or a ref walk per file opened.
-        for basis in [DiffBasis::HeadToIndex, DiffBasis::IndexToWorktree] {
-            if file.has_basis(&basis) {
-                let previous_path = file.previous_path(&basis);
-                tasks.push(self.request_diff(identity.clone(), basis, previous_path));
-            }
-        }
-        Task::batch(tasks)
+        file_task(identity)
     }
 
     fn file(&self, path: &Path) -> Option<&RepositoryFile> {
@@ -2539,13 +2630,20 @@ fn diff_task(
     basis: DiffBasis,
     request: u64,
     old_path: Option<PathBuf>,
+    cancellation: CancellationToken,
 ) -> Task<RepositoryAction> {
     let worktree = identity.worktree.clone();
     let path = identity.path.clone();
     let requested = basis.clone();
     cosmic::task::future(async move {
         let content = tokio::task::spawn_blocking(move || {
-            load_repository_diff(&worktree, &path, &requested, old_path.as_deref())
+            load_repository_diff(
+                &worktree,
+                &path,
+                &requested,
+                old_path.as_deref(),
+                &cancellation,
+            )
         })
         .await
         .unwrap_or_else(|error| RenderedDiff::Error(format!("diff worker failed: {error}")));
@@ -2958,7 +3056,7 @@ pub fn editor_focus_id(card: CardId) -> widget::Id {
 }
 
 pub fn focus_restore_id(card: CardId) -> widget::Id {
-    widget::Id::new(format!("repository.{card}.back"))
+    widget::Id::new(format!("repository.{card}.view"))
 }
 
 fn file_list_view(card: CardId, runtime: &RepositoryRuntime) -> Element<'_, RepositoryAction> {
@@ -3094,7 +3192,7 @@ impl widget::menu::Action for ExternalEditorCommand<'_> {
     }
 }
 
-/// The parent card embeds this in its existing title row, not above the body.
+/// Dedicated content toolbar, mounted separately from tabs and the scroll viewport.
 pub fn selected_file_toolbar(
     card: CardId,
     runtime: &RepositoryRuntime,
@@ -3114,45 +3212,63 @@ pub fn selected_file_toolbar(
             .width(128),
         selected.path.to_string_lossy(),
     );
+    // Unsupported text has no preview renderer. Noneditable load/error states
+    // still expose file information, so inspecting a binary diff is reversible.
+    let file_information = !editable && !matches!(runtime.document, DocumentState::Image { .. });
+    let preview = icon_control(
+        crate::ui_controls::symbolic_icon("view-reveal-symbolic"),
+        if file_information {
+            "View file information"
+        } else {
+            "Preview file"
+        },
+        runtime.source_surface == SourceSurface::Editor
+            && (!editable || !editing)
+            && (file_information || runtime.can_apply_markdown_mode(true)),
+        if file_information {
+            !runtime.is_saving()
+        } else {
+            runtime.can_apply_markdown_mode(true)
+        },
+        Some(if file_information {
+            RepositoryAction::ApplySourceSurface { card, diff: false }
+        } else {
+            RepositoryAction::ApplyMarkdownMode {
+                card,
+                preview: true,
+            }
+        }),
+    );
+    let preview = if editable {
+        preview
+    } else {
+        preview.id(focus_restore_id(card))
+    };
+    let edit = icon_control(
+        crate::ui_controls::symbolic_icon("document-edit-symbolic"),
+        "Edit file",
+        editable && editing && runtime.can_apply_markdown_mode(false),
+        runtime.can_apply_markdown_mode(false),
+        Some(RepositoryAction::ApplyMarkdownMode {
+            card,
+            preview: false,
+        }),
+    );
+    let edit = if editable {
+        edit.id(focus_restore_id(card))
+    } else {
+        edit
+    };
     let mut controls: Vec<Element<'_, RepositoryAction>> = vec![
-        icon_control(
-            crate::ui_controls::symbolic_icon("go-previous-symbolic"),
-            "Back to repository files",
-            false,
-            !runtime.blocks_navigation(),
-            Some(RepositoryAction::BackToFiles { card }),
-        )
-        .id(focus_restore_id(card))
-        .into(),
         title.into(),
         segmented_controls(vec![
-            icon_control(
-                crate::ui_controls::symbolic_icon("view-reveal-symbolic"),
-                "View file",
-                runtime.source_surface == SourceSurface::Editor && (!editable || !editing),
-                !runtime.is_saving(),
-                Some(RepositoryAction::ApplyMarkdownMode {
-                    card,
-                    preview: true,
-                }),
-            )
-            .into(),
-            icon_control(
-                crate::ui_controls::symbolic_icon("document-edit-symbolic"),
-                "Edit file",
-                editable && editing,
-                editable && !runtime.is_saving(),
-                Some(RepositoryAction::ApplyMarkdownMode {
-                    card,
-                    preview: false,
-                }),
-            )
-            .into(),
+            preview.into(),
+            edit.into(),
             icon_control(
                 comparison_icon(),
                 "View diff",
-                runtime.source_surface == SourceSurface::Diff,
-                runtime.can_show_diff() && !runtime.is_saving(),
+                runtime.source_surface == SourceSurface::Diff && runtime.can_show_diff(),
+                runtime.can_show_diff(),
                 Some(RepositoryAction::ApplySourceSurface { card, diff: true }),
             )
             .into(),
@@ -3170,7 +3286,7 @@ pub fn selected_file_toolbar(
                 crate::ui_controls::symbolic_icon("edit-undo-symbolic"),
                 "Discard unsaved changes",
                 false,
-                !runtime.is_saving(),
+                runtime.can_discard_edits(),
                 Some(RepositoryAction::DiscardEdits { card }),
             )
             .into(),
@@ -3238,7 +3354,7 @@ pub fn selected_file_toolbar(
             icon(editor),
             format!("Open in {} · right-click for other editors", editor.name),
             false,
-            !runtime.is_saving(),
+            runtime.can_open_external(),
             Some(RepositoryAction::OpenExternal {
                 card,
                 editor_id: editor.id.clone(),
@@ -3274,11 +3390,11 @@ pub fn selected_file_toolbar(
         )
         .direction(iced::widget::scrollable::Direction::Horizontal(
             iced::widget::scrollable::Scrollbar::default()
-                .width(2)
-                .scroller_width(2),
+                .width(crate::design::SCROLLBAR_THUMB_WIDTH)
+                .scroller_width(crate::design::SCROLLBAR_THUMB_WIDTH),
         ))
         .width(Length::Fill)
-        .height(34)
+        .height(40)
         .into(),
     )
 }
@@ -3332,7 +3448,7 @@ fn editable_document_view<'a>(
     document: &'a EditorDocument,
 ) -> Element<'a, RepositoryAction> {
     let spacing = cosmic::theme::spacing();
-    let mut rows: Vec<Element<'a, RepositoryAction>> = Vec::new();
+    let mut error_rows: Vec<Element<'a, RepositoryAction>> = Vec::new();
     if let Some(error) = document
         .error
         .as_ref()
@@ -3381,7 +3497,7 @@ fn editable_document_view<'a>(
                 .into(),
             );
         }
-        rows.push(
+        error_rows.push(
             widget::container(widget::row::with_children(actions).spacing(spacing.space_xxs))
                 .class(cosmic::theme::Container::Secondary)
                 .padding(spacing.space_xs)
@@ -3409,51 +3525,29 @@ fn editable_document_view<'a>(
         .width(Length::Fill)
         .into()
     } else {
-        iced::widget::mouse_area(
-            // Iced's own editor rather than libcosmic's wrapper around it.
-            // The wrapper exists to add a context menu, and it pins its
-            // inner editor to `highlighter::PlainText`, so it is incapable
-            // of syntax highlighting. Its second widget tree is also what
-            // could retain the preceding stateless placeholder during an
-            // async file-load transition. With the context menu declined
-            // the wrapper was already a pass-through to exactly this
-            // widget, which is where the focus and editing state live.
-            iced::widget::text_editor::TextEditor::new(&document.content)
-                // Before `highlight_with`: `id` is only offered by the
-                // not-yet-highlighted builder.
-                .id(editor_focus_id(card))
-                .highlight_with::<highlighter::Highlighter>(
-                    highlighter_settings(&document.path, cosmic::theme::is_dark()),
-                    |highlight, _theme: &cosmic::Theme| highlight.to_format(),
-                )
-                .font(Font::MONOSPACE)
-                .padding(iced::Padding {
-                    right: f32::from(spacing.space_xs) + crate::design::SCROLLBAR_GUTTER,
-                    ..iced::Padding::new(f32::from(spacing.space_xs))
-                })
-                .height(Length::Fill)
-                .style(|theme, status| {
-                    use iced::widget::text_editor::Catalog;
-                    let mut style = theme.style(&<cosmic::Theme as Catalog>::default(), status);
-                    style.border = iced::Border::default();
-                    style
-                })
-                .on_action(move |action| {
-                    if runtime.markdown_mode == MarkdownMode::Preview && action.is_edit() {
-                        RepositoryAction::ApplyMarkdownMode {
-                            card,
-                            preview: true,
-                        }
-                    } else {
-                        RepositoryAction::EditorAction { card, action }
-                    }
-                }),
-        )
-        .interaction(iced::mouse::Interaction::Text)
-        .into()
+        text_editor::TextEditor::new(&document.content)
+            // Before `highlight_with`: `id` is only offered by the
+            // not-yet-highlighted builder.
+            .id(editor_focus_id(card))
+            .highlight_with::<highlighter::Highlighter>(
+                highlighter_settings(&document.path, cosmic::theme::is_dark()),
+                |highlight, _theme: &cosmic::Theme| highlight.to_format(),
+            )
+            .font(Font::MONOSPACE)
+            .padding(spacing.space_xs)
+            .height(Length::Fill)
+            .style(|theme, status| {
+                use iced::widget::text_editor::Catalog;
+                let mut style = theme.style(&<cosmic::Theme as Catalog>::default(), status);
+                style.border = iced::Border::default();
+                style
+            })
+            .on_action(move |action| RepositoryAction::EditorAction { card, action })
+            .into()
     };
-    rows.push(content);
-    widget::column::with_children(rows)
+    // Keep the named editor in the same slot when save warnings appear.
+    let error_slot = widget::column::with_children(error_rows).width(Length::Fill);
+    widget::column::with_children([error_slot.into(), content])
         .height(Length::Fill)
         .into()
 }
@@ -3467,13 +3561,14 @@ fn diff_basis_controls(card: CardId, runtime: &RepositoryRuntime) -> Element<'_,
         Some(BasisResolution::Unavailable(_)) => None,
         None => Some(basis_choice(&runtime.diff_basis)),
     };
-    let file = runtime.selected.as_ref();
+    let unstaged = runtime.can_select_diff_basis(&DiffBasis::IndexToWorktree);
+    let staged = runtime.can_select_diff_basis(&DiffBasis::HeadToIndex);
     segmented_controls(vec![
         icon_control(
             crate::ui_controls::symbolic_icon("document-edit-symbolic"),
             "Unstaged changes",
-            selected == Some(BasisChoice::Unstaged),
-            !runtime.is_saving() && file.is_some_and(|file| file.unstaged),
+            unstaged && selected == Some(BasisChoice::Unstaged),
+            unstaged,
             Some(RepositoryAction::ApplyDiffBasis {
                 card,
                 basis: DiffBasis::IndexToWorktree,
@@ -3483,8 +3578,8 @@ fn diff_basis_controls(card: CardId, runtime: &RepositoryRuntime) -> Element<'_,
         icon_control(
             crate::ui_controls::symbolic_icon("object-select-symbolic"),
             "Staged changes",
-            selected == Some(BasisChoice::Staged),
-            !runtime.is_saving() && file.is_some_and(|file| file.staged),
+            staged && selected == Some(BasisChoice::Staged),
+            staged,
             Some(RepositoryAction::ApplyDiffBasis {
                 card,
                 basis: DiffBasis::HeadToIndex,
@@ -3494,8 +3589,9 @@ fn diff_basis_controls(card: CardId, runtime: &RepositoryRuntime) -> Element<'_,
         icon_control(
             branch_comparison_icon(),
             "Compare branch with base",
-            selected == Some(BasisChoice::Committed(CommittedChoice::Branch)),
-            !runtime.is_saving() && file.is_some(),
+            runtime.can_select_committed_basis(CommittedChoice::Branch)
+                && selected == Some(BasisChoice::Committed(CommittedChoice::Branch)),
+            runtime.can_select_committed_basis(CommittedChoice::Branch),
             Some(RepositoryAction::SelectCommittedBasis {
                 card,
                 choice: CommittedChoice::Branch,
@@ -3505,8 +3601,9 @@ fn diff_basis_controls(card: CardId, runtime: &RepositoryRuntime) -> Element<'_,
         icon_control(
             crate::ui_controls::symbolic_icon("document-open-recent-symbolic"),
             "Last commit changes",
-            selected == Some(BasisChoice::Committed(CommittedChoice::LastCommit)),
-            !runtime.is_saving() && file.is_some(),
+            runtime.can_select_committed_basis(CommittedChoice::LastCommit)
+                && selected == Some(BasisChoice::Committed(CommittedChoice::LastCommit)),
+            runtime.can_select_committed_basis(CommittedChoice::LastCommit),
             Some(RepositoryAction::SelectCommittedBasis {
                 card,
                 choice: CommittedChoice::LastCommit,
@@ -3530,16 +3627,16 @@ fn diff_review_controls(
             icon_control(
                 crate::ui_controls::symbolic_icon("view-list-symbolic"),
                 "Inline diff",
-                runtime.diff_mode == DiffMode::Inline,
-                model.is_some(),
+                runtime.can_change_diff_layout() && runtime.diff_mode == DiffMode::Inline,
+                runtime.can_change_diff_layout(),
                 Some(RepositoryAction::ApplyDiffMode { card, split: false }),
             )
             .into(),
             icon_control(
                 comparison_icon(),
                 "Side-by-side diff",
-                runtime.diff_mode == DiffMode::Split,
-                model.is_some(),
+                runtime.can_change_diff_layout() && runtime.diff_mode == DiffMode::Split,
+                runtime.can_change_diff_layout(),
                 Some(RepositoryAction::ApplyDiffMode { card, split: true }),
             )
             .into(),
@@ -3548,7 +3645,7 @@ fn diff_review_controls(
             crate::ui_controls::symbolic_icon("go-up-symbolic"),
             "Previous change",
             false,
-            change_count != 0,
+            runtime.can_navigate_diff(),
             Some(RepositoryAction::PreviousChange { card }),
         )
         .into(),
@@ -3564,14 +3661,32 @@ fn diff_review_controls(
             crate::ui_controls::symbolic_icon("go-down-symbolic"),
             "Next change",
             false,
-            change_count != 0,
+            runtime.can_navigate_diff(),
             Some(RepositoryAction::NextChange { card }),
         )
         .into(),
     ];
-    if let Some(model) = model {
+    if runtime.can_retry_diff() {
+        controls.push(
+            icon_control(
+                crate::ui_controls::symbolic_icon("view-refresh-symbolic"),
+                "Retry diff",
+                false,
+                true,
+                Some(RepositoryAction::RetryDiff { card }),
+            )
+            .into(),
+        );
+    }
+    if let Some(model) = model
+        && let counts = crate::repository::line_change_counts(
+            Some(u64::from(model.additions)),
+            Some(u64::from(model.deletions)),
+        )
+        && !counts.is_empty()
+    {
         controls.push(crate::interaction::tooltip(
-            widget::text::caption(format!("+{} −{}", model.additions, model.deletions)),
+            widget::text::caption(counts),
             match runtime.diff_state(&runtime.diff_basis) {
                 Some(DiffState::Ready(RenderedDiff::Text {
                     old_label,
@@ -4002,8 +4117,7 @@ fn diff_gutter(line: Option<u32>, width: f32) -> Element<'static, RepositoryActi
 }
 
 fn diff_color(kind: DiffRowKind, alpha: f32) -> iced::Color {
-    // Deliberately distinct red/green in both themes; never warning-yellow for
-    // a replacement. Text keeps the theme's foreground for contrast.
+    // Keep additions and deletions distinct without obscuring their text.
     let mut color = match kind {
         DiffRowKind::Addition => iced::Color::from_rgb8(46, 160, 93),
         DiffRowKind::Deletion => iced::Color::from_rgb8(224, 78, 90),
@@ -4011,6 +4125,51 @@ fn diff_color(kind: DiffRowKind, alpha: f32) -> iced::Color {
     };
     color.a = alpha;
     color
+}
+
+fn color_over(foreground: iced::Color, background: iced::Color) -> iced::Color {
+    if foreground.a == 1.0 {
+        return foreground;
+    }
+    if foreground.a == 0.0 {
+        return background;
+    }
+    let foreground = foreground.into_linear();
+    let background = background.into_linear();
+    let alpha = foreground[3];
+    iced::Color::from_linear_rgba(
+        foreground[0] * alpha + background[0] * (1.0 - alpha),
+        foreground[1] * alpha + background[1] * (1.0 - alpha),
+        foreground[2] * alpha + background[2] * (1.0 - alpha),
+        1.0,
+    )
+}
+
+fn readable_diff_color(foreground: iced::Color, background: iced::Color) -> iced::Color {
+    let foreground = color_over(foreground, background);
+    if foreground.relative_contrast(background) >= 4.5 {
+        foreground
+    } else if iced::Color::BLACK.relative_contrast(background)
+        >= iced::Color::WHITE.relative_contrast(background)
+    {
+        iced::Color::BLACK
+    } else {
+        iced::Color::WHITE
+    }
+}
+
+fn diff_row_background(theme: &cosmic::Theme, kind: DiffRowKind) -> iced::Color {
+    color_over(
+        diff_color(
+            kind,
+            if theme.theme_type.is_dark() {
+                0.055
+            } else {
+                0.035
+            },
+        ),
+        theme.cosmic().bg_color().into(),
+    )
 }
 
 fn diff_text<'a>(
@@ -4022,7 +4181,31 @@ fn diff_text<'a>(
     horizontal: f32,
     lines: (Option<u32>, Option<u32>),
 ) -> Element<'a, RepositoryAction> {
-    let spans = crate::diff_view::line_spans(text, changed, syntax, diff_color(kind, 0.46));
+    let theme = cosmic::theme::active();
+    let row_background = diff_row_background(&theme, kind);
+    let mut spans = crate::diff_view::line_spans(
+        text,
+        changed,
+        syntax,
+        diff_color(kind, if cosmic::theme::is_dark() { 0.18 } else { 0.12 }),
+    );
+    for span in &mut spans {
+        let background = match span
+            .highlight
+            .as_mut()
+            .map(|highlight| &mut highlight.background)
+        {
+            Some(iced::Background::Color(color)) => {
+                *color = color_over(*color, row_background);
+                *color
+            }
+            _ => row_background,
+        };
+        let foreground = span
+            .color
+            .unwrap_or_else(|| theme.cosmic().on_bg_color().into());
+        span.color = Some(readable_diff_color(foreground, background));
+    }
     Element::new(DiffHorizontalContent {
         content: iced::widget::rich_text(spans)
             .size(DIFF_FONT_SIZE)
@@ -4050,9 +4233,9 @@ fn diff_container<'a>(
     kind: DiffRowKind,
 ) -> Element<'a, RepositoryAction> {
     widget::container(content)
-        .class(cosmic::theme::Container::custom(move |_| {
+        .class(cosmic::theme::Container::custom(move |theme| {
             iced::widget::container::Style {
-                background: Some(iced::Background::Color(diff_color(kind, 0.13))),
+                background: Some(iced::Background::Color(diff_row_background(theme, kind))),
                 ..Default::default()
             }
         }))
@@ -4325,6 +4508,147 @@ mod tests {
 
     use crate::lsp::{LspRange, LspSnippet, LspSnippetStop};
     use crate::model::ProjectId;
+
+    #[test]
+    fn faint_diff_syntax_remains_readable_over_both_highlight_layers() {
+        for theme in [cosmic::Theme::light(), cosmic::Theme::dark()] {
+            for kind in [DiffRowKind::Addition, DiffRowKind::Deletion] {
+                let row = diff_row_background(&theme, kind);
+                let highlight = color_over(diff_color(kind, 0.18), row);
+                let faint = iced::Color::from_rgba(0.6, 0.6, 0.6, 0.7);
+                for background in [row, highlight] {
+                    let foreground = readable_diff_color(faint, background);
+                    assert!(foreground.relative_contrast(background) >= 4.5);
+                    assert_eq!(readable_diff_color(foreground, background), foreground);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn preview_actions_require_a_preview_renderer_and_preserve_the_current_surface() {
+        let card = CardId::new();
+        let (mut runtime, _) = diff_runtime(card);
+        runtime.document = DocumentState::Editable(EditorDocument::new(
+            PathBuf::from("plain.rs"),
+            "fn main() {}\n".into(),
+            blake3::hash(b"fn main() {}\n"),
+            false,
+        ));
+        assert!(!runtime.can_apply_markdown_mode(true));
+        drop(runtime.update(RepositoryAction::ApplyMarkdownMode {
+            card,
+            preview: true,
+        }));
+        assert_eq!(runtime.source_surface, SourceSurface::Diff);
+        assert_eq!(runtime.markdown_mode, MarkdownMode::Edit);
+        drop(runtime.update(RepositoryAction::ApplyMarkdownMode {
+            card,
+            preview: false,
+        }));
+        assert_eq!(runtime.source_surface, SourceSurface::Editor);
+
+        runtime.document = DocumentState::Editable(EditorDocument::new(
+            PathBuf::from("README.md"),
+            "# Heading\n".into(),
+            blake3::hash(b"# Heading\n"),
+            true,
+        ));
+        assert!(runtime.can_apply_markdown_mode(true));
+        drop(runtime.update(RepositoryAction::ApplyMarkdownMode {
+            card,
+            preview: true,
+        }));
+        assert_eq!(runtime.markdown_mode, MarkdownMode::Preview);
+        assert!(runtime.editor_focus_target(card).is_none());
+    }
+
+    #[test]
+    fn diff_actions_share_capabilities_without_blocking_committed_comparisons_or_retry() {
+        let card = CardId::new();
+        let (mut runtime, _) = diff_runtime(card);
+        runtime.source_surface = SourceSurface::Editor;
+        let file = runtime.selected.as_mut().unwrap();
+        file.staged = false;
+        file.unstaged = false;
+        assert!(!runtime.can_show_diff());
+        assert!(!runtime.can_select_diff_basis(&DiffBasis::HeadToIndex));
+        drop(runtime.update(RepositoryAction::ApplySourceSurface { card, diff: true }));
+        drop(runtime.update(RepositoryAction::ApplyDiffBasis {
+            card,
+            basis: DiffBasis::HeadToIndex,
+        }));
+        assert_eq!(runtime.source_surface, SourceSurface::Editor);
+        assert_eq!(runtime.diff_basis, DiffBasis::IndexToWorktree);
+
+        let basis = DiffBasis::CommitToParent {
+            oid: fixture_oid(1),
+            parent: Some(fixture_oid(2)),
+        };
+        assert!(runtime.can_select_diff_basis(&basis));
+        drop(runtime.update(RepositoryAction::ApplyDiffBasis {
+            card,
+            basis: basis.clone(),
+        }));
+        assert!(runtime.can_show_diff());
+        assert!(!runtime.can_change_diff_layout());
+        drop(runtime.update(RepositoryAction::ApplyDiffMode { card, split: true }));
+        assert_eq!(runtime.diff_mode, DiffMode::Inline);
+        runtime.set_diff_state(
+            basis.clone(),
+            DiffState::Ready(RenderedDiff::Error("read failed".into())),
+        );
+        assert!(runtime.can_retry_diff());
+        drop(runtime.update(RepositoryAction::RetryDiff { card }));
+        assert!(!runtime.can_retry_diff());
+        assert!(matches!(
+            runtime.diff_state(&basis),
+            Some(DiffState::Loading { .. })
+        ));
+        runtime.set_diff_state(basis, DiffState::Ready(staged_text_diff(model_with(1))));
+        assert!(runtime.can_change_diff_layout());
+        drop(runtime.update(RepositoryAction::ApplyDiffMode { card, split: true }));
+        assert_eq!(runtime.diff_mode, DiffMode::Split);
+    }
+
+    #[test]
+    fn editor_navigation_only_schedules_visible_diffs_and_cancels_hidden_workers() {
+        let card = CardId::new();
+        let (mut runtime, identity) = diff_runtime(card);
+        drop(runtime.open_file(card, identity.path));
+        assert!(
+            runtime.diffs.is_empty(),
+            "opening text must not compute either hidden diff"
+        );
+        drop(runtime.update(RepositoryAction::ApplySourceSurface { card, diff: true }));
+        let (request, cancelled_on_hide) = match runtime.diff_state(&DiffBasis::IndexToWorktree) {
+            Some(DiffState::Loading {
+                request,
+                cancellation,
+            }) => (*request, cancellation.clone()),
+            _ => panic!("the visible comparison must start loading"),
+        };
+        assert!(runtime.diff_state(&DiffBasis::HeadToIndex).is_none());
+        drop(runtime.update(RepositoryAction::ApplySourceSurface { card, diff: true }));
+        assert!(
+            matches!(
+                runtime.diff_state(&DiffBasis::IndexToWorktree),
+                Some(DiffState::Loading { request: current, .. }) if *current == request
+            ),
+            "redrawing or reselecting the same surface must not restart its worker"
+        );
+        drop(runtime.update(RepositoryAction::ApplySourceSurface { card, diff: false }));
+        assert!(cancelled_on_hide.is_cancelled());
+        assert!(runtime.diff_state(&DiffBasis::IndexToWorktree).is_none());
+
+        drop(runtime.update(RepositoryAction::ApplySourceSurface { card, diff: true }));
+        let cancelled_on_close = match runtime.diff_state(&DiffBasis::IndexToWorktree) {
+            Some(DiffState::Loading { cancellation, .. }) => cancellation.clone(),
+            _ => panic!("returning to an unfinished comparison must restart it"),
+        };
+        drop(runtime);
+        assert!(cancelled_on_close.is_cancelled());
+    }
     use crate::repository::Oid;
     use tempfile::tempdir;
 
@@ -4350,6 +4674,7 @@ mod tests {
                     new_label: "new".into(),
                 },
                 Path::new("kernel.cu"),
+                &CancellationToken::new(),
             ) else {
                 panic!("text comparison must produce rows");
             };
@@ -5239,10 +5564,7 @@ mod tests {
             result: Ok(vec![changed]),
         });
         assert!(runtime.inspector_context().has_unstaged);
-        assert!(matches!(
-            runtime.diff_state(&DiffBasis::IndexToWorktree),
-            Some(DiffState::Loading { .. })
-        ));
+        assert!(runtime.diff_state(&DiffBasis::IndexToWorktree).is_none());
         assert!(!runtime.is_saving());
     }
 
@@ -5371,10 +5693,7 @@ mod tests {
         assert!(!document.dirty);
         assert!(document.active_save.is_none());
         assert!(!document.conflict);
-        assert!(matches!(
-            runtime.diff_state(&DiffBasis::IndexToWorktree),
-            Some(DiffState::Loading { .. })
-        ));
+        assert!(runtime.diff_state(&DiffBasis::IndexToWorktree).is_none());
     }
 
     #[test]
@@ -5568,7 +5887,13 @@ mod tests {
         assert_eq!(context.diff_deletions, Some(2));
         assert_eq!(context.diff_change, Some((1, 2)));
 
-        runtime.set_diff_state(DiffBasis::HeadToIndex, DiffState::Loading { request: 1 });
+        runtime.set_diff_state(
+            DiffBasis::HeadToIndex,
+            DiffState::Loading {
+                request: 1,
+                cancellation: CancellationToken::new(),
+            },
+        );
         assert_eq!(
             runtime.inspector_runtime_status(),
             RepositoryRuntimeStatus::Loading
@@ -5618,7 +5943,7 @@ mod tests {
     }
 
     #[test]
-    fn successful_save_prepares_a_fresh_diff_for_clean_and_untracked_files() {
+    fn successful_save_invalidates_hidden_diff_then_loads_fresh_changes_on_demand() {
         for tracked in [true, false] {
             let view = RepositoryView {
                 project: ProjectId::new(),
@@ -5684,6 +6009,8 @@ mod tests {
                     .and_then(|selected| selected.status.as_deref()),
                 Some(if tracked { " M" } else { "??" })
             );
+            assert!(runtime.diff_state(&DiffBasis::IndexToWorktree).is_none());
+            drop(runtime.update(RepositoryAction::ApplySourceSurface { card, diff: true }));
             assert!(matches!(
                 runtime.diff_state(&DiffBasis::IndexToWorktree),
                 Some(DiffState::Loading { .. })
@@ -5725,10 +6052,19 @@ mod tests {
             offset: 600.0,
             height: 300.0,
         };
-        runtime.set_diff_state(DiffBasis::HeadToIndex, DiffState::Loading { request: 3 });
+        runtime.set_diff_state(
+            DiffBasis::HeadToIndex,
+            DiffState::Loading {
+                request: 3,
+                cancellation: CancellationToken::new(),
+            },
+        );
         runtime.set_diff_state(
             DiffBasis::IndexToWorktree,
-            DiffState::Loading { request: 2 },
+            DiffState::Loading {
+                request: 2,
+                cancellation: CancellationToken::new(),
+            },
         );
         let identity = AsyncIdentity {
             card,
@@ -5801,24 +6137,6 @@ mod tests {
         assert!(
             matches!(runtime.document, DocumentState::Loading(ref path) if path == Path::new("current.rs"))
         );
-    }
-
-    #[test]
-    fn presentation_modes_are_persistent_runtime_state() {
-        let view = RepositoryView {
-            project: ProjectId::new(),
-            repository: PathBuf::from("/repo/.git"),
-            worktree: PathBuf::from("/repo"),
-        };
-        let mut runtime = RepositoryRuntime::new(view);
-        let card = CardId::new();
-        let _ = runtime.update(RepositoryAction::ApplyMarkdownMode {
-            card,
-            preview: true,
-        });
-        let _ = runtime.update(RepositoryAction::ApplyDiffMode { card, split: true });
-        assert_eq!(runtime.markdown_mode, MarkdownMode::Preview);
-        assert_eq!(runtime.diff_mode, DiffMode::Split);
     }
 
     #[test]
@@ -5940,12 +6258,8 @@ mod tests {
 
     #[test]
     fn change_navigation_realizes_far_rows_before_programmatic_scroll() {
-        let view = RepositoryView {
-            project: ProjectId::new(),
-            repository: PathBuf::from("/repo/.git"),
-            worktree: PathBuf::from("/repo"),
-        };
-        let mut runtime = RepositoryRuntime::new(view);
+        let card = CardId::new();
+        let (mut runtime, _) = diff_runtime(card);
         runtime.diff_viewport.height = 720.0;
         runtime.set_diff_state(
             DiffBasis::IndexToWorktree,
@@ -5969,7 +6283,6 @@ mod tests {
                 syntax: DiffSyntax::default(),
             })),
         );
-        let card = CardId::new();
         let _ = runtime.update(RepositoryAction::NextChange { card });
         let middle = visible_rows(100_000, runtime.diff_viewport, DIFF_ROW_HEIGHT);
         assert!(middle.start <= 50_000 && middle.end > 50_000);
@@ -6618,7 +6931,10 @@ mod tests {
         runtime.diff_basis = DiffBasis::IndexToWorktree;
         runtime.set_diff_state(
             DiffBasis::IndexToWorktree,
-            DiffState::Loading { request: 1 },
+            DiffState::Loading {
+                request: 1,
+                cancellation: CancellationToken::new(),
+            },
         );
         runtime.next_diff_request = 1;
         let _ = runtime.update(RepositoryAction::ApplyDiffBasis {
@@ -6628,12 +6944,11 @@ mod tests {
         assert_eq!(runtime.diff_basis, commit);
         assert!(matches!(
             runtime.diff_state(&commit),
-            Some(DiffState::Loading { request: 2 })
+            Some(DiffState::Loading { request: 2, .. })
         ));
 
-        // The unstaged answer lands now. It may reach its own slot, and must
-        // not be shown as the commit comparison, nor reset the viewport and
-        // change cursor the user is holding in it.
+        // A cancelled answer may still arrive. It must neither recreate its
+        // slot nor reset the viewport/change cursor of the active comparison.
         runtime.diff_viewport = ListViewport {
             offset: 480.0,
             height: 300.0,
@@ -6648,17 +6963,14 @@ mod tests {
         assert!(
             matches!(
                 runtime.diff_state(&commit),
-                Some(DiffState::Loading { request: 2 })
+                Some(DiffState::Loading { request: 2, .. })
             ),
             "the superseded basis answered for the current one"
         );
         assert!(runtime.diff_model().is_none());
         assert_eq!(runtime.diff_viewport.offset, 480.0);
         assert_eq!(runtime.diff_change, 3);
-        assert!(matches!(
-            runtime.diff_state(&DiffBasis::IndexToWorktree),
-            Some(DiffState::Ready(RenderedDiff::Text { model, .. })) if model.additions == 9
-        ));
+        assert!(runtime.diff_state(&DiffBasis::IndexToWorktree).is_none());
 
         // A superseded request for the *current* basis is dropped outright.
         let _ = runtime.update(RepositoryAction::DiffLoaded {
@@ -6669,7 +6981,7 @@ mod tests {
         });
         assert!(matches!(
             runtime.diff_state(&commit),
-            Some(DiffState::Loading { request: 2 })
+            Some(DiffState::Loading { request: 2, .. })
         ));
     }
 
@@ -6989,7 +7301,7 @@ mod tests {
     fn stepping_through_commits_does_not_retain_a_diff_per_commit() {
         let card = CardId::new();
         let (mut runtime, identity) = diff_runtime(card);
-        // The two working bases, as opening the file would have read them.
+        // Previously viewed working comparisons remain cached.
         for basis in [DiffBasis::HeadToIndex, DiffBasis::IndexToWorktree] {
             runtime.set_diff_state(basis, DiffState::Ready(staged_text_diff(model_with(1))));
         }
@@ -7005,6 +7317,12 @@ mod tests {
                 card,
                 basis: basis.clone(),
             });
+            drop(runtime.update(RepositoryAction::DiffLoaded {
+                identity: identity.clone(),
+                basis: basis.clone(),
+                request: runtime.next_diff_request,
+                content: staged_text_diff(model_with(1)),
+            }));
             assert_eq!(runtime.diff_basis, basis, "step {step} was not applied");
             assert!(
                 runtime
@@ -7032,8 +7350,7 @@ mod tests {
             );
         }
 
-        // The evicted slots were still in flight. Their answers land nowhere
-        // and do not recreate the slot the user has moved away from.
+        // A duplicate answer for an evicted slot must not recreate it.
         let _ = runtime.update(RepositoryAction::DiffLoaded {
             identity,
             basis: commit(0),

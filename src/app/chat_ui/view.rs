@@ -29,6 +29,69 @@ fn command(target: Target, value: Command) -> Message {
 }
 
 impl Cagents {
+    pub(in crate::app) fn chat_binding_view(&self, card: CardId) -> Option<Element<'_, Message>> {
+        let binding = self.chat_ui.bindings.get(&card)?;
+        let valid =
+            binding.input.trim().len() == 36 && uuid::Uuid::parse_str(binding.input.trim()).is_ok();
+        let mut rows: Vec<Element<'_, Message>> = vec![
+            design::heading("Select the exact Codex conversation").into(),
+            body(
+                "The shared server does not identify which thread this terminal is viewing. Copy the full thread ID from /status in the intended CLI. Preview is read-only; nothing is resumed or sent.",
+            ),
+            iced::widget::text_input("Full conversation UUID", &binding.input)
+                .on_input(move |input| action(Action::BindingInput(card, input)))
+                .on_submit_maybe(
+                    (valid && !binding.loading).then_some(action(Action::BindingPreview(card))),
+                )
+                .into(),
+        ];
+        if let Some(preview) = &binding.preview {
+            rows.push(body(format!(
+                "Conversation: {}\nID: {}\nDirectory: {}",
+                preview.title,
+                preview.session_id,
+                preview.working_directory.display()
+            )));
+            rows.push(body("Confirm only if this is the conversation you intend to control. This attaches to its existing shared backend with its current permissions. The source terminal stays running; no duplicate agent is launched."));
+        }
+        if let Some(error) = &binding.error {
+            rows.push(body(error.as_str()));
+        }
+        rows.push(
+            widget::column::with_children(vec![
+                widget::button::text(if binding.loading {
+                    "Reading conversation…"
+                } else {
+                    "Preview conversation"
+                })
+                .on_press_maybe(
+                    (valid && !binding.loading).then_some(action(Action::BindingPreview(card))),
+                )
+                .into(),
+                widget::button::text("Confirm selected conversation")
+                    .on_press_maybe(
+                        (binding.preview.is_some() && !binding.loading)
+                            .then_some(action(Action::BindingConfirm(card))),
+                    )
+                    .into(),
+                widget::button::text("Cancel")
+                    .on_press(action(Action::BindingCancel(card)))
+                    .into(),
+            ])
+            .spacing(8)
+            .into(),
+        );
+        Some(
+            widget::container(
+                widget::scrollable(widget::column::with_children(rows).spacing(8).padding(12))
+                    .height(Length::Shrink),
+            )
+            .max_height(320)
+            .width(Length::Fill)
+            .into(),
+        )
+    }
+
     pub(in crate::app) fn chat_view(&self, card: CardId) -> Element<'_, Message> {
         match self.cards.get(&card) {
             Some(CardRuntime::Chat(runtime)) => {
@@ -431,25 +494,45 @@ impl Runtime {
             .cost_microusd
             .map(|cost| format!(" · ${:.4}", cost as f64 / 1_000_000.0))
             .unwrap_or_default();
+        let detail = if transitioning {
+            "Session transition in progress"
+        } else if self.attachment_chooser_pending {
+            "Choosing attachments"
+        } else if self.pending.is_some() {
+            "Awaiting acknowledgement"
+        } else {
+            &snapshot.detail
+        };
+        let status: Element<'_, Message> = if detail.is_empty() {
+            let (name, label) = if snapshot.waiting || !snapshot.requests.is_empty() {
+                ("agent-waiting-symbolic", "Waiting for your input")
+            } else if snapshot.busy {
+                ("agent-working-symbolic", "Working")
+            } else {
+                ("emblem-ok-symbolic", "Ready")
+            };
+            crate::ui_controls::icon_control(
+                crate::ui_controls::symbolic_icon(name),
+                label,
+                false,
+                false,
+                None,
+            )
+            .into()
+        } else {
+            widget::text::caption(detail).into()
+        };
         content.push(
-            widget::text::caption(format!(
-                "{} · {} in / {} out{}{}",
-                if transitioning {
-                    "Session transition in progress"
-                } else if self.attachment_chooser_pending {
-                    "Choosing attachments"
-                } else if self.pending.is_some() {
-                    "Awaiting acknowledgement"
-                } else if snapshot.detail.is_empty() {
-                    if snapshot.busy { "Working" } else { "Ready" }
-                } else {
-                    &snapshot.detail
-                },
-                usage.input_tokens,
-                usage.output_tokens,
-                context,
-                cost
-            ))
+            widget::row::with_children(vec![
+                status,
+                widget::text::caption(format!(
+                    "{} in / {} out{}{}",
+                    usage.input_tokens, usage.output_tokens, context, cost
+                ))
+                .into(),
+            ])
+            .spacing(8)
+            .align_y(Alignment::Center)
             .into(),
         );
         widget::container(

@@ -1,6 +1,12 @@
 //! Immutable native diff models computed away from the application update thread.
 
-use std::{collections::HashMap, ops::Range, path::Path};
+use std::{
+    collections::HashMap,
+    hash::{Hash, Hasher},
+    ops::Range,
+    path::Path,
+    sync::LazyLock,
+};
 
 use imara_diff::{Algorithm, Diff, InternedInput};
 
@@ -116,52 +122,168 @@ pub(crate) fn highlighter_settings(path: &Path, dark: bool) -> cosmic::iced::hig
     }
 }
 
-fn highlight_side(text: &str, path: &Path, dark: bool) -> Vec<Vec<SyntaxSpan>> {
-    let mut stream = cosmic::iced::highlighter::Stream::new(&highlighter_settings(path, dark));
-    text.split_inclusive('\n')
-        .map(|line| {
-            let line = line
-                .strip_suffix("\r\n")
-                .or_else(|| line.strip_suffix('\n'))
-                .unwrap_or(line);
-            let spans = stream
-                .highlight_line(line)
-                .map(|(range, highlight)| SyntaxSpan {
-                    range,
-                    color: highlight.color().map(|color| {
+type SyntaxLines = [Vec<Vec<SyntaxSpan>>; 2];
+
+/// Immutable grammar/theme tables, identical to iced's highlighter. Parsing is
+/// theme-independent: advance one parser and scope stack, then color each scope
+/// for both palettes without reparsing or cloning the parser at every line.
+fn highlight_side(
+    text: &str,
+    path: &Path,
+    cancellation: &CancellationToken,
+) -> Result<SyntaxLines, Cancelled> {
+    use two_face::re_exports::syntect::{highlighting, parsing};
+    static SYNTAXES: LazyLock<parsing::SyntaxSet> =
+        LazyLock::new(two_face::syntax::extra_no_newlines);
+    static THEMES: LazyLock<highlighting::ThemeSet> =
+        LazyLock::new(highlighting::ThemeSet::load_defaults);
+
+    check_cancelled(cancellation)?;
+    let settings = highlighter_settings(path, false);
+    let syntax = SYNTAXES
+        .find_syntax_by_token(&settings.token)
+        .unwrap_or_else(|| SYNTAXES.find_syntax_plain_text());
+    let mut parser = parsing::ParseState::new(syntax);
+    let mut stack = parsing::ScopeStack::new();
+    let highlighters = [
+        highlighting::Highlighter::new(&THEMES.themes["InspiredGitHub"]),
+        highlighting::Highlighter::new(&THEMES.themes["base16-ocean.dark"]),
+    ];
+    let mut lines: SyntaxLines = Default::default();
+    for line in text.split_inclusive('\n') {
+        check_cancelled(cancellation)?;
+        let line = line
+            .strip_suffix("\r\n")
+            .or_else(|| line.strip_suffix('\n'))
+            .unwrap_or(line);
+        let ops = parser.parse_line(line, &SYNTAXES).unwrap_or_default();
+        check_cancelled(cancellation)?;
+        let mut spans: [Vec<SyntaxSpan>; 2] = Default::default();
+        let mut start = 0;
+        // Apply even zero-length operations: they carry multiline lexical
+        // state. This is iced's scope iteration, shared across both themes.
+        for (end, op) in ops
+            .iter()
+            .map(|(end, op)| (*end, Some(op)))
+            .chain(std::iter::once((line.len(), None)))
+        {
+            check_cancelled(cancellation)?;
+            if start < end {
+                for (palette, highlighter) in highlighters.iter().enumerate() {
+                    let style = highlighter.style_mod_for_stack(&stack.scopes);
+                    let color = style.foreground.map(|color| {
+                        let color = cosmic::iced::Color::from_rgba8(
+                            color.r,
+                            color.g,
+                            color.b,
+                            color.a as f32 / 255.0,
+                        );
                         [
                             color.r.to_bits(),
                             color.g.to_bits(),
                             color.b.to_bits(),
                             color.a.to_bits(),
                         ]
-                    }),
-                    font: highlight.font(),
-                })
-                .collect();
-            stream.commit();
-            spans
-        })
-        .collect()
+                    });
+                    let font = style.font_style.and_then(|style| {
+                        use cosmic::iced::{Font, font};
+                        let bold = style.contains(highlighting::FontStyle::BOLD);
+                        let italic = style.contains(highlighting::FontStyle::ITALIC);
+                        (bold || italic).then_some(Font {
+                            weight: if bold {
+                                font::Weight::Bold
+                            } else {
+                                font::Weight::Normal
+                            },
+                            style: if italic {
+                                font::Style::Italic
+                            } else {
+                                font::Style::Normal
+                            },
+                            ..Font::MONOSPACE
+                        })
+                    });
+                    spans[palette].push(SyntaxSpan {
+                        range: start..end,
+                        color,
+                        font,
+                    });
+                }
+            }
+            if let Some(op) = op {
+                let _ = stack.apply(op);
+            }
+            start = end;
+        }
+        for (lines, spans) in lines.iter_mut().zip(spans) {
+            lines.push(spans);
+        }
+    }
+    Ok(lines)
 }
 
-fn build_highlighted_diff(before: &str, after: &str, path: &Path) -> DiffModel {
-    let mut model = build_diff_rows(before, after);
+#[derive(Debug)]
+struct Cancelled;
+
+fn check_cancelled(cancellation: &CancellationToken) -> Result<(), Cancelled> {
+    if cancellation.is_cancelled() {
+        Err(Cancelled)
+    } else {
+        Ok(())
+    }
+}
+
+fn build_highlighted_diff(
+    before: &str,
+    after: &str,
+    path: &Path,
+    cancellation: &CancellationToken,
+) -> Result<DiffModel, Cancelled> {
+    let mut model = build_diff_rows(before, after, cancellation)?;
     model.syntax = DiffSyntax {
-        old: [
-            highlight_side(before, path, false),
-            highlight_side(before, path, true),
-        ],
-        new: [
-            highlight_side(after, path, false),
-            highlight_side(after, path, true),
-        ],
+        old: highlight_side(before, path, cancellation)?,
+        new: highlight_side(after, path, cancellation)?,
     };
-    measure_diff(&mut model);
-    model
+    measure_diff(&mut model, cancellation)?;
+    Ok(model)
 }
 
-fn measure_diff(model: &mut DiffModel) {
+/// Colors do not affect glyph advances; fonts and every span boundary do.
+/// Keep the exact rich-text partition (including intraline boundaries), rather
+/// than measuring plain text or estimating widths from character counts.
+#[derive(Eq)]
+struct ShapeKey<'a> {
+    text: &'a str,
+    changed: &'a [Range<usize>],
+    syntax: &'a [SyntaxSpan],
+}
+
+impl PartialEq for ShapeKey<'_> {
+    fn eq(&self, other: &Self) -> bool {
+        self.text == other.text
+            && self.changed == other.changed
+            && self.syntax.len() == other.syntax.len()
+            && self
+                .syntax
+                .iter()
+                .zip(other.syntax)
+                .all(|(a, b)| a.range == b.range && a.font == b.font)
+    }
+}
+
+impl Hash for ShapeKey<'_> {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.text.hash(state);
+        self.changed.hash(state);
+        self.syntax.len().hash(state);
+        for span in self.syntax {
+            span.range.hash(state);
+            span.font.hash(state);
+        }
+    }
+}
+
+fn measure_diff(model: &mut DiffModel, cancellation: &CancellationToken) -> Result<(), Cancelled> {
     let palettes = if model
         .syntax
         .old
@@ -173,41 +295,55 @@ fn measure_diff(model: &mut DiffModel) {
     } else {
         2
     };
-    for palette in 0..palettes {
-        let dark = palette == 1;
-        let mut width = 0.0_f32;
-        for row in &model.split_rows {
-            for (old, line, text, changed) in [
-                (
-                    true,
-                    row.old_line,
-                    row.old_text.as_deref(),
-                    &row.old_changed,
-                ),
-                (
-                    false,
-                    row.new_line,
-                    row.new_text.as_deref(),
-                    &row.new_changed,
-                ),
-            ] {
-                if let Some(text) = text {
-                    let syntax = model.syntax.line(old, line, dark);
-                    if !old
-                        && row.kind == DiffRowKind::Context
-                        && syntax == model.syntax.line(true, row.old_line, dark)
-                    {
-                        continue;
-                    }
-                    width = width.max(shaped_line_width(text, changed, syntax));
+    let mut widths = [0.0_f32; 2];
+    // Worker-local, bounded, borrowing the existing model: no retained native
+    // paragraphs or copies of source text, and no cross-repository cache.
+    let mut measured = HashMap::new();
+    for row in &model.split_rows {
+        for (old, line, text, changed) in [
+            (
+                true,
+                row.old_line,
+                row.old_text.as_deref(),
+                &row.old_changed,
+            ),
+            (
+                false,
+                row.new_line,
+                row.new_text.as_deref(),
+                &row.new_changed,
+            ),
+        ] {
+            if let Some(text) = text {
+                for (palette, width) in widths.iter_mut().enumerate().take(palettes) {
+                    check_cancelled(cancellation)?;
+                    let syntax = model.syntax.line(old, line, palette == 1);
+                    let key = ShapeKey {
+                        text,
+                        changed,
+                        syntax,
+                    };
+                    let shaped = if let Some(width) = measured.get(&key) {
+                        *width
+                    } else {
+                        let width = shaped_line_width(text, changed, syntax);
+                        check_cancelled(cancellation)?;
+                        if measured.len() == 4096 {
+                            measured.clear();
+                        }
+                        measured.insert(key, width);
+                        width
+                    };
+                    *width = width.max(shaped);
                 }
             }
         }
-        model.max_line_width[usize::from(dark)] = width.ceil() as u32;
     }
     if palettes == 1 {
-        model.max_line_width[1] = model.max_line_width[0];
+        widths[1] = widths[0];
     }
+    model.max_line_width = widths.map(|width| width.ceil() as u32);
+    Ok(())
 }
 impl DiffModel {
     pub fn is_empty(&self) -> bool {
@@ -264,7 +400,17 @@ impl RenderedDiff {
     /// An unmerged path never does — it has three index stages and no single
     /// old side — so it is passed through instead of being flattened into a
     /// two-sided diff.
-    pub fn from_content(content: DiffContent, path: &Path) -> Self {
+    ///
+    /// Cancellation discards the entire model, never exposing partially built
+    /// rows, syntax, or widths.
+    pub fn from_content(
+        content: DiffContent,
+        path: &Path,
+        cancellation: &CancellationToken,
+    ) -> Self {
+        if cancellation.is_cancelled() {
+            return Self::Error("repository operation cancelled".into());
+        }
         match content {
             DiffContent::Comparison {
                 old,
@@ -280,12 +426,17 @@ impl RenderedDiff {
                         new_label,
                     });
                 }
+                let model = match build_highlighted_diff(
+                    old.text().unwrap_or_default(),
+                    new.text().unwrap_or_default(),
+                    path,
+                    cancellation,
+                ) {
+                    Ok(model) => model,
+                    Err(Cancelled) => return Self::Error("repository operation cancelled".into()),
+                };
                 Self::Text {
-                    model: build_highlighted_diff(
-                        old.text().unwrap_or_default(),
-                        new.text().unwrap_or_default(),
-                        path,
-                    ),
+                    model,
                     old_label,
                     new_label,
                 }
@@ -301,11 +452,17 @@ impl RenderedDiff {
 /// `previous_path` is a rename or copy source: the old side reads it instead of
 /// `relative_path`, so a renamed file compares against its own former content
 /// rather than against nothing.
+///
+/// The caller owns cancellation and must fence completed results by request.
+/// Git is interruptible; CPU work checks between rows, lexical scope operations
+/// and native paragraphs. A single parser line, native shaping call, or imara
+/// diff operation is indivisible and finishes before the next checkpoint.
 pub fn load_repository_diff(
     worktree: &Path,
     relative_path: &Path,
     basis: &DiffBasis,
     previous_path: Option<&Path>,
+    cancellation: &CancellationToken,
 ) -> RenderedDiff {
     // `RepoPath` *is* the path validation: it rejects an absolute path, `.`,
     // `..`, an empty component and an interior NUL, which is what makes the
@@ -324,37 +481,49 @@ pub fn load_repository_diff(
         path,
         old_path,
     };
-    // Fenced by the request counter in `RepositoryRuntime`, not by
-    // cancellation: a superseded result is rejected on arrival rather than
-    // aborted in flight, so this call owns a token nobody else can cancel.
-    match RepositoryService::system("git").diff(&request, &CancellationToken::new()) {
-        Ok(content) => RenderedDiff::from_content(content, relative_path),
+    match RepositoryService::system("git").diff(&request, cancellation) {
+        Ok(content) => RenderedDiff::from_content(content, relative_path, cancellation),
         Err(error) => RenderedDiff::Error(error.to_string()),
     }
 }
 
 pub fn build_diff(before: &str, after: &str) -> DiffModel {
-    let mut model = build_diff_rows(before, after);
-    measure_diff(&mut model);
+    let cancellation = CancellationToken::new();
+    let mut model =
+        build_diff_rows(before, after, &cancellation).expect("local token is not cancelled");
+    measure_diff(&mut model, &cancellation).expect("local token is not cancelled");
     model
 }
 
-fn build_diff_rows(before: &str, after: &str) -> DiffModel {
+fn build_diff_rows(
+    before: &str,
+    after: &str,
+    cancellation: &CancellationToken,
+) -> Result<DiffModel, Cancelled> {
+    check_cancelled(cancellation)?;
     let input = InternedInput::new(before, after);
+    check_cancelled(cancellation)?;
     let mut diff = Diff::compute(Algorithm::Histogram, &input);
+    check_cancelled(cancellation)?;
     diff.postprocess_lines(&input);
+    check_cancelled(cancellation)?;
 
     let before_lines = input
         .before
         .iter()
-        .map(|token| display_line(input.interner[*token]))
-        .collect::<Vec<_>>();
+        .map(|token| {
+            check_cancelled(cancellation)?;
+            Ok(display_line(input.interner[*token]))
+        })
+        .collect::<Result<Vec<_>, Cancelled>>()?;
     let after_lines = input
         .after
         .iter()
-        .map(|token| display_line(input.interner[*token]))
-        .collect::<Vec<_>>();
-    let hunks = diff.hunks().collect::<Vec<_>>();
+        .map(|token| {
+            check_cancelled(cancellation)?;
+            Ok(display_line(input.interner[*token]))
+        })
+        .collect::<Result<Vec<_>, Cancelled>>()?;
     let mut inline_rows = Vec::new();
     let mut split_rows = Vec::new();
     let mut inline_change_starts = Vec::new();
@@ -365,7 +534,8 @@ fn build_diff_rows(before: &str, after: &str) -> DiffModel {
     let mut after_endings = HashMap::<&str, u8>::new();
     let mut intraline_budget = 4_000_000usize;
 
-    for hunk in hunks {
+    for hunk in diff.hunks() {
+        check_cancelled(cancellation)?;
         append_context(
             &before_lines,
             &after_lines,
@@ -375,7 +545,8 @@ fn build_diff_rows(before: &str, after: &str) -> DiffModel {
             hunk.after.start as usize,
             &mut inline_rows,
             &mut split_rows,
-        );
+            cancellation,
+        )?;
         inline_change_starts.push(inline_rows.len());
         split_change_starts.push(split_rows.len());
 
@@ -386,12 +557,15 @@ fn build_diff_rows(before: &str, after: &str) -> DiffModel {
         before_endings.clear();
         after_endings.clear();
         for line in &before_lines[old_start..old_end] {
+            check_cancelled(cancellation)?;
             *before_endings.entry(&line.text).or_default() |= line.ending.bit();
         }
         for line in &after_lines[new_start..new_end] {
+            check_cancelled(cancellation)?;
             *after_endings.entry(&line.text).or_default() |= line.ending.bit();
         }
         for (offset, line) in before_lines[old_start..old_end].iter().enumerate() {
+            check_cancelled(cancellation)?;
             let ending_changed = line.ending_differs(&after_endings);
             inline_rows.push(InlineDiffRow {
                 old_line: Some((old_start + offset + 1) as u32),
@@ -406,6 +580,7 @@ fn build_diff_rows(before: &str, after: &str) -> DiffModel {
             });
         }
         for (offset, line) in after_lines[new_start..new_end].iter().enumerate() {
+            check_cancelled(cancellation)?;
             let ending_changed = line.ending_differs(&before_endings);
             inline_rows.push(InlineDiffRow {
                 old_line: None,
@@ -422,6 +597,7 @@ fn build_diff_rows(before: &str, after: &str) -> DiffModel {
 
         let paired = (old_end - old_start).max(new_end - new_start);
         for offset in 0..paired {
+            check_cancelled(cancellation)?;
             let old_text = before_lines
                 .get(old_start + offset)
                 .filter(|_| old_start + offset < old_end);
@@ -489,9 +665,10 @@ fn build_diff_rows(before: &str, after: &str) -> DiffModel {
         after_lines.len(),
         &mut inline_rows,
         &mut split_rows,
-    );
+        cancellation,
+    )?;
 
-    DiffModel {
+    Ok(DiffModel {
         inline_rows,
         split_rows,
         inline_change_starts,
@@ -500,7 +677,7 @@ fn build_diff_rows(before: &str, after: &str) -> DiffModel {
         deletions: diff.count_removals(),
         max_line_width: [0; 2],
         syntax: DiffSyntax::default(),
-    }
+    })
 }
 
 pub(crate) const DIFF_FONT_SIZE: f32 = 14.0;
@@ -676,9 +853,11 @@ fn append_context(
     new_end: usize,
     inline: &mut Vec<InlineDiffRow>,
     split: &mut Vec<SplitDiffRow>,
-) {
+    cancellation: &CancellationToken,
+) -> Result<(), Cancelled> {
     debug_assert_eq!(old_end - *old_cursor, new_end - *new_cursor);
     while *old_cursor < old_end && *new_cursor < new_end {
+        check_cancelled(cancellation)?;
         let old_line = *old_cursor + 1;
         let new_line = *new_cursor + 1;
         let text = before[*old_cursor].text.clone();
@@ -701,6 +880,7 @@ fn append_context(
         *old_cursor += 1;
         *new_cursor += 1;
     }
+    Ok(())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -772,6 +952,130 @@ mod tests {
     use crate::repository::{DiffSide, Oid, ValidatedRefName};
 
     #[test]
+    fn shared_parser_matches_editor_highlighting_across_multiline_and_unicode() {
+        for (path, source) in [
+            (
+                "sample.rs",
+                "/* outer\n/* nested */ still comment\n*/\nlet café = \"a\\\"b\";\r\n/// docs\nfn office() {}\n",
+            ),
+            (
+                "sample.py",
+                "value = '''multiline\n雪 e\u{301}\n'''\ndef office():\n\treturn \"ffi\"\n",
+            ),
+            (
+                "sample.js",
+                "const template = `a\n${value + \"雪\"}\nz`;\n/* comment\n*/ let b = /x+/g;",
+            ),
+            ("unknown.unsupported", "plain\t雪\r\n\nlast"),
+        ] {
+            let actual =
+                highlight_side(source, Path::new(path), &CancellationToken::new()).unwrap();
+            for (palette, dark) in [false, true].into_iter().enumerate() {
+                let mut stream = cosmic::iced::highlighter::Stream::new(&highlighter_settings(
+                    Path::new(path),
+                    dark,
+                ));
+                let expected = source
+                    .split_inclusive('\n')
+                    .map(|line| {
+                        let line = line
+                            .strip_suffix("\r\n")
+                            .or_else(|| line.strip_suffix('\n'))
+                            .unwrap_or(line);
+                        let spans = stream
+                            .highlight_line(line)
+                            .map(|(range, highlight)| SyntaxSpan {
+                                range,
+                                color: highlight.color().map(|color| {
+                                    [
+                                        color.r.to_bits(),
+                                        color.g.to_bits(),
+                                        color.b.to_bits(),
+                                        color.a.to_bits(),
+                                    ]
+                                }),
+                                font: highlight.font(),
+                            })
+                            .collect::<Vec<_>>();
+                        stream.commit();
+                        spans
+                    })
+                    .collect::<Vec<_>>();
+                assert_eq!(actual[palette], expected, "{path}, dark={dark}");
+            }
+        }
+    }
+
+    #[test]
+    fn cached_measurement_matches_every_native_paragraph_in_both_palettes() {
+        let before = "/*\nlet office = \"ffi 雪 e\u{301}\";\n*/\n\tlet repeated = 42;\n\tlet repeated = 42;\n";
+        let after = "//\nlet office = \"ffl 雪 e\u{301}\";\n//\n\tlet repeated = 42;\n\tlet repeated = 42;\n";
+        let model = build_highlighted_diff(
+            before,
+            after,
+            Path::new("sample.rs"),
+            &CancellationToken::new(),
+        )
+        .unwrap();
+        for dark in [false, true] {
+            let mut expected = 0.0_f32;
+            for row in &model.split_rows {
+                for (old, line, text, changed) in [
+                    (
+                        true,
+                        row.old_line,
+                        row.old_text.as_deref(),
+                        &row.old_changed,
+                    ),
+                    (
+                        false,
+                        row.new_line,
+                        row.new_text.as_deref(),
+                        &row.new_changed,
+                    ),
+                ] {
+                    if let Some(text) = text {
+                        expected = expected.max(shaped_line_width(
+                            text,
+                            changed,
+                            model.syntax.line(old, line, dark),
+                        ));
+                    }
+                }
+            }
+            assert_eq!(
+                model.max_line_width[usize::from(dark)],
+                expected.ceil() as u32
+            );
+        }
+    }
+
+    #[test]
+    fn cancelled_comparison_never_publishes_a_partial_diff() {
+        let cancellation = CancellationToken::new();
+        cancellation.cancel();
+        let result = RenderedDiff::from_content(
+            DiffContent::Comparison {
+                old: crate::repository::DiffSide::Text {
+                    text: "old\n".into(),
+                    bytes: 4,
+                },
+                new: crate::repository::DiffSide::Text {
+                    text: "new\n".into(),
+                    bytes: 4,
+                },
+                old_label: "old".into(),
+                new_label: "new".into(),
+            },
+            Path::new("sample.rs"),
+            &cancellation,
+        );
+        assert!(matches!(result, RenderedDiff::Error(_)));
+        assert!(highlight_side("let value = 1;", Path::new("sample.rs"), &cancellation).is_err());
+        assert!(build_diff_rows("old\n", "new\n", &cancellation).is_err());
+    }
+
+    #[test]
     fn cuda_and_named_files_resolve_to_real_bundled_syntax() {
         for (path, source) in [
             (
@@ -799,8 +1103,9 @@ mod tests {
                 "const value: string = \"module\"; // TypeScript",
             ),
         ] {
-            for dark in [false, true] {
-                let lines = highlight_side(source, Path::new(path), dark);
+            let palettes =
+                highlight_side(source, Path::new(path), &CancellationToken::new()).unwrap();
+            for lines in palettes {
                 let colors = lines
                     .iter()
                     .flatten()
@@ -814,12 +1119,17 @@ mod tests {
         }
         let source = "template<class T> T value(T input) { return input; }";
         assert_eq!(
-            highlight_side(source, Path::new("kernel.cu"), true),
-            highlight_side(source, Path::new("kernel.cpp"), true),
+            highlight_side(source, Path::new("kernel.cu"), &CancellationToken::new()).unwrap(),
+            highlight_side(source, Path::new("kernel.cpp"), &CancellationToken::new()).unwrap(),
             "CUDA's C++ constructs must use the actual bundled C++ grammar",
         );
         assert!(
-            highlight_side(source, Path::new("unknown.unsupported"), true)
+            highlight_side(
+                source,
+                Path::new("unknown.unsupported"),
+                &CancellationToken::new()
+            )
+            .unwrap()[1]
                 .iter()
                 .flatten()
                 .all(|span| span.color.is_none())
@@ -830,7 +1140,13 @@ mod tests {
     fn diff_syntax_keeps_side_specific_multiline_state_and_change_backgrounds() {
         let before = "/*\nint value = 1;\n*/\nvoid old_kernel() {}\n";
         let after = "// comment\nint value = 1;\n// end\nvoid new_kernel() {}\n";
-        let model = build_highlighted_diff(before, after, Path::new("kernel.cu"));
+        let model = build_highlighted_diff(
+            before,
+            after,
+            Path::new("kernel.cu"),
+            &CancellationToken::new(),
+        )
+        .unwrap();
         let context = model
             .split_rows
             .iter()
@@ -1082,6 +1398,7 @@ mod tests {
                     new_label: "new".into(),
                 },
                 Path::new("sample.txt"),
+                &CancellationToken::new(),
             )
         };
         let text = |text: &str| DiffSide::Text {
@@ -1146,7 +1463,8 @@ mod tests {
                     theirs: text("theirs\n"),
                     worktree: text("merged\n"),
                 },
-                Path::new("sample.txt")
+                Path::new("sample.txt"),
+                &CancellationToken::new(),
             ),
             RenderedDiff::NoText(DiffContent::Unmerged { .. })
         ));
@@ -1164,8 +1482,13 @@ mod tests {
             (Path::new("ok.txt"), Some(Path::new("../escape.txt"))),
             (Path::new("ok.txt"), Some(Path::new("nested/../escape.txt"))),
         ] {
-            let content =
-                load_repository_diff(root.path(), path, &DiffBasis::IndexToWorktree, previous);
+            let content = load_repository_diff(
+                root.path(),
+                path,
+                &DiffBasis::IndexToWorktree,
+                previous,
+                &CancellationToken::new(),
+            );
             assert!(
                 matches!(content, RenderedDiff::Error(_)),
                 "{path:?} with previous {previous:?} must be refused, got {content:?}"
@@ -1190,6 +1513,7 @@ mod tests {
             Path::new("sample.txt"),
             &DiffBasis::IndexToWorktree,
             None,
+            &CancellationToken::new(),
         )
         else {
             panic!("fixture should produce a text diff");
@@ -1335,6 +1659,7 @@ mod tests {
             Path::new("conflict.txt"),
             &DiffBasis::IndexToWorktree,
             None,
+            &CancellationToken::new(),
         );
         let RenderedDiff::NoText(DiffContent::Unmerged {
             base,
@@ -1389,6 +1714,7 @@ mod tests {
             Path::new("link"),
             &DiffBasis::IndexToWorktree,
             None,
+            &CancellationToken::new(),
         );
         let RenderedDiff::NoText(DiffContent::Comparison { old, new, .. }) = &content else {
             panic!("a symlink replaced by a file has no text diff, got {content:?}");
@@ -1585,7 +1911,13 @@ mod tests {
         basis: &DiffBasis,
         previous_path: Option<&Path>,
     ) -> (DiffModel, String, String) {
-        let content = load_repository_diff(worktree, Path::new(path), basis, previous_path);
+        let content = load_repository_diff(
+            worktree,
+            Path::new(path),
+            basis,
+            previous_path,
+            &CancellationToken::new(),
+        );
         let RenderedDiff::Text {
             model,
             old_label,
@@ -1600,8 +1932,13 @@ mod tests {
     /// The working-tree side of an untracked or replaced path, which the
     /// unstaged basis reports as its new side.
     fn working_side(worktree: &Path, path: &str) -> DiffSide {
-        let content =
-            load_repository_diff(worktree, Path::new(path), &DiffBasis::IndexToWorktree, None);
+        let content = load_repository_diff(
+            worktree,
+            Path::new(path),
+            &DiffBasis::IndexToWorktree,
+            None,
+            &CancellationToken::new(),
+        );
         let RenderedDiff::NoText(DiffContent::Comparison { new, .. }) = content else {
             panic!("{path} should have no text diff, got {content:?}");
         };

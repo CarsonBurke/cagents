@@ -56,6 +56,7 @@ ui = [
     "dep:tokio-util",
     "dep:toml",
     "dep:tracing-subscriber",
+    "dep:two-face",
 ]
 integrated-browser = [
     "full",
@@ -139,6 +140,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"], optional = true }
 toml = { version = "1.1.4", optional = true }
 tungstenite = { version = "=0.29.0", default-features = false, features = ["handshake"], optional = true }
+two-face = { version = "0.4", default-features = false, features = ["syntect-default-fancy"], optional = true }
 url = { version = "2.5", features = ["serde"] }
 uuid = { version = "1.18", features = ["serde", "v4"] }
 wayland-client = { version = "=0.31.15", features = ["system"], optional = true }

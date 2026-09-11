@@ -1268,6 +1268,9 @@ fn color(value: Rgb) -> Color {
     Color::from_rgb8(value.red, value.green, value.blue)
 }
 
+// Ghostty's default faint-opacity is 0.5, rounded up to an 8-bit alpha.
+const FAINT_ALPHA: u8 = 128;
+
 /// Draws one grid row's quads: backgrounds and decorations.
 ///
 /// A cell-at-a-time loop cost one background quad plus up to three decoration
@@ -1315,10 +1318,12 @@ fn draw_row(
             cell.style.underline,
             cell.style.strikethrough,
             cell.style.overline,
+            cell.style.faint,
+            cell.style.invisible,
         )
     }) {
-        let (foreground, underline, strikethrough, overline) = run.key;
-        if underline == Underline::None && !strikethrough && !overline {
+        let (foreground, underline, strikethrough, overline, faint, invisible) = run.key;
+        if invisible || (underline == Underline::None && !strikethrough && !overline) {
             continue;
         }
         let Some(bounds) = geometry.run_bounds(run.start, run.len, row) else {
@@ -1327,7 +1332,11 @@ fn draw_row(
         draw_decorations(
             renderer,
             bounds,
-            foreground,
+            color(foreground).scale_alpha(if faint {
+                f32::from(FAINT_ALPHA) / 255.0
+            } else {
+                1.0
+            }),
             underline,
             strikethrough,
             overline,
@@ -1444,10 +1453,11 @@ fn shape_segment(
                 metrics.face_size(key),
                 line_height,
             ))
-            .color(cosmic_text::Color::rgb(
+            .color(cosmic_text::Color::rgba(
                 foreground.red,
                 foreground.green,
                 foreground.blue,
+                if cell.style.faint { FAINT_ALPHA } else { 255 },
             ));
         match spans.last_mut() {
             Some((range, last)) if *last == attrs => range.end = content.len(),
@@ -1526,7 +1536,7 @@ fn runs<Key: PartialEq, F: Fn(&CellSnapshot) -> Key>(
 fn draw_decorations(
     renderer: &mut Renderer,
     bounds: Rectangle,
-    foreground: Rgb,
+    foreground: Color,
     underline: Underline,
     strikethrough: bool,
     overline: bool,
@@ -1544,7 +1554,7 @@ fn draw_decorations(
                 shadow: Shadow::default(),
                 snap: true,
             },
-            color(foreground),
+            foreground,
         );
     };
     if underline != Underline::None {
@@ -2332,6 +2342,52 @@ mod tests {
         });
 
         assert_columns(&metrics, &cells, "mixed styles");
+    }
+
+    #[test]
+    fn faint_text_reaches_the_renderer_with_translucent_foreground_only() {
+        let metrics = CellMetrics::resolve(DEFAULT_FONT_SIZE, 1.0, "");
+        let cells = cells("ABC", |index, mut cell| {
+            cell.foreground = Rgb {
+                red: 200,
+                green: 100,
+                blue: 50,
+            };
+            cell.background = Rgb {
+                red: 20,
+                green: 40,
+                blue: 60,
+            };
+            cell.style.faint = index != 0;
+            cell.selected = index == 2;
+            cell
+        });
+        let mut content = String::new();
+        let mut spans = Vec::new();
+        let mut guard = font_system()
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let buffer = shape_segment(
+            guard.raw(),
+            &metrics,
+            &cells,
+            &mut content,
+            &mut spans,
+            false,
+        );
+        drop(guard);
+        let colors: Vec<_> = buffer
+            .layout_runs()
+            .flat_map(|run| run.glyphs.iter().map(|glyph| glyph.color_opt.unwrap()))
+            .collect();
+        assert_eq!(
+            colors,
+            [
+                cosmic_text::Color::rgba(200, 100, 50, 255),
+                cosmic_text::Color::rgba(200, 100, 50, 128),
+                cosmic_text::Color::rgba(20, 40, 60, 128),
+            ]
+        );
     }
 
     #[test]

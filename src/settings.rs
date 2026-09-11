@@ -284,6 +284,10 @@ fn default_managed_worktree_directory() -> String {
     "worktrees/".to_owned()
 }
 
+const fn default_focus_follows_mouse() -> bool {
+    true
+}
+
 const fn default_editor_auto_save() -> bool {
     true
 }
@@ -308,6 +312,8 @@ pub struct AppSettings {
     pub schema_version: u32,
     pub max_hot_cards: usize,
     pub hibernation_delay_ms: u64,
+    #[serde(default = "default_focus_follows_mouse")]
+    pub focus_follows_mouse: bool,
     #[serde(default)]
     pub app_theme: AppTheme,
     #[serde(default = "default_ui_scale")]
@@ -363,6 +369,7 @@ impl Default for AppSettings {
             schema_version: SETTINGS_SCHEMA_VERSION,
             max_hot_cards: 6,
             hibernation_delay_ms: 30_000,
+            focus_follows_mouse: default_focus_follows_mouse(),
             app_theme: AppTheme::default(),
             ui_scale: default_ui_scale(),
             terminal_line_height: default_terminal_line_height(),
@@ -373,7 +380,7 @@ impl Default for AppSettings {
             terminal_font_family: String::new(),
             sidebar_width: design::NAVIGATION_DEFAULT_WIDTH,
             inspector_width: design::INSPECTOR_DEFAULT_WIDTH,
-            default_column_fraction: 0.72,
+            default_column_fraction: 0.5,
             terminal_scrollback_lines: 10_000,
             link_open_destination: LinkOpenDestination::default(),
             link_open_gesture: LinkOpenGesture::default(),
@@ -1222,6 +1229,7 @@ mod tests {
         let path = path_in(&directory);
 
         assert_eq!(load(&path).unwrap(), AppSettings::default());
+        assert_eq!(load(&path).unwrap().default_column_fraction, 0.5);
         assert!(!path.exists());
     }
 
@@ -1245,6 +1253,7 @@ mod tests {
             default_column_fraction: 0.55,
             managed_worktree_directory: "../managed trees/".to_owned(),
             worktree_sort: WorktreeSort::Oldest,
+            focus_follows_mouse: false,
             confirm_terminal_close: false,
             ..AppSettings::default()
         };
@@ -1256,11 +1265,19 @@ mod tests {
         assert_eq!(decoded, settings);
     }
     #[test]
-    fn settings_without_close_preference_keep_active_process_confirmation() {
-        let mut old = toml::Value::try_from(AppSettings::default()).unwrap();
-        old.as_table_mut().unwrap().remove("confirm_terminal_close");
+    fn settings_without_interaction_preferences_keep_defaults_and_custom_width() {
+        let mut old = toml::Value::try_from(AppSettings {
+            default_column_fraction: 0.65,
+            ..AppSettings::default()
+        })
+        .unwrap();
+        let table = old.as_table_mut().unwrap();
+        table.remove("confirm_terminal_close");
+        table.remove("focus_follows_mouse");
         let decoded: AppSettings = old.try_into().unwrap();
         assert!(decoded.confirm_terminal_close);
+        assert!(decoded.focus_follows_mouse);
+        assert_eq!(decoded.default_column_fraction, 0.65);
     }
 
     #[test]
@@ -1390,6 +1407,8 @@ mod tests {
             let loaded = load(&path).unwrap();
             assert_eq!(loaded.schema_version, SETTINGS_SCHEMA_VERSION);
             assert_eq!(loaded.sidebar_width, expected_width);
+            assert_eq!(loaded.default_column_fraction, 0.72);
+            assert!(loaded.focus_follows_mouse);
             assert_eq!(loaded.keyboard_shortcuts, KeyboardShortcuts::default());
         }
     }
@@ -1424,6 +1443,8 @@ cycle_pane_width = ["Alt+R"]
         assert_eq!(migrated.schema_version, SETTINGS_SCHEMA_VERSION);
         assert_eq!(migrated.sidebar_width, 376.0);
         assert_eq!(migrated.terminal_font_size, 15.0);
+        assert_eq!(migrated.default_column_fraction, 0.72);
+        assert!(migrated.focus_follows_mouse);
     }
 
     #[test]
@@ -1703,9 +1724,14 @@ next_column = ["Alt+W", "Alt+Right"]
         let legacy_path = directory.path().join("settings.json");
         let settings = AppSettings {
             terminal_font_size: 18.0,
+            default_column_fraction: 0.65,
             ..AppSettings::default()
         };
-        fs::write(&legacy_path, br#"{"terminal_font_size":18.0}"#).unwrap();
+        fs::write(
+            &legacy_path,
+            br#"{"terminal_font_size":18.0,"default_column_fraction":0.65}"#,
+        )
+        .unwrap();
 
         assert_eq!(load(&path).unwrap(), settings);
         assert!(path.is_file());
