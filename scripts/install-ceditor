@@ -15,8 +15,16 @@ case "$prefix" in /*) ;; *) printf '%s\n' '--prefix must be absolute' >&2; exit 
 cargo build --locked --release --package ceditor
 target=$(cargo metadata --no-deps --format-version 1 | sed -n 's/.*"target_directory":"\([^"]*\)".*/\1/p')
 [ -n "$target" ] || { printf '%s\n' 'Cargo did not report its target directory' >&2; exit 1; }
-install -Dm755 "$target/release/ceditor" "$prefix/bin/ceditor"
+install -d "$prefix/bin"
+staged=$(mktemp "$prefix/bin/.ceditor-install.XXXXXX")
+trap 'rm -f -- "$staged"' EXIT
+trap 'exit 1' HUP INT TERM
+install -m755 "$target/release/ceditor" "$staged"
+mv -fT -- "$staged" "$prefix/bin/ceditor"
 install -Dm644 packaging/io.github.cagents.ceditor.desktop "$prefix/share/applications/io.github.cagents.ceditor.desktop"
 install -Dm644 packaging/io.github.cagents.ceditor.svg "$prefix/share/icons/hicolor/scalable/apps/io.github.cagents.ceditor.svg"
+if command -v gtk-update-icon-cache >/dev/null 2>&1; then
+    gtk-update-icon-cache --force --ignore-theme-index "$prefix/share/icons/hicolor" >/dev/null 2>&1 || :
+fi
 if command -v update-desktop-database >/dev/null 2>&1; then update-desktop-database "$prefix/share/applications"; fi
 printf '%s\n' "Installed ceditor to $prefix/bin. Ensure this directory is in PATH."
