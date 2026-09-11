@@ -2024,7 +2024,7 @@ impl Application for Editor {
         if !self.settings_open {
             return None;
         }
-        let theme_choices = [
+        let theme_choices: Vec<Element<'_, Message>> = [
             ("System", AppTheme::System),
             ("Light", AppTheme::Light),
             ("Dark", AppTheme::Dark),
