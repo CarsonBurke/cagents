@@ -201,7 +201,7 @@ repository, then choose a published version:
 gh auth login --hostname github.com
 gh auth status --hostname github.com
 REPOSITORY='CarsonBurke/cagents'
-VERSION='0.1.1'
+VERSION='0.1.2'
 ```
 
 ### Recommended: download, verify, inspect, then install
@@ -281,7 +281,7 @@ Append `--restart-daemon` only when an explicit full daemon update is intended:
 ```sh
 (
   gh auth status --hostname github.com || exit 1
-  VERSION=0.1.1
+  VERSION=0.1.2
   download_dir="$(mktemp -d)" || exit 1
   trap 'rm -rf "$download_dir"' 0
   trap 'exit 1' HUP INT TERM
@@ -588,9 +588,10 @@ memory, foreground jobs, or arbitrary commands. Unknown conversation identity,
 unsupported command recipes, and surviving or ambiguous owners block recovery;
 the durable checkpoint remains available instead of inventing a fresh
 conversation or replaying commands. Keep the matching provider session storage.
-Empty process arguments or environment are also ambiguous: Linux can expose
-them during `exec`, so recovery refuses to restart sessions without inspectable
-evidence rather than assuming that an unmarked process is safe to duplicate.
+Empty process arguments or environment can occur during `exec`, so recovery
+requires inspectable evidence before restarting sessions. An intentionally empty
+environment is accepted only when Linux exposes its initialized zero-length
+address range; missing or redacted ranges cannot authorize a duplicate writer.
 An old shell's unsaved in-memory variables or jobs are not a resumable shell
 snapshot.
 Daemon startup waiting scales with the checkpoint inventory, including the
@@ -818,10 +819,10 @@ For a release, install `bubblewrap`, `curl`, `git`, and the standard archive too
 locally, then build and publish explicitly:
 
 ```sh
-./scripts/build-release-linux --ref v0.1.1 --output /tmp/cagents-v0.1.1
-./scripts/publish-release --version 0.1.1 --dist /tmp/cagents-v0.1.1 --verify-only
+./scripts/build-release-linux --ref v0.1.2 --output /tmp/cagents-v0.1.2
+./scripts/publish-release --version 0.1.2 --dist /tmp/cagents-v0.1.2 --verify-only
 gh auth login --hostname github.com
-./scripts/publish-release --version 0.1.1 --dist /tmp/cagents-v0.1.1
+./scripts/publish-release --version 0.1.2 --dist /tmp/cagents-v0.1.2
 ```
 
 Both manifests and the existing tag must agree on the release version. The
