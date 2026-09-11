@@ -615,24 +615,19 @@ mod tests {
                 last_exit: None,
             },
         };
-        let mut child = std::process::Command::new("/bin/sleep")
-            .arg("30")
-            .current_dir(directory.path())
-            .env_remove("TERM_PROGRAM")
-            .env("CAGENTS_TERMINAL_ID", session.id.to_string())
-            .spawn()
-            .unwrap();
-        std::os::unix::fs::symlink(
-            format!("/proc/{}", child.id()),
-            directory.path().join(child.id().to_string()),
+        let process = directory.path().join("42");
+        fs::create_dir(&process).unwrap();
+        fs::write(process.join("stat"), b"42 (sleep) S 1 42 42").unwrap();
+        fs::write(process.join("cmdline"), b"/bin/sleep\0").unwrap();
+        fs::write(process.join("environ"), b"PATH=/bin\0").unwrap();
+        std::os::unix::fs::symlink(directory.path(), process.join("cwd")).unwrap();
+        assert!(ensure_no_surviving_process(&session, u32::MAX, directory.path()).is_ok());
+        fs::write(
+            process.join("environ"),
+            format!("CAGENTS_TERMINAL_ID={}\0", session.id),
         )
         .unwrap();
-        let result = ensure_no_surviving_process(&session, u32::MAX, directory.path());
-        let alive = child.try_wait().unwrap().is_none();
-        child.kill().unwrap();
-        child.wait().unwrap();
-        assert!(result.unwrap_err().contains(&session.id.to_string()));
-        assert!(alive);
+        assert!(ensure_no_surviving_process(&session, u32::MAX, directory.path()).is_err());
     }
 
     #[test]

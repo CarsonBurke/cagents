@@ -11512,6 +11512,69 @@ mod tests {
     }
 
     #[test]
+    fn switching_inactive_codex_terminal_reveals_and_focuses_conversation_binding() {
+        use crate::model::{BootId, HostIncarnation, HostSessionId};
+
+        let mut app = context_inspector_test_app(false);
+        app.context_inspector_open = false;
+        let mut cards: Vec<_> = (0..4).map(|_| terminal_card_state()).collect();
+        let first = cards[0].id;
+        let unrelated = cards[1].id;
+        let target = cards[3].id;
+        let CardKind::Terminal(terminal) = &mut cards[3].kind else {
+            unreachable!();
+        };
+        terminal.launch.program = "codex".into();
+        terminal.continuity = TerminalContinuity::Live {
+            host_session_id: HostSessionId::new("codex-host"),
+            boot_id: BootId::new("boot"),
+            host_incarnation: HostIncarnation::new("incarnation"),
+        };
+        let source = terminal.clone();
+        app.durable = Arc::new(WorkspaceState {
+            focused: Some(first),
+            cards,
+            ..WorkspaceState::default()
+        });
+        app.workspace = Cagents::rebuild_workspace(&app.durable);
+        app.workspace.resize_viewport(600.0);
+        app.workspace.native_scroll(0.0, 600.0);
+        app.observe_agent_update_for_card(target);
+        app.observe_agent_update_for_card(unrelated);
+        assert_eq!(app.workspace.focused(), Some(first));
+        assert_eq!(
+            app.workspace.visibility(target),
+            Some(VisibilityClass::Offscreen)
+        );
+        assert!(app.sidebar_state.has_card_update(target));
+        assert!(app.chat_binding_view(target).is_none());
+
+        let _ = app.update(Message::ChatUi(chat_ui::Action::Switch(target)));
+
+        assert_eq!(app.workspace.focused(), Some(target));
+        assert_eq!(app.durable.focused, Some(target));
+        assert!(app.workspace.camera().target() > app.workspace.camera().offset());
+        assert!(app.chat_binding_view(target).is_some());
+        assert!(!app.sidebar_state.has_card_update(target));
+        assert!(app.sidebar_state.has_card_update(unrelated));
+        let update = app.workspace.tick(Duration::from_secs(1));
+        let _ = app.apply_viewport(update, true, false);
+        assert_eq!(
+            app.workspace.visibility(target),
+            Some(VisibilityClass::Visible)
+        );
+
+        // Opening the selector must not choose a conversation or replace its source terminal.
+        let _ = app.update(Message::ChatUi(chat_ui::Action::BindingConfirm(target)));
+        assert_eq!(
+            app.card_state(target).unwrap().kind,
+            CardKind::Terminal(source)
+        );
+        assert!(!app.chat_start_pending(target));
+        assert!(app.chat_binding_view(target).is_some());
+    }
+
+    #[test]
     fn dirty_close_restores_the_actual_underlying_modal_focus_target() {
         let mut app = context_inspector_test_app(true);
         let project = ProjectId::new();

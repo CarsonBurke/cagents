@@ -782,7 +782,13 @@ impl Cagents {
                                     error: None,
                                 },
                             );
-                            return Task::none();
+                            return match self.workspace.focus(card) {
+                                Ok(update) => self.apply_viewport(update, true, false),
+                                Err(error) => {
+                                    self.status = Some(TransientNotice::error(error.to_string()));
+                                    Task::none()
+                                }
+                            };
                         }
                         let terminate = session.launch.provider != Provider::Codex;
                         return self.start_chat(card, session, true, source, terminate);
