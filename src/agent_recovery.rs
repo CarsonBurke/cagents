@@ -571,6 +571,17 @@ fn sensitive_environment_key(name: &str) -> bool {
         })
 }
 
+fn persistable_environment_entry(name: &str, value: &str) -> bool {
+    if credential_environment_key(name) || indirect_environment_key(name) {
+        return false;
+    }
+    // A proxy/base URL can contain credentials even when its variable name does
+    // not. Keep those values only in the host's ephemeral execution environment.
+    !url::Url::parse(value).is_ok_and(|url| {
+        !url.username().is_empty() || url.password().is_some() || url.query().is_some()
+    })
+}
+
 /// A fresh native process uses the selected provider's configuration, never the
 /// launching harness's tool bridge, artifact scope, or terminal/session identity.
 pub(crate) fn fresh_environment_key(
@@ -598,17 +609,7 @@ pub(crate) fn fresh_environment_key(
     if !native_runtime_environment_key(name) && !provider_setting_environment_key(provider, name) {
         return false;
     }
-    if !persistable {
-        return true;
-    }
-    if credential_environment_key(name) || indirect_environment_key(name) {
-        return false;
-    }
-    // A proxy/base URL can contain credentials even when its variable name does
-    // not. Keep those values only in the host's ephemeral execution environment.
-    !url::Url::parse(value).is_ok_and(|url| {
-        !url.username().is_empty() || url.password().is_some() || url.query().is_some()
-    })
+    !persistable || persistable_environment_entry(name, value)
 }
 
 pub(crate) fn fresh_native_environment(
@@ -693,9 +694,9 @@ fn check_return_environment_variable(
     Ok(())
 }
 
-/// Construct durable native execution configuration without copying arbitrary
-/// process secrets into a session descriptor. New environment-only credentials
-/// require explicit configuration before the source may be stopped.
+/// Construct exact native execution configuration without restoring stale launch
+/// values. New credential/account settings require explicit authority before the
+/// source may be stopped; persistence is filtered separately for every source.
 #[cfg(feature = "host")]
 fn preserved_native_environment(
     bytes: &[u8],
@@ -738,8 +739,8 @@ fn preserved_native_environment(
                     "The source uses credential, account, or permission setting {name}, which requires explicit launch configuration before native handoff; the source has not been stopped."
                 ));
             }
-            // Ordinary provider configuration is safe to retain verbatim; its
-            // namespace alone does not make it a credential or permission grant.
+            // Ordinary provider configuration can retain its exact execution
+            // value; this does not authorize persisting any embedded credentials.
             environment.insert(name.to_owned(), value.to_owned());
         }
     }
@@ -778,9 +779,9 @@ fn native_environment_parts(
     let durable = execution
         .iter()
         .filter(|(name, value)| {
-            transient.is_none()
-                || explicit.get(*name) == Some(*value)
-                || fresh_environment_key(provider, name, value, true)
+            (explicit.get(*name) == Some(*value)
+                || fresh_environment_key(provider, name, value, false))
+                && persistable_environment_entry(name, value)
         })
         .map(|(name, value)| (name.clone(), value.clone()))
         .collect();
@@ -1180,6 +1181,93 @@ mod tests {
                 false
             ));
             assert!(!fresh_environment_key(Provider::Omp, name, "private", true));
+        }
+    }
+
+    #[cfg(feature = "host")]
+    #[test]
+    fn ordinary_source_authenticated_proxy_is_execution_only() {
+        let (durable, execution) = native_environment_parts(
+            b"HOME=/source\0HTTPS_PROXY=http://user:password@proxy.invalid:8080\0OMP_MAX_TOKENS=8192\0",
+            Provider::Omp,
+            &BTreeMap::new(),
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            durable,
+            BTreeMap::from([
+                ("HOME".into(), "/source".into()),
+                ("OMP_MAX_TOKENS".into(), "8192".into()),
+            ])
+        );
+        assert_eq!(
+            execution["HTTPS_PROXY"],
+            "http://user:password@proxy.invalid:8080"
+        );
+        assert_eq!(execution["OMP_MAX_TOKENS"], "8192");
+    }
+
+    #[cfg(feature = "host")]
+    #[test]
+    fn explicit_authority_never_makes_credentials_durable() {
+        let explicit = BTreeMap::from([
+            ("HOME".into(), "/source".into()),
+            ("ANTHROPIC_API_KEY".into(), "explicit-key".into()),
+            (
+                "HTTPS_PROXY".into(),
+                "http://user:password@proxy.invalid:8080".into(),
+            ),
+            (
+                "CUSTOM_ENDPOINT".into(),
+                "https://service.invalid/?token=private".into(),
+            ),
+            (
+                "GIT_CONFIG_PARAMETERS".into(),
+                "'http.extraHeader'='Authorization: Bearer git-token'".into(),
+            ),
+            ("OMP_APPROVAL_MODE".into(), "manual".into()),
+            ("CUSTOM_SETTING".into(), "selected".into()),
+        ]);
+        let observed = b"HOME=/source\0ANTHROPIC_API_KEY=explicit-key\0HTTPS_PROXY=http://user:password@proxy.invalid:8080\0CUSTOM_ENDPOINT=https://service.invalid/?token=private\0GIT_CONFIG_PARAMETERS='http.extraHeader'='Authorization: Bearer git-token'\0OMP_APPROVAL_MODE=manual\0CUSTOM_SETTING=selected\0";
+        // Explicit CLI launches and returned PTYs must use the same persistence
+        // boundary, even when a secret was already in the old launch recipe.
+        for transient in [None, Some(&explicit)] {
+            let (durable, execution) =
+                native_environment_parts(observed, Provider::Omp, &explicit, transient).unwrap();
+            assert_eq!(execution, explicit);
+            assert_eq!(
+                durable,
+                BTreeMap::from([
+                    ("HOME".into(), "/source".into()),
+                    ("OMP_APPROVAL_MODE".into(), "manual".into()),
+                    ("CUSTOM_SETTING".into(), "selected".into()),
+                ])
+            );
+        }
+    }
+
+    #[cfg(feature = "host")]
+    #[test]
+    fn source_proxy_must_match_selected_authority_without_restoring_stale_values() {
+        let authority = BTreeMap::from([(
+            "HTTPS_PROXY".into(),
+            "http://user:password@proxy.invalid:8080".into(),
+        )]);
+        let empty = BTreeMap::new();
+        for (explicit, transient) in [(&authority, None), (&empty, Some(&authority))] {
+            let failure = native_environment_parts(
+                b"HTTPS_PROXY=http://other:changed-secret@proxy.invalid:8080\0",
+                Provider::Omp,
+                explicit,
+                transient,
+            )
+            .unwrap_err();
+            assert!(!failure.contains("changed-secret"));
+            let (durable, execution) =
+                native_environment_parts(b"", Provider::Omp, explicit, transient).unwrap();
+            assert!(!durable.contains_key("HTTPS_PROXY"));
+            assert!(!execution.contains_key("HTTPS_PROXY"));
         }
     }
 
