@@ -4,10 +4,26 @@ use std::{
     path::{Path, PathBuf},
 };
 
-#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+const fn default_sidebar_open() -> bool {
+    true
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Session {
     pub paths: Vec<PathBuf>,
     pub active: Option<usize>,
+    #[serde(default = "default_sidebar_open")]
+    pub sidebar_open: bool,
+}
+
+impl Default for Session {
+    fn default() -> Self {
+        Self {
+            paths: Vec::new(),
+            active: None,
+            sidebar_open: default_sidebar_open(),
+        }
+    }
 }
 
 impl Session {
@@ -125,6 +141,7 @@ mod tests {
         let session = Session {
             paths: vec!["/project/z\nλ.txt".into(), "/project/a.txt".into()],
             active: Some(0),
+            sidebar_open: false,
         };
         save_session(&settings, &session).unwrap();
         assert_eq!(load_session(&settings).unwrap(), session);
@@ -132,6 +149,7 @@ mod tests {
         let replacement = Session {
             paths: vec![session.paths[1].clone()],
             active: Some(0),
+            sidebar_open: true,
         };
         save_session(&settings, &replacement).unwrap();
         assert_eq!(load_session(&settings).unwrap(), replacement);
@@ -142,10 +160,23 @@ mod tests {
     }
 
     #[test]
+    fn session_without_sidebar_state_restores_an_open_sidebar() {
+        let directory = tempfile::tempdir().unwrap();
+        let settings = directory.path().join("settings.toml");
+        std::fs::write(
+            settings.with_file_name("session.json"),
+            r#"{"paths":[],"active":null}"#,
+        )
+        .unwrap();
+        assert!(load_session(&settings).unwrap().sidebar_open);
+    }
+
+    #[test]
     fn explicit_files_follow_restored_tabs_and_own_startup_focus() {
         let session = Session {
             paths: vec!["/project/b.txt".into(), "/project/a.txt".into()],
             active: Some(0),
+            sidebar_open: true,
         };
         assert_eq!(
             session.startup_paths(Vec::new()),

@@ -16,6 +16,7 @@ use cagents::{
         SidebarMode, SidebarModel, SidebarProject, SidebarState, SidebarWorktree,
         SourceControlModel,
     },
+    splitter::{self, Splitter},
     ui_controls::{icon_control, popover, segmented_controls},
 };
 use cosmic::app::ApplicationExt;
@@ -120,6 +121,7 @@ pub enum Message {
     Notices,
     CloseNotices,
     Dismiss,
+    ToggleSidebar,
 }
 
 pub struct Editor {
@@ -144,6 +146,7 @@ pub struct Editor {
     file_list_mode: FileListMode,
     restoring_session: bool,
     saved_session: crate::preferences::Session,
+    sidebar_open: bool,
 }
 
 fn repository_task(task: iced::Task<RepositoryAction>) -> Task<Message> {
@@ -504,7 +507,12 @@ impl Editor {
                 })
                 .collect(),
             active: self.tabs.iter().position(|tab| Some(tab.id) == self.active),
+            sidebar_open: self.sidebar_open,
         }
+    }
+
+    fn sidebar_width(&self) -> f32 {
+        sidebar::clamp_expanded_width(self.settings.sidebar_width)
     }
 
     fn save_session(&mut self) {
@@ -1169,6 +1177,7 @@ impl Application for Editor {
             }
         }
         let lsp = LspManager::new(settings.language_servers.clone());
+        let sidebar_open = saved_session.sidebar_open;
         let mut app = Self {
             core,
             tabs: Vec::new(),
@@ -1191,6 +1200,7 @@ impl Application for Editor {
             file_list_mode,
             restoring_session: !startup_paths.is_empty(),
             saved_session,
+            sidebar_open,
         };
         let mut tasks = vec![app.appearance(), app.lsp_next()];
         if let Some(window) = app.core.main_window_id() {
@@ -1252,6 +1262,7 @@ impl Application for Editor {
                         | Message::Completion(..)
                         | Message::Jump(..)
                         | Message::Sidebar(_)
+                        | Message::ToggleSidebar
                         | Message::Key(_)
                 )
             {
@@ -1543,6 +1554,16 @@ impl Application for Editor {
                     if self.modal_open() {
                         return Task::none();
                     }
+                    if let SidebarAction::Resize { width } = &action {
+                        // The panel's splitter clamps to its rendered bounds;
+                        // clamp again to the persisted settings range.
+                        self.settings.sidebar_width =
+                            width.clamp(sidebar::EXPANDED_WIDTH_MIN, sidebar::EXPANDED_WIDTH_MAX);
+                        return Task::none();
+                    }
+                    if matches!(&action, SidebarAction::ResizeFinished) {
+                        return self.save_settings();
+                    }
                     if let SidebarAction::SetFileListMode { mode, .. } = &action {
                         self.file_list_mode = *mode;
                         for tab in &mut self.tabs {
@@ -1681,6 +1702,11 @@ impl Application for Editor {
                         }
                     }
                     self.resume_pending_files()
+                }
+                Message::ToggleSidebar => {
+                    self.sidebar_open = !self.sidebar_open;
+                    self.save_session();
+                    Task::none()
                 }
                 Message::AutoSave(enabled) => {
                     self.settings.editor_auto_save = enabled;
@@ -1906,6 +1932,18 @@ impl Application for Editor {
     fn header_start(&self) -> Vec<Element<'_, Message>> {
         vec![
             icon_control(
+                widget::icon::from_name("view-sidebar-start-symbolic").handle(),
+                if self.sidebar_open {
+                    "Hide sidebar"
+                } else {
+                    "Show sidebar"
+                },
+                self.sidebar_open,
+                !self.modal_open(),
+                Some(Message::ToggleSidebar),
+            )
+            .into(),
+            icon_control(
                 widget::icon::from_name("document-open-symbolic").handle(),
                 "Open file (Ctrl+O)",
                 false,
@@ -2016,25 +2054,33 @@ impl Application for Editor {
         // The COSMIC header above has no separator of its own: always rule
         // off the content below it, tabs or placeholder alike.
         body.push(widget::divider::horizontal::default().into());
+        // The strip lives in the editor column so its tabs, rules, toolbar,
+        // and content share one left edge instead of straddling the sidebar.
+        let mut strip = Vec::new();
         if !tabs.is_empty() {
-            body.push(
-                widget::scrollable::horizontal(
-                    widget::row::with_children(tabs)
-                        .spacing(2)
-                        .height(design::PRIMARY_CONTROL_SIZE),
+            strip.push(
+                widget::container(
+                    widget::scrollable::horizontal(
+                        widget::row::with_children(tabs)
+                            .spacing(4)
+                            .height(design::PRIMARY_CONTROL_SIZE),
+                    )
+                    .id(widget::Id::new("ceditor.tabs"))
+                    .direction(iced::widget::scrollable::Direction::Horizontal(
+                        iced::widget::scrollable::Scrollbar::hidden(),
+                    ))
+                    .width(Length::Fill)
+                    .height(design::PRIMARY_CONTROL_SIZE),
                 )
-                .id(widget::Id::new("ceditor.tabs"))
-                .direction(iced::widget::scrollable::Direction::Horizontal(
-                    iced::widget::scrollable::Scrollbar::hidden(),
-                ))
+                .padding([4, 8])
                 .width(Length::Fill)
-                .height(design::PRIMARY_CONTROL_SIZE)
                 .into(),
             );
-            body.push(widget::divider::horizontal::default().into());
+            strip.push(widget::divider::horizontal::default().into());
         }
         if let Some(tab) = self.current() {
             let mut editor = Vec::new();
+            editor.extend(strip);
             let mut toolbar_controls = Vec::new();
             if let Some(toolbar) = repository_widget::selected_file_toolbar(tab.id, &tab.runtime) {
                 toolbar_controls.push(toolbar.map(Message::Repository));
@@ -2115,20 +2161,48 @@ impl Application for Editor {
                         .into(),
                 );
             }
+            let mut workspace = Vec::new();
+            if self.sidebar_open {
+                workspace.push(
+                    sidebar::file_panel(
+                        &tab.sidebar,
+                        &tab.navigation,
+                        self.sidebar_width(),
+                        self.modal_open(),
+                    )
+                    .map(Message::Sidebar),
+                );
+                // The files panel carries no trailing rule of its own: the
+                // splitter draws the single sidebar border and the drag
+                // handle. A second divider here would double the border.
+                workspace.push(
+                    Splitter::new(
+                        iced::id::Id::new("ceditor.sidebar-splitter"),
+                        "Resize sidebar",
+                        self.sidebar_width(),
+                        sidebar::EXPANDED_WIDTH_MIN,
+                        sidebar::EXPANDED_WIDTH_MAX,
+                        splitter::Edge::Trailing,
+                        self.modal_open(),
+                        |width| Message::Sidebar(SidebarAction::Resize { width }),
+                        || Message::Sidebar(SidebarAction::ResizeFinished),
+                    )
+                    .into(),
+                );
+            }
+            workspace.push(
+                widget::column::with_children(editor)
+                    .width(Length::Fill)
+                    .height(Length::Fill)
+                    .into(),
+            );
             body.push(
-                widget::row::with_children(vec![
-                    sidebar::file_panel(&tab.sidebar, &tab.navigation, 280.0, self.modal_open())
-                        .map(Message::Sidebar),
-                    widget::divider::vertical::default().into(),
-                    widget::column::with_children(editor)
-                        .width(Length::Fill)
-                        .height(Length::Fill)
-                        .into(),
-                ])
-                .height(Length::Fill)
-                .into(),
+                widget::row::with_children(workspace)
+                    .height(Length::Fill)
+                    .into(),
             );
         } else {
+            body.extend(strip);
             body.push(widget::container(widget::column::with_children(vec![widget::text::title1("Open a file or folder").into(), widget::text::body("Native editing, safe autosave, Git diffs, and language servers — without a daemon.").into(), widget::button::standard("Open folder").on_press(Message::Choose(true)).into()]).spacing(16)).padding(32).height(Length::Fill).into());
         }
         widget::column::with_children(body)
@@ -2366,6 +2440,7 @@ mod tests {
             file_list_mode: FileListMode::Tree,
             restoring_session: false,
             saved_session: crate::preferences::Session::default(),
+            sidebar_open: true,
         }
     }
 
@@ -2381,6 +2456,29 @@ mod tests {
         let mut open_empty = editor();
         open_empty.notices_open = true;
         assert!(open_empty.notices_control().is_some());
+    }
+
+    #[test]
+    fn toggling_the_sidebar_flips_visibility() {
+        let mut app = editor();
+        assert!(app.sidebar_open);
+        drop(app.update(Message::ToggleSidebar));
+        assert!(!app.sidebar_open);
+        drop(app.update(Message::ToggleSidebar));
+        assert!(app.sidebar_open);
+    }
+
+    #[test]
+    fn sidebar_resize_clamps_and_persists_the_width() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut app = editor();
+        app.settings_path = directory.path().join("settings.toml");
+        app.settings_writable = true;
+        drop(app.update(Message::Sidebar(SidebarAction::Resize { width: 9999.0 })));
+        assert_eq!(app.sidebar_width(), sidebar::EXPANDED_WIDTH_MAX);
+        drop(app.update(Message::Sidebar(SidebarAction::ResizeFinished)));
+        let persisted = settings::load(&app.settings_path).unwrap();
+        assert_eq!(persisted.sidebar_width, sidebar::EXPANDED_WIDTH_MAX);
     }
 
     #[test]
@@ -2521,6 +2619,7 @@ mod tests {
         let session = crate::preferences::Session {
             paths: vec![first.clone(), root.join("missing.txt"), last.clone()],
             active: Some(2),
+            sidebar_open: true,
         };
         let opened = session
             .startup_paths(Vec::new())
@@ -2535,6 +2634,7 @@ mod tests {
             crate::preferences::Session {
                 paths: vec![first, last],
                 active: Some(1),
+                sidebar_open: true,
             }
         );
     }
@@ -2562,6 +2662,7 @@ mod tests {
             crate::preferences::Session {
                 paths: vec!["/workspace/a.rs".into(), "/workspace/b.rs".into()],
                 active: Some(0),
+                sidebar_open: true,
             }
         );
     }
