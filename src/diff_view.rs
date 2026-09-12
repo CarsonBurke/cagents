@@ -391,8 +391,8 @@ pub enum RenderedDiff {
     ///
     /// The labels are the service's own, so the chrome names the comparison
     /// being shown — `Index`/`Working tree`, `HEAD`/`Index`,
-    /// `main (a1b2c3d4)`/`HEAD`, or a pair of commit ids — instead of one
-    /// wording for every basis.
+    /// `main (a1b2c3d4)`/`HEAD (e5f6a7b8)`, or a pair of commit ids —
+    /// instead of one wording for every basis.
     Text {
         model: DiffModel,
         old_label: String,
@@ -1885,9 +1885,11 @@ mod tests {
         // never reads the index or the worktree.
         assert_eq!((compared.0.additions, compared.0.deletions), (1, 0));
         assert_eq!(compared.0.inline_rows[1].text, "two");
+        let expected_old = format!("main ({})", merge_base.short());
+        let expected_new = format!("HEAD ({})", head.short());
         assert_eq!(
             (compared.1.as_str(), compared.2.as_str()),
-            (format!("main ({})", merge_base.short()).as_str(), "HEAD")
+            (expected_old.as_str(), expected_new.as_str())
         );
         let untouched = text_diff(root.path(), "other.txt", &branch, None);
         assert!(

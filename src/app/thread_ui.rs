@@ -182,6 +182,23 @@ mod tests {
         let id = ThreadId::new();
         let durable = Arc::make_mut(&mut app.durable);
         durable.cards[0].title = "Native chat".into();
+        // Thread naming reads the conversation card: the fixture's default
+        // terminal card never qualifies.
+        durable.cards[0].kind = crate::model::CardKind::Chat(crate::chat::Session {
+            id: crate::model::TerminalId::new(),
+            launch: crate::chat::Launch {
+                provider: crate::agent::Provider::Omp,
+                recipe: crate::model::LaunchRecipe {
+                    program: "/bin/sh".into(),
+                    arguments: Vec::new(),
+                    working_directory: std::path::PathBuf::from("/tmp"),
+                    environment: Default::default(),
+                },
+                session_id: None,
+            },
+            proof: None,
+            terminal: None,
+        });
         durable.threads.push(ProjectThread {
             id,
             project_id: project,

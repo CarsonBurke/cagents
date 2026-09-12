@@ -12131,6 +12131,7 @@ mod tests {
             Message::ContextInspector(InspectorAction::Close)
         ));
         let _restore_focus = app.update(close);
+        settle_context_inspector_transition(&mut app);
         assert!(!app.context_inspector_open);
         assert!(!app.context_inspector_overlay_active);
         assert!(!app.workspace_inputs_blocked());
@@ -12205,6 +12206,7 @@ mod tests {
             },
         )));
         let _restore_focus = startup.update(close);
+        settle_context_inspector_transition(&mut startup);
         assert!(!startup.context_inspector_open);
         assert!(!startup.context_inspector_overlay_active);
         assert!(startup.context_inspector_restore_focus.is_none());
@@ -12220,6 +12222,7 @@ mod tests {
         assert!(startup.context_inspector_is_overlay());
         assert!(startup.context_inspector_overlay_active);
         let _restore_focus = startup.update(Message::ContextInspector(InspectorAction::Close));
+        settle_context_inspector_transition(&mut startup);
         assert!(!startup.context_inspector_is_overlay());
         assert!(!startup.context_inspector_overlay_active);
         assert!(startup.context_inspector_restore_focus.is_none());
@@ -13315,6 +13318,14 @@ mod tests {
         assert!(state.document.is_none());
         assert!(state.path.is_none());
         assert_eq!(state.diagnostics_version, None);
+    }
+
+    /// Drive the close animation to completion through the production path.
+    /// Tests have no frame clock, so without this every close is still
+    /// mid-animation and the overlay stays mounted by design.
+    fn settle_context_inspector_transition(app: &mut Cagents) {
+        let _ =
+            app.advance_context_inspector_transition(Instant::now() + DIALOG_TRANSITION_DURATION);
     }
 
     pub(super) fn context_inspector_test_app(with_focused_card: bool) -> Cagents {
