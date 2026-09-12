@@ -2257,6 +2257,9 @@ enum MutationScope {
     /// single write, so a non-zero exit means nothing was written at all:
     /// Path-limited `git reset --no-refresh` and `git update-index` each write
     /// the index once, after the last selected path, under `index.lock`.
+    /// That single write says nothing about unmatched pathspecs — `reset`
+    /// ignores those and still exits 0 — so a caller that must refuse ghosts
+    /// validates the selection first (see `unstage`).
     AllOrNothing,
     /// The command resolves every pathspec before it writes anything, and
     /// then writes entry by entry.
@@ -5008,6 +5011,27 @@ impl<E: ProcessExecutor> RepositoryService<E> {
             return Err(ValidationError::EmptySelection.into());
         }
         if let Some(head) = self.resolve_head(&request.worktree, cancellation)? {
+            // `reset` silently ignores pathspecs that match nothing and still
+            // exits 0, so a stale selection would report ghosts as applied
+            // while unstaging the rest. Refuse the whole request up front
+            // when any selected path resolves to nothing git knows — the
+            // index, or the HEAD tree for renamed-away sources.
+            let indexed = self.indexed_paths(&request.worktree, &paths, cancellation)?;
+            let unindexed: Vec<&RepoPath> = paths
+                .iter()
+                .filter(|path| !indexed.contains(path))
+                .collect();
+            if !unindexed.is_empty() {
+                let in_head =
+                    self.head_tree_paths(&request.worktree, &head, &unindexed, cancellation)?;
+                if let Some(ghost) = unindexed.iter().find(|path| !in_head.contains(path)) {
+                    return Ok(MutationOutcome::NotApplied {
+                        failure: MutationFailure::Rejected {
+                            reason: format!("{ghost}: path does not match anything known to git"),
+                        },
+                    });
+                }
+            }
             // `restore --staged` preloads worktree stat information and runs
             // post-checkout hooks. Neither belongs in an index-only operation.
             // A path-limited reset never moves HEAD; --no-refresh also skips
@@ -5059,6 +5083,36 @@ impl<E: ProcessExecutor> RepositoryService<E> {
             .iter()
             .filter(|path| listed.contains(path))
             .cloned()
+            .collect())
+    }
+
+    /// Filters paths down to the ones present in a commit's tree, preserving
+    /// the caller's order. Renamed-away sources live here even after leaving
+    /// the index, so this is the second half of "matches something git
+    /// knows" for selections that may name renames.
+    fn head_tree_paths(
+        &self,
+        worktree: &Path,
+        revision: &Oid,
+        paths: &[&RepoPath],
+        cancellation: &CancellationToken,
+    ) -> Result<Vec<RepoPath>, RepositoryError> {
+        let mut arguments = vec![
+            OsString::from("ls-tree"),
+            OsString::from("-z"),
+            OsString::from(revision.as_str()),
+            OsString::from("--"),
+        ];
+        arguments.extend(paths.iter().map(|path| path.as_os_str().to_owned()));
+        let command = self.git_literal_read(worktree, arguments);
+        let output = self.run_checked(&command, cancellation)?;
+        let parsed = parse_tree_entries(&output.stdout);
+        let entries = invalid_output(parsed, output)?;
+        let listed: Vec<RepoPath> = entries.into_iter().map(|entry| entry.path).collect();
+        Ok(paths
+            .iter()
+            .filter(|path| listed.contains(*path))
+            .map(|path| (*path).clone())
             .collect())
     }
 
