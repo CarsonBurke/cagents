@@ -1477,7 +1477,13 @@ mod tests {
     fn set_test_access_acl(file: &File, value: &[u8]) -> bool {
         match write_attribute(file, c"system.posix_acl_access", value) {
             Ok(()) => true,
-            Err(error) if error.raw_os_error() == Some(libc::EOPNOTSUPP) => false,
+            // tmpfs without ACL support rejects the unknown xattr name with
+            // EINVAL rather than EOPNOTSUPP; both mean the fixture cannot
+            // carry an ACL here, matching the Resolver::Walk fallback used
+            // by production probing.
+            Err(error) if matches!(error.raw_os_error(), Some(libc::EOPNOTSUPP | libc::EINVAL)) => {
+                false
+            }
             Err(error) => panic!("could not set fixture access ACL: {error}"),
         }
     }
