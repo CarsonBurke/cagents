@@ -3944,10 +3944,7 @@ impl widget::menu::Action for ExternalEditorCommand<'_> {
 fn toolbar_group<'a>(
     controls: Vec<Element<'a, RepositoryAction>>,
 ) -> Element<'a, RepositoryAction> {
-    widget::row::with_children(controls)
-        .spacing(2)
-        .align_y(Alignment::Center)
-        .into()
+    crate::ui_controls::segmented_controls(controls)
 }
 
 /// Dedicated content toolbar, mounted separately from tabs and the scroll viewport.
