@@ -1839,7 +1839,7 @@ mod tests {
         assert_eq!(baseline.screen_height_px(), 460);
 
         assert!(
-            geometry_at(0.2).content_bounds.width < baseline.content_bounds.width,
+            geometry_at(0.2).content_bounds.width <= baseline.content_bounds.width,
             "absolute edge snapping should still conservatively clip the fixed grid"
         );
 

@@ -338,6 +338,55 @@ enum ScrollTarget {
     Position(ScrollPosition),
 }
 
+/// Tolerance absorbing f32 residue where a captured offset meets a visual-row
+/// boundary: our own captures read back ~1e-4px below exact row multiples,
+/// and flooring that noise aims a whole line off and traps the seek in a
+/// two-position oscillation. Hundreds of times below a visible pixel.
+const SEEK_ROW_EPSILON: f32 = 0.05;
+
+/// Canonicalize a scroll position so captures round-trip: scrolling by lines
+/// accumulates ~1e-4px residue that flips line attribution at boundaries
+/// (reporting line 24 + 19.5999px instead of line 25 + 0px for the same
+/// viewport). Snapping sub-pixel straddles to the boundary they round to
+/// keeps restore, capture, and read-back on one stable representation;
+/// genuine mid-row offsets are untouched.
+fn canonical_scroll(
+    position: ScrollPosition,
+    line_height: f32,
+    single_row: bool,
+) -> ScrollPosition {
+    let line_height = line_height.max(1.0);
+    let mut line = position.line;
+    let mut vertical = position.vertical;
+    if vertical.is_finite() && vertical >= 0.0 {
+        if single_row {
+            // No visual rows to index: a whole line height of offset is
+            // smooth scroll resting between lines — carry it into the line.
+            let carry = ((vertical + SEEK_ROW_EPSILON) / line_height)
+                .floor()
+                .max(0.0);
+            line = line.saturating_add(carry as usize);
+            vertical -= carry * line_height;
+            if vertical.abs() < SEEK_ROW_EPSILON {
+                vertical = 0.0;
+            }
+        } else {
+            // Wrapped lines: the offset indexes visual rows, so only absorb
+            // residue onto the row grid and never carry into the line.
+            let row = vertical / line_height;
+            let snapped = row.round();
+            if (row - snapped).abs() * line_height < SEEK_ROW_EPSILON {
+                vertical = snapped * line_height;
+            }
+        }
+    }
+    ScrollPosition {
+        line,
+        vertical,
+        horizontal: position.horizontal,
+    }
+}
+
 /// The native renderer exposes relative visual-row scrolling, not a mutable
 /// buffer or logical seek. Shape and observe each step until the logical target
 /// is reached. Each step consumes at least the rest of the current wrapped line
@@ -345,8 +394,21 @@ enum ScrollTarget {
 fn seek_scroll(
     editor: &mut NativeEditor,
     target: ScrollTarget,
+    wrapping: Wrapping,
     mut shape: impl FnMut(&mut NativeEditor),
 ) {
+    let line_height = editor.buffer().metrics().line_height.max(1.0);
+    // Canonicalize the target the same way captures are canonicalized: a
+    // vertical offset at or past a full line height addresses the following
+    // line, and without the carry the seek aims a whole line above the
+    // captured viewport and then oscillates against it.
+    let target = match target {
+        ScrollTarget::Position(position) => {
+            let single_row = wrapping == Wrapping::None;
+            ScrollTarget::Position(canonical_scroll(position, line_height, single_row))
+        }
+        other => other,
+    };
     let position = match target {
         ScrollTarget::Fraction { fraction, visible } => {
             (editor.buffer().lines.len() as f32 - visible).max(0.0) * fraction.clamp(0.0, 1.0)
@@ -362,12 +424,16 @@ fn seek_scroll(
         let before = (scroll.line, scroll.vertical);
         let line_height = buffer.metrics().line_height.max(1.0);
         let current_row = scroll.vertical / line_height;
-        let rows = buffer
+        // Shaping is lazy: lines below the shaped frontier have no layout yet.
+        // Stepping estimates can assume a single row, but the target row must
+        // not clamp to unknown information — an unshaped wrapped line reads
+        // as one row and would pin every restore to its top.
+        let shaped_rows = buffer
             .lines
             .get(scroll.line)
             .and_then(|line| line.layout_opt())
-            .map_or(1, Vec::len)
-            .max(1) as f32;
+            .map(Vec::len);
+        let rows = shaped_rows.unwrap_or(1).max(1) as f32;
         let delta = if matches!(target, ScrollTarget::Fraction { fraction, .. } if fraction <= 0.0)
         {
             -i32::MAX
@@ -387,12 +453,16 @@ fn seek_scroll(
                 .max(1.0)
                 .min(i32::MAX as f32) as i32
         } else {
-            let target_row = match target {
+            let mut target_row = match target {
                 ScrollTarget::Fraction { .. } => position.fract() * rows,
-                ScrollTarget::Position(position) => position.vertical / line_height,
+                ScrollTarget::Position(position) => {
+                    (position.vertical + SEEK_ROW_EPSILON) / line_height
+                }
             }
-            .floor()
-            .min(rows - 1.0);
+            .floor();
+            if let Some(shaped) = shaped_rows {
+                target_row = target_row.min(shaped.max(1) as f32 - 1.0);
+            }
             (target_row - current_row).round() as i32
         };
         if delta == 0 {
@@ -526,11 +596,16 @@ where
         let internal = self.0.borrow();
         internal.pending_scroll.unwrap_or_else(|| {
             let scroll = internal.editor.buffer().scroll();
-            ScrollPosition {
-                line: scroll.line,
-                vertical: scroll.vertical,
-                horizontal: internal.horizontal,
-            }
+            let line_height = internal.editor.buffer().metrics().line_height;
+            canonical_scroll(
+                ScrollPosition {
+                    line: scroll.line,
+                    vertical: scroll.vertical,
+                    horizontal: internal.horizontal,
+                },
+                line_height,
+                internal.wrapping == Wrapping::None,
+            )
         })
     }
 
@@ -831,7 +906,9 @@ where
         };
         shape(&mut internal.editor, canvas);
         if let Some(target) = target {
-            seek_scroll(&mut internal.editor, target, |editor| shape(editor, canvas));
+            seek_scroll(&mut internal.editor, target, self.wrapping, |editor| {
+                shape(editor, canvas)
+            });
         }
         if unwrapped {
             // Grow only for newly visited wider lines; never scan/shape the
@@ -1729,6 +1806,10 @@ mod tests {
     }
 
     fn layout_content(content: &mut Content, width: f32, height: f32) {
+        // Mirror production layout: the widget syncs its wrapping mode into
+        // content before shaping or seeking, and scroll canonicalization
+        // reads it back.
+        content.0.get_mut().wrapping = Wrapping::Word;
         content.0.get_mut().editor.update(
             Size::new(width, height),
             cosmic::iced::Font::MONOSPACE,
@@ -1742,17 +1823,25 @@ mod tests {
     fn seek_content(content: &mut Content, target: ScrollTarget, width: f32, height: f32) -> usize {
         let mut shapes = 0;
         let mut highlighter = highlighter::PlainText::new(&());
-        seek_scroll(&mut content.0.get_mut().editor, target, |editor| {
-            shapes += 1;
-            editor.update(
-                Size::new(width, height),
-                cosmic::iced::Font::MONOSPACE,
-                Pixels(16.0),
-                LineHeight::Absolute(Pixels(20.0)),
-                Wrapping::Word,
-                &mut highlighter,
-            );
-        });
+        // Mirror production layout (see above): this helper shapes with Word
+        // wrapping, so content must agree before seeking.
+        content.0.get_mut().wrapping = Wrapping::Word;
+        seek_scroll(
+            &mut content.0.get_mut().editor,
+            target,
+            Wrapping::Word,
+            |editor| {
+                shapes += 1;
+                editor.update(
+                    Size::new(width, height),
+                    cosmic::iced::Font::MONOSPACE,
+                    Pixels(16.0),
+                    LineHeight::Absolute(Pixels(20.0)),
+                    Wrapping::Word,
+                    &mut highlighter,
+                );
+            },
+        );
         shapes
     }
 
