@@ -51,6 +51,33 @@ pub fn create(launch: &Launch) -> Result<(ProcessSpec, Box<dyn Adapter>), String
     ))
 }
 
+/// Record a provider-confirmed rotation in the recipe: after an
+/// interrupt-driven reset the live conversation differs from the originally
+/// launched `--resume` ID. Rewrites the same flags `arguments()` validates
+/// so a checkpointed launch stays self-consistent. Forgery checks stay in
+/// `arguments()` — only call this with the live provider's own identity.
+pub fn align_resume_identity(arguments: &mut Vec<String>, id: &str) -> Result<(), String> {
+    let mut index = 0;
+    while index < arguments.len() {
+        let (flag, inline) = match arguments[index].split_once('=') {
+            Some((key, _)) => (key.to_string(), true),
+            None => (arguments[index].clone(), false),
+        };
+        if matches!(flag.as_str(), "--resume" | "-r" | "--session-id") {
+            if inline {
+                arguments[index] = format!("{flag}={id}");
+            } else {
+                index += 1;
+                *arguments
+                    .get_mut(index)
+                    .ok_or("Claude resume requires an exact session ID")? = id.to_string();
+            }
+        }
+        index += 1;
+    }
+    Ok(())
+}
+
 fn arguments(launch: &Launch) -> Result<Vec<String>, String> {
     if launch.recipe.arguments.len() > 128
         || launch
@@ -2198,6 +2225,38 @@ mod tests {
     use super::*;
     use crate::agent::Provider;
     use std::io::Write as _;
+
+    #[test]
+    fn align_resume_identity_rewrites_space_and_inline_forms() {
+        let mut arguments = vec![
+            "--print".to_string(),
+            "--resume".to_string(),
+            "old".to_string(),
+            "--session-id=old".to_string(),
+            "-r".to_string(),
+            "old".to_string(),
+            "--model".to_string(),
+            "sonnet".to_string(),
+        ];
+        align_resume_identity(&mut arguments, "new").unwrap();
+        assert_eq!(
+            arguments,
+            vec![
+                "--print",
+                "--resume",
+                "new",
+                "--session-id=new",
+                "-r",
+                "new",
+                "--model",
+                "sonnet",
+            ]
+        );
+        let mut untouched = vec!["--print".to_string(), "--model".to_string()];
+        align_resume_identity(&mut untouched, "new").unwrap();
+        assert_eq!(untouched, vec!["--print", "--model"]);
+        assert!(align_resume_identity(&mut vec!["--resume".to_string()], "new").is_err());
+    }
 
     fn approval(id: &str, tool: &str, input: Value) -> Value {
         json!({"type":"control_request", "request_id":id, "request":{"subtype":"can_use_tool", "tool_name":tool, "tool_use_id":"tool-1", "input":input}})

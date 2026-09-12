@@ -965,6 +965,13 @@ fn prepare_upgrade_with(
             let source = record.session.clone();
             let mut launch = source.launch.clone();
             launch.session_id = record.handle.confirmed_session_id();
+            // An interrupt-driven reset rotates the live conversation past
+            // the originally launched resume ID. The confirmed identity is
+            // the provider's own report, so record it in the recipe too —
+            // otherwise the checkpoint neither validates nor restarts the
+            // final conversation.
+            super::super::chat::protocol::align_resume_identity(&mut launch)
+                .map_err(upgrade_error)?;
             if launch.terminal_recipe().is_none() {
                 return Err(upgrade_error(format!(
                     "Native chat {} has no exact resumable conversation; wait for provider initialization or close it explicitly",
