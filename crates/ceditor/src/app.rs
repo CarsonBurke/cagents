@@ -933,9 +933,12 @@ impl Editor {
         Task::batch([focus, self.resume_pending_files()])
     }
 
-    fn notices_control(&self) -> Element<'_, Message> {
+    fn notices_control(&self) -> Option<Element<'_, Message>> {
         let has_notices =
             self.notice.is_some() || self.tabs.iter().any(|tab| tab.lsp_error.is_some());
+        if !has_notices && !self.notices_open {
+            return None;
+        }
         let anchor = icon_control(
             widget::icon::from_name(if has_notices {
                 "dialog-warning-symbolic"
@@ -1010,11 +1013,14 @@ impl Editor {
             .width(420)
             .into()
         });
-        popover(
-            anchor,
-            content,
-            widget::popover::Position::Bottom,
-            Message::CloseNotices,
+        Some(
+            popover(
+                anchor,
+                content,
+                widget::popover::Position::Bottom,
+                Message::CloseNotices,
+            )
+            .into(),
         )
     }
 
@@ -1918,8 +1924,11 @@ impl Application for Editor {
         ]
     }
     fn header_end(&self) -> Vec<Element<'_, Message>> {
-        vec![
-            self.notices_control(),
+        let mut end: Vec<Element<'_, Message>> = Vec::new();
+        if let Some(notices) = self.notices_control() {
+            end.push(notices);
+        }
+        end.push(
             icon_control(
                 widget::icon::from_name("emblem-system-symbolic").handle(),
                 "Settings",
@@ -1928,7 +1937,8 @@ impl Application for Editor {
                 Some(Message::Settings),
             )
             .into(),
-        ]
+        );
+        end
     }
     fn view(&self) -> Element<'_, Message> {
         let tabs: Vec<Element<'_, Message>> = self
@@ -2358,6 +2368,20 @@ mod tests {
             restoring_session: false,
             saved_session: crate::preferences::Session::default(),
         }
+    }
+
+    #[test]
+    fn notices_control_hides_when_there_is_nothing_to_show() {
+        let app = editor();
+        assert!(app.notices_control().is_none());
+
+        let mut with_notice = editor();
+        with_notice.notice = Some("boom".into());
+        assert!(with_notice.notices_control().is_some());
+
+        let mut open_empty = editor();
+        open_empty.notices_open = true;
+        assert!(open_empty.notices_control().is_some());
     }
 
     #[test]

@@ -3607,7 +3607,7 @@ fn thread_view(
                     } else if activity == Some(crate::agent::ActivityState::Working) {
                         theme.cosmic().warning.base.into()
                     } else {
-                        theme.current_container().on.into()
+                        design::muted_color(theme)
                     }),
                     ..Default::default()
                 }
@@ -3813,7 +3813,14 @@ fn project_icon(project: &SidebarProject, size: u16) -> Element<'_, SidebarActio
             .width(size)
             .height(size)
             .into(),
-        None => widget::icon::from_name("folder-symbolic").size(size).into(),
+        None => widget::container(widget::icon::from_name("folder-symbolic").size(size))
+            .class(theme::Container::custom(move |theme| {
+                cosmic::iced::widget::container::Style {
+                    icon_color: Some(design::muted_color(theme)),
+                    ..Default::default()
+                }
+            }))
+            .into(),
     }
 }
 

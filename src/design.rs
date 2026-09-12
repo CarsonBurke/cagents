@@ -19,7 +19,7 @@ pub const TEXT_HEADING: f32 = 14.0;
 /// Secondary labels stay readable without competing with active content.
 pub fn muted_color(theme: &cosmic::Theme) -> cosmic::iced::Color {
     let mut color: cosmic::iced::Color = theme.current_container().on.into();
-    color.a *= 0.55;
+    color.a *= 0.75;
     color
 }
 
