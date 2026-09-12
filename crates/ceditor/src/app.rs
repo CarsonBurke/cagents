@@ -2003,6 +2003,9 @@ impl Application for Editor {
             })
             .collect();
         let mut body = Vec::new();
+        // The COSMIC header above has no separator of its own: always rule
+        // off the content below it, tabs or placeholder alike.
+        body.push(widget::divider::horizontal::default().into());
         if !tabs.is_empty() {
             body.push(
                 widget::scrollable::horizontal(

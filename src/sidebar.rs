@@ -4215,6 +4215,7 @@ fn source_control_panel<'a>(
             .height(design::HEADER_HEIGHT)
             .width(Length::Fill),
     );
+    column = column.push(widget::divider::horizontal::default());
 
     // Both notices are permanent slots. The failure arm below this ends in a
     // named `Try again` button, and iced reconciles a named child at the index
@@ -4619,7 +4620,7 @@ fn list_mode_controls<'a>(
     changes: bool,
     modal_open: bool,
 ) -> Element<'a, SidebarAction> {
-    widget::row::with_children(
+    crate::ui_controls::segmented_controls(
         [
             (
                 "Tree file list",
@@ -4649,9 +4650,9 @@ fn list_mode_controls<'a>(
                 gated(action, modal_open),
             )
             .into()
-        }),
+        })
+        .collect(),
     )
-    .into()
 }
 
 fn changes_section<'a>(
