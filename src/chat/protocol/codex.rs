@@ -24,6 +24,23 @@ fn remote_socket(address: &str) -> Result<Option<PathBuf>, String> {
     Ok((!path.is_empty()).then(|| PathBuf::from(path)))
 }
 
+/// Record a provider-confirmed rotation in the recipe: rewrites the `resume`
+/// thread ID `create()` validates so a checkpointed launch stays
+/// self-consistent. Only call with the live provider's own identity.
+pub fn align_resume_identity(arguments: &mut Vec<String>, id: &str) -> Result<(), String> {
+    let mut index = 0;
+    while index < arguments.len() {
+        if arguments[index] == "resume" {
+            index += 1;
+            *arguments
+                .get_mut(index)
+                .ok_or("Codex resume requires an exact thread ID")? = id.to_string();
+        }
+        index += 1;
+    }
+    Ok(())
+}
+
 pub fn create(launch: &Launch) -> Result<(ProcessSpec, Box<dyn Adapter>), String> {
     if launch
         .session_id
@@ -1471,6 +1488,18 @@ fn elicitation_answers(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn align_resume_identity_rewrites_resume_thread() {
+        let mut arguments = vec![
+            "app-server".to_string(),
+            "resume".to_string(),
+            "old".to_string(),
+        ];
+        align_resume_identity(&mut arguments, "new").unwrap();
+        assert_eq!(arguments, vec!["app-server", "resume", "new"]);
+        assert!(align_resume_identity(&mut vec!["resume".to_string()], "new").is_err());
+    }
 
     fn adapter() -> Codex {
         Codex {

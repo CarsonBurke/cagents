@@ -65,3 +65,28 @@ pub trait Adapter: Send {
 pub fn create(launch: &Launch) -> Result<(ProcessSpec, Box<dyn Adapter>), String> {
     launch.provider.create_chat(launch)
 }
+
+/// Record a provider-confirmed conversation rotation in the launch recipe.
+///
+/// Upgrade checkpointing stamps the live confirmed identity onto
+/// `session_id`, but the recipe still names the originally launched resume
+/// ID — a checkpoint that neither validates nor restarts the final
+/// conversation. This rewrites the provider's resume arguments to the
+/// confirmed identity. Only call with an identity the live provider
+/// reported, never user input: strict `create()` forgery checks stay intact
+/// everywhere else. OMP needs nothing: it derives `--resume` from the
+/// session ID when creating the process spec.
+pub fn align_resume_identity(launch: &mut Launch) -> Result<(), String> {
+    let Some(id) = launch.session_id.clone() else {
+        return Ok(());
+    };
+    match launch.provider {
+        crate::agent::Provider::Claude => {
+            claude::align_resume_identity(&mut launch.recipe.arguments, &id)
+        }
+        crate::agent::Provider::Codex => {
+            codex::align_resume_identity(&mut launch.recipe.arguments, &id)
+        }
+        crate::agent::Provider::Omp => Ok(()),
+    }
+}
