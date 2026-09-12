@@ -4,6 +4,10 @@ use thiserror::Error;
 const DEFAULT_COMMAND_CAPACITY: usize = 256;
 const DEFAULT_PTY_CAPACITY: usize = 64;
 const DEFAULT_TRANSCRIPT_CAPACITY: usize = 64;
+/// Raw PTY bytes retained per terminal transcript. Transcripts are
+/// write-only failure diagnostics, and full-screen apps repaint constantly,
+/// so an unbounded log turns one animated pane into endless disk writes.
+const DEFAULT_TRANSCRIPT_MAX_BYTES: u64 = 1 << 20;
 
 /// Parser-owned default colors; application OSC overrides remain authoritative.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -27,6 +31,9 @@ pub struct TerminalConfig {
     pub command_capacity: usize,
     pub pty_capacity: usize,
     pub transcript_capacity: usize,
+    /// Cap on appended transcript bytes per terminal, including bytes already
+    /// present when the terminal starts. New output past the cap is dropped.
+    pub transcript_max_bytes: u64,
     /// Exact native execution environment for a host-owned CLI replacement.
     /// Never serialized with the terminal's durable launch recipe.
     pub execution_environment: Option<super::ipc::ChatExecutionEnvironment>,
@@ -45,6 +52,7 @@ impl Default for TerminalConfig {
             command_capacity: DEFAULT_COMMAND_CAPACITY,
             pty_capacity: DEFAULT_PTY_CAPACITY,
             transcript_capacity: DEFAULT_TRANSCRIPT_CAPACITY,
+            transcript_max_bytes: DEFAULT_TRANSCRIPT_MAX_BYTES,
             execution_environment: None,
         }
     }

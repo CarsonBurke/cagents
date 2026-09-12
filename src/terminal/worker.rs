@@ -46,6 +46,8 @@ use super::{
 
 const PTY_READ_SIZE: usize = 16 * 1024;
 const PTY_BATCH_LIMIT: usize = 256 * 1024;
+/// Marker appended once when a transcript hits its size cap.
+const TRANSCRIPT_TRUNCATED_MARKER: &[u8] = b"\n[cagents transcript truncated: size cap reached]\n";
 
 #[derive(Debug)]
 enum Command {
@@ -741,7 +743,13 @@ impl Worker {
 
         let transcript = session
             .transcript_path
-            .map(|path| TranscriptWriter::start(path, config.transcript_capacity.max(1)))
+            .map(|path| {
+                TranscriptWriter::start(
+                    path,
+                    config.transcript_capacity.max(1),
+                    config.transcript_max_bytes.max(1),
+                )
+            })
             .transpose()?;
         let visibility = if config.initially_visible {
             Visibility::Visible
@@ -1819,20 +1827,41 @@ struct TranscriptWriter {
 }
 
 impl TranscriptWriter {
-    fn start(path: PathBuf, capacity: usize) -> Result<Self, String> {
+    fn start(path: PathBuf, capacity: usize, max_bytes: u64) -> Result<Self, String> {
         let file = open_private_append_file(&path)
             .map_err(|error| format!("open transcript {}: {error}", path.display()))?;
+        let written = file.metadata().map(|metadata| metadata.len()).unwrap_or(0);
         let (sender, receiver) = crossbeam_channel::bounded(capacity);
         let worker = thread::Builder::new()
             .name("terminal-transcript-writer".into())
             .spawn(move || {
                 let mut writer = BufWriter::new(file);
+                let mut written = written;
+                // Already over cap (e.g. an older uncapped session): the file
+                // stays as-is and nothing more is recorded.
+                let mut capped = written >= max_bytes;
+                if capped {
+                    let _ = writer.write_all(TRANSCRIPT_TRUNCATED_MARKER);
+                    let _ = writer.flush();
+                }
                 while let Ok(message) = receiver.recv() {
                     match message {
                         TranscriptMessage::Bytes(bytes) => {
+                            if capped {
+                                continue;
+                            }
+                            let within_cap =
+                                written.saturating_add(bytes.len() as u64) <= max_bytes;
+                            if !within_cap {
+                                capped = true;
+                                let _ = writer.write_all(TRANSCRIPT_TRUNCATED_MARKER);
+                                let _ = writer.flush();
+                                continue;
+                            }
                             if writer.write_all(&bytes).is_err() {
                                 break;
                             }
+                            written += bytes.len() as u64;
                         }
                         TranscriptMessage::Shutdown => break,
                     }
@@ -1843,10 +1872,14 @@ impl TranscriptWriter {
         Ok(Self { sender, worker })
     }
 
+    /// Best-effort and never blocking: output bursts faster than the disk
+    /// writer are dropped instead of stalling PTY processing. Only a dead
+    /// writer thread reports an error.
     fn send(&self, bytes: Vec<u8>) -> Result<(), ()> {
-        self.sender
-            .send(TranscriptMessage::Bytes(bytes))
-            .map_err(|_| ())
+        match self.sender.try_send(TranscriptMessage::Bytes(bytes)) {
+            Ok(()) | Err(TrySendError::Full(_)) => Ok(()),
+            Err(TrySendError::Disconnected(_)) => Err(()),
+        }
     }
 
     fn finish(self) {
@@ -2625,7 +2658,7 @@ mod tests {
         fs::write(&path, b"before\n").unwrap();
         fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
 
-        let writer = TranscriptWriter::start(path.clone(), 1).unwrap();
+        let writer = TranscriptWriter::start(path.clone(), 1, 1 << 20).unwrap();
         writer.send(b"after\n".to_vec()).unwrap();
         writer.finish();
 
@@ -2646,7 +2679,9 @@ mod tests {
         let directory = root.path().join("new-transcripts");
         let path = directory.join("terminal.log");
 
-        TranscriptWriter::start(path.clone(), 1).unwrap().finish();
+        TranscriptWriter::start(path.clone(), 1, 1 << 20)
+            .unwrap()
+            .finish();
 
         assert_eq!(
             fs::metadata(&directory).unwrap().permissions().mode() & 0o777,
@@ -2655,6 +2690,45 @@ mod tests {
         assert_eq!(
             fs::metadata(&path).unwrap().permissions().mode() & 0o777,
             0o600
+        );
+    }
+
+    #[test]
+    fn transcript_writer_stops_at_size_cap_with_marker() {
+        let root = tempdir().unwrap();
+        let path = root.path().join("terminal.log");
+
+        let writer = TranscriptWriter::start(path.clone(), 64, 16).unwrap();
+        writer.send(vec![b'x'; 64]).unwrap();
+        writer.send(b"discarded\n".to_vec()).unwrap();
+        writer.finish();
+
+        let content = fs::read(&path).unwrap();
+        assert!(
+            content.ends_with(TRANSCRIPT_TRUNCATED_MARKER),
+            "capped transcript should end with the truncation marker"
+        );
+        assert!(
+            content.len() <= 16 + TRANSCRIPT_TRUNCATED_MARKER.len(),
+            "capped transcript should not grow past the cap plus marker"
+        );
+    }
+
+    #[test]
+    fn transcript_writer_caps_preexisting_oversized_file() {
+        let root = tempdir().unwrap();
+        let path = root.path().join("terminal.log");
+        fs::write(&path, vec![b'y'; 32]).unwrap();
+
+        let writer = TranscriptWriter::start(path.clone(), 64, 16).unwrap();
+        writer.send(b"new output\n".to_vec()).unwrap();
+        writer.finish();
+
+        let content = fs::read(&path).unwrap();
+        assert_eq!(
+            content,
+            [vec![b'y'; 32], TRANSCRIPT_TRUNCATED_MARKER.to_vec()].concat(),
+            "oversized transcript should keep existing bytes and record nothing more"
         );
     }
 
@@ -2668,14 +2742,16 @@ mod tests {
         let linked_file = directory.join("linked.log");
         symlink(&victim, &linked_file).unwrap();
 
-        assert!(TranscriptWriter::start(linked_file, 1).is_err());
+        assert!(TranscriptWriter::start(linked_file, 1, 1 << 20).is_err());
         assert_eq!(fs::read(&victim).unwrap(), b"unchanged");
 
         let real_directory = root.path().join("real");
         fs::create_dir(&real_directory).unwrap();
         let linked_directory = root.path().join("linked-directory");
         symlink(&real_directory, &linked_directory).unwrap();
-        assert!(TranscriptWriter::start(linked_directory.join("terminal.log"), 1).is_err());
+        assert!(
+            TranscriptWriter::start(linked_directory.join("terminal.log"), 1, 1 << 20).is_err()
+        );
     }
 
     #[test]
