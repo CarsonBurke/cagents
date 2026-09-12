@@ -16,7 +16,7 @@ use cagents::{
         SidebarMode, SidebarModel, SidebarProject, SidebarState, SidebarWorktree,
         SourceControlModel,
     },
-    ui_controls::{icon_control, popover},
+    ui_controls::{icon_control, popover, segmented_controls},
 };
 use cosmic::app::ApplicationExt;
 use cosmic::{
@@ -2038,28 +2038,24 @@ impl Application for Editor {
             }
             if tab.runtime.lsp_document().is_some() {
                 toolbar_controls.push(
-                    widget::container(
-                        widget::row::with_children(vec![
-                            icon_control(
-                                widget::icon::from_name("insert-text-symbolic").handle(),
-                                "Complete (Ctrl+Space)",
-                                false,
-                                !self.modal_open(),
-                                Some(Message::Complete),
-                            )
-                            .into(),
-                            icon_control(
-                                widget::icon::from_name("dialog-information-symbolic").handle(),
-                                "Show symbol information",
-                                false,
-                                !self.modal_open(),
-                                Some(Message::Hover),
-                            )
-                            .into(),
-                        ])
-                        .spacing(2)
-                        .align_y(iced::Alignment::Center),
-                    )
+                    widget::container(segmented_controls(vec![
+                        icon_control(
+                            widget::icon::from_name("insert-text-symbolic").handle(),
+                            "Complete (Ctrl+Space)",
+                            false,
+                            !self.modal_open(),
+                            Some(Message::Complete),
+                        )
+                        .into(),
+                        icon_control(
+                            widget::icon::from_name("dialog-information-symbolic").handle(),
+                            "Show symbol information",
+                            false,
+                            !self.modal_open(),
+                            Some(Message::Hover),
+                        )
+                        .into(),
+                    ]))
                     .padding(iced::Padding {
                         right: 12.0,
                         ..iced::Padding::ZERO
