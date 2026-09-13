@@ -1895,6 +1895,7 @@ impl Editor {
             return self.select_find_match(0);
         }
         match key {
+            keyboard::Key::Named(keyboard::key::Named::Escape) => self.update(Message::CloseFind),
             keyboard::Key::Named(keyboard::key::Named::Backspace) => {
                 self.find_query.pop();
                 self.select_find_match(0)
