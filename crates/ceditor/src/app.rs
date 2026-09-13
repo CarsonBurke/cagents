@@ -2111,21 +2111,6 @@ impl Application for Editor {
                         | Message::ToggleSidebar
                         | Message::NewTab
                         | Message::Key(_)
-                        | Message::SelectSettingsCategory(_)
-                        | Message::ShortcutChanged(_, _)
-                        | Message::QuickOpenQueryChanged(_)
-                        | Message::QuickOpenSearchFinished { .. }
-                        | Message::OpenQuickFile(_)
-                        | Message::CloseQuickOpen
-                        | Message::AutoSave(_)
-                        | Message::WrapLines(_)
-                        | Message::SyntaxTheme(_)
-                        | Message::LanguageServerAssistance(_)
-                        | Message::Theme(_)
-                        | Message::Scale(_)
-                        | Message::SettingsSaved(_)
-                        | Message::FindQueryChanged(_)
-                        | Message::CloseFind
                 )
             {
                 return Task::none();
@@ -3225,6 +3210,7 @@ impl Application for Editor {
                 ),
             ))
             .padding([0.0, 8.0])
+            .center_y(Length::Fill)
             .height(design::HEADER_HEIGHT)
             .width(Length::Fill)
             .into(),
@@ -3282,6 +3268,8 @@ impl Application for Editor {
                             .align_y(iced::Alignment::Center)
                             .width(Length::Fill),
                     )
+                    .padding([0.0, 8.0])
+                    .center_y(Length::Fill)
                     .height(design::HEADER_HEIGHT)
                     .width(Length::Fill)
                     .into(),
@@ -3939,6 +3927,14 @@ mod tests {
         assert!(app.settings_open);
         drop(app.update(Message::Settings));
         assert!(!app.settings_open);
+    }
+
+    #[test]
+    fn settings_category_selection_works_while_settings_is_open() {
+        let mut app = editor();
+        app.settings_open = true;
+        drop(app.update(Message::SelectSettingsCategory(SettingsCategory::Keyboard)));
+        assert_eq!(app.settings_category, SettingsCategory::Keyboard);
     }
 
     #[test]

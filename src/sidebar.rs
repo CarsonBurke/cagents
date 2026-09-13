@@ -2979,6 +2979,7 @@ fn header<'a>(
     let header = widget::row::with_children(children)
         .align_y(Alignment::Center)
         .spacing(spacing.space_xxxs)
+        .padding([0, spacing.space_xxs])
         .height(Length::Fixed(HEADER_HEIGHT))
         .width(Length::Fill);
     if modal_open {

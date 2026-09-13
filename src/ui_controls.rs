@@ -100,7 +100,7 @@ pub fn symbolic_icon(name: &str) -> widget::icon::Handle {
         widget::icon::from_svg_bytes(br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16"><g fill="none" stroke="black" stroke-width="1.4" stroke-linejoin="round"><rect x="1.5" y="2.5" width="13" height="11" rx="1.5"/><path d="M6 3v10"/></g></svg>"#.as_slice()).symbolic(true)
     });
     static SETTINGS: LazyLock<widget::icon::Handle> = LazyLock::new(|| {
-        widget::icon::from_svg_bytes(br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16"><path d="M6.7 1.8 7.2 1h1.6l.5.8 1 .4.9-.2 1.1 1.1-.2.9.4 1 .8v1.6l-1 .8-.4 1 .2.9-1.1 1.1-.9-.2-1 .4-.5.8H7.2l-.5-.8-1-.4-.9.2-1.1-1.1.2-.9-.4-1-1-.8V5.8l1-.8.4-1-.2-.9 1.1-1.1.9.2zM8 5.1a2.1 2.1 0 1 0 0 4.2 2.1 2.1 0 0 0 0-4.2Z" fill="none" stroke="black" stroke-width="1.2" stroke-linejoin="round"/></svg>"#.as_slice()).symbolic(true)
+        widget::icon::from_svg_bytes(br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16"><path d="M6.7 1.5h2.6l.3 1.7 1.1.5 1.5-.8L14 4.7l-.8 1.5.5 1.1 1.7.3v2.6l-1.7.3-.5 1.1.8 1.5-1.8 1.8-1.5-.8-1.1.5-.3 1.7H6.7l-.3-1.7-1.1-.5-1.5.8L2 11.1l.8-1.5-.5-1.1L.6 8.2V5.6l1.7-.3.5-1.1L2 2.7 3.8.9l1.5.8 1.1-.5zM8 5.5a2.5 2.5 0 1 0 0 5 2.5 2.5 0 0 0 0-5Z" fill="none" stroke="black" stroke-width="1.2" stroke-linejoin="round"/></svg>"#.as_slice()).symbolic(true)
     });
     static INSERT_TEXT: LazyLock<widget::icon::Handle> = LazyLock::new(|| {
         widget::icon::from_svg_bytes(br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16"><path d="M3.5 3.25h9M8 3.25v9.5" fill="none" stroke="black" stroke-width="1.4" stroke-linecap="round"/></svg>"#.as_slice()).symbolic(true)
