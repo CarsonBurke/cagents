@@ -117,8 +117,9 @@ pub enum Message {
     SelectSettingsCategory(SettingsCategory),
     ShortcutChanged(EditorShortcut, String),
     FindInFile,
-    FindQueryChanged(String),
     CloseFind,
+    FindNext,
+    FindPrevious,
     QuickOpen,
     QuickOpenQueryChanged(String),
     OpenQuickFile(PathBuf),
@@ -338,6 +339,7 @@ pub struct Editor {
     quick_open_files: Option<Vec<PathBuf>>,
     find_open: bool,
     find_query: String,
+    find_match_index: usize,
     quick_open_generation: u64,
     quick_open: bool,
     quick_open_query: String,
@@ -661,8 +663,6 @@ fn find_bar<'a>(editor: &'a Editor, tab: &'a Tab) -> Element<'a, Message> {
                 .into(),
             widget::text_input("Find in file", &editor.find_query)
                 .id(widget::Id::new("ceditor.find.query"))
-                .on_input(Message::FindQueryChanged)
-                .on_submit(|_| Message::CloseFind)
                 .width(Length::Fill)
                 .into(),
             design::caption(if editor.find_query.trim().is_empty() {
@@ -670,6 +670,22 @@ fn find_bar<'a>(editor: &'a Editor, tab: &'a Tab) -> Element<'a, Message> {
             } else {
                 format!("{matches} matches")
             })
+            .into(),
+            icon_control(
+                symbolic_icon("go-up-symbolic"),
+                "Previous match (Shift+Enter)",
+                false,
+                true,
+                Some(Message::FindPrevious),
+            )
+            .into(),
+            icon_control(
+                symbolic_icon("go-down-symbolic"),
+                "Next match (Enter)",
+                false,
+                true,
+                Some(Message::FindNext),
+            )
             .into(),
             icon_control(
                 symbolic_icon("window-close-symbolic"),
@@ -1838,6 +1854,82 @@ impl Editor {
         })
     }
 
+    fn focus_active_editor(&self) -> Task<Message> {
+        let Some(id) = self.active else {
+            return Task::none();
+        };
+        self.tab(id).map_or_else(Task::none, |tab| {
+            tab.runtime.focus_editor(id).map(cosmic::Action::App)
+        })
+    }
+
+    fn select_find_match(&mut self, occurrence: usize) -> Task<Message> {
+        let Some(id) = self.active else {
+            return Task::none();
+        };
+        let query = self.find_query.clone();
+        let total = self.tab_mut(id).map(|tab| {
+            tab.runtime.set_search_mode(true);
+            tab.runtime.select_text_match(&query, occurrence)
+        });
+        match total.flatten() {
+            Some(total) => self.find_match_index = occurrence % total,
+            None => self.find_match_index = 0,
+        }
+        self.focus_active_editor()
+    }
+
+    fn handle_find_key(&mut self, event: &keyboard::Event) -> Task<Message> {
+        let keyboard::Event::KeyPressed {
+            key,
+            modifiers,
+            text,
+            repeat: false,
+            ..
+        } = event
+        else {
+            return Task::none();
+        };
+        if modifiers.control() && matches!(key, keyboard::Key::Character(value) if value == "a") {
+            self.find_query.clear();
+            return self.select_find_match(0);
+        }
+        match key {
+            keyboard::Key::Named(keyboard::key::Named::Backspace) => {
+                self.find_query.pop();
+                self.select_find_match(0)
+            }
+            keyboard::Key::Named(keyboard::key::Named::Enter) => {
+                if modifiers.shift() {
+                    self.update(Message::FindPrevious)
+                } else {
+                    self.update(Message::FindNext)
+                }
+            }
+            keyboard::Key::Named(keyboard::key::Named::ArrowUp) => {
+                self.update(Message::FindPrevious)
+            }
+            keyboard::Key::Named(keyboard::key::Named::ArrowDown)
+            | keyboard::Key::Named(keyboard::key::Named::ArrowRight) => {
+                self.update(Message::FindNext)
+            }
+            keyboard::Key::Named(keyboard::key::Named::ArrowLeft) => {
+                self.update(Message::FindPrevious)
+            }
+            _ => {
+                if let Some(text) = text
+                    .as_deref()
+                    .filter(|text| !text.is_empty() && !text.chars().any(char::is_control))
+                {
+                    self.find_query.push_str(text);
+                    self.select_find_match(0)
+                } else {
+                    Task::none()
+                }
+            }
+        }
+    }
+
     fn quick_open_search(&self, query: String, generation: u64) -> Task<Message> {
         let Some(id) = self.active else {
             return Task::none();
@@ -2021,6 +2113,7 @@ impl Application for Editor {
             quick_open_generation: 0,
             find_open: false,
             find_query: String::new(),
+            find_match_index: 0,
             quick_open: false,
             quick_open_query: String::new(),
             notice,
@@ -2742,26 +2835,29 @@ impl Application for Editor {
                 }
                 Message::FindInFile => {
                     self.find_open = !self.find_open;
+                    self.find_match_index = 0;
                     if self.find_open {
-                        return iced::widget::operation::focus(widget::Id::new(
-                            "ceditor.find.query",
-                        ))
-                        .map(cosmic::Action::App);
+                        return self.select_find_match(0);
                     }
-                    Task::none()
+                    if let Some(id) = self.active
+                        && let Some(tab) = self.tab_mut(id)
+                    {
+                        tab.runtime.set_search_mode(false);
+                    }
+                    self.focus_active_editor()
                 }
-                Message::FindQueryChanged(query) => {
-                    self.find_query = query.clone();
-                    if let Some(id) = self.active {
-                        if let Some(tab) = self.tab_mut(id) {
-                            tab.runtime.select_text(&query);
-                        }
-                    }
-                    Task::none()
+                Message::FindNext => self.select_find_match(self.find_match_index.wrapping_add(1)),
+                Message::FindPrevious => {
+                    self.select_find_match(self.find_match_index.wrapping_sub(1))
                 }
                 Message::CloseFind => {
                     self.find_open = false;
-                    Task::none()
+                    if let Some(id) = self.active
+                        && let Some(tab) = self.tab_mut(id)
+                    {
+                        tab.runtime.set_search_mode(false);
+                    }
+                    self.focus_active_editor()
                 }
                 Message::QuickOpen => {
                     self.quick_open = !self.quick_open;
@@ -2988,6 +3084,9 @@ impl Application for Editor {
                     Task::none()
                 }
                 Message::Key(event) => {
+                    if self.find_open {
+                        return self.handle_find_key(&event);
+                    }
                     if let Some(task) = self.handle_shortcut(&event) {
                         return task;
                     }
@@ -3831,6 +3930,7 @@ mod tests {
             settings_path: PathBuf::new(),
             settings_open: false,
             find_open: false,
+            find_match_index: 0,
             find_query: String::new(),
             quick_open: false,
             quick_open_query: String::new(),

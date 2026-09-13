@@ -991,6 +991,7 @@ pub struct RepositoryRuntime {
     files: FileListState,
     selected: Option<RepositoryFile>,
     document: DocumentState,
+    search_mode: bool,
     /// One entry per comparison this selection has been asked for.
     ///
     /// A list rather than a map: at most six bases are live at once, and
@@ -1102,6 +1103,7 @@ impl RepositoryRuntime {
             mutation_refresh_pending: false,
             files: FileListState::Loading,
             selected: None,
+            search_mode: false,
             document: DocumentState::None,
             diffs: Vec::new(),
             working_diff: WorkingDiffRefresh::default(),
@@ -1609,31 +1611,40 @@ impl RepositoryRuntime {
         });
         true
     }
-    /// Selects the first case-insensitive occurrence in the open buffer.
-    ///
-    /// This keeps search selection inside the runtime that owns the native
-    /// text-editor content, so the application can update a find bar without
-    /// reaching through the editor widget's private content state.
-    pub fn select_text(&mut self, query: &str) -> bool {
+    /// Keeps the editor's focus while the ceditor find bar owns keyboard
+    /// input, allowing native text selection to remain visible as a highlight.
+    pub fn set_search_mode(&mut self, enabled: bool) {
+        self.search_mode = enabled;
+    }
+
+    /// Selects one case-insensitive occurrence in the open buffer and returns
+    /// the total number of occurrences.
+    pub fn select_text_match(&mut self, query: &str, occurrence: usize) -> Option<usize> {
         let DocumentState::Editable(document) = &mut self.document else {
-            return false;
+            return None;
         };
         let query = query.trim();
         if query.is_empty() {
             document
                 .content
                 .perform(text_editor::Action::ClearSelection);
-            return false;
+            return None;
         }
         let text = document.content.text();
         let query = query.to_ascii_lowercase();
         let lower = text.to_ascii_lowercase();
-        let Some(start) = lower.find(&query) else {
+        let total = lower.match_indices(&query).count();
+        if total == 0 {
             document
                 .content
                 .perform(text_editor::Action::ClearSelection);
-            return false;
-        };
+            return None;
+        }
+        let start = lower
+            .match_indices(&query)
+            .nth(occurrence % total)
+            .map(|(start, _)| start)
+            .expect("an occurrence modulo its total count exists");
         let end = start + query.len();
         let start = caret_for_offset(&document.content, start);
         let end = caret_for_offset(&document.content, end);
@@ -1641,7 +1652,12 @@ impl RepositoryRuntime {
             position: end,
             selection: Some(start),
         });
-        true
+        Some(total)
+    }
+
+    /// Selects the first case-insensitive occurrence in the open buffer.
+    pub fn select_text(&mut self, query: &str) -> bool {
+        self.select_text_match(query, 0).is_some()
     }
 
     /// The focus target of the editable buffer while that buffer is the
@@ -4514,8 +4530,12 @@ fn editable_document_view<'a>(
                 style.border = iced::Border::default();
                 style
             })
-            .key_binding(text_editor::default_bindings)
-            .on_action(move |action| RepositoryAction::EditorAction { card, action });
+            .key_binding(text_editor::default_bindings);
+        let editor = if runtime.search_mode {
+            editor
+        } else {
+            editor.on_action(move |action| RepositoryAction::EditorAction { card, action })
+        };
         let entries = [
             ("Cut", ClipboardOp::Cut),
             ("Copy", ClipboardOp::Copy),
@@ -8487,8 +8507,37 @@ mod tests {
             unreachable!();
         };
         let cursor = document.content.cursor();
-        assert_eq!(cursor.position, text_editor::Position::new(0, 10));
-        assert_eq!(cursor.selection, Some(text_editor::Position::new(0, 6)));
+        assert_eq!(
+            cursor.position,
+            text_editor::Position {
+                line: 0,
+                column: 10,
+            }
+        );
+        assert_eq!(
+            cursor.selection,
+            Some(text_editor::Position { line: 0, column: 6 })
+        );
+
+        assert_eq!(runtime.select_text_match("alpha", 1), Some(2));
+        let DocumentState::Editable(document) = &runtime.document else {
+            unreachable!();
+        };
+        let cursor = document.content.cursor();
+        assert_eq!(
+            cursor.position,
+            text_editor::Position {
+                line: 0,
+                column: 16,
+            }
+        );
+        assert_eq!(
+            cursor.selection,
+            Some(text_editor::Position {
+                line: 0,
+                column: 11,
+            })
+        );
 
         assert!(!runtime.select_text("missing"));
         let DocumentState::Editable(document) = &runtime.document else {
