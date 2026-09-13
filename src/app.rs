@@ -8022,6 +8022,7 @@ impl Application for Cagents {
                     | SidebarAction::ToggleSourceControlPanel { .. }
                     | SidebarAction::FilesQueryChanged { .. }
                     | SidebarAction::SetChangeListMode { .. }
+                    | SidebarAction::SetWorktreePanel { .. }
                     | SidebarAction::ToggleDirectory { .. }
                     | SidebarAction::CommitMessageChanged { .. }
                     | SidebarAction::PublishRemoteChanged { .. }

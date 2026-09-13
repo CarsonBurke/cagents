@@ -16,6 +16,7 @@ use cagents::{
     sidebar::{
         self, ActiveWorktreeKey, FileCommand, FileSearch, SidebarAction, SidebarFocus, SidebarMode,
         SidebarModel, SidebarProject, SidebarState, SidebarWorktree, SourceControlModel,
+        WorktreePanel,
     },
     splitter::{self, Splitter},
     ui_controls::{icon_control, popover, segmented_controls},
@@ -155,6 +156,7 @@ pub struct Editor {
     sidebar_open: bool,
     pending_save_as: Option<(CardId, String)>,
     sidebar_transition: Option<SidebarTransition>,
+    sidebar_panel: WorktreePanel,
 }
 
 const SIDEBAR_TRANSITION_DURATION: Duration = Duration::from_millis(160);
@@ -1614,6 +1616,7 @@ impl Application for Editor {
             sidebar_open,
             pending_save_as: None,
             sidebar_transition: None,
+            sidebar_panel: WorktreePanel::Files,
         };
         let mut tasks = vec![app.appearance(), app.lsp_next()];
         if let Some(window) = app.core.main_window_id() {
@@ -2041,6 +2044,10 @@ impl Application for Editor {
                     }
                     if matches!(&action, SidebarAction::ResizeFinished) {
                         return self.save_settings();
+                    }
+                    if let SidebarAction::SetWorktreePanel { panel } = action {
+                        self.sidebar_panel = panel;
+                        return Task::none();
                     }
                     let Some(id) = self.active else {
                         return Task::none();
@@ -2760,8 +2767,18 @@ impl Application for Editor {
             if progress > 0.0 {
                 let width = self.sidebar_width();
                 workspace.push(cagents::interaction::reveal_leading_width(
-                    sidebar::file_panel(&tab.sidebar, &tab.navigation, width, self.modal_open())
-                        .map(Message::Sidebar),
+                    sidebar::worktree_sidebar(
+                        &tab.sidebar,
+                        &tab.navigation,
+                        width,
+                        self.modal_open(),
+                        if tab.git {
+                            self.sidebar_panel
+                        } else {
+                            WorktreePanel::Files
+                        },
+                    )
+                    .map(Message::Sidebar),
                     width,
                     progress,
                 ));
@@ -3095,6 +3112,7 @@ mod tests {
             sidebar_open: true,
             pending_save_as: None,
             sidebar_transition: None,
+            sidebar_panel: WorktreePanel::Files,
         }
     }
 
@@ -3128,6 +3146,24 @@ mod tests {
         drop(app.update(Message::ToggleSidebar));
         assert!(app.sidebar_open);
         assert!(app.sidebar_transition.is_some());
+    }
+
+    #[test]
+    fn sidebar_can_switch_to_changes_for_a_git_tab() {
+        let mut app = editor();
+        assert_eq!(app.sidebar_panel, WorktreePanel::Files);
+        drop(
+            app.update(Message::Sidebar(SidebarAction::SetWorktreePanel {
+                panel: WorktreePanel::Changes,
+            })),
+        );
+        assert_eq!(app.sidebar_panel, WorktreePanel::Changes);
+        drop(
+            app.update(Message::Sidebar(SidebarAction::SetWorktreePanel {
+                panel: WorktreePanel::Files,
+            })),
+        );
+        assert_eq!(app.sidebar_panel, WorktreePanel::Files);
     }
 
     #[test]

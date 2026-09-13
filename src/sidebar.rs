@@ -1852,6 +1852,11 @@ impl SourceControlModel {
             || matches!(&self.branch_changes, BranchChanges::Ready(branch) if !branch.rows.is_empty())
     }
 
+    /// Whether this panel is bound to a Git worktree, so Changes can load.
+    pub fn offers_changes(&self) -> bool {
+        self.branch.is_some() || self.unborn || self.detached || self.head_oid.is_some()
+    }
+
     pub fn group(&self, area: ChangeArea) -> Option<&ChangeGroup> {
         self.groups.iter().find(|group| group.area == area)
     }
@@ -2491,6 +2496,7 @@ impl SidebarState {
                 }
             }
             SidebarAction::SetChangeListMode { mode, .. } => self.change_list_mode = *mode,
+            SidebarAction::SetWorktreePanel { .. } => {}
             SidebarAction::ToggleDirectory { path, .. } => {
                 if !self.expanded_directories.remove(path) {
                     self.expanded_directories.insert(path.clone());
@@ -2655,6 +2661,9 @@ pub enum SidebarAction {
     SetChangeListMode {
         key: ActiveWorktreeKey,
         mode: FileListMode,
+    },
+    SetWorktreePanel {
+        panel: WorktreePanel,
     },
     OpenFileInEditor {
         key: ActiveWorktreeKey,
@@ -4165,7 +4174,14 @@ pub fn git_panel<'a>(
     width: f32,
     modal_open: bool,
 ) -> Element<'a, SidebarAction> {
-    worktree_panel(model, state, width, modal_open, WorktreePanel::Changes)
+    worktree_panel(
+        model,
+        state,
+        width,
+        modal_open,
+        WorktreePanel::Changes,
+        false,
+    )
 }
 
 /// File navigation for the active worktree. Opens files in workspace columns;
@@ -4176,11 +4192,24 @@ pub fn file_panel<'a>(
     width: f32,
     modal_open: bool,
 ) -> Element<'a, SidebarAction> {
-    worktree_panel(model, state, width, modal_open, WorktreePanel::Files)
+    worktree_panel(model, state, width, modal_open, WorktreePanel::Files, false)
 }
 
-#[derive(Clone, Copy)]
-enum WorktreePanel {
+/// Files or Git changes, with a switch between them. Used by the standalone
+/// editor, which has no context-inspector tab strip.
+pub fn worktree_sidebar<'a>(
+    model: &'a SidebarModel,
+    state: &'a SidebarState,
+    width: f32,
+    modal_open: bool,
+    panel: WorktreePanel,
+) -> Element<'a, SidebarAction> {
+    worktree_panel(model, state, width, modal_open, panel, true)
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum WorktreePanel {
+    #[default]
     Files,
     Changes,
 }
@@ -4191,6 +4220,7 @@ fn worktree_panel<'a>(
     width: f32,
     modal_open: bool,
     panel: WorktreePanel,
+    show_panel_switch: bool,
 ) -> Element<'a, SidebarAction> {
     let width = if width.is_finite() {
         width.clamp(0.0, design::INSPECTOR_MAX_WIDTH)
@@ -4215,6 +4245,7 @@ fn worktree_panel<'a>(
             model.file_management && matches!(model.data_state, SidebarDataState::Ready),
             modal_open,
             panel,
+            show_panel_switch,
         ),
         None => widget::container(
             widget::column::with_children(vec![
@@ -4271,6 +4302,7 @@ fn source_control_panel<'a>(
     file_management: bool,
     modal_open: bool,
     panel: WorktreePanel,
+    show_panel_switch: bool,
 ) -> Element<'a, SidebarAction> {
     let spacing = cosmic::theme::spacing();
     let chrome = &source.chrome;
@@ -4291,6 +4323,48 @@ fn source_control_panel<'a>(
         .width(Length::Fill)
         .into(),
     ]);
+    if show_panel_switch {
+        let git = source.offers_changes();
+        let files = crate::ui_controls::icon_control(
+            crate::ui_controls::symbolic_icon("folder-symbolic"),
+            "Files",
+            matches!(panel, WorktreePanel::Files),
+            !modal_open,
+            gated(
+                SidebarAction::SetWorktreePanel {
+                    panel: WorktreePanel::Files,
+                },
+                modal_open,
+            ),
+        );
+        let changes = crate::ui_controls::icon_control(
+            crate::ui_controls::symbolic_icon("document-edit-symbolic"),
+            if git {
+                "Changes"
+            } else {
+                "Open a Git repository to review changes"
+            },
+            matches!(panel, WorktreePanel::Changes),
+            !modal_open && git,
+            gated(
+                SidebarAction::SetWorktreePanel {
+                    panel: WorktreePanel::Changes,
+                },
+                modal_open || !git,
+            ),
+        );
+        let changes: Element<'_, SidebarAction> = if git && source.has_changes() {
+            changes
+                .icon_color(cosmic::theme::active().cosmic().warning.base.into())
+                .into()
+        } else {
+            changes.into()
+        };
+        header = header.push(crate::ui_controls::segmented_controls(vec![
+            files.into(),
+            changes,
+        ]));
+    }
     if matches!(panel, WorktreePanel::Files) {
         header = header.push(
             crate::ui_controls::icon_control(
