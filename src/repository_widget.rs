@@ -8507,16 +8507,37 @@ mod tests {
             unreachable!();
         };
         let cursor = document.content.cursor();
-        assert_eq!(cursor.position, text_editor::Position::new(0, 10));
-        assert_eq!(cursor.selection, Some(text_editor::Position::new(0, 6)));
+        assert_eq!(
+            cursor.position,
+            text_editor::Position {
+                line: 0,
+                column: 10,
+            }
+        );
+        assert_eq!(
+            cursor.selection,
+            Some(text_editor::Position { line: 0, column: 6 })
+        );
 
         assert_eq!(runtime.select_text_match("alpha", 1), Some(2));
         let DocumentState::Editable(document) = &runtime.document else {
             unreachable!();
         };
         let cursor = document.content.cursor();
-        assert_eq!(cursor.position, text_editor::Position::new(0, 16));
-        assert_eq!(cursor.selection, Some(text_editor::Position::new(0, 11)));
+        assert_eq!(
+            cursor.position,
+            text_editor::Position {
+                line: 0,
+                column: 16,
+            }
+        );
+        assert_eq!(
+            cursor.selection,
+            Some(text_editor::Position {
+                line: 0,
+                column: 11,
+            })
+        );
 
         assert!(!runtime.select_text("missing"));
         let DocumentState::Editable(document) = &runtime.document else {
