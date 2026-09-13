@@ -474,7 +474,7 @@ fn save_health_view(health: &SaveHealthState) -> Option<Element<'_, Message>> {
             ),
             "Changes are being saved again.",
             Some(crate::interaction::tooltip(
-                widget::button::icon(widget::icon::from_name("window-close-symbolic"))
+                widget::button::icon(crate::ui_controls::symbolic_icon("window-close-symbolic"))
                     .id(widget::Id::new("session-save.acknowledge-recovery"))
                     .name("Acknowledge session save recovery")
                     .width(ICON_CONTROL_SIZE)
@@ -9797,7 +9797,7 @@ impl Application for Cagents {
                     widget::button::standard("Open repository")
                         .id(widget::Id::new("empty.open-repository"))
                         .name("Open repository")
-                        .leading_icon(widget::icon::from_name("folder-open-symbolic").size(16))
+                        .leading_icon(crate::ui_controls::symbolic_icon("folder-open-symbolic"))
                         .on_press(Message::OpenRepository)
                         .into(),
                     widget::button::standard("New browser")

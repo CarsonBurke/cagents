@@ -3320,7 +3320,7 @@ fn empty(state: &SidebarState, compact: bool, modal_open: bool) -> Element<'stat
         .into();
     widget::container(
         widget::column::with_children(vec![
-            widget::icon::from_name(icon_name)
+            widget::icon(crate::ui_controls::symbolic_icon(icon_name))
                 .size(STATUS_ICON_SIZE)
                 .into(),
             design::heading(title).into(),
@@ -5969,7 +5969,7 @@ fn icon_action<'a>(
 ) -> Element<'a, SidebarAction> {
     let label = label.into();
     crate::interaction::tooltip(
-        button::icon(icon::from_name(icon_name).size(ROW_ICON_SIZE))
+        button::icon(crate::ui_controls::symbolic_icon(icon_name))
             .class(sidebar_button_style(false))
             .id(id)
             .name(label.clone())

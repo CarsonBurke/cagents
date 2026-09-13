@@ -19,7 +19,7 @@ use cagents::{
         WorktreePanel,
     },
     splitter::{self, Splitter},
-    ui_controls::{icon_control, popover, segmented_controls},
+    ui_controls::{icon_control, popover, segmented_controls, symbolic_icon},
 };
 use cosmic::app::ApplicationExt;
 use cosmic::{
@@ -1367,12 +1367,11 @@ impl Editor {
             return None;
         }
         let anchor = icon_control(
-            widget::icon::from_name(if has_notices {
+            symbolic_icon(if has_notices {
                 "dialog-warning-symbolic"
             } else {
                 "dialog-information-symbolic"
-            })
-            .handle(),
+            }),
             if has_notices {
                 "Notices — errors need attention"
             } else {
@@ -1413,7 +1412,7 @@ impl Editor {
                 widget::row::with_children(vec![
                     widget::text::title3("Notices").width(Length::Fill).into(),
                     icon_control(
-                        widget::icon::from_name("window-close-symbolic").handle(),
+                        symbolic_icon("window-close-symbolic"),
                         "Close notices (Escape)",
                         false,
                         true,
@@ -2504,7 +2503,7 @@ impl Application for Editor {
     fn header_start(&self) -> Vec<Element<'_, Message>> {
         vec![
             icon_control(
-                widget::icon::from_name("view-sidebar-start-symbolic").handle(),
+                symbolic_icon("view-sidebar-start-symbolic"),
                 if self.sidebar_open {
                     "Hide sidebar"
                 } else {
@@ -2516,7 +2515,7 @@ impl Application for Editor {
             )
             .into(),
             icon_control(
-                widget::icon::from_name("document-open-symbolic").handle(),
+                symbolic_icon("document-open-symbolic"),
                 "Open file (Ctrl+O)",
                 false,
                 !self.modal_open(),
@@ -2524,7 +2523,7 @@ impl Application for Editor {
             )
             .into(),
             icon_control(
-                widget::icon::from_name("folder-open-symbolic").handle(),
+                symbolic_icon("folder-open-symbolic"),
                 "Open folder (Ctrl+Shift+O)",
                 false,
                 !self.modal_open(),
@@ -2540,7 +2539,7 @@ impl Application for Editor {
         }
         end.push(
             icon_control(
-                widget::icon::from_name("emblem-system-symbolic").handle(),
+                symbolic_icon("emblem-system-symbolic"),
                 "Settings",
                 self.settings_open,
                 self.closing.is_none() && self.file_dialog.is_none(),
@@ -2599,7 +2598,7 @@ impl Application for Editor {
                                     title,
                                 ),
                                 icon_control(
-                                    widget::icon::from_name("window-close-symbolic").handle(),
+                                    symbolic_icon("window-close-symbolic"),
                                     "Close tab",
                                     false,
                                     !self.modal_open(),
@@ -2650,7 +2649,7 @@ impl Application for Editor {
         let mut tab_row = tabs;
         tab_row.push(
             icon_control(
-                cagents::ui_controls::symbolic_icon("list-add-symbolic"),
+                symbolic_icon("list-add-symbolic"),
                 "New tab (Ctrl+T)",
                 false,
                 !self.modal_open(),
@@ -2692,7 +2691,7 @@ impl Application for Editor {
                 toolbar_controls.push(
                     widget::container(segmented_controls(vec![
                         icon_control(
-                            widget::icon::from_name("insert-text-symbolic").handle(),
+                            symbolic_icon("insert-text-symbolic"),
                             "Complete (Ctrl+Space)",
                             false,
                             !self.modal_open(),
@@ -2700,7 +2699,7 @@ impl Application for Editor {
                         )
                         .into(),
                         icon_control(
-                            widget::icon::from_name("dialog-information-symbolic").handle(),
+                            symbolic_icon("dialog-information-symbolic"),
                             "Show symbol information",
                             false,
                             !self.modal_open(),
@@ -3008,7 +3007,7 @@ impl Application for Editor {
                         "Size of text and controls.",
                         widget::row::with_children(vec![
                             icon_control(
-                                cagents::ui_controls::symbolic_icon("list-remove-symbolic"),
+                                symbolic_icon("list-remove-symbolic"),
                                 "Decrease scale",
                                 false,
                                 self.settings.ui_scale > 0.75,
@@ -3025,7 +3024,7 @@ impl Application for Editor {
                             .center_y(design::PRIMARY_CONTROL_SIZE)
                             .into(),
                             icon_control(
-                                cagents::ui_controls::symbolic_icon("list-add-symbolic"),
+                                symbolic_icon("list-add-symbolic"),
                                 "Increase scale",
                                 false,
                                 self.settings.ui_scale < 2.0,

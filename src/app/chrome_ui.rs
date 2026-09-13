@@ -407,7 +407,7 @@ impl Cagents {
                         .width(Length::Fill)
                         .into(),
                     command(
-                        widget::icon::from_name("window-close-symbolic"),
+                        crate::ui_controls::symbolic_icon("window-close-symbolic"),
                         "Close application notices",
                         widget::Id::new("chrome.notices.close"),
                         Some(Message::ChromeUi(Action::Close)),
@@ -793,7 +793,7 @@ impl Cagents {
             ));
         }
         children.push(command(
-            widget::icon::from_name("window-close-symbolic"),
+            crate::ui_controls::symbolic_icon("window-close-symbolic"),
             chrome.map_or_else(
                 || Cow::Owned(card_close_name(labels.type_label, title)),
                 |chrome| Cow::Borrowed(chrome.close_name.as_str()),

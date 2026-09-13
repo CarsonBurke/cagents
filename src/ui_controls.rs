@@ -88,6 +88,32 @@ pub fn symbolic_icon(name: &str) -> widget::icon::Handle {
     static SAVE: LazyLock<widget::icon::Handle> = LazyLock::new(|| {
         widget::icon::from_svg_bytes(br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16"><g fill="none" stroke="black" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><path d="M3 2.5h7l3 3v8H3zM6 2.5V6h5V2.5M6 13.5v-3h4v3"/></g></svg>"#.as_slice()).symbolic(true)
     });
+    // Cosmic's document-open is an upload arrow; a page is the file itself.
+    static OPEN_FILE: LazyLock<widget::icon::Handle> = LazyLock::new(|| {
+        widget::icon::from_svg_bytes(br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16"><g fill="none" stroke="black" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><path d="M3.5 1.75h5.5l3.5 3.5v8.75H3.5zM9 1.75v3.5h3.5M5.5 8.25h5M5.5 10.75h3.25"/></g></svg>"#.as_slice()).symbolic(true)
+    });
+    // Theme folder-open is a heavy fill. An open tray reads as a folder at 16px.
+    static OPEN_FOLDER: LazyLock<widget::icon::Handle> = LazyLock::new(|| {
+        widget::icon::from_svg_bytes(br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16"><g fill="none" stroke="black" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><path d="M2 3.5h4.25l1.5 1.75"/><path d="M2 5.25h12.25L12.7 13.25H3.55z"/></g></svg>"#.as_slice()).symbolic(true)
+    });
+    static SIDEBAR: LazyLock<widget::icon::Handle> = LazyLock::new(|| {
+        widget::icon::from_svg_bytes(br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16"><g fill="none" stroke="black" stroke-width="1.4" stroke-linejoin="round"><rect x="1.5" y="2.5" width="13" height="11" rx="1.5"/><path d="M6 3v10"/></g></svg>"#.as_slice()).symbolic(true)
+    });
+    static SETTINGS: LazyLock<widget::icon::Handle> = LazyLock::new(|| {
+        widget::icon::from_svg_bytes(br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16"><g fill="none" stroke="black" stroke-width="1.4" stroke-linecap="round"><path d="M2.5 5h11M2.5 11h11"/><circle cx="6.25" cy="5" r="1.65" fill="black" stroke="none"/><circle cx="10.25" cy="11" r="1.65" fill="black" stroke="none"/></g></svg>"#.as_slice()).symbolic(true)
+    });
+    static INSERT_TEXT: LazyLock<widget::icon::Handle> = LazyLock::new(|| {
+        widget::icon::from_svg_bytes(br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16"><path d="M3.5 3.25h9M8 3.25v9.5" fill="none" stroke="black" stroke-width="1.4" stroke-linecap="round"/></svg>"#.as_slice()).symbolic(true)
+    });
+    static INFO: LazyLock<widget::icon::Handle> = LazyLock::new(|| {
+        widget::icon::from_svg_bytes(br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16"><g fill="none" stroke="black" stroke-width="1.4" stroke-linecap="round"><circle cx="8" cy="8" r="5.5"/><path d="M8 7.2v4.1M8 5.2h0"/></g></svg>"#.as_slice()).symbolic(true)
+    });
+    static CLOSE: LazyLock<widget::icon::Handle> = LazyLock::new(|| {
+        widget::icon::from_svg_bytes(br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16"><path d="M4.75 4.75l6.5 6.5M11.25 4.75l-6.5 6.5" fill="none" stroke="black" stroke-width="1.5" stroke-linecap="round"/></svg>"#.as_slice()).symbolic(true)
+    });
+    static MINUS: LazyLock<widget::icon::Handle> = LazyLock::new(|| {
+        widget::icon::from_svg_bytes(br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16"><path d="M4 8h8" fill="none" stroke="black" stroke-width="1.5" stroke-linecap="round"/></svg>"#.as_slice()).symbolic(true)
+    });
     match name {
         "document-edit-symbolic" => CHANGES.clone(),
         "text-editor-symbolic" => EDIT.clone(),
@@ -98,6 +124,7 @@ pub fn symbolic_icon(name: &str) -> widget::icon::Handle {
         "view-list-tree-symbolic" => TREE.clone(),
         "view-reveal-symbolic" => PREVIEW.clone(),
         "view-split-right-symbolic" => SPLIT_PANEL.clone(),
+        "view-sidebar-start-symbolic" => SIDEBAR.clone(),
         "pull-request-symbolic" => PULL_REQUEST.clone(),
         "merged-pull-request-symbolic" => MERGED_PULL_REQUEST.clone(),
         "closed-pull-request-symbolic" => CLOSED_PULL_REQUEST.clone(),
@@ -105,6 +132,7 @@ pub fn symbolic_icon(name: &str) -> widget::icon::Handle {
         "go-up-symbolic" => CHEVRON_UP.clone(),
         "go-next-symbolic" => CHEVRON_RIGHT.clone(),
         "list-add-symbolic" => PLUS.clone(),
+        "list-remove-symbolic" => MINUS.clone(),
         "thread-symbolic" => THREAD.clone(),
         "thread-add-symbolic" => THREAD_ADD.clone(),
         "worktree-add-symbolic" => WORKTREE_ADD.clone(),
@@ -112,8 +140,14 @@ pub fn symbolic_icon(name: &str) -> widget::icon::Handle {
         "agent-working-symbolic" => WORKING.clone(),
         "agent-waiting-symbolic" => WAITING.clone(),
         "document-new-symbolic" => ADDED_FILE.clone(),
+        "document-open-symbolic" => OPEN_FILE.clone(),
+        "folder-open-symbolic" => OPEN_FOLDER.clone(),
         "document-save-symbolic" => SAVE.clone(),
         "document-save-as-symbolic" => SAVE.clone(),
+        "emblem-system-symbolic" | "preferences-system-symbolic" => SETTINGS.clone(),
+        "insert-text-symbolic" => INSERT_TEXT.clone(),
+        "dialog-information-symbolic" => INFO.clone(),
+        "window-close-symbolic" => CLOSE.clone(),
         _ => widget::icon::from_name(name).handle(),
     }
 }
