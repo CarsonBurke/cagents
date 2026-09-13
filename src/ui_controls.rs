@@ -38,6 +38,9 @@ pub fn symbolic_icon(name: &str) -> widget::icon::Handle {
     static CHEVRON_DOWN: LazyLock<widget::icon::Handle> = LazyLock::new(|| {
         widget::icon::from_svg_bytes(br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16"><path d="m4 6 4 4 4-4" fill="none" stroke="black" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>"#.as_slice()).symbolic(true)
     });
+    static CHEVRON_UP: LazyLock<widget::icon::Handle> = LazyLock::new(|| {
+        widget::icon::from_svg_bytes(br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16"><path d="m4 10 4-4 4 4" fill="none" stroke="black" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>"#.as_slice()).symbolic(true)
+    });
     static CHEVRON_RIGHT: LazyLock<widget::icon::Handle> = LazyLock::new(|| {
         widget::icon::from_svg_bytes(br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16"><path d="m6 4 4 4-4 4" fill="none" stroke="black" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>"#.as_slice()).symbolic(true)
     });
@@ -65,6 +68,11 @@ pub fn symbolic_icon(name: &str) -> widget::icon::Handle {
     static ADDED_FILE: LazyLock<widget::icon::Handle> = LazyLock::new(|| {
         widget::icon::from_svg_bytes(br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16"><g fill="none" stroke="black" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><path d="M3 1.5h6l4 4v9H3zM9 1.5v4h4M5.5 10h5M8 7.5v5"/></g></svg>"#.as_slice()).symbolic(true)
     });
+    // A floppy disk, not the desktop theme's download-arrow tray: the save
+    // action stands alone in toolbars with only a tooltip to name it.
+    static SAVE: LazyLock<widget::icon::Handle> = LazyLock::new(|| {
+        widget::icon::from_svg_bytes(br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16"><g fill="none" stroke="black" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><path d="M3 2.5h7l3 3v8H3zM6 2.5V6h5V2.5M6 13.5v-3h4v3"/></g></svg>"#.as_slice()).symbolic(true)
+    });
     match name {
         "document-edit-symbolic" => CHANGES.clone(),
         "view-list-tree-symbolic" => TREE.clone(),
@@ -74,6 +82,7 @@ pub fn symbolic_icon(name: &str) -> widget::icon::Handle {
         "merged-pull-request-symbolic" => MERGED_PULL_REQUEST.clone(),
         "closed-pull-request-symbolic" => CLOSED_PULL_REQUEST.clone(),
         "go-down-symbolic" => CHEVRON_DOWN.clone(),
+        "go-up-symbolic" => CHEVRON_UP.clone(),
         "go-next-symbolic" => CHEVRON_RIGHT.clone(),
         "list-add-symbolic" => PLUS.clone(),
         "thread-symbolic" => THREAD.clone(),
@@ -83,6 +92,8 @@ pub fn symbolic_icon(name: &str) -> widget::icon::Handle {
         "agent-working-symbolic" => WORKING.clone(),
         "agent-waiting-symbolic" => WAITING.clone(),
         "document-new-symbolic" => ADDED_FILE.clone(),
+        "document-save-symbolic" => SAVE.clone(),
+        "document-save-as-symbolic" => SAVE.clone(),
         _ => widget::icon::from_name(name).handle(),
     }
 }

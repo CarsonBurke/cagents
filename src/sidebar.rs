@@ -2079,6 +2079,8 @@ pub struct SidebarView {
     controls_expanded: bool,
     collapsed_projects: BTreeSet<ProjectId>,
     selection: Option<SidebarSelection>,
+    #[serde(default)]
+    expanded_directories: BTreeSet<RepoPath>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2108,13 +2110,15 @@ pub struct SidebarState {
     panel_open: bool,
     files_query: String,
     files_filter_open: bool,
-    file_list_mode: FileListMode,
     change_list_mode: FileListMode,
     worktree_sort: crate::settings::WorktreeSort,
     agent_updates: BTreeMap<CardId, Option<(ProjectId, WorktreeId)>>,
     agent_activity: BTreeMap<CardId, PaneActivity>,
     commit_message: String,
-    collapsed_directories: BTreeSet<RepoPath>,
+    /// File-tree folders the user opened. Everything else renders collapsed,
+    /// so a fresh worktree shows its top level and loading a whole project
+    /// tree stays cheap. Diff and change review ignore this and expand all.
+    expanded_directories: BTreeSet<RepoPath>,
     publish: Option<PublishDraft>,
     discard: Option<DiscardConfirmation>,
     panel_selection: Option<PanelSelection>,
@@ -2127,6 +2131,7 @@ impl SidebarState {
             controls_expanded: self.controls_expanded,
             collapsed_projects: self.collapsed_projects.clone(),
             selection: self.selection,
+            expanded_directories: self.expanded_directories.clone(),
         }
     }
 
@@ -2135,6 +2140,25 @@ impl SidebarState {
         self.controls_expanded = view.controls_expanded;
         self.collapsed_projects = view.collapsed_projects;
         self.selection = view.selection;
+        self.expanded_directories = view.expanded_directories;
+    }
+
+    /// Folders the user opened, as display paths, for session persistence.
+    pub fn expanded_display_paths(&self) -> Vec<String> {
+        self.expanded_directories
+            .iter()
+            .map(|path| path.display().into_owned())
+            .collect()
+    }
+
+    /// Restores folders opened in a previous session. Unknown or invalid
+    /// paths are skipped: the tree still renders, just collapsed.
+    pub fn restore_expanded_display_paths(&mut self, paths: &[String]) {
+        use std::ffi::OsStr;
+        self.expanded_directories = paths
+            .iter()
+            .filter_map(|path| crate::repository::RepoPath::parse(OsStr::new(path)).ok())
+            .collect();
     }
     pub fn set_worktree_sort(&mut self, order: crate::settings::WorktreeSort) {
         self.worktree_sort = order;
@@ -2322,7 +2346,7 @@ impl SidebarState {
         self.files_query.clear();
         self.files_filter_open = false;
         self.commit_message.clear();
-        self.collapsed_directories.clear();
+        self.expanded_directories.clear();
         self.publish = None;
         self.discard = None;
         self.panel_selection = None;
@@ -2383,11 +2407,10 @@ impl SidebarState {
                     self.files_query.clear();
                 }
             }
-            SidebarAction::SetFileListMode { mode, .. } => self.file_list_mode = *mode,
             SidebarAction::SetChangeListMode { mode, .. } => self.change_list_mode = *mode,
             SidebarAction::ToggleDirectory { path, .. } => {
-                if !self.collapsed_directories.remove(path) {
-                    self.collapsed_directories.insert(path.clone());
+                if !self.expanded_directories.remove(path) {
+                    self.expanded_directories.insert(path.clone());
                 }
             }
             SidebarAction::OpenFile { path, .. } => {
@@ -2545,10 +2568,6 @@ pub enum SidebarAction {
     FilesQueryChanged {
         key: ActiveWorktreeKey,
         query: String,
-    },
-    SetFileListMode {
-        key: ActiveWorktreeKey,
-        mode: FileListMode,
     },
     SetChangeListMode {
         key: ActiveWorktreeKey,
@@ -4205,16 +4224,11 @@ fn source_control_panel<'a>(
             .id(chrome.files_filter_id.clone()),
         );
     }
-    header = header.push(list_mode_controls(
-        key,
-        if matches!(panel, WorktreePanel::Files) {
-            state.file_list_mode
-        } else {
-            state.change_list_mode
-        },
-        matches!(panel, WorktreePanel::Changes),
-        modal_open,
-    ));
+    // File browsing is always a tree, so only change review offers the
+    // tree/flat switch: the flat list exists for viewing diffs, not files.
+    if matches!(panel, WorktreePanel::Changes) {
+        header = header.push(list_mode_controls(key, state.change_list_mode, modal_open));
+    }
     column = column.push(
         header
             .align_y(Alignment::Center)
@@ -4465,9 +4479,16 @@ fn files_section<'a>(
         });
     }
     let folded = fold(state.files_query().trim());
-    let flat = state.file_list_mode == FileListMode::Flat || !folded.is_empty();
-    let (visible, hidden) =
-        visible_file_rows(&source.files, &state.collapsed_directories, &folded, flat);
+    // File browsing is always a tree: the flat list exists only for
+    // diff/change review. A text filter still flattens to matching files.
+    let flat = !folded.is_empty();
+    let (visible, hidden) = visible_file_rows(
+        &source.files,
+        &state.expanded_directories,
+        &folded,
+        flat,
+        false,
+    );
     // An empty worktree and an over-narrow filter are different facts, and
     // neither is worth saying while there are rows to read.
     let notice = if source.files.is_empty() {
@@ -4491,9 +4512,9 @@ fn files_section<'a>(
                 path: row.path.clone(),
             }
         };
-        let collapsed = state.collapsed_directories.contains(&row.path);
+        let expanded = state.expanded_directories.contains(&row.path);
         let file_icon = if row.directory {
-            crate::file_icon::folder(!collapsed)
+            crate::file_icon::folder(expanded)
         } else {
             crate::file_icon::icon(row.path.as_path())
         };
@@ -4522,7 +4543,7 @@ fn files_section<'a>(
             ])
             .align_y(Alignment::Center)
             .spacing(spacing.space_xxxs),
-            action,
+            Some(action),
             selected,
             modal_open,
         );
@@ -4572,7 +4593,10 @@ fn files_section<'a>(
 /// The file rows a frame renders, and how many further rows the cap hid.
 ///
 /// Flat mode and queries show file paths without directory rows. Tree mode
-/// retains expansion state when switching back from a flat or filtered list.
+/// shows only the children of expanded directories: everything starts
+/// collapsed, so a whole project tree renders as its top level until the user
+/// opens folders. Diff and change trees pass `expand_all` to keep every
+/// change visible for review regardless of file-tree expansion.
 ///
 /// At most [`MAX_VISIBLE_FILE_ROWS`] references are ever collected. This runs
 /// on every view rebuild, including rebuilds caused by terminal output the
@@ -4582,9 +4606,10 @@ fn files_section<'a>(
 /// nothing.
 fn visible_file_rows<'a>(
     rows: &'a [FileRow],
-    collapsed: &BTreeSet<RepoPath>,
+    expanded: &BTreeSet<RepoPath>,
     folded_query: &str,
     flat: bool,
+    expand_all: bool,
 ) -> (Vec<&'a FileRow>, usize) {
     let mut visible: Vec<&'a FileRow> = Vec::with_capacity(rows.len().min(MAX_VISIBLE_FILE_ROWS));
     let mut hidden = 0usize;
@@ -4614,7 +4639,7 @@ fn visible_file_rows<'a>(
         } else {
             hidden += 1;
         }
-        if row.directory && collapsed.contains(&row.path) {
+        if row.directory && !expand_all && !expanded.contains(&row.path) {
             skip_below = Some(row.depth);
         }
     }
@@ -4624,7 +4649,6 @@ fn visible_file_rows<'a>(
 fn list_mode_controls<'a>(
     key: &ActiveWorktreeKey,
     selected: FileListMode,
-    changes: bool,
     modal_open: bool,
 ) -> Element<'a, SidebarAction> {
     crate::ui_controls::segmented_controls(
@@ -4638,16 +4662,9 @@ fn list_mode_controls<'a>(
         ]
         .into_iter()
         .map(|(label, icon, mode)| {
-            let action = if changes {
-                SidebarAction::SetChangeListMode {
-                    key: key.clone(),
-                    mode,
-                }
-            } else {
-                SidebarAction::SetFileListMode {
-                    key: key.clone(),
-                    mode,
-                }
+            let action = SidebarAction::SetChangeListMode {
+                key: key.clone(),
+                mode,
             };
             crate::ui_controls::icon_control(
                 crate::ui_controls::symbolic_icon(icon),
@@ -4741,24 +4758,25 @@ fn branch_changes_section<'a>(
             .into();
     }
     let flat = state.change_list_mode == FileListMode::Flat;
-    let (tree, hidden) = visible_file_rows(&branch.tree, &state.collapsed_directories, "", flat);
+    // Branch review always expands: every changed path stays visible no
+    // matter which file-tree folders are open.
+    let (tree, hidden) =
+        visible_file_rows(&branch.tree, &state.expanded_directories, "", flat, true);
     let mut rows = widget::column::with_capacity(tree.len()).spacing(0);
     for file in tree {
         if file.directory {
-            let collapsed = state.collapsed_directories.contains(&file.path);
+            // An inert hierarchy label: branch review always expands, so
+            // there is no toggle to offer and no file-tree state to borrow.
             rows = rows.push(panel_row(
-                &*file.chrome.accessible_name,
+                &*file.chrome.label,
                 file.depth,
                 widget::row::with_children(vec![
-                    crate::file_icon::folder(!collapsed).into(),
+                    crate::file_icon::folder(true).into(),
                     design::body(&*file.chrome.label).into(),
                 ])
                 .spacing(4)
                 .align_y(Alignment::Center),
-                SidebarAction::ToggleDirectory {
-                    key: source.key.clone(),
-                    path: file.path.clone(),
-                },
+                None,
                 false,
                 modal_open,
             ));
@@ -4789,14 +4807,14 @@ fn branch_changes_section<'a>(
                 semantic_caption(&*row.status, tone),
                 design::caption(&*row.counts).into(),
             ]).spacing(spacing.space_xxxs).align_y(Alignment::Center),
-            SidebarAction::OpenBranchFile {
+            Some(SidebarAction::OpenBranchFile {
                 key: source.key.clone(),
                 path: row.entry.path.clone(),
                 old_path: row.entry.old_path.clone(),
                 base_ref: branch.base_ref.clone(),
                 head: branch.head.clone(),
                 merge_base: branch.merge_base.clone(),
-            },
+            }),
             matches!(&state.panel_selection, Some(PanelSelection::Branch(path)) if path == &row.entry.path),
             modal_open,
         ));
@@ -4817,8 +4835,9 @@ fn change_group_view<'a>(
     modal_open: bool,
 ) -> Element<'a, SidebarAction> {
     let flat = state.change_list_mode == FileListMode::Flat;
+    // Uncommitted-change review always expands, like branch review above.
     let (tree, tree_hidden) =
-        visible_file_rows(&group.tree, &state.collapsed_directories, "", flat);
+        visible_file_rows(&group.tree, &state.expanded_directories, "", flat, true);
     let visible: Vec<&ChangeRow> = tree
         .iter()
         .filter(|row| !row.directory)
@@ -4839,20 +4858,17 @@ fn change_group_view<'a>(
         .push(RowInteraction::actions(header.into(), actions.into()));
     for file in tree {
         if file.directory {
-            let collapsed = state.collapsed_directories.contains(&file.path);
+            // An inert hierarchy label, like branch review above.
             column = column.push(panel_row(
-                &*file.chrome.accessible_name,
+                &*file.chrome.label,
                 file.depth,
                 widget::row::with_children(vec![
-                    crate::file_icon::folder(!collapsed).into(),
+                    crate::file_icon::folder(true).into(),
                     design::body(&*file.chrome.label).into(),
                 ])
                 .spacing(4)
                 .align_y(Alignment::Center),
-                SidebarAction::ToggleDirectory {
-                    key: source.key.clone(),
-                    path: file.path.clone(),
-                },
+                None,
                 false,
                 modal_open,
             ));
@@ -4968,11 +4984,11 @@ fn change_row_view<'a>(
         ])
         .align_y(Alignment::Center)
         .spacing(spacing.space_xxxs),
-        SidebarAction::OpenChange {
+        Some(SidebarAction::OpenChange {
             key: source.key.clone(),
             path: row.entry.path.clone(),
             area,
-        },
+        }),
         selected,
         modal_open,
     );
@@ -5531,7 +5547,9 @@ fn panel_row<'a>(
     name: impl Into<Cow<'a, str>>,
     depth: usize,
     content: impl Into<Element<'a, SidebarAction>>,
-    action: SidebarAction,
+    // `None` renders an inert hierarchy label: review trees always expand,
+    // so their folders offer no toggle and must not borrow the file tree's.
+    action: Option<SidebarAction>,
     selected: bool,
     modal_open: bool,
 ) -> Element<'a, SidebarAction> {
@@ -5555,7 +5573,7 @@ fn panel_row<'a>(
         .padding([0, spacing.space_xxxs])
         .height(Length::Fixed(PANEL_ROW_HEIGHT))
         .width(Length::Fill)
-        .on_press_maybe(gated(action, modal_open)),
+        .on_press_maybe(action.and_then(|action| gated(action, modal_open))),
     )
 }
 
@@ -7240,8 +7258,10 @@ mod tests {
         ];
         let source = SourceControlModel::ready(main_key(), &snapshot);
         let group = source.group(ChangeArea::Unstaged).unwrap();
-        let collapsed = BTreeSet::from([repo_path("src")]);
-        let (tree, _) = visible_file_rows(&group.tree, &collapsed, "", false);
+        // Directories start collapsed, so `src/hidden.rs` stays hidden until
+        // the user opens `src`.
+        let expanded = BTreeSet::new();
+        let (tree, _) = visible_file_rows(&group.tree, &expanded, "", false, false);
         let selected = tree
             .iter()
             .filter(|row| !row.directory)
@@ -8542,27 +8562,76 @@ mod tests {
     }
 
     #[test]
-    fn flat_files_ignore_collapsed_directories_without_losing_tree_state() {
+    fn tree_starts_collapsed_and_flat_ignores_expansion() {
         let source = source_control();
         let mut state = SidebarState::default();
+        let paths = |state: &SidebarState, flat, query: &str| {
+            visible_file_rows(
+                &source.files,
+                &state.expanded_directories,
+                query,
+                flat,
+                false,
+            )
+            .0
+            .iter()
+            .map(|row| row.path.display().into_owned())
+            .collect::<Vec<_>>()
+        };
+        // A fresh tree shows only top-level rows; loading the whole project
+        // tree stays cheap until the user opens folders.
+        assert_eq!(paths(&state, false, ""), ["src", "README.md"]);
         state.apply(&SidebarAction::ToggleDirectory {
             key: main_key(),
             path: repo_path("src"),
         });
-        let paths = |flat, query: &str| {
-            visible_file_rows(&source.files, &state.collapsed_directories, query, flat)
-                .0
-                .iter()
-                .map(|row| row.path.display().into_owned())
-                .collect::<Vec<_>>()
-        };
-        assert_eq!(paths(false, ""), ["src", "README.md"]);
         assert_eq!(
-            paths(true, ""),
+            paths(&state, false, ""),
+            ["src", "src/app.rs", "src/sidebar.rs", "README.md"]
+        );
+        // Flat mode and filters ignore expansion without losing tree state.
+        assert_eq!(
+            paths(&state, true, ""),
             ["src/app.rs", "src/sidebar.rs", "README.md"]
         );
-        assert_eq!(paths(true, "sidebar"), ["src/sidebar.rs"]);
-        assert_eq!(paths(false, ""), ["src", "README.md"]);
+        assert_eq!(paths(&state, true, "sidebar"), ["src/sidebar.rs"]);
+        assert_eq!(
+            paths(&state, false, ""),
+            ["src", "src/app.rs", "src/sidebar.rs", "README.md"]
+        );
+        // Diff and change review always expand, independent of the file tree.
+        let (expanded, _) = visible_file_rows(
+            &source.files,
+            &SidebarState::default().expanded_directories,
+            "",
+            false,
+            true,
+        );
+        assert_eq!(
+            expanded
+                .iter()
+                .map(|row| row.path.display().into_owned())
+                .collect::<Vec<_>>(),
+            ["src", "src/app.rs", "src/sidebar.rs", "README.md"]
+        );
+    }
+
+    #[test]
+    fn expanded_folders_round_trip_through_display_paths() {
+        let mut state = SidebarState::default();
+        state.restore_expanded_display_paths(&[
+            "src".into(),
+            "src/nested".into(),
+            "/absolute".into(),
+            "..".into(),
+            String::new(),
+        ]);
+        // Only relative, well-formed folders survive: the tree renders,
+        // just collapsed, for anything the session could not name.
+        assert_eq!(
+            state.expanded_display_paths(),
+            ["src".to_owned(), "src/nested".to_owned()]
+        );
     }
 
     fn panel_worktree(key: &ActiveWorktreeKey, branch: &str) -> SidebarWorktree {
@@ -8803,7 +8872,7 @@ mod tests {
             "",
             "a commit message is written for the tree it will be committed to"
         );
-        assert!(state.collapsed_directories.is_empty());
+        assert!(state.expanded_directories.is_empty());
         assert!(
             state.pending_discard().is_none(),
             "a confirmation counted against the worktree that was left must not be answerable"
