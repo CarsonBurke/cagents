@@ -1609,6 +1609,40 @@ impl RepositoryRuntime {
         });
         true
     }
+    /// Selects the first case-insensitive occurrence in the open buffer.
+    ///
+    /// This keeps search selection inside the runtime that owns the native
+    /// text-editor content, so the application can update a find bar without
+    /// reaching through the editor widget's private content state.
+    pub fn select_text(&mut self, query: &str) -> bool {
+        let DocumentState::Editable(document) = &mut self.document else {
+            return false;
+        };
+        let query = query.trim();
+        if query.is_empty() {
+            document
+                .content
+                .perform(text_editor::Action::ClearSelection);
+            return false;
+        }
+        let text = document.content.text();
+        let query = query.to_ascii_lowercase();
+        let lower = text.to_ascii_lowercase();
+        let Some(start) = lower.find(&query) else {
+            document
+                .content
+                .perform(text_editor::Action::ClearSelection);
+            return false;
+        };
+        let end = start + query.len();
+        let start = caret_for_offset(&document.content, start);
+        let end = caret_for_offset(&document.content, end);
+        document.content.move_to(text_editor::Cursor {
+            position: end,
+            selection: Some(start),
+        });
+        true
+    }
 
     /// The focus target of the editable buffer while that buffer is the
     /// surface actually on screen, and `None` while it is not.
@@ -1765,6 +1799,10 @@ impl RepositoryRuntime {
             FileListState::Ready(files) => files,
             _ => &[],
         }
+    }
+    #[must_use]
+    pub fn is_directory_only(&self) -> bool {
+        self.directory_only
     }
 
     pub fn selected_path(&self) -> Option<&Path> {
@@ -3638,6 +3676,14 @@ fn base_candidates(snapshot: &RepositorySnapshot) -> Vec<ValidatedRefName> {
 /// will not show. Children are listed when the folder is expanded.
 pub fn load_directory_files(directory: &Path) -> Result<Vec<RepositoryFile>, String> {
     load_directory_listing(directory, Path::new(""))
+}
+/// Recursively searches a directory for quick-open results without changing
+/// the sidebar's intentionally lazy tree listing.
+pub fn search_directory_files_for_quick_open(
+    root: &Path,
+    query: &str,
+) -> Result<Vec<RepositoryFile>, String> {
+    search_directory_files(root, query, &CancellationToken::default()).map(|(files, _)| files)
 }
 
 fn load_directory_listing(root: &Path, relative: &Path) -> Result<Vec<RepositoryFile>, String> {
@@ -8428,6 +8474,27 @@ mod tests {
             !runtime.move_cursor_to(LspPosition::new(9, 0)),
             "a line the buffer does not have is refused rather than clamped"
         );
+    }
+
+    #[test]
+    fn select_text_selects_first_match_and_clears_missing_matches() {
+        let card = CardId::new();
+        let (mut runtime, _) =
+            RepositoryRuntime::open_fixture(card, "notes.txt", "Alpha beta ALPHA");
+
+        assert!(runtime.select_text("BETA"));
+        let DocumentState::Editable(document) = &runtime.document else {
+            unreachable!();
+        };
+        let cursor = document.content.cursor();
+        assert_eq!(cursor.position, text_editor::Position::new(0, 10));
+        assert_eq!(cursor.selection, Some(text_editor::Position::new(0, 6)));
+
+        assert!(!runtime.select_text("missing"));
+        let DocumentState::Editable(document) = &runtime.document else {
+            unreachable!();
+        };
+        assert_eq!(document.content.cursor().selection, None);
     }
 
     #[test]

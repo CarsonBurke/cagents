@@ -102,7 +102,10 @@ pub enum Message {
     WindowFocused(window::Id, bool),
     RefreshVisible,
     Repository(RepositoryAction),
-    ResolvedDiffBasis { card: CardId, basis: DiffBasis },
+    ResolvedDiffBasis {
+        card: CardId,
+        basis: DiffBasis,
+    },
     Sidebar(SidebarAction),
     Snapshot(CardId, Result<RepositorySnapshot, String>),
     Mutation(CardId, Result<MutationOutcome, String>),
@@ -120,6 +123,12 @@ pub enum Message {
     QuickOpenQueryChanged(String),
     OpenQuickFile(PathBuf),
     CloseQuickOpen,
+    QuickOpenSearchFinished {
+        card: CardId,
+        generation: u64,
+        query: String,
+        result: Result<Vec<PathBuf>, String>,
+    },
     AutoSave(bool),
     WrapLines(bool),
     SyntaxTheme(cagents::settings::EditorSyntaxTheme),
@@ -326,8 +335,10 @@ pub struct Editor {
     settings_path: PathBuf,
     settings_open: bool,
     settings_writable: bool,
+    quick_open_files: Option<Vec<PathBuf>>,
     find_open: bool,
     find_query: String,
+    quick_open_generation: u64,
     quick_open: bool,
     quick_open_query: String,
     notice: Option<String>,
@@ -1827,6 +1838,42 @@ impl Editor {
         })
     }
 
+    fn quick_open_search(&self, query: String, generation: u64) -> Task<Message> {
+        let Some(id) = self.active else {
+            return Task::none();
+        };
+        let Some(tab) = self.tab(id) else {
+            return Task::none();
+        };
+        if !tab.runtime.is_directory_only() || query.trim().is_empty() {
+            return Task::none();
+        }
+        let root = tab.runtime.descriptor.worktree.clone();
+        let search_query = query.clone();
+        cosmic::task::future(async move {
+            let result = tokio::task::spawn_blocking(move || {
+                repository_widget::search_directory_files_for_quick_open(&root, &search_query).map(
+                    |files| {
+                        files
+                            .into_iter()
+                            .filter(|file| !file.directory)
+                            .map(|file| file.path)
+                            .collect()
+                    },
+                )
+            })
+            .await
+            .map_err(|error| error.to_string())
+            .and_then(|result| result.map_err(|error| error.to_string()));
+            Message::QuickOpenSearchFinished {
+                card: id,
+                generation,
+                query,
+                result,
+            }
+        })
+    }
+
     fn stage(&mut self, id: CardId, stage: bool) -> Task<Message> {
         let Some(tab) = self.tab_mut(id) else {
             return Task::none();
@@ -1970,6 +2017,8 @@ impl Application for Editor {
             settings_path: flags.settings_path,
             settings_open: false,
             settings_writable,
+            quick_open_files: None,
+            quick_open_generation: 0,
             find_open: false,
             find_query: String::new(),
             quick_open: false,
@@ -2065,6 +2114,7 @@ impl Application for Editor {
                         | Message::SelectSettingsCategory(_)
                         | Message::ShortcutChanged(_, _)
                         | Message::QuickOpenQueryChanged(_)
+                        | Message::QuickOpenSearchFinished { .. }
                         | Message::OpenQuickFile(_)
                         | Message::CloseQuickOpen
                         | Message::AutoSave(_)
@@ -2716,7 +2766,12 @@ impl Application for Editor {
                     Task::none()
                 }
                 Message::FindQueryChanged(query) => {
-                    self.find_query = query;
+                    self.find_query = query.clone();
+                    if let Some(id) = self.active {
+                        if let Some(tab) = self.tab_mut(id) {
+                            tab.runtime.select_text(&query);
+                        }
+                    }
                     Task::none()
                 }
                 Message::CloseFind => {
@@ -2725,6 +2780,8 @@ impl Application for Editor {
                 }
                 Message::QuickOpen => {
                     self.quick_open = !self.quick_open;
+                    self.quick_open_generation = self.quick_open_generation.wrapping_add(1);
+                    self.quick_open_files = None;
                     if self.quick_open {
                         self.quick_open_query.clear();
                         return iced::widget::operation::focus(widget::Id::new(
@@ -2735,7 +2792,27 @@ impl Application for Editor {
                     Task::none()
                 }
                 Message::QuickOpenQueryChanged(query) => {
-                    self.quick_open_query = query;
+                    self.quick_open_query = query.clone();
+                    self.quick_open_files = None;
+                    self.quick_open_generation = self.quick_open_generation.wrapping_add(1);
+                    self.quick_open_search(query, self.quick_open_generation)
+                }
+                Message::QuickOpenSearchFinished {
+                    card,
+                    generation,
+                    query,
+                    result,
+                } => {
+                    if self.quick_open
+                        && self.active == Some(card)
+                        && self.quick_open_generation == generation
+                        && self.quick_open_query == query
+                    {
+                        match result {
+                            Ok(files) => self.quick_open_files = Some(files),
+                            Err(error) => self.notice = Some(error),
+                        }
+                    }
                     Task::none()
                 }
                 Message::OpenQuickFile(path) => {
@@ -2743,11 +2820,15 @@ impl Application for Editor {
                         return Task::none();
                     };
                     self.quick_open = false;
+                    self.quick_open_generation = self.quick_open_generation.wrapping_add(1);
                     self.quick_open_query.clear();
+                    self.quick_open_files = None;
                     self.request_file(id, path)
                 }
                 Message::CloseQuickOpen => {
                     self.quick_open = false;
+                    self.quick_open_generation = self.quick_open_generation.wrapping_add(1);
+                    self.quick_open_files = None;
                     Task::none()
                 }
                 Message::ToggleSidebar => {
@@ -3440,21 +3521,21 @@ impl Application for Editor {
             let files = self
                 .current()
                 .map(|tab| {
-                    tab.runtime
-                        .listed_files()
-                        .iter()
-                        .filter(|file| !file.directory)
-                        .filter(|file| {
+                    let candidates = self.quick_open_files.clone().unwrap_or_else(|| {
+                        tab.runtime
+                            .listed_files()
+                            .iter()
+                            .filter(|file| !file.directory)
+                            .map(|file| file.path.as_path().to_path_buf())
+                            .collect()
+                    });
+                    candidates
+                        .into_iter()
+                        .filter(|path| {
                             query.is_empty()
-                                || file
-                                    .path
-                                    .as_path()
-                                    .to_string_lossy()
-                                    .to_ascii_lowercase()
-                                    .contains(&query)
+                                || path.to_string_lossy().to_ascii_lowercase().contains(&query)
                         })
                         .take(40)
-                        .map(|file| file.path.as_path().to_path_buf())
                         .collect::<Vec<_>>()
                 })
                 .unwrap_or_default();
@@ -3766,6 +3847,8 @@ mod tests {
             quick_open: false,
             quick_open_query: String::new(),
             settings_writable: false,
+            quick_open_files: None,
+            quick_open_generation: 0,
             notice: None,
             notices_open: false,
             file_dialog: None,
