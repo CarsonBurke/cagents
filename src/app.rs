@@ -474,7 +474,7 @@ fn save_health_view(health: &SaveHealthState) -> Option<Element<'_, Message>> {
             ),
             "Changes are being saved again.",
             Some(crate::interaction::tooltip(
-                widget::button::icon(widget::icon::from_name("window-close-symbolic"))
+                widget::button::icon(crate::ui_controls::symbolic_icon("window-close-symbolic"))
                     .id(widget::Id::new("session-save.acknowledge-recovery"))
                     .name("Acknowledge session save recovery")
                     .width(ICON_CONTROL_SIZE)
@@ -3109,6 +3109,7 @@ impl Cagents {
                     let mut runtime = RepositoryRuntime::new(view);
                     runtime.set_auto_save(self.settings.editor_auto_save);
                     runtime.set_wrap_lines(self.settings.editor_wrap_lines);
+                    runtime.set_syntax_theme(self.settings.editor_syntax_theme);
                     runtime.set_external_editors(self.sidebar_model.external_editors.clone());
                     repository_tasks.push(repository_task(runtime.initial_load(card.id)));
                     self.cards
@@ -3392,6 +3393,7 @@ impl Cagents {
                 let mut runtime = RepositoryRuntime::new(view);
                 runtime.set_auto_save(self.settings.editor_auto_save);
                 runtime.set_wrap_lines(self.settings.editor_wrap_lines);
+                runtime.set_syntax_theme(self.settings.editor_syntax_theme);
                 runtime.set_external_editors(self.sidebar_model.external_editors.clone());
                 let load = repository_task(runtime.initial_load(id));
                 self.cards
@@ -3441,6 +3443,7 @@ impl Cagents {
         let mut runtime = RepositoryRuntime::new(view);
         runtime.set_auto_save(self.settings.editor_auto_save);
         runtime.set_wrap_lines(self.settings.editor_wrap_lines);
+        runtime.set_syntax_theme(self.settings.editor_syntax_theme);
         runtime.set_external_editors(self.sidebar_model.external_editors.clone());
         let load = repository_task(runtime.initial_load(card_id));
         self.cards
@@ -4050,6 +4053,7 @@ impl Cagents {
                 let mut runtime = RepositoryRuntime::new(view);
                 runtime.set_auto_save(self.settings.editor_auto_save);
                 runtime.set_wrap_lines(self.settings.editor_wrap_lines);
+                runtime.set_syntax_theme(self.settings.editor_syntax_theme);
                 runtime.set_external_editors(self.sidebar_model.external_editors.clone());
                 let task = repository_task(runtime.initial_load(card));
                 self.cards
@@ -6904,6 +6908,7 @@ impl Cagents {
                         for runtime in self.cards.values_mut() {
                             if let CardRuntime::Repository(runtime) = runtime {
                                 runtime.set_wrap_lines(self.settings.editor_wrap_lines);
+                                runtime.set_syntax_theme(self.settings.editor_syntax_theme);
                             }
                         }
                         Task::none()
@@ -7001,6 +7006,7 @@ impl Cagents {
             if let CardRuntime::Repository(runtime) = runtime {
                 runtime.set_auto_save(self.settings.editor_auto_save);
                 runtime.set_wrap_lines(self.settings.editor_wrap_lines);
+                runtime.set_syntax_theme(self.settings.editor_syntax_theme);
                 Some(repository_task(runtime.auto_save_task(card)))
             } else {
                 None
@@ -8016,6 +8022,7 @@ impl Application for Cagents {
                     | SidebarAction::ToggleSourceControlPanel { .. }
                     | SidebarAction::FilesQueryChanged { .. }
                     | SidebarAction::SetChangeListMode { .. }
+                    | SidebarAction::SetWorktreePanel { .. }
                     | SidebarAction::ToggleDirectory { .. }
                     | SidebarAction::CommitMessageChanged { .. }
                     | SidebarAction::PublishRemoteChanged { .. }
@@ -9790,7 +9797,7 @@ impl Application for Cagents {
                     widget::button::standard("Open repository")
                         .id(widget::Id::new("empty.open-repository"))
                         .name("Open repository")
-                        .leading_icon(widget::icon::from_name("folder-open-symbolic").size(16))
+                        .leading_icon(crate::ui_controls::symbolic_icon("folder-open-symbolic"))
                         .on_press(Message::OpenRepository)
                         .into(),
                     widget::button::standard("New browser")

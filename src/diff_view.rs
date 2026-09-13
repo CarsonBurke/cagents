@@ -90,7 +90,11 @@ impl DiffSyntax {
 
 /// Native bundled grammar names are shared by the editable buffer and diffs.
 /// CUDA uses the bundled C++ grammar (there is no bundled CUDA grammar).
-pub(crate) fn highlighter_settings(path: &Path, dark: bool) -> cosmic::iced::highlighter::Settings {
+pub(crate) fn highlighter_settings(
+    path: &Path,
+    theme: crate::settings::EditorSyntaxTheme,
+    dark: bool,
+) -> cosmic::iced::highlighter::Settings {
     use cosmic::iced::highlighter;
 
     let name = path
@@ -115,12 +119,29 @@ pub(crate) fn highlighter_settings(path: &Path, dark: bool) -> cosmic::iced::hig
         },
     };
     highlighter::Settings {
-        theme: if dark {
-            highlighter::Theme::Base16Ocean
-        } else {
-            highlighter::Theme::InspiredGitHub
-        },
+        theme: syntax_highlighter_theme(theme, dark),
         token,
+    }
+}
+
+pub(crate) fn syntax_highlighter_theme(
+    theme: crate::settings::EditorSyntaxTheme,
+    dark: bool,
+) -> cosmic::iced::highlighter::Theme {
+    use cosmic::iced::highlighter::Theme;
+    match theme {
+        crate::settings::EditorSyntaxTheme::Auto => {
+            if dark {
+                Theme::Base16Ocean
+            } else {
+                Theme::InspiredGitHub
+            }
+        }
+        crate::settings::EditorSyntaxTheme::SolarizedDark => Theme::SolarizedDark,
+        crate::settings::EditorSyntaxTheme::Mocha => Theme::Base16Mocha,
+        crate::settings::EditorSyntaxTheme::Ocean => Theme::Base16Ocean,
+        crate::settings::EditorSyntaxTheme::Eighties => Theme::Base16Eighties,
+        crate::settings::EditorSyntaxTheme::InspiredGitHub => Theme::InspiredGitHub,
     }
 }
 
@@ -141,7 +162,7 @@ fn highlight_side(
         LazyLock::new(highlighting::ThemeSet::load_defaults);
 
     check_cancelled(cancellation)?;
-    let settings = highlighter_settings(path, false);
+    let settings = highlighter_settings(path, crate::settings::EditorSyntaxTheme::Auto, false);
     let syntax = SYNTAXES
         .find_syntax_by_token(&settings.token)
         .unwrap_or_else(|| SYNTAXES.find_syntax_plain_text());
@@ -1150,6 +1171,7 @@ mod tests {
             for (palette, dark) in [false, true].into_iter().enumerate() {
                 let mut stream = cosmic::iced::highlighter::Stream::new(&highlighter_settings(
                     Path::new(path),
+                    crate::settings::EditorSyntaxTheme::Auto,
                     dark,
                 ));
                 let expected = source

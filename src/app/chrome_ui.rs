@@ -407,7 +407,7 @@ impl Cagents {
                         .width(Length::Fill)
                         .into(),
                     command(
-                        widget::icon::from_name("window-close-symbolic"),
+                        crate::ui_controls::symbolic_icon("window-close-symbolic"),
                         "Close application notices",
                         widget::Id::new("chrome.notices.close"),
                         Some(Message::ChromeUi(Action::Close)),
@@ -576,13 +576,15 @@ impl Cagents {
         .push(self.new_tab_control())
         .spacing(2)
         .height(design::PRIMARY_CONTROL_SIZE);
-        let tabs = widget::scrollable::horizontal(tabs)
-            .id(widget::Id::new("workspace.tabs"))
-            .direction(iced::widget::scrollable::Direction::Horizontal(
-                iced::widget::scrollable::Scrollbar::hidden(),
-            ))
-            .width(Length::Fill)
-            .height(design::PRIMARY_CONTROL_SIZE);
+        let tabs = crate::interaction::overflow_fade_x(crate::interaction::horizontal_wheel(
+            widget::scrollable::horizontal(tabs)
+                .id(widget::Id::new("workspace.tabs"))
+                .direction(iced::widget::scrollable::Direction::Horizontal(
+                    iced::widget::scrollable::Scrollbar::hidden(),
+                ))
+                .width(Length::Fill)
+                .height(design::PRIMARY_CONTROL_SIZE),
+        ));
         let actions = widget::row::with_children(self.workflow_header())
             .spacing(2)
             .align_y(Alignment::Center);
@@ -791,7 +793,7 @@ impl Cagents {
             ));
         }
         children.push(command(
-            widget::icon::from_name("window-close-symbolic"),
+            crate::ui_controls::symbolic_icon("window-close-symbolic"),
             chrome.map_or_else(
                 || Cow::Owned(card_close_name(labels.type_label, title)),
                 |chrome| Cow::Borrowed(chrome.close_name.as_str()),

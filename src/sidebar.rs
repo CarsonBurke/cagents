@@ -33,7 +33,7 @@ use crate::{
         ConflictKind, DirtyState, DiscardRequest, HISTORY_PAGE_SIZE, HeadState, Oid, PathSelection,
         PushTarget, RemoteRecord, RepoPath, RepositoryId, RepositoryInfo, RepositorySnapshot,
         StatusSnapshot, TrackingState, ValidatedBranchName, ValidatedRefName, WorktreeRecord,
-        build_file_tree,
+        build_file_tree, build_file_tree_with_directories,
     },
     splitter::{Edge as SplitterEdge, Splitter},
 };
@@ -74,7 +74,7 @@ const PANEL_ROW_HEIGHT: f32 = design::DENSE_ROW_HEIGHT;
 /// this list is built eagerly like the project navigation above it. The bound
 /// is explicit - the section says how many rows it withheld and the quick
 /// filter narrows to them - rather than a silent truncation.
-const MAX_VISIBLE_FILE_ROWS: usize = 400;
+pub(crate) const MAX_VISIBLE_FILE_ROWS: usize = 400;
 /// How many change rows one `Changes` group renders at once, bounded for the
 /// same reason as the file tree. "Stage all" and "Unstage all" act on exactly
 /// the rows that are visible, so the bound is never a hidden side effect.
@@ -1428,6 +1428,26 @@ pub enum BranchChanges {
 /// Everything a frame needs is derived once, here: filter keys, widget
 /// identities, accessible names, and the status and count strings. The view
 /// reads them and allocates nothing per row.
+/// On-demand file-name search for a plain folder. Git worktrees keep
+/// `Inactive` and filter the already-loaded `git ls-files` list in memory.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum FileSearch {
+    #[default]
+    Inactive,
+    Pending {
+        query: String,
+    },
+    Ready {
+        query: String,
+        files: Vec<FileRow>,
+        hidden: usize,
+    },
+    Failed {
+        query: String,
+        message: String,
+    },
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SourceControlModel {
     pub key: ActiveWorktreeKey,
@@ -1485,10 +1505,31 @@ pub struct SourceControlModel {
     /// a reload from blanking the panel.
     reloading: bool,
     chrome: SourceControlChrome,
+    pub file_search: FileSearch,
 }
 
 fn file_rows(paths: &[RepoPath]) -> Vec<FileRow> {
-    build_file_tree(paths)
+    file_rows_from_tree(build_file_tree(paths))
+}
+
+fn file_rows_from_listing(files: &[crate::repository_widget::RepositoryFile]) -> Vec<FileRow> {
+    let mut file_paths = Vec::new();
+    let mut directories = Vec::new();
+    for file in files {
+        let Ok(path) = RepoPath::parse(&file.path) else {
+            continue;
+        };
+        if file.directory {
+            directories.push(path);
+        } else {
+            file_paths.push(path);
+        }
+    }
+    file_rows_from_tree(build_file_tree_with_directories(&file_paths, &directories))
+}
+
+fn file_rows_from_tree(entries: Vec<crate::repository::FileTreeEntry>) -> Vec<FileRow> {
+    entries
         .into_iter()
         .map(|entry| {
             let kind = if entry.directory { "folder" } else { "file" };
@@ -1510,6 +1551,22 @@ fn file_rows(paths: &[RepoPath]) -> Vec<FileRow> {
 impl SourceControlModel {
     /// File navigation for a plain folder, without invented Git data.
     pub fn directory(key: ActiveWorktreeKey, paths: &[RepoPath]) -> Self {
+        Self::directory_listing(
+            key,
+            &paths
+                .iter()
+                .map(|path| crate::repository_widget::RepositoryFile {
+                    path: path.as_path().to_path_buf(),
+                    ..crate::repository_widget::RepositoryFile::default()
+                })
+                .collect::<Vec<_>>(),
+        )
+    }
+
+    pub fn directory_listing(
+        key: ActiveWorktreeKey,
+        files: &[crate::repository_widget::RepositoryFile],
+    ) -> Self {
         let mut model = Self::empty(key, SidebarDataState::Ready);
         model.chrome.subheading = model
             .key
@@ -1518,8 +1575,24 @@ impl SourceControlModel {
             .map(|name| name.to_string_lossy().into_owned())
             .unwrap_or_else(|| model.key.canonical_path.display().to_string())
             .into_boxed_str();
-        model.files = file_rows(paths);
+        model.files = file_rows_from_listing(files);
         model
+    }
+
+    pub fn set_file_search(&mut self, search: FileSearch) {
+        self.file_search = search;
+    }
+
+    pub fn file_search_results(
+        query: String,
+        files: &[crate::repository_widget::RepositoryFile],
+        hidden: usize,
+    ) -> FileSearch {
+        FileSearch::Ready {
+            query,
+            files: file_rows_from_listing(files),
+            hidden,
+        }
     }
 
     /// The panel before its first snapshot has arrived.
@@ -1559,6 +1632,7 @@ impl SourceControlModel {
             next_history_page: 0,
             reloading: false,
             chrome,
+            file_search: FileSearch::Inactive,
         }
     }
 
@@ -1636,6 +1710,7 @@ impl SourceControlModel {
             branch,
             key,
             chrome,
+            file_search: FileSearch::Inactive,
         }
     }
 
@@ -1775,6 +1850,11 @@ impl SourceControlModel {
     pub fn has_changes(&self) -> bool {
         self.groups.iter().any(|group| !group.is_empty())
             || matches!(&self.branch_changes, BranchChanges::Ready(branch) if !branch.rows.is_empty())
+    }
+
+    /// Whether this panel is bound to a Git worktree, so Changes can load.
+    pub fn offers_changes(&self) -> bool {
+        self.branch.is_some() || self.unborn || self.detached || self.head_oid.is_some()
     }
 
     pub fn group(&self, area: ChangeArea) -> Option<&ChangeGroup> {
@@ -2274,6 +2354,14 @@ impl SidebarState {
         }
     }
 
+    pub fn directory_is_expanded(&self, path: &RepoPath) -> bool {
+        self.expanded_directories.contains(path)
+    }
+
+    pub fn expanded_directory_paths(&self) -> impl Iterator<Item = &RepoPath> {
+        self.expanded_directories.iter()
+    }
+
     pub fn query(&self) -> &str {
         &self.query
     }
@@ -2408,6 +2496,7 @@ impl SidebarState {
                 }
             }
             SidebarAction::SetChangeListMode { mode, .. } => self.change_list_mode = *mode,
+            SidebarAction::SetWorktreePanel { .. } => {}
             SidebarAction::ToggleDirectory { path, .. } => {
                 if !self.expanded_directories.remove(path) {
                     self.expanded_directories.insert(path.clone());
@@ -2572,6 +2661,9 @@ pub enum SidebarAction {
     SetChangeListMode {
         key: ActiveWorktreeKey,
         mode: FileListMode,
+    },
+    SetWorktreePanel {
+        panel: WorktreePanel,
     },
     OpenFileInEditor {
         key: ActiveWorktreeKey,
@@ -3228,7 +3320,7 @@ fn empty(state: &SidebarState, compact: bool, modal_open: bool) -> Element<'stat
         .into();
     widget::container(
         widget::column::with_children(vec![
-            widget::icon::from_name(icon_name)
+            widget::icon(crate::ui_controls::symbolic_icon(icon_name))
                 .size(STATUS_ICON_SIZE)
                 .into(),
             design::heading(title).into(),
@@ -3973,13 +4065,17 @@ fn file_context_controls<'a>(
             ("Rename…", "edit-rename-symbolic", FileCommand::Rename),
             (
                 "Duplicate file…",
-                "edit-copy-symbolic",
+                "edit-duplicate-symbolic",
                 FileCommand::CopyFile,
             ),
-            ("Copy path", "edit-copy-symbolic", FileCommand::CopyPath),
+            (
+                "Copy path",
+                "edit-copy-path-symbolic",
+                FileCommand::CopyPath,
+            ),
             (
                 "Copy relative path",
-                "edit-copy-symbolic",
+                "edit-copy-relative-path-symbolic",
                 FileCommand::CopyRelativePath,
             ),
         ] {
@@ -3988,7 +4084,7 @@ fn file_context_controls<'a>(
             }
             entries.push(widget::menu::Item::Button(
                 label.to_owned(),
-                Some(icon::from_name(icon).handle()),
+                Some(crate::ui_controls::symbolic_icon(icon)),
                 FileContextCommand::Manage { key, path, command },
             ));
         }
@@ -4078,7 +4174,15 @@ pub fn git_panel<'a>(
     width: f32,
     modal_open: bool,
 ) -> Element<'a, SidebarAction> {
-    worktree_panel(model, state, width, modal_open, WorktreePanel::Changes)
+    worktree_panel(
+        model,
+        state,
+        width,
+        modal_open,
+        WorktreePanel::Changes,
+        false,
+        false,
+    )
 }
 
 /// File navigation for the active worktree. Opens files in workspace columns;
@@ -4089,11 +4193,32 @@ pub fn file_panel<'a>(
     width: f32,
     modal_open: bool,
 ) -> Element<'a, SidebarAction> {
-    worktree_panel(model, state, width, modal_open, WorktreePanel::Files)
+    worktree_panel(
+        model,
+        state,
+        width,
+        modal_open,
+        WorktreePanel::Files,
+        false,
+        false,
+    )
 }
 
-#[derive(Clone, Copy)]
-enum WorktreePanel {
+/// Files or Git changes, with a switch between them. Used by the standalone
+/// editor, which has no context-inspector tab strip.
+pub fn worktree_sidebar<'a>(
+    model: &'a SidebarModel,
+    state: &'a SidebarState,
+    width: f32,
+    modal_open: bool,
+    panel: WorktreePanel,
+) -> Element<'a, SidebarAction> {
+    worktree_panel(model, state, width, modal_open, panel, true, true)
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum WorktreePanel {
+    #[default]
     Files,
     Changes,
 }
@@ -4104,6 +4229,8 @@ fn worktree_panel<'a>(
     width: f32,
     modal_open: bool,
     panel: WorktreePanel,
+    show_panel_switch: bool,
+    settings_footer: bool,
 ) -> Element<'a, SidebarAction> {
     let width = if width.is_finite() {
         width.clamp(0.0, design::INSPECTOR_MAX_WIDTH)
@@ -4128,6 +4255,7 @@ fn worktree_panel<'a>(
             model.file_management && matches!(model.data_state, SidebarDataState::Ready),
             modal_open,
             panel,
+            show_panel_switch,
         ),
         None => widget::container(
             widget::column::with_children(vec![
@@ -4157,7 +4285,22 @@ fn worktree_panel<'a>(
         .width(Length::Fill)
         .into(),
     };
-    widget::container(content)
+    let pane = if settings_footer {
+        widget::column::with_children(vec![
+            widget::container(content)
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .into(),
+            widget::divider::horizontal::default().into(),
+            footer(false, modal_open),
+        ])
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .into()
+    } else {
+        content
+    };
+    widget::container(pane)
         .class(theme::Container::Background)
         .width(Length::Fixed(width))
         .height(Length::Fill)
@@ -4184,6 +4327,7 @@ fn source_control_panel<'a>(
     file_management: bool,
     modal_open: bool,
     panel: WorktreePanel,
+    show_panel_switch: bool,
 ) -> Element<'a, SidebarAction> {
     let spacing = cosmic::theme::spacing();
     let chrome = &source.chrome;
@@ -4204,6 +4348,48 @@ fn source_control_panel<'a>(
         .width(Length::Fill)
         .into(),
     ]);
+    if show_panel_switch {
+        let git = source.offers_changes();
+        let files = crate::ui_controls::icon_control(
+            crate::ui_controls::symbolic_icon("folder-symbolic"),
+            "Files",
+            matches!(panel, WorktreePanel::Files),
+            !modal_open,
+            gated(
+                SidebarAction::SetWorktreePanel {
+                    panel: WorktreePanel::Files,
+                },
+                modal_open,
+            ),
+        );
+        let changes = crate::ui_controls::icon_control(
+            crate::ui_controls::symbolic_icon("document-edit-symbolic"),
+            if git {
+                "Changes"
+            } else {
+                "Open a Git repository to review changes"
+            },
+            matches!(panel, WorktreePanel::Changes),
+            !modal_open && git,
+            gated(
+                SidebarAction::SetWorktreePanel {
+                    panel: WorktreePanel::Changes,
+                },
+                modal_open || !git,
+            ),
+        );
+        let changes: Element<'_, SidebarAction> = if git && source.has_changes() {
+            changes
+                .icon_color(cosmic::theme::active().cosmic().warning.base.into())
+                .into()
+        } else {
+            changes.into()
+        };
+        header = header.push(crate::ui_controls::segmented_controls(vec![
+            files.into(),
+            changes,
+        ]));
+    }
     if matches!(panel, WorktreePanel::Files) {
         header = header.push(
             crate::ui_controls::icon_control(
@@ -4261,7 +4447,11 @@ fn source_control_panel<'a>(
 
     match &source.data_state {
         SidebarDataState::Loading => {
-            notices = notices.push(design::caption("Loading source control…"));
+            notices = notices.push(design::caption(if matches!(panel, WorktreePanel::Files) {
+                "Loading files…"
+            } else {
+                "Loading source control…"
+            }));
             return worktree_panel_chrome(header.into(), notices.into(), None);
         }
         SidebarDataState::Error(message) => {
@@ -4504,21 +4694,50 @@ fn files_section<'a>(
     // File browsing is always a tree: the flat list exists only for
     // diff/change review. A text filter still flattens to matching files.
     let flat = !folded.is_empty();
-    let (visible, hidden) = visible_file_rows(
-        &source.files,
-        &state.expanded_directories,
-        &folded,
-        flat,
-        false,
-    );
-    // An empty worktree and an over-narrow filter are different facts, and
-    // neither is worth saying while there are rows to read.
-    let notice = if source.files.is_empty() {
-        Some("This worktree has no tracked files.")
-    } else if visible.is_empty() {
-        Some("No files match this filter.")
-    } else {
-        None
+    let (visible, hidden, notice): (Vec<&FileRow>, usize, Option<&str>) = match &source.file_search
+    {
+        FileSearch::Pending { query }
+            if fold(query.trim()).as_ref() == folded.as_ref() && !folded.is_empty() =>
+        {
+            let (visible, hidden) = visible_file_rows(
+                &source.files,
+                &state.expanded_directories,
+                &folded,
+                true,
+                false,
+            );
+            (visible, hidden, Some("Searching…"))
+        }
+        FileSearch::Ready {
+            query,
+            files,
+            hidden,
+        } if fold(query.trim()).as_ref() == folded.as_ref() && !folded.is_empty() => {
+            let notice = files.is_empty().then_some("No files match this filter.");
+            (files.iter().collect(), *hidden, notice)
+        }
+        FileSearch::Failed { query, message }
+            if fold(query.trim()).as_ref() == folded.as_ref() && !folded.is_empty() =>
+        {
+            (Vec::new(), 0, Some(message.as_str()))
+        }
+        _ => {
+            let (visible, hidden) = visible_file_rows(
+                &source.files,
+                &state.expanded_directories,
+                &folded,
+                flat,
+                false,
+            );
+            let notice = if source.files.is_empty() {
+                Some("This worktree has no tracked files.")
+            } else if visible.is_empty() {
+                Some("No files match this filter.")
+            } else {
+                None
+            };
+            (visible, hidden, notice)
+        }
     };
     let mut rows = widget::column::with_capacity(visible.len()).spacing(0);
     for row in visible {
@@ -5775,7 +5994,7 @@ fn icon_action<'a>(
 ) -> Element<'a, SidebarAction> {
     let label = label.into();
     crate::interaction::tooltip(
-        button::icon(icon::from_name(icon_name).size(ROW_ICON_SIZE))
+        button::icon(crate::ui_controls::symbolic_icon(icon_name))
             .class(sidebar_button_style(false))
             .id(id)
             .name(label.clone())
