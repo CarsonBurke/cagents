@@ -300,6 +300,16 @@ pub enum RepositoryAction {
         identity: AsyncIdentity,
         result: Result<Vec<RepositoryFile>, String>,
     },
+    SearchDirectory {
+        card: CardId,
+        query: String,
+    },
+    DirectorySearchLoaded {
+        card: CardId,
+        generation: u64,
+        query: String,
+        result: Result<(Vec<RepositoryFile>, usize), String>,
+    },
     NewTerminal {
         card: CardId,
     },
@@ -453,6 +463,8 @@ impl RepositoryAction {
         match self {
             Self::RefreshFiles { card }
             | Self::ListDirectory { card, .. }
+            | Self::SearchDirectory { card, .. }
+            | Self::DirectorySearchLoaded { card, .. }
             | Self::NewTerminal { card }
             | Self::OpenFile { card, .. }
             | Self::OpenBranchFile { card, .. }
@@ -1000,6 +1012,8 @@ pub struct RepositoryRuntime {
     wrap_lines: bool,
     syntax_theme: crate::settings::EditorSyntaxTheme,
     listed_directories: BTreeSet<PathBuf>,
+    file_search_generation: u64,
+    file_search_cancel: CancellationToken,
     auto_save_pending: Option<(u64, u64)>,
     next_auto_save_ticket: u64,
     diff_change: usize,
@@ -1104,6 +1118,8 @@ impl RepositoryRuntime {
             wrap_lines: false,
             syntax_theme: crate::settings::EditorSyntaxTheme::Auto,
             listed_directories: BTreeSet::new(),
+            file_search_generation: 0,
+            file_search_cancel: CancellationToken::new(),
             auto_save_pending: None,
             next_auto_save_ticket: 0,
             diff_change: 0,
@@ -1175,6 +1191,55 @@ impl RepositoryRuntime {
                     .and_then(|result| result);
             RepositoryAction::DirectoryListed { identity, result }
         })
+    }
+
+    pub fn search_directory(&mut self, card: CardId, query: String) -> Task<RepositoryAction> {
+        if !self.directory_only {
+            return Task::none();
+        }
+        self.file_search_cancel.cancel();
+        if query.trim().is_empty() {
+            return Task::none();
+        }
+        let token = CancellationToken::new();
+        self.file_search_cancel = token.clone();
+        self.file_search_generation = self.file_search_generation.wrapping_add(1).max(1);
+        let generation = self.file_search_generation;
+        let worktree = self.descriptor.worktree.clone();
+        cosmic::task::future(async move {
+            tokio::time::sleep(Duration::from_millis(80)).await;
+            if token.is_cancelled() {
+                return RepositoryAction::DirectorySearchLoaded {
+                    card,
+                    generation,
+                    query,
+                    result: Ok((Vec::new(), 0)),
+                };
+            }
+            let search_token = token.clone();
+            let search_query = query.clone();
+            let result = tokio::task::spawn_blocking(move || {
+                search_directory_files(&worktree, &search_query, &search_token)
+            })
+            .await
+            .map_err(|error| format!("file search failed: {error}"))
+            .and_then(|result| result);
+            RepositoryAction::DirectorySearchLoaded {
+                card,
+                generation,
+                query,
+                result,
+            }
+        })
+    }
+
+    pub fn file_search_generation(&self) -> u64 {
+        self.file_search_generation
+    }
+
+    pub fn cancel_file_search(&mut self) {
+        self.file_search_cancel.cancel();
+        self.file_search_generation = self.file_search_generation.wrapping_add(1);
     }
 
     #[cfg(test)]
@@ -2410,6 +2475,7 @@ impl RepositoryRuntime {
         match action {
             RepositoryAction::RefreshFiles { card } => self.initial_load(card),
             RepositoryAction::ListDirectory { card, path } => self.list_directory(card, path),
+            RepositoryAction::SearchDirectory { card, query } => self.search_directory(card, query),
             RepositoryAction::DirectoryListed { identity, result } => {
                 if identity.generation != self.file_list_generation {
                     return Task::none();
@@ -2427,9 +2493,9 @@ impl RepositoryRuntime {
                 files.sort_by(|left, right| left.path.cmp(&right.path));
                 Task::none()
             }
-            RepositoryAction::NewTerminal { .. } | RepositoryAction::Clipboard { .. } => {
-                Task::none()
-            }
+            RepositoryAction::NewTerminal { .. }
+            | RepositoryAction::Clipboard { .. }
+            | RepositoryAction::DirectorySearchLoaded { .. } => Task::none(),
             RepositoryAction::StageSelected { .. } => Task::none(),
             RepositoryAction::FilesLoaded { identity, result } => {
                 if !self.accepts_file_list(&identity) || identity.path != Path::new(".") {
@@ -3613,6 +3679,55 @@ fn load_directory_listing(root: &Path, relative: &Path) -> Result<Vec<Repository
     }
     files.sort_by(|left, right| left.path.cmp(&right.path));
     Ok(files)
+}
+
+const MAX_FILE_SEARCH_VISITS: usize = 50_000;
+
+fn search_directory_files(
+    root: &Path,
+    query: &str,
+    token: &CancellationToken,
+) -> Result<(Vec<RepositoryFile>, usize), String> {
+    let needle = query.trim().to_ascii_lowercase();
+    if needle.is_empty() {
+        return Ok((Vec::new(), 0));
+    }
+    let mut queue = VecDeque::from([PathBuf::new()]);
+    let mut matches = Vec::new();
+    let mut hidden = 0usize;
+    let mut visited = 0usize;
+    while let Some(directory) = queue.pop_front() {
+        if token.is_cancelled() {
+            return Ok((matches, hidden));
+        }
+        let entries = match load_directory_listing(root, &directory) {
+            Ok(entries) => entries,
+            Err(_) => continue,
+        };
+        for entry in entries {
+            visited += 1;
+            if visited > MAX_FILE_SEARCH_VISITS {
+                hidden = hidden.max(1);
+                matches.sort_by(|left, right| left.path.cmp(&right.path));
+                return Ok((matches, hidden));
+            }
+            if entry.directory {
+                queue.push_back(entry.path);
+                continue;
+            }
+            let haystack = entry.path.to_string_lossy().to_ascii_lowercase();
+            if !haystack.contains(&needle) {
+                continue;
+            }
+            if matches.len() < crate::sidebar::MAX_VISIBLE_FILE_ROWS {
+                matches.push(entry);
+            } else {
+                hidden += 1;
+            }
+        }
+    }
+    matches.sort_by(|left, right| left.path.cmp(&right.path));
+    Ok((matches, hidden))
 }
 
 pub fn load_repository_files(worktree: &Path) -> Result<Vec<RepositoryFile>, String> {
@@ -9743,5 +9858,30 @@ mod tests {
             .map(|file| file.path.to_string_lossy().into_owned())
             .collect();
         assert_eq!(nested_names, vec!["nested/child.txt", "nested/deeper"]);
+    }
+
+    #[test]
+    fn directory_search_is_on_demand_and_capped_to_visible_rows() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join("nested/deeper")).unwrap();
+        std::fs::write(root.path().join("top.txt"), "a").unwrap();
+        std::fs::write(root.path().join("nested/note.md"), "b").unwrap();
+        std::fs::write(root.path().join("nested/deeper/note.txt"), "c").unwrap();
+        std::fs::write(root.path().join("other.rs"), "d").unwrap();
+        let (matches, hidden) =
+            search_directory_files(root.path(), "note", &CancellationToken::new()).unwrap();
+        let names: Vec<_> = matches
+            .iter()
+            .map(|file| file.path.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            names,
+            vec!["nested/deeper/note.txt", "nested/note.md"],
+            "search must find nested files without listing the whole tree first"
+        );
+        assert_eq!(hidden, 0);
+        let (none, _) =
+            search_directory_files(root.path(), "missing", &CancellationToken::new()).unwrap();
+        assert!(none.is_empty());
     }
 }

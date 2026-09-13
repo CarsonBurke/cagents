@@ -74,7 +74,7 @@ const PANEL_ROW_HEIGHT: f32 = design::DENSE_ROW_HEIGHT;
 /// this list is built eagerly like the project navigation above it. The bound
 /// is explicit - the section says how many rows it withheld and the quick
 /// filter narrows to them - rather than a silent truncation.
-const MAX_VISIBLE_FILE_ROWS: usize = 400;
+pub(crate) const MAX_VISIBLE_FILE_ROWS: usize = 400;
 /// How many change rows one `Changes` group renders at once, bounded for the
 /// same reason as the file tree. "Stage all" and "Unstage all" act on exactly
 /// the rows that are visible, so the bound is never a hidden side effect.
@@ -1428,6 +1428,26 @@ pub enum BranchChanges {
 /// Everything a frame needs is derived once, here: filter keys, widget
 /// identities, accessible names, and the status and count strings. The view
 /// reads them and allocates nothing per row.
+/// On-demand file-name search for a plain folder. Git worktrees keep
+/// `Inactive` and filter the already-loaded `git ls-files` list in memory.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum FileSearch {
+    #[default]
+    Inactive,
+    Pending {
+        query: String,
+    },
+    Ready {
+        query: String,
+        files: Vec<FileRow>,
+        hidden: usize,
+    },
+    Failed {
+        query: String,
+        message: String,
+    },
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SourceControlModel {
     pub key: ActiveWorktreeKey,
@@ -1485,6 +1505,7 @@ pub struct SourceControlModel {
     /// a reload from blanking the panel.
     reloading: bool,
     chrome: SourceControlChrome,
+    pub file_search: FileSearch,
 }
 
 fn file_rows(paths: &[RepoPath]) -> Vec<FileRow> {
@@ -1558,6 +1579,22 @@ impl SourceControlModel {
         model
     }
 
+    pub fn set_file_search(&mut self, search: FileSearch) {
+        self.file_search = search;
+    }
+
+    pub fn file_search_results(
+        query: String,
+        files: &[crate::repository_widget::RepositoryFile],
+        hidden: usize,
+    ) -> FileSearch {
+        FileSearch::Ready {
+            query,
+            files: file_rows_from_listing(files),
+            hidden,
+        }
+    }
+
     /// The panel before its first snapshot has arrived.
     pub fn loading(key: ActiveWorktreeKey) -> Self {
         Self::empty(key, SidebarDataState::Loading)
@@ -1595,6 +1632,7 @@ impl SourceControlModel {
             next_history_page: 0,
             reloading: false,
             chrome,
+            file_search: FileSearch::Inactive,
         }
     }
 
@@ -1672,6 +1710,7 @@ impl SourceControlModel {
             branch,
             key,
             chrome,
+            file_search: FileSearch::Inactive,
         }
     }
 
@@ -4556,21 +4595,50 @@ fn files_section<'a>(
     // File browsing is always a tree: the flat list exists only for
     // diff/change review. A text filter still flattens to matching files.
     let flat = !folded.is_empty();
-    let (visible, hidden) = visible_file_rows(
-        &source.files,
-        &state.expanded_directories,
-        &folded,
-        flat,
-        false,
-    );
-    // An empty worktree and an over-narrow filter are different facts, and
-    // neither is worth saying while there are rows to read.
-    let notice = if source.files.is_empty() {
-        Some("This worktree has no tracked files.")
-    } else if visible.is_empty() {
-        Some("No files match this filter.")
-    } else {
-        None
+    let (visible, hidden, notice): (Vec<&FileRow>, usize, Option<&str>) = match &source.file_search
+    {
+        FileSearch::Pending { query }
+            if fold(query.trim()).as_ref() == folded.as_ref() && !folded.is_empty() =>
+        {
+            let (visible, hidden) = visible_file_rows(
+                &source.files,
+                &state.expanded_directories,
+                &folded,
+                true,
+                false,
+            );
+            (visible, hidden, Some("Searching…"))
+        }
+        FileSearch::Ready {
+            query,
+            files,
+            hidden,
+        } if fold(query.trim()).as_ref() == folded.as_ref() && !folded.is_empty() => {
+            let notice = files.is_empty().then_some("No files match this filter.");
+            (files.iter().collect(), *hidden, notice)
+        }
+        FileSearch::Failed { query, message }
+            if fold(query.trim()).as_ref() == folded.as_ref() && !folded.is_empty() =>
+        {
+            (Vec::new(), 0, Some(message.as_str()))
+        }
+        _ => {
+            let (visible, hidden) = visible_file_rows(
+                &source.files,
+                &state.expanded_directories,
+                &folded,
+                flat,
+                false,
+            );
+            let notice = if source.files.is_empty() {
+                Some("This worktree has no tracked files.")
+            } else if visible.is_empty() {
+                Some("No files match this filter.")
+            } else {
+                None
+            };
+            (visible, hidden, notice)
+        }
     };
     let mut rows = widget::column::with_capacity(visible.len()).spacing(0);
     for row in visible {

@@ -14,7 +14,7 @@ use cagents::{
     },
     settings::{self, AppSettings, AppTheme},
     sidebar::{
-        self, ActiveWorktreeKey, FileCommand, SidebarAction, SidebarFocus, SidebarMode,
+        self, ActiveWorktreeKey, FileCommand, FileSearch, SidebarAction, SidebarFocus, SidebarMode,
         SidebarModel, SidebarProject, SidebarState, SidebarWorktree, SourceControlModel,
     },
     splitter::{self, Splitter},
@@ -1861,6 +1861,7 @@ impl Application for Editor {
                             action,
                             RepositoryAction::FilesLoaded { .. }
                                 | RepositoryAction::DirectoryListed { .. }
+                                | RepositoryAction::DirectorySearchLoaded { .. }
                                 | RepositoryAction::FileLoaded { .. }
                                 | RepositoryAction::DiffLoaded { .. }
                                 | RepositoryAction::DiffBasisResolved { .. }
@@ -1878,6 +1879,29 @@ impl Application for Editor {
                         if self.tab(*card).is_some_and(|tab| self.tab_is_untitled(tab)) {
                             return self.save_as(*card);
                         }
+                    }
+                    if let RepositoryAction::DirectorySearchLoaded {
+                        generation,
+                        query,
+                        result,
+                        ..
+                    } = action
+                    {
+                        let Some(tab) = self.tab_mut(id) else {
+                            return Task::none();
+                        };
+                        if generation != tab.runtime.file_search_generation() {
+                            return Task::none();
+                        }
+                        if let Some(source) = tab.sidebar.source_control.as_mut() {
+                            source.set_file_search(match result {
+                                Ok((files, hidden)) => {
+                                    SourceControlModel::file_search_results(query, &files, hidden)
+                                }
+                                Err(message) => FileSearch::Failed { query, message },
+                            });
+                        }
+                        return Task::none();
                     }
                     if let RepositoryAction::Clipboard { card, op } = action {
                         return self.editor_clipboard(card, op);
@@ -1949,11 +1973,18 @@ impl Application for Editor {
                     let mut tasks = vec![task];
                     if listing_changed && !tab.git {
                         if let Some(key) = tab.navigation.active_worktree().cloned() {
-                            tab.sidebar.source_control =
-                                Some(SourceControlModel::directory_listing(
-                                    key,
-                                    tab.runtime.listed_files(),
-                                ));
+                            let search = tab
+                                .sidebar
+                                .source_control
+                                .as_ref()
+                                .map(|source| source.file_search.clone())
+                                .unwrap_or_default();
+                            let mut model = SourceControlModel::directory_listing(
+                                key,
+                                tab.runtime.listed_files(),
+                            );
+                            model.set_file_search(search);
+                            tab.sidebar.source_control = Some(model);
                         }
                     }
                     if back_to_files && tab.runtime.selected_path().is_none() {
@@ -2022,6 +2053,7 @@ impl Application for Editor {
                         | SidebarAction::FileCommand { key, .. }
                         | SidebarAction::RefreshWorktree { key }
                         | SidebarAction::FilesQueryChanged { key, .. }
+                        | SidebarAction::ToggleFilesFilter { key }
                         | SidebarAction::ToggleDirectory { key, .. }
                         | SidebarAction::ToggleSection { key, .. } => Some(key),
                         _ => None,
@@ -2065,6 +2097,63 @@ impl Application for Editor {
                             repository_task(
                                 tab.runtime.list_directory(id, path.as_path().to_path_buf()),
                             )
+                        }
+                        SidebarAction::FilesQueryChanged { query, .. } => {
+                            if tab.git {
+                                return Task::none();
+                            }
+                            if let Some(source) = tab.sidebar.source_control.as_mut() {
+                                source.set_file_search(if query.trim().is_empty() {
+                                    FileSearch::Inactive
+                                } else {
+                                    FileSearch::Pending {
+                                        query: query.clone(),
+                                    }
+                                });
+                            }
+                            if query.trim().is_empty() {
+                                tab.runtime.cancel_file_search();
+                                Task::none()
+                            } else {
+                                repository_task(tab.runtime.search_directory(id, query))
+                            }
+                        }
+                        SidebarAction::ToggleFilesFilter { key } => {
+                            let open = tab.navigation.files_filter_open();
+                            let query = tab.navigation.files_query().to_owned();
+                            if tab.git {
+                                return if open {
+                                    widget::text_input::focus(sidebar::files_filter_focus_id(&key))
+                                        .map(cosmic::Action::App)
+                                } else {
+                                    Task::none()
+                                };
+                            }
+                            if open {
+                                if !query.trim().is_empty() {
+                                    if let Some(source) = tab.sidebar.source_control.as_mut() {
+                                        source.set_file_search(FileSearch::Pending {
+                                            query: query.clone(),
+                                        });
+                                    }
+                                }
+                                let search = if query.trim().is_empty() {
+                                    Task::none()
+                                } else {
+                                    repository_task(tab.runtime.search_directory(id, query))
+                                };
+                                Task::batch([
+                                    widget::text_input::focus(sidebar::files_filter_focus_id(&key))
+                                        .map(cosmic::Action::App),
+                                    search,
+                                ])
+                            } else {
+                                if let Some(source) = tab.sidebar.source_control.as_mut() {
+                                    source.set_file_search(FileSearch::Inactive);
+                                }
+                                tab.runtime.cancel_file_search();
+                                Task::none()
+                            }
                         }
                         _ => Task::none(),
                     };
@@ -2324,6 +2413,16 @@ impl Application for Editor {
                             match key.as_str().to_ascii_lowercase().as_str() {
                                 "o" => return self.update(Message::Choose(modifiers.shift())),
                                 "t" => return self.update(Message::NewTab),
+                                "f" => {
+                                    if let Some(tab) = self.current() {
+                                        if let Some(key) = tab.navigation.active_worktree().cloned()
+                                        {
+                                            return self.update(Message::Sidebar(
+                                                SidebarAction::ToggleFilesFilter { key },
+                                            ));
+                                        }
+                                    }
+                                }
                                 "s" => {
                                     if let Some(card) = self.active {
                                         return self.update(Message::Repository(
