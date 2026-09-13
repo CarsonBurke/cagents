@@ -1631,6 +1631,14 @@ impl RepositoryRuntime {
         self.selected.as_ref().map(|file| file.path.as_path())
     }
 
+    /// The live buffer, or nothing while no editable document is open.
+    pub fn editor_text(&self) -> Option<String> {
+        match &self.document {
+            DocumentState::Editable(document) => Some(document.content.text()),
+            _ => None,
+        }
+    }
+
     pub fn selected_staging_selection(
         &self,
         stage: bool,
@@ -7793,10 +7801,9 @@ mod tests {
     }
 
     fn buffer_text(runtime: &RepositoryRuntime) -> String {
-        match &runtime.document {
-            DocumentState::Editable(document) => document.content.text(),
-            _ => panic!("test expects an editable buffer"),
-        }
+        runtime
+            .editor_text()
+            .expect("test expects an editable buffer")
     }
 
     fn lsp_version(runtime: &RepositoryRuntime) -> i32 {
