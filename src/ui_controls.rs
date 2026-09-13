@@ -68,6 +68,21 @@ pub fn symbolic_icon(name: &str) -> widget::icon::Handle {
     static ADDED_FILE: LazyLock<widget::icon::Handle> = LazyLock::new(|| {
         widget::icon::from_svg_bytes(br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16"><g fill="none" stroke="black" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><path d="M3 1.5h6l4 4v9H3zM9 1.5v4h4M5.5 10h5M8 7.5v5"/></g></svg>"#.as_slice()).symbolic(true)
     });
+    static EDIT: LazyLock<widget::icon::Handle> = LazyLock::new(|| {
+        widget::icon::from_svg_bytes(br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16"><g fill="none" stroke="black" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><path d="M9.5 3.5 12.5 6.5 6 13H3v-3zM8.5 4.5l3 3"/></g></svg>"#.as_slice()).symbolic(true)
+    });
+    static RENAME: LazyLock<widget::icon::Handle> = LazyLock::new(|| {
+        widget::icon::from_svg_bytes(br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16"><g fill="none" stroke="black" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><path d="M2.5 12.5h5M9.5 3.5 12.5 6.5 7 12H4v-3z"/></g></svg>"#.as_slice()).symbolic(true)
+    });
+    static DUPLICATE: LazyLock<widget::icon::Handle> = LazyLock::new(|| {
+        widget::icon::from_svg_bytes(br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16"><g fill="none" stroke="black" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><rect x="5.5" y="4.5" width="8" height="10" rx="1"/><path d="M10.5 4.5V3a1 1 0 0 0-1-1h-7a1 1 0 0 0-1 1v10a1 1 0 0 0 1 1H5"/></g></svg>"#.as_slice()).symbolic(true)
+    });
+    static COPY_PATH: LazyLock<widget::icon::Handle> = LazyLock::new(|| {
+        widget::icon::from_svg_bytes(br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16"><g fill="none" stroke="black" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><path d="M3 2.5h6l4 4v7H3zM9 2.5v4h4M5 9.5h6M5 12h4"/></g></svg>"#.as_slice()).symbolic(true)
+    });
+    static COPY_RELATIVE: LazyLock<widget::icon::Handle> = LazyLock::new(|| {
+        widget::icon::from_svg_bytes(br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16"><g fill="none" stroke="black" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><path d="M3 8.5h4.5M5.5 6.5 3 8.5l2.5 2M13 7.5h-4.5M10.5 5.5 13 7.5l-2.5 2"/></g></svg>"#.as_slice()).symbolic(true)
+    });
     // A floppy disk, not the desktop theme's download-arrow tray: the save
     // action stands alone in toolbars with only a tooltip to name it.
     static SAVE: LazyLock<widget::icon::Handle> = LazyLock::new(|| {
@@ -75,6 +90,11 @@ pub fn symbolic_icon(name: &str) -> widget::icon::Handle {
     });
     match name {
         "document-edit-symbolic" => CHANGES.clone(),
+        "text-editor-symbolic" => EDIT.clone(),
+        "edit-rename-symbolic" => RENAME.clone(),
+        "edit-duplicate-symbolic" => DUPLICATE.clone(),
+        "edit-copy-path-symbolic" => COPY_PATH.clone(),
+        "edit-copy-relative-path-symbolic" => COPY_RELATIVE.clone(),
         "view-list-tree-symbolic" => TREE.clone(),
         "view-reveal-symbolic" => PREVIEW.clone(),
         "view-split-right-symbolic" => SPLIT_PANEL.clone(),
@@ -148,14 +168,14 @@ pub fn icon_control<'a, Message: Clone + 'a>(
     IconControl {
         button: widget::button::custom(content)
             .name(label.clone())
-            .selected(selected)
-            .class(control_style(selected, None))
+            .selected(selected && enabled)
+            .class(control_style(selected && enabled, None))
             .width(crate::design::PRIMARY_CONTROL_SIZE)
             .height(crate::design::PRIMARY_CONTROL_SIZE)
             .padding(0)
             .on_press_maybe(if enabled { on_press } else { None }),
         label,
-        selected,
+        selected: selected && enabled,
     }
 }
 
@@ -173,7 +193,7 @@ impl<'a, Message: Clone + 'a> IconControl<'a, Message> {
 
 impl<'a, Message: Clone + 'a> From<IconControl<'a, Message>> for Element<'a, Message> {
     fn from(control: IconControl<'a, Message>) -> Self {
-        tooltip(control.button, control.label)
+        tooltip(crate::interaction::hover(control.button), control.label)
     }
 }
 
@@ -289,7 +309,10 @@ fn control_style(selected: bool, color: Option<iced::Color>) -> cosmic::theme::B
     cosmic::theme::Button::Custom {
         active: Box::new(appearance),
         disabled: Box::new(move |theme| widget::button::Style {
-            icon_color: Some(theme.current_container().component.on_disabled.into()),
+            // Symbolic SVG recoloring ignores alpha, so mix against the
+            // surface instead of relying on `on_disabled` transparency.
+            icon_color: Some(muted_icon_color(theme)),
+            background: None,
             ..appearance(false, theme)
         }),
         hovered: Box::new(move |focused, theme| widget::button::Style {
@@ -304,6 +327,17 @@ fn control_style(selected: bool, color: Option<iced::Color>) -> cosmic::theme::B
             )),
             ..appearance(focused, theme)
         }),
+    }
+}
+
+fn muted_icon_color(theme: &cosmic::Theme) -> iced::Color {
+    let on: iced::Color = theme.current_container().component.on.into();
+    let base: iced::Color = theme.current_container().component.base.into();
+    iced::Color {
+        r: on.r * 0.38 + base.r * 0.62,
+        g: on.g * 0.38 + base.g * 0.62,
+        b: on.b * 0.38 + base.b * 0.62,
+        a: 1.0,
     }
 }
 

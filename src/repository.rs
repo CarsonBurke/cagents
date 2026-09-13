@@ -1634,8 +1634,18 @@ struct FileTreeNode {
 /// Expands a flat path list into a pre-order tree of directory and file rows,
 /// directories first and byte-sorted within each level.
 pub fn build_file_tree(paths: &[RepoPath]) -> Vec<FileTreeEntry> {
+    build_file_tree_with_directories(paths, &[])
+}
+
+/// Same tree as [`build_file_tree`], plus directory-only leaves that have no
+/// files listed yet. Used by shallow folder listings so collapsed trees can
+/// show a folder before its children have been read.
+pub fn build_file_tree_with_directories(
+    files: &[RepoPath],
+    directories: &[RepoPath],
+) -> Vec<FileTreeEntry> {
     let mut root = FileTreeNode::default();
-    for path in paths {
+    for path in files {
         let mut node = &mut root;
         let mut components = path.components().peekable();
         while let Some(component) = components.next() {
@@ -1645,7 +1655,13 @@ pub fn build_file_tree(paths: &[RepoPath]) -> Vec<FileTreeEntry> {
             }
         }
     }
-    let mut rows = Vec::with_capacity(paths.len());
+    for path in directories {
+        let mut node = &mut root;
+        for component in path.components() {
+            node = node.children.entry(component.to_vec()).or_default();
+        }
+    }
+    let mut rows = Vec::with_capacity(files.len() + directories.len());
     emit_file_tree(&root, &mut Vec::new(), 0, &mut rows);
     rows
 }

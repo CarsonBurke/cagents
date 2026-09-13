@@ -312,6 +312,41 @@ pub enum WorktreeSort {
     Alphabetical,
 }
 
+/// Syntax colors for native editors and diffs. `Auto` follows the app theme.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EditorSyntaxTheme {
+    #[default]
+    Auto,
+    SolarizedDark,
+    Mocha,
+    Ocean,
+    Eighties,
+    InspiredGitHub,
+}
+
+impl EditorSyntaxTheme {
+    pub const ALL: &'static [Self] = &[
+        Self::Auto,
+        Self::SolarizedDark,
+        Self::Mocha,
+        Self::Ocean,
+        Self::Eighties,
+        Self::InspiredGitHub,
+    ];
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Auto => "Match app",
+            Self::SolarizedDark => "Solarized Dark",
+            Self::Mocha => "Mocha",
+            Self::Ocean => "Ocean",
+            Self::Eighties => "Eighties",
+            Self::InspiredGitHub => "Inspired GitHub",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AppSettings {
@@ -354,6 +389,8 @@ pub struct AppSettings {
     pub editor_auto_save: bool,
     #[serde(default)]
     pub editor_wrap_lines: bool,
+    #[serde(default)]
+    pub editor_syntax_theme: EditorSyntaxTheme,
     #[serde(default = "default_confirm_terminal_close")]
     pub confirm_terminal_close: bool,
     /// External language servers, in declaration order. The first server whose
@@ -396,6 +433,7 @@ impl Default for AppSettings {
             worktree_sort: WorktreeSort::default(),
             editor_auto_save: default_editor_auto_save(),
             editor_wrap_lines: false,
+            editor_syntax_theme: EditorSyntaxTheme::default(),
             confirm_terminal_close: default_confirm_terminal_close(),
             language_servers: default_language_servers(),
             keyboard_shortcuts: KeyboardShortcuts::default(),

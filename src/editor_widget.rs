@@ -37,12 +37,10 @@ use cosmic::iced::advanced::{
     text::{self, Ellipsize, LineHeight, Text, Wrapping},
     widget::{self, Widget, operation},
 };
-#[cfg(test)]
-pub use cosmic::iced::widget::text_editor::Motion;
 pub use cosmic::iced::widget::text_editor::{
-    Action, Cursor, Edit, Line, LineEnding, Position, Selection,
+    Action, Binding, Cursor, Edit, KeyPress, Line, LineEnding, Motion, Position, Selection,
 };
-use cosmic::iced::widget::text_editor::{Binding, Catalog, KeyPress, Status, Style, StyleFn};
+use cosmic::iced::widget::text_editor::{Catalog, Status, Style, StyleFn};
 use cosmic::iced::{
     Border, Element, Event, Length, Padding, Pixels, Point, Rectangle, Size, Vector, alignment,
     keyboard, window,
@@ -322,6 +320,29 @@ where
             preedit: state.preedit.as_ref().map(input_method::Preedit::as_ref),
         }
     }
+}
+
+/// Ctrl+Delete / Ctrl+Backspace delete the adjacent word, then the usual
+/// iced editor chords (copy/cut/paste/select-all and caret motion).
+pub fn default_bindings<Message>(press: KeyPress) -> Option<Binding<Message>> {
+    if press.modifiers.command() && !press.modifiers.alt() && !press.modifiers.shift() {
+        match press.key.as_ref() {
+            keyboard::Key::Named(keyboard::key::Named::Delete) => {
+                return Some(Binding::Sequence(vec![
+                    Binding::Select(Motion::WordRight),
+                    Binding::Delete,
+                ]));
+            }
+            keyboard::Key::Named(keyboard::key::Named::Backspace) => {
+                return Some(Binding::Sequence(vec![
+                    Binding::Select(Motion::WordLeft),
+                    Binding::Delete,
+                ]));
+            }
+            _ => {}
+        }
+    }
+    Binding::from_key_press(press)
 }
 
 /// A small logical anchor independent of the document's text allocation.

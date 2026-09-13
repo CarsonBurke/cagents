@@ -1,7 +1,7 @@
 //! Native repository-card state, asynchronous file review tasks, and focused UI.
 
 use std::{
-    collections::{BTreeMap, HashMap, VecDeque},
+    collections::{BTreeMap, BTreeSet, HashMap, VecDeque},
     ffi::OsString,
     ops::Range,
     path::{Path, PathBuf},
@@ -12,6 +12,8 @@ use std::{
 
 #[path = "editor_widget.rs"]
 mod text_editor;
+
+pub use text_editor::{Action as EditorAction, Edit as EditorEdit};
 
 use cosmic::iced::advanced::{
     Clipboard, Layout, Shell, Widget, layout, renderer,
@@ -42,7 +44,7 @@ use crate::{
     ui_controls::icon_control,
 };
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct RepositoryFile {
     pub path: PathBuf,
     pub staged_old_path: Option<PathBuf>,
@@ -50,6 +52,7 @@ pub struct RepositoryFile {
     pub staged: bool,
     pub unstaged: bool,
     pub status: Option<String>,
+    pub directory: bool,
 }
 
 impl RepositoryFile {
@@ -289,6 +292,14 @@ pub enum RepositoryAction {
     RefreshFiles {
         card: CardId,
     },
+    ListDirectory {
+        card: CardId,
+        path: PathBuf,
+    },
+    DirectoryListed {
+        identity: AsyncIdentity,
+        result: Result<Vec<RepositoryFile>, String>,
+    },
     NewTerminal {
         card: CardId,
     },
@@ -339,6 +350,10 @@ pub enum RepositoryAction {
     EditorAction {
         card: CardId,
         action: text_editor::Action,
+    },
+    Clipboard {
+        card: CardId,
+        op: ClipboardOp,
     },
     Save {
         card: CardId,
@@ -425,15 +440,25 @@ pub enum RepositoryAction {
     },
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClipboardOp {
+    Cut,
+    Copy,
+    Paste,
+    SelectAll,
+}
+
 impl RepositoryAction {
     pub fn card(&self) -> CardId {
         match self {
             Self::RefreshFiles { card }
+            | Self::ListDirectory { card, .. }
             | Self::NewTerminal { card }
             | Self::OpenFile { card, .. }
             | Self::OpenBranchFile { card, .. }
             | Self::SelectBranchBase { card, .. }
             | Self::EditorAction { card, .. }
+            | Self::Clipboard { card, .. }
             | Self::Save { card, .. }
             | Self::Reload { card }
             | Self::DiscardEdits { card }
@@ -454,6 +479,7 @@ impl RepositoryAction {
             | Self::RemovedViewport { card, .. }
             | Self::MarkdownLink { card, .. } => *card,
             Self::FilesLoaded { identity, .. }
+            | Self::DirectoryListed { identity, .. }
             | Self::FileLoaded { identity, .. }
             | Self::DiffLoaded { identity, .. }
             | Self::WorkingDiffLoaded { identity, .. }
@@ -972,6 +998,8 @@ pub struct RepositoryRuntime {
     basis_resolution: Option<BasisResolution>,
     auto_save: bool,
     wrap_lines: bool,
+    syntax_theme: crate::settings::EditorSyntaxTheme,
+    listed_directories: BTreeSet<PathBuf>,
     auto_save_pending: Option<(u64, u64)>,
     next_auto_save_ticket: u64,
     diff_change: usize,
@@ -1074,6 +1102,8 @@ impl RepositoryRuntime {
             basis_resolution: None,
             auto_save: true,
             wrap_lines: false,
+            syntax_theme: crate::settings::EditorSyntaxTheme::Auto,
+            listed_directories: BTreeSet::new(),
             auto_save_pending: None,
             next_auto_save_ticket: 0,
             diff_change: 0,
@@ -1110,6 +1140,43 @@ impl RepositoryRuntime {
         self.wrap_lines = wrap_lines;
     }
 
+    pub fn set_syntax_theme(&mut self, theme: crate::settings::EditorSyntaxTheme) {
+        self.syntax_theme = theme;
+    }
+
+    pub fn selected_text(&self) -> Option<String> {
+        match &self.document {
+            DocumentState::Editable(document) => document.content.selection(),
+            _ => None,
+        }
+    }
+
+    pub fn list_directory(&mut self, card: CardId, path: PathBuf) -> Task<RepositoryAction> {
+        if !self.directory_only {
+            return Task::none();
+        }
+        if self.listed_directories.contains(&path) {
+            return Task::none();
+        }
+        self.listed_directories.insert(path.clone());
+        let identity = AsyncIdentity {
+            card,
+            worktree: self.descriptor.worktree.clone(),
+            path,
+            generation: self.file_list_generation,
+        };
+        let worktree = identity.worktree.clone();
+        let relative = identity.path.clone();
+        cosmic::task::future(async move {
+            let result =
+                tokio::task::spawn_blocking(move || load_directory_listing(&worktree, &relative))
+                    .await
+                    .map_err(|error| format!("folder listing failed: {error}"))
+                    .and_then(|result| result);
+            RepositoryAction::DirectoryListed { identity, result }
+        })
+    }
+
     #[cfg(test)]
     pub(crate) fn post_persist_failure_fixture(card: CardId) -> (Self, RepositoryAction) {
         let path = PathBuf::from("notes.txt");
@@ -1127,6 +1194,7 @@ impl RepositoryRuntime {
             staged: false,
             unstaged: true,
             status: Some(" M".into()),
+            directory: false,
         }]);
         runtime.selected = runtime.file(&path).cloned();
         let identity = AsyncIdentity {
@@ -1186,6 +1254,7 @@ impl RepositoryRuntime {
                     staged: false,
                     unstaged: true,
                     status: Some(" M".into()),
+                    directory: false,
                 })
                 .collect(),
         );
@@ -1278,6 +1347,7 @@ impl RepositoryRuntime {
                     staged: false,
                     unstaged: true,
                     status: Some(" M".into()),
+                    directory: false,
                 })
                 .collect(),
         );
@@ -1360,6 +1430,8 @@ impl RepositoryRuntime {
     fn load_files(&mut self, card: CardId) -> Task<RepositoryAction> {
         self.file_list_loading = true;
         self.file_list_generation = self.file_list_generation.wrapping_add(1).max(1);
+        self.listed_directories.clear();
+        self.listed_directories.insert(PathBuf::new());
         let identity = AsyncIdentity {
             card,
             worktree: self.descriptor.worktree.clone(),
@@ -1391,11 +1463,7 @@ impl RepositoryRuntime {
         // the list entirely. Keep its buffer, but remove all obsolete Git facts.
         let file = self.file(&path).cloned().unwrap_or_else(|| RepositoryFile {
             path: path.clone(),
-            staged_old_path: None,
-            unstaged_old_path: None,
-            staged: false,
-            unstaged: false,
-            status: None,
+            ..RepositoryFile::default()
         });
         if !self.file_has_basis(&file, &self.diff_basis) && self.basis_resolution.is_none() {
             self.diff_basis = if file.unstaged {
@@ -1624,7 +1692,14 @@ impl RepositoryRuntime {
     /// has to know that before it waits for something that will never happen.
     #[must_use]
     pub fn can_open_file(&self, path: &Path) -> bool {
-        self.file(path).is_some()
+        self.file(path).is_some_and(|file| !file.directory)
+    }
+
+    pub fn listed_files(&self) -> &[RepositoryFile] {
+        match &self.files {
+            FileListState::Ready(files) => files,
+            _ => &[],
+        }
     }
 
     pub fn selected_path(&self) -> Option<&Path> {
@@ -2334,7 +2409,27 @@ impl RepositoryRuntime {
     pub fn update(&mut self, action: RepositoryAction) -> Task<RepositoryAction> {
         match action {
             RepositoryAction::RefreshFiles { card } => self.initial_load(card),
-            RepositoryAction::NewTerminal { .. } => Task::none(),
+            RepositoryAction::ListDirectory { card, path } => self.list_directory(card, path),
+            RepositoryAction::DirectoryListed { identity, result } => {
+                if identity.generation != self.file_list_generation {
+                    return Task::none();
+                }
+                let FileListState::Ready(files) = &mut self.files else {
+                    return Task::none();
+                };
+                let Ok(entries) = result else {
+                    return Task::none();
+                };
+                let prefix = &identity.path;
+                files
+                    .retain(|file| file.path == *prefix || file.path.strip_prefix(prefix).is_err());
+                files.extend(entries);
+                files.sort_by(|left, right| left.path.cmp(&right.path));
+                Task::none()
+            }
+            RepositoryAction::NewTerminal { .. } | RepositoryAction::Clipboard { .. } => {
+                Task::none()
+            }
             RepositoryAction::StageSelected { .. } => Task::none(),
             RepositoryAction::FilesLoaded { identity, result } => {
                 if !self.accepts_file_list(&identity) || identity.path != Path::new(".") {
@@ -3004,11 +3099,7 @@ impl RepositoryRuntime {
         self.viewports = retained.unwrap_or_default();
         self.selected = Some(RepositoryFile {
             path: path.clone(),
-            staged_old_path: None,
-            unstaged_old_path: None,
-            staged: false,
-            unstaged: false,
-            status: None,
+            ..RepositoryFile::default()
         });
         self.document = DocumentState::None;
         self.diffs.clear();
@@ -3032,6 +3123,7 @@ impl RepositoryRuntime {
                     staged: false,
                     unstaged: false,
                     status: None,
+                    directory: false,
                 }
             }
             None => return Task::none(),
@@ -3474,50 +3566,50 @@ fn base_candidates(snapshot: &RepositorySnapshot) -> Vec<ValidatedRefName> {
         .collect()
 }
 
-/// Lists a plain folder without following symlinked directories. Traversal
-/// uses the same descriptor-relative resolver as file loading and saving.
+/// Lists one directory without following symlinked directories or walking
+/// descendants. Folder trees start collapsed, so a recursive walk would spend
+/// the first paint of `Documents/unorganized` enumerating files the panel
+/// will not show. Children are listed when the folder is expanded.
 pub fn load_directory_files(directory: &Path) -> Result<Vec<RepositoryFile>, String> {
+    load_directory_listing(directory, Path::new(""))
+}
+
+fn load_directory_listing(root: &Path, relative: &Path) -> Result<Vec<RepositoryFile>, String> {
     use std::os::fd::AsRawFd;
-    let root = crate::fs_safety::Root::open(directory).map_err(|error| error.to_string())?;
-    let mut pending = vec![(PathBuf::new(), 0usize)];
+    let handle_root = crate::fs_safety::Root::open(root).map_err(|error| error.to_string())?;
+    let handle = if relative.as_os_str().is_empty() {
+        std::fs::File::open(root).map_err(|error| error.to_string())?
+    } else {
+        crate::fs_safety::open_beneath(&handle_root, relative).map_err(|error| error.to_string())?
+    };
+    let descriptor_path = format!("/proc/self/fd/{}", handle.as_raw_fd());
     let mut files = Vec::new();
     let mut entries = 0usize;
-    while let Some((relative, depth)) = pending.pop() {
-        if depth > 128 {
-            return Err("Folder nesting exceeds 128 levels; open a narrower folder.".into());
+    for entry in std::fs::read_dir(descriptor_path).map_err(|error| error.to_string())? {
+        let entry = entry.map_err(|error| error.to_string())?;
+        entries += 1;
+        if entries > 20_000 {
+            return Err("This folder has more than 20,000 entries; open a narrower folder.".into());
         }
-        let handle = if relative.as_os_str().is_empty() {
-            std::fs::File::open(directory).map_err(|error| error.to_string())?
+        let name = entry.file_name();
+        if name == "." || name == ".." || name == ".git" {
+            continue;
+        }
+        let path = if relative.as_os_str().is_empty() {
+            PathBuf::from(&name)
         } else {
-            crate::fs_safety::open_beneath(&root, &relative).map_err(|error| error.to_string())?
+            relative.join(&name)
         };
-        let descriptor_path = format!("/proc/self/fd/{}", handle.as_raw_fd());
-        for entry in std::fs::read_dir(descriptor_path).map_err(|error| error.to_string())? {
-            let entry = entry.map_err(|error| error.to_string())?;
-            entries += 1;
-            if entries > 100_000 {
-                return Err("Folder exceeds 100,000 entries; open a narrower folder.".into());
-            }
-            let name = entry.file_name();
-            if name == ".git" {
-                continue;
-            }
-            let path = relative.join(name);
-            let metadata = crate::fs_safety::metadata_beneath(&root, &path)
-                .map_err(|error| error.to_string())?;
-            if metadata.is_dir() {
-                pending.push((path, depth + 1));
-            } else {
-                files.push(RepositoryFile {
-                    path,
-                    staged_old_path: None,
-                    unstaged_old_path: None,
-                    staged: false,
-                    unstaged: false,
-                    status: None,
-                });
-            }
+        if crate::repository::RepoPath::parse(&path).is_err() {
+            continue;
         }
+        let metadata = crate::fs_safety::metadata_beneath(&handle_root, &path)
+            .map_err(|error| error.to_string())?;
+        files.push(RepositoryFile {
+            path,
+            directory: metadata.is_dir(),
+            ..RepositoryFile::default()
+        });
     }
     files.sort_by(|left, right| left.path.cmp(&right.path));
     Ok(files)
@@ -3577,6 +3669,7 @@ fn assemble_repository_files(
                 staged,
                 unstaged,
                 status: status.map(ParsedStatus::display_code),
+                directory: false,
             }
         })
         .collect())
@@ -3825,6 +3918,23 @@ fn branch_comparison_icon() -> widget::icon::Handle {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct ExternalEditorCommand<'a>(CardId, &'a str);
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct EditorClipboardCommand {
+    card: CardId,
+    op: ClipboardOp,
+}
+
+impl widget::menu::Action for EditorClipboardCommand {
+    type Message = RepositoryAction;
+
+    fn message(&self) -> RepositoryAction {
+        RepositoryAction::Clipboard {
+            card: self.card,
+            op: self.op,
+        }
+    }
+}
+
 impl widget::menu::Action for ExternalEditorCommand<'_> {
     type Message = RepositoryAction;
 
@@ -3907,7 +4017,7 @@ pub fn selected_file_toolbar(
         preview.id(focus_restore_id(card))
     };
     let edit = icon_control(
-        crate::ui_controls::symbolic_icon("document-edit-symbolic"),
+        crate::ui_controls::symbolic_icon("text-editor-symbolic"),
         "Edit file",
         editable && editing && runtime.can_apply_markdown_mode(false),
         runtime.can_apply_markdown_mode(false),
@@ -4204,12 +4314,16 @@ fn editable_document_view<'a>(
         .width(Length::Fill)
         .into()
     } else {
-        text_editor::TextEditor::new(&document.content)
+        let editor = text_editor::TextEditor::new(&document.content)
             // Before `highlight_with`: `id` is only offered by the
             // not-yet-highlighted builder.
             .id(editor_focus_id(card))
             .highlight_with::<highlighter::Highlighter>(
-                highlighter_settings(&document.path, cosmic::theme::is_dark()),
+                highlighter_settings(
+                    &document.path,
+                    runtime.syntax_theme,
+                    cosmic::theme::is_dark(),
+                ),
                 |highlight, _theme: &cosmic::Theme| highlight.to_format(),
             )
             .font(Font::MONOSPACE)
@@ -4239,8 +4353,23 @@ fn editable_document_view<'a>(
                 style.border = iced::Border::default();
                 style
             })
-            .on_action(move |action| RepositoryAction::EditorAction { card, action })
-            .into()
+            .key_binding(text_editor::default_bindings)
+            .on_action(move |action| RepositoryAction::EditorAction { card, action });
+        let entries = [
+            ("Cut", ClipboardOp::Cut),
+            ("Copy", ClipboardOp::Copy),
+            ("Paste", ClipboardOp::Paste),
+            ("Select all", ClipboardOp::SelectAll),
+        ]
+        .into_iter()
+        .map(|(label, op)| {
+            widget::menu::Item::Button(label.to_owned(), None, EditorClipboardCommand { card, op })
+        })
+        .collect();
+        crate::interaction::context_menu(
+            editor,
+            widget::menu::items(&std::collections::HashMap::new(), entries),
+        )
     };
     // Keep the named editor in the same slot when save warnings appear.
     let error_slot = widget::column::with_children(error_rows).width(Length::Fill);
@@ -6451,6 +6580,7 @@ mod tests {
                 staged: false,
                 unstaged: true,
                 status: Some(" R".into()),
+                directory: false,
             }]
         );
     }
@@ -6482,7 +6612,8 @@ mod tests {
                     unstaged_old_path: None,
                     staged: false,
                     unstaged: true,
-                    status: Some("??".into())
+                    status: Some("??".into()),
+                    directory: false,
                 },
                 RepositoryFile {
                     path: PathBuf::from("renamed.md"),
@@ -6490,7 +6621,8 @@ mod tests {
                     unstaged_old_path: None,
                     staged: true,
                     unstaged: false,
-                    status: Some("R ".into())
+                    status: Some("R ".into()),
+                    directory: false,
                 },
                 RepositoryFile {
                     path: PathBuf::from("tracked.md"),
@@ -6498,7 +6630,8 @@ mod tests {
                     unstaged_old_path: None,
                     staged: false,
                     unstaged: true,
-                    status: Some(" M".into())
+                    status: Some(" M".into()),
+                    directory: false,
                 },
             ]
         );
@@ -6584,6 +6717,7 @@ mod tests {
             staged: false,
             unstaged: true,
             status: Some(" M".into()),
+            directory: false,
         });
         let mut document = EditorDocument::new(
             path.clone(),
@@ -6787,6 +6921,7 @@ mod tests {
             staged: false,
             unstaged: true,
             status: Some(" M".into()),
+            directory: false,
         });
         let mut document = EditorDocument::new(
             path.clone(),
@@ -6888,6 +7023,7 @@ mod tests {
             staged: false,
             unstaged: true,
             status: Some(" M".into()),
+            directory: false,
         });
         let identity = AsyncIdentity {
             card,
@@ -7089,6 +7225,7 @@ mod tests {
             staged: false,
             unstaged: true,
             status: Some(" M".into()),
+            directory: false,
         });
         runtime.document = DocumentState::Loading(path.clone());
 
@@ -7122,6 +7259,7 @@ mod tests {
                 staged: true,
                 unstaged: false,
                 status: Some("M ".into()),
+                directory: false,
             }]),
         });
 
@@ -7156,6 +7294,7 @@ mod tests {
             staged: false,
             unstaged: true,
             status: Some(" M".into()),
+            directory: false,
         });
         let identity = AsyncIdentity {
             card,
@@ -7217,6 +7356,7 @@ mod tests {
             staged: false,
             unstaged: true,
             status: Some(" M".into()),
+            directory: false,
         });
         let mut document =
             EditorDocument::new(path, "disk\n".into(), blake3::hash(b"disk\n"), true);
@@ -7346,6 +7486,7 @@ mod tests {
             staged: true,
             unstaged: true,
             status: Some("MM".into()),
+            directory: false,
         };
         runtime.files = FileListState::Ready(vec![file.clone()]);
         runtime.selected = Some(file);
@@ -7436,6 +7577,7 @@ mod tests {
             staged: false,
             unstaged: true,
             status: Some(" M".into()),
+            directory: false,
         });
         runtime.diff_basis = DiffBasis::IndexToWorktree;
         let card = CardId::new();
@@ -7465,6 +7607,7 @@ mod tests {
                 staged: false,
                 unstaged: !tracked,
                 status: (!tracked).then(|| "??".into()),
+                directory: false,
             });
             let mut document = EditorDocument::new(
                 path.clone(),
@@ -7549,6 +7692,7 @@ mod tests {
             staged: true,
             unstaged: true,
             status: Some("MM".into()),
+            directory: false,
         });
         runtime.diff_basis = DiffBasis::IndexToWorktree;
         runtime.diff_change = 2;
@@ -7622,6 +7766,7 @@ mod tests {
             staged: false,
             unstaged: true,
             status: Some(" M".into()),
+            directory: false,
         });
         runtime.document = DocumentState::Loading(PathBuf::from("current.rs"));
         let stale = AsyncIdentity {
@@ -7708,6 +7853,7 @@ mod tests {
             staged: false,
             unstaged: true,
             status: Some(" M".into()),
+            directory: false,
         });
         runtime.set_diff_state(
             DiffBasis::IndexToWorktree,
@@ -8983,6 +9129,7 @@ mod tests {
             staged: true,
             unstaged: true,
             status: Some("MM".into()),
+            directory: false,
         };
         runtime.generation = 1;
         runtime.files = FileListState::Ready(vec![file.clone()]);
@@ -9225,6 +9372,7 @@ mod tests {
             staged: false,
             unstaged: true,
             status: Some("??".into()),
+            directory: false,
         };
         runtime.files = FileListState::Ready(vec![file.clone()]);
         let mut tree = Tree::new(view(card, &runtime).as_widget());
@@ -9435,7 +9583,11 @@ mod tests {
             ("deploy/Dockerfile.dev", "FROM scratch"),
             ("src/kernel.cu", "__global__ void kernel() { return; }"),
         ] {
-            let settings = highlighter_settings(Path::new(path), true);
+            let settings = highlighter_settings(
+                Path::new(path),
+                crate::settings::EditorSyntaxTheme::Auto,
+                true,
+            );
             assert!(
                 colours(&settings.token, line),
                 "{path} must resolve to a grammar rather than render as flat plain text"
@@ -9452,15 +9604,23 @@ mod tests {
         // reading a dark one off a light surface is what makes highlighted
         // text illegible.
         assert!(
-            highlighter_settings(Path::new("main.rs"), true)
-                .theme
-                .is_dark(),
+            highlighter_settings(
+                Path::new("main.rs"),
+                crate::settings::EditorSyntaxTheme::Auto,
+                true,
+            )
+            .theme
+            .is_dark(),
             "a dark application must highlight with a dark scheme"
         );
         assert!(
-            !highlighter_settings(Path::new("main.rs"), false)
-                .theme
-                .is_dark(),
+            !highlighter_settings(
+                Path::new("main.rs"),
+                crate::settings::EditorSyntaxTheme::Auto,
+                false,
+            )
+            .theme
+            .is_dark(),
             "a light application must highlight with a light scheme"
         );
     }
@@ -9557,5 +9717,31 @@ mod tests {
             runtime.editor_focus_target(card).is_none(),
             "the file list has no buffer for a caret to be in"
         );
+    }
+
+    #[test]
+    fn directory_listings_are_one_level_until_a_folder_is_opened() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join("nested/deeper")).unwrap();
+        std::fs::write(root.path().join("top.txt"), "a").unwrap();
+        std::fs::write(root.path().join("nested/child.txt"), "b").unwrap();
+        std::fs::write(root.path().join("nested/deeper/leaf.txt"), "c").unwrap();
+        let listed = load_directory_files(root.path()).unwrap();
+        let names: Vec<_> = listed
+            .iter()
+            .map(|file| (file.path.to_string_lossy().into_owned(), file.directory))
+            .collect();
+        assert_eq!(
+            names,
+            vec![("nested".into(), true), ("top.txt".into(), false)],
+            "the first paint must not walk Documents-sized trees"
+        );
+
+        let nested = load_directory_listing(root.path(), Path::new("nested")).unwrap();
+        let nested_names: Vec<_> = nested
+            .iter()
+            .map(|file| file.path.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(nested_names, vec!["nested/child.txt", "nested/deeper"]);
     }
 }

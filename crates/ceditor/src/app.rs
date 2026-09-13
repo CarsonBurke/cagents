@@ -9,7 +9,9 @@ use cagents::{
         CancellationToken, DiffBasis, MutationOutcome, RepoPath, RepositoryId, RepositoryService,
         RepositorySnapshot, StageRequest, UnstageRequest,
     },
-    repository_widget::{self, LspIntent, RepositoryAction, RepositoryRuntime},
+    repository_widget::{
+        self, ClipboardOp, EditorAction, EditorEdit, LspIntent, RepositoryAction, RepositoryRuntime,
+    },
     settings::{self, AppSettings, AppTheme},
     sidebar::{
         self, ActiveWorktreeKey, FileCommand, SidebarAction, SidebarFocus, SidebarMode,
@@ -108,6 +110,7 @@ pub enum Message {
     Settings,
     AutoSave(bool),
     WrapLines(bool),
+    SyntaxTheme(cagents::settings::EditorSyntaxTheme),
     LanguageServerAssistance(bool),
     Theme(AppTheme),
     Scale(f32),
@@ -306,6 +309,50 @@ fn create_new_file(path: &Path, text: &str) -> Result<(), String> {
         let _ = std::fs::File::open(parent).and_then(|directory| directory.sync_all());
     }
     Ok(())
+}
+
+fn settings_choice_row(choices: Vec<Element<'_, Message>>) -> Element<'_, Message> {
+    widget::row::with_children(choices)
+        .spacing(design::GRID_UNIT)
+        .align_y(iced::Alignment::Center)
+        .into()
+}
+
+fn settings_field<'a>(
+    title: &'static str,
+    detail: &'static str,
+    control: Element<'a, Message>,
+) -> Element<'a, Message> {
+    widget::column::with_children(vec![
+        widget::text::caption_heading(title).into(),
+        design::caption(detail)
+            .wrapping(iced::widget::text::Wrapping::Word)
+            .width(Length::Fill)
+            .into(),
+        control,
+    ])
+    .spacing(design::GRID_UNIT)
+    .width(Length::Fill)
+    .into()
+}
+
+fn settings_group<'a>(
+    title: &'static str,
+    detail: &'static str,
+    controls: Vec<Element<'a, Message>>,
+) -> Element<'a, Message> {
+    let mut children = vec![
+        widget::text::title4(title).into(),
+        design::caption(detail)
+            .wrapping(iced::widget::text::Wrapping::Word)
+            .width(Length::Fill)
+            .into(),
+    ];
+    children.extend(controls);
+    widget::column::with_children(children)
+        .spacing(12)
+        .width(Length::Fill)
+        .into()
 }
 
 fn tab_title_style() -> cosmic::theme::Button {
@@ -709,6 +756,7 @@ impl Editor {
         runtime.set_standalone(true);
         runtime.set_auto_save(self.settings.editor_auto_save);
         runtime.set_wrap_lines(self.settings.editor_wrap_lines);
+        runtime.set_syntax_theme(self.settings.editor_syntax_theme);
         let mut sidebar = SidebarModel::ready(
             SidebarMode::Expanded,
             vec![SidebarProject::new(
@@ -859,6 +907,44 @@ impl Editor {
             },
             true,
         )
+    }
+
+    fn editor_clipboard(&mut self, id: CardId, op: ClipboardOp) -> Task<Message> {
+        match op {
+            ClipboardOp::Copy => self
+                .tab(id)
+                .and_then(|tab| tab.runtime.selected_text())
+                .map_or_else(Task::none, |text| {
+                    iced::clipboard::write(text).map(cosmic::Action::App)
+                }),
+            ClipboardOp::Cut => {
+                let Some(text) = self.tab(id).and_then(|tab| tab.runtime.selected_text()) else {
+                    return Task::none();
+                };
+                Task::batch([
+                    iced::clipboard::write(text).map(cosmic::Action::App),
+                    self.update(Message::Repository(RepositoryAction::EditorAction {
+                        card: id,
+                        action: EditorAction::Edit(EditorEdit::Delete),
+                    })),
+                ])
+            }
+            ClipboardOp::Paste => iced::clipboard::read().map(move |text| {
+                cosmic::Action::App(match text {
+                    Some(text) => Message::Repository(RepositoryAction::EditorAction {
+                        card: id,
+                        action: EditorAction::Edit(EditorEdit::Paste(std::sync::Arc::new(text))),
+                    }),
+                    None => Message::RefreshVisible,
+                })
+            }),
+            ClipboardOp::SelectAll => {
+                self.update(Message::Repository(RepositoryAction::EditorAction {
+                    card: id,
+                    action: EditorAction::SelectAll,
+                }))
+            }
+        }
     }
 
     fn save_as(&mut self, id: CardId) -> Task<Message> {
@@ -1734,6 +1820,7 @@ impl Application for Editor {
                         if !matches!(
                             action,
                             RepositoryAction::FilesLoaded { .. }
+                                | RepositoryAction::DirectoryListed { .. }
                                 | RepositoryAction::FileLoaded { .. }
                                 | RepositoryAction::DiffLoaded { .. }
                                 | RepositoryAction::DiffBasisResolved { .. }
@@ -1751,6 +1838,9 @@ impl Application for Editor {
                         if self.tab(*card).is_some_and(|tab| self.tab_is_untitled(tab)) {
                             return self.save_as(*card);
                         }
+                    }
+                    if let RepositoryAction::Clipboard { card, op } = action {
+                        return self.editor_clipboard(card, op);
                     }
                     if let RepositoryAction::OpenFile { path, .. } = action {
                         return self.request_file(id, path);
@@ -1801,21 +1891,11 @@ impl Application for Editor {
                     let Some(tab) = self.tab_mut(id) else {
                         return Task::none();
                     };
-                    if let RepositoryAction::FilesLoaded {
-                        result: Ok(files), ..
-                    } = &action
-                    {
-                        if !tab.git {
-                            let paths: Vec<_> = files
-                                .iter()
-                                .filter_map(|file| RepoPath::parse(&file.path).ok())
-                                .collect();
-                            if let Some(key) = tab.navigation.active_worktree().cloned() {
-                                tab.sidebar.source_control =
-                                    Some(SourceControlModel::directory(key, &paths));
-                            }
-                        }
-                    }
+                    let listing_changed = matches!(
+                        &action,
+                        RepositoryAction::FilesLoaded { result: Ok(_), .. }
+                            | RepositoryAction::DirectoryListed { result: Ok(_), .. }
+                    );
                     let task = tab
                         .runtime
                         .update(action)
@@ -1827,12 +1907,31 @@ impl Application for Editor {
                         })
                         .map(cosmic::Action::App);
                     let mut tasks = vec![task];
+                    if listing_changed && !tab.git {
+                        if let Some(key) = tab.navigation.active_worktree().cloned() {
+                            tab.sidebar.source_control =
+                                Some(SourceControlModel::directory_listing(
+                                    key,
+                                    tab.runtime.listed_files(),
+                                ));
+                        }
+                    }
                     if back_to_files && tab.runtime.selected_path().is_none() {
                         tab.owned_file = None;
                         tab.pending_file = None;
                     }
                     if loaded {
                         tab.files_loaded = true;
+                        if !tab.git {
+                            let expanded: Vec<_> = tab
+                                .navigation
+                                .expanded_directory_paths()
+                                .map(|path| path.as_path().to_path_buf())
+                                .collect();
+                            for path in expanded {
+                                tasks.push(repository_task(tab.runtime.list_directory(id, path)));
+                            }
+                        }
                     }
                     if focus_loaded {
                         tasks.push(tab.runtime.focus_editor(id).map(cosmic::Action::App));
@@ -1919,6 +2018,13 @@ impl Application for Editor {
                         }
                         SidebarAction::RefreshWorktree { .. } | SidebarAction::Refresh => {
                             self.refresh(id)
+                        }
+                        SidebarAction::ToggleDirectory { path, .. }
+                            if tab.navigation.directory_is_expanded(&path) =>
+                        {
+                            repository_task(
+                                tab.runtime.list_directory(id, path.as_path().to_path_buf()),
+                            )
                         }
                         _ => Task::none(),
                     };
@@ -2017,6 +2123,13 @@ impl Application for Editor {
                     self.settings.editor_wrap_lines = enabled;
                     for tab in &mut self.tabs {
                         tab.runtime.set_wrap_lines(enabled);
+                    }
+                    self.save_settings()
+                }
+                Message::SyntaxTheme(theme) => {
+                    self.settings.editor_syntax_theme = theme;
+                    for tab in &mut self.tabs {
+                        tab.runtime.set_syntax_theme(theme);
                     }
                     self.save_settings()
                 }
@@ -2272,30 +2385,31 @@ impl Application for Editor {
         end
     }
     fn view(&self) -> Element<'_, Message> {
-        let tabs: Vec<Element<'_, Message>> = self
-            .tabs
-            .iter()
-            .map(|tab| {
-                let selected = self.active == Some(tab.id);
-                let title = format!(
-                    "{}{}",
-                    if tab.runtime.is_dirty() { "• " } else { "" },
-                    tab.title
-                );
-                let icon = tab
-                    .pending_file
-                    .as_ref()
-                    .map(|pending| pending.canonical.as_ref().unwrap_or(&pending.path))
-                    .or(tab.owned_file.as_ref())
-                    .map_or_else(
-                        || cagents::file_icon::folder(true),
-                        |path| cagents::file_icon::icon(path),
+        let tabs: Vec<Element<'_, Message>> =
+            self.tabs
+                .iter()
+                .map(|tab| {
+                    let selected = self.active == Some(tab.id);
+                    let title = format!(
+                        "{}{}",
+                        if tab.runtime.is_dirty() { "• " } else { "" },
+                        tab.title
                     );
-                widget::container(
-                    widget::row::with_children(vec![
-                        cagents::interaction::tooltip(
-                            widget::button::custom(
-                                widget::row::with_children(vec![
+                    let icon = tab
+                        .pending_file
+                        .as_ref()
+                        .map(|pending| pending.canonical.as_ref().unwrap_or(&pending.path))
+                        .or(tab.owned_file.as_ref())
+                        .map_or_else(
+                            || cagents::file_icon::folder(true),
+                            |path| cagents::file_icon::icon(path),
+                        );
+                    cagents::interaction::hover(
+                        widget::container(
+                            widget::row::with_children(vec![
+                                cagents::interaction::tooltip(
+                                    widget::button::custom(
+                                        widget::row::with_children(vec![
                                     widget::container(icon).center_y(Length::Fill).into(),
                                     design::body(title.clone())
                                         .wrapping(iced::widget::text::Wrapping::None)
@@ -2305,55 +2419,55 @@ impl Application for Editor {
                                         .width(Length::Fill)
                                         .into(),
                                 ])
-                                .spacing(6)
-                                .align_y(iced::Alignment::Center)
-                                .height(Length::Fill)
-                                .width(Length::Fill),
-                            )
-                            .name(title.clone())
-                            .class(tab_title_style())
-                            .padding([0, 8])
-                            .width(Length::Fill)
-                            .height(Length::Fill)
-                            .on_press(Message::Select(tab.id)),
-                            title,
-                        ),
-                        icon_control(
-                            widget::icon::from_name("window-close-symbolic").handle(),
-                            "Close tab",
-                            false,
-                            !self.modal_open(),
-                            Some(Message::CloseTab(tab.id)),
+                                        .spacing(6)
+                                        .align_y(iced::Alignment::Center)
+                                        .height(Length::Fill)
+                                        .width(Length::Fill),
+                                    )
+                                    .name(title.clone())
+                                    .class(tab_title_style())
+                                    .padding([0, 8])
+                                    .width(Length::Fill)
+                                    .height(Length::Fill)
+                                    .on_press(Message::Select(tab.id)),
+                                    title,
+                                ),
+                                icon_control(
+                                    widget::icon::from_name("window-close-symbolic").handle(),
+                                    "Close tab",
+                                    false,
+                                    !self.modal_open(),
+                                    Some(Message::CloseTab(tab.id)),
+                                )
+                                .into(),
+                            ])
+                            .align_y(iced::Alignment::Center)
+                            .spacing(2)
+                            .height(Length::Fill),
                         )
-                        .into(),
-                    ])
-                    .align_y(iced::Alignment::Center)
-                    .spacing(2)
-                    .height(Length::Fill),
-                )
-                .width(184)
-                .height(design::PRIMARY_CONTROL_SIZE)
-                .class(cosmic::theme::Container::custom(move |theme| {
-                    iced::widget::container::Style {
-                        background: selected.then(|| {
-                            iced::Background::Color(
-                                theme
-                                    .current_container()
-                                    .component
-                                    .selected_state_color()
-                                    .into(),
-                            )
-                        }),
-                        border: iced::Border {
-                            radius: theme.cosmic().corner_radii.radius_s.into(),
-                            ..Default::default()
-                        },
-                        ..Default::default()
-                    }
-                }))
-                .into()
-            })
-            .collect();
+                        .width(184)
+                        .height(design::PRIMARY_CONTROL_SIZE)
+                        .class(cosmic::theme::Container::custom(move |theme| {
+                            iced::widget::container::Style {
+                                background: selected.then(|| {
+                                    iced::Background::Color(
+                                        theme
+                                            .current_container()
+                                            .component
+                                            .selected_state_color()
+                                            .into(),
+                                    )
+                                }),
+                                border: iced::Border {
+                                    radius: theme.cosmic().corner_radii.radius_s.into(),
+                                    ..Default::default()
+                                },
+                                ..Default::default()
+                            }
+                        })),
+                    )
+                })
+                .collect();
         let mut body = Vec::new();
         // The COSMIC header above has no separator of its own: always rule
         // off the content below it, tabs or placeholder alike.
@@ -2649,75 +2763,127 @@ impl Application for Editor {
         if !self.settings_open {
             return None;
         }
-        let theme_choices: Vec<Element<'_, Message>> = [
-            ("System", AppTheme::System),
-            ("Light", AppTheme::Light),
-            ("Dark", AppTheme::Dark),
-        ]
-        .into_iter()
-        .map(|(label, theme)| {
-            let selected = self.settings.app_theme == theme;
-            widget::button::custom(design::body(label))
-                .name(label)
-                .class(if selected {
-                    cosmic::theme::Button::Suggested
-                } else {
-                    cosmic::theme::Button::Text
-                })
-                .selected(selected)
-                .width(Length::Fill)
-                .on_press(Message::Theme(theme))
-                .into()
-        })
-        .collect();
+        let theme_choices = ["System", "Light", "Dark"]
+            .into_iter()
+            .zip([AppTheme::System, AppTheme::Light, AppTheme::Dark])
+            .map(|(label, theme)| {
+                let selected = self.settings.app_theme == theme;
+                cagents::interaction::hover(
+                    widget::button::custom(design::body(label))
+                        .name(label)
+                        .class(if selected {
+                            cosmic::theme::Button::Suggested
+                        } else {
+                            cosmic::theme::Button::Standard
+                        })
+                        .selected(selected)
+                        .on_press(Message::Theme(theme)),
+                )
+            })
+            .collect();
+        let syntax_choices = settings::EditorSyntaxTheme::ALL
+            .iter()
+            .copied()
+            .map(|theme| {
+                let selected = self.settings.editor_syntax_theme == theme;
+                cagents::interaction::hover(
+                    widget::button::custom(design::body(theme.label()))
+                        .name(theme.label())
+                        .class(if selected {
+                            cosmic::theme::Button::Suggested
+                        } else {
+                            cosmic::theme::Button::Standard
+                        })
+                        .selected(selected)
+                        .on_press(Message::SyntaxTheme(theme)),
+                )
+            })
+            .collect();
         let content = widget::column::with_children(vec![
-            widget::text::title4("Editing").into(),
-            widget::toggler(self.settings.editor_auto_save)
-                .label("Save files automatically".to_owned())
-                .on_toggle(Message::AutoSave)
-                .into(),
-            design::caption("Save after a pause. Conflicts and save errors still require your attention.")
-                .wrapping(iced::widget::text::Wrapping::Word)
-                .into(),
-            widget::toggler(self.settings.editor_wrap_lines)
-                .label("Wrap long lines".to_owned())
-                .on_toggle(Message::WrapLines)
-                .into(),
-            design::caption("Fit long lines to the editor width. Off keeps each line on one row.")
-                .wrapping(iced::widget::text::Wrapping::Word)
-                .into(),
-            widget::text::title4("Appearance").into(),
-            widget::text::body("Color scheme").into(),
-            widget::row::with_children(theme_choices).spacing(8).into(),
-            widget::row::with_children(vec![
-                widget::text::body("Interface scale").width(Length::Fill).into(),
-                widget::button::text("Smaller")
-                    .on_press_maybe((self.settings.ui_scale > 0.75).then_some(
-                        Message::Scale((self.settings.ui_scale - 0.1).max(0.75)),
-                    ))
-                    .into(),
-                widget::text::body(format!("{:.0}%", self.settings.ui_scale * 100.0)).into(),
-                widget::button::text("Larger")
-                    .on_press_maybe((self.settings.ui_scale < 2.0).then_some(
-                        Message::Scale((self.settings.ui_scale + 0.1).min(2.0)),
-                    ))
-                    .into(),
-            ]).spacing(12).align_y(iced::Alignment::Center).into(),
-            widget::text::title4("Language servers").into(),
-            widget::checkbox(self.language_server_assistance)
-                .label("Language-server assistance")
-                .on_toggle(Message::LanguageServerAssistance)
-                .into(),
-            design::caption("Opt in to semantic diagnostics, completion, and symbol information. Syntax highlighting, saving, and Git work without a language server.")
-                .wrapping(iced::widget::text::Wrapping::Word)
-                .into(),
-            design::caption("Edit language_servers in the preferences file, then restart ceditor to apply server changes.")
-                .wrapping(iced::widget::text::Wrapping::Word)
-                .into(),
-            design::caption(self.settings_path.to_string_lossy())
-                .wrapping(iced::widget::text::Wrapping::WordOrGlyph)
-                .into(),
-        ]).spacing(12).width(Length::Fill);
+            settings_group(
+                "Editing",
+                "Saving and how the buffer wraps.",
+                vec![
+                    widget::toggler(self.settings.editor_auto_save)
+                        .label("Save files automatically".to_owned())
+                        .on_toggle(Message::AutoSave)
+                        .into(),
+                    design::caption("Saves after a pause. Conflicts still need a decision.")
+                        .wrapping(iced::widget::text::Wrapping::Word)
+                        .into(),
+                    widget::toggler(self.settings.editor_wrap_lines)
+                        .label("Wrap long lines".to_owned())
+                        .on_toggle(Message::WrapLines)
+                        .into(),
+                ],
+            ),
+            settings_group(
+                "Appearance",
+                "Window colors, syntax colors, and interface scale.",
+                vec![
+                    settings_field("Color scheme", "Follow the desktop, or lock light or dark.", settings_choice_row(theme_choices)),
+                    settings_field(
+                        "Syntax highlighting",
+                        "Match app follows the color scheme. The others keep a fixed highlighter palette.",
+                        settings_choice_row(syntax_choices),
+                    ),
+                    settings_field(
+                        "Interface scale",
+                        "Size of text and controls.",
+                        widget::row::with_children(vec![
+                            icon_control(
+                                cagents::ui_controls::symbolic_icon("list-remove-symbolic"),
+                                "Decrease scale",
+                                false,
+                                self.settings.ui_scale > 0.75,
+                                (self.settings.ui_scale > 0.75).then_some(Message::Scale(
+                                    (self.settings.ui_scale - 0.1).max(0.75),
+                                )),
+                            )
+                            .into(),
+                            widget::container(design::body(format!(
+                                "{:.0}%",
+                                self.settings.ui_scale * 100.0
+                            )))
+                            .center_x(64)
+                            .center_y(design::PRIMARY_CONTROL_SIZE)
+                            .into(),
+                            icon_control(
+                                cagents::ui_controls::symbolic_icon("list-add-symbolic"),
+                                "Increase scale",
+                                false,
+                                self.settings.ui_scale < 2.0,
+                                (self.settings.ui_scale < 2.0).then_some(Message::Scale(
+                                    (self.settings.ui_scale + 0.1).min(2.0),
+                                )),
+                            )
+                            .into(),
+                        ])
+                        .spacing(design::GRID_UNIT)
+                        .align_y(iced::Alignment::Center)
+                        .into(),
+                    ),
+                ],
+            ),
+            settings_group(
+                "Language servers",
+                "Semantic diagnostics, completion, and hover. Off by default.",
+                vec![
+                    widget::toggler(self.language_server_assistance)
+                        .label("Language-server assistance".to_owned())
+                        .on_toggle(Message::LanguageServerAssistance)
+                        .into(),
+                    design::caption("Edit language_servers in the preferences file, then restart ceditor.")
+                        .wrapping(iced::widget::text::Wrapping::Word)
+                        .into(),
+                    design::caption(self.settings_path.to_string_lossy())
+                        .wrapping(iced::widget::text::Wrapping::WordOrGlyph)
+                        .into(),
+                ],
+            ),
+        ])
+        .spacing(24)
+        .width(Length::Fill);
         Some(cagents::interaction::opaque(
             widget::container(widget::column::with_children(vec![
                 widget::text::title3("Editor settings").into(),

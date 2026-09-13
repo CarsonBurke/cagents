@@ -33,7 +33,7 @@ use crate::{
         ConflictKind, DirtyState, DiscardRequest, HISTORY_PAGE_SIZE, HeadState, Oid, PathSelection,
         PushTarget, RemoteRecord, RepoPath, RepositoryId, RepositoryInfo, RepositorySnapshot,
         StatusSnapshot, TrackingState, ValidatedBranchName, ValidatedRefName, WorktreeRecord,
-        build_file_tree,
+        build_file_tree, build_file_tree_with_directories,
     },
     splitter::{Edge as SplitterEdge, Splitter},
 };
@@ -1488,7 +1488,27 @@ pub struct SourceControlModel {
 }
 
 fn file_rows(paths: &[RepoPath]) -> Vec<FileRow> {
-    build_file_tree(paths)
+    file_rows_from_tree(build_file_tree(paths))
+}
+
+fn file_rows_from_listing(files: &[crate::repository_widget::RepositoryFile]) -> Vec<FileRow> {
+    let mut file_paths = Vec::new();
+    let mut directories = Vec::new();
+    for file in files {
+        let Ok(path) = RepoPath::parse(&file.path) else {
+            continue;
+        };
+        if file.directory {
+            directories.push(path);
+        } else {
+            file_paths.push(path);
+        }
+    }
+    file_rows_from_tree(build_file_tree_with_directories(&file_paths, &directories))
+}
+
+fn file_rows_from_tree(entries: Vec<crate::repository::FileTreeEntry>) -> Vec<FileRow> {
+    entries
         .into_iter()
         .map(|entry| {
             let kind = if entry.directory { "folder" } else { "file" };
@@ -1510,6 +1530,22 @@ fn file_rows(paths: &[RepoPath]) -> Vec<FileRow> {
 impl SourceControlModel {
     /// File navigation for a plain folder, without invented Git data.
     pub fn directory(key: ActiveWorktreeKey, paths: &[RepoPath]) -> Self {
+        Self::directory_listing(
+            key,
+            &paths
+                .iter()
+                .map(|path| crate::repository_widget::RepositoryFile {
+                    path: path.as_path().to_path_buf(),
+                    ..crate::repository_widget::RepositoryFile::default()
+                })
+                .collect::<Vec<_>>(),
+        )
+    }
+
+    pub fn directory_listing(
+        key: ActiveWorktreeKey,
+        files: &[crate::repository_widget::RepositoryFile],
+    ) -> Self {
         let mut model = Self::empty(key, SidebarDataState::Ready);
         model.chrome.subheading = model
             .key
@@ -1518,7 +1554,7 @@ impl SourceControlModel {
             .map(|name| name.to_string_lossy().into_owned())
             .unwrap_or_else(|| model.key.canonical_path.display().to_string())
             .into_boxed_str();
-        model.files = file_rows(paths);
+        model.files = file_rows_from_listing(files);
         model
     }
 
@@ -2272,6 +2308,14 @@ impl SidebarState {
                 .and_then(|path| RepoPath::parse(path).ok())
                 .map(PanelSelection::File);
         }
+    }
+
+    pub fn directory_is_expanded(&self, path: &RepoPath) -> bool {
+        self.expanded_directories.contains(path)
+    }
+
+    pub fn expanded_directory_paths(&self) -> impl Iterator<Item = &RepoPath> {
+        self.expanded_directories.iter()
     }
 
     pub fn query(&self) -> &str {
@@ -3973,13 +4017,17 @@ fn file_context_controls<'a>(
             ("Rename…", "edit-rename-symbolic", FileCommand::Rename),
             (
                 "Duplicate file…",
-                "edit-copy-symbolic",
+                "edit-duplicate-symbolic",
                 FileCommand::CopyFile,
             ),
-            ("Copy path", "edit-copy-symbolic", FileCommand::CopyPath),
+            (
+                "Copy path",
+                "edit-copy-path-symbolic",
+                FileCommand::CopyPath,
+            ),
             (
                 "Copy relative path",
-                "edit-copy-symbolic",
+                "edit-copy-relative-path-symbolic",
                 FileCommand::CopyRelativePath,
             ),
         ] {
@@ -3988,7 +4036,7 @@ fn file_context_controls<'a>(
             }
             entries.push(widget::menu::Item::Button(
                 label.to_owned(),
-                Some(icon::from_name(icon).handle()),
+                Some(crate::ui_controls::symbolic_icon(icon)),
                 FileContextCommand::Manage { key, path, command },
             ));
         }
@@ -4261,7 +4309,11 @@ fn source_control_panel<'a>(
 
     match &source.data_state {
         SidebarDataState::Loading => {
-            notices = notices.push(design::caption("Loading source control…"));
+            notices = notices.push(design::caption(if matches!(panel, WorktreePanel::Files) {
+                "Loading files…"
+            } else {
+                "Loading source control…"
+            }));
             return worktree_panel_chrome(header.into(), notices.into(), None);
         }
         SidebarDataState::Error(message) => {
