@@ -425,6 +425,22 @@ impl Editor {
             || self.notices_open
     }
 
+    fn settings_footer(&self) -> Element<'_, Message> {
+        widget::row::with_children(vec![
+            icon_control(
+                symbolic_icon("emblem-system-symbolic"),
+                "Settings",
+                self.settings_open,
+                self.closing.is_none() && self.file_dialog.is_none(),
+                Some(Message::Settings),
+            )
+            .into(),
+        ])
+        .padding(cosmic::theme::spacing().space_xxxs)
+        .width(Length::Fill)
+        .into()
+    }
+
     fn rename_blocked(&self, absolute: &Path) -> bool {
         self.tabs.iter().any(|tab| {
             if !absolute.starts_with(&tab.runtime.descriptor.worktree) {
@@ -2031,6 +2047,9 @@ impl Application for Editor {
                     Task::batch(tasks)
                 }
                 Message::Sidebar(action) => {
+                    if matches!(action, SidebarAction::OpenSettings) {
+                        return self.update(Message::Settings);
+                    }
                     if self.modal_open() {
                         return Task::none();
                     }
@@ -2533,21 +2552,7 @@ impl Application for Editor {
         ]
     }
     fn header_end(&self) -> Vec<Element<'_, Message>> {
-        let mut end: Vec<Element<'_, Message>> = Vec::new();
-        if let Some(notices) = self.notices_control() {
-            end.push(notices);
-        }
-        end.push(
-            icon_control(
-                symbolic_icon("emblem-system-symbolic"),
-                "Settings",
-                self.settings_open,
-                self.closing.is_none() && self.file_dialog.is_none(),
-                Some(Message::Settings),
-            )
-            .into(),
-        );
-        end
+        self.notices_control().into_iter().collect()
     }
     fn view(&self) -> Element<'_, Message> {
         let tabs: Vec<Element<'_, Message>> =
@@ -2813,7 +2818,27 @@ impl Application for Editor {
             ));
         } else {
             body.extend(strip);
-            body.push(widget::container(widget::column::with_children(vec![widget::text::title1("Open a file or folder").into(), widget::text::body("Create a new tab to paste a note, or open an existing file or folder. Native editing, safe autosave, Git diffs, and language servers — without a daemon.").into(), widget::button::standard("Open folder").on_press(Message::Choose(true)).into()]).spacing(16)).padding(32).height(Length::Fill).into());
+            body.push(
+                widget::column::with_children(vec![
+                    widget::container(
+                        widget::column::with_children(vec![
+                            widget::text::title1("Open a file or folder").into(),
+                            widget::text::body("Create a new tab to paste a note, or open an existing file or folder. Native editing, safe autosave, Git diffs, and language servers — without a daemon.").into(),
+                            widget::button::standard("Open folder")
+                                .on_press(Message::Choose(true))
+                                .into(),
+                        ])
+                        .spacing(16),
+                    )
+                    .padding(32)
+                    .height(Length::Fill)
+                    .into(),
+                    widget::divider::horizontal::default().into(),
+                    self.settings_footer(),
+                ])
+                .height(Length::Fill)
+                .into(),
+            );
         }
         widget::column::with_children(body)
             .height(Length::Fill)
@@ -3165,6 +3190,16 @@ mod tests {
             })),
         );
         assert_eq!(app.sidebar_panel, WorktreePanel::Files);
+    }
+
+    #[test]
+    fn settings_opens_from_the_sidebar_footer() {
+        let mut app = editor();
+        assert!(!app.settings_open);
+        drop(app.update(Message::Sidebar(SidebarAction::OpenSettings)));
+        assert!(app.settings_open);
+        drop(app.update(Message::Settings));
+        assert!(!app.settings_open);
     }
 
     #[test]

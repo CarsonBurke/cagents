@@ -4181,6 +4181,7 @@ pub fn git_panel<'a>(
         modal_open,
         WorktreePanel::Changes,
         false,
+        false,
     )
 }
 
@@ -4192,7 +4193,15 @@ pub fn file_panel<'a>(
     width: f32,
     modal_open: bool,
 ) -> Element<'a, SidebarAction> {
-    worktree_panel(model, state, width, modal_open, WorktreePanel::Files, false)
+    worktree_panel(
+        model,
+        state,
+        width,
+        modal_open,
+        WorktreePanel::Files,
+        false,
+        false,
+    )
 }
 
 /// Files or Git changes, with a switch between them. Used by the standalone
@@ -4204,7 +4213,7 @@ pub fn worktree_sidebar<'a>(
     modal_open: bool,
     panel: WorktreePanel,
 ) -> Element<'a, SidebarAction> {
-    worktree_panel(model, state, width, modal_open, panel, true)
+    worktree_panel(model, state, width, modal_open, panel, true, true)
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -4221,6 +4230,7 @@ fn worktree_panel<'a>(
     modal_open: bool,
     panel: WorktreePanel,
     show_panel_switch: bool,
+    settings_footer: bool,
 ) -> Element<'a, SidebarAction> {
     let width = if width.is_finite() {
         width.clamp(0.0, design::INSPECTOR_MAX_WIDTH)
@@ -4275,7 +4285,22 @@ fn worktree_panel<'a>(
         .width(Length::Fill)
         .into(),
     };
-    widget::container(content)
+    let pane = if settings_footer {
+        widget::column::with_children(vec![
+            widget::container(content)
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .into(),
+            widget::divider::horizontal::default().into(),
+            footer(false, modal_open),
+        ])
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .into()
+    } else {
+        content
+    };
+    widget::container(pane)
         .class(theme::Container::Background)
         .width(Length::Fixed(width))
         .height(Length::Fill)
