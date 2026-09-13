@@ -576,7 +576,7 @@ impl Cagents {
         .push(self.new_tab_control())
         .spacing(2)
         .height(design::PRIMARY_CONTROL_SIZE);
-        let tabs = crate::interaction::horizontal_wheel(
+        let tabs = crate::interaction::overflow_fade_x(crate::interaction::horizontal_wheel(
             widget::scrollable::horizontal(tabs)
                 .id(widget::Id::new("workspace.tabs"))
                 .direction(iced::widget::scrollable::Direction::Horizontal(
@@ -584,7 +584,7 @@ impl Cagents {
                 ))
                 .width(Length::Fill)
                 .height(design::PRIMARY_CONTROL_SIZE),
-        );
+        ));
         let actions = widget::row::with_children(self.workflow_header())
             .spacing(2)
             .align_y(Alignment::Center);

@@ -6,10 +6,11 @@ use cosmic::cosmic_theme::{Component, Container, palette::Srgba};
 use cosmic::iced::advanced::Renderer as _;
 use cosmic::iced::advanced::{
     Clipboard, Layout, Shell, Widget, layout, overlay, renderer,
-    widget::{Id, Operation, Tree, tree},
+    widget::{Id, Operation, Tree, operation, tree},
 };
 use cosmic::iced::{
-    Animation, Color, Event, Length, Point, Rectangle, Size, Vector, mouse, time::Instant, window,
+    Animation, Background, Border, Color, Event, Gradient, Length, Point, Radians, Rectangle,
+    Shadow, Size, Vector, gradient::Linear, mouse, time::Instant, window,
 };
 use cosmic::{Element, Renderer, Theme, widget};
 use serde::Deserialize;
@@ -60,6 +61,18 @@ pub fn horizontal_wheel<'a, Message: 'a>(
     content: impl Into<Element<'a, Message>>,
 ) -> Element<'a, Message> {
     Element::new(HorizontalWheel {
+        content: content.into(),
+    })
+}
+
+/// Fade the leading/trailing edges of a horizontal strip when it can scroll.
+///
+/// Tab rows hide their scrollbar; the fade is the usual hint that more tabs
+/// sit off-screen.
+pub fn overflow_fade_x<'a, Message: 'a>(
+    content: impl Into<Element<'a, Message>>,
+) -> Element<'a, Message> {
+    Element::new(OverflowFadeX {
         content: content.into(),
     })
 }
@@ -554,6 +567,293 @@ impl<Message> Widget<Message, Theme, Renderer> for HorizontalWheel<'_, Message> 
             destinations,
         );
     }
+}
+
+const OVERFLOW_FADE_WIDTH: f32 = 24.0;
+
+fn overflow_edges(offset: f32, viewport: f32, content: f32) -> (bool, bool) {
+    (offset > 0.5, content - offset > viewport + 0.5)
+}
+
+struct OverflowFadeX<'a, Message> {
+    content: Element<'a, Message>,
+}
+
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+struct OverflowState {
+    start: bool,
+    end: bool,
+}
+
+struct OverflowProbe {
+    start: bool,
+    end: bool,
+    found: bool,
+}
+
+impl<T> Operation<T> for OverflowProbe {
+    fn traverse(&mut self, operate: &mut dyn FnMut(&mut dyn Operation<T>)) {
+        operate(self);
+    }
+
+    fn scrollable(
+        &mut self,
+        _id: Option<&Id>,
+        bounds: Rectangle,
+        content_bounds: Rectangle,
+        translation: Vector,
+        _state: &mut dyn operation::Scrollable,
+    ) {
+        // The tab strip is the outermost scrollable. Nested ones (editor
+        // panes, menus) would otherwise overwrite the fade with their offset.
+        if self.found {
+            return;
+        }
+        self.found = true;
+        (self.start, self.end) = overflow_edges(translation.x, bounds.width, content_bounds.width);
+    }
+}
+
+fn read_overflow<Message>(
+    content: &mut Element<'_, Message>,
+    tree: &mut Tree,
+    layout: Layout<'_>,
+    renderer: &Renderer,
+) -> OverflowState {
+    let mut probe = OverflowProbe {
+        start: false,
+        end: false,
+        found: false,
+    };
+    content
+        .as_widget_mut()
+        .operate(tree, layout, renderer, &mut probe);
+    OverflowState {
+        start: probe.start,
+        end: probe.end,
+    }
+}
+
+impl<Message> Widget<Message, Theme, Renderer> for OverflowFadeX<'_, Message> {
+    fn tag(&self) -> tree::Tag {
+        tree::Tag::of::<OverflowState>()
+    }
+    fn state(&self) -> tree::State {
+        tree::State::new(OverflowState::default())
+    }
+    fn children(&self) -> Vec<Tree> {
+        vec![Tree::new(&self.content)]
+    }
+    fn diff(&mut self, tree: &mut Tree) {
+        tree.diff_children(std::slice::from_mut(&mut self.content));
+    }
+    fn size(&self) -> Size<Length> {
+        self.content.as_widget().size()
+    }
+    fn layout(
+        &mut self,
+        tree: &mut Tree,
+        renderer: &Renderer,
+        limits: &layout::Limits,
+    ) -> layout::Node {
+        let node = self
+            .content
+            .as_widget_mut()
+            .layout(&mut tree.children[0], renderer, limits);
+        let overflow = read_overflow(
+            &mut self.content,
+            &mut tree.children[0],
+            Layout::new(&node),
+            renderer,
+        );
+        *tree.state.downcast_mut::<OverflowState>() = overflow;
+        node
+    }
+    fn operate(
+        &mut self,
+        tree: &mut Tree,
+        layout: Layout<'_>,
+        renderer: &Renderer,
+        operation: &mut dyn Operation,
+    ) {
+        self.content.as_widget_mut().operate(
+            &mut tree.children[0],
+            layout.with_virtual_offset(layout.virtual_offset()),
+            renderer,
+            operation,
+        );
+    }
+    fn update(
+        &mut self,
+        tree: &mut Tree,
+        event: &Event,
+        layout: Layout<'_>,
+        cursor: mouse::Cursor,
+        renderer: &Renderer,
+        clipboard: &mut dyn Clipboard,
+        shell: &mut Shell<'_, Message>,
+        viewport: &Rectangle,
+    ) {
+        let child_layout = layout.with_virtual_offset(layout.virtual_offset());
+        self.content.as_widget_mut().update(
+            &mut tree.children[0],
+            event,
+            child_layout,
+            cursor,
+            renderer,
+            clipboard,
+            shell,
+            viewport,
+        );
+        let overflow = read_overflow(
+            &mut self.content,
+            &mut tree.children[0],
+            child_layout,
+            renderer,
+        );
+        let state = tree.state.downcast_mut::<OverflowState>();
+        if *state != overflow {
+            *state = overflow;
+            shell.request_redraw();
+        }
+    }
+    fn mouse_interaction(
+        &self,
+        tree: &Tree,
+        layout: Layout<'_>,
+        cursor: mouse::Cursor,
+        viewport: &Rectangle,
+        renderer: &Renderer,
+    ) -> mouse::Interaction {
+        self.content.as_widget().mouse_interaction(
+            &tree.children[0],
+            layout.with_virtual_offset(layout.virtual_offset()),
+            cursor,
+            viewport,
+            renderer,
+        )
+    }
+    fn draw(
+        &self,
+        tree: &Tree,
+        renderer: &mut Renderer,
+        theme: &Theme,
+        style: &renderer::Style,
+        layout: Layout<'_>,
+        cursor: mouse::Cursor,
+        viewport: &Rectangle,
+    ) {
+        self.content.as_widget().draw(
+            &tree.children[0],
+            renderer,
+            theme,
+            style,
+            layout.with_virtual_offset(layout.virtual_offset()),
+            cursor,
+            viewport,
+        );
+        let state = tree.state.downcast_ref::<OverflowState>();
+        if !state.start && !state.end {
+            return;
+        }
+        let bounds = layout.bounds();
+        let Some(clip) = bounds.intersection(viewport) else {
+            return;
+        };
+        // Match the chrome behind the tabs, not the component fill sitting on it.
+        let mut color: Color = theme.current_container().base.into();
+        color.a = 1.0;
+        let mut clear = color;
+        clear.a = 0.0;
+        renderer.with_layer(clip, |renderer| {
+            if state.start {
+                fill_overflow_fade(
+                    renderer,
+                    Rectangle {
+                        x: bounds.x,
+                        y: bounds.y,
+                        width: OVERFLOW_FADE_WIDTH.min(bounds.width),
+                        height: bounds.height,
+                    },
+                    color,
+                    clear,
+                );
+            }
+            if state.end {
+                let width = OVERFLOW_FADE_WIDTH.min(bounds.width);
+                fill_overflow_fade(
+                    renderer,
+                    Rectangle {
+                        x: bounds.x + bounds.width - width,
+                        y: bounds.y,
+                        width,
+                        height: bounds.height,
+                    },
+                    clear,
+                    color,
+                );
+            }
+        });
+    }
+    fn overlay<'a>(
+        &'a mut self,
+        tree: &'a mut Tree,
+        layout: Layout<'a>,
+        renderer: &Renderer,
+        viewport: &Rectangle,
+        translation: Vector,
+    ) -> Option<overlay::Element<'a, Message, Theme, Renderer>> {
+        self.content.as_widget_mut().overlay(
+            &mut tree.children[0],
+            layout.with_virtual_offset(layout.virtual_offset()),
+            renderer,
+            viewport,
+            translation,
+        )
+    }
+    fn a11y_nodes(
+        &self,
+        layout: Layout<'_>,
+        tree: &Tree,
+        cursor: mouse::Cursor,
+    ) -> iced_accessibility::A11yTree {
+        self.content.as_widget().a11y_nodes(
+            layout.with_virtual_offset(layout.virtual_offset()),
+            &tree.children[0],
+            cursor,
+        )
+    }
+    fn drag_destinations(
+        &self,
+        tree: &Tree,
+        layout: Layout<'_>,
+        renderer: &Renderer,
+        destinations: &mut cosmic::iced::advanced::clipboard::DndDestinationRectangles,
+    ) {
+        self.content.as_widget().drag_destinations(
+            &tree.children[0],
+            layout.with_virtual_offset(layout.virtual_offset()),
+            renderer,
+            destinations,
+        );
+    }
+}
+
+fn fill_overflow_fade(renderer: &mut Renderer, bounds: Rectangle, from: Color, to: Color) {
+    renderer.fill_quad(
+        renderer::Quad {
+            bounds,
+            border: Border::default(),
+            shadow: Shadow::default(),
+            snap: true,
+        },
+        // iced treats 0 rad as upward (CSS 0deg). π/2 is left-to-right.
+        Background::Gradient(Gradient::Linear(
+            Linear::new(Radians(std::f32::consts::FRAC_PI_2))
+                .add_stop(0.0, from)
+                .add_stop(1.0, to),
+        )),
+    );
 }
 
 #[derive(Clone, Copy)]
@@ -1069,6 +1369,20 @@ mod tests {
             panic!("expected a wheel event");
         };
         assert_eq!(delta, mouse::ScrollDelta::Pixels { x: 60.0, y: 0.0 });
+    }
+
+    #[test]
+    fn overflow_edges_are_clear_when_content_fits() {
+        assert_eq!(overflow_edges(0.0, 200.0, 180.0), (false, false));
+        assert_eq!(overflow_edges(0.0, 200.0, 200.0), (false, false));
+        assert_eq!(overflow_edges(0.25, 200.0, 200.4), (false, false));
+    }
+
+    #[test]
+    fn overflow_edges_mark_whichever_side_can_still_scroll() {
+        assert_eq!(overflow_edges(0.0, 200.0, 400.0), (false, true));
+        assert_eq!(overflow_edges(12.0, 200.0, 400.0), (true, true));
+        assert_eq!(overflow_edges(200.0, 200.0, 400.0), (true, false));
     }
 }
 
