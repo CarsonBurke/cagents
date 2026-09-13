@@ -1,5 +1,5 @@
-use cagents::sidebar::FileListMode;
 use std::{
+    collections::BTreeMap,
     io::{Read, Write},
     path::{Path, PathBuf},
 };
@@ -14,6 +14,10 @@ pub struct Session {
     pub active: Option<usize>,
     #[serde(default = "default_sidebar_open")]
     pub sidebar_open: bool,
+    /// File-tree folders the user opened, keyed by worktree path. Everything
+    /// else renders collapsed, so whole project trees stay cheap to load.
+    #[serde(default)]
+    pub expanded_directories: BTreeMap<String, Vec<String>>,
 }
 
 impl Default for Session {
@@ -22,6 +26,7 @@ impl Default for Session {
             paths: Vec::new(),
             active: None,
             sidebar_open: default_sidebar_open(),
+            expanded_directories: BTreeMap::new(),
         }
     }
 }
@@ -51,37 +56,6 @@ pub fn load_session(settings: &Path) -> Result<Session, String> {
 pub fn save_session(settings: &Path, session: &Session) -> Result<(), String> {
     let document = serde_json::to_vec(session).map_err(|error| error.to_string())?;
     save_atomic(&settings.with_file_name("session.json"), &document)
-}
-
-pub fn load(settings: &Path) -> Result<FileListMode, String> {
-    let path = settings.with_file_name("file-list-mode");
-    let mut value = String::new();
-    match std::fs::File::open(&path) {
-        Ok(file) => {
-            file.take(16)
-                .read_to_string(&mut value)
-                .map_err(|error| error.to_string())?;
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return Ok(FileListMode::Tree);
-        }
-        Err(error) => return Err(format!("{}: {error}", path.display())),
-    }
-    match value.trim() {
-        "tree" => Ok(FileListMode::Tree),
-        "flat" => Ok(FileListMode::Flat),
-        _ => Err(format!("Invalid file-list mode in {}", path.display())),
-    }
-}
-
-pub fn save(settings: &Path, mode: FileListMode) -> Result<(), String> {
-    save_atomic(
-        &settings.with_file_name("file-list-mode"),
-        match mode {
-            FileListMode::Tree => b"tree\n",
-            FileListMode::Flat => b"flat\n",
-        },
-    )
 }
 
 pub fn load_language_server_assistance(settings: &Path) -> Result<bool, String> {
@@ -142,6 +116,10 @@ mod tests {
             paths: vec!["/project/z\nλ.txt".into(), "/project/a.txt".into()],
             active: Some(0),
             sidebar_open: false,
+            expanded_directories: BTreeMap::from([(
+                "/project".into(),
+                vec!["src".into(), "src/nested".into()],
+            )]),
         };
         save_session(&settings, &session).unwrap();
         assert_eq!(load_session(&settings).unwrap(), session);
@@ -150,6 +128,7 @@ mod tests {
             paths: vec![session.paths[1].clone()],
             active: Some(0),
             sidebar_open: true,
+            expanded_directories: BTreeMap::new(),
         };
         save_session(&settings, &replacement).unwrap();
         assert_eq!(load_session(&settings).unwrap(), replacement);
@@ -177,6 +156,7 @@ mod tests {
             paths: vec!["/project/b.txt".into(), "/project/a.txt".into()],
             active: Some(0),
             sidebar_open: true,
+            expanded_directories: BTreeMap::new(),
         };
         assert_eq!(
             session.startup_paths(Vec::new()),

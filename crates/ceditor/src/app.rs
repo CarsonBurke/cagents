@@ -12,9 +12,8 @@ use cagents::{
     repository_widget::{self, LspIntent, RepositoryAction, RepositoryRuntime},
     settings::{self, AppSettings, AppTheme},
     sidebar::{
-        self, ActiveWorktreeKey, FileCommand, FileListMode, SidebarAction, SidebarFocus,
-        SidebarMode, SidebarModel, SidebarProject, SidebarState, SidebarWorktree,
-        SourceControlModel,
+        self, ActiveWorktreeKey, FileCommand, SidebarAction, SidebarFocus, SidebarMode,
+        SidebarModel, SidebarProject, SidebarState, SidebarWorktree, SourceControlModel,
     },
     splitter::{self, Splitter},
     ui_controls::{icon_control, popover, segmented_controls},
@@ -143,7 +142,6 @@ pub struct Editor {
     lsp: LspManager,
     language_server_assistance: bool,
     next_document: u64,
-    file_list_mode: FileListMode,
     restoring_session: bool,
     saved_session: crate::preferences::Session,
     sidebar_open: bool,
@@ -494,6 +492,20 @@ impl Editor {
     }
 
     fn session(&self) -> crate::preferences::Session {
+        // Overlay live expansion over the saved map so reopening a folder
+        // restores its open tree, including folders whose tabs are closed.
+        let mut expanded_directories = self.saved_session.expanded_directories.clone();
+        for tab in &self.tabs {
+            if let Some(key) = tab.navigation.active_worktree() {
+                let root = key.canonical_path.display().to_string();
+                let paths = tab.navigation.expanded_display_paths();
+                if paths.is_empty() {
+                    expanded_directories.remove(&root);
+                } else {
+                    expanded_directories.insert(root, paths);
+                }
+            }
+        }
         crate::preferences::Session {
             paths: self
                 .tabs
@@ -508,6 +520,7 @@ impl Editor {
                 .collect(),
             active: self.tabs.iter().position(|tab| Some(tab.id) == self.active),
             sidebar_open: self.sidebar_open,
+            expanded_directories,
         }
     }
 
@@ -607,10 +620,13 @@ impl Editor {
             },
         );
         if let Some(key) = navigation.active_worktree().cloned() {
-            navigation.apply(&SidebarAction::SetFileListMode {
-                key,
-                mode: self.file_list_mode,
-            });
+            if let Some(paths) = self
+                .saved_session
+                .expanded_directories
+                .get(&key.canonical_path.display().to_string())
+            {
+                navigation.restore_expanded_display_paths(paths);
+            }
         }
         let task = repository_task(runtime.initial_load(id));
         self.tabs.push(Tab {
@@ -1147,11 +1163,6 @@ impl Application for Editor {
             Ok(settings) => (settings, None, true),
             Err(error) => (AppSettings::default(), Some(error.to_string()), false),
         };
-        let file_list_mode =
-            crate::preferences::load(&flags.settings_path).unwrap_or_else(|error| {
-                notice = Some(error);
-                FileListMode::Tree
-            });
         let saved_session =
             crate::preferences::load_session(&flags.settings_path).unwrap_or_else(|error| {
                 notice = Some(error);
@@ -1197,7 +1208,6 @@ impl Application for Editor {
             lsp,
             language_server_assistance,
             next_document: 1,
-            file_list_mode,
             restoring_session: !startup_paths.is_empty(),
             saved_session,
             sidebar_open,
@@ -1564,31 +1574,6 @@ impl Application for Editor {
                     if matches!(&action, SidebarAction::ResizeFinished) {
                         return self.save_settings();
                     }
-                    if let SidebarAction::SetFileListMode { mode, .. } = &action {
-                        self.file_list_mode = *mode;
-                        for tab in &mut self.tabs {
-                            if let Some(key) = tab.navigation.active_worktree().cloned() {
-                                tab.navigation
-                                    .apply(&SidebarAction::SetFileListMode { key, mode: *mode });
-                            }
-                        }
-                        if self.settings_writable {
-                            let result = settings::save(&self.settings_path, &self.settings)
-                                .map_err(|error| error.to_string())
-                                .and_then(|()| {
-                                    crate::preferences::save(&self.settings_path, *mode)
-                                });
-                            if let Err(error) = result {
-                                self.notice = Some(error);
-                            }
-                        } else {
-                            self.notice = Some(
-                                "Repair the settings file before saving the file-list preference."
-                                    .into(),
-                            );
-                        }
-                        return Task::none();
-                    }
                     let Some(id) = self.active else {
                         return Task::none();
                     };
@@ -1608,7 +1593,8 @@ impl Application for Editor {
                         return Task::none();
                     }
                     tab.navigation.apply(&action);
-                    match action {
+                    let persist_expansion = matches!(action, SidebarAction::ToggleDirectory { .. });
+                    let task = match action {
                         SidebarAction::FileCommand { path, command, .. } => match command {
                             FileCommand::CopyPath => iced::clipboard::write(
                                 tab.runtime
@@ -1637,7 +1623,13 @@ impl Application for Editor {
                             self.refresh(id)
                         }
                         _ => Task::none(),
+                    };
+                    // Folder expansion persists across sessions; the save is a
+                    // no-op unless the open tree actually changed.
+                    if persist_expansion {
+                        self.save_session();
                     }
+                    task
                 }
                 Message::Snapshot(id, result) => {
                     if let Some(tab) = self.tab_mut(id) {
@@ -1989,11 +1981,21 @@ impl Application for Editor {
                     if tab.runtime.is_dirty() { "• " } else { "" },
                     tab.title
                 );
+                let icon = tab
+                    .pending_file
+                    .as_ref()
+                    .map(|pending| pending.canonical.as_ref().unwrap_or(&pending.path))
+                    .or(tab.owned_file.as_ref())
+                    .map_or_else(
+                        || cagents::file_icon::folder(true),
+                        |path| cagents::file_icon::icon(path),
+                    );
                 widget::container(
                     widget::row::with_children(vec![
                         cagents::interaction::tooltip(
                             widget::button::custom(
                                 widget::row::with_children(vec![
+                                    widget::container(icon).center_y(Length::Fill).into(),
                                     design::body(title.clone())
                                         .wrapping(iced::widget::text::Wrapping::None)
                                         .ellipsize(iced::widget::text::Ellipsize::End(
@@ -2002,8 +2004,9 @@ impl Application for Editor {
                                         .width(Length::Fill)
                                         .into(),
                                 ])
-                                .height(Length::Fill)
+                                .spacing(6)
                                 .align_y(iced::Alignment::Center)
+                                .height(Length::Fill)
                                 .width(Length::Fill),
                             )
                             .name(title.clone())
@@ -2056,6 +2059,12 @@ impl Application for Editor {
         body.push(widget::divider::horizontal::default().into());
         // The strip lives in the editor column so its tabs, rules, toolbar,
         // and content share one left edge instead of straddling the sidebar.
+        // Its height mirrors the panel header (HEADER_HEIGHT plus one
+        // inter-child spacing) so both rules land on the same row and the
+        // borders connect instead of leaving a gap.
+        let strip_pad = (design::HEADER_HEIGHT + cosmic::theme::spacing().space_xxxs as f32
+            - design::PRIMARY_CONTROL_SIZE)
+            / 2.0;
         let mut strip = Vec::new();
         if !tabs.is_empty() {
             strip.push(
@@ -2072,7 +2081,7 @@ impl Application for Editor {
                     .width(Length::Fill)
                     .height(design::PRIMARY_CONTROL_SIZE),
                 )
-                .padding([4, 8])
+                .padding([strip_pad, 8.0])
                 .width(Length::Fill)
                 .into(),
             );
@@ -2437,7 +2446,6 @@ mod tests {
             lsp: LspManager::new(Vec::new()),
             language_server_assistance: false,
             next_document: 1,
-            file_list_mode: FileListMode::Tree,
             restoring_session: false,
             saved_session: crate::preferences::Session::default(),
             sidebar_open: true,
@@ -2620,6 +2628,7 @@ mod tests {
             paths: vec![first.clone(), root.join("missing.txt"), last.clone()],
             active: Some(2),
             sidebar_open: true,
+            expanded_directories: Default::default(),
         };
         let opened = session
             .startup_paths(Vec::new())
@@ -2635,6 +2644,7 @@ mod tests {
                 paths: vec![first, last],
                 active: Some(1),
                 sidebar_open: true,
+                expanded_directories: Default::default(),
             }
         );
     }
@@ -2663,6 +2673,7 @@ mod tests {
                 paths: vec!["/workspace/a.rs".into(), "/workspace/b.rs".into()],
                 active: Some(0),
                 sidebar_open: true,
+                expanded_directories: Default::default(),
             }
         );
     }
