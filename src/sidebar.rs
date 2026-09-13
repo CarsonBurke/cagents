@@ -4188,7 +4188,6 @@ fn source_control_panel<'a>(
     let spacing = cosmic::theme::spacing();
     let chrome = &source.chrome;
     let key = &source.key;
-    let mut column = widget::column::with_capacity(8).spacing(spacing.space_xxxs);
     let mut header = widget::row::with_children(vec![
         widget::container(worktree_icon().icon().size(ROW_ICON_SIZE))
             .center_x(Length::Fixed(ROW_ICON_WIDTH))
@@ -4229,14 +4228,11 @@ fn source_control_panel<'a>(
     if matches!(panel, WorktreePanel::Changes) {
         header = header.push(list_mode_controls(key, state.change_list_mode, modal_open));
     }
-    column = column.push(
-        header
-            .align_y(Alignment::Center)
-            .spacing(spacing.space_xxxs)
-            .height(design::HEADER_HEIGHT)
-            .width(Length::Fill),
-    );
-    column = column.push(widget::divider::horizontal::default());
+    let header = header
+        .align_y(Alignment::Center)
+        .spacing(spacing.space_xxxs)
+        .height(design::HEADER_HEIGHT)
+        .width(Length::Fill);
 
     // Both notices are permanent slots. The failure arm below this ends in a
     // named `Try again` button, and iced reconciles a named child at the index
@@ -4244,7 +4240,8 @@ fn source_control_panel<'a>(
     // children over those same indices: a notice arriving above the button left
     // the reconciled child list one entry short, so the button had no tree at
     // all and disappeared from the one frame that was asking for a press.
-    column = column.push(slot(source.progress_label().map(|label| {
+    let mut notices = widget::column::with_capacity(4).spacing(spacing.space_xxxs);
+    notices = notices.push(slot(source.progress_label().map(|label| {
         widget::row::with_children(vec![
             crate::ui_controls::activity_spinner(
                 14.0,
@@ -4256,7 +4253,7 @@ fn source_control_panel<'a>(
         .spacing(spacing.space_xxs)
         .into()
     })));
-    column = column.push(slot(source.error.as_deref().map(|error| {
+    notices = notices.push(slot(source.error.as_deref().map(|error| {
         design::caption(error)
             .wrapping(cosmic::iced::widget::text::Wrapping::Word)
             .into()
@@ -4264,14 +4261,11 @@ fn source_control_panel<'a>(
 
     match &source.data_state {
         SidebarDataState::Loading => {
-            column = column.push(design::caption("Loading source control…"));
-            return widget::container(column)
-                .padding([0, spacing.space_xxs])
-                .width(Length::Fill)
-                .into();
+            notices = notices.push(design::caption("Loading source control…"));
+            return worktree_panel_chrome(header.into(), notices.into(), None);
         }
         SidebarDataState::Error(message) => {
-            column = column
+            notices = notices
                 .push(
                     design::caption(format!("Couldn’t read this worktree. {message}"))
                         .wrapping(cosmic::iced::widget::text::Wrapping::Word),
@@ -4284,25 +4278,23 @@ fn source_control_panel<'a>(
                             modal_open,
                         )),
                 );
-            return widget::container(column)
-                .padding([0, spacing.space_xxs])
-                .width(Length::Fill)
-                .into();
+            return worktree_panel_chrome(header.into(), notices.into(), None);
         }
         SidebarDataState::Ready => {}
     }
 
     if matches!(panel, WorktreePanel::Files) {
-        return widget::column::with_children(vec![
-            widget::container(column)
-                .padding([0, spacing.space_xxs])
-                .width(Length::Fill)
-                .into(),
-            files_section(state, source, modal_open, editors, file_management),
-        ])
-        .width(Length::Fill)
-        .height(Length::Fill)
-        .into();
+        return worktree_panel_chrome(
+            header.into(),
+            notices.into(),
+            Some(files_section(
+                state,
+                source,
+                modal_open,
+                editors,
+                file_management,
+            )),
+        );
     }
 
     let mut sections = widget::column::with_capacity(3).spacing(spacing.space_xxxs);
@@ -4318,25 +4310,55 @@ fn source_control_panel<'a>(
         || history_section(source, modal_open),
     ));
 
-    widget::column::with_children(vec![
-        widget::container(column)
-            .padding([0, spacing.space_xxs])
+    worktree_panel_chrome(
+        header.into(),
+        notices.into(),
+        Some(
+            widget::scrollable(
+                widget::container(sections)
+                    .padding([spacing.space_xxxs, spacing.space_xxs])
+                    .width(Length::Fill),
+            )
+            .direction(sidebar_scroll_direction())
+            .class(cosmic::style::iced::Scrollable::Minimal)
             .width(Length::Fill)
+            .height(Length::Fill)
             .into(),
-        widget::scrollable(
-            widget::container(sections)
-                .padding([spacing.space_xxxs, spacing.space_xxs])
-                .width(Length::Fill),
-        )
-        .direction(sidebar_scroll_direction())
-        .class(cosmic::style::iced::Scrollable::Minimal)
-        .width(Length::Fill)
-        .height(Length::Fill)
-        .into(),
-    ])
-    .width(Length::Fill)
-    .height(Length::Fill)
-    .into()
+        ),
+    )
+}
+
+/// Worktree title, full-width rule, then padded notices and the panel body.
+///
+/// The projects sidebar already pads its header without padding the rule
+/// beneath it. Wrapping both in one inset container left a gap between the
+/// rule and the pane's vertical borders, so the files and Git headers looked
+/// disconnected from the splitter they share with the editor tab strip.
+fn worktree_panel_chrome<'a>(
+    header: Element<'a, SidebarAction>,
+    notices: Element<'a, SidebarAction>,
+    body: Option<Element<'a, SidebarAction>>,
+) -> Element<'a, SidebarAction> {
+    let spacing = cosmic::theme::spacing();
+    let mut chrome = widget::column::with_capacity(3).spacing(spacing.space_xxxs);
+    chrome = chrome.push(
+        widget::container(header)
+            .padding([0, spacing.space_xxs])
+            .width(Length::Fill),
+    );
+    chrome = chrome.push(widget::divider::horizontal::default());
+    chrome = chrome.push(
+        widget::container(notices)
+            .padding([0, spacing.space_xxs])
+            .width(Length::Fill),
+    );
+    match body {
+        Some(body) => widget::column::with_children(vec![chrome.into(), body])
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .into(),
+        None => chrome.width(Length::Fill).into(),
+    }
 }
 
 /// The parts of one section header row: what it shows, and the single intent

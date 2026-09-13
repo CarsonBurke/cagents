@@ -15,7 +15,7 @@ pub const APPLICATION_ID: &str = "io.github.cagents.ceditor";
 #[command(
     version,
     about,
-    after_help = "Open existing files or folders. With no paths, restore saved tabs or browse the current directory.\nCtrl+O opens a file; Ctrl+Shift+O opens a folder; Ctrl+S saves; Ctrl+W closes a tab.\nSettings and language-server configuration are independent of cagents."
+    after_help = "Open existing files or folders. With no paths, restore saved tabs or browse the current directory.\nCtrl+T creates an untitled note; Ctrl+O opens a file; Ctrl+Shift+O opens a folder; Ctrl+S saves (or save-as for untitled notes); Ctrl+W closes a tab.\nSettings and language-server configuration are independent of cagents."
 )]
 struct Arguments {
     /// Existing files or directories to open, each in its own tab

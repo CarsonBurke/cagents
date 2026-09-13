@@ -122,6 +122,8 @@ pub enum Message {
     CloseNotices,
     Dismiss,
     ToggleSidebar,
+    NewTab,
+    SavedAs(CardId, Result<Option<PathBuf>, String>),
 }
 
 pub struct Editor {
@@ -146,6 +148,7 @@ pub struct Editor {
     restoring_session: bool,
     saved_session: crate::preferences::Session,
     sidebar_open: bool,
+    pending_save_as: Option<(CardId, String)>,
 }
 
 fn repository_task(task: iced::Task<RepositoryAction>) -> Task<Message> {
@@ -201,6 +204,108 @@ fn chosen_path(
         Err(cosmic::dialog::file_chooser::Error::Cancelled) => Ok(None),
         Err(error) => Err(error.to_string()),
     }
+}
+
+fn chosen_save_path(
+    response: Result<
+        cosmic::dialog::file_chooser::save::Response,
+        cosmic::dialog::file_chooser::Error,
+    >,
+) -> Result<Option<PathBuf>, String> {
+    match response {
+        Ok(response) => response
+            .url()
+            .ok_or_else(|| "No save location was chosen".to_string())?
+            .to_file_path()
+            .map(Some)
+            .map_err(|()| "Only local files are supported".into()),
+        Err(cosmic::dialog::file_chooser::Error::Cancelled) => Ok(None),
+        Err(error) if save_chooser_cancelled(&error) => Ok(None),
+        Err(error) => Err(error.to_string()),
+    }
+}
+
+fn save_chooser_cancelled(error: &cosmic::dialog::file_chooser::Error) -> bool {
+    let text = error.to_string();
+    text.contains("cancel") || text.contains("Cancel")
+}
+
+fn paths_equal(left: &Path, right: &Path) -> bool {
+    if left == right {
+        return true;
+    }
+    match (left.canonicalize(), right.canonicalize()) {
+        (Ok(left), Ok(right)) => left == right,
+        _ => false,
+    }
+}
+
+fn untitled_directory(settings_path: &Path) -> Option<PathBuf> {
+    let parent = settings_path.parent()?;
+    if parent.as_os_str().is_empty() {
+        return None;
+    }
+    Some(parent.join("untitled"))
+}
+
+fn untitled_tab_title(file_name: &str) -> String {
+    match file_name.strip_prefix("Untitled-") {
+        Some(index) if index.chars().all(|character| character.is_ascii_digit()) => {
+            format!("Untitled {index}")
+        }
+        _ if file_name == "Untitled" => "Untitled".into(),
+        _ => file_name.to_owned(),
+    }
+}
+
+fn allocate_untitled_path(directory: &Path) -> Result<PathBuf, String> {
+    std::fs::create_dir_all(directory).map_err(|error| error.to_string())?;
+    for index in 1..10_000 {
+        let name = if index == 1 {
+            "Untitled".to_owned()
+        } else {
+            format!("Untitled-{index}")
+        };
+        let path = directory.join(name);
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+        {
+            Ok(file) => {
+                file.sync_all().map_err(|error| error.to_string())?;
+                return Ok(path);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error.to_string()),
+        }
+    }
+    Err("Too many untitled notes are already open.".into())
+}
+
+fn create_new_file(path: &Path, text: &str) -> Result<(), String> {
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .map_err(|error| {
+            if error.kind() == std::io::ErrorKind::AlreadyExists {
+                "A file already exists at that path.".into()
+            } else {
+                error.to_string()
+            }
+        })?;
+    if let Err(error) =
+        std::io::Write::write_all(&mut file, text.as_bytes()).and_then(|()| file.sync_all())
+    {
+        drop(file);
+        let _ = std::fs::remove_file(path);
+        return Err(error.to_string());
+    }
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::File::open(parent).and_then(|directory| directory.sync_all());
+    }
+    Ok(())
 }
 
 fn tab_title_style() -> cosmic::theme::Button {
@@ -572,14 +677,24 @@ impl Editor {
             worktree_id: worktree,
             canonical_path: opened.root.clone(),
         };
-        let title = opened
-            .file
-            .as_deref()
-            .unwrap_or(&opened.root)
-            .file_name()
-            .unwrap_or(opened.root.as_os_str())
-            .to_string_lossy()
-            .into_owned();
+        let untitled = self.is_untitled_root(&opened.root);
+        let title = if untitled {
+            opened
+                .file
+                .as_deref()
+                .and_then(|path| path.file_name())
+                .map(|name| untitled_tab_title(&name.to_string_lossy()))
+                .unwrap_or_else(|| "Untitled".into())
+        } else {
+            opened
+                .file
+                .as_deref()
+                .unwrap_or(&opened.root)
+                .file_name()
+                .unwrap_or(opened.root.as_os_str())
+                .to_string_lossy()
+                .into_owned()
+        };
         let descriptor = RepositoryView {
             project,
             repository: opened.root.clone(),
@@ -678,6 +793,153 @@ impl Editor {
             .map(|tab| tab.id)
     }
 
+    fn untitled_root(&self) -> Option<PathBuf> {
+        untitled_directory(&self.settings_path)
+    }
+
+    fn is_untitled_root(&self, root: &Path) -> bool {
+        self.untitled_root()
+            .is_some_and(|directory| paths_equal(root, &directory))
+    }
+
+    fn tab_is_untitled(&self, tab: &Tab) -> bool {
+        self.is_untitled_root(&tab.runtime.descriptor.worktree)
+    }
+
+    fn untitled_scratch_path(&self, id: CardId) -> Option<PathBuf> {
+        let tab = self.tab(id).filter(|tab| self.tab_is_untitled(tab))?;
+        tab.owned_file.clone().or_else(|| {
+            tab.pending_file.as_ref().map(|pending| {
+                pending
+                    .canonical
+                    .clone()
+                    .unwrap_or_else(|| tab.runtime.descriptor.worktree.join(&pending.path))
+            })
+        })
+    }
+
+    fn untitled_text(&self, id: CardId) -> String {
+        if let Some(text) = self.tab(id).and_then(|tab| tab.runtime.editor_text()) {
+            return text;
+        }
+        self.untitled_scratch_path(id)
+            .and_then(|path| std::fs::read_to_string(path).ok())
+            .unwrap_or_default()
+    }
+
+    fn untitled_has_content(&self, id: CardId) -> bool {
+        !self.untitled_text(id).trim().is_empty()
+    }
+
+    fn new_tab(&mut self) -> Task<Message> {
+        if self.modal_open() {
+            return Task::none();
+        }
+        let Some(directory) = self.untitled_root() else {
+            self.notice = Some("ceditor configuration directory is unavailable".into());
+            return Task::none();
+        };
+        let path = match allocate_untitled_path(&directory) {
+            Ok(path) => path,
+            Err(error) => {
+                self.notice = Some(error);
+                return Task::none();
+            }
+        };
+        let file = path
+            .file_name()
+            .map(PathBuf::from)
+            .expect("allocated untitled path has a file name");
+        self.selection_epoch = self.selection_epoch.wrapping_add(1);
+        self.add(
+            Opened {
+                root: directory,
+                file: Some(file),
+                snapshot: None,
+            },
+            true,
+        )
+    }
+
+    fn save_as(&mut self, id: CardId) -> Task<Message> {
+        let Some(tab) = self.tab(id).filter(|tab| self.tab_is_untitled(tab)) else {
+            return Task::none();
+        };
+        let file_name = tab
+            .pending_file
+            .as_ref()
+            .map(|pending| pending.path.as_path())
+            .or(tab.owned_file.as_deref())
+            .and_then(|path| path.file_name())
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "Untitled".into());
+        self.pending_save_as = Some((id, self.untitled_text(id)));
+        cosmic::task::future(async move {
+            let dialog = cosmic::dialog::file_chooser::save::Dialog::new()
+                .title("Save note".to_owned())
+                .file_name(file_name);
+            Message::SavedAs(id, chosen_save_path(dialog.save_file().await))
+        })
+    }
+
+    fn finish_save_as(
+        &mut self,
+        id: CardId,
+        result: Result<Option<PathBuf>, String>,
+    ) -> Task<Message> {
+        let Some((pending_id, text)) = self.pending_save_as.take() else {
+            return Task::none();
+        };
+        if pending_id != id {
+            return Task::none();
+        }
+        let path = match result {
+            Ok(Some(path)) => path,
+            Ok(None) => return Task::none(),
+            Err(error) => {
+                self.notice = Some(error);
+                return Task::none();
+            }
+        };
+        if self.untitled_root().is_some_and(|directory| {
+            path.parent()
+                .is_some_and(|parent| paths_equal(parent, &directory))
+        }) {
+            self.notice = Some("Choose a location outside Untitled notes.".into());
+            return Task::none();
+        }
+        if let Err(error) = create_new_file(&path, &text) {
+            self.notice = Some(error);
+            return Task::none();
+        }
+        if self.tab(id).is_some_and(|tab| self.tab_is_untitled(tab)) {
+            self.remove_tab(id);
+        }
+        if self.exiting {
+            return self.continue_exit();
+        }
+        self.selection_epoch = self.selection_epoch.wrapping_add(1);
+        Self::open(path, self.selection_epoch)
+    }
+
+    fn remove_tab(&mut self, id: CardId) {
+        let scratch = (!self.exiting)
+            .then(|| self.untitled_scratch_path(id))
+            .flatten();
+        self.close_document(id);
+        self.tabs.retain(|tab| tab.id != id);
+        if self.active == Some(id) {
+            self.active = self.tabs.last().map(|tab| tab.id);
+        }
+        if self.closing == Some(id) {
+            self.closing = None;
+            self.close_confirmed = false;
+        }
+        if let Some(path) = scratch {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+
     fn request_file(&mut self, id: CardId, path: PathBuf) -> Task<Message> {
         self.selection_epoch = self.selection_epoch.wrapping_add(1);
         let Some(tab) = self.tab_mut(id) else {
@@ -733,6 +995,7 @@ impl Editor {
                     .flatten()
             })
             .collect();
+        let untitled_dir = untitled_directory(&self.settings_path);
         let mut tasks = Vec::new();
         for (id, canonical) in pending {
             let owner = self.file_owner(&canonical);
@@ -755,12 +1018,20 @@ impl Editor {
             if tab.owned_file.as_ref() == Some(&canonical) {
                 continue;
             }
-            tab.title = pending
+            let file_name = pending
                 .path
                 .file_name()
                 .unwrap_or(pending.path.as_os_str())
                 .to_string_lossy()
                 .into_owned();
+            let untitled = untitled_dir
+                .as_ref()
+                .is_some_and(|directory| paths_equal(&tab.runtime.descriptor.worktree, directory));
+            tab.title = if untitled {
+                untitled_tab_title(&file_name)
+            } else {
+                file_name
+            };
             tab.owned_file = Some(canonical);
             tasks.push(repository_task(tab.runtime.update(
                 RepositoryAction::OpenFile {
@@ -850,15 +1121,19 @@ impl Editor {
     }
 
     fn request_close(&mut self, id: CardId) -> Task<Message> {
+        let untitled_note = self.tab(id).is_some_and(|tab| self.tab_is_untitled(tab))
+            && self.untitled_has_content(id)
+            && !self.exiting;
         if self
             .tab(id)
             .is_some_and(|tab| tab.runtime.blocks_navigation() || tab.mutation)
+            || (untitled_note && !self.close_confirmed)
         {
             self.active = Some(id);
             self.closing = Some(id);
             self.close_confirmed = false;
             let tab = self.tab(id).unwrap();
-            let focus = if tab.runtime.can_save() {
+            let focus = if untitled_note || tab.runtime.can_save() {
                 "ceditor.close.save"
             } else if tab.runtime.can_abandon_unsaved_changes() && !tab.mutation {
                 "ceditor.close.discard"
@@ -867,13 +1142,7 @@ impl Editor {
             };
             return iced::widget::operation::focus(widget::Id::new(focus)).map(cosmic::Action::App);
         }
-        self.close_document(id);
-        self.tabs.retain(|tab| tab.id != id);
-        if self.active == Some(id) {
-            self.active = self.tabs.last().map(|tab| tab.id);
-        }
-        self.closing = None;
-        self.close_confirmed = false;
+        self.remove_tab(id);
         if self.exiting {
             self.continue_exit()
         } else {
@@ -1218,6 +1487,7 @@ impl Application for Editor {
             restoring_session: !startup_paths.is_empty(),
             saved_session,
             sidebar_open,
+            pending_save_as: None,
         };
         let mut tasks = vec![app.appearance(), app.lsp_next()];
         if let Some(window) = app.core.main_window_id() {
@@ -1254,6 +1524,8 @@ impl Application for Editor {
                 | Message::Sidebar(_)
                 | Message::Repository(RepositoryAction::BackToFiles { .. })
                 | Message::Repository(RepositoryAction::FilesLoaded { .. })
+                | Message::NewTab
+                | Message::SavedAs(..)
         );
         let task = (|| {
             if let Message::Key(keyboard::Event::KeyPressed {
@@ -1280,6 +1552,7 @@ impl Application for Editor {
                         | Message::Jump(..)
                         | Message::Sidebar(_)
                         | Message::ToggleSidebar
+                        | Message::NewTab
                         | Message::Key(_)
                 )
             {
@@ -1395,13 +1668,16 @@ impl Application for Editor {
                     self.continue_exit()
                 }
                 Message::SaveClose => {
-                    let Some(card) = self
-                        .closing
-                        .filter(|id| self.tab(*id).is_some_and(|tab| tab.runtime.can_save()))
-                    else {
+                    let Some(card) = self.closing.filter(|id| {
+                        self.tab(*id)
+                            .is_some_and(|tab| tab.runtime.can_save() || self.tab_is_untitled(tab))
+                    }) else {
                         return Task::none();
                     };
                     self.close_confirmed = true;
+                    if self.tab(card).is_some_and(|tab| self.tab_is_untitled(tab)) {
+                        return self.save_as(card);
+                    }
                     self.update(Message::Repository(RepositoryAction::Save {
                         card,
                         overwrite: false,
@@ -1409,6 +1685,16 @@ impl Application for Editor {
                 }
                 Message::DiscardClose => {
                     if let Some(id) = self.closing {
+                        let untitled = self.tab(id).is_some_and(|tab| self.tab_is_untitled(tab));
+                        if untitled {
+                            if let Some(tab) = self.tab_mut(id) {
+                                if !tab.mutation {
+                                    let _ = tab.runtime.abandon_unsaved_changes();
+                                }
+                            }
+                            self.close_confirmed = true;
+                            return self.request_close(id);
+                        }
                         if self.tab_mut(id).is_some_and(|tab| {
                             !tab.mutation && tab.runtime.abandon_unsaved_changes()
                         }) {
@@ -1459,6 +1745,11 @@ impl Application for Editor {
                                 | RepositoryAction::Reload { .. }
                         ) {
                             return Task::none();
+                        }
+                    }
+                    if let RepositoryAction::Save { card, .. } = &action {
+                        if self.tab(*card).is_some_and(|tab| self.tab_is_untitled(tab)) {
+                            return self.save_as(*card);
                         }
                     }
                     if let RepositoryAction::OpenFile { path, .. } = action {
@@ -1707,6 +1998,8 @@ impl Application for Editor {
                     self.save_session();
                     Task::none()
                 }
+                Message::NewTab => self.new_tab(),
+                Message::SavedAs(id, result) => self.finish_save_as(id, result),
                 Message::AutoSave(enabled) => {
                     self.settings.editor_auto_save = enabled;
                     let mut tasks: Vec<_> = self
@@ -1862,6 +2155,7 @@ impl Application for Editor {
                         if let keyboard::Key::Character(key) = key {
                             match key.as_str().to_ascii_lowercase().as_str() {
                                 "o" => return self.update(Message::Choose(modifiers.shift())),
+                                "t" => return self.update(Message::NewTab),
                                 "s" => {
                                     if let Some(card) = self.active {
                                         return self.update(Message::Repository(
@@ -2073,27 +2367,38 @@ impl Application for Editor {
             - design::PRIMARY_CONTROL_SIZE)
             / 2.0;
         let mut strip = Vec::new();
-        if !tabs.is_empty() {
-            strip.push(
-                widget::container(
-                    widget::scrollable::horizontal(
-                        widget::row::with_children(tabs)
-                            .spacing(4)
-                            .height(design::PRIMARY_CONTROL_SIZE),
-                    )
-                    .id(widget::Id::new("ceditor.tabs"))
-                    .direction(iced::widget::scrollable::Direction::Horizontal(
-                        iced::widget::scrollable::Scrollbar::hidden(),
-                    ))
-                    .width(Length::Fill)
-                    .height(design::PRIMARY_CONTROL_SIZE),
+        let mut tab_row = tabs;
+        tab_row.push(
+            icon_control(
+                cagents::ui_controls::symbolic_icon("list-add-symbolic"),
+                "New tab (Ctrl+T)",
+                false,
+                !self.modal_open(),
+                Some(Message::NewTab),
+            )
+            .id(widget::Id::new("ceditor.tabs.new"))
+            .into(),
+        );
+        strip.push(
+            widget::container(
+                widget::scrollable::horizontal(
+                    widget::row::with_children(tab_row)
+                        .spacing(4)
+                        .align_y(iced::Alignment::Center)
+                        .height(design::PRIMARY_CONTROL_SIZE),
                 )
-                .padding([strip_pad, 8.0])
+                .id(widget::Id::new("ceditor.tabs"))
+                .direction(iced::widget::scrollable::Direction::Horizontal(
+                    iced::widget::scrollable::Scrollbar::hidden(),
+                ))
                 .width(Length::Fill)
-                .into(),
-            );
-            strip.push(widget::divider::horizontal::default().into());
-        }
+                .height(design::PRIMARY_CONTROL_SIZE),
+            )
+            .padding([strip_pad, 8.0])
+            .width(Length::Fill)
+            .into(),
+        );
+        strip.push(widget::divider::horizontal::default().into());
         if let Some(tab) = self.current() {
             let mut editor = Vec::new();
             editor.extend(strip);
@@ -2219,7 +2524,7 @@ impl Application for Editor {
             );
         } else {
             body.extend(strip);
-            body.push(widget::container(widget::column::with_children(vec![widget::text::title1("Open a file or folder").into(), widget::text::body("Native editing, safe autosave, Git diffs, and language servers — without a daemon.").into(), widget::button::standard("Open folder").on_press(Message::Choose(true)).into()]).spacing(16)).padding(32).height(Length::Fill).into());
+            body.push(widget::container(widget::column::with_children(vec![widget::text::title1("Open a file or folder").into(), widget::text::body("Create a new tab to paste a note, or open an existing file or folder. Native editing, safe autosave, Git diffs, and language servers — without a daemon.").into(), widget::button::standard("Open folder").on_press(Message::Choose(true)).into()]).spacing(16)).padding(32).height(Length::Fill).into());
         }
         widget::column::with_children(body)
             .height(Length::Fill)
@@ -2274,7 +2579,8 @@ impl Application for Editor {
         }
         if let Some(id) = self.closing {
             let tab = self.tab(id)?;
-            let ready = !tab.runtime.blocks_navigation() && !tab.mutation;
+            let untitled_note = self.tab_is_untitled(tab) && self.untitled_has_content(id);
+            let ready = !tab.runtime.blocks_navigation() && !tab.mutation && !untitled_note;
             let mut controls = vec![
                 widget::button::standard("Cancel")
                     .id(widget::Id::new("ceditor.close.cancel"))
@@ -2289,7 +2595,7 @@ impl Application for Editor {
                         .into(),
                 );
             } else {
-                if tab.runtime.can_abandon_unsaved_changes() && !tab.mutation {
+                if (tab.runtime.can_abandon_unsaved_changes() || untitled_note) && !tab.mutation {
                     controls.push(
                         widget::button::destructive("Discard and close")
                             .id(widget::Id::new("ceditor.close.discard"))
@@ -2297,19 +2603,25 @@ impl Application for Editor {
                             .into(),
                     );
                 }
-                if tab.runtime.can_save() {
+                if tab.runtime.can_save() || untitled_note {
                     controls.push(
-                        widget::button::standard("Save and close")
-                            .id(widget::Id::new("ceditor.close.save"))
-                            .on_press(Message::SaveClose)
-                            .into(),
+                        widget::button::standard(if untitled_note {
+                            "Save as"
+                        } else {
+                            "Save and close"
+                        })
+                        .id(widget::Id::new("ceditor.close.save"))
+                        .on_press(Message::SaveClose)
+                        .into(),
                     );
                 }
             }
             return Some(cagents::interaction::opaque(
                 widget::container(
                     widget::column::with_children(vec![
-                        widget::text::title3(if ready {
+                        widget::text::title3(if untitled_note {
+                            "Save this note?"
+                        } else if ready {
                             "Close tab?"
                         } else {
                             "Finish saving before closing"
@@ -2317,6 +2629,8 @@ impl Application for Editor {
                         .into(),
                         widget::text::body(tab.runtime.save_error().unwrap_or(if tab.mutation {
                             "A Git operation is still running."
+                        } else if untitled_note {
+                            "This note has not been saved to a file yet."
                         } else if ready {
                             "The tab is ready to close."
                         } else {
@@ -2456,6 +2770,7 @@ mod tests {
             restoring_session: false,
             saved_session: crate::preferences::Session::default(),
             sidebar_open: true,
+            pending_save_as: None,
         }
     }
 
@@ -3071,5 +3386,263 @@ mod tests {
         assert_eq!(app.closing, Some(id));
         drop(app.update(Message::ConfirmClose));
         assert!(app.tab(id).is_none());
+    }
+
+    fn configured(directory: &tempfile::TempDir) -> Editor {
+        let mut app = editor();
+        app.settings_path = directory.path().join("settings.toml");
+        app
+    }
+
+    fn load_selected(app: &mut Editor, id: CardId) {
+        files_loaded(app, id);
+        let tab = app.tab(id).unwrap();
+        let worktree = tab.runtime.descriptor.worktree.clone();
+        let path = tab
+            .pending_file
+            .as_ref()
+            .map(|pending| pending.path.clone())
+            .or_else(|| tab.runtime.selected_path().map(Path::to_path_buf))
+            .unwrap();
+        drop(
+            app.update(Message::Repository(RepositoryAction::FileLoaded {
+                identity: AsyncIdentity {
+                    card: id,
+                    worktree: worktree.clone(),
+                    path: path.clone(),
+                    generation: 1,
+                },
+                result: cagents::editor::load_file(&worktree, &path),
+            })),
+        );
+    }
+
+    #[test]
+    fn untitled_tab_titles_number_scratch_files() {
+        assert_eq!(untitled_tab_title("Untitled"), "Untitled");
+        assert_eq!(untitled_tab_title("Untitled-2"), "Untitled 2");
+        assert_eq!(untitled_tab_title("Untitled-10"), "Untitled 10");
+        assert_eq!(untitled_tab_title("notes.md"), "notes.md");
+    }
+
+    #[test]
+    fn new_tab_creates_scratch_notes_until_they_are_saved() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut app = configured(&directory);
+        drop(app.update(Message::NewTab));
+        let first = app.active.unwrap();
+        assert_eq!(app.tab(first).unwrap().title, "Untitled");
+        assert!(app.tab_is_untitled(app.tab(first).unwrap()));
+        let scratch = directory.path().join("untitled").join("Untitled");
+        assert!(scratch.is_file());
+        load_selected(&mut app, first);
+        assert_eq!(
+            app.tab(first).unwrap().title,
+            "Untitled",
+            "opening the scratch file must not rename the tab to the on-disk name"
+        );
+        drop(app.update(Message::NewTab));
+        assert_eq!(app.tabs.len(), 2);
+        assert_eq!(app.tabs[1].title, "Untitled 2");
+        assert!(
+            directory
+                .path()
+                .join("untitled")
+                .join("Untitled-2")
+                .is_file()
+        );
+        assert_eq!(
+            app.session().paths,
+            vec![
+                scratch.clone(),
+                directory.path().join("untitled").join("Untitled-2")
+            ]
+        );
+    }
+
+    #[test]
+    fn new_tab_is_idle_while_a_modal_is_open() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut app = configured(&directory);
+        app.settings_open = true;
+        drop(app.update(Message::NewTab));
+        assert!(app.tabs.is_empty());
+        assert!(!directory.path().join("untitled").exists());
+    }
+
+    #[test]
+    fn closing_an_empty_untitled_tab_deletes_the_scratch_file() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut app = configured(&directory);
+        drop(app.update(Message::NewTab));
+        let id = app.active.unwrap();
+        let scratch = app.untitled_scratch_path(id).unwrap();
+        drop(app.update(Message::CloseTab(id)));
+        assert!(app.tabs.is_empty());
+        assert!(!scratch.exists());
+    }
+
+    #[test]
+    fn closing_an_untitled_note_asks_before_discarding_it() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut app = configured(&directory);
+        drop(app.update(Message::NewTab));
+        let id = app.active.unwrap();
+        load_selected(&mut app, id);
+        drop(
+            app.update(Message::Repository(RepositoryAction::EditorAction {
+                card: id,
+                action: widget::text_editor::Action::Edit(widget::text_editor::Edit::Paste(
+                    Arc::new("draft note\n".into()),
+                )),
+            })),
+        );
+        drop(app.update(Message::CloseTab(id)));
+        assert_eq!(app.closing, Some(id));
+        assert!(app.tab(id).is_some());
+        drop(app.update(Message::DiscardClose));
+        assert!(app.tab(id).is_none());
+        assert!(!directory.path().join("untitled").join("Untitled").exists());
+    }
+
+    #[test]
+    fn save_as_moves_an_untitled_note_to_the_chosen_path() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut app = configured(&directory);
+        drop(app.update(Message::NewTab));
+        let id = app.active.unwrap();
+        load_selected(&mut app, id);
+        drop(
+            app.update(Message::Repository(RepositoryAction::EditorAction {
+                card: id,
+                action: widget::text_editor::Action::Edit(widget::text_editor::Edit::Paste(
+                    Arc::new("keep this\n".into()),
+                )),
+            })),
+        );
+        let destination = directory.path().join("kept.md");
+        let scratch = app.untitled_scratch_path(id).unwrap();
+        app.pending_save_as = Some((id, app.untitled_text(id)));
+        drop(app.finish_save_as(id, Ok(Some(destination.clone()))));
+        assert!(!scratch.exists());
+        assert_eq!(
+            std::fs::read_to_string(&destination).unwrap(),
+            "keep this\n"
+        );
+        assert!(app.tabs.is_empty());
+        drop(app.update(Message::Opened(
+            app.selection_epoch,
+            Editor::resolve_open(destination.clone()),
+        )));
+        let opened = app.active.unwrap();
+        assert!(!app.tab_is_untitled(app.tab(opened).unwrap()));
+        assert_eq!(app.tab(opened).unwrap().title, "kept.md");
+    }
+
+    #[test]
+    fn save_as_does_not_replace_an_existing_file() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut app = configured(&directory);
+        drop(app.update(Message::NewTab));
+        let id = app.active.unwrap();
+        let destination = directory.path().join("existing.md");
+        std::fs::write(&destination, "original\n").unwrap();
+        app.pending_save_as = Some((id, app.untitled_text(id)));
+        drop(app.finish_save_as(id, Ok(Some(destination.clone()))));
+        assert_eq!(std::fs::read_to_string(&destination).unwrap(), "original\n");
+        assert!(app.tab(id).is_some());
+        assert_eq!(
+            app.notice.as_deref(),
+            Some("A file already exists at that path.")
+        );
+    }
+
+    #[test]
+    fn saving_an_untitled_tab_requests_a_destination() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut app = configured(&directory);
+        drop(app.update(Message::NewTab));
+        let id = app.active.unwrap();
+        let task = app.update(Message::Repository(RepositoryAction::Save {
+            card: id,
+            overwrite: false,
+        }));
+        drop(task);
+        assert!(app.tab(id).is_some());
+        assert!(app.tab_is_untitled(app.tab(id).unwrap()));
+        assert!(app.pending_save_as.is_some());
+    }
+
+    #[test]
+    fn window_close_keeps_untitled_scratch_files_for_restore() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut app = configured(&directory);
+        app.settings_writable = true;
+        drop(app.update(Message::NewTab));
+        let id = app.active.unwrap();
+        let scratch = app.untitled_scratch_path(id).unwrap();
+        std::fs::write(&scratch, "keep me\n").unwrap();
+        load_selected(&mut app, id);
+        assert!(app.untitled_has_content(id));
+        assert!(!app.tab(id).unwrap().runtime.blocks_navigation());
+        drop(app.update(Message::CloseWindow));
+        assert!(scratch.is_file());
+        assert_eq!(std::fs::read_to_string(&scratch).unwrap(), "keep me\n");
+        let session = crate::preferences::load_session(&app.settings_path).unwrap();
+        assert_eq!(session.paths, vec![scratch]);
+    }
+
+    #[test]
+    fn save_as_writes_after_the_untitled_tab_is_closed() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut app = configured(&directory);
+        drop(app.update(Message::NewTab));
+        let id = app.active.unwrap();
+        load_selected(&mut app, id);
+        drop(
+            app.update(Message::Repository(RepositoryAction::EditorAction {
+                card: id,
+                action: widget::text_editor::Action::Edit(widget::text_editor::Edit::Paste(
+                    Arc::new("still save me\n".into()),
+                )),
+            })),
+        );
+        app.pending_save_as = Some((id, app.untitled_text(id)));
+        drop(app.update(Message::CloseTab(id)));
+        drop(app.update(Message::DiscardClose));
+        assert!(app.tabs.is_empty());
+        let destination = directory.path().join("survived.txt");
+        drop(app.finish_save_as(id, Ok(Some(destination.clone()))));
+        assert_eq!(
+            std::fs::read_to_string(&destination).unwrap(),
+            "still save me\n"
+        );
+    }
+
+    #[test]
+    fn save_as_during_exit_continues_shutdown() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut app = configured(&directory);
+        app.settings_writable = true;
+        drop(app.update(Message::NewTab));
+        let id = app.active.unwrap();
+        load_selected(&mut app, id);
+        drop(
+            app.update(Message::Repository(RepositoryAction::EditorAction {
+                card: id,
+                action: widget::text_editor::Action::Edit(widget::text_editor::Edit::Paste(
+                    Arc::new("exiting\n".into()),
+                )),
+            })),
+        );
+        drop(app.update(Message::CloseWindow));
+        assert_eq!(app.closing, Some(id));
+        app.pending_save_as = Some((id, app.untitled_text(id)));
+        let destination = directory.path().join("exited.txt");
+        drop(app.finish_save_as(id, Ok(Some(destination.clone()))));
+        assert_eq!(std::fs::read_to_string(&destination).unwrap(), "exiting\n");
+        assert!(app.tabs.is_empty());
+        assert!(app.exiting);
+        assert_eq!(app.session().paths, Vec::<PathBuf>::new());
     }
 }

@@ -454,8 +454,10 @@ shares the editor and repository UI without starting the cagents daemon,
 terminal host, or embedded browser. File-list mode and settings persist independently.
 Open tabs, order, and the active tab restore on launch; explicit paths are also
 opened, and a new session with no paths browses the current directory.
-Standalone tabs omit the redundant application icon and use the same compact
-geometry and pane separators as cagents.
+**Ctrl+T** or the plus control after the last tab creates an untitled note in a
+scratch folder next to the editor settings; **Ctrl+S** then chooses where that
+note lives. Standalone tabs omit the redundant application icon and use the same
+compact geometry and pane separators as cagents.
 
 Language-server assistance is off by default in ceditor. Syntax highlighting,
 editing, saving, and Git work without rust-analyzer or another language server.
