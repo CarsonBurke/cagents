@@ -88,19 +88,19 @@ pub fn symbolic_icon(name: &str) -> widget::icon::Handle {
     static SAVE: LazyLock<widget::icon::Handle> = LazyLock::new(|| {
         widget::icon::from_svg_bytes(br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16"><g fill="none" stroke="black" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><path d="M3 2.5h7l3 3v8H3zM6 2.5V6h5V2.5M6 13.5v-3h4v3"/></g></svg>"#.as_slice()).symbolic(true)
     });
-    // Cosmic's document-open is an upload arrow; a page is the file itself.
+    // A page plus an inward arrow makes the open action unambiguous at 16px.
     static OPEN_FILE: LazyLock<widget::icon::Handle> = LazyLock::new(|| {
-        widget::icon::from_svg_bytes(br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16"><g fill="none" stroke="black" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><path d="M3.5 1.75h5.5l3.5 3.5v8.75H3.5zM9 1.75v3.5h3.5M5.5 8.25h5M5.5 10.75h3.25"/></g></svg>"#.as_slice()).symbolic(true)
+        widget::icon::from_svg_bytes(br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16"><g fill="none" stroke="black" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><path d="M6 1.75h3.5l3.5 3.5v8.75H6zM9.5 1.75v3.5H13M2 8h5m-2-2 2 2-2 2"/></g></svg>"#.as_slice()).symbolic(true)
     });
-    // Theme folder-open is a heavy fill. An open tray reads as a folder at 16px.
+    // The arrow enters the open folder rather than relying on a filled theme glyph.
     static OPEN_FOLDER: LazyLock<widget::icon::Handle> = LazyLock::new(|| {
-        widget::icon::from_svg_bytes(br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16"><g fill="none" stroke="black" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><path d="M2 3.5h4.25l1.5 1.75"/><path d="M2 5.25h12.25L12.7 13.25H3.55z"/></g></svg>"#.as_slice()).symbolic(true)
+        widget::icon::from_svg_bytes(br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16"><g fill="none" stroke="black" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><path d="M2 3.5h4.25l1.5 1.75H14L12.7 13.25H3.55zM2 6h12M1 8h5m-2-2 2 2-2 2"/></g></svg>"#.as_slice()).symbolic(true)
     });
     static SIDEBAR: LazyLock<widget::icon::Handle> = LazyLock::new(|| {
         widget::icon::from_svg_bytes(br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16"><g fill="none" stroke="black" stroke-width="1.4" stroke-linejoin="round"><rect x="1.5" y="2.5" width="13" height="11" rx="1.5"/><path d="M6 3v10"/></g></svg>"#.as_slice()).symbolic(true)
     });
     static SETTINGS: LazyLock<widget::icon::Handle> = LazyLock::new(|| {
-        widget::icon::from_svg_bytes(br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16"><g fill="none" stroke="black" stroke-width="1.4" stroke-linecap="round"><path d="M2.5 5h11M2.5 11h11"/><circle cx="6.25" cy="5" r="1.65" fill="black" stroke="none"/><circle cx="10.25" cy="11" r="1.65" fill="black" stroke="none"/></g></svg>"#.as_slice()).symbolic(true)
+        widget::icon::from_svg_bytes(br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16"><path d="M6.7 1.8 7.2 1h1.6l.5.8 1 .4.9-.2 1.1 1.1-.2.9.4 1 .8v1.6l-1 .8-.4 1 .2.9-1.1 1.1-.9-.2-1 .4-.5.8H7.2l-.5-.8-1-.4-.9.2-1.1-1.1.2-.9-.4-1-1-.8V5.8l1-.8.4-1-.2-.9 1.1-1.1.9.2zM8 5.1a2.1 2.1 0 1 0 0 4.2 2.1 2.1 0 0 0 0-4.2Z" fill="none" stroke="black" stroke-width="1.2" stroke-linejoin="round"/></svg>"#.as_slice()).symbolic(true)
     });
     static INSERT_TEXT: LazyLock<widget::icon::Handle> = LazyLock::new(|| {
         widget::icon::from_svg_bytes(br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16"><path d="M3.5 3.25h9M8 3.25v9.5" fill="none" stroke="black" stroke-width="1.4" stroke-linecap="round"/></svg>"#.as_slice()).symbolic(true)
@@ -114,7 +114,11 @@ pub fn symbolic_icon(name: &str) -> widget::icon::Handle {
     static MINUS: LazyLock<widget::icon::Handle> = LazyLock::new(|| {
         widget::icon::from_svg_bytes(br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16"><path d="M4 8h8" fill="none" stroke="black" stroke-width="1.5" stroke-linecap="round"/></svg>"#.as_slice()).symbolic(true)
     });
+    static SEARCH: LazyLock<widget::icon::Handle> = LazyLock::new(|| {
+        widget::icon::from_svg_bytes(br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16"><circle cx="7" cy="7" r="4.25" fill="none" stroke="black" stroke-width="1.4"/><path d="m10.25 10.25 3.25 3.25" fill="none" stroke="black" stroke-width="1.4" stroke-linecap="round"/></svg>"#.as_slice()).symbolic(true)
+    });
     match name {
+        "edit-find-symbolic" | "system-search-symbolic" => SEARCH.clone(),
         "document-edit-symbolic" => CHANGES.clone(),
         "text-editor-symbolic" => EDIT.clone(),
         "edit-rename-symbolic" => RENAME.clone(),
@@ -186,6 +190,7 @@ pub struct IconControl<'a, Message> {
     button: widget::button::Button<'a, Message>,
     label: Cow<'a, str>,
     selected: bool,
+    enabled: bool,
 }
 
 /// A centered, fixed-size icon target with a quiet surface selected state.
@@ -210,6 +215,7 @@ pub fn icon_control<'a, Message: Clone + 'a>(
             .on_press_maybe(if enabled { on_press } else { None }),
         label,
         selected: selected && enabled,
+        enabled,
     }
 }
 
@@ -227,7 +233,18 @@ impl<'a, Message: Clone + 'a> IconControl<'a, Message> {
 
 impl<'a, Message: Clone + 'a> From<IconControl<'a, Message>> for Element<'a, Message> {
     fn from(control: IconControl<'a, Message>) -> Self {
-        tooltip(crate::interaction::hover(control.button), control.label)
+        let IconControl {
+            button,
+            label,
+            enabled,
+            ..
+        } = control;
+        let button: Element<'a, Message> = if enabled {
+            crate::interaction::hover(button).into()
+        } else {
+            button.into()
+        };
+        tooltip(button, label)
     }
 }
 

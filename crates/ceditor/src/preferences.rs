@@ -104,6 +104,58 @@ fn save_atomic(path: &Path, contents: &[u8]) -> Result<(), String> {
         .map_err(|error| error.to_string())
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct EditorShortcuts {
+    pub new_tab: String,
+    pub open_file: String,
+    pub open_folder: String,
+    pub save_file: String,
+    pub close_tab: String,
+    #[serde(alias = "search_files")]
+    pub find_in_file: String,
+    pub filter_files: String,
+    pub quick_open: String,
+    pub toggle_sidebar: String,
+}
+
+impl Default for EditorShortcuts {
+    fn default() -> Self {
+        Self {
+            new_tab: "Ctrl+T".into(),
+            open_file: "Ctrl+O".into(),
+            open_folder: "Ctrl+Shift+O".into(),
+            save_file: "Ctrl+S".into(),
+            close_tab: "Ctrl+W".into(),
+            find_in_file: "Ctrl+F".into(),
+            filter_files: "Ctrl+Shift+F".into(),
+            quick_open: "Ctrl+P".into(),
+            toggle_sidebar: "Ctrl+B".into(),
+        }
+    }
+}
+
+pub fn load_shortcuts(settings: &Path) -> Result<EditorShortcuts, String> {
+    let path = settings.with_file_name("shortcuts.toml");
+    match std::fs::read_to_string(&path) {
+        Ok(contents) => {
+            toml::from_str(&contents).map_err(|error| format!("{}: {error}", path.display()))
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            Ok(EditorShortcuts::default())
+        }
+        Err(error) => Err(format!("{}: {error}", path.display())),
+    }
+}
+
+pub fn save_shortcuts(settings: &Path, shortcuts: &EditorShortcuts) -> Result<(), String> {
+    let contents = toml::to_string_pretty(shortcuts).map_err(|error| error.to_string())?;
+    save_atomic(
+        &settings.with_file_name("shortcuts.toml"),
+        contents.as_bytes(),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

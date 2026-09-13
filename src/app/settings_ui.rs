@@ -573,8 +573,10 @@ fn category_icon(category: SettingsCategory) -> &'static str {
 }
 
 fn settings_icon(name: &'static str, progress: f32) -> widget::icon::Icon {
-    let handle: widget::icon::Handle = widget::icon::from_name(name).into();
-    handle.icon().size(16).opacity(progress.clamp(0.0, 1.0))
+    crate::ui_controls::symbolic_icon(name)
+        .icon()
+        .size(16)
+        .opacity(progress.clamp(0.0, 1.0))
 }
 
 fn category_button<'a>(
