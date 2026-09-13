@@ -52,6 +52,28 @@ pub fn reveal_width<'a, Message: 'a>(
     reveal_width_aligned(content, width, progress, false)
 }
 
+/// Treat a vertical mouse wheel as horizontal motion.
+///
+/// iced's native scrollable only swaps axes while Shift is held. Tab strips
+/// are horizontal-only, so a normal wheel should move them without a modifier.
+pub fn horizontal_wheel<'a, Message: 'a>(
+    content: impl Into<Element<'a, Message>>,
+) -> Element<'a, Message> {
+    Element::new(HorizontalWheel {
+        content: content.into(),
+    })
+}
+
+fn wheel_as_horizontal(delta: mouse::ScrollDelta) -> Event {
+    let x = match delta {
+        mouse::ScrollDelta::Lines { x, y } => (x + y) * 60.0,
+        mouse::ScrollDelta::Pixels { x, y } => x + y,
+    };
+    Event::Mouse(mouse::Event::WheelScrolled {
+        delta: mouse::ScrollDelta::Pixels { x, y: 0.0 },
+    })
+}
+
 /// Reveal a left-anchored pane without reflowing its contents on every frame.
 pub fn reveal_leading_width<'a, Message: 'a>(
     content: impl Into<Element<'a, Message>>,
@@ -381,6 +403,156 @@ impl<Message> Widget<Message, Theme, Renderer> for Layers<'_, Message> {
                 destinations,
             );
         }
+    }
+}
+
+struct HorizontalWheel<'a, Message> {
+    content: Element<'a, Message>,
+}
+
+impl<Message> Widget<Message, Theme, Renderer> for HorizontalWheel<'_, Message> {
+    fn children(&self) -> Vec<Tree> {
+        vec![Tree::new(&self.content)]
+    }
+    fn diff(&mut self, tree: &mut Tree) {
+        tree.diff_children(std::slice::from_mut(&mut self.content));
+    }
+    fn size(&self) -> Size<Length> {
+        self.content.as_widget().size()
+    }
+    fn layout(
+        &mut self,
+        tree: &mut Tree,
+        renderer: &Renderer,
+        limits: &layout::Limits,
+    ) -> layout::Node {
+        self.content
+            .as_widget_mut()
+            .layout(&mut tree.children[0], renderer, limits)
+    }
+    fn operate(
+        &mut self,
+        tree: &mut Tree,
+        layout: Layout<'_>,
+        renderer: &Renderer,
+        operation: &mut dyn Operation,
+    ) {
+        self.content.as_widget_mut().operate(
+            &mut tree.children[0],
+            layout.with_virtual_offset(layout.virtual_offset()),
+            renderer,
+            operation,
+        );
+    }
+    fn update(
+        &mut self,
+        tree: &mut Tree,
+        event: &Event,
+        layout: Layout<'_>,
+        cursor: mouse::Cursor,
+        renderer: &Renderer,
+        clipboard: &mut dyn Clipboard,
+        shell: &mut Shell<'_, Message>,
+        viewport: &Rectangle,
+    ) {
+        let remapped;
+        let event = match event {
+            Event::Mouse(mouse::Event::WheelScrolled { delta })
+                if cursor.is_over(layout.bounds()) =>
+            {
+                remapped = wheel_as_horizontal(*delta);
+                &remapped
+            }
+            other => other,
+        };
+        self.content.as_widget_mut().update(
+            &mut tree.children[0],
+            event,
+            layout.with_virtual_offset(layout.virtual_offset()),
+            cursor,
+            renderer,
+            clipboard,
+            shell,
+            viewport,
+        );
+    }
+    fn mouse_interaction(
+        &self,
+        tree: &Tree,
+        layout: Layout<'_>,
+        cursor: mouse::Cursor,
+        viewport: &Rectangle,
+        renderer: &Renderer,
+    ) -> mouse::Interaction {
+        self.content.as_widget().mouse_interaction(
+            &tree.children[0],
+            layout.with_virtual_offset(layout.virtual_offset()),
+            cursor,
+            viewport,
+            renderer,
+        )
+    }
+    fn draw(
+        &self,
+        tree: &Tree,
+        renderer: &mut Renderer,
+        theme: &Theme,
+        style: &renderer::Style,
+        layout: Layout<'_>,
+        cursor: mouse::Cursor,
+        viewport: &Rectangle,
+    ) {
+        self.content.as_widget().draw(
+            &tree.children[0],
+            renderer,
+            theme,
+            style,
+            layout.with_virtual_offset(layout.virtual_offset()),
+            cursor,
+            viewport,
+        )
+    }
+    fn overlay<'a>(
+        &'a mut self,
+        tree: &'a mut Tree,
+        layout: Layout<'a>,
+        renderer: &Renderer,
+        viewport: &Rectangle,
+        translation: Vector,
+    ) -> Option<overlay::Element<'a, Message, Theme, Renderer>> {
+        self.content.as_widget_mut().overlay(
+            &mut tree.children[0],
+            layout.with_virtual_offset(layout.virtual_offset()),
+            renderer,
+            viewport,
+            translation,
+        )
+    }
+    fn a11y_nodes(
+        &self,
+        layout: Layout<'_>,
+        tree: &Tree,
+        cursor: mouse::Cursor,
+    ) -> iced_accessibility::A11yTree {
+        self.content.as_widget().a11y_nodes(
+            layout.with_virtual_offset(layout.virtual_offset()),
+            &tree.children[0],
+            cursor,
+        )
+    }
+    fn drag_destinations(
+        &self,
+        tree: &Tree,
+        layout: Layout<'_>,
+        renderer: &Renderer,
+        destinations: &mut cosmic::iced::advanced::clipboard::DndDestinationRectangles,
+    ) {
+        self.content.as_widget().drag_destinations(
+            &tree.children[0],
+            layout.with_virtual_offset(layout.virtual_offset()),
+            renderer,
+            destinations,
+        );
     }
 }
 
@@ -882,6 +1054,21 @@ impl<Message> Widget<Message, Theme, Renderer> for Effect<'_, Message> {
 impl<'a, Message: 'a> From<Effect<'a, Message>> for Element<'a, Message> {
     fn from(effect: Effect<'a, Message>) -> Self {
         Self::new(effect)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_vertical_wheel_becomes_horizontal_pixels() {
+        let Event::Mouse(mouse::Event::WheelScrolled { delta }) =
+            wheel_as_horizontal(mouse::ScrollDelta::Lines { x: 0.0, y: 1.0 })
+        else {
+            panic!("expected a wheel event");
+        };
+        assert_eq!(delta, mouse::ScrollDelta::Pixels { x: 60.0, y: 0.0 });
     }
 }
 

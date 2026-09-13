@@ -2554,7 +2554,7 @@ impl Application for Editor {
             .into(),
         );
         strip.push(
-            widget::container(
+            widget::container(cagents::interaction::horizontal_wheel(
                 widget::scrollable::horizontal(
                     widget::row::with_children(tab_row)
                         .spacing(4)
@@ -2567,7 +2567,7 @@ impl Application for Editor {
                 ))
                 .width(Length::Fill)
                 .height(design::PRIMARY_CONTROL_SIZE),
-            )
+            ))
             .padding([strip_pad, 8.0])
             .width(Length::Fill)
             .into(),
