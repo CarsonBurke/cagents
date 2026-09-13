@@ -31,6 +31,7 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     path::{Path, PathBuf},
     sync::Arc,
+    time::{Duration, Instant},
 };
 
 #[derive(Clone)]
@@ -127,6 +128,7 @@ pub enum Message {
     ToggleSidebar,
     NewTab,
     SavedAs(CardId, Result<Option<PathBuf>, String>),
+    Frame(Instant),
 }
 
 pub struct Editor {
@@ -152,6 +154,36 @@ pub struct Editor {
     saved_session: crate::preferences::Session,
     sidebar_open: bool,
     pending_save_as: Option<(CardId, String)>,
+    sidebar_transition: Option<SidebarTransition>,
+}
+
+const SIDEBAR_TRANSITION_DURATION: Duration = Duration::from_millis(160);
+
+#[derive(Debug, Clone, Copy)]
+struct SidebarTransition {
+    started_at: Instant,
+    from: f32,
+    to: f32,
+}
+
+impl SidebarTransition {
+    fn duration(self) -> Duration {
+        SIDEBAR_TRANSITION_DURATION.mul_f32((self.to - self.from).abs())
+    }
+
+    fn progress(self, now: Instant) -> f32 {
+        let duration = self.duration();
+        if duration.is_zero() {
+            return self.to;
+        }
+        let elapsed = now.saturating_duration_since(self.started_at);
+        let linear = (elapsed.as_secs_f32() / duration.as_secs_f32()).clamp(0.0, 1.0);
+        cosmic::anim::slerp(self.from, self.to, linear)
+    }
+
+    fn is_complete(self, now: Instant) -> bool {
+        now.saturating_duration_since(self.started_at) >= self.duration()
+    }
 }
 
 fn repository_task(task: iced::Task<RepositoryAction>) -> Task<Message> {
@@ -685,6 +717,13 @@ impl Editor {
 
     fn sidebar_width(&self) -> f32 {
         sidebar::clamp_expanded_width(self.settings.sidebar_width)
+    }
+
+    fn sidebar_progress(&self) -> f32 {
+        self.sidebar_transition
+            .map_or(if self.sidebar_open { 1.0 } else { 0.0 }, |transition| {
+                transition.progress(Instant::now())
+            })
     }
 
     fn save_session(&mut self) {
@@ -1574,6 +1613,7 @@ impl Application for Editor {
             saved_session,
             sidebar_open,
             pending_save_as: None,
+            sidebar_transition: None,
         };
         let mut tasks = vec![app.appearance(), app.lsp_next()];
         if let Some(window) = app.core.main_window_id() {
@@ -2100,8 +2140,23 @@ impl Application for Editor {
                     self.resume_pending_files()
                 }
                 Message::ToggleSidebar => {
+                    let from = self.sidebar_progress();
                     self.sidebar_open = !self.sidebar_open;
+                    self.sidebar_transition = Some(SidebarTransition {
+                        started_at: Instant::now(),
+                        from,
+                        to: if self.sidebar_open { 1.0 } else { 0.0 },
+                    });
                     self.save_session();
+                    Task::none()
+                }
+                Message::Frame(now) => {
+                    if self
+                        .sidebar_transition
+                        .is_some_and(|transition| transition.is_complete(now))
+                    {
+                        self.sidebar_transition = None;
+                    }
                     Task::none()
                 }
                 Message::NewTab => self.new_tab(),
@@ -2332,7 +2387,12 @@ impl Application for Editor {
         } else {
             Subscription::none()
         };
-        Subscription::batch([events, refresh])
+        let frames = if self.sidebar_transition.is_some() {
+            window::frames().map(|(_, now)| Message::Frame(now))
+        } else {
+            Subscription::none()
+        };
+        Subscription::batch([events, refresh, frames])
     }
 
     fn header_start(&self) -> Vec<Element<'_, Message>> {
@@ -2597,16 +2657,15 @@ impl Application for Editor {
                 );
             }
             let mut workspace = Vec::new();
-            if self.sidebar_open {
-                workspace.push(
-                    sidebar::file_panel(
-                        &tab.sidebar,
-                        &tab.navigation,
-                        self.sidebar_width(),
-                        self.modal_open(),
-                    )
-                    .map(Message::Sidebar),
-                );
+            let progress = self.sidebar_progress();
+            if progress > 0.0 {
+                let width = self.sidebar_width();
+                workspace.push(cagents::interaction::reveal_leading_width(
+                    sidebar::file_panel(&tab.sidebar, &tab.navigation, width, self.modal_open())
+                        .map(Message::Sidebar),
+                    width,
+                    progress,
+                ));
                 // The files panel carries no trailing rule of its own: the
                 // splitter draws the single sidebar border and the drag
                 // handle. A second divider here would double the border.
@@ -2614,7 +2673,7 @@ impl Application for Editor {
                     Splitter::new(
                         iced::id::Id::new("ceditor.sidebar-splitter"),
                         "Resize sidebar",
-                        self.sidebar_width(),
+                        width,
                         sidebar::EXPANDED_WIDTH_MIN,
                         sidebar::EXPANDED_WIDTH_MAX,
                         splitter::Edge::Trailing,
@@ -2631,11 +2690,10 @@ impl Application for Editor {
                     .height(Length::Fill)
                     .into(),
             );
-            body.push(
-                widget::row::with_children(workspace)
-                    .height(Length::Fill)
-                    .into(),
-            );
+            body.push(cagents::interaction::drive_animation(
+                widget::row::with_children(workspace).height(Length::Fill),
+                self.sidebar_transition.is_some(),
+            ));
         } else {
             body.extend(strip);
             body.push(widget::container(widget::column::with_children(vec![widget::text::title1("Open a file or folder").into(), widget::text::body("Create a new tab to paste a note, or open an existing file or folder. Native editing, safe autosave, Git diffs, and language servers — without a daemon.").into(), widget::button::standard("Open folder").on_press(Message::Choose(true)).into()]).spacing(16)).padding(32).height(Length::Fill).into());
@@ -2937,6 +2995,7 @@ mod tests {
             saved_session: crate::preferences::Session::default(),
             sidebar_open: true,
             pending_save_as: None,
+            sidebar_transition: None,
         }
     }
 
@@ -2960,8 +3019,16 @@ mod tests {
         assert!(app.sidebar_open);
         drop(app.update(Message::ToggleSidebar));
         assert!(!app.sidebar_open);
+        let closing = app
+            .sidebar_transition
+            .expect("closing must animate like the cagents inspector");
+        assert_eq!(closing.to, 0.0);
+        drop(app.update(Message::Frame(Instant::now() + SIDEBAR_TRANSITION_DURATION)));
+        assert!(app.sidebar_transition.is_none());
+        assert_eq!(app.sidebar_progress(), 0.0);
         drop(app.update(Message::ToggleSidebar));
         assert!(app.sidebar_open);
+        assert!(app.sidebar_transition.is_some());
     }
 
     #[test]

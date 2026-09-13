@@ -49,11 +49,30 @@ pub fn reveal_width<'a, Message: 'a>(
     width: f32,
     progress: f32,
 ) -> Element<'a, Message> {
+    reveal_width_aligned(content, width, progress, false)
+}
+
+/// Reveal a left-anchored pane without reflowing its contents on every frame.
+pub fn reveal_leading_width<'a, Message: 'a>(
+    content: impl Into<Element<'a, Message>>,
+    width: f32,
+    progress: f32,
+) -> Element<'a, Message> {
+    reveal_width_aligned(content, width, progress, true)
+}
+
+fn reveal_width_aligned<'a, Message: 'a>(
+    content: impl Into<Element<'a, Message>>,
+    width: f32,
+    progress: f32,
+    leading: bool,
+) -> Element<'a, Message> {
     Effect {
         content: content.into(),
         kind: Kind::RevealWidth {
             width: width.max(0.0),
             progress: progress.clamp(0.0, 1.0),
+            leading,
         },
         tip: None,
     }
@@ -372,7 +391,11 @@ enum Kind {
     Fade(f32),
     Tooltip,
     DriveAnimation(bool),
-    RevealWidth { width: f32, progress: f32 },
+    RevealWidth {
+        width: f32,
+        progress: f32,
+        leading: bool,
+    },
     Opaque,
 }
 
@@ -474,7 +497,10 @@ impl<Message> Widget<Message, Theme, Renderer> for Effect<'_, Message> {
     }
     fn size(&self) -> Size<Length> {
         let mut size = self.content.as_widget().size();
-        if let Kind::RevealWidth { width, progress } = self.kind {
+        if let Kind::RevealWidth {
+            width, progress, ..
+        } = self.kind
+        {
             size.width = Length::Fixed(width * progress);
         }
         size
@@ -492,7 +518,12 @@ impl<Message> Widget<Message, Theme, Renderer> for Effect<'_, Message> {
         renderer: &Renderer,
         limits: &layout::Limits,
     ) -> layout::Node {
-        if let Kind::RevealWidth { width, progress } = self.kind {
+        if let Kind::RevealWidth {
+            width,
+            progress,
+            leading,
+        } = self.kind
+        {
             let visible = (width * progress).min(limits.max().width);
             let child = self.content.as_widget_mut().layout(
                 &mut tree.children[0],
@@ -500,9 +531,10 @@ impl<Message> Widget<Message, Theme, Renderer> for Effect<'_, Message> {
                 &layout::Limits::new(Size::new(width, 0.0), Size::new(width, limits.max().height)),
             );
             let height = child.size().height;
+            let x = if leading { 0.0 } else { visible - width };
             return layout::Node::with_children(
                 Size::new(visible, height),
-                vec![child.move_to(Point::new(visible - width, 0.0))],
+                vec![child.move_to(Point::new(x, 0.0))],
             );
         }
         self.content
