@@ -148,6 +148,8 @@ enum BasisResolution {
     Resolving(CommittedChoice),
     /// The user must choose the base ref, because nothing resolved one.
     NeedsBase(Vec<ValidatedRefName>),
+    /// The branch has no commits, so no committed comparison can resolve.
+    NoCommits,
     Unavailable(String),
 }
 
@@ -401,11 +403,6 @@ pub enum RepositoryAction {
     RetryDiff {
         card: CardId,
     },
-    FileViewport {
-        card: CardId,
-        offset: f32,
-        height: f32,
-    },
     DiffViewport {
         card: CardId,
         offset: f32,
@@ -449,7 +446,6 @@ impl RepositoryAction {
             | Self::SelectCommittedBasis { card, .. }
             | Self::ApplyDiffBasis { card, .. }
             | Self::RetryDiff { card }
-            | Self::FileViewport { card, .. }
             | Self::DiffViewport { card, .. }
             | Self::PreviewViewport { card, .. }
             | Self::PreviousChange { card }
@@ -901,7 +897,6 @@ struct VisibleRows {
     bottom_space: f32,
 }
 
-const FILE_ROW_HEIGHT: f32 = 36.0;
 const DIFF_ROW_HEIGHT: f32 = 30.0;
 const VISIBLE_ROW_OVERSCAN: usize = 6;
 const INITIAL_VIEWPORT_HEIGHT: f32 = 900.0;
@@ -981,7 +976,6 @@ pub struct RepositoryRuntime {
     next_auto_save_ticket: u64,
     diff_change: usize,
     diff_scroll_id: widget::Id,
-    file_viewport: ListViewport,
     diff_viewport: ListViewport,
     diff_horizontal: f32,
     preview_scroll_id: widget::Id,
@@ -1084,7 +1078,6 @@ impl RepositoryRuntime {
             next_auto_save_ticket: 0,
             diff_change: 0,
             diff_scroll_id: widget::Id::new(format!("repository.diff.{identity}")),
-            file_viewport: ListViewport::default(),
             diff_viewport: ListViewport::default(),
             diff_horizontal: 0.0,
             preview_scroll_id: widget::Id::new(format!("repository.preview.{identity}")),
@@ -1350,7 +1343,6 @@ impl RepositoryRuntime {
             return Task::none();
         }
         self.files = FileListState::Loading;
-        self.file_viewport = ListViewport::default();
         self.background_file_refresh = false;
         self.load_files(card)
     }
@@ -1949,6 +1941,7 @@ impl RepositoryRuntime {
             && !self.directory_only
             && self.selected.is_some()
             && self.basis_resolution != Some(BasisResolution::Resolving(choice))
+            && !matches!(self.basis_resolution, Some(BasisResolution::NoCommits))
     }
 
     fn can_change_diff_layout(&self) -> bool {
@@ -2074,6 +2067,13 @@ impl RepositoryRuntime {
             match resolution {
                 BasisResolution::Resolving(_) => (Some("Loading"), None, None, None, None),
                 BasisResolution::NeedsBase(_) => (Some("Choose a base"), None, None, None, None),
+                BasisResolution::NoCommits => (
+                    Some("Unavailable"),
+                    Some("This branch has no commits yet, so there is nothing to compare.".into()),
+                    None,
+                    None,
+                    None,
+                ),
                 BasisResolution::Unavailable(message) => {
                     (Some("Unavailable"), Some(message.clone()), None, None, None)
                 }
@@ -2164,9 +2164,11 @@ impl RepositoryRuntime {
             DocumentState::Failed { .. } => RepositoryRuntimeStatus::Unavailable,
             _ if self.source_surface == SourceSurface::Diff => match &self.basis_resolution {
                 Some(BasisResolution::Resolving(_)) => RepositoryRuntimeStatus::Loading,
-                Some(BasisResolution::NeedsBase(_) | BasisResolution::Unavailable(_)) => {
-                    RepositoryRuntimeStatus::Unavailable
-                }
+                Some(
+                    BasisResolution::NeedsBase(_)
+                    | BasisResolution::NoCommits
+                    | BasisResolution::Unavailable(_),
+                ) => RepositoryRuntimeStatus::Unavailable,
                 None => match self.diff_state(&self.diff_basis) {
                     Some(DiffState::Loading { .. }) => RepositoryRuntimeStatus::Loading,
                     Some(DiffState::Ready(RenderedDiff::Error(_))) => {
@@ -2757,10 +2759,7 @@ impl RepositoryRuntime {
                         self.basis_resolution = Some(BasisResolution::NeedsBase(candidates));
                     }
                     Ok(ResolvedBasis::NoCommit) => {
-                        self.basis_resolution = Some(BasisResolution::Unavailable(
-                            "This branch has no commits yet, so there is nothing to compare."
-                                .into(),
-                        ));
+                        self.basis_resolution = Some(BasisResolution::NoCommits);
                     }
                     Err(error) => {
                         self.basis_resolution = Some(BasisResolution::Unavailable(error));
@@ -2800,10 +2799,6 @@ impl RepositoryRuntime {
                 let identity = self.current_identity(card, selected.path.clone());
                 let basis = self.diff_basis.clone();
                 self.request_diff(identity, basis, previous_path)
-            }
-            RepositoryAction::FileViewport { offset, height, .. } => {
-                self.file_viewport = ListViewport { offset, height };
-                Task::none()
             }
             RepositoryAction::PreviewViewport { offset, .. } => {
                 if self.source_surface == SourceSurface::Editor
@@ -3753,10 +3748,16 @@ fn bytes_to_path(bytes: &[u8]) -> PathBuf {
 }
 
 pub fn view(card: CardId, runtime: &RepositoryRuntime) -> Element<'_, RepositoryAction> {
+    // File browsing lives in the sidebar tree, and the flat list exists only
+    // for diff/change review. With nothing selected the card says so instead
+    // of duplicating the tree as a second flat browser.
     let body = if runtime.selected.is_some() {
         selected_file_view(card, runtime)
     } else {
-        file_list_view(card, runtime)
+        information_state(
+            "No file selected",
+            "Choose a file from the repository list.",
+        )
     };
     // Ordinary columns reconcile children through Tree::diff, including tag
     // changes. The pinned keyed column directly diffs equal-length children
@@ -3780,139 +3781,6 @@ pub fn editor_focus_id(card: CardId) -> widget::Id {
 pub fn focus_restore_id(card: CardId) -> widget::Id {
     widget::Id::new(format!("repository.{card}.view"))
 }
-
-fn file_list_view(card: CardId, runtime: &RepositoryRuntime) -> Element<'_, RepositoryAction> {
-    let spacing = cosmic::theme::spacing();
-    let title = runtime
-        .descriptor
-        .worktree
-        .file_name()
-        .map(|name| name.to_string_lossy().into_owned())
-        .filter(|name| !name.is_empty())
-        .unwrap_or_else(|| "Repository".into());
-    let header = widget::container(
-        widget::row::with_children(vec![
-            crate::file_icon::folder(true).size(20).into(),
-            widget::column::with_children(vec![
-                widget::text::title3(title)
-                    .wrapping(iced::widget::text::Wrapping::None)
-                    .ellipsize(iced::widget::text::Ellipsize::End(
-                        iced::advanced::text::EllipsizeHeightLimit::Lines(1),
-                    ))
-                    .width(Length::Fill)
-                    .into(),
-                crate::design::caption(runtime.descriptor.worktree.display().to_string())
-                    .wrapping(iced::widget::text::Wrapping::None)
-                    .ellipsize(iced::widget::text::Ellipsize::Start(
-                        iced::advanced::text::EllipsizeHeightLimit::Lines(1),
-                    ))
-                    .width(Length::Fill)
-                    .into(),
-            ])
-            .width(Length::Fill)
-            .into(),
-            if runtime.standalone {
-                iced::widget::Space::new().into()
-            } else {
-                icon_control(
-                    crate::ui_controls::symbolic_icon("utilities-terminal-symbolic"),
-                    "New terminal here",
-                    false,
-                    true,
-                    Some(RepositoryAction::NewTerminal { card }),
-                )
-                .into()
-            },
-            if matches!(runtime.files, FileListState::Failed(_)) {
-                icon_control(
-                    crate::ui_controls::symbolic_icon("view-refresh-symbolic"),
-                    "Retry loading files",
-                    false,
-                    !runtime.file_list_loading,
-                    Some(RepositoryAction::RefreshFiles { card }),
-                )
-                .into()
-            } else {
-                iced::widget::Space::new().into()
-            },
-        ])
-        .align_y(Alignment::Center)
-        .spacing(spacing.space_xs),
-    )
-    .padding([spacing.space_xs, spacing.space_s]);
-    let files: Element<'_, RepositoryAction> = match &runtime.files {
-        FileListState::Loading => loading("Loading tracked and changed files…"),
-        FileListState::Failed(error) => information_state("Could not list files", error),
-        FileListState::Ready(files) if files.is_empty() => information_state(
-            "No reviewable files",
-            "This worktree has no tracked or untracked regular-file paths.",
-        ),
-        FileListState::Ready(files) => {
-            let visible = visible_rows(files.len(), runtime.file_viewport, FILE_ROW_HEIGHT);
-            let mut rows = Vec::with_capacity(visible.end - visible.start + 2);
-            if visible.top_space > 0.0 {
-                rows.push(iced::widget::Space::new().height(visible.top_space).into());
-            }
-            rows.extend(files[visible.start..visible.end].iter().map(|file| {
-                let label = file.path.to_string_lossy();
-                let mut children: Vec<Element<'_, RepositoryAction>> = vec![
-                    crate::file_icon::icon(&file.path).into(),
-                    widget::text::body(label)
-                        .wrapping(iced::widget::text::Wrapping::None)
-                        .ellipsize(iced::widget::text::Ellipsize::End(
-                            iced::advanced::text::EllipsizeHeightLimit::Lines(1),
-                        ))
-                        .width(Length::Fill)
-                        .into(),
-                ];
-                if let Some(status) = &file.status {
-                    children.push(crate::design::caption(status.clone()).into());
-                }
-                widget::button::custom(
-                    widget::row::with_children(children)
-                        .align_y(Alignment::Center)
-                        .spacing(spacing.space_xxs),
-                )
-                .class(cosmic::theme::Button::Text)
-                .name(file.path.to_string_lossy())
-                .width(Length::Fill)
-                .height(Length::Fixed(FILE_ROW_HEIGHT))
-                .on_press(RepositoryAction::OpenFile {
-                    card,
-                    path: file.path.clone(),
-                })
-                .into()
-            }));
-            if visible.bottom_space > 0.0 {
-                rows.push(
-                    iced::widget::Space::new()
-                        .height(visible.bottom_space)
-                        .into(),
-                );
-            }
-            widget::scrollable(widget::column::with_children(rows))
-                .direction(iced::widget::scrollable::Direction::Vertical(
-                    crate::design::scrollbar(),
-                ))
-                .on_scroll(move |viewport| RepositoryAction::FileViewport {
-                    card,
-                    offset: viewport.absolute_offset().y,
-                    height: viewport.bounds().height,
-                })
-                .height(Length::Fill)
-                .width(Length::Fill)
-                .into()
-        }
-    };
-    widget::column::with_children(vec![
-        header.into(),
-        widget::divider::horizontal::default().into(),
-        files,
-    ])
-    .height(Length::Fill)
-    .into()
-}
-
 fn comparison_icon() -> widget::icon::Handle {
     static ICON: LazyLock<widget::icon::Handle> = LazyLock::new(|| {
         widget::icon::from_svg_bytes(&br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><g fill="none" stroke="black" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="16" rx="1"/><path d="M12 4v16M6 10h3M15 10h3M16.5 8.5v3M6 15h3M15 15h3"/></g></svg>"#[..]).symbolic(true)
@@ -4038,14 +3906,11 @@ pub fn selected_file_toolbar(
         )
         .into(),
     ])];
-    if !runtime.directory_only {
-        controls.push(diff_basis_controls(card, runtime));
-    }
-    if runtime.source_surface == SourceSurface::Diff {
-        controls.push(diff_review_controls(card, runtime));
-    }
+    // File actions stay mounted whether or not they can run: an inactive
+    // icon renders muted but keeps its tooltip, so the toolbar never jumps
+    // around as edits, saves, and staging change what is available.
     let mut document_actions = Vec::new();
-    if runtime.is_dirty() {
+    if editable {
         document_actions.push(
             icon_control(
                 crate::ui_controls::symbolic_icon("edit-undo-symbolic"),
@@ -4056,8 +3921,6 @@ pub fn selected_file_toolbar(
             )
             .into(),
         );
-    }
-    if editable {
         document_actions.push(
             icon_control(
                 crate::ui_controls::symbolic_icon("document-save-symbolic"),
@@ -4078,7 +3941,7 @@ pub fn selected_file_toolbar(
             .into(),
         );
     }
-    for (stage, available, icon, label) in [
+    for (stage, has_changes, icon, label) in [
         (
             true,
             selected.unstaged,
@@ -4092,21 +3955,25 @@ pub fn selected_file_toolbar(
             "Unstage file changes",
         ),
     ] {
-        if available && !runtime.mutation_refresh_pending {
-            document_actions.push(
-                icon_control(
-                    crate::ui_controls::symbolic_icon(icon),
-                    label,
-                    false,
-                    !runtime.blocks_navigation(),
-                    Some(RepositoryAction::StageSelected { card, stage }),
-                )
-                .into(),
-            );
-        }
+        document_actions.push(
+            icon_control(
+                crate::ui_controls::symbolic_icon(icon),
+                label,
+                false,
+                has_changes && !runtime.mutation_refresh_pending && !runtime.blocks_navigation(),
+                Some(RepositoryAction::StageSelected { card, stage }),
+            )
+            .into(),
+        );
     }
-    if !document_actions.is_empty() {
-        controls.push(toolbar_group(document_actions));
+    controls.push(toolbar_group(document_actions));
+    // Diff navigation follows the file it compares: view modes, file
+    // actions, then diff scope.
+    if !runtime.directory_only {
+        controls.push(diff_basis_controls(card, runtime));
+    }
+    if runtime.source_surface == SourceSurface::Diff {
+        controls.push(diff_review_controls(card, runtime));
     }
     let mut secondary = Vec::new();
     if !runtime.standalone
@@ -4361,7 +4228,7 @@ fn diff_basis_controls(card: CardId, runtime: &RepositoryRuntime) -> Element<'_,
         Some(BasisResolution::NeedsBase(_)) => {
             Some(BasisChoice::Committed(CommittedChoice::Branch))
         }
-        Some(BasisResolution::Unavailable(_)) => None,
+        Some(BasisResolution::NoCommits | BasisResolution::Unavailable(_)) => None,
         None => Some(basis_choice(&runtime.diff_basis)),
     };
     let unstaged = runtime.can_select_diff_basis(&DiffBasis::IndexToWorktree);
@@ -4528,6 +4395,10 @@ fn diff_surface(card: CardId, runtime: &RepositoryRuntime) -> Element<'_, Reposi
             loading(format!("Resolving the {} comparison…", choice.label()))
         }
         Some(BasisResolution::NeedsBase(candidates)) => base_choice_view(card, candidates),
+        Some(BasisResolution::NoCommits) => information_state(
+            "Comparison unavailable",
+            "This branch has no commits yet, so there is nothing to compare.",
+        ),
         Some(BasisResolution::Unavailable(message)) => {
             information_state("Comparison unavailable", message.clone())
         }
@@ -7746,14 +7617,15 @@ mod tests {
     }
 
     #[test]
-    fn visible_row_projection_bounds_widgets_for_large_file_and_diff_fixtures() {
+    fn visible_row_projection_bounds_widgets_for_large_virtualized_lists() {
+        const ROW_HEIGHT: f32 = 36.0;
         let top = visible_rows(
             100_000,
             ListViewport {
                 offset: 0.0,
                 height: 720.0,
             },
-            FILE_ROW_HEIGHT,
+            ROW_HEIGHT,
         );
         let middle = visible_rows(
             1_000_000,
@@ -7766,8 +7638,8 @@ mod tests {
         assert!(top.end - top.start <= 34);
         assert!(middle.end - middle.start <= 43);
         assert_eq!(
-            top.top_space + (top.end - top.start) as f32 * FILE_ROW_HEIGHT + top.bottom_space,
-            100_000.0 * FILE_ROW_HEIGHT
+            top.top_space + (top.end - top.start) as f32 * ROW_HEIGHT + top.bottom_space,
+            100_000.0 * ROW_HEIGHT
         );
         assert_eq!(
             middle.top_space
@@ -7785,32 +7657,7 @@ mod tests {
             worktree: PathBuf::from("/repo"),
         };
         let mut runtime = RepositoryRuntime::new(view);
-        runtime.files = FileListState::Ready(
-            (0..100_000)
-                .map(|index| RepositoryFile {
-                    path: PathBuf::from(format!("file-{index:06}.txt")),
-                    staged_old_path: None,
-                    unstaged_old_path: None,
-                    staged: false,
-                    unstaged: false,
-                    status: None,
-                })
-                .collect(),
-        );
         let card = CardId::new();
-        for offset in [
-            0.0,
-            50_000.0 * FILE_ROW_HEIGHT,
-            100_000.0 * FILE_ROW_HEIGHT - 720.0,
-        ] {
-            runtime.file_viewport = ListViewport {
-                offset,
-                height: 720.0,
-            };
-            let element = file_list_view(card, &runtime);
-            assert!(widget_nodes(&element) < 1_000, "file widget tree was eager");
-        }
-
         let inline = InlineDiffRow {
             old_line: Some(1),
             new_line: Some(1),
@@ -8888,7 +8735,7 @@ mod tests {
             BasisResolution::Resolving(CommittedChoice::Branch),
             // No candidates at all, so even the ref selector offers nothing.
             BasisResolution::NeedsBase(Vec::new()),
-            BasisResolution::Unavailable("This branch has no commits yet".into()),
+            BasisResolution::NoCommits,
         ] {
             runtime.basis_resolution = Some(resolution.clone());
             // The diff the user was reading is still cached, and the basis

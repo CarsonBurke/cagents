@@ -385,19 +385,15 @@ impl<'view, Message: 'view> Widget<Message, Theme, Renderer> for Splitter<'view,
         let scale = style.scale_factor as f32;
         let bounds =
             pixel_aligned_rule(layout.bounds(), layout.virtual_offset().x, scale, self.edge);
+        // The exact rule color cosmic dividers paint
+        // (`current_container().divider`): the component-level divider and
+        // pre-compositing against the window background both rendered a
+        // brighter, stronger line than every sibling border.
         let color: Color = if tree.state.downcast_ref::<SplitterState>().is_focused {
             theme.current_container().component.on.into()
         } else {
-            theme.current_container().component.divider.into()
+            theme.current_container().divider.into()
         };
-        // Composite once against the surface, so intersecting rules do not
-        // accumulate translucent strokes into dark crosses.
-        let base = Color::from(theme.cosmic().bg_color());
-        let color = Color::from_rgb(
-            color.r * color.a + base.r * (1.0 - color.a),
-            color.g * color.a + base.g * (1.0 - color.a),
-            color.b * color.a + base.b * (1.0 - color.a),
-        );
         renderer.fill_quad(
             renderer::Quad {
                 bounds,

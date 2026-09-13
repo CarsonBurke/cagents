@@ -1846,6 +1846,35 @@ mod tests {
     }
 
     #[test]
+    fn short_files_hide_the_scrollbar_while_long_files_scroll() {
+        // Files that fit the viewport must not paint a scrollbar track; only
+        // overflowing content scrolls. `draw` early-returns on `scrollable`,
+        // so this geometry flag is the whole visibility contract.
+        for source in [
+            "".to_owned(),
+            "one\n".to_owned(),
+            "one\ntwo\nthree\n".to_owned(),
+        ] {
+            let mut content = Content::with_text(&source);
+            layout_content(&mut content, 500.0, 200.0);
+            for height in [211.0, 1000.7, 1762.0] {
+                let bounds = Rectangle::new(Point::ORIGIN, Size::new(600.0, height));
+                let editor: TextEditor<'_, highlighter::PlainText, ()> = TextEditor::new(&content);
+                assert!(
+                    !editor.scroll_geometry(bounds).scrollable,
+                    "short file scrolls at height {height}"
+                );
+            }
+        }
+        let source = (1..=200).map(|i| format!("line {i}\n")).collect::<String>();
+        let mut content = Content::with_text(&source);
+        layout_content(&mut content, 500.0, 200.0);
+        let bounds = Rectangle::new(Point::ORIGIN, Size::new(600.0, 210.0));
+        let editor: TextEditor<'_, highlighter::PlainText, ()> = TextEditor::new(&content);
+        assert!(editor.scroll_geometry(bounds).scrollable);
+    }
+
+    #[test]
     fn scrollbar_follows_native_scroll_without_changing_selection_or_text() {
         let source = (1..=200)
             .map(|line| format!("line {line}\n"))

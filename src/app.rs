@@ -8015,7 +8015,6 @@ impl Application for Cagents {
                     SidebarAction::ToggleSection { .. }
                     | SidebarAction::ToggleSourceControlPanel { .. }
                     | SidebarAction::FilesQueryChanged { .. }
-                    | SidebarAction::SetFileListMode { .. }
                     | SidebarAction::SetChangeListMode { .. }
                     | SidebarAction::ToggleDirectory { .. }
                     | SidebarAction::CommitMessageChanged { .. }
