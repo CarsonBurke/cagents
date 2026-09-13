@@ -213,7 +213,7 @@ pub fn parse_chords(raw: &str) -> Vec<String> {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct ShortcutBinding {
+pub struct ShortcutBinding {
     pub control: bool,
     pub alt: bool,
     pub shift: bool,
@@ -222,13 +222,13 @@ pub(crate) struct ShortcutBinding {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ShortcutKey {
+pub enum ShortcutKey {
     Character(char),
     ArrowLeft,
     ArrowRight,
 }
 
-pub(crate) fn parse_shortcut(raw: &str) -> Result<ShortcutBinding, &'static str> {
+pub fn parse_shortcut(raw: &str) -> Result<ShortcutBinding, &'static str> {
     let mut control = false;
     let mut alt = false;
     let mut shift = false;

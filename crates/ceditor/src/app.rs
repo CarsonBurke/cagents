@@ -6,13 +6,13 @@ use cagents::{
     },
     model::{CardId, ProjectId, RepositoryView, WorktreeId},
     repository::{
-        CancellationToken, DiffBasis, MutationOutcome, RepoPath, RepositoryId, RepositoryService,
-        RepositorySnapshot, StageRequest, UnstageRequest,
+        CancellationToken, DiffBasis, MutationOutcome, PathSelection, RepoPath, RepositoryId,
+        RepositoryService, RepositorySnapshot, StageRequest, UnstageRequest,
     },
     repository_widget::{
         self, ClipboardOp, EditorAction, EditorEdit, LspIntent, RepositoryAction, RepositoryRuntime,
     },
-    settings::{self, AppSettings, AppTheme},
+    settings::{self, AppSettings, AppTheme, ShortcutBinding, ShortcutKey},
     sidebar::{
         self, ActiveWorktreeKey, FileCommand, FileSearch, SidebarAction, SidebarFocus, SidebarMode,
         SidebarModel, SidebarProject, SidebarState, SidebarWorktree, SourceControlModel,
@@ -61,6 +61,7 @@ struct Tab {
     sidebar: SidebarModel,
     navigation: SidebarState,
     pending_file: Option<PendingFile>,
+    pending_diff: Option<bool>,
     owned_file: Option<PathBuf>,
     next_open: u64,
     files_loaded: bool,
@@ -101,7 +102,10 @@ pub enum Message {
     WindowFocused(window::Id, bool),
     RefreshVisible,
     Repository(RepositoryAction),
-    ResolvedDiffBasis { card: CardId, basis: DiffBasis },
+    ResolvedDiffBasis {
+        card: CardId,
+        basis: DiffBasis,
+    },
     Sidebar(SidebarAction),
     Snapshot(CardId, Result<RepositorySnapshot, String>),
     Mutation(CardId, Result<MutationOutcome, String>),
@@ -110,6 +114,21 @@ pub enum Message {
     CancelFileOperation,
     FileOperationFinished(Result<PathBuf, String>),
     Settings,
+    SelectSettingsCategory(SettingsCategory),
+    ShortcutChanged(EditorShortcut, String),
+    FindInFile,
+    FindQueryChanged(String),
+    CloseFind,
+    QuickOpen,
+    QuickOpenQueryChanged(String),
+    OpenQuickFile(PathBuf),
+    CloseQuickOpen,
+    QuickOpenSearchFinished {
+        card: CardId,
+        generation: u64,
+        query: String,
+        result: Result<Vec<PathBuf>, String>,
+    },
     AutoSave(bool),
     WrapLines(bool),
     SyntaxTheme(cagents::settings::EditorSyntaxTheme),
@@ -132,15 +151,196 @@ pub enum Message {
     Frame(Instant),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SettingsCategory {
+    Editing,
+    Appearance,
+    Keyboard,
+    LanguageServers,
+}
+
+impl SettingsCategory {
+    const ALL: [Self; 4] = [
+        Self::Editing,
+        Self::Appearance,
+        Self::Keyboard,
+        Self::LanguageServers,
+    ];
+
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Editing => "Editing",
+            Self::Appearance => "Appearance",
+            Self::Keyboard => "Keyboard",
+            Self::LanguageServers => "Language servers",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EditorShortcut {
+    NewTab,
+    OpenFile,
+    OpenFolder,
+    SaveFile,
+    CloseTab,
+    FindInFile,
+    FilterFiles,
+    QuickOpen,
+    ToggleSidebar,
+}
+impl crate::preferences::EditorShortcuts {
+    fn set(&mut self, action: EditorShortcut, value: String) {
+        match action {
+            EditorShortcut::NewTab => self.new_tab = value,
+            EditorShortcut::OpenFile => self.open_file = value,
+            EditorShortcut::OpenFolder => self.open_folder = value,
+            EditorShortcut::SaveFile => self.save_file = value,
+            EditorShortcut::CloseTab => self.close_tab = value,
+            EditorShortcut::FindInFile => self.find_in_file = value,
+            EditorShortcut::FilterFiles => self.filter_files = value,
+            EditorShortcut::QuickOpen => self.quick_open = value,
+            EditorShortcut::ToggleSidebar => self.toggle_sidebar = value,
+        }
+    }
+
+    fn value(&self, action: EditorShortcut) -> &str {
+        match action {
+            EditorShortcut::NewTab => &self.new_tab,
+            EditorShortcut::OpenFile => &self.open_file,
+            EditorShortcut::OpenFolder => &self.open_folder,
+            EditorShortcut::SaveFile => &self.save_file,
+            EditorShortcut::CloseTab => &self.close_tab,
+            EditorShortcut::FindInFile => &self.find_in_file,
+            EditorShortcut::FilterFiles => &self.filter_files,
+            EditorShortcut::QuickOpen => &self.quick_open,
+            EditorShortcut::ToggleSidebar => &self.toggle_sidebar,
+        }
+    }
+
+    fn validate(&self) -> Result<(), String> {
+        let mut seen = Vec::new();
+        for value in [
+            &self.new_tab,
+            &self.open_file,
+            &self.open_folder,
+            &self.save_file,
+            &self.close_tab,
+            &self.find_in_file,
+            &self.filter_files,
+            &self.quick_open,
+            &self.toggle_sidebar,
+        ] {
+            let binding = cagents::settings::parse_shortcut(value)
+                .map_err(|error| format!("Invalid shortcut: {error}"))?;
+            if seen.contains(&binding) {
+                return Err("Shortcuts must not conflict.".into());
+            }
+            seen.push(binding);
+        }
+        Ok(())
+    }
+}
+impl Editor {
+    fn shortcut_pressed(&self, action: EditorShortcut, event: &keyboard::Event) -> bool {
+        cagents::settings::parse_shortcut(self.shortcuts.value(action))
+            .is_ok_and(|binding| shortcut_matches(binding, event))
+    }
+
+    fn handle_shortcut(&mut self, event: &keyboard::Event) -> Option<Task<Message>> {
+        if self.modal_open() {
+            return None;
+        }
+        if self.shortcut_pressed(EditorShortcut::NewTab, event) {
+            return Some(self.update(Message::NewTab));
+        }
+        if self.shortcut_pressed(EditorShortcut::OpenFile, event) {
+            return Some(self.update(Message::Choose(false)));
+        }
+        if self.shortcut_pressed(EditorShortcut::OpenFolder, event) {
+            return Some(self.update(Message::Choose(true)));
+        }
+        if self.shortcut_pressed(EditorShortcut::SaveFile, event) {
+            return self.active.map(|card| {
+                self.update(Message::Repository(RepositoryAction::Save {
+                    card,
+                    overwrite: false,
+                }))
+            });
+        }
+        if self.shortcut_pressed(EditorShortcut::CloseTab, event) {
+            return self.active.map(|card| self.update(Message::CloseTab(card)));
+        }
+        if self.shortcut_pressed(EditorShortcut::FindInFile, event) {
+            return self.active.map(|_| self.update(Message::FindInFile));
+        }
+        if self.shortcut_pressed(EditorShortcut::FilterFiles, event) {
+            return self.active.and_then(|card| {
+                self.tab(card)
+                    .and_then(|tab| tab.navigation.active_worktree().cloned())
+                    .map(|key| {
+                        self.update(Message::Sidebar(SidebarAction::ToggleFilesFilter { key }))
+                    })
+            });
+        }
+        if self.shortcut_pressed(EditorShortcut::QuickOpen, event) {
+            return Some(self.update(Message::QuickOpen));
+        }
+        if self.shortcut_pressed(EditorShortcut::ToggleSidebar, event) {
+            return Some(self.update(Message::ToggleSidebar));
+        }
+        None
+    }
+}
+
+fn shortcut_matches(binding: ShortcutBinding, event: &keyboard::Event) -> bool {
+    let keyboard::Event::KeyPressed {
+        key,
+        physical_key,
+        modifiers,
+        repeat: false,
+        ..
+    } = event
+    else {
+        return false;
+    };
+    binding.control == modifiers.control()
+        && binding.alt == modifiers.alt()
+        && binding.shift == modifiers.shift()
+        && binding.logo == modifiers.logo()
+        && match binding.key {
+            ShortcutKey::ArrowLeft => {
+                matches!(key, keyboard::Key::Named(keyboard::key::Named::ArrowLeft))
+            }
+            ShortcutKey::ArrowRight => {
+                matches!(key, keyboard::Key::Named(keyboard::key::Named::ArrowRight))
+            }
+            ShortcutKey::Character(expected) => key
+                .to_latin(*physical_key)
+                .map(|actual| actual.to_ascii_lowercase() == expected)
+                .unwrap_or_else(|| {
+                    matches!(key, keyboard::Key::Character(value) if value.eq_ignore_ascii_case(&expected.to_string()))
+                }),
+        }
+}
 pub struct Editor {
     core: Core,
     tabs: Vec<Tab>,
     active: Option<CardId>,
     selection_epoch: u64,
     settings: AppSettings,
+    shortcuts: crate::preferences::EditorShortcuts,
+    shortcut_draft: crate::preferences::EditorShortcuts,
+    settings_category: SettingsCategory,
     settings_path: PathBuf,
     settings_open: bool,
     settings_writable: bool,
+    quick_open_files: Option<Vec<PathBuf>>,
+    find_open: bool,
+    find_query: String,
+    quick_open_generation: u64,
+    quick_open: bool,
+    quick_open_query: String,
     notice: Option<String>,
     notices_open: bool,
     file_dialog: Option<FileOperationDialog>,
@@ -388,7 +588,105 @@ fn settings_group<'a>(
         .width(Length::Fill)
         .into()
 }
+fn shortcut_setting<'a>(
+    title: &'static str,
+    detail: &'static str,
+    action: EditorShortcut,
+    value: &'a str,
+) -> Element<'a, Message> {
+    settings_field(
+        title,
+        detail,
+        widget::text_input(title, value)
+            .on_input(move |value| Message::ShortcutChanged(action, value))
+            .into(),
+    )
+}
 
+fn dialog_surface<'a>(
+    content: impl Into<Element<'a, Message>>,
+    max_width: f32,
+) -> Element<'a, Message> {
+    cagents::interaction::opaque(
+        widget::container(content)
+            .class(cosmic::theme::Container::Dialog(false))
+            .padding(16)
+            .width(Length::Fill)
+            .max_width(max_width)
+            .max_height(720),
+    )
+    .into()
+}
+
+fn dialog_overlay(surface: Element<'_, Message>, dismiss: Message) -> Element<'_, Message> {
+    let background = widget::container(iced::widget::Space::new())
+        .class(cosmic::theme::Container::custom(|_| {
+            iced::widget::container::Style {
+                background: Some(iced::Background::Color(iced::Color::from_rgba(
+                    0.0, 0.0, 0.0, 0.48,
+                ))),
+                ..Default::default()
+            }
+        }))
+        .width(Length::Fill)
+        .height(Length::Fill);
+    let backdrop = cagents::interaction::opaque(widget::mouse_area(background).on_press(dismiss));
+    let centered = widget::container(surface)
+        .center(Length::Fill)
+        .padding(16)
+        .width(Length::Fill)
+        .height(Length::Fill);
+    cagents::interaction::layer(backdrop, centered.into())
+}
+
+fn find_matches(text: &str, query: &str) -> usize {
+    let query = query.trim();
+    if query.is_empty() {
+        return 0;
+    }
+    let text = text.to_ascii_lowercase();
+    let query = query.to_ascii_lowercase();
+    text.match_indices(&query).count()
+}
+
+fn find_bar<'a>(editor: &'a Editor, tab: &'a Tab) -> Element<'a, Message> {
+    let matches = find_matches(
+        tab.runtime.editor_text().as_deref().unwrap_or_default(),
+        &editor.find_query,
+    );
+    widget::container(
+        widget::row::with_children(vec![
+            widget::icon(symbolic_icon("system-search-symbolic"))
+                .size(16)
+                .into(),
+            widget::text_input("Find in file", &editor.find_query)
+                .id(widget::Id::new("ceditor.find.query"))
+                .on_input(Message::FindQueryChanged)
+                .on_submit(|_| Message::CloseFind)
+                .width(Length::Fill)
+                .into(),
+            design::caption(if editor.find_query.trim().is_empty() {
+                "Type to find".to_owned()
+            } else {
+                format!("{matches} matches")
+            })
+            .into(),
+            icon_control(
+                symbolic_icon("window-close-symbolic"),
+                "Close find",
+                false,
+                true,
+                Some(Message::CloseFind),
+            )
+            .into(),
+        ])
+        .spacing(8)
+        .align_y(iced::Alignment::Center),
+    )
+    .padding([4.0, 8.0])
+    .width(Length::Fill)
+    .into()
+}
 fn tab_title_style() -> cosmic::theme::Button {
     fn appearance(focused: bool, theme: &cosmic::Theme) -> widget::button::Style {
         widget::button::Style {
@@ -420,6 +718,7 @@ fn tab_title_style() -> cosmic::theme::Button {
 impl Editor {
     fn modal_open(&self) -> bool {
         self.settings_open
+            || self.quick_open
             || self.closing.is_some()
             || self.file_dialog.is_some()
             || self.notices_open
@@ -863,6 +1162,7 @@ impl Editor {
             sidebar,
             navigation,
             pending_file,
+            pending_diff: None,
             owned_file: None,
             next_open: 1,
             files_loaded: false,
@@ -1084,23 +1384,34 @@ impl Editor {
     }
 
     fn request_file(&mut self, id: CardId, path: PathBuf) -> Task<Message> {
+        self.request_file_for_surface(id, path, None)
+    }
+
+    fn request_file_for_surface(
+        &mut self,
+        id: CardId,
+        path: PathBuf,
+        diff_staged: Option<bool>,
+    ) -> Task<Message> {
         self.selection_epoch = self.selection_epoch.wrapping_add(1);
         let Some(tab) = self.tab_mut(id) else {
             return Task::none();
         };
         tab.pending_file = None;
         if RepoPath::parse(&path).is_err() {
+            tab.pending_diff = None;
             return Task::none();
         }
         if tab.runtime.blocks_navigation() {
+            tab.pending_diff = None;
             self.notice =
                 Some("Save or discard the current file before opening another file.".into());
             return Task::none();
         }
+        tab.pending_diff = diff_staged;
         let request = tab.next_open;
         tab.next_open = tab.next_open.wrapping_add(1);
         let absolute = tab.runtime.descriptor.worktree.join(&path);
-        // Replacing the pending request also fences any older canonicalization.
         tab.pending_file = Some(PendingFile {
             path,
             request,
@@ -1527,6 +1838,42 @@ impl Editor {
         })
     }
 
+    fn quick_open_search(&self, query: String, generation: u64) -> Task<Message> {
+        let Some(id) = self.active else {
+            return Task::none();
+        };
+        let Some(tab) = self.tab(id) else {
+            return Task::none();
+        };
+        if !tab.runtime.is_directory_only() || query.trim().is_empty() {
+            return Task::none();
+        }
+        let root = tab.runtime.descriptor.worktree.clone();
+        let search_query = query.clone();
+        cosmic::task::future(async move {
+            let result = tokio::task::spawn_blocking(move || {
+                repository_widget::search_directory_files_for_quick_open(&root, &search_query).map(
+                    |files| {
+                        files
+                            .into_iter()
+                            .filter(|file| !file.directory)
+                            .map(|file| file.path)
+                            .collect()
+                    },
+                )
+            })
+            .await
+            .map_err(|error| error.to_string())
+            .and_then(|result| result.map_err(|error| error.to_string()));
+            Message::QuickOpenSearchFinished {
+                card: id,
+                generation,
+                query,
+                result,
+            }
+        })
+    }
+
     fn stage(&mut self, id: CardId, stage: bool) -> Task<Message> {
         let Some(tab) = self.tab_mut(id) else {
             return Task::none();
@@ -1567,6 +1914,48 @@ impl Editor {
             Message::Mutation(id, result)
         })
     }
+    fn stage_selection(
+        &mut self,
+        id: CardId,
+        stage: bool,
+        selection: Vec<PathSelection>,
+    ) -> Task<Message> {
+        let Some(tab) = self.tab_mut(id) else {
+            return Task::none();
+        };
+        if tab.mutation || tab.runtime.blocks_navigation() || selection.is_empty() {
+            return Task::none();
+        }
+        let root = tab.runtime.descriptor.worktree.clone();
+        tab.mutation = true;
+        cosmic::task::future(async move {
+            let result = tokio::task::spawn_blocking(move || {
+                let service = RepositoryService::system("git");
+                let token = CancellationToken::default();
+                if stage {
+                    service.stage(
+                        &StageRequest {
+                            worktree: root,
+                            selection,
+                        },
+                        &token,
+                    )
+                } else {
+                    service.unstage(
+                        &UnstageRequest {
+                            worktree: root,
+                            selection,
+                        },
+                        &token,
+                    )
+                }
+            })
+            .await
+            .map_err(|error| error.to_string())
+            .and_then(|result| result.map_err(|error| error.to_string()));
+            Message::Mutation(id, result)
+        })
+    }
 }
 
 impl Application for Editor {
@@ -1592,6 +1981,15 @@ impl Application for Editor {
                     notice = Some(error);
                     false
                 });
+        let shortcuts =
+            crate::preferences::load_shortcuts(&flags.settings_path).unwrap_or_else(|error| {
+                notice = Some(match notice.take() {
+                    Some(previous) => format!("{previous}\n{error}"),
+                    None => error,
+                });
+                crate::preferences::EditorShortcuts::default()
+            });
+        let shortcut_draft = shortcuts.clone();
         let mut startup_paths = saved_session.startup_paths(flags.paths);
         if startup_paths.is_empty() {
             match std::env::current_dir() {
@@ -1613,9 +2011,18 @@ impl Application for Editor {
             active: None,
             selection_epoch: 0,
             settings,
+            shortcuts,
+            shortcut_draft,
+            settings_category: SettingsCategory::Editing,
             settings_path: flags.settings_path,
             settings_open: false,
             settings_writable,
+            quick_open_files: None,
+            quick_open_generation: 0,
+            find_open: false,
+            find_query: String::new(),
+            quick_open: false,
+            quick_open_query: String::new(),
             notice,
             notices_open: false,
             file_dialog: None,
@@ -1683,6 +2090,12 @@ impl Application for Editor {
                 if self.file_dialog.is_some() {
                     return self.update(Message::CancelFileOperation);
                 }
+                if self.quick_open {
+                    return self.update(Message::CloseQuickOpen);
+                }
+                if self.find_open {
+                    return self.update(Message::CloseFind);
+                }
             }
             if self.modal_open()
                 && matches!(
@@ -1698,6 +2111,21 @@ impl Application for Editor {
                         | Message::ToggleSidebar
                         | Message::NewTab
                         | Message::Key(_)
+                        | Message::SelectSettingsCategory(_)
+                        | Message::ShortcutChanged(_, _)
+                        | Message::QuickOpenQueryChanged(_)
+                        | Message::QuickOpenSearchFinished { .. }
+                        | Message::OpenQuickFile(_)
+                        | Message::CloseQuickOpen
+                        | Message::AutoSave(_)
+                        | Message::WrapLines(_)
+                        | Message::SyntaxTheme(_)
+                        | Message::LanguageServerAssistance(_)
+                        | Message::Theme(_)
+                        | Message::Scale(_)
+                        | Message::SettingsSaved(_)
+                        | Message::FindQueryChanged(_)
+                        | Message::CloseFind
                 )
             {
                 return Task::none();
@@ -1978,6 +2406,9 @@ impl Application for Editor {
                         RepositoryAction::FilesLoaded { result: Ok(_), .. }
                             | RepositoryAction::DirectoryListed { result: Ok(_), .. }
                     );
+                    let open_diff = matches!(action, RepositoryAction::FileLoaded { .. })
+                        .then(|| tab.pending_diff.take())
+                        .flatten();
                     let task = tab
                         .runtime
                         .update(action)
@@ -1989,6 +2420,22 @@ impl Application for Editor {
                         })
                         .map(cosmic::Action::App);
                     let mut tasks = vec![task];
+                    if let Some(staged) = open_diff {
+                        let surface = tab.runtime.update(RepositoryAction::ApplySourceSurface {
+                            card: id,
+                            diff: true,
+                        });
+                        let basis = staged.then(|| {
+                            tab.runtime.update(RepositoryAction::ApplyDiffBasis {
+                                card: id,
+                                basis: DiffBasis::HeadToIndex,
+                            })
+                        });
+                        tasks[0] = tasks.remove(0).chain(repository_task(surface));
+                        if let Some(basis) = basis {
+                            tasks[0] = tasks.remove(0).chain(repository_task(basis));
+                        }
+                    }
                     if listing_changed && !tab.git {
                         if let Some(key) = tab.navigation.active_worktree().cloned() {
                             let search = tab
@@ -2052,6 +2499,39 @@ impl Application for Editor {
                     }
                     if self.modal_open() {
                         return Task::none();
+                    }
+                    if let Some(id) = self.active {
+                        match &action {
+                            SidebarAction::OpenChange { key, path, area }
+                                if self.tab(id).is_some_and(|tab| {
+                                    tab.navigation.active_worktree() == Some(key)
+                                }) =>
+                            {
+                                if let Some(tab) = self.tab_mut(id) {
+                                    tab.navigation.apply(&action);
+                                }
+                                return self.request_file_for_surface(
+                                    id,
+                                    path.as_path().to_path_buf(),
+                                    Some(*area == cagents::repository::ChangeArea::Staged),
+                                );
+                            }
+                            SidebarAction::Stage { key, selection }
+                                if self.tab(id).is_some_and(|tab| {
+                                    tab.navigation.active_worktree() == Some(key)
+                                }) =>
+                            {
+                                return self.stage_selection(id, true, selection.clone());
+                            }
+                            SidebarAction::Unstage { key, selection }
+                                if self.tab(id).is_some_and(|tab| {
+                                    tab.navigation.active_worktree() == Some(key)
+                                }) =>
+                            {
+                                return self.stage_selection(id, false, selection.clone());
+                            }
+                            _ => {}
+                        }
                     }
                     if let SidebarAction::Resize { width } = &action {
                         // The panel's splitter clamps to its rendered bounds;
@@ -2253,6 +2733,104 @@ impl Application for Editor {
                     }
                     self.resume_pending_files()
                 }
+                Message::SelectSettingsCategory(category) => {
+                    self.settings_category = category;
+                    Task::none()
+                }
+                Message::ShortcutChanged(action, value) => {
+                    self.shortcut_draft.set(action, value);
+                    match self.shortcut_draft.validate() {
+                        Ok(()) => {
+                            self.shortcuts = self.shortcut_draft.clone();
+                            if self.settings_writable {
+                                if let Err(error) = crate::preferences::save_shortcuts(
+                                    &self.settings_path,
+                                    &self.shortcuts,
+                                ) {
+                                    self.notice = Some(error);
+                                }
+                            }
+                        }
+                        Err(error) => self.notice = Some(error),
+                    }
+                    Task::none()
+                }
+                Message::FindInFile => {
+                    self.find_open = !self.find_open;
+                    if self.find_open {
+                        return iced::widget::operation::focus(widget::Id::new(
+                            "ceditor.find.query",
+                        ))
+                        .map(cosmic::Action::App);
+                    }
+                    Task::none()
+                }
+                Message::FindQueryChanged(query) => {
+                    self.find_query = query.clone();
+                    if let Some(id) = self.active {
+                        if let Some(tab) = self.tab_mut(id) {
+                            tab.runtime.select_text(&query);
+                        }
+                    }
+                    Task::none()
+                }
+                Message::CloseFind => {
+                    self.find_open = false;
+                    Task::none()
+                }
+                Message::QuickOpen => {
+                    self.quick_open = !self.quick_open;
+                    self.quick_open_generation = self.quick_open_generation.wrapping_add(1);
+                    self.quick_open_files = None;
+                    if self.quick_open {
+                        self.quick_open_query.clear();
+                        return iced::widget::operation::focus(widget::Id::new(
+                            "ceditor.quick-open.query",
+                        ))
+                        .map(cosmic::Action::App);
+                    }
+                    Task::none()
+                }
+                Message::QuickOpenQueryChanged(query) => {
+                    self.quick_open_query = query.clone();
+                    self.quick_open_files = None;
+                    self.quick_open_generation = self.quick_open_generation.wrapping_add(1);
+                    self.quick_open_search(query, self.quick_open_generation)
+                }
+                Message::QuickOpenSearchFinished {
+                    card,
+                    generation,
+                    query,
+                    result,
+                } => {
+                    if self.quick_open
+                        && self.active == Some(card)
+                        && self.quick_open_generation == generation
+                        && self.quick_open_query == query
+                    {
+                        match result {
+                            Ok(files) => self.quick_open_files = Some(files),
+                            Err(error) => self.notice = Some(error),
+                        }
+                    }
+                    Task::none()
+                }
+                Message::OpenQuickFile(path) => {
+                    let Some(id) = self.active else {
+                        return Task::none();
+                    };
+                    self.quick_open = false;
+                    self.quick_open_generation = self.quick_open_generation.wrapping_add(1);
+                    self.quick_open_query.clear();
+                    self.quick_open_files = None;
+                    self.request_file(id, path)
+                }
+                Message::CloseQuickOpen => {
+                    self.quick_open = false;
+                    self.quick_open_generation = self.quick_open_generation.wrapping_add(1);
+                    self.quick_open_files = None;
+                    Task::none()
+                }
                 Message::ToggleSidebar => {
                     let from = self.sidebar_progress();
                     self.sidebar_open = !self.sidebar_open;
@@ -2424,53 +3002,26 @@ impl Application for Editor {
                     }
                     Task::none()
                 }
-                Message::Key(keyboard::Event::KeyPressed {
-                    key,
-                    modifiers,
-                    repeat: false,
-                    ..
-                }) => {
-                    if self.modal_open() {
-                        return Task::none();
+                Message::Key(event) => {
+                    if let Some(task) = self.handle_shortcut(&event) {
+                        return task;
                     }
-                    if modifiers.control() {
-                        if let keyboard::Key::Character(key) = key {
-                            match key.as_str().to_ascii_lowercase().as_str() {
-                                "o" => return self.update(Message::Choose(modifiers.shift())),
-                                "t" => return self.update(Message::NewTab),
-                                "f" => {
-                                    if let Some(tab) = self.current() {
-                                        if let Some(key) = tab.navigation.active_worktree().cloned()
-                                        {
-                                            return self.update(Message::Sidebar(
-                                                SidebarAction::ToggleFilesFilter { key },
-                                            ));
-                                        }
-                                    }
-                                }
-                                "s" => {
-                                    if let Some(card) = self.active {
-                                        return self.update(Message::Repository(
-                                            RepositoryAction::Save {
-                                                card,
-                                                overwrite: false,
-                                            },
-                                        ));
-                                    }
-                                }
-                                "w" => {
-                                    if let Some(card) = self.active {
-                                        return self.request_close(card);
-                                    }
-                                }
-                                " " => return self.update(Message::Complete),
-                                _ => {}
-                            }
+                    if let keyboard::Event::KeyPressed {
+                        key,
+                        modifiers,
+                        repeat: false,
+                        ..
+                    } = &event
+                    {
+                        if !self.modal_open()
+                            && modifiers.control()
+                            && matches!(key, keyboard::Key::Character(value) if value == " ")
+                        {
+                            return self.update(Message::Complete);
                         }
                     }
                     Task::none()
                 }
-                Message::Key(_) => Task::none(),
             }
         })();
         if navigation_changed || previous_tabs != (self.active, self.tabs.len()) {
@@ -2642,14 +3193,7 @@ impl Application for Editor {
         // The COSMIC header above has no separator of its own: always rule
         // off the content below it, tabs or placeholder alike.
         body.push(widget::divider::horizontal::default().into());
-        // The strip lives in the editor column so its tabs, rules, toolbar,
-        // and content share one left edge instead of straddling the sidebar.
-        // Its height mirrors the panel header (HEADER_HEIGHT plus one
-        // inter-child spacing) so both rules land on the same row and the
-        // borders connect instead of leaving a gap.
-        let strip_pad = (design::HEADER_HEIGHT + cosmic::theme::spacing().space_xxxs as f32
-            - design::PRIMARY_CONTROL_SIZE)
-            / 2.0;
+        // Keep the tab strip on the same fixed baseline as the app header.
         let mut strip = Vec::new();
         let mut tab_row = tabs;
         tab_row.push(
@@ -2680,7 +3224,8 @@ impl Application for Editor {
                     .height(design::PRIMARY_CONTROL_SIZE),
                 ),
             ))
-            .padding([strip_pad, 8.0])
+            .padding([0.0, 8.0])
+            .height(design::HEADER_HEIGHT)
             .width(Length::Fill)
             .into(),
         );
@@ -2719,6 +3264,16 @@ impl Application for Editor {
                     .into(),
                 );
             }
+            toolbar_controls.push(
+                icon_control(
+                    symbolic_icon("system-search-symbolic"),
+                    "Find in file (Ctrl+F)",
+                    self.find_open,
+                    !self.modal_open(),
+                    Some(Message::FindInFile),
+                )
+                .into(),
+            );
             if !toolbar_controls.is_empty() {
                 editor.push(
                     widget::container(
@@ -2731,6 +3286,10 @@ impl Application for Editor {
                     .width(Length::Fill)
                     .into(),
                 );
+                editor.push(widget::divider::horizontal::default().into());
+            }
+            if self.find_open {
+                editor.push(find_bar(self, tab));
                 editor.push(widget::divider::horizontal::default().into());
             }
             editor.push(repository_widget::view(tab.id, &tab.runtime).map(Message::Repository));
@@ -2884,11 +3443,9 @@ impl Application for Editor {
                 .spacing(8)
                 .into(),
             );
-            return Some(cagents::interaction::opaque(
-                widget::container(widget::column::with_children(content).spacing(12))
-                    .class(cosmic::theme::Container::Dialog(false))
-                    .padding(20)
-                    .width(480),
+            return Some(dialog_overlay(
+                dialog_surface(widget::column::with_children(content).spacing(12), 480.0),
+                Message::CancelFileOperation,
             ));
         }
         if let Some(id) = self.closing {
@@ -2930,8 +3487,8 @@ impl Application for Editor {
                     );
                 }
             }
-            return Some(cagents::interaction::opaque(
-                widget::container(
+            return Some(dialog_overlay(
+                dialog_surface(
                     widget::column::with_children(vec![
                         widget::text::title3(if untitled_note {
                             "Save this note?"
@@ -2954,10 +3511,66 @@ impl Application for Editor {
                         widget::row::with_children(controls).spacing(8).into(),
                     ])
                     .spacing(16),
-                )
-                .class(cosmic::theme::Container::Dialog(false))
-                .padding(24)
-                .width(520),
+                    520.0,
+                ),
+                Message::CancelClose,
+            ));
+        }
+        if self.quick_open {
+            let query = self.quick_open_query.trim().to_ascii_lowercase();
+            let files = self
+                .current()
+                .map(|tab| {
+                    let candidates = self.quick_open_files.clone().unwrap_or_else(|| {
+                        tab.runtime
+                            .listed_files()
+                            .iter()
+                            .filter(|file| !file.directory)
+                            .map(|file| file.path.as_path().to_path_buf())
+                            .collect()
+                    });
+                    candidates
+                        .into_iter()
+                        .filter(|path| {
+                            query.is_empty()
+                                || path.to_string_lossy().to_ascii_lowercase().contains(&query)
+                        })
+                        .take(40)
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            let mut rows: Vec<Element<'_, Message>> = files
+                .into_iter()
+                .map(|path| {
+                    let label = path.to_string_lossy().into_owned();
+                    widget::button::text(label)
+                        .on_press(Message::OpenQuickFile(path))
+                        .width(Length::Fill)
+                        .into()
+                })
+                .collect();
+            if rows.is_empty() {
+                rows.push(design::caption("No matching files").into());
+            }
+            return Some(dialog_overlay(
+                dialog_surface(
+                    widget::column::with_children(vec![
+                        widget::text::title3("Quick open").into(),
+                        widget::text_input("Search files", &self.quick_open_query)
+                            .id(widget::Id::new("ceditor.quick-open.query"))
+                            .on_input(Message::QuickOpenQueryChanged)
+                            .into(),
+                        widget::scrollable(widget::column::with_children(rows).spacing(2))
+                            .direction(iced::widget::scrollable::Direction::Vertical(
+                                cagents::design::scrollbar(),
+                            ))
+                            .height(360)
+                            .into(),
+                    ])
+                    .spacing(12),
+                    620.0,
+                ),
+                Message::CloseQuickOpen,
             ));
         }
         if !self.settings_open {
@@ -2970,7 +3583,6 @@ impl Application for Editor {
                 let selected = self.settings.app_theme == theme;
                 cagents::interaction::hover(
                     widget::button::custom(design::body(label))
-                        .name(label)
                         .class(if selected {
                             cosmic::theme::Button::Suggested
                         } else {
@@ -2988,7 +3600,6 @@ impl Application for Editor {
                 let selected = self.settings.editor_syntax_theme == theme;
                 cagents::interaction::hover(
                     widget::button::custom(design::body(theme.label()))
-                        .name(theme.label())
                         .class(if selected {
                             cosmic::theme::Button::Suggested
                         } else {
@@ -2999,8 +3610,8 @@ impl Application for Editor {
                 )
             })
             .collect();
-        let content = widget::column::with_children(vec![
-            settings_group(
+        let controls = match self.settings_category {
+            SettingsCategory::Editing => vec![settings_group(
                 "Editing",
                 "Saving and how the buffer wraps.",
                 vec![
@@ -3016,12 +3627,16 @@ impl Application for Editor {
                         .on_toggle(Message::WrapLines)
                         .into(),
                 ],
-            ),
-            settings_group(
+            )],
+            SettingsCategory::Appearance => vec![settings_group(
                 "Appearance",
                 "Window colors, syntax colors, and interface scale.",
                 vec![
-                    settings_field("Color scheme", "Follow the desktop, or lock light or dark.", settings_choice_row(theme_choices)),
+                    settings_field(
+                        "Color scheme",
+                        "Follow the desktop, or lock light or dark.",
+                        settings_choice_row(theme_choices),
+                    ),
                     settings_field(
                         "Syntax highlighting",
                         "Match app follows the color scheme. The others keep a fixed highlighter palette.",
@@ -3064,8 +3679,68 @@ impl Application for Editor {
                         .into(),
                     ),
                 ],
-            ),
-            settings_group(
+            )],
+            SettingsCategory::Keyboard => vec![settings_group(
+                "Keyboard shortcuts",
+                "Use Ctrl, Alt, or Super plus one key. Changes save immediately when valid.",
+                vec![
+                    shortcut_setting(
+                        "New tab",
+                        "Create an untitled editor tab.",
+                        EditorShortcut::NewTab,
+                        &self.shortcut_draft.new_tab,
+                    ),
+                    shortcut_setting(
+                        "Open file",
+                        "Open a file picker.",
+                        EditorShortcut::OpenFile,
+                        &self.shortcut_draft.open_file,
+                    ),
+                    shortcut_setting(
+                        "Open folder",
+                        "Open a folder picker.",
+                        EditorShortcut::OpenFolder,
+                        &self.shortcut_draft.open_folder,
+                    ),
+                    shortcut_setting(
+                        "Save file",
+                        "Save the active file or open Save as for an untitled note.",
+                        EditorShortcut::SaveFile,
+                        &self.shortcut_draft.save_file,
+                    ),
+                    shortcut_setting(
+                        "Close tab",
+                        "Close the active tab.",
+                        EditorShortcut::CloseTab,
+                        &self.shortcut_draft.close_tab,
+                    ),
+                    shortcut_setting(
+                        "Find in file",
+                        "Search inside the active file.",
+                        EditorShortcut::FindInFile,
+                        &self.shortcut_draft.find_in_file,
+                    ),
+                    shortcut_setting(
+                        "Filter files",
+                        "Focus the sidebar file filter.",
+                        EditorShortcut::FilterFiles,
+                        &self.shortcut_draft.filter_files,
+                    ),
+                    shortcut_setting(
+                        "Quick open",
+                        "Search and open a file from the active worktree.",
+                        EditorShortcut::QuickOpen,
+                        &self.shortcut_draft.quick_open,
+                    ),
+                    shortcut_setting(
+                        "Toggle sidebar",
+                        "Show or hide the files sidebar.",
+                        EditorShortcut::ToggleSidebar,
+                        &self.shortcut_draft.toggle_sidebar,
+                    ),
+                ],
+            )],
+            SettingsCategory::LanguageServers => vec![settings_group(
                 "Language servers",
                 "Semantic diagnostics, completion, and hover. Off by default.",
                 vec![
@@ -3073,37 +3748,79 @@ impl Application for Editor {
                         .label("Language-server assistance".to_owned())
                         .on_toggle(Message::LanguageServerAssistance)
                         .into(),
-                    design::caption("Edit language_servers in the preferences file, then restart ceditor.")
-                        .wrapping(iced::widget::text::Wrapping::Word)
-                        .into(),
+                    design::caption(
+                        "Edit language_servers in the preferences file, then restart ceditor.",
+                    )
+                    .wrapping(iced::widget::text::Wrapping::Word)
+                    .into(),
                     design::caption(self.settings_path.to_string_lossy())
                         .wrapping(iced::widget::text::Wrapping::WordOrGlyph)
                         .into(),
                 ],
-            ),
+            )],
+        };
+        let navigation =
+            widget::column::with_children(SettingsCategory::ALL.into_iter().map(|category| {
+                cagents::interaction::hover(
+                    widget::button::custom(design::body(category.label()))
+                        .class(cagents::sidebar::sidebar_button_style(
+                            category == self.settings_category,
+                        ))
+                        .selected(category == self.settings_category)
+                        .on_press(Message::SelectSettingsCategory(category))
+                        .height(design::ROW_HEIGHT)
+                        .width(Length::Fill),
+                )
+            }))
+            .spacing(design::GRID_UNIT)
+            .padding([2.0 * design::GRID_UNIT, design::GRID_UNIT])
+            .width(180)
+            .height(Length::Fill);
+        let body = widget::row::with_children(vec![
+            navigation.into(),
+            widget::divider::vertical::default().into(),
+            widget::scrollable(
+                widget::container(widget::column::with_children(controls).spacing(20))
+                    .padding([4.0 * design::GRID_UNIT, 5.0 * design::GRID_UNIT])
+                    .width(Length::Fill)
+                    .max_width(620),
+            )
+            .direction(iced::widget::scrollable::Direction::Vertical(
+                cagents::design::scrollbar(),
+            ))
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .into(),
         ])
-        .spacing(24)
-        .width(Length::Fill);
-        Some(cagents::interaction::opaque(
-            widget::container(widget::column::with_children(vec![
-                widget::text::title3("Editor settings").into(),
-                design::caption(if self.settings_writable {
-                    "Changes apply immediately and save automatically."
-                } else {
-                    "Changes apply now, but cannot be saved until the preferences file is repaired."
-                }).wrapping(iced::widget::text::Wrapping::Word).into(),
-                widget::scrollable(content)
-                    .direction(iced::widget::scrollable::Direction::Vertical(cagents::design::scrollbar()))
-                    .height(Length::Shrink).into(),
-                widget::row::with_children(vec![
-                    iced::widget::Space::new().width(Length::Fill).into(),
-                    widget::button::suggested("Done").on_press(Message::Settings).into(),
-                ]).into(),
-            ]).spacing(20))
-                .class(cosmic::theme::Container::Dialog(false))
-                .padding(24)
-                .width(560)
-                .max_height(680),
+        .width(Length::Fill)
+        .height(Length::Fill);
+        let header = widget::row::with_children(vec![
+            widget::text::title3("Editor settings")
+                .width(Length::Fill)
+                .into(),
+            icon_control(
+                symbolic_icon("window-close-symbolic"),
+                "Close settings",
+                false,
+                true,
+                Some(Message::Settings),
+            )
+            .into(),
+        ])
+        .align_y(iced::Alignment::Center)
+        .height(design::HEADER_HEIGHT);
+        Some(dialog_overlay(
+            dialog_surface(
+                widget::column::with_children(vec![
+                    header.into(),
+                    widget::divider::horizontal::default().into(),
+                    body.into(),
+                ])
+                .spacing(0)
+                .height(Length::Fill),
+                900.0,
+            ),
+            Message::Settings,
         ))
     }
 }
@@ -3120,9 +3837,18 @@ mod tests {
             active: None,
             selection_epoch: 0,
             settings: AppSettings::default(),
+            shortcuts: crate::preferences::EditorShortcuts::default(),
+            shortcut_draft: crate::preferences::EditorShortcuts::default(),
+            settings_category: SettingsCategory::Editing,
             settings_path: PathBuf::new(),
             settings_open: false,
+            find_open: false,
+            find_query: String::new(),
+            quick_open: false,
+            quick_open_query: String::new(),
             settings_writable: false,
+            quick_open_files: None,
+            quick_open_generation: 0,
             notice: None,
             notices_open: false,
             file_dialog: None,
@@ -3140,6 +3866,19 @@ mod tests {
             sidebar_transition: None,
             sidebar_panel: WorktreePanel::Files,
         }
+    }
+    #[test]
+    fn find_matches_counts_case_insensitive_occurrences() {
+        assert_eq!(find_matches("Alpha beta ALPHA", "alpha"), 2);
+        assert_eq!(find_matches("Alpha beta", ""), 0);
+        assert_eq!(find_matches("Alpha beta", "gamma"), 0);
+    }
+    #[test]
+    fn settings_controls_remain_interactive_over_the_overlay() {
+        let mut app = editor();
+        app.settings_open = true;
+        drop(app.update(Message::AutoSave(true)));
+        assert!(app.settings.editor_auto_save);
     }
 
     #[test]

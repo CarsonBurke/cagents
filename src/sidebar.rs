@@ -2921,7 +2921,7 @@ fn header<'a>(
         ));
         let selected = state.controls_expanded || (!compact && !state.query.is_empty());
         let search_button = crate::interaction::tooltip(
-            button::icon(icon::from_name("edit-find-symbolic").size(ROW_ICON_SIZE))
+            button::icon(crate::ui_controls::symbolic_icon("edit-find-symbolic"))
                 .class(sidebar_button_style(selected))
                 .id(stable_id("toggle-controls"))
                 .name("Search projects")
@@ -5914,7 +5914,7 @@ fn gated(action: SidebarAction, modal_open: bool) -> Option<SidebarAction> {
 }
 
 /// Neutral text, transparent rows, and restrained pointer/keyboard feedback.
-pub(crate) fn sidebar_button_style(selected: bool) -> theme::Button {
+pub fn sidebar_button_style(selected: bool) -> theme::Button {
     fn appearance(
         theme: &cosmic::Theme,
         focused: bool,
