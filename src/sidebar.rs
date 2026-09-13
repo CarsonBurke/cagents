@@ -48,7 +48,7 @@ pub const EXPANDED_WIDTH_MAX: f32 = design::NAVIGATION_MAX_WIDTH;
 /// `settings::AppSettings::default`, so a corrupt file looks like a fresh one.
 const DEFAULT_EXPANDED_WIDTH: f32 = design::NAVIGATION_DEFAULT_WIDTH;
 const COMPACT_WIDTH: f32 = design::NAVIGATION_RAIL_WIDTH;
-const HEADER_HEIGHT: f32 = design::HEADER_HEIGHT - design::BORDER_WIDTH;
+const HEADER_HEIGHT: f32 = design::HEADER_HEIGHT - 2.0 * design::BORDER_WIDTH;
 const PROJECT_HEADER_HEIGHT: f32 = design::ROW_HEIGHT;
 const WORKTREE_ROW_HEIGHT: f32 = design::ROW_HEIGHT;
 const ICON_CONTROL_SIZE: f32 = design::PRIMARY_CONTROL_SIZE;
