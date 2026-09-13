@@ -4543,7 +4543,7 @@ fn files_section<'a>(
             ])
             .align_y(Alignment::Center)
             .spacing(spacing.space_xxxs),
-            action,
+            Some(action),
             selected,
             modal_open,
         );
@@ -4765,8 +4765,10 @@ fn branch_changes_section<'a>(
     let mut rows = widget::column::with_capacity(tree.len()).spacing(0);
     for file in tree {
         if file.directory {
+            // An inert hierarchy label: branch review always expands, so
+            // there is no toggle to offer and no file-tree state to borrow.
             rows = rows.push(panel_row(
-                &*file.chrome.accessible_name,
+                &*file.chrome.label,
                 file.depth,
                 widget::row::with_children(vec![
                     crate::file_icon::folder(true).into(),
@@ -4774,10 +4776,7 @@ fn branch_changes_section<'a>(
                 ])
                 .spacing(4)
                 .align_y(Alignment::Center),
-                SidebarAction::ToggleDirectory {
-                    key: source.key.clone(),
-                    path: file.path.clone(),
-                },
+                None,
                 false,
                 modal_open,
             ));
@@ -4808,14 +4807,14 @@ fn branch_changes_section<'a>(
                 semantic_caption(&*row.status, tone),
                 design::caption(&*row.counts).into(),
             ]).spacing(spacing.space_xxxs).align_y(Alignment::Center),
-            SidebarAction::OpenBranchFile {
+            Some(SidebarAction::OpenBranchFile {
                 key: source.key.clone(),
                 path: row.entry.path.clone(),
                 old_path: row.entry.old_path.clone(),
                 base_ref: branch.base_ref.clone(),
                 head: branch.head.clone(),
                 merge_base: branch.merge_base.clone(),
-            },
+            }),
             matches!(&state.panel_selection, Some(PanelSelection::Branch(path)) if path == &row.entry.path),
             modal_open,
         ));
@@ -4859,8 +4858,9 @@ fn change_group_view<'a>(
         .push(RowInteraction::actions(header.into(), actions.into()));
     for file in tree {
         if file.directory {
+            // An inert hierarchy label, like branch review above.
             column = column.push(panel_row(
-                &*file.chrome.accessible_name,
+                &*file.chrome.label,
                 file.depth,
                 widget::row::with_children(vec![
                     crate::file_icon::folder(true).into(),
@@ -4868,10 +4868,7 @@ fn change_group_view<'a>(
                 ])
                 .spacing(4)
                 .align_y(Alignment::Center),
-                SidebarAction::ToggleDirectory {
-                    key: source.key.clone(),
-                    path: file.path.clone(),
-                },
+                None,
                 false,
                 modal_open,
             ));
@@ -4987,11 +4984,11 @@ fn change_row_view<'a>(
         ])
         .align_y(Alignment::Center)
         .spacing(spacing.space_xxxs),
-        SidebarAction::OpenChange {
+        Some(SidebarAction::OpenChange {
             key: source.key.clone(),
             path: row.entry.path.clone(),
             area,
-        },
+        }),
         selected,
         modal_open,
     );
@@ -5550,7 +5547,9 @@ fn panel_row<'a>(
     name: impl Into<Cow<'a, str>>,
     depth: usize,
     content: impl Into<Element<'a, SidebarAction>>,
-    action: SidebarAction,
+    // `None` renders an inert hierarchy label: review trees always expand,
+    // so their folders offer no toggle and must not borrow the file tree's.
+    action: Option<SidebarAction>,
     selected: bool,
     modal_open: bool,
 ) -> Element<'a, SidebarAction> {
@@ -5574,7 +5573,7 @@ fn panel_row<'a>(
         .padding([0, spacing.space_xxxs])
         .height(Length::Fixed(PANEL_ROW_HEIGHT))
         .width(Length::Fill)
-        .on_press_maybe(gated(action, modal_open)),
+        .on_press_maybe(action.and_then(|action| gated(action, modal_open))),
     )
 }
 

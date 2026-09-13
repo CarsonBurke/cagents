@@ -26,6 +26,7 @@ use cosmic::{
     widget,
 };
 use std::{
+    collections::{BTreeMap, BTreeSet},
     path::{Path, PathBuf},
     sync::Arc,
 };
@@ -494,16 +495,22 @@ impl Editor {
     fn session(&self) -> crate::preferences::Session {
         // Overlay live expansion over the saved map so reopening a folder
         // restores its open tree, including folders whose tabs are closed.
-        let mut expanded_directories = self.saved_session.expanded_directories.clone();
+        // Tabs sharing one root union their folders: a fresh tab must not
+        // wipe what another tab on the same tree opened.
+        let mut live: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
         for tab in &self.tabs {
             if let Some(key) = tab.navigation.active_worktree() {
-                let root = key.canonical_path.display().to_string();
-                let paths = tab.navigation.expanded_display_paths();
-                if paths.is_empty() {
-                    expanded_directories.remove(&root);
-                } else {
-                    expanded_directories.insert(root, paths);
-                }
+                live.entry(key.canonical_path.display().to_string())
+                    .or_default()
+                    .extend(tab.navigation.expanded_display_paths());
+            }
+        }
+        let mut expanded_directories = self.saved_session.expanded_directories.clone();
+        for (root, paths) in live {
+            if paths.is_empty() {
+                expanded_directories.remove(&root);
+            } else {
+                expanded_directories.insert(root, paths.into_iter().collect());
             }
         }
         crate::preferences::Session {
@@ -2723,6 +2730,49 @@ mod tests {
         assert!(failure.is_err());
         drop(app.update(Message::Chosen(app.selection_epoch, failure)));
         assert_ne!(app.notice.as_deref(), Some("An earlier save failed"));
+    }
+
+    #[test]
+    fn same_root_tabs_union_expanded_folders_in_session() {
+        let mut app = editor();
+        let first = add(&mut app, "/workspace", Some("a.rs"));
+        add(&mut app, "/workspace", Some("b.rs"));
+        // Expand a folder in the first tab while the second tab on the same
+        // root never opened anything: the fresh tab must not wipe it.
+        app.active = Some(first);
+        let key = app
+            .tab(first)
+            .unwrap()
+            .navigation
+            .active_worktree()
+            .cloned()
+            .unwrap();
+        drop(app.update(Message::Sidebar(SidebarAction::ToggleDirectory {
+            key,
+            path: RepoPath::parse("src").unwrap(),
+        })));
+        assert_eq!(
+            app.session().expanded_directories.get("/workspace"),
+            Some(&vec!["src".to_owned()]),
+            "a fresh same-root tab wiped the opened folder",
+        );
+        // Collapsing everything still sticks once every tab agrees.
+        let key = app
+            .tab(first)
+            .unwrap()
+            .navigation
+            .active_worktree()
+            .cloned()
+            .unwrap();
+        drop(app.update(Message::Sidebar(SidebarAction::ToggleDirectory {
+            key,
+            path: RepoPath::parse("src").unwrap(),
+        })));
+        assert!(
+            !app.session()
+                .expanded_directories
+                .contains_key("/workspace")
+        );
     }
 
     fn add(app: &mut Editor, root: &str, file: Option<&str>) -> CardId {

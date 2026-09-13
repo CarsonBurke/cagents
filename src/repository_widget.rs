@@ -3749,15 +3749,34 @@ fn bytes_to_path(bytes: &[u8]) -> PathBuf {
 
 pub fn view(card: CardId, runtime: &RepositoryRuntime) -> Element<'_, RepositoryAction> {
     // File browsing lives in the sidebar tree, and the flat list exists only
-    // for diff/change review. With nothing selected the card says so instead
-    // of duplicating the tree as a second flat browser.
+    // for diff/change review. With nothing selected the card reports its
+    // file-listing state instead of duplicating the tree as a second flat
+    // browser: a loading or failed list must stay visible with its retry.
     let body = if runtime.selected.is_some() {
         selected_file_view(card, runtime)
     } else {
-        information_state(
-            "No file selected",
-            "Choose a file from the repository list.",
-        )
+        match &runtime.files {
+            FileListState::Loading => loading("Loading tracked and changed files…"),
+            FileListState::Failed(error) => widget::container(
+                widget::column::with_children(vec![
+                    information_state("Could not list files", error.clone()).into(),
+                    widget::button::standard("Retry loading files")
+                        .on_press_maybe(
+                            (!runtime.file_list_loading)
+                                .then_some(RepositoryAction::RefreshFiles { card }),
+                        )
+                        .into(),
+                ])
+                .align_x(Alignment::Center)
+                .spacing(cosmic::theme::spacing().space_s),
+            )
+            .center(Length::Fill)
+            .into(),
+            FileListState::Ready(_) => information_state(
+                "No file selected",
+                "Choose a file from the repository list.",
+            ),
+        }
     };
     // Ordinary columns reconcile children through Tree::diff, including tag
     // changes. The pinned keyed column directly diffs equal-length children
@@ -9292,6 +9311,49 @@ mod tests {
             .filter(|&(_, count)| count >= MIN_PIXELS)
             .map(|(family, _)| family)
             .collect()
+    }
+
+    /// With nothing selected the card reports its file-listing state instead
+    /// of a second browser. Each state renders its own surface, so a stuck
+    /// or failed list cannot hide behind "no file selected" — and the
+    /// failure surface keeps the retry that re-arms the load.
+    #[test]
+    fn empty_selection_reports_file_listing_state() {
+        let card = CardId::new();
+        let view = RepositoryView {
+            project: ProjectId::new(),
+            repository: PathBuf::from("/repo/.git"),
+            worktree: PathBuf::from("/repo"),
+        };
+        let render = |files: FileListState| {
+            let mut runtime = RepositoryRuntime::new(view.clone());
+            runtime.files = files;
+            rendered_card(card, &runtime, (520, 200))
+        };
+        let loading = render(FileListState::Loading);
+        let failed = render(FileListState::Failed("status failed".into()));
+        let ready = render(FileListState::Ready(Vec::new()));
+        for (name, frame) in [
+            ("loading", &loading),
+            ("failed", &failed),
+            ("ready", &ready),
+        ] {
+            assert!(
+                frame.iter().any(|&channel| channel != 0),
+                "{name} rendered nothing at all, so the comparisons below would pass vacuously"
+            );
+        }
+        assert_ne!(loading, failed, "a failed list renders as loading");
+        assert_ne!(failed, ready, "a failed list renders as no selection");
+        assert_ne!(loading, ready, "a loading list renders as no selection");
+
+        let mut runtime = RepositoryRuntime::new(view);
+        runtime.files = FileListState::Failed("status failed".into());
+        drop(runtime.update(RepositoryAction::RefreshFiles { card }));
+        assert!(
+            matches!(runtime.files, FileListState::Loading),
+            "the failure surface's retry must re-arm the file load"
+        );
     }
 
     /// GitHub issue #1 asks for editable *syntax-highlighted* buffers, and the
