@@ -71,12 +71,17 @@ pub struct SyntaxSpan {
     font: Option<cosmic::iced::Font>,
 }
 
-/// Full-side lexical state, cached for both application palettes. A context
-/// row can have different syntax on each side after a comment delimiter changes.
+/// Full-side lexical state, cached for the light and dark palettes of one
+/// syntax theme. A context row can have different syntax on each side after a
+/// comment delimiter changes.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct DiffSyntax {
     old: Arc<SyntaxLines>,
     new: Arc<SyntaxLines>,
+    /// Which palette pair `old` and `new` were coloured from. Two models built
+    /// from the same text under different themes are genuinely different
+    /// models, so this belongs in the identity the cache compares.
+    theme: crate::settings::EditorSyntaxTheme,
 }
 
 impl DiffSyntax {
@@ -145,14 +150,38 @@ pub(crate) fn syntax_highlighter_theme(
     }
 }
 
+/// syntect's own name for the palette [`syntax_highlighter_theme`] selects.
+///
+/// The diff worker drives syntect directly — it colours every scope for both
+/// palettes from one parse, which iced's per-line `Stream` cannot do — and
+/// iced keeps `Theme::key` private, so the name has to be repeated here. It is
+/// derived from the same function the editable buffer uses, so the two
+/// surfaces cannot disagree about *which* palette the setting means.
+fn syntect_theme_name(theme: crate::settings::EditorSyntaxTheme, dark: bool) -> &'static str {
+    use cosmic::iced::highlighter::Theme;
+    match syntax_highlighter_theme(theme, dark) {
+        Theme::SolarizedDark => "Solarized (dark)",
+        Theme::Base16Mocha => "base16-mocha.dark",
+        Theme::Base16Ocean => "base16-ocean.dark",
+        Theme::Base16Eighties => "base16-eighties.dark",
+        Theme::InspiredGitHub => "InspiredGitHub",
+    }
+}
+
 type SyntaxLines = [Vec<Vec<SyntaxSpan>>; 2];
 
 /// Immutable grammar/theme tables, identical to iced's highlighter. Parsing is
 /// theme-independent: advance one parser and scope stack, then color each scope
-/// for both palettes without reparsing or cloning the parser at every line.
+/// for both of `theme`'s palettes without reparsing or cloning the parser at
+/// every line.
+///
+/// Both palettes are produced because the application's light/dark mode can
+/// change without the document changing, and a theme that is not `Auto` simply
+/// yields the same palette twice.
 fn highlight_side(
     text: &str,
     path: &Path,
+    theme: crate::settings::EditorSyntaxTheme,
     cancellation: &CancellationToken,
 ) -> Result<SyntaxLines, Cancelled> {
     use two_face::re_exports::syntect::{highlighting, parsing};
@@ -162,16 +191,15 @@ fn highlight_side(
         LazyLock::new(highlighting::ThemeSet::load_defaults);
 
     check_cancelled(cancellation)?;
-    let settings = highlighter_settings(path, crate::settings::EditorSyntaxTheme::Auto, false);
+    let settings = highlighter_settings(path, theme, false);
     let syntax = SYNTAXES
         .find_syntax_by_token(&settings.token)
         .unwrap_or_else(|| SYNTAXES.find_syntax_plain_text());
     let mut parser = parsing::ParseState::new(syntax);
     let mut stack = parsing::ScopeStack::new();
-    let highlighters = [
-        highlighting::Highlighter::new(&THEMES.themes["InspiredGitHub"]),
-        highlighting::Highlighter::new(&THEMES.themes["base16-ocean.dark"]),
-    ];
+    let highlighters = [false, true].map(|dark| {
+        highlighting::Highlighter::new(&THEMES.themes[syntect_theme_name(theme, dark)])
+    });
     let mut lines: SyntaxLines = Default::default();
     for line in text.split_inclusive('\n') {
         check_cancelled(cancellation)?;
@@ -265,20 +293,21 @@ pub fn build_document_diff(
     before: impl Into<Arc<str>>,
     after: &str,
     path: &Path,
+    theme: crate::settings::EditorSyntaxTheme,
     cancellation: &CancellationToken,
 ) -> Option<DiffModel> {
     check_cancelled(cancellation).ok()?;
     let before = before.into();
     let mut model = build_diff_rows(&before, after, cancellation).ok()?;
-    let old = Arc::new(highlight_side(&before, path, cancellation).ok()?);
+    let old = Arc::new(highlight_side(&before, path, theme, cancellation).ok()?);
     // Identical source has identical lexical state, not merely equal-looking
     // context rows. Share immutable spans instead of parsing or copying twice.
     let new = if before.as_ref() == after {
         Arc::clone(&old)
     } else {
-        Arc::new(highlight_side(after, path, cancellation).ok()?)
+        Arc::new(highlight_side(after, path, theme, cancellation).ok()?)
     };
-    model.syntax = DiffSyntax { old, new };
+    model.syntax = DiffSyntax { old, new, theme };
     measure_diff(&mut model, cancellation).ok()?;
     check_cancelled(cancellation).ok()?;
     Some(model)
@@ -399,6 +428,13 @@ impl DiffModel {
             DiffMode::Split => self.split_rows.len(),
         }
     }
+
+    /// The syntax theme this model's spans were coloured with, so a cached
+    /// model can be rebuilt when the user changes the setting.
+    #[must_use]
+    pub fn syntax_theme(&self) -> crate::settings::EditorSyntaxTheme {
+        self.syntax.theme
+    }
 }
 
 /// What the diff surface draws for one path and one comparison basis.
@@ -442,6 +478,7 @@ impl RenderedDiff {
     pub fn from_content(
         content: DiffContent,
         path: &Path,
+        theme: crate::settings::EditorSyntaxTheme,
         cancellation: &CancellationToken,
     ) -> Self {
         if cancellation.is_cancelled() {
@@ -466,6 +503,7 @@ impl RenderedDiff {
                     old.text().unwrap_or_default(),
                     new.text().unwrap_or_default(),
                     path,
+                    theme,
                     cancellation,
                 ) {
                     Some(model) => model,
@@ -498,6 +536,7 @@ pub fn load_repository_diff(
     relative_path: &Path,
     basis: &DiffBasis,
     previous_path: Option<&Path>,
+    theme: crate::settings::EditorSyntaxTheme,
     cancellation: &CancellationToken,
 ) -> RenderedDiff {
     // `RepoPath` *is* the path validation: it rejects an absolute path, `.`,
@@ -518,7 +557,7 @@ pub fn load_repository_diff(
         old_path,
     };
     match RepositoryService::system("git").diff(&request, cancellation) {
-        Ok(content) => RenderedDiff::from_content(content, relative_path, cancellation),
+        Ok(content) => RenderedDiff::from_content(content, relative_path, theme, cancellation),
         Err(error) => RenderedDiff::Error(error.to_string()),
     }
 }
@@ -1149,6 +1188,14 @@ mod tests {
     use super::*;
     use crate::repository::{DiffSide, Oid, ValidatedRefName};
 
+    /// The default syntax theme, spelled once for the call sites that only
+    /// need *a* theme rather than a particular one.
+    const AUTO: crate::settings::EditorSyntaxTheme = crate::settings::EditorSyntaxTheme::Auto;
+
+    /// The diff surface and the editable buffer must agree for *every* theme
+    /// the setting offers, not only the default: they are two independent
+    /// highlighters over the same grammar, so the same file would otherwise
+    /// show different colours depending on which tab it is open in.
     #[test]
     fn shared_parser_matches_editor_highlighting_across_multiline_and_unicode() {
         for (path, source) in [
@@ -1166,41 +1213,44 @@ mod tests {
             ),
             ("unknown.unsupported", "plain\t雪\r\n\nlast"),
         ] {
-            let actual =
-                highlight_side(source, Path::new(path), &CancellationToken::new()).unwrap();
-            for (palette, dark) in [false, true].into_iter().enumerate() {
-                let mut stream = cosmic::iced::highlighter::Stream::new(&highlighter_settings(
-                    Path::new(path),
-                    crate::settings::EditorSyntaxTheme::Auto,
-                    dark,
-                ));
-                let expected = source
-                    .split_inclusive('\n')
-                    .map(|line| {
-                        let line = line
-                            .strip_suffix("\r\n")
-                            .or_else(|| line.strip_suffix('\n'))
-                            .unwrap_or(line);
-                        let spans = stream
-                            .highlight_line(line)
-                            .map(|(range, highlight)| SyntaxSpan {
-                                range,
-                                color: highlight.color().map(|color| {
-                                    [
-                                        color.r.to_bits(),
-                                        color.g.to_bits(),
-                                        color.b.to_bits(),
-                                        color.a.to_bits(),
-                                    ]
-                                }),
-                                font: highlight.font(),
-                            })
-                            .collect::<Vec<_>>();
-                        stream.commit();
-                        spans
-                    })
-                    .collect::<Vec<_>>();
-                assert_eq!(actual[palette], expected, "{path}, dark={dark}");
+            for &theme in crate::settings::EditorSyntaxTheme::ALL {
+                let actual =
+                    highlight_side(source, Path::new(path), theme, &CancellationToken::new())
+                        .unwrap();
+                for (palette, dark) in [false, true].into_iter().enumerate() {
+                    let mut stream = cosmic::iced::highlighter::Stream::new(&highlighter_settings(
+                        Path::new(path),
+                        theme,
+                        dark,
+                    ));
+                    let expected = source
+                        .split_inclusive('\n')
+                        .map(|line| {
+                            let line = line
+                                .strip_suffix("\r\n")
+                                .or_else(|| line.strip_suffix('\n'))
+                                .unwrap_or(line);
+                            let spans = stream
+                                .highlight_line(line)
+                                .map(|(range, highlight)| SyntaxSpan {
+                                    range,
+                                    color: highlight.color().map(|color| {
+                                        [
+                                            color.r.to_bits(),
+                                            color.g.to_bits(),
+                                            color.b.to_bits(),
+                                            color.a.to_bits(),
+                                        ]
+                                    }),
+                                    font: highlight.font(),
+                                })
+                                .collect::<Vec<_>>();
+                            stream.commit();
+                            spans
+                        })
+                        .collect::<Vec<_>>();
+                    assert_eq!(actual[palette], expected, "{path}, {theme:?}, dark={dark}");
+                }
             }
         }
     }
@@ -1213,6 +1263,7 @@ mod tests {
             before,
             after,
             Path::new("sample.rs"),
+            AUTO,
             &CancellationToken::new(),
         )
         .unwrap();
@@ -1267,15 +1318,31 @@ mod tests {
                 new_label: "new".into(),
             },
             Path::new("sample.rs"),
+            AUTO,
             &cancellation,
         );
         assert!(matches!(result, RenderedDiff::Error(_)));
-        assert!(highlight_side("let value = 1;", Path::new("sample.rs"), &cancellation).is_err());
+        assert!(
+            highlight_side(
+                "let value = 1;",
+                Path::new("sample.rs"),
+                AUTO,
+                &cancellation
+            )
+            .is_err()
+        );
         assert!(build_diff_rows(&Arc::from("old\n"), "new\n", &cancellation).is_err());
         assert!(
-            build_document_diff("old\n", "new\n", Path::new("sample.rs"), &cancellation).is_none()
+            build_document_diff(
+                "old\n",
+                "new\n",
+                Path::new("sample.rs"),
+                AUTO,
+                &cancellation
+            )
+            .is_none()
         );
-        assert!(build_document_diff("", "", Path::new("sample.rs"), &cancellation).is_none());
+        assert!(build_document_diff("", "", Path::new("sample.rs"), AUTO, &cancellation).is_none());
     }
 
     #[test]
@@ -1285,6 +1352,7 @@ mod tests {
             before,
             "/* changed\n雪 e\u{301}\n*/\n\nlast\n",
             Path::new("sample.rs"),
+            AUTO,
             &CancellationToken::new(),
         )
         .unwrap();
@@ -1292,6 +1360,7 @@ mod tests {
             Arc::clone(&edited.before),
             before,
             Path::new("sample.rs"),
+            AUTO,
             &CancellationToken::new(),
         )
         .unwrap();
@@ -1347,7 +1416,7 @@ mod tests {
             ),
         ] {
             let palettes =
-                highlight_side(source, Path::new(path), &CancellationToken::new()).unwrap();
+                highlight_side(source, Path::new(path), AUTO, &CancellationToken::new()).unwrap();
             for lines in palettes {
                 let colors = lines
                     .iter()
@@ -1362,14 +1431,27 @@ mod tests {
         }
         let source = "template<class T> T value(T input) { return input; }";
         assert_eq!(
-            highlight_side(source, Path::new("kernel.cu"), &CancellationToken::new()).unwrap(),
-            highlight_side(source, Path::new("kernel.cpp"), &CancellationToken::new()).unwrap(),
+            highlight_side(
+                source,
+                Path::new("kernel.cu"),
+                AUTO,
+                &CancellationToken::new()
+            )
+            .unwrap(),
+            highlight_side(
+                source,
+                Path::new("kernel.cpp"),
+                AUTO,
+                &CancellationToken::new()
+            )
+            .unwrap(),
             "CUDA's C++ constructs must use the actual bundled C++ grammar",
         );
         assert!(
             highlight_side(
                 source,
                 Path::new("unknown.unsupported"),
+                AUTO,
                 &CancellationToken::new()
             )
             .unwrap()[1]
@@ -1387,6 +1469,7 @@ mod tests {
             before,
             after,
             Path::new("kernel.cu"),
+            AUTO,
             &CancellationToken::new(),
         )
         .unwrap();
@@ -1724,6 +1807,7 @@ mod tests {
                     new_label: "new".into(),
                 },
                 Path::new("sample.txt"),
+                AUTO,
                 &CancellationToken::new(),
             )
         };
@@ -1790,6 +1874,7 @@ mod tests {
                     worktree: text("merged\n"),
                 },
                 Path::new("sample.txt"),
+                AUTO,
                 &CancellationToken::new(),
             ),
             RenderedDiff::NoText(DiffContent::Unmerged { .. })
@@ -1813,6 +1898,7 @@ mod tests {
                 path,
                 &DiffBasis::IndexToWorktree,
                 previous,
+                AUTO,
                 &CancellationToken::new(),
             );
             assert!(
@@ -1839,6 +1925,7 @@ mod tests {
             Path::new("sample.txt"),
             &DiffBasis::IndexToWorktree,
             None,
+            AUTO,
             &CancellationToken::new(),
         )
         else {
@@ -1989,6 +2076,7 @@ mod tests {
             Path::new("conflict.txt"),
             &DiffBasis::IndexToWorktree,
             None,
+            AUTO,
             &CancellationToken::new(),
         );
         let RenderedDiff::NoText(DiffContent::Unmerged {
@@ -2044,6 +2132,7 @@ mod tests {
             Path::new("link"),
             &DiffBasis::IndexToWorktree,
             None,
+            AUTO,
             &CancellationToken::new(),
         );
         let RenderedDiff::NoText(DiffContent::Comparison { old, new, .. }) = &content else {
@@ -2246,6 +2335,7 @@ mod tests {
             Path::new(path),
             basis,
             previous_path,
+            AUTO,
             &CancellationToken::new(),
         );
         let RenderedDiff::Text {
@@ -2267,6 +2357,7 @@ mod tests {
             Path::new(path),
             &DiffBasis::IndexToWorktree,
             None,
+            AUTO,
             &CancellationToken::new(),
         );
         let RenderedDiff::NoText(DiffContent::Comparison { new, .. }) = content else {

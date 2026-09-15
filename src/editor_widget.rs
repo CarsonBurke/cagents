@@ -273,13 +273,46 @@ where
             visible += pixels / (line_height * rows);
         }
         let visible = visible.max(1.0 / wrapped_rows);
+        let (canvas_width, offset) = if internal.wrapping == Wrapping::None {
+            (internal.canvas_width, internal.horizontal)
+        } else {
+            // Wrapped text has no canvas wider than its viewport, so there is
+            // nothing to pan and nothing to draw a track for.
+            (0.0, 0.0)
+        };
         ScrollGeometry::new(
             bounds,
             text_bounds,
             buffer.lines.len().max(1) as f32,
             first,
             visible,
+            canvas_width,
+            offset,
         )
+    }
+
+    /// Pans the unwrapped canvas by `delta` logical pixels, answering whether
+    /// the offset moved.
+    ///
+    /// The reachable range is the canvas the layout pass has already measured,
+    /// which covers every line the viewport has shown. Offering more would
+    /// mean shaping the document's unvisited lines just to learn how wide they
+    /// are, which is exactly what the canvas exists to avoid.
+    fn pan_horizontally(&self, bounds: Rectangle, delta: f32) -> bool {
+        if self.wrapping != Wrapping::None || !delta.is_finite() {
+            return false;
+        }
+        let viewport = bounds.shrink(self.text_padding());
+        let mut internal = self.content.0.borrow_mut();
+        let maximum = (internal.canvas_width - viewport.width).max(0.0);
+        let horizontal = (internal.horizontal + delta).clamp(0.0, maximum);
+        if horizontal == internal.horizontal {
+            return false;
+        }
+        internal.horizontal = horizontal;
+        // The caret did not move, so nothing should pull the view back to it.
+        internal.reveal_horizontal = false;
+        true
     }
 
     fn input_method<'b>(
@@ -687,6 +720,48 @@ where
         })
     }
 
+    /// Borrows one line's text in place, together with its line ending.
+    ///
+    /// [`Content::line`] has to clone the line into a `Cow::Owned` because the
+    /// borrow it would otherwise hand out lives inside this type's `RefCell`.
+    /// Callers that only read the text — mapping a caret to a byte offset, for
+    /// instance — walk every line of the document, so that clone is one heap
+    /// allocation and one copy per line of the file on every keystroke. A
+    /// closure keeps the borrow alive for exactly as long as it is needed and
+    /// allocates nothing.
+    ///
+    /// Returns `None` for an out-of-range index, like [`Content::line`].
+    pub fn with_line<T>(&self, index: usize, f: impl FnOnce(&str, LineEnding) -> T) -> Option<T> {
+        let internal = self.0.borrow();
+        let line = internal.editor.line(index)?;
+        Some(f(&line.text, line.ending))
+    }
+
+    /// Byte length of the text [`Content::text`] would produce, without
+    /// building it.
+    ///
+    /// This is a length, not a fingerprint: equal lengths do not imply equal
+    /// text, so it can only rule a change *in*, never out.
+    pub fn text_len(&self) -> usize {
+        let internal = self.0.borrow();
+        let count = internal.editor.line_count();
+        let mut length = 0;
+        for index in 0..count {
+            let Some(line) = internal.editor.line(index) else {
+                break;
+            };
+            length += line.text.len();
+            if index + 1 < count {
+                length += if line.ending == LineEnding::None {
+                    LineEnding::default().as_str().len()
+                } else {
+                    line.ending.as_str().len()
+                };
+            }
+        }
+        length
+    }
+
     /// Returns an iterator of the text of the lines in the [`Content`].
     pub fn lines(&self) -> impl Iterator<Item = Line<'_>> {
         (0..)
@@ -774,6 +849,7 @@ pub struct State<Highlighter: text::Highlighter> {
     drag_click: Option<mouse::click::Kind>,
     partial_scroll: f32,
     scrollbar_grab: Option<f32>,
+    horizontal_grab: Option<f32>,
     scrollbar_target: Option<ScrollTarget>,
     last_theme: RefCell<Option<String>>,
     highlighter: RefCell<Highlighter>,
@@ -853,6 +929,7 @@ where
             drag_click: None,
             partial_scroll: 0.0,
             scrollbar_grab: None,
+            horizontal_grab: None,
             scrollbar_target: None,
             last_theme: RefCell::default(),
             highlighter: RefCell::new(Highlighter::new(&self.highlighter_settings)),
@@ -993,6 +1070,9 @@ where
             state.scrollbar_grab = None;
             state.scrollbar_target = None;
         }
+        if geometry.horizontal.is_none() {
+            state.horizontal_grab = None;
+        }
         let pointer = cursor.position().filter(|point| _viewport.contains(*point));
         let drag = match event {
             Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left))
@@ -1033,6 +1113,53 @@ where
                 visible: geometry.visible,
             });
             shell.invalidate_layout();
+            shell.capture_event();
+            shell.request_redraw();
+            return;
+        }
+        // The horizontal thumb is dragged the same way, but it writes the
+        // canvas offset directly: the native editor has no horizontal scroll
+        // action to publish, and `draw` reads the offset as it is.
+        match event {
+            Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left))
+                if state.horizontal_grab.take().is_some() =>
+            {
+                shell.capture_event();
+                shell.request_redraw();
+                return;
+            }
+            Event::Window(window::Event::Unfocused) => state.horizontal_grab = None,
+            _ => {}
+        }
+        let pan = geometry.horizontal.and_then(|scroll| match event {
+            Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left))
+                if self.on_edit.is_some()
+                    && pointer.is_some_and(|point| scroll.track.contains(point)) =>
+            {
+                let point = pointer?;
+                let grab = if scroll.thumb.contains(point) {
+                    point.x - scroll.thumb.x
+                } else {
+                    scroll.thumb.width / 2.0
+                };
+                state.horizontal_grab = Some(grab);
+                Some(scroll.offset_at(point.x, grab))
+            }
+            Event::Mouse(mouse::Event::CursorMoved { .. }) => {
+                let grab = state.horizontal_grab?;
+                cursor
+                    .position()
+                    .map(|point| scroll.offset_at(point.x, grab))
+            }
+            _ => None,
+        });
+        if let Some(offset) = pan {
+            let mut internal = self.content.0.borrow_mut();
+            if internal.horizontal != offset {
+                internal.horizontal = offset;
+                internal.reveal_horizontal = false;
+            }
+            drop(internal);
             shell.capture_event();
             shell.request_redraw();
             return;
@@ -1150,12 +1277,32 @@ where
                 }
                 Update::Release => {
                     state.drag_click = None;
+                    // X11 and Wayland both expect a finished selection to
+                    // become the primary selection, which middle click pastes.
+                    if let Some(selection) = self.content.selection() {
+                        clipboard.write(clipboard::Kind::Primary, selection);
+                    }
                 }
-                Update::Scroll(lines) => {
+                Update::PastePrimary(position) => {
+                    // Middle click moves the caret first, exactly as it does
+                    // everywhere else on this platform, and then inserts.
+                    shell.publish(on_edit(Action::Click(position)));
+                    if let Some(contents) = clipboard.read(clipboard::Kind::Primary) {
+                        shell.publish(on_edit(Action::Edit(Edit::Paste(Arc::new(contents)))));
+                    }
+                    state.focus = Some(Focus::now());
+                    shell.capture_event();
+                }
+                Update::Scroll { lines, horizontal } => {
                     let bounds = self.content.0.borrow().editor.bounds();
 
                     if bounds.height >= i32::MAX as f32 {
                         return;
+                    }
+
+                    if self.pan_horizontally(layout.bounds(), horizontal) {
+                        shell.request_redraw();
+                        shell.capture_event();
                     }
 
                     let lines = lines + state.partial_scroll;
@@ -1526,39 +1673,24 @@ where
         }
         drop(internal);
         let geometry = self.scroll_geometry(bounds);
-        if !geometry.scrollable {
-            return;
+        if geometry.scrollable {
+            draw_scrollbar(
+                renderer,
+                geometry.track,
+                geometry.thumb,
+                style.value,
+                state.scrollbar_grab.is_some() || _cursor.is_over(geometry.track),
+            );
         }
-        let mut track_color = style.value;
-        track_color.a *= 0.06;
-        renderer.fill_quad(
-            renderer::Quad {
-                bounds: geometry.track,
-                border: Border {
-                    radius: 4.0.into(),
-                    ..Border::default()
-                },
-                ..renderer::Quad::default()
-            },
-            track_color,
-        );
-        let mut thumb_color = style.value;
-        thumb_color.a *= if state.scrollbar_grab.is_some() || _cursor.is_over(geometry.track) {
-            0.55
-        } else {
-            0.3
-        };
-        renderer.fill_quad(
-            renderer::Quad {
-                bounds: geometry.thumb,
-                border: Border {
-                    radius: 4.0.into(),
-                    ..Border::default()
-                },
-                ..renderer::Quad::default()
-            },
-            thumb_color,
-        );
+        if let Some(scroll) = geometry.horizontal {
+            draw_scrollbar(
+                renderer,
+                scroll.track,
+                scroll.thumb,
+                style.value,
+                state.horizontal_grab.is_some() || _cursor.is_over(scroll.track),
+            );
+        }
     }
 
     fn mouse_interaction(
@@ -1577,8 +1709,11 @@ where
             return mouse::Interaction::default();
         }
         let geometry = self.scroll_geometry(layout.bounds());
-        if cursor.is_over(geometry.track) {
-            return if !is_disabled && geometry.scrollable {
+        let over_horizontal = geometry
+            .horizontal
+            .is_some_and(|scroll| cursor.is_over(scroll.track));
+        if cursor.is_over(geometry.track) || over_horizontal {
+            return if !is_disabled && (geometry.scrollable || over_horizontal) {
                 mouse::Interaction::Pointer
             } else {
                 mouse::Interaction::default()
@@ -1636,7 +1771,14 @@ enum Update<Message> {
     Click(mouse::Click),
     Drag(Point),
     Release,
-    Scroll(f32),
+    /// Middle click: move the caret there, then insert the primary selection.
+    PastePrimary(Point),
+    Scroll {
+        /// Vertical movement, in document lines.
+        lines: f32,
+        /// Horizontal movement, in logical pixels.
+        horizontal: f32,
+    },
     InputMethod(Ime),
     Binding(Binding<Message>),
 }
@@ -1682,6 +1824,10 @@ impl<Message> Update<Message> {
                     }
                 }
                 mouse::Event::ButtonReleased(mouse::Button::Left) => Some(Update::Release),
+                mouse::Event::ButtonPressed(mouse::Button::Middle) => cursor
+                    .position_in(bounds)
+                    .map(|position| position - Vector::new(padding.left, padding.top))
+                    .map(Update::PastePrimary),
                 mouse::Event::CursorMoved { .. } => match state.drag_click {
                     Some(mouse::click::Kind::Single) => {
                         let cursor_position =
@@ -1692,16 +1838,24 @@ impl<Message> Update<Message> {
                     _ => None,
                 },
                 mouse::Event::WheelScrolled { delta } if cursor.is_over(bounds) => {
-                    Some(Update::Scroll(match delta {
-                        mouse::ScrollDelta::Lines { y, .. } => {
-                            if y.abs() > 0.0 {
+                    // The horizontal axis is in pixels because that is what the
+                    // canvas offset is; the factors are iced's own, so a wheel
+                    // notch pans this editor as far as it pans any other
+                    // scrollable in the shell.
+                    Some(match delta {
+                        mouse::ScrollDelta::Lines { x, y } => Update::Scroll {
+                            lines: if y.abs() > 0.0 {
                                 y.signum() * -(y.abs() * 4.0).max(1.0)
                             } else {
                                 0.0
-                            }
-                        }
-                        mouse::ScrollDelta::Pixels { y, .. } => -y / 4.0,
-                    }))
+                            },
+                            horizontal: x * 60.0,
+                        },
+                        mouse::ScrollDelta::Pixels { x, y } => Update::Scroll {
+                            lines: -y / 4.0,
+                            horizontal: *x,
+                        },
+                    })
                 }
                 _ => None,
             },
@@ -1757,16 +1911,72 @@ impl<Message> Update<Message> {
     }
 }
 
+/// One scrollbar's track and thumb, in the shell's scrollbar tokens.
+fn draw_scrollbar<Renderer: renderer::Renderer>(
+    renderer: &mut Renderer,
+    track: Rectangle,
+    thumb: Rectangle,
+    color: cosmic::iced::Color,
+    active: bool,
+) {
+    let quad = |bounds| renderer::Quad {
+        bounds,
+        border: Border {
+            radius: 4.0.into(),
+            ..Border::default()
+        },
+        ..renderer::Quad::default()
+    };
+    let mut track_color = color;
+    track_color.a *= 0.06;
+    renderer.fill_quad(quad(track), track_color);
+    let mut thumb_color = color;
+    thumb_color.a *= if active { 0.55 } else { 0.3 };
+    renderer.fill_quad(quad(thumb), thumb_color);
+}
+
 #[derive(Debug, Clone, Copy)]
 struct ScrollGeometry {
     track: Rectangle,
     thumb: Rectangle,
     visible: f32,
     scrollable: bool,
+    /// The horizontal pair, present only while the measured canvas is wider
+    /// than the viewport.
+    horizontal: Option<HorizontalScroll>,
+}
+
+/// A horizontal track, its thumb, and the offset range the thumb spans.
+#[derive(Debug, Clone, Copy)]
+struct HorizontalScroll {
+    track: Rectangle,
+    thumb: Rectangle,
+    maximum: f32,
+}
+
+impl HorizontalScroll {
+    /// The canvas offset a thumb grabbed at `grab` represents when the pointer
+    /// is at `x`.
+    fn offset_at(self, x: f32, grab: f32) -> f32 {
+        let travel = self.track.width - self.thumb.width;
+        if travel > 0.0 {
+            ((x - self.track.x - grab) / travel).clamp(0.0, 1.0) * self.maximum
+        } else {
+            0.0
+        }
+    }
 }
 
 impl ScrollGeometry {
-    fn new(bounds: Rectangle, text: Rectangle, total: f32, first: f32, visible: f32) -> Self {
+    fn new(
+        bounds: Rectangle,
+        text: Rectangle,
+        total: f32,
+        first: f32,
+        visible: f32,
+        canvas_width: f32,
+        offset: f32,
+    ) -> Self {
         let track = Rectangle {
             x: bounds.x + bounds.width - crate::design::SCROLLBAR_GUTTER
                 + crate::design::SCROLLBAR_MARGIN,
@@ -1790,7 +2000,40 @@ impl ScrollGeometry {
             },
             visible,
             scrollable: maximum > 0.0,
+            horizontal: Self::horizontal(bounds, text, canvas_width, offset),
         }
+    }
+
+    fn horizontal(
+        bounds: Rectangle,
+        text: Rectangle,
+        canvas_width: f32,
+        offset: f32,
+    ) -> Option<HorizontalScroll> {
+        let maximum = canvas_width - text.width;
+        if maximum <= 0.0 || text.width <= 0.0 {
+            return None;
+        }
+        let track = Rectangle {
+            x: text.x,
+            y: bounds.y + bounds.height - crate::design::SCROLLBAR_GUTTER
+                + crate::design::SCROLLBAR_MARGIN,
+            width: text.width,
+            height: crate::design::SCROLLBAR_THUMB_WIDTH,
+        };
+        let width = (track.width * text.width / canvas_width)
+            .max(24.0)
+            .min(track.width);
+        let fraction = (offset / maximum).clamp(0.0, 1.0);
+        Some(HorizontalScroll {
+            track,
+            thumb: Rectangle {
+                x: track.x + (track.width - width) * fraction,
+                width,
+                ..track
+            },
+            maximum,
+        })
     }
 
     fn fraction_at(self, y: f32, grab: f32) -> f32 {
@@ -2200,16 +2443,35 @@ mod tests {
     #[test]
     fn dragging_short_viewports_is_bounded_and_fit_content_is_inert() {
         let bounds = Rectangle::new(Point::ORIGIN, Size::new(200.0, 20.0));
-        let fit = ScrollGeometry::new(bounds, bounds, 1.0, 0.0, 1.0);
+        let fit = ScrollGeometry::new(bounds, bounds, 1.0, 0.0, 1.0, 200.0, 0.0);
         assert!(!fit.scrollable);
         assert_eq!(fit.fraction_at(500.0, 0.0), 0.0);
         assert!(fit.thumb.height <= bounds.height);
+        assert!(
+            fit.horizontal.is_none(),
+            "a canvas that fits needs no horizontal track"
+        );
         let bounds = Rectangle {
             height: 200.0,
             ..bounds
         };
-        let scrolling = ScrollGeometry::new(bounds, bounds, 100.0, 40.0, 10.0);
+        let scrolling = ScrollGeometry::new(bounds, bounds, 100.0, 40.0, 10.0, 200.0, 0.0);
         assert_eq!(scrolling.fraction_at(-500.0, 0.0), 0.0);
         assert_eq!(scrolling.fraction_at(500.0, 0.0), 1.0);
+
+        // A canvas wider than the viewport gets a track whose thumb maps the
+        // pointer back onto the full offset range in both directions.
+        let wide = ScrollGeometry::new(bounds, bounds, 1.0, 0.0, 1.0, 600.0, 400.0)
+            .horizontal
+            .expect("a canvas three viewports wide must be pannable");
+        assert_eq!(wide.maximum, 400.0);
+        assert!(wide.thumb.width < wide.track.width);
+        assert!(
+            (wide.thumb.x + wide.thumb.width - (wide.track.x + wide.track.width)).abs() < 0.01,
+            "a fully panned canvas puts the thumb at the end of its track"
+        );
+        assert_eq!(wide.offset_at(-500.0, 0.0), 0.0);
+        assert_eq!(wide.offset_at(500.0, 0.0), 400.0);
+        assert!(wide.track.y >= bounds.y + bounds.height - crate::design::SCROLLBAR_GUTTER);
     }
 }

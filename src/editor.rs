@@ -92,13 +92,27 @@ pub fn validate_repo_path(path: &Path) -> Result<(), FileIoError> {
 }
 
 pub fn load_file(worktree: &Path, relative_path: &Path) -> Result<FileContent, FileIoError> {
-    let path = checked_path(worktree, relative_path)?;
-    let metadata = fs::symlink_metadata(&path).map_err(io_error)?;
+    validate_repo_path(relative_path)?;
+    let root = worktree_root(worktree)?;
+    // A symlink is the one classification that has to be made from the name
+    // without opening it, because opening it is exactly what must not happen.
+    let metadata = fs_safety::metadata_beneath(&root, relative_path).map_err(resolve_error)?;
     if metadata.file_type().is_symlink() {
-        return fs::read_link(&path)
+        return fs_safety::read_link_beneath(&root, relative_path)
             .map(|target| FileContent::ReadOnly(ReadOnlyReason::Symlink { target }))
-            .map_err(io_error);
+            .map_err(resolve_error);
     }
+    if !metadata.is_file() {
+        return Ok(FileContent::ReadOnly(ReadOnlyReason::NotRegularFile));
+    }
+
+    // Everything from here on describes the open descriptor, not the name:
+    // `metadata_beneath` answered about a name, and a build, a `git checkout`
+    // or a hostile local process can put a different object behind it before
+    // the read. The kind and the size are therefore taken again from the file
+    // whose bytes are actually about to be read.
+    let file = fs_safety::open_beneath(&root, relative_path).map_err(resolve_error)?;
+    let metadata = fs_safety::metadata_of(&file).map_err(io_error)?;
     if !metadata.is_file() {
         return Ok(FileContent::ReadOnly(ReadOnlyReason::NotRegularFile));
     }
@@ -112,9 +126,7 @@ pub fn load_file(worktree: &Path, relative_path: &Path) -> Result<FileContent, F
     // A file can grow after metadata was read. Bound the read itself, not only
     // its result, so a concurrently growing file cannot exhaust memory.
     let mut bytes = Vec::with_capacity(metadata.len() as usize);
-    File::open(&path)
-        .map_err(io_error)?
-        .take(MAX_EDITABLE_FILE_BYTES + 1)
+    file.take(MAX_EDITABLE_FILE_BYTES + 1)
         .read_to_end(&mut bytes)
         .map_err(io_error)?;
     if bytes.len() as u64 > MAX_EDITABLE_FILE_BYTES {
@@ -350,6 +362,12 @@ fn check_svg_layers(
     Ok(())
 }
 
+/// Replaces a regular file's contents atomically, preserving its permissions,
+/// its POSIX access ACL and its content extended attributes.
+///
+/// The destination is compared against the baseline the buffer was loaded from
+/// unless `overwrite` is set, and a mismatch is reported rather than
+/// overwritten.
 pub fn save_file(
     worktree: &Path,
     relative_path: &Path,
@@ -357,42 +375,146 @@ pub fn save_file(
     expected_disk_hash: blake3::Hash,
     overwrite: bool,
 ) -> Result<SaveOutcome, FileIoError> {
-    save_file_with_atomic_replace(
+    save_file_with_hooks(
         worktree,
         relative_path,
         text,
         expected_disk_hash,
         overwrite,
-        atomic_replace,
+        || Ok(()),
+        fs_safety::sync_directory,
     )
 }
 
-fn save_file_with_atomic_replace(
+fn save_file_with_hooks(
     worktree: &Path,
     relative_path: &Path,
     text: &str,
     expected_disk_hash: blake3::Hash,
     overwrite: bool,
-    replace: impl FnOnce(&Path, &[u8], Permissions) -> Result<SaveDurability, FileIoError>,
+    before_publish: impl FnOnce() -> io::Result<()>,
+    sync_parent: impl FnOnce(&Root) -> io::Result<()>,
 ) -> Result<SaveOutcome, FileIoError> {
-    let path = checked_path(worktree, relative_path)?;
-    let metadata = fs::symlink_metadata(&path).map_err(io_error)?;
-    if metadata.file_type().is_symlink() || !metadata.is_file() {
+    validate_repo_path(relative_path)?;
+    let root = worktree_root(worktree)?;
+    let (parent, name) =
+        fs_safety::open_parent_beneath(&root, relative_path).map_err(resolve_error)?;
+    let name = Path::new(&name);
+    // The destination is classified by name once, only to refuse a symlink
+    // without opening it, and then opened; every decision that follows — its
+    // mode, its ACL, its attributes and the bytes the conflict check hashes —
+    // is taken from that one descriptor, so nothing can be swapped in behind
+    // the name between the check and the save.
+    let listed = fs_safety::metadata_beneath(&parent, name).map_err(resolve_error)?;
+    if listed.file_type().is_symlink() {
+        return Err(FileIoError::Io(
+            "the destination is no longer a regular file".into(),
+        ));
+    }
+    let mut destination = fs_safety::open_beneath(&parent, name).map_err(resolve_error)?;
+    let metadata = fs_safety::metadata_of(&destination).map_err(io_error)?;
+    if !metadata.is_file() {
         return Err(FileIoError::Io(
             "the destination is no longer a regular file".into(),
         ));
     }
 
-    let disk = fs::read(&path).map_err(io_error)?;
-    let disk_hash = blake3::hash(&disk);
-    if !overwrite && disk_hash != expected_disk_hash {
-        return Ok(SaveOutcome::Conflict { disk_hash });
+    // A forced save compares nothing, so it reads nothing. An ordinary save
+    // bounds the read the way `load_file` does rather than reading whatever is
+    // there now: this worktree is shared with coding agents, so the
+    // destination can have been replaced by a file far larger than the editor
+    // would ever open. Reading one byte past the limit is enough to answer the
+    // only question being asked, because a buffer can never have been loaded
+    // from a file that long and the hashes therefore cannot match.
+    if !overwrite {
+        let disk =
+            fs_safety::read_bounded(&mut destination, MAX_EDITABLE_FILE_BYTES).map_err(io_error)?;
+        let disk_hash = blake3::hash(&disk);
+        if disk_hash != expected_disk_hash {
+            return Ok(SaveOutcome::Conflict { disk_hash });
+        }
     }
 
-    let durability = replace(&path, text.as_bytes(), metadata.permissions())?;
+    let durability = publish_replacement(
+        &parent,
+        name,
+        &destination,
+        text.as_bytes(),
+        metadata.permissions(),
+        before_publish,
+        sync_parent,
+    )?;
     Ok(SaveOutcome::Saved {
         content_hash: blake3::hash(text.as_bytes()),
         durability,
+    })
+}
+
+/// Writes `bytes` into a temporary sibling that carries the destination's
+/// permissions, access ACL and content attributes, then renames it over the
+/// destination.
+///
+/// The replacement is a new inode, so every piece of metadata the old one
+/// carried has to be reproduced deliberately — `st_mode` alone leaves an
+/// ACL-bearing file readable by the wrong people and silently drops the user's
+/// extended attributes.
+fn publish_replacement(
+    parent: &Root,
+    name: &Path,
+    destination: &File,
+    bytes: &[u8],
+    permissions: Permissions,
+    before_publish: impl FnOnce() -> io::Result<()>,
+    sync_parent: impl FnOnce(&Root) -> io::Result<()>,
+) -> Result<SaveDurability, FileIoError> {
+    let (mut temporary, temporary_name) =
+        fs_safety::create_temporary_in(parent, 0o600).map_err(resolve_error)?;
+    let result = (|| {
+        // Establish access rules before any sensitive bytes exist: otherwise
+        // the final chmod could briefly expose a mode-only view of an ACL.
+        fs_safety::copy_access_acl(destination, &temporary).map_err(io_error)?;
+        temporary.write_all(bytes).map_err(io_error)?;
+        // Set the mode after writing: writing can clear set-ID permission bits.
+        temporary.set_permissions(permissions).map_err(io_error)?;
+        // ...and reinstate the ACL after it, because the kernel rewrites the
+        // ACL's mask from the mode.
+        fs_safety::copy_access_acl(destination, &temporary).map_err(io_error)?;
+        let lost = fs_safety::copy_extended_attributes(destination, &temporary);
+        temporary.sync_all().map_err(io_error)?;
+        before_publish().map_err(io_error)?;
+        fs_safety::rename_within(parent, &temporary_name, name.as_os_str())
+            .map_err(resolve_error)?;
+        Ok(lost)
+    })();
+    let lost = match result {
+        Ok(lost) => lost,
+        Err(error) => {
+            if let Err(cleanup_error) = fs_safety::unlink_within(parent, &temporary_name) {
+                return Err(FileIoError::Io(format!(
+                    "{error}; could not remove partial save: {cleanup_error}"
+                )));
+            }
+            return Err(error);
+        }
+    };
+    // The bytes are published. Losing an optional attribute is not worth
+    // failing a save that already succeeded, but it must not be silent either.
+    for attribute in lost {
+        tracing::warn!(
+            path = %parent.path().join(name).display(),
+            %attribute,
+            "saved file did not receive one of its extended attributes"
+        );
+    }
+    // The rename has replaced the destination. From this point onward, an I/O
+    // failure must be reported as a successful replacement with unconfirmed
+    // durability; returning `Err` would falsely tell callers the old baseline
+    // is still on disk.
+    Ok(match sync_parent(parent) {
+        Ok(()) => SaveDurability::Durable,
+        Err(error) => SaveDurability::Unconfirmed {
+            error: error.to_string(),
+        },
     })
 }
 
@@ -484,7 +606,21 @@ fn file_operation_root(
             "source and destination must be different paths".into(),
         ));
     }
-    Root::open(worktree).map_err(|error| FileIoError::InvalidRepositoryRoot(error.to_string()))
+    worktree_root(worktree)
+}
+
+/// Opens the worktree as the root every repository-relative path is resolved
+/// beneath.
+///
+/// The worktree path is the application's own — the one piece of input here
+/// that repository contents cannot influence — so resolving it by name once is
+/// exactly what makes everything below it fd-relative. It is canonicalized
+/// first because a worktree may legitimately live behind a symbolic link,
+/// which `Root::open` refuses for its final component.
+fn worktree_root(worktree: &Path) -> Result<Root, FileIoError> {
+    let root = fs::canonicalize(worktree)
+        .map_err(|error| FileIoError::InvalidRepositoryRoot(error.to_string()))?;
+    Root::open(&root).map_err(|error| FileIoError::InvalidRepositoryRoot(error.to_string()))
 }
 
 fn regular_source(root: &Root, source: &Path) -> Result<File, FileIoError> {
@@ -518,65 +654,6 @@ fn resolve_error(error: ResolveError) -> FileIoError {
         ResolveError::Escaped { .. } => FileIoError::OutsideWorktree,
         error => FileIoError::Io(error.to_string()),
     }
-}
-
-fn checked_path(worktree: &Path, relative_path: &Path) -> Result<PathBuf, FileIoError> {
-    validate_repo_path(relative_path)?;
-    let root = fs::canonicalize(worktree)
-        .map_err(|error| FileIoError::InvalidRepositoryRoot(error.to_string()))?;
-    let path = root.join(relative_path);
-    let parent = path.parent().ok_or(FileIoError::InvalidRepositoryPath)?;
-    let canonical_parent = fs::canonicalize(parent).map_err(io_error)?;
-    if !canonical_parent.starts_with(&root) {
-        return Err(FileIoError::OutsideWorktree);
-    }
-    Ok(path)
-}
-
-fn atomic_replace(
-    path: &Path,
-    bytes: &[u8],
-    permissions: Permissions,
-) -> Result<SaveDurability, FileIoError> {
-    atomic_replace_with_hooks(
-        path,
-        bytes,
-        permissions,
-        || Ok(()),
-        |parent| File::open(parent).and_then(|directory| directory.sync_all()),
-    )
-}
-
-fn atomic_replace_with_hooks(
-    path: &Path,
-    bytes: &[u8],
-    permissions: Permissions,
-    before_persist: impl FnOnce() -> io::Result<()>,
-    sync_parent: impl FnOnce(&Path) -> io::Result<()>,
-) -> Result<SaveDurability, FileIoError> {
-    let parent = path.parent().ok_or(FileIoError::InvalidRepositoryPath)?;
-    let mut temporary = tempfile::NamedTempFile::new_in(parent).map_err(io_error)?;
-    temporary
-        .as_file_mut()
-        .set_permissions(permissions)
-        .map_err(io_error)?;
-    temporary.write_all(bytes).map_err(io_error)?;
-    temporary.flush().map_err(io_error)?;
-    temporary.as_file().sync_all().map_err(io_error)?;
-    before_persist().map_err(io_error)?;
-    temporary
-        .persist(path)
-        .map_err(|error| io_error(error.error))?;
-    // `persist` has replaced the destination. From this point onward, an I/O
-    // failure must be reported as a successful replacement with unconfirmed
-    // durability; returning `Err` would falsely tell callers the old baseline
-    // is still on disk.
-    Ok(match sync_parent(parent) {
-        Ok(()) => SaveDurability::Durable,
-        Err(error) => SaveDurability::Unconfirmed {
-            error: error.to_string(),
-        },
-    })
 }
 
 fn io_error(error: io::Error) -> FileIoError {
@@ -734,34 +811,32 @@ mod tests {
     }
 
     #[test]
-    fn failure_before_persist_leaves_destination_unchanged_and_returns_error() {
+    fn failure_before_publication_leaves_destination_unchanged_and_removes_temporary() {
         let root = tempdir().unwrap();
         let path = root.path().join("notes.txt");
         fs::write(&path, "before\n").unwrap();
         let expected = blake3::hash(b"before\n");
 
-        let result = save_file_with_atomic_replace(
+        let result = save_file_with_hooks(
             root.path(),
             Path::new("notes.txt"),
             "after\n",
             expected,
             false,
-            |path, bytes, permissions| {
-                atomic_replace_with_hooks(
-                    path,
-                    bytes,
-                    permissions,
-                    || Err(io::Error::other("injected failure before persist")),
-                    |_| panic!("parent sync must not run when persist was not attempted"),
-                )
-            },
+            || Err(io::Error::other("injected failure before publication")),
+            |_| panic!("parent sync must not run when publication was not attempted"),
         );
 
         assert!(matches!(
             result,
-            Err(FileIoError::Io(error)) if error.contains("injected failure before persist")
+            Err(FileIoError::Io(error)) if error.contains("injected failure before publication")
         ));
         assert_eq!(fs::read_to_string(path).unwrap(), "before\n");
+        assert_eq!(
+            fs::read_dir(root.path()).unwrap().count(),
+            1,
+            "a failed save must not leave its temporary file behind"
+        );
     }
 
     #[test]
@@ -771,21 +846,14 @@ mod tests {
         fs::write(&path, "before\n").unwrap();
         let expected = blake3::hash(b"before\n");
 
-        let result = save_file_with_atomic_replace(
+        let result = save_file_with_hooks(
             root.path(),
             Path::new("notes.txt"),
             "after\n",
             expected,
             false,
-            |path, bytes, permissions| {
-                atomic_replace_with_hooks(
-                    path,
-                    bytes,
-                    permissions,
-                    || Ok(()),
-                    |_| Err(io::Error::other("injected parent sync failure")),
-                )
-            },
+            || Ok(()),
+            |_| Err(io::Error::other("injected parent sync failure")),
         )
         .unwrap();
 
@@ -798,6 +866,82 @@ mod tests {
                 && error.contains("injected parent sync failure")
         ));
         assert_eq!(fs::read_to_string(path).unwrap(), "after\n");
+    }
+
+    #[test]
+    fn save_preserves_set_id_bits_extended_attributes_and_reports_oversize_conflict() {
+        let root = tempdir().unwrap();
+        let path = root.path().join("notes.txt");
+        fs::write(&path, "before\n").unwrap();
+        // Group-executable plus set-group-ID: installing the mode before the
+        // content would have the write clear `S_ISGID` again. The mode is read
+        // back rather than assumed, because a kernel is allowed to refuse
+        // `S_ISGID` to a process that is not in the file's group.
+        fs::set_permissions(&path, Permissions::from_mode(0o2750)).unwrap();
+        let installed = fs::metadata(&path).unwrap().permissions().mode() & 0o7777;
+        let attribute = c"user.cagents.test";
+        let file = File::open(&path).unwrap();
+        // SAFETY: the descriptor is live and both the name and the value
+        // outlive the call.
+        let supported = unsafe {
+            libc::fsetxattr(
+                std::os::fd::AsRawFd::as_raw_fd(&file),
+                attribute.as_ptr(),
+                c"kept".as_ptr().cast(),
+                4,
+                0,
+            )
+        } == 0;
+        drop(file);
+
+        let outcome = save_file(
+            root.path(),
+            Path::new("notes.txt"),
+            "after\n",
+            blake3::hash(b"before\n"),
+            false,
+        )
+        .unwrap();
+        assert!(matches!(outcome, SaveOutcome::Saved { .. }));
+        assert_eq!(fs::read_to_string(&path).unwrap(), "after\n");
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o7777,
+            installed,
+            "a save must not drop the destination's set-ID bits"
+        );
+        if supported {
+            let file = File::open(&path).unwrap();
+            let mut value = [0_u8; 8];
+            // SAFETY: as above; the buffer length is passed exactly.
+            let read = unsafe {
+                libc::fgetxattr(
+                    std::os::fd::AsRawFd::as_raw_fd(&file),
+                    attribute.as_ptr(),
+                    value.as_mut_ptr().cast(),
+                    value.len(),
+                )
+            };
+            assert_eq!(read, 4, "a save must carry the user's attributes across");
+            assert_eq!(&value[..4], b"kept");
+        }
+
+        // A destination replaced by a file past the editable limit can never be
+        // the baseline a buffer was loaded from, so it conflicts rather than
+        // being read whole.
+        let huge = File::options().write(true).open(&path).unwrap();
+        huge.set_len(MAX_EDITABLE_FILE_BYTES + 1).unwrap();
+        drop(huge);
+        assert!(matches!(
+            save_file(
+                root.path(),
+                Path::new("notes.txt"),
+                "mine\n",
+                blake3::hash(b"after\n"),
+                false,
+            )
+            .unwrap(),
+            SaveOutcome::Conflict { .. }
+        ));
     }
 
     #[test]
