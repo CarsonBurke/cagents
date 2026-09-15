@@ -1,6 +1,6 @@
 //! Daemon-owned, non-PTY provider actor. Detaching never stops its transport.
 use super::{
-    Command, Event, Item, ItemContent, Snapshot,
+    Command, Event, Item, ItemContent, Phase, Snapshot,
     protocol::{Adapter, ProcessSpec, Step, TransportSpec},
 };
 use crate::agent::ActivityState;
@@ -1130,9 +1130,13 @@ fn apply_event(state: &mut Snapshot, indices: &mut BTreeMap<String, usize>, even
                 state.items.push(Item {
                     id,
                     role,
+                    // The delta stream carries no phase, so the item created to
+                    // receive the text declares the default instead of guessing
+                    // that an unfinished message is narration.
                     content: ItemContent::Text {
                         text: delta,
                         thinking,
+                        phase: Phase::Final,
                     },
                 });
             }
@@ -1196,6 +1200,7 @@ mod tests {
             content: ItemContent::Text {
                 text: value.into(),
                 thinking: false,
+                phase: Phase::Final,
             },
         }
     }

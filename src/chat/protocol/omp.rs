@@ -1,7 +1,7 @@
 use super::{Adapter, ProcessSpec, Step};
 use crate::chat::{
-    self, Answer, Choice, Command, Event, Field, Item, ItemContent, Launch, Model, PromptMode,
-    Request, Role, ToolStatus,
+    self, Answer, ChangeKind, Choice, Command, CommandAction, Event, Field, FileChange, Item,
+    ItemContent, Launch, Model, Phase, PromptMode, Request, Role, ToolStatus,
 };
 use base64::{Engine, engine::general_purpose::STANDARD};
 use serde_json::{Value, json};
@@ -103,6 +103,7 @@ struct Omp {
     history_request: Option<String>,
     requests: HashMap<String, String>,
     chunks: HashMap<String, Chunk>,
+    calls: HashMap<String, Call>,
     usage: chat::Usage,
 }
 struct Chunk {
@@ -110,6 +111,43 @@ struct Chunk {
     count: usize,
     bytes: usize,
     data: Vec<u8>,
+}
+/// What OMP classified a tool call as, together with the arguments it ran with.
+///
+/// OMP splits a call across frames: the arguments come with its start and the
+/// result with its end, and a history separates the same two halves into an
+/// assistant `toolCall` block and the `toolResult` message answering it. A
+/// command's text and directory have to be carried across that gap or the
+/// finished step would render without the command it ran. A completed call is
+/// kept rather than dropped because a live session reports the same result
+/// twice, once as `tool_execution_end` and once as the `toolResult` message.
+struct Call {
+    command: String,
+    working_directory: String,
+    action: CommandAction,
+}
+impl Call {
+    /// The step this call shows, at whatever stage it has reached.
+    fn item(&self, status: ToolStatus, output: String, details: &Value) -> ItemContent {
+        ItemContent::Command {
+            // A shell step has no target beyond the command line the view
+            // already falls back to. Every other action was given the path or
+            // pattern it acted on, which is the target worth naming.
+            label: match self.action {
+                CommandAction::Run => String::new(),
+                _ => self.command.clone(),
+            },
+            command: self.command.clone(),
+            working_directory: self.working_directory.clone(),
+            action: self.action,
+            status,
+            exit_code: details["exitCode"]
+                .as_i64()
+                .and_then(|code| i32::try_from(code).ok()),
+            duration_ms: duration(details),
+            output,
+        }
+    }
 }
 impl Omp {
     fn request(&mut self, kind: &str) -> Value {
@@ -149,19 +187,23 @@ impl Omp {
             _ => Role::System,
         };
         if role_name == "toolResult" {
+            let id = text(message, "toolCallId").to_owned();
+            let status = if message["isError"].as_bool() == Some(true) {
+                ToolStatus::Failed
+            } else {
+                ToolStatus::Succeeded
+            };
+            let content = self.result(
+                &id,
+                text(message, "toolName"),
+                content_text(&message["content"]),
+                &message["details"],
+                status,
+            );
             return vec![Item {
-                id: format!("tool:{}", text(message, "toolCallId")),
+                id: format!("tool:{id}"),
                 role: Role::Assistant,
-                content: ItemContent::Tool {
-                    name: text(message, "toolName").into(),
-                    input: String::new(),
-                    output: content_text(&message["content"]),
-                    status: if message["isError"].as_bool() == Some(true) {
-                        ToolStatus::Failed
-                    } else {
-                        ToolStatus::Succeeded
-                    },
-                },
+                content,
             }];
         }
         let key = message_key(message);
@@ -172,6 +214,7 @@ impl Omp {
                 content: ItemContent::Text {
                     text: content.into(),
                     thinking: false,
+                    phase: Phase::Final,
                 },
             }];
         }
@@ -187,6 +230,7 @@ impl Omp {
                         ItemContent::Text {
                             text: text(block, "text").into(),
                             thinking: false,
+                            phase: phase(block),
                         },
                     ),
                     "thinking" => (
@@ -194,17 +238,19 @@ impl Omp {
                         ItemContent::Text {
                             text: text(block, "thinking").into(),
                             thinking: true,
+                            phase: Phase::Final,
                         },
                     ),
-                    "toolCall" => (
-                        format!("tool:{}", text(block, "id")),
-                        ItemContent::Tool {
-                            name: text(block, "name").into(),
-                            input: block["arguments"].to_string(),
-                            output: String::new(),
-                            status: ToolStatus::Running,
-                        },
-                    ),
+                    "toolCall" => {
+                        let id = text(block, "id");
+                        let content = self.running(
+                            id,
+                            text(block, "name"),
+                            &block["arguments"],
+                            String::new(),
+                        );
+                        (format!("tool:{id}"), content)
+                    }
                     "image" => (
                         format!("{key}:{index}"),
                         ItemContent::Image {
@@ -221,6 +267,49 @@ impl Omp {
                 Some(Item { id, role, content })
             })
             .collect()
+    }
+    /// The item a tool call produces while it is still running.
+    fn running(&mut self, id: &str, name: &str, args: &Value, output: String) -> ItemContent {
+        match call(name, args) {
+            Some(call) => {
+                // A running command has neither an exit status nor a duration.
+                let content = call.item(ToolStatus::Running, output, &Value::Null);
+                self.calls.insert(id.to_owned(), call);
+                content
+            }
+            None => ItemContent::Tool {
+                name: name.into(),
+                input: arguments(args),
+                output,
+                status: ToolStatus::Running,
+            },
+        }
+    }
+    /// The item a finished tool call produces.
+    ///
+    /// The arguments a command needs come from the call this adapter recorded
+    /// when the tool started, because a result frame carries only the result.
+    fn result(
+        &self,
+        id: &str,
+        name: &str,
+        output: String,
+        details: &Value,
+        status: ToolStatus,
+    ) -> ItemContent {
+        if let Some(call) = self.calls.get(id) {
+            return call.item(status, output, details);
+        }
+        let changes = changes(details);
+        if changes.is_empty() {
+            return ItemContent::Tool {
+                name: name.into(),
+                input: String::new(),
+                output,
+                status,
+            };
+        }
+        ItemContent::Changes { changes, status }
     }
     fn extension(&mut self, frame: &Value) -> Result<Step, String> {
         let id = text(frame, "id").to_owned();
@@ -299,6 +388,7 @@ impl Omp {
                     content: ItemContent::Text {
                         text: text(frame, "message").into(),
                         thinking: false,
+                        phase: Phase::Final,
                     },
                 }));
             }
@@ -320,6 +410,7 @@ impl Omp {
                             .collect::<Vec<_>>()
                             .join("\n"),
                         thinking: false,
+                        phase: Phase::Final,
                     },
                 }));
             }
@@ -492,6 +583,7 @@ impl Adapter for Omp {
                             self.ready = false;
                             self.history_request = None;
                             self.requests.clear();
+                            self.calls.clear();
                             self.usage = chat::Usage::default();
                             step.events.push(Event::Reset {
                                 reason: "OMP changed the current conversation.".into(),
@@ -622,27 +714,33 @@ impl Adapter for Omp {
                 }
             }
             "tool_execution_start" | "tool_execution_update" | "tool_execution_end" => {
-                let kind = text(&frame, "type");
-                let output = if kind == "tool_execution_end" {
-                    content_text(&frame["result"]["content"])
+                let id = text(&frame, "toolCallId").to_owned();
+                let name = text(&frame, "toolName");
+                let content = if text(&frame, "type") == "tool_execution_end" {
+                    let status = if frame["isError"].as_bool() == Some(true) {
+                        ToolStatus::Failed
+                    } else {
+                        ToolStatus::Succeeded
+                    };
+                    self.result(
+                        &id,
+                        name,
+                        content_text(&frame["result"]["content"]),
+                        &frame["result"]["details"],
+                        status,
+                    )
                 } else {
-                    content_text(&frame["partialResult"]["content"])
+                    self.running(
+                        &id,
+                        name,
+                        &frame["args"],
+                        content_text(&frame["partialResult"]["content"]),
+                    )
                 };
                 step.events.push(Event::Item(Item {
-                    id: format!("tool:{}", text(&frame, "toolCallId")),
+                    id: format!("tool:{id}"),
                     role: Role::Assistant,
-                    content: ItemContent::Tool {
-                        name: text(&frame, "toolName").into(),
-                        input: frame.get("args").map(Value::to_string).unwrap_or_default(),
-                        output,
-                        status: if kind != "tool_execution_end" {
-                            ToolStatus::Running
-                        } else if frame["isError"].as_bool() == Some(true) {
-                            ToolStatus::Failed
-                        } else {
-                            ToolStatus::Succeeded
-                        },
-                    },
+                    content,
                 }));
             }
             "command_output" => {
@@ -653,6 +751,7 @@ impl Adapter for Omp {
                     content: ItemContent::Text {
                         text: text(&frame, "text").into(),
                         thinking: false,
+                        phase: Phase::Final,
                     },
                 }));
             }
@@ -747,6 +846,97 @@ fn content_text(value: &Value) -> String {
         .filter_map(|block| block["text"].as_str())
         .collect::<Vec<_>>()
         .join("\n")
+}
+/// What OMP says a tool call was for.
+///
+/// A tool's registered name is the provider's own classification, so `bash` is
+/// a shell command and `read` is a file read without anything here having to
+/// interpret arguments. A name outside this set is left to the `Tool` fallback
+/// rather than guessed at.
+fn call(name: &str, args: &Value) -> Option<Call> {
+    let target = |key: &str, action: CommandAction| Call {
+        command: text(args, key).into(),
+        working_directory: String::new(),
+        action,
+    };
+    match name {
+        "bash" => Some(Call {
+            command: text(args, "command").into(),
+            working_directory: text(args, "cwd").into(),
+            action: CommandAction::Run,
+        }),
+        "read" => Some(target("path", CommandAction::Read)),
+        "grep" | "search" => Some(target("pattern", CommandAction::Search)),
+        "glob" | "find" => Some(target("path", CommandAction::List)),
+        _ => None,
+    }
+}
+/// A tool call's arguments as the `Tool` fallback shows them.
+fn arguments(args: &Value) -> String {
+    if args.is_null() {
+        String::new()
+    } else {
+        args.to_string()
+    }
+}
+/// The files an edit reports changing, one entry per path.
+///
+/// OMP's edit tool returns the unified diff it applied, split per path when it
+/// touched several, which is what lets the view render the change itself rather
+/// than a sentence about it. A result carrying no diff is not an edit and stays
+/// with the `Tool` fallback.
+fn changes(details: &Value) -> Vec<FileChange> {
+    match details["perFileResults"].as_array() {
+        Some(results) => results.iter().filter_map(change).collect(),
+        None => change(details).into_iter().collect(),
+    }
+}
+fn change(result: &Value) -> Option<FileChange> {
+    if result["isError"].as_bool() == Some(true) {
+        return None;
+    }
+    let diff = result["diff"].as_str().filter(|diff| !diff.is_empty())?;
+    let path = result["path"].as_str().filter(|path| !path.is_empty())?;
+    Some(FileChange {
+        path: path.into(),
+        // A moved file reports the path it moved to, so the path it came from is
+        // the one the result keeps aside.
+        kind: match (result["sourcePath"].as_str(), text(result, "op")) {
+            (Some(from), _) => ChangeKind::Renamed { from: from.into() },
+            (None, "create") => ChangeKind::Added,
+            (None, "delete") => ChangeKind::Deleted,
+            (None, _) => ChangeKind::Updated,
+        },
+        diff: diff.into(),
+    })
+}
+/// OMP times a command against a monotonic clock, so its wall time arrives as a
+/// fractional count of milliseconds.
+fn duration(details: &Value) -> Option<u64> {
+    details["wallTimeMs"]
+        .as_f64()
+        .filter(|millis| millis.is_finite() && *millis >= 0.0)
+        .map(|millis| millis.round() as u64)
+}
+/// The phase OMP recorded for a block of assistant text.
+///
+/// A text block carries the provider item it came from in `textSignature`, and
+/// for the models that separate a turn's narration from its answer that
+/// signature is a versioned JSON object holding the provider's own phase.
+/// Models that sign text with an opaque blob, and models that do not sign text
+/// at all, say nothing about the phase, and an unstated phase is the answer.
+fn phase(block: &Value) -> Phase {
+    let signature = text(block, "textSignature");
+    if !signature.starts_with('{') {
+        return Phase::Final;
+    }
+    let Ok(signature) = serde_json::from_str::<Value>(signature) else {
+        return Phase::Final;
+    };
+    if signature["v"].as_u64() != Some(1) || text(&signature, "phase") != "commentary" {
+        return Phase::Final;
+    }
+    Phase::Commentary
 }
 fn commands(value: &Value) -> Vec<chat::SlashCommand> {
     value["commands"]
@@ -997,5 +1187,51 @@ mod tests {
         assert!(
             matches!(&failure.events[0],Event::Error {message,fatal:false} if message=="Extension failed")
         );
+    }
+
+    #[test]
+    fn a_shell_tool_keeps_the_command_it_ran_once_only_its_result_is_left() {
+        let mut adapter = Omp::default();
+        let started = adapter.receive(json!({"type":"tool_execution_start","toolCallId":"call","toolName":"bash","args":{"command":"cargo check","cwd":"/repo"},"intent":"Checking the crate"})).unwrap();
+        assert!(matches!(&started.events[0],
+            Event::Item(Item { content: ItemContent::Command { command, working_directory, action: CommandAction::Run, status: ToolStatus::Running, output, .. }, .. })
+            if command == "cargo check" && working_directory == "/repo" && output.is_empty()));
+        let finished = adapter.receive(json!({"type":"tool_execution_end","toolCallId":"call","toolName":"bash","isError":true,"result":{"content":[{"type":"text","text":"error[E0425]"}],"details":{"exitCode":101,"wallTimeMs":1520.5}}})).unwrap();
+        let Event::Item(item) = &finished.events[0] else {
+            panic!("item")
+        };
+        assert_eq!(item.id, "tool:call");
+        assert!(matches!(&item.content,
+            ItemContent::Command { label, command, working_directory, action: CommandAction::Run, status: ToolStatus::Failed, exit_code: Some(101), duration_ms: Some(1521), output }
+            if label.is_empty() && command == "cargo check" && working_directory == "/repo" && output == "error[E0425]"));
+        // The same completion arrives again as the tool-result message, which
+        // must not degrade the step it already produced.
+        let repeated = adapter.receive(json!({"type":"message_end","message":{"role":"toolResult","toolCallId":"call","toolName":"bash","content":[{"type":"text","text":"error[E0425]"}],"isError":true,"details":{"exitCode":101,"wallTimeMs":1520.5}}})).unwrap();
+        assert!(matches!(&repeated.events[0],
+            Event::Item(Item { content: ItemContent::Command { command, .. }, .. }) if command == "cargo check"));
+    }
+
+    #[test]
+    fn a_moved_file_reports_the_path_it_came_from_rather_than_an_edit() {
+        let adapter = Omp::default();
+        let content = adapter.result(
+            "call",
+            "edit",
+            "Renamed src/old.rs".into(),
+            &json!({"path":"src/new.rs","sourcePath":"src/old.rs","op":"update","diff":"@@ -1 +1 @@\n-old\n+new"}),
+            ToolStatus::Succeeded,
+        );
+        let ItemContent::Changes { changes, .. } = content else {
+            panic!("changes")
+        };
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0].path, "src/new.rs");
+        assert_eq!(
+            changes[0].kind,
+            ChangeKind::Renamed {
+                from: "src/old.rs".into()
+            }
+        );
+        assert_eq!(changes[0].diff, "@@ -1 +1 @@\n-old\n+new");
     }
 }
