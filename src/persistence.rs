@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, BTreeSet, HashMap},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     fs::{File, OpenOptions},
     io,
     os::unix::fs::OpenOptionsExt,
@@ -134,6 +134,18 @@ pub struct CardSummary {
     pub kind: PersistedCardKind,
 }
 
+/// A restored workspace together with the cards that could not be restored
+/// into it.
+///
+/// The warnings exist so a failed card is a reportable event rather than a
+/// silent deletion: the shell shows them, and the writer lane keeps running.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RestoredWorkspace {
+    pub state: WorkspaceState,
+    /// One human-readable line per card that was left out, newest problem last.
+    pub warnings: Vec<String>,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct WorkspaceManifest {
     pub id: WorkspaceId,
@@ -240,6 +252,9 @@ struct StoreInner {
 /// one mutex, so callers cannot accidentally create a second writer lane.
 pub struct StateStore {
     inner: Mutex<StoreInner>,
+    /// Retained so the store can size its own WAL sidecar without asking a
+    /// caller for the path it was opened with.
+    path: PathBuf,
     boot_id: BootId,
     recovery: RecoveryReport,
 }
@@ -329,6 +344,7 @@ impl StateStore {
                 connection,
                 closed: false,
             }),
+            path: path.to_path_buf(),
             boot_id,
             recovery,
         })
@@ -675,6 +691,37 @@ impl StateStore {
         id: WorkspaceId,
         proof: Option<&HostSessionProof>,
     ) -> Result<Option<WorkspaceState>> {
+        Ok(self
+            .load_workspace_restored(id, proof)?
+            .map(|restored| restored.state))
+    }
+
+    /// Loads a workspace, tolerating individual cards that cannot be restored.
+    ///
+    /// Card decoding is fallible *per card*. One unreadable card — a terminal
+    /// whose recipe row is gone, a payload written by a newer build, a browser
+    /// history that no longer validates — used to abort the entire restore,
+    /// which the shell then presents as an empty workspace with no projects and
+    /// no worktrees, on every launch, with the cause never logged anywhere.
+    /// Everything that decodes is now restored and every card that did not is
+    /// reported in [`RestoredWorkspace::warnings`] for the shell to surface.
+    ///
+    /// A corrupt *manifest* is deliberately still all-or-nothing. That is a
+    /// different class of failure: without a trustworthy manifest there is no
+    /// card list, ordering, focus, or thread layout to restore cards *into*, so
+    /// a partial result could not be distinguished from the user's real
+    /// workspace and the next save would commit it over the intact rows.
+    ///
+    /// A card left out here is absent from the next snapshot, so the save path
+    /// tombstones it — the row and its payload stay, marked closed. That is
+    /// why the failure is *reported* rather than swallowed: the user has to
+    /// learn a card was lost, at the moment it happens, instead of finding it
+    /// closed later with no explanation.
+    pub fn load_workspace_restored(
+        &self,
+        id: WorkspaceId,
+        proof: Option<&HostSessionProof>,
+    ) -> Result<Option<RestoredWorkspace>> {
         let mut inner = self.lock_inner()?;
         ensure_open(&inner)?;
         let transaction = inner.connection.transaction()?;
@@ -683,19 +730,36 @@ impl StateStore {
         };
 
         let mut cards = Vec::with_capacity(manifest.cards.len());
+        let mut warnings = Vec::new();
         for summary in &manifest.cards {
-            let card = load_card_connection(&transaction, summary.id, &self.boot_id, proof)?
-                .ok_or_else(|| {
-                    StoreError::InvalidState(format!(
-                        "workspace {} references missing card {}",
-                        id, summary.id
-                    ))
-                })?;
-            cards.push(card);
+            match load_card_connection(&transaction, summary.id, &self.boot_id, proof) {
+                Ok(Some(card)) => cards.push(card),
+                Ok(None) => {
+                    tracing::error!(
+                        workspace = %id,
+                        card = %summary.id,
+                        "workspace manifest references a card row that no longer exists"
+                    );
+                    warnings.push(format!(
+                        "{} ({}): the card record is missing from the database",
+                        summary.title, summary.id
+                    ));
+                }
+                Err(error) => {
+                    tracing::error!(
+                        workspace = %id,
+                        card = %summary.id,
+                        kind = summary.kind.as_str(),
+                        %error,
+                        "card could not be restored and was left out of the workspace"
+                    );
+                    warnings.push(format!("{} ({}): {error}", summary.title, summary.id));
+                }
+            }
         }
         transaction.commit()?;
 
-        Ok(Some(WorkspaceState {
+        let mut state = WorkspaceState {
             schema_version: manifest.schema_version,
             id: manifest.id,
             generation: manifest.generation,
@@ -707,7 +771,11 @@ impl StateStore {
             project_order: manifest.project_order,
             threads: manifest.threads,
             active_thread: manifest.active_thread,
-        }))
+        };
+        if !warnings.is_empty() {
+            retarget_dropped_cards(&mut state);
+        }
+        Ok(Some(RestoredWorkspace { state, warnings }))
     }
 
     pub fn save_transcript_metadata(
@@ -973,12 +1041,360 @@ impl StateStore {
             &now_unix_ms().to_string(),
         )?;
         transaction.commit()?;
+        // Fold the WAL back into the database and reset it to zero length.
+        // Without this the sidecar keeps its high-water mark forever — a 400 KB
+        // database was shipping a 4 MB WAL — and a checkpoint failure is not
+        // worth failing a clean shutdown over, so it only warns.
+        checkpoint_wal(&inner.connection);
         inner.closed = true;
         Ok(())
     }
 
+    /// Truncates the WAL once it has grown past
+    /// [`WAL_CHECKPOINT_THRESHOLD_BYTES`], so a session that runs for days does
+    /// not keep a multi-megabyte sidecar around between shutdowns.
+    ///
+    /// Returns whether a checkpoint was attempted. Sizing the sidecar with one
+    /// `stat` keeps the common case free: the writer lane calls this after a
+    /// flush, and a checkpoint is real work that acquires the write lock.
+    pub fn checkpoint_wal_if_large(&self) -> Result<bool> {
+        let wal = sqlite_sidecar_path(&self.path, "-wal");
+        let oversized = std::fs::symlink_metadata(&wal)
+            .map(|metadata| metadata.is_file() && metadata.len() >= WAL_CHECKPOINT_THRESHOLD_BYTES)
+            .unwrap_or(false);
+        if !oversized {
+            return Ok(false);
+        }
+        let inner = self.lock_inner()?;
+        ensure_open(&inner)?;
+        checkpoint_wal(&inner.connection);
+        Ok(true)
+    }
+
+    /// Reclaims terminal transcript files the store can no longer account for.
+    ///
+    /// Transcripts are write-only diagnostics living beside the database, and
+    /// nothing ever deleted them: a transcript whose terminal is gone stayed on
+    /// disk forever, and a file written before the per-transcript cap existed
+    /// was never reclaimed either. Measured on a normal installation this had
+    /// reached 1.7 GB.
+    ///
+    /// The policy, in order:
+    /// 1. a transcript whose terminal id is in neither `terminal_recipes` nor
+    ///    `transcript_metadata` is orphaned and removed;
+    /// 2. a transcript larger than [`TranscriptRetention::max_file_bytes`] is
+    ///    removed — the writer refuses to append to an over-cap file, so its
+    ///    bytes are dead weight;
+    /// 3. if the survivors still exceed
+    ///    [`TranscriptRetention::max_total_bytes`], the oldest go until they
+    ///    fit.
+    ///
+    /// Nothing outside `directory` can be touched: entries come from one
+    /// `read_dir` of it, each candidate is a single path component joined onto
+    /// it, and a symlink — for the directory itself or for any entry — is
+    /// refused rather than followed. Files that are not `<terminal-id>.log` are
+    /// left alone; this directory is not assumed to be exclusively ours.
+    ///
+    /// `also_live` names terminal ids owned by databases other than this one.
+    /// Every window has its own database but they all share one transcript
+    /// directory, so an id this store does not know is not necessarily
+    /// orphaned; see [`read_live_terminal_ids`] and
+    /// [`TranscriptRetention::remove_orphans`].
+    pub fn prune_transcripts(
+        &self,
+        directory: &Path,
+        also_live: HashSet<String>,
+        retention: TranscriptRetention,
+    ) -> Result<TranscriptPruneReport> {
+        let mut live = also_live;
+        live.extend(self.live_terminal_ids()?);
+        prune_transcript_directory(directory, &live, retention)
+    }
+
+    /// Every terminal id storage still knows about, from both tables that can
+    /// name one: a recipe row can outlive its transcript metadata and vice
+    /// versa, and either is reason enough to keep the file.
+    pub fn live_terminal_ids(&self) -> Result<HashSet<String>> {
+        let inner = self.lock_inner()?;
+        ensure_open(&inner)?;
+        let mut live = HashSet::new();
+        collect_live_terminal_ids(&inner.connection, &mut live)?;
+        Ok(live)
+    }
+
     fn lock_inner(&self) -> Result<MutexGuard<'_, StoreInner>> {
         self.inner.lock().map_err(|_| StoreError::MutexPoisoned)
+    }
+}
+
+impl Drop for StateStore {
+    fn drop(&mut self) {
+        // A store that was never cleanly shut down — a discarded window, a
+        // failed startup, a test fixture — still leaves its WAL behind, so the
+        // truncating checkpoint happens here too. `shutdown` already did it and
+        // marked the store closed, which is what keeps this from repeating it.
+        let Ok(inner) = self.inner.lock() else {
+            return;
+        };
+        if !inner.closed {
+            checkpoint_wal(&inner.connection);
+        }
+    }
+}
+
+/// How much WAL the writer lane tolerates before folding it back into the
+/// database.
+///
+/// SQLite's own auto-checkpoint keeps the WAL near 1000 pages but never shrinks
+/// the file, so the sidecar sits at its high-water mark for the life of the
+/// process. Truncating above 8 MiB bounds that without making the write lock
+/// contended: a quiet session never reaches it, and a busy one pays one
+/// checkpoint per 8 MiB of committed frames.
+const WAL_CHECKPOINT_THRESHOLD_BYTES: u64 = 8 * 1024 * 1024;
+
+/// Folds the WAL back into the database and resets it to zero length,
+/// reporting rather than propagating failure.
+///
+/// Checkpointing is pure housekeeping: every commit is already durable in the
+/// WAL, so a checkpoint that loses a race with another connection's reader must
+/// not turn into a save or shutdown error. `PRAGMA wal_checkpoint` reports that
+/// race in its `busy` column instead of failing, which is why the row is read.
+fn checkpoint_wal(connection: &Connection) {
+    let outcome = connection.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
+        Ok((
+            row.get::<_, i64>(0)?,
+            row.get::<_, i64>(1)?,
+            row.get::<_, i64>(2)?,
+        ))
+    });
+    match outcome {
+        Ok((busy, frames, checkpointed)) if busy == 0 => {
+            tracing::debug!(frames, checkpointed, "checkpointed the session WAL");
+        }
+        Ok((_, frames, checkpointed)) => {
+            tracing::warn!(
+                frames,
+                checkpointed,
+                "session WAL checkpoint was blocked by another reader; the WAL was left in place"
+            );
+        }
+        Err(error) => {
+            tracing::warn!(%error, "session WAL checkpoint failed");
+        }
+    }
+}
+
+/// Suffix of a terminal transcript file, as written by the terminal host.
+const TRANSCRIPT_SUFFIX: &str = ".log";
+
+/// Terminal ids a window database still knows about, read without opening a
+/// second writable store.
+///
+/// Every window has its own database and they all share one transcript
+/// directory, so pruning has to ask every database before it can call a
+/// transcript orphaned. The connection is read-only and `NOFOLLOW`, exactly
+/// like [`StateStore::copy_snapshot`]: it never migrates, reconciles, or
+/// writes to a database another window owns.
+pub fn read_live_terminal_ids(path: &Path) -> Result<HashSet<String>> {
+    let connection = Connection::open_with_flags(
+        path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NOFOLLOW,
+    )?;
+    connection.busy_timeout(DEFAULT_BUSY_TIMEOUT)?;
+    let mut live = HashSet::new();
+    collect_live_terminal_ids(&connection, &mut live)?;
+    Ok(live)
+}
+
+fn collect_live_terminal_ids(connection: &Connection, live: &mut HashSet<String>) -> Result<()> {
+    for sql in [
+        "SELECT terminal_id FROM terminal_recipes",
+        "SELECT terminal_id FROM transcript_metadata",
+    ] {
+        let mut statement = connection.prepare(sql)?;
+        let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
+        for row in rows {
+            live.insert(row?);
+        }
+    }
+    Ok(())
+}
+
+/// What pruning may keep on disk.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TranscriptRetention {
+    /// Largest single transcript kept, matching the 1 MiB cap the terminal
+    /// transcript writer enforces. A larger file was produced by a build that
+    /// predates the cap; the writer will never append to it again, so keeping
+    /// it only costs disk.
+    pub max_file_bytes: u64,
+    /// Ceiling on the whole transcript directory. Transcripts are diagnostics
+    /// for terminals the user still has open, so the budget is generous enough
+    /// to hold a hundred capped transcripts and no more.
+    pub max_total_bytes: u64,
+    /// Whether an id nobody claims may be deleted.
+    ///
+    /// Set this only when the live id set is known to be complete. Every
+    /// window keeps its own database but they all write into one transcript
+    /// directory, so if one window's database could not be read, an unclaimed
+    /// transcript may still belong to a terminal that window owns.
+    pub remove_orphans: bool,
+}
+
+impl Default for TranscriptRetention {
+    fn default() -> Self {
+        Self {
+            max_file_bytes: 1 << 20,
+            max_total_bytes: 128 << 20,
+            remove_orphans: true,
+        }
+    }
+}
+
+/// What one pruning pass did.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TranscriptPruneReport {
+    pub removed_orphaned: usize,
+    pub removed_oversized: usize,
+    pub removed_for_budget: usize,
+    pub retained: usize,
+    pub retained_bytes: u64,
+    /// Entries refused for being symlinks or otherwise not plain files. They
+    /// are never removed and never followed.
+    pub refused: usize,
+}
+
+impl TranscriptPruneReport {
+    pub fn removed(&self) -> usize {
+        self.removed_orphaned + self.removed_oversized + self.removed_for_budget
+    }
+}
+
+/// A transcript that survived the per-file rules, and what the total budget
+/// needs to know about it.
+struct RetainedTranscript {
+    path: PathBuf,
+    bytes: u64,
+    modified: SystemTime,
+}
+
+fn prune_transcript_directory(
+    directory: &Path,
+    live: &HashSet<String>,
+    retention: TranscriptRetention,
+) -> Result<TranscriptPruneReport> {
+    let mut report = TranscriptPruneReport::default();
+    match std::fs::symlink_metadata(directory) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            return Err(StoreError::InvalidState(format!(
+                "transcript directory {} is a symbolic link",
+                directory.display()
+            )));
+        }
+        Ok(metadata) if !metadata.is_dir() => {
+            return Err(StoreError::InvalidState(format!(
+                "transcript path {} is not a directory",
+                directory.display()
+            )));
+        }
+        Ok(_) => {}
+        // Nothing has ever written a transcript here. Not an error.
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(report),
+        Err(error) => return Err(error.into()),
+    }
+
+    let mut retained: Vec<RetainedTranscript> = Vec::new();
+    for entry in std::fs::read_dir(directory)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let Some(id) = name
+            .to_str()
+            .and_then(|name| name.strip_suffix(TRANSCRIPT_SUFFIX))
+            .filter(|id| !id.is_empty())
+        else {
+            continue;
+        };
+        // `name` is a single component from this directory's own listing, so
+        // joining it cannot escape the directory.
+        let path = directory.join(&name);
+        let metadata = match std::fs::symlink_metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                tracing::warn!(path = %path.display(), %error, "could not inspect transcript");
+                report.refused += 1;
+                continue;
+            }
+        };
+        if metadata.file_type().is_symlink() || !metadata.is_file() {
+            tracing::warn!(
+                path = %path.display(),
+                "refusing to prune a transcript entry that is not a plain file"
+            );
+            report.refused += 1;
+            continue;
+        }
+
+        if retention.remove_orphans && !live.contains(id) {
+            if remove_transcript(&path, "its terminal no longer exists") {
+                report.removed_orphaned += 1;
+            } else {
+                report.refused += 1;
+            }
+            continue;
+        }
+        if metadata.len() > retention.max_file_bytes {
+            if remove_transcript(&path, "it exceeds the per-transcript cap") {
+                report.removed_oversized += 1;
+            } else {
+                report.refused += 1;
+            }
+            continue;
+        }
+        retained.push(RetainedTranscript {
+            path,
+            bytes: metadata.len(),
+            modified: metadata.modified().unwrap_or(UNIX_EPOCH),
+        });
+    }
+
+    let mut total: u64 = retained.iter().map(|entry| entry.bytes).sum();
+    if total > retention.max_total_bytes {
+        retained.sort_by_key(|entry| entry.modified);
+        let mut index = 0;
+        while total > retention.max_total_bytes && index < retained.len() {
+            let entry = &retained[index];
+            if remove_transcript(&entry.path, "the transcript directory is over budget") {
+                total -= entry.bytes;
+                report.removed_for_budget += 1;
+            } else {
+                report.refused += 1;
+            }
+            index += 1;
+        }
+        retained.drain(..index);
+    }
+    report.retained = retained.len();
+    report.retained_bytes = total;
+    Ok(report)
+}
+
+/// Unlinks one transcript, reporting whether it is gone.
+///
+/// A failure here is not fatal: the file simply stays, and the next pass tries
+/// again. `remove_file` never follows a final symlink, and the caller has
+/// already refused those anyway.
+fn remove_transcript(path: &Path, reason: &str) -> bool {
+    match std::fs::remove_file(path) {
+        Ok(()) => {
+            tracing::info!(path = %path.display(), reason, "pruned terminal transcript");
+            true
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => true,
+        Err(error) => {
+            tracing::warn!(path = %path.display(), %error, "could not prune terminal transcript");
+            false
+        }
     }
 }
 
@@ -2290,6 +2706,33 @@ fn validate_workspace(state: &WorkspaceState) -> Result<()> {
     Ok(())
 }
 
+/// Repairs the navigation references a dropped card leaves dangling.
+///
+/// Restoring a workspace without one of its cards is only useful if the result
+/// is still *savable*: [`validate_workspace`] rejects a focus or a thread
+/// membership that names a card the workspace does not contain, so leaving
+/// them behind would trade one lost card for a workspace that can never be
+/// written again.
+fn retarget_dropped_cards(state: &mut WorkspaceState) {
+    let open: HashSet<CardId> = state
+        .cards
+        .iter()
+        .filter(|card| card.existence.is_open())
+        .map(|card| card.id)
+        .collect();
+    if state
+        .focused
+        .is_some_and(|focused| !open.contains(&focused))
+    {
+        state.focused = state
+            .cards
+            .iter()
+            .find(|card| card.existence.is_open())
+            .map(|card| card.id);
+    }
+    normalize_project_threads(&mut state.threads, &mut state.active_thread, &open);
+}
+
 /// The stored shape of a card, as far as the save path needs to know it.
 struct ExistingCard {
     kind: PersistedCardKind,
@@ -2548,19 +2991,29 @@ fn load_terminal(
     current_boot: &BootId,
     proof: Option<&HostSessionProof>,
 ) -> Result<TerminalSession> {
-    let (terminal_id, recipe_json, continuity_json, resume_hint) = connection.query_row(
-        "SELECT terminal_id, recipe_json, continuity_json, resume_hint
-         FROM terminal_recipes WHERE card_id = ?1",
-        [card_id.to_string()],
-        |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, String>(2)?,
-                row.get::<_, Option<String>>(3)?,
-            ))
-        },
-    )?;
+    // `.optional()` rather than `?`: a terminal card whose recipe row is gone
+    // is a per-card restore failure the caller can report, not a raw
+    // `QueryReturnedNoRows` that used to abort the whole workspace restore.
+    let recipe = connection
+        .query_row(
+            "SELECT terminal_id, recipe_json, continuity_json, resume_hint
+             FROM terminal_recipes WHERE card_id = ?1",
+            [card_id.to_string()],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some((terminal_id, recipe_json, continuity_json, resume_hint)) = recipe else {
+        return Err(StoreError::InvalidState(format!(
+            "terminal card {card_id} has no stored launch recipe"
+        )));
+    };
     let terminal_id: TerminalId = parse_id("terminal", &terminal_id)?;
     let launch = from_json("terminal recipe", &recipe_json)?;
     let stored = from_json("terminal continuity", &continuity_json)?;
@@ -2638,8 +3091,10 @@ fn continuity_for_restore(
 }
 
 fn load_browser(connection: &Connection, card_id: CardId) -> Result<BrowserSession> {
-    let (browser_id, current_url, history_json, history_index, scroll_x, scroll_y, fidelity) =
-        connection.query_row(
+    // Optional for the same reason as the terminal recipe: a missing payload
+    // row is a diagnosable per-card failure, not a bare `QueryReturnedNoRows`.
+    let row = connection
+        .query_row(
             "SELECT browser_id, current_url, history_json, history_index, scroll_x, scroll_y,
                     fidelity
              FROM browser_restore WHERE card_id = ?1",
@@ -2655,7 +3110,15 @@ fn load_browser(connection: &Connection, card_id: CardId) -> Result<BrowserSessi
                     row.get::<_, String>(6)?,
                 ))
             },
-        )?;
+        )
+        .optional()?;
+    let Some((browser_id, current_url, history_json, history_index, scroll_x, scroll_y, fidelity)) =
+        row
+    else {
+        return Err(StoreError::InvalidState(format!(
+            "browser card {card_id} has no stored restore state"
+        )));
+    };
     let fidelity = match fidelity.as_str() {
         "history_and_scroll" => BrowserRestoreFidelity::HistoryAndScroll,
         "url_only" => BrowserRestoreFidelity::UrlOnly,
@@ -2665,8 +3128,11 @@ fn load_browser(connection: &Connection, card_id: CardId) -> Result<BrowserSessi
             )));
         }
     };
-    let history = from_json("browser history", &history_json)?;
-    let history_index = i64_to_usize(history_index, "browser history index")?;
+    let mut history: Vec<url::Url> = from_json("browser history", &history_json)?;
+    let mut history_index = i64_to_usize(history_index, "browser history index")?;
+    // A vector written by a build that predates the cap is trimmed on the way
+    // in, so an oversized history is reclaimed instead of carried forever.
+    crate::model::trim_browser_history(&mut history, &mut history_index);
     let browser = BrowserSession {
         id: parse_id("browser", &browser_id)?,
         current_url: url::Url::parse(&current_url).map_err(|error| {
@@ -3980,5 +4446,244 @@ mod tests {
         let restored = store.load_workspace(workspace.id, None).unwrap().unwrap();
         assert_eq!(restored.cards.len(), 2);
         assert_eq!(restored.cards[1].id, latecomer_id);
+    }
+
+    #[test]
+    fn an_undecodable_card_costs_only_that_card() {
+        let directory = tempdir().unwrap();
+        let boot_id = boot("boot-a");
+        let store = StateStore::open(directory.path().join("state.sqlite3"), boot_id.clone())
+            .expect("store must open");
+        let mut workspace = workspace_with_terminal(&boot_id);
+        let survivor = workspace.cards[0].id;
+        let mut broken = workspace.cards[0].clone();
+        broken.id = CardId::new();
+        broken.title = "broken".into();
+        let broken_terminal = TerminalId::new();
+        let CardKind::Terminal(session) = &mut broken.kind else {
+            unreachable!("the fixture card is a terminal")
+        };
+        session.id = broken_terminal;
+        session.transcript_path = None;
+        let broken_card = broken.id;
+        workspace.cards.push(broken);
+        workspace.focused = Some(broken_card);
+        let mut lane = SaveLane::default();
+        lane.save(&store, &workspace).unwrap();
+
+        // Exactly the corruption that used to discard the whole session: the
+        // card row survives, its launch recipe does not.
+        {
+            let mut inner = store.lock_inner().unwrap();
+            let transaction = inner.connection.transaction().unwrap();
+            transaction
+                .execute(
+                    "DELETE FROM terminal_recipes WHERE terminal_id = ?1",
+                    [broken_terminal.to_string()],
+                )
+                .unwrap();
+            transaction.commit().unwrap();
+        }
+
+        let restored = store
+            .load_workspace_restored(workspace.id, None)
+            .expect("a single bad card must not fail the restore")
+            .expect("the workspace still exists");
+        assert_eq!(restored.state.cards.len(), 1);
+        assert_eq!(restored.state.cards[0].id, survivor);
+        assert_eq!(restored.warnings.len(), 1);
+        assert!(
+            restored.warnings[0].contains("launch recipe")
+                && restored.warnings[0].contains(&broken_card.to_string()),
+            "the warning must name the card and the reason: {:?}",
+            restored.warnings
+        );
+        assert_eq!(
+            restored.state.focused,
+            Some(survivor),
+            "focus must move off the card that could not be restored"
+        );
+
+        // And the session must still be savable afterwards; a lost card that
+        // also disabled saving is the failure this replaced.
+        let mut recovered = SaveLane {
+            workspace: restored.state.generation,
+            cards: restored
+                .state
+                .cards
+                .iter()
+                .map(|card| (card.id, card.generation))
+                .collect(),
+        };
+        recovered
+            .save(&store, &restored.state)
+            .expect("a partially restored workspace must still save");
+    }
+
+    #[test]
+    fn a_clean_shutdown_leaves_no_write_ahead_log() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("state.sqlite3");
+        let boot_id = boot("boot-a");
+        let store = StateStore::open(&path, boot_id.clone()).unwrap();
+        SaveLane::default()
+            .save(&store, &workspace_with_terminal(&boot_id))
+            .unwrap();
+        let wal = sqlite_sidecar_path(&path, "-wal");
+        assert!(
+            fs::metadata(&wal).unwrap().len() > 0,
+            "the commit must be in the WAL before it is checkpointed"
+        );
+
+        store.shutdown().unwrap();
+
+        assert_eq!(
+            fs::metadata(&wal)
+                .map(|metadata| metadata.len())
+                .unwrap_or(0),
+            0,
+            "a clean shutdown must fold the WAL back into the database"
+        );
+    }
+
+    fn transcript_directory() -> (tempfile::TempDir, PathBuf) {
+        let root = tempdir().unwrap();
+        let directory = root.path().join("transcripts");
+        fs::create_dir(&directory).unwrap();
+        (root, directory)
+    }
+
+    #[test]
+    fn pruning_reclaims_orphans_and_oversized_files_and_never_follows_a_symlink() {
+        let (root, directory) = transcript_directory();
+        let live = TerminalId::new().to_string();
+        let oversized = TerminalId::new().to_string();
+        let orphan = TerminalId::new().to_string();
+        let disguised = TerminalId::new().to_string();
+        fs::write(directory.join(format!("{live}.log")), b"kept").unwrap();
+        fs::write(directory.join(format!("{oversized}.log")), vec![b'x'; 4096]).unwrap();
+        fs::write(directory.join(format!("{orphan}.log")), b"gone").unwrap();
+        let victim = root.path().join("victim");
+        fs::write(&victim, b"unchanged").unwrap();
+        symlink(&victim, directory.join(format!("{disguised}.log"))).unwrap();
+
+        let claimed = HashSet::from([live.clone(), oversized.clone()]);
+        let report = prune_transcript_directory(
+            &directory,
+            &claimed,
+            TranscriptRetention {
+                max_file_bytes: 1024,
+                max_total_bytes: 1 << 20,
+                remove_orphans: true,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(report.removed_orphaned, 1);
+        assert_eq!(report.removed_oversized, 1);
+        assert_eq!(report.refused, 1);
+        assert_eq!(report.retained, 1);
+        assert!(directory.join(format!("{live}.log")).is_file());
+        assert!(!directory.join(format!("{orphan}.log")).exists());
+        assert!(!directory.join(format!("{oversized}.log")).exists());
+        assert_eq!(
+            fs::read(&victim).unwrap(),
+            b"unchanged",
+            "a symlinked entry must never be followed"
+        );
+        assert!(
+            fs::symlink_metadata(directory.join(format!("{disguised}.log"))).is_ok(),
+            "a refused entry is left exactly as it was"
+        );
+    }
+
+    #[test]
+    fn pruning_keeps_unclaimed_transcripts_when_ownership_is_unproven() {
+        let (_root, directory) = transcript_directory();
+        let unclaimed = TerminalId::new().to_string();
+        fs::write(
+            directory.join(format!("{unclaimed}.log")),
+            b"another window's",
+        )
+        .unwrap();
+
+        let report = prune_transcript_directory(
+            &directory,
+            &HashSet::new(),
+            TranscriptRetention {
+                remove_orphans: false,
+                ..TranscriptRetention::default()
+            },
+        )
+        .unwrap();
+
+        assert_eq!(report.removed_orphaned, 0);
+        assert_eq!(report.retained, 1);
+        assert!(directory.join(format!("{unclaimed}.log")).is_file());
+    }
+
+    #[test]
+    fn pruning_enforces_the_directory_budget_oldest_first() {
+        let (_root, directory) = transcript_directory();
+        let older = TerminalId::new().to_string();
+        let newer = TerminalId::new().to_string();
+        for (id, age) in [(&older, 1_000_u64), (&newer, 2_000)] {
+            let path = directory.join(format!("{id}.log"));
+            fs::write(&path, vec![b'y'; 512]).unwrap();
+            File::options()
+                .write(true)
+                .open(&path)
+                .unwrap()
+                .set_modified(UNIX_EPOCH + Duration::from_secs(age))
+                .unwrap();
+        }
+
+        let claimed = HashSet::from([older.clone(), newer.clone()]);
+        let report = prune_transcript_directory(
+            &directory,
+            &claimed,
+            TranscriptRetention {
+                max_file_bytes: 1024,
+                max_total_bytes: 512,
+                remove_orphans: true,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(report.removed_for_budget, 1);
+        assert_eq!(report.retained, 1);
+        assert_eq!(report.retained_bytes, 512);
+        assert!(!directory.join(format!("{older}.log")).exists());
+        assert!(directory.join(format!("{newer}.log")).is_file());
+    }
+
+    #[test]
+    fn a_stored_terminal_keeps_its_transcript() {
+        let (_root, directory) = transcript_directory();
+        let store_directory = tempdir().unwrap();
+        let boot_id = boot("boot-a");
+        let store = StateStore::open(
+            store_directory.path().join("state.sqlite3"),
+            boot_id.clone(),
+        )
+        .unwrap();
+        let workspace = workspace_with_terminal(&boot_id);
+        let CardKind::Terminal(session) = &workspace.cards[0].kind else {
+            unreachable!("the fixture card is a terminal")
+        };
+        let live = session.id.to_string();
+        SaveLane::default().save(&store, &workspace).unwrap();
+        let orphan = TerminalId::new().to_string();
+        fs::write(directory.join(format!("{live}.log")), b"live").unwrap();
+        fs::write(directory.join(format!("{orphan}.log")), b"orphan").unwrap();
+
+        let report = store
+            .prune_transcripts(&directory, HashSet::new(), TranscriptRetention::default())
+            .unwrap();
+
+        assert_eq!(report.removed_orphaned, 1);
+        assert_eq!(report.retained, 1);
+        assert!(directory.join(format!("{live}.log")).is_file());
+        assert!(!directory.join(format!("{orphan}.log")).exists());
     }
 }
