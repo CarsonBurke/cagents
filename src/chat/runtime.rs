@@ -28,6 +28,11 @@ const STATE_LIMIT: usize = 1024 * 1024;
 const QUEUE_LIMIT: usize = 64 * 1024 * 1024;
 const IO_TIMEOUT: Duration = Duration::from_secs(30);
 const PRESENT_INTERVAL: Duration = Duration::from_millis(50);
+/// Frames parsed per poll iteration: bounded so a provider flood cannot starve
+/// the stdin writer or queued UI commands.
+const FRAMES_PER_POLL: usize = 256;
+/// Queued stdin bytes above which new commands wait for the provider to read.
+const QUEUE_BACKPRESSURE: usize = QUEUE_LIMIT / 2;
 type CommandRequest = (Command, crossbeam_channel::Sender<Result<(), String>>);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -53,6 +58,7 @@ struct Inner {
     observe_next: Arc<AtomicBool>,
     stop: Arc<AtomicBool>,
     completed: Arc<AtomicBool>,
+    draining: Arc<AtomicBool>,
     failure: Arc<Mutex<Option<String>>>,
     worker: Mutex<Option<JoinHandle<()>>>,
     store: Arc<Mutex<Store>>,
@@ -101,6 +107,7 @@ impl Handle {
         let observe_next = Arc::new(AtomicBool::new(true));
         let stop = Arc::new(AtomicBool::new(false));
         let completed = Arc::new(AtomicBool::new(false));
+        let draining = Arc::new(AtomicBool::new(false));
         let failure = Arc::new(Mutex::new(None));
         let store = Arc::new(Mutex::new(store));
         let confirmed_session = Arc::new(Mutex::new(None));
@@ -114,6 +121,7 @@ impl Handle {
             observe_next: observe_next.clone(),
             stop: stop.clone(),
             completed: completed.clone(),
+            draining: draining.clone(),
             failure: failure.clone(),
             worker: Mutex::new(None),
             store: store.clone(),
@@ -164,6 +172,10 @@ impl Handle {
                 .unwrap_or_else(|_| {
                     Err("Native chat worker panicked; exact provider state is unconfirmed".into())
                 });
+                // The actor has stopped answering commands, yet teardown below can
+                // take seconds. Reject commands now so a caller is told the provider
+                // exited instead of waiting out an acknowledgement nobody will send.
+                draining.store(true, Ordering::Release);
                 if let Err(error) = result {
                     *failure.lock().unwrap_or_else(|p| p.into_inner()) = Some(error.clone());
                     let stderr =
@@ -196,7 +208,10 @@ impl Handle {
         Ok(Self(inner))
     }
     pub fn command(&self, command: Command) -> Result<(), String> {
-        if self.is_completed() && matches!(command, Command::LoadEarlier | Command::Refresh) {
+        // `completed` is published only once teardown finished; `draining` the moment
+        // the actor stopped consuming its command channel.
+        let exiting = self.is_completed() || self.0.draining.load(Ordering::Acquire);
+        if exiting && matches!(command, Command::LoadEarlier | Command::Refresh) {
             let cached = page_command(&self.0.store, &command)?;
             if command == Command::LoadEarlier && !cached {
                 return Err("Earlier cached history is exhausted; the exited provider must be explicitly resumed to load more".into());
@@ -211,7 +226,7 @@ impl Handle {
             }
             return Ok(());
         }
-        if self.is_completed() {
+        if exiting {
             return Err("Provider process exited; explicitly recover the exact session".into());
         }
         if self.0.stop.load(Ordering::Acquire) {
@@ -295,6 +310,25 @@ impl Handle {
     }
     pub fn is_completed(&self) -> bool {
         self.0.completed.load(Ordering::Acquire)
+    }
+    /// The recorded failure, without rebuilding the transcript window. Restore polls
+    /// this; it must never pay for a multi-megabyte snapshot.
+    pub fn failure(&self) -> Option<String> {
+        if let Some(error) = self
+            .0
+            .failure
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone()
+        {
+            return Some(error);
+        }
+        self.0
+            .state
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .error
+            .clone()
     }
     pub fn owns_work(&self) -> bool {
         !self.is_completed()
@@ -403,9 +437,7 @@ pub(crate) fn preflight(spec: &ProcessSpec, initial: &mut Step) -> Result<Store,
         {
             return Err(message.clone());
         }
-        if let Some(event) = store.apply(event)? {
-            metadata.push(event);
-        }
+        metadata.extend(store.apply(event)?);
     }
     let mut count = ByteCounter(0);
     serde_json::to_writer(&mut count, &metadata).map_err(|error| error.to_string())?;
@@ -443,18 +475,26 @@ impl ChildGuard {
         }
         self.1 = true;
         // The child was started in its own process group; never signal a caller's group.
+        let pid = self.0.id() as i32;
         unsafe {
-            libc::kill(-(self.0.id() as i32), libc::SIGTERM);
+            libc::kill(-pid, libc::SIGTERM);
         }
         let deadline = Instant::now() + Duration::from_secs(2);
+        let mut exited = false;
         while Instant::now() < deadline {
             if self.0.try_wait().ok().flatten().is_some() {
+                exited = true;
                 break;
             }
             thread::sleep(Duration::from_millis(10));
         }
-        unsafe {
-            libc::kill(-(self.0.id() as i32), libc::SIGKILL);
+        // Reaping the group leader releases its PID, so an unconditional escalation
+        // could SIGKILL an unrelated group that recycled the number. Escalate only
+        // while the leader is unreaped, or while the group provably still has members.
+        if !exited || unsafe { libc::kill(-pid, 0) } == 0 {
+            unsafe {
+                libc::kill(-pid, libc::SIGKILL);
+            }
         }
         let _ = self.0.wait();
     }
@@ -563,7 +603,13 @@ impl Actor {
                 }
             }
             self.drain_commands(closing.is_some())?;
-            while self.pending.is_empty() {
+            // Parse every frame that already arrived. Gating this on an empty stdin
+            // queue froze streaming for a whole turn against any provider that reads
+            // stdin only between turns, then killed the session by blaming its
+            // framing; a stalled write has its own `write_started` deadline below.
+            let mut frames_ready = false;
+            let mut parsed = 0usize;
+            loop {
                 let Some(newline) = self.output.iter().position(|byte| *byte == b'\n') else {
                     break;
                 };
@@ -571,11 +617,16 @@ impl Actor {
                     self.output.drain(..1);
                     continue;
                 }
+                if parsed == FRAMES_PER_POLL {
+                    frames_ready = true;
+                    break;
+                }
                 let frame = serde_json::from_slice(&self.output[..newline]).map_err(|error| {
                     format!("Unsupported provider stdout (expected JSON-lines): {error}")
                 })?;
                 self.output.drain(..=newline);
                 partial_started = None;
+                parsed += 1;
                 self.first_frame = true;
                 let step = self.adapter.receive(frame)?;
                 self.provider_step(step)?;
@@ -583,7 +634,8 @@ impl Actor {
             if self.output.len() > FRAME_LIMIT {
                 return Err("Provider stdout frame exceeds 32 MiB".into());
             }
-            if self.output.is_empty() {
+            // Only a genuinely incomplete line is on the framing deadline.
+            if frames_ready || self.output.is_empty() {
                 partial_started = None;
             } else {
                 let since = partial_started.get_or_insert_with(Instant::now);
@@ -661,7 +713,9 @@ impl Actor {
                     revents: 0,
                 },
             ];
-            let timeout = if self.pending.is_empty() && !self.incoming.is_empty() {
+            let timeout = if frames_ready
+                || (self.queued <= QUEUE_BACKPRESSURE && !self.incoming.is_empty())
+            {
                 0
             } else if self.dirty && self.visible.load(Ordering::Acquire) {
                 50
@@ -737,7 +791,11 @@ impl Actor {
     }
     fn drain_commands(&mut self, closing: bool) -> Result<(), String> {
         for _ in 0..64 {
-            if !self.pending.is_empty() {
+            // Backpressure applies to queued bytes, not to the mere existence of a
+            // queued write: a provider that reads stdin only between turns keeps
+            // `pending` non-empty for the whole turn, and refusing to drain there left
+            // UI commands unacknowledged until the caller's 10 second timeout.
+            if self.queued > QUEUE_BACKPRESSURE {
                 break;
             }
             let Ok((command, reply)) = self.incoming.try_recv() else {
@@ -843,15 +901,17 @@ impl Actor {
                 } => Some(message.clone()),
                 _ => None,
             };
-            let event = self
+            let events = self
                 .store
                 .lock()
                 .unwrap_or_else(|p| p.into_inner())
                 .apply(event)?;
-            if let Some(event) = event {
-                self.apply(event);
-            } else {
+            if events.is_empty() {
                 self.touch();
+            } else {
+                for event in events {
+                    self.apply(event);
+                }
             }
             if self.retained > STATE_LIMIT {
                 return Err(

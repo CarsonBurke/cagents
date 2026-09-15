@@ -167,74 +167,221 @@ impl State {
     }
 }
 
-struct CachedItem {
-    content: ItemContent,
-    markdown: Vec<markdown::Item>,
+/// FNV-1a over the last bytes of `text`, seeded with `seed` and the text's
+/// byte length.
+///
+/// The digest is what makes a change token trustworthy without reading a whole
+/// message: the length alone would miss a same-length rewrite of a tool's
+/// output, and an append whose earlier bytes were rewritten would otherwise be
+/// handed to the incremental parser as if it were a plain suffix.
+fn tail_digest(seed: u64, text: &str) -> u64 {
+    const WINDOW: usize = 64;
+    let bytes = text.as_bytes();
+    let mut hash = seed ^ text.len() as u64;
+    for byte in &bytes[bytes.len().saturating_sub(WINDOW)..] {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash
+}
+
+/// A constant-size stand-in for an item's content.
+///
+/// The daemon coalesces presentation at 50 ms, so `Runtime::refresh` runs about
+/// twenty times a second for the whole of a turn. Deciding whether an item
+/// changed must therefore not touch its body: the window holds up to 128 items
+/// and a long answer is megabytes. The content's shape, its field lengths, and
+/// a bounded tail digest answer that question in constant time.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ChangeToken {
+    /// The content variant plus the flags that sit beside its text.
+    shape: u8,
+    /// Byte length of the field that streams, so a pure append is recognized
+    /// and its suffix located.
+    body: usize,
+    /// Digest over the tail of every field.
+    digest: u64,
+}
+
+impl ChangeToken {
+    fn text_shape(thinking: bool) -> u8 {
+        u8::from(thinking)
+    }
+    fn of(content: &ItemContent) -> Self {
+        match content {
+            ItemContent::Text { text, thinking } => Self {
+                shape: Self::text_shape(*thinking),
+                body: text.len(),
+                digest: tail_digest(0, text),
+            },
+            ItemContent::Tool {
+                name,
+                input,
+                output,
+                status,
+            } => Self {
+                shape: 2 + match status {
+                    chat::ToolStatus::Running => 0,
+                    chat::ToolStatus::Succeeded => 1,
+                    chat::ToolStatus::Failed => 2,
+                    chat::ToolStatus::Denied => 3,
+                },
+                body: output.len(),
+                digest: tail_digest(tail_digest(tail_digest(0, name), input), output),
+            },
+            ItemContent::Image { path, description } => Self {
+                shape: 6,
+                body: path.len(),
+                digest: tail_digest(tail_digest(0, path), description),
+            },
+        }
+    }
+    /// The item's body when the only change since this token was taken is bytes
+    /// appended to it, so the cached parse can be extended instead of redone.
+    fn appended<'a>(&self, content: &'a ItemContent) -> Option<&'a str> {
+        let ItemContent::Text { text, thinking } = content else {
+            return None;
+        };
+        if self.shape != Self::text_shape(*thinking) || text.len() <= self.body {
+            return None;
+        }
+        // `get` also rejects a rewrite that left the old length mid-character.
+        let parsed = text.get(..self.body)?;
+        (tail_digest(0, parsed) == self.digest).then_some(text.as_str())
+    }
+}
+
+/// Fenced code blocks found in an item's body, scanned one line at a time so a
+/// streamed body is never re-scanned from the top.
+#[derive(Default)]
+struct CodeScan {
+    /// Bytes of the body already scanned; always just past a line ending.
+    scanned: usize,
+    /// The open fence's marker character and run length.
+    fence: Option<(char, usize)>,
+    /// Whether `codes` ends with the block the open fence is still filling.
+    open: bool,
+    /// Each fenced block's body, in the order the blocks appear.
     codes: Vec<String>,
+}
+
+impl CodeScan {
+    /// Scans the complete lines of `body` that the cursor has not reached.
+    ///
+    /// A partial trailing line is left for the refresh that completes it: a
+    /// fence is only a fence once its line ends, and a provisional scan would
+    /// have to be undone.
+    fn feed(&mut self, body: &str) {
+        while let Some(index) = body[self.scanned..].find('\n') {
+            let line = &body[self.scanned..self.scanned + index];
+            self.scanned += index + 1;
+            self.line(line.strip_suffix('\r').unwrap_or(line));
+        }
+    }
+    fn line(&mut self, line: &str) {
+        let trimmed = line.trim_start();
+        let marker = trimmed.chars().next().unwrap_or(' ');
+        if matches!(marker, '`' | '~') {
+            let length = trimmed
+                .chars()
+                .take_while(|character| *character == marker)
+                .count();
+            if length >= 3 {
+                match self.fence {
+                    None => {
+                        self.fence = Some((marker, length));
+                        return;
+                    }
+                    Some((opening, count)) if opening == marker && length >= count => {
+                        if !self.open {
+                            // An empty block still earns its copy control.
+                            self.codes.push(String::new());
+                        }
+                        self.fence = None;
+                        self.open = false;
+                        return;
+                    }
+                    _ => {}
+                }
+            }
+        }
+        if self.fence.is_some() {
+            if !self.open {
+                self.codes.push(String::new());
+                self.open = true;
+            }
+            if let Some(code) = self.codes.last_mut() {
+                code.push_str(line);
+                code.push('\n');
+            }
+        }
+    }
+}
+
+/// One transcript item's presentation, retained across refreshes.
+///
+/// The body is never copied in: what an item looked like when it was parsed is
+/// recorded as a `ChangeToken`, and the authoritative text stays in the
+/// snapshot the runtime already holds.
+struct CachedItem {
+    token: ChangeToken,
+    markdown: markdown::Content,
+    code: CodeScan,
+    /// A tool row's `name · status` caption, formed once per change rather than
+    /// once per frame.
+    detail: Option<String>,
     image: Option<iced::widget::image::Handle>,
 }
 impl CachedItem {
     fn new(content: &ItemContent) -> Self {
-        let mut codes = Vec::new();
-        let markdown = if let ItemContent::Text { text, .. } = content {
-            let mut fence: Option<(char, usize)> = None;
-            let mut code = String::new();
-            for line in text.lines() {
-                let trimmed = line.trim_start();
-                let marker = trimmed.chars().next().unwrap_or(' ');
-                let length = trimmed
-                    .chars()
-                    .take_while(|character| *character == marker)
-                    .count();
-                if matches!(marker, '`' | '~') && length >= 3 {
-                    match fence {
-                        None => {
-                            fence = Some((marker, length));
-                            continue;
-                        }
-                        Some((opening, count)) if opening == marker && length >= count => {
-                            codes.push(std::mem::take(&mut code));
-                            fence = None;
-                            continue;
-                        }
-                        _ => {}
+        let mut cached = Self {
+            token: ChangeToken::of(content),
+            markdown: markdown::Content::new(),
+            code: CodeScan::default(),
+            detail: None,
+            image: None,
+        };
+        match content {
+            ItemContent::Text { text, .. } => cached.extend(text, 0),
+            ItemContent::Tool { name, status, .. } => {
+                cached.detail = Some(format!(
+                    "{name} · {}",
+                    match status {
+                        chat::ToolStatus::Running => "Running",
+                        chat::ToolStatus::Succeeded => "Completed",
+                        chat::ToolStatus::Failed => "Failed",
+                        chat::ToolStatus::Denied => "Denied",
                     }
-                }
-                if fence.is_some() {
-                    code.push_str(line);
-                    code.push('\n');
-                }
+                ));
             }
-            if !code.is_empty() {
-                codes.push(code);
+            ItemContent::Image { path, .. } => {
+                cached.image = match path {
+                    path if Path::new(path).is_absolute() => {
+                        Some(iced::widget::image::Handle::from_path(path))
+                    }
+                    path if path.len() <= 24 * 1024 * 1024 && path.starts_with("data:image/") => {
+                        path.split_once(";base64,")
+                            .and_then(|(_, encoded)| {
+                                base64::engine::general_purpose::STANDARD
+                                    .decode(encoded)
+                                    .ok()
+                            })
+                            .map(iced::widget::image::Handle::from_bytes)
+                    }
+                    _ => None,
+                };
             }
-            markdown::parse(text).collect()
-        } else {
-            Vec::new()
-        };
-        let image = match content {
-            ItemContent::Image { path, .. } if Path::new(path).is_absolute() => {
-                Some(iced::widget::image::Handle::from_path(path))
-            }
-            ItemContent::Image { path, .. }
-                if path.len() <= 24 * 1024 * 1024 && path.starts_with("data:image/") =>
-            {
-                path.split_once(";base64,")
-                    .and_then(|(_, encoded)| {
-                        base64::engine::general_purpose::STANDARD
-                            .decode(encoded)
-                            .ok()
-                    })
-                    .map(iced::widget::image::Handle::from_bytes)
-            }
-            _ => None,
-        };
-        Self {
-            content: content.clone(),
-            markdown,
-            codes,
-            image,
         }
+        cached
+    }
+    /// Parses the part of `body` past `parsed`, the bytes already seen.
+    ///
+    /// `markdown::Content` re-parses only its trailing block, and the fence
+    /// scan resumes from its own cursor, so a streamed answer costs its new
+    /// bytes per frame instead of its whole length.
+    fn extend(&mut self, body: &str, parsed: usize) {
+        self.markdown.push_str(&body[parsed..]);
+        self.code.feed(body);
     }
 }
 
@@ -306,14 +453,20 @@ impl Runtime {
         let live_ids: HashSet<&str> = snapshot.items.iter().map(|item| item.id.as_str()).collect();
         self.cache.retain(|id, _| live_ids.contains(id.as_str()));
         for item in &snapshot.items {
-            if self
-                .cache
-                .get(&item.id)
-                .is_none_or(|cached| cached.content != item.content)
-            {
-                self.cache
-                    .insert(item.id.clone(), CachedItem::new(&item.content));
+            let token = ChangeToken::of(&item.content);
+            if let Some(cached) = self.cache.get_mut(&item.id) {
+                if cached.token == token {
+                    continue;
+                }
+                if let Some(body) = cached.token.appended(&item.content) {
+                    let parsed = cached.token.body;
+                    cached.extend(body, parsed);
+                    cached.token = token;
+                    continue;
+                }
             }
+            self.cache
+                .insert(item.id.clone(), CachedItem::new(&item.content));
         }
         self.answers
             .retain(|(id, _), _| snapshot.requests.iter().any(|request| &request.id == id));
@@ -1195,15 +1348,24 @@ impl Cagents {
                 let Some(runtime) = self.chat_runtime_mut(target) else {
                     return Task::none();
                 };
-                let Some(cached) = runtime.cache.get(&id) else {
-                    return Task::none();
-                };
-                let text = match (part, &cached.content) {
-                    (CopyPart::Text, ItemContent::Text { text, .. }) => Some(text),
-                    (CopyPart::Input, ItemContent::Tool { input, .. }) => Some(input),
-                    (CopyPart::Output, ItemContent::Tool { output, .. }) => Some(output),
-                    (CopyPart::Code(index), _) => cached.codes.get(index),
-                    _ => None,
+                // The body itself lives in the snapshot; only the extracted
+                // code blocks are the cache's own.
+                let text = match part {
+                    CopyPart::Code(index) => runtime
+                        .cache
+                        .get(&id)
+                        .and_then(|cached| cached.code.codes.get(index)),
+                    part => runtime
+                        .snapshot
+                        .items
+                        .iter()
+                        .find(|item| item.id == id)
+                        .and_then(|item| match (part, &item.content) {
+                            (CopyPart::Text, ItemContent::Text { text, .. }) => Some(text),
+                            (CopyPart::Input, ItemContent::Tool { input, .. }) => Some(input),
+                            (CopyPart::Output, ItemContent::Tool { output, .. }) => Some(output),
+                            _ => None,
+                        }),
                 };
                 if let Some(text) = text {
                     return iced::clipboard::write(text.clone()).map(cosmic::Action::App);
@@ -1495,5 +1657,99 @@ impl Cagents {
             }
         }
         Task::none()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn text(body: &str) -> ItemContent {
+        ItemContent::Text {
+            text: body.to_owned(),
+            thinking: false,
+        }
+    }
+
+    /// A message that arrives byte by byte must present exactly as one that
+    /// arrived whole. The incremental fence scan is the only difference, and a
+    /// mistake in it would show the wrong code behind a copy control rather
+    /// than fail loudly.
+    #[test]
+    fn streamed_body_finds_the_same_code_blocks_as_a_whole_one() {
+        const BODY: &str =
+            "Intro\n\n```rust\nfn main() {}\nlet total = 1;\n```\n\nAfter\n\n~~~\nplain\n~~~\n";
+        let whole = CachedItem::new(&text(BODY));
+        assert_eq!(
+            whole.code.codes,
+            vec![
+                "fn main() {}\nlet total = 1;\n".to_owned(),
+                "plain\n".to_owned()
+            ]
+        );
+
+        let mut streamed = CachedItem::new(&text(""));
+        for end in 1..=BODY.len() {
+            if !BODY.is_char_boundary(end) {
+                continue;
+            }
+            let content = text(&BODY[..end]);
+            let Some(body) = streamed.token.appended(&content) else {
+                panic!("a longer prefix of the same body must read as an append");
+            };
+            let parsed = streamed.token.body;
+            streamed.extend(body, parsed);
+            streamed.token = ChangeToken::of(&content);
+        }
+        assert_eq!(streamed.code.codes, whole.code.codes);
+        assert_eq!(streamed.token, whole.token);
+    }
+
+    /// The token is what licenses reusing a parse, so it must refuse anything
+    /// that is not bytes added to the end.
+    #[test]
+    fn change_token_refuses_a_rewritten_body() {
+        let cached = CachedItem::new(&text("hello world"));
+        assert_eq!(
+            cached.token.appended(&text("hello world and more")),
+            Some("hello world and more")
+        );
+        assert!(
+            cached
+                .token
+                .appended(&text("HELLO WORLD and more"))
+                .is_none()
+        );
+        assert!(cached.token.appended(&text("hello world")).is_none());
+        assert!(cached.token.appended(&text("hello")).is_none());
+        assert!(
+            cached
+                .token
+                .appended(&ItemContent::Text {
+                    text: "hello world and more".to_owned(),
+                    thinking: true,
+                })
+                .is_none(),
+            "thinking text is collapsed differently and is not the same item"
+        );
+    }
+
+    /// Same-length edits are what a length-only token would miss.
+    #[test]
+    fn change_token_separates_same_length_tool_output() {
+        let tool = |output: &str| ItemContent::Tool {
+            name: "shell".to_owned(),
+            input: "ls".to_owned(),
+            output: output.to_owned(),
+            status: chat::ToolStatus::Running,
+        };
+        assert_ne!(
+            ChangeToken::of(&tool("aaaa")),
+            ChangeToken::of(&tool("aaab"))
+        );
+        assert_eq!(
+            ChangeToken::of(&tool("aaaa")),
+            ChangeToken::of(&tool("aaaa"))
+        );
     }
 }

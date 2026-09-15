@@ -825,7 +825,18 @@ impl Claude {
             if self.retracted.contains(carrier) {
                 continue;
             }
-            let items = self.carrier_items.get(carrier).ok_or("Claude retracted a message outside the retained correlation window; reconnect to reload canonical history")?;
+            let Some(items) = self.carrier_items.get(carrier) else {
+                // A retraction is presentation fidelity, not correctness: a carrier that
+                // aged out of the correlation window must never end the conversation.
+                step.events.push(Event::Error {
+                    message: "Claude retracted a message outside the retained correlation window; its original text stays displayed until the session is reloaded".into(),
+                    fatal: false,
+                });
+                if self.retracted.len() < 2048 {
+                    self.retracted.insert(carrier.into());
+                }
+                continue;
+            };
             ids.extend(items.iter().cloned());
             if self.retracted.len() >= 2048 {
                 return Err("Claude retraction ledger exceeds its bounded limit".into());
