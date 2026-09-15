@@ -157,6 +157,7 @@ impl Provider {
     }
 
     /// Read only the canonical selector position in an already normalized recipe.
+    #[cfg(any(feature = "host", feature = "ui", test))]
     pub(crate) fn resume_id(self, arguments: &[String]) -> Option<&str> {
         let (selector, id) = if self.adapter().resume_precedes_options {
             match arguments {

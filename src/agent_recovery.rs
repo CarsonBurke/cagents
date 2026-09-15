@@ -385,6 +385,7 @@ pub(crate) fn fresh_omp_session(process: &AgentProcess) -> Option<std::path::Pat
     }
 }
 
+#[cfg(any(feature = "host", feature = "ui"))]
 fn observation_environment_key(name: &str) -> bool {
     matches!(
         name,
@@ -402,6 +403,7 @@ fn observation_environment_key(name: &str) -> bool {
     )
 }
 
+#[cfg(any(feature = "host", feature = "ui"))]
 pub(crate) fn native_runtime_environment_key(name: &str) -> bool {
     observation_environment_key(name)
         || matches!(
@@ -442,6 +444,7 @@ pub(crate) fn native_runtime_environment_key(name: &str) -> bool {
         )
 }
 
+#[cfg(any(feature = "host", feature = "ui"))]
 fn provider_setting_environment_key(provider: Provider, name: &str) -> bool {
     let starts_with = |prefix: &str| {
         name.get(..prefix.len())
@@ -542,6 +545,7 @@ fn provider_setting_environment_key(provider: Provider, name: &str) -> bool {
     false
 }
 
+#[cfg(any(feature = "host", feature = "ui"))]
 fn credential_environment_key(name: &str) -> bool {
     [
         "SECRET",
@@ -562,6 +566,7 @@ fn credential_environment_key(name: &str) -> bool {
         .any(|part| part.eq_ignore_ascii_case("AUTH") || part.eq_ignore_ascii_case("TOKEN"))
 }
 
+#[cfg(any(feature = "host", feature = "ui"))]
 fn indirect_environment_key(name: &str) -> bool {
     // Git's opaque config payloads may contain extraHeader credentials, helpers,
     // or URL rewrites. Classify the namespace, never the payload's spelling.
@@ -591,6 +596,7 @@ fn sensitive_environment_key(name: &str) -> bool {
         })
 }
 
+#[cfg(any(feature = "host", feature = "ui"))]
 fn persistable_environment_entry(name: &str, value: &str) -> bool {
     if credential_environment_key(name) || indirect_environment_key(name) {
         return false;
@@ -604,6 +610,7 @@ fn persistable_environment_entry(name: &str, value: &str) -> bool {
 
 /// A fresh native process uses the selected provider's configuration, never the
 /// launching harness's tool bridge, artifact scope, or terminal/session identity.
+#[cfg(any(feature = "host", feature = "ui"))]
 pub(crate) fn fresh_environment_key(
     provider: Provider,
     name: &str,
@@ -632,6 +639,7 @@ pub(crate) fn fresh_environment_key(
     !persistable || persistable_environment_entry(name, value)
 }
 
+#[cfg(any(feature = "host", feature = "ui"))]
 pub(crate) fn fresh_native_environment(
     provider: Provider,
     persistable: bool,
