@@ -47,10 +47,10 @@ pub fn symbolic_icon(name: &str) -> widget::icon::Handle {
     static PLUS: LazyLock<widget::icon::Handle> = LazyLock::new(|| {
         widget::icon::from_svg_bytes(br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16"><path d="M4 8h8M8 4v8" fill="none" stroke="black" stroke-width="1.5" stroke-linecap="round"/></svg>"#.as_slice()).symbolic(true)
     });
-    static THREAD: LazyLock<widget::icon::Handle> = LazyLock::new(|| {
+    static CHANNEL: LazyLock<widget::icon::Handle> = LazyLock::new(|| {
         widget::icon::from_svg_bytes(br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16"><path d="M2 2.5h12v9H7l-4 3v-3H2zM5 6h6M5 8.5h4" fill="none" stroke="black" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/></svg>"#.as_slice()).symbolic(true)
     });
-    static THREAD_ADD: LazyLock<widget::icon::Handle> = LazyLock::new(|| {
+    static CHANNEL_ADD: LazyLock<widget::icon::Handle> = LazyLock::new(|| {
         widget::icon::from_svg_bytes(br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16"><path d="M8 2.5H2v9h1v3l4-3h7V9M12 1v6M9 4h6" fill="none" stroke="black" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/></svg>"#.as_slice()).symbolic(true)
     });
     static WORKTREE_ADD: LazyLock<widget::icon::Handle> = LazyLock::new(|| {
@@ -137,8 +137,8 @@ pub fn symbolic_icon(name: &str) -> widget::icon::Handle {
         "go-next-symbolic" => CHEVRON_RIGHT.clone(),
         "list-add-symbolic" => PLUS.clone(),
         "list-remove-symbolic" => MINUS.clone(),
-        "thread-symbolic" => THREAD.clone(),
-        "thread-add-symbolic" => THREAD_ADD.clone(),
+        "channel-symbolic" => CHANNEL.clone(),
+        "channel-add-symbolic" => CHANNEL_ADD.clone(),
         "worktree-add-symbolic" => WORKTREE_ADD.clone(),
         "notifications-symbolic" => ATTENTION.clone(),
         "agent-working-symbolic" => WORKING.clone(),

@@ -848,6 +848,9 @@ pub struct State<Highlighter: text::Highlighter> {
     last_click: Option<mouse::Click>,
     drag_click: Option<mouse::click::Kind>,
     partial_scroll: f32,
+    /// The last modifier state the compositor reported, because a wheel event
+    /// carries none of its own and the Shift axis swap has to know.
+    modifiers: keyboard::Modifiers,
     scrollbar_grab: Option<f32>,
     horizontal_grab: Option<f32>,
     scrollbar_target: Option<ScrollTarget>,
@@ -928,6 +931,7 @@ where
             last_click: None,
             drag_click: None,
             partial_scroll: 0.0,
+            modifiers: keyboard::Modifiers::default(),
             scrollbar_grab: None,
             horizontal_grab: None,
             scrollbar_target: None,
@@ -1066,6 +1070,19 @@ where
     ) {
         let geometry = self.scroll_geometry(layout.bounds());
         let state = tree.state.downcast_mut::<State<Highlighter>>();
+        // Every later branch may return early, and the wheel needs the current
+        // modifiers no matter which one does, so record them first. Losing
+        // window focus also loses the key release that would clear Shift, so a
+        // stale modifier must not survive it.
+        match event {
+            Event::Keyboard(keyboard::Event::ModifiersChanged(modifiers)) => {
+                state.modifiers = *modifiers;
+            }
+            Event::Window(window::Event::Unfocused) => {
+                state.modifiers = keyboard::Modifiers::default();
+            }
+            _ => {}
+        }
         if !geometry.scrollable {
             state.scrollbar_grab = None;
             state.scrollbar_target = None;
@@ -1293,19 +1310,29 @@ where
                     state.focus = Some(Focus::now());
                     shell.capture_event();
                 }
-                Update::Scroll { lines, horizontal } => {
+                Update::Scroll {
+                    lines,
+                    horizontal,
+                    redirected,
+                } => {
                     let bounds = self.content.0.borrow().editor.bounds();
 
                     if bounds.height >= i32::MAX as f32 {
                         return;
                     }
 
-                    if self.pan_horizontally(layout.bounds(), horizontal) {
+                    let panned = self.pan_horizontally(layout.bounds(), horizontal);
+                    if panned {
                         shell.request_redraw();
                         shell.capture_event();
                     }
-
-                    let lines = lines + state.partial_scroll;
+                    // A redirect the horizontal axis could not absorb - a
+                    // wrapped buffer, or a document whose longest line already
+                    // fits - still has to scroll, or holding Shift would
+                    // appear to freeze the wheel. Only a pan that actually
+                    // moved consumes the vertical delta.
+                    let lines =
+                        if redirected && panned { 0.0 } else { lines } + state.partial_scroll;
                     state.partial_scroll = lines.fract();
 
                     shell.publish(on_edit(Action::Scroll {
@@ -1778,6 +1805,15 @@ enum Update<Message> {
         lines: f32,
         /// Horizontal movement, in logical pixels.
         horizontal: f32,
+        /// Whether `horizontal` was produced by redirecting the wheel's
+        /// vertical delta rather than by a real horizontal one.
+        ///
+        /// The handler needs this because only it knows the geometry: a
+        /// redirected gesture that the horizontal axis cannot absorb - a
+        /// wrapped buffer, or a file whose longest line already fits the
+        /// viewport - has to fall back to scrolling vertically, or holding
+        /// Shift would appear to freeze the wheel.
+        redirected: bool,
     },
     InputMethod(Ime),
     Binding(Binding<Message>),
@@ -1842,18 +1878,46 @@ impl<Message> Update<Message> {
                     // canvas offset is; the factors are iced's own, so a wheel
                     // notch pans this editor as far as it pans any other
                     // scrollable in the shell.
-                    Some(match delta {
+                    //
+                    // Shift routes the wheel's vertical delta onto the
+                    // horizontal axis, which is the convention every native
+                    // scrollable in the shell already follows and the only way
+                    // a wheel that reports nothing but `y` can follow a long
+                    // unwrapped line. Only one axis is ever taken, because
+                    // `interaction::wheel_as_horizontal` established that
+                    // picking an axis is the only safe projection: summing the
+                    // two components cancels an opposite-sign diagonal exactly,
+                    // discarding the gesture. The axis is chosen by magnitude
+                    // rather than by `x == 0`, because a high-resolution
+                    // trackpad reports a small nonzero `x` on a two-finger drag
+                    // that is plainly vertical, and testing for exact zero
+                    // would hand the whole gesture to that jitter.
+                    //
+                    // Both axes are negated because a positive wheel delta asks
+                    // for the content to move right or down, which moves the
+                    // viewport the opposite way.
+                    //
+                    // `lines` stays the plain vertical delta in every case. The
+                    // handler suppresses it only once it has confirmed the
+                    // horizontal axis absorbed the gesture, so a redirect that
+                    // had nowhere to go still scrolls.
+                    let shift = state.modifiers.shift();
+                    let redirect = move |x: f32, y: f32| shift && y.abs() > x.abs();
+                    let pan = move |x: f32, y: f32| -if redirect(x, y) { y } else { x };
+                    Some(match *delta {
                         mouse::ScrollDelta::Lines { x, y } => Update::Scroll {
-                            lines: if y.abs() > 0.0 {
-                                y.signum() * -(y.abs() * 4.0).max(1.0)
-                            } else {
+                            lines: if y == 0.0 {
                                 0.0
+                            } else {
+                                y.signum() * -(y.abs() * 4.0).max(1.0)
                             },
-                            horizontal: x * 60.0,
+                            horizontal: pan(x, y) * 60.0,
+                            redirected: redirect(x, y),
                         },
                         mouse::ScrollDelta::Pixels { x, y } => Update::Scroll {
                             lines: -y / 4.0,
-                            horizontal: *x,
+                            horizontal: pan(x, y),
+                            redirected: redirect(x, y),
                         },
                     })
                 }
@@ -2288,17 +2352,7 @@ mod tests {
 
     #[test]
     fn horizontal_restore_keeps_glyph_hit_testing_caret_and_wrapping_in_agreement() {
-        use cosmic::iced::advanced::renderer::Headless;
-        let renderer = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap()
-            .block_on(cosmic::Renderer::new(
-                cosmic::iced::Font::MONOSPACE,
-                Pixels(16.0),
-                Some("tiny-skia"),
-            ))
-            .unwrap();
+        let renderer = headless_renderer();
         let layout = |content: &Content, wrapping| {
             let mut widget: TextEditor<'_, highlighter::PlainText, ()> = TextEditor::new(content)
                 .font(cosmic::iced::Font::MONOSPACE)
@@ -2473,5 +2527,305 @@ mod tests {
         assert_eq!(wide.offset_at(-500.0, 0.0), 0.0);
         assert_eq!(wide.offset_at(500.0, 0.0), 400.0);
         assert!(wide.track.y >= bounds.y + bounds.height - crate::design::SCROLLBAR_GUTTER);
+    }
+
+    /// A software renderer, which is all the editor needs: shaping, glyph
+    /// metrics and hit testing come from cosmic-text, not the GPU.
+    fn headless_renderer() -> cosmic::Renderer {
+        use cosmic::iced::advanced::renderer::Headless;
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(cosmic::Renderer::new(
+                cosmic::iced::Font::MONOSPACE,
+                Pixels(16.0),
+                Some("tiny-skia"),
+            ))
+            .unwrap()
+    }
+
+    /// The viewport every wheel test lays out and points its cursor into.
+    const WHEEL_VIEWPORT: Size = Size {
+        width: 260.0,
+        height: 200.0,
+    };
+
+    /// Drives the real widget so the assertions read the offset the editor
+    /// will draw and the scroll it asked the application to perform, rather
+    /// than any intermediate the conversion happens to keep.
+    fn wheel_editor<'a>(
+        content: &'a Content,
+        wrapping: Wrapping,
+    ) -> TextEditor<'a, highlighter::PlainText, Action> {
+        TextEditor::new(content)
+            .font(cosmic::iced::Font::MONOSPACE)
+            .size(16.0)
+            .wrapping(wrapping)
+            .height(Length::Fill)
+            .on_action(|action| action)
+    }
+
+    #[test]
+    fn shift_wheel_pans_the_unwrapped_canvas_to_both_bounds() {
+        let renderer = headless_renderer();
+        let content = Content::with_text(&"abcdefghij".repeat(30));
+        let mut widget = wheel_editor(&content, Wrapping::None);
+        let mut tree =
+            widget::Tree::new(&widget as &dyn Widget<Action, cosmic::Theme, cosmic::Renderer>);
+        let bounds = Rectangle::new(Point::ORIGIN, WHEEL_VIEWPORT);
+        let node = widget.layout(
+            &mut tree,
+            &renderer,
+            &layout::Limits::new(Size::ZERO, WHEEL_VIEWPORT),
+        );
+        let mut published = Vec::new();
+        let feed = |widget: &mut TextEditor<'_, highlighter::PlainText, Action>,
+                    tree: &mut widget::Tree,
+                    published: &mut Vec<Action>,
+                    event: Event| {
+            let mut clipboard = cosmic::iced::advanced::clipboard::Null;
+            let mut shell = Shell::new(published);
+            widget.update(
+                tree,
+                &event,
+                Layout::new(&node),
+                mouse::Cursor::Available(Point::new(100.0, 100.0)),
+                &renderer,
+                &mut clipboard,
+                &mut shell,
+                &bounds,
+            );
+        };
+        let wheel = |delta| Event::Mouse(mouse::Event::WheelScrolled { delta });
+        let modifiers = |modifiers| Event::Keyboard(keyboard::Event::ModifiersChanged(modifiers));
+        let vertical = |published: &Vec<Action>| match published.last() {
+            Some(Action::Scroll { lines }) => *lines,
+            other => panic!("a wheel over the editor must publish a scroll, got {other:?}"),
+        };
+
+        assert_eq!(content.scroll_position().horizontal, 0.0);
+        feed(
+            &mut widget,
+            &mut tree,
+            &mut published,
+            modifiers(keyboard::Modifiers::SHIFT),
+        );
+        feed(
+            &mut widget,
+            &mut tree,
+            &mut published,
+            wheel(mouse::ScrollDelta::Lines { x: 0.0, y: -1.0 }),
+        );
+        assert_eq!(content.scroll_position().horizontal, 60.0);
+        assert_eq!(vertical(&published), 0);
+
+        feed(
+            &mut widget,
+            &mut tree,
+            &mut published,
+            wheel(mouse::ScrollDelta::Lines { x: 0.0, y: 1.0 }),
+        );
+        assert_eq!(
+            content.scroll_position().horizontal,
+            0.0,
+            "Shift must pan both ways"
+        );
+
+        // A real horizontal component wins outright, so a diagonal lands on
+        // its own `x` rather than a sum. `interaction::wheel_as_horizontal`
+        // documents why: summing cancels an opposite-sign diagonal exactly.
+        feed(
+            &mut widget,
+            &mut tree,
+            &mut published,
+            wheel(mouse::ScrollDelta::Pixels { x: -8.0, y: -4.0 }),
+        );
+        assert_eq!(content.scroll_position().horizontal, 8.0);
+
+        // The gesture a sum would discard. Opposite-sign components must still
+        // pan by `x`, never cancel to a dead gesture.
+        feed(
+            &mut widget,
+            &mut tree,
+            &mut published,
+            wheel(mouse::ScrollDelta::Pixels { x: -6.0, y: 6.0 }),
+        );
+        assert_eq!(
+            content.scroll_position().horizontal,
+            14.0,
+            "an opposite-sign diagonal must not cancel itself"
+        );
+
+        // High-resolution deltas stay continuous instead of quantizing to a
+        // wheel notch or a line.
+        for _ in 0..4 {
+            feed(
+                &mut widget,
+                &mut tree,
+                &mut published,
+                wheel(mouse::ScrollDelta::Pixels { x: 0.0, y: -0.5 }),
+            );
+        }
+        assert_eq!(content.scroll_position().horizontal, 16.0);
+
+        // The wheel must stop exactly where a thumb dragged to the end of its
+        // track stops, so the two routes cannot disagree about the canvas.
+        let maximum = widget
+            .scroll_geometry(bounds)
+            .horizontal
+            .expect("a long unwrapped line must be pannable")
+            .maximum;
+        assert!(maximum > 0.0);
+        feed(
+            &mut widget,
+            &mut tree,
+            &mut published,
+            wheel(mouse::ScrollDelta::Pixels {
+                x: 0.0,
+                y: -100_000.0,
+            }),
+        );
+        assert_eq!(content.scroll_position().horizontal, maximum);
+        feed(
+            &mut widget,
+            &mut tree,
+            &mut published,
+            wheel(mouse::ScrollDelta::Pixels {
+                x: 0.0,
+                y: 100_000.0,
+            }),
+        );
+        assert_eq!(content.scroll_position().horizontal, 0.0);
+
+        // Releasing Shift restores plain vertical scrolling, and the wheel's
+        // own horizontal delta keeps panning without a modifier.
+        feed(
+            &mut widget,
+            &mut tree,
+            &mut published,
+            modifiers(keyboard::Modifiers::default()),
+        );
+        feed(
+            &mut widget,
+            &mut tree,
+            &mut published,
+            wheel(mouse::ScrollDelta::Lines { x: 0.0, y: -1.0 }),
+        );
+        assert_eq!(content.scroll_position().horizontal, 0.0);
+        assert!(vertical(&published) > 0);
+        feed(
+            &mut widget,
+            &mut tree,
+            &mut published,
+            wheel(mouse::ScrollDelta::Lines { x: -1.0, y: 0.0 }),
+        );
+        assert_eq!(content.scroll_position().horizontal, 60.0);
+        assert_eq!(vertical(&published), 0);
+    }
+
+    #[test]
+    fn wrapped_documents_gain_no_horizontal_range_from_the_wheel() {
+        let renderer = headless_renderer();
+        let content = Content::with_text(&"wrapped words ".repeat(200));
+        let mut widget = wheel_editor(&content, Wrapping::Word);
+        let mut tree =
+            widget::Tree::new(&widget as &dyn Widget<Action, cosmic::Theme, cosmic::Renderer>);
+        let bounds = Rectangle::new(Point::ORIGIN, WHEEL_VIEWPORT);
+        let node = widget.layout(
+            &mut tree,
+            &renderer,
+            &layout::Limits::new(Size::ZERO, WHEEL_VIEWPORT),
+        );
+        assert!(
+            widget.scroll_geometry(bounds).horizontal.is_none(),
+            "wrapped text has no canvas to pan"
+        );
+        let mut published = Vec::new();
+        for event in [
+            Event::Keyboard(keyboard::Event::ModifiersChanged(
+                keyboard::Modifiers::SHIFT,
+            )),
+            Event::Mouse(mouse::Event::WheelScrolled {
+                delta: mouse::ScrollDelta::Pixels { x: 0.0, y: -120.0 },
+            }),
+            Event::Mouse(mouse::Event::WheelScrolled {
+                delta: mouse::ScrollDelta::Pixels { x: -120.0, y: 0.0 },
+            }),
+        ] {
+            let mut clipboard = cosmic::iced::advanced::clipboard::Null;
+            let mut shell = Shell::new(&mut published);
+            widget.update(
+                &mut tree,
+                &event,
+                Layout::new(&node),
+                mouse::Cursor::Available(Point::new(100.0, 100.0)),
+                &renderer,
+                &mut clipboard,
+                &mut shell,
+                &bounds,
+            );
+            assert_eq!(content.scroll_position().horizontal, 0.0);
+        }
+        // The redirect had nowhere to go, so the gesture must still scroll.
+        // Swallowing it would make Shift freeze the wheel on every wrapped
+        // buffer and on every file whose longest line already fits.
+        assert_eq!(
+            published
+                .iter()
+                .filter_map(|action| match action {
+                    Action::Scroll { lines } => Some(*lines),
+                    _ => None,
+                })
+                .sum::<i32>(),
+            30,
+            "Shift+wheel must fall back to vertical scrolling when nothing can pan"
+        );
+    }
+
+    /// A high-resolution trackpad reports a small nonzero `x` on a drag that is
+    /// plainly vertical. Testing the horizontal component for exact zero would
+    /// hand the whole gesture to that jitter, panning by a fraction of a pixel
+    /// while the vertical delta was discarded.
+    #[test]
+    fn a_mostly_vertical_trackpad_drag_still_pans_by_its_dominant_axis() {
+        let renderer = headless_renderer();
+        let content = Content::with_text(&"abcdefghij".repeat(30));
+        let mut widget = wheel_editor(&content, Wrapping::None);
+        let mut tree =
+            widget::Tree::new(&widget as &dyn Widget<Action, cosmic::Theme, cosmic::Renderer>);
+        let bounds = Rectangle::new(Point::ORIGIN, WHEEL_VIEWPORT);
+        let node = widget.layout(
+            &mut tree,
+            &renderer,
+            &layout::Limits::new(Size::ZERO, WHEEL_VIEWPORT),
+        );
+        let mut published = Vec::new();
+        for event in [
+            Event::Keyboard(keyboard::Event::ModifiersChanged(
+                keyboard::Modifiers::SHIFT,
+            )),
+            Event::Mouse(mouse::Event::WheelScrolled {
+                delta: mouse::ScrollDelta::Pixels { x: -0.4, y: -40.0 },
+            }),
+        ] {
+            let mut clipboard = cosmic::iced::advanced::clipboard::Null;
+            let mut shell = Shell::new(&mut published);
+            widget.update(
+                &mut tree,
+                &event,
+                Layout::new(&node),
+                mouse::Cursor::Available(Point::new(100.0, 100.0)),
+                &renderer,
+                &mut clipboard,
+                &mut shell,
+                &bounds,
+            );
+        }
+        assert_eq!(
+            content.scroll_position().horizontal,
+            40.0,
+            "the dominant axis decides the pan, not a nonzero test on x"
+        );
     }
 }

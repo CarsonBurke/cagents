@@ -226,7 +226,10 @@ impl Runtime {
             widget::scrollable(
                 widget::column::with_children(transcript)
                     .spacing(16)
-                    .width(Length::Fill),
+                    .width(Length::Fill)
+                    // Message rows carry copy and expand controls on their
+                    // right edge; the thumb floats over that column.
+                    .padding(design::with_vertical_rail(iced::Padding::ZERO)),
             )
             .direction(iced::widget::scrollable::Direction::Vertical(
                 design::scrollbar(),
@@ -304,7 +307,8 @@ impl Runtime {
                                 .map(|request| self.request_view(request, available))
                                 .collect::<Vec<_>>(),
                         )
-                        .spacing(12),
+                        .spacing(12)
+                        .padding(crate::design::with_vertical_rail(iced::Padding::ZERO)),
                     )
                     .direction(
                         cosmic::iced::widget::scrollable::Direction::Vertical(
@@ -437,10 +441,16 @@ impl Runtime {
             if !commands.is_empty() {
                 content.push(
                     widget::container(
-                        widget::scrollable(widget::column::with_children(commands).spacing(0))
-                            .direction(cosmic::iced::widget::scrollable::Direction::Vertical(
+                        widget::scrollable(
+                            widget::column::with_children(commands)
+                                .spacing(0)
+                                .padding(crate::design::with_vertical_rail(iced::Padding::ZERO)),
+                        )
+                        .direction(
+                            cosmic::iced::widget::scrollable::Direction::Vertical(
                                 crate::design::scrollbar(),
-                            )),
+                            ),
+                        ),
                     )
                     .max_height(120)
                     .into(),
@@ -505,12 +515,21 @@ impl Runtime {
             (None, None)
         };
         content.push(if transitioning {
-            widget::container(widget::scrollable(body(draft)).direction(
-                cosmic::iced::widget::scrollable::Direction::Vertical(crate::design::scrollbar()),
-            ))
+            // The reservation belongs inside the scroll viewport. An inset on
+            // the outer container moves the viewport itself, and the thumb
+            // floats at that viewport's right edge either way, so the draft
+            // text would still run underneath it.
+            widget::container(
+                widget::scrollable(
+                    widget::container(body(draft))
+                        .padding(crate::design::with_vertical_rail(iced::Padding::from(8.0))),
+                )
+                .direction(cosmic::iced::widget::scrollable::Direction::Vertical(
+                    crate::design::scrollbar(),
+                )),
+            )
             .height(104)
             .width(Length::Fill)
-            .padding(8)
             .into()
         } else {
             iced::widget::text_editor::TextEditor::new(&self.composer)

@@ -679,7 +679,7 @@ impl Cagents {
         let durable = Arc::make_mut(&mut self.durable);
         durable.focused = Some(card_id);
         durable.cards.insert(durable_index, card.clone());
-        self.register_thread_card(card_id);
+        self.register_channel_card(card_id);
         let update = self
             .workspace
             .add_card(

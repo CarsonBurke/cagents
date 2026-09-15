@@ -10,6 +10,13 @@ use crate::design;
 /// same pitch the strip lays out with.
 pub const SPACING: f32 = 4.0;
 
+/// Inset between the strip's viewport and each end of the bar holding it.
+///
+/// A caller that sizes the scroll viewport has to subtract this from both
+/// ends, so the number lives here rather than being spelled again at the
+/// call site where the two copies could drift apart.
+pub const EDGE_INSET: f32 = 8.0;
+
 /// Wraps a tab so a middle click closes it without changing left-click
 /// selection behavior.
 pub fn middle_click_close<'a, Message: Clone + 'a>(
@@ -66,6 +73,10 @@ fn strip<'a, Message: 'a>(
             .height(row_height),
     )
     .id(id)
+    // No scrollbar rail: the thumb is suppressed outright, so there is nothing
+    // for a tab to be overlapped by. `overflow_fade_x` is what tells the
+    // reader that the strip continues past the edge, and it needs the tabs to
+    // reach that edge to fade them.
     .direction(scrollable::Direction::Horizontal(
         scrollable::Scrollbar::hidden(),
     ))
@@ -77,7 +88,7 @@ fn strip<'a, Message: 'a>(
     widget::container(crate::interaction::overflow_fade_x(
         crate::interaction::horizontal_wheel(tabs),
     ))
-    .padding([0.0, 8.0])
+    .padding([0.0, EDGE_INSET])
     .center_y(Length::Fill)
     // Callers pass the nominal header height; the bar that receives the strip
     // spends `BORDER_WIDTH` of it on the rule beneath. Reserving it here keeps

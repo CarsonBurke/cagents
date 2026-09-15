@@ -9,9 +9,10 @@ use std::{
 use cagents::{
     model::{
         BootId, BrowserId, BrowserRestoreFidelity, BrowserSession, CardId, CardKind, CardState,
-        Existence, Exposure, HostIncarnation, HostSessionId, HostSessionProof, LaunchRecipe,
-        ProjectId, ProjectState, RepositoryView, Residency, TerminalContinuity, TerminalId,
-        TerminalSession, WorkspaceId, WorkspaceState, WorktreeId, WorktreeState,
+        ChannelId, Existence, Exposure, HostIncarnation, HostSessionId, HostSessionProof,
+        LaunchRecipe, ProjectChannel, ProjectId, ProjectState, RepositoryView, Residency,
+        TerminalContinuity, TerminalId, TerminalSession, WorkspaceId, WorkspaceState, WorktreeId,
+        WorktreeState,
     },
     persistence::StateStore,
     session::SessionRuntime,
@@ -87,8 +88,8 @@ impl RestoreFixture {
             active_worktree: Some(worktree_path.clone()),
             worktree_focus: HashMap::from([(worktree_path.clone(), terminal_card_id)]),
             project_order: Vec::new(),
-            threads: Vec::new(),
-            active_thread: None,
+            channels: Vec::new(),
+            active_channel: None,
             cards: vec![
                 CardState {
                     id: terminal_card_id,
@@ -384,4 +385,45 @@ fn browser_focus_and_navigation_only_snapshots_survive_restart_without_cards() {
     assert!(restored.worktree_focus.is_empty());
     assert!(restored.cards.iter().all(|card| !card.existence.is_open()));
     runtime.shutdown();
+}
+
+/// A channel is durable state in its own right: its identity, the chats it
+/// owns, the chat it had focused, its title, and the fact that it was selected
+/// all have to come back.
+///
+/// Storage spells this state exactly the way the build before the channel
+/// rename did - `cagents::persistence` pins those field names against the
+/// on-disk format - so this is equally the restore path for a workspace an
+/// older installation saved.
+#[test]
+fn a_selected_channel_restores_its_chats_focus_and_title() {
+    let directory = tempdir().unwrap();
+    let database_path = directory.path().join("channels.sqlite3");
+    let mut fixture = RestoreFixture::new();
+    let channel_id = ChannelId::new();
+    fixture.workspace.channels = vec![ProjectChannel {
+        id: channel_id,
+        project_id: fixture.project.id,
+        title: "Investigate startup".into(),
+        cards: vec![fixture.terminal_card_id, fixture.browser_card_id],
+        focused: Some(fixture.browser_card_id),
+    }];
+    fixture.workspace.active_channel = Some(channel_id);
+    fixture.persist(&database_path);
+
+    let (mut runtime, restored) =
+        SessionRuntime::open(&database_path, fixture.boot_id.clone()).unwrap();
+    let restored = restored.expect("a saved workspace must restore");
+    assert_eq!(restored.active_channel, Some(channel_id));
+    assert_eq!(restored.channels.len(), 1);
+    assert_eq!(restored.channels[0].id, channel_id);
+    assert_eq!(restored.channels[0].project_id, fixture.project.id);
+    assert_eq!(restored.channels[0].title, "Investigate startup");
+    assert_eq!(
+        restored.channels[0].cards,
+        vec![fixture.terminal_card_id, fixture.browser_card_id]
+    );
+    assert_eq!(restored.channels[0].focused, Some(fixture.browser_card_id));
+    runtime.shutdown();
+    assert_eq!(runtime.last_error(), None);
 }

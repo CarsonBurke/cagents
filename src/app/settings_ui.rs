@@ -526,10 +526,10 @@ fn settings_category_controls<'a>(
                     progress,
                 ),
                 setting_input(
-                    "New thread",
+                    "New channel",
                     "Creates an independent native conversation in the project's main worktree. Leave blank to unbind.",
-                    &draft.keyboard_shortcuts.new_thread,
-                    SettingsField::ShortcutNewThread,
+                    &draft.keyboard_shortcuts.new_channel,
+                    SettingsField::ShortcutNewChannel,
                     progress,
                 ),
                 setting_input(
@@ -666,7 +666,9 @@ pub(super) fn settings_dialog<'a>(
                 .spacing(design::GRID_UNIT)
                 .width(Length::Fill),
             )
-            .padding([3.0 * design::GRID_UNIT, 2.0 * design::GRID_UNIT])
+            .padding(design::with_vertical_rail(
+                [3.0 * design::GRID_UNIT, 2.0 * design::GRID_UNIT].into(),
+            ))
             .width(Length::Fill),
         )
         .direction(cosmic::iced::widget::scrollable::Direction::Vertical(

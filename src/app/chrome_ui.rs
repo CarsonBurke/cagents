@@ -450,12 +450,19 @@ impl Cagents {
                 widget::container(
                     widget::column::with_children(vec![
                         heading.into(),
-                        widget::scrollable(widget::column::with_children(notices).spacing(12))
-                            .direction(iced::widget::scrollable::Direction::Vertical(
-                                design::scrollbar(),
-                            ))
-                            .height(Length::Shrink)
-                            .into(),
+                        widget::scrollable(
+                            widget::column::with_children(notices)
+                                .spacing(12)
+                                // Each notice ends in a Dismiss control on its
+                                // right edge, which the floating thumb would
+                                // otherwise cover.
+                                .padding(design::with_vertical_rail(iced::Padding::ZERO)),
+                        )
+                        .direction(iced::widget::scrollable::Direction::Vertical(
+                            design::scrollbar(),
+                        ))
+                        .height(Length::Shrink)
+                        .into(),
                     ])
                     .spacing(8),
                 )
@@ -571,10 +578,11 @@ impl Cagents {
     }
 
     fn tab_strip_geometry(&self) -> (f32, f32) {
-        // The ceditor-equivalent wrapper contributes 8px on each side; keep
-        // that inset out of the scroll viewport and reveal calculation.
+        // The strip's own wrapper insets both ends; keep that out of the
+        // scroll viewport and reveal calculation.
+        let insets = 2.0 * crate::tab_strip::EDGE_INSET;
         let available =
-            (self.workspace.viewport_width() - self.workspace_header_width() - 16.0).max(0.0);
+            (self.workspace.viewport_width() - self.workspace_header_width() - insets).max(0.0);
         // Match ceditor: tabs keep a readable fixed width and the strip
         // scrolls as soon as the tab set no longer fits.
         (available, 184.0)

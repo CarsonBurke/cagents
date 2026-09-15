@@ -1,5 +1,6 @@
 mod agent_ui;
 mod branch_ui;
+mod channel_ui;
 mod chat_ui;
 mod chrome_ui;
 mod daemon_recovery;
@@ -14,7 +15,6 @@ mod refresh_ui;
 mod safety_tests;
 mod settings_ui;
 mod terminal_close;
-mod thread_ui;
 mod update_ui;
 mod worktree_operations;
 mod worktree_ui;
@@ -1707,7 +1707,7 @@ fn user_workspace_message_blocked_while_modal(message: &Message) -> bool {
         Message::Repository(action) => !repository_action_allowed_while_modal(action),
         Message::ChatUi(action) => !action.allowed_while_modal(),
         Message::ChromeUi(action) => !matches!(action, chrome_ui::Action::Close),
-        Message::ThreadUi(_) => true,
+        Message::ChannelUi(_) => true,
         Message::UpdateUi(update_ui::Action::Apply) => true,
         Message::PullRequestUi(action) => !action.allowed_while_modal(),
         Message::Sidebar(action) => !answers_discard_confirmation(action),
@@ -1788,7 +1788,7 @@ fn workspace_navigation_blocked_during_save(message: &Message) -> bool {
             | Message::NewBrowser
             | Message::OpenBrowser(_)
             | Message::ChromeUi(chrome_ui::Action::Launch(_))
-            | Message::ThreadUi(_)
+            | Message::ChannelUi(_)
             | Message::FocusCard(_)
             | Message::FocusAdjacent(_)
             | Message::Viewport {
@@ -1805,8 +1805,8 @@ fn workspace_navigation_blocked_during_save(message: &Message) -> bool {
                     | SidebarAction::OpenWorktree { .. }
                     | SidebarAction::OpenPullRequest { .. }
                     | SidebarAction::NewWorktree { .. }
-                    | SidebarAction::NewThread { .. }
-                    | SidebarAction::OpenThread { .. }
+                    | SidebarAction::NewChannel { .. }
+                    | SidebarAction::OpenChannel { .. }
                     | SidebarAction::CreatePullRequest { .. }
                     | SidebarAction::OpenSettings
             )
@@ -1903,7 +1903,7 @@ pub enum SettingsField {
     FocusFollowsMouse,
     LinkOpenGesture,
     ShortcutNewTerminal,
-    ShortcutNewThread,
+    ShortcutNewChannel,
     ShortcutClonePane,
     ShortcutCloseFocusedColumn,
     ShortcutSearchProjects,
@@ -1928,7 +1928,7 @@ enum SettingsFeedback {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ShortcutDraft {
     new_terminal: String,
-    new_thread: String,
+    new_channel: String,
     clone_pane: String,
     close_focused_column: String,
     search_projects: String,
@@ -1941,7 +1941,7 @@ impl ShortcutDraft {
     fn from_shortcuts(shortcuts: &KeyboardShortcuts) -> Self {
         Self {
             new_terminal: settings::format_chords(&shortcuts.new_terminal),
-            new_thread: settings::format_chords(&shortcuts.new_thread),
+            new_channel: settings::format_chords(&shortcuts.new_channel),
             clone_pane: settings::format_chords(&shortcuts.clone_pane),
             close_focused_column: settings::format_chords(&shortcuts.close_focused_column),
             search_projects: settings::format_chords(&shortcuts.search_projects),
@@ -2068,7 +2068,7 @@ impl SettingsDraft {
                 };
             }
             SettingsField::ShortcutNewTerminal => self.keyboard_shortcuts.new_terminal = value,
-            SettingsField::ShortcutNewThread => self.keyboard_shortcuts.new_thread = value,
+            SettingsField::ShortcutNewChannel => self.keyboard_shortcuts.new_channel = value,
             SettingsField::ShortcutClonePane => self.keyboard_shortcuts.clone_pane = value,
             SettingsField::ShortcutCloseFocusedColumn => {
                 self.keyboard_shortcuts.close_focused_column = value;
@@ -2251,8 +2251,8 @@ fn settings_update(
             next.keyboard_shortcuts.new_terminal = settings::parse_chords(value);
             Ok(())
         }
-        SettingsField::ShortcutNewThread => {
-            next.keyboard_shortcuts.new_thread = settings::parse_chords(value);
+        SettingsField::ShortcutNewChannel => {
+            next.keyboard_shortcuts.new_channel = settings::parse_chords(value);
             Ok(())
         }
         SettingsField::ShortcutClonePane => {
@@ -2538,7 +2538,7 @@ pub enum Message {
     ChatUi(chat_ui::Action),
     UpdateUi(update_ui::Action),
     ChromeUi(chrome_ui::Action),
-    ThreadUi(thread_ui::Action),
+    ChannelUi(channel_ui::Action),
     BranchUi(branch_ui::Action),
     RefreshUi(refresh_ui::Action),
     /// Opens the confirmation; `ConfirmResetSettings` performs the reset.
@@ -2941,7 +2941,7 @@ pub struct Cagents {
     active_workspace: Option<PathBuf>,
     worktree_focus: HashMap<PathBuf, CardId>,
     worktree_offsets: HashMap<PathBuf, f32>,
-    thread_offsets: HashMap<crate::model::ThreadId, f32>,
+    channel_offsets: HashMap<crate::model::ChannelId, f32>,
     worktree_owners: HashMap<CardId, PathBuf>,
     known_worktree_roots: HashSet<PathBuf>,
     workspace_view_generation: u64,
@@ -3514,7 +3514,7 @@ impl Cagents {
         let durable = Arc::make_mut(&mut self.durable);
         durable.cards.insert(durable_index, card.clone());
         durable.focused = Some(card_id);
-        self.register_thread_card(card_id);
+        self.register_channel_card(card_id);
         let update = self
             .workspace
             .add_card(
@@ -3633,7 +3633,7 @@ impl Cagents {
         let durable = Arc::make_mut(&mut self.durable);
         durable.cards.insert(durable_index, card.clone());
         durable.focused = Some(id);
-        self.register_thread_card(id);
+        self.register_channel_card(id);
         self.lifecycle
             .register(id, card.exposure, card.residency, Instant::now());
         let start = match card.kind {
@@ -3696,7 +3696,7 @@ impl Cagents {
         let durable = Arc::make_mut(&mut self.durable);
         durable.cards.push(card);
         durable.focused = Some(card_id);
-        self.register_thread_card(card_id);
+        self.register_channel_card(card_id);
         let mut runtime = RepositoryRuntime::new(view);
         runtime.set_auto_save(self.settings.editor_auto_save);
         runtime.set_wrap_lines(self.settings.editor_wrap_lines);
@@ -3800,7 +3800,7 @@ impl Cagents {
             kind: CardKind::Browser(session),
         });
         durable.focused = Some(card_id);
-        self.register_thread_card(card_id);
+        self.register_channel_card(card_id);
         self.lifecycle.register(
             card_id,
             Exposure::Visible,
@@ -5391,7 +5391,7 @@ impl Cagents {
     }
 
     fn synchronize_sidebar_selection(&mut self) {
-        if self.durable.active_thread.is_some() {
+        if self.durable.active_channel.is_some() {
             return;
         }
         let Some(card) = self.workspace.focused().and_then(|id| self.card_state(id)) else {
@@ -5554,11 +5554,11 @@ impl Cagents {
                 card.existence.is_open()
                     && self
                         .durable
-                        .threads
+                        .channels
                         .iter()
-                        .find(|thread| thread.cards.contains(&card.id))
-                        .map(|thread| thread.id)
-                        == self.durable.active_thread
+                        .find(|channel| channel.cards.contains(&card.id))
+                        .map(|channel| channel.id)
+                        == self.durable.active_channel
                     && matches!(&card.kind, CardKind::Repository(view) if view.worktree == worktree)
             })
             .map(|card| card.id)
@@ -6943,7 +6943,7 @@ impl Cagents {
             sidebar: self.sidebar_state.saved_view(),
             worktree_offsets: self.worktree_offsets.clone(),
         };
-        if self.durable.active_thread.is_none()
+        if self.durable.active_channel.is_none()
             && let Some(path) = &self.active_workspace
         {
             view.worktree_offsets
@@ -7164,7 +7164,7 @@ impl Cagents {
                 if matches!(
                     field,
                     SettingsField::ShortcutNewTerminal
-                        | SettingsField::ShortcutNewThread
+                        | SettingsField::ShortcutNewChannel
                         | SettingsField::ShortcutClonePane
                         | SettingsField::ShortcutCloseFocusedColumn
                         | SettingsField::ShortcutSearchProjects
@@ -7227,7 +7227,7 @@ impl Cagents {
                     | SettingsField::LinkOpenDestination
                     | SettingsField::LinkOpenGesture
                     | SettingsField::ShortcutNewTerminal
-                    | SettingsField::ShortcutNewThread
+                    | SettingsField::ShortcutNewChannel
                     | SettingsField::ShortcutClonePane
                     | SettingsField::ShortcutCloseFocusedColumn
                     | SettingsField::ShortcutSearchProjects
@@ -7448,7 +7448,7 @@ impl Application for Cagents {
             active_workspace: None,
             worktree_focus: HashMap::new(),
             worktree_offsets: HashMap::new(),
-            thread_offsets: HashMap::new(),
+            channel_offsets: HashMap::new(),
             worktree_owners: HashMap::new(),
             known_worktree_roots: worktrees
                 .iter()
@@ -7584,7 +7584,7 @@ impl Application for Cagents {
                     .insert(terminal.id, terminal.clone());
             }
         }
-        app.refresh_sidebar_threads();
+        app.refresh_sidebar_channels();
         let mut tasks = vec![
             scope,
             app.commit_terminal_handoffs(),
@@ -8025,8 +8025,8 @@ impl Application for Cagents {
                         } else if let Some(active) = self.active_workspace.clone() {
                             // Discovery can resolve legacy launch directories
                             // into distinct worktrees after session restoration.
-                            task = if let Some(thread) = self.durable.active_thread {
-                                self.select_thread(thread)
+                            task = if let Some(channel) = self.durable.active_channel {
+                                self.select_channel(channel)
                             } else {
                                 self.select_worktree(active, false)
                             };
@@ -8285,11 +8285,11 @@ impl Application for Cagents {
                         iced::widget::operation::focus(pull_request_dialog_focus_id())
                             .map(cosmic::Action::App)
                     }
-                    SidebarAction::NewThread { project_id } => {
-                        self.handle_thread_ui(thread_ui::Action::Create(project_id))
+                    SidebarAction::NewChannel { project_id } => {
+                        self.handle_channel_ui(channel_ui::Action::Create(project_id))
                     }
-                    SidebarAction::OpenThread { thread_id } => {
-                        self.handle_thread_ui(thread_ui::Action::Open(thread_id))
+                    SidebarAction::OpenChannel { channel_id } => {
+                        self.handle_channel_ui(channel_ui::Action::Open(channel_id))
                     }
                     SidebarAction::ToggleFilesFilter { key } => {
                         if self.source_control_is_bound(&key) && self.sidebar_state.files_filter_open() {
@@ -9456,7 +9456,9 @@ impl Application for Cagents {
                     Some(workspace_widget::GlobalShortcut::NewTerminal) => {
                         cosmic::task::message(Message::NewTerminal)
                     }
-                    Some(workspace_widget::GlobalShortcut::NewThread) => self.new_project_thread(),
+                    Some(workspace_widget::GlobalShortcut::NewChannel) => {
+                        self.new_project_channel()
+                    }
                     Some(workspace_widget::GlobalShortcut::ClonePane) => self.clone_focused_pane(),
                     Some(workspace_widget::GlobalShortcut::CloseFocusedCard) => {
                         match close_focused_message(&self.workspace) {
@@ -9561,7 +9563,7 @@ impl Application for Cagents {
             Message::ProjectUi(action) => self.handle_project_action(action),
             Message::PullRequestUi(action) => self.handle_pull_request_ui(action),
             Message::ChromeUi(action) => self.update_chrome(action),
-            Message::ThreadUi(action) => self.handle_thread_ui(action),
+            Message::ChannelUi(action) => self.handle_channel_ui(action),
             Message::BranchUi(action) => self.update_branch_ui(action),
             Message::RefreshUi(action) => self.update_refresh(action),
             Message::NativeWindowAction(action) => Task::done(cosmic::Action::Cosmic(action)),
@@ -9727,7 +9729,7 @@ impl Application for Cagents {
         }
         let notices = self.reconcile_notice_popup();
         self.synchronize_sidebar_selection();
-        self.refresh_sidebar_threads();
+        self.refresh_sidebar_channels();
         let binding = self.rebind_source_control();
         if let Some(source) = self.sidebar_model.source_control.as_ref() {
             let selected = self
@@ -13858,7 +13860,7 @@ mod tests {
             refresh_ui: refresh_ui::State::default(),
             active_workspace: None,
             worktree_focus: HashMap::new(),
-            thread_offsets: HashMap::new(),
+            channel_offsets: HashMap::new(),
             worktree_offsets: HashMap::new(),
             worktree_owners: HashMap::new(),
             known_worktree_roots: HashSet::new(),

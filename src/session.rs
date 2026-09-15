@@ -1296,8 +1296,8 @@ mod tests {
             active_worktree: None,
             worktree_focus: HashMap::new(),
             project_order: Vec::new(),
-            threads: Vec::new(),
-            active_thread: None,
+            channels: Vec::new(),
+            active_channel: None,
             cards: vec![CardState {
                 id: CardId::new(),
                 generation: 0,

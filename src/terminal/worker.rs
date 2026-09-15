@@ -2450,6 +2450,13 @@ mod tests {
     }
 
     fn capture_worker_for(recipe: LaunchRecipe) -> (Worker, Receiver<TerminalEvent>) {
+        capture_worker_with(recipe, TerminalConfig::default())
+    }
+
+    fn capture_worker_with(
+        recipe: LaunchRecipe,
+        config: TerminalConfig,
+    ) -> (Worker, Receiver<TerminalEvent>) {
         let session = TerminalSession {
             id: crate::model::TerminalId::new(),
             launch: recipe.clone(),
@@ -2464,14 +2471,7 @@ mod tests {
         let (events, receiver) = crossbeam_channel::unbounded();
         let published = Arc::new(PublishedState::new(true, Arc::new(|_| {})));
         (
-            Worker::start(
-                session,
-                TerminalConfig::default(),
-                commands,
-                events,
-                published,
-            )
-            .unwrap(),
+            Worker::start(session, config, commands, events, published).unwrap(),
             receiver,
         )
     }
@@ -3309,5 +3309,220 @@ mod tests {
         assert_eq!(command.get_env("CLICOLOR"), Some(OsStr::new("0")));
         assert_eq!(command.get_env("CLICOLOR_FORCE"), Some(OsStr::new("1")));
         assert_eq!(command.get_env("COLORFGBG"), Some(OsStr::new("0;15")));
+    }
+
+    const SCROLLBACK_LINES: usize = 2000;
+    /// A 0.67s flick at 60 Hz presentation.
+    const FRAMES: usize = 40;
+    /// What a 120 Hz high-resolution trackpad delivers inside one 60 Hz frame,
+    /// which is the situation issue #101 is about.
+    const NOTCHES_PER_FRAME: usize = 8;
+    const LINES_PER_NOTCH: isize = 3;
+
+    /// One measured scroll run: what the pipeline actually did, what it cost,
+    /// where it started and where it ended up.
+    #[derive(Debug)]
+    struct ScrollRun {
+        commands: usize,
+        captures: usize,
+        wire_bytes: usize,
+        origin: (u64, String),
+        offset: u64,
+        screen: String,
+        latency: crate::performance::LatencySummary,
+    }
+
+    /// Applies `deltas` to a filled scrollback, driving every command through
+    /// the viewport re-read, the snapshot capture and the wire encoding the
+    /// daemon would have performed for it.
+    fn scroll_run(deltas: impl IntoIterator<Item = isize>) -> ScrollRun {
+        use crate::performance::{Action, Recorder};
+        use crate::terminal::ipc::{TerminalSnapshot, write_frame};
+        use std::time::Instant;
+
+        // libghostty sizes scrollback from its own page pool rather than from
+        // a row count, so the pool is asked for generously and the workload
+        // then checks that it never reached a bound by accident.
+        let (mut worker, _events) = capture_worker_with(
+            LaunchRecipe {
+                program: "/bin/true".into(),
+                arguments: Vec::new(),
+                working_directory: PathBuf::from("/"),
+                environment: BTreeMap::new(),
+            },
+            TerminalConfig {
+                max_scrollback: 4_000_000,
+                ..TerminalConfig::default()
+            },
+        );
+        // A deterministic 80-column history, wide enough that a viewport
+        // re-read and its wire encoding both do realistic per-cell work.
+        let mut history = Vec::with_capacity(SCROLLBACK_LINES * 80);
+        for line in 0..SCROLLBACK_LINES {
+            history.extend_from_slice(format!("{line:<78}\r\n").as_bytes());
+        }
+        worker.process_output(history);
+
+        let screen = |snapshot: &RenderSnapshot| {
+            snapshot
+                .lines
+                .iter()
+                .map(|line| {
+                    line.cells
+                        .iter()
+                        .map(|cell| cell.text.as_str())
+                        .collect::<String>()
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        let mut recorder = Recorder::default();
+        let mut previous = worker.published.snapshot.load_full();
+        let origin = (previous.scroll.offset, screen(&previous));
+        let mut commands = 0;
+        let mut captures = 0;
+        let mut wire_bytes = 0;
+        for delta in deltas {
+            // Returning credit first is what the UI does after drawing, so the
+            // worker is free to capture the command that follows.
+            worker.published.acknowledge(worker.generation);
+            let generation = recorder.commit(Action::TerminalScroll).unwrap();
+            assert!(
+                !worker.handle_command(Command::Scroll(ScrollCommand::Delta(delta))),
+                "a scroll command must not request shutdown"
+            );
+            let published = worker.published.snapshot.load_full();
+            if published.generation != previous.generation {
+                captures += 1;
+                let mut frame = Vec::new();
+                write_frame(&mut frame, &TerminalSnapshot::diff(&published, &previous)).unwrap();
+                wire_bytes += frame.len();
+            }
+            assert!(recorder.redraw_scheduled(generation, Instant::now()));
+            previous = published;
+            commands += 1;
+        }
+
+        let mut durations: Vec<_> = recorder
+            .samples()
+            .filter_map(|sample| sample.redraw_scheduling_ns.map(Duration::from_nanos))
+            .collect();
+        ScrollRun {
+            commands,
+            captures,
+            wire_bytes,
+            origin,
+            offset: previous.scroll.offset,
+            screen: screen(&previous),
+            latency: crate::performance::LatencySummary::from_durations(&mut durations).unwrap(),
+        }
+    }
+
+    /// Deterministic scroll workload for issue #101, plus the equivalence that
+    /// makes coalescing safe.
+    ///
+    /// The widget lives in the `ui` feature graph and the emulator in `host`,
+    /// so no single build can drive a wheel gesture end to end. This half
+    /// measures the expensive half of the pipeline - applying a viewport move
+    /// to ghostty, re-reading the viewport into a snapshot, and encoding that
+    /// snapshot for the socket - and proves that folding a frame's notches
+    /// into one command lands on exactly the same screen. The folding itself
+    /// is covered by `terminal::widget::tests`.
+    ///
+    /// Timings are printed, never asserted: a `test`-profile build with an
+    /// unoptimized parser gives a ratio, not a latency budget, and this crate
+    /// treats even release numbers as non-gating.
+    #[test]
+    fn coalescing_a_frame_of_notches_costs_one_capture_and_lands_on_the_same_screen() {
+        let notches = FRAMES * NOTCHES_PER_FRAME;
+        let per_event = scroll_run(std::iter::repeat_n(-LINES_PER_NOTCH, notches));
+        let per_frame = scroll_run(std::iter::repeat_n(
+            -LINES_PER_NOTCH * NOTCHES_PER_FRAME as isize,
+            FRAMES,
+        ));
+
+        // The whole point: the same gesture reaches the same place, showing
+        // the same rows, for an eighth of the commands and captures.
+        assert_eq!(per_frame.offset, per_event.offset);
+        assert_eq!(per_frame.screen, per_event.screen);
+        assert_eq!(per_event.captures, notches);
+        assert_eq!(per_frame.captures, FRAMES);
+        // A run that clamped at the top would satisfy the equality above
+        // without having measured scrolling at all.
+        assert!(
+            per_event.offset > 0,
+            "the workload must stay inside scrollback rather than clamp"
+        );
+
+        let budget = crate::performance::PerformanceBudget {
+            // One coalesced move has to fit inside a 60 Hz frame alongside the
+            // rest of that frame's work, so a quarter of a frame at p95.
+            interaction_p95: Duration::from_micros(4_166),
+            interaction_p99: Duration::from_micros(8_333),
+            ..crate::performance::PerformanceBudget::default()
+        };
+        for (policy, run) in [("per-event", &per_event), ("per-frame", &per_frame)] {
+            println!(
+                "scroll workload [{policy}] commands={} captures={} wire_bytes={} \
+                 p50={:?} p95={:?} p99={:?} worst={:?} within_budget={} (non-gating)",
+                run.commands,
+                run.captures,
+                run.wire_bytes,
+                run.latency.median,
+                run.latency.p95,
+                run.latency.p99,
+                run.latency.worst,
+                budget.accepts(run.latency)
+            );
+        }
+        println!(
+            "scroll workload [saving] commands x{:.2} wire_bytes x{:.2} total_capture_time \
+             {:?} -> {:?}",
+            per_event.commands as f64 / per_frame.commands as f64,
+            per_event.wire_bytes as f64 / per_frame.wire_bytes as f64,
+            per_event.latency.median * per_event.commands as u32,
+            per_frame.latency.median * per_frame.commands as u32
+        );
+    }
+
+    /// Folding must not change where a gesture stops, which is the one place
+    /// a summed delta could plausibly differ from the notches it replaced.
+    #[test]
+    fn overshooting_either_bound_clamps_the_same_whether_or_not_it_was_coalesced() {
+        let overshoot = SCROLLBACK_LINES as isize * 2;
+        let notches = (overshoot / LINES_PER_NOTCH) as usize;
+
+        let top_per_event = scroll_run(std::iter::repeat_n(-LINES_PER_NOTCH, notches));
+        let top_per_frame = scroll_run(std::iter::repeat_n(
+            -LINES_PER_NOTCH * NOTCHES_PER_FRAME as isize,
+            notches / NOTCHES_PER_FRAME,
+        ));
+        assert_eq!(top_per_event.offset, 0, "the top of scrollback is row zero");
+        assert_eq!(top_per_frame.offset, 0);
+        assert_eq!(top_per_frame.screen, top_per_event.screen);
+
+        // Coming back down has to land on the live screen again, not one row
+        // short of it or past the end of history.
+        let bottom_per_event = scroll_run(
+            std::iter::repeat_n(-LINES_PER_NOTCH, notches)
+                .chain(std::iter::repeat_n(LINES_PER_NOTCH, notches)),
+        );
+        let bottom_per_frame = scroll_run(
+            std::iter::repeat_n(
+                -LINES_PER_NOTCH * NOTCHES_PER_FRAME as isize,
+                notches / NOTCHES_PER_FRAME,
+            )
+            .chain(std::iter::repeat_n(
+                LINES_PER_NOTCH * NOTCHES_PER_FRAME as isize,
+                notches / NOTCHES_PER_FRAME,
+            )),
+        );
+        assert_eq!(bottom_per_frame.offset, bottom_per_event.offset);
+        assert_eq!(bottom_per_frame.screen, bottom_per_event.screen);
+        assert_eq!(
+            (bottom_per_event.offset, &bottom_per_event.screen),
+            (bottom_per_event.origin.0, &bottom_per_event.origin.1),
+            "returning to the bottom must show the live screen again"
+        );
     }
 }

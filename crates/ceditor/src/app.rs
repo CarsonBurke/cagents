@@ -1917,13 +1917,17 @@ impl Editor {
                 ])
                 .align_y(iced::Alignment::Center)
                 .into(),
-                widget::scrollable(widget::column::with_children(details).spacing(10))
-                    .id(widget::Id::new("ceditor.notices.details"))
-                    .direction(iced::widget::scrollable::Direction::Vertical(
-                        design::scrollbar(),
-                    ))
-                    .height(280)
-                    .into(),
+                widget::scrollable(
+                    widget::column::with_children(details)
+                        .spacing(10)
+                        .padding(design::with_vertical_rail(iced::Padding::ZERO)),
+                )
+                .id(widget::Id::new("ceditor.notices.details"))
+                .direction(iced::widget::scrollable::Direction::Vertical(
+                    design::scrollbar(),
+                ))
+                .height(280)
+                .into(),
                 widget::button::standard("Dismiss notices")
                     .on_press_maybe(has_notices.then_some(Message::Dismiss))
                     .into(),
@@ -3748,12 +3752,16 @@ impl Application for Editor {
                 }
                 editor.push(widget::divider::horizontal::default().into());
                 editor.push(
-                    widget::scrollable(widget::column::with_children(results).spacing(4))
-                        .direction(iced::widget::scrollable::Direction::Vertical(
-                            cagents::design::scrollbar(),
-                        ))
-                        .height(150)
-                        .into(),
+                    widget::scrollable(
+                        widget::column::with_children(results)
+                            .spacing(4)
+                            .padding(design::with_vertical_rail(iced::Padding::ZERO)),
+                    )
+                    .direction(iced::widget::scrollable::Direction::Vertical(
+                        design::scrollbar(),
+                    ))
+                    .height(150)
+                    .into(),
                 );
             }
             let mut workspace = Vec::new();
@@ -3976,12 +3984,18 @@ impl Application for Editor {
                             .id(widget::Id::new("ceditor.quick-open.query"))
                             .on_input(Message::QuickOpenQueryChanged)
                             .into(),
-                        widget::scrollable(widget::column::with_children(rows).spacing(2))
-                            .direction(iced::widget::scrollable::Direction::Vertical(
-                                cagents::design::scrollbar(),
-                            ))
-                            .height(360)
-                            .into(),
+                        widget::scrollable(
+                            widget::column::with_children(rows)
+                                .spacing(2)
+                                // Every result button fills the row, so the
+                                // thumb would sit on top of its background.
+                                .padding(design::with_vertical_rail(iced::Padding::ZERO)),
+                        )
+                        .direction(iced::widget::scrollable::Direction::Vertical(
+                            design::scrollbar(),
+                        ))
+                        .height(360)
+                        .into(),
                     ])
                     .spacing(12),
                     620.0,
@@ -4211,7 +4225,7 @@ impl Application for Editor {
                     .max_width(620),
             )
             .direction(iced::widget::scrollable::Direction::Vertical(
-                cagents::design::scrollbar(),
+                design::scrollbar(),
             ))
             .width(Length::Fill)
             .height(Length::Fill)

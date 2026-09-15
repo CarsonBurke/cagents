@@ -18,7 +18,7 @@ use std::{
 
 use cosmic::{
     Element,
-    iced::{Alignment, Length, advanced::text::EllipsizeHeightLimit, id::Id},
+    iced::{Alignment, Length, Padding, advanced::text::EllipsizeHeightLimit, id::Id},
     theme,
     widget::{self, button, icon},
 };
@@ -27,7 +27,7 @@ use url::Url;
 use crate::{
     design::{self, NavigationLayout, ROW_ICON_SIZE, STATUS_ICON_SIZE},
     github::{PullRequest, PullRequestCheck},
-    model::{CardId, ProjectId, ProjectState, ThreadId, WorktreeId},
+    model::{CardId, ChannelId, ProjectId, ProjectState, WorktreeId},
     repository::{
         BranchComparison, ChangeArea, ChangeKind, ChangedPath, CommitIdentity, CommitSummary,
         ConflictKind, DirtyState, DiscardRequest, HISTORY_PAGE_SIZE, HeadState, Oid, PathSelection,
@@ -56,6 +56,29 @@ const ROW_ICON_WIDTH: f32 = 20.0;
 // `ROW_ICON_SIZE`/`STATUS_ICON_SIZE` are `crate::design`'s: the in-row icon
 // role is shared with the workspace chrome, and a second definition here is
 // how the two drifted apart.
+
+/// Horizontal step between one row slot and the next, and the unit the rest of
+/// the grid is built from. A compile-time number rather than the theme's
+/// `space_xxxs`, because `row_interaction`'s pointer regions and the rail's
+/// row width are derived from it and neither of those can ask a theme.
+const ROW_GUTTER: f32 = design::GRID_UNIT;
+/// One hierarchy step. A child row's icon slot starts exactly where its
+/// parent's label does, so the tree reads without a guide line.
+const ROW_INDENT: f32 = ROW_ICON_WIDTH + ROW_GUTTER;
+/// The live-indicator slot, reserved whether or not the row has an indicator
+/// this frame. A spinner, an attention badge and a chat count all land here,
+/// so a label cannot reflow when an agent starts working or a chat opens.
+const ROW_STATUS_WIDTH: f32 = design::ROW_ICON_SIZE as f32;
+/// One rail row: the leading glyph and the indicator slot, with no gutter
+/// between them. `COMPACT_WIDTH` less the list's own inset and the scrollbar
+/// rail leaves exactly this much, which is why the rail spends none of it on a
+/// hierarchy indent.
+const COMPACT_ROW_WIDTH: f32 = ROW_ICON_WIDTH + ROW_STATUS_WIDTH;
+/// The project header's hover-revealed commands: disclose, new channel, new
+/// worktree. Reserved inside the header row so a long project name ellipsizes
+/// instead of running under them, and read by `row_interaction::header_at` so
+/// the same three controls stay out of the group's drag region.
+const HEADER_ACTION_WIDTH: f32 = 3.0 * ICON_CONTROL_SIZE;
 
 fn worktree_icon() -> widget::icon::Handle {
     static ICON: LazyLock<widget::icon::Handle> = LazyLock::new(|| {
@@ -306,7 +329,7 @@ pub struct SidebarProject {
     pub name: String,
     pub repository: PathBuf,
     pub worktrees: Vec<SidebarWorktree>,
-    pub threads: Vec<SidebarThread>,
+    pub channels: Vec<SidebarChannel>,
     pub pull_requests: Vec<SidebarPullRequest>,
     pub github_status: String,
     pub github_ready: bool,
@@ -317,38 +340,53 @@ pub struct SidebarProject {
     chrome: ProjectChrome,
 }
 
+/// One project-level channel row.
+///
+/// A channel is a container: `chats` counts the conversations open inside it,
+/// which is what keeps the row distinguishable from a single conversation.
+/// [`ChannelId`] names the container, while each chat inside it is a card with
+/// its own `CardId`, so the two levels cannot be mistaken for one another.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SidebarThread {
-    pub id: ThreadId,
+pub struct SidebarChannel {
+    pub id: ChannelId,
     pub title: String,
     pub selected: bool,
     pub activity: Option<crate::agent::ActivityState>,
     pub unread: bool,
+    pub chats: usize,
     folded_title: Box<str>,
     open_id: Id,
     accessible_name: Box<str>,
+    tooltip: Box<str>,
 }
 
-impl SidebarThread {
+impl SidebarChannel {
     pub fn new(
-        id: ThreadId,
+        id: ChannelId,
         title: String,
         selected: bool,
         activity: Option<crate::agent::ActivityState>,
         unread: bool,
+        chats: usize,
     ) -> Self {
+        let contents = match chats {
+            1 => "1 chat".to_owned(),
+            other => format!("{other} chats"),
+        };
         Self {
             id,
             selected,
             activity,
             unread,
+            chats,
             folded_title: fold(&title),
-            open_id: entity_id("thread.open", id),
+            open_id: entity_id("channel.open", id),
             accessible_name: format!(
-                "Open thread {title}{}",
+                "Open channel {title}, {contents}{}",
                 if unread { ", unread agent update" } else { "" }
             )
             .into_boxed_str(),
+            tooltip: format!("{title} · {contents}").into_boxed_str(),
             title,
         }
     }
@@ -377,7 +415,7 @@ impl SidebarProject {
             name,
             repository,
             worktrees,
-            threads: Vec::new(),
+            channels: Vec::new(),
             pull_requests,
             github_status: "GitHub has not been refreshed.".into(),
             github_ready: false,
@@ -440,13 +478,13 @@ struct ProjectChrome {
     open_id: Id,
     toggle_id: Id,
     new_worktree_id: Id,
-    new_thread_id: Id,
+    new_channel_id: Id,
     open_name: Box<str>,
     compact_open_name: Box<str>,
     collapse_name: Box<str>,
     expand_name: Box<str>,
     new_worktree_name: Box<str>,
-    new_thread_name: Box<str>,
+    new_channel_name: Box<str>,
 }
 
 impl ProjectChrome {
@@ -457,13 +495,13 @@ impl ProjectChrome {
             open_id: entity_id("project.open", id),
             toggle_id: entity_id("project.toggle", id),
             new_worktree_id: entity_id("project.new_worktree", id),
-            new_thread_id: entity_id("project.new_thread", id),
+            new_channel_id: entity_id("project.new_channel", id),
             open_name: format!("Open project {name}").into_boxed_str(),
             compact_open_name: format!("Open {name}").into_boxed_str(),
             collapse_name: format!("Collapse {name} project").into_boxed_str(),
             expand_name: format!("Expand {name} project").into_boxed_str(),
             new_worktree_name: format!("New worktree for {name}").into_boxed_str(),
-            new_thread_name: format!("New thread for {name}").into_boxed_str(),
+            new_channel_name: format!("New channel for {name}").into_boxed_str(),
         }
     }
 }
@@ -2576,8 +2614,8 @@ impl SidebarState {
             | SidebarAction::OpenFileInEditor { .. }
             | SidebarAction::FileCommand { .. }
             | SidebarAction::NewWorktree { .. }
-            | SidebarAction::NewThread { .. }
-            | SidebarAction::OpenThread { .. }
+            | SidebarAction::NewChannel { .. }
+            | SidebarAction::OpenChannel { .. }
             | SidebarAction::ReorderProject { .. }
             | SidebarAction::DragWindow
             | SidebarAction::MaximizeWindow
@@ -2631,11 +2669,11 @@ pub enum SidebarAction {
     ToggleControls,
     ToggleProject(ProjectId),
     OpenRepositoryPicker,
-    NewThread {
+    NewChannel {
         project_id: ProjectId,
     },
-    OpenThread {
-        thread_id: ThreadId,
+    OpenChannel {
+        channel_id: ChannelId,
     },
     OpenRepository {
         project_id: ProjectId,
@@ -3213,7 +3251,7 @@ fn project_list<'a>(
     );
     project_scroll(
         widget::container(column)
-            .padding(spacing.space_xxxs)
+            .padding(RowGrid::list_padding(compact))
             .width(Length::Fill)
             .into(),
         state.filter,
@@ -3374,6 +3412,228 @@ fn empty(state: &SidebarState, compact: bool, modal_open: bool) -> Element<'stat
     .into()
 }
 
+/// Which of the two grids a navigation row sits on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RowKind {
+    /// A project header. It owns the group's disclosure and "new …" commands,
+    /// so it reserves room for those instead of a live indicator.
+    Project,
+    /// A row inside a project: a channel, a worktree, or one of the rail's
+    /// "new …" actions.
+    Child,
+}
+
+/// The content grid every sidebar navigation row is laid out on.
+///
+/// Projects, channels, worktrees and "new …" actions used to be four
+/// independent layout paths: one boxed its icon in a fixed slot while the next
+/// let a glyph size itself, one reserved its trailing controls while the next
+/// pushed a badge only while an agent happened to be working. Adjacent labels
+/// therefore started at three different x positions, and a rail row moved
+/// sideways whenever a spinner appeared. Every row is built from this type, so
+/// the grid can only move as a whole.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RowGrid {
+    kind: RowKind,
+    /// The rail renders glyphs only: no label, no hierarchy indent, and no
+    /// gutter to spend between the two slots it has room for.
+    compact: bool,
+}
+
+/// One row's content while its slots are being filled.
+type RowContent<'a> = widget::Row<'a, SidebarAction, cosmic::Theme, cosmic::Renderer>;
+
+impl RowGrid {
+    const fn project(compact: bool) -> Self {
+        Self {
+            kind: RowKind::Project,
+            compact,
+        }
+    }
+
+    const fn child(compact: bool) -> Self {
+        Self {
+            kind: RowKind::Child,
+            compact,
+        }
+    }
+
+    /// Distance from the row's left edge to its leading icon slot.
+    fn indent(self) -> f32 {
+        match self.kind {
+            RowKind::Child if !self.compact => ROW_INDENT,
+            _ => 0.0,
+        }
+    }
+
+    fn gutter(self) -> f32 {
+        if self.compact { 0.0 } else { ROW_GUTTER }
+    }
+
+    fn height(self) -> f32 {
+        match self.kind {
+            RowKind::Project => PROJECT_HEADER_HEIGHT,
+            RowKind::Child => WORKTREE_ROW_HEIGHT,
+        }
+    }
+
+    /// The scroll viewport's own inset, rail included.
+    ///
+    /// The rail belongs to the content inside the viewport rather than to a
+    /// container around the scrollable: an outer gutter moves the thumb along
+    /// with the content and leaves the two touching exactly as before. The
+    /// rail's inset is the grid's own gutter rather than the theme's, so a
+    /// denser spacing preset cannot squeeze `COMPACT_ROW_WIDTH` out of the
+    /// rail.
+    fn list_padding(compact: bool) -> Padding {
+        design::with_vertical_rail(if compact {
+            Padding {
+                top: ROW_GUTTER,
+                right: 0.0,
+                bottom: ROW_GUTTER,
+                left: ROW_GUTTER,
+            }
+        } else {
+            Padding::from(cosmic::theme::spacing().space_xxxs)
+        })
+    }
+
+    /// Leading icon slot, label slot, and the reserved indicator slot.
+    ///
+    /// Durable badges - primary, detached, locked, dirty, checks - are pushed
+    /// after this and inherit the gutter: they are facts about a worktree
+    /// rather than live activity, so they neither compete for the reserved
+    /// slot nor move when an agent wakes up.
+    fn content<'a>(
+        self,
+        icon: impl Into<Element<'a, SidebarAction>>,
+        label: Option<Element<'a, SidebarAction>>,
+        status: Option<Element<'a, SidebarAction>>,
+    ) -> RowContent<'a> {
+        let mut content = widget::row::with_capacity(3)
+            .align_y(Alignment::Center)
+            .height(Length::Fill)
+            .spacing(self.gutter())
+            .push(
+                widget::container(icon)
+                    .center_x(Length::Fixed(ROW_ICON_WIDTH))
+                    .center_y(Length::Fill),
+            );
+        if let Some(label) = label {
+            content = content.push(label);
+        }
+        if matches!(self.kind, RowKind::Child) {
+            content = content.push(
+                widget::container(slot(status))
+                    .center_x(Length::Fixed(ROW_STATUS_WIDTH))
+                    .center_y(Length::Fill),
+            );
+        }
+        content
+    }
+
+    /// The button a row is: one height, one inset, one width rule.
+    fn control<'a>(
+        self,
+        content: RowContent<'a>,
+        selected: bool,
+    ) -> button::Button<'a, SidebarAction> {
+        button::custom(content)
+            .class(sidebar_button_style(selected))
+            .selected(selected)
+            .padding([0.0, self.gutter()])
+            .width(if self.compact {
+                Length::Fixed(COMPACT_ROW_WIDTH)
+            } else {
+                Length::Fill
+            })
+            .height(Length::Fixed(self.height()))
+    }
+
+    /// Places a finished row on the grid: its hierarchy indent, and whatever
+    /// trailing reservation its kind owes.
+    ///
+    /// The indent is padding around the control rather than inside it, so a
+    /// selected row's background still starts at its own column instead of
+    /// spanning the indent strip back to the pane border.
+    fn mount<'a>(
+        self,
+        control: impl Into<Element<'a, SidebarAction>>,
+    ) -> Element<'a, SidebarAction> {
+        let control = control.into();
+        let row = if matches!(self.kind, RowKind::Project) && !self.compact {
+            widget::row::with_children(vec![
+                control,
+                cosmic::iced::widget::Space::new()
+                    .width(Length::Fixed(HEADER_ACTION_WIDTH))
+                    .into(),
+            ])
+            .align_y(Alignment::Center)
+            .height(Length::Fixed(self.height()))
+            .into()
+        } else {
+            control
+        };
+        let indent = self.indent();
+        if indent == 0.0 {
+            return row;
+        }
+        widget::container(row)
+            .padding(Padding::ZERO.left(indent))
+            .into()
+    }
+}
+
+/// A project header's identity row: its icon, its name, and the room its
+/// hover-revealed commands occupy on the right.
+///
+/// The commands themselves are mounted over this row by
+/// `RowInteraction::actions`, so the reservation - not the controls - is what
+/// keeps a long project name from running under them.
+fn project_identity_row<'a>(
+    project: &'a SidebarProject,
+    selected: bool,
+    modal_open: bool,
+    compact: bool,
+) -> Element<'a, SidebarAction> {
+    let chrome = &project.chrome;
+    let grid = RowGrid::project(compact);
+    let label = (!compact).then(|| {
+        design::heading(project.name.as_str())
+            .class(theme::Text::Default)
+            .wrapping(cosmic::iced::widget::text::Wrapping::None)
+            .ellipsize(cosmic::iced::widget::text::Ellipsize::End(
+                EllipsizeHeightLimit::Lines(1),
+            ))
+            .width(Length::Fill)
+            .into()
+    });
+    let control = grid
+        .control(
+            grid.content(project_icon(project, ROW_ICON_SIZE), label, None),
+            selected,
+        )
+        .id(chrome.open_id.clone())
+        .name(if compact {
+            &*chrome.compact_open_name
+        } else {
+            &*chrome.open_name
+        })
+        .on_press_maybe(gated(
+            SidebarAction::OpenRepository {
+                project_id: project.id,
+                repository: project.repository.clone(),
+            },
+            modal_open,
+        ));
+    let tip: Cow<'a, str> = if compact {
+        Cow::Borrowed(&*chrome.compact_open_name)
+    } else {
+        Cow::Owned(project.repository.display().to_string())
+    };
+    grid.mount(crate::interaction::tooltip(control, tip))
+}
+
 fn project_view<'a>(
     project: &FilteredProject<'a>,
     expanded: bool,
@@ -3385,7 +3645,7 @@ fn project_view<'a>(
     let entity = project.project;
     let chrome = &entity.chrome;
     let project_id = entity.id;
-    let selection = if entity.threads.iter().any(|thread| thread.selected) {
+    let selection = if entity.channels.iter().any(|channel| channel.selected) {
         None
     } else {
         selection
@@ -3394,45 +3654,14 @@ fn project_view<'a>(
         return compact_project(project, selection, modal_open, sticky_viewport);
     }
 
-    let spacing = cosmic::theme::spacing();
     let worktree_count = project.worktrees.len();
-    let has_children = worktree_count > 0 || !project.threads.is_empty();
-    let project_identity = button::custom(
-        widget::row::with_children(vec![
-            widget::container(project_icon(entity, ROW_ICON_SIZE))
-                .center_x(Length::Fixed(ROW_ICON_WIDTH))
-                .into(),
-            design::heading(entity.name.as_str())
-                .class(theme::Text::Default)
-                .wrapping(cosmic::iced::widget::text::Wrapping::None)
-                .ellipsize(cosmic::iced::widget::text::Ellipsize::End(
-                    EllipsizeHeightLimit::Lines(1),
-                ))
-                .width(Length::Fill)
-                .into(),
-        ])
-        .align_y(Alignment::Center)
-        .height(Length::Fill)
-        .spacing(spacing.space_xxxs),
-    )
-    .class(sidebar_button_style(
+    let has_children = worktree_count > 0 || !project.channels.is_empty();
+    let project_identity = project_identity_row(
+        entity,
         selection == Some(SidebarSelection::Project(project_id)),
-    ))
-    .id(chrome.open_id.clone())
-    .name(&*chrome.open_name)
-    .selected(selection == Some(SidebarSelection::Project(project_id)))
-    .padding([0, spacing.space_xxxs])
-    .height(Length::Fixed(PROJECT_HEADER_HEIGHT))
-    .width(Length::Fill)
-    .on_press_maybe(gated(
-        SidebarAction::OpenRepository {
-            project_id,
-            repository: entity.repository.clone(),
-        },
         modal_open,
-    ));
-    let project_identity =
-        crate::interaction::tooltip(project_identity, entity.repository.display().to_string());
+        false,
+    );
 
     let disclosure: Element<'a, SidebarAction> = if has_children {
         icon_action(
@@ -3467,24 +3696,16 @@ fn project_view<'a>(
         ),
         chrome.new_worktree_id.clone(),
     );
-    let add_thread = icon_action(
-        "thread-add-symbolic",
-        &*chrome.new_thread_name,
-        gated(SidebarAction::NewThread { project_id }, modal_open),
-        chrome.new_thread_id.clone(),
+    let add_channel = icon_action(
+        "channel-add-symbolic",
+        &*chrome.new_channel_name,
+        gated(SidebarAction::NewChannel { project_id }, modal_open),
+        chrome.new_channel_id.clone(),
     );
-    let identity = widget::row::with_children(vec![
-        project_identity,
-        cosmic::iced::widget::Space::new()
-            .width(3.0 * ICON_CONTROL_SIZE)
-            .into(),
-    ])
-    .align_y(Alignment::Center)
-    .height(PROJECT_HEADER_HEIGHT);
     let header = RowInteraction::actions(
-        identity.into(),
+        project_identity,
         widget::container(
-            widget::row::with_children(vec![disclosure, add_thread, add_worktree])
+            widget::row::with_children(vec![disclosure, add_channel, add_worktree])
                 .align_y(Alignment::Center)
                 .spacing(0)
                 .height(PROJECT_HEADER_HEIGHT),
@@ -3523,31 +3744,22 @@ fn project_view<'a>(
     }
 
     if expanded {
-        for thread in &project.threads {
-            column = column.push(
-                widget::container(thread_view(thread, modal_open, false)).padding([
-                    0.0,
-                    0.0,
-                    0.0,
-                    ICON_CONTROL_SIZE,
-                ]),
-            );
+        for channel in &project.channels {
+            column = column.push(channel_view(channel, modal_open, false));
         }
         for &worktree in &project.worktrees {
-            column = column.push(
-                widget::container(worktree_view(
-                    project_id,
-                    worktree,
-                    is_primary_worktree(&entity.repository, &worktree.path),
-                    selection,
-                    modal_open,
-                    entity.github_ready,
-                    project.editors,
-                    project.state.has_agent_update(project_id, worktree.id),
-                    project.state.agent_activity(project_id, worktree.id),
-                ))
-                .padding([0.0, 0.0, 0.0, ICON_CONTROL_SIZE]),
-            );
+            column = column.push(worktree_view(
+                project_id,
+                worktree,
+                is_primary_worktree(&entity.repository, &worktree.path),
+                selection,
+                modal_open,
+                entity.github_ready,
+                project.editors,
+                project.state.has_agent_update(project_id, worktree.id),
+                project.state.agent_activity(project_id, worktree.id),
+                false,
+            ));
         }
     }
 
@@ -3575,145 +3787,82 @@ fn compact_project<'a>(
             | Some(SidebarSelection::PullRequest { project_id, .. })
             if project_id == entity.id
     );
-    let action = button::custom(project_icon(entity, ROW_ICON_SIZE))
-        .class(sidebar_button_style(selected))
-        .id(chrome.open_id.clone())
-        .name(&*chrome.compact_open_name)
-        .width(ICON_CONTROL_SIZE)
-        .height(ICON_CONTROL_SIZE)
-        .selected(selected)
-        .on_press_maybe(gated(
-            SidebarAction::OpenRepository {
-                project_id: entity.id,
-                repository: entity.repository.clone(),
-            },
-            modal_open,
-        ));
-    let header = widget::container(context_controls(
-        crate::interaction::tooltip(action, &*chrome.compact_open_name),
+    let header = context_controls(
+        project_identity_row(entity, selected, modal_open, true),
         entity.id,
         None,
         modal_open,
         entity.github_ready,
         project.editors,
-    ))
-    .center_x(Length::Fill);
-    let selection = if entity.threads.iter().any(|thread| thread.selected) {
+    );
+    let selection = if entity.channels.iter().any(|channel| channel.selected) {
         None
     } else {
         selection
     };
-    let mut column = widget::column::with_capacity(project.worktrees.len() + 1)
-        .align_x(Alignment::Center)
-        .width(Length::Fill);
+    let grid = RowGrid::child(true);
+    // The rail's rows are one fixed width, so they start where the header
+    // above them starts. Centring them instead would move every row sideways
+    // whenever the reserved rail changed the content box's width.
+    let mut column = widget::column::with_capacity(project.worktrees.len() + 1).width(Length::Fill);
     for operation in &entity.operations {
-        let action = button::icon(
-            icon::from_name(if operation.cancellable {
-                "process-stop-symbolic"
+        let control = grid
+            .control(
+                grid.content(
+                    widget::icon(
+                        icon::from_name(if operation.cancellable {
+                            "process-stop-symbolic"
+                        } else {
+                            "dialog-information-symbolic"
+                        })
+                        .handle(),
+                    )
+                    .size(ROW_ICON_SIZE),
+                    None,
+                    None,
+                ),
+                false,
+            )
+            .name(if operation.cancellable {
+                format!("Cancel worktree operation: {}", operation.label)
             } else {
-                "dialog-information-symbolic"
+                operation.label.clone()
             })
-            .size(ROW_ICON_SIZE),
-        )
-        .name(if operation.cancellable {
-            format!("Cancel worktree operation: {}", operation.label)
-        } else {
-            operation.label.clone()
-        })
-        .width(ICON_CONTROL_SIZE)
-        .height(ICON_CONTROL_SIZE)
-        .on_press_maybe(
-            (operation.cancellable && !modal_open)
-                .then_some(SidebarAction::CancelWorktreeOperation(operation.id)),
-        );
-        column = column.push(crate::interaction::tooltip(action, &operation.label));
+            .on_press_maybe(
+                (operation.cancellable && !modal_open)
+                    .then_some(SidebarAction::CancelWorktreeOperation(operation.id)),
+            );
+        column = column.push(grid.mount(crate::interaction::tooltip(control, &operation.label)));
     }
-    for thread in &project.threads {
-        column = column.push(thread_view(thread, modal_open, true));
+    for channel in &project.channels {
+        column = column.push(channel_view(channel, modal_open, true));
     }
     for &worktree in &project.worktrees {
-        let selected = selection
-            == Some(SidebarSelection::Worktree {
-                project_id: entity.id,
-                worktree_id: worktree.id,
-            });
-        let action = button::custom(worktree_status_icon(
-            worktree,
-            project.state.has_agent_update(entity.id, worktree.id),
-        ))
-        .id(worktree.chrome.open_id.clone())
-        .name(worktree_accessible_name(
-            worktree,
-            project.state.has_agent_update(entity.id, worktree.id),
-            project.state.agent_activity(entity.id, worktree.id),
-        ))
-        .width(ROW_ICON_WIDTH)
-        .height(Length::Fixed(WORKTREE_ROW_HEIGHT))
-        .class(sidebar_button_style(selected))
-        .selected(selected)
-        .on_press_maybe(gated(
-            SidebarAction::OpenWorktree {
-                project_id: entity.id,
-                worktree_id: worktree.id,
-                path: worktree.path.clone(),
-            },
-            modal_open,
-        ));
-        let mut row = widget::row::with_capacity(2)
-            .align_y(Alignment::Center)
-            .push(crate::interaction::tooltip(
-                action,
-                &*worktree.chrome.tooltip,
-            ));
-        let activity = project.state.agent_activity(entity.id, worktree.id);
-        let waiting_unread = activity == Some(crate::agent::ActivityState::Waiting)
-            && project.state.has_agent_update(entity.id, worktree.id);
-        if activity == Some(crate::agent::ActivityState::Working)
-            || (!waiting_unread
-                && worktree
-                    .chrome
-                    .pull_request
-                    .as_ref()
-                    .is_some_and(SidebarPullRequest::has_pending_checks))
-        {
-            row = row.push(crate::ui_controls::activity_spinner_tone(
-                f32::from(ROW_ICON_SIZE),
-                design::warning_color,
-            ));
-        } else if waiting_unread {
-            row = row.push(status_icon(
-                "agent-waiting-symbolic",
-                "An agent needs input",
-                BadgeTone::Danger,
-            ));
-        } else if let Some(label) = worktree.chrome.dirty_badge.as_deref() {
-            row = row.push(status_icon(
-                "document-edit-symbolic",
-                label,
-                BadgeTone::Warning,
-            ));
-        }
-        column = column.push(context_controls(
-            row,
+        column = column.push(worktree_view(
             entity.id,
-            Some(worktree.id),
+            worktree,
+            is_primary_worktree(&entity.repository, &worktree.path),
+            selection,
             modal_open,
             entity.github_ready,
             project.editors,
+            project.state.has_agent_update(entity.id, worktree.id),
+            project.state.agent_activity(entity.id, worktree.id),
+            true,
         ));
     }
-    column = column.push(icon_action(
-        "thread-add-symbolic",
-        &*chrome.new_thread_name,
+    column = column.push(new_row_action(
+        "channel-add-symbolic",
+        &*chrome.new_channel_name,
         gated(
-            SidebarAction::NewThread {
+            SidebarAction::NewChannel {
                 project_id: entity.id,
             },
             modal_open,
         ),
-        chrome.new_thread_id.clone(),
+        chrome.new_channel_id.clone(),
     ));
-    column = column.push(icon_action(
+    column = column.push(new_row_action(
         "worktree-add-symbolic",
         &*chrome.new_worktree_name,
         gated(
@@ -3726,7 +3875,7 @@ fn compact_project<'a>(
         chrome.new_worktree_id.clone(),
     ));
     widget::container(RowInteraction::group(
-        header.into(),
+        header,
         column.into(),
         sticky_viewport,
     ))
@@ -3735,75 +3884,79 @@ fn compact_project<'a>(
     .into()
 }
 
-fn thread_view(
-    thread: &SidebarThread,
+/// The one live indicator a channel row shows in its reserved slot.
+///
+/// Attention outranks the chat count: a channel whose agent is working or
+/// waiting is the reason to look at the sidebar at all, and the count stays in
+/// the row's accessible name and tooltip either way.
+fn channel_indicator(channel: &SidebarChannel) -> Option<Element<'_, SidebarAction>> {
+    if channel.activity == Some(crate::agent::ActivityState::Working) {
+        return Some(crate::interaction::tooltip(
+            crate::ui_controls::activity_spinner_tone(
+                f32::from(ROW_ICON_SIZE),
+                design::warning_color,
+            ),
+            "An agent is actively working",
+        ));
+    }
+    if channel.unread {
+        return Some(status_icon(
+            "agent-waiting-symbolic",
+            "Channel needs attention",
+            BadgeTone::Danger,
+        ));
+    }
+    // A channel holds conversations rather than being one, and the count is
+    // the only thing on the row that says so.
+    (channel.chats > 1).then(|| design::caption(channel.chats.to_string()).into())
+}
+
+fn channel_view(
+    channel: &SidebarChannel,
     modal_open: bool,
     compact: bool,
 ) -> Element<'_, SidebarAction> {
-    let activity = thread.activity;
-    let unread = thread.unread;
-    let mut content = widget::row::with_capacity(4)
-        .align_y(Alignment::Center)
-        .spacing(4)
-        .push(
-            widget::container(
-                widget::icon(crate::ui_controls::symbolic_icon("thread-symbolic"))
-                    .size(ROW_ICON_SIZE),
-            )
-            .class(theme::Container::custom(move |theme| {
-                cosmic::iced::widget::container::Style {
-                    icon_color: Some(if unread {
-                        theme.cosmic().destructive.base.into()
-                    } else if activity == Some(crate::agent::ActivityState::Working) {
-                        theme.cosmic().warning.base.into()
-                    } else {
-                        design::muted_icon_color(theme)
-                    }),
-                    ..Default::default()
-                }
-            })),
-        );
-    if !compact {
-        content = content.push(
-            design::body(&thread.title)
-                .wrapping(cosmic::iced::widget::text::Wrapping::None)
-                .ellipsize(cosmic::iced::widget::text::Ellipsize::End(
-                    EllipsizeHeightLimit::Lines(1),
-                ))
-                .width(Length::Fill),
-        );
-        if thread.activity == Some(crate::agent::ActivityState::Working) {
-            content = content.push(crate::ui_controls::activity_spinner_tone(
-                f32::from(ROW_ICON_SIZE),
-                design::warning_color,
-            ));
-        } else if thread.unread {
-            content = content.push(status_icon(
-                "agent-waiting-symbolic",
-                "Thread needs attention",
-                BadgeTone::Danger,
-            ));
+    let grid = RowGrid::child(compact);
+    let activity = channel.activity;
+    let unread = channel.unread;
+    let glyph = widget::container(
+        widget::icon(crate::ui_controls::symbolic_icon("channel-symbolic")).size(ROW_ICON_SIZE),
+    )
+    .class(theme::Container::custom(move |theme| {
+        cosmic::iced::widget::container::Style {
+            icon_color: Some(if unread {
+                theme.cosmic().destructive.base.into()
+            } else if activity == Some(crate::agent::ActivityState::Working) {
+                theme.cosmic().warning.base.into()
+            } else {
+                design::muted_icon_color(theme)
+            }),
+            ..Default::default()
         }
-    }
-    let action = button::custom(content)
-        .id(thread.open_id.clone())
-        .name(&*thread.accessible_name)
-        .class(sidebar_button_style(thread.selected))
-        .selected(thread.selected)
-        .padding([0, cosmic::theme::spacing().space_xxxs])
-        .height(WORKTREE_ROW_HEIGHT)
-        .width(if compact {
-            Length::Fixed(ICON_CONTROL_SIZE)
-        } else {
-            Length::Fill
-        })
+    }));
+    let label = (!compact).then(|| {
+        design::body(&channel.title)
+            .wrapping(cosmic::iced::widget::text::Wrapping::None)
+            .ellipsize(cosmic::iced::widget::text::Ellipsize::End(
+                EllipsizeHeightLimit::Lines(1),
+            ))
+            .width(Length::Fill)
+            .into()
+    });
+    let action = grid
+        .control(
+            grid.content(glyph, label, channel_indicator(channel)),
+            channel.selected,
+        )
+        .id(channel.open_id.clone())
+        .name(&*channel.accessible_name)
         .on_press_maybe(gated(
-            SidebarAction::OpenThread {
-                thread_id: thread.id,
+            SidebarAction::OpenChannel {
+                channel_id: channel.id,
             },
             modal_open,
         ));
-    crate::interaction::tooltip(action, &thread.title)
+    grid.mount(crate::interaction::tooltip(action, &*channel.tooltip))
 }
 
 fn worktree_accessible_name(
@@ -3823,6 +3976,55 @@ fn worktree_accessible_name(
     name
 }
 
+/// The one live indicator a worktree row shows in its reserved slot.
+///
+/// The rail folds pending checks into the same spinner: it has room for one
+/// indicator, and "something is running here" is what the rail is for. The
+/// expanded row keeps checks as a durable badge of their own, after the
+/// reserved slot.
+fn worktree_indicator(
+    worktree: &SidebarWorktree,
+    agent_update: bool,
+    activity: Option<crate::agent::ActivityState>,
+    compact: bool,
+) -> Option<Element<'_, SidebarAction>> {
+    let working = activity == Some(crate::agent::ActivityState::Working);
+    let waiting_unread = activity == Some(crate::agent::ActivityState::Waiting) && agent_update;
+    let checks = worktree
+        .chrome
+        .pull_request
+        .as_ref()
+        .is_some_and(SidebarPullRequest::has_pending_checks);
+    if working || (compact && !waiting_unread && checks) {
+        return Some(crate::interaction::tooltip(
+            crate::ui_controls::activity_spinner_tone(
+                f32::from(ROW_ICON_SIZE),
+                design::warning_color,
+            ),
+            if working {
+                "An agent is actively working"
+            } else {
+                "CI checks pending or running"
+            },
+        ));
+    }
+    if waiting_unread {
+        return Some(status_icon(
+            "agent-waiting-symbolic",
+            "An agent needs input",
+            BadgeTone::Danger,
+        ));
+    }
+    if compact {
+        return worktree
+            .chrome
+            .dirty_badge
+            .as_deref()
+            .map(|label| status_icon("document-edit-symbolic", label, BadgeTone::Warning));
+    }
+    None
+}
+
 fn worktree_view<'a>(
     project_id: ProjectId,
     worktree: &'a SidebarWorktree,
@@ -3833,15 +4035,11 @@ fn worktree_view<'a>(
     editors: &'a [SidebarEditor],
     agent_update: bool,
     activity: Option<crate::agent::ActivityState>,
+    compact: bool,
 ) -> Element<'a, SidebarAction> {
     let chrome = &worktree.chrome;
-    let spacing = cosmic::theme::spacing();
-    let mut row = widget::row::with_capacity(8)
-        .align_y(Alignment::Center)
-        .spacing(spacing.space_xxxs)
-        .height(Length::Fill)
-        .push(worktree_status_icon(worktree, agent_update));
-    row = row.push(
+    let grid = RowGrid::child(compact);
+    let label = (!compact).then(|| {
         design::body(&*chrome.label)
             .class(if !agent_update {
                 theme::Text::Custom(design::muted_text)
@@ -3852,93 +4050,65 @@ fn worktree_view<'a>(
             .ellipsize(cosmic::iced::widget::text::Ellipsize::End(
                 EllipsizeHeightLimit::Lines(1),
             ))
-            .width(Length::Fill),
+            .width(Length::Fill)
+            .into()
+    });
+    let mut content = grid.content(
+        worktree_status_icon(worktree, agent_update),
+        label,
+        worktree_indicator(worktree, agent_update, activity, compact),
     );
-    if let Some(activity) = activity
-        && (activity != crate::agent::ActivityState::Waiting || agent_update)
-    {
-        let (icon, detail, tone) = match activity {
-            crate::agent::ActivityState::Working => (
-                "agent-working-symbolic",
-                "An agent is actively working",
+    // Durable attributes, after the reserved slot: each is a fact about the
+    // worktree rather than live activity, so none of them moves while an agent
+    // starts or stops working. The rail has no room for any of them.
+    if !compact {
+        if let Some(label) = chrome.dirty_badge.as_deref() {
+            content = content.push(status_icon(
+                "document-edit-symbolic",
+                label,
                 BadgeTone::Warning,
-            ),
-            crate::agent::ActivityState::Waiting => (
-                "agent-waiting-symbolic",
-                "An agent needs input",
-                BadgeTone::Danger,
-            ),
-            _ => unreachable!("only active agent states are displayed"),
-        };
-        row = row.push(if activity == crate::agent::ActivityState::Working {
-            crate::interaction::tooltip(
-                crate::ui_controls::activity_spinner_tone(
-                    f32::from(ROW_ICON_SIZE),
-                    design::warning_color,
-                ),
-                detail,
-            )
-        } else {
-            status_icon(icon, detail, tone)
-        });
-    }
-    if let Some(label) = chrome.dirty_badge.as_deref() {
-        row = row.push(status_icon(
-            "document-edit-symbolic",
-            label,
-            BadgeTone::Warning,
-        ));
-    }
-    if chrome
-        .pull_request
-        .as_ref()
-        .is_some_and(SidebarPullRequest::has_pending_checks)
-        && activity != Some(crate::agent::ActivityState::Working)
-    {
-        row = row.push(check_indicator(CheckStatus::Pending));
-    }
-    if primary {
-        row = row.push(status_icon(
-            "go-home-symbolic",
-            "Primary worktree",
-            BadgeTone::Neutral,
-        ));
-    }
-    if worktree.detached {
-        row = row.push(status_icon(
-            "dialog-information-symbolic",
-            "Detached HEAD",
-            BadgeTone::Neutral,
-        ));
-    }
-    if worktree.locked {
-        row = row.push(status_icon(
-            "changes-prevent-symbolic",
-            "Locked worktree",
-            BadgeTone::Neutral,
-        ));
+            ));
+        }
+        if chrome
+            .pull_request
+            .as_ref()
+            .is_some_and(SidebarPullRequest::has_pending_checks)
+            && activity != Some(crate::agent::ActivityState::Working)
+        {
+            content = content.push(check_indicator(CheckStatus::Pending));
+        }
+        if primary {
+            content = content.push(status_icon(
+                "go-home-symbolic",
+                "Primary worktree",
+                BadgeTone::Neutral,
+            ));
+        }
+        if worktree.detached {
+            content = content.push(status_icon(
+                "dialog-information-symbolic",
+                "Detached HEAD",
+                BadgeTone::Neutral,
+            ));
+        }
+        if worktree.locked {
+            content = content.push(status_icon(
+                "changes-prevent-symbolic",
+                "Locked worktree",
+                BadgeTone::Neutral,
+            ));
+        }
     }
 
-    let action = button::custom(row)
-        .class(sidebar_button_style(
-            selection
-                == Some(SidebarSelection::Worktree {
-                    project_id,
-                    worktree_id: worktree.id,
-                }),
-        ))
+    let selected = selection
+        == Some(SidebarSelection::Worktree {
+            project_id,
+            worktree_id: worktree.id,
+        });
+    let action = grid
+        .control(content, selected)
         .id(chrome.open_id.clone())
-        .selected(
-            selection
-                == Some(SidebarSelection::Worktree {
-                    project_id,
-                    worktree_id: worktree.id,
-                }),
-        )
         .name(worktree_accessible_name(worktree, agent_update, activity))
-        .padding([0, spacing.space_xxxs])
-        .height(Length::Fixed(WORKTREE_ROW_HEIGHT))
-        .width(Length::Fill)
         .on_press_maybe(gated(
             SidebarAction::OpenWorktree {
                 project_id,
@@ -3947,14 +4117,19 @@ fn worktree_view<'a>(
             },
             modal_open,
         ));
-    context_controls(
-        crate::interaction::tooltip(crate::interaction::hover(action), &*chrome.tooltip),
+    let action: Element<'a, SidebarAction> = if compact {
+        action.into()
+    } else {
+        crate::interaction::hover(action)
+    };
+    grid.mount(context_controls(
+        crate::interaction::tooltip(action, &*chrome.tooltip),
         project_id,
         Some(worktree.id),
         modal_open,
         github_ready,
         editors,
-    )
+    ))
 }
 
 fn project_icon(project: &SidebarProject, size: u16) -> Element<'_, SidebarAction> {
@@ -4561,7 +4736,10 @@ fn source_control_panel<'a>(
         Some(
             widget::scrollable(
                 widget::container(sections)
-                    .padding([spacing.space_xxxs, spacing.space_xxs])
+                    .padding(design::with_vertical_rail(Padding::from([
+                        spacing.space_xxxs,
+                        spacing.space_xxs,
+                    ])))
                     .width(Length::Fill),
             )
             .direction(sidebar_scroll_direction())
@@ -4875,7 +5053,10 @@ fn files_section<'a>(
         .into(),
         widget::scrollable(
             widget::container(list)
-                .padding([spacing.space_xxxs, spacing.space_xxs])
+                .padding(design::with_vertical_rail(Padding::from([
+                    spacing.space_xxxs,
+                    spacing.space_xxs,
+                ])))
                 .width(Length::Fill),
         )
         .direction(sidebar_scroll_direction())
@@ -6063,6 +6244,37 @@ fn icon_action<'a>(
     )
 }
 
+/// A "new …" command that is a row of its own, on the grid of the rows it
+/// creates.
+///
+/// The rail lists these under a project's channels and worktrees, so they are
+/// child rows: the same leading slot, the same reserved indicator slot, and
+/// therefore the same content start as the `main` worktree above them.
+/// [`icon_action`] remains the form for a command that lives inside another
+/// row, such as the expanded header's hover-revealed commands.
+fn new_row_action<'a>(
+    icon_name: &'static str,
+    label: impl Into<Cow<'a, str>>,
+    action: Option<SidebarAction>,
+    id: Id,
+) -> Element<'a, SidebarAction> {
+    let grid = RowGrid::child(true);
+    let label = label.into();
+    let control = grid
+        .control(
+            grid.content(
+                widget::icon(crate::ui_controls::symbolic_icon(icon_name)).size(ROW_ICON_SIZE),
+                None,
+                None,
+            ),
+            false,
+        )
+        .id(id)
+        .name(label.clone())
+        .on_press_maybe(action);
+    grid.mount(crate::interaction::tooltip(control, label))
+}
+
 /// The rule between the pane and the workspace, doubling as the pane's resize
 /// handle.
 ///
@@ -6194,7 +6406,7 @@ fn check_indicator(status: CheckStatus) -> Element<'static, SidebarAction> {
 struct FilteredProject<'a> {
     project: &'a SidebarProject,
     worktrees: Vec<&'a SidebarWorktree>,
-    threads: Vec<&'a SidebarThread>,
+    channels: Vec<&'a SidebarChannel>,
     editors: &'a [SidebarEditor],
     state: &'a SidebarState,
 }
@@ -6216,14 +6428,14 @@ fn filtered_projects<'a>(
         .iter()
         .filter_map(|project| {
             let project_matches = query.is_empty() || project.matches(&query);
-            let threads = project
-                .threads
+            let channels = project
+                .channels
                 .iter()
-                .filter(|thread| {
-                    (project_matches || thread.folded_title.contains(&query))
+                .filter(|channel| {
+                    (project_matches || channel.folded_title.contains(&query))
                         && match state.filter {
                             SidebarFilter::All => true,
-                            SidebarFilter::Attention => thread.unread,
+                            SidebarFilter::Attention => channel.unread,
                             SidebarFilter::PullRequests => false,
                         }
                 })
@@ -6279,10 +6491,10 @@ fn filtered_projects<'a>(
             });
             let visible = match state.filter {
                 SidebarFilter::All => {
-                    project_matches || !worktrees.is_empty() || !threads.is_empty()
+                    project_matches || !worktrees.is_empty() || !channels.is_empty()
                 }
                 SidebarFilter::Attention | SidebarFilter::PullRequests => {
-                    !worktrees.is_empty() || !threads.is_empty()
+                    !worktrees.is_empty() || !channels.is_empty()
                 }
             };
             visible.then_some(FilteredProject {
@@ -6291,7 +6503,7 @@ fn filtered_projects<'a>(
                     .into_iter()
                     .map(|(_, worktree)| worktree)
                     .collect(),
-                threads,
+                channels,
                 editors: &model.external_editors,
                 state,
             })
@@ -6360,7 +6572,7 @@ fn filter_id(filter: SidebarFilter) -> Id {
 /// names intact instead of replacing rows with mouse-only hit targets.
 mod row_interaction {
     use super::{
-        ICON_CONTROL_SIZE, PROJECT_HEADER_HEIGHT, ProjectId, SidebarAction, SidebarFilter,
+        HEADER_ACTION_WIDTH, PROJECT_HEADER_HEIGHT, ProjectId, SidebarAction, SidebarFilter,
     };
     use cosmic::iced::advanced::Renderer as _;
     use cosmic::iced::{
@@ -6535,7 +6747,7 @@ mod row_interaction {
                     let header = Rectangle {
                         x: bounds.x,
                         y: bounds.y,
-                        width: (bounds.width - 3.0 * ICON_CONTROL_SIZE).max(0.0),
+                        width: (bounds.width - HEADER_ACTION_WIDTH).max(0.0),
                         height: PROJECT_HEADER_HEIGHT,
                     };
                     header.contains(point).then_some(*id)
@@ -7365,15 +7577,16 @@ mod tests {
     }
 
     #[test]
-    fn thread_attention_keeps_its_project_visible_without_unread_worktrees() {
+    fn channel_attention_keeps_its_project_visible_without_unread_worktrees() {
         let mut entry = project();
-        let thread_id = ThreadId::from_uuid(Uuid::from_u128(20));
-        entry.threads.push(SidebarThread::new(
-            thread_id,
+        let channel_id = ChannelId::from_uuid(Uuid::from_u128(20));
+        entry.channels.push(SidebarChannel::new(
+            channel_id,
             "Investigate login".into(),
             true,
             Some(crate::agent::ActivityState::Waiting),
             true,
+            2,
         ));
         let mut model = SidebarModel::ready(SidebarMode::Expanded, vec![entry]);
         let mut state = SidebarState::default();
@@ -7382,13 +7595,249 @@ mod tests {
         let projects = filtered_projects(&model, &state, false);
         assert_eq!(projects.len(), 1);
         assert!(projects[0].worktrees.is_empty());
-        assert_eq!(projects[0].threads[0].id, thread_id);
-        model.projects[0].threads[0].unread = false;
+        assert_eq!(projects[0].channels[0].id, channel_id);
+        model.projects[0].channels[0].unread = false;
         assert!(filtered_projects(&model, &state, false).is_empty());
         assert_eq!(
-            model.projects[0].threads[0].activity,
+            model.projects[0].channels[0].activity,
             Some(crate::agent::ActivityState::Waiting),
         );
+    }
+
+    /// Every navigation row laid out in `layout`: its content row's bounds and
+    /// the bounds of the slots inside it, outermost row first.
+    ///
+    /// A row is recognised by the grid's own leading icon slot - the only node
+    /// whose first child is laid out to exactly `ROW_ICON_WIDTH` - so these are
+    /// the positions the renderer draws at rather than the numbers the builders
+    /// were handed.
+    fn navigation_rows(
+        layout: Layout<'_>,
+        rows: &mut Vec<(cosmic::iced::Rectangle, Vec<cosmic::iced::Rectangle>)>,
+    ) {
+        let slots: Vec<cosmic::iced::Rectangle> =
+            layout.children().map(|child| child.bounds()).collect();
+        if slots
+            .first()
+            .is_some_and(|slot| (slot.width - ROW_ICON_WIDTH).abs() < 0.5)
+        {
+            rows.push((layout.bounds(), slots));
+            return;
+        }
+        for child in layout.children() {
+            navigation_rows(child, rows);
+        }
+    }
+
+    fn grid_fixture() -> SidebarModel {
+        let mut entry = project();
+        // The first worktree is the repository itself, so `main` is the
+        // primary row the reported screenshot compares against.
+        entry.worktrees[0].path = entry.repository.clone();
+        entry.channels.push(SidebarChannel::new(
+            ChannelId::from_uuid(Uuid::from_u128(20)),
+            "Investigate login".into(),
+            false,
+            None,
+            false,
+            1,
+        ));
+        SidebarModel::ready(SidebarMode::Expanded, vec![entry])
+    }
+
+    #[test]
+    fn navigation_rows_share_one_content_grid() {
+        let renderer = headless_renderer();
+        let model = grid_fixture();
+        let state = SidebarState::default();
+        let laid_out = |element: &mut Element<'_, SidebarAction>, width: f32| {
+            let mut tree = Tree::new(&*element);
+            let node = element.as_widget_mut().layout(
+                &mut tree,
+                &renderer,
+                &layout::Limits::new(Size::ZERO, Size::new(width, 512.0)),
+            );
+            let mut rows = Vec::new();
+            navigation_rows(Layout::new(&node), &mut rows);
+            rows
+        };
+        // `RowInteraction::group` stashes its header's layout for sticky
+        // positioning and leaves a childless node in its place, so the header
+        // is measured through the builder the group mounts, under the limits
+        // the group hands it.
+        let header = |compact: bool, width: f32| {
+            laid_out(
+                &mut project_identity_row(&model.projects[0], false, false, compact),
+                width,
+            )
+        };
+        let members = |compact: bool, width: f32| {
+            let projects = filtered_projects(&model, &state, compact);
+            laid_out(
+                &mut project_view(
+                    &projects[0],
+                    true,
+                    compact,
+                    None,
+                    false,
+                    row_interaction::StickyViewport::default(),
+                ),
+                width,
+            )
+        };
+
+        let width = design::NAVIGATION_DEFAULT_WIDTH;
+        let expanded_header = header(false, width);
+        let expanded = members(false, width);
+        // The channel, then both worktrees.
+        assert_eq!((expanded_header.len(), expanded.len()), (1, 3));
+        let (head, channel, primary) = (&expanded_header[0].1, &expanded[0].1, &expanded[1].1);
+        assert_eq!(
+            channel[0].x, head[1].x,
+            "a child row's icon starts where its project's label does",
+        );
+        assert_eq!(
+            (channel[0].x, channel[1].x),
+            (primary[0].x, primary[1].x),
+            "channel and worktree rows share one icon and one label column",
+        );
+        for (row, slots) in expanded_header.iter().chain(&expanded) {
+            assert_eq!(slots[0].height, design::ROW_HEIGHT, "row icon slot height");
+            assert_eq!(
+                slots[0].center_y(),
+                slots[1].center_y(),
+                "icon and label sit on one baseline grid",
+            );
+            assert_eq!(row.height, design::ROW_HEIGHT);
+        }
+
+        let compact_header = header(true, COMPACT_ROW_WIDTH);
+        let compact = members(true, COMPACT_ROW_WIDTH);
+        // The channel, both worktrees, "New channel" and "New worktree".
+        assert_eq!((compact_header.len(), compact.len()), (1, 5));
+        let (new_channel, primary) = (&compact[3].1, &compact[1].1);
+        assert_eq!(
+            (
+                new_channel[0].x,
+                new_channel[0].width,
+                new_channel[0].height
+            ),
+            (primary[0].x, primary[0].width, primary[0].height),
+            "\"New channel\" and the primary worktree share the rail's grid",
+        );
+        for (row, slots) in compact_header.iter().chain(&compact) {
+            assert_eq!(slots[0].x, compact_header[0].1[0].x, "one rail column");
+            assert_eq!(row.height, design::ROW_HEIGHT);
+        }
+        for (row, _) in &compact {
+            assert_eq!(
+                row.x + row.width,
+                COMPACT_ROW_WIDTH,
+                "every rail row reserves the same indicator slot",
+            );
+        }
+    }
+
+    #[test]
+    fn row_indicators_share_one_reserved_slot() {
+        let renderer = headless_renderer();
+        let channel = |activity, unread, chats| {
+            SidebarChannel::new(
+                ChannelId::from_uuid(Uuid::from_u128(20)),
+                "Investigate login".into(),
+                false,
+                activity,
+                unread,
+                chats,
+            )
+        };
+        let label_slot = |channel: &SidebarChannel| {
+            let mut element = channel_view(channel, false, false);
+            let mut tree = Tree::new(&element);
+            let node = element.as_widget_mut().layout(
+                &mut tree,
+                &renderer,
+                &layout::Limits::new(
+                    Size::ZERO,
+                    Size::new(design::NAVIGATION_DEFAULT_WIDTH, design::ROW_HEIGHT),
+                ),
+            );
+            let mut rows = Vec::new();
+            navigation_rows(Layout::new(&node), &mut rows);
+            assert_eq!(rows.len(), 1);
+            rows[0].1[1]
+        };
+        let plain = label_slot(&channel(None, false, 1));
+        for (state, row) in [
+            (
+                "a working spinner",
+                channel(Some(crate::agent::ActivityState::Working), false, 1),
+            ),
+            ("an attention badge", channel(None, true, 1)),
+            ("a chat count", channel(None, false, 4)),
+        ] {
+            let slot = label_slot(&row);
+            assert_eq!(
+                (slot.x, slot.width),
+                (plain.x, plain.width),
+                "{state} reflowed the label",
+            );
+        }
+    }
+
+    /// How far right anything inside the scroll viewport's padded content
+    /// reaches. The `filtered_scroll` decorator, the scrollable and its content
+    /// container all span the pane deliberately; the first node inside that
+    /// container's padding is at depth three.
+    fn content_right_edge(layout: Layout<'_>, depth: usize) -> f32 {
+        let own = if depth >= 3 {
+            layout.bounds().x + layout.bounds().width
+        } else {
+            f32::MIN
+        };
+        layout.children().fold(own, |edge, child| {
+            edge.max(content_right_edge(child, depth + 1))
+        })
+    }
+
+    #[test]
+    fn sidebar_content_clears_the_scrollbar_rail_inside_the_viewport() {
+        let renderer = headless_renderer();
+        let model = grid_fixture();
+        let state = SidebarState::default();
+        for (compact, width) in [
+            (false, design::NAVIGATION_DEFAULT_WIDTH),
+            (false, EXPANDED_WIDTH_MIN),
+            // A fractional logical width is what a 1.25 display scale hands a
+            // pane whose device width is odd.
+            (false, 259.5),
+            (true, COMPACT_WIDTH),
+        ] {
+            let mut element = project_list(&model, &state, compact, false);
+            let mut tree = Tree::new(&element);
+            let node = element.as_widget_mut().layout(
+                &mut tree,
+                &renderer,
+                &layout::Limits::new(Size::ZERO, Size::new(width, 240.0)),
+            );
+            assert_eq!(
+                Layout::new(&node).bounds().width,
+                width,
+                "the scrollable still spans the pane: the rail is inset inside \
+                 its viewport rather than taken off a container around it",
+            );
+            let edge = content_right_edge(Layout::new(&node), 0);
+            assert!(
+                edge <= width - design::SCROLLBAR_GUTTER,
+                "content reaches {edge} of {width}, under the rail",
+            );
+            assert!(
+                edge > width - 2.0 * design::SCROLLBAR_GUTTER,
+                "content stops {} short of {width}: more than the rail, so the \
+                 reservation is not what is holding it back",
+                width - edge,
+            );
+        }
     }
 
     #[test]

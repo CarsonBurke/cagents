@@ -116,11 +116,17 @@ pub const INSPECTOR_MAX_WIDTH: f32 = 480.0;
 
 /// Shared gutter geometry for native scrollables and custom-rendered content.
 ///
-/// Keep the reserved rail slightly wider than the visible thumb so content
-/// never crowds the scrollbar at fractional display scales.
+/// The three constants are one contract, not three independent numbers. A
+/// scrollbar occupies `SCROLLBAR_GUTTER` on its axis; the visible thumb is
+/// `SCROLLBAR_THUMB_WIDTH` and sits centred in that rail. Content is inset by
+/// the full rail, so a floating thumb never overlaps a label, icon, badge, or
+/// interactive target even at fractional display scales.
 pub const SCROLLBAR_GUTTER: f32 = 12.0;
 pub const SCROLLBAR_THUMB_WIDTH: f32 = 6.0;
-pub const SCROLLBAR_MARGIN: f32 = 1.5;
+/// Centres the thumb in the rail. Native scrollbars occupy
+/// `width + margin * 2`, which this makes exactly `SCROLLBAR_GUTTER`, so a
+/// native surface and a custom-drawn one reserve the same space.
+pub const SCROLLBAR_MARGIN: f32 = (SCROLLBAR_GUTTER - SCROLLBAR_THUMB_WIDTH) / 2.0;
 pub const BORDER_WIDTH: f32 = 1.0;
 
 pub fn scrollbar() -> cosmic::iced::widget::scrollable::Scrollbar {
@@ -128,6 +134,32 @@ pub fn scrollbar() -> cosmic::iced::widget::scrollable::Scrollbar {
         .width(SCROLLBAR_THUMB_WIDTH)
         .scroller_width(SCROLLBAR_THUMB_WIDTH)
         .margin(SCROLLBAR_MARGIN)
+}
+
+/// Reserves the vertical scrollbar's rail inside `padding`.
+///
+/// Every vertical scrollable insets its content this way rather than letting
+/// the thumb float over it. `Scrollbar::spacing` would reserve the space for
+/// us, but it also embeds the scrollbar, which then takes layout space and
+/// stays visible on content that does not scroll at all.
+pub fn with_vertical_rail(padding: cosmic::iced::Padding) -> cosmic::iced::Padding {
+    cosmic::iced::Padding {
+        right: padding.right + SCROLLBAR_GUTTER,
+        ..padding
+    }
+}
+
+/// Reserves the horizontal scrollbar's rail inside `padding`.
+pub fn with_horizontal_rail(padding: cosmic::iced::Padding) -> cosmic::iced::Padding {
+    cosmic::iced::Padding {
+        bottom: padding.bottom + SCROLLBAR_GUTTER,
+        ..padding
+    }
+}
+
+/// Reserves both rails, leaving the bottom-right junction clear of content.
+pub fn with_both_rails(padding: cosmic::iced::Padding) -> cosmic::iced::Padding {
+    with_horizontal_rail(with_vertical_rail(padding))
 }
 
 pub const WIDE_BREAKPOINT: f32 = 1_440.0;

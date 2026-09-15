@@ -4,8 +4,24 @@ set -eu
 umask 077
 root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 cd "$root"
+usage() {
+    printf '%s\n' 'Usage: sh scripts/run-redraw-latency [NEW_PRIVATE_OUTPUT_DIRECTORY]' \
+        '       sh scripts/run-redraw-latency --scroll' >&2
+}
+# The terminal scroll workload for issue #101 is deterministic and runs in
+# process: it needs no compositor, no daemon and no release build, so it is
+# served here instead of through the five fresh-process UI runs below. It
+# reports what one viewport scroll command costs and therefore what applying
+# one coalesced move per frame saves over applying every wheel notch.
+if [ "${1-}" = '--scroll' ]; then
+    [ "$#" -eq 1 ] || { usage; exit 2; }
+    command -v cargo >/dev/null 2>&1 || { printf '%s\n' 'Required command unavailable: cargo' >&2; exit 1; }
+    exec cargo test --locked --no-default-features --features host --lib -- \
+        --exact --nocapture \
+        terminal::worker::tests::coalescing_a_frame_of_notches_costs_one_capture_and_lands_on_the_same_screen
+fi
 if [ "$#" -gt 1 ]; then
-    printf '%s\n' 'Usage: sh scripts/run-redraw-latency [NEW_PRIVATE_OUTPUT_DIRECTORY]' >&2
+    usage
     exit 2
 fi
 for command in cargo jq timeout mktemp; do

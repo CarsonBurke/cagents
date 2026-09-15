@@ -1,15 +1,21 @@
-#[cfg(any(feature = "host", feature = "ui"))]
-use std::{fs::OpenOptions, os::unix::fs::OpenOptionsExt};
 use std::{
-    fs::{self, DirBuilder, File},
+    fs::{self, DirBuilder},
     io,
     os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt},
     path::Path,
 };
+#[cfg(any(feature = "host", feature = "ui"))]
+use std::{
+    fs::{File, OpenOptions},
+    os::unix::fs::OpenOptionsExt,
+};
 
 const PRIVATE_DIRECTORY_MODE: u32 = 0o700;
+#[cfg(any(feature = "host", feature = "ui"))]
 const PRIVATE_FILE_MODE: u32 = 0o600;
+#[cfg(any(feature = "host", feature = "ui"))]
 const O_NOFOLLOW: i32 = libc::O_NOFOLLOW;
+#[cfg(any(feature = "host", feature = "ui"))]
 const O_NONBLOCK: i32 = libc::O_NONBLOCK;
 
 fn storage_error(path: &Path, message: impl std::fmt::Display) -> io::Error {
@@ -83,6 +89,7 @@ pub(crate) fn prepare_private_directory(path: &Path) -> io::Result<()> {
     validate_owned_directory(path)
 }
 
+#[cfg(any(feature = "host", feature = "ui"))]
 fn validate_owned_regular_file(path: &Path, metadata: &fs::Metadata) -> io::Result<()> {
     if !metadata.is_file() {
         return Err(storage_error(path, "expected a regular file"));
@@ -100,6 +107,7 @@ fn validate_owned_regular_file(path: &Path, metadata: &fs::Metadata) -> io::Resu
     Ok(())
 }
 
+#[cfg(any(feature = "host", feature = "ui"))]
 pub(crate) fn migrate_existing_private_file(path: &Path) -> io::Result<bool> {
     match fs::symlink_metadata(path) {
         Ok(metadata) => {
@@ -115,6 +123,7 @@ pub(crate) fn migrate_existing_private_file(path: &Path) -> io::Result<bool> {
     }
 }
 
+#[cfg(any(feature = "host", feature = "ui"))]
 pub(crate) fn validate_and_privatize_open_file(path: &Path, file: &File) -> io::Result<()> {
     let metadata = file.metadata()?;
     validate_owned_regular_file(path, &metadata)?;
