@@ -13,6 +13,28 @@
 use super::*;
 use crate::chat::{ChangeKind, FileChange, SearchResult, ToolStatus};
 
+/// The surface's spacing rhythm.
+///
+/// Four values, not an ad-hoc number per call site. Everything a reader sees
+/// as "related" sits at `GAP_XS`, "part of the same block" at `GAP_S`, "a
+/// block of its own" at `GAP_M`, and "a different exchange" at `GAP_L`. That
+/// progression is what makes structure legible without drawing a box around
+/// every group.
+pub(super) const GAP_XS: f32 = design::GRID_UNIT;
+pub(super) const GAP_S: f32 = design::GRID_UNIT * 2.0;
+pub(super) const GAP_M: f32 = design::GRID_UNIT * 3.0;
+pub(super) const GAP_L: f32 = design::GRID_UNIT * 7.0;
+
+/// The gutter column that carries a patch line's marker.
+const PATCH_GUTTER_WIDTH: f32 = 8.0;
+
+/// The rail a turn's steps hang from, and the space between it and them.
+///
+/// A continuous hairline down the left of the strip is what turns a list of
+/// rows into one sequence of work. It is drawn as the container's left edge
+/// rather than per row, so it cannot break between rows.
+const RAIL_INSET: f32 = design::GRID_UNIT * 3.0;
+
 /// The glyph and tone a step's status draws as.
 ///
 /// Status is information, not a control, so it is a plain icon rather than one
@@ -59,17 +81,25 @@ fn kind_glyph(content: &ItemContent) -> &'static str {
 /// Built from `selectable_text` because the transcript's whole purpose is
 /// handing output to the reader: a command's output that cannot be selected
 /// forces them to use a copy button for a single word.
-fn code_surface<'a>(text: &'a str, limit: Option<f32>) -> Element<'a, Message> {
-    let inner = widget::container(
+///
+/// `caption` names what the block is - the language, or `Output` - in a header
+/// that shares the block's top corners, so the label belongs to the code
+/// rather than floating above it.
+fn code_surface<'a>(
+    text: &'a str,
+    caption: Option<&'a str>,
+    limit: Option<f32>,
+) -> Element<'a, Message> {
+    let body = widget::container(
         widget::selectable_text(text)
             .size(design::TEXT_BODY)
             .font(iced::Font::MONOSPACE)
             .width(Length::Fill),
     )
-    .padding(design::GRID_UNIT * 2.0);
-    let scrolled: Element<'_, Message> = match limit {
+    .padding([GAP_S as u16, GAP_M as u16]);
+    let body: Element<'_, Message> = match limit {
         Some(height) => widget::container(
-            widget::scrollable(inner)
+            widget::scrollable(body)
                 .direction(iced::widget::scrollable::Direction::Vertical(
                     design::scrollbar(),
                 ))
@@ -77,55 +107,108 @@ fn code_surface<'a>(text: &'a str, limit: Option<f32>) -> Element<'a, Message> {
         )
         .max_height(height)
         .into(),
-        None => inner.into(),
+        None => body.into(),
     };
-    widget::container(scrolled)
-        .class(cosmic::theme::Container::Card)
-        .width(Length::Fill)
-        .into()
+    let Some(caption) = caption else {
+        return widget::container(body)
+            .class(design::surface(
+                Some(design::sunken),
+                [design::RADIUS_S; 4],
+                true,
+            ))
+            .width(Length::Fill)
+            .into();
+    };
+    widget::container(
+        widget::column::with_children(vec![
+            widget::container(design::caption(caption))
+                .padding([GAP_XS as u16, GAP_M as u16])
+                .width(Length::Fill)
+                .class(design::surface(
+                    Some(design::raised),
+                    [design::RADIUS_S, design::RADIUS_S, 0.0, 0.0],
+                    false,
+                ))
+                .into(),
+            body,
+        ])
+        .width(Length::Fill),
+    )
+    .class(design::surface(
+        Some(design::sunken),
+        [design::RADIUS_S; 4],
+        true,
+    ))
+    .width(Length::Fill)
+    .into()
 }
 
-/// One line of a unified patch, tinted by what it does.
+/// One line of a unified patch, marked in its own gutter column.
 ///
 /// The provider hands us a patch, not the two file revisions
 /// `crate::diff_view` consumes, and a patch only describes the regions it
 /// touches. Reconstructing both full revisions from it would mean inventing
-/// the untouched remainder, so the patch is rendered as what it is, with the
-/// same added and removed tones the rest of the shell uses.
+/// the untouched remainder, so the patch is rendered as what it is.
+///
+/// The marker the patch already carries is promoted to its own column and
+/// tinted, and the line gets a faint wash behind it. Neither the marker nor
+/// the wash is drawn at full accent strength, because a saturated fill behind
+/// monospace text costs the text the contrast that marking a change is for.
+/// Both parts size themselves to their own text, so a wrapped line keeps its
+/// marker aligned with its first row instead of stretching a sibling to a
+/// height the row has not resolved yet.
 fn patch_line(line: &str) -> Element<'_, Message> {
-    let tone = match line.as_bytes().first() {
-        Some(b'+') => Some(design::Tone::Themed(design::diff_added_color)),
-        Some(b'-') => Some(design::Tone::Themed(design::diff_removed_color)),
-        _ => None,
+    let marker = line.as_bytes().first().copied();
+    let (wash, ink): (
+        Option<fn(&cosmic::Theme) -> iced::Color>,
+        Option<fn(&cosmic::Theme) -> cosmic::iced::widget::text::Style>,
+    ) = match marker {
+        Some(b'+') => (Some(design::diff_added_color), Some(design::added_text)),
+        Some(b'-') => (Some(design::diff_removed_color), Some(design::removed_text)),
+        _ => (None, None),
     };
-    let text = widget::selectable_text(line)
+    // The marker is split off so the body keeps the reader's ink while the
+    // gutter carries the color, and so the columns line up down the patch.
+    let (gutter, rest) = match marker {
+        Some(b'+') | Some(b'-') | Some(b' ') => line.split_at(1),
+        _ => ("", line),
+    };
+    let body = widget::selectable_text(rest)
         .size(design::TEXT_BODY)
         .font(iced::Font::MONOSPACE)
         .width(Length::Fill);
-    let text: Element<'_, Message> = match line.as_bytes().first() {
-        // A hunk header is structural rather than content, so it recedes to
-        // the same weight as the other secondary labels on the surface.
-        Some(b'@') => text
-            .class(cosmic::theme::Text::Custom(design::muted_text))
-            .into(),
-        _ => text.into(),
+    // A hunk header is structure rather than content, so it recedes to the
+    // weight of the surface's other secondary labels.
+    let body: Element<'_, Message> = if marker == Some(b'@') {
+        body.class(cosmic::theme::Text::Custom(design::muted_text))
+            .into()
+    } else {
+        body.into()
     };
-    match tone {
-        Some(tone) => widget::container(text)
-            .class(cosmic::theme::Container::custom(move |theme| {
-                cosmic::widget::container::Style {
-                    background: Some(iced::Background::Color(tone.resolve(theme))),
-                    ..Default::default()
-                }
-            }))
-            .padding([0, design::GRID_UNIT as u16])
-            .width(Length::Fill)
-            .into(),
-        None => widget::container(text)
-            .padding([0, design::GRID_UNIT as u16])
-            .width(Length::Fill)
-            .into(),
-    }
+    widget::container(
+        widget::row::with_children(vec![
+            widget::text::body(gutter)
+                .size(design::TEXT_BODY)
+                .font(iced::Font::MONOSPACE)
+                .width(PATCH_GUTTER_WIDTH)
+                .class(match ink {
+                    Some(ink) => cosmic::theme::Text::Custom(ink),
+                    None => cosmic::theme::Text::Default,
+                })
+                .into(),
+            body,
+        ])
+        .spacing(GAP_XS),
+    )
+    .class(cosmic::theme::Container::custom(move |theme| {
+        cosmic::widget::container::Style {
+            background: wash.map(|wash| iced::Background::Color(wash(theme))),
+            ..Default::default()
+        }
+    }))
+    .padding([0, GAP_S as u16])
+    .width(Length::Fill)
+    .into()
 }
 
 /// How much of one file's patch is rendered before the rest is withheld.
@@ -147,16 +230,21 @@ fn patch_view(diff: &str) -> Element<'_, Message> {
     }
     if total > lines.len() {
         lines.push(
-            design::caption(format!(
+            widget::container(design::caption(format!(
                 "{} further lines withheld from the inline patch.",
                 total - lines.len()
-            ))
+            )))
+            .padding([GAP_XS as u16, GAP_M as u16])
             .into(),
         );
     }
     widget::container(widget::column::with_children(lines).width(Length::Fill))
-        .class(cosmic::theme::Container::Card)
-        .padding([design::GRID_UNIT as u16, 0])
+        .class(design::surface(
+            Some(design::sunken),
+            [design::RADIUS_S; 4],
+            true,
+        ))
+        .padding([GAP_XS as u16, 0])
         .width(Length::Fill)
         .into()
 }
@@ -174,11 +262,13 @@ fn change_view(change: &FileChange) -> Element<'_, Message> {
     let mut rows: Vec<Element<'_, Message>> = vec![
         widget::row::with_children(vec![
             design::caption(change_verb(&change.kind)).into(),
-            design::body(change.path.as_str())
+            widget::text::body(change.path.as_str())
+                .size(design::TEXT_BODY)
+                .font(iced::Font::MONOSPACE)
                 .width(Length::Fill)
                 .into(),
         ])
-        .spacing(design::GRID_UNIT * 2.0)
+        .spacing(GAP_S)
         .align_y(Alignment::Center)
         .into(),
     ];
@@ -189,7 +279,7 @@ fn change_view(change: &FileChange) -> Element<'_, Message> {
         rows.push(patch_view(&change.diff));
     }
     widget::column::with_children(rows)
-        .spacing(design::GRID_UNIT)
+        .spacing(GAP_XS)
         .width(Length::Fill)
         .into()
 }
@@ -245,25 +335,28 @@ impl Runtime {
                 } else {
                     "pan-end-symbolic"
                 }))
-                .size(design::ROW_ICON_SIZE)
+                .size(12)
                 .into(),
                 widget::icon(crate::ui_controls::symbolic_icon(glyph))
-                    .size(design::ROW_ICON_SIZE)
+                    .size(12)
                     .into(),
-                design::caption(summary.clone()).width(Length::Fill).into(),
+                design::caption(summary.clone()).into(),
             ])
-            .spacing(design::GRID_UNIT * 2.0)
+            .spacing(GAP_S)
             .align_y(Alignment::Center),
         )
         .name(summary)
         .class(crate::ui_controls::control_style(false, tone))
-        .padding([design::GRID_UNIT as u16, design::GRID_UNIT as u16 * 2])
-        .width(Length::Fill)
+        .padding([GAP_XS as u16, GAP_S as u16])
         .on_press(action(Action::ToggleTurn(target, key.to_owned())));
+        // The header is sized to its own text rather than stretched across the
+        // pane. A full-width control for a four-word summary is what made the
+        // surface read as a stack of bars.
+        let header = widget::container(header).width(Length::Shrink);
         if !open {
             return header.into();
         }
-        let mut rows: Vec<Element<'a, Message>> = vec![header.into()];
+        let mut rows: Vec<Element<'a, Message>> = Vec::new();
         for placed in &turn.steps {
             let Some(item) = self.snapshot.items.get(placed.index) else {
                 continue;
@@ -273,10 +366,35 @@ impl Runtime {
             };
             rows.push(self.step_view(item, cached, settings));
         }
-        widget::column::with_children(rows)
-            .spacing(design::GRID_UNIT / 2.0)
+        widget::column::with_children(vec![
+            header.into(),
+            // One hairline beside the rows rather than a border on each of
+            // them, so the sequence reads as continuous. `Border` carries a
+            // single width for all four edges, so a left-only edge has to be
+            // its own sliver.
+            widget::row::with_children(vec![
+                widget::container(iced::widget::Space::new().height(Length::Fill))
+                    .width(design::BORDER_WIDTH)
+                    .height(Length::Fill)
+                    .class(cosmic::theme::Container::custom(|theme| {
+                        cosmic::widget::container::Style {
+                            background: Some(iced::Background::Color(design::hairline(theme))),
+                            ..Default::default()
+                        }
+                    }))
+                    .into(),
+                widget::column::with_children(rows)
+                    .spacing(GAP_XS)
+                    .width(Length::Fill)
+                    .into(),
+            ])
+            .spacing(RAIL_INSET)
             .width(Length::Fill)
-            .into()
+            .into(),
+        ])
+        .spacing(GAP_XS)
+        .width(Length::Fill)
+        .into()
     }
 
     /// The collapsed strip's own line.
@@ -323,14 +441,19 @@ impl Runtime {
         let label = turn::step_label(&item.content);
         let mut line: Vec<Element<'a, Message>> = vec![
             widget::icon(crate::ui_controls::symbolic_icon(kind_glyph(&item.content)))
-                .size(design::ROW_ICON_SIZE)
+                .size(14)
                 .into(),
         ];
         if !verb.is_empty() {
             line.push(design::caption(verb).into());
         }
+        // The target is a path, a pattern, or a command, so it is set in the
+        // same face the reader would see it in a terminal or an editor. That
+        // is also what separates it at a glance from the verb beside it.
         line.push(
-            design::body(label)
+            widget::text::body(label)
+                .size(design::TEXT_BODY)
+                .font(iced::Font::MONOSPACE)
                 .width(Length::Fill)
                 .wrapping(iced::widget::text::Wrapping::None)
                 .into(),
@@ -345,27 +468,26 @@ impl Runtime {
         };
         let header = widget::button::custom(
             widget::row::with_children(line)
-                .spacing(design::GRID_UNIT * 2.0)
+                .spacing(GAP_S)
                 .align_y(Alignment::Center),
         )
         .name(name)
         .class(crate::ui_controls::control_style(open, None))
-        .padding([design::GRID_UNIT as u16, design::GRID_UNIT as u16 * 2])
+        .padding([GAP_XS as u16, GAP_S as u16])
         .width(Length::Fill)
         .on_press(action(Action::Toggle(target, item.id.clone())));
         if !open {
-            return widget::container(header)
-                .padding([0, 0, 0, design::GRID_UNIT as u16 * 4])
-                .width(Length::Fill)
-                .into();
+            return header.into();
         }
         let detail = self.step_detail(item, cached, settings);
-        widget::container(
-            widget::column::with_children(vec![header.into(), detail])
-                .spacing(design::GRID_UNIT)
-                .width(Length::Fill),
-        )
-        .padding([0, 0, 0, design::GRID_UNIT as u16 * 4])
+        widget::column::with_children(vec![
+            header.into(),
+            widget::container(detail)
+                .padding(iced::Padding::from([0.0, GAP_S]).bottom(GAP_S))
+                .width(Length::Fill)
+                .into(),
+        ])
+        .spacing(GAP_XS)
         .width(Length::Fill)
         .into()
     }
@@ -386,7 +508,11 @@ impl Runtime {
         match &item.content {
             ItemContent::Text { text, .. } => {
                 if self.raw.contains(&item.id) {
-                    rows.push(code_surface(text.as_str(), Some(Self::OUTPUT_HEIGHT)));
+                    rows.push(code_surface(
+                        text.as_str(),
+                        Some("Markdown"),
+                        Some(Self::OUTPUT_HEIGHT),
+                    ));
                 } else {
                     rows.push(
                         markdown::view(cached.markdown.items(), settings)
@@ -401,14 +527,19 @@ impl Runtime {
                 output,
                 ..
             } => {
-                rows.push(code_surface(command.as_str(), None));
-                if !working_directory.is_empty() {
-                    rows.push(design::caption(format!("in {working_directory}")).into());
-                }
+                rows.push(code_surface(
+                    command.as_str(),
+                    (!working_directory.is_empty()).then_some(working_directory.as_str()),
+                    None,
+                ));
                 if output.is_empty() {
                     rows.push(design::caption("No output.").into());
                 } else {
-                    rows.push(code_surface(output.as_str(), Some(Self::OUTPUT_HEIGHT)));
+                    rows.push(code_surface(
+                        output.as_str(),
+                        Some("Output"),
+                        Some(Self::OUTPUT_HEIGHT),
+                    ));
                 }
             }
             ItemContent::Changes { changes, .. } => {
@@ -426,14 +557,20 @@ impl Runtime {
             }
             ItemContent::Tool { input, output, .. } => {
                 if !input.is_empty() {
-                    rows.push(design::caption("Input").into());
-                    rows.push(code_surface(input.as_str(), Some(Self::OUTPUT_HEIGHT)));
+                    rows.push(code_surface(
+                        input.as_str(),
+                        Some("Input"),
+                        Some(Self::OUTPUT_HEIGHT),
+                    ));
                 }
                 if output.is_empty() {
                     rows.push(design::caption("No output.").into());
                 } else {
-                    rows.push(design::caption("Output").into());
-                    rows.push(code_surface(output.as_str(), Some(Self::OUTPUT_HEIGHT)));
+                    rows.push(code_surface(
+                        output.as_str(),
+                        Some("Output"),
+                        Some(Self::OUTPUT_HEIGHT),
+                    ));
                 }
             }
             ItemContent::Image { path, description } => {

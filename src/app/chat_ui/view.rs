@@ -33,6 +33,39 @@ fn code_label(index: usize) -> Cow<'static, str> {
 const COMPOSER_LINE_HEIGHT: f32 = 18.0;
 const COMPOSER_PADDING: f32 = design::GRID_UNIT * 2.0;
 
+/// The widest a user's message is drawn.
+///
+/// Narrower than the measure prose is held to, because a prompt is an aside
+/// in the conversation rather than the body of it: keeping it clearly short
+/// of the full column is what makes the alternation of asking and answering
+/// visible while scrolling.
+const PROMPT_MEASURE: f32 = 560.0;
+
+/// The context gauge's track: wide enough to read a proportion off, short
+/// enough that it stays a detail in the status line.
+const GAUGE_WIDTH: f32 = 72.0;
+const GAUGE_HEIGHT: f32 = 6.0;
+
+/// The composer editor, drawing no surface of its own.
+///
+/// The composer is one surface that holds the editor and its controls
+/// together, the way a reader sees it. Letting the editor paint its own filled
+/// bordered box inside that surface is what produced a box inside a box, which
+/// is most of what made the old composer look like stacked slabs.
+fn composer_editor_style(
+    theme: &cosmic::Theme,
+    _status: iced::widget::text_editor::Status,
+) -> iced::widget::text_editor::Style {
+    let cosmic = theme.cosmic();
+    iced::widget::text_editor::Style {
+        background: iced::Background::Color(iced::Color::TRANSPARENT),
+        border: iced::Border::default(),
+        placeholder: design::muted_color(theme),
+        value: cosmic.palette.neutral_9.into(),
+        selection: cosmic.accent.base.into(),
+    }
+}
+
 /// The icon and tooltip for a submit control.
 ///
 /// `slot` is the control's place among the modes the provider currently
@@ -241,7 +274,11 @@ impl Runtime {
             .into(),
             widget::scrollable(
                 widget::column::with_children(transcript)
-                    .spacing(16)
+                    // Turns are held apart further than anything inside one,
+                    // so the whitespace itself says where an exchange ends.
+                    // That is the separation a divider between messages was
+                    // doing badly.
+                    .spacing(step::GAP_L)
                     .width(Length::Fill)
                     // Message rows carry copy and expand controls on their
                     // right edge; the thumb floats over that column.
@@ -532,29 +569,29 @@ impl Runtime {
         } else {
             (None, None)
         };
-        // The composer grows with the draft instead of holding a fixed pane:
+        // The composer grows with the draft rather than holding a fixed pane:
         // a one-line message should not reserve six lines of the transcript,
         // and a long one should not be read three lines at a time through a
-        // scrollbar. The ceiling keeps the transcript from being squeezed out
-        // by a very long paste, past which the editor scrolls as before.
-        let composer_lines = draft.lines().count().clamp(1, 12) as f32;
-        let composer_height = composer_lines * COMPOSER_LINE_HEIGHT + 2.0 * COMPOSER_PADDING;
-        content.push(if transitioning {
+        // scrollbar. `Shrink` measures the editor's wrapped extent, so a
+        // single long line that wraps counts as the rows it actually draws,
+        // which counting newlines could not see. The ceiling keeps a very
+        // long paste from squeezing the transcript out, past which the editor
+        // scrolls as before.
+        let composer_ceiling = 12.0 * COMPOSER_LINE_HEIGHT + 2.0 * COMPOSER_PADDING;
+        let editor: Element<'_, Message> = if transitioning {
             // The reservation belongs inside the scroll viewport. An inset on
             // the outer container moves the viewport itself, and the thumb
             // floats at that viewport's right edge either way, so the draft
             // text would still run underneath it.
             widget::container(
-                widget::scrollable(
-                    widget::container(body(draft)).padding(crate::design::with_vertical_rail(
-                        iced::Padding::from(COMPOSER_PADDING),
-                    )),
-                )
+                widget::scrollable(widget::container(body(draft)).padding(
+                    crate::design::with_vertical_rail(iced::Padding::from(COMPOSER_PADDING)),
+                ))
                 .direction(cosmic::iced::widget::scrollable::Direction::Vertical(
                     crate::design::scrollbar(),
                 )),
             )
-            .height(composer_height)
+            .max_height(composer_ceiling)
             .width(Length::Fill)
             .into()
         } else {
@@ -562,8 +599,17 @@ impl Runtime {
                 .id(card_control_id(target.card, "chat-composer"))
                 .placeholder(placeholder)
                 .size(design::TEXT_BODY)
-                .height(composer_height)
-                .padding(COMPOSER_PADDING)
+                .height(Length::Shrink)
+                .max_height(composer_ceiling)
+                // The editor scrolls once the draft passes the ceiling, and
+                // its thumb floats over the text's right edge, so the gutter
+                // is reserved here as well as in the read-only branch.
+                .padding(design::with_vertical_rail(iced::Padding::from(
+                    COMPOSER_PADDING,
+                )))
+                .class(cosmic::theme::iced::TextEditor::Custom(Box::new(
+                    composer_editor_style,
+                )))
                 .on_action(move |event| action(Action::Composer(target, event)))
                 .key_binding(move |press| {
                     match submit_chord(&press, submit.0, submit.1, enter_sends) {
@@ -574,7 +620,7 @@ impl Runtime {
                     }
                 })
                 .into()
-        });
+        };
         let mut actions = Vec::new();
         if snapshot.capabilities.attachments {
             actions.push(icon(
@@ -637,11 +683,31 @@ impl Runtime {
                 Action::Command(target, Command::Interrupt),
             ));
         }
+        // The editor and its controls are one object: a single raised surface
+        // with the controls tucked inside its lower edge, so the composer
+        // reads as one place to type rather than a field with a toolbar
+        // bolted under it.
         content.push(
-            widget::row::with_children(actions)
-                .spacing(4)
-                .align_y(Alignment::Center)
-                .into(),
+            widget::container(
+                widget::column::with_children(vec![
+                    editor,
+                    widget::container(
+                        widget::row::with_children(actions)
+                            .spacing(step::GAP_XS)
+                            .align_y(Alignment::Center),
+                    )
+                    .padding(iced::Padding::from([0.0, step::GAP_XS]).bottom(step::GAP_XS))
+                    .into(),
+                ])
+                .width(Length::Fill),
+            )
+            .class(design::surface(
+                Some(design::raised),
+                [design::RADIUS_M; 4],
+                true,
+            ))
+            .width(Length::Fill)
+            .into(),
         );
         let usage = &snapshot.usage;
         let detail = if transitioning {
@@ -664,45 +730,59 @@ impl Runtime {
         // of information a reader checks most often behind a hover.
         let mut status: Vec<Element<'_, Message>> = vec![
             widget::icon(crate::ui_controls::symbolic_icon(glyph))
-                .size(design::ROW_ICON_SIZE)
+                .size(12)
                 .into(),
-            design::body(if detail.is_empty() { state } else { detail })
-                .class(cosmic::theme::Text::Custom(design::muted_text))
+            design::caption(if detail.is_empty() { state } else { detail })
+                .width(Length::Fill)
+                .wrapping(iced::widget::text::Wrapping::None)
                 .into(),
         ];
-        status.push(iced::widget::Space::new().width(Length::Fill).into());
         if usage.context_limit > 0 {
             // A context budget is a quantity a reader acts on - compact now,
             // or lose the thread - so it is drawn as a gauge rather than
-            // buried in a sentence of digits.
+            // buried in a sentence of digits. A capsule, because a squared
+            // bar four pixels tall reads as a crack in the layout.
             let used = (usage.context_tokens as f32 / usage.context_limit as f32).clamp(0.0, 1.0);
+            let radius = GAUGE_HEIGHT / 2.0;
             status.push(
                 widget::container(
-                    widget::container(iced::widget::Space::new().height(Length::Fill))
-                        .width(Length::FillPortion((used * 1000.0) as u16 + 1))
-                        .class(cosmic::theme::Container::custom(move |theme| {
-                            cosmic::widget::container::Style {
-                                background: Some(iced::Background::Color(if used > 0.9 {
-                                    design::destructive_color(theme)
-                                } else if used > 0.75 {
-                                    design::warning_color(theme)
-                                } else {
-                                    design::muted_color(theme)
-                                })),
-                                border: iced::Border {
-                                    radius: theme.cosmic().corner_radii.radius_xs.into(),
+                    // The fill and the remainder both carry a portion, because
+                    // a single proportional child of a container is resolved
+                    // against the whole width and would draw a full gauge at
+                    // any occupancy.
+                    widget::row::with_children(vec![
+                        widget::container(iced::widget::Space::new().height(Length::Fill))
+                            .width(Length::FillPortion((used * 1000.0).round() as u16))
+                            .height(Length::Fill)
+                            .class(cosmic::theme::Container::custom(move |theme| {
+                                cosmic::widget::container::Style {
+                                    background: Some(iced::Background::Color(if used > 0.9 {
+                                        design::destructive_color(theme)
+                                    } else if used > 0.75 {
+                                        design::warning_color(theme)
+                                    } else {
+                                        design::accent_color(theme)
+                                    })),
+                                    border: iced::Border {
+                                        radius: radius.into(),
+                                        ..Default::default()
+                                    },
                                     ..Default::default()
-                                },
-                                ..Default::default()
-                            }
-                        })),
+                                }
+                            }))
+                            .into(),
+                        iced::widget::Space::new()
+                            .width(Length::FillPortion(((1.0 - used) * 1000.0).round() as u16))
+                            .into(),
+                    ])
+                    .height(Length::Fill),
                 )
-                .width(64)
-                .height(design::GRID_UNIT)
-                .class(cosmic::theme::Container::Card)
+                .width(GAUGE_WIDTH)
+                .height(GAUGE_HEIGHT)
+                .class(design::surface(Some(design::sunken), [radius; 4], false))
                 .into(),
             );
-            status.push(design::caption(format!("{:.0}% context", used * 100.0)).into());
+            status.push(design::caption(format!("{:.0}%", used * 100.0)).into());
         }
         status.push(
             design::caption(format!(
@@ -716,17 +796,17 @@ impl Runtime {
         }
         content.push(
             widget::row::with_children(status)
-                .spacing(design::GRID_UNIT * 2.0)
+                .spacing(step::GAP_S)
                 .align_y(Alignment::Center)
                 .into(),
         );
         widget::container(
             widget::column::with_children(content)
-                .spacing(8)
+                .spacing(step::GAP_S)
                 .height(Length::Fill)
                 .width(Length::Fill),
         )
-        .padding(12)
+        .padding(step::GAP_M)
         .width(Length::Fill)
         .height(Length::Fill)
         .into()
@@ -770,16 +850,17 @@ impl Runtime {
             rows.push(self.prose_view(item, cached, placed.slot, settings));
         }
         widget::column::with_children(rows)
-            .spacing(design::GRID_UNIT * 2.0)
+            .spacing(step::GAP_M)
             .width(Length::Fill)
             .into()
     }
 
     /// The user's own message.
     ///
-    /// Given its own surface and held to the readable measure so a turn's
-    /// opening is findable when scrolling back, which is what the repeated
-    /// "You" heading was standing in for.
+    /// Set on the accent wash and tucked to the right, with the corner nearest
+    /// its author squared off. That asymmetry is what identifies the author
+    /// without printing "You" above every message, and the narrower measure
+    /// keeps a turn's opening findable when scrolling back.
     fn prompt_view<'a>(&'a self, item: &'a chat::Item) -> Element<'a, Message> {
         let text = match &item.content {
             ItemContent::Text { text, .. } => text.as_str(),
@@ -791,9 +872,18 @@ impl Runtime {
                     .size(design::TEXT_BODY)
                     .width(Length::Shrink),
             )
-            .class(cosmic::theme::Container::Card)
-            .padding(design::GRID_UNIT * 2.5)
-            .max_width(design::READABLE_MEASURE),
+            .class(design::surface(
+                Some(design::accent_wash),
+                [
+                    design::RADIUS_L,
+                    design::RADIUS_L,
+                    design::RADIUS_XS,
+                    design::RADIUS_L,
+                ],
+                false,
+            ))
+            .padding([step::GAP_S as u16, step::GAP_M as u16])
+            .max_width(PROMPT_MEASURE),
         )
         .align_x(Alignment::End)
         .width(Length::Fill)
@@ -814,24 +904,36 @@ impl Runtime {
     ) -> Element<'a, Message> {
         let target = self.target;
         if slot == turn::Slot::Commentary {
+            // Narration is a passing remark, so it gets one line at caption
+            // weight, indented to sit under the activity it describes. Given
+            // a paragraph of its own it drowned out the answer.
             return widget::container(
                 design::caption(turn::first_line(match &item.content {
                     ItemContent::Text { text, .. } => text.as_str(),
                     content => turn::step_label(content),
                 }))
-                .width(Length::Fill),
+                .width(Length::Fill)
+                .wrapping(iced::widget::text::Wrapping::None),
             )
-            .padding([0, 0, 0, design::GRID_UNIT as u16 * 2])
+            .padding(iced::Padding::ZERO.left(step::GAP_M))
             .width(Length::Fill)
             .into();
         }
         if item.role == chat::Role::System {
+            // A notice is chrome, not conversation: one line, a small glyph,
+            // and an accent sliver to mark where it starts. The card it used
+            // to be drew a rectangle around a single sentence.
             return widget::container(
                 widget::row::with_children(vec![
+                    widget::container(iced::widget::Space::new().height(Length::Fill))
+                        .width(design::BORDER_WIDTH * 2.0)
+                        .height(Length::Fill)
+                        .class(design::surface(Some(design::accent_color), [1.0; 4], false))
+                        .into(),
                     widget::icon(crate::ui_controls::symbolic_icon(
                         "dialog-information-symbolic",
                     ))
-                    .size(design::ROW_ICON_SIZE)
+                    .size(14)
                     .into(),
                     design::caption(match &item.content {
                         ItemContent::Text { text, .. } => text.as_str(),
@@ -840,11 +942,10 @@ impl Runtime {
                     .width(Length::Fill)
                     .into(),
                 ])
-                .spacing(design::GRID_UNIT * 2.0)
+                .spacing(step::GAP_S)
                 .align_y(Alignment::Center),
             )
-            .class(cosmic::theme::Container::Card)
-            .padding(design::GRID_UNIT * 2.0)
+            .padding([step::GAP_XS as u16, 0])
             .width(Length::Fill)
             .into();
         }
@@ -900,13 +1001,16 @@ impl Runtime {
         }
         rows.push(
             widget::row::with_children(controls)
-                .spacing(design::GRID_UNIT)
+                .spacing(step::GAP_XS)
                 .align_y(Alignment::Center)
                 .into(),
         );
+        // The answer is bare prose on the pane's own surface. Wrapping it in
+        // a panel would put a frame around the one thing the reader came for,
+        // and would make it look like just another block.
         widget::container(
             widget::column::with_children(rows)
-                .spacing(design::GRID_UNIT)
+                .spacing(step::GAP_S)
                 .max_width(design::READABLE_MEASURE),
         )
         .width(Length::Fill)

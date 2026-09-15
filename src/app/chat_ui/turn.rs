@@ -106,6 +106,9 @@ impl Turn {
 pub(super) fn group(items: &[Item]) -> Vec<Turn> {
     let mut turns: Vec<Turn> = Vec::new();
     for (index, item) in items.iter().enumerate() {
+        if !renders(&item.content) {
+            continue;
+        }
         let opens = item.role == Role::User && !item.content.is_step();
         if opens || turns.is_empty() {
             let prompt = opens.then_some(index);
@@ -125,6 +128,21 @@ pub(super) fn group(items: &[Item]) -> Vec<Turn> {
     }
     turns.retain(|turn| !turn.is_empty());
     turns
+}
+
+/// Whether an item would put anything on screen.
+///
+/// A provider that announces a session emits a notice with no body, and the
+/// surface used to draw it as an empty rectangle at the top of every
+/// conversation - two of them, in fact, one captioned and one blank. A text
+/// item with nothing in it is also the transient state of a message that is
+/// about to stream, so it reappears as soon as its first bytes arrive rather
+/// than being dropped for good.
+fn renders(content: &ItemContent) -> bool {
+    match content {
+        ItemContent::Text { text, .. } => !text.trim().is_empty(),
+        _ => true,
+    }
 }
 
 fn slot_of(content: &ItemContent) -> Slot {
@@ -309,24 +327,34 @@ mod tests {
     }
 
     #[test]
-    fn an_empty_turn_is_dropped_rather_than_rendered() {
-        // The surface used to show a `System` heading with no body at all.
-        let items = vec![Item {
+    fn a_notice_with_no_body_is_not_rendered_at_all() {
+        // Two `System` headings used to open every conversation, one of them
+        // with no body whatsoever, drawn as an empty rectangle.
+        let empty = Item {
             id: "s1".into(),
             role: Role::System,
             content: ItemContent::Text {
-                text: String::new(),
+                text: "   \n".into(),
                 thinking: false,
                 phase: Phase::Final,
             },
-        }];
-        let turns = group(&items);
-        assert_eq!(
-            turns.len(),
-            1,
-            "an item with an empty body still has a slot"
-        );
+        };
+        assert_eq!(group(std::slice::from_ref(&empty)).len(), 0);
         assert_eq!(group(&[]).len(), 0);
+        // A message that has not streamed its first bytes yet is the same
+        // shape, and must come back once it has them.
+        let items = vec![
+            text("u1", Role::User, Phase::Final, false),
+            empty,
+            text("a1", Role::Assistant, Phase::Final, false),
+        ];
+        let turns = group(&items);
+        assert_eq!(turns.len(), 1);
+        assert_eq!(
+            turns[0].prose.iter().map(|p| p.index).collect::<Vec<_>>(),
+            [2],
+            "only the item with a body occupies a slot"
+        );
     }
 
     #[test]

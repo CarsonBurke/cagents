@@ -66,6 +66,24 @@ pub fn muted_text(theme: &cosmic::Theme) -> cosmic::iced::widget::text::Style {
     }
 }
 
+/// The gutter marker on an added or removed patch line.
+///
+/// The marker is tinted rather than the whole line, so the line keeps the
+/// reader's ink while the gutter says what happened to it.
+pub fn added_text(theme: &cosmic::Theme) -> cosmic::iced::widget::text::Style {
+    cosmic::iced::widget::text::Style {
+        color: Some(success_color(theme)),
+        ..Default::default()
+    }
+}
+
+pub fn removed_text(theme: &cosmic::Theme) -> cosmic::iced::widget::text::Style {
+    cosmic::iced::widget::text::Style {
+        color: Some(destructive_color(theme)),
+        ..Default::default()
+    }
+}
+
 /// Symbolic icons ignore alpha in their SVG recoloring. Blend them toward the
 /// surface instead so muted navigation glyphs stay visibly quieter than text.
 pub fn muted_icon_color(theme: &cosmic::Theme) -> cosmic::iced::Color {
@@ -145,6 +163,99 @@ pub fn success_color(theme: &cosmic::Theme) -> cosmic::iced::Color {
 
 pub fn destructive_color(theme: &cosmic::Theme) -> cosmic::iced::Color {
     theme.cosmic().destructive.base.into()
+}
+
+/// Corner radii, as a scale rather than one value reused everywhere.
+///
+/// Stock COSMIC cards answer every question with the same rectangle, which is
+/// what makes a surface built out of them read as a stack of slabs. A scale
+/// lets a control, a code block, and a message each carry the curvature its
+/// size deserves: the larger the element, the larger the radius it needs for
+/// the corner to read as deliberate.
+pub const RADIUS_XS: f32 = 4.0;
+pub const RADIUS_S: f32 = 6.0;
+pub const RADIUS_M: f32 = 10.0;
+pub const RADIUS_L: f32 = 14.0;
+
+/// Mixes `over` into `under` by `amount`, ignoring `over`'s own alpha.
+///
+/// Compositing by alpha would leave the result translucent, so a widget drawn
+/// over another translucent surface would darken twice. Resolving the mix to
+/// an opaque color keeps a stack of surfaces predictable.
+fn mix(under: cosmic::iced::Color, over: cosmic::iced::Color, amount: f32) -> cosmic::iced::Color {
+    let keep = 1.0 - amount;
+    cosmic::iced::Color {
+        r: under.r * keep + over.r * amount,
+        g: under.g * keep + over.g * amount,
+        b: under.b * keep + over.b * amount,
+        a: 1.0,
+    }
+}
+
+/// The surface a pane draws on.
+fn base(theme: &cosmic::Theme) -> cosmic::iced::Color {
+    theme.current_container().base.into()
+}
+
+/// A separator that reads as an edge rather than as a frame.
+///
+/// A full-strength border turns every element into a box. At this weight the
+/// line only defines where one surface stops, which is all a border on a
+/// transcript needs to do.
+pub fn hairline(theme: &cosmic::Theme) -> cosmic::iced::Color {
+    mix(base(theme), theme.current_container().on.into(), 0.12)
+}
+
+/// One step above the surface: a code block, a composer, a notice.
+pub fn raised(theme: &cosmic::Theme) -> cosmic::iced::Color {
+    mix(base(theme), theme.current_container().on.into(), 0.045)
+}
+
+/// One step below the surface, for content quoted from elsewhere.
+pub fn sunken(theme: &cosmic::Theme) -> cosmic::iced::Color {
+    let on: cosmic::iced::Color = theme.current_container().on.into();
+    // Darkening is only available where the surface has room to darken. On a
+    // light theme the same intent is served by tinting toward the ink.
+    if on.r + on.g + on.b > 1.5 {
+        mix(base(theme), cosmic::iced::Color::BLACK, 0.28)
+    } else {
+        mix(base(theme), on, 0.06)
+    }
+}
+
+/// The accent at reading strength: enough to claim a surface as the user's
+/// own without turning their message into a colored block.
+pub fn accent_wash(theme: &cosmic::Theme) -> cosmic::iced::Color {
+    mix(base(theme), theme.cosmic().accent.base.into(), 0.14)
+}
+
+pub fn accent_color(theme: &cosmic::Theme) -> cosmic::iced::Color {
+    theme.cosmic().accent.base.into()
+}
+
+/// A rounded surface with an optional hairline edge.
+///
+/// `radius` takes the four corners clockwise from the top left, so a shape can
+/// be asymmetric where that carries meaning - a message bubble tucking its
+/// corner toward its author, a header joining the block below it.
+pub fn surface(
+    fill: Option<fn(&cosmic::Theme) -> cosmic::iced::Color>,
+    radius: [f32; 4],
+    edge: bool,
+) -> cosmic::theme::Container<'static> {
+    cosmic::theme::Container::custom(move |theme| cosmic::widget::container::Style {
+        background: fill.map(|fill| cosmic::iced::Background::Color(fill(theme))),
+        border: cosmic::iced::Border {
+            radius: radius.into(),
+            width: if edge { BORDER_WIDTH } else { 0.0 },
+            color: if edge {
+                hairline(theme)
+            } else {
+                cosmic::iced::Color::TRANSPARENT
+            },
+        },
+        ..Default::default()
+    })
 }
 
 pub const NAVIGATION_DEFAULT_WIDTH: f32 = 260.0;
