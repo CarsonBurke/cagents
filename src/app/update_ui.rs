@@ -50,7 +50,7 @@ impl Cagents {
                     return Some("Save or discard open editor changes before updating.");
                 }
                 CardRuntime::Chat(chat) => {
-                    if let Some(reason) = chat.transition_blocker() {
+                    if let Some(reason) = chat.restart_blocker() {
                         return Some(reason);
                     }
                 }

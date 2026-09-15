@@ -1898,6 +1898,7 @@ pub enum SettingsField {
     LinkOpenDestination,
     EditorAutoSave,
     EditorWrapLines,
+    ChatEnterSends,
     EditorSyntaxTheme,
     ConfirmTerminalClose,
     FocusFollowsMouse,
@@ -1972,6 +1973,7 @@ struct SettingsDraft {
     editor_wrap_lines: bool,
     editor_syntax_theme: settings::EditorSyntaxTheme,
     confirm_terminal_close: bool,
+    chat_enter_sends: bool,
     focus_follows_mouse: bool,
     link_open_destination: LinkOpenDestination,
     link_open_gesture: LinkOpenGesture,
@@ -2019,6 +2021,7 @@ impl SettingsDraft {
             editor_auto_save: settings.editor_auto_save,
             editor_wrap_lines: settings.editor_wrap_lines,
             confirm_terminal_close: settings.confirm_terminal_close,
+            chat_enter_sends: settings.chat_enter_sends,
             editor_syntax_theme: settings.editor_syntax_theme,
             focus_follows_mouse: settings.focus_follows_mouse,
             link_open_destination: settings.link_open_destination,
@@ -2046,6 +2049,7 @@ impl SettingsDraft {
             SettingsField::EditorAutoSave => self.editor_auto_save = value == "true",
             SettingsField::EditorWrapLines => self.editor_wrap_lines = value == "true",
             SettingsField::ConfirmTerminalClose => self.confirm_terminal_close = value == "true",
+            SettingsField::ChatEnterSends => self.chat_enter_sends = value == "true",
             SettingsField::EditorSyntaxTheme => {
                 if let Some(theme) = settings::EditorSyntaxTheme::from_key(&value) {
                     self.editor_syntax_theme = theme;
@@ -2110,6 +2114,10 @@ fn settings_update(
             .parse::<bool>()
             .map(|enabled| next.confirm_terminal_close = enabled)
             .map_err(|_| "Choose whether active terminal closes require confirmation.".to_owned()),
+        SettingsField::ChatEnterSends => value
+            .parse::<bool>()
+            .map(|enabled| next.chat_enter_sends = enabled)
+            .map_err(|_| "Choose which key sends a chat message.".to_owned()),
         SettingsField::WorktreeSort => match value {
             "newest" => {
                 next.worktree_sort = settings::WorktreeSort::Newest;
@@ -7222,6 +7230,7 @@ impl Cagents {
                     | SettingsField::TerminalCursorStyle
                     | SettingsField::ManagedWorktreeDirectory
                     | SettingsField::ConfirmTerminalClose
+                    | SettingsField::ChatEnterSends
                     | SettingsField::FocusFollowsMouse
                     | SettingsField::DefaultColumnFraction
                     | SettingsField::LinkOpenDestination

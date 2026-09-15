@@ -106,6 +106,47 @@ pub fn heading<'a>(
     })
 }
 
+/// The widest a column of prose is allowed to grow.
+///
+/// Reading a paragraph that spans a maximised window costs the eye its place
+/// on every wrap. Typography practice puts the comfortable measure at roughly
+/// 60 to 80 characters, which at our body size is this many logical pixels.
+/// The transcript's own chrome still spans the full width; only the text is
+/// held back.
+pub const READABLE_MEASURE: f32 = 720.0;
+
+/// A patch's added and removed lines, tinted rather than filled.
+///
+/// The semantic accent at full strength competes with the code it is meant to
+/// annotate, so each tone is mixed toward the surface it draws on: strong
+/// enough to read at a glance down the gutter, weak enough that the text on
+/// top keeps its contrast.
+fn diff_tone(theme: &cosmic::Theme, accent: cosmic::iced::Color) -> cosmic::iced::Color {
+    let base: cosmic::iced::Color = theme.current_container().base.into();
+    cosmic::iced::Color {
+        r: accent.r * 0.22 + base.r * 0.78,
+        g: accent.g * 0.22 + base.g * 0.78,
+        b: accent.b * 0.22 + base.b * 0.78,
+        a: 1.0,
+    }
+}
+
+pub fn diff_added_color(theme: &cosmic::Theme) -> cosmic::iced::Color {
+    diff_tone(theme, theme.cosmic().success.base.into())
+}
+
+pub fn diff_removed_color(theme: &cosmic::Theme) -> cosmic::iced::Color {
+    diff_tone(theme, theme.cosmic().destructive.base.into())
+}
+
+pub fn success_color(theme: &cosmic::Theme) -> cosmic::iced::Color {
+    theme.cosmic().success.base.into()
+}
+
+pub fn destructive_color(theme: &cosmic::Theme) -> cosmic::iced::Color {
+    theme.cosmic().destructive.base.into()
+}
+
 pub const NAVIGATION_DEFAULT_WIDTH: f32 = 260.0;
 pub const NAVIGATION_MIN_WIDTH: f32 = 220.0;
 pub const NAVIGATION_MAX_WIDTH: f32 = 420.0;
