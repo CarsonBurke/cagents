@@ -1,5 +1,6 @@
 mod agent_ui;
 mod branch_ui;
+mod channel_ui;
 mod chat_ui;
 mod chrome_ui;
 mod daemon_recovery;
@@ -14,7 +15,6 @@ mod refresh_ui;
 mod safety_tests;
 mod settings_ui;
 mod terminal_close;
-mod channel_ui;
 mod update_ui;
 mod worktree_operations;
 mod worktree_ui;
@@ -9456,7 +9456,9 @@ impl Application for Cagents {
                     Some(workspace_widget::GlobalShortcut::NewTerminal) => {
                         cosmic::task::message(Message::NewTerminal)
                     }
-                    Some(workspace_widget::GlobalShortcut::NewChannel) => self.new_project_channel(),
+                    Some(workspace_widget::GlobalShortcut::NewChannel) => {
+                        self.new_project_channel()
+                    }
                     Some(workspace_widget::GlobalShortcut::ClonePane) => self.clone_focused_pane(),
                     Some(workspace_widget::GlobalShortcut::CloseFocusedCard) => {
                         match close_focused_message(&self.workspace) {

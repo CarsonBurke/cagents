@@ -174,7 +174,10 @@ impl Cagents {
                     .iter()
                     .any(|card| card.id == *id && card.existence.is_open())
             });
-            if !channel.focused.is_some_and(|id| channel.cards.contains(&id)) {
+            if !channel
+                .focused
+                .is_some_and(|id| channel.cards.contains(&id))
+            {
                 channel.focused = channel.cards.first().copied();
             }
         }
@@ -201,7 +204,12 @@ impl Cagents {
     }
 
     pub(super) fn select_channel(&mut self, id: ChannelId) -> Task<Message> {
-        let Some(channel) = self.durable.channels.iter().find(|channel| channel.id == id) else {
+        let Some(channel) = self
+            .durable
+            .channels
+            .iter()
+            .find(|channel| channel.id == id)
+        else {
             return Task::none();
         };
         let Some(project) = self.sidebar_model.project(channel.project_id) else {
@@ -615,7 +623,10 @@ mod tests {
         let _ = app.select_worktree("/repo/worktree".into(), false);
         assert_eq!(app.workspace.order().collect::<Vec<_>>(), vec![worktree.id]);
         let _ = app.select_channel(channel);
-        assert_eq!(app.workspace.order().collect::<Vec<_>>(), vec![channeled.id]);
+        assert_eq!(
+            app.workspace.order().collect::<Vec<_>>(),
+            vec![channeled.id]
+        );
         let _ = app.select_worktree("/tmp".into(), false);
         assert_eq!(app.durable.active_channel, None);
         assert_eq!(

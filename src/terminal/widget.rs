@@ -3769,9 +3769,9 @@ mod tests {
             match self.state.wheel_effect(lines, self.scroll) {
                 WheelEffect::Idle => {}
                 WheelEffect::Viewport(delta) => self.owe(ViewportScroll::Lines(delta)),
-                WheelEffect::Report { button, notches } => self
-                    .sent
-                    .extend((0..notches).map(|_| Sent::Report(button))),
+                WheelEffect::Report { button, notches } => {
+                    self.sent.extend((0..notches).map(|_| Sent::Report(button)))
+                }
                 WheelEffect::Keys { key, notches } => {
                     self.sent.extend((0..notches).map(|_| Sent::Key(key)));
                 }
@@ -3832,7 +3832,10 @@ mod tests {
             reporting.wheel(-1.0);
         }
         reporting.frame();
-        assert_eq!(reporting.sent, vec![Sent::Report(MouseButton::WheelDown); 3]);
+        assert_eq!(
+            reporting.sent,
+            vec![Sent::Report(MouseButton::WheelDown); 3]
+        );
 
         // An alternate-screen application has no scrollback to move and gets
         // one arrow key per notch instead, likewise unfolded.

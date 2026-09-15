@@ -5387,10 +5387,14 @@ pub fn selected_file_toolbar(
         widget::row::with_children(controls)
             .spacing(12)
             .align_y(Alignment::Center)
-            .height(Length::Fill),
+            .height(Length::Fill)
+            // Reserve the rail instead of embedding the scrollbar: an embedded
+            // one is drawn even when every action fits, putting a permanent
+            // track under a toolbar that usually has nothing to scroll.
+            .padding(crate::design::with_horizontal_rail(iced::Padding::ZERO)),
     )
     .direction(iced::widget::scrollable::Direction::Horizontal(
-        crate::design::scrollbar().spacing(0),
+        crate::design::scrollbar(),
     ))
     .width(Length::FillPortion(4))
     .height(crate::design::HEADER_HEIGHT);
@@ -5976,11 +5980,29 @@ fn removed_context_view<'a>(
     } else {
         let visible = visible_rows(removed.len(), runtime.removed_viewport, DIFF_ROW_HEIGHT);
         let mut lines = Vec::with_capacity(visible.end - visible.start + 2);
+        // `Direction::Both` gives its content an infinite, compressed cross
+        // axis, so a column of width-fluid rows takes its width from nothing:
+        // `diff_container` was `FillPortion`, and the two virtualization
+        // spacers cannot help because `Column::push` drops any child whose
+        // size hint is void, which a zero-height spacer is. Every row
+        // therefore laid out zero pixels wide and the pane was invisible while
+        // still costing its height. Stating the rows' width fixes the column's
+        // cross size, and sizing it to the widest line is what makes the
+        // horizontal rail below them reachable.
+        //
+        // `diff_model_view` fixes its canvas width for the same reason, but it
+        // can afford `responsive` to learn the viewport first because it has no
+        // accessibility nodes to lose. `Responsive` does not implement
+        // `a11y_nodes`, so measuring this pane that way would silently drop
+        // both the region's announcement and the removed source itself.
+        let code_width =
+            (model.max_line_width[usize::from(cosmic::theme::is_dark())] as f32).max(1.0);
+        let content_width = REMOVED_GUTTER_WIDTH + code_width + 2.0 * DIFF_ROW_PADDING;
         lines.push(iced::widget::Space::new().height(visible.top_space).into());
         for row in &removed[visible.start..visible.end] {
             lines.push(diff_container(
                 widget::row::with_children([
-                    diff_gutter(row.old_line, 48.0),
+                    diff_gutter(row.old_line, REMOVED_GUTTER_WIDTH),
                     widget::selectable_text(row.text.as_str())
                         .font(Font::MONOSPACE)
                         .size(DIFF_FONT_SIZE)
@@ -5988,6 +6010,7 @@ fn removed_context_view<'a>(
                         .into(),
                 ]),
                 DiffRowKind::Deletion,
+                Length::Fixed(content_width),
             ));
         }
         lines.push(
@@ -5995,25 +6018,30 @@ fn removed_context_view<'a>(
                 .height(visible.bottom_space)
                 .into(),
         );
-        widget::scrollable(widget::column::with_children(lines))
-            .id(runtime.removed_scroll_id.clone())
-            .direction(iced::widget::scrollable::Direction::Both {
-                vertical: crate::design::scrollbar(),
-                horizontal: crate::design::scrollbar(),
-            })
-            .on_scroll(move |viewport| RepositoryAction::RemovedViewport {
-                card,
-                offset: viewport.absolute_offset().y,
-                height: viewport.bounds().height,
-            })
-            .height(if native_split {
-                Length::Fill
-            } else {
-                Length::Fixed(140.0)
-            })
-            .name("Removed lines")
-            .description("Selectable, not editable")
-            .into()
+        // Either thumb floats over these rows, so each axis reserves its own
+        // rail and the corner where the two meet stays clear of any row.
+        widget::scrollable(
+            widget::column::with_children(lines)
+                .padding(crate::design::with_both_rails(iced::Padding::ZERO)),
+        )
+        .id(runtime.removed_scroll_id.clone())
+        .direction(iced::widget::scrollable::Direction::Both {
+            vertical: crate::design::scrollbar(),
+            horizontal: crate::design::scrollbar(),
+        })
+        .on_scroll(move |viewport| RepositoryAction::RemovedViewport {
+            card,
+            offset: viewport.absolute_offset().y,
+            height: viewport.bounds().height,
+        })
+        .height(if native_split {
+            Length::Fill
+        } else {
+            Length::Fixed(140.0)
+        })
+        .name("Removed lines")
+        .description("Selectable, not editable")
+        .into()
     };
     widget::container(body)
         .padding(4)
@@ -6174,8 +6202,12 @@ fn diff_model_view<'a>(
                         .into(),
                 );
             }
-            // Both-axis scrollbars overlay their content in this iced version.
-            // Reserve the bottom rail so the final line remains fully readable.
+            // Both thumbs float over this content, so each axis reserves its
+            // own rail: the bottom one here, the right one in
+            // `DiffScrollGeometry`. The padding helpers in `design` would
+            // reserve the same space, but the canvas's own coordinates are
+            // derived from `viewport_width`, so the reservation has to be
+            // visible to that arithmetic rather than applied above it.
             children.push(
                 iced::widget::Space::new()
                     .height(crate::design::SCROLLBAR_GUTTER)
@@ -6216,6 +6248,9 @@ fn diff_model_view<'a>(
 const DIFF_ROW_PADDING: f32 = 4.0;
 const DIFF_MARKER_WIDTH: f32 = 16.0;
 const DIFF_SPLIT_DIVIDER: f32 = 1.0;
+/// The removed pane numbers only the old side, so it sizes its gutter itself
+/// rather than sharing the diff's digit-derived width.
+const REMOVED_GUTTER_WIDTH: f32 = 48.0;
 
 #[derive(Debug, Clone, Copy)]
 struct DiffScrollGeometry {
@@ -6225,6 +6260,8 @@ struct DiffScrollGeometry {
 
 impl DiffScrollGeometry {
     fn new(width: f32, gutter: f32, mode: DiffMode) -> Self {
+        // The vertical thumb's rail, taken off the width every coordinate
+        // downstream is measured in, so a code column never ends underneath it.
         let viewport_width = (width - crate::design::SCROLLBAR_GUTTER).max(0.0);
         let code_viewport = match mode {
             DiffMode::Inline => {
@@ -6282,6 +6319,7 @@ fn inline_diff_row<'a>(
         ])
         .align_y(Alignment::Center),
         row.kind,
+        Length::FillPortion(1),
     )
 }
 
@@ -6358,6 +6396,7 @@ fn diff_half<'a>(
         ])
         .align_y(Alignment::Center),
         kind,
+        Length::FillPortion(1),
     )
 }
 
@@ -6494,9 +6533,13 @@ fn diff_text<'a>(
     })
 }
 
+/// `width` is the row's cross-axis extent, which the caller must state because
+/// a `Direction::Both` scrollable compresses its content's cross axis: a column
+/// of width-fluid rows there takes its width from nothing and collapses.
 fn diff_container<'a>(
     content: impl Into<Element<'a, RepositoryAction>>,
     kind: DiffRowKind,
+    width: Length,
 ) -> Element<'a, RepositoryAction> {
     widget::container(content)
         .class(cosmic::theme::Container::custom(move |theme| {
@@ -6507,7 +6550,7 @@ fn diff_container<'a>(
         }))
         .padding([3.0, DIFF_ROW_PADDING])
         .height(DIFF_ROW_HEIGHT)
-        .width(Length::FillPortion(1))
+        .width(width)
         .clip(true)
         .into()
 }
@@ -7717,6 +7760,165 @@ mod tests {
         }
     }
 
+    /// Every scroll viewport in a laid-out surface, outermost first, paired
+    /// with the content node that scrolls inside it.
+    ///
+    /// A scroll viewport is the one place a child is laid out larger than the
+    /// parent clipping it, so finding them by that shape keeps the assertions
+    /// below independent of how the surrounding view nests them.
+    fn scroll_viewports(root: &layout::Node) -> Vec<(&layout::Node, &layout::Node)> {
+        let mut found = Vec::new();
+        let mut pending = std::collections::VecDeque::from([root]);
+        while let Some(node) = pending.pop_front() {
+            if let [content] = node.children() {
+                let outer = node.size();
+                let inner = content.size();
+                if inner.width > outer.width + 0.5 || inner.height > outer.height + 0.5 {
+                    found.push((node, content));
+                }
+            }
+            pending.extend(node.children());
+        }
+        found
+    }
+
+    /// The rectangle a node's drawable children occupy, in that node's own
+    /// coordinates. Zero-area children are the virtualization and rail
+    /// spacers, which are the reservation rather than content inside it.
+    fn occupied(parent: &layout::Node) -> iced::Rectangle {
+        parent
+            .children()
+            .iter()
+            .map(layout::Node::bounds)
+            .filter(|bounds| bounds.width > 0.0 && bounds.height > 0.0)
+            .reduce(|union, bounds| union.union(&bounds))
+            .expect("the surface lays out drawable content")
+    }
+
+    fn laid_out(
+        mut element: Element<'_, RepositoryAction>,
+        renderer: &cosmic::Renderer,
+        size: iced::Size,
+    ) -> layout::Node {
+        let mut tree = Tree::new(element.as_widget());
+        element.as_widget_mut().layout(
+            &mut tree,
+            renderer,
+            &layout::Limits::new(iced::Size::ZERO, size),
+        )
+    }
+
+    /// The scroll rail is a layout promise, so it is read back off laid-out
+    /// surfaces rather than off the constants it is built from: a two-axis
+    /// scrollable has to leave the corner where its two thumbs meet empty, a
+    /// vertical-only one has to stop its content short of the right edge, and
+    /// a horizontal-only one must reserve the bottom rail without also
+    /// reserving a right rail it has no thumb to hide under.
+    #[test]
+    fn scroll_rails_keep_content_clear_of_every_thumb_and_their_junction() {
+        let renderer = headless_renderer();
+        let rail = crate::design::SCROLLBAR_GUTTER;
+        let card = CardId::new();
+        let line = "let value = compute(argument, another_argument, third_argument);";
+        let before = format!("{}kept\n", format!("{line}\n").repeat(24));
+        let (runtime, _) = native_diff_runtime(card, &before, "kept\n");
+        let model = runtime.diff_model().expect("a text comparison");
+
+        // Two axes: the diff canvas, whose rails are the ones editor content
+        // coordinates are derived from.
+        let surface = iced::Size::new(420.0, 240.0);
+        let diff = laid_out(
+            diff_model_view(card, &runtime, model, "HEAD", "Worktree"),
+            &renderer,
+            surface,
+        );
+        let (viewport, canvas) = *scroll_viewports(&diff)
+            .first()
+            .expect("the diff mounts a scrollable");
+        assert!(
+            canvas.size().width > viewport.size().width
+                && canvas.size().height > viewport.size().height,
+            "the fixture has to overflow both axes for either thumb to exist"
+        );
+        // The canvas holds one column, translated in X as the code pans.
+        let column = canvas
+            .children()
+            .first()
+            .expect("the canvas carries the row column");
+        let right = viewport.size().width - (column.bounds().x + column.bounds().width);
+        assert!(
+            (right - rail).abs() < 0.5,
+            "diff rows reach {right} from the viewport's right edge, not {rail}"
+        );
+        let rows = occupied(column);
+        let bottom = column.bounds().height - (rows.y + rows.height);
+        assert!(
+            (bottom - rail).abs() < 0.5,
+            "the lowest diff row leaves {bottom} below it, not {rail}"
+        );
+
+        // Horizontal only: the content toolbar's action lane. There is no
+        // vertical thumb, so a right rail there would only be dead space.
+        let toolbar = laid_out(
+            selected_file_toolbar(card, &runtime).expect("a selected file has a toolbar"),
+            &renderer,
+            iced::Size::new(240.0, crate::design::HEADER_HEIGHT),
+        );
+        let (viewport, content) = *scroll_viewports(&toolbar)
+            .first()
+            .expect("the action lane scrolls");
+        assert!(content.size().width > viewport.size().width);
+        let controls = occupied(content);
+        assert!(
+            content.size().width - (controls.x + controls.width) < 0.5,
+            "a horizontal-only lane reserves no right rail"
+        );
+        let bottom = content.size().height - (controls.y + controls.height);
+        assert!(
+            bottom >= rail - 0.5,
+            "the lowest control leaves {bottom} below it, inside the {rail} rail"
+        );
+
+        // Vertical only: the Markdown preview, whose inset comes from the
+        // theme's medium spacing. That is wider than the rail today, and this
+        // is what notices if a density preset ever makes it narrower.
+        let (mut preview, identity) = RepositoryRuntime::selection_fixture(card, "notes.md");
+        let text = "# Notes\n\nA paragraph long enough to wrap inside the preview.\n".repeat(24);
+        drop(preview.update(RepositoryAction::FileLoaded {
+            identity,
+            result: Ok(crate::editor::FileContent::Editable {
+                content_hash: blake3::hash(text.as_bytes()),
+                text,
+                markdown: true,
+            }),
+        }));
+        drop(preview.update(RepositoryAction::ApplyMarkdownMode {
+            card,
+            preview: true,
+        }));
+        let DocumentState::Editable(document) = &preview.document else {
+            panic!("the fixture loads an editable Markdown buffer");
+        };
+        let rendered = laid_out(
+            editable_document_view(card, &preview, document),
+            &renderer,
+            surface,
+        );
+        let (viewport, content) = *scroll_viewports(&rendered)
+            .first()
+            .expect("the preview scrolls");
+        assert!(
+            content.size().height > viewport.size().height,
+            "the fixture has to overflow for a thumb to exist"
+        );
+        let prose = occupied(content);
+        let right = content.size().width - (prose.x + prose.width);
+        assert!(
+            right >= rail - 0.5,
+            "preview prose ends {right} from the right edge, inside the {rail} rail"
+        );
+    }
+
     #[test]
     fn diff_accessibility_retains_source_and_line_context_through_scrolling() {
         use iced_accessibility::accesskit::Role;
@@ -7837,6 +8039,22 @@ mod tests {
             148.0,
             "the pane is its 140px scroll region plus 4px of padding above and below"
         );
+        // `Direction::Both` compresses its content's cross axis, so a column of
+        // width-fluid rows collapses to nothing and renders an invisible pane
+        // that still costs its height. Every deletion row must carry a real
+        // width, and the widest one must reach the widest line's extent.
+        let rows = row_widths(Layout::new(&node));
+        assert!(
+            !rows.is_empty() && rows.iter().all(|width| *width > 0.0),
+            "every removed row must lay out with a real width, got {rows:?}"
+        );
+        let code_width =
+            (model.max_line_width[usize::from(cosmic::theme::is_dark())] as f32).max(1.0);
+        let widest = rows.iter().copied().fold(0.0_f32, f32::max);
+        assert!(
+            (widest - (REMOVED_GUTTER_WIDTH + code_width + 2.0 * DIFF_ROW_PADDING)).abs() < 1.0,
+            "the rows must span the widest line, got {widest}"
+        );
 
         let nodes = element.as_widget().a11y_nodes(
             Layout::new(&node),
@@ -7868,7 +8086,9 @@ mod tests {
         let mut messages = Vec::new();
         for event in [
             iced::Event::Mouse(iced::mouse::Event::ButtonPressed(iced::mouse::Button::Left)),
-            iced::Event::Mouse(iced::mouse::Event::ButtonReleased(iced::mouse::Button::Left)),
+            iced::Event::Mouse(iced::mouse::Event::ButtonReleased(
+                iced::mouse::Button::Left,
+            )),
             iced::Event::Keyboard(iced::keyboard::Event::KeyPressed {
                 key: iced::keyboard::Key::Character("x".into()),
                 modified_key: iced::keyboard::Key::Character("x".into()),
@@ -10726,6 +10946,24 @@ mod tests {
                 Some("tiny-skia"),
             ))
             .expect("a headless renderer")
+    }
+
+    /// Widths of the laid-out deletion rows. `DIFF_ROW_HEIGHT` identifies them
+    /// uniquely: `diff_container` is the only node fixed to that height, and
+    /// its own padding leaves every descendant shorter.
+    fn row_widths(layout: Layout<'_>) -> Vec<f32> {
+        fn walk(layout: Layout<'_>, widths: &mut Vec<f32>) {
+            let bounds = layout.bounds();
+            if (bounds.height - DIFF_ROW_HEIGHT).abs() < 0.01 {
+                widths.push(bounds.width);
+            }
+            for child in layout.children() {
+                walk(child, widths);
+            }
+        }
+        let mut widths = Vec::new();
+        walk(layout, &mut widths);
+        widths
     }
 
     #[test]

@@ -37,7 +37,8 @@ impl LatencySummary {
         // Nearest-rank on the inclusive index range, matching the percentile
         // the latency fixture and `scripts/run-redraw-latency` already report
         // so numbers from the two harnesses can be compared directly.
-        let percentile = |percent: usize| durations[((durations.len() - 1) * percent).div_ceil(100)];
+        let percentile =
+            |percent: usize| durations[((durations.len() - 1) * percent).div_ceil(100)];
         Some(Self {
             samples: durations.len(),
             median: percentile(50),

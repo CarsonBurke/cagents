@@ -14,7 +14,12 @@ impl Cagents {
         let project = self
             .durable
             .active_channel
-            .and_then(|id| self.durable.channels.iter().find(|channel| channel.id == id))
+            .and_then(|id| {
+                self.durable
+                    .channels
+                    .iter()
+                    .find(|channel| channel.id == id)
+            })
             .map(|channel| channel.project_id)
             .or_else(|| {
                 self.active_workspace.as_deref().and_then(|path| {
@@ -213,7 +218,10 @@ mod tests {
         ));
 
         app.refresh_sidebar_channels();
-        assert_eq!(app.sidebar_model.projects[0].channels[0].title, "New channel");
+        assert_eq!(
+            app.sidebar_model.projects[0].channels[0].title,
+            "New channel"
+        );
         Arc::make_mut(&mut app.durable).cards[0].title = "Explain the parser".into();
         app.refresh_sidebar_channels();
         assert_eq!(

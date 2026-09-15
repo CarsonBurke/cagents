@@ -666,7 +666,9 @@ pub(super) fn settings_dialog<'a>(
                 .spacing(design::GRID_UNIT)
                 .width(Length::Fill),
             )
-            .padding([3.0 * design::GRID_UNIT, 2.0 * design::GRID_UNIT])
+            .padding(design::with_vertical_rail(
+                [3.0 * design::GRID_UNIT, 2.0 * design::GRID_UNIT].into(),
+            ))
             .width(Length::Fill),
         )
         .direction(cosmic::iced::widget::scrollable::Direction::Vertical(

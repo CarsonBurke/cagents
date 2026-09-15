@@ -3508,11 +3508,14 @@ mod tests {
                 .chain(std::iter::repeat_n(LINES_PER_NOTCH, notches)),
         );
         let bottom_per_frame = scroll_run(
-            std::iter::repeat_n(-LINES_PER_NOTCH * NOTCHES_PER_FRAME as isize, notches / NOTCHES_PER_FRAME)
-                .chain(std::iter::repeat_n(
-                    LINES_PER_NOTCH * NOTCHES_PER_FRAME as isize,
-                    notches / NOTCHES_PER_FRAME,
-                )),
+            std::iter::repeat_n(
+                -LINES_PER_NOTCH * NOTCHES_PER_FRAME as isize,
+                notches / NOTCHES_PER_FRAME,
+            )
+            .chain(std::iter::repeat_n(
+                LINES_PER_NOTCH * NOTCHES_PER_FRAME as isize,
+                notches / NOTCHES_PER_FRAME,
+            )),
         );
         assert_eq!(bottom_per_frame.offset, bottom_per_event.offset);
         assert_eq!(bottom_per_frame.screen, bottom_per_event.screen);

@@ -19,9 +19,10 @@ use thiserror::Error;
 use crate::{
     model::{
         BootId, BrowserRestoreFidelity, BrowserSession, CardId, CardKind, CardState, ChannelId,
-        Existence, Exposure, HostSessionProof, OperationId, ProjectChannel, ProjectId, ProjectState,
-        Residency, TerminalContinuity, TerminalId, TerminalSession, Tombstone, TranscriptMetadata,
-        WorkspaceId, WorkspaceState, WorktreeId, WorktreeState, normalize_project_channels,
+        Existence, Exposure, HostSessionProof, OperationId, ProjectChannel, ProjectId,
+        ProjectState, Residency, TerminalContinuity, TerminalId, TerminalSession, Tombstone,
+        TranscriptMetadata, WorkspaceId, WorkspaceState, WorktreeId, WorktreeState,
+        normalize_project_channels,
     },
     secure_file::{
         migrate_existing_private_file, open_existing_private_file, prepare_private_directory,
@@ -2875,10 +2876,13 @@ fn load_workspace_manifest_connection(
         });
     }
 
-    let mut channels = metadata(connection, &format!("workspace:{id}:navigation:{CHANNELS_FIELD}"))?
-        .map(|value| from_json("workspace channels", &value))
-        .transpose()?
-        .unwrap_or_default();
+    let mut channels = metadata(
+        connection,
+        &format!("workspace:{id}:navigation:{CHANNELS_FIELD}"),
+    )?
+    .map(|value| from_json("workspace channels", &value))
+    .transpose()?
+    .unwrap_or_default();
     let mut active_channel = metadata(
         connection,
         &format!("workspace:{id}:navigation:{ACTIVE_CHANNEL_FIELD}"),
@@ -3944,7 +3948,10 @@ mod tests {
                         format!("workspace:{}:navigation:worktree_focus", workspace.id),
                         format!("workspace:{}:navigation:project_order", workspace.id),
                         format!("workspace:{}:navigation:{CHANNELS_FIELD}", workspace.id),
-                        format!("workspace:{}:navigation:{ACTIVE_CHANNEL_FIELD}", workspace.id),
+                        format!(
+                            "workspace:{}:navigation:{ACTIVE_CHANNEL_FIELD}",
+                            workspace.id
+                        ),
                     ],
                 )
                 .unwrap();

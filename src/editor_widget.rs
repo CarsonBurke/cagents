@@ -2539,9 +2539,8 @@ mod tests {
         let renderer = headless_renderer();
         let content = Content::with_text(&"abcdefghij".repeat(30));
         let mut widget = wheel_editor(&content, Wrapping::None);
-        let mut tree = widget::Tree::new(
-            &widget as &dyn Widget<Action, cosmic::Theme, cosmic::Renderer>,
-        );
+        let mut tree =
+            widget::Tree::new(&widget as &dyn Widget<Action, cosmic::Theme, cosmic::Renderer>);
         let bounds = Rectangle::new(Point::ORIGIN, WHEEL_VIEWPORT);
         let node = widget.layout(
             &mut tree,
@@ -2550,9 +2549,9 @@ mod tests {
         );
         let mut published = Vec::new();
         let feed = |widget: &mut TextEditor<'_, highlighter::PlainText, Action>,
-                        tree: &mut widget::Tree,
-                        published: &mut Vec<Action>,
-                        event: Event| {
+                    tree: &mut widget::Tree,
+                    published: &mut Vec<Action>,
+                    event: Event| {
             let mut clipboard = cosmic::iced::advanced::clipboard::Null;
             let mut shell = Shell::new(published);
             widget.update(
@@ -2567,15 +2566,19 @@ mod tests {
             );
         };
         let wheel = |delta| Event::Mouse(mouse::Event::WheelScrolled { delta });
-        let modifiers =
-            |modifiers| Event::Keyboard(keyboard::Event::ModifiersChanged(modifiers));
+        let modifiers = |modifiers| Event::Keyboard(keyboard::Event::ModifiersChanged(modifiers));
         let vertical = |published: &Vec<Action>| match published.last() {
             Some(Action::Scroll { lines }) => *lines,
             other => panic!("a wheel over the editor must publish a scroll, got {other:?}"),
         };
 
         assert_eq!(content.scroll_position().horizontal, 0.0);
-        feed(&mut widget, &mut tree, &mut published, modifiers(keyboard::Modifiers::SHIFT));
+        feed(
+            &mut widget,
+            &mut tree,
+            &mut published,
+            modifiers(keyboard::Modifiers::SHIFT),
+        );
         feed(
             &mut widget,
             &mut tree,
@@ -2694,9 +2697,8 @@ mod tests {
         let renderer = headless_renderer();
         let content = Content::with_text(&"wrapped words ".repeat(200));
         let mut widget = wheel_editor(&content, Wrapping::Word);
-        let mut tree = widget::Tree::new(
-            &widget as &dyn Widget<Action, cosmic::Theme, cosmic::Renderer>,
-        );
+        let mut tree =
+            widget::Tree::new(&widget as &dyn Widget<Action, cosmic::Theme, cosmic::Renderer>);
         let bounds = Rectangle::new(Point::ORIGIN, WHEEL_VIEWPORT);
         let node = widget.layout(
             &mut tree,

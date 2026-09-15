@@ -1005,7 +1005,10 @@ pub(crate) fn normalize_project_channels(
         channel
             .cards
             .retain(|id| open_cards.contains(id) && owned.insert(*id));
-        if !channel.focused.is_some_and(|id| channel.cards.contains(&id)) {
+        if !channel
+            .focused
+            .is_some_and(|id| channel.cards.contains(&id))
+        {
             channel.focused = channel.cards.first().copied();
         }
     }
