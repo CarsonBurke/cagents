@@ -166,6 +166,23 @@ pub enum Role {
     Assistant,
     System,
 }
+/// Where an assistant message sits within its turn.
+///
+/// Providers narrate continuously while they work and only a small fraction of
+/// what they emit is the answer to the question. Measured over this
+/// workstation's own Codex history, 101 227 assistant messages were commentary
+/// against 13 750 final answers. A transcript that renders both identically
+/// buries the answer in the narration, so the distinction has to reach the
+/// view rather than being flattened away in the adapter.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Phase {
+    /// The answer a turn was asked for.
+    #[default]
+    Final,
+    /// Progress narration emitted while the turn is still working.
+    Commentary,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ToolStatus {
     Running,
@@ -173,12 +190,84 @@ pub enum ToolStatus {
     Failed,
     Denied,
 }
+
+/// What a shell command was actually for.
+///
+/// Providers classify their own command invocations, which is what lets a
+/// transcript say "Read src/app.rs" instead of reprinting an argv. Anything a
+/// provider does not classify stays [`CommandAction::Run`] and is shown as the
+/// command it is.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CommandAction {
+    #[default]
+    Run,
+    Read,
+    Search,
+    List,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ChangeKind {
+    Added,
+    Deleted,
+    Updated,
+    /// `from` is the pre-rename path; the change's own path is the new one.
+    Renamed {
+        from: String,
+    },
+}
+
+/// One file's worth of a provider's edit, carrying the patch rather than a
+/// rendering of it so the view can use the repository pane's diff canvas.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FileChange {
+    pub path: String,
+    pub kind: ChangeKind,
+    /// Unified diff for this path alone.
+    pub diff: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SearchResult {
+    pub title: String,
+    pub url: String,
+    pub snippet: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ItemContent {
     Text {
         text: String,
         thinking: bool,
+        /// Defaulted so transcripts stored before phases existed still load.
+        #[serde(default)]
+        phase: Phase,
     },
+    /// A shell command the provider ran on the user's behalf.
+    Command {
+        /// The provider's own summary, e.g. `Read src/app.rs`. Empty when the
+        /// provider offered none, in which case the view falls back to
+        /// `command`.
+        label: String,
+        command: String,
+        working_directory: String,
+        action: CommandAction,
+        status: ToolStatus,
+        exit_code: Option<i32>,
+        duration_ms: Option<u64>,
+        output: String,
+    },
+    /// A provider edit, one entry per touched path.
+    Changes {
+        changes: Vec<FileChange>,
+        status: ToolStatus,
+    },
+    WebSearch {
+        query: String,
+        results: Vec<SearchResult>,
+    },
+    /// Every other tool call, including MCP. The fallback that keeps an
+    /// unrecognized provider item renderable instead of dropped.
     Tool {
         name: String,
         input: String,
@@ -189,6 +278,75 @@ pub enum ItemContent {
         path: String,
         description: String,
     },
+}
+
+impl ItemContent {
+    /// Byte cost of the payload, used by the transcript store's paging window.
+    pub fn byte_len(&self) -> usize {
+        fn diff_bytes(changes: &[FileChange]) -> usize {
+            changes.iter().fold(0, |total, change| {
+                total
+                    .saturating_add(change.path.len())
+                    .saturating_add(change.diff.len())
+            })
+        }
+        match self {
+            Self::Text { text, .. } => text.len(),
+            Self::Command {
+                label,
+                command,
+                working_directory,
+                output,
+                ..
+            } => label
+                .len()
+                .saturating_add(command.len())
+                .saturating_add(working_directory.len())
+                .saturating_add(output.len()),
+            Self::Changes { changes, .. } => diff_bytes(changes),
+            Self::WebSearch { query, results } => {
+                results.iter().fold(query.len(), |total, result| {
+                    total
+                        .saturating_add(result.title.len())
+                        .saturating_add(result.url.len())
+                        .saturating_add(result.snippet.len())
+                })
+            }
+            Self::Tool {
+                name,
+                input,
+                output,
+                ..
+            } => name
+                .len()
+                .saturating_add(input.len())
+                .saturating_add(output.len()),
+            Self::Image { path, description } => path.len().saturating_add(description.len()),
+        }
+    }
+
+    /// Whether the item is a step of a turn rather than conversation prose.
+    ///
+    /// Steps collapse into the turn's activity strip; prose does not.
+    pub fn is_step(&self) -> bool {
+        match self {
+            Self::Text { thinking, .. } => *thinking,
+            Self::Command { .. }
+            | Self::Changes { .. }
+            | Self::WebSearch { .. }
+            | Self::Tool { .. } => true,
+            Self::Image { .. } => false,
+        }
+    }
+
+    pub fn status(&self) -> Option<ToolStatus> {
+        match self {
+            Self::Command { status, .. }
+            | Self::Changes { status, .. }
+            | Self::Tool { status, .. } => Some(*status),
+            Self::Text { .. } | Self::WebSearch { .. } | Self::Image { .. } => None,
+        }
+    }
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Item {
