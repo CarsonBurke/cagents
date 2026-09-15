@@ -307,8 +307,11 @@ impl ChangeToken {
                     |digest, change| {
                         // The kind is folded in as its discriminant so an
                         // add that becomes a rename is a change even when
-                        // the path and the patch are untouched.
-                        Self::mix(
+                        // the path and the patch are untouched, and a
+                        // rename's source path with it, because the detail
+                        // prints it and it is the one field of the variant
+                        // that nothing else in this digest covers.
+                        let digest = Self::mix(
                             tail_digest(tail_digest(digest, &change.path), &change.diff),
                             match &change.kind {
                                 chat::ChangeKind::Added => 0,
@@ -316,7 +319,11 @@ impl ChangeToken {
                                 chat::ChangeKind::Updated => 2,
                                 chat::ChangeKind::Renamed { .. } => 3,
                             },
-                        )
+                        );
+                        match &change.kind {
+                            chat::ChangeKind::Renamed { from } => tail_digest(digest, from),
+                            _ => digest,
+                        }
                     },
                 ),
             },
@@ -455,6 +462,61 @@ fn status_word(status: chat::ToolStatus) -> &'static str {
         chat::ToolStatus::Succeeded => "Completed",
         chat::ToolStatus::Failed => "Failed",
         chat::ToolStatus::Denied => "Denied",
+    }
+}
+
+/// What a copy control hands the reader.
+///
+/// Every step variant answers, because a control that silently does nothing is
+/// worse than no control: a command's output and a tool's result are only
+/// reachable through their step's detail, so this is the only way out of the
+/// transcript for them. `Text` is the whole step as a reader would quote it;
+/// `Input` and `Output` are the individual blocks their own headers offer.
+fn copy_text(part: CopyPart, content: &ItemContent) -> Option<String> {
+    fn joined(parts: &[&str]) -> Option<String> {
+        let text = parts
+            .iter()
+            .copied()
+            .filter(|part| !part.is_empty())
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        (!text.is_empty()).then_some(text)
+    }
+    match (part, content) {
+        (CopyPart::Text, ItemContent::Text { text, .. }) => joined(&[text]),
+        (
+            CopyPart::Text,
+            ItemContent::Command {
+                command, output, ..
+            },
+        ) => joined(&[command, output]),
+        (CopyPart::Text, ItemContent::Changes { changes, .. }) => joined(
+            &changes
+                .iter()
+                .map(|change| change.diff.as_str())
+                .collect::<Vec<_>>(),
+        ),
+        (CopyPart::Text, ItemContent::WebSearch { query, results }) => {
+            let mut text = query.clone();
+            for result in results {
+                text.push_str("\n\n");
+                text.push_str(&result.title);
+                text.push('\n');
+                text.push_str(&result.url);
+            }
+            Some(text)
+        }
+        (CopyPart::Text, ItemContent::Tool { input, output, .. }) => joined(&[input, output]),
+        (CopyPart::Text, ItemContent::Image { path, description }) => joined(&[description, path]),
+        // A command has no separate input block, so its header offers the
+        // command line under the same name the tool detail uses for one.
+        (CopyPart::Input, ItemContent::Command { command, .. }) => joined(&[command]),
+        (CopyPart::Input, ItemContent::Tool { input, .. }) => joined(&[input]),
+        (CopyPart::Output, ItemContent::Command { output, .. })
+        | (CopyPart::Output, ItemContent::Tool { output, .. }) => joined(&[output]),
+        // The code blocks of a Markdown answer are the cache's own, resolved
+        // by the caller before it reaches this.
+        (CopyPart::Code(_), _) | (CopyPart::Input | CopyPart::Output, _) => None,
     }
 }
 
@@ -703,7 +765,7 @@ impl Runtime {
     fn turn_running(&self, key: &str) -> bool {
         self.turns
             .iter()
-            .find(|turn| self.turn_key(turn) == key)
+            .find(|turn| turn.key == key)
             .is_some_and(|turn| turn.running)
     }
 
@@ -948,6 +1010,16 @@ impl Cagents {
         self.chat_ui.handoffs.retain(|target| target.card != card);
         self.chat_ui.closing.retain(|target| target.card != card);
         self.observe_agent_activity_for_card(card, None);
+    }
+    /// Forgets a chat runtime whose card is going away for good.
+    ///
+    /// The difference from `chat_forget` is the draft: a card that is about to
+    /// be tombstoned will never build a runtime under that id again, so
+    /// stashing its unsent text would pin the string for the lifetime of the
+    /// process with nothing able to read it back.
+    pub(super) fn chat_discard(&mut self, card: CardId) {
+        self.chat_forget(card);
+        self.chat_ui.drafts.remove(&card);
     }
     pub(super) fn chat_start_pending(&self, card: CardId) -> bool {
         self.chat_ui.attempts.contains_key(&card)
@@ -1602,21 +1674,17 @@ impl Cagents {
                     CopyPart::Code(index) => runtime
                         .cache
                         .get(&id)
-                        .and_then(|cached| cached.code.codes.get(index)),
+                        .and_then(|cached| cached.code.codes.get(index))
+                        .cloned(),
                     part => runtime
                         .snapshot
                         .items
                         .iter()
                         .find(|item| item.id == id)
-                        .and_then(|item| match (part, &item.content) {
-                            (CopyPart::Text, ItemContent::Text { text, .. }) => Some(text),
-                            (CopyPart::Input, ItemContent::Tool { input, .. }) => Some(input),
-                            (CopyPart::Output, ItemContent::Tool { output, .. }) => Some(output),
-                            _ => None,
-                        }),
+                        .and_then(|item| copy_text(part, &item.content)),
                 };
                 if let Some(text) = text {
-                    return iced::clipboard::write(text.clone()).map(cosmic::Action::App);
+                    return iced::clipboard::write(text).map(cosmic::Action::App);
                 }
             }
             Action::OpenUrl(raw) => {
@@ -2012,6 +2080,96 @@ mod tests {
         assert_eq!(
             ChangeToken::of(&tool("aaaa")),
             ChangeToken::of(&tool("aaaa"))
+        );
+    }
+
+    /// A copy control that resolves to nothing is indistinguishable from a
+    /// broken one, and a command's output has no other way out of the
+    /// transcript.
+    #[test]
+    fn every_step_a_copy_control_is_offered_on_resolves_to_text() {
+        let command = ItemContent::Command {
+            label: "Ran tests".to_owned(),
+            command: "cargo test".to_owned(),
+            working_directory: "/tmp".to_owned(),
+            action: chat::CommandAction::Run,
+            status: chat::ToolStatus::Succeeded,
+            exit_code: Some(0),
+            duration_ms: Some(12),
+            output: "ok. 3 passed".to_owned(),
+        };
+        assert_eq!(
+            copy_text(CopyPart::Text, &command).as_deref(),
+            Some("cargo test\n\nok. 3 passed")
+        );
+        assert_eq!(
+            copy_text(CopyPart::Input, &command).as_deref(),
+            Some("cargo test")
+        );
+        assert_eq!(
+            copy_text(CopyPart::Output, &command).as_deref(),
+            Some("ok. 3 passed")
+        );
+        let changes = ItemContent::Changes {
+            changes: vec![chat::FileChange {
+                path: "src/app.rs".to_owned(),
+                diff: "@@\n-old\n+new\n".to_owned(),
+                kind: chat::ChangeKind::Updated,
+            }],
+            status: chat::ToolStatus::Succeeded,
+        };
+        assert_eq!(
+            copy_text(CopyPart::Text, &changes).as_deref(),
+            Some("@@\n-old\n+new\n")
+        );
+        let tool = ItemContent::Tool {
+            name: "write".to_owned(),
+            input: "{}".to_owned(),
+            output: "done".to_owned(),
+            status: chat::ToolStatus::Succeeded,
+        };
+        assert_eq!(
+            copy_text(CopyPart::Text, &tool).as_deref(),
+            Some("{}\n\ndone")
+        );
+        assert_eq!(
+            copy_text(
+                CopyPart::Text,
+                &ItemContent::WebSearch {
+                    query: "iced scrollable".to_owned(),
+                    results: vec![chat::SearchResult {
+                        title: "Scrollable".to_owned(),
+                        url: "https://docs.rs/iced".to_owned(),
+                        snippet: String::new(),
+                    }],
+                }
+            )
+            .as_deref(),
+            Some("iced scrollable\n\nScrollable\nhttps://docs.rs/iced")
+        );
+    }
+
+    /// The detail prints a rename's source path, so a token that ignores it
+    /// would leave the stale path on screen after an in-place patch update.
+    #[test]
+    fn change_token_separates_renames_that_differ_only_in_their_source() {
+        let renamed = |from: &str| ItemContent::Changes {
+            changes: vec![chat::FileChange {
+                path: "src/new.rs".to_owned(),
+                diff: String::new(),
+                kind: chat::ChangeKind::Renamed {
+                    from: from.to_owned(),
+                },
+            }],
+            status: chat::ToolStatus::Succeeded,
+        };
+        assert_ne!(
+            ChangeToken::of(&renamed("src/old.rs")),
+            ChangeToken::of(&renamed("src/older.rs"))
+        );
+        assert_eq!(
+            ChangeToken::of(&renamed("src/old.rs")),
+            ChangeToken::of(&renamed("src/old.rs"))
         );
     }
 }

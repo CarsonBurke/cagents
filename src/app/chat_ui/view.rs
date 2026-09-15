@@ -812,21 +812,6 @@ impl Runtime {
         .into()
     }
 
-    /// The key a turn's disclosure state is stored under.
-    ///
-    /// The first item's id, because a turn has no identity of its own: it is
-    /// derived from item order on every snapshot, and the reader's choice to
-    /// open its steps has to survive that.
-    pub(super) fn turn_key<'a>(&'a self, turn: &turn::Turn) -> &'a str {
-        let index = turn
-            .prompt
-            .or_else(|| turn.steps.first().map(|placed| placed.index))
-            .or_else(|| turn.prose.first().map(|placed| placed.index));
-        index
-            .and_then(|index| self.snapshot.items.get(index))
-            .map_or("", |item| item.id.as_str())
-    }
-
     /// One exchange: what was asked, what was done, and what came back.
     fn turn_view<'a>(
         &'a self,
@@ -834,11 +819,13 @@ impl Runtime {
         settings: markdown::Settings,
     ) -> Element<'a, Message> {
         let mut rows: Vec<Element<'a, Message>> = Vec::new();
-        if let Some(item) = turn.prompt.and_then(|index| self.snapshot.items.get(index)) {
-            rows.push(self.prompt_view(item));
+        for index in &turn.prompt {
+            if let Some(item) = self.snapshot.items.get(*index) {
+                rows.push(self.prompt_view(item));
+            }
         }
         if !turn.steps.is_empty() {
-            rows.push(self.step_strip(self.turn_key(turn), turn, settings));
+            rows.push(self.step_strip(turn.key.as_str(), turn, settings));
         }
         for placed in &turn.prose {
             let Some(item) = self.snapshot.items.get(placed.index) else {
@@ -855,6 +842,26 @@ impl Runtime {
             .into()
     }
 
+    /// What to call an attachment the reader just sent.
+    ///
+    /// A file has a name, and the name is all the reader needs: the directories
+    /// above it are the ones they were just browsing. An inline attachment has
+    /// no name at all, because its "path" is the payload itself, so the tail of
+    /// it is base64 and the provider's description is the only thing that reads
+    /// as a label.
+    fn attachment_label<'a>(path: &'a str, description: &'a str) -> &'a str {
+        if !path.starts_with("data:") {
+            if let Some(name) = path.rsplit('/').next().filter(|name| !name.is_empty()) {
+                return name;
+            }
+        }
+        if description.is_empty() {
+            "Attachment"
+        } else {
+            description
+        }
+    }
+
     /// The user's own message.
     ///
     /// Set on the accent wash and tucked to the right, with the corner nearest
@@ -862,28 +869,47 @@ impl Runtime {
     /// without printing "You" above every message, and the narrower measure
     /// keeps a turn's opening findable when scrolling back.
     fn prompt_view<'a>(&'a self, item: &'a chat::Item) -> Element<'a, Message> {
+        let attachment = matches!(item.content, ItemContent::Image { .. });
         let text = match &item.content {
             ItemContent::Text { text, .. } => text.as_str(),
+            ItemContent::Image { path, description } => Self::attachment_label(path, description),
             content => turn::step_label(content),
         };
+        // An attachment sits under its prompt as an outlined chip rather than
+        // another filled bubble, so a message with two images does not read as
+        // three separate things the reader said.
+        let body: Element<'a, Message> = if attachment {
+            widget::row::with_children(vec![
+                widget::icon(crate::ui_controls::symbolic_icon(
+                    "mail-attachment-symbolic",
+                ))
+                .size(12)
+                .into(),
+                design::caption(text).into(),
+            ])
+            .spacing(step::GAP_XS)
+            .align_y(Alignment::Center)
+            .into()
+        } else {
+            widget::selectable_text(text)
+                .size(design::TEXT_BODY)
+                .width(Length::Shrink)
+                .into()
+        };
         widget::container(
-            widget::container(
-                widget::selectable_text(text)
-                    .size(design::TEXT_BODY)
-                    .width(Length::Shrink),
-            )
-            .class(design::surface(
-                Some(design::accent_wash),
-                [
-                    design::RADIUS_L,
-                    design::RADIUS_L,
-                    design::RADIUS_XS,
-                    design::RADIUS_L,
-                ],
-                false,
-            ))
-            .padding([step::GAP_S as u16, step::GAP_M as u16])
-            .max_width(PROMPT_MEASURE),
+            widget::container(body)
+                .class(design::surface(
+                    (!attachment).then_some(design::accent_wash),
+                    [
+                        design::RADIUS_L,
+                        design::RADIUS_L,
+                        design::RADIUS_XS,
+                        design::RADIUS_L,
+                    ],
+                    attachment,
+                ))
+                .padding([step::GAP_S as u16, step::GAP_M as u16])
+                .max_width(PROMPT_MEASURE),
         )
         .align_x(Alignment::End)
         .width(Length::Fill)
@@ -1271,5 +1297,26 @@ mod tests {
                 "{mode:?} in slot {slot} is bound to {chord} but reads {label:?}"
             );
         }
+    }
+
+    /// A chip the reader cannot read is worse than no chip: the point of it is
+    /// to confirm which file they just sent.
+    #[test]
+    fn an_attachment_is_named_by_something_a_reader_recognises() {
+        assert_eq!(
+            Runtime::attachment_label("/home/reader/holiday/beach.png", "Image attachment"),
+            "beach.png",
+            "a file on disk is identified by its name, not the browsing above it"
+        );
+        assert_eq!(
+            Runtime::attachment_label("data:image/png;base64,iVBORw0KGgoAAAANSUhEUg", "Diagram"),
+            "Diagram",
+            "an inline payload has no name, so the description has to carry it"
+        );
+        assert_eq!(
+            Runtime::attachment_label("data:image/png;base64,iVBORw0KGgoAAAANSUhEUg", ""),
+            "Attachment",
+            "a payload no provider described still needs a readable label"
+        );
     }
 }

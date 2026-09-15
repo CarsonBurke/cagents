@@ -38,10 +38,12 @@ pub(super) struct Placed {
 /// A user message and the activity it caused.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct Turn {
-    /// The user message that opened the turn, absent for activity that arrived
-    /// before any user message - a resumed session's history, or a provider
-    /// greeting.
-    pub(super) prompt: Option<usize>,
+    /// The user message that opened the turn, in the order its parts arrived.
+    /// Empty for activity that arrived before any user message - a resumed
+    /// session's history, or a provider greeting. More than one entry because
+    /// a single message is not a single item: a prompt with two attachments
+    /// reaches the transcript as three `Role::User` items.
+    pub(super) prompt: Vec<usize>,
     pub(super) steps: Vec<Placed>,
     pub(super) prose: Vec<Placed>,
     /// Set while any step in this turn is still running, which is what marks
@@ -50,16 +52,86 @@ pub(super) struct Turn {
     /// Worst status any step reached, so a collapsed strip can show that
     /// something failed without being expanded.
     pub(super) outcome: Option<ToolStatus>,
+    /// The key the reader's disclosure choice is stored under, and the
+    /// collapsed strip's own line. Both are formed here, once per snapshot,
+    /// because the view draws them on every frame and they change only when
+    /// the transcript does.
+    ///
+    /// The key is the first item's id, because a turn has no identity of its
+    /// own: it is derived from item order on every snapshot, and the reader's
+    /// choice to open its steps has to survive that. It does not survive the
+    /// store's paging window dropping the turn's prompt, and should not: what
+    /// is left is leftover activity with no prompt, which is a different
+    /// thing from the exchange the reader made a choice about.
+    pub(super) key: String,
+    pub(super) summary: String,
 }
 
 impl Turn {
     fn opened(prompt: Option<usize>) -> Self {
         Self {
-            prompt,
+            prompt: prompt.into_iter().collect(),
             steps: Vec::new(),
             prose: Vec::new(),
             running: false,
             outcome: None,
+            key: String::new(),
+            summary: String::new(),
+        }
+    }
+
+    /// The glyph and tone a collapsed strip reports for this turn.
+    ///
+    /// `None` when no step has reported a status at all, which is the opening
+    /// seconds of most turns: the first thing a provider sends is reasoning,
+    /// and reasoning carries no status. Claiming success there - which a
+    /// checkmark does - is a claim about work that has not happened yet.
+    pub(super) fn glyph(&self) -> Option<ToolStatus> {
+        self.outcome
+            .or_else(|| self.running.then_some(ToolStatus::Running))
+    }
+
+    /// Fills in the key and summary once the turn's membership is final.
+    fn describe(&mut self, items: &[Item]) {
+        self.key = self
+            .prompt
+            .first()
+            .copied()
+            .or_else(|| self.steps.first().map(|placed| placed.index))
+            .or_else(|| self.prose.first().map(|placed| placed.index))
+            .and_then(|index| items.get(index))
+            .map(|item| item.id.to_string())
+            .unwrap_or_default();
+        // A single step names itself, because "1 step" tells the reader
+        // nothing they could not see from the row's absence. Several steps are
+        // counted, with a failure called out, because that is the one thing a
+        // collapsed strip must not hide.
+        self.summary = match self.steps.as_slice() {
+            [only] => match items.get(only.index) {
+                Some(item) => {
+                    let verb = step_verb(&item.content);
+                    let label = step_label(&item.content);
+                    if verb.is_empty() {
+                        label.to_owned()
+                    } else {
+                        format!("{verb} {label}")
+                    }
+                }
+                None => "1 step".to_owned(),
+            },
+            steps => format!("{} steps", steps.len()),
+        };
+        // Still working outranks how the finished steps went, because a
+        // reader deciding whether to wait needs that first. The glyph still
+        // carries the failure, so nothing is hidden by saying "working".
+        if self.running {
+            self.summary.push_str(" · working");
+            return;
+        }
+        match self.outcome {
+            Some(ToolStatus::Failed) => self.summary.push_str(" · failed"),
+            Some(ToolStatus::Denied) => self.summary.push_str(" · denied"),
+            Some(ToolStatus::Running) | Some(ToolStatus::Succeeded) | None => {}
         }
     }
 
@@ -69,7 +141,15 @@ impl Turn {
     /// `System` headings at the top of every conversation, one of which had no
     /// body at all.
     pub(super) fn is_empty(&self) -> bool {
-        self.prompt.is_none() && self.steps.is_empty() && self.prose.is_empty()
+        self.prompt.is_empty() && self.steps.is_empty() && self.prose.is_empty()
+    }
+
+    /// Whether nothing has happened in this turn since its prompt.
+    ///
+    /// A user message's remaining parts are what this is for: they arrive as
+    /// separate items, and each one would otherwise open a turn of its own.
+    fn awaiting_activity(&self) -> bool {
+        self.steps.is_empty() && self.prose.is_empty()
     }
 
     fn observe(&mut self, status: Option<ToolStatus>) {
@@ -103,6 +183,14 @@ impl Turn {
 /// leading turn with no prompt, which is how a resumed conversation's history
 /// and a provider's opening notice both render without inventing a prompt for
 /// them.
+///
+/// Consecutive user messages with no activity between them share one turn.
+/// They have to, because a prompt carrying attachments arrives as one item per
+/// content part and each part is a `Role::User` item; grouping them by arrival
+/// would detach the agent's work from the message that caused it and print an
+/// "attachment" bubble as though the reader had sent it alone. Two messages
+/// the reader genuinely sent back to back land in one turn as well, which is
+/// right for the same reason: there is no activity between them to attribute.
 pub(super) fn group(items: &[Item]) -> Vec<Turn> {
     let mut turns: Vec<Turn> = Vec::new();
     for (index, item) in items.iter().enumerate() {
@@ -110,12 +198,15 @@ pub(super) fn group(items: &[Item]) -> Vec<Turn> {
             continue;
         }
         let opens = item.role == Role::User && !item.content.is_step();
-        if opens || turns.is_empty() {
-            let prompt = opens.then_some(index);
-            turns.push(Turn::opened(prompt));
-            if opens {
-                continue;
+        if opens {
+            match turns.last_mut() {
+                Some(turn) if turn.awaiting_activity() => turn.prompt.push(index),
+                _ => turns.push(Turn::opened(Some(index))),
             }
+            continue;
+        }
+        if turns.is_empty() {
+            turns.push(Turn::opened(None));
         }
         // `turns` is non-empty: the branch above pushes when it would not be.
         let turn = turns.last_mut().expect("a turn is open");
@@ -127,6 +218,9 @@ pub(super) fn group(items: &[Item]) -> Vec<Turn> {
         }
     }
     turns.retain(|turn| !turn.is_empty());
+    for turn in &mut turns {
+        turn.describe(items);
+    }
     turns
 }
 
@@ -268,7 +362,7 @@ mod tests {
         ];
         let turns = group(&items);
         assert_eq!(turns.len(), 2, "each user message opens exactly one turn");
-        assert_eq!(turns[0].prompt, Some(0));
+        assert_eq!(turns[0].prompt, [0]);
         assert_eq!(
             turns[0].steps.iter().map(|p| p.index).collect::<Vec<_>>(),
             [1]
@@ -283,8 +377,68 @@ mod tests {
             "commentary and the answer occupy different slots"
         );
         assert!(!turns[0].running);
-        assert_eq!(turns[1].prompt, Some(4));
+        assert_eq!(turns[1].prompt, [4]);
         assert!(turns[1].running, "a running step marks its own turn live");
+    }
+
+    #[test]
+    fn every_part_of_one_user_message_shares_the_turn_its_activity_belongs_to() {
+        let items = vec![
+            text("u1/input/0", Role::User, Phase::Final, false),
+            Item {
+                id: "u1/input/1".into(),
+                role: Role::User,
+                content: ItemContent::Image {
+                    path: "/home/reader/diagram.png".into(),
+                    description: "User attachment".into(),
+                },
+            },
+            command("c1", ToolStatus::Succeeded),
+            text("a1", Role::Assistant, Phase::Final, false),
+        ];
+        let turns = group(&items);
+        assert_eq!(
+            turns.len(),
+            1,
+            "a prompt and its attachment are one message, not two turns"
+        );
+        assert_eq!(turns[0].prompt, [0, 1]);
+        assert_eq!(
+            turns[0].steps.iter().map(|p| p.index).collect::<Vec<_>>(),
+            [2],
+            "the work stays attached to the message that caused it"
+        );
+        assert_eq!(turns[0].prose.len(), 1);
+    }
+
+    #[test]
+    fn a_turn_claims_no_outcome_until_a_step_reports_one() {
+        let items = vec![
+            text("u1", Role::User, Phase::Final, false),
+            text("r1", Role::Assistant, Phase::Final, true),
+        ];
+        let turns = group(&items);
+        assert_eq!(
+            turns[0].glyph(),
+            None,
+            "reasoning carries no status, so nothing may claim success yet"
+        );
+        assert_eq!(turns[0].summary, "Thinking");
+        let items = vec![
+            text("u1", Role::User, Phase::Final, false),
+            command("c1", ToolStatus::Failed),
+            command("c2", ToolStatus::Running),
+        ];
+        let turns = group(&items);
+        assert_eq!(
+            turns[0].glyph(),
+            Some(ToolStatus::Failed),
+            "the failure stays visible in the glyph"
+        );
+        assert_eq!(
+            turns[0].summary, "2 steps · working",
+            "still working outranks how the finished steps went"
+        );
     }
 
     #[test]
@@ -295,9 +449,12 @@ mod tests {
         ];
         let turns = group(&items);
         assert_eq!(turns.len(), 2);
-        assert_eq!(turns[0].prompt, None, "history must not invent a prompt");
+        assert!(
+            turns[0].prompt.is_empty(),
+            "history must not invent a prompt"
+        );
         assert_eq!(turns[0].prose.len(), 1);
-        assert_eq!(turns[1].prompt, Some(1));
+        assert_eq!(turns[1].prompt, [1]);
     }
 
     #[test]

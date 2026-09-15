@@ -84,11 +84,14 @@ fn kind_glyph(content: &ItemContent) -> &'static str {
 ///
 /// `caption` names what the block is - the language, or `Output` - in a header
 /// that shares the block's top corners, so the label belongs to the code
-/// rather than floating above it.
+/// rather than floating above it. `copy` puts a copy control on that same
+/// header, which is where a reader looks for it and the only way to take a
+/// command's output without dragging a selection through a scrolling box.
 fn code_surface<'a>(
     text: &'a str,
     caption: Option<&'a str>,
     limit: Option<f32>,
+    copy: Option<Action>,
 ) -> Element<'a, Message> {
     let body = widget::container(
         widget::selectable_text(text)
@@ -121,15 +124,25 @@ fn code_surface<'a>(
     };
     widget::container(
         widget::column::with_children(vec![
-            widget::container(design::caption(caption))
-                .padding([GAP_XS as u16, GAP_M as u16])
-                .width(Length::Fill)
-                .class(design::surface(
-                    Some(design::raised),
-                    [design::RADIUS_S, design::RADIUS_S, 0.0, 0.0],
-                    false,
-                ))
-                .into(),
+            widget::container(
+                widget::row::with_children(match copy {
+                    Some(copy) => vec![
+                        design::caption(caption).width(Length::Fill).into(),
+                        icon("edit-copy-symbolic", "Copy this block", true, copy),
+                    ],
+                    None => vec![design::caption(caption).into()],
+                })
+                .align_y(Alignment::Center)
+                .spacing(GAP_S),
+            )
+            .padding([GAP_XS as u16, GAP_M as u16])
+            .width(Length::Fill)
+            .class(design::surface(
+                Some(design::raised),
+                [design::RADIUS_S, design::RADIUS_S, 0.0, 0.0],
+                false,
+            ))
+            .into(),
             body,
         ])
         .width(Length::Fill),
@@ -324,28 +337,33 @@ impl Runtime {
     ) -> Element<'a, Message> {
         let target = self.target;
         let open = self.opened.get(key).copied().unwrap_or(turn.running);
-        let summary = self.strip_summary(turn);
-        let (glyph, tone) = turn
-            .outcome
-            .map_or(("emblem-ok-symbolic", None), status_glyph);
+        let mut line: Vec<Element<'a, Message>> = vec![
+            widget::icon(crate::ui_controls::symbolic_icon(if open {
+                "pan-down-symbolic"
+            } else {
+                "pan-end-symbolic"
+            }))
+            .size(12)
+            .into(),
+        ];
+        let tone = match turn.glyph().map(status_glyph) {
+            Some((glyph, tone)) => {
+                line.push(
+                    widget::icon(crate::ui_controls::symbolic_icon(glyph))
+                        .size(12)
+                        .into(),
+                );
+                tone
+            }
+            None => None,
+        };
+        line.push(design::caption(turn.summary.as_str()).into());
         let header = widget::button::custom(
-            widget::row::with_children(vec![
-                widget::icon(crate::ui_controls::symbolic_icon(if open {
-                    "pan-down-symbolic"
-                } else {
-                    "pan-end-symbolic"
-                }))
-                .size(12)
-                .into(),
-                widget::icon(crate::ui_controls::symbolic_icon(glyph))
-                    .size(12)
-                    .into(),
-                design::caption(summary.clone()).into(),
-            ])
-            .spacing(GAP_S)
-            .align_y(Alignment::Center),
+            widget::row::with_children(line)
+                .spacing(GAP_S)
+                .align_y(Alignment::Center),
         )
-        .name(summary)
+        .name(turn.summary.clone())
         .class(crate::ui_controls::control_style(false, tone))
         .padding([GAP_XS as u16, GAP_S as u16])
         .on_press(action(Action::ToggleTurn(target, key.to_owned())));
@@ -395,37 +413,6 @@ impl Runtime {
         .spacing(GAP_XS)
         .width(Length::Fill)
         .into()
-    }
-
-    /// The collapsed strip's own line.
-    ///
-    /// A single step names itself, because "1 step" tells the reader nothing
-    /// they could not see from the row's absence. Several steps are counted,
-    /// with a failure called out, because that is the one thing a collapsed
-    /// strip must not hide.
-    fn strip_summary(&self, turn: &turn::Turn) -> String {
-        let mut summary = match turn.steps.as_slice() {
-            [only] => match self.snapshot.items.get(only.index) {
-                Some(item) => {
-                    let verb = turn::step_verb(&item.content);
-                    let label = turn::step_label(&item.content);
-                    if verb.is_empty() {
-                        label.to_owned()
-                    } else {
-                        format!("{verb} {label}")
-                    }
-                }
-                None => "1 step".to_owned(),
-            },
-            steps => format!("{} steps", steps.len()),
-        };
-        match turn.outcome {
-            Some(ToolStatus::Failed) => summary.push_str(" · failed"),
-            Some(ToolStatus::Denied) => summary.push_str(" · denied"),
-            Some(ToolStatus::Running) => summary.push_str(" · working"),
-            Some(ToolStatus::Succeeded) | None => {}
-        }
-        summary
     }
 
     /// One step: a summary line that discloses its own detail.
@@ -512,6 +499,7 @@ impl Runtime {
                         text.as_str(),
                         Some("Markdown"),
                         Some(Self::OUTPUT_HEIGHT),
+                        None,
                     ));
                 } else {
                     rows.push(
@@ -531,6 +519,7 @@ impl Runtime {
                     command.as_str(),
                     (!working_directory.is_empty()).then_some(working_directory.as_str()),
                     None,
+                    Some(Action::Copy(target, item.id.clone(), CopyPart::Input)),
                 ));
                 if output.is_empty() {
                     rows.push(design::caption("No output.").into());
@@ -539,6 +528,7 @@ impl Runtime {
                         output.as_str(),
                         Some("Output"),
                         Some(Self::OUTPUT_HEIGHT),
+                        Some(Action::Copy(target, item.id.clone(), CopyPart::Output)),
                     ));
                 }
             }
@@ -561,6 +551,7 @@ impl Runtime {
                         input.as_str(),
                         Some("Input"),
                         Some(Self::OUTPUT_HEIGHT),
+                        Some(Action::Copy(target, item.id.clone(), CopyPart::Input)),
                     ));
                 }
                 if output.is_empty() {
@@ -570,6 +561,7 @@ impl Runtime {
                         output.as_str(),
                         Some("Output"),
                         Some(Self::OUTPUT_HEIGHT),
+                        Some(Action::Copy(target, item.id.clone(), CopyPart::Output)),
                     ));
                 }
             }

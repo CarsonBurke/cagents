@@ -8879,7 +8879,7 @@ impl Application for Cagents {
                 self.retire_lsp_card(id);
                 self.sidebar_state.clear_agent_activity(id);
                 self.sidebar_state.acknowledge_agent_update(id);
-                self.chat_forget(id);
+                self.chat_discard(id);
                 if let Some(runtime) = self.cards.remove(&id) {
                     match runtime {
                         CardRuntime::Terminal(_handle) => {
