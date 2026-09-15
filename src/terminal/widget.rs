@@ -4,6 +4,7 @@ use std::{
     marker::PhantomData,
     ops::Range,
     sync::{Arc, LazyLock, Mutex},
+    time::{Duration, Instant},
 };
 
 use cosmic::iced::advanced::Renderer as _;
@@ -14,11 +15,14 @@ use cosmic::{
     iced::{
         Border, Color, Event, Font, Length, Pixels, Point, Rectangle, Shadow, Size,
         advanced::{
-            Clipboard, Layout, Shell, Widget, layout, mouse, renderer, text,
+            InputMethod, Layout, Shell, Widget,
+            clipboard::{self, Clipboard},
+            input_method, layout, mouse, renderer, text,
             widget::{Tree, tree},
         },
         keyboard,
         mouse::{Button as IcedMouseButton, ScrollDelta},
+        window,
     },
 };
 
@@ -34,6 +38,20 @@ use crate::{
 };
 
 const DEFAULT_PADDING: f32 = 8.0;
+
+/// How long the cursor stays lit, and then dark, while it blinks. 530ms is
+/// what xterm and Ghostty both default to.
+const BLINK_PHASE: Duration = Duration::from_millis(530);
+
+/// Opacity multiplier for the cursor of a terminal that does not hold the
+/// keyboard, so that exactly one card on screen reads as the place typing
+/// lands.
+const UNFOCUSED_CURSOR_ALPHA: f32 = 0.45;
+
+/// Opacity of the selection wash. The cell keeps its own background and
+/// foreground underneath, so the accent has to say "selected" without making
+/// the text it covers any harder to read than the text beside it.
+const SELECTION_ALPHA: f32 = 0.35;
 
 /// Text metrics for one terminal grid at one scale factor.
 ///
@@ -417,6 +435,23 @@ impl TerminalGeometry {
         cursor.position_in(visible_grid)
     }
 
+    /// The grid cell a pointer position - as returned by
+    /// [`Self::cursor_position`] - falls in.
+    ///
+    /// Mouse motion is deduplicated on this: every reporting format but
+    /// pixel-resolution SGR (mode 1016) encodes motion inside one cell
+    /// identically, so only a cell crossing is worth a frame. A child using
+    /// 1016 therefore sees cell-quantised motion, which is the trade that
+    /// keeps a hover off the bounded command channel entirely.
+    fn cell_at(self, position: Point) -> (u16, u16) {
+        let column = (position.x / self.cell_width) as u32;
+        let row = (position.y / self.cell_height) as u32;
+        (
+            column.min(u32::from(self.columns.saturating_sub(1))) as u16,
+            row.min(u32::from(self.rows.saturating_sub(1))) as u16,
+        )
+    }
+
     /// The clipped rectangle covering `length` consecutive cells starting at
     /// `column`.
     ///
@@ -460,8 +495,12 @@ struct TerminalScrollbar {
 }
 
 impl TerminalScrollbar {
-    fn new(bounds: Rectangle, scroll: super::ScrollSnapshot, focused: bool) -> Option<Self> {
-        if !focused || !scroll.scrollable() || bounds.height <= 0.0 || bounds.width <= 0.0 {
+    /// The rail's geometry, whenever the viewport has history to move through.
+    ///
+    /// Whether it is painted at all is a separate question: see
+    /// [`Self::visible`].
+    fn new(bounds: Rectangle, scroll: super::ScrollSnapshot) -> Option<Self> {
+        if !scroll.scrollable() || bounds.height <= 0.0 || bounds.width <= 0.0 {
             return None;
         }
         let track = Rectangle {
@@ -497,6 +536,240 @@ impl TerminalScrollbar {
         let fraction = ((pointer_y - self.track.y - grab_offset) / travel).clamp(0.0, 1.0);
         (fraction as f64 * self.max_offset as f64).round() as u64
     }
+
+    /// Whether the rail is painted.
+    ///
+    /// The focused terminal always shows it; an unfocused one only while its
+    /// viewport sits above the live bottom, so that a card left in scrollback
+    /// says so instead of looking like it is following the child.
+    fn visible(scroll: super::ScrollSnapshot, focused: bool) -> bool {
+        focused || scroll.offset < scroll.max_offset()
+    }
+}
+
+/// One cell in scrollback coordinates: an absolute row of the child's history
+/// and a grid column.
+///
+/// The viewport moves under a selection - a drag past the edge scrolls it, and
+/// so does the child's own output - so a viewport row would silently come to
+/// name different text. Ordering is reading order, which is what lets a drag
+/// be normalized by comparing its two ends.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct SelectionCell {
+    row: u64,
+    column: u16,
+}
+
+/// What a press selects, and what a drag after it keeps snapping to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SelectionMode {
+    Character,
+    Word,
+    Line,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Selection {
+    anchor: SelectionCell,
+    head: SelectionCell,
+    mode: SelectionMode,
+}
+
+impl Selection {
+    fn new(cell: SelectionCell, mode: SelectionMode) -> Self {
+        Self {
+            anchor: cell,
+            head: cell,
+            mode,
+        }
+    }
+
+    /// The first and last cell the selection covers, inclusive, in reading
+    /// order.
+    ///
+    /// Both ends are expanded against the live grid rather than stored
+    /// expanded, so a drag that began on a double click keeps snapping to
+    /// whole words as it grows.
+    fn span(self, grid: SelectionGrid<'_>) -> (SelectionCell, SelectionCell) {
+        let (mut start, mut end) = if self.anchor <= self.head {
+            (self.anchor, self.head)
+        } else {
+            (self.head, self.anchor)
+        };
+        match self.mode {
+            SelectionMode::Character => {}
+            SelectionMode::Word => {
+                start.column = grid.word_bounds(start).0;
+                end.column = grid.word_bounds(end).1;
+            }
+            SelectionMode::Line => {
+                start.column = 0;
+                end.column = grid.columns.saturating_sub(1);
+            }
+        }
+        (start, end)
+    }
+}
+
+/// The grid a selection resolves against: the snapshot's rows, and the
+/// absolute row its first line holds.
+#[derive(Clone, Copy)]
+struct SelectionGrid<'a> {
+    rows: &'a [Arc<RowSnapshot>],
+    offset: u64,
+    columns: u16,
+}
+
+impl<'a> SelectionGrid<'a> {
+    /// The cells of an absolute row, when the snapshot holds that row.
+    ///
+    /// History the capture does not reach has no text here, which is the one
+    /// place a selection stops resolving.
+    fn cells(self, row: u64) -> Option<&'a [CellSnapshot]> {
+        let index = usize::try_from(row.checked_sub(self.offset)?).ok()?;
+        let cells = &self.rows.get(index)?.cells;
+        Some(&cells[..cells.len().min(usize::from(self.columns))])
+    }
+
+    /// The run of like cells around `cell`: the word under a double click, or
+    /// the blanks between two words.
+    fn word_bounds(self, cell: SelectionCell) -> (u16, u16) {
+        let Some(cells) = self.cells(cell.row).filter(|cells| !cells.is_empty()) else {
+            return (cell.column, cell.column);
+        };
+        let index = usize::from(cell.column).min(cells.len() - 1);
+        // A wide cluster's trailing cell carries no text of its own, so it
+        // takes the class of the cluster it completes rather than ending the
+        // run halfway through a glyph.
+        let class = (0..=index)
+            .rev()
+            .find_map(|index| word_class(&cells[index]))
+            .unwrap_or(WordClass::Symbol);
+        let extends =
+            |cell: &CellSnapshot| word_class(cell).is_none_or(|candidate| candidate == class);
+        let mut start = index;
+        while start > 0 && extends(&cells[start - 1]) {
+            start -= 1;
+        }
+        let mut end = index;
+        while end + 1 < cells.len() && extends(&cells[end + 1]) {
+            end += 1;
+        }
+        (start as u16, end as u16)
+    }
+}
+
+/// The punctuation a double click keeps inside one word. What a user reaches
+/// for in an agent's terminal is a path, a flag, a package name or a
+/// `file:line` reference, none of which survive a word rule that stops at
+/// every symbol.
+const WORD_PUNCTUATION: [char; 7] = ['_', '-', '.', '/', '+', '~', ':'];
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WordClass {
+    Word,
+    Blank,
+    Symbol,
+}
+
+/// A cell's word class, or `None` for a cell carrying no text of its own: the
+/// trailing cell of a wide cluster, which [`segments`] skips for the same
+/// reason.
+fn word_class(cell: &CellSnapshot) -> Option<WordClass> {
+    match cell.text.as_str().chars().next() {
+        None => None,
+        Some(character) if character.is_alphanumeric() || WORD_PUNCTUATION.contains(&character) => {
+            Some(WordClass::Word)
+        }
+        Some(character) if character.is_whitespace() => Some(WordClass::Blank),
+        Some(_) => Some(WordClass::Symbol),
+    }
+}
+
+/// The first and last column a selection covers on one absolute row, or `None`
+/// when the row falls outside it.
+///
+/// A multi-row selection runs from its anchor column to the end of that row,
+/// covers the rows between whole, and stops at its head column on the last.
+fn selection_columns(
+    (start, end): (SelectionCell, SelectionCell),
+    row: u64,
+    columns: u16,
+) -> Option<(u16, u16)> {
+    if row < start.row || row > end.row {
+        return None;
+    }
+    let last = columns.checked_sub(1)?;
+    let first = if row == start.row {
+        start.column.min(last)
+    } else {
+        0
+    };
+    let final_column = if row == end.row {
+        end.column.min(last)
+    } else {
+        last
+    };
+    (first <= final_column).then_some((first, final_column))
+}
+
+/// Renders a selection span to text.
+///
+/// Each row is trimmed at its right edge before the rows are joined: a grid
+/// row is space-padded to its full width, and a copied command carrying sixty
+/// trailing blanks is useless wherever it is pasted.
+fn selection_text(grid: SelectionGrid<'_>, span: (SelectionCell, SelectionCell)) -> String {
+    let mut text = String::new();
+    for row in span.0.row..=span.1.row {
+        if row > span.0.row {
+            text.push('\n');
+        }
+        let Some((first, last)) = selection_columns(span, row, grid.columns) else {
+            continue;
+        };
+        let Some(cells) = grid.cells(row) else {
+            continue;
+        };
+        let line = text.len();
+        for cell in cells
+            .iter()
+            .take(usize::from(last) + 1)
+            .skip(usize::from(first))
+        {
+            // The trailing cell of a wide cluster holds no text; appending it
+            // would repeat the glyph its first cell already contributed.
+            if !cell.text.is_empty() {
+                text.push_str(cell.text.as_str());
+            }
+        }
+        text.truncate(line + text[line..].trim_end().len());
+    }
+    text
+}
+
+/// The bytes a paste puts on the child's input.
+///
+/// A terminal's line terminator on input is the carriage return the Enter key
+/// sends, so text copied from anywhere with newlines in it has to arrive that
+/// way or the child sees half a line ending. NUL is dropped because no child
+/// can receive it as typed input.
+fn normalize_paste(text: &str) -> String {
+    let mut normalized = String::with_capacity(text.len());
+    let mut characters = text.chars().peekable();
+    while let Some(character) = characters.next() {
+        match character {
+            '\0' => {}
+            '\r' => {
+                if characters.peek() == Some(&'\n') {
+                    characters.next();
+                }
+                normalized.push('\r');
+            }
+            '\n' => normalized.push('\r'),
+            _ => normalized.push(character),
+        }
+    }
+    normalized
 }
 
 #[derive(Default)]
@@ -509,9 +782,72 @@ struct WidgetState {
     last_cursor: Option<Point>,
     scrollbar_drag: Option<f32>,
     wheel_remainder: f32,
+    /// The grid cell the last reported motion landed in.
+    last_motion_cell: Option<(u16, u16)>,
+    /// When the current cursor-blink phase began, on the frame clock. `None`
+    /// while nothing is blinking.
+    blink_since: Option<Instant>,
+    /// Whether the blinking cursor is currently in its dark phase. The default
+    /// is lit, so a cursor that has never blinked is drawn.
+    cursor_dark: bool,
+    /// The cell the blink phase is anchored to.
+    blink_anchor: Option<(u16, u16)>,
+    /// Text being composed by the input method, held so the shell can paint it
+    /// at the cursor until it is committed.
+    preedit: Option<input_method::Preedit>,
+    /// The active selection, in absolute scrollback coordinates. `None` means
+    /// nothing is selected.
+    selection: Option<Selection>,
+    /// Whether the pointer is currently extending `selection`.
+    selecting: bool,
+    /// The previous left press, so that a second and third one in the same
+    /// place count as a double and triple click.
+    last_click: Option<mouse::Click>,
+    /// Whether the last `Escape` press was spent clearing a selection, so that
+    /// its release is withheld from the child too.
+    escape_cleared: bool,
+    /// The screen the selection was made against, so that switching to or from
+    /// the alternate screen drops it.
+    alternate_screen: bool,
     /// Shaped text, reused across frames. Mutated through `&self` because
     /// `draw` is the only place that knows which rows are actually visible.
     shaped: RefCell<ShapeCache>,
+}
+
+impl WidgetState {
+    /// Advances the cursor-blink phase to the frame instant `now` and returns
+    /// the instant the next phase begins.
+    ///
+    /// The phase is driven from the frame clock and one scheduled redraw per
+    /// phase rather than a frame subscription, so a terminal sitting at an idle
+    /// prompt wakes the compositor twice a second instead of sixty times - and
+    /// an unfocused or steady-cursor terminal, which never calls this, wakes it
+    /// not at all.
+    fn advance_blink(&mut self, now: Instant, anchor: Option<(u16, u16)>) -> Instant {
+        // Frames stop entirely while a terminal is unfocused or occluded, so a
+        // resumed cycle - or a cursor that just moved under the user's typing -
+        // restarts lit rather than folding an unbounded number of phases.
+        let since = match self.blink_since {
+            Some(since)
+                if self.blink_anchor == anchor
+                    && now.saturating_duration_since(since) < BLINK_PHASE * 2 =>
+            {
+                since
+            }
+            _ => {
+                self.blink_anchor = anchor;
+                self.cursor_dark = false;
+                self.blink_since = Some(now);
+                now
+            }
+        };
+        if now.saturating_duration_since(since) >= BLINK_PHASE {
+            self.cursor_dark = !self.cursor_dark;
+            self.blink_since = Some(since + BLINK_PHASE);
+            return since + BLINK_PHASE * 2;
+        }
+        since + BLINK_PHASE
+    }
 }
 
 /// The inputs that invalidate every shaped buffer at once.
@@ -780,6 +1116,14 @@ impl<Message> TerminalWidget<Message> {
                 if !state.focused {
                     state.pressed_buttons = 0;
                     state.scrollbar_drag = None;
+                    // A composition belongs to whoever holds the keyboard, and
+                    // the input method reopens on the next focus: keeping the
+                    // old preedit would republish text the user abandoned.
+                    state.preedit = None;
+                    // A highlight in a card that no longer holds the keyboard
+                    // would advertise a copy whose chord now lands elsewhere.
+                    state.selection = None;
+                    state.selecting = false;
                 }
             }
             Err(error) => self.publish_error(error, shell),
@@ -794,6 +1138,13 @@ impl<Message> TerminalWidget<Message> {
     ) {
         let size = geometry.terminal_size();
         if state.last_size != Some(size) {
+            // Reflow moves every cell the selection named, so keeping it would
+            // leave it covering text the user never dragged over. The first
+            // frame has no size yet and nothing to clear.
+            if state.last_size.is_some() {
+                state.selection = None;
+                state.selecting = false;
+            }
             match self.handle.resize(size) {
                 Ok(()) => state.last_size = Some(size),
                 Err(error) => self.publish_error(error, shell),
@@ -824,6 +1175,76 @@ impl<Message> TerminalWidget<Message> {
         };
         if let Err(error) = self.handle.mouse(input) {
             self.publish_error(error, shell);
+        }
+    }
+
+    /// The grid this frame's selection resolves against.
+    fn selection_grid(&self) -> SelectionGrid<'_> {
+        SelectionGrid {
+            rows: &self.snapshot.lines,
+            offset: self.snapshot.scroll.offset,
+            columns: self.snapshot.columns,
+        }
+    }
+
+    /// The absolute scrollback cell a viewport cell names, so that a selection
+    /// keeps meaning the same text once the viewport moves under it.
+    fn selection_cell(&self, (column, row): (u16, u16)) -> SelectionCell {
+        SelectionCell {
+            row: self.snapshot.scroll.offset + u64::from(row),
+            column,
+        }
+    }
+
+    /// The selected text, or `None` when nothing is selected and when a
+    /// selection covers only blanks - neither is worth putting on a clipboard
+    /// the user can no longer get their previous contents back from.
+    fn selected_text(&self, state: &WidgetState) -> Option<String> {
+        let selection = state.selection?;
+        let grid = self.selection_grid();
+        let text = selection_text(grid, selection.span(grid));
+        (!text.is_empty()).then_some(text)
+    }
+
+    /// Sends pasted text to the child, on the same path a committed
+    /// composition takes: it has no key of its own to encode either.
+    fn paste(&self, text: &str, shell: &mut Shell<'_, Message>) {
+        let normalized = normalize_paste(text);
+        if normalized.is_empty() {
+            return;
+        }
+        if let Err(error) = self.handle.input(normalized.into_bytes()) {
+            self.publish_error(error, shell);
+        }
+    }
+
+    /// The composition target published to the shell while this terminal holds
+    /// the keyboard: the cursor's own cell.
+    ///
+    /// The preedit rides along rather than being drawn here. The shell paints
+    /// it against this rectangle, which is exactly where the committed text
+    /// will land, and the grid has no columns to lend text that the child has
+    /// not accepted yet - a composed cluster's cell width is only known once
+    /// it is committed and the child echoes it back.
+    fn input_method<'state>(
+        &self,
+        state: &'state WidgetState,
+        geometry: TerminalGeometry,
+    ) -> InputMethod<&'state str> {
+        if !self.model_focused {
+            return InputMethod::Disabled;
+        }
+        let Some(caret) = self
+            .snapshot
+            .cursor
+            .and_then(|caret| geometry.cell_bounds(caret.column, caret.row))
+        else {
+            return InputMethod::Disabled;
+        };
+        InputMethod::Enabled {
+            cursor: caret,
+            purpose: input_method::Purpose::Terminal,
+            preedit: state.preedit.as_ref().map(input_method::Preedit::as_ref),
         }
     }
 }
@@ -857,7 +1278,7 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for TerminalWidget<Message
         layout: Layout<'_>,
         cursor: mouse::Cursor,
         _renderer: &Renderer,
-        _clipboard: &mut dyn Clipboard,
+        clipboard: &mut dyn Clipboard,
         shell: &mut Shell<'_, Message>,
         _viewport: &Rectangle,
     ) {
@@ -873,7 +1294,18 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for TerminalWidget<Message
         let state = tree.state.downcast_mut::<WidgetState>();
         self.synchronize_size(state, geometry, shell);
         self.synchronize_focus(state, shell);
-        let scrollbar = TerminalScrollbar::new(bounds, self.snapshot.scroll, self.model_focused);
+        // Switching to or from the alternate screen replaces the whole grid,
+        // and scrollback coordinates do not carry across that swap.
+        if state.alternate_screen != self.snapshot.scroll.alternate_screen {
+            state.alternate_screen = self.snapshot.scroll.alternate_screen;
+            state.selection = None;
+            state.selecting = false;
+        }
+        // Only the focused terminal's rail is draggable. An unfocused card may
+        // still paint one (see [`TerminalScrollbar::visible`]), but the click
+        // that reaches it focuses the terminal instead of grabbing the thumb.
+        let scrollbar =
+            TerminalScrollbar::new(bounds, self.snapshot.scroll).filter(|_| self.model_focused);
         if scrollbar.is_none() {
             state.scrollbar_drag = None;
         }
@@ -922,6 +1354,47 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for TerminalWidget<Message
                 ..
             }) if self.model_focused => {
                 state.modifiers = map_iced_modifiers(*modifiers);
+                // Copy, paste and dropping a selection are this widget's
+                // chords, never the child's, and each is captured even when it
+                // does nothing so that no half of one reaches the child.
+                if let Some(chord) = clipboard_chord(key, *modifiers) {
+                    match chord {
+                        ClipboardChord::Copy => {
+                            if let Some(text) = self.selected_text(state) {
+                                clipboard.write(clipboard::Kind::Standard, text);
+                            }
+                        }
+                        ClipboardChord::Paste => {
+                            if let Some(text) = clipboard.read(clipboard::Kind::Standard) {
+                                self.paste(&text, shell);
+                            }
+                        }
+                    }
+                    shell.capture_event();
+                    return;
+                }
+                if state.selection.is_some() && is_escape(key) {
+                    state.selection = None;
+                    state.selecting = false;
+                    state.escape_cleared = true;
+                    shell.capture_event();
+                    shell.request_redraw();
+                    return;
+                }
+                // Shift plus a paging key moves this terminal's viewport, the
+                // way every terminal binds scrollback, and the child never sees
+                // it. Scrollback exists only on the primary screen, so an
+                // alternate-screen application still receives the shifted key
+                // and can bind it itself.
+                if self.snapshot.scroll.scrollable()
+                    && let Some(scroll) = viewport_scroll(key, *modifiers, geometry.rows)
+                {
+                    if let Err(error) = scroll.apply(&self.handle) {
+                        self.publish_error(error, shell);
+                    }
+                    shell.capture_event();
+                    return;
+                }
                 let input = KeyInput {
                     action: if *repeat {
                         KeyAction::Repeat
@@ -942,6 +1415,23 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for TerminalWidget<Message
                 if self.model_focused =>
             {
                 state.modifiers = map_iced_modifiers(*modifiers);
+                // The press was consumed here, so its release must be too: a
+                // child reading key releases may not see one half of a chord.
+                if state.escape_cleared && is_escape(key) {
+                    state.escape_cleared = false;
+                    shell.capture_event();
+                    return;
+                }
+                if clipboard_chord(key, *modifiers).is_some() {
+                    shell.capture_event();
+                    return;
+                }
+                if self.snapshot.scroll.scrollable()
+                    && viewport_scroll(key, *modifiers, geometry.rows).is_some()
+                {
+                    shell.capture_event();
+                    return;
+                }
                 let input = KeyInput {
                     action: KeyAction::Release,
                     key: map_iced_key(key),
@@ -967,16 +1457,76 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for TerminalWidget<Message
                 }
                 if let Some(position) = geometry.cursor_position(cursor) {
                     state.last_cursor = Some(position);
-                    state.pressed_buttons = state.pressed_buttons.saturating_add(1);
-                    self.send_mouse(
-                        state,
-                        geometry,
-                        position,
-                        MouseAction::Press,
-                        Some(map_iced_button(*button)),
-                        shell,
-                    );
+                    let cell = geometry.cell_at(position);
+                    state.last_motion_cell = Some(cell);
+                    // Selecting and pasting belong to this widget whenever the
+                    // child is not reading the mouse itself, and shift takes
+                    // them back from a child that is. Without that override a
+                    // full-screen application's own output could never be
+                    // copied, which is why every terminal binds it.
+                    let ours = state.modifiers.shift
+                        || (!self.snapshot.scroll.mouse_tracking
+                            && !state.modifiers.control
+                            && !state.modifiers.alt
+                            && !state.modifiers.super_key);
+                    match button {
+                        IcedMouseButton::Left if ours => {
+                            let click = mouse::Click::new(
+                                position,
+                                IcedMouseButton::Left,
+                                state.last_click,
+                            );
+                            state.selection = Some(Selection::new(
+                                self.selection_cell(cell),
+                                match click.kind() {
+                                    mouse::click::Kind::Single => SelectionMode::Character,
+                                    mouse::click::Kind::Double => SelectionMode::Word,
+                                    mouse::click::Kind::Triple => SelectionMode::Line,
+                                },
+                            ));
+                            state.last_click = Some(click);
+                            state.selecting = true;
+                            shell.request_redraw();
+                        }
+                        IcedMouseButton::Middle if ours => {
+                            // The primary selection is what a middle click
+                            // pastes everywhere else on X11 and Wayland.
+                            if let Some(text) = clipboard.read(clipboard::Kind::Primary) {
+                                self.paste(&text, shell);
+                            }
+                        }
+                        button => {
+                            state.pressed_buttons = state.pressed_buttons.saturating_add(1);
+                            self.send_mouse(
+                                state,
+                                geometry,
+                                position,
+                                MouseAction::Press,
+                                Some(map_iced_button(*button)),
+                                shell,
+                            );
+                        }
+                    }
                 }
+                shell.capture_event();
+            }
+            Event::Mouse(mouse::Event::ButtonReleased(IcedMouseButton::Left))
+                if state.selecting =>
+            {
+                state.selecting = false;
+                // A press that never left its cell is a click, not a
+                // selection: it drops the old highlight instead of putting one
+                // character on the primary selection.
+                if state.selection.is_some_and(|selection| {
+                    selection.mode == SelectionMode::Character && selection.anchor == selection.head
+                }) {
+                    state.selection = None;
+                } else if let Some(text) = self.selected_text(state) {
+                    // Release is the gesture a middle-click paste consumes, so
+                    // it is where the primary selection is written.
+                    clipboard.write(clipboard::Kind::Primary, text);
+                }
+                shell.request_redraw();
                 shell.capture_event();
             }
             Event::Mouse(mouse::Event::ButtonReleased(button)) if state.pressed_buttons != 0 => {
@@ -994,10 +1544,63 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for TerminalWidget<Message
                     shell.capture_event();
                 }
             }
+            Event::Mouse(mouse::Event::CursorMoved { position }) if state.selecting => {
+                let grid = geometry.grid_bounds;
+                // Dragging past an edge keeps the selection growing into
+                // history: one line per motion event, which is the pointer's
+                // own rate and so needs no timer of its own.
+                let step = if position.y < grid.y {
+                    -1
+                } else if position.y >= grid.y + grid.height {
+                    1
+                } else {
+                    0
+                };
+                let scrolled = step != 0 && self.snapshot.scroll.scrollable();
+                if scrolled && let Err(error) = self.handle.scroll_lines(step) {
+                    self.publish_error(error, shell);
+                }
+                // Clamping happens in `cell_at`, so a pointer dragged outside
+                // the grid still extends along its nearest edge.
+                let cell = geometry.cell_at(Point::new(position.x - grid.x, position.y - grid.y));
+                // A scrolled viewport puts a different absolute row under an
+                // unchanged cell, so that case may not be deduplicated away.
+                if scrolled || state.last_motion_cell != Some(cell) {
+                    state.last_motion_cell = Some(cell);
+                    if let Some(selection) = &mut state.selection {
+                        selection.head = self.selection_cell(cell);
+                    }
+                    shell.request_redraw();
+                }
+                shell.capture_event();
+            }
             Event::Mouse(mouse::Event::CursorMoved { .. }) => {
                 if let Some(position) = geometry.cursor_position(cursor) {
                     state.last_cursor = Some(position);
-                    self.send_mouse(state, geometry, position, MouseAction::Motion, None, shell);
+                    // A child that never enabled mouse reporting discards every
+                    // motion report, yet each one still costs a request frame,
+                    // the daemon's reply, and a slot in the same bounded command
+                    // channel the user's keystrokes queue in. Report only what
+                    // can be observed - tracking enabled, or a drag in progress
+                    // - and then only on a cell crossing.
+                    let cell = geometry.cell_at(position);
+                    if (self.snapshot.scroll.mouse_tracking || state.pressed_buttons != 0)
+                        && state.last_motion_cell != Some(cell)
+                    {
+                        state.last_motion_cell = Some(cell);
+                        self.send_mouse(
+                            state,
+                            geometry,
+                            position,
+                            MouseAction::Motion,
+                            None,
+                            shell,
+                        );
+                    }
+                } else {
+                    // Leaving and re-entering the grid is a fresh motion even
+                    // when the pointer lands back on the same cell.
+                    state.last_motion_cell = None;
                 }
             }
             Event::Mouse(mouse::Event::WheelScrolled { delta }) if cursor.is_over(bounds) => {
@@ -1050,6 +1653,55 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for TerminalWidget<Message
                 }
                 shell.capture_event();
             }
+            Event::Window(window::Event::RedrawRequested(now)) => {
+                let caret = self.snapshot.cursor.filter(|caret| caret.visible);
+                let anchor = caret.map(|caret| (caret.column, caret.row));
+                if self.model_focused && caret.is_some_and(|caret| caret.blinking) {
+                    shell.request_redraw_at(state.advance_blink(*now, anchor));
+                } else {
+                    // Nothing to animate: drop the phase so the next blink
+                    // starts lit, and ask for no further frames.
+                    state.blink_since = None;
+                    state.blink_anchor = anchor;
+                    state.cursor_dark = false;
+                }
+                // The shell only honours an input-method request raised during
+                // a redraw, and only the focused terminal returns an enabled
+                // one, so exactly one card claims the composition target.
+                shell.request_input_method(&self.input_method(state, geometry));
+            }
+            Event::InputMethod(event) if self.model_focused => match event {
+                input_method::Event::Opened => {
+                    state.preedit = Some(input_method::Preedit::new());
+                    shell.request_redraw();
+                }
+                input_method::Event::Closed => {
+                    state.preedit = None;
+                    shell.request_redraw();
+                }
+                input_method::Event::Preedit(content, selection) => {
+                    state.preedit = Some(input_method::Preedit {
+                        content: content.clone(),
+                        selection: selection.clone(),
+                        text_size: Some(Pixels(self.font_size)),
+                    });
+                    shell.request_redraw();
+                }
+                input_method::Event::Commit(text) => {
+                    state.preedit = None;
+                    // Composition is over, so the child receives exactly the
+                    // bytes a keyboard able to type this would have sent. It
+                    // deliberately bypasses key encoding: composed text has no
+                    // key of its own to encode.
+                    if !text.is_empty()
+                        && let Err(error) = self.handle.input(text.clone().into_bytes())
+                    {
+                        self.publish_error(error, shell);
+                    }
+                    shell.capture_event();
+                    shell.request_redraw();
+                }
+            },
             _ => {}
         }
     }
@@ -1058,7 +1710,7 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for TerminalWidget<Message
         &self,
         tree: &Tree,
         renderer: &mut Renderer,
-        _theme: &Theme,
+        theme: &Theme,
         _style: &renderer::Style,
         layout: Layout<'_>,
         _cursor: mouse::Cursor,
@@ -1100,6 +1752,7 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for TerminalWidget<Message
                 return;
             };
             renderer.with_layer(content_clip, |renderer| {
+                let state = tree.state.downcast_ref::<WidgetState>();
                 let row_limit = usize::from(self.snapshot.rows.min(geometry.rows));
                 let column_limit = usize::from(self.snapshot.columns.min(geometry.columns));
                 let rows = &self.snapshot.lines[..self.snapshot.lines.len().min(row_limit)];
@@ -1114,10 +1767,38 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for TerminalWidget<Message
                     );
                 }
 
+                // The wash goes over the cells' own backgrounds and under the
+                // glyphs, so selected text keeps every colour it had and only
+                // gains the accent behind it.
+                if let Some(selection) = state.selection {
+                    let span = selection.span(self.selection_grid());
+                    let columns = self.snapshot.columns.min(geometry.columns);
+                    let wash =
+                        Color::from(*theme.cosmic().accent_color()).scale_alpha(SELECTION_ALPHA);
+                    for row_index in 0..rows.len() {
+                        let row = row_index as u16;
+                        let absolute = self.snapshot.scroll.offset + u64::from(row);
+                        let Some((first, last)) = selection_columns(span, absolute, columns) else {
+                            continue;
+                        };
+                        let Some(bounds) = geometry.run_bounds(first, last - first + 1, row) else {
+                            continue;
+                        };
+                        renderer.fill_quad(
+                            renderer::Quad {
+                                bounds,
+                                border: Border::default(),
+                                shadow: Shadow::default(),
+                                snap: true,
+                            },
+                            wash,
+                        );
+                    }
+                }
+
                 // Glyphs. One shaped buffer per segment, reused for as long as
                 // the daemon leaves the row alone, so a still terminal reshapes
                 // nothing and a scrolling one reshapes only the rows that moved.
-                let state = tree.state.downcast_ref::<WidgetState>();
                 let mut shaped = state.shaped.borrow_mut();
                 shaped.refresh(&geometry, self.font_size, rows, column_limit);
                 let default_foreground = color(self.snapshot.foreground);
@@ -1145,7 +1826,13 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for TerminalWidget<Message
                 if let Some((cursor, cell_bounds)) = self
                     .snapshot
                     .cursor
-                    .filter(|cursor| cursor.visible)
+                    // Blinking hides the cursor outright for its dark phase,
+                    // and only the focused terminal blinks: a card in the
+                    // background keeps a static mark and asks for no frames.
+                    .filter(|cursor| {
+                        cursor.visible
+                            && !(self.model_focused && cursor.blinking && state.cursor_dark)
+                    })
                     .and_then(|cursor| {
                         geometry
                             .cell_bounds(cursor.column, cursor.row)
@@ -1175,19 +1862,30 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for TerminalWidget<Message
                         },
                         CursorShape::Block | CursorShape::HollowBlock => cell_bounds,
                     };
-                    let border = if shape == CursorShape::HollowBlock {
+                    // One terminal at a time owns the keyboard, and a solid
+                    // block in each of several visible cards says nothing about
+                    // where typing lands. The unfocused ones hollow their block
+                    // out and dim whatever they do draw.
+                    let hollow = shape == CursorShape::HollowBlock
+                        || (!self.model_focused && shape == CursorShape::Block);
+                    let alpha = if self.model_focused {
+                        1.0
+                    } else {
+                        UNFOCUSED_CURSOR_ALPHA
+                    };
+                    let border = if hollow {
                         Border {
-                            color: color(cursor.color),
+                            color: color(cursor.color).scale_alpha(alpha),
                             width: 1.0 / geometry.scale_factor,
                             radius: 0.0.into(),
                         }
                     } else {
                         Border::default()
                     };
-                    let fill = if shape == CursorShape::HollowBlock {
+                    let fill = if hollow {
                         Color::TRANSPARENT
                     } else {
-                        color(cursor.color).scale_alpha(0.65)
+                        color(cursor.color).scale_alpha(0.65 * alpha)
                     };
                     renderer.fill_quad(
                         renderer::Quad {
@@ -1200,8 +1898,8 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for TerminalWidget<Message
                     );
                 }
             });
-            if let Some(bar) =
-                TerminalScrollbar::new(bounds, self.snapshot.scroll, self.model_focused)
+            if let Some(bar) = TerminalScrollbar::new(bounds, self.snapshot.scroll)
+                .filter(|_| TerminalScrollbar::visible(self.snapshot.scroll, self.model_focused))
             {
                 renderer.fill_quad(
                     renderer::Quad {
@@ -1213,7 +1911,14 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for TerminalWidget<Message
                         shadow: Shadow::default(),
                         snap: true,
                     },
-                    color(self.snapshot.foreground).scale_alpha(0.45),
+                    // Dimmed when unfocused: the rail is there to say this card
+                    // is looking at history, not to invite a drag that only the
+                    // focused terminal services.
+                    color(self.snapshot.foreground).scale_alpha(if self.model_focused {
+                        0.45
+                    } else {
+                        0.2
+                    }),
                 );
             }
         });
@@ -1237,8 +1942,9 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for TerminalWidget<Message
         _viewport: &Rectangle,
         _renderer: &Renderer,
     ) -> mouse::Interaction {
-        if TerminalScrollbar::new(layout.bounds(), self.snapshot.scroll, self.model_focused)
-            .is_some_and(|bar| cursor.is_over(bar.track))
+        if self.model_focused
+            && TerminalScrollbar::new(layout.bounds(), self.snapshot.scroll)
+                .is_some_and(|bar| cursor.is_over(bar.track))
         {
             return mouse::Interaction::Pointer;
         }
@@ -1658,6 +2364,86 @@ fn map_iced_button(button: IcedMouseButton) -> MouseButton {
     }
 }
 
+/// A keyboard-driven viewport move, applied to this terminal instead of being
+/// encoded and sent to the child.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ViewportScroll {
+    Lines(isize),
+    Top,
+    Bottom,
+}
+
+impl ViewportScroll {
+    fn apply(self, handle: &TerminalSurface) -> Result<(), TerminalSendError> {
+        match self {
+            Self::Lines(delta) => handle.scroll_lines(delta),
+            Self::Top => handle.scroll_to_top(),
+            Self::Bottom => handle.scroll_to_bottom(),
+        }
+    }
+}
+
+/// The viewport move a key press performs instead of reaching the child, if
+/// any.
+///
+/// A page step keeps one row of overlap so the eye can stitch the two screens
+/// together, the way a pager's own paging does. Any modifier beyond shift
+/// belongs to the child: those are chords applications bind themselves.
+fn viewport_scroll(
+    key: &keyboard::Key,
+    modifiers: keyboard::Modifiers,
+    rows: u16,
+) -> Option<ViewportScroll> {
+    if !modifiers.shift() || modifiers.control() || modifiers.alt() || modifiers.logo() {
+        return None;
+    }
+    let page = rows.saturating_sub(1).max(1) as isize;
+    match key.as_ref() {
+        keyboard::Key::Named(keyboard::key::Named::PageUp) => Some(ViewportScroll::Lines(-page)),
+        keyboard::Key::Named(keyboard::key::Named::PageDown) => Some(ViewportScroll::Lines(page)),
+        keyboard::Key::Named(keyboard::key::Named::Home) => Some(ViewportScroll::Top),
+        keyboard::Key::Named(keyboard::key::Named::End) => Some(ViewportScroll::Bottom),
+        _ => None,
+    }
+}
+
+/// The clipboard action a key press performs here instead of reaching the
+/// child, if any.
+///
+/// The shift is what makes these the terminal's own: the unshifted chords are
+/// the child's, where Ctrl+C interrupts the foreground job and Ctrl+V quotes
+/// the next character. Any further modifier belongs to the child for the same
+/// reason [`viewport_scroll`] hands one back.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ClipboardChord {
+    Copy,
+    Paste,
+}
+
+fn clipboard_chord(key: &keyboard::Key, modifiers: keyboard::Modifiers) -> Option<ClipboardChord> {
+    if !modifiers.control() || !modifiers.shift() || modifiers.alt() || modifiers.logo() {
+        return None;
+    }
+    let keyboard::Key::Character(text) = key.as_ref() else {
+        return None;
+    };
+    // Shift is held, so the layout may well report the capital.
+    if text.eq_ignore_ascii_case("c") {
+        Some(ClipboardChord::Copy)
+    } else if text.eq_ignore_ascii_case("v") {
+        Some(ClipboardChord::Paste)
+    } else {
+        None
+    }
+}
+
+fn is_escape(key: &keyboard::Key) -> bool {
+    matches!(
+        key.as_ref(),
+        keyboard::Key::Named(keyboard::key::Named::Escape)
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use crate::terminal::CellText;
@@ -1665,7 +2451,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn scrollbar_requires_focused_history_and_drag_clamps_to_real_offsets() {
+    fn scrollbar_requires_history_and_drag_clamps_to_real_offsets() {
         let bounds = Rectangle {
             x: 20.0,
             y: 30.0,
@@ -1679,7 +2465,6 @@ mod tests {
             alternate_screen: false,
             mouse_tracking: false,
         };
-        assert!(TerminalScrollbar::new(bounds, scroll, false).is_none());
         assert!(
             TerminalScrollbar::new(
                 bounds,
@@ -1687,7 +2472,6 @@ mod tests {
                     alternate_screen: true,
                     ..scroll
                 },
-                true
             )
             .is_none()
         );
@@ -1698,16 +2482,137 @@ mod tests {
                     total: 20,
                     ..scroll
                 },
-                true
             )
             .is_none()
         );
-        let bar = TerminalScrollbar::new(bounds, scroll, true).unwrap();
+        // An unfocused terminal paints its rail only while scrolled back, so a
+        // card left in history says so and a live one stays clean.
+        let live = super::super::ScrollSnapshot {
+            offset: scroll.max_offset(),
+            ..scroll
+        };
+        assert!(TerminalScrollbar::visible(scroll, false));
+        assert!(!TerminalScrollbar::visible(live, false));
+        assert!(TerminalScrollbar::visible(live, true));
+        let bar = TerminalScrollbar::new(bounds, scroll).unwrap();
         assert_eq!(bar.thumb.height, 60.0);
         assert_eq!(bar.row_at(bar.thumb.y + 10.0, 10.0), 40);
         assert_eq!(bar.row_at(-500.0, 10.0), 0);
         assert_eq!(bar.row_at(900.0, 10.0), 80);
         assert_eq!(bar.track.x + bar.track.width, bounds.x + bounds.width);
+    }
+
+    #[test]
+    fn shifted_paging_keys_move_the_viewport_and_nothing_else_does() {
+        let named = |key| keyboard::Key::Named(key);
+        let shift = keyboard::Modifiers::SHIFT;
+        assert_eq!(
+            viewport_scroll(&named(keyboard::key::Named::PageUp), shift, 24),
+            Some(ViewportScroll::Lines(-23))
+        );
+        assert_eq!(
+            viewport_scroll(&named(keyboard::key::Named::PageDown), shift, 24),
+            Some(ViewportScroll::Lines(23))
+        );
+        assert_eq!(
+            viewport_scroll(&named(keyboard::key::Named::Home), shift, 24),
+            Some(ViewportScroll::Top)
+        );
+        assert_eq!(
+            viewport_scroll(&named(keyboard::key::Named::End), shift, 24),
+            Some(ViewportScroll::Bottom)
+        );
+        // A one-row grid still steps by a row rather than standing still.
+        assert_eq!(
+            viewport_scroll(&named(keyboard::key::Named::PageUp), shift, 1),
+            Some(ViewportScroll::Lines(-1))
+        );
+        // Unshifted and over-modified paging keys belong to the child.
+        assert_eq!(
+            viewport_scroll(
+                &named(keyboard::key::Named::PageUp),
+                keyboard::Modifiers::empty(),
+                24
+            ),
+            None
+        );
+        assert_eq!(
+            viewport_scroll(
+                &named(keyboard::key::Named::PageUp),
+                shift | keyboard::Modifiers::CTRL,
+                24
+            ),
+            None
+        );
+        assert_eq!(
+            viewport_scroll(&keyboard::Key::Character("a".into()), shift, 24),
+            None
+        );
+    }
+
+    #[test]
+    fn cursor_blink_alternates_per_phase_and_restarts_after_a_stall() {
+        let mut state = WidgetState::default();
+        let start = Instant::now();
+        let anchor = Some((3, 4));
+        // The first frame lights the cursor and asks for exactly one redraw,
+        // one phase out.
+        assert_eq!(state.advance_blink(start, anchor), start + BLINK_PHASE);
+        assert!(!state.cursor_dark);
+        // Crossing a boundary flips the phase once.
+        assert_eq!(
+            state.advance_blink(start + BLINK_PHASE, anchor),
+            start + BLINK_PHASE * 2
+        );
+        assert!(state.cursor_dark);
+        // A frame inside the phase changes nothing and does not move the
+        // deadline.
+        assert_eq!(
+            state.advance_blink(start + BLINK_PHASE + BLINK_PHASE / 2, anchor),
+            start + BLINK_PHASE * 2
+        );
+        assert!(state.cursor_dark);
+        // A long gap - unfocused, occluded - restarts the cycle lit instead of
+        // folding every elapsed phase.
+        let resumed = start + BLINK_PHASE * 9;
+        state.advance_blink(resumed, anchor);
+        assert!(!state.cursor_dark);
+        state.advance_blink(resumed + BLINK_PHASE, anchor);
+        assert!(state.cursor_dark);
+        // A cursor that moved - the user typed - is lit again immediately.
+        state.advance_blink(resumed + BLINK_PHASE, Some((3, 5)));
+        assert!(!state.cursor_dark);
+    }
+
+    #[test]
+    fn pointer_positions_inside_one_cell_share_a_motion_key() {
+        let bounds = Rectangle {
+            x: 12.0,
+            y: 18.0,
+            width: 400.0,
+            height: 300.0,
+        };
+        let geometry = TerminalGeometry::new(
+            bounds,
+            DEFAULT_FONT_SIZE,
+            1.0,
+            "",
+            LINE_HEIGHT_RATIO,
+            DEFAULT_PADDING,
+        );
+        let key = |x: f32, y: f32| {
+            geometry
+                .cursor_position(mouse::Cursor::Available(Point::new(x, y)))
+                .map(|position| geometry.cell_at(position))
+        };
+        let cell = geometry.cell_bounds(3, 2).unwrap();
+        assert_eq!(key(cell.x + 0.5, cell.y + 0.5), Some((3, 2)));
+        assert_eq!(
+            key(cell.x + cell.width - 0.5, cell.y + cell.height - 0.5),
+            Some((3, 2))
+        );
+        assert_eq!(key(cell.x + cell.width + 0.5, cell.y + 0.5), Some((4, 2)));
+        assert_eq!(key(cell.x + 0.5, cell.y + cell.height + 0.5), Some((3, 3)));
     }
 
     #[test]
@@ -1735,7 +2640,7 @@ mod tests {
                     alternate_screen: false,
                     mouse_tracking: false,
                 };
-                let bar = TerminalScrollbar::new(bounds, scroll, true).unwrap();
+                let bar = TerminalScrollbar::new(bounds, scroll).unwrap();
                 assert!(geometry.content_bounds.x + geometry.content_bounds.width <= bar.track.x);
                 let final_cell = geometry
                     .cell_bounds(geometry.columns - 1, geometry.rows - 1)
@@ -1785,7 +2690,7 @@ mod tests {
                 width,
                 height: 10.0,
             };
-            let bar = TerminalScrollbar::new(bounds, scroll, true).unwrap();
+            let bar = TerminalScrollbar::new(bounds, scroll).unwrap();
             assert!(bar.thumb.x >= bounds.x);
             assert!(bar.thumb.x + bar.thumb.width <= bounds.x + bounds.width);
             assert_eq!(bar.thumb.height, bounds.height);
@@ -2595,5 +3500,113 @@ mod tests {
                 "a family change must reshape every row"
             );
         }
+    }
+
+    /// A grid whose first row sits well inside scrollback, so that anything
+    /// confusing a viewport row for an absolute one fails here.
+    fn selection_grid(rows: &[Arc<RowSnapshot>], columns: u16) -> SelectionGrid<'_> {
+        SelectionGrid {
+            rows,
+            offset: 7,
+            columns,
+        }
+    }
+
+    fn at(row: u64, column: u16) -> SelectionCell {
+        SelectionCell { row, column }
+    }
+
+    #[test]
+    fn a_selection_covers_the_same_span_whichever_way_it_was_dragged() {
+        let rows = vec![row("first row"), row("second row"), row("third row")];
+        let grid = selection_grid(&rows, 12);
+        let dragged = |anchor, head| {
+            Selection {
+                anchor,
+                head,
+                mode: SelectionMode::Character,
+            }
+            .span(grid)
+        };
+
+        let (top, bottom) = (at(7, 4), at(9, 2));
+        assert_eq!(dragged(top, bottom), (top, bottom));
+        assert_eq!(dragged(bottom, top), (top, bottom));
+        assert_eq!(
+            selection_text(grid, dragged(bottom, top)),
+            selection_text(grid, dragged(top, bottom))
+        );
+
+        // And leftward within one row, where only the column differs.
+        let (left, right) = (at(8, 1), at(8, 4));
+        assert_eq!(dragged(right, left), (left, right));
+    }
+
+    #[test]
+    fn selected_text_trims_each_row_and_joins_them_with_newlines() {
+        let rows = vec![row("cargo check     "), row("ok              ")];
+        let grid = selection_grid(&rows, 16);
+        assert_eq!(
+            selection_text(grid, (at(7, 0), at(8, 15))),
+            "cargo check\nok"
+        );
+        // A partial first row still runs to the end of that row, and only the
+        // last row stops at the head column.
+        assert_eq!(selection_text(grid, (at(7, 6), at(8, 0))), "check\no");
+
+        // A wide cluster's trailing cell carries no text, so the glyph its
+        // first cell contributed is not repeated.
+        let wide = Arc::new(RowSnapshot {
+            cells: vec![
+                CellSnapshot {
+                    text: CellText::new("日"),
+                    ..CellSnapshot::default()
+                },
+                CellSnapshot::default(),
+                CellSnapshot {
+                    text: CellText::new("x"),
+                    ..CellSnapshot::default()
+                },
+            ],
+        });
+        let rows = vec![wide];
+        assert_eq!(
+            selection_text(selection_grid(&rows, 3), (at(7, 0), at(7, 2))),
+            "日x"
+        );
+    }
+
+    #[test]
+    fn a_double_click_takes_the_whole_token_and_a_blank_run_whole_too() {
+        let token = "src/app/chat_ui.rs:488";
+        let rows = vec![row(&format!("see {token}   next"))];
+        let grid = selection_grid(&rows, 40);
+        let clicked = |column, mode| Selection::new(at(7, column), mode).span(grid);
+
+        // A path with a line number in it is one thing the user meant to
+        // grab, not five tokens separated by punctuation.
+        let start = "see ".len() as u16;
+        let span = clicked(start + 6, SelectionMode::Word);
+        assert_eq!(span, (at(7, start), at(7, start + token.len() as u16 - 1)));
+        assert_eq!(selection_text(grid, span), token);
+
+        let blanks = start + token.len() as u16;
+        assert_eq!(
+            clicked(blanks + 1, SelectionMode::Word),
+            (at(7, blanks), at(7, blanks + 2))
+        );
+
+        // A triple click takes the row whole, however far into it it landed.
+        assert_eq!(clicked(5, SelectionMode::Line), (at(7, 0), at(7, 39)));
+    }
+
+    #[test]
+    fn a_paste_arrives_as_carriage_returns_and_never_carries_a_nul() {
+        assert_eq!(
+            normalize_paste("one\r\ntwo\nthree\rfour"),
+            "one\rtwo\rthree\rfour"
+        );
+        assert_eq!(normalize_paste("trailing\r\n"), "trailing\r");
+        assert_eq!(normalize_paste("a\0b"), "ab");
     }
 }

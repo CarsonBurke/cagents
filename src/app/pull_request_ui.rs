@@ -55,10 +55,6 @@ pub struct State {
 }
 
 impl State {
-    pub fn target(&self) -> Option<&Target> {
-        self.target.as_ref()
-    }
-
     /// Call after selection, repository refresh, or HEAD changes, including while
     /// another inspector tab is visible. Old completions cannot restore old data.
     pub fn synchronize(

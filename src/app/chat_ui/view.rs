@@ -24,6 +24,76 @@ fn body<'a>(text: impl Into<Cow<'a, str>> + 'a) -> Element<'a, Message> {
         .width(Length::Fill)
         .into()
 }
+/// The copy control's label for code block `index`.
+///
+/// The transcript is rebuilt on every frame of a streaming turn, so the labels
+/// a message plausibly needs are spelled out instead of formatted per frame.
+fn code_label(index: usize) -> Cow<'static, str> {
+    const LABELS: [&str; 8] = [
+        "Copy code block 1",
+        "Copy code block 2",
+        "Copy code block 3",
+        "Copy code block 4",
+        "Copy code block 5",
+        "Copy code block 6",
+        "Copy code block 7",
+        "Copy code block 8",
+    ];
+    LABELS.get(index).map_or_else(
+        || Cow::Owned(format!("Copy code block {}", index + 1)),
+        |label| Cow::Borrowed(*label),
+    )
+}
+/// The icon and tooltip for a submit control.
+///
+/// `slot` is the control's place among the modes the provider currently
+/// allows: the first answers to Ctrl+Enter and the second to Ctrl+Shift+Enter,
+/// so the tooltip names the chord the composer is bound to.
+fn submit_control(mode: PromptMode, slot: usize) -> (&'static str, &'static str) {
+    match (mode, slot) {
+        (PromptMode::Send, _) => ("mail-send-symbolic", "Send message — Ctrl+Enter"),
+        (PromptMode::Steer, 0) => ("go-jump-symbolic", "Steer the active turn — Ctrl+Enter"),
+        (PromptMode::Steer, _) => (
+            "go-jump-symbolic",
+            "Steer the active turn — Ctrl+Shift+Enter",
+        ),
+        (PromptMode::Queue, 0) => ("list-add-symbolic", "Queue for the next turn — Ctrl+Enter"),
+        (PromptMode::Queue, _) => (
+            "list-add-symbolic",
+            "Queue for the next turn — Ctrl+Shift+Enter",
+        ),
+    }
+}
+/// The submit mode a composer key press asks for, or `None` when the press is
+/// ordinary editing.
+///
+/// `primary` and `alternate` are the modes the send controls accept right now;
+/// the chords must reach exactly those and nothing else. Plain Enter and
+/// Shift+Enter both break the line, as a composer for prose has to: binding
+/// the alternate mode to Shift+Enter would have made one keystroke insert a
+/// newline while the agent is idle and queue a turn while it is busy, which is
+/// the same key doing two unrelated things. The binding is consulted for every
+/// key press in the window, so an unfocused composer must not answer for one.
+/// `command` is Ctrl everywhere but macOS, where it is Cmd, so a single arm
+/// covers both platforms.
+fn submit_chord(
+    press: &text_editor::KeyPress,
+    primary: Option<PromptMode>,
+    alternate: Option<PromptMode>,
+) -> Option<PromptMode> {
+    if !matches!(press.status, text_editor::Status::Focused { .. })
+        || !matches!(press.key, keyboard::Key::Named(keyboard::key::Named::Enter))
+        || press.modifiers.alt()
+        || !press.modifiers.command()
+    {
+        return None;
+    }
+    if press.modifiers.shift() {
+        alternate
+    } else {
+        primary
+    }
+}
 fn command(target: Target, value: Command) -> Message {
     action(Action::Command(target, value))
 }
@@ -111,6 +181,16 @@ impl Runtime {
         let available =
             !transitioning && !self.disconnected && !self.snapshot.exited && self.pending.is_none();
         let snapshot = &self.snapshot;
+        // One theme lookup and one settings value per frame, rather than one
+        // per rendered message.
+        let markdown_settings = markdown::Settings::with_text_size(
+            design::TEXT_BODY,
+            markdown::Style::from(if cosmic::theme::is_dark() {
+                iced::Theme::Dark
+            } else {
+                iced::Theme::Light
+            }),
+        );
         let mut transcript = Vec::new();
         if snapshot.has_earlier {
             transcript.push(
@@ -133,7 +213,7 @@ impl Runtime {
             let Some(cached) = self.cache.get(&item.id) else {
                 continue;
             };
-            transcript.push(self.item_view(item, cached));
+            transcript.push(self.item_view(item, cached, markdown_settings));
         }
         let mut content = vec![
             widget::column::with_children(
@@ -394,8 +474,38 @@ impl Runtime {
                 .height(Length::Fill)
                 .into(),
         ];
+        let has_draft = !draft.trim().is_empty() || !self.attachments.is_empty();
+        // The submit modes the send controls expose, in the order the keyboard
+        // reaches them: the first is Ctrl+Enter, the second Ctrl+Shift+Enter.
+        let modes: &[PromptMode] = if snapshot.busy {
+            match (snapshot.capabilities.steer, snapshot.capabilities.queue) {
+                (true, true) => &[PromptMode::Steer, PromptMode::Queue],
+                (true, false) => &[PromptMode::Steer],
+                (false, true) => &[PromptMode::Queue],
+                (false, false) => &[],
+            }
+        } else {
+            &[PromptMode::Send]
+        };
+        let placeholder = match (modes.first(), modes.get(1)) {
+            (Some(PromptMode::Send), _) => "Message · Enter for a new line · Ctrl+Enter to send",
+            (Some(PromptMode::Steer), Some(_)) => {
+                "Message · Enter for a new line · Ctrl+Enter to steer · Ctrl+Shift+Enter to queue"
+            }
+            (Some(PromptMode::Steer), None) => {
+                "Message · Enter for a new line · Ctrl+Enter to steer"
+            }
+            (Some(PromptMode::Queue), _) => "Message · Enter for a new line · Ctrl+Enter to queue",
+            (None, _) => "Message · Enter for a new line · this turn accepts no further input",
+        };
+        // A chord only submits what a send control would accept right now.
+        let submit = if available && has_draft {
+            (modes.first().copied(), modes.get(1).copied())
+        } else {
+            (None, None)
+        };
         content.push(if transitioning {
-            widget::container(widget::scrollable(body(draft.clone())).direction(
+            widget::container(widget::scrollable(body(draft)).direction(
                 cosmic::iced::widget::scrollable::Direction::Vertical(crate::design::scrollbar()),
             ))
             .height(104)
@@ -405,14 +515,22 @@ impl Runtime {
         } else {
             iced::widget::text_editor::TextEditor::new(&self.composer)
                 .id(card_control_id(target.card, "chat-composer"))
-                .placeholder("Message · Enter for a new line · use Send to submit")
+                .placeholder(placeholder)
                 .size(design::TEXT_BODY)
                 .height(104)
                 .padding(8)
                 .on_action(move |event| action(Action::Composer(target, event)))
+                .key_binding(move |press| {
+                    match submit_chord(&press, submit.0, submit.1) {
+                        Some(mode) => Some(text_editor::Binding::Custom(action(Action::Submit(
+                            target, mode,
+                        )))),
+                        // Everything else, Enter included, edits the draft.
+                        None => text_editor::Binding::from_key_press(press),
+                    }
+                })
                 .into()
         });
-        let has_draft = !draft.trim().is_empty() || !self.attachments.is_empty();
         let mut actions = Vec::new();
         if snapshot.capabilities.attachments {
             actions.push(icon(
@@ -458,35 +576,21 @@ impl Runtime {
             });
         }
         actions.push(iced::widget::Space::new().width(Length::Fill).into());
+        for (slot, mode) in modes.iter().enumerate() {
+            let (name, label) = submit_control(*mode, slot);
+            actions.push(icon(
+                name,
+                label,
+                available && has_draft,
+                Action::Submit(target, *mode),
+            ));
+        }
         if snapshot.busy {
-            if snapshot.capabilities.steer {
-                actions.push(icon(
-                    "go-jump-symbolic",
-                    "Steer the active turn",
-                    available && has_draft,
-                    Action::Submit(target, PromptMode::Steer),
-                ));
-            }
-            if snapshot.capabilities.queue {
-                actions.push(icon(
-                    "list-add-symbolic",
-                    "Queue for the next turn",
-                    available && has_draft,
-                    Action::Submit(target, PromptMode::Queue),
-                ));
-            }
             actions.push(icon(
                 "media-playback-stop-symbolic",
                 "Cancel active turn",
                 available,
                 Action::Command(target, Command::Interrupt),
-            ));
-        } else {
-            actions.push(icon(
-                "mail-send-symbolic",
-                "Send message",
-                available && has_draft,
-                Action::Submit(target, PromptMode::Send),
             ));
         }
         content.push(
@@ -569,6 +673,7 @@ impl Runtime {
         &'a self,
         item: &'a chat::Item,
         cached: &'a CachedItem,
+        settings: markdown::Settings,
     ) -> Element<'a, Message> {
         let target = self.target;
         let mut rows = Vec::new();
@@ -617,26 +722,15 @@ impl Runtime {
                     if self.raw.contains(&item.id) {
                         rows.push(body(text.as_str()));
                     } else {
-                        let theme = if cosmic::theme::is_dark() {
-                            iced::Theme::Dark
-                        } else {
-                            iced::Theme::Light
-                        };
                         rows.push(
-                            markdown::view(
-                                &cached.markdown,
-                                markdown::Settings::with_text_size(
-                                    design::TEXT_BODY,
-                                    markdown::Style::from(theme),
-                                ),
-                            )
-                            .map(|uri| action(Action::OpenUrl(uri.to_string())))
-                            .into(),
+                            markdown::view(cached.markdown.items(), settings)
+                                .map(|uri| action(Action::OpenUrl(uri.to_string())))
+                                .into(),
                         );
-                        for index in 0..cached.codes.len() {
+                        for index in 0..cached.code.codes.len() {
                             rows.push(icon(
                                 "edit-copy-symbolic",
-                                format!("Copy code block {}", index + 1),
+                                code_label(index),
                                 true,
                                 Action::Copy(target, item.id.clone(), CopyPart::Code(index)),
                             ));
@@ -644,19 +738,10 @@ impl Runtime {
                     }
                 }
             }
-            ItemContent::Tool {
-                name,
-                input,
-                output,
-                status,
-            } => {
-                let status = match status {
-                    chat::ToolStatus::Running => "Running",
-                    chat::ToolStatus::Succeeded => "Completed",
-                    chat::ToolStatus::Failed => "Failed",
-                    chat::ToolStatus::Denied => "Denied",
-                };
-                heading.push(crate::design::caption(format!("{name} · {status}")).into());
+            ItemContent::Tool { input, output, .. } => {
+                if let Some(detail) = &cached.detail {
+                    heading.push(crate::design::caption(detail.as_str()).into());
+                }
                 heading.push(icon(
                     "pan-down-symbolic",
                     "Expand or collapse tool details",
@@ -834,5 +919,106 @@ impl Runtime {
         .padding(10)
         .width(Length::Fill)
         .into()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn press(modifiers: keyboard::Modifiers, focused: bool) -> text_editor::KeyPress {
+        let key = keyboard::Key::Named(keyboard::key::Named::Enter);
+        text_editor::KeyPress {
+            key: key.clone(),
+            modified_key: key,
+            physical_key: keyboard::key::Physical::Code(keyboard::key::Code::Enter),
+            modifiers,
+            text: None,
+            status: if focused {
+                text_editor::Status::Focused { is_hovered: false }
+            } else {
+                text_editor::Status::Active
+            },
+        }
+    }
+
+    /// The composer is the product's primary input: a chord must reach the
+    /// send controls, and a bare Enter must never send a half-written message.
+    #[test]
+    fn only_the_documented_chords_submit() {
+        let send = Some(PromptMode::Send);
+        let queue = Some(PromptMode::Queue);
+
+        assert_eq!(
+            submit_chord(&press(keyboard::Modifiers::COMMAND, true), send, None),
+            send
+        );
+        assert_eq!(
+            submit_chord(
+                &press(
+                    keyboard::Modifiers::COMMAND | keyboard::Modifiers::SHIFT,
+                    true
+                ),
+                send,
+                queue
+            ),
+            queue
+        );
+        // No alternate mode on offer: the chord falls back to a line break.
+        assert_eq!(
+            submit_chord(
+                &press(
+                    keyboard::Modifiers::COMMAND | keyboard::Modifiers::SHIFT,
+                    true
+                ),
+                send,
+                None
+            ),
+            None
+        );
+        for modifiers in [
+            keyboard::Modifiers::default(),
+            // Shift+Enter must stay a line break whether or not the provider
+            // is offering an alternate mode, or one keystroke would mean two
+            // unrelated things depending on whether the agent is busy.
+            keyboard::Modifiers::SHIFT,
+            keyboard::Modifiers::ALT,
+            keyboard::Modifiers::COMMAND | keyboard::Modifiers::ALT,
+        ] {
+            assert_eq!(
+                submit_chord(&press(modifiers, true), send, queue),
+                None,
+                "{modifiers:?} must edit the draft rather than submit it"
+            );
+        }
+        // The binding is offered every key press in the window.
+        assert_eq!(
+            submit_chord(&press(keyboard::Modifiers::COMMAND, false), send, queue),
+            None
+        );
+        // Nothing to submit: the chord falls back to inserting a line.
+        assert_eq!(
+            submit_chord(&press(keyboard::Modifiers::COMMAND, true), None, None),
+            None
+        );
+    }
+
+    /// Every submit control's tooltip has to name the chord bound to it, or the
+    /// keyboard path stays invisible.
+    #[test]
+    fn submit_tooltips_name_their_chord() {
+        for (mode, slot, chord) in [
+            (PromptMode::Send, 0, "Ctrl+Enter"),
+            (PromptMode::Steer, 0, "Ctrl+Enter"),
+            (PromptMode::Queue, 0, "Ctrl+Enter"),
+            (PromptMode::Steer, 1, "Ctrl+Shift+Enter"),
+            (PromptMode::Queue, 1, "Ctrl+Shift+Enter"),
+        ] {
+            let (_, label) = submit_control(mode, slot);
+            assert!(
+                label.ends_with(chord),
+                "{mode:?} in slot {slot} is bound to {chord} but reads {label:?}"
+            );
+        }
     }
 }

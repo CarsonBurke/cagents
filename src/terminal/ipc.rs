@@ -337,6 +337,25 @@ pub struct ServerEnvelope {
     pub message: ServerMessage,
 }
 
+/// A borrowed, serialize-only view of [`ServerEnvelope`].
+///
+/// The daemon fans one broadcast out to every subscriber of a terminal, and the
+/// session proof is three `String`s. Cloning the owned envelope per subscriber
+/// made a redraw edge allocate proportionally to the subscriber count, so the
+/// per-client queue keeps the proof behind an `Arc` and the writer serializes
+/// through this view instead.
+///
+/// The field order, names and types are exactly [`ServerEnvelope`]'s, so the
+/// postcard encoding is byte-identical; `borrowed_envelope_encodes_identically`
+/// pins that.
+#[derive(Debug, Serialize)]
+pub struct ServerEnvelopeRef<'envelope> {
+    pub version: u16,
+    pub request_id: Option<u64>,
+    pub proof: &'envelope HostSessionProof,
+    pub message: &'envelope ServerMessage,
+}
+
 // Boxing the large payload would change this public wire type's construction and
 // pattern-matching API; keep the stable API intact.
 #[allow(clippy::large_enum_variant)]
@@ -497,6 +516,7 @@ pub enum ShutdownOutcome {
         live_terminals_before: u64,
         termination_requested: bool,
     },
+    /// The caller asked for an empty daemon and the daemon is not empty.
     EmptyRequired {
         current_count: u64,
     },
@@ -507,6 +527,13 @@ pub enum ShutdownOutcome {
     DaemonRestarted,
     InvalidCapability,
     AlreadyShuttingDown,
+    /// Native chats still own work, so an unconditional stop was refused: the
+    /// operator has to observe the inventory and re-issue through the
+    /// preflight/confirm capability. Appended last, so the postcard variant
+    /// index of every variant above is unchanged.
+    ConfirmationRequired {
+        current_count: u64,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -1391,6 +1418,36 @@ mod tests {
             };
             assert_eq!(TerminalEvent::from(decoded), event);
         }
+    }
+
+    /// The daemon's writer serializes `ServerEnvelopeRef`, but every peer
+    /// decodes `ServerEnvelope`. A field reorder or type change on either side
+    /// would silently mis-decode, so pin the encoding rather than the shape.
+    #[test]
+    fn borrowed_envelope_encodes_identically() {
+        let envelope = ServerEnvelope {
+            version: PROTOCOL_VERSION,
+            request_id: Some(7),
+            proof: proof("session", "boot", "incarnation"),
+            message: ServerMessage::Redraw {
+                terminal_id: TerminalId::new(),
+                generation: 42,
+            },
+        };
+        let mut owned = Vec::new();
+        write_frame(&mut owned, &envelope).unwrap();
+        let mut borrowed = Vec::new();
+        write_frame(
+            &mut borrowed,
+            &ServerEnvelopeRef {
+                version: envelope.version,
+                request_id: envelope.request_id,
+                proof: &envelope.proof,
+                message: &envelope.message,
+            },
+        )
+        .unwrap();
+        assert_eq!(owned, borrowed);
     }
 
     #[test]

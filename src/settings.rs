@@ -345,6 +345,24 @@ impl EditorSyntaxTheme {
             Self::InspiredGitHub => "Inspired GitHub",
         }
     }
+
+    /// The stable identifier the settings surface round-trips. Deliberately
+    /// hand-written rather than derived from the serde rename, so renaming a
+    /// variant cannot silently change the value the UI parses.
+    pub const fn key(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::SolarizedDark => "solarized_dark",
+            Self::Mocha => "mocha",
+            Self::Ocean => "ocean",
+            Self::Eighties => "eighties",
+            Self::InspiredGitHub => "inspired_github",
+        }
+    }
+
+    pub fn from_key(key: &str) -> Option<Self> {
+        Self::ALL.iter().copied().find(|theme| theme.key() == key)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

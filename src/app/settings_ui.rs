@@ -320,6 +320,23 @@ fn settings_category_controls<'a>(
                 ],
             ),
             settings_group(
+                "Editor",
+                "Syntax colors for native editors and the diff surface. Applies immediately to every open column.",
+                vec![settings_choice(
+                    "Syntax theme",
+                    "Match app follows the interface color scheme, including later theme changes.",
+                    SettingsField::EditorSyntaxTheme,
+                    settings::EditorSyntaxTheme::ALL.iter().map(|theme| {
+                        (
+                            theme.label(),
+                            theme.key(),
+                            draft.editor_syntax_theme == *theme,
+                        )
+                    }),
+                    progress,
+                )],
+            ),
+            settings_group(
                 "Workspace layout",
                 "Keep navigation and context readable without giving up working space.",
                 vec![setting_stepper(
@@ -730,14 +747,15 @@ pub(super) fn settings_dialog<'a>(
             .width(Length::Fill)
             .into()
     };
-    let reset = crate::ui_controls::icon_control(
-        crate::ui_controls::symbolic_icon("edit-undo-symbolic"),
-        "Reset all settings to defaults",
-        false,
-        true,
-        Some(Message::ResetSettings),
-    )
-    .into();
+    // A destructive, irreversible action does not belong behind an unlabelled
+    // 30px glyph whose tooltip needs a 1000ms dwell to appear. This control now
+    // only raises the confirmation, which carries the destructive button.
+    let reset = widget::button::standard("Reset all settings")
+        .id(widget::Id::new("settings.reset"))
+        .name("Reset all settings to defaults")
+        .leading_icon(crate::ui_controls::symbolic_icon("edit-undo-symbolic"))
+        .on_press(Message::ResetSettings)
+        .into();
     let footer: Element<'a, Message> = widget::row::with_children(vec![feedback, reset])
         .align_y(Alignment::Center)
         .spacing(3.0 * design::GRID_UNIT)
@@ -761,7 +779,7 @@ pub(super) fn settings_dialog<'a>(
     )
     .padding([2.0 * design::GRID_UNIT, gutter])
     .width(Length::Fill);
-    let surface = dialog_ui::surface(
+    let surface = dialog_ui::connected_surface(
         widget::column::with_children(vec![
             header.into(),
             widget::divider::horizontal::default().into(),

@@ -12,9 +12,45 @@ pub const DENSE_ROW_HEIGHT: f32 = 28.0;
 pub const PRIMARY_CONTROL_SIZE: f32 = 30.0;
 pub const SECONDARY_CONTROL_MIN_SIZE: f32 = 30.0;
 
+/// Icons that sit inside a row, beside its text. Every surface that renders
+/// this role - navigation rows, panel rows, header status - uses this token, so
+/// the same role cannot be 16px in one pane and 14px in the next.
+pub const ROW_ICON_SIZE: u16 = 16;
+/// Icons that stand alone as the illustration of a whole pane state.
+pub const STATUS_ICON_SIZE: u16 = 20;
+
 pub const TEXT_BODY: f32 = 13.0;
 pub const TEXT_CAPTION: f32 = 11.0;
 pub const TEXT_HEADING: f32 = 13.0;
+
+/// The shell's "working" tone: something is in flight and may still fail.
+pub fn warning_color(theme: &cosmic::Theme) -> cosmic::iced::Color {
+    theme.cosmic().warning.base.into()
+}
+
+/// A color resolved when a widget draws, rather than when a view is built.
+///
+/// `cosmic::theme::active()` locks the process-global theme and clones the
+/// active `Theme`, so a per-row builder that reached for a semantic color paid
+/// that round trip once per visible row per frame. Naming the resolver instead
+/// lets the widget read the `&Theme` its own `draw` is already handed, which is
+/// also the theme the frame actually renders with.
+#[derive(Clone, Copy)]
+pub enum Tone {
+    /// A color the caller has already resolved.
+    Fixed(cosmic::iced::Color),
+    /// A semantic color, read from the drawing theme.
+    Themed(fn(&cosmic::Theme) -> cosmic::iced::Color),
+}
+
+impl Tone {
+    pub fn resolve(self, theme: &cosmic::Theme) -> cosmic::iced::Color {
+        match self {
+            Self::Fixed(color) => color,
+            Self::Themed(resolve) => resolve(theme),
+        }
+    }
+}
 
 /// Secondary labels stay readable without competing with active content.
 pub fn muted_color(theme: &cosmic::Theme) -> cosmic::iced::Color {
@@ -27,6 +63,19 @@ pub fn muted_text(theme: &cosmic::Theme) -> cosmic::iced::widget::text::Style {
     cosmic::iced::widget::text::Style {
         color: Some(muted_color(theme)),
         ..Default::default()
+    }
+}
+
+/// Symbolic icons ignore alpha in their SVG recoloring. Blend them toward the
+/// surface instead so muted navigation glyphs stay visibly quieter than text.
+pub fn muted_icon_color(theme: &cosmic::Theme) -> cosmic::iced::Color {
+    let on: cosmic::iced::Color = theme.current_container().on.into();
+    let base: cosmic::iced::Color = theme.current_container().base.into();
+    cosmic::iced::Color {
+        r: on.r * 0.38 + base.r * 0.62,
+        g: on.g * 0.38 + base.g * 0.62,
+        b: on.b * 0.38 + base.b * 0.62,
+        a: 1.0,
     }
 }
 
@@ -66,8 +115,11 @@ pub const INSPECTOR_DEFAULT_WIDTH: f32 = 380.0;
 pub const INSPECTOR_MAX_WIDTH: f32 = 480.0;
 
 /// Shared gutter geometry for native scrollables and custom-rendered content.
-pub const SCROLLBAR_GUTTER: f32 = 10.5;
-pub const SCROLLBAR_THUMB_WIDTH: f32 = 7.5;
+///
+/// Keep the reserved rail slightly wider than the visible thumb so content
+/// never crowds the scrollbar at fractional display scales.
+pub const SCROLLBAR_GUTTER: f32 = 12.0;
+pub const SCROLLBAR_THUMB_WIDTH: f32 = 6.0;
 pub const SCROLLBAR_MARGIN: f32 = 1.5;
 pub const BORDER_WIDTH: f32 = 1.0;
 

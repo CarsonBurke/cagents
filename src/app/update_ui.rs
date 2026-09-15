@@ -117,13 +117,25 @@ impl Cagents {
         } else {
             return None;
         };
+        // `window_update_blocker` already computes the actionable reason this
+        // window would refuse the update; without consulting it here the
+        // control stays live, `update::apply` runs, and the refusal only
+        // surfaces asynchronously through the notices popover.
+        let blocker = matches!(action, Some(Message::UpdateUi(Action::Apply)))
+            .then(|| self.window_update_blocker())
+            .flatten();
+        let label = match blocker {
+            Some(reason) => format!("{label} — {reason}"),
+            None => label,
+        };
+        let enabled = !self.modal_is_open() && action.is_some() && blocker.is_none();
         Some(
             crate::ui_controls::icon_control(
                 crate::ui_controls::symbolic_icon(icon),
                 label,
                 false,
-                !self.modal_is_open() && action.is_some(),
-                (!self.modal_is_open()).then_some(action).flatten(),
+                enabled,
+                enabled.then_some(action).flatten(),
             )
             .id(widget::Id::new("application-update"))
             .into(),
@@ -167,7 +179,14 @@ impl Cagents {
                 Task::none()
             }
             Action::Apply => {
-                if self.modal_is_open() || self.update_ui.updating() {
+                if self.update_ui.updating() {
+                    return Task::none();
+                }
+                // The daemon handshake refuses a blocked update anyway; fail
+                // here so the reason reaches the user as a notice instead of
+                // an opaque asynchronous failure.
+                if let Some(reason) = self.window_update_blocker() {
+                    self.status = Some(TransientNotice::warning(reason.to_owned()));
                     return Task::none();
                 }
                 let Some(UpdateState::Available { release }) = &self.update_ui.result else {

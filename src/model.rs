@@ -888,6 +888,16 @@ pub enum BrowserRestoreFidelity {
     UrlOnly,
 }
 
+/// How many history entries a browser card retains.
+///
+/// The whole history vector is re-serialized into `browser_restore.history_json`
+/// on every navigation, so an uncapped history makes each single navigation cost
+/// time proportional to the card's entire lifetime — on both the serializer and
+/// the SQLite blob write. A few hundred entries is far more back-history than
+/// any user traverses while keeping that per-navigation cost flat; older
+/// entries are dropped from the front.
+pub const BROWSER_HISTORY_LIMIT: usize = 256;
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct BrowserSession {
     pub id: BrowserId,
@@ -918,9 +928,26 @@ impl BrowserSession {
         } else if descriptor.history_index >= descriptor.history.len() {
             descriptor.history_index = descriptor.history.len() - 1;
         }
+        trim_browser_history(&mut descriptor.history, &mut descriptor.history_index);
         descriptor.fidelity = BrowserRestoreFidelity::HistoryAndScroll;
         descriptor
     }
+}
+
+/// Drops the oldest entries until the history fits [`BROWSER_HISTORY_LIMIT`],
+/// keeping `index` pointed at the same entry it pointed at before.
+///
+/// Recent history — everything a user can reach with the back button — is
+/// preserved exactly; only entries older than the cap are forgotten.
+pub fn trim_browser_history(history: &mut Vec<Url>, index: &mut usize) {
+    let Some(excess) = history.len().checked_sub(BROWSER_HISTORY_LIMIT) else {
+        return;
+    };
+    if excess == 0 {
+        return;
+    }
+    history.drain(..excess);
+    *index = index.saturating_sub(excess);
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1182,5 +1209,31 @@ mod tests {
             serde_json::from_slice::<LaunchRecipe>(&encoded).unwrap(),
             recipe
         );
+    }
+
+    #[test]
+    fn browser_history_trim_drops_the_oldest_entries_and_follows_the_cursor() {
+        let mut history: Vec<Url> = (0..BROWSER_HISTORY_LIMIT + 10)
+            .map(|index| Url::parse(&format!("https://example.test/{index}")).unwrap())
+            .collect();
+        let newest = history.last().cloned().unwrap();
+        let mut index = history.len() - 1;
+
+        trim_browser_history(&mut history, &mut index);
+
+        assert_eq!(history.len(), BROWSER_HISTORY_LIMIT);
+        assert_eq!(history[index], newest, "the cursor must follow its entry");
+        assert_eq!(
+            history[0],
+            Url::parse("https://example.test/10").unwrap(),
+            "the oldest entries are the ones dropped"
+        );
+
+        // Already inside the bound: nothing moves.
+        let mut short = vec![Url::parse("https://example.test/only").unwrap()];
+        let mut short_index = 0;
+        trim_browser_history(&mut short, &mut short_index);
+        assert_eq!(short.len(), 1);
+        assert_eq!(short_index, 0);
     }
 }

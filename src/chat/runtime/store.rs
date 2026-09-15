@@ -11,6 +11,8 @@ use std::{
 const PART_BYTES: usize = 128 * 1024;
 const WINDOW_BYTES: usize = 3 * 1024 * 1024;
 const WINDOW_ITEMS: usize = 128;
+/// The serialized item carries identity only, so it is not pageable and must stay small.
+const METADATA_LIMIT: usize = 64 * 1024;
 type Cursor = (i64, usize);
 pub(super) struct Window {
     pub items: Vec<Item>,
@@ -54,7 +56,7 @@ impl Store {
                 .map_err(|e| e.to_string())?;
             let db = Connection::open(&path).map_err(|e| e.to_string())?;
             db.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA cache_size=-8192; PRAGMA foreign_keys=ON;
-                CREATE TABLE items(id TEXT PRIMARY KEY, ordinal INTEGER UNIQUE NOT NULL, metadata BLOB NOT NULL, len0 INTEGER NOT NULL, len1 INTEGER NOT NULL);
+                CREATE TABLE items(id TEXT PRIMARY KEY, ordinal INTEGER UNIQUE NOT NULL, metadata BLOB NOT NULL, len0 INTEGER NOT NULL, len1 INTEGER NOT NULL, len2 INTEGER NOT NULL);
                 CREATE TABLE chunks(id TEXT NOT NULL REFERENCES items(id) ON DELETE CASCADE, field INTEGER NOT NULL, position INTEGER NOT NULL, data BLOB NOT NULL, PRIMARY KEY(id,field,position));").map_err(|e| e.to_string())?;
             Ok(Self {
                 db,
@@ -82,7 +84,11 @@ impl Store {
             )
             .map_err(|e| e.to_string())
     }
-    fn put(&mut self, mut item: Item, older: bool) -> Result<(), String> {
+    /// Every unbounded field becomes a byte-addressed chunk, so the serialized item
+    /// holds identity alone. Returns a non-fatal warning instead of an error when an
+    /// item's identity still cannot be cached intact: a single unrepresentable item
+    /// must never end the conversation.
+    fn put(&mut self, mut item: Item, older: bool) -> Result<Option<String>, String> {
         let previous: Option<(i64, Vec<u8>, i64)> = self
             .db
             .query_row(
@@ -93,7 +99,7 @@ impl Store {
             .optional()
             .map_err(|e| e.to_string())?;
         if older && previous.is_some() {
-            return Ok(());
+            return Ok(None);
         }
         let mut preserve_input = false;
         if let Some((_, metadata, _)) = &previous {
@@ -109,12 +115,18 @@ impl Store {
                 preserve_input = input.is_empty();
             }
         }
-        let (body0, body1) = match &mut item.content {
-            ItemContent::Text { text, .. } => (std::mem::take(text), String::new()),
+        let (body0, body1, body2) = match &mut item.content {
+            ItemContent::Text { text, .. } => (std::mem::take(text), String::new(), String::new()),
             ItemContent::Tool { input, output, .. } => {
-                (std::mem::take(input), std::mem::take(output))
+                (std::mem::take(input), std::mem::take(output), String::new())
             }
-            ItemContent::Image { description, .. } => (std::mem::take(description), String::new()),
+            // An inline attachment is a body, not identity: a screenshot data URL is
+            // routinely megabytes and would otherwise blow the identity budget.
+            ItemContent::Image { description, path } => (
+                std::mem::take(description),
+                String::new(),
+                std::mem::take(path),
+            ),
         };
         let ordinal = match &previous {
             Some((ordinal, _, _)) => *ordinal,
@@ -136,12 +148,32 @@ impl Store {
         } else {
             body0.len() as i64
         };
-        let metadata = postcard::to_stdvec(&item).map_err(|e| e.to_string())?;
-        if metadata.len() > 64 * 1024 {
-            return Err("Provider item identity/name/path metadata exceeds 64 KiB".into());
+        let mut metadata = postcard::to_stdvec(&item).map_err(|e| e.to_string())?;
+        let mut warning = None;
+        if metadata.len() > METADATA_LIMIT {
+            // A provider-supplied tool name is the only remaining unbounded identity
+            // field, so trim it rather than dropping a turn of the conversation.
+            if let ItemContent::Tool { name, .. } = &mut item.content {
+                let mut end = name.len().min(1024);
+                while end > 0 && !name.is_char_boundary(end) {
+                    end -= 1;
+                }
+                name.truncate(end);
+                metadata = postcard::to_stdvec(&item).map_err(|e| e.to_string())?;
+            }
+            warning = Some(format!(
+                "Provider item {} exceeded the 64 KiB identity budget; its name was truncated",
+                brief(&item.id)
+            ));
+        }
+        if metadata.len() > METADATA_LIMIT {
+            return Ok(Some(format!(
+                "Provider item {} exceeds the 64 KiB identity budget and was not cached",
+                brief(&item.id)
+            )));
         }
         let transaction = self.db.transaction().map_err(|e| e.to_string())?;
-        transaction.execute("INSERT INTO items VALUES(?1,?2,?3,?4,?5) ON CONFLICT(id) DO UPDATE SET metadata=excluded.metadata,len0=excluded.len0,len1=excluded.len1", params![item.id,ordinal,metadata,len0,body1.len() as i64]).map_err(|e| e.to_string())?;
+        transaction.execute("INSERT INTO items VALUES(?1,?2,?3,?4,?5,?6) ON CONFLICT(id) DO UPDATE SET metadata=excluded.metadata,len0=excluded.len0,len1=excluded.len1,len2=excluded.len2", params![item.id,ordinal,metadata,len0,body1.len() as i64,body2.len() as i64]).map_err(|e| e.to_string())?;
         if preserve_input {
             transaction
                 .execute("DELETE FROM chunks WHERE id=?1 AND field=1", [&item.id])
@@ -153,16 +185,26 @@ impl Store {
             insert_body(&transaction, &item.id, 0, 0, &body0)?;
         }
         insert_body(&transaction, &item.id, 1, 0, &body1)?;
+        insert_body(&transaction, &item.id, 2, 0, &body2)?;
         transaction.commit().map_err(|e| e.to_string())?;
         self.dirty = true;
-        Ok(())
+        Ok(warning)
     }
-    pub fn apply(&mut self, event: Event) -> Result<Option<Event>, String> {
-        if !matches!(&event, Event::TextDelta { .. }) {
-            self.flush_text()?;
+    /// Returns the events the store does not own, plus any non-fatal warning raised
+    /// while caching. Warnings are events, never errors: the caller must stay alive.
+    pub fn apply(&mut self, event: Event) -> Result<Vec<Event>, String> {
+        let mut out = Vec::new();
+        if !matches!(&event, Event::TextDelta { .. })
+            && let Some(warning) = self.flush_text()?
+        {
+            out.push(nonfatal(warning));
         }
         match event {
-            Event::Item(item) => self.put(item, false)?,
+            Event::Item(item) => {
+                if let Some(warning) = self.put(item, false)? {
+                    out.push(nonfatal(warning));
+                }
+            }
             Event::History {
                 mut items,
                 has_earlier,
@@ -170,8 +212,22 @@ impl Store {
                 self.provider_earlier = has_earlier;
                 let mut seen = std::collections::BTreeSet::new();
                 items.retain(|item| seen.insert(item.id.clone()));
+                let mut affected = 0usize;
+                let mut first_warning = None;
                 for item in items.into_iter().rev() {
-                    self.put(item, true)?;
+                    if let Some(warning) = self.put(item, true)? {
+                        affected += 1;
+                        if first_warning.is_none() {
+                            first_warning = Some(warning);
+                        }
+                    }
+                }
+                if let Some(warning) = first_warning {
+                    out.push(nonfatal(if affected > 1 {
+                        format!("{warning} ({affected} replayed items affected)")
+                    } else {
+                        warning
+                    }));
                 }
                 if let Some(first) = self.pending_earlier.take()
                     && self
@@ -199,10 +255,14 @@ impl Store {
                         || pending.2 != thinking
                         || pending.3.len() + delta.len() > 64 * 1024
                 }) {
-                    self.flush_text()?;
+                    if let Some(warning) = self.flush_text()? {
+                        out.push(nonfatal(warning));
+                    }
                 }
                 if delta.len() > 64 * 1024 {
-                    self.append(&id, role, thinking, &delta)?;
+                    if let Some(warning) = self.append(&id, role, thinking, &delta)? {
+                        out.push(nonfatal(warning));
+                    }
                 } else if let Some(pending) = &mut self.pending_text {
                     pending.3.push_str(&delta);
                 } else {
@@ -230,24 +290,38 @@ impl Store {
                 self.cached_earlier = false;
                 self.pending_earlier = None;
                 self.dirty = true;
-                return Ok(Some(Event::Reset { reason }));
+                out.push(Event::Reset { reason });
+                return Ok(out);
             }
-            other => return Ok(Some(other)),
+            other => {
+                out.push(other);
+                return Ok(out);
+            }
         }
-        Ok(None)
+        Ok(out)
     }
-    fn flush_text(&mut self) -> Result<(), String> {
-        if let Some(pending) = self.pending_text.take()
-            && let Err(error) = self.append(&pending.0, pending.1, pending.2, &pending.3)
-        {
-            self.pending_text = Some(pending);
-            return Err(error);
+    fn flush_text(&mut self) -> Result<Option<String>, String> {
+        match self.pending_text.take() {
+            Some(pending) => match self.append(&pending.0, pending.1, pending.2, &pending.3) {
+                Ok(warning) => Ok(warning),
+                Err(error) => {
+                    self.pending_text = Some(pending);
+                    Err(error)
+                }
+            },
+            None => Ok(None),
         }
-        Ok(())
     }
-    fn append(&mut self, id: &str, role: Role, thinking: bool, delta: &str) -> Result<(), String> {
+    fn append(
+        &mut self,
+        id: &str,
+        role: Role,
+        thinking: bool,
+        delta: &str,
+    ) -> Result<Option<String>, String> {
+        let mut warning = None;
         if !self.exists(id)? {
-            self.put(
+            warning = self.put(
                 Item {
                     id: id.into(),
                     role,
@@ -258,6 +332,10 @@ impl Store {
                 },
                 false,
             )?;
+            if !self.exists(id)? {
+                // The identity itself could not be cached; the delta has nowhere to go.
+                return Ok(warning);
+            }
         }
         let (metadata, length): (Vec<u8>, i64) = self
             .db
@@ -282,7 +360,7 @@ impl Store {
                 .map_err(|e| e.to_string())?;
             transaction.commit().map_err(|e| e.to_string())?;
         }
-        Ok(())
+        Ok(warning)
     }
     /// Returns true when earlier history is already cached (no provider command).
     pub fn earlier(&mut self) -> Result<bool, String> {
@@ -340,9 +418,9 @@ impl Store {
             .min(target))
     }
     pub(super) fn window(&mut self) -> Result<Window, String> {
-        self.flush_text()?;
+        let _ = self.flush_text()?;
         let records = {
-            let mut statement = self.db.prepare("SELECT id,ordinal,metadata,len0,len1 FROM items WHERE ordinal<=?1 ORDER BY ordinal DESC LIMIT 129").map_err(|e| e.to_string())?;
+            let mut statement = self.db.prepare("SELECT id,ordinal,metadata,len0,len1,len2 FROM items WHERE ordinal<=?1 ORDER BY ordinal DESC LIMIT 129").map_err(|e| e.to_string())?;
             let rows = statement
                 .query_map([self.end.map_or(i64::MAX, |cursor| cursor.0)], |row| {
                     Ok((
@@ -351,6 +429,7 @@ impl Store {
                         row.get::<_, Vec<u8>>(2)?,
                         row.get::<_, i64>(3)? as usize,
                         row.get::<_, i64>(4)? as usize,
+                        row.get::<_, i64>(5)? as usize,
                     ))
                 })
                 .map_err(|e| e.to_string())?;
@@ -361,7 +440,7 @@ impl Store {
         let mut bytes = 0;
         let mut first = None;
         let mut newest = None;
-        'records: for (id, ordinal, metadata, len0, len1) in records {
+        'records: for (id, ordinal, metadata, len0, len1, len2) in records {
             let base: Item = postcard::from_bytes(&metadata).map_err(|e| e.to_string())?;
             let total = len0 + len1;
             let parts = total.max(1).div_ceil(PART_BYTES);
@@ -391,6 +470,18 @@ impl Store {
                     end.saturating_sub(len0),
                 )?)
                 .map_err(|e| e.to_string())?;
+                // An inline attachment is never paged: half a base64 payload renders as
+                // nothing, so it is restored whole or replaced by an explanation.
+                let attachment =
+                    if len2 > 0 && metadata.len() + (end - start) + len2 + 128 <= WINDOW_BYTES {
+                        Some(
+                            String::from_utf8(self.field(&id, 2, 0, len2)?)
+                                .map_err(|e| e.to_string())?,
+                        )
+                    } else {
+                        None
+                    };
+                let attached = attachment.as_ref().map_or(0, String::len);
                 match &mut item.content {
                     ItemContent::Text { text, .. } => *text = body0,
                     ItemContent::Tool {
@@ -405,9 +496,21 @@ impl Store {
                             *name = format!("{name} (part {}/{parts})", part + 1);
                         }
                     }
-                    ItemContent::Image { description, .. } => *description = body0,
+                    ItemContent::Image { path, description } => {
+                        *description = body0;
+                        match attachment {
+                            Some(data) => *path = data,
+                            None if len2 > 0 => {
+                                *description = format!(
+                                    "{description} (inline image of {} KiB exceeds the presentation window)",
+                                    len2 / 1024
+                                );
+                            }
+                            None => {}
+                        }
+                    }
                 }
-                let size = metadata.len() + end - start + 128;
+                let size = metadata.len() + end - start + 128 + attached;
                 if !items.is_empty() && (bytes + size > WINDOW_BYTES || items.len() == WINDOW_ITEMS)
                 {
                     break 'records;
@@ -466,6 +569,21 @@ impl Drop for Store {
         let _ = self.db.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)");
         let _ = fs::remove_dir_all(&self.directory);
     }
+}
+/// A caching shortfall degrades presentation; it never terminates the provider.
+fn nonfatal(message: String) -> Event {
+    Event::Error {
+        message,
+        fatal: false,
+    }
+}
+/// Provider IDs are untrusted and unbounded; diagnostics quote only a prefix.
+fn brief(id: &str) -> &str {
+    let mut end = id.len().min(64);
+    while end > 0 && !id.is_char_boundary(end) {
+        end -= 1;
+    }
+    &id[..end]
 }
 fn insert_body(
     transaction: &rusqlite::Transaction<'_>,
@@ -536,5 +654,74 @@ mod tests {
         assert_eq!(pages.concat(), original);
         store.latest();
         assert!(!store.window().unwrap().has_later);
+    }
+    /// A 2 MiB screenshot used to be rejected by the 64 KiB identity guard, which
+    /// killed the provider and made the session unreopenable.
+    #[test]
+    fn inline_image_far_past_the_identity_budget_round_trips() {
+        let mut store = Store::at(std::env::temp_dir()).unwrap();
+        let payload = format!("data:image/png;base64,{}", "QUJD".repeat(512 * 1024));
+        let warnings = store
+            .apply(Event::Item(Item {
+                id: "shot".into(),
+                role: Role::User,
+                content: ItemContent::Image {
+                    path: payload.clone(),
+                    description: "screenshot".into(),
+                },
+            }))
+            .unwrap();
+        assert!(warnings.is_empty(), "{warnings:?}");
+        let window = store.window().unwrap();
+        assert_eq!(window.items.len(), 1);
+        match &window.items[0].content {
+            ItemContent::Image { path, description } => {
+                assert_eq!(path, &payload);
+                assert_eq!(description, "screenshot");
+            }
+            other => panic!("unexpected content {other:?}"),
+        }
+        // The session stays usable: later items still apply and page.
+        store
+            .apply(Event::Item(Item {
+                id: "after".into(),
+                role: Role::Assistant,
+                content: ItemContent::Text {
+                    text: "ok".into(),
+                    thinking: false,
+                },
+            }))
+            .unwrap();
+        assert_eq!(store.window().unwrap().items.len(), 2);
+    }
+    /// Unbounded identity metadata degrades presentation instead of ending the actor.
+    #[test]
+    fn oversized_identity_metadata_reports_without_failing() {
+        let mut store = Store::at(std::env::temp_dir()).unwrap();
+        let events = store
+            .apply(Event::Item(Item {
+                id: "call".into(),
+                role: Role::Assistant,
+                content: ItemContent::Tool {
+                    name: "n".repeat(128 * 1024),
+                    input: "{}".into(),
+                    output: String::new(),
+                    status: crate::chat::ToolStatus::Running,
+                },
+            }))
+            .unwrap();
+        assert!(
+            matches!(events.as_slice(), [Event::Error { fatal: false, .. }]),
+            "{events:?}"
+        );
+        let window = store.window().unwrap();
+        assert_eq!(window.items.len(), 1);
+        match &window.items[0].content {
+            ItemContent::Tool { name, input, .. } => {
+                assert!(name.len() <= 1024);
+                assert_eq!(input, "{}");
+            }
+            other => panic!("unexpected content {other:?}"),
+        }
     }
 }

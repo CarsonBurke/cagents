@@ -992,7 +992,11 @@ fn ensure_daemon_ready_at(socket: &Path) -> Result<(), HostedTerminalStartError>
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
-        .process_group(0);
+        .process_group(0)
+        // This process may itself have been started with the UI launch
+        // handshake set. Inheriting it would make the daemon, and every child
+        // the tray spawns from it, emit a stray readiness line on stdout.
+        .env_remove(crate::instance::UI_LAUNCH_HANDSHAKE_ENV);
     // SAFETY: the hook performs only the close_range syscall before exec.
     unsafe {
         command.pre_exec(crate::daemon::seal_inherited_descriptors);
@@ -1300,6 +1304,27 @@ fn wait_before_reconnect(
         }
     }
 }
+fn coalesce_client_scroll_command(
+    command: ClientCommand,
+    commands: &Receiver<ClientCommand>,
+    carried: &mut Option<ClientCommand>,
+) -> ClientCommand {
+    let ClientCommand::Scroll(TerminalScroll::Lines(mut delta)) = command else {
+        return command;
+    };
+    while let Ok(next) = commands.try_recv() {
+        match next {
+            ClientCommand::Scroll(TerminalScroll::Lines(next_delta)) => {
+                delta = delta.saturating_add(next_delta);
+            }
+            other => {
+                *carried = Some(other);
+                break;
+            }
+        }
+    }
+    ClientCommand::Scroll(TerminalScroll::Lines(delta))
+}
 
 fn serve_connection(
     context: &ConnectionContext<'_>,
@@ -1395,7 +1420,14 @@ fn serve_connection(
             );
             return ConnectionEnd::Retry;
         }
+        // The daemon can refuse or sever a connection before it ever reads the
+        // connect frame — client capacity, for one — and that unsolicited error
+        // carries the only accurate reason this handle will ever see.
+        let unsolicited = envelope.request_id.is_none();
         if envelope.request_id != Some(connect_id) {
+            if unsolicited && let ServerMessage::Error(error) = envelope.message {
+                return reject_handshake(events, published, stop, error);
+            }
             return ConnectionEnd::Retry;
         }
         match envelope.message {
@@ -1545,11 +1577,12 @@ fn serve_connection(
             } else {
                 commands.try_recv()
             };
-            let command = match command {
+            let mut command = match command {
                 Ok(command) => command,
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => ClientCommand::Stop,
             };
+            command = coalesce_client_scroll_command(command, commands, carried);
             if stop.is_requested() {
                 connection.close();
                 return ConnectionEnd::Stop;
@@ -1772,7 +1805,20 @@ fn serve_connection(
             }
             ServerMessage::Error(error) => {
                 let Some(request_id) = envelope.request_id else {
-                    return ConnectionEnd::Retry;
+                    // The daemon severed this connection on its own — it fell
+                    // behind its delivery queue, or the daemon is at capacity.
+                    // The frame carries the only accurate reason the UI can
+                    // report; without it a drop looks like a dead daemon.
+                    let retryable = error.retryable;
+                    if !retryable {
+                        published.fail_attachment(error.message.clone());
+                    }
+                    publish_protocol_error(events, published, "cagents daemon connection", error);
+                    return if retryable {
+                        ConnectionEnd::Retry
+                    } else {
+                        ConnectionEnd::Stop
+                    };
                 };
                 let mut attachment_failed = false;
                 let operation = match pending.remove(&request_id) {

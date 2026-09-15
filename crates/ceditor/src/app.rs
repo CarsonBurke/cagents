@@ -12,7 +12,7 @@ use cagents::{
     repository_widget::{
         self, ClipboardOp, EditorAction, EditorEdit, LspIntent, RepositoryAction, RepositoryRuntime,
     },
-    settings::{self, AppSettings, AppTheme, ShortcutBinding, ShortcutKey},
+    settings::{self, AppSettings, AppTheme},
     sidebar::{
         self, ActiveWorktreeKey, FileCommand, FileSearch, SidebarAction, SidebarFocus, SidebarMode,
         SidebarModel, SidebarProject, SidebarState, SidebarWorktree, SourceControlModel,
@@ -20,6 +20,7 @@ use cagents::{
     },
     splitter::{self, Splitter},
     ui_controls::{icon_control, popover, segmented_controls, symbolic_icon},
+    workspace_widget,
 };
 use cosmic::app::ApplicationExt;
 use cosmic::{
@@ -67,6 +68,11 @@ struct Tab {
     files_loaded: bool,
     git: bool,
     diagnostics: Vec<LspDiagnostic>,
+    /// The document version the server computed `diagnostics` for, as it
+    /// stamped them. Compared against the manager's current version and never
+    /// against a count of this side's own edits: the manager re-opens a
+    /// document on a restart or respawn, neither of which is an edit here.
+    diagnostics_version: Option<i32>,
     completions: Vec<LspCompletionItem>,
     hover: Option<String>,
     lsp_error: Option<String>,
@@ -117,11 +123,15 @@ pub enum Message {
     SelectSettingsCategory(SettingsCategory),
     ShortcutChanged(EditorShortcut, String),
     FindInFile,
+    FindQueryChanged(String),
     CloseFind,
     FindNext,
     FindPrevious,
     QuickOpen,
     QuickOpenQueryChanged(String),
+    QuickOpenNext,
+    QuickOpenPrevious,
+    QuickOpenActivate,
     OpenQuickFile(PathBuf),
     CloseQuickOpen,
     QuickOpenSearchFinished {
@@ -153,7 +163,7 @@ pub enum Message {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SettingsCategory {
+pub(crate) enum SettingsCategory {
     Editing,
     Appearance,
     Keyboard,
@@ -179,7 +189,7 @@ impl SettingsCategory {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum EditorShortcut {
+pub(crate) enum EditorShortcut {
     NewTab,
     OpenFile,
     OpenFolder,
@@ -245,7 +255,7 @@ impl crate::preferences::EditorShortcuts {
 impl Editor {
     fn shortcut_pressed(&self, action: EditorShortcut, event: &keyboard::Event) -> bool {
         cagents::settings::parse_shortcut(self.shortcuts.value(action))
-            .is_ok_and(|binding| shortcut_matches(binding, event))
+            .is_ok_and(|binding| workspace_widget::shortcut_event_matches(binding, event))
     }
 
     fn handle_shortcut(&mut self, event: &keyboard::Event) -> Option<Task<Message>> {
@@ -294,36 +304,6 @@ impl Editor {
     }
 }
 
-fn shortcut_matches(binding: ShortcutBinding, event: &keyboard::Event) -> bool {
-    let keyboard::Event::KeyPressed {
-        key,
-        physical_key,
-        modifiers,
-        repeat: false,
-        ..
-    } = event
-    else {
-        return false;
-    };
-    binding.control == modifiers.control()
-        && binding.alt == modifiers.alt()
-        && binding.shift == modifiers.shift()
-        && binding.logo == modifiers.logo()
-        && match binding.key {
-            ShortcutKey::ArrowLeft => {
-                matches!(key, keyboard::Key::Named(keyboard::key::Named::ArrowLeft))
-            }
-            ShortcutKey::ArrowRight => {
-                matches!(key, keyboard::Key::Named(keyboard::key::Named::ArrowRight))
-            }
-            ShortcutKey::Character(expected) => key
-                .to_latin(*physical_key)
-                .map(|actual| actual.to_ascii_lowercase() == expected)
-                .unwrap_or_else(|| {
-                    matches!(key, keyboard::Key::Character(value) if value.eq_ignore_ascii_case(&expected.to_string()))
-                }),
-        }
-}
 pub struct Editor {
     core: Core,
     tabs: Vec<Tab>,
@@ -340,9 +320,15 @@ pub struct Editor {
     find_open: bool,
     find_query: String,
     find_match_index: usize,
+    /// Occurrences of `find_query` in the active buffer, recorded by the
+    /// search itself. Counting again in `view` re-materialized and
+    /// re-lowercased the whole rope on every animation frame.
+    find_match_total: usize,
     quick_open_generation: u64,
     quick_open: bool,
     quick_open_query: String,
+    quick_open_index: usize,
+    quick_open_cancel: CancellationToken,
     notice: Option<String>,
     notices_open: bool,
     file_dialog: Option<FileOperationDialog>,
@@ -359,9 +345,129 @@ pub struct Editor {
     pending_save_as: Option<(CardId, String)>,
     sidebar_transition: Option<SidebarTransition>,
     sidebar_panel: WorktreePanel,
+    /// Newest generation written per preference file. Storage work runs on the
+    /// blocking pool, so two captures of the same file can finish out of
+    /// order; the loser is dropped instead of resurrecting stale values.
+    preference_lane: Arc<std::sync::Mutex<[u64; PreferenceFile::COUNT]>>,
+    preference_generation: u64,
+}
+
+/// One write-ordering lane per preference file ceditor owns.
+#[derive(Clone, Copy)]
+enum PreferenceFile {
+    Settings,
+    Assistance,
+    Shortcuts,
+    Session,
+}
+
+impl PreferenceFile {
+    const COUNT: usize = 4;
+}
+
+/// Captured on the event loop; all storage work runs on the blocking pool.
+///
+/// `settings::save` takes a blocking `flock` shared with every other cagents
+/// window and fsyncs twice. None of that belongs on the thread driving the
+/// compositor frame.
+enum PreferenceWrite {
+    Settings(AppSettings),
+    Assistance {
+        settings: AppSettings,
+        enabled: bool,
+    },
+    Shortcuts(crate::preferences::EditorShortcuts),
+    Session(crate::preferences::Session),
+}
+
+impl PreferenceWrite {
+    const fn file(&self) -> PreferenceFile {
+        match self {
+            Self::Settings(_) => PreferenceFile::Settings,
+            Self::Assistance { .. } => PreferenceFile::Assistance,
+            Self::Shortcuts(_) => PreferenceFile::Shortcuts,
+            Self::Session(_) => PreferenceFile::Session,
+        }
+    }
+}
+
+struct PreferenceSave {
+    path: PathBuf,
+    generation: u64,
+    lane: Arc<std::sync::Mutex<[u64; PreferenceFile::COUNT]>>,
+    write: PreferenceWrite,
+}
+
+impl PreferenceSave {
+    fn run(self) -> Result<(), String> {
+        let file = self.write.file();
+        let mut lane = self
+            .lane
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let applied = &mut lane[file as usize];
+        if *applied >= self.generation {
+            return Ok(());
+        }
+        *applied = self.generation;
+        // The lane stays locked across the write so two captures of one file
+        // land in capture order rather than blocking-pool completion order.
+        match self.write {
+            PreferenceWrite::Settings(settings) => {
+                settings::save(&self.path, &settings).map_err(|error| error.to_string())
+            }
+            PreferenceWrite::Assistance { settings, enabled } => {
+                settings::save(&self.path, &settings)
+                    .map_err(|error| error.to_string())
+                    .and_then(|()| {
+                        crate::preferences::save_language_server_assistance(&self.path, enabled)
+                    })
+            }
+            PreferenceWrite::Shortcuts(shortcuts) => {
+                crate::preferences::save_shortcuts(&self.path, &shortcuts)
+            }
+            PreferenceWrite::Session(session) => {
+                crate::preferences::save_session(&self.path, &session)
+            }
+        }
+    }
 }
 
 const SIDEBAR_TRANSITION_DURATION: Duration = Duration::from_millis(160);
+
+/// Quick open waits out a typing burst before walking the tree, matching the
+/// sidebar's file filter over the same helper.
+const QUICK_OPEN_SEARCH_DEBOUNCE: Duration = Duration::from_millis(80);
+
+/// Hands one captured preference write to the blocking pool and reports the
+/// outcome on a later frame.
+fn preference_task(save: PreferenceSave) -> Task<Message> {
+    cosmic::task::future(async move {
+        let result = tokio::task::spawn_blocking(move || save.run())
+            .await
+            .map_err(|error| error.to_string())
+            .and_then(|result| result);
+        Message::SettingsSaved(result)
+    })
+}
+
+/// Whether an event is the fixed Ctrl+Space completion request.
+///
+/// The space bar has no `Named` variant in this toolkit, and a modifier-held
+/// press usually carries no text, so the logical `Character(" ")` arm this
+/// used to rely on alone could never fire. The physical code is the reliable
+/// signal; the character form stays for backends that do report the text.
+fn is_completion_chord(
+    key: &keyboard::Key,
+    physical_key: keyboard::key::Physical,
+    modifiers: keyboard::Modifiers,
+) -> bool {
+    modifiers.control()
+        && (matches!(
+            physical_key,
+            keyboard::key::Physical::Code(keyboard::key::Code::Space)
+        ) || matches!(key, keyboard::Key::Character(value) if value == " "))
+}
 
 #[derive(Debug, Clone, Copy)]
 struct SidebarTransition {
@@ -620,6 +726,20 @@ fn dialog_surface<'a>(
     .into()
 }
 
+fn connected_dialog_surface<'a>(
+    content: impl Into<Element<'a, Message>>,
+    max_width: f32,
+) -> Element<'a, Message> {
+    cagents::interaction::opaque(
+        widget::container(content)
+            .class(cosmic::theme::Container::Dialog(false))
+            .width(Length::Fill)
+            .max_width(max_width)
+            .max_height(720),
+    )
+    .into()
+}
+
 fn dialog_overlay(surface: Element<'_, Message>, dismiss: Message) -> Element<'_, Message> {
     let background = widget::container(iced::widget::Space::new())
         .class(cosmic::theme::Container::custom(|_| {
@@ -641,21 +761,7 @@ fn dialog_overlay(surface: Element<'_, Message>, dismiss: Message) -> Element<'_
     cagents::interaction::layer(backdrop, centered.into())
 }
 
-fn find_matches(text: &str, query: &str) -> usize {
-    let query = query.trim();
-    if query.is_empty() {
-        return 0;
-    }
-    let text = text.to_ascii_lowercase();
-    let query = query.to_ascii_lowercase();
-    text.match_indices(&query).count()
-}
-
-fn find_bar<'a>(editor: &'a Editor, tab: &'a Tab) -> Element<'a, Message> {
-    let matches = find_matches(
-        tab.runtime.editor_text().as_deref().unwrap_or_default(),
-        &editor.find_query,
-    );
+fn find_bar(editor: &Editor) -> Element<'_, Message> {
     widget::container(
         widget::row::with_children(vec![
             widget::icon(symbolic_icon("system-search-symbolic"))
@@ -663,12 +769,19 @@ fn find_bar<'a>(editor: &'a Editor, tab: &'a Tab) -> Element<'a, Message> {
                 .into(),
             widget::text_input("Find in file", &editor.find_query)
                 .id(widget::Id::new("ceditor.find.query"))
+                .on_input(Message::FindQueryChanged)
                 .width(Length::Fill)
                 .into(),
             design::caption(if editor.find_query.trim().is_empty() {
                 "Type to find".to_owned()
+            } else if editor.find_match_total == 0 {
+                "No matches".to_owned()
             } else {
-                format!("{matches} matches")
+                format!(
+                    "{} of {} matches",
+                    editor.find_match_index + 1,
+                    editor.find_match_total
+                )
             })
             .into(),
             icon_control(
@@ -1059,23 +1172,49 @@ impl Editor {
             })
     }
 
-    fn save_session(&mut self) {
+    fn capture_preference(&mut self, write: PreferenceWrite) -> PreferenceSave {
+        self.preference_generation += 1;
+        PreferenceSave {
+            path: self.settings_path.clone(),
+            generation: self.preference_generation,
+            lane: Arc::clone(&self.preference_lane),
+            write,
+        }
+    }
+
+    /// Captures the navigation state worth writing, or nothing when it has not
+    /// changed since the last capture.
+    ///
+    /// The private configuration directory is created once, when `init` loads
+    /// the settings file. Re-validating it here used to go through the shared
+    /// settings writer, which read and *migrated* settings.toml on the way —
+    /// so expanding a folder silently rewrote the user's preferences file.
+    fn capture_session_save(&mut self) -> Option<PreferenceSave> {
         if self.exiting || self.restoring_session || !self.settings_writable {
-            return;
+            return None;
         }
         let session = self.session();
         if session == self.saved_session {
-            return;
+            return None;
         }
-        // These ordered atomic writes run only on navigation changes, never edits.
-        // The shared writer validates the private directory without overwriting
-        // preferences another window changed.
-        let result = settings::save_merged(&self.settings_path, &self.settings, &self.settings)
-            .map_err(|error| error.to_string())
-            .and_then(|()| crate::preferences::save_session(&self.settings_path, &session));
-        match result {
-            Ok(()) => self.saved_session = session,
-            Err(error) => self.notice = Some(error),
+        // Recorded at capture time so a burst of navigation changes queues one
+        // write per distinct state; the lane drops whichever loses the race.
+        self.saved_session = session.clone();
+        Some(self.capture_preference(PreferenceWrite::Session(session)))
+    }
+
+    fn save_session(&mut self) -> Task<Message> {
+        self.capture_session_save()
+            .map_or_else(Task::none, preference_task)
+    }
+
+    /// Shutdown has no later frame to deliver an acknowledgment on, so the
+    /// final navigation write is the one place this blocks.
+    fn save_session_now(&mut self) {
+        if let Some(save) = self.capture_session_save()
+            && let Err(error) = save.run()
+        {
+            self.notice = Some(error);
         }
     }
 
@@ -1184,6 +1323,7 @@ impl Editor {
             files_loaded: false,
             git,
             diagnostics: Vec::new(),
+            diagnostics_version: None,
             completions: Vec::new(),
             hover: None,
             lsp_error: None,
@@ -1565,6 +1705,7 @@ impl Editor {
                         tab.completions.clear();
                         tab.hover = None;
                         tab.diagnostics.clear();
+                        tab.diagnostics_version = None;
                     }
                 }
                 LspIntent::Save { text } => {
@@ -1585,8 +1726,30 @@ impl Editor {
         if let Some(tab) = self.tab_mut(id) {
             tab.runtime.set_lsp_document(None);
             tab.diagnostics.clear();
+            tab.diagnostics_version = None;
             tab.completions.clear();
             tab.hover = None;
+        }
+    }
+
+    /// Whether `id`'s diagnostics still describe the text the server holds.
+    ///
+    /// Both versions have to be known: an absent published version means no
+    /// diagnostics have arrived for this document, and an absent document
+    /// version means the manager is no longer tracking it, so nothing on
+    /// screen can be vouched for.
+    fn diagnostics_are_current(&self, id: CardId) -> bool {
+        let Some(tab) = self.tab(id) else {
+            return false;
+        };
+        match (
+            tab.diagnostics_version,
+            tab.runtime
+                .lsp_document()
+                .and_then(|doc| self.lsp.document_version(doc)),
+        ) {
+            (Some(published), Some(current)) => published == current,
+            _ => false,
         }
     }
 
@@ -1639,15 +1802,10 @@ impl Editor {
             );
             return Task::none();
         }
-        let path = self.settings_path.clone();
         let settings = self.settings.clone();
         // Preference changes are low frequency. One ordered atomic write avoids
         // competing snapshots overwriting newer values.
-        let result = settings::save(path, &settings).map_err(|error| error.to_string());
-        if let Err(error) = result {
-            self.notice = Some(error);
-        }
-        Task::none()
+        preference_task(self.capture_preference(PreferenceWrite::Settings(settings)))
     }
 
     fn set_language_server_assistance(&mut self, enabled: bool) -> Task<Message> {
@@ -1672,17 +1830,10 @@ impl Editor {
             tasks.push(self.lsp_next());
         }
         if self.settings_writable {
-            let result = settings::save(&self.settings_path, &self.settings)
-                .map_err(|error| error.to_string())
-                .and_then(|()| {
-                    crate::preferences::save_language_server_assistance(
-                        &self.settings_path,
-                        enabled,
-                    )
-                });
-            if let Err(error) = result {
-                self.notice = Some(error);
-            }
+            let settings = self.settings.clone();
+            tasks.push(preference_task(self.capture_preference(
+                PreferenceWrite::Assistance { settings, enabled },
+            )));
         } else {
             self.notice = Some(
                 "Repair the settings file before saving the language-server assistance preference."
@@ -1863,75 +2014,160 @@ impl Editor {
         })
     }
 
-    fn select_find_match(&mut self, occurrence: usize) -> Task<Message> {
+    fn focus_find_query(&self) -> Task<Message> {
+        iced::widget::operation::focus(widget::Id::new("ceditor.find.query"))
+            .map(cosmic::Action::App)
+    }
+
+    /// Releases the search hold on every tab.
+    ///
+    /// A tab in search mode ignores every editor action except scrolling, so a
+    /// tab that kept the hold after find moved elsewhere swallowed typing,
+    /// paste and IME commits with no indication and no way back.
+    fn clear_search_mode(&mut self) {
+        for tab in &mut self.tabs {
+            tab.runtime.set_search_mode(false);
+        }
+    }
+
+    /// Closes the find bar and releases the search hold.
+    ///
+    /// Find targets one buffer, so a tab switch closes it rather than silently
+    /// re-pointing the query and the match index at a different file.
+    fn close_find(&mut self) {
+        self.find_open = false;
+        self.find_match_index = 0;
+        self.find_match_total = 0;
+        self.clear_search_mode();
+    }
+
+    /// Dismisses the palette and abandons the tree walk it started.
+    fn close_quick_open(&mut self) {
+        self.quick_open = false;
+        self.quick_open_generation = self.quick_open_generation.wrapping_add(1);
+        self.quick_open_files = None;
+        self.quick_open_index = 0;
+        self.quick_open_cancel.cancel();
+    }
+
+    /// Selects one occurrence in the active tab and records the occurrence
+    /// count, which is the only place it is ever computed.
+    fn select_find_match(&mut self, occurrence: usize) {
         let Some(id) = self.active else {
-            return Task::none();
+            return;
         };
         let query = self.find_query.clone();
-        let total = self.tab_mut(id).map(|tab| {
+        let total = self.tab_mut(id).and_then(|tab| {
             tab.runtime.set_search_mode(true);
             tab.runtime.select_text_match(&query, occurrence)
         });
-        match total.flatten() {
-            Some(total) => self.find_match_index = occurrence % total,
-            None => self.find_match_index = 0,
+        match total {
+            Some(total) => {
+                self.find_match_index = occurrence % total;
+                self.find_match_total = total;
+            }
+            None => {
+                self.find_match_index = 0;
+                self.find_match_total = 0;
+            }
         }
-        self.focus_active_editor()
     }
 
-    fn handle_find_key(&mut self, event: &keyboard::Event) -> Task<Message> {
+    /// The keys the find bar itself owns.
+    ///
+    /// Everything else returns `None` and falls through to the shortcut table:
+    /// find is deliberately not modal, so Ctrl+S must still save while it is
+    /// open. Navigation is Enter, Shift+Enter, Up and Down only — Left and
+    /// Right belong to the query input, where they move the caret.
+    fn handle_find_key(&mut self, event: &keyboard::Event) -> Option<Task<Message>> {
         let keyboard::Event::KeyPressed {
             key,
             modifiers,
-            text,
             repeat: false,
             ..
         } = event
         else {
-            return Task::none();
+            return None;
         };
-        if modifiers.control() && matches!(key, keyboard::Key::Character(value) if value == "a") {
-            self.find_query.clear();
-            return self.select_find_match(0);
-        }
         match key {
-            keyboard::Key::Named(keyboard::key::Named::Escape) => self.update(Message::CloseFind),
-            keyboard::Key::Named(keyboard::key::Named::Backspace) => {
-                self.find_query.pop();
-                self.select_find_match(0)
+            keyboard::Key::Named(keyboard::key::Named::Escape) => {
+                Some(self.update(Message::CloseFind))
             }
-            keyboard::Key::Named(keyboard::key::Named::Enter) => {
-                if modifiers.shift() {
-                    self.update(Message::FindPrevious)
-                } else {
-                    self.update(Message::FindNext)
-                }
-            }
-            keyboard::Key::Named(keyboard::key::Named::ArrowUp) => {
+            keyboard::Key::Named(keyboard::key::Named::Enter) => Some(if modifiers.shift() {
                 self.update(Message::FindPrevious)
-            }
-            keyboard::Key::Named(keyboard::key::Named::ArrowDown)
-            | keyboard::Key::Named(keyboard::key::Named::ArrowRight) => {
+            } else {
                 self.update(Message::FindNext)
+            }),
+            keyboard::Key::Named(keyboard::key::Named::ArrowUp) => {
+                Some(self.update(Message::FindPrevious))
             }
-            keyboard::Key::Named(keyboard::key::Named::ArrowLeft) => {
-                self.update(Message::FindPrevious)
+            keyboard::Key::Named(keyboard::key::Named::ArrowDown) => {
+                Some(self.update(Message::FindNext))
             }
-            _ => {
-                if let Some(text) = text
-                    .as_deref()
-                    .filter(|text| !text.is_empty() && !text.chars().any(char::is_control))
-                {
-                    self.find_query.push_str(text);
-                    self.select_find_match(0)
-                } else {
-                    Task::none()
-                }
-            }
+            _ => None,
         }
     }
 
-    fn quick_open_search(&self, query: String, generation: u64) -> Task<Message> {
+    /// The keys the quick-open palette owns.
+    ///
+    /// Quick open counts as a modal, which blocks the shortcut table, so this
+    /// runs before that guard. Held arrows repeat, as in any result list.
+    fn handle_quick_open_key(&mut self, event: &keyboard::Event) -> Option<Task<Message>> {
+        let keyboard::Event::KeyPressed { key, .. } = event else {
+            return None;
+        };
+        match key {
+            keyboard::Key::Named(keyboard::key::Named::ArrowDown) => {
+                Some(self.update(Message::QuickOpenNext))
+            }
+            keyboard::Key::Named(keyboard::key::Named::ArrowUp) => {
+                Some(self.update(Message::QuickOpenPrevious))
+            }
+            keyboard::Key::Named(keyboard::key::Named::Enter) => {
+                Some(self.update(Message::QuickOpenActivate))
+            }
+            _ => None,
+        }
+    }
+
+    /// The rows the palette is showing, in display order.
+    fn quick_open_results(&self) -> Vec<PathBuf> {
+        let query = self.quick_open_query.trim().to_ascii_lowercase();
+        self.current()
+            .map(|tab| {
+                let candidates = self.quick_open_files.clone().unwrap_or_else(|| {
+                    tab.runtime
+                        .listed_files()
+                        .iter()
+                        .filter(|file| !file.directory)
+                        .map(|file| file.path.as_path().to_path_buf())
+                        .collect()
+                });
+                candidates
+                    .into_iter()
+                    .filter(|path| {
+                        query.is_empty()
+                            || path.to_string_lossy().to_ascii_lowercase().contains(&query)
+                    })
+                    .take(40)
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Clamps the selection to the rows currently listed, so a shrinking
+    /// result set never leaves the highlight off the end.
+    fn quick_open_selection(&self, total: usize) -> usize {
+        if self.quick_open_index >= total {
+            total.saturating_sub(1)
+        } else {
+            self.quick_open_index
+        }
+    }
+
+    fn quick_open_search(&mut self, query: String, generation: u64) -> Task<Message> {
+        // Abandon the walk the new keystroke supersedes before starting another.
+        self.quick_open_cancel.cancel();
         let Some(id) = self.active else {
             return Task::none();
         };
@@ -1942,22 +2178,34 @@ impl Editor {
             return Task::none();
         }
         let root = tab.runtime.descriptor.worktree.clone();
+        let token = CancellationToken::new();
+        self.quick_open_cancel = token.clone();
         let search_query = query.clone();
         cosmic::task::future(async move {
-            let result = tokio::task::spawn_blocking(move || {
-                repository_widget::search_directory_files_for_quick_open(&root, &search_query).map(
-                    |files| {
+            // A recursive walk per keystroke queued concurrent 50k-entry scans
+            // on the pool that also carries auto-save and file loads.
+            tokio::time::sleep(QUICK_OPEN_SEARCH_DEBOUNCE).await;
+            let result = if token.is_cancelled() {
+                Ok(Vec::new())
+            } else {
+                tokio::task::spawn_blocking(move || {
+                    repository_widget::search_directory_files_for_quick_open_cancellable(
+                        &root,
+                        &search_query,
+                        &token,
+                    )
+                    .map(|files| {
                         files
                             .into_iter()
                             .filter(|file| !file.directory)
                             .map(|file| file.path)
                             .collect()
-                    },
-                )
-            })
-            .await
-            .map_err(|error| error.to_string())
-            .and_then(|result| result.map_err(|error| error.to_string()));
+                    })
+                })
+                .await
+                .map_err(|error| error.to_string())
+                .and_then(|result| result.map_err(|error| error.to_string()))
+            };
             Message::QuickOpenSearchFinished {
                 card: id,
                 generation,
@@ -2059,6 +2307,11 @@ impl Application for Editor {
 
     fn init(mut core: Core, flags: Flags) -> (Self, Task<Message>) {
         core.window.border_padding = Some(0);
+        // This load creates and validates the private configuration directory
+        // that every later preference write assumes exists. It is the only
+        // place that happens: doing it again from a navigation-state save went
+        // through the shared settings writer, which migrated settings.toml as
+        // a side effect of reading it.
         let (settings, mut notice, settings_writable) = match settings::load(&flags.settings_path) {
             Ok(settings) => (settings, None, true),
             Err(error) => (AppSettings::default(), Some(error.to_string()), false),
@@ -2115,8 +2368,11 @@ impl Application for Editor {
             find_open: false,
             find_query: String::new(),
             find_match_index: 0,
+            find_match_total: 0,
             quick_open: false,
             quick_open_query: String::new(),
+            quick_open_index: 0,
+            quick_open_cancel: CancellationToken::default(),
             notice,
             notices_open: false,
             file_dialog: None,
@@ -2133,6 +2389,8 @@ impl Application for Editor {
             pending_save_as: None,
             sidebar_transition: None,
             sidebar_panel: WorktreePanel::Files,
+            preference_lane: Arc::new(std::sync::Mutex::new([0; PreferenceFile::COUNT])),
+            preference_generation: 0,
         };
         let mut tasks = vec![app.appearance(), app.lsp_next()];
         if let Some(window) = app.core.main_window_id() {
@@ -2190,6 +2448,15 @@ impl Application for Editor {
                 if self.find_open {
                     return self.update(Message::CloseFind);
                 }
+            }
+            // Quick open counts as a modal, and the guard below drops every
+            // key while a modal is up. A palette whose whole point is staying
+            // on the keyboard has to read its own keys first.
+            if self.quick_open
+                && let Message::Key(event) = &message
+                && let Some(task) = self.handle_quick_open_key(event)
+            {
+                return task;
             }
             if self.modal_open()
                 && matches!(
@@ -2307,7 +2574,7 @@ impl Application for Editor {
                 Message::CloseWindow => {
                     // Shutdown removes runtime tabs to honor dirty-buffer guards;
                     // keep the user's pre-shutdown tab order and selection.
-                    self.save_session();
+                    self.save_session_now();
                     if self.file_dialog.as_ref().is_some_and(|dialog| dialog.busy) {
                         self.exiting = true;
                         return Task::none();
@@ -2744,7 +3011,7 @@ impl Application for Editor {
                     // Folder expansion persists across sessions; the save is a
                     // no-op unless the open tree actually changed.
                     if persist_expansion {
-                        self.save_session();
+                        return Task::batch([task, self.save_session()]);
                     }
                     task
                 }
@@ -2822,12 +3089,10 @@ impl Application for Editor {
                         Ok(()) => {
                             self.shortcuts = self.shortcut_draft.clone();
                             if self.settings_writable {
-                                if let Err(error) = crate::preferences::save_shortcuts(
-                                    &self.settings_path,
-                                    &self.shortcuts,
-                                ) {
-                                    self.notice = Some(error);
-                                }
+                                let shortcuts = self.shortcuts.clone();
+                                return preference_task(
+                                    self.capture_preference(PreferenceWrite::Shortcuts(shortcuts)),
+                                );
                             }
                         }
                         Err(error) => self.notice = Some(error),
@@ -2835,49 +3100,82 @@ impl Application for Editor {
                     Task::none()
                 }
                 Message::FindInFile => {
-                    self.find_open = !self.find_open;
-                    self.find_match_index = 0;
                     if self.find_open {
-                        return self.select_find_match(0);
+                        self.close_find();
+                        return self.focus_active_editor();
                     }
-                    if let Some(id) = self.active
-                        && let Some(tab) = self.tab_mut(id)
-                    {
-                        tab.runtime.set_search_mode(false);
-                    }
-                    self.focus_active_editor()
+                    self.find_open = true;
+                    self.select_find_match(0);
+                    self.focus_find_query()
                 }
-                Message::FindNext => self.select_find_match(self.find_match_index.wrapping_add(1)),
+                Message::FindQueryChanged(query) => {
+                    self.find_query = query;
+                    self.select_find_match(0);
+                    Task::none()
+                }
+                Message::FindNext => {
+                    self.select_find_match(self.find_match_index.wrapping_add(1));
+                    self.focus_find_query()
+                }
                 Message::FindPrevious => {
-                    self.select_find_match(self.find_match_index.wrapping_sub(1))
+                    // Wrapping to `usize::MAX` and letting the search take it
+                    // modulo the total only lands on the last match when the
+                    // total divides 2^64: for 3 or 5 matches it re-selected the
+                    // first, for 7 the second.
+                    let previous = self
+                        .find_match_index
+                        .checked_sub(1)
+                        .unwrap_or_else(|| self.find_match_total.saturating_sub(1));
+                    self.select_find_match(previous);
+                    self.focus_find_query()
                 }
                 Message::CloseFind => {
-                    self.find_open = false;
-                    if let Some(id) = self.active
-                        && let Some(tab) = self.tab_mut(id)
-                    {
-                        tab.runtime.set_search_mode(false);
-                    }
+                    self.close_find();
                     self.focus_active_editor()
                 }
                 Message::QuickOpen => {
-                    self.quick_open = !self.quick_open;
-                    self.quick_open_generation = self.quick_open_generation.wrapping_add(1);
-                    self.quick_open_files = None;
-                    if self.quick_open {
-                        self.quick_open_query.clear();
-                        return iced::widget::operation::focus(widget::Id::new(
-                            "ceditor.quick-open.query",
-                        ))
-                        .map(cosmic::Action::App);
+                    let opening = !self.quick_open;
+                    self.close_quick_open();
+                    if !opening {
+                        return Task::none();
                     }
-                    Task::none()
+                    self.quick_open = true;
+                    self.quick_open_query.clear();
+                    iced::widget::operation::focus(widget::Id::new("ceditor.quick-open.query"))
+                        .map(cosmic::Action::App)
                 }
                 Message::QuickOpenQueryChanged(query) => {
                     self.quick_open_query = query.clone();
                     self.quick_open_files = None;
+                    // A new query means a new result list: start at its top.
+                    self.quick_open_index = 0;
                     self.quick_open_generation = self.quick_open_generation.wrapping_add(1);
                     self.quick_open_search(query, self.quick_open_generation)
+                }
+                Message::QuickOpenNext => {
+                    let total = self.quick_open_results().len();
+                    if total > 0 {
+                        self.quick_open_index = (self.quick_open_selection(total) + 1) % total;
+                    }
+                    Task::none()
+                }
+                Message::QuickOpenPrevious => {
+                    let total = self.quick_open_results().len();
+                    if total > 0 {
+                        self.quick_open_index = self
+                            .quick_open_selection(total)
+                            .checked_sub(1)
+                            .unwrap_or(total - 1);
+                    }
+                    Task::none()
+                }
+                Message::QuickOpenActivate => {
+                    let results = self.quick_open_results();
+                    let selected = self.quick_open_selection(results.len());
+                    let Some(path) = results.into_iter().nth(selected) else {
+                        return Task::none();
+                    };
+                    self.update(Message::OpenQuickFile(path))
                 }
                 Message::QuickOpenSearchFinished {
                     card,
@@ -2901,16 +3199,12 @@ impl Application for Editor {
                     let Some(id) = self.active else {
                         return Task::none();
                     };
-                    self.quick_open = false;
-                    self.quick_open_generation = self.quick_open_generation.wrapping_add(1);
+                    self.close_quick_open();
                     self.quick_open_query.clear();
-                    self.quick_open_files = None;
                     self.request_file(id, path)
                 }
                 Message::CloseQuickOpen => {
-                    self.quick_open = false;
-                    self.quick_open_generation = self.quick_open_generation.wrapping_add(1);
-                    self.quick_open_files = None;
+                    self.close_quick_open();
                     Task::none()
                 }
                 Message::ToggleSidebar => {
@@ -2921,8 +3215,7 @@ impl Application for Editor {
                         from,
                         to: if self.sidebar_open { 1.0 } else { 0.0 },
                     });
-                    self.save_session();
-                    Task::none()
+                    self.save_session()
                 }
                 Message::Frame(now) => {
                     if self
@@ -3021,7 +3314,10 @@ impl Application for Editor {
                             .find(|tab| tab.runtime.lsp_document() == Some(doc))
                         {
                             match event {
-                                LspEvent::Diagnostics { items, .. } => tab.diagnostics = items,
+                                LspEvent::Diagnostics { items, version, .. } => {
+                                    tab.diagnostics = items;
+                                    tab.diagnostics_version = Some(version);
+                                }
                                 LspEvent::Completion { items, .. } => tab.completions = items,
                                 LspEvent::Hover { markdown, .. } => tab.hover = markdown,
                                 LspEvent::Status { status, .. } => {
@@ -3038,6 +3334,7 @@ impl Application for Editor {
                                     tab.completions.clear();
                                     tab.hover = None;
                                     tab.diagnostics.clear();
+                                    tab.diagnostics_version = None;
                                     tab.lsp_error = Some(error.to_string());
                                 }
                                 _ => {}
@@ -3078,6 +3375,17 @@ impl Application for Editor {
                     self.drain(id)
                 }
                 Message::Jump(id, at) => {
+                    // The diagnostics list is this message's only producer.
+                    // Diagnostics are unsolicited and replace each other
+                    // wholesale, so the rows on screen can describe text the
+                    // buffer has moved past; jumping would land the caret on a
+                    // line the diagnostic never named.
+                    if !self.diagnostics_are_current(id) {
+                        self.notice = Some(
+                            "these diagnostics describe an earlier version of the file".into(),
+                        );
+                        return Task::none();
+                    }
                     if let Some(tab) = self.tab_mut(id) {
                         tab.runtime.move_cursor_to(at);
                         return tab.runtime.focus_editor(id).map(cosmic::Action::App);
@@ -3085,33 +3393,42 @@ impl Application for Editor {
                     Task::none()
                 }
                 Message::Key(event) => {
-                    if self.find_open {
-                        return self.handle_find_key(&event);
+                    if self.find_open
+                        && let Some(task) = self.handle_find_key(&event)
+                    {
+                        return task;
                     }
                     if let Some(task) = self.handle_shortcut(&event) {
                         return task;
                     }
                     if let keyboard::Event::KeyPressed {
                         key,
+                        physical_key,
                         modifiers,
                         repeat: false,
                         ..
                     } = &event
+                        && !self.modal_open()
+                        && is_completion_chord(key, *physical_key, *modifiers)
                     {
-                        if !self.modal_open()
-                            && modifiers.control()
-                            && matches!(key, keyboard::Key::Character(value) if value == " ")
-                        {
-                            return self.update(Message::Complete);
-                        }
+                        return self.update(Message::Complete);
                     }
                     Task::none()
                 }
             }
         })();
-        if navigation_changed || previous_tabs != (self.active, self.tabs.len()) {
-            self.save_session();
+        // Find owns one buffer. If the active tab changed under it, the
+        // outgoing tab would keep the search hold that makes its editor ignore
+        // every edit, recoverable only by closing the tab.
+        let find_closed = previous_tabs.0 != self.active && self.find_open;
+        if find_closed {
+            self.close_find();
         }
+        let session = if navigation_changed || previous_tabs != (self.active, self.tabs.len()) {
+            self.save_session()
+        } else {
+            Task::none()
+        };
         let tabs_changed = previous_tabs != (self.active, self.tabs.len());
         let refresh =
             self.can_refresh_visible() && (previous_tabs.0 != self.active || !was_refresh_visible);
@@ -3124,6 +3441,14 @@ impl Application for Editor {
             },
             if refresh {
                 self.refresh_visible()
+            } else {
+                Task::none()
+            },
+            session,
+            if find_closed {
+                // The find input just vanished; hand the keyboard to the
+                // buffer the user switched to.
+                self.focus_active_editor()
             } else {
                 Task::none()
             },
@@ -3210,7 +3535,7 @@ impl Application for Editor {
                             || cagents::file_icon::folder(true),
                             |path| cagents::file_icon::icon(path),
                         );
-                    cagents::interaction::hover(
+                    cagents::interaction::hover(cagents::tab_strip::middle_click_close(
                         widget::container(
                             widget::row::with_children(vec![
                                 cagents::interaction::tooltip(
@@ -3271,7 +3596,8 @@ impl Application for Editor {
                                 ..Default::default()
                             }
                         })),
-                    )
+                        Message::CloseTab(tab.id),
+                    ))
                 })
                 .collect();
         let mut body = Vec::new();
@@ -3279,43 +3605,29 @@ impl Application for Editor {
         // off the content below it, tabs or placeholder alike.
         body.push(widget::divider::horizontal::default().into());
         // Keep the tab strip on the same fixed baseline as the app header.
-        let mut strip = Vec::new();
-        let mut tab_row = tabs;
-        tab_row.push(
-            icon_control(
-                symbolic_icon("list-add-symbolic"),
-                "New tab (Ctrl+T)",
-                false,
-                !self.modal_open(),
-                Some(Message::NewTab),
-            )
-            .id(widget::Id::new("ceditor.tabs.new"))
-            .into(),
-        );
-        strip.push(
-            widget::container(cagents::interaction::overflow_fade_x(
-                cagents::interaction::horizontal_wheel(
-                    widget::scrollable::horizontal(
-                        widget::row::with_children(tab_row)
-                            .spacing(4)
-                            .align_y(iced::Alignment::Center)
-                            .height(design::PRIMARY_CONTROL_SIZE),
-                    )
-                    .id(widget::Id::new("ceditor.tabs"))
-                    .direction(iced::widget::scrollable::Direction::Horizontal(
-                        iced::widget::scrollable::Scrollbar::hidden(),
-                    ))
-                    .width(Length::Fill)
-                    .height(design::PRIMARY_CONTROL_SIZE),
-                ),
-            ))
-            .padding([0.0, 8.0])
-            .center_y(Length::Fill)
-            .height(design::HEADER_HEIGHT)
-            .width(Length::Fill)
-            .into(),
-        );
-        strip.push(widget::divider::horizontal::default().into());
+        let strip = vec![
+            cagents::tab_strip::horizontal(
+                widget::Id::new("ceditor.tabs"),
+                {
+                    let mut tab_row = tabs;
+                    tab_row.push(
+                        icon_control(
+                            symbolic_icon("list-add-symbolic"),
+                            "New tab (Ctrl+T)",
+                            false,
+                            !self.modal_open(),
+                            Some(Message::NewTab),
+                        )
+                        .id(widget::Id::new("ceditor.tabs.new"))
+                        .into(),
+                    );
+                    tab_row
+                },
+                design::PRIMARY_CONTROL_SIZE,
+                design::HEADER_HEIGHT,
+            ),
+            widget::divider::horizontal::default().into(),
+        ];
         if let Some(tab) = self.current() {
             let mut editor = Vec::new();
             editor.extend(strip);
@@ -3350,6 +3662,7 @@ impl Application for Editor {
                     .into(),
                 );
             }
+            toolbar_controls.push(iced::widget::Space::new().width(Length::Fill).into());
             toolbar_controls.push(
                 icon_control(
                     symbolic_icon("system-search-symbolic"),
@@ -3377,7 +3690,7 @@ impl Application for Editor {
                 editor.push(widget::divider::horizontal::default().into());
             }
             if self.find_open {
-                editor.push(find_bar(self, tab));
+                editor.push(find_bar(self));
                 editor.push(widget::divider::horizontal::default().into());
             }
             editor.push(repository_widget::view(tab.id, &tab.runtime).map(Message::Repository));
@@ -3393,15 +3706,43 @@ impl Application for Editor {
                 if let Some(hover) = &tab.hover {
                     results.push(widget::text::body(hover).into());
                 }
-                for item in &tab.diagnostics {
+                let presented = cagents::inspector::diagnostic_rows(
+                    &tab.diagnostics,
+                    cagents::inspector::LSP_ROW_LIMIT,
+                );
+                let stale = !presented.rows.is_empty() && !self.diagnostics_are_current(tab.id);
+                let withheld = presented.withheld;
+                for row in presented.rows {
                     results.push(
-                        widget::button::text(format!(
-                            "{}:{} {}",
-                            item.range.start.line + 1,
-                            item.range.start.character + 1,
-                            item.message
-                        ))
-                        .on_press(Message::Jump(tab.id, item.range.start))
+                        widget::button::custom(
+                            widget::column::with_children(vec![
+                                design::caption(row.label).into(),
+                                design::body(row.message)
+                                    .wrapping(iced::widget::text::Wrapping::Word)
+                                    .into(),
+                            ])
+                            .spacing(2),
+                        )
+                        .class(cosmic::theme::Button::Text)
+                        .width(Length::Fill)
+                        .on_press(Message::Jump(tab.id, row.at))
+                        .into(),
+                    );
+                }
+                if withheld > 0 {
+                    results.push(
+                        design::caption(cagents::inspector::withheld_diagnostics_label(withheld))
+                            .into(),
+                    );
+                }
+                if stale {
+                    // Say so where the rows are, rather than only refusing the
+                    // jump once the user has already clicked one.
+                    results.push(
+                        design::caption(
+                            "these diagnostics describe an earlier version of the file",
+                        )
+                        .wrapping(iced::widget::text::Wrapping::Word)
                         .into(),
                     );
                 }
@@ -3605,33 +3946,20 @@ impl Application for Editor {
             ));
         }
         if self.quick_open {
-            let query = self.quick_open_query.trim().to_ascii_lowercase();
-            let files = self
-                .current()
-                .map(|tab| {
-                    let candidates = self.quick_open_files.clone().unwrap_or_else(|| {
-                        tab.runtime
-                            .listed_files()
-                            .iter()
-                            .filter(|file| !file.directory)
-                            .map(|file| file.path.as_path().to_path_buf())
-                            .collect()
-                    });
-                    candidates
-                        .into_iter()
-                        .filter(|path| {
-                            query.is_empty()
-                                || path.to_string_lossy().to_ascii_lowercase().contains(&query)
-                        })
-                        .take(40)
-                        .collect::<Vec<_>>()
-                })
-                .unwrap_or_default();
+            let files = self.quick_open_results();
+            let selected = self.quick_open_selection(files.len());
             let mut rows: Vec<Element<'_, Message>> = files
                 .into_iter()
-                .map(|path| {
+                .enumerate()
+                .map(|(index, path)| {
                     let label = path.to_string_lossy().into_owned();
+                    let highlighted = index == selected;
                     widget::button::text(label)
+                        .class(if highlighted {
+                            cosmic::theme::Button::Suggested
+                        } else {
+                            cosmic::theme::Button::Text
+                        })
                         .on_press(Message::OpenQuickFile(path))
                         .width(Length::Fill)
                         .into()
@@ -3826,6 +4154,15 @@ impl Application for Editor {
                         EditorShortcut::ToggleSidebar,
                         &self.shortcut_draft.toggle_sidebar,
                     ),
+                    // Fixed, not configurable: the completion request is wired
+                    // to the chord directly rather than through the shortcut
+                    // table, so list it read-only instead of leaving it
+                    // undiscoverable.
+                    settings_field(
+                        "Request completions",
+                        "Ask the language server for completions at the caret.",
+                        design::body("Ctrl+Space").into(),
+                    ),
                 ],
             )],
             SettingsCategory::LanguageServers => vec![settings_group(
@@ -3882,7 +4219,7 @@ impl Application for Editor {
         ])
         .width(Length::Fill)
         .height(Length::Fill);
-        let header = widget::row::with_children(vec![
+        let header = widget::container(widget::row::with_children(vec![
             widget::text::title3("Editor settings")
                 .width(Length::Fill)
                 .into(),
@@ -3894,11 +4231,12 @@ impl Application for Editor {
                 Some(Message::Settings),
             )
             .into(),
-        ])
+        ]))
+        .padding([2.0 * design::GRID_UNIT, 4.0 * design::GRID_UNIT])
         .align_y(iced::Alignment::Center)
         .height(design::HEADER_HEIGHT);
         Some(dialog_overlay(
-            dialog_surface(
+            connected_dialog_surface(
                 widget::column::with_children(vec![
                     header.into(),
                     widget::divider::horizontal::default().into(),
@@ -3932,9 +4270,12 @@ mod tests {
             settings_open: false,
             find_open: false,
             find_match_index: 0,
+            find_match_total: 0,
             find_query: String::new(),
             quick_open: false,
             quick_open_query: String::new(),
+            quick_open_index: 0,
+            quick_open_cancel: CancellationToken::default(),
             settings_writable: false,
             quick_open_files: None,
             quick_open_generation: 0,
@@ -3954,14 +4295,267 @@ mod tests {
             pending_save_as: None,
             sidebar_transition: None,
             sidebar_panel: WorktreePanel::Files,
+            preference_lane: Arc::new(std::sync::Mutex::new([0; PreferenceFile::COUNT])),
+            preference_generation: 0,
         }
     }
-    #[test]
-    fn find_matches_counts_case_insensitive_occurrences() {
-        assert_eq!(find_matches("Alpha beta ALPHA", "alpha"), 2);
-        assert_eq!(find_matches("Alpha beta", ""), 0);
-        assert_eq!(find_matches("Alpha beta", "gamma"), 0);
+
+    fn character_key(character: &str, code: keyboard::key::Code) -> keyboard::Event {
+        let key = keyboard::Key::Character(character.into());
+        keyboard::Event::KeyPressed {
+            key: key.clone(),
+            modified_key: key,
+            physical_key: keyboard::key::Physical::Code(code),
+            location: keyboard::Location::Standard,
+            modifiers: keyboard::Modifiers::CTRL,
+            text: None,
+            repeat: false,
+        }
     }
+
+    fn named_key(named: keyboard::key::Named, modifiers: keyboard::Modifiers) -> keyboard::Event {
+        let key = keyboard::Key::Named(named);
+        keyboard::Event::KeyPressed {
+            key: key.clone(),
+            modified_key: key,
+            physical_key: keyboard::key::Physical::Unidentified(
+                keyboard::key::NativeCode::Unidentified,
+            ),
+            location: keyboard::Location::Standard,
+            modifiers,
+            text: None,
+            repeat: false,
+        }
+    }
+
+    /// Opens `file` from `root` into tab `id` as an editable buffer.
+    fn file_loaded(app: &mut Editor, id: CardId, root: &Path, file: &str) {
+        files_loaded(app, id);
+        drop(
+            app.update(Message::Repository(RepositoryAction::FileLoaded {
+                identity: AsyncIdentity {
+                    card: id,
+                    worktree: root.to_path_buf(),
+                    path: file.into(),
+                    generation: 1,
+                },
+                result: cagents::editor::load_file(root, Path::new(file)),
+            })),
+        );
+        assert!(
+            app.tab(id).unwrap().runtime.editor_text().is_some(),
+            "the buffer for {file} never opened",
+        );
+    }
+
+    #[test]
+    fn a_tab_left_behind_while_find_was_open_still_accepts_edits() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        std::fs::write(root.join("a.rs"), "alpha\n").unwrap();
+        std::fs::write(root.join("b.rs"), "beta\n").unwrap();
+        let mut app = editor();
+        let first = add(&mut app, root.to_str().unwrap(), Some("a.rs"));
+        file_loaded(&mut app, first, root, "a.rs");
+        let second = add(&mut app, root.to_str().unwrap(), Some("b.rs"));
+        file_loaded(&mut app, second, root, "b.rs");
+        drop(app.update(Message::Select(first)));
+        drop(app.update(Message::FindInFile));
+        assert!(app.find_open);
+        // Clicking another tab's title while find is open used to leave the
+        // outgoing tab holding search mode, where it drops every edit.
+        drop(app.update(Message::Select(second)));
+        assert!(!app.find_open);
+        drop(app.update(Message::Key(named_key(
+            keyboard::key::Named::Escape,
+            keyboard::Modifiers::empty(),
+        ))));
+        drop(app.update(Message::Select(first)));
+        drop(
+            app.update(Message::Repository(RepositoryAction::EditorAction {
+                card: first,
+                action: widget::text_editor::Action::Edit(widget::text_editor::Edit::Paste(
+                    Arc::new("typed".into()),
+                )),
+            })),
+        );
+        assert!(
+            app.tab(first)
+                .unwrap()
+                .runtime
+                .editor_text()
+                .unwrap()
+                .contains("typed"),
+            "the tab find was opened on silently discarded the edit",
+        );
+    }
+
+    #[test]
+    fn find_previous_from_the_first_match_wraps_to_the_last() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        for total in [3usize, 5, 7] {
+            let file = format!("matches{total}.txt");
+            std::fs::write(root.join(&file), "hit\n".repeat(total)).unwrap();
+            let mut app = editor();
+            let id = add(&mut app, root.to_str().unwrap(), Some(&file));
+            file_loaded(&mut app, id, root, &file);
+            drop(app.update(Message::FindInFile));
+            drop(app.update(Message::FindQueryChanged("hit".into())));
+            assert_eq!(app.find_match_total, total);
+            assert_eq!(app.find_match_index, 0);
+            drop(app.update(Message::FindPrevious));
+            assert_eq!(
+                app.find_match_index,
+                total - 1,
+                "previous from the first match did not wrap for {total} matches",
+            );
+            drop(app.update(Message::FindNext));
+            assert_eq!(app.find_match_index, 0);
+        }
+    }
+
+    #[test]
+    fn the_find_bar_does_not_swallow_other_shortcuts() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        std::fs::write(root.join("a.rs"), "alpha\n").unwrap();
+        let mut app = editor();
+        let id = add(&mut app, root.to_str().unwrap(), Some("a.rs"));
+        file_loaded(&mut app, id, root, "a.rs");
+        drop(app.update(Message::FindInFile));
+        let save = character_key("s", keyboard::key::Code::KeyS);
+        assert!(
+            app.handle_find_key(&save).is_none(),
+            "find claimed Ctrl+S, which reads as a data-loss risk",
+        );
+        // Left and Right belong to the query input's caret.
+        for arrow in [
+            keyboard::key::Named::ArrowLeft,
+            keyboard::key::Named::ArrowRight,
+        ] {
+            assert!(
+                app.handle_find_key(&named_key(arrow, keyboard::Modifiers::empty()))
+                    .is_none(),
+            );
+        }
+        let sidebar_open = app.sidebar_open;
+        drop(app.update(Message::Key(character_key("b", keyboard::key::Code::KeyB))));
+        assert_ne!(
+            app.sidebar_open, sidebar_open,
+            "no shortcut reached the shortcut table while the find bar was open",
+        );
+        assert!(app.find_open, "an unrelated chord closed the find bar");
+    }
+
+    #[test]
+    fn digit_chords_fire_from_the_physical_digit_row() {
+        let mut app = editor();
+        app.shortcuts.toggle_sidebar = "Ctrl+1".into();
+        let sidebar_open = app.sidebar_open;
+        // Layouts that shift the digit row report a symbol as the logical key,
+        // which is why the canonical matcher consults the physical digit.
+        let key = keyboard::Key::Character("!".into());
+        drop(app.update(Message::Key(keyboard::Event::KeyPressed {
+            key: key.clone(),
+            modified_key: key,
+            physical_key: keyboard::key::Physical::Code(keyboard::key::Code::Digit1),
+            location: keyboard::Location::Standard,
+            modifiers: keyboard::Modifiers::CTRL,
+            text: None,
+            repeat: false,
+        })));
+        assert_ne!(
+            app.sidebar_open, sidebar_open,
+            "the configured digit chord never fired",
+        );
+    }
+
+    #[test]
+    fn quick_open_is_driveable_from_the_keyboard() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        std::fs::write(root.join("a.rs"), "alpha\n").unwrap();
+        std::fs::write(root.join("b.rs"), "beta\n").unwrap();
+        let mut app = editor();
+        let id = add(&mut app, root.to_str().unwrap(), None);
+        drop(
+            app.update(Message::Repository(RepositoryAction::FilesLoaded {
+                identity: AsyncIdentity {
+                    card: id,
+                    worktree: root.to_path_buf(),
+                    path: ".".into(),
+                    generation: 1,
+                },
+                result: repository_widget::load_directory_files(root),
+            })),
+        );
+        drop(app.update(Message::QuickOpen));
+        assert!(app.quick_open);
+        let results = app.quick_open_results();
+        assert_eq!(results.len(), 2, "quick open listed {results:?}");
+        assert_eq!(app.quick_open_selection(results.len()), 0);
+        let down = named_key(
+            keyboard::key::Named::ArrowDown,
+            keyboard::Modifiers::empty(),
+        );
+        drop(app.update(Message::Key(down.clone())));
+        assert_eq!(app.quick_open_selection(results.len()), 1);
+        // Down from the last row wraps, and Up from the first row wraps back.
+        drop(app.update(Message::Key(down)));
+        assert_eq!(app.quick_open_selection(results.len()), 0);
+        drop(app.update(Message::Key(named_key(
+            keyboard::key::Named::ArrowUp,
+            keyboard::Modifiers::empty(),
+        ))));
+        assert_eq!(app.quick_open_selection(results.len()), 1);
+        let selected = results[1].clone();
+        drop(app.update(Message::Key(named_key(
+            keyboard::key::Named::Enter,
+            keyboard::Modifiers::empty(),
+        ))));
+        assert!(!app.quick_open, "Enter did not open the selected result");
+        assert_eq!(
+            app.tab(id)
+                .unwrap()
+                .pending_file
+                .as_ref()
+                .map(|pending| pending.path.clone()),
+            Some(selected),
+        );
+    }
+
+    #[test]
+    fn control_space_is_the_completion_chord() {
+        use keyboard::{
+            Key, Modifiers,
+            key::{Code, Named, Physical},
+        };
+
+        // A modifier-held space carries no text, so the physical code is the
+        // only reliable signal; the character form is the fallback.
+        assert!(is_completion_chord(
+            &Key::Character("x".into()),
+            Physical::Code(Code::Space),
+            Modifiers::CTRL
+        ));
+        assert!(is_completion_chord(
+            &Key::Character(" ".into()),
+            Physical::Unidentified(keyboard::key::NativeCode::Unidentified),
+            Modifiers::CTRL
+        ));
+        assert!(!is_completion_chord(
+            &Key::Character(" ".into()),
+            Physical::Code(Code::Space),
+            Modifiers::empty()
+        ));
+        assert!(!is_completion_chord(
+            &Key::Named(Named::Enter),
+            Physical::Code(Code::Enter),
+            Modifiers::CTRL
+        ));
+    }
+
     #[test]
     fn settings_controls_remain_interactive_over_the_overlay() {
         let mut app = editor();
@@ -4038,6 +4632,50 @@ mod tests {
         assert_eq!(app.settings_category, SettingsCategory::Keyboard);
     }
 
+    /// Runs the preference write `update` handed to the blocking pool. Unit
+    /// tests have no executor to drain a `Task`, and the persisted bytes are
+    /// the contract under test.
+    fn flush_settings(app: &mut Editor) {
+        let settings = app.settings.clone();
+        app.capture_preference(PreferenceWrite::Settings(settings))
+            .run()
+            .unwrap();
+    }
+
+    fn flush_assistance(app: &mut Editor) {
+        let settings = app.settings.clone();
+        let enabled = app.language_server_assistance;
+        app.capture_preference(PreferenceWrite::Assistance { settings, enabled })
+            .run()
+            .unwrap();
+    }
+
+    fn flush_session(app: &mut Editor) {
+        let session = app.session();
+        app.capture_preference(PreferenceWrite::Session(session))
+            .run()
+            .unwrap();
+    }
+
+    #[test]
+    fn a_jump_into_stale_diagnostics_is_refused_and_explained() {
+        let mut app = editor();
+        let id = add(&mut app, "/workspace", Some("a.rs"));
+        app.tab_mut(id)
+            .unwrap()
+            .runtime
+            .set_lsp_document(Some(LspDocumentId(1)));
+        app.tab_mut(id).unwrap().diagnostics_version = Some(3);
+        // The manager holds no version for that document, so nothing on
+        // screen can be vouched for and the caret must not move.
+        assert!(!app.diagnostics_are_current(id));
+        drop(app.update(Message::Jump(id, LspPosition::new(4, 0))));
+        assert_eq!(
+            app.notice.as_deref(),
+            Some("these diagnostics describe an earlier version of the file"),
+        );
+    }
+
     #[test]
     fn sidebar_resize_clamps_and_persists_the_width() {
         let directory = tempfile::tempdir().unwrap();
@@ -4047,6 +4685,7 @@ mod tests {
         drop(app.update(Message::Sidebar(SidebarAction::Resize { width: 9999.0 })));
         assert_eq!(app.sidebar_width(), sidebar::EXPANDED_WIDTH_MAX);
         drop(app.update(Message::Sidebar(SidebarAction::ResizeFinished)));
+        flush_settings(&mut app);
         let persisted = settings::load(&app.settings_path).unwrap();
         assert_eq!(persisted.sidebar_width, sidebar::EXPANDED_WIDTH_MAX);
     }
@@ -4095,9 +4734,11 @@ mod tests {
         drop(app.update(Message::LanguageServerAssistance(true)));
         let first_document = app.tab(id).unwrap().runtime.lsp_document().unwrap();
         assert!(app.tab(id).unwrap().lsp_error.is_some());
+        flush_assistance(&mut app);
         assert!(crate::preferences::load_language_server_assistance(&app.settings_path).unwrap());
         drop(app.update(Message::LanguageServerAssistance(false)));
         assert!(app.tab(id).unwrap().runtime.lsp_document().is_none());
+        flush_assistance(&mut app);
         assert!(!crate::preferences::load_language_server_assistance(&app.settings_path).unwrap());
         assert!(app.tab(id).unwrap().runtime.is_dirty());
         assert_eq!(
@@ -4249,18 +4890,18 @@ mod tests {
         let first = add(&mut app, "/workspace", Some("a.rs"));
         let second = add(&mut app, "/workspace", Some("b.rs"));
         drop(app.update(Message::Select(first)));
-        let initial = crate::preferences::load_session(&app.settings_path).unwrap();
         assert_eq!(
-            initial.paths,
+            app.session().paths,
             vec![
                 PathBuf::from("/workspace/a.rs"),
                 PathBuf::from("/workspace/b.rs")
             ]
         );
         drop(app.update(Message::CloseTab(second)));
-        let remaining = crate::preferences::load_session(&app.settings_path).unwrap();
+        let remaining = app.session();
         assert_eq!(remaining.paths, vec![PathBuf::from("/workspace/a.rs")]);
         assert_eq!(remaining.active, Some(0));
+        flush_session(&mut app);
         drop(app.update(Message::CloseWindow));
         assert!(app.tabs.is_empty());
         assert_eq!(
@@ -4825,6 +5466,9 @@ mod tests {
         load_selected(&mut app, id);
         assert!(app.untitled_has_content(id));
         assert!(!app.tab(id).unwrap().runtime.blocks_navigation());
+        // The navigation write went to the blocking pool; flush it so the
+        // assertion below reads real bytes.
+        flush_session(&mut app);
         drop(app.update(Message::CloseWindow));
         assert!(scratch.is_file());
         assert_eq!(std::fs::read_to_string(&scratch).unwrap(), "keep me\n");

@@ -24,6 +24,7 @@ pub(super) const ADAPTER: ProviderAdapter = ProviderAdapter {
                 .unwrap_or_else(|| home.join(".codex")),
         )
     },
+    #[cfg(feature = "host")]
     session_directory: "sessions",
     // Configurable titles do not provide an unconditional lifecycle grammar.
     activity_from_title: |_| None,
@@ -51,6 +52,7 @@ pub(super) const ADAPTER: ProviderAdapter = ProviderAdapter {
     ],
     resume_flag: "resume",
     resume_precedes_options: true,
+    #[cfg(feature = "host")]
     forwards_to_native_child: true,
     #[cfg(feature = "host")]
     create_chat: crate::chat::protocol::codex::create,

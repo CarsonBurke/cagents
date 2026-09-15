@@ -767,8 +767,14 @@ struct SnapshotStore {
 }
 
 impl SnapshotStore {
+    /// Poison only means some other task panicked while holding this lock; the
+    /// store's invariants do not depend on that task finishing, and refusing to
+    /// lock would turn one panicked session into an abort of the whole UI
+    /// process on the user's next keystroke.
     fn lock(&self) -> std::sync::MutexGuard<'_, SnapshotStoreInner> {
-        self.inner.lock().expect("snapshot store mutex")
+        self.inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
     /// Binds `doc` to `uri`, seeding or extending the URI's version stream.
@@ -1039,7 +1045,7 @@ impl EventSink {
                 self.pending
                     .inner
                     .lock()
-                    .expect("pending events mutex")
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
                     .stage(event);
                 self.pending.notify.notify_one();
             }
@@ -1051,7 +1057,7 @@ impl EventSink {
         self.pending
             .inner
             .lock()
-            .expect("pending events mutex")
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
             .forget(doc);
     }
 }
@@ -1065,7 +1071,7 @@ async fn drain_pending(tx: async_channel::Sender<LspEvent>, pending: Arc<Pending
             let next = pending
                 .inner
                 .lock()
-                .expect("pending events mutex")
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .take(prefer_terminal);
             prefer_terminal = !prefer_terminal;
             match next {
@@ -1095,7 +1101,10 @@ struct StderrTail {
 
 impl StderrTail {
     fn push(&self, line: String) {
-        let mut lines = self.lines.lock().expect("stderr tail mutex");
+        let mut lines = self
+            .lines
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         if lines.len() == STDERR_TAIL_LINES {
             lines.pop_front();
         }
@@ -1105,7 +1114,7 @@ impl StderrTail {
     fn snapshot(&self) -> Vec<String> {
         self.lines
             .lock()
-            .expect("stderr tail mutex")
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
             .iter()
             .cloned()
             .collect()
@@ -1741,7 +1750,10 @@ impl SessionContext {
         if self.retired.load(Ordering::Acquire) {
             return;
         }
-        *self.status.lock().expect("status mutex") = status.clone();
+        *self
+            .status
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = status.clone();
         for doc in self.snapshots.docs_for_session(&self.key) {
             self.events
                 .emit(LspEvent::Status {
@@ -2155,7 +2167,10 @@ async fn run_session(
     // stopped by the peer closing the connection or by `teardown`.
     let _ = tokio::time::timeout(EXIT_FLUSH_TIMEOUT, &mut protocol).await;
     teardown(protocol, child, stderr_drain, &context.process_group).await;
-    *context.status.lock().expect("status mutex") = LspStatus::Disabled;
+    *context
+        .status
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = LspStatus::Disabled;
 }
 
 /// Stops the protocol task, then terminates and reaps the process, then
@@ -3097,7 +3112,10 @@ struct SessionHandle {
 
 impl SessionHandle {
     fn status(&self) -> LspStatus {
-        self.status.lock().expect("status mutex").clone()
+        self.status
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
     }
 
     /// Stops using this session. The task keeps running until it has stopped
@@ -3107,7 +3125,7 @@ impl SessionHandle {
         let _ = self.commands.send(SessionCommand::Shutdown);
         self.task
             .lock()
-            .expect("session task mutex")
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
             .take()
             .map(|task| RetiringSession {
                 task,
@@ -3751,7 +3769,10 @@ impl LspManager {
             process_group: Arc::clone(&handle.process_group),
             stderr: Arc::new(StderrTail::default()),
         };
-        *handle.task.lock().expect("session task mutex") =
+        *handle
+            .task
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) =
             Some(runtime.spawn(run_session(context, rx)));
         self.sessions.insert(key.clone(), handle.clone());
         if orphaned {

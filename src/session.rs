@@ -14,7 +14,9 @@ use crate::{
         BootId, CardId, ProjectId, ProjectState, TerminalId, TerminalSession, WorkspaceState,
         WorktreeId, WorktreeState,
     },
-    persistence::{SnapshotBase, StateStore, StoreError},
+    persistence::{
+        SnapshotBase, StateStore, StoreError, TranscriptPruneReport, TranscriptRetention,
+    },
 };
 
 const PERSIST_DEBOUNCE: Duration = Duration::from_millis(250);
@@ -220,6 +222,10 @@ pub struct SessionRuntime {
     database_path: PathBuf,
     restored_projects: Vec<ProjectState>,
     restored_worktrees: Vec<WorktreeState>,
+    /// One line per card that storage held but could not restore. Losing a
+    /// card is a reportable event, not a silent deletion, so the shell can
+    /// surface these.
+    restore_warnings: Vec<String>,
     operation_store: Arc<StateStore>,
 }
 
@@ -260,13 +266,20 @@ impl SessionRuntime {
     ) -> Result<(Self, Option<WorkspaceState>), SessionError> {
         let database_path = database_path.as_ref().to_path_buf();
         let store = Arc::new(StateStore::open(&database_path, boot_id)?);
+        // A card storage cannot decode is dropped with a warning rather than
+        // failing the open: the writer thread below must exist even then, or
+        // one unreadable card would disable saving for the whole run.
         let restored = store
             .list_workspaces()?
             .into_iter()
             .find(|summary| summary.existence.is_open())
-            .map(|summary| store.load_workspace(summary.id, None))
+            .map(|summary| store.load_workspace_restored(summary.id, None))
             .transpose()?
             .flatten();
+        let (restored, restore_warnings) = match restored {
+            Some(restored) => (Some(restored.state), restored.warnings),
+            None => (None, Vec::new()),
+        };
         let projects = store.list_projects()?;
         let worktrees = store.list_worktrees()?;
         let writes = PendingWrites::restored(
@@ -321,6 +334,7 @@ impl SessionRuntime {
                 database_path,
                 restored_projects: projects,
                 restored_worktrees: worktrees,
+                restore_warnings,
                 operation_store,
             },
             restored,
@@ -431,6 +445,80 @@ impl SessionRuntime {
         )
     }
 
+    /// Cards storage held but could not restore, one human-readable line each.
+    ///
+    /// Empty for a clean restore. A non-empty list means the restored
+    /// workspace is missing those cards and the user should be told: the
+    /// alternative — the behaviour this replaced — was losing the entire
+    /// session with no diagnostic anywhere.
+    pub fn restore_warnings(&self) -> &[String] {
+        &self.restore_warnings
+    }
+
+    /// Reclaims terminal transcript files nothing owns any more.
+    ///
+    /// Session lifecycle owns this because only the session databases know
+    /// which terminal ids are still live. Call it once, after opening the
+    /// session; it does a single directory scan and no database writes.
+    ///
+    /// Transcripts are shared by every window while each window keeps its own
+    /// database, so the live set is the union over all of them. If any window
+    /// database cannot be read, unclaimed transcripts are left alone rather
+    /// than risk deleting a transcript another window is still writing.
+    pub fn prune_transcripts(&self) -> Result<TranscriptPruneReport, SessionError> {
+        let directories = instance::project_dirs().ok_or(SessionError::DataDirectoryUnavailable)?;
+        let transcripts = directories.data_dir().join("transcripts");
+        let mut also_live = std::collections::HashSet::new();
+        let mut complete = true;
+        match instance::window_database_paths() {
+            Ok(paths) => {
+                for path in paths {
+                    if path == self.database_path {
+                        continue;
+                    }
+                    match crate::persistence::read_live_terminal_ids(&path) {
+                        Ok(ids) => also_live.extend(ids),
+                        Err(error) => {
+                            tracing::warn!(
+                                database = %path.display(),
+                                %error,
+                                "could not read another window's terminals; \
+                                 keeping every unclaimed transcript"
+                            );
+                            complete = false;
+                        }
+                    }
+                }
+            }
+            Err(error) => {
+                tracing::warn!(
+                    %error,
+                    "could not enumerate window databases; keeping every unclaimed transcript"
+                );
+                complete = false;
+            }
+        }
+        let retention = TranscriptRetention {
+            remove_orphans: complete,
+            ..TranscriptRetention::default()
+        };
+        let report = self
+            .operation_store
+            .prune_transcripts(&transcripts, also_live, retention)?;
+        if report.removed() > 0 || report.refused > 0 {
+            tracing::info!(
+                orphaned = report.removed_orphaned,
+                oversized = report.removed_oversized,
+                over_budget = report.removed_for_budget,
+                refused = report.refused,
+                retained = report.retained,
+                retained_bytes = report.retained_bytes,
+                "pruned terminal transcripts"
+            );
+        }
+        Ok(report)
+    }
+
     /// Shares the existing connection, never opens a second startup-reconciling store.
     pub fn operation_store(&self) -> Arc<StateStore> {
         Arc::clone(&self.operation_store)
@@ -538,6 +626,9 @@ trait SessionStore {
     fn save_project(&self, project: &ProjectState) -> Result<u64, StoreError>;
     fn save_worktree(&self, worktree: &WorktreeState) -> Result<u64, StoreError>;
     fn shutdown(&self) -> Result<(), StoreError>;
+    /// Housekeeping the writer lane runs after a flush lands. Storage with no
+    /// write-ahead log of its own has nothing to do here.
+    fn checkpoint_wal_if_large(&self) {}
 }
 
 impl SessionStore for StateStore {
@@ -569,6 +660,10 @@ impl SessionStore for StateStore {
     fn shutdown(&self) -> Result<(), StoreError> {
         Self::shutdown(self)
     }
+
+    fn checkpoint_wal_if_large(&self) {
+        report_checkpoint(Self::checkpoint_wal_if_large(self));
+    }
 }
 
 impl SessionStore for Arc<StateStore> {
@@ -595,6 +690,17 @@ impl SessionStore for Arc<StateStore> {
     }
     fn shutdown(&self) -> Result<(), StoreError> {
         StateStore::shutdown(self)
+    }
+    fn checkpoint_wal_if_large(&self) {
+        report_checkpoint(StateStore::checkpoint_wal_if_large(self));
+    }
+}
+
+/// A checkpoint is housekeeping, never a save: a failure is worth a log line
+/// and nothing else.
+fn report_checkpoint(outcome: Result<bool, StoreError>) {
+    if let Err(error) = outcome {
+        tracing::warn!(%error, "session WAL checkpoint could not run");
     }
 }
 
@@ -974,6 +1080,10 @@ fn persistence_loop(
             record_flush_errors(&last_error, &errors);
             if writes.is_empty() {
                 health.flushed();
+                // Commits accumulate in the WAL, which SQLite never shrinks on
+                // its own; this costs one `stat` per flush and only does real
+                // work once the sidecar has grown past its threshold.
+                store.checkpoint_wal_if_large();
                 due = None;
                 retry_delay = config.retry_initial;
                 attempts_this_cycle = 0;

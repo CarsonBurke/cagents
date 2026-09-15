@@ -25,7 +25,7 @@ use cosmic::{
 use url::Url;
 
 use crate::{
-    design::{self, NavigationLayout},
+    design::{self, NavigationLayout, ROW_ICON_SIZE, STATUS_ICON_SIZE},
     github::{PullRequest, PullRequestCheck},
     model::{CardId, ProjectId, ProjectState, ThreadId, WorktreeId},
     repository::{
@@ -53,10 +53,9 @@ const PROJECT_HEADER_HEIGHT: f32 = design::ROW_HEIGHT;
 const WORKTREE_ROW_HEIGHT: f32 = design::ROW_HEIGHT;
 const ICON_CONTROL_SIZE: f32 = design::PRIMARY_CONTROL_SIZE;
 const ROW_ICON_WIDTH: f32 = 20.0;
-/// Icons that sit inside a row, beside its text.
-const ROW_ICON_SIZE: u16 = 16;
-/// Icons that stand alone as the illustration of a whole pane state.
-const STATUS_ICON_SIZE: u16 = 20;
+// `ROW_ICON_SIZE`/`STATUS_ICON_SIZE` are `crate::design`'s: the in-row icon
+// role is shared with the workspace chrome, and a second definition here is
+// how the two drifted apart.
 
 fn worktree_icon() -> widget::icon::Handle {
     static ICON: LazyLock<widget::icon::Handle> = LazyLock::new(|| {
@@ -275,8 +274,8 @@ impl SidebarModel {
     ///
     /// It exists because the panel is subscribed to nothing. It reloads when
     /// the user asks, when it rebinds, and when one of its own mutations
-    /// completes - while the filesystem watcher that keeps a repository card
-    /// current belongs to the card. `app.rs` routes each of the card's
+    /// completes, while the periodic freshness poll that keeps a repository
+    /// card current belongs to the card. `app.rs` routes each of the card's
     /// observations through here to decide whether the panel is reading the
     /// tree that moved.
     pub fn source_control_bound_to(&self, worktree: &Path) -> Option<&ActiveWorktreeKey> {
@@ -858,37 +857,64 @@ impl SidebarPullRequest {
 }
 
 /// One semantic mapping for navigation, the inspector and its tab.
+///
+/// This resolves the tone against the active theme, which locks the
+/// process-global theme and clones it. A per-row builder must use
+/// [`pull_request_icon`] with [`pull_request_tone`] instead and let the row's
+/// own style closure resolve the color from the theme it is handed.
 pub fn pull_request_visual(pr: &SidebarPullRequest) -> (widget::icon::Handle, cosmic::iced::Color) {
     let theme = cosmic::theme::active();
-    let cosmic = theme.cosmic();
-    let (name, color) = match pr.state {
-        Some(WorktreePullRequestState::Merged) => (
-            "merged-pull-request-symbolic",
-            cosmic::iced::Color::from_rgb8(163, 113, 247),
-        ),
-        Some(WorktreePullRequestState::Closed) => (
-            "closed-pull-request-symbolic",
-            cosmic.destructive.base.into(),
-        ),
-        _ if pr.checks == CheckStatus::Failing || pr.needs_review => {
-            ("pull-request-symbolic", cosmic.destructive.base.into())
+    (pull_request_icon(pr), pull_request_tone(pr).color(&theme))
+}
+
+/// The glyph a pull request draws. No theme decides it.
+fn pull_request_icon(pr: &SidebarPullRequest) -> widget::icon::Handle {
+    crate::ui_controls::symbolic_icon(match pr.state {
+        Some(WorktreePullRequestState::Merged) => "merged-pull-request-symbolic",
+        Some(WorktreePullRequestState::Closed) => "closed-pull-request-symbolic",
+        _ => "pull-request-symbolic",
+    })
+}
+
+/// The semantic role that decides a pull request's tone.
+///
+/// Small and `Copy` so a row's style closure can carry it and resolve the color
+/// itself, which is the only way to keep the lookup off the global theme.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PullRequestTone {
+    Merged,
+    Danger,
+    Pending,
+    Draft,
+    Passing,
+    Neutral,
+}
+
+fn pull_request_tone(pr: &SidebarPullRequest) -> PullRequestTone {
+    match pr.state {
+        Some(WorktreePullRequestState::Merged) => PullRequestTone::Merged,
+        Some(WorktreePullRequestState::Closed) => PullRequestTone::Danger,
+        _ if pr.checks == CheckStatus::Failing || pr.needs_review => PullRequestTone::Danger,
+        _ if pr.checks == CheckStatus::Pending => PullRequestTone::Pending,
+        _ if pr.draft => PullRequestTone::Draft,
+        _ if pr.checks == CheckStatus::Passing => PullRequestTone::Passing,
+        _ => PullRequestTone::Neutral,
+    }
+}
+
+impl PullRequestTone {
+    fn color(self, theme: &cosmic::Theme) -> cosmic::iced::Color {
+        let cosmic = theme.cosmic();
+        match self {
+            // Merged is GitHub's purple, which no COSMIC role names.
+            Self::Merged => cosmic::iced::Color::from_rgb8(163, 113, 247),
+            Self::Danger => cosmic.destructive.base.into(),
+            Self::Pending => cosmic.warning.base.into(),
+            Self::Draft => theme.current_container().component.on_disabled.into(),
+            Self::Passing => cosmic.success.base.into(),
+            Self::Neutral => theme.current_container().component.on.into(),
         }
-        _ if pr.checks == CheckStatus::Pending => {
-            ("pull-request-symbolic", cosmic.warning.base.into())
-        }
-        _ if pr.draft => (
-            "pull-request-symbolic",
-            theme.current_container().component.on_disabled.into(),
-        ),
-        _ if pr.checks == CheckStatus::Passing => {
-            ("pull-request-symbolic", cosmic.success.base.into())
-        }
-        _ => (
-            "pull-request-symbolic",
-            theme.current_container().component.on.into(),
-        ),
-    };
-    (crate::ui_controls::symbolic_icon(name), color)
+    }
 }
 
 /// Exact number of rows in a section.
@@ -2859,7 +2885,6 @@ pub fn view<'a>(
 
     widget::container(crate::interaction::layer(
         widget::container(content)
-            .class(theme::Container::Primary)
             .width(Length::Fill)
             .height(Length::Fill)
             .into(),
@@ -2953,12 +2978,13 @@ fn header<'a>(
         stable_id("open-repository"),
     ));
     if compact {
-        return widget::column::with_children(actions)
-            .align_x(Alignment::Center)
-            .padding([spacing.space_xxxs, 0])
-            .spacing(spacing.space_xxxs)
-            .width(Length::Fill)
-            .into();
+        return window_gestures(
+            widget::column::with_children(actions)
+                .align_x(Alignment::Center)
+                .padding([spacing.space_xxxs, 0])
+                .spacing(spacing.space_xxxs)
+                .width(Length::Fill),
+        );
     }
 
     let mut children: Vec<Element<'a, SidebarAction>> = Vec::with_capacity(6);
@@ -2969,9 +2995,9 @@ fn header<'a>(
             .into(),
     );
     if loading {
-        children.push(crate::ui_controls::activity_spinner(
+        children.push(crate::ui_controls::activity_spinner_tone(
             f32::from(ROW_ICON_SIZE),
-            cosmic::theme::active().cosmic().warning.base.into(),
+            design::warning_color,
         ));
     }
     children.extend(actions);
@@ -2982,15 +3008,26 @@ fn header<'a>(
         .padding([0, spacing.space_xxs])
         .height(Length::Fixed(HEADER_HEIGHT))
         .width(Length::Fill);
-    if modal_open {
-        header.into()
-    } else {
-        widget::mouse_area(header)
-            .on_drag(SidebarAction::DragWindow)
-            .on_double_press(SidebarAction::MaximizeWindow)
-            .on_right_press(SidebarAction::WindowMenu)
-            .into()
-    }
+    window_gestures(header)
+}
+
+/// The pane's top strip is part of the titlebar.
+///
+/// The window is undecorated, so every strip of chrome along the top edge owes
+/// the user drag, double-click-maximize and the window menu - `native_header`
+/// attaches all three beside this pane, and the compact rail is as much of a
+/// titlebar as the expanded header is. These stay live while a dialog is up:
+/// moving or maximizing the window is not a pane command, and [`gated`]'s
+/// reasoning - that a command the application refuses must not report itself
+/// enabled - does not reach them.
+fn window_gestures<'a>(
+    content: impl Into<Element<'a, SidebarAction>>,
+) -> Element<'a, SidebarAction> {
+    widget::mouse_area(content)
+        .on_drag(SidebarAction::DragWindow)
+        .on_double_press(SidebarAction::MaximizeWindow)
+        .on_right_press(SidebarAction::WindowMenu)
+        .into()
 }
 
 pub(crate) fn selected_project<'a>(
@@ -3202,9 +3239,9 @@ fn project_scroll(
 fn loading(compact: bool) -> Element<'static, SidebarAction> {
     let spacing = cosmic::theme::spacing();
     let content = widget::column::with_children(vec![
-        crate::ui_controls::activity_spinner(
+        crate::ui_controls::activity_spinner_tone(
             f32::from(STATUS_ICON_SIZE),
-            cosmic::theme::active().cosmic().warning.base.into(),
+            design::warning_color,
         ),
         design::caption(if compact {
             "Loading"
@@ -3366,6 +3403,7 @@ fn project_view<'a>(
                 .center_x(Length::Fixed(ROW_ICON_WIDTH))
                 .into(),
             design::heading(entity.name.as_str())
+                .class(theme::Text::Default)
                 .wrapping(cosmic::iced::widget::text::Wrapping::None)
                 .ellipsize(cosmic::iced::widget::text::Ellipsize::End(
                     EllipsizeHeightLimit::Lines(1),
@@ -3638,9 +3676,9 @@ fn compact_project<'a>(
                     .as_ref()
                     .is_some_and(SidebarPullRequest::has_pending_checks))
         {
-            row = row.push(crate::ui_controls::activity_spinner(
+            row = row.push(crate::ui_controls::activity_spinner_tone(
                 f32::from(ROW_ICON_SIZE),
-                cosmic::theme::active().cosmic().warning.base.into(),
+                design::warning_color,
             ));
         } else if waiting_unread {
             row = row.push(status_icon(
@@ -3719,7 +3757,7 @@ fn thread_view(
                     } else if activity == Some(crate::agent::ActivityState::Working) {
                         theme.cosmic().warning.base.into()
                     } else {
-                        design::muted_color(theme)
+                        design::muted_icon_color(theme)
                     }),
                     ..Default::default()
                 }
@@ -3735,9 +3773,9 @@ fn thread_view(
                 .width(Length::Fill),
         );
         if thread.activity == Some(crate::agent::ActivityState::Working) {
-            content = content.push(crate::ui_controls::activity_spinner(
+            content = content.push(crate::ui_controls::activity_spinner_tone(
                 f32::from(ROW_ICON_SIZE),
-                cosmic::theme::active().cosmic().warning.base.into(),
+                design::warning_color,
             ));
         } else if thread.unread {
             content = content.push(status_icon(
@@ -3834,9 +3872,9 @@ fn worktree_view<'a>(
         };
         row = row.push(if activity == crate::agent::ActivityState::Working {
             crate::interaction::tooltip(
-                crate::ui_controls::activity_spinner(
+                crate::ui_controls::activity_spinner_tone(
                     f32::from(ROW_ICON_SIZE),
-                    cosmic::theme::active().cosmic().warning.base.into(),
+                    design::warning_color,
                 ),
                 detail,
             )
@@ -3928,7 +3966,7 @@ fn project_icon(project: &SidebarProject, size: u16) -> Element<'_, SidebarActio
         None => widget::container(widget::icon::from_name("folder-symbolic").size(size))
             .class(theme::Container::custom(move |theme| {
                 cosmic::iced::widget::container::Style {
-                    icon_color: Some(design::muted_color(theme)),
+                    icon_color: Some(design::muted_icon_color(theme)),
                     ..Default::default()
                 }
             }))
@@ -4048,6 +4086,44 @@ impl widget::menu::Action for FileContextCommand<'_> {
     }
 }
 
+/// The file commands a row offers, in the order its menu draws them.
+///
+/// `file_management` is the host's willingness to mutate the working tree, so
+/// it gates Rename and Duplicate and nothing else: copying a path is a
+/// clipboard write, and a row that offers no command at all reads as dead
+/// chrome. Directories are copyable for the same reason, and only the two
+/// mutations have nothing to do on one.
+fn file_commands(
+    directory: bool,
+    file_management: bool,
+) -> impl Iterator<Item = (&'static str, &'static str, FileCommand)> {
+    [
+        ("Rename…", "edit-rename-symbolic", FileCommand::Rename),
+        (
+            "Duplicate file…",
+            "edit-duplicate-symbolic",
+            FileCommand::CopyFile,
+        ),
+        (
+            "Copy path",
+            "edit-copy-path-symbolic",
+            FileCommand::CopyPath,
+        ),
+        (
+            "Copy relative path",
+            "edit-copy-relative-path-symbolic",
+            FileCommand::CopyRelativePath,
+        ),
+    ]
+    .into_iter()
+    .filter(move |(_, _, command)| {
+        !matches!(command, FileCommand::Rename | FileCommand::CopyFile)
+            || (file_management && !directory)
+    })
+}
+
+/// The right-click menu for one file-tree row. Every row has one: see
+/// [`file_commands`].
 fn file_context_controls<'a>(
     content: Element<'a, SidebarAction>,
     key: &ActiveWorktreeKey,
@@ -4056,39 +4132,17 @@ fn file_context_controls<'a>(
     file_management: bool,
     blocked: bool,
 ) -> Element<'a, SidebarAction> {
-    if blocked || (!file_management && (row.directory || editors.is_empty())) {
+    if blocked {
         return content;
     }
     let path = &row.path;
     let mut entries = Vec::with_capacity(4 + editors.len());
-    if file_management {
-        for (label, icon, command) in [
-            ("Rename…", "edit-rename-symbolic", FileCommand::Rename),
-            (
-                "Duplicate file…",
-                "edit-duplicate-symbolic",
-                FileCommand::CopyFile,
-            ),
-            (
-                "Copy path",
-                "edit-copy-path-symbolic",
-                FileCommand::CopyPath,
-            ),
-            (
-                "Copy relative path",
-                "edit-copy-relative-path-symbolic",
-                FileCommand::CopyRelativePath,
-            ),
-        ] {
-            if row.directory && matches!(command, FileCommand::Rename | FileCommand::CopyFile) {
-                continue;
-            }
-            entries.push(widget::menu::Item::Button(
-                label.to_owned(),
-                Some(crate::ui_controls::symbolic_icon(icon)),
-                FileContextCommand::Manage { key, path, command },
-            ));
-        }
+    for (label, icon, command) in file_commands(row.directory, file_management) {
+        entries.push(widget::menu::Item::Button(
+            label.to_owned(),
+            Some(crate::ui_controls::symbolic_icon(icon)),
+            FileContextCommand::Manage { key, path, command },
+        ));
     }
     if !row.directory {
         entries.extend(editors.iter().map(|editor| {
@@ -4118,24 +4172,28 @@ fn editor_icon(editor: &SidebarEditor) -> icon::Handle {
 }
 
 fn worktree_status_icon(worktree: &SidebarWorktree, update: bool) -> Element<'_, SidebarAction> {
-    let (handle, color) = worktree
+    let (handle, tone) = worktree
         .chrome
         .pull_request
         .as_ref()
-        .map(|pr| {
-            let (handle, color) = pull_request_visual(pr);
-            (handle, Some(color))
-        })
+        .map(|pr| (pull_request_icon(pr), Some(pull_request_tone(pr))))
         .unwrap_or_else(|| (worktree_icon(), None));
     let glyph = widget::container(widget::icon(handle).size(ROW_ICON_SIZE)).class(
         theme::Container::custom(move |theme| cosmic::iced::widget::container::Style {
-            icon_color: Some(color.unwrap_or_else(|| {
-                if !update {
-                    design::muted_color(theme)
-                } else {
-                    theme.current_container().on.into()
-                }
-            })),
+            // Resolved here, against the theme this frame is drawing with: this
+            // builder runs once per visible worktree row, and reaching for
+            // `cosmic::theme::active()` locked the process-global theme and
+            // cloned it that many times per frame.
+            icon_color: Some(tone.map_or_else(
+                || {
+                    if !update {
+                        design::muted_icon_color(theme)
+                    } else {
+                        theme.current_container().on.into()
+                    }
+                },
+                |tone| tone.color(theme),
+            )),
             ..Default::default()
         }),
     );
@@ -4302,7 +4360,6 @@ fn worktree_panel<'a>(
         content
     };
     widget::container(pane)
-        .class(theme::Container::Background)
         .width(Length::Fixed(width))
         .height(Length::Fill)
         .into()
@@ -4381,7 +4438,7 @@ fn source_control_panel<'a>(
         );
         let changes: Element<'_, SidebarAction> = if git && source.has_changes() {
             changes
-                .icon_color(cosmic::theme::active().cosmic().warning.base.into())
+                .icon_tone(design::Tone::Themed(design::warning_color))
                 .into()
         } else {
             changes.into()
@@ -4430,10 +4487,7 @@ fn source_control_panel<'a>(
     let mut notices = widget::column::with_capacity(4).spacing(spacing.space_xxxs);
     notices = notices.push(slot(source.progress_label().map(|label| {
         widget::row::with_children(vec![
-            crate::ui_controls::activity_spinner(
-                14.0,
-                cosmic::theme::active().cosmic().warning.base.into(),
-            ),
+            crate::ui_controls::activity_spinner_tone(14.0, design::warning_color),
             design::caption(label).into(),
         ])
         .align_y(Alignment::Center)
@@ -4961,10 +5015,7 @@ fn branch_changes_section<'a>(
                 BranchChanges::Loading(base_ref) => column
                     .push(
                         widget::row::with_children(vec![
-                            crate::ui_controls::activity_spinner(
-                                14.0,
-                                cosmic::theme::active().cosmic().warning.base.into(),
-                            ),
+                            crate::ui_controls::activity_spinner_tone(14.0, design::warning_color),
                             design::caption(format!("Comparing with {}…", base_ref.short_name()))
                                 .into(),
                         ])
@@ -5932,7 +5983,11 @@ pub fn sidebar_button_style(selected: bool) -> theme::Button {
             text.a *= 0.5;
         }
         style.text_color = Some(text);
-        style.icon_color = Some(text);
+        style.icon_color = Some(if selected || focused {
+            text
+        } else {
+            design::muted_icon_color(theme)
+        });
         style.border_radius = theme.cosmic().corner_radii.radius_s.into();
         if selected || focused || alpha > 0.0 {
             let mut surface = foreground;
@@ -6037,42 +6092,6 @@ enum BadgeTone {
     Danger,
 }
 
-fn badge<'a>(label: impl Into<Cow<'a, str>> + 'a, tone: BadgeTone) -> Element<'a, SidebarAction> {
-    let spacing = cosmic::theme::spacing();
-    widget::container(
-        design::caption(label)
-            .class(theme::Text::default())
-            .wrapping(cosmic::iced::widget::text::Wrapping::None),
-    )
-    .class(theme::Container::custom(move |theme| {
-        let cosmic = theme.cosmic();
-        let component = match tone {
-            BadgeTone::Neutral => &cosmic.secondary(false).component,
-            BadgeTone::Success => &cosmic.success,
-            BadgeTone::Warning => &cosmic.warning,
-            BadgeTone::Danger => &cosmic.destructive,
-        };
-        cosmic::iced::widget::container::Style {
-            icon_color: Some(component.on.into()),
-            text_color: Some(component.on.into()),
-            background: Some(cosmic::iced::Background::Color(match tone {
-                BadgeTone::Neutral => cosmic::iced::Color::TRANSPARENT,
-                _ => component.base.into(),
-            })),
-            border: cosmic::iced::Border {
-                radius: cosmic.corner_radii.radius_s.into(),
-                width: 1.0,
-                color: component.border.into(),
-            },
-            shadow: cosmic::iced::Shadow::default(),
-            snap: true,
-        }
-    }))
-    .padding([spacing.space_none, spacing.space_xxxs])
-    .width(Length::Shrink)
-    .into()
-}
-
 fn status_summary(
     detached: bool,
     locked: bool,
@@ -6153,9 +6172,9 @@ fn status_icon<'a>(
 fn check_indicator(status: CheckStatus) -> Element<'static, SidebarAction> {
     if status == CheckStatus::Pending {
         return crate::interaction::tooltip(
-            crate::ui_controls::activity_spinner(
+            crate::ui_controls::activity_spinner_tone(
                 f32::from(ROW_ICON_SIZE),
-                cosmic::theme::active().cosmic().warning.base.into(),
+                design::warning_color,
             ),
             "CI checks pending or running",
         );
@@ -6209,6 +6228,10 @@ fn filtered_projects<'a>(
                         }
                 })
                 .collect::<Vec<_>>();
+            // The primary-worktree test compares paths, and the comparator ran
+            // it for both sides of every comparison: a fact that is one per row
+            // cost O(n log n) path comparisons per project per frame, on a list
+            // rebuilt by every terminal wake. Resolve it once per row instead.
             let mut worktrees = project
                 .worktrees
                 .iter()
@@ -6222,12 +6245,16 @@ fn filtered_projects<'a>(
                     SidebarFilter::Attention => state.has_agent_update(project.id, worktree.id),
                 })
                 .filter(|worktree| project_matches || worktree.matches(&query))
+                .map(|worktree| {
+                    (
+                        is_primary_worktree(&project.repository, &worktree.path),
+                        worktree,
+                    )
+                })
                 .collect::<Vec<_>>();
-            worktrees.sort_by(|left, right| {
-                let primary =
-                    |row: &SidebarWorktree| is_primary_worktree(&project.repository, &row.path);
-                primary(right)
-                    .cmp(&primary(left))
+            worktrees.sort_by(|(left_primary, left), (right_primary, right)| {
+                right_primary
+                    .cmp(left_primary)
                     .then_with(|| {
                         use crate::settings::WorktreeSort;
                         match state.worktree_sort {
@@ -6260,7 +6287,10 @@ fn filtered_projects<'a>(
             };
             visible.then_some(FilteredProject {
                 project,
-                worktrees,
+                worktrees: worktrees
+                    .into_iter()
+                    .map(|(_, worktree)| worktree)
+                    .collect(),
                 threads,
                 editors: &model.external_editors,
                 state,
@@ -7576,7 +7606,7 @@ mod tests {
     }
 
     #[test]
-    fn file_menu_opens_without_editors_only_when_file_management_is_enabled() {
+    fn file_menu_opens_for_every_row_unless_blocked() {
         use cosmic::iced::{
             Event, Point, Rectangle, Vector,
             advanced::{Shell, clipboard},
@@ -7641,8 +7671,7 @@ mod tests {
                             .is_some();
                         assert_eq!(
                             opens,
-                            !blocked
-                                && (file_management || (!row.directory && !editors.is_empty())),
+                            !blocked,
                             "file_management={file_management}, blocked={blocked}, directory={}, editors={}",
                             row.directory,
                             editors.len(),
@@ -7651,6 +7680,36 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn copying_a_path_needs_neither_file_management_nor_a_file() {
+        let commands = |directory, file_management| {
+            file_commands(directory, file_management)
+                .map(|(_, _, command)| command)
+                .collect::<Vec<_>>()
+        };
+        for directory in [false, true] {
+            assert_eq!(
+                commands(directory, false),
+                vec![FileCommand::CopyPath, FileCommand::CopyRelativePath],
+                "a clipboard write is not a working-tree mutation (directory={directory})"
+            );
+        }
+        assert_eq!(
+            commands(true, true),
+            vec![FileCommand::CopyPath, FileCommand::CopyRelativePath],
+            "a directory has nothing to rename or duplicate"
+        );
+        assert_eq!(
+            commands(false, true),
+            vec![
+                FileCommand::Rename,
+                FileCommand::CopyFile,
+                FileCommand::CopyPath,
+                FileCommand::CopyRelativePath,
+            ],
+        );
     }
 
     #[test]
@@ -8236,6 +8295,53 @@ mod tests {
                 frame_enter_presses(&renderer, header(&model, &state, compact, false, true))
                     .is_empty()
             );
+        }
+    }
+
+    #[test]
+    fn the_sidebar_header_keeps_its_titlebar_gestures_in_every_state() {
+        use cosmic::iced::{
+            Event, Point, Rectangle,
+            advanced::{Shell, clipboard},
+            mouse,
+        };
+        let renderer = headless_renderer();
+        let model = SidebarModel::ready(SidebarMode::Expanded, vec![project()]);
+        let state = SidebarState::default();
+        // The window is undecorated, so the compact rail is as much of a
+        // titlebar as the expanded header, and a dialog does not stop the user
+        // moving the window.
+        for compact in [false, true] {
+            for modal_open in [false, true] {
+                let mut element = header(&model, &state, compact, false, modal_open);
+                let mut tree = Tree::new(&element);
+                let viewport = Rectangle::with_size(Size::new(260.0, 44.0));
+                let node = element.as_widget_mut().layout(
+                    &mut tree,
+                    &renderer,
+                    &layout::Limits::new(Size::ZERO, viewport.size()),
+                );
+                let mut messages = Vec::new();
+                for event in [
+                    mouse::Event::ButtonPressed(mouse::Button::Right),
+                    mouse::Event::ButtonReleased(mouse::Button::Right),
+                ] {
+                    element.as_widget_mut().update(
+                        &mut tree,
+                        &Event::Mouse(event),
+                        Layout::new(&node),
+                        mouse::Cursor::Available(Point::new(2.0, 2.0)),
+                        &renderer,
+                        &mut clipboard::Null,
+                        &mut Shell::new(&mut messages),
+                        &viewport,
+                    );
+                }
+                assert!(
+                    messages.contains(&SidebarAction::WindowMenu),
+                    "compact={compact}, modal_open={modal_open}"
+                );
+            }
         }
     }
 

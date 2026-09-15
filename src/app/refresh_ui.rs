@@ -34,7 +34,7 @@ impl Drop for State {
 }
 
 #[derive(Debug, Clone, Copy)]
-pub(super) enum Action {
+pub enum Action {
     Tick,
     Focused(window::Id, bool),
 }

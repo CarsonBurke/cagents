@@ -846,7 +846,53 @@ const MARKDOWN_NESTING_LIMIT: usize = 8;
 /// file. The inspector is a narrow column, so each list renders a bounded
 /// prefix and states the remainder instead of growing the widget tree with the
 /// server's answer.
-const LSP_ROW_LIMIT: usize = 24;
+pub const LSP_ROW_LIMIT: usize = 24;
+
+/// One diagnostic, ready to render.
+///
+/// Deliberately carries no widget type: diagnostics presentation - file
+/// ordering, the severity and origin label, the bounded row count - is a
+/// product behaviour shared by every shell that embeds an editor, while the
+/// widget a shell builds from it is that shell's own affair.
+pub struct DiagnosticRow<'a> {
+    /// `Error · line 42 · rustc E0308`, already assembled.
+    pub label: String,
+    pub message: &'a str,
+    /// Where activating the row should place the caret.
+    pub at: LspPosition,
+    pub severity: LspSeverity,
+}
+
+/// [`DiagnosticRow`]s in file order, capped, plus the count not shown.
+pub struct DiagnosticRows<'a> {
+    pub rows: Vec<DiagnosticRow<'a>>,
+    pub withheld: usize,
+}
+
+/// Orders `diagnostics` by position, labels each one, and keeps at most
+/// `limit`. Pass [`LSP_ROW_LIMIT`] unless the surface is genuinely unbounded.
+pub fn diagnostic_rows(diagnostics: &[LspDiagnostic], limit: usize) -> DiagnosticRows<'_> {
+    let mut ordered: Vec<&LspDiagnostic> = diagnostics.iter().collect();
+    // Servers publish in their own order; a reader wants file order.
+    ordered.sort_by_key(|diagnostic| diagnostic.range.start);
+    let withheld = ordered.len().saturating_sub(limit);
+    let rows = ordered
+        .into_iter()
+        .take(limit)
+        .map(|diagnostic| DiagnosticRow {
+            label: diagnostic_label(diagnostic),
+            message: diagnostic.message.as_str(),
+            at: diagnostic.range.start,
+            severity: diagnostic.severity,
+        })
+        .collect();
+    DiagnosticRows { rows, withheld }
+}
+
+/// The sentence a shell shows in place of the rows it withheld.
+pub fn withheld_diagnostics_label(withheld: usize) -> String {
+    withheld_label(withheld, "diagnostic", "diagnostics")
+}
 
 /// Appends the language-server sections to a repository card's model.
 /// Additive so `model_for_card`'s existing four-argument signature, and its
@@ -929,24 +975,21 @@ fn diagnostics_section(card: CardId, diagnostics: &[LspDiagnostic]) -> Option<Se
     if diagnostics.is_empty() {
         return None;
     }
-    let mut ordered: Vec<&LspDiagnostic> = diagnostics.iter().collect();
-    // Servers publish in their own order; a reader wants file order.
-    ordered.sort_by_key(|diagnostic| diagnostic.range.start);
-    let withheld = ordered.len().saturating_sub(LSP_ROW_LIMIT);
-    let mut facts: Vec<Fact> = ordered
+    let presented = diagnostic_rows(diagnostics, LSP_ROW_LIMIT);
+    let mut facts: Vec<Fact> = presented
+        .rows
         .into_iter()
-        .take(LSP_ROW_LIMIT)
-        .map(|diagnostic| {
-            Fact::new(diagnostic_label(diagnostic), diagnostic.message.as_str()).activated(
-                InspectorAction::JumpToLspDiagnostic {
-                    card,
-                    at: diagnostic.range.start,
-                },
-            )
+        .map(|row| {
+            Fact::new(row.label, row.message)
+                .activated(InspectorAction::JumpToLspDiagnostic { card, at: row.at })
         })
         .collect();
-    if withheld > 0 {
-        facts.push(withheld_fact(withheld, "diagnostic", "diagnostics"));
+    if presented.withheld > 0 {
+        facts.push(withheld_fact(
+            presented.withheld,
+            "diagnostic",
+            "diagnostics",
+        ));
     }
     Some(Section::new("Diagnostics", facts))
 }
