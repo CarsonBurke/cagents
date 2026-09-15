@@ -30,6 +30,19 @@ pub fn muted_text(theme: &cosmic::Theme) -> cosmic::iced::widget::text::Style {
     }
 }
 
+/// Symbolic icons ignore alpha in their SVG recoloring. Blend them toward the
+/// surface instead so muted navigation glyphs stay visibly quieter than text.
+pub fn muted_icon_color(theme: &cosmic::Theme) -> cosmic::iced::Color {
+    let on: cosmic::iced::Color = theme.current_container().on.into();
+    let base: cosmic::iced::Color = theme.current_container().base.into();
+    cosmic::iced::Color {
+        r: on.r * 0.38 + base.r * 0.62,
+        g: on.g * 0.38 + base.g * 0.62,
+        b: on.b * 0.38 + base.b * 0.62,
+        a: 1.0,
+    }
+}
+
 pub fn body<'a>(
     text: impl Into<std::borrow::Cow<'a, str>> + 'a,
 ) -> cosmic::widget::text::Text<'a, cosmic::Theme, cosmic::Renderer> {

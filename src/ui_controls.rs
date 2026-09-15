@@ -100,7 +100,7 @@ pub fn symbolic_icon(name: &str) -> widget::icon::Handle {
         widget::icon::from_svg_bytes(br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16"><g fill="none" stroke="black" stroke-width="1.4" stroke-linejoin="round"><rect x="1.5" y="2.5" width="13" height="11" rx="1.5"/><path d="M6 3v10"/></g></svg>"#.as_slice()).symbolic(true)
     });
     static SETTINGS: LazyLock<widget::icon::Handle> = LazyLock::new(|| {
-        widget::icon::from_svg_bytes(br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16"><path d="M6.7 1.5h2.6l.3 1.7 1.1.5 1.5-.8L14 4.7l-.8 1.5.5 1.1 1.7.3v2.6l-1.7.3-.5 1.1.8 1.5-1.8 1.8-1.5-.8-1.1.5-.3 1.7H6.7l-.3-1.7-1.1-.5-1.5.8L2 11.1l.8-1.5-.5-1.1L.6 8.2V5.6l1.7-.3.5-1.1L2 2.7 3.8.9l1.5.8 1.1-.5zM8 5.5a2.5 2.5 0 1 0 0 5 2.5 2.5 0 0 0 0-5Z" fill="none" stroke="black" stroke-width="1.2" stroke-linejoin="round"/></svg>"#.as_slice()).symbolic(true)
+        widget::icon::from_svg_bytes(br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M12 8.25a3.75 3.75 0 1 0 0 7.5 3.75 3.75 0 0 0 0-7.5Zm9 3.75-2.25-.42a7.04 7.04 0 0 0-.72-1.74l1.29-1.88-1.94-1.94-1.88 1.29a7.04 7.04 0 0 0-1.74-.72L13.34 4h-2.68l-.42 2.25a7.04 7.04 0 0 0-1.74.72L6.62 6.02 4.68 7.96l1.29 1.88a7.04 7.04 0 0 0-.72 1.74L3 12v2.68l2.25.42c.18.61.42 1.19.72 1.74l-1.29 1.88 1.94 1.94 1.88-1.29c.55.3 1.13.54 1.74.72l.42 2.25h2.68l.42-2.25a7.04 7.04 0 0 0 1.74-.72l1.88 1.29 1.94-1.94-1.29-1.88c.3-.55.54-1.13.72-1.74l2.25-.42V12Z" fill="none" stroke="black" stroke-width="1.7" stroke-linejoin="round" stroke-linecap="round"/></svg>"#.as_slice()).symbolic(true)
     });
     static INSERT_TEXT: LazyLock<widget::icon::Handle> = LazyLock::new(|| {
         widget::icon::from_svg_bytes(br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16"><path d="M3.5 3.25h9M8 3.25v9.5" fill="none" stroke="black" stroke-width="1.4" stroke-linecap="round"/></svg>"#.as_slice()).symbolic(true)
@@ -394,147 +394,11 @@ fn muted_icon_color(theme: &cosmic::Theme) -> iced::Color {
 
 /// A small activity glyph that redraws only while mounted, visible and focused.
 /// The widget owns its clock: there is no application subscription or view rebuild.
-pub fn activity_spinner<'a, Message: 'a>(size: f32, color: iced::Color) -> Element<'a, Message> {
-    Element::new(activity::Spinner { size, color })
-}
-
-mod activity {
-    use cosmic::iced::{
-        self, Event, Length, Rectangle, Size,
-        advanced::{
-            Clipboard, Layout, Shell, Widget, layout, renderer,
-            widget::{Tree, tree},
-        },
-        mouse, window,
-    };
-    use cosmic::{Renderer, Theme};
-    use std::time::{Duration, Instant};
-
-    pub(super) struct Spinner {
-        pub size: f32,
-        pub color: iced::Color,
-    }
-
-    struct State {
-        focused: bool,
-        phase: u8,
-        last_frame: Option<Instant>,
-    }
-
-    impl<Message> Widget<Message, Theme, Renderer> for Spinner {
-        fn tag(&self) -> tree::Tag {
-            tree::Tag::of::<State>()
-        }
-
-        fn state(&self) -> tree::State {
-            tree::State::new(State {
-                focused: true,
-                phase: 0,
-                last_frame: None,
-            })
-        }
-
-        fn size(&self) -> Size<Length> {
-            Size::new(Length::Fixed(self.size), Length::Fixed(self.size))
-        }
-
-        fn layout(
-            &mut self,
-            _tree: &mut Tree,
-            _renderer: &Renderer,
-            limits: &layout::Limits,
-        ) -> layout::Node {
-            layout::atomic(limits, self.size, self.size)
-        }
-
-        fn update(
-            &mut self,
-            tree: &mut Tree,
-            event: &Event,
-            layout: Layout<'_>,
-            _cursor: mouse::Cursor,
-            _renderer: &Renderer,
-            _clipboard: &mut dyn Clipboard,
-            shell: &mut Shell<'_, Message>,
-            viewport: &Rectangle,
-        ) {
-            let state = tree.state.downcast_mut::<State>();
-            match event {
-                Event::Window(window::Event::Unfocused) => state.focused = false,
-                Event::Window(window::Event::Focused) => {
-                    state.focused = true;
-                    state.last_frame = None;
-                    if layout.bounds().intersection(viewport).is_some() {
-                        shell.request_redraw();
-                    }
-                }
-                Event::Window(window::Event::RedrawRequested(now))
-                    if state.focused && layout.bounds().intersection(viewport).is_some() =>
-                {
-                    let interval = Duration::from_millis(80);
-                    if state
-                        .last_frame
-                        .is_none_or(|last| now.duration_since(last) >= interval)
-                    {
-                        state.phase = (state.phase + 1) % 8;
-                        state.last_frame = Some(*now);
-                    }
-                    shell.request_redraw_at(state.last_frame.unwrap() + interval);
-                }
-                _ => {}
-            }
-        }
-
-        fn draw(
-            &self,
-            tree: &Tree,
-            renderer: &mut Renderer,
-            _theme: &Theme,
-            _style: &renderer::Style,
-            layout: Layout<'_>,
-            _cursor: mouse::Cursor,
-            viewport: &Rectangle,
-        ) {
-            use cosmic::iced::advanced::Renderer as _;
-            let Some(clip) = layout.bounds().intersection(viewport) else {
-                return;
-            };
-            let bounds = layout.bounds();
-            let phase = tree.state.downcast_ref::<State>().phase;
-            let dot = self.size / 6.0;
-            let radius = (self.size - dot) / 2.0;
-            const POSITIONS: [(f32, f32); 8] = [
-                (0.0, -1.0),
-                (0.707, -0.707),
-                (1.0, 0.0),
-                (0.707, 0.707),
-                (0.0, 1.0),
-                (-0.707, 0.707),
-                (-1.0, 0.0),
-                (-0.707, -0.707),
-            ];
-            renderer.with_layer(clip, |renderer| {
-                for (index, (x, y)) in POSITIONS.into_iter().enumerate() {
-                    let mut color = self.color;
-                    color.a *= 1.0 - f32::from((phase + 8 - index as u8) % 8) * 0.1;
-                    renderer.fill_quad(
-                        renderer::Quad {
-                            bounds: Rectangle {
-                                x: bounds.center_x() + x * radius - dot / 2.0,
-                                y: bounds.center_y() + y * radius - dot / 2.0,
-                                width: dot,
-                                height: dot,
-                            },
-                            border: iced::Border {
-                                radius: (dot / 2.0).into(),
-                                ..Default::default()
-                            },
-                            ..Default::default()
-                        },
-                        color,
-                    );
-                }
-            });
-        }
-    }
+pub fn activity_spinner<'a, Message: Clone + 'a>(
+    size: f32,
+    _color: iced::Color,
+) -> Element<'a, Message> {
+    cosmic::widget::progress_bar::indeterminate_circular()
+        .size(size)
+        .into()
 }

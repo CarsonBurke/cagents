@@ -3366,6 +3366,7 @@ fn project_view<'a>(
                 .center_x(Length::Fixed(ROW_ICON_WIDTH))
                 .into(),
             design::heading(entity.name.as_str())
+                .class(theme::Text::Default)
                 .wrapping(cosmic::iced::widget::text::Wrapping::None)
                 .ellipsize(cosmic::iced::widget::text::Ellipsize::End(
                     EllipsizeHeightLimit::Lines(1),
@@ -3719,7 +3720,7 @@ fn thread_view(
                     } else if activity == Some(crate::agent::ActivityState::Working) {
                         theme.cosmic().warning.base.into()
                     } else {
-                        design::muted_color(theme)
+                        design::muted_icon_color(theme)
                     }),
                     ..Default::default()
                 }
@@ -3928,7 +3929,7 @@ fn project_icon(project: &SidebarProject, size: u16) -> Element<'_, SidebarActio
         None => widget::container(widget::icon::from_name("folder-symbolic").size(size))
             .class(theme::Container::custom(move |theme| {
                 cosmic::iced::widget::container::Style {
-                    icon_color: Some(design::muted_color(theme)),
+                    icon_color: Some(design::muted_icon_color(theme)),
                     ..Default::default()
                 }
             }))
@@ -4131,7 +4132,7 @@ fn worktree_status_icon(worktree: &SidebarWorktree, update: bool) -> Element<'_,
         theme::Container::custom(move |theme| cosmic::iced::widget::container::Style {
             icon_color: Some(color.unwrap_or_else(|| {
                 if !update {
-                    design::muted_color(theme)
+                    design::muted_icon_color(theme)
                 } else {
                     theme.current_container().on.into()
                 }
@@ -5932,7 +5933,11 @@ pub fn sidebar_button_style(selected: bool) -> theme::Button {
             text.a *= 0.5;
         }
         style.text_color = Some(text);
-        style.icon_color = Some(text);
+        style.icon_color = Some(if selected || focused {
+            text
+        } else {
+            design::muted_icon_color(theme)
+        });
         style.border_radius = theme.cosmic().corner_radii.radius_s.into();
         if selected || focused || alpha > 0.0 {
             let mut surface = foreground;
