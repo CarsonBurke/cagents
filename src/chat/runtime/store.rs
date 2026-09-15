@@ -1,6 +1,6 @@
 //! Private, disk-backed transcript. Stable provider IDs and byte-addressed chunks
 //! keep both long conversations and a single enormous tool result pageable.
-use crate::chat::{Event, Item, ItemContent, Role};
+use crate::chat::{Event, Item, ItemContent, Phase, Role};
 use rusqlite::{Connection, OptionalExtension, params};
 use std::{
     fs,
@@ -13,6 +13,17 @@ const WINDOW_BYTES: usize = 3 * 1024 * 1024;
 const WINDOW_ITEMS: usize = 128;
 /// The serialized item carries identity only, so it is not pageable and must stay small.
 const METADATA_LIMIT: usize = 64 * 1024;
+/// An identity string a provider can make arbitrarily long is trimmed to this
+/// many bytes, so one runaway label costs a label rather than a turn.
+const NAME_BYTES: usize = 1024;
+/// Patch and snippet text live inside vectors that no chunk can page, so an
+/// oversized item keeps at most this much of them. Half the identity budget
+/// leaves room for the paths, titles and URLs alongside.
+const BULK_BYTES: usize = METADATA_LIMIT / 2;
+/// Charged per vector element beside its own text to cover what postcard adds:
+/// a variant tag and a length prefix per string. Without it an item of many
+/// tiny paths could satisfy the text budget and still overrun the serialized one.
+const ELEMENT_BYTES: usize = 16;
 type Cursor = (i64, usize);
 pub(super) struct Window {
     pub items: Vec<Item>,
@@ -117,6 +128,18 @@ impl Store {
         }
         let (body0, body1, body2) = match &mut item.content {
             ItemContent::Text { text, .. } => (std::mem::take(text), String::new(), String::new()),
+            // A command's output is the only field of it that grows without a
+            // bound; its label, argv and directory are identity.
+            ItemContent::Command { output, .. } => {
+                (std::mem::take(output), String::new(), String::new())
+            }
+            // A patch and a search snippet sit inside a vector, and a chunk is
+            // addressed by byte offset, so a paged body could never be split
+            // back into the elements it came from. These payloads stay in the
+            // item and `shrink` bounds them instead.
+            ItemContent::Changes { .. } | ItemContent::WebSearch { .. } => {
+                (String::new(), String::new(), String::new())
+            }
             ItemContent::Tool { input, output, .. } => {
                 (std::mem::take(input), std::mem::take(output), String::new())
             }
@@ -151,18 +174,12 @@ impl Store {
         let mut metadata = postcard::to_stdvec(&item).map_err(|e| e.to_string())?;
         let mut warning = None;
         if metadata.len() > METADATA_LIMIT {
-            // A provider-supplied tool name is the only remaining unbounded identity
-            // field, so trim it rather than dropping a turn of the conversation.
-            if let ItemContent::Tool { name, .. } = &mut item.content {
-                let mut end = name.len().min(1024);
-                while end > 0 && !name.is_char_boundary(end) {
-                    end -= 1;
-                }
-                name.truncate(end);
-                metadata = postcard::to_stdvec(&item).map_err(|e| e.to_string())?;
-            }
+            // Every identity field a provider controls is trimmed rather than
+            // dropping a turn of the conversation.
+            shrink(&mut item.content);
+            metadata = postcard::to_stdvec(&item).map_err(|e| e.to_string())?;
             warning = Some(format!(
-                "Provider item {} exceeded the 64 KiB identity budget; its name was truncated",
+                "Provider item {} exceeded the 64 KiB identity budget and was shortened to fit",
                 brief(&item.id)
             ));
         }
@@ -325,9 +342,13 @@ impl Store {
                 Item {
                     id: id.into(),
                     role,
+                    // A delta stream carries no phase, so the shell this
+                    // synthesizes to hold the text names the default rather
+                    // than inventing narration the provider never declared.
                     content: ItemContent::Text {
                         text: String::new(),
                         thinking,
+                        phase: Phase::Final,
                     },
                 },
                 false,
@@ -443,6 +464,7 @@ impl Store {
         'records: for (id, ordinal, metadata, len0, len1, len2) in records {
             let base: Item = postcard::from_bytes(&metadata).map_err(|e| e.to_string())?;
             let total = len0 + len1;
+            let kind = layout(&base.content);
             let parts = total.max(1).div_ceil(PART_BYTES);
             let until = if self.end.is_some_and(|cursor| cursor.0 == ordinal) {
                 self.end.unwrap().1.min(parts)
@@ -456,20 +478,27 @@ impl Store {
                 } else {
                     self.boundary(&id, len0, (part + 1) * PART_BYTES)?
                 };
+                let (start0, end0) = (start.min(len0), end.min(len0));
+                let (start1, end1) = (start.saturating_sub(len0), end.saturating_sub(len0));
                 let mut item = base.clone();
                 if part > 0 {
-                    item.id = format!("{id}:native-part:{part}");
+                    // A part index names a position in a body rather than the bytes at
+                    // that position, and the slice moves while an item is live: a
+                    // command's output grows, and a finished tool call is rewritten into
+                    // a command, which drops the input from the body and re-slices what
+                    // is left. Since the reader's disclosure state is keyed by item id,
+                    // an index alone would hand a part the state its reader gave to
+                    // different bytes, so the id also carries the range each field is
+                    // read at and which variant decided that field's meaning. Neither
+                    // moves while a body only grows, so a part the reader expanded
+                    // stays expanded across frames.
+                    item.id =
+                        format!("{id}:native-part:{part}:{kind}:{start0}-{end0}:{start1}-{end1}");
                 }
-                let body0 =
-                    String::from_utf8(self.field(&id, 0, start.min(len0), end.min(len0))?)
-                        .map_err(|e| e.to_string())?;
-                let body1 = String::from_utf8(self.field(
-                    &id,
-                    1,
-                    start.saturating_sub(len0),
-                    end.saturating_sub(len0),
-                )?)
-                .map_err(|e| e.to_string())?;
+                let body0 = String::from_utf8(self.field(&id, 0, start0, end0)?)
+                    .map_err(|e| e.to_string())?;
+                let body1 = String::from_utf8(self.field(&id, 1, start1, end1)?)
+                    .map_err(|e| e.to_string())?;
                 // An inline attachment is never paged: half a base64 payload renders as
                 // nothing, so it is restored whole or replaced by an explanation.
                 let attachment =
@@ -484,6 +513,29 @@ impl Store {
                 let attached = attachment.as_ref().map_or(0, String::len);
                 match &mut item.content {
                     ItemContent::Text { text, .. } => *text = body0,
+                    ItemContent::Command {
+                        label,
+                        command,
+                        output,
+                        ..
+                    } => {
+                        *output = body0;
+                        if parts > 1 {
+                            // The view shows the command itself when the
+                            // provider supplied no label, so a paged command
+                            // has to name itself in the label that now carries
+                            // which part of the output this is.
+                            let base = if label.is_empty() {
+                                command.clone()
+                            } else {
+                                std::mem::take(label)
+                            };
+                            *label = format!("{base} (part {}/{parts})", part + 1);
+                        }
+                    }
+                    // Bounded when the item was cached, so there is no chunked
+                    // body to restore here.
+                    ItemContent::Changes { .. } | ItemContent::WebSearch { .. } => {}
                     ItemContent::Tool {
                         name,
                         input,
@@ -570,6 +622,87 @@ impl Drop for Store {
         let _ = fs::remove_dir_all(&self.directory);
     }
 }
+/// Bounds the identity fields a provider can make arbitrarily large so an
+/// oversized item is shortened rather than lost. The payloads that live in a
+/// vector share one budget and the vector is cut where that budget runs out,
+/// because an item naming a thousand paths cannot carry a useful patch for
+/// each of them anyway and its paths are worth more than its last patch.
+fn shrink(content: &mut ItemContent) {
+    match content {
+        ItemContent::Command {
+            label,
+            command,
+            working_directory,
+            ..
+        } => {
+            clamp(label, NAME_BYTES);
+            clamp(command, NAME_BYTES);
+            clamp(working_directory, NAME_BYTES);
+        }
+        ItemContent::Changes { changes, .. } => {
+            let mut budget = BULK_BYTES;
+            changes.retain_mut(|change| {
+                clamp(&mut change.path, NAME_BYTES);
+                let Some(room) = budget.checked_sub(change.path.len() + ELEMENT_BYTES) else {
+                    return false;
+                };
+                clamp_lines(&mut change.diff, room);
+                budget = room - change.diff.len();
+                true
+            });
+        }
+        ItemContent::WebSearch { query, results } => {
+            clamp(query, NAME_BYTES);
+            let mut budget = BULK_BYTES;
+            results.retain_mut(|result| {
+                clamp(&mut result.title, NAME_BYTES);
+                clamp(&mut result.url, NAME_BYTES);
+                let spent = result.title.len() + result.url.len() + ELEMENT_BYTES;
+                let Some(room) = budget.checked_sub(spent) else {
+                    return false;
+                };
+                clamp(&mut result.snippet, room);
+                budget = room - result.snippet.len();
+                true
+            });
+        }
+        ItemContent::Tool { name, .. } => clamp(name, NAME_BYTES),
+        // Prose and attachments keep nothing but their role and ID here; their
+        // text was already taken out into chunks.
+        ItemContent::Text { .. } | ItemContent::Image { .. } => {}
+    }
+}
+/// Truncates to at most `limit` bytes without splitting a UTF-8 sequence.
+fn clamp(text: &mut String, limit: usize) {
+    if text.len() <= limit {
+        return;
+    }
+    let mut end = limit;
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    text.truncate(end);
+}
+/// Truncates patch text after the last newline that fits in `limit`.
+///
+/// A unified diff is line-structured: the first byte of a line decides whether
+/// that line is added, removed or context, and a hunk header declares how many
+/// of each follow. A patch cut mid-line therefore does not merely lose text, it
+/// can survive as an intact-looking patch describing an edit the provider never
+/// made, so the cut only ever lands on a line boundary and the remainder stays
+/// a true prefix of what was sent.
+fn clamp_lines(text: &mut String, limit: usize) {
+    if text.len() <= limit {
+        return;
+    }
+    // A newline is ASCII, so a position found in the byte prefix is always a
+    // character boundary.
+    let end = text.as_bytes()[..limit]
+        .iter()
+        .rposition(|byte| *byte == b'\n')
+        .map_or(0, |index| index + 1);
+    text.truncate(end);
+}
 /// A caching shortfall degrades presentation; it never terminates the provider.
 fn nonfatal(message: String) -> Event {
     Event::Error {
@@ -584,6 +717,21 @@ fn brief(id: &str) -> &str {
         end -= 1;
     }
     &id[..end]
+}
+/// Names how a variant's payload is spread across the chunk fields, for the
+/// part IDs of a paged item. Which field a byte offset belongs to is decided by
+/// the variant, so a rewritten item can hold entirely different bytes at the
+/// same offset of the same field: a tool call keeps its input in field 0 and a
+/// command keeps its output there.
+fn layout(content: &ItemContent) -> &'static str {
+    match content {
+        ItemContent::Text { .. } => "text",
+        ItemContent::Command { .. } => "command",
+        ItemContent::Changes { .. } => "changes",
+        ItemContent::WebSearch { .. } => "search",
+        ItemContent::Tool { .. } => "tool",
+        ItemContent::Image { .. } => "image",
+    }
 }
 fn insert_body(
     transaction: &rusqlite::Transaction<'_>,
@@ -629,6 +777,7 @@ mod tests {
                 content: ItemContent::Text {
                     text: original.clone(),
                     thinking: false,
+                    phase: Phase::Final,
                 },
             }))
             .unwrap();
@@ -689,6 +838,7 @@ mod tests {
                 content: ItemContent::Text {
                     text: "ok".into(),
                     thinking: false,
+                    phase: Phase::Final,
                 },
             }))
             .unwrap();
@@ -718,10 +868,176 @@ mod tests {
         assert_eq!(window.items.len(), 1);
         match &window.items[0].content {
             ItemContent::Tool { name, input, .. } => {
-                assert!(name.len() <= 1024);
+                assert!(name.len() <= NAME_BYTES);
                 assert_eq!(input, "{}");
             }
             other => panic!("unexpected content {other:?}"),
+        }
+    }
+    /// A patch cut mid-line can stay syntactically intact while describing an
+    /// edit nobody made, so an oversized change set must lose whole lines only.
+    #[test]
+    fn oversized_change_set_is_truncated_on_a_line_boundary() {
+        let mut store = Store::at(std::env::temp_dir()).unwrap();
+        let mut diff = String::from("@@ -1 +1,8000 @@\n-gone\n");
+        for line in 0..8000 {
+            diff.push_str(&format!("+line {line} of the provider's patch\n"));
+        }
+        assert!(diff.len() > PART_BYTES);
+        let events = store
+            .apply(Event::Item(Item {
+                id: "edit".into(),
+                role: Role::Assistant,
+                content: ItemContent::Changes {
+                    changes: vec![crate::chat::FileChange {
+                        path: "src/app.rs".into(),
+                        kind: crate::chat::ChangeKind::Updated,
+                        diff: diff.clone(),
+                    }],
+                    status: crate::chat::ToolStatus::Succeeded,
+                },
+            }))
+            .unwrap();
+        assert!(
+            matches!(events.as_slice(), [Event::Error { fatal: false, .. }]),
+            "{events:?}"
+        );
+        let window = store.window().unwrap();
+        assert_eq!(window.items.len(), 1);
+        match &window.items[0].content {
+            ItemContent::Changes { changes, .. } => {
+                let [change] = changes.as_slice() else {
+                    panic!("unexpected change set {changes:?}");
+                };
+                assert_eq!(change.path, "src/app.rs");
+                assert!(change.diff.len() < diff.len(), "patch was not bounded");
+                assert!(
+                    diff.starts_with(change.diff.as_str()),
+                    "surviving patch is not a prefix of what the provider sent"
+                );
+                assert!(
+                    change.diff.ends_with('\n'),
+                    "patch was cut inside a line: {:?}",
+                    &change.diff[change.diff.len().saturating_sub(64)..]
+                );
+                for line in change.diff.lines() {
+                    assert!(
+                        line.starts_with(|first: char| matches!(first, '@' | '+' | '-' | ' ')),
+                        "surviving patch has a line no diff parser accepts: {line:?}"
+                    );
+                }
+            }
+            other => panic!("unexpected content {other:?}"),
+        }
+    }
+    /// Command output is the one field of a command that pages, so it must come
+    /// back from the chunk it was written to rather than from an empty one.
+    #[test]
+    fn command_output_pages_without_losing_bytes() {
+        let mut store = Store::at(std::env::temp_dir()).unwrap();
+        let original = "cargo output line\n".repeat(20_000);
+        assert!(original.len() > 2 * PART_BYTES);
+        store
+            .apply(Event::Item(Item {
+                id: "exec".into(),
+                role: Role::Assistant,
+                content: ItemContent::Command {
+                    label: "Run cargo".into(),
+                    command: "cargo test".into(),
+                    working_directory: "/repo".into(),
+                    action: crate::chat::CommandAction::Run,
+                    status: crate::chat::ToolStatus::Succeeded,
+                    exit_code: Some(0),
+                    duration_ms: Some(12),
+                    output: original.clone(),
+                },
+            }))
+            .unwrap();
+        let window = store.window().unwrap();
+        let parts = original.len().div_ceil(PART_BYTES);
+        assert_eq!(window.items.len(), parts);
+        let mut restored = String::new();
+        for (index, item) in window.items.iter().enumerate() {
+            match &item.content {
+                ItemContent::Command {
+                    label,
+                    command,
+                    output,
+                    exit_code,
+                    ..
+                } => {
+                    assert_eq!(command, "cargo test");
+                    assert_eq!(*exit_code, Some(0));
+                    assert_eq!(label, &format!("Run cargo (part {}/{parts})", index + 1));
+                    restored.push_str(output);
+                }
+                other => panic!("unexpected content {other:?}"),
+            }
+        }
+        assert_eq!(restored, original);
+    }
+    /// A part id is the key the view's disclosure state is held under, and a
+    /// provider rewrites a live item: a finished tool call arrives again as a
+    /// command, which drops the input from the body and re-slices what is left.
+    /// A part that kept its old id would open on its first paint because the
+    /// reader had expanded the different bytes that id used to name.
+    #[test]
+    fn re_sliced_parts_do_not_reuse_the_ids_of_different_bytes() {
+        let mut store = Store::at(std::env::temp_dir()).unwrap();
+        let output = "shell output line\n".repeat(19_445);
+        let input = "{\"command\":\"ls\"}".repeat(18_750);
+        // Both bodies span more than two parts, so a part lands wholly inside
+        // the call's input and the byte range it names outlives the rewrite
+        // that moves the output to where that input used to be.
+        assert!(output.len() > 2 * PART_BYTES && input.len() > 2 * PART_BYTES);
+        let parts = |window: Window| {
+            window
+                .items
+                .into_iter()
+                .map(|item| item.id)
+                .filter(|id| id.contains(":native-part:"))
+                .collect::<Vec<_>>()
+        };
+        store
+            .apply(Event::Item(Item {
+                id: "call".into(),
+                role: Role::Assistant,
+                content: ItemContent::Tool {
+                    name: "shell".into(),
+                    input,
+                    output: output.clone(),
+                    status: crate::chat::ToolStatus::Running,
+                },
+            }))
+            .unwrap();
+        let before = parts(store.window().unwrap());
+        assert!(before.len() > 1, "{before:?}");
+        // Nothing changed between the two windows, so every part keeps its id
+        // and a reader who expands one and scrolls does not lose it.
+        assert_eq!(parts(store.window().unwrap()), before);
+        store
+            .apply(Event::Item(Item {
+                id: "call".into(),
+                role: Role::Assistant,
+                content: ItemContent::Command {
+                    label: "shell".into(),
+                    command: "ls".into(),
+                    working_directory: "/repo".into(),
+                    action: crate::chat::CommandAction::Run,
+                    status: crate::chat::ToolStatus::Succeeded,
+                    exit_code: Some(0),
+                    duration_ms: Some(3),
+                    output,
+                },
+            }))
+            .unwrap();
+        let after = parts(store.window().unwrap());
+        assert!(after.len() > 1, "{after:?}");
+        for id in &after {
+            assert!(
+                !before.contains(id),
+                "part id {id} was reused for different bytes"
+            );
         }
     }
 }

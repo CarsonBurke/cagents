@@ -288,6 +288,17 @@ fn settings_category_controls<'a>(
                         })
                         .into(),
                 ),
+                setting_field(
+                    "Chat send key",
+                    "Enter sends the message and Shift+Enter breaks the line. Turn this off to compose with Enter and send with Ctrl+Enter.",
+                    widget::toggler(draft.chat_enter_sends)
+                        .label("Enter sends a chat message".to_owned())
+                        .on_toggle(|enabled| Message::SettingsChanged {
+                            field: SettingsField::ChatEnterSends,
+                            value: enabled.to_string(),
+                        })
+                        .into(),
+                ),
             ],
         )],
         SettingsCategory::Appearance => vec![

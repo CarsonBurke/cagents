@@ -347,7 +347,12 @@ pub fn segmented_controls<'a, Message: 'a>(
     .into()
 }
 
-fn control_style(selected: bool, tone: Option<crate::design::Tone>) -> cosmic::theme::Button {
+/// The shell's flat control surface: no border, no fill until hovered.
+///
+/// Exposed so a surface that composes its own row - a transcript step, a
+/// navigation entry - presses the same treatment as the icon controls beside
+/// it instead of reaching for a stock button class.
+pub fn control_style(selected: bool, tone: Option<crate::design::Tone>) -> cosmic::theme::Button {
     let appearance = move |focused: bool, theme: &cosmic::Theme| widget::button::Style {
         background: (selected || focused).then(|| {
             iced::Background::Color(

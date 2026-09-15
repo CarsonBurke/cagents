@@ -9,7 +9,33 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
 };
 
+mod step;
+mod turn;
 mod view;
+
+fn action(action: Action) -> Message {
+    Message::ChatUi(action)
+}
+
+/// One icon control on the chat surface.
+///
+/// Shared by the transcript and the composer so a control means the same
+/// thing, and is the same size, wherever it appears.
+fn icon<'a>(
+    name: &'static str,
+    label: impl Into<Cow<'a, str>>,
+    enabled: bool,
+    message: Action,
+) -> Element<'a, Message> {
+    crate::ui_controls::icon_control(
+        widget::icon::from_name(name).handle(),
+        label,
+        false,
+        enabled,
+        Some(action(message)),
+    )
+    .into()
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Target {
@@ -51,6 +77,9 @@ pub enum Action {
     Command(Target, Command),
     CommandFinished(Target, u64, Result<(), String>),
     Toggle(Target, String),
+    /// Opens or closes a whole turn's step strip, addressed by the id of the
+    /// turn's first item.
+    ToggleTurn(Target, String),
     Raw(Target, String),
     Copy(Target, String, CopyPart),
     OpenUrl(String),
@@ -141,6 +170,14 @@ pub(super) struct State {
     handoffs: HashSet<Target>,
     closing: HashSet<Target>,
     closed: HashSet<CardId>,
+    /// Unsent composer text belonging to a card whose chat runtime has been
+    /// dropped.
+    ///
+    /// Returning a chat card to its terminal view and back used to discard
+    /// whatever was typed, which is why leaving the surface at all had to be
+    /// refused. Holding the draft here makes the round trip lossless, so the
+    /// refusal is only needed where the process itself is about to restart.
+    drafts: HashMap<CardId, String>,
 }
 impl Default for State {
     fn default() -> Self {
@@ -154,6 +191,7 @@ impl Default for State {
             bindings: HashMap::new(),
             closing: HashSet::new(),
             closed: HashSet::new(),
+            drafts: HashMap::new(),
         }
     }
 }
@@ -204,15 +242,102 @@ struct ChangeToken {
 }
 
 impl ChangeToken {
-    fn text_shape(thinking: bool) -> u8 {
-        u8::from(thinking)
+    /// Text's shape carries both flags that sit beside its body, because a
+    /// message that turns from commentary into an answer must not be mistaken
+    /// for an append of the same length.
+    fn text_shape(thinking: bool, phase: chat::Phase) -> u8 {
+        u8::from(thinking) | (u8::from(phase == chat::Phase::Commentary) << 1)
+    }
+    fn status_offset(status: chat::ToolStatus) -> u8 {
+        match status {
+            chat::ToolStatus::Running => 0,
+            chat::ToolStatus::Succeeded => 1,
+            chat::ToolStatus::Failed => 2,
+            chat::ToolStatus::Denied => 3,
+        }
+    }
+    /// Folds a number into a digest so a field that is not a string still
+    /// changes the token. An exit code arriving on a command whose output is
+    /// already complete is exactly that case.
+    fn mix(digest: u64, value: u64) -> u64 {
+        (digest ^ value).wrapping_mul(0x0000_0100_0000_01b3)
     }
     fn of(content: &ItemContent) -> Self {
         match content {
-            ItemContent::Text { text, thinking } => Self {
-                shape: Self::text_shape(*thinking),
+            ItemContent::Text {
+                text,
+                thinking,
+                phase,
+            } => Self {
+                shape: Self::text_shape(*thinking, *phase),
                 body: text.len(),
                 digest: tail_digest(0, text),
+            },
+            ItemContent::Command {
+                label,
+                command,
+                working_directory,
+                action,
+                status,
+                exit_code,
+                duration_ms,
+                output,
+            } => Self {
+                shape: 4 + Self::status_offset(*status),
+                body: output.len(),
+                digest: Self::mix(
+                    Self::mix(
+                        tail_digest(
+                            tail_digest(
+                                tail_digest(tail_digest(0, label), command),
+                                working_directory,
+                            ),
+                            output,
+                        ),
+                        exit_code.map_or(u64::MAX, |code| code as i64 as u64),
+                    ),
+                    duration_ms.unwrap_or(u64::MAX) ^ u64::from(*action as u8),
+                ),
+            },
+            ItemContent::Changes { changes, status } => Self {
+                shape: 8 + Self::status_offset(*status),
+                body: changes.last().map_or(0, |change| change.diff.len()),
+                digest: changes.iter().fold(
+                    Self::mix(0, changes.len() as u64),
+                    |digest, change| {
+                        // The kind is folded in as its discriminant so an
+                        // add that becomes a rename is a change even when
+                        // the path and the patch are untouched, and a
+                        // rename's source path with it, because the detail
+                        // prints it and it is the one field of the variant
+                        // that nothing else in this digest covers.
+                        let digest = Self::mix(
+                            tail_digest(tail_digest(digest, &change.path), &change.diff),
+                            match &change.kind {
+                                chat::ChangeKind::Added => 0,
+                                chat::ChangeKind::Deleted => 1,
+                                chat::ChangeKind::Updated => 2,
+                                chat::ChangeKind::Renamed { .. } => 3,
+                            },
+                        );
+                        match &change.kind {
+                            chat::ChangeKind::Renamed { from } => tail_digest(digest, from),
+                            _ => digest,
+                        }
+                    },
+                ),
+            },
+            ItemContent::WebSearch { query, results } => Self {
+                shape: 12,
+                body: results.len(),
+                digest: results
+                    .iter()
+                    .fold(tail_digest(0, query), |digest, result| {
+                        tail_digest(
+                            tail_digest(tail_digest(digest, &result.title), &result.url),
+                            &result.snippet,
+                        )
+                    }),
             },
             ItemContent::Tool {
                 name,
@@ -220,17 +345,12 @@ impl ChangeToken {
                 output,
                 status,
             } => Self {
-                shape: 2 + match status {
-                    chat::ToolStatus::Running => 0,
-                    chat::ToolStatus::Succeeded => 1,
-                    chat::ToolStatus::Failed => 2,
-                    chat::ToolStatus::Denied => 3,
-                },
+                shape: 13 + Self::status_offset(*status),
                 body: output.len(),
                 digest: tail_digest(tail_digest(tail_digest(0, name), input), output),
             },
             ItemContent::Image { path, description } => Self {
-                shape: 6,
+                shape: 17,
                 body: path.len(),
                 digest: tail_digest(tail_digest(0, path), description),
             },
@@ -239,10 +359,15 @@ impl ChangeToken {
     /// The item's body when the only change since this token was taken is bytes
     /// appended to it, so the cached parse can be extended instead of redone.
     fn appended<'a>(&self, content: &'a ItemContent) -> Option<&'a str> {
-        let ItemContent::Text { text, thinking } = content else {
+        let ItemContent::Text {
+            text,
+            thinking,
+            phase,
+        } = content
+        else {
             return None;
         };
-        if self.shape != Self::text_shape(*thinking) || text.len() <= self.body {
+        if self.shape != Self::text_shape(*thinking, *phase) || text.len() <= self.body {
             return None;
         }
         // `get` also rejects a rewrite that left the old length mid-character.
@@ -318,6 +443,83 @@ impl CodeScan {
     }
 }
 
+/// A step's elapsed time at the precision a reader can act on.
+///
+/// Sub-second work is reported in milliseconds because the difference between
+/// 4 ms and 400 ms is the difference between a cache hit and a process launch;
+/// past a second the milliseconds stop carrying information.
+fn format_duration(millis: u64) -> String {
+    match millis {
+        0..1_000 => format!("{millis}ms"),
+        0..60_000 => format!("{:.1}s", millis as f64 / 1_000.0),
+        _ => format!("{}m {}s", millis / 60_000, (millis % 60_000) / 1_000),
+    }
+}
+
+fn status_word(status: chat::ToolStatus) -> &'static str {
+    match status {
+        chat::ToolStatus::Running => "Running",
+        chat::ToolStatus::Succeeded => "Completed",
+        chat::ToolStatus::Failed => "Failed",
+        chat::ToolStatus::Denied => "Denied",
+    }
+}
+
+/// What a copy control hands the reader.
+///
+/// Every step variant answers, because a control that silently does nothing is
+/// worse than no control: a command's output and a tool's result are only
+/// reachable through their step's detail, so this is the only way out of the
+/// transcript for them. `Text` is the whole step as a reader would quote it;
+/// `Input` and `Output` are the individual blocks their own headers offer.
+fn copy_text(part: CopyPart, content: &ItemContent) -> Option<String> {
+    fn joined(parts: &[&str]) -> Option<String> {
+        let text = parts
+            .iter()
+            .copied()
+            .filter(|part| !part.is_empty())
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        (!text.is_empty()).then_some(text)
+    }
+    match (part, content) {
+        (CopyPart::Text, ItemContent::Text { text, .. }) => joined(&[text]),
+        (
+            CopyPart::Text,
+            ItemContent::Command {
+                command, output, ..
+            },
+        ) => joined(&[command, output]),
+        (CopyPart::Text, ItemContent::Changes { changes, .. }) => joined(
+            &changes
+                .iter()
+                .map(|change| change.diff.as_str())
+                .collect::<Vec<_>>(),
+        ),
+        (CopyPart::Text, ItemContent::WebSearch { query, results }) => {
+            let mut text = query.clone();
+            for result in results {
+                text.push_str("\n\n");
+                text.push_str(&result.title);
+                text.push('\n');
+                text.push_str(&result.url);
+            }
+            Some(text)
+        }
+        (CopyPart::Text, ItemContent::Tool { input, output, .. }) => joined(&[input, output]),
+        (CopyPart::Text, ItemContent::Image { path, description }) => joined(&[description, path]),
+        // A command has no separate input block, so its header offers the
+        // command line under the same name the tool detail uses for one.
+        (CopyPart::Input, ItemContent::Command { command, .. }) => joined(&[command]),
+        (CopyPart::Input, ItemContent::Tool { input, .. }) => joined(&[input]),
+        (CopyPart::Output, ItemContent::Command { output, .. })
+        | (CopyPart::Output, ItemContent::Tool { output, .. }) => joined(&[output]),
+        // The code blocks of a Markdown answer are the cache's own, resolved
+        // by the caller before it reaches this.
+        (CopyPart::Code(_), _) | (CopyPart::Input | CopyPart::Output, _) => None,
+    }
+}
+
 /// One transcript item's presentation, retained across refreshes.
 ///
 /// The body is never copied in: what an item looked like when it was parsed is
@@ -327,8 +529,8 @@ struct CachedItem {
     token: ChangeToken,
     markdown: markdown::Content,
     code: CodeScan,
-    /// A tool row's `name · status` caption, formed once per change rather than
-    /// once per frame.
+    /// A step's trailing metadata — exit status and duration — formed once per
+    /// change rather than once per frame.
     detail: Option<String>,
     image: Option<iced::widget::image::Handle>,
 }
@@ -343,16 +545,46 @@ impl CachedItem {
         };
         match content {
             ItemContent::Text { text, .. } => cached.extend(text, 0),
-            ItemContent::Tool { name, status, .. } => {
-                cached.detail = Some(format!(
-                    "{name} · {}",
-                    match status {
-                        chat::ToolStatus::Running => "Running",
-                        chat::ToolStatus::Succeeded => "Completed",
-                        chat::ToolStatus::Failed => "Failed",
-                        chat::ToolStatus::Denied => "Denied",
+            ItemContent::Command {
+                status,
+                exit_code,
+                duration_ms,
+                ..
+            } => {
+                // The label already says what ran, so this line carries only
+                // what the label cannot: whether it worked and how long it
+                // took. A zero exit code is the uninteresting case and is left
+                // out so a failure stands out.
+                let mut detail = String::new();
+                match exit_code {
+                    Some(0) | None => {}
+                    Some(code) => detail.push_str(&format!("exit {code}")),
+                }
+                if let Some(elapsed) = duration_ms {
+                    if !detail.is_empty() {
+                        detail.push_str(" · ");
                     }
-                ));
+                    detail.push_str(&format_duration(*elapsed));
+                }
+                if detail.is_empty() {
+                    detail.push_str(status_word(*status));
+                }
+                cached.detail = Some(detail);
+            }
+            ItemContent::Changes { changes, status } => {
+                cached.detail = Some(match changes.len() {
+                    0 | 1 => status_word(*status).to_owned(),
+                    count => format!("{count} files"),
+                });
+            }
+            ItemContent::WebSearch { results, .. } => {
+                cached.detail = Some(match results.len() {
+                    1 => "1 result".to_owned(),
+                    count => format!("{count} results"),
+                });
+            }
+            ItemContent::Tool { status, .. } => {
+                cached.detail = Some(status_word(*status).to_owned());
             }
             ItemContent::Image { path, .. } => {
                 cached.image = match path {
@@ -397,6 +629,17 @@ pub(super) struct Runtime {
     handle: Arc<ClientHandle>,
     snapshot: Arc<Snapshot>,
     cache: HashMap<String, CachedItem>,
+    /// The snapshot's items grouped into turns, rebuilt only when the snapshot
+    /// changes rather than once per frame.
+    turns: Vec<turn::Turn>,
+    /// The reader's explicit choice to open or close a turn's step strip,
+    /// keyed by the turn's first item id.
+    ///
+    /// An override rather than a set, because the useful default is not
+    /// constant: a running turn shows its steps, because watching them is the
+    /// point, and a finished turn hides them, because the answer is. Only a
+    /// deliberate toggle is recorded here.
+    opened: HashMap<String, bool>,
     composer: text_editor::Content<cosmic::Renderer>,
     revision: u64,
     attachments: Vec<Attachment>,
@@ -424,6 +667,8 @@ impl Runtime {
             snapshot: Arc::new(Snapshot::default()),
             handle,
             cache: HashMap::new(),
+            turns: Vec::new(),
+            opened: HashMap::new(),
             composer: text_editor::Content::new(),
             revision: 0,
             attachments: Vec::new(),
@@ -452,6 +697,13 @@ impl Runtime {
         }
         let live_ids: HashSet<&str> = snapshot.items.iter().map(|item| item.id.as_str()).collect();
         self.cache.retain(|id, _| live_ids.contains(id.as_str()));
+        // The disclosure sets are keyed by item id and the store drops items
+        // past its window, so without this they grow for the life of the card:
+        // one entry per step the reader ever opened, held after the step it
+        // named stopped existing.
+        self.expanded.retain(|id| live_ids.contains(id.as_str()));
+        self.raw.retain(|id| live_ids.contains(id.as_str()));
+        self.opened.retain(|id, _| live_ids.contains(id.as_str()));
         for item in &snapshot.items {
             let token = ChangeToken::of(&item.content);
             if let Some(cached) = self.cache.get_mut(&item.id) {
@@ -493,6 +745,7 @@ impl Runtime {
         if snapshot.session_id.is_some() || self.snapshot.session_id.is_some() {
             self.session.launch.session_id = snapshot.session_id.clone();
         }
+        self.turns = turn::group(&snapshot.items);
         self.snapshot = snapshot;
     }
     pub(super) fn set_visible(&self, visible: bool) -> Result<(), String> {
@@ -507,24 +760,49 @@ impl Runtime {
             self.refresh();
         }
     }
+    /// Whether the turn keyed by `key` still has a step in flight, which is
+    /// the default disclosure state a toggle inverts.
+    fn turn_running(&self, key: &str) -> bool {
+        self.turns
+            .iter()
+            .find(|turn| turn.key == key)
+            .is_some_and(|turn| turn.running)
+    }
+
+    /// Why this chat cannot be swapped for its terminal view right now.
+    ///
+    /// An unsent draft is deliberately absent: `Cagents::chat_forget` stashes
+    /// it and a returning runtime restores it, so typing a single character no
+    /// longer makes the card impossible to leave. Attachments and half-entered
+    /// request answers still block, because those are references and decisions
+    /// that cannot be reconstructed from text.
     pub(super) fn transition_blocker(&self) -> Option<&'static str> {
         if self.attachment_chooser_pending {
             Some("Finish or cancel the file chooser before leaving the chat.")
         } else if self.pending.is_some() {
             Some("Wait for the pending chat command to finish before leaving the chat.")
-        } else if !self.composer.is_empty()
-            || !self.attachments.is_empty()
-            || self
-                .answers
-                .values()
-                .any(|answers| answers.iter().any(|answer| !answer.is_empty()))
+        } else if !self.attachments.is_empty() {
+            Some("Send or remove the attached files before leaving the chat.")
+        } else if self
+            .answers
+            .values()
+            .any(|answers| answers.iter().any(|answer| !answer.is_empty()))
         {
-            Some(
-                "Submit unsent chat input and attachments, or copy and clear the input and remove attachments before leaving the chat.",
-            )
+            Some("Submit or clear the answer you started before leaving the chat.")
         } else {
             None
         }
+    }
+    /// Why this chat cannot survive the process restarting.
+    ///
+    /// The draft stash lives in memory, so an update is the one transition
+    /// that really does discard unsent text.
+    pub(super) fn restart_blocker(&self) -> Option<&'static str> {
+        self.transition_blocker().or_else(|| {
+            (!self.composer.is_empty()).then_some(
+                "Send or clear the unsent chat message before updating; restarting discards it.",
+            )
+        })
     }
 }
 
@@ -716,11 +994,32 @@ impl Cagents {
             .map(|(target, wake)| Message::ChatUi(Action::Wake(target, wake)))
     }
     pub(super) fn chat_forget(&mut self, card: CardId) {
+        // The runtime is about to be dropped, so its unsent text is captured
+        // here rather than lost. `chat_forget` is the single place a chat
+        // runtime stops existing while its card lives on.
+        if let Some(CardRuntime::Chat(runtime)) = self.cards.get(&card) {
+            let draft = runtime.composer.text();
+            if draft.trim().is_empty() {
+                self.chat_ui.drafts.remove(&card);
+            } else {
+                self.chat_ui.drafts.insert(card, draft);
+            }
+        }
         self.chat_ui.attempts.remove(&card);
         self.chat_ui.bindings.remove(&card);
         self.chat_ui.handoffs.retain(|target| target.card != card);
         self.chat_ui.closing.retain(|target| target.card != card);
         self.observe_agent_activity_for_card(card, None);
+    }
+    /// Forgets a chat runtime whose card is going away for good.
+    ///
+    /// The difference from `chat_forget` is the draft: a card that is about to
+    /// be tombstoned will never build a runtime under that id again, so
+    /// stashing its unsent text would pin the string for the lifetime of the
+    /// process with nothing able to read it back.
+    pub(super) fn chat_discard(&mut self, card: CardId) {
+        self.chat_forget(card);
+        self.chat_ui.drafts.remove(&card);
     }
     pub(super) fn chat_start_pending(&self, card: CardId) -> bool {
         self.chat_ui.attempts.contains_key(&card)
@@ -1128,6 +1427,14 @@ impl Cagents {
                         } else {
                             let mut runtime =
                                 Runtime::new(target, session.clone(), handle, visible);
+                            // Whatever was typed before this card last left the
+                            // chat surface comes back with it.
+                            if let Some(draft) = self.chat_ui.drafts.remove(&target.card)
+                                && !draft.is_empty()
+                            {
+                                runtime.composer = text_editor::Content::with_text(&draft);
+                                runtime.revision = runtime.revision.wrapping_add(1);
+                            }
                             runtime.show(visible);
                             if let Some(CardRuntime::Terminal(terminal)) = self
                                 .cards
@@ -1337,6 +1644,19 @@ impl Cagents {
                     }
                 }
             }
+            Action::ToggleTurn(target, key) => {
+                if let Some(runtime) = self.chat_runtime_mut(target) {
+                    // The default depends on whether the turn is still
+                    // running, so the toggle is recorded against what is
+                    // currently shown rather than against a fixed value.
+                    let open = runtime
+                        .opened
+                        .get(&key)
+                        .copied()
+                        .unwrap_or_else(|| runtime.turn_running(&key));
+                    runtime.opened.insert(key, !open);
+                }
+            }
             Action::Raw(target, id) => {
                 if let Some(runtime) = self.chat_runtime_mut(target) {
                     if !runtime.raw.remove(&id) {
@@ -1354,21 +1674,17 @@ impl Cagents {
                     CopyPart::Code(index) => runtime
                         .cache
                         .get(&id)
-                        .and_then(|cached| cached.code.codes.get(index)),
+                        .and_then(|cached| cached.code.codes.get(index))
+                        .cloned(),
                     part => runtime
                         .snapshot
                         .items
                         .iter()
                         .find(|item| item.id == id)
-                        .and_then(|item| match (part, &item.content) {
-                            (CopyPart::Text, ItemContent::Text { text, .. }) => Some(text),
-                            (CopyPart::Input, ItemContent::Tool { input, .. }) => Some(input),
-                            (CopyPart::Output, ItemContent::Tool { output, .. }) => Some(output),
-                            _ => None,
-                        }),
+                        .and_then(|item| copy_text(part, &item.content)),
                 };
                 if let Some(text) = text {
-                    return iced::clipboard::write(text.clone()).map(cosmic::Action::App);
+                    return iced::clipboard::write(text).map(cosmic::Action::App);
                 }
             }
             Action::OpenUrl(raw) => {
@@ -1668,6 +1984,7 @@ mod tests {
         ItemContent::Text {
             text: body.to_owned(),
             thinking: false,
+            phase: chat::Phase::Final,
         }
     }
 
@@ -1728,9 +2045,22 @@ mod tests {
                 .appended(&ItemContent::Text {
                     text: "hello world and more".to_owned(),
                     thinking: true,
+                    phase: chat::Phase::Final,
                 })
                 .is_none(),
             "thinking text is collapsed differently and is not the same item"
+        );
+        assert!(
+            cached
+                .token
+                .appended(&ItemContent::Text {
+                    text: "hello world and more".to_owned(),
+                    thinking: false,
+                    phase: chat::Phase::Commentary,
+                })
+                .is_none(),
+            "narration and an answer are typeset differently, so a phase change \
+             is not an append"
         );
     }
 
@@ -1750,6 +2080,96 @@ mod tests {
         assert_eq!(
             ChangeToken::of(&tool("aaaa")),
             ChangeToken::of(&tool("aaaa"))
+        );
+    }
+
+    /// A copy control that resolves to nothing is indistinguishable from a
+    /// broken one, and a command's output has no other way out of the
+    /// transcript.
+    #[test]
+    fn every_step_a_copy_control_is_offered_on_resolves_to_text() {
+        let command = ItemContent::Command {
+            label: "Ran tests".to_owned(),
+            command: "cargo test".to_owned(),
+            working_directory: "/tmp".to_owned(),
+            action: chat::CommandAction::Run,
+            status: chat::ToolStatus::Succeeded,
+            exit_code: Some(0),
+            duration_ms: Some(12),
+            output: "ok. 3 passed".to_owned(),
+        };
+        assert_eq!(
+            copy_text(CopyPart::Text, &command).as_deref(),
+            Some("cargo test\n\nok. 3 passed")
+        );
+        assert_eq!(
+            copy_text(CopyPart::Input, &command).as_deref(),
+            Some("cargo test")
+        );
+        assert_eq!(
+            copy_text(CopyPart::Output, &command).as_deref(),
+            Some("ok. 3 passed")
+        );
+        let changes = ItemContent::Changes {
+            changes: vec![chat::FileChange {
+                path: "src/app.rs".to_owned(),
+                diff: "@@\n-old\n+new\n".to_owned(),
+                kind: chat::ChangeKind::Updated,
+            }],
+            status: chat::ToolStatus::Succeeded,
+        };
+        assert_eq!(
+            copy_text(CopyPart::Text, &changes).as_deref(),
+            Some("@@\n-old\n+new\n")
+        );
+        let tool = ItemContent::Tool {
+            name: "write".to_owned(),
+            input: "{}".to_owned(),
+            output: "done".to_owned(),
+            status: chat::ToolStatus::Succeeded,
+        };
+        assert_eq!(
+            copy_text(CopyPart::Text, &tool).as_deref(),
+            Some("{}\n\ndone")
+        );
+        assert_eq!(
+            copy_text(
+                CopyPart::Text,
+                &ItemContent::WebSearch {
+                    query: "iced scrollable".to_owned(),
+                    results: vec![chat::SearchResult {
+                        title: "Scrollable".to_owned(),
+                        url: "https://docs.rs/iced".to_owned(),
+                        snippet: String::new(),
+                    }],
+                }
+            )
+            .as_deref(),
+            Some("iced scrollable\n\nScrollable\nhttps://docs.rs/iced")
+        );
+    }
+
+    /// The detail prints a rename's source path, so a token that ignores it
+    /// would leave the stale path on screen after an in-place patch update.
+    #[test]
+    fn change_token_separates_renames_that_differ_only_in_their_source() {
+        let renamed = |from: &str| ItemContent::Changes {
+            changes: vec![chat::FileChange {
+                path: "src/new.rs".to_owned(),
+                diff: String::new(),
+                kind: chat::ChangeKind::Renamed {
+                    from: from.to_owned(),
+                },
+            }],
+            status: chat::ToolStatus::Succeeded,
+        };
+        assert_ne!(
+            ChangeToken::of(&renamed("src/old.rs")),
+            ChangeToken::of(&renamed("src/older.rs"))
+        );
+        assert_eq!(
+            ChangeToken::of(&renamed("src/old.rs")),
+            ChangeToken::of(&renamed("src/old.rs"))
         );
     }
 }

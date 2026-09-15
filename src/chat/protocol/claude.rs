@@ -4,8 +4,8 @@
 //! https://unpkg.com/@anthropic-ai/claude-agent-sdk@0.3.236/sdk.d.ts
 use super::{Adapter, ProcessSpec, Step};
 use crate::chat::{
-    Answer, Attachment, Capabilities, Choice, Command, Event, Field, Item, ItemContent, Launch,
-    Model, PromptMode, Request, Role, SlashCommand, ToolStatus, Usage,
+    Answer, Attachment, Capabilities, Choice, Command, CommandAction, Event, Field, Item,
+    ItemContent, Launch, Model, Phase, PromptMode, Request, Role, SlashCommand, ToolStatus, Usage,
 };
 use base64::Engine as _;
 use serde_json::{Value, json};
@@ -646,6 +646,7 @@ impl Claude {
                                     ItemContent::Text {
                                         text,
                                         thinking: false,
+                                        ..
                                     },
                                     "text",
                                 ) => text == string(block, "text"),
@@ -653,12 +654,17 @@ impl Claude {
                                     ItemContent::Text {
                                         text,
                                         thinking: true,
+                                        ..
                                     },
                                     "thinking",
                                 ) => text == string(block, "thinking"),
-                                (ItemContent::Tool { .. }, "tool_use" | "server_tool_use") => {
-                                    item.id == string(block, "id")
-                                }
+                                (
+                                    ItemContent::Command { .. }
+                                    | ItemContent::Changes { .. }
+                                    | ItemContent::WebSearch { .. }
+                                    | ItemContent::Tool { .. },
+                                    "tool_use" | "server_tool_use",
+                                ) => item.id == string(block, "id"),
                                 _ => false,
                             }
                     })
@@ -685,16 +691,20 @@ impl Claude {
                         let item = Item {
                             id: tool_id,
                             role: Role::Assistant,
-                            content: ItemContent::Tool {
-                                name: required(block, "name")?.into(),
-                                input: block["input"].to_string(),
-                                output: String::new(),
-                                status: ToolStatus::Running,
-                            },
+                            content: tool_content(
+                                required(block, "name")?,
+                                &block["input"],
+                                &self.cwd,
+                            ),
                         };
                         // Replayed assistant envelopes must not reset a completed tool result.
-                        if !self.tools.get(&item.id).is_some_and(|old| matches!(&old.content, ItemContent::Tool { status, .. } if *status != ToolStatus::Running)) {
-                            self.tool(item.clone()); step.events.push(Event::Item(item));
+                        if !self.tools.get(&item.id).is_some_and(|old| {
+                            old.content
+                                .status()
+                                .is_some_and(|status| status != ToolStatus::Running)
+                        }) {
+                            self.tool(item.clone());
+                            step.events.push(Event::Item(item));
                         }
                     }
                     "tool_result" => {
@@ -709,14 +719,11 @@ impl Claude {
                                 status: ToolStatus::Running,
                             },
                         });
-                        if let ItemContent::Tool { output, status, .. } = &mut item.content {
-                            *output = content_text(&block["content"]);
-                            *status = if block["is_error"].as_bool() == Some(true) {
-                                ToolStatus::Failed
-                            } else {
-                                ToolStatus::Succeeded
-                            };
-                        }
+                        apply_result(
+                            &mut item.content,
+                            content_text(&block["content"]),
+                            block["is_error"].as_bool() == Some(true),
+                        );
                         if let Some(content) = block["content"].as_array() {
                             for (index, attachment) in content
                                 .iter()
@@ -1257,7 +1264,111 @@ fn text_item(id: String, role: Role, text: String, thinking: bool) -> Item {
     Item {
         id,
         role,
-        content: ItemContent::Text { text, thinking },
+        // Claude's stream-json frames carry no turn-phase label: an assistant
+        // text block is shaped identically whether it narrates progress or
+        // answers the question, and the closing `result` frame only repeats
+        // text that was already delivered as its own block. A guessed phase
+        // would demote real answers into narration, so every text item is
+        // final until the provider itself says otherwise.
+        content: ItemContent::Text {
+            text,
+            thinking,
+            phase: Phase::Final,
+        },
+    }
+}
+/// Map a Claude tool call onto the transcript's richer variants.
+///
+/// Only Claude's own built-in tools are classified, because the tool's name is
+/// what makes the intent unambiguous; an arbitrary tool's arguments are not
+/// evidence of what it does. MCP tools, subagent tasks and the edit tools stay
+/// a tool disclosure, and so does a built-in whose defining input has not
+/// arrived yet, since a command item without its command tells the view less
+/// than the tool call it came from.
+fn tool_content(name: &str, input: &Value, cwd: &Path) -> ItemContent {
+    let session = || cwd.to_string_lossy().into_owned();
+    // Claude's search tools walk `path` and fall back to the session directory
+    // when it is absent, which is what the provider itself does.
+    let scope = || match input["path"].as_str().filter(|path| !path.is_empty()) {
+        Some(path) => path.to_owned(),
+        None => session(),
+    };
+    let pattern = string(input, "pattern");
+    let file = string(input, "file_path");
+    match name {
+        "Bash" if !string(input, "command").is_empty() => command_content(
+            // Claude writes its own short summary of the command it is running.
+            string(input, "description").into(),
+            string(input, "command").into(),
+            session(),
+            CommandAction::Run,
+        ),
+        "Read" if !file.is_empty() => command_content(
+            format!("Read {file}"),
+            file.into(),
+            session(),
+            CommandAction::Read,
+        ),
+        "Grep" if !pattern.is_empty() => command_content(
+            format!("Search {pattern}"),
+            pattern.into(),
+            scope(),
+            CommandAction::Search,
+        ),
+        "Glob" if !pattern.is_empty() => command_content(
+            format!("List {pattern}"),
+            pattern.into(),
+            scope(),
+            CommandAction::List,
+        ),
+        _ => ItemContent::Tool {
+            name: name.into(),
+            input: input.to_string(),
+            output: String::new(),
+            status: ToolStatus::Running,
+        },
+    }
+}
+fn command_content(
+    label: String,
+    command: String,
+    working_directory: String,
+    action: CommandAction,
+) -> ItemContent {
+    ItemContent::Command {
+        label,
+        command,
+        working_directory,
+        action,
+        status: ToolStatus::Running,
+        // Claude reports neither an exit status nor a duration for its tools,
+        // and an inferred one would be indistinguishable in the view from a
+        // measured one.
+        exit_code: None,
+        duration_ms: None,
+        output: String::new(),
+    }
+}
+/// Attach a tool result to whichever variant the call was mapped to, so that a
+/// richer mapping never costs the result the provider reported.
+fn apply_result(content: &mut ItemContent, text: String, failed: bool) {
+    let result = if failed {
+        ToolStatus::Failed
+    } else {
+        ToolStatus::Succeeded
+    };
+    match content {
+        ItemContent::Command { output, status, .. } | ItemContent::Tool { output, status, .. } => {
+            *output = text;
+            *status = result;
+        }
+        // `tool_content` maps a Claude tool call to `Command` or `Tool` and to
+        // nothing else, keeping even the edit tools a tool disclosure, so the
+        // remaining variants never hold a Claude tool result.
+        ItemContent::Text { .. }
+        | ItemContent::Changes { .. }
+        | ItemContent::WebSearch { .. }
+        | ItemContent::Image { .. } => {}
     }
 }
 fn image_content(block: &Value) -> ItemContent {
@@ -1507,7 +1618,7 @@ impl Claude {
                     return Err("Claude delta arrived without its content block".into());
                 };
                 match (&mut item.content, string(delta, "type")) {
-                    (ItemContent::Text { text, thinking }, "text_delta" | "thinking_delta") => {
+                    (ItemContent::Text { text, thinking, .. }, "text_delta" | "thinking_delta") => {
                         let value = delta[if *thinking { "thinking" } else { "text" }]
                             .as_str()
                             .ok_or("Claude text delta has no string payload")?;
@@ -1547,12 +1658,23 @@ impl Claude {
                 let index = event["index"]
                     .as_u64()
                     .ok_or("Claude block stop has no index")?;
-                if let Some(item) = self.blocks.get(&(message, index)).cloned() {
-                    if let ItemContent::Tool { input, .. } = &item.content {
-                        if !input.is_empty() {
+                if let Some(mut item) = self.blocks.get(&(message, index)).cloned() {
+                    if let ItemContent::Tool { name, input, .. } = &item.content {
+                        let parsed = if input.is_empty() {
+                            Value::Null
+                        } else {
                             serde_json::from_str::<Value>(input).map_err(|e| {
                                 format!("Malformed completed Claude tool input: {e}")
-                            })?;
+                            })?
+                        };
+                        // Classifying a tool needs its whole input, which only
+                        // exists once the block has stopped, so the fragments
+                        // accumulate as a plain tool call and the richer
+                        // mapping happens here rather than against a prefix.
+                        let content = tool_content(name, &parsed, &self.cwd);
+                        if !matches!(content, ItemContent::Tool { .. }) {
+                            item.content = content;
+                            step.events.push(Event::Item(item.clone()));
                         }
                         self.tool(item);
                     }
@@ -2454,6 +2576,143 @@ mod tests {
             text.events
                 .iter()
                 .any(|e| matches!(e, Event::Item(i) if i.id == "msg-1:1"))
+        );
+    }
+
+    fn items(step: &Step) -> Vec<ItemContent> {
+        step.events
+            .iter()
+            .filter_map(|event| match event {
+                Event::Item(item) => Some(item.content.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn bash_call_and_its_result_become_one_command_carrying_the_output() {
+        let mut adapter = Claude {
+            cwd: PathBuf::from("/workspace"),
+            ..Claude::default()
+        };
+        let call = adapter.receive(json!({"type":"assistant","uuid":"a1","message":{"id":"msg-1","content":[{"type":"tool_use","id":"tool-1","name":"Bash","input":{"command":"cargo test","description":"Run the tests"}}]}})).unwrap();
+        assert_eq!(
+            items(&call),
+            vec![ItemContent::Command {
+                label: "Run the tests".into(),
+                command: "cargo test".into(),
+                working_directory: "/workspace".into(),
+                action: CommandAction::Run,
+                status: ToolStatus::Running,
+                exit_code: None,
+                duration_ms: None,
+                output: String::new(),
+            }]
+        );
+        let settled = adapter.receive(json!({"type":"user","uuid":"u1","message":{"id":"msg-2","content":[{"type":"tool_result","tool_use_id":"tool-1","content":"3 passed"}]}})).unwrap();
+        assert_eq!(
+            items(&settled),
+            vec![ItemContent::Command {
+                label: "Run the tests".into(),
+                command: "cargo test".into(),
+                working_directory: "/workspace".into(),
+                action: CommandAction::Run,
+                status: ToolStatus::Succeeded,
+                exit_code: None,
+                duration_ms: None,
+                output: "3 passed".into(),
+            }]
+        );
+    }
+
+    #[test]
+    fn builtin_tool_names_classify_the_action_and_edits_stay_tool_disclosures() {
+        let mut adapter = Claude {
+            cwd: PathBuf::from("/workspace"),
+            ..Claude::default()
+        };
+        let step = adapter
+            .receive(json!({"type":"assistant","uuid":"a1","message":{"id":"msg-1","content":[
+                {"type":"tool_use","id":"t1","name":"Read","input":{"file_path":"src/app.rs"}},
+                {"type":"tool_use","id":"t2","name":"Grep","input":{"pattern":"TODO","path":"src"}},
+                {"type":"tool_use","id":"t3","name":"Glob","input":{"pattern":"**/*.rs"}},
+                {"type":"tool_use","id":"t4","name":"Edit","input":{"file_path":"src/app.rs","old_string":"a","new_string":"b"}}
+            ]}}))
+            .unwrap();
+        let mapped = items(&step)
+            .into_iter()
+            .map(|content| match content {
+                ItemContent::Command {
+                    label,
+                    working_directory,
+                    action,
+                    ..
+                } => (label, working_directory, Some(action)),
+                ItemContent::Tool { name, .. } => (name, String::new(), None),
+                other => panic!("Claude tool mapped to {other:?}"),
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            mapped,
+            vec![
+                (
+                    "Read src/app.rs".to_owned(),
+                    "/workspace".to_owned(),
+                    Some(CommandAction::Read)
+                ),
+                (
+                    "Search TODO".to_owned(),
+                    "src".to_owned(),
+                    Some(CommandAction::Search)
+                ),
+                (
+                    "List **/*.rs".to_owned(),
+                    "/workspace".to_owned(),
+                    Some(CommandAction::List)
+                ),
+                ("Edit".to_owned(), String::new(), None),
+            ]
+        );
+    }
+
+    #[test]
+    fn streamed_tool_input_accumulates_before_it_is_classified() {
+        let mut adapter = Claude {
+            cwd: PathBuf::from("/workspace"),
+            ..Claude::default()
+        };
+        adapter
+            .receive(stream(
+                json!({"type":"message_start","message":{"id":"msg-1"}}),
+            ))
+            .unwrap();
+        adapter.receive(stream(json!({"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"tool-1","name":"Bash"}}))).unwrap();
+        let partial = adapter.receive(stream(json!({"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"command\":\"ls"}}))).unwrap();
+        assert_eq!(
+            items(&partial),
+            vec![ItemContent::Tool {
+                name: "Bash".into(),
+                input: "{\"command\":\"ls".into(),
+                output: String::new(),
+                status: ToolStatus::Running,
+            }]
+        );
+        adapter.receive(stream(json!({"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"\"}"}}))).unwrap();
+        let stopped = adapter
+            .receive(stream(json!({"type":"content_block_stop","index":0})))
+            .unwrap();
+        assert_eq!(
+            items(&stopped),
+            vec![ItemContent::Command {
+                label: String::new(),
+                command: "ls".into(),
+                working_directory: "/workspace".into(),
+                action: CommandAction::Run,
+                status: ToolStatus::Running,
+                exit_code: None,
+                duration_ms: None,
+                output: String::new(),
+            }]
         );
     }
 

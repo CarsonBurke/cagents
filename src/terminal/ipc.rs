@@ -36,7 +36,13 @@ use crate::{
 /// Version 8 adds durable upgrade preparation and restored source linkage.
 /// Version 9 adds read-only conversation preview and explicit bound activation.
 /// Version 10 adds intentional exits, transient native environments and host-owned CLI returns.
-pub const PROTOCOL_VERSION: u16 = 10;
+/// Version 11 adds semantic chat items: commands, file changes, web searches, and a
+/// commentary/final phase on assistant text. `ItemContent` gained variants ahead of
+/// `Tool` and `Image` and a third field on `Text`; postcard is not self-describing, so
+/// neither the shifted variant indices nor the added field can be tolerated by a peer
+/// that predates them - a `serde(default)` never fires because a missing trailing field
+/// is indistinguishable from the next value in the frame.
+pub const PROTOCOL_VERSION: u16 = 11;
 /// Postcard encodes an 80x24 grid in roughly 20 KiB and a typical single-row
 /// delta in a few hundred bytes, but a full repaint of a very large grid after
 /// a resize still has to fit, so keep generous headroom.

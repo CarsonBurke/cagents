@@ -1,23 +1,5 @@
 use super::*;
 
-fn action(action: Action) -> Message {
-    Message::ChatUi(action)
-}
-fn icon<'a>(
-    name: &'static str,
-    label: impl Into<Cow<'a, str>>,
-    enabled: bool,
-    message: Action,
-) -> Element<'a, Message> {
-    crate::ui_controls::icon_control(
-        widget::icon::from_name(name).handle(),
-        label,
-        false,
-        enabled,
-        Some(action(message)),
-    )
-    .into()
-}
 fn body<'a>(text: impl Into<Cow<'a, str>> + 'a) -> Element<'a, Message> {
     widget::selectable_text(text)
         .size(design::TEXT_BODY)
@@ -44,54 +26,115 @@ fn code_label(index: usize) -> Cow<'static, str> {
         |label| Cow::Borrowed(*label),
     )
 }
+/// The composer's own line height and inner padding.
+///
+/// Named because the composer's height is computed from the draft rather than
+/// fixed, so the two constants have to agree with what the editor draws.
+const COMPOSER_LINE_HEIGHT: f32 = 18.0;
+const COMPOSER_PADDING: f32 = design::GRID_UNIT * 2.0;
+
+/// The widest a user's message is drawn.
+///
+/// Narrower than the measure prose is held to, because a prompt is an aside
+/// in the conversation rather than the body of it: keeping it clearly short
+/// of the full column is what makes the alternation of asking and answering
+/// visible while scrolling.
+const PROMPT_MEASURE: f32 = 560.0;
+
+/// The context gauge's track: wide enough to read a proportion off, short
+/// enough that it stays a detail in the status line.
+const GAUGE_WIDTH: f32 = 72.0;
+const GAUGE_HEIGHT: f32 = 6.0;
+
+/// The composer editor, drawing no surface of its own.
+///
+/// The composer is one surface that holds the editor and its controls
+/// together, the way a reader sees it. Letting the editor paint its own filled
+/// bordered box inside that surface is what produced a box inside a box, which
+/// is most of what made the old composer look like stacked slabs.
+fn composer_editor_style(
+    theme: &cosmic::Theme,
+    _status: iced::widget::text_editor::Status,
+) -> iced::widget::text_editor::Style {
+    let cosmic = theme.cosmic();
+    iced::widget::text_editor::Style {
+        background: iced::Background::Color(iced::Color::TRANSPARENT),
+        border: iced::Border::default(),
+        placeholder: design::muted_color(theme),
+        value: cosmic.palette.neutral_9.into(),
+        selection: cosmic.accent.base.into(),
+    }
+}
+
 /// The icon and tooltip for a submit control.
 ///
 /// `slot` is the control's place among the modes the provider currently
-/// allows: the first answers to Ctrl+Enter and the second to Ctrl+Shift+Enter,
-/// so the tooltip names the chord the composer is bound to.
-fn submit_control(mode: PromptMode, slot: usize) -> (&'static str, &'static str) {
-    match (mode, slot) {
-        (PromptMode::Send, _) => ("mail-send-symbolic", "Send message — Ctrl+Enter"),
-        (PromptMode::Steer, 0) => ("go-jump-symbolic", "Steer the active turn — Ctrl+Enter"),
+/// allows, and `enter_sends` decides which chord the first of them answers to,
+/// so the tooltip names the key the composer is actually bound to rather than
+/// a fixed one.
+fn submit_control(mode: PromptMode, slot: usize, enter_sends: bool) -> (&'static str, String) {
+    let primary = if enter_sends { "Enter" } else { "Ctrl+Enter" };
+    let (name, verb, chord) = match (mode, slot) {
+        (PromptMode::Send, _) => ("mail-send-symbolic", "Send message", primary),
+        (PromptMode::Steer, 0) => ("go-jump-symbolic", "Steer the active turn", primary),
         (PromptMode::Steer, _) => (
             "go-jump-symbolic",
-            "Steer the active turn — Ctrl+Shift+Enter",
+            "Steer the active turn",
+            "Ctrl+Shift+Enter",
         ),
-        (PromptMode::Queue, 0) => ("list-add-symbolic", "Queue for the next turn — Ctrl+Enter"),
+        (PromptMode::Queue, 0) => ("list-add-symbolic", "Queue for the next turn", primary),
         (PromptMode::Queue, _) => (
             "list-add-symbolic",
-            "Queue for the next turn — Ctrl+Shift+Enter",
+            "Queue for the next turn",
+            "Ctrl+Shift+Enter",
         ),
-    }
+    };
+    (name, format!("{verb} — {chord}"))
 }
 /// The submit mode a composer key press asks for, or `None` when the press is
 /// ordinary editing.
 ///
 /// `primary` and `alternate` are the modes the send controls accept right now;
-/// the chords must reach exactly those and nothing else. Plain Enter and
-/// Shift+Enter both break the line, as a composer for prose has to: binding
-/// the alternate mode to Shift+Enter would have made one keystroke insert a
-/// newline while the agent is idle and queue a turn while it is busy, which is
-/// the same key doing two unrelated things. The binding is consulted for every
-/// key press in the window, so an unfocused composer must not answer for one.
+/// the chords must reach exactly those and nothing else. The binding is
+/// consulted for every key press in the window, so an unfocused composer must
+/// not answer for one.
+///
+/// `enter_sends` decides which key carries the common action. With it on -
+/// the default, and what every chat surface a user arrives from does - bare
+/// Enter sends and Shift+Enter breaks the line. With it off, Enter and
+/// Shift+Enter both break the line and sending moves to the modified chord,
+/// which suits composing a long prompt. Either way the modified chord always
+/// submits, so a user who learned Ctrl+Enter never loses it, and the
+/// alternate mode is reached by adding Shift to that chord rather than by
+/// overloading a bare key with two unrelated meanings.
 /// `command` is Ctrl everywhere but macOS, where it is Cmd, so a single arm
 /// covers both platforms.
 fn submit_chord(
     press: &text_editor::KeyPress,
     primary: Option<PromptMode>,
     alternate: Option<PromptMode>,
+    enter_sends: bool,
 ) -> Option<PromptMode> {
     if !matches!(press.status, text_editor::Status::Focused { .. })
         || !matches!(press.key, keyboard::Key::Named(keyboard::key::Named::Enter))
         || press.modifiers.alt()
-        || !press.modifiers.command()
     {
         return None;
     }
-    if press.modifiers.shift() {
-        alternate
-    } else {
+    if press.modifiers.command() {
+        return if press.modifiers.shift() {
+            alternate
+        } else {
+            primary
+        };
+    }
+    // An unmodified Enter only submits when the preference asks it to, and
+    // Shift+Enter is always the line break so there is one keystroke that
+    // means the same thing under either preference.
+    if enter_sends && !press.modifiers.shift() {
         primary
+    } else {
+        None
     }
 }
 fn command(target: Target, value: Command) -> Message {
@@ -167,16 +210,17 @@ impl Cagents {
 
     pub(in crate::app) fn chat_view(&self, card: CardId) -> Element<'_, Message> {
         match self.cards.get(&card) {
-            Some(CardRuntime::Chat(runtime)) => {
-                runtime.view(self.chat_start_pending(card) || self.chat_ui.closed.contains(&card))
-            }
+            Some(CardRuntime::Chat(runtime)) => runtime.view(
+                self.chat_start_pending(card) || self.chat_ui.closed.contains(&card),
+                self.settings.chat_enter_sends,
+            ),
             _ => widget::text::body("Connecting to native chat…").into(),
         }
     }
 }
 
 impl Runtime {
-    fn view(&self, transitioning: bool) -> Element<'_, Message> {
+    fn view(&self, transitioning: bool, enter_sends: bool) -> Element<'_, Message> {
         let target = self.target;
         let available =
             !transitioning && !self.disconnected && !self.snapshot.exited && self.pending.is_none();
@@ -202,18 +246,23 @@ impl Runtime {
                     .into(),
             );
         }
-        if snapshot.items.is_empty() {
-            transcript.push(body(if snapshot.detail.is_empty() {
-                "Your conversation appears here. Send a message to begin."
-            } else {
-                &snapshot.detail
-            }));
+        if self.turns.is_empty() {
+            transcript.push(
+                widget::container(
+                    design::body(if snapshot.detail.is_empty() {
+                        "Your conversation appears here. Send a message to begin."
+                    } else {
+                        &snapshot.detail
+                    })
+                    .class(cosmic::theme::Text::Custom(design::muted_text)),
+                )
+                .center_x(Length::Fill)
+                .padding(design::GRID_UNIT * 8.0)
+                .into(),
+            );
         }
-        for item in &snapshot.items {
-            let Some(cached) = self.cache.get(&item.id) else {
-                continue;
-            };
-            transcript.push(self.item_view(item, cached, markdown_settings));
+        for turn in &self.turns {
+            transcript.push(self.turn_view(turn, markdown_settings));
         }
         let mut content = vec![
             widget::column::with_children(
@@ -225,7 +274,11 @@ impl Runtime {
             .into(),
             widget::scrollable(
                 widget::column::with_children(transcript)
-                    .spacing(16)
+                    // Turns are held apart further than anything inside one,
+                    // so the whitespace itself says where an exchange ends.
+                    // That is the separation a divider between messages was
+                    // doing badly.
+                    .spacing(step::GAP_L)
                     .width(Length::Fill)
                     // Message rows carry copy and expand controls on their
                     // right edge; the thumb floats over that column.
@@ -497,16 +550,18 @@ impl Runtime {
         } else {
             &[PromptMode::Send]
         };
-        let placeholder = match (modes.first(), modes.get(1)) {
-            (Some(PromptMode::Send), _) => "Message · Enter for a new line · Ctrl+Enter to send",
-            (Some(PromptMode::Steer), Some(_)) => {
-                "Message · Enter for a new line · Ctrl+Enter to steer · Ctrl+Shift+Enter to queue"
+        let placeholder = match (modes.first(), enter_sends) {
+            (Some(PromptMode::Send), true) => {
+                "Message · Enter to send · Shift+Enter for a new line"
             }
-            (Some(PromptMode::Steer), None) => {
-                "Message · Enter for a new line · Ctrl+Enter to steer"
+            (Some(PromptMode::Send), false) => {
+                "Message · Ctrl+Enter to send · Enter for a new line"
             }
-            (Some(PromptMode::Queue), _) => "Message · Enter for a new line · Ctrl+Enter to queue",
-            (None, _) => "Message · Enter for a new line · this turn accepts no further input",
+            (Some(PromptMode::Steer), true) => "Message · Enter to steer this turn",
+            (Some(PromptMode::Steer), false) => "Message · Ctrl+Enter to steer this turn",
+            (Some(PromptMode::Queue), true) => "Message · Enter to queue for the next turn",
+            (Some(PromptMode::Queue), false) => "Message · Ctrl+Enter to queue for the next turn",
+            (None, _) => "Message · this turn accepts no further input",
         };
         // A chord only submits what a send control would accept right now.
         let submit = if available && has_draft {
@@ -514,21 +569,29 @@ impl Runtime {
         } else {
             (None, None)
         };
-        content.push(if transitioning {
+        // The composer grows with the draft rather than holding a fixed pane:
+        // a one-line message should not reserve six lines of the transcript,
+        // and a long one should not be read three lines at a time through a
+        // scrollbar. `Shrink` measures the editor's wrapped extent, so a
+        // single long line that wraps counts as the rows it actually draws,
+        // which counting newlines could not see. The ceiling keeps a very
+        // long paste from squeezing the transcript out, past which the editor
+        // scrolls as before.
+        let composer_ceiling = 12.0 * COMPOSER_LINE_HEIGHT + 2.0 * COMPOSER_PADDING;
+        let editor: Element<'_, Message> = if transitioning {
             // The reservation belongs inside the scroll viewport. An inset on
             // the outer container moves the viewport itself, and the thumb
             // floats at that viewport's right edge either way, so the draft
             // text would still run underneath it.
             widget::container(
-                widget::scrollable(
-                    widget::container(body(draft))
-                        .padding(crate::design::with_vertical_rail(iced::Padding::from(8.0))),
-                )
+                widget::scrollable(widget::container(body(draft)).padding(
+                    crate::design::with_vertical_rail(iced::Padding::from(COMPOSER_PADDING)),
+                ))
                 .direction(cosmic::iced::widget::scrollable::Direction::Vertical(
                     crate::design::scrollbar(),
                 )),
             )
-            .height(104)
+            .max_height(composer_ceiling)
             .width(Length::Fill)
             .into()
         } else {
@@ -536,20 +599,28 @@ impl Runtime {
                 .id(card_control_id(target.card, "chat-composer"))
                 .placeholder(placeholder)
                 .size(design::TEXT_BODY)
-                .height(104)
-                .padding(8)
+                .height(Length::Shrink)
+                .max_height(composer_ceiling)
+                // The editor scrolls once the draft passes the ceiling, and
+                // its thumb floats over the text's right edge, so the gutter
+                // is reserved here as well as in the read-only branch.
+                .padding(design::with_vertical_rail(iced::Padding::from(
+                    COMPOSER_PADDING,
+                )))
+                .class(cosmic::theme::iced::TextEditor::Custom(Box::new(
+                    composer_editor_style,
+                )))
                 .on_action(move |event| action(Action::Composer(target, event)))
                 .key_binding(move |press| {
-                    match submit_chord(&press, submit.0, submit.1) {
+                    match submit_chord(&press, submit.0, submit.1, enter_sends) {
                         Some(mode) => Some(text_editor::Binding::Custom(action(Action::Submit(
                             target, mode,
                         )))),
-                        // Everything else, Enter included, edits the draft.
                         None => text_editor::Binding::from_key_press(press),
                     }
                 })
                 .into()
-        });
+        };
         let mut actions = Vec::new();
         if snapshot.capabilities.attachments {
             actions.push(icon(
@@ -596,7 +667,7 @@ impl Runtime {
         }
         actions.push(iced::widget::Space::new().width(Length::Fill).into());
         for (slot, mode) in modes.iter().enumerate() {
-            let (name, label) = submit_control(*mode, slot);
+            let (name, label) = submit_control(*mode, slot, enter_sends);
             actions.push(icon(
                 name,
                 label,
@@ -612,29 +683,33 @@ impl Runtime {
                 Action::Command(target, Command::Interrupt),
             ));
         }
+        // The editor and its controls are one object: a single raised surface
+        // with the controls tucked inside its lower edge, so the composer
+        // reads as one place to type rather than a field with a toolbar
+        // bolted under it.
         content.push(
-            widget::row::with_children(actions)
-                .spacing(4)
-                .align_y(Alignment::Center)
-                .into(),
+            widget::container(
+                widget::column::with_children(vec![
+                    editor,
+                    widget::container(
+                        widget::row::with_children(actions)
+                            .spacing(step::GAP_XS)
+                            .align_y(Alignment::Center),
+                    )
+                    .padding(iced::Padding::from([0.0, step::GAP_XS]).bottom(step::GAP_XS))
+                    .into(),
+                ])
+                .width(Length::Fill),
+            )
+            .class(design::surface(
+                Some(design::raised),
+                [design::RADIUS_M; 4],
+                true,
+            ))
+            .width(Length::Fill)
+            .into(),
         );
         let usage = &snapshot.usage;
-        let context = if usage.context_limit > 0 {
-            format!(
-                " · context {}/{} ({:.0}%)",
-                usage.context_tokens,
-                usage.context_limit,
-                100.0 * usage.context_tokens as f64 / usage.context_limit as f64
-            )
-        } else if usage.context_tokens > 0 {
-            format!(" · context {}", usage.context_tokens)
-        } else {
-            String::new()
-        };
-        let cost = usage
-            .cost_microusd
-            .map(|cost| format!(" · ${:.4}", cost as f64 / 1_000_000.0))
-            .unwrap_or_default();
         let detail = if transitioning {
             "Session transition in progress"
         } else if self.attachment_chooser_pending {
@@ -644,200 +719,328 @@ impl Runtime {
         } else {
             &snapshot.detail
         };
-        let status: Element<'_, Message> = if detail.is_empty() {
-            let (name, label) = if snapshot.waiting || !snapshot.requests.is_empty() {
-                ("agent-waiting-symbolic", "Waiting for your input")
-            } else if snapshot.busy {
-                ("agent-working-symbolic", "Working")
-            } else {
-                ("emblem-ok-symbolic", "Ready")
-            };
-            crate::ui_controls::icon_control(
-                crate::ui_controls::symbolic_icon(name),
-                label,
-                false,
-                false,
-                None,
-            )
-            .into()
+        let (glyph, state) = if snapshot.waiting || !snapshot.requests.is_empty() {
+            ("agent-waiting-symbolic", "Waiting for you")
+        } else if snapshot.busy {
+            ("agent-working-symbolic", "Working")
         } else {
-            crate::design::caption(detail).into()
+            ("emblem-ok-symbolic", "Ready")
         };
-        content.push(
-            widget::row::with_children(vec![
-                status,
-                crate::design::caption(format!(
-                    "{} in / {} out{}{}",
-                    usage.input_tokens, usage.output_tokens, context, cost
-                ))
+        // The state is named as well as drawn. An icon alone put the one piece
+        // of information a reader checks most often behind a hover.
+        let mut status: Vec<Element<'_, Message>> = vec![
+            widget::icon(crate::ui_controls::symbolic_icon(glyph))
+                .size(12)
                 .into(),
-            ])
-            .spacing(8)
-            .align_y(Alignment::Center)
+            design::caption(if detail.is_empty() { state } else { detail })
+                .width(Length::Fill)
+                .wrapping(iced::widget::text::Wrapping::None)
+                .into(),
+        ];
+        if usage.context_limit > 0 {
+            // A context budget is a quantity a reader acts on - compact now,
+            // or lose the thread - so it is drawn as a gauge rather than
+            // buried in a sentence of digits. A capsule, because a squared
+            // bar four pixels tall reads as a crack in the layout.
+            let used = (usage.context_tokens as f32 / usage.context_limit as f32).clamp(0.0, 1.0);
+            let radius = GAUGE_HEIGHT / 2.0;
+            status.push(
+                widget::container(
+                    // The fill and the remainder both carry a portion, because
+                    // a single proportional child of a container is resolved
+                    // against the whole width and would draw a full gauge at
+                    // any occupancy.
+                    widget::row::with_children(vec![
+                        widget::container(iced::widget::Space::new().height(Length::Fill))
+                            .width(Length::FillPortion((used * 1000.0).round() as u16))
+                            .height(Length::Fill)
+                            .class(cosmic::theme::Container::custom(move |theme| {
+                                cosmic::widget::container::Style {
+                                    background: Some(iced::Background::Color(if used > 0.9 {
+                                        design::destructive_color(theme)
+                                    } else if used > 0.75 {
+                                        design::warning_color(theme)
+                                    } else {
+                                        design::accent_color(theme)
+                                    })),
+                                    border: iced::Border {
+                                        radius: radius.into(),
+                                        ..Default::default()
+                                    },
+                                    ..Default::default()
+                                }
+                            }))
+                            .into(),
+                        iced::widget::Space::new()
+                            .width(Length::FillPortion(((1.0 - used) * 1000.0).round() as u16))
+                            .into(),
+                    ])
+                    .height(Length::Fill),
+                )
+                .width(GAUGE_WIDTH)
+                .height(GAUGE_HEIGHT)
+                .class(design::surface(Some(design::sunken), [radius; 4], false))
+                .into(),
+            );
+            status.push(design::caption(format!("{:.0}%", used * 100.0)).into());
+        }
+        status.push(
+            design::caption(format!(
+                "{} in · {} out",
+                usage.input_tokens, usage.output_tokens
+            ))
             .into(),
+        );
+        if let Some(cost) = usage.cost_microusd {
+            status.push(design::caption(format!("${:.4}", cost as f64 / 1_000_000.0)).into());
+        }
+        content.push(
+            widget::row::with_children(status)
+                .spacing(step::GAP_S)
+                .align_y(Alignment::Center)
+                .into(),
         );
         widget::container(
             widget::column::with_children(content)
-                .spacing(8)
+                .spacing(step::GAP_S)
                 .height(Length::Fill)
                 .width(Length::Fill),
         )
-        .padding(12)
+        .padding(step::GAP_M)
         .width(Length::Fill)
         .height(Length::Fill)
         .into()
     }
 
-    fn item_view<'a>(
+    /// One exchange: what was asked, what was done, and what came back.
+    fn turn_view<'a>(
+        &'a self,
+        turn: &'a turn::Turn,
+        settings: markdown::Settings,
+    ) -> Element<'a, Message> {
+        let mut rows: Vec<Element<'a, Message>> = Vec::new();
+        for index in &turn.prompt {
+            if let Some(item) = self.snapshot.items.get(*index) {
+                rows.push(self.prompt_view(item));
+            }
+        }
+        if !turn.steps.is_empty() {
+            rows.push(self.step_strip(turn.key.as_str(), turn, settings));
+        }
+        for placed in &turn.prose {
+            let Some(item) = self.snapshot.items.get(placed.index) else {
+                continue;
+            };
+            let Some(cached) = self.cache.get(&item.id) else {
+                continue;
+            };
+            rows.push(self.prose_view(item, cached, placed.slot, settings));
+        }
+        widget::column::with_children(rows)
+            .spacing(step::GAP_M)
+            .width(Length::Fill)
+            .into()
+    }
+
+    /// What to call an attachment the reader just sent.
+    ///
+    /// A file has a name, and the name is all the reader needs: the directories
+    /// above it are the ones they were just browsing. An inline attachment has
+    /// no name at all, because its "path" is the payload itself, so the tail of
+    /// it is base64 and the provider's description is the only thing that reads
+    /// as a label.
+    fn attachment_label<'a>(path: &'a str, description: &'a str) -> &'a str {
+        if !path.starts_with("data:") {
+            if let Some(name) = path.rsplit('/').next().filter(|name| !name.is_empty()) {
+                return name;
+            }
+        }
+        if description.is_empty() {
+            "Attachment"
+        } else {
+            description
+        }
+    }
+
+    /// The user's own message.
+    ///
+    /// Set on the accent wash and tucked to the right, with the corner nearest
+    /// its author squared off. That asymmetry is what identifies the author
+    /// without printing "You" above every message, and the narrower measure
+    /// keeps a turn's opening findable when scrolling back.
+    fn prompt_view<'a>(&'a self, item: &'a chat::Item) -> Element<'a, Message> {
+        let attachment = matches!(item.content, ItemContent::Image { .. });
+        let text = match &item.content {
+            ItemContent::Text { text, .. } => text.as_str(),
+            ItemContent::Image { path, description } => Self::attachment_label(path, description),
+            content => turn::step_label(content),
+        };
+        // An attachment sits under its prompt as an outlined chip rather than
+        // another filled bubble, so a message with two images does not read as
+        // three separate things the reader said.
+        let body: Element<'a, Message> = if attachment {
+            widget::row::with_children(vec![
+                widget::icon(crate::ui_controls::symbolic_icon(
+                    "mail-attachment-symbolic",
+                ))
+                .size(12)
+                .into(),
+                design::caption(text).into(),
+            ])
+            .spacing(step::GAP_XS)
+            .align_y(Alignment::Center)
+            .into()
+        } else {
+            widget::selectable_text(text)
+                .size(design::TEXT_BODY)
+                .width(Length::Shrink)
+                .into()
+        };
+        widget::container(
+            widget::container(body)
+                .class(design::surface(
+                    (!attachment).then_some(design::accent_wash),
+                    [
+                        design::RADIUS_L,
+                        design::RADIUS_L,
+                        design::RADIUS_XS,
+                        design::RADIUS_L,
+                    ],
+                    attachment,
+                ))
+                .padding([step::GAP_S as u16, step::GAP_M as u16])
+                .max_width(PROMPT_MEASURE),
+        )
+        .align_x(Alignment::End)
+        .width(Length::Fill)
+        .into()
+    }
+
+    /// An assistant answer, its narration, or a system notice.
+    ///
+    /// Commentary recedes: it outnumbers answers several times over, and
+    /// giving both the same weight is why a reader could not find the answer
+    /// in the surface this replaces.
+    fn prose_view<'a>(
         &'a self,
         item: &'a chat::Item,
         cached: &'a CachedItem,
+        slot: turn::Slot,
         settings: markdown::Settings,
     ) -> Element<'a, Message> {
         let target = self.target;
-        let mut rows = Vec::new();
-        let label = match item.role {
-            chat::Role::User => "You",
-            chat::Role::Assistant => self.session.launch.provider.label(),
-            chat::Role::System => "System",
-        };
-        let mut heading = vec![design::heading(label).width(Length::Fill).into()];
-        match &item.content {
-            ItemContent::Text { text, thinking } => {
-                if *thinking {
-                    heading.push(icon(
-                        "pan-down-symbolic",
-                        if self.expanded.contains(&item.id) {
-                            "Collapse thinking"
-                        } else {
-                            "Expand thinking"
-                        },
-                        true,
-                        Action::Toggle(target, item.id.clone()),
-                    ));
-                }
-                heading.push(icon(
-                    "text-x-generic-symbolic",
-                    "Toggle selectable Markdown source",
-                    true,
-                    Action::Raw(target, item.id.clone()),
-                ));
-                heading.push(icon(
-                    "edit-copy-symbolic",
-                    "Copy message",
-                    true,
-                    Action::Copy(target, item.id.clone(), CopyPart::Text),
-                ));
-                rows.push(
-                    widget::row::with_children(heading)
-                        .align_y(Alignment::Center)
-                        .spacing(4)
-                        .into(),
-                );
-                if *thinking {
-                    rows.push(crate::design::caption("Thinking").into());
-                }
-                if !thinking || self.expanded.contains(&item.id) {
-                    if self.raw.contains(&item.id) {
-                        rows.push(body(text.as_str()));
-                    } else {
-                        rows.push(
-                            markdown::view(cached.markdown.items(), settings)
-                                .map(|uri| action(Action::OpenUrl(uri.to_string())))
-                                .into(),
-                        );
-                        for index in 0..cached.code.codes.len() {
-                            rows.push(icon(
-                                "edit-copy-symbolic",
-                                code_label(index),
-                                true,
-                                Action::Copy(target, item.id.clone(), CopyPart::Code(index)),
-                            ));
-                        }
-                    }
-                }
-            }
-            ItemContent::Tool { input, output, .. } => {
-                if let Some(detail) = &cached.detail {
-                    heading.push(crate::design::caption(detail.as_str()).into());
-                }
-                heading.push(icon(
-                    "pan-down-symbolic",
-                    "Expand or collapse tool details",
-                    true,
-                    Action::Toggle(target, item.id.clone()),
-                ));
-                rows.push(
-                    widget::row::with_children(heading)
-                        .align_y(Alignment::Center)
-                        .spacing(4)
-                        .into(),
-                );
-                if self.expanded.contains(&item.id) {
-                    rows.push(
-                        widget::row::with_children(vec![
-                            crate::design::caption("Input").width(Length::Fill).into(),
-                            icon(
-                                "edit-copy-symbolic",
-                                "Copy tool input",
-                                true,
-                                Action::Copy(target, item.id.clone(), CopyPart::Input),
-                            ),
-                        ])
-                        .into(),
-                    );
-                    rows.push(body(input.as_str()));
-                    rows.push(
-                        widget::row::with_children(vec![
-                            crate::design::caption("Output").width(Length::Fill).into(),
-                            icon(
-                                "edit-copy-symbolic",
-                                "Copy tool output",
-                                true,
-                                Action::Copy(target, item.id.clone(), CopyPart::Output),
-                            ),
-                        ])
-                        .into(),
-                    );
-                    rows.push(body(output.as_str()));
-                }
-            }
-            ItemContent::Image { path, description } => {
-                rows.push(widget::row::with_children(heading).into());
-                if let Some(handle) = &cached.image {
-                    rows.push(
-                        iced::widget::image(handle.clone())
-                            .width(Length::Fill)
-                            .height(240)
-                            .content_fit(iced::ContentFit::Contain)
-                            .into(),
-                    );
-                }
-                rows.push(body(description.as_str()));
-                if path.starts_with("http://") || path.starts_with("https://") {
-                    rows.push(
-                        widget::button::text("Open image")
-                            .on_press(action(Action::OpenUrl(path.clone())))
-                            .into(),
-                    );
-                } else if path.starts_with("data:") {
-                    if cached.image.is_none() {
-                        rows.push(
-                            crate::design::caption(
-                                "Image could not be decoded or exceeds the display size bound.",
-                            )
-                            .into(),
-                        );
-                    }
-                } else if !path.is_empty() {
-                    rows.push(crate::design::caption(path.as_str()).into());
-                }
-            }
-        }
-        widget::column::with_children(rows)
-            .spacing(4)
+        if slot == turn::Slot::Commentary {
+            // Narration is a passing remark, so it gets one line at caption
+            // weight, indented to sit under the activity it describes. Given
+            // a paragraph of its own it drowned out the answer.
+            return widget::container(
+                design::caption(turn::first_line(match &item.content {
+                    ItemContent::Text { text, .. } => text.as_str(),
+                    content => turn::step_label(content),
+                }))
+                .width(Length::Fill)
+                .wrapping(iced::widget::text::Wrapping::None),
+            )
+            .padding(iced::Padding::ZERO.left(step::GAP_M))
             .width(Length::Fill)
-            .into()
+            .into();
+        }
+        if item.role == chat::Role::System {
+            // A notice is chrome, not conversation: one line, a small glyph,
+            // and an accent sliver to mark where it starts. The card it used
+            // to be drew a rectangle around a single sentence.
+            return widget::container(
+                widget::row::with_children(vec![
+                    widget::container(iced::widget::Space::new().height(Length::Fill))
+                        .width(design::BORDER_WIDTH * 2.0)
+                        .height(Length::Fill)
+                        .class(design::surface(Some(design::accent_color), [1.0; 4], false))
+                        .into(),
+                    widget::icon(crate::ui_controls::symbolic_icon(
+                        "dialog-information-symbolic",
+                    ))
+                    .size(14)
+                    .into(),
+                    design::caption(match &item.content {
+                        ItemContent::Text { text, .. } => text.as_str(),
+                        content => turn::step_label(content),
+                    })
+                    .width(Length::Fill)
+                    .into(),
+                ])
+                .spacing(step::GAP_S)
+                .align_y(Alignment::Center),
+            )
+            .padding([step::GAP_XS as u16, 0])
+            .width(Length::Fill)
+            .into();
+        }
+        let ItemContent::Text { text, .. } = &item.content else {
+            // Anything else in the answer slot is a step the grouping did not
+            // recognize; render it the way a step renders rather than
+            // inventing a second treatment for it.
+            return self.step_view(item, cached, settings);
+        };
+        let mut rows: Vec<Element<'a, Message>> = Vec::new();
+        if self.raw.contains(&item.id) {
+            rows.push(
+                widget::selectable_text(text.as_str())
+                    .size(design::TEXT_BODY)
+                    .font(iced::Font::MONOSPACE)
+                    .width(Length::Fill)
+                    .into(),
+            );
+        } else {
+            rows.push(
+                markdown::view(cached.markdown.items(), settings)
+                    .map(|uri| action(Action::OpenUrl(uri.to_string())))
+                    .into(),
+            );
+        }
+        // The answer's own controls, at its foot rather than above it, and
+        // only the two a reader of an answer reaches for.
+        let mut controls: Vec<Element<'a, Message>> = vec![
+            icon(
+                "edit-copy-symbolic",
+                "Copy this message",
+                true,
+                Action::Copy(target, item.id.clone(), CopyPart::Text),
+            ),
+            icon(
+                "text-x-generic-symbolic",
+                if self.raw.contains(&item.id) {
+                    "Show formatted text"
+                } else {
+                    "Show Markdown source"
+                },
+                true,
+                Action::Raw(target, item.id.clone()),
+            ),
+        ];
+        for index in 0..cached.code.codes.len() {
+            controls.push(icon(
+                "edit-copy-symbolic",
+                code_label(index),
+                true,
+                Action::Copy(target, item.id.clone(), CopyPart::Code(index)),
+            ));
+        }
+        rows.push(
+            widget::row::with_children(controls)
+                .spacing(step::GAP_XS)
+                .align_y(Alignment::Center)
+                .into(),
+        );
+        // The answer is bare prose on the pane's own surface. Wrapping it in
+        // a panel would put a frame around the one thing the reader came for,
+        // and would make it look like just another block.
+        widget::container(
+            widget::column::with_children(rows)
+                .spacing(step::GAP_S)
+                .max_width(design::READABLE_MEASURE),
+        )
+        .width(Length::Fill)
+        .into()
     }
 
     fn request_view<'a>(
@@ -961,63 +1164,117 @@ mod tests {
         }
     }
 
-    /// The composer is the product's primary input: a chord must reach the
-    /// send controls, and a bare Enter must never send a half-written message.
+    /// The composer is the product's primary input: the chords must reach the
+    /// send controls, and nothing else may submit a half-written message.
     #[test]
-    fn only_the_documented_chords_submit() {
+    fn the_modified_chord_submits_under_either_preference() {
         let send = Some(PromptMode::Send);
         let queue = Some(PromptMode::Queue);
 
+        for enter_sends in [true, false] {
+            assert_eq!(
+                submit_chord(
+                    &press(keyboard::Modifiers::COMMAND, true),
+                    send,
+                    None,
+                    enter_sends
+                ),
+                send,
+                "Ctrl+Enter must keep sending whichever key the preference favours"
+            );
+            assert_eq!(
+                submit_chord(
+                    &press(
+                        keyboard::Modifiers::COMMAND | keyboard::Modifiers::SHIFT,
+                        true
+                    ),
+                    send,
+                    queue,
+                    enter_sends
+                ),
+                queue
+            );
+            // No alternate mode on offer: the chord falls back to editing.
+            assert_eq!(
+                submit_chord(
+                    &press(
+                        keyboard::Modifiers::COMMAND | keyboard::Modifiers::SHIFT,
+                        true
+                    ),
+                    send,
+                    None,
+                    enter_sends
+                ),
+                None
+            );
+            for modifiers in [
+                // Shift+Enter is the line break under either preference, so
+                // there is one keystroke that always means the same thing.
+                keyboard::Modifiers::SHIFT,
+                keyboard::Modifiers::ALT,
+                keyboard::Modifiers::COMMAND | keyboard::Modifiers::ALT,
+            ] {
+                assert_eq!(
+                    submit_chord(&press(modifiers, true), send, queue, enter_sends),
+                    None,
+                    "{modifiers:?} must edit the draft rather than submit it"
+                );
+            }
+            // The binding is offered every key press in the window.
+            assert_eq!(
+                submit_chord(
+                    &press(keyboard::Modifiers::COMMAND, false),
+                    send,
+                    queue,
+                    enter_sends
+                ),
+                None
+            );
+            // Nothing to submit: the chord falls back to inserting a line.
+            assert_eq!(
+                submit_chord(
+                    &press(keyboard::Modifiers::COMMAND, true),
+                    None,
+                    None,
+                    enter_sends
+                ),
+                None
+            );
+        }
+    }
+
+    /// The preference is the whole point of the setting: it has to change what
+    /// a bare Enter does and nothing else.
+    #[test]
+    fn a_bare_enter_submits_only_when_the_preference_asks() {
+        let send = Some(PromptMode::Send);
         assert_eq!(
-            submit_chord(&press(keyboard::Modifiers::COMMAND, true), send, None),
+            submit_chord(
+                &press(keyboard::Modifiers::default(), true),
+                send,
+                None,
+                true
+            ),
             send
         );
         assert_eq!(
             submit_chord(
-                &press(
-                    keyboard::Modifiers::COMMAND | keyboard::Modifiers::SHIFT,
-                    true
-                ),
+                &press(keyboard::Modifiers::default(), true),
                 send,
-                queue
+                None,
+                false
             ),
-            queue
+            None
         );
-        // No alternate mode on offer: the chord falls back to a line break.
+        // Even when Enter sends, an unfocused composer must not answer for a
+        // key press meant for another widget.
         assert_eq!(
             submit_chord(
-                &press(
-                    keyboard::Modifiers::COMMAND | keyboard::Modifiers::SHIFT,
-                    true
-                ),
+                &press(keyboard::Modifiers::default(), false),
                 send,
-                None
-            ),
-            None
-        );
-        for modifiers in [
-            keyboard::Modifiers::default(),
-            // Shift+Enter must stay a line break whether or not the provider
-            // is offering an alternate mode, or one keystroke would mean two
-            // unrelated things depending on whether the agent is busy.
-            keyboard::Modifiers::SHIFT,
-            keyboard::Modifiers::ALT,
-            keyboard::Modifiers::COMMAND | keyboard::Modifiers::ALT,
-        ] {
-            assert_eq!(
-                submit_chord(&press(modifiers, true), send, queue),
                 None,
-                "{modifiers:?} must edit the draft rather than submit it"
-            );
-        }
-        // The binding is offered every key press in the window.
-        assert_eq!(
-            submit_chord(&press(keyboard::Modifiers::COMMAND, false), send, queue),
-            None
-        );
-        // Nothing to submit: the chord falls back to inserting a line.
-        assert_eq!(
-            submit_chord(&press(keyboard::Modifiers::COMMAND, true), None, None),
+                true
+            ),
             None
         );
     }
@@ -1025,19 +1282,41 @@ mod tests {
     /// Every submit control's tooltip has to name the chord bound to it, or the
     /// keyboard path stays invisible.
     #[test]
-    fn submit_tooltips_name_their_chord() {
-        for (mode, slot, chord) in [
-            (PromptMode::Send, 0, "Ctrl+Enter"),
-            (PromptMode::Steer, 0, "Ctrl+Enter"),
-            (PromptMode::Queue, 0, "Ctrl+Enter"),
-            (PromptMode::Steer, 1, "Ctrl+Shift+Enter"),
-            (PromptMode::Queue, 1, "Ctrl+Shift+Enter"),
+    fn submit_tooltips_name_the_chord_the_preference_bound() {
+        for (mode, slot, enter_sends, chord) in [
+            (PromptMode::Send, 0, true, "Enter"),
+            (PromptMode::Send, 0, false, "Ctrl+Enter"),
+            (PromptMode::Steer, 0, true, "Enter"),
+            (PromptMode::Queue, 0, false, "Ctrl+Enter"),
+            (PromptMode::Steer, 1, true, "Ctrl+Shift+Enter"),
+            (PromptMode::Queue, 1, false, "Ctrl+Shift+Enter"),
         ] {
-            let (_, label) = submit_control(mode, slot);
+            let (_, label) = submit_control(mode, slot, enter_sends);
             assert!(
                 label.ends_with(chord),
                 "{mode:?} in slot {slot} is bound to {chord} but reads {label:?}"
             );
         }
+    }
+
+    /// A chip the reader cannot read is worse than no chip: the point of it is
+    /// to confirm which file they just sent.
+    #[test]
+    fn an_attachment_is_named_by_something_a_reader_recognises() {
+        assert_eq!(
+            Runtime::attachment_label("/home/reader/holiday/beach.png", "Image attachment"),
+            "beach.png",
+            "a file on disk is identified by its name, not the browsing above it"
+        );
+        assert_eq!(
+            Runtime::attachment_label("data:image/png;base64,iVBORw0KGgoAAAANSUhEUg", "Diagram"),
+            "Diagram",
+            "an inline payload has no name, so the description has to carry it"
+        );
+        assert_eq!(
+            Runtime::attachment_label("data:image/png;base64,iVBORw0KGgoAAAANSUhEUg", ""),
+            "Attachment",
+            "a payload no provider described still needs a readable label"
+        );
     }
 }

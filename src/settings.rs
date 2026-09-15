@@ -302,6 +302,10 @@ const fn default_confirm_terminal_close() -> bool {
     true
 }
 
+const fn default_chat_enter_sends() -> bool {
+    true
+}
+
 /// Main stays first; imported worktrees without creation evidence sort by path.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -411,6 +415,14 @@ pub struct AppSettings {
     pub editor_syntax_theme: EditorSyntaxTheme,
     #[serde(default = "default_confirm_terminal_close")]
     pub confirm_terminal_close: bool,
+    /// Whether a bare Enter in the chat composer sends the message.
+    ///
+    /// Sending is the default because it is what every chat surface a user
+    /// arrives from does, and because the alternative made the common action
+    /// the harder chord. Turning this off restores Enter as a line break and
+    /// moves sending to Ctrl+Enter, which suits composing long prompts.
+    #[serde(default = "default_chat_enter_sends")]
+    pub chat_enter_sends: bool,
     /// External language servers, in declaration order. The first server whose
     /// language claims a file extension handles that file. An empty list
     /// disables LSP entirely.
@@ -453,6 +465,7 @@ impl Default for AppSettings {
             editor_wrap_lines: false,
             editor_syntax_theme: EditorSyntaxTheme::default(),
             confirm_terminal_close: default_confirm_terminal_close(),
+            chat_enter_sends: default_chat_enter_sends(),
             language_servers: default_language_servers(),
             keyboard_shortcuts: KeyboardShortcuts::default(),
         }

@@ -5,8 +5,9 @@
 //! the first answer wins (app-server/src/outgoing_message.rs). Never auto-answer.
 use super::{Adapter, ProcessSpec, Step, TransportSpec};
 use crate::chat::{
-    Answer, Attachment, Capabilities, Choice, Command, Event, Field, Item, ItemContent, Launch,
-    Model, PromptMode, Request, Role, ToolStatus, Usage,
+    Answer, Attachment, Capabilities, ChangeKind, Choice, Command, CommandAction, Event, Field,
+    FileChange, Item, ItemContent, Launch, Model, Phase, PromptMode, Request, Role, SearchResult,
+    ToolStatus, Usage,
 };
 use serde_json::{Value, json};
 use std::os::unix::fs::{DirBuilderExt, FileTypeExt, MetadataExt};
@@ -337,7 +338,7 @@ impl Codex {
             }
             for value in array(turn, "items")? {
                 for item in parse_item(value, !active, turn_id)? {
-                    if active && self.busy && matches!(item.content, ItemContent::Tool { .. }) {
+                    if active && self.busy && streams_updates(&item.content) {
                         if self.active_items.len() >= MAX_ACTIVE_ITEMS
                             && !self.active_items.contains_key(&item.id)
                         {
@@ -463,10 +464,10 @@ impl Codex {
                 ("Additional permissions", RequestKind::Permissions)
             }
             "item/tool/requestUserInput" => {
-                description = if params["isBlocking"]
-                    .as_bool()
-                    .ok_or("Missing Codex question blocking status")?
-                {
+                // A question whose blocking flag never arrived is described as
+                // the blocking kind, because overstating a question's urgency
+                // costs less than ending the session it was asked in.
+                description = if params["isBlocking"].as_bool().unwrap_or(true) {
                     "Codex is waiting for your answer."
                 } else {
                     "Optional question; Codex can continue while you answer."
@@ -781,13 +782,24 @@ impl Adapter for Codex {
                 Pending::Models => {
                     for value in array(result, "data")? {
                         let id = string(value, "model")?.to_owned();
-                        let reasoning = array(value, "supportedReasoningEfforts")?
-                            .iter()
-                            .map(|e| string(e, "reasoningEffort").map(str::to_owned))
-                            .collect::<Result<Vec<_>, _>>()?;
+                        // A catalog entry that does not describe its efforts,
+                        // or does not name itself for the picker, is still a
+                        // model the user can select, so the unreadable parts
+                        // are dropped rather than the whole catalog with the
+                        // session it arrived in.
+                        let reasoning: Vec<String> = value["supportedReasoningEfforts"]
+                            .as_array()
+                            .map(|efforts| {
+                                efforts
+                                    .iter()
+                                    .filter_map(|effort| effort["reasoningEffort"].as_str())
+                                    .map(str::to_owned)
+                                    .collect()
+                            })
+                            .unwrap_or_default();
                         let model = Model {
                             id: id.clone(),
-                            label: string(value, "displayName")?.into(),
+                            label: value["displayName"].as_str().unwrap_or(&id).into(),
                             reasoning,
                         };
                         if let Some(existing) = self.models.iter_mut().find(|m| m.id == id) {
@@ -898,7 +910,7 @@ impl Adapter for Codex {
                 };
                 for value in array(turn, "items")? {
                     for item in parse_item(value, !self.busy, string(turn, "id")?)? {
-                        if self.busy && matches!(item.content, ItemContent::Tool { .. }) {
+                        if self.busy && streams_updates(&item.content) {
                             if self.active_items.len() >= MAX_ACTIVE_ITEMS
                                 && !self.active_items.contains_key(&item.id)
                             {
@@ -936,7 +948,7 @@ impl Adapter for Codex {
                 for item in parse_item(&params["item"], done, string(params, "turnId")?)? {
                     if done {
                         self.active_items.remove(&item.id);
-                    } else if matches!(item.content, ItemContent::Tool { .. }) {
+                    } else if streams_updates(&item.content) {
                         if self.active_items.len() >= MAX_ACTIVE_ITEMS
                             && !self.active_items.contains_key(&item.id)
                         {
@@ -984,10 +996,20 @@ impl Adapter for Codex {
             | "item/fileChange/outputDelta"
             | "item/mcpToolCall/progress" => {
                 let id = item_key(string(params, "turnId")?, string(params, "itemId")?);
+                // A delta for an item this adapter is not tracking belongs to
+                // an item that already completed, or to one that never
+                // streamed, and losing the tail of its output is better than
+                // ending the session over a delta nothing can render.
                 if let Some(item) = self.active_items.get_mut(&id) {
-                    if let ItemContent::Tool { output, .. } = &mut item.content {
+                    // A fileChange's content is its patch rather than a stream, so the
+                    // deprecated textual delta that used to accompany one has nowhere to land.
+                    if let ItemContent::Tool { output, .. } | ItemContent::Command { output, .. } =
+                        &mut item.content
+                    {
+                        // An MCP progress notification only carries a message
+                        // when the server wrote one.
                         let delta = if method.ends_with("progress") {
-                            string(params, "message")?
+                            params["message"].as_str().unwrap_or_default()
                         } else {
                             string(params, "delta")?
                         };
@@ -997,17 +1019,16 @@ impl Adapter for Codex {
                         output.push_str(delta);
                         step.events.push(Event::Item(item.clone()));
                     }
-                } else {
-                    return Err(format!(
-                        "Codex tool delta arrived without a live item: {id}"
-                    ));
                 }
             }
             "item/fileChange/patchUpdated" => {
                 let id = item_key(string(params, "turnId")?, string(params, "itemId")?);
+                // The patch is parsed only once there is an item to hold it, so
+                // a notification for an item this adapter never tracked cannot
+                // fail the session over a patch nothing would render.
                 if let Some(item) = self.active_items.get_mut(&id) {
-                    if let ItemContent::Tool { input, .. } = &mut item.content {
-                        *input = params["changes"].to_string();
+                    if let ItemContent::Changes { changes, .. } = &mut item.content {
+                        *changes = file_changes(params)?;
                         step.events.push(Event::Item(item.clone()));
                     }
                 }
@@ -1065,6 +1086,7 @@ impl Adapter for Codex {
                 content: ItemContent::Text {
                     text: params["plan"].to_string(),
                     thinking: false,
+                    phase: Phase::Final,
                 },
             })),
             "thread/queue/changed" => step.events.push(Event::Status {
@@ -1072,8 +1094,9 @@ impl Adapter for Codex {
                 detail: "Codex's native queue changed".into(),
             }),
             "item/reasoning/summaryPartAdded" | "thread/compacted" => {}
-            // Auxiliary app-server notifications are not transcript data. Unknown
-            // item types and requests, in contrast, are visibly rejected above.
+            // Auxiliary app-server notifications are not transcript data.
+            // Unknown item types are shown as tool disclosures and unknown
+            // requests are visibly rejected above.
             _ => {}
         }
         Ok(step)
@@ -1155,14 +1178,112 @@ fn decision_label(id: &str, value: &Value) -> String {
 fn item_key(turn: &str, item: &str) -> String {
     format!("{turn}/{item}")
 }
+/// Items the app-server keeps writing into after announcing them, which is why
+/// they are retained and re-emitted rather than rendered once and forgotten.
+fn streams_updates(content: &ItemContent) -> bool {
+    matches!(
+        content,
+        ItemContent::Tool { .. } | ItemContent::Command { .. } | ItemContent::Changes { .. }
+    )
+}
+/// Codex leaves `phase` null for models that do not classify their messages,
+/// and an unclassified message has to be treated as the turn's answer or the
+/// answer would be hidden for those models.
+fn message_phase(value: &Value) -> Phase {
+    match value["phase"].as_str() {
+        Some("commentary") => Phase::Commentary,
+        _ => Phase::Final,
+    }
+}
+/// Codex's own best-effort parse of a shell command, which may decompose into
+/// several actions because a command can be a pipeline. The first classified
+/// action is what the invocation was for; `unknown` entries carry nothing the
+/// view cannot already read off the command itself.
+fn command_intent(actions: &Value) -> (CommandAction, String) {
+    let Some(actions) = actions.as_array() else {
+        return (CommandAction::Run, String::new());
+    };
+    for action in actions {
+        let path = action["path"].as_str();
+        match action["type"].as_str() {
+            Some("read") => {
+                return (
+                    CommandAction::Read,
+                    path.map(|path| format!("Read {path}")).unwrap_or_default(),
+                );
+            }
+            Some("search") => {
+                return (
+                    CommandAction::Search,
+                    match (action["query"].as_str(), path) {
+                        (Some(query), Some(path)) => format!("Search {query} in {path}"),
+                        (Some(query), None) => format!("Search {query}"),
+                        (None, Some(path)) => format!("Search {path}"),
+                        (None, None) => String::new(),
+                    },
+                );
+            }
+            Some("listFiles") => {
+                return (
+                    CommandAction::List,
+                    path.map(|path| format!("List {path}")).unwrap_or_default(),
+                );
+            }
+            _ => {}
+        }
+    }
+    (CommandAction::Run, String::new())
+}
+/// Codex keys a patch by the file it read, so an update's `move_path` is where
+/// the file ended up while the entry's own `path` is where it came from.
+fn file_changes(value: &Value) -> Result<Vec<FileChange>, String> {
+    let entries = array(value, "changes")?;
+    let mut changes = Vec::with_capacity(entries.len());
+    for change in entries {
+        let original = string(change, "path")?;
+        let descriptor = &change["kind"];
+        let (path, kind) = match descriptor["type"].as_str().unwrap_or_default() {
+            "add" => (original.to_owned(), ChangeKind::Added),
+            "delete" => (original.to_owned(), ChangeKind::Deleted),
+            "update" => match descriptor["move_path"].as_str() {
+                Some(moved) => (
+                    moved.to_owned(),
+                    ChangeKind::Renamed {
+                        from: original.into(),
+                    },
+                ),
+                None => (original.to_owned(), ChangeKind::Updated),
+            },
+            // A kind this build does not know, and a kind an entry never
+            // stated, is still a file change, and rendering it as an update
+            // keeps the transcript alive where rejecting the patch would end
+            // the session.
+            _ => (original.to_owned(), ChangeKind::Updated),
+        };
+        changes.push(FileChange {
+            path,
+            kind,
+            // Reporting an absent patch as an empty one would render a real
+            // edit as a change that touched nothing.
+            diff: string(change, "diff")?.into(),
+        });
+    }
+    Ok(changes)
+}
 fn parse_item(value: &Value, done: bool, turn: &str) -> Result<Vec<Item>, String> {
     let scoped_id = item_key(turn, string(value, "id")?);
     let id = scoped_id.as_str();
     let kind = string(value, "type")?;
+    // Only an assistant message has a phase: user input, reasoning and system
+    // notices are never the answer a turn was asked for.
     let text = |id: String, text: String, thinking: bool, role: Role| Item {
         id,
         role,
-        content: ItemContent::Text { text, thinking },
+        content: ItemContent::Text {
+            text,
+            thinking,
+            phase: Phase::Final,
+        },
     };
     let status = match value["status"].as_str() {
         _ if value["success"] == false
@@ -1191,17 +1312,20 @@ fn parse_item(value: &Value, done: bool, turn: &str) -> Result<Vec<Item>, String
         }]
     };
     let items = match kind {
-        "agentMessage" | "plan" => vec![text(
-            id.into(),
-            string(value, "text")?.into(),
-            false,
-            Role::Assistant,
-        )],
+        "agentMessage" | "plan" => vec![Item {
+            id: id.into(),
+            role: Role::Assistant,
+            content: ItemContent::Text {
+                text: string(value, "text")?.into(),
+                thinking: false,
+                phase: message_phase(value),
+            },
+        }],
         "userMessage" => {
             let mut items = Vec::new();
             for (index, content) in array(value, "content")?.iter().enumerate() {
                 let part_id = format!("{id}/input/{index}");
-                match string(content, "type")? {
+                match content["type"].as_str().unwrap_or_default() {
                     "text" => items.push(text(
                         part_id,
                         string(content, "text")?.into(),
@@ -1220,10 +1344,13 @@ fn parse_item(value: &Value, done: bool, turn: &str) -> Result<Vec<Item>, String
                             description: "User attachment".into(),
                         },
                     }),
-                    "mention" | "skill" | "audio" | "localAudio" => {
-                        items.push(text(part_id, content.to_string(), false, Role::User))
-                    }
-                    other => return Err(format!("Unsupported Codex user input item: {other}")),
+                    // A mention, skill or audio part has no rendering of its
+                    // own, and neither has a part type this build cannot name,
+                    // whether because a later Codex introduced it or because
+                    // the part never stated one. Showing the payload keeps the
+                    // user's own input in the transcript, where rejecting it
+                    // would end the session that received it.
+                    _ => items.push(text(part_id, content.to_string(), false, Role::User)),
                 }
             }
             items
@@ -1244,20 +1371,33 @@ fn parse_item(value: &Value, done: bool, turn: &str) -> Result<Vec<Item>, String
             }
             items
         }
-        "commandExecution" => tool(
-            "Command".into(),
-            format!(
-                "{}\nWorking directory: {}",
-                string(value, "command")?,
-                string(value, "cwd")?
-            ),
-            value["aggregatedOutput"].as_str().unwrap_or("").into(),
-        ),
-        "fileChange" => tool(
-            "File changes".into(),
-            value["changes"].to_string(),
-            String::new(),
-        ),
+        "commandExecution" => {
+            let (action, label) = command_intent(&value["commandActions"]);
+            vec![Item {
+                id: id.into(),
+                role: Role::Assistant,
+                content: ItemContent::Command {
+                    label,
+                    command: string(value, "command")?.into(),
+                    working_directory: string(value, "cwd")?.into(),
+                    action,
+                    status,
+                    exit_code: value["exitCode"]
+                        .as_i64()
+                        .and_then(|code| i32::try_from(code).ok()),
+                    duration_ms: value["durationMs"].as_u64(),
+                    output: value["aggregatedOutput"].as_str().unwrap_or("").into(),
+                },
+            }]
+        }
+        "fileChange" => vec![Item {
+            id: id.into(),
+            role: Role::Assistant,
+            content: ItemContent::Changes {
+                changes: file_changes(value)?,
+                status,
+            },
+        }],
         "mcpToolCall" => tool(
             format!("{} / {}", string(value, "server")?, string(value, "tool")?),
             value["arguments"].to_string(),
@@ -1279,11 +1419,29 @@ fn parse_item(value: &Value, done: bool, turn: &str) -> Result<Vec<Item>, String
             value["prompt"].as_str().unwrap_or("").into(),
             value["agentsStates"].to_string(),
         ),
-        "webSearch" => tool(
-            "Web search".into(),
-            string(value, "query")?.into(),
-            value["results"].to_string(),
-        ),
+        "webSearch" => vec![Item {
+            id: id.into(),
+            role: Role::Assistant,
+            content: ItemContent::WebSearch {
+                query: string(value, "query")?.into(),
+                // Results cross the app-server boundary as opaque JSON, so a
+                // result type without the fields the model names still
+                // contributes whatever it does carry.
+                results: value["results"]
+                    .as_array()
+                    .map(|results| {
+                        results
+                            .iter()
+                            .map(|result| SearchResult {
+                                title: result["title"].as_str().unwrap_or("").into(),
+                                url: result["url"].as_str().unwrap_or("").into(),
+                                snippet: result["snippet"].as_str().unwrap_or("").into(),
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+            },
+        }],
         "functionCallOutput" => tool(
             string(value, "name")?.into(),
             String::new(),
@@ -1323,26 +1481,14 @@ fn parse_item(value: &Value, done: bool, turn: &str) -> Result<Vec<Item>, String
             false,
             Role::System,
         )],
-        "sleep" | "subAgentActivity" => tool(kind.into(), String::new(), value.to_string()),
-        other => return Err(format!("Unsupported Codex transcript item type: {other}")),
+        // Codex's own auxiliary items, `sleep` and `subAgentActivity` among
+        // them, and any item type a later Codex introduces, still belong to the
+        // turn. The tool disclosure exists to keep an unrecognized item
+        // renderable rather than ending the session over it.
+        other => tool(other.into(), String::new(), value.to_string()),
     };
     for item in &items {
-        let bytes = match &item.content {
-            ItemContent::Text { text, .. } => text.len(),
-            ItemContent::Tool {
-                name,
-                input,
-                output,
-                ..
-            } => name
-                .len()
-                .saturating_add(input.len())
-                .saturating_add(output.len()),
-            ItemContent::Image { path, description } => {
-                path.len().saturating_add(description.len())
-            }
-        };
-        if bytes > MAX_ITEM_BYTES {
+        if item.content.byte_len() > MAX_ITEM_BYTES {
             return Err("Codex item exceeds native client size bound".into());
         }
     }
@@ -1658,7 +1804,7 @@ mod tests {
     }
 
     #[test]
-    fn resumed_tool_and_final_history_use_same_turn_scoped_identity() {
+    fn resumed_step_and_final_history_use_same_turn_scoped_identity() {
         let mut adapter = adapter();
         adapter.busy = true;
         let item = json!({"id":"0","type":"commandExecution","command":"echo hello","cwd":"/tmp","status":"inProgress","aggregatedOutput":"hel"});
@@ -1666,7 +1812,7 @@ mod tests {
         adapter.page(&json!({"data":[{"id":"turn-a","status":"inProgress","items":[item]}],"nextCursor":"older"}),&mut page).unwrap();
         let delta = adapter.receive(json!({"method":"item/commandExecution/outputDelta","params":{"threadId":"thread-exact","turnId":"turn-a","itemId":"0","delta":"lo"}})).unwrap();
         assert!(
-            matches!(&delta.events[0],Event::Item(Item { id,content:ItemContent::Tool { output,.. },.. }) if id == "turn-a/0" && output == "hello")
+            matches!(&delta.events[0],Event::Item(Item { id,content:ItemContent::Command { output,.. },.. }) if id == "turn-a/0" && output == "hello")
         );
         let completed = json!({"id":"0","type":"agentMessage","text":"answer"});
         let one = parse_item(&completed, true, "turn-a").unwrap();
@@ -1674,6 +1820,100 @@ mod tests {
         assert_ne!(one[0].id, two[0].id);
         let live = adapter.receive(json!({"method":"item/agentMessage/delta","params":{"threadId":"thread-exact","turnId":"turn-a","itemId":"0","delta":"answer"}})).unwrap();
         assert!(matches!(&live.events[0],Event::TextDelta { id,.. } if id == &one[0].id));
+    }
+
+    #[test]
+    fn file_change_rename_points_at_the_destination_and_keeps_the_source() {
+        let item = json!({"id":"0","type":"fileChange","status":"completed","changes":[
+            {"path":"src/old.rs","kind":{"type":"update","move_path":"src/new.rs"},"diff":"@@ -1 +1 @@\n-old\n+new\n"},
+            {"path":"src/kept.rs","kind":{"type":"update","move_path":null},"diff":"@@ -2 +2 @@\n"},
+            {"path":"src/gone.rs","kind":{"type":"delete"},"diff":"-gone\n"},
+            {"path":"src/fresh.rs","kind":{"type":"add"},"diff":"+fresh\n"}
+        ]});
+        let items = parse_item(&item, true, "turn").unwrap();
+        let ItemContent::Changes { changes, status } = &items[0].content else {
+            panic!("A Codex fileChange must carry its patch, not a rendering of it");
+        };
+        assert_eq!(*status, ToolStatus::Succeeded);
+        assert_eq!(
+            changes[0],
+            FileChange {
+                path: "src/new.rs".into(),
+                kind: ChangeKind::Renamed {
+                    from: "src/old.rs".into()
+                },
+                diff: "@@ -1 +1 @@\n-old\n+new\n".into(),
+            }
+        );
+        assert_eq!(changes[1].kind, ChangeKind::Updated);
+        assert_eq!(changes[2].kind, ChangeKind::Deleted);
+        assert_eq!(changes[3].kind, ChangeKind::Added);
+        let unknown = parse_item(&json!({"id":"0","type":"fileChange","status":"completed","changes":[{"path":"p","kind":{"type":"chmod"},"diff":"@@ -1 +1 @@\n"}]}), true, "turn").unwrap();
+        let ItemContent::Changes { changes, .. } = &unknown[0].content else {
+            panic!("A file change kind this build does not know is still a file change");
+        };
+        assert_eq!(changes[0].kind, ChangeKind::Updated);
+    }
+
+    #[test]
+    fn an_unrecognized_item_part_or_untracked_patch_cannot_end_the_session() {
+        let future = json!({"id":"0","type":"quantumThought","status":"completed","why":"new"});
+        let items = parse_item(&future, true, "turn").unwrap();
+        assert!(matches!(&items[0].content,
+            ItemContent::Tool { name, output, status: ToolStatus::Succeeded, .. }
+            if name == "quantumThought" && output.contains("quantumThought")));
+        let part = json!({"id":"1","type":"userMessage","content":[{"type":"hologram","n":3}]});
+        let items = parse_item(&part, true, "turn").unwrap();
+        assert!(matches!(&items[0].content,
+            ItemContent::Text { text, .. } if text.contains("hologram")));
+        assert_eq!(items[0].role, Role::User);
+        let mut adapter = adapter();
+        let ignored = adapter.receive(json!({"method":"item/fileChange/patchUpdated","params":{"threadId":"thread-exact","turnId":"turn-a","itemId":"0","changes":"not an array"}})).unwrap();
+        assert!(ignored.events.is_empty());
+    }
+
+    #[test]
+    fn command_actions_classify_the_command_and_name_its_target() {
+        let read = json!({"id":"0","type":"commandExecution","command":"sed -n '1,20p' src/app.rs","cwd":"/repo","status":"completed","exitCode":0,"durationMs":12,"aggregatedOutput":"fn main() {}","commandActions":[{"type":"unknown","command":"cd /repo"},{"type":"read","command":"sed -n '1,20p' src/app.rs","name":"app.rs","path":"src/app.rs"},{"type":"search","command":"rg main","query":"main","path":"src"}]});
+        let items = parse_item(&read, true, "turn").unwrap();
+        let ItemContent::Command {
+            label,
+            command,
+            working_directory,
+            action,
+            exit_code,
+            duration_ms,
+            output,
+            ..
+        } = &items[0].content
+        else {
+            panic!("A Codex commandExecution must map to a command");
+        };
+        assert_eq!(*action, CommandAction::Read);
+        assert_eq!(label, "Read src/app.rs");
+        assert_eq!(command, "sed -n '1,20p' src/app.rs");
+        assert_eq!(working_directory, "/repo");
+        assert_eq!(*exit_code, Some(0));
+        assert_eq!(*duration_ms, Some(12));
+        assert_eq!(output, "fn main() {}");
+        let unclassified = json!({"id":"1","type":"commandExecution","command":"make release","cwd":"/repo","status":"inProgress","commandActions":[{"type":"unknown","command":"make release"}]});
+        let items = parse_item(&unclassified, false, "turn").unwrap();
+        let ItemContent::Command {
+            label,
+            action,
+            status,
+            exit_code,
+            duration_ms,
+            ..
+        } = &items[0].content
+        else {
+            panic!("A Codex commandExecution must map to a command");
+        };
+        assert_eq!(*action, CommandAction::Run);
+        assert!(label.is_empty());
+        assert_eq!(*status, ToolStatus::Running);
+        assert_eq!(*exit_code, None);
+        assert_eq!(*duration_ms, None);
     }
 
     #[test]
