@@ -12,9 +12,45 @@ pub const DENSE_ROW_HEIGHT: f32 = 28.0;
 pub const PRIMARY_CONTROL_SIZE: f32 = 30.0;
 pub const SECONDARY_CONTROL_MIN_SIZE: f32 = 30.0;
 
+/// Icons that sit inside a row, beside its text. Every surface that renders
+/// this role - navigation rows, panel rows, header status - uses this token, so
+/// the same role cannot be 16px in one pane and 14px in the next.
+pub const ROW_ICON_SIZE: u16 = 16;
+/// Icons that stand alone as the illustration of a whole pane state.
+pub const STATUS_ICON_SIZE: u16 = 20;
+
 pub const TEXT_BODY: f32 = 13.0;
 pub const TEXT_CAPTION: f32 = 11.0;
 pub const TEXT_HEADING: f32 = 13.0;
+
+/// The shell's "working" tone: something is in flight and may still fail.
+pub fn warning_color(theme: &cosmic::Theme) -> cosmic::iced::Color {
+    theme.cosmic().warning.base.into()
+}
+
+/// A color resolved when a widget draws, rather than when a view is built.
+///
+/// `cosmic::theme::active()` locks the process-global theme and clones the
+/// active `Theme`, so a per-row builder that reached for a semantic color paid
+/// that round trip once per visible row per frame. Naming the resolver instead
+/// lets the widget read the `&Theme` its own `draw` is already handed, which is
+/// also the theme the frame actually renders with.
+#[derive(Clone, Copy)]
+pub enum Tone {
+    /// A color the caller has already resolved.
+    Fixed(cosmic::iced::Color),
+    /// A semantic color, read from the drawing theme.
+    Themed(fn(&cosmic::Theme) -> cosmic::iced::Color),
+}
+
+impl Tone {
+    pub fn resolve(self, theme: &cosmic::Theme) -> cosmic::iced::Color {
+        match self {
+            Self::Fixed(color) => color,
+            Self::Themed(resolve) => resolve(theme),
+        }
+    }
+}
 
 /// Secondary labels stay readable without competing with active content.
 pub fn muted_color(theme: &cosmic::Theme) -> cosmic::iced::Color {

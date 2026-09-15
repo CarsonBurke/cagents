@@ -332,6 +332,28 @@ fn physical_digit(physical_key: keyboard::key::Physical) -> Option<char> {
     }
 }
 
+/// Matches a parsed chord against a keyboard event using the product's one
+/// chord grammar.
+///
+/// `ceditor` builds on this crate and shares [`parse_shortcut`]'s grammar, so
+/// it has to share the matcher too: a forked matcher made the same configured
+/// chord fire on a different physical key in each shell, and digit chords the
+/// parser accepts never fired at all without the physical-digit fallback.
+#[must_use]
+pub fn shortcut_event_matches(binding: ShortcutBinding, event: &keyboard::Event) -> bool {
+    let keyboard::Event::KeyPressed {
+        key,
+        physical_key,
+        modifiers,
+        repeat: false,
+        ..
+    } = event
+    else {
+        return false;
+    };
+    shortcut_matches(binding, key, *physical_key, *modifiers)
+}
+
 /// The application's constructors for the events the strip reports.
 pub struct Events<ViewportMessage> {
     /// Scroll offsets and width changes, which the owner applies to the

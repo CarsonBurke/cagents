@@ -5,6 +5,13 @@ use crate::interaction::tooltip;
 pub(super) struct State {
     popup: Option<Popup>,
     focus_index: usize,
+    /// Last reported horizontal offset of the tab strip.
+    ///
+    /// The native scrollable only accepts absolute offsets, so revealing a tab
+    /// without knowing where the strip already sits means every reveal snaps
+    /// the tab to the viewport edge - including a reveal triggered by merely
+    /// hovering an already-visible tab under focus-follows-mouse.
+    tabs_offset: f32,
 }
 
 impl State {
@@ -24,7 +31,7 @@ enum Popup {
 }
 
 #[derive(Debug, Clone, Copy)]
-pub(super) enum NewTab {
+pub enum NewTab {
     Terminal,
     NativeChat,
     Omp,
@@ -73,11 +80,11 @@ const NEW_TAB_CHOICES: [(&str, &str, NewTab, &str); 6] = [
 ];
 
 #[derive(Debug, Clone)]
-pub(super) enum Action {
+pub enum Action {
     ToggleNewTab,
     ToggleNotices,
     Close,
-    DismissNotice,
+    TabsScrolled(f32),
     Launch(NewTab),
 }
 
@@ -178,7 +185,7 @@ impl Cagents {
                             });
                     [
                         Some("chrome.notices.close"),
-                        self.status.as_ref().map(|_| "chrome.notices.dismiss"),
+                        (!self.notices.is_empty()).then_some("chrome.notices.dismiss"),
                         action,
                         None,
                         None,
@@ -237,10 +244,6 @@ impl Cagents {
                     .map(cosmic::Action::App)
                 })
             }
-            Action::DismissNotice => {
-                self.status = None;
-                self.reconcile_notice_popup()
-            }
             Action::Launch(kind) => {
                 self.chrome_ui.close();
                 match kind {
@@ -266,6 +269,10 @@ impl Cagents {
                         })
                     }
                 }
+            }
+            Action::TabsScrolled(offset) => {
+                self.chrome_ui.tabs_offset = offset;
+                Task::none()
             }
         }
     }
@@ -328,7 +335,7 @@ impl Cagents {
     }
 
     fn has_chrome_notices(&self) -> bool {
-        self.status.is_some()
+        !self.notices.is_empty()
             || self
                 .save_health
                 .as_ref()
@@ -348,73 +355,98 @@ impl Cagents {
         if !self.has_chrome_notices() {
             return None;
         }
-        let error = self
-            .status
-            .as_ref()
-            .is_some_and(|notice| notice.severity == NoticeSeverity::Error)
-            || self.save_health.as_ref().is_some_and(|health| {
-                matches!(
-                    health.health,
-                    SessionSaveHealth::RetryExhausted { .. } | SessionSaveHealth::WriterUnavailable
-                )
-            });
+        // The anchor must carry the actual severity. Collapsing it to a binary
+        // `error` flag rendered a completed pull request as an amber warning
+        // triangle labelled "Application notices", and `NoticeSeverity::icon`
+        // already owns the per-severity glyph.
+        let health_severity = self.save_health.as_ref().and_then(|health| {
+            matches!(
+                health.health,
+                SessionSaveHealth::RetryExhausted { .. } | SessionSaveHealth::WriterUnavailable
+            )
+            .then_some(NoticeSeverity::Error)
+        });
+        // From the log, not `self.status`: `update` drains that slot into the
+        // log on every message, so reading it here would almost always see
+        // `None` and fall back to a warning glyph for an error.
+        let severity = self
+            .notices
+            .severity()
+            .max(health_severity)
+            .unwrap_or(NoticeSeverity::Warning);
         let control = crate::ui_controls::icon_control(
-            crate::ui_controls::symbolic_icon(if error {
-                "dialog-error-symbolic"
-            } else {
-                "dialog-warning-symbolic"
-            }),
-            if error {
-                "Application errors"
-            } else {
-                "Application notices"
+            crate::ui_controls::symbolic_icon(severity.icon()),
+            match severity {
+                NoticeSeverity::Success => "Application notices: success",
+                NoticeSeverity::Warning => "Application notices",
+                NoticeSeverity::Error => "Application errors",
             },
             self.chrome_ui.popup == Some(Popup::Notices),
             !self.modal_is_open(),
             (!self.modal_is_open()).then_some(Message::ChromeUi(Action::ToggleNotices)),
         )
         .id(widget::Id::new("chrome.notices"))
-        .icon_color(if error {
-            cosmic::theme::active().cosmic().destructive.base.into()
-        } else {
-            cosmic::theme::active().cosmic().warning.base.into()
+        .icon_color(match severity {
+            NoticeSeverity::Success => cosmic::theme::active().cosmic().success.base.into(),
+            NoticeSeverity::Warning => cosmic::theme::active().cosmic().warning.base.into(),
+            NoticeSeverity::Error => cosmic::theme::active().cosmic().destructive.base.into(),
         });
         let content =
             (self.chrome_ui.popup == Some(Popup::Notices) && !self.modal_is_open()).then(|| {
-                let mut notices = Vec::with_capacity(2);
-                if let Some(notice) = &self.status {
-                    notices.push(
+                let mut notices = Vec::with_capacity(self.notices.len() + 1);
+                for entry in self.notices.recent() {
+                    let body: Element<'_, Message> = if entry.repeats > 1 {
                         widget::column::with_children(vec![
-                            widget::text::body(&notice.message)
-                                .wrapping(iced::widget::text::Wrapping::WordOrGlyph)
-                                .width(Length::Fill)
-                                .into(),
-                            widget::button::text("Dismiss notice")
-                                .id(widget::Id::new("chrome.notices.dismiss"))
-                                .name("Dismiss application notice")
-                                .on_press(Message::ChromeUi(Action::DismissNotice))
-                                .into(),
+                            super::notice_body(&entry.notice.message),
+                            super::notice_detail(format!("Repeated {} times", entry.repeats)),
                         ])
-                        .spacing(8)
-                        .into(),
-                    );
+                        .spacing(design::GRID_UNIT)
+                        .into()
+                    } else {
+                        super::notice_body(&entry.notice.message)
+                    };
+                    notices.push(super::notice_surface(
+                        entry.notice.severity,
+                        body,
+                        Some(
+                            widget::button::text("Dismiss")
+                                .id(widget::Id::new(format!(
+                                    "chrome.notices.dismiss.{}",
+                                    entry.id
+                                )))
+                                .name("Dismiss application notice")
+                                .on_press(Message::DismissNotice(entry.id))
+                                .into(),
+                        ),
+                        false,
+                    ));
                 }
                 if let Some(health) = self.save_health.as_ref().and_then(save_health_view) {
                     notices.push(health);
                 }
-                let heading = widget::row::with_children(vec![
+                let mut heading_children = vec![
                     design::heading("Application notices")
                         .width(Length::Fill)
                         .into(),
-                    command(
-                        crate::ui_controls::symbolic_icon("window-close-symbolic"),
-                        "Close application notices",
-                        widget::Id::new("chrome.notices.close"),
-                        Some(Message::ChromeUi(Action::Close)),
-                    ),
-                ])
-                .align_y(Alignment::Center)
-                .spacing(8);
+                ];
+                if !self.notices.is_empty() {
+                    heading_children.push(
+                        widget::button::text("Dismiss all")
+                            .id(widget::Id::new("chrome.notices.dismiss"))
+                            .name("Dismiss every application notice")
+                            .on_press(Message::DismissAllNotices)
+                            .into(),
+                    );
+                }
+                heading_children.push(command(
+                    crate::ui_controls::symbolic_icon("window-close-symbolic"),
+                    "Close application notices",
+                    widget::Id::new("chrome.notices.close"),
+                    Some(Message::ChromeUi(Action::Close)),
+                ));
+                let heading = widget::row::with_children(heading_children)
+                    .align_y(Alignment::Center)
+                    .spacing(8);
                 widget::container(
                     widget::column::with_children(vec![
                         heading.into(),
@@ -548,6 +580,12 @@ impl Cagents {
         (available, 184.0)
     }
 
+    /// Scrolls the tab strip by the least amount that brings the focused tab
+    /// fully into view, and not at all when it is already visible.
+    ///
+    /// Reveal fires on every focus change, and under focus-follows-mouse that
+    /// is every hover. An absolute right-aligning scroll therefore dragged the
+    /// strip out from under the pointer.
     pub(super) fn reveal_active_tab(&self) -> Task<Message> {
         let Some(index) = self
             .workspace
@@ -557,9 +595,36 @@ impl Cagents {
             return Task::none();
         };
         let (available, width) = self.tab_strip_geometry();
+        if available <= 0.0 {
+            return Task::none();
+        }
+        // The trailing "new tab" control shares the scrollable row, so a tab
+        // revealed flush against the viewport edge would sit underneath it.
+        let pitch = width + crate::tab_strip::SPACING;
+        let content = self.workspace.order().count() as f32 * pitch + design::PRIMARY_CONTROL_SIZE;
+        let max_offset = (content - available).max(0.0);
+        if max_offset <= 0.0 {
+            // Everything fits; any offset at all would be wrong.
+            return if self.chrome_ui.tabs_offset > 0.0 {
+                workspace_widget::scroll_to(widget::Id::new("workspace.tabs"), 0.0)
+                    .map(cosmic::Action::App)
+            } else {
+                Task::none()
+            };
+        }
+        let leading = index as f32 * pitch;
+        let trailing = leading + width;
+        let offset = self.chrome_ui.tabs_offset;
+        let target = if leading < offset {
+            leading
+        } else if trailing > offset + available {
+            trailing - available
+        } else {
+            return Task::none();
+        };
         workspace_widget::scroll_to(
             widget::Id::new("workspace.tabs"),
-            ((index + 1) as f32 * (width + 4.0) - available).max(0.0),
+            target.clamp(0.0, max_offset),
         )
         .map(cosmic::Action::App)
     }
@@ -576,11 +641,12 @@ impl Cagents {
             .map(|id| self.column_header(id, self.workspace.focused() == Some(id), tab_width))
             .chain(std::iter::once(self.new_tab_control()))
             .collect();
-        let tabs = crate::tab_strip::horizontal(
+        let tabs = crate::tab_strip::horizontal_with_scroll(
             widget::Id::new("workspace.tabs"),
             tabs,
             design::PRIMARY_CONTROL_SIZE,
             design::HEADER_HEIGHT,
+            |viewport| Message::ChromeUi(Action::TabsScrolled(viewport.absolute_offset().x)),
         );
         let actions = widget::row::with_children(self.workflow_header())
             .spacing(2)

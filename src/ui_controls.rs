@@ -203,7 +203,8 @@ pub fn icon_control<'a, Message: Clone + 'a>(
     on_press: Option<Message>,
 ) -> IconControl<'a, Message> {
     let label = label.into();
-    let content = widget::container(widget::icon(icon).size(16)).center(Length::Fill);
+    let content = widget::container(widget::icon(icon).size(crate::design::ROW_ICON_SIZE))
+        .center(Length::Fill);
     IconControl {
         button: widget::button::custom(content)
             .name(label.clone())
@@ -225,8 +226,14 @@ impl<'a, Message: Clone + 'a> IconControl<'a, Message> {
         self
     }
 
-    pub fn icon_color(mut self, color: iced::Color) -> Self {
-        self.button = self.button.class(control_style(self.selected, Some(color)));
+    pub fn icon_color(self, color: iced::Color) -> Self {
+        self.icon_tone(crate::design::Tone::Fixed(color))
+    }
+
+    /// The semantic tone variant: resolved from the drawing theme, so a row
+    /// builder never locks the process-global theme to name a color.
+    pub fn icon_tone(mut self, tone: crate::design::Tone) -> Self {
+        self.button = self.button.class(control_style(self.selected, Some(tone)));
         self
     }
 }
@@ -340,7 +347,7 @@ pub fn segmented_controls<'a, Message: 'a>(
     .into()
 }
 
-fn control_style(selected: bool, color: Option<iced::Color>) -> cosmic::theme::Button {
+fn control_style(selected: bool, tone: Option<crate::design::Tone>) -> cosmic::theme::Button {
     let appearance = move |focused: bool, theme: &cosmic::Theme| widget::button::Style {
         background: (selected || focused).then(|| {
             iced::Background::Color(
@@ -354,7 +361,10 @@ fn control_style(selected: bool, color: Option<iced::Color>) -> cosmic::theme::B
         border_radius: theme.cosmic().corner_radii.radius_s.into(),
         border_width: 0.0,
         border_color: theme.current_container().component.on_disabled.into(),
-        icon_color: Some(color.unwrap_or_else(|| theme.current_container().component.on.into())),
+        icon_color: Some(tone.map_or_else(
+            || theme.current_container().component.on.into(),
+            |tone| tone.resolve(theme),
+        )),
         ..widget::button::Style::new()
     };
     cosmic::theme::Button::Custom {
@@ -394,11 +404,33 @@ fn muted_icon_color(theme: &cosmic::Theme) -> iced::Color {
 
 /// A small activity glyph that redraws only while mounted, visible and focused.
 /// The widget owns its clock: there is no application subscription or view rebuild.
+///
+/// `color` is the tone the indicator draws in. The pinned COSMIC spinner takes
+/// its bar color from the active accent and has no style of its own, so the
+/// tone is applied by substituting the accent for this subtree rather than
+/// dropped on the floor.
 pub fn activity_spinner<'a, Message: Clone + 'a>(
     size: f32,
-    _color: iced::Color,
+    color: iced::Color,
 ) -> Element<'a, Message> {
-    cosmic::widget::progress_bar::indeterminate_circular()
-        .size(size)
-        .into()
+    spinner(size, crate::design::Tone::Fixed(color))
+}
+
+/// [`activity_spinner`] in a semantic tone, resolved from the drawing theme.
+///
+/// Per-row indicators must use this: naming the color eagerly meant
+/// `cosmic::theme::active()` - a process-global theme lock plus a clone of the
+/// active `Theme` - once per visible row per frame.
+pub fn activity_spinner_tone<'a, Message: Clone + 'a>(
+    size: f32,
+    tone: fn(&cosmic::Theme) -> iced::Color,
+) -> Element<'a, Message> {
+    spinner(size, crate::design::Tone::Themed(tone))
+}
+
+fn spinner<'a, Message: Clone + 'a>(size: f32, tone: crate::design::Tone) -> Element<'a, Message> {
+    crate::interaction::accent_tint(
+        cosmic::widget::progress_bar::indeterminate_circular().size(size),
+        tone,
+    )
 }

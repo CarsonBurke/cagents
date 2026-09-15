@@ -6,7 +6,7 @@ use crate::{
 use std::sync::Arc;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) struct Identity {
+pub struct Identity {
     key: ActiveWorktreeKey,
     head: Oid,
     base_ref: ValidatedRefName,
@@ -42,7 +42,7 @@ impl Drop for State {
 }
 
 #[derive(Debug, Clone)]
-pub(super) enum Action {
+pub enum Action {
     Loaded {
         generation: u64,
         identity: Identity,

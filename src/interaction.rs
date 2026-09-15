@@ -77,10 +77,37 @@ pub fn overflow_fade_x<'a, Message: 'a>(
     })
 }
 
+/// Renders `content` with the theme's accent color replaced by `tone`.
+///
+/// The pinned COSMIC progress indicators take their bar color from the active
+/// accent and expose no style of their own - `Circular`'s `Style` is `()` - so
+/// an explicit tone can only be applied by substituting the theme the child
+/// draws with. Only the accent is replaced; every other color the child reads
+/// is the real theme's.
+pub fn accent_tint<'a, Message: 'a>(
+    content: impl Into<Element<'a, Message>>,
+    tone: crate::design::Tone,
+) -> Element<'a, Message> {
+    Element::new(AccentTint {
+        content: content.into(),
+        tone,
+    })
+}
+
+/// Projects a wheel gesture onto the horizontal axis.
+///
+/// Summing the two components cancels a diagonal trackpad gesture exactly - a
+/// gesture reporting `x = -d, y = +d` sums to zero - and [`HorizontalWheel`]
+/// has already replaced the original event by then, so the motion is discarded
+/// rather than forwarded. A real horizontal delta therefore wins outright, and
+/// only a purely vertical one is remapped.
 fn wheel_as_horizontal(delta: mouse::ScrollDelta) -> Event {
+    fn horizontal(x: f32, y: f32) -> f32 {
+        if x == 0.0 { y } else { x }
+    }
     let x = match delta {
-        mouse::ScrollDelta::Lines { x, y } => (x + y) * 60.0,
-        mouse::ScrollDelta::Pixels { x, y } => x + y,
+        mouse::ScrollDelta::Lines { x, y } => horizontal(x, y) * 60.0,
+        mouse::ScrollDelta::Pixels { x, y } => horizontal(x, y),
     };
     Event::Mouse(mouse::Event::WheelScrolled {
         delta: mouse::ScrollDelta::Pixels { x, y: 0.0 },
@@ -142,7 +169,11 @@ pub fn tooltip<'a, Message: 'a>(
     label: impl Into<Cow<'a, str>>,
 ) -> Element<'a, Message> {
     let label = label.into();
-    let tip = cosmic::widget::container(cosmic::widget::text(label).size(12))
+    // The shell's type scale owns this size. Tooltip text is the whole content
+    // of its surface rather than secondary metadata beside something else, so
+    // it takes the body role; `design::caption` also mutes its color, which an
+    // overlay with its own background must not do.
+    let tip = cosmic::widget::container(crate::design::body(label))
         .class(cosmic::theme::Container::custom(|_| Default::default()))
         .padding(8)
         .max_width(320)
@@ -519,6 +550,188 @@ impl<Message> Widget<Message, Theme, Renderer> for HorizontalWheel<'_, Message> 
             &tree.children[0],
             renderer,
             theme,
+            style,
+            layout.with_virtual_offset(layout.virtual_offset()),
+            cursor,
+            viewport,
+        )
+    }
+    fn overlay<'a>(
+        &'a mut self,
+        tree: &'a mut Tree,
+        layout: Layout<'a>,
+        renderer: &Renderer,
+        viewport: &Rectangle,
+        translation: Vector,
+    ) -> Option<overlay::Element<'a, Message, Theme, Renderer>> {
+        self.content.as_widget_mut().overlay(
+            &mut tree.children[0],
+            layout.with_virtual_offset(layout.virtual_offset()),
+            renderer,
+            viewport,
+            translation,
+        )
+    }
+    fn a11y_nodes(
+        &self,
+        layout: Layout<'_>,
+        tree: &Tree,
+        cursor: mouse::Cursor,
+    ) -> iced_accessibility::A11yTree {
+        self.content.as_widget().a11y_nodes(
+            layout.with_virtual_offset(layout.virtual_offset()),
+            &tree.children[0],
+            cursor,
+        )
+    }
+    fn drag_destinations(
+        &self,
+        tree: &Tree,
+        layout: Layout<'_>,
+        renderer: &Renderer,
+        destinations: &mut cosmic::iced::advanced::clipboard::DndDestinationRectangles,
+    ) {
+        self.content.as_widget().drag_destinations(
+            &tree.children[0],
+            layout.with_virtual_offset(layout.virtual_offset()),
+            renderer,
+            destinations,
+        );
+    }
+}
+
+struct AccentTint<'a, Message> {
+    content: Element<'a, Message>,
+    tone: crate::design::Tone,
+}
+
+/// At most this many tones are retained; the shell draws one.
+const MAX_ACCENT_TINTS: usize = 4;
+
+thread_local! {
+    /// Accent substitutions, shared by every tinted widget and reused across
+    /// frames.
+    ///
+    /// Building one clones the whole COSMIC theme, which must not happen once
+    /// per row per frame. Entries are keyed by tone and by the identity of the
+    /// theme they were derived from: changing the theme replaces the `Arc` - or
+    /// the static - that `Theme::cosmic` points at, so that address is the
+    /// cheapest generation counter available here.
+    static ACCENT_TINTS: RefCell<Vec<(Color, *const cosmic::cosmic_theme::Theme, Theme)>> =
+        const { RefCell::new(Vec::new()) };
+}
+
+fn accent_tinted(source: &Theme, color: Color) -> Theme {
+    let from = std::ptr::from_ref(source.cosmic());
+    ACCENT_TINTS.with_borrow_mut(|cache| {
+        if let Some((_, _, tinted)) = cache
+            .iter()
+            .find(|(tone, origin, _)| *tone == color && *origin == from)
+        {
+            return tinted.clone();
+        }
+        let mut cosmic = source.cosmic().clone();
+        let tone = Srgba::new(color.r, color.g, color.b, color.a);
+        cosmic.accent.base = tone;
+        cosmic.accent_text = Some(tone);
+        let tinted = Theme {
+            theme_type: cosmic::theme::ThemeType::Custom(Arc::new(cosmic)),
+            ..source.clone()
+        };
+        if cache.len() >= MAX_ACCENT_TINTS {
+            cache.clear();
+        }
+        cache.push((color, from, tinted.clone()));
+        tinted
+    })
+}
+
+impl<Message> Widget<Message, Theme, Renderer> for AccentTint<'_, Message> {
+    fn children(&self) -> Vec<Tree> {
+        vec![Tree::new(&self.content)]
+    }
+    fn diff(&mut self, tree: &mut Tree) {
+        tree.diff_children(std::slice::from_mut(&mut self.content));
+    }
+    fn size(&self) -> Size<Length> {
+        self.content.as_widget().size()
+    }
+    fn layout(
+        &mut self,
+        tree: &mut Tree,
+        renderer: &Renderer,
+        limits: &layout::Limits,
+    ) -> layout::Node {
+        self.content
+            .as_widget_mut()
+            .layout(&mut tree.children[0], renderer, limits)
+    }
+    fn operate(
+        &mut self,
+        tree: &mut Tree,
+        layout: Layout<'_>,
+        renderer: &Renderer,
+        operation: &mut dyn Operation,
+    ) {
+        self.content.as_widget_mut().operate(
+            &mut tree.children[0],
+            layout.with_virtual_offset(layout.virtual_offset()),
+            renderer,
+            operation,
+        );
+    }
+    fn update(
+        &mut self,
+        tree: &mut Tree,
+        event: &Event,
+        layout: Layout<'_>,
+        cursor: mouse::Cursor,
+        renderer: &Renderer,
+        clipboard: &mut dyn Clipboard,
+        shell: &mut Shell<'_, Message>,
+        viewport: &Rectangle,
+    ) {
+        self.content.as_widget_mut().update(
+            &mut tree.children[0],
+            event,
+            layout.with_virtual_offset(layout.virtual_offset()),
+            cursor,
+            renderer,
+            clipboard,
+            shell,
+            viewport,
+        );
+    }
+    fn mouse_interaction(
+        &self,
+        tree: &Tree,
+        layout: Layout<'_>,
+        cursor: mouse::Cursor,
+        viewport: &Rectangle,
+        renderer: &Renderer,
+    ) -> mouse::Interaction {
+        self.content.as_widget().mouse_interaction(
+            &tree.children[0],
+            layout.with_virtual_offset(layout.virtual_offset()),
+            cursor,
+            viewport,
+            renderer,
+        )
+    }
+    fn draw(
+        &self,
+        tree: &Tree,
+        renderer: &mut Renderer,
+        theme: &Theme,
+        style: &renderer::Style,
+        layout: Layout<'_>,
+        cursor: mouse::Cursor,
+        viewport: &Rectangle,
+    ) {
+        self.content.as_widget().draw(
+            &tree.children[0],
+            renderer,
+            &accent_tinted(theme, self.tone.resolve(theme)),
             style,
             layout.with_virtual_offset(layout.virtual_offset()),
             cursor,
@@ -1371,6 +1584,32 @@ mod tests {
             panic!("expected a wheel event");
         };
         assert_eq!(delta, mouse::ScrollDelta::Pixels { x: 60.0, y: 0.0 });
+    }
+
+    #[test]
+    fn a_diagonal_wheel_keeps_its_horizontal_component() {
+        // Summing the axes cancelled this gesture to a standstill, and the
+        // wrapper had already replaced the original event with the sum.
+        for (delta, expected) in [
+            (
+                mouse::ScrollDelta::Lines { x: -1.0, y: 1.0 },
+                mouse::ScrollDelta::Pixels { x: -60.0, y: 0.0 },
+            ),
+            (
+                mouse::ScrollDelta::Pixels { x: -8.0, y: 8.0 },
+                mouse::ScrollDelta::Pixels { x: -8.0, y: 0.0 },
+            ),
+            (
+                mouse::ScrollDelta::Pixels { x: 0.0, y: 8.0 },
+                mouse::ScrollDelta::Pixels { x: 8.0, y: 0.0 },
+            ),
+        ] {
+            let Event::Mouse(mouse::Event::WheelScrolled { delta }) = wheel_as_horizontal(delta)
+            else {
+                panic!("expected a wheel event");
+            };
+            assert_eq!(delta, expected);
+        }
     }
 
     #[test]

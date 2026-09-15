@@ -188,7 +188,9 @@ const DIALOG_TRANSITION_DURATION: Duration = Duration::from_millis(160);
 const CONTENT_MAX_WIDTH: f32 = 560.0;
 const STATUS_SURFACE_MAX_WIDTH: f32 = 360.0;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Variants are ordered by escalation, so `max` picks the severity a combined
+/// surface must present.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum NoticeSeverity {
     Success,
     Warning,
@@ -217,6 +219,111 @@ impl NoticeSeverity {
 struct TransientNotice {
     severity: NoticeSeverity,
     message: String,
+}
+
+/// How long a non-error notice stays on screen before it retires itself.
+const NOTICE_TOAST_LIFETIME: Duration = Duration::from_secs(6);
+/// Granularity of the retirement sweep; the slack it adds to a six-second
+/// lifetime is not worth a timer that restarts on every frame.
+const NOTICE_EXPIRY_INTERVAL: Duration = Duration::from_millis(500);
+/// Toasts visible at once. Beyond this the stack summarises the remainder and
+/// points at the notices popover, which holds the full log.
+const NOTICE_TOAST_VISIBLE: usize = 3;
+/// Notices retained for review. Bounded because nothing else bounds them: the
+/// shell raises a notice from almost a hundred call sites, several of them on
+/// per-frame or per-poll paths.
+const NOTICE_LOG_CAPACITY: usize = 24;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LoggedNotice {
+    id: u64,
+    notice: TransientNotice,
+    raised: Instant,
+    /// Repeats of an identical message collapse onto one entry rather than
+    /// flooding the log; a failing poll would otherwise evict everything else.
+    repeats: u32,
+}
+
+impl LoggedNotice {
+    /// Errors persist until dismissed. A warning or a success is informational,
+    /// so it retires on its own rather than accumulating chrome the user has to
+    /// clear by hand.
+    fn expires_at(&self) -> Option<Instant> {
+        (self.notice.severity != NoticeSeverity::Error).then(|| self.raised + NOTICE_TOAST_LIFETIME)
+    }
+}
+
+/// The shell's notice history: a bounded ring plus the identity counter that
+/// lets a dismiss request name exactly one entry.
+#[derive(Debug, Default)]
+struct NoticeLog {
+    entries: VecDeque<LoggedNotice>,
+    next_id: u64,
+}
+
+impl NoticeLog {
+    fn record(&mut self, notice: TransientNotice, now: Instant) {
+        if let Some(last) = self.entries.back_mut()
+            && last.notice == notice
+        {
+            last.repeats = last.repeats.saturating_add(1);
+            last.raised = now;
+            return;
+        }
+        self.next_id = self.next_id.wrapping_add(1);
+        self.entries.push_back(LoggedNotice {
+            id: self.next_id,
+            notice,
+            raised: now,
+            repeats: 1,
+        });
+        while self.entries.len() > NOTICE_LOG_CAPACITY {
+            self.entries.pop_front();
+        }
+    }
+
+    fn dismiss(&mut self, id: u64) {
+        self.entries.retain(|entry| entry.id != id);
+    }
+
+    fn clear(&mut self) {
+        self.entries.clear();
+    }
+
+    /// Drops every entry whose lifetime has elapsed. Returns whether anything
+    /// was removed, so the caller can avoid an unnecessary redraw.
+    fn retire_expired(&mut self, now: Instant) -> bool {
+        let before = self.entries.len();
+        self.entries
+            .retain(|entry| entry.expires_at().is_none_or(|at| at > now));
+        self.entries.len() != before
+    }
+
+    /// The earliest deadline still pending, so the shell can tick exactly once
+    /// per expiry instead of polling while any notice exists.
+    fn next_deadline(&self) -> Option<Instant> {
+        self.entries
+            .iter()
+            .filter_map(LoggedNotice::expires_at)
+            .min()
+    }
+
+    /// Newest first: a toast stack reads downward from the most recent event.
+    fn recent(&self) -> impl Iterator<Item = &LoggedNotice> {
+        self.entries.iter().rev()
+    }
+
+    fn severity(&self) -> Option<NoticeSeverity> {
+        self.entries.iter().map(|entry| entry.notice.severity).max()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    fn len(&self) -> usize {
+        self.entries.len()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -402,6 +509,34 @@ fn notice_surface<'a>(
     surface.into()
 }
 
+/// Notice text the user has to read and often copy.
+///
+/// Two reasons this is not `design::body`/`design::caption`. Notice bodies
+/// carry database paths, URLs and error strings, so they must be selectable —
+/// the chat transcript already uses `selectable_text` for exactly that. And
+/// `design::caption` attaches its own muted text class, which resolves against
+/// the *ambient* container and therefore overrides the `text_color` that
+/// `notice_surface` sets for the severity, leaving the title in the severity
+/// foreground and the detail lines in the ambient one.
+fn notice_body<'a>(text: impl Into<Cow<'a, str>> + 'a) -> Element<'a, Message> {
+    widget::selectable_text(text)
+        .size(design::TEXT_BODY)
+        .wrapping(cosmic::iced::widget::text::Wrapping::WordOrGlyph)
+        .width(Length::Fill)
+        .into()
+}
+
+/// Selectable equivalent of `design::caption`: diagnostic detail the user
+/// needs to copy into a bug report, a shell, or a search.
+fn notice_detail<'a>(text: impl Into<Cow<'a, str>> + 'a) -> Element<'a, Message> {
+    widget::selectable_text(text)
+        .size(design::TEXT_CAPTION)
+        .wrapping(cosmic::iced::widget::text::Wrapping::WordOrGlyph)
+        .width(Length::Fill)
+        .class(cosmic::theme::Text::Custom(design::muted_text))
+        .into()
+}
+
 fn save_health_view(health: &SaveHealthState) -> Option<Element<'_, Message>> {
     if !health.is_visible() {
         return None;
@@ -495,15 +630,9 @@ fn save_health_view(health: &SaveHealthState) -> Option<Element<'_, Message>> {
     Some(notice_surface(
         severity,
         widget::column::with_children(vec![
-            widget::text::body(title)
-                .wrapping(cosmic::iced::widget::text::Wrapping::WordOrGlyph)
-                .into(),
-            design::caption(detail)
-                .wrapping(cosmic::iced::widget::text::Wrapping::WordOrGlyph)
-                .into(),
-            design::caption(guidance)
-                .wrapping(cosmic::iced::widget::text::Wrapping::WordOrGlyph)
-                .into(),
+            notice_body(title),
+            notice_detail(detail),
+            notice_detail(guidance),
         ])
         .spacing(spacing.space_xxxs)
         .width(Length::Fill)
@@ -941,6 +1070,17 @@ fn display_path(path: &Path) -> Cow<'_, str> {
     }
 }
 
+/// The process's starting directory, already formatted for display.
+///
+/// Nothing in this application calls `set_current_dir`, so this value cannot
+/// change while the process runs. The empty-workspace surface is the default
+/// first-run view and `view` re-runs on every redraw, so resolving this there
+/// cost a blocking `getcwd` plus three allocations per frame.
+static STARTING_DIRECTORY_CAPTION: LazyLock<String> = LazyLock::new(|| {
+    let directory = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/"));
+    format!("Starting directory: {}", display_path(&directory))
+});
+
 fn terminal_transcript_path(id: TerminalId) -> Option<PathBuf> {
     instance::project_dirs().map(|dirs| {
         dirs.data_dir()
@@ -1108,22 +1248,28 @@ pub struct LoadedRepository {
     github: GitHubAvailability,
 }
 
-type BootstrapResult = (
-    WorkspaceState,
-    Option<SessionRuntime>,
-    Vec<ProjectState>,
-    Vec<WorktreeState>,
-    AppSettings,
-    Option<PathBuf>,
-    bool,
-    Option<String>,
-    Option<SaveHealthState>,
-);
+/// Everything `bootstrap` resolves before iced exists, named rather than
+/// positional: this used to be a nine-wide tuple mutated through `bootstrap.7`.
+pub(crate) struct Bootstrap {
+    workspace: WorkspaceState,
+    session: Option<SessionRuntime>,
+    projects: Vec<ProjectState>,
+    worktrees: Vec<WorktreeState>,
+    settings: AppSettings,
+    settings_path: Option<PathBuf>,
+    settings_write_blocked: bool,
+    /// The one failure that is fatal under the launch handshake, so it stays
+    /// separate from the advisory warnings below.
+    status: Option<String>,
+    save_health: Option<SaveHealthState>,
+    /// Cards that storage held but could not restore. Advisory, never fatal.
+    restore_warnings: Vec<String>,
+}
 
 /// Loaded before iced starts: session restoration and file locks never wait on
 /// the native event loop. Only successfully restored launches can report ready.
 pub struct Startup {
-    bootstrap: BootstrapResult,
+    bootstrap: Bootstrap,
     window_view: Option<WindowView>,
 }
 
@@ -1397,6 +1543,10 @@ fn repository_action_allowed_while_modal(action: &RepositoryAction) -> bool {
             | RepositoryAction::WorkingDiffDue { .. }
             | RepositoryAction::WorkingDiffLoaded { .. }
             | RepositoryAction::AutoSaveDue { .. }
+            // Refusing these strands the card's file list and markdown preview
+            // behind their own debounce until the next self-heal.
+            | RepositoryAction::FileListUnchanged { .. }
+            | RepositoryAction::MarkdownDue { .. }
     )
 }
 
@@ -1522,7 +1672,7 @@ fn user_message_blocked_during_update(message: &Message) -> bool {
     user_workspace_message_blocked_while_modal(message)
         || matches!(
             message,
-            Message::KeyEvent(_)
+            Message::KeyEvent { .. }
                 | Message::Viewport { .. }
                 | Message::NewWindow
                 | Message::WindowCloseRequested(_)
@@ -1552,6 +1702,8 @@ fn user_message_blocked_during_update(message: &Message) -> bool {
                 | Message::SettingsChanged { .. }
                 | Message::SettingsDraftChanged { .. }
                 | Message::ResetSettings
+                | Message::ConfirmResetSettings
+                | Message::CancelResetSettings
                 | Message::NativeWindowAction(_)
                 | Message::ProjectUi(
                     project_ui::Action::Command { .. }
@@ -1693,6 +1845,7 @@ pub enum SettingsField {
     LinkOpenDestination,
     EditorAutoSave,
     EditorWrapLines,
+    EditorSyntaxTheme,
     ConfirmTerminalClose,
     FocusFollowsMouse,
     LinkOpenGesture,
@@ -1764,6 +1917,7 @@ struct SettingsDraft {
     default_column_fraction: String,
     editor_auto_save: bool,
     editor_wrap_lines: bool,
+    editor_syntax_theme: settings::EditorSyntaxTheme,
     confirm_terminal_close: bool,
     focus_follows_mouse: bool,
     link_open_destination: LinkOpenDestination,
@@ -1812,6 +1966,7 @@ impl SettingsDraft {
             editor_auto_save: settings.editor_auto_save,
             editor_wrap_lines: settings.editor_wrap_lines,
             confirm_terminal_close: settings.confirm_terminal_close,
+            editor_syntax_theme: settings.editor_syntax_theme,
             focus_follows_mouse: settings.focus_follows_mouse,
             link_open_destination: settings.link_open_destination,
             link_open_gesture: settings.link_open_gesture,
@@ -1838,6 +1993,11 @@ impl SettingsDraft {
             SettingsField::EditorAutoSave => self.editor_auto_save = value == "true",
             SettingsField::EditorWrapLines => self.editor_wrap_lines = value == "true",
             SettingsField::ConfirmTerminalClose => self.confirm_terminal_close = value == "true",
+            SettingsField::EditorSyntaxTheme => {
+                if let Some(theme) = settings::EditorSyntaxTheme::from_key(&value) {
+                    self.editor_syntax_theme = theme;
+                }
+            }
             SettingsField::FocusFollowsMouse => self.focus_follows_mouse = value == "true",
             SettingsField::LinkOpenDestination => {
                 self.link_open_destination = if value == LinkOpenDestination::SystemDefault.as_str()
@@ -1916,6 +2076,9 @@ fn settings_update(
             .parse::<bool>()
             .map(|enabled| next.editor_auto_save = enabled)
             .map_err(|_| "Choose whether editor auto-save is enabled.".to_owned()),
+        SettingsField::EditorSyntaxTheme => settings::EditorSyntaxTheme::from_key(value)
+            .map(|theme| next.editor_syntax_theme = theme)
+            .ok_or_else(|| "Choose one of the listed syntax themes.".to_owned()),
         SettingsField::EditorWrapLines => value
             .parse::<bool>()
             .map(|enabled| next.editor_wrap_lines = enabled)
@@ -2289,7 +2452,13 @@ pub enum Message {
         result: Result<PullRequestCreationOutcome, String>,
     },
     CancelDialog,
-    KeyEvent(keyboard::Event),
+    KeyEvent {
+        event: keyboard::Event,
+        /// Whether a widget already consumed this keystroke. The shell's
+        /// fallback chains must stand down when it did, or Escape typed to
+        /// clear a terminal selection also closes the inspector behind it.
+        captured: bool,
+    },
     FocusAdjacent(crate::workspace::FocusDirection),
     FocusProjectSearch,
     ToggleContextInspector,
@@ -2319,13 +2488,21 @@ pub enum Message {
     ThreadUi(thread_ui::Action),
     BranchUi(branch_ui::Action),
     RefreshUi(refresh_ui::Action),
+    /// Opens the confirmation; `ConfirmResetSettings` performs the reset.
     ResetSettings,
+    ConfirmResetSettings,
+    CancelResetSettings,
     SessionSaveHealthChanged(SessionSaveHealthEvent),
     Lsp(LspEvent),
     LanguageServersReaped,
     RetrySessionSave,
     AcknowledgeSessionRecovery,
     DismissStatus,
+    /// Dismisses exactly one logged notice; a stale id is a no-op.
+    DismissNotice(u64),
+    DismissAllNotices,
+    /// Retires every notice whose lifetime has elapsed.
+    ExpireNotices,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2699,6 +2876,8 @@ pub struct Cagents {
     core: Core,
     settings_path: Option<PathBuf>,
     settings_write_blocked: bool,
+    /// Bounded notice history, fed from `status` at the end of every `update`.
+    notices: NoticeLog,
     sidebar_model: SidebarModel,
     project_ui: project_ui::State,
     chat_ui: chat_ui::State,
@@ -2719,6 +2898,9 @@ pub struct Cagents {
     github_availability: HashMap<ProjectId, GitHubAvailability>,
     repository_generations: HashMap<ProjectId, u64>,
     worktree_dialog: Option<WorktreeDialog>,
+    /// Resetting settings destroys every customization with no undo, so it
+    /// confirms first like every other destructive action in the shell.
+    settings_reset_confirm: bool,
     pull_request_dialog: Option<PullRequestDialog>,
     /// Opening or dismissing a newer draft supersedes in-flight draft recovery.
     pull_request_dialog_generation: u64,
@@ -2814,7 +2996,7 @@ async fn open_system_url_with_opener(url: &Url, opener: impl AsRef<OsStr>) -> Re
 }
 
 impl Cagents {
-    fn bootstrap(strict: bool) -> Result<BootstrapResult, String> {
+    fn bootstrap(strict: bool) -> Result<Bootstrap, String> {
         let (settings, settings_path, settings_write_blocked, status) =
             match settings::default_path() {
                 Ok(path) => match settings::load(&path) {
@@ -2832,17 +3014,33 @@ impl Cagents {
             return Err(error.clone());
         }
         let default_database_path = SessionRuntime::default_database_path().ok();
-        let (session, restored, projects, worktrees, save_health) =
+        let (session, restored, projects, worktrees, save_health, restore_warnings) =
             match SessionRuntime::open_default() {
                 Ok((mut session, restored)) => {
                     let (projects, worktrees) = session.take_catalog();
                     let save_health = SaveHealthState::new(session.database_path().to_owned());
+                    // A single directory scan plus one read-only query per
+                    // other open window, so it belongs on the path that has
+                    // just opened the database rather than in a background task
+                    // that would race the first terminal into the same
+                    // directory. Failure is diagnostic only: transcripts are a
+                    // convenience, and refusing to start because stale ones
+                    // could not be reclaimed would be absurd.
+                    match session.prune_transcripts() {
+                        Ok(_) => {}
+                        Err(error) => tracing::warn!(
+                            %error,
+                            "could not reclaim unowned terminal transcripts"
+                        ),
+                    }
+                    let warnings = session.restore_warnings().to_vec();
                     (
                         Some(session),
                         restored,
                         projects,
                         worktrees,
                         Some(save_health),
+                        warnings,
                     )
                 }
                 Err(error) => {
@@ -2850,13 +3048,20 @@ impl Cagents {
                         return Err(format!("could not restore workspace: {error}"));
                     }
                     let save_health = SaveHealthState::writer_unavailable(default_database_path);
-                    (None, None, Vec::new(), Vec::new(), Some(save_health))
+                    (
+                        None,
+                        None,
+                        Vec::new(),
+                        Vec::new(),
+                        Some(save_health),
+                        Vec::new(),
+                    )
                 }
             };
         let mut restored = restored.unwrap_or_default();
         normalize_restored_titles(&mut restored);
-        Ok((
-            restored,
+        Ok(Bootstrap {
+            workspace: restored,
             session,
             projects,
             worktrees,
@@ -2865,7 +3070,8 @@ impl Cagents {
             settings_write_blocked,
             status,
             save_health,
-        ))
+            restore_warnings,
+        })
     }
 
     pub fn load_startup() -> Result<Startup, String> {
@@ -2879,7 +3085,7 @@ impl Cagents {
         let strict = instance::ui_launch_handshake_requested();
         let mut bootstrap = Self::bootstrap(strict)?;
         let view = bootstrap
-            .1
+            .session
             .as_ref()
             .map(|session| {
                 session
@@ -2897,7 +3103,7 @@ impl Cagents {
             Ok(view) => view.flatten(),
             Err(error) if strict => return Err(error),
             Err(error) => {
-                bootstrap.7 = Some(error);
+                bootstrap.status = Some(error);
                 None
             }
         };
@@ -5385,14 +5591,21 @@ impl Cagents {
     /// `Open` that is never drained leaves a document the server has not been
     /// told about while the application shows results for it.
     fn drain_lsp_intents(&mut self, card: CardId) -> Task<Message> {
-        let (intents, auto_save) = match self.cards.get_mut(&card) {
-            Some(CardRuntime::Repository(runtime)) => (
-                runtime.take_lsp_intents(),
-                Task::batch([
-                    repository_task(runtime.auto_save_task(card)),
-                    repository_task(runtime.working_diff_task(card)),
-                ]),
-            ),
+        let (intents, edits, auto_save) = match self.cards.get_mut(&card) {
+            Some(CardRuntime::Repository(runtime)) => {
+                let intents = runtime.take_lsp_intents();
+                // Strictly after `take_lsp_intents`, which is what materialises
+                // the `Change` these edits describe.
+                let edits = runtime.take_lsp_edits();
+                (
+                    intents,
+                    edits,
+                    Task::batch([
+                        repository_task(runtime.auto_save_task(card)),
+                        repository_task(runtime.working_diff_task(card)),
+                    ]),
+                )
+            }
             _ => return Task::none(),
         };
         if intents.is_empty() {
@@ -5417,13 +5630,13 @@ impl Cagents {
                     let Some(doc) = self.lsp_document(card) else {
                         continue;
                     };
-                    // The widget cannot report *where* the text differs, so the
-                    // manager is given an empty edit slice and sends the whole
-                    // document. Every answer computed against the old text is
-                    // dropped in the same breath: a completion range or a hover
-                    // span that predates a keystroke describes characters the
-                    // buffer no longer has.
-                    self.lsp.change(doc, version, &[], &text);
+                    // An empty slice means the widget could not describe the
+                    // change as ranges, and the manager then sends the whole
+                    // document from `text`. Either way every answer computed
+                    // against the old text is dropped in the same breath: a
+                    // completion range or a hover span that predates a
+                    // keystroke describes characters the buffer no longer has.
+                    self.lsp.change(doc, version, &edits, &text);
                     if let Some(state) = self.lsp_contexts.get_mut(&card) {
                         state.invalidate_answers();
                     }
@@ -6048,6 +6261,136 @@ impl Cagents {
         }
     }
 
+    /// Ticks only while some notice can still retire itself.
+    ///
+    /// The interval is fixed rather than derived from the remaining time
+    /// because a `Subscription` is identified by its arguments: a shrinking
+    /// duration would tear down and rebuild the timer on every frame the
+    /// notice is on screen.
+    fn notice_expiry_subscription(&self) -> Subscription<Message> {
+        if self.notices.next_deadline().is_none() {
+            return Subscription::none();
+        }
+        iced::time::every(NOTICE_EXPIRY_INTERVAL).map(|_| Message::ExpireNotices)
+    }
+
+    /// The notice stack: the shell's only *unprompted* report surface.
+    ///
+    /// Without it every one of the shell's error notices is invisible until
+    /// the user happens to notice a small glyph appear in the header and clicks
+    /// it, which is indistinguishable from the action having silently failed.
+    fn notice_toasts(&self) -> Option<Element<'_, Message>> {
+        if self.notices.is_empty() || self.modal_is_open() {
+            return None;
+        }
+        let spacing = cosmic::theme::spacing();
+        let mut toasts: Vec<Element<'_, Message>> = self
+            .notices
+            .recent()
+            .take(NOTICE_TOAST_VISIBLE)
+            .map(|entry| {
+                let body: Element<'_, Message> = if entry.repeats > 1 {
+                    widget::column::with_children(vec![
+                        notice_body(&entry.notice.message),
+                        notice_detail(format!("Repeated {} times", entry.repeats)),
+                    ])
+                    .spacing(design::GRID_UNIT)
+                    .into()
+                } else {
+                    notice_body(&entry.notice.message)
+                };
+                notice_surface(
+                    entry.notice.severity,
+                    body,
+                    Some(
+                        crate::ui_controls::icon_control(
+                            crate::ui_controls::symbolic_icon("window-close-symbolic"),
+                            format!("Dismiss {} notice", entry.notice.severity.label()),
+                            false,
+                            true,
+                            Some(Message::DismissNotice(entry.id)),
+                        )
+                        .into(),
+                    ),
+                    // Not compact: a notice message is a sentence, and the
+                    // compact variant pins a fixed row height that clips it.
+                    false,
+                )
+            })
+            .collect();
+        let mut footer: Vec<Element<'_, Message>> = Vec::with_capacity(3);
+        // Pushes both controls to the trailing edge, under the toasts.
+        footer.push(iced::widget::Space::new().width(Length::Fill).into());
+        if self.notices.len() > NOTICE_TOAST_VISIBLE {
+            let hidden = self.notices.len() - NOTICE_TOAST_VISIBLE;
+            footer.push(
+                widget::button::text(format!("{hidden} more"))
+                    .id(widget::Id::new("notices.overflow"))
+                    .name("Show every application notice")
+                    .on_press(Message::ChromeUi(chrome_ui::Action::ToggleNotices))
+                    .into(),
+            );
+        }
+        footer.push(
+            widget::button::text("Dismiss all")
+                .id(widget::Id::new("notices.dismiss-all"))
+                .name("Dismiss every application notice")
+                .on_press(Message::DismissAllNotices)
+                .into(),
+        );
+        toasts.push(
+            widget::row::with_children(footer)
+                .spacing(spacing.space_xxs)
+                .width(Length::Fill)
+                .align_y(Alignment::Center)
+                .into(),
+        );
+        Some(
+            // Only the column is opaque. Making the full-size positioning
+            // container opaque would capture every click in the window, since
+            // `Kind::Opaque` captures any press inside its own bounds. The
+            // column takes a fixed width because `notice_surface` fills, and a
+            // filling child of a shrinking column collapses to its minimum.
+            widget::container(crate::interaction::opaque(
+                widget::column::with_children(toasts)
+                    .spacing(spacing.space_xxs)
+                    .align_x(Alignment::End)
+                    .width(Length::Fixed(STATUS_SURFACE_MAX_WIDTH)),
+            ))
+            .align_x(Alignment::End)
+            .align_y(Alignment::End)
+            .padding(3.0 * design::GRID_UNIT)
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .into(),
+        )
+    }
+
+    /// The focused card when it is a repository card showing an editable
+    /// buffer, which is the only context in which the search chord means
+    /// "find in this file" rather than "find a project".
+    fn focused_editable_repository_card(&self) -> Option<CardId> {
+        let card = self.workspace.focused()?;
+        match self.cards.get(&card) {
+            Some(CardRuntime::Repository(runtime))
+                if runtime.editor_focus_target(card).is_some() =>
+            {
+                Some(card)
+            }
+            _ => None,
+        }
+    }
+
+    /// The focused card when its find bar is open, so Escape can close the bar
+    /// before it reaches anything behind it.
+    fn focused_repository_card_with_find(&self) -> Option<CardId> {
+        let card = self.workspace.focused()?;
+        match self.cards.get(&card) {
+            Some(CardRuntime::Repository(runtime)) if runtime.find_is_open() => Some(card),
+            _ => None,
+        }
+    }
+
     fn show_workspace_for_action(&mut self) {
         let was_open = self.inspector.take().is_some();
         self.inspector_transition = None;
@@ -6070,6 +6413,7 @@ impl Cagents {
             || self.pull_request_dialog.is_some()
             || self.dirty_repository_close.is_some()
             || self.terminal_close.is_some()
+            || self.settings_reset_confirm
             || self.project_ui.modal_open()
             // Mounted by `dialog` from the sidebar's own state, so nothing
             // beneath it can learn about it any other way. Leaving it out is
@@ -6904,7 +7248,7 @@ impl Cagents {
                             }
                         }))
                     }
-                    SettingsField::EditorWrapLines => {
+                    SettingsField::EditorWrapLines | SettingsField::EditorSyntaxTheme => {
                         for runtime in self.cards.values_mut() {
                             if let CardRuntime::Repository(runtime) = runtime {
                                 runtime.set_wrap_lines(self.settings.editor_wrap_lines);
@@ -7048,8 +7392,8 @@ impl Application for Cagents {
         core.window.border_padding = Some(0);
         #[cfg(feature = "latency-harness")]
         let latency_fixture = crate::latency_fixture::Fixture::from_env();
-        let (
-            durable,
+        let Bootstrap {
+            workspace: durable,
             session,
             mut projects,
             mut worktrees,
@@ -7058,7 +7402,8 @@ impl Application for Cagents {
             settings_write_blocked,
             status,
             save_health,
-        ) = startup.bootstrap;
+            restore_warnings,
+        } = startup.bootstrap;
         reconcile_restored_projects(&mut projects, &mut worktrees, &durable.project_order);
         let window_view = startup.window_view;
         if let Some(view) = &window_view {
@@ -7144,6 +7489,7 @@ impl Application for Cagents {
             window_width: 1_600.0,
             settings_path,
             settings_write_blocked,
+            notices: NoticeLog::default(),
             sidebar_model: SidebarModel::ready(SidebarMode::Expanded, sidebar_projects),
             sidebar_state: SidebarState::default(),
             project_ui: project_ui::State::default(),
@@ -7167,6 +7513,7 @@ impl Application for Cagents {
             github_availability: HashMap::new(),
             repository_generations: HashMap::new(),
             worktree_dialog: None,
+            settings_reset_confirm: false,
             pull_request_dialog: None,
             pull_request_dialog_generation: 0,
             dirty_repository_close: None,
@@ -7214,6 +7561,15 @@ impl Application for Cagents {
             lifecycle_sweep_deadline: None,
             lifecycle_sweep_generation: 0,
         };
+        // One notice per lost card, not a single joined line: the log dedupes
+        // by message, so distinct failures stay distinct and a repeated one
+        // collapses into a count. The alternative this replaces was losing
+        // cards with no diagnostic anywhere in the UI.
+        let restored_at = Instant::now();
+        for warning in restore_warnings {
+            app.notices
+                .record(TransientNotice::warning(warning), restored_at);
+        }
         if let Some(view) = window_view {
             app.sidebar_state.restore_view(view.sidebar);
             app.worktree_offsets = view.worktree_offsets;
@@ -8149,9 +8505,23 @@ impl Application for Cagents {
                             Task::none()
                         }
                     }
-                    // File management belongs to standalone ceditor; this model
-                    // never enables these menu items.
-                    SidebarAction::FileCommand { .. } => Task::none(),
+                    // Renaming and duplicating belong to standalone ceditor;
+                    // this model never enables those menu items. The two copy
+                    // commands are pure clipboard work that a worktree browser
+                    // needs regardless of file management.
+                    SidebarAction::FileCommand { key, path, command } => match command {
+                        sidebar::FileCommand::CopyPath => iced::clipboard::write(
+                            key.canonical_path.join(path.as_path()).display().to_string(),
+                        )
+                        .map(cosmic::Action::App),
+                        sidebar::FileCommand::CopyRelativePath => {
+                            iced::clipboard::write(path.display().into_owned())
+                                .map(cosmic::Action::App)
+                        }
+                        sidebar::FileCommand::Rename | sidebar::FileCommand::CopyFile => {
+                            Task::none()
+                        }
+                    },
                     SidebarAction::SearchChanged(_)
                     | SidebarAction::SetFilter(_)
                     | SidebarAction::ToggleProject(_) => Task::none(),
@@ -9055,14 +9425,20 @@ impl Application for Cagents {
                 }
                 self.focus_context_overlay_if_exposed()
             }
-            Message::KeyEvent(event) => {
+            Message::KeyEvent { event, captured } => {
                 if let keyboard::Event::ModifiersChanged(modifiers) = &event {
                     self.keyboard_modifiers = *modifiers;
                 }
                 if let Some(task) = self.chrome_key_event(&event) {
                     return task;
                 }
-                if is_escape_press(&event) {
+                // A widget that consumed Escape has already answered it - a
+                // focused terminal clearing its selection, for one. Running the
+                // chain anyway would close the inspector behind it in the same
+                // keystroke. Global shortcuts below are deliberately exempt:
+                // `WorkspaceSurface` captures those chords itself, before any
+                // child sees them, and relies on this message to act on them.
+                if is_escape_press(&event) && !captured {
                     if self.terminal_close.is_some() {
                         return self.cancel_terminal_close();
                     }
@@ -9081,6 +9457,14 @@ impl Application for Cagents {
                             return Task::none();
                         }
                         return cosmic::task::message(Message::CancelRepositoryClose);
+                    }
+                    // Ahead of the inspector and the sidebar because the find
+                    // bar is the innermost thing the user is looking at, and
+                    // behind the confirmations above because those are modal.
+                    if let Some(card) = self.focused_repository_card_with_find() {
+                        return cosmic::task::message(Message::Repository(
+                            RepositoryAction::CloseFind { card },
+                        ));
                     }
                     if self.inspector.is_some() {
                         return cosmic::task::message(Message::CloseInspector);
@@ -9136,8 +9520,16 @@ impl Application for Cagents {
                             None => Task::none(),
                         }
                     }
+                    // A focused editor claims the search chord for its own
+                    // buffer, which is what it means in every editor the user
+                    // has. Anywhere else it keeps its existing meaning.
                     Some(workspace_widget::GlobalShortcut::FocusProjectSearch) => {
-                        cosmic::task::message(Message::FocusProjectSearch)
+                        match self.focused_editable_repository_card() {
+                            Some(card) => cosmic::task::message(Message::Repository(
+                                RepositoryAction::OpenFind { card },
+                            )),
+                            None => cosmic::task::message(Message::FocusProjectSearch),
+                        }
                     }
                     Some(workspace_widget::GlobalShortcut::FocusAdjacent(direction)) => {
                         cosmic::task::message(Message::FocusAdjacent(direction))
@@ -9230,7 +9622,18 @@ impl Application for Cagents {
             Message::RefreshUi(action) => self.update_refresh(action),
             Message::NativeWindowAction(action) => Task::done(cosmic::Action::Cosmic(action)),
             Message::ChatUi(action) => self.handle_chat_ui(action),
-            Message::ResetSettings => self.reset_settings(),
+            Message::ResetSettings => {
+                self.settings_reset_confirm = true;
+                Task::none()
+            }
+            Message::CancelResetSettings => {
+                self.settings_reset_confirm = false;
+                Task::none()
+            }
+            Message::ConfirmResetSettings => {
+                self.settings_reset_confirm = false;
+                self.reset_settings()
+            }
             Message::Lsp(event) => {
                 self.apply_lsp_event(event);
                 Task::none()
@@ -9254,10 +9657,18 @@ impl Application for Cagents {
                 }
                 Task::none()
             }
-            Message::DismissStatus => {
+            Message::DismissStatus | Message::DismissAllNotices => {
                 self.status = None;
-                Task::none()
+                self.notices.clear();
+                self.reconcile_notice_popup()
             }
+            Message::DismissNotice(id) => {
+                self.notices.dismiss(id);
+                self.reconcile_notice_popup()
+            }
+            // Only the retirement sweep the tail of `update` performs anyway;
+            // the message exists so the deadline timer has something to fire.
+            Message::ExpireNotices => Task::none(),
             Message::SourceControlLoaded {
                 key,
                 request,
@@ -9360,6 +9771,15 @@ impl Application for Cagents {
                 Task::batch(refreshes)
             }
         };
+        // `status` is the shell's write channel: ninety-odd call sites raise a
+        // notice by assigning it. Draining it here is what makes those notices
+        // survive the next assignment instead of silently replacing each other,
+        // and it is the one place that can bound the history.
+        let now = Instant::now();
+        if let Some(notice) = self.status.take() {
+            self.notices.record(notice, now);
+        }
+        self.notices.retire_expired(now);
         if self.latency_focus != self.workspace.focused() {
             self.latency.abandon_pending();
         }
@@ -9398,6 +9818,7 @@ impl Application for Cagents {
             self.refresh_subscription(),
             self.terminal_agent_activity_subscription(),
             self.update_subscription(),
+            self.notice_expiry_subscription(),
             Subscription::run_with(
                 TerminalWakeSource(self.terminal_wake_rx.clone()),
                 terminal_wake_stream,
@@ -9416,8 +9837,11 @@ impl Application for Cagents {
                     token: activation.token,
                 },
             }),
-            event::listen_with(|event, _status, event_window| match event {
-                iced::Event::Keyboard(event) => Some(Message::KeyEvent(event)),
+            event::listen_with(|event, status, event_window| match event {
+                iced::Event::Keyboard(event) => Some(Message::KeyEvent {
+                    event,
+                    captured: matches!(status, event::Status::Captured),
+                }),
                 iced::Event::Window(window::Event::Rescaled(scale_factor)) => {
                     Some(Message::WindowScaleFactorChanged(scale_factor))
                 }
@@ -9486,6 +9910,41 @@ impl Application for Cagents {
             });
         }
         let spacing = cosmic::theme::spacing();
+        // Above the settings surface it is raised from, because it is about to
+        // discard every shortcut, font, theme and language-server entry the
+        // user configured, with no undo.
+        if self.settings_reset_confirm {
+            return Some(dialog_ui::overlay(
+                dialog_ui::surface(
+                    widget::column::with_children(vec![
+                        widget::text::title3("Reset all settings?").into(),
+                        notice_body(
+                            "Every customization returns to its default: keyboard shortcuts, \
+                             terminal font and theme, editor syntax theme, interface scale, \
+                             pane widths, and the configured language servers.",
+                        ),
+                        notice_detail("This cannot be undone."),
+                        widget::row::with_children(vec![
+                            iced::widget::Space::new().width(Length::Fill).into(),
+                            widget::button::standard("Cancel")
+                                .id(widget::Id::new("dialog.reset-settings.cancel"))
+                                .on_press(Message::CancelResetSettings)
+                                .into(),
+                            widget::button::destructive("Reset settings")
+                                .id(widget::Id::new("dialog.reset-settings.confirm"))
+                                .on_press(Message::ConfirmResetSettings)
+                                .into(),
+                        ])
+                        .spacing(spacing.space_xxs)
+                        .into(),
+                    ])
+                    .spacing(3.0 * design::GRID_UNIT),
+                    480.0,
+                ),
+                Some(Message::CancelResetSettings),
+                1.0,
+            ));
+        }
         // First, because a discard is the one dialog on screen precisely
         // because it is about to destroy work that exists nowhere else.
         if let Some(pending) = self.sidebar_state.pending_discard() {
@@ -9783,7 +10242,6 @@ impl Application for Cagents {
         // `sync_window_title`.
 
         let workspace: Element<'_, Message> = if self.workspace.cards().is_empty() {
-            let directory = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/"));
             let action_buttons = || {
                 vec![
                     widget::button::suggested("New terminal")
@@ -9834,7 +10292,7 @@ impl Application for Cagents {
                     )
                     .wrapping(cosmic::iced::widget::text::Wrapping::Word)
                     .into(),
-                    design::caption(format!("Starting directory: {}", display_path(&directory)))
+                    design::caption(STARTING_DIRECTORY_CAPTION.as_str())
                         .wrapping(cosmic::iced::widget::text::Wrapping::Word)
                         .into(),
                     actions,
@@ -9987,6 +10445,13 @@ impl Application for Cagents {
                 .height(Length::Fill)
                 .width(Length::Fill)
                 .into()
+        };
+        // Above every pane and the inspector, below `dialog`: a notice reports
+        // on work the user already asked for, so it must never sit on top of a
+        // question the shell is asking them.
+        let surface = match self.notice_toasts() {
+            Some(toasts) => crate::interaction::layer(surface, toasts),
+            None => surface,
         };
         let surface = crate::interaction::drive_animation(
             surface,
@@ -12131,7 +12596,10 @@ mod tests {
             text: None,
             repeat: false,
         };
-        let close = task_app_message(app.update(Message::KeyEvent(escape)));
+        let close = task_app_message(app.update(Message::KeyEvent {
+            event: escape,
+            captured: false,
+        }));
         assert!(matches!(
             close,
             Message::ContextInspector(InspectorAction::Close)
@@ -12200,8 +12668,8 @@ mod tests {
         assert!(startup.context_inspector_overlay_active);
         assert!(startup.workspace_inputs_blocked());
 
-        let close = task_app_message(startup.update(Message::KeyEvent(
-            keyboard::Event::KeyPressed {
+        let close = task_app_message(startup.update(Message::KeyEvent {
+            event: keyboard::Event::KeyPressed {
                 key: keyboard::Key::Named(keyboard::key::Named::Escape),
                 modified_key: keyboard::Key::Named(keyboard::key::Named::Escape),
                 physical_key: keyboard::key::Physical::Code(keyboard::key::Code::Escape),
@@ -12210,7 +12678,8 @@ mod tests {
                 text: None,
                 repeat: false,
             },
-        )));
+            captured: false,
+        }));
         let _restore_focus = startup.update(close);
         settle_context_inspector_transition(&mut startup);
         assert!(!startup.context_inspector_open);
@@ -13399,6 +13868,7 @@ mod tests {
             pending_terminal_handoffs: HashMap::new(),
             terminal_handoff_commit_inflight: false,
             settings_write_blocked: true,
+            notices: NoticeLog::default(),
             sidebar_model: SidebarModel::ready(SidebarMode::Expanded, Vec::new()),
             sidebar_state: SidebarState::default(),
             project_ui: project_ui::State::default(),
@@ -13419,6 +13889,7 @@ mod tests {
             github_availability: HashMap::new(),
             repository_generations: HashMap::new(),
             worktree_dialog: None,
+            settings_reset_confirm: false,
             pull_request_dialog: None,
             pull_request_dialog_generation: 0,
             dirty_repository_close: None,

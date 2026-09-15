@@ -26,7 +26,7 @@ impl State {
             if self
                 .dialog
                 .as_ref()
-                .is_some_and(|dialog| dialog.error.is_some())
+                .is_some_and(|dialog| dialog.blocker.is_some())
             {
                 "dialog.project.close"
             } else {
@@ -40,7 +40,18 @@ impl State {
 struct Dialog {
     target: Target,
     pending: bool,
-    error: Option<String>,
+    /// A pre-flight refusal: deletion cannot proceed, so the confirm button
+    /// stays disabled until the user resolves it outside the dialog.
+    blocker: Option<String>,
+    /// A failed attempt. `ConfirmDelete` is written to be re-entered, so this
+    /// must be displayed without disabling the retry.
+    failure: Option<String>,
+}
+
+impl Dialog {
+    fn message(&self) -> Option<&str> {
+        self.blocker.as_deref().or(self.failure.as_deref())
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -216,11 +227,12 @@ impl Cagents {
                         return self.launch_editor(target.path, &editor_id);
                     }
                     ProjectCommand::Delete => {
-                        let error = self.worktree_deletion_blocker(&target);
+                        let blocker = self.worktree_deletion_blocker(&target);
                         self.project_ui.dialog = Some(Dialog {
                             target,
                             pending: false,
-                            error,
+                            blocker,
+                            failure: None,
                         });
                         return iced::widget::operation::focus(self.project_ui.focus_target())
                             .map(cosmic::Action::App);
@@ -294,16 +306,22 @@ impl Cagents {
                     return Task::none();
                 }
                 let target = dialog.target.clone();
-                if let Some(error) = self.worktree_deletion_blocker(&target) {
-                    self.project_ui.dialog.as_mut().unwrap().error = Some(error);
+                if let Some(blocker) = self.worktree_deletion_blocker(&target) {
+                    let dialog = self.project_ui.dialog.as_mut().unwrap();
+                    dialog.blocker = Some(blocker);
+                    dialog.failure = None;
                     return Task::none();
                 }
                 let Some(store) = self.session.as_ref().map(SessionRuntime::operation_store) else {
+                    let dialog = self.project_ui.dialog.as_mut().unwrap();
+                    dialog.failure =
+                        Some("The session store is unavailable, so the deletion was not recorded. Reopen the window and try again.".to_owned());
                     return Task::none();
                 };
                 let dialog = self.project_ui.dialog.as_mut().unwrap();
                 dialog.pending = true;
-                dialog.error = None;
+                dialog.blocker = None;
+                dialog.failure = None;
                 return cosmic::task::future(async move {
                     let request = target.clone();
                     let result =
@@ -315,10 +333,14 @@ impl Cagents {
                 });
             }
             Action::Deleted { target, result } => match result {
-                Err(error) => {
+                Err(failure) => {
+                    // Re-check first: the failure may have been caused by state
+                    // that has since become a hard blocker.
+                    let blocker = self.worktree_deletion_blocker(&target);
                     if let Some(dialog) = &mut self.project_ui.dialog {
                         dialog.pending = false;
-                        dialog.error = Some(error);
+                        dialog.blocker = blocker;
+                        dialog.failure = Some(failure);
                     }
                 }
                 Ok(warning) => {
@@ -461,31 +483,50 @@ impl Cagents {
     pub(super) fn project_dialog_view(&self) -> Option<Element<'_, Message>> {
         let dialog = self.project_ui.dialog.as_ref()?;
         let target = &dialog.target;
-        let mut content = widget::column::with_capacity(8)
-            .spacing(12)
-            .push(widget::text::title3("Delete worktree?"))
-            .push(widget::text::body(&target.label))
-            .push(crate::design::caption(target.path.display().to_string()))
-            .push(widget::button::standard("Cancel")
-                .id(widget::Id::new("dialog.project.close"))
-                .on_press_maybe((!dialog.pending).then_some(Message::ProjectUi(Action::Dismiss))))
-            .push(widget::text::body("Git will remove this clean worktree directory. The branch is retained. Primary, locked, dirty, and in-use worktrees are never removed."));
-        if let Some(error) = &dialog.error {
-            content = content.push(widget::text::body(error));
-        }
-        content = content.push(
-            widget::button::destructive(if dialog.pending {
-                "Deleting…"
-            } else {
-                "Delete worktree"
-            })
-            .id(widget::Id::new("dialog.project.confirm"))
-            .on_press_maybe(
-                (!dialog.pending && dialog.error.is_none())
-                    .then_some(Message::ProjectUi(Action::ConfirmDelete)),
+        let mut rows: Vec<Element<'_, Message>> = vec![
+            widget::text::title3("Delete worktree?").into(),
+            super::notice_body(&target.label),
+            super::notice_detail(target.path.display().to_string()),
+            super::notice_detail(
+                "Git will remove this clean worktree directory. The branch is retained. \
+                 Primary, locked, dirty, and in-use worktrees are never removed.",
             ),
+        ];
+        if let Some(message) = dialog.message() {
+            rows.push(super::notice_body(message));
+        }
+        // A failed attempt leaves the confirm button live: `ConfirmDelete`
+        // re-checks every precondition, so a transient git failure must not
+        // force the user to dismiss and re-open the dialog to retry.
+        let confirm = (!dialog.pending && dialog.blocker.is_none())
+            .then_some(Message::ProjectUi(Action::ConfirmDelete));
+        rows.push(
+            widget::row::with_children(vec![
+                iced::widget::Space::new().width(Length::Fill).into(),
+                widget::button::standard("Cancel")
+                    .id(widget::Id::new("dialog.project.close"))
+                    .on_press_maybe(
+                        (!dialog.pending).then_some(Message::ProjectUi(Action::Dismiss)),
+                    )
+                    .into(),
+                widget::button::destructive(if dialog.pending {
+                    "Deleting…"
+                } else if dialog.failure.is_some() {
+                    "Retry delete"
+                } else {
+                    "Delete worktree"
+                })
+                .id(widget::Id::new("dialog.project.confirm"))
+                .on_press_maybe(confirm)
+                .into(),
+            ])
+            .spacing(cosmic::theme::spacing().space_xxs)
+            .into(),
         );
-        Some(super::dialog_ui::surface(content, 480.0))
+        Some(super::dialog_ui::surface(
+            widget::column::with_children(rows).spacing(3.0 * design::GRID_UNIT),
+            480.0,
+        ))
     }
 }
 

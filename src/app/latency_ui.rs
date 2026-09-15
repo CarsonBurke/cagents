@@ -182,7 +182,7 @@ impl Cagents {
             }
         }
     }
-    pub(super) fn fixture_bootstrap() -> BootstrapResult {
+    pub(super) fn fixture_bootstrap() -> Bootstrap {
         let mut state = WorkspaceState::default();
         for index in 0..crate::latency_fixture::CARD_COUNT {
             let launch = LaunchRecipe {
@@ -218,16 +218,17 @@ impl Cagents {
             });
         }
         state.focused = state.cards.first().map(|card| card.id);
-        (
-            state,
-            None,
-            Vec::new(),
-            Vec::new(),
-            AppSettings::default(),
-            None,
-            true,
-            None,
-            None,
-        )
+        Bootstrap {
+            workspace: state,
+            session: None,
+            projects: Vec::new(),
+            worktrees: Vec::new(),
+            settings: AppSettings::default(),
+            settings_path: None,
+            settings_write_blocked: true,
+            status: None,
+            save_health: None,
+            restore_warnings: Vec::new(),
+        }
     }
 }

@@ -65,15 +65,18 @@ fn escape_consumes_terminal_confirmation_without_closing_context() {
     let (mut app, card, _, _) = live_app();
     request_active_close(&mut app, card);
     let key = keyboard::Key::Named(keyboard::key::Named::Escape);
-    let _ = app.update(Message::KeyEvent(keyboard::Event::KeyPressed {
-        key: key.clone(),
-        modified_key: key,
-        physical_key: keyboard::key::Physical::Code(keyboard::key::Code::Escape),
-        location: keyboard::Location::Standard,
-        modifiers: keyboard::Modifiers::empty(),
-        text: None,
-        repeat: false,
-    }));
+    let _ = app.update(Message::KeyEvent {
+        event: keyboard::Event::KeyPressed {
+            key: key.clone(),
+            modified_key: key,
+            physical_key: keyboard::key::Physical::Code(keyboard::key::Code::Escape),
+            location: keyboard::Location::Standard,
+            modifiers: keyboard::Modifiers::empty(),
+            text: None,
+            repeat: false,
+        },
+        captured: false,
+    });
     assert!(app.terminal_close.is_none());
     assert!(app.card_state(card).unwrap().existence.is_open());
     assert!(app.terminal_close_attempts.is_empty());
