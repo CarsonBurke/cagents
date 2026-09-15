@@ -2859,7 +2859,6 @@ pub fn view<'a>(
 
     widget::container(crate::interaction::layer(
         widget::container(content)
-            .class(theme::Container::Primary)
             .width(Length::Fill)
             .height(Length::Fill)
             .into(),
@@ -4303,7 +4302,6 @@ fn worktree_panel<'a>(
         content
     };
     widget::container(pane)
-        .class(theme::Container::Background)
         .width(Length::Fixed(width))
         .height(Length::Fill)
         .into()

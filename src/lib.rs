@@ -52,6 +52,8 @@ pub mod settings;
 pub mod sidebar;
 #[cfg(feature = "ui")]
 pub mod splitter;
+#[cfg(feature = "ui")]
+pub mod tab_strip;
 pub mod terminal;
 #[cfg(feature = "host")]
 pub mod tray;

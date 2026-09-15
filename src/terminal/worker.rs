@@ -820,18 +820,27 @@ impl Worker {
         let mut pty_open = true;
         let mut exited = false;
         let mut shutting_down = false;
+        let mut carried_command = None;
         while !shutting_down && (pty_open || !exited) {
-            match wait_for_worker_event(
-                &self.commands,
-                &self.pty_rx,
-                &self.child_exit_rx,
-                &self.published.capture_rx,
-                pty_open,
-                !exited,
-            ) {
+            let event = carried_command
+                .take()
+                .map(|command| WorkerEvent::Command(Some(command)))
+                .unwrap_or_else(|| {
+                    wait_for_worker_event(
+                        &self.commands,
+                        &self.pty_rx,
+                        &self.child_exit_rx,
+                        &self.published.capture_rx,
+                        pty_open,
+                        !exited,
+                    )
+                });
+            match event {
                 WorkerEvent::Command(Some(command)) => {
-                    // Commands and returned capture credit share the worker's
-                    // serialization boundary with PTY parsing.
+                    // Wheel bursts otherwise queue one repaint per event. Fold
+                    // adjacent viewport deltas before publishing a snapshot.
+                    let command =
+                        coalesce_scroll_command(command, &self.commands, &mut carried_command);
                     shutting_down = self.handle_command(command);
                 }
                 WorkerEvent::Command(None) => shutting_down = true,
@@ -1507,6 +1516,27 @@ fn theme_scheme(theme: TerminalTheme) -> ColorScheme {
     } else {
         ColorScheme::Dark
     }
+}
+fn coalesce_scroll_command(
+    command: Command,
+    commands: &Receiver<Command>,
+    carried: &mut Option<Command>,
+) -> Command {
+    let Command::Scroll(ScrollCommand::Delta(mut delta)) = command else {
+        return command;
+    };
+    while let Ok(next) = commands.try_recv() {
+        match next {
+            Command::Scroll(ScrollCommand::Delta(next_delta)) => {
+                delta = delta.saturating_add(next_delta);
+            }
+            other => {
+                *carried = Some(other);
+                break;
+            }
+        }
+    }
+    Command::Scroll(ScrollCommand::Delta(delta))
 }
 
 /// Set parser defaults, not resolved UI RGB values: truecolor and application

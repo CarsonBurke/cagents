@@ -1611,8 +1611,8 @@ impl RepositoryRuntime {
         });
         true
     }
-    /// Keeps the editor's focus while the ceditor find bar owns keyboard
-    /// input, allowing native text selection to remain visible as a highlight.
+    /// Marks the editor as search-owned: document edits are ignored while the
+    /// native viewport continues to accept scrolling actions.
     pub fn set_search_mode(&mut self, enabled: bool) {
         self.search_mode = enabled;
     }
@@ -2675,6 +2675,9 @@ impl RepositoryRuntime {
                 Task::none()
             }
             RepositoryAction::EditorAction { action, .. } => {
+                if self.search_mode && !matches!(action, text_editor::Action::Scroll { .. }) {
+                    return Task::none();
+                }
                 if self.source_surface == SourceSurface::Diff && !self.editable_working_diff() {
                     return Task::none();
                 }
@@ -4536,11 +4539,8 @@ fn editable_document_view<'a>(
                 style
             })
             .key_binding(text_editor::default_bindings);
-        let editor = if runtime.search_mode {
-            editor
-        } else {
-            editor.on_action(move |action| RepositoryAction::EditorAction { card, action })
-        };
+        let editor =
+            editor.on_action(move |action| RepositoryAction::EditorAction { card, action });
         let entries = [
             ("Cut", ClipboardOp::Cut),
             ("Copy", ClipboardOp::Copy),

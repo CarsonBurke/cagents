@@ -570,29 +570,18 @@ impl Cagents {
         content: Element<'a, Message>,
     ) -> Element<'a, Message> {
         let (_, tab_width) = self.tab_strip_geometry();
-        let tabs = widget::row::with_children(
-            self.workspace
-                .order()
-                .map(|id| self.column_header(id, self.workspace.focused() == Some(id), tab_width)),
-        )
-        .push(self.new_tab_control())
-        .spacing(4)
-        .height(design::PRIMARY_CONTROL_SIZE);
-        let tabs = widget::container(crate::interaction::overflow_fade_x(
-            crate::interaction::horizontal_wheel(
-                widget::scrollable::horizontal(tabs)
-                    .id(widget::Id::new("workspace.tabs"))
-                    .direction(iced::widget::scrollable::Direction::Horizontal(
-                        iced::widget::scrollable::Scrollbar::hidden(),
-                    ))
-                    .width(Length::Fill)
-                    .height(design::PRIMARY_CONTROL_SIZE),
-            ),
-        ))
-        .padding([0.0, 8.0])
-        .center_y(Length::Fill)
-        .height(design::HEADER_HEIGHT)
-        .width(Length::Fill);
+        let tabs = self
+            .workspace
+            .order()
+            .map(|id| self.column_header(id, self.workspace.focused() == Some(id), tab_width))
+            .chain(std::iter::once(self.new_tab_control()))
+            .collect();
+        let tabs = crate::tab_strip::horizontal(
+            widget::Id::new("workspace.tabs"),
+            tabs,
+            design::PRIMARY_CONTROL_SIZE,
+            design::HEADER_HEIGHT,
+        );
         let actions = widget::row::with_children(self.workflow_header())
             .spacing(2)
             .align_y(Alignment::Center);
@@ -812,34 +801,36 @@ impl Cagents {
             ),
             Some(Message::CloseCard(id)),
         ));
-        widget::container(
-            widget::row::with_children(children)
-                .align_y(Alignment::Center)
-                .height(Length::Fill)
-                .spacing(2)
-                .width(Length::Fill),
-        )
-        .height(design::PRIMARY_CONTROL_SIZE)
-        .width(width)
-        .class(cosmic::theme::Container::custom(move |theme| {
-            iced::widget::container::Style {
-                background: focused.then(|| {
-                    iced::Background::Color(
-                        theme
-                            .current_container()
-                            .component
-                            .selected_state_color()
-                            .into(),
-                    )
-                }),
-                border: iced::Border {
-                    radius: theme.cosmic().corner_radii.radius_s.into(),
+        crate::tab_strip::middle_click_close(
+            widget::container(
+                widget::row::with_children(children)
+                    .align_y(Alignment::Center)
+                    .height(Length::Fill)
+                    .spacing(2)
+                    .width(Length::Fill),
+            )
+            .height(design::PRIMARY_CONTROL_SIZE)
+            .width(width)
+            .class(cosmic::theme::Container::custom(move |theme| {
+                iced::widget::container::Style {
+                    background: focused.then(|| {
+                        iced::Background::Color(
+                            theme
+                                .current_container()
+                                .component
+                                .selected_state_color()
+                                .into(),
+                        )
+                    }),
+                    border: iced::Border {
+                        radius: theme.cosmic().corner_radii.radius_s.into(),
+                        ..Default::default()
+                    },
                     ..Default::default()
-                },
-                ..Default::default()
-            }
-        }))
-        .into()
+                }
+            })),
+            Message::CloseCard(id),
+        )
     }
 
     pub(super) fn context_panel(

@@ -117,6 +117,7 @@ pub enum Message {
     SelectSettingsCategory(SettingsCategory),
     ShortcutChanged(EditorShortcut, String),
     FindInFile,
+    FindQueryChanged(String),
     CloseFind,
     FindNext,
     FindPrevious,
@@ -677,6 +678,7 @@ fn find_bar<'a>(editor: &'a Editor, tab: &'a Tab) -> Element<'a, Message> {
                 .into(),
             widget::text_input("Find in file", &editor.find_query)
                 .id(widget::Id::new("ceditor.find.query"))
+                .on_input(Message::FindQueryChanged)
                 .width(Length::Fill)
                 .into(),
             design::caption(if editor.find_query.trim().is_empty() {
@@ -1877,9 +1879,14 @@ impl Editor {
         })
     }
 
-    fn select_find_match(&mut self, occurrence: usize) -> Task<Message> {
+    fn focus_find_query(&self) -> Task<Message> {
+        iced::widget::operation::focus(widget::Id::new("ceditor.find.query"))
+            .map(cosmic::Action::App)
+    }
+
+    fn select_find_match(&mut self, occurrence: usize) {
         let Some(id) = self.active else {
-            return Task::none();
+            return;
         };
         let query = self.find_query.clone();
         let total = self.tab_mut(id).map(|tab| {
@@ -1890,30 +1897,23 @@ impl Editor {
             Some(total) => self.find_match_index = occurrence % total,
             None => self.find_match_index = 0,
         }
-        self.focus_active_editor()
     }
 
     fn handle_find_key(&mut self, event: &keyboard::Event) -> Task<Message> {
+        if self.shortcut_pressed(EditorShortcut::FindInFile, event) {
+            return self.update(Message::FindInFile);
+        }
         let keyboard::Event::KeyPressed {
             key,
             modifiers,
-            text,
             repeat: false,
             ..
         } = event
         else {
             return Task::none();
         };
-        if modifiers.control() && matches!(key, keyboard::Key::Character(value) if value == "a") {
-            self.find_query.clear();
-            return self.select_find_match(0);
-        }
         match key {
             keyboard::Key::Named(keyboard::key::Named::Escape) => self.update(Message::CloseFind),
-            keyboard::Key::Named(keyboard::key::Named::Backspace) => {
-                self.find_query.pop();
-                self.select_find_match(0)
-            }
             keyboard::Key::Named(keyboard::key::Named::Enter) => {
                 if modifiers.shift() {
                     self.update(Message::FindPrevious)
@@ -1931,17 +1931,7 @@ impl Editor {
             keyboard::Key::Named(keyboard::key::Named::ArrowLeft) => {
                 self.update(Message::FindPrevious)
             }
-            _ => {
-                if let Some(text) = text
-                    .as_deref()
-                    .filter(|text| !text.is_empty() && !text.chars().any(char::is_control))
-                {
-                    self.find_query.push_str(text);
-                    self.select_find_match(0)
-                } else {
-                    Task::none()
-                }
-            }
+            _ => Task::none(),
         }
     }
 
@@ -2852,7 +2842,8 @@ impl Application for Editor {
                     self.find_open = !self.find_open;
                     self.find_match_index = 0;
                     if self.find_open {
-                        return self.select_find_match(0);
+                        self.select_find_match(0);
+                        return self.focus_find_query();
                     }
                     if let Some(id) = self.active
                         && let Some(tab) = self.tab_mut(id)
@@ -2861,9 +2852,18 @@ impl Application for Editor {
                     }
                     self.focus_active_editor()
                 }
-                Message::FindNext => self.select_find_match(self.find_match_index.wrapping_add(1)),
+                Message::FindQueryChanged(query) => {
+                    self.find_query = query;
+                    self.select_find_match(0);
+                    Task::none()
+                }
+                Message::FindNext => {
+                    self.select_find_match(self.find_match_index.wrapping_add(1));
+                    self.focus_find_query()
+                }
                 Message::FindPrevious => {
-                    self.select_find_match(self.find_match_index.wrapping_sub(1))
+                    self.select_find_match(self.find_match_index.wrapping_sub(1));
+                    self.focus_find_query()
                 }
                 Message::CloseFind => {
                     self.find_open = false;
@@ -3224,7 +3224,7 @@ impl Application for Editor {
                             || cagents::file_icon::folder(true),
                             |path| cagents::file_icon::icon(path),
                         );
-                    cagents::interaction::hover(
+                    cagents::interaction::hover(cagents::tab_strip::middle_click_close(
                         widget::container(
                             widget::row::with_children(vec![
                                 cagents::interaction::tooltip(
@@ -3285,7 +3285,8 @@ impl Application for Editor {
                                 ..Default::default()
                             }
                         })),
-                    )
+                        Message::CloseTab(tab.id),
+                    ))
                 })
                 .collect();
         let mut body = Vec::new();
@@ -3293,43 +3294,29 @@ impl Application for Editor {
         // off the content below it, tabs or placeholder alike.
         body.push(widget::divider::horizontal::default().into());
         // Keep the tab strip on the same fixed baseline as the app header.
-        let mut strip = Vec::new();
-        let mut tab_row = tabs;
-        tab_row.push(
-            icon_control(
-                symbolic_icon("list-add-symbolic"),
-                "New tab (Ctrl+T)",
-                false,
-                !self.modal_open(),
-                Some(Message::NewTab),
-            )
-            .id(widget::Id::new("ceditor.tabs.new"))
-            .into(),
-        );
-        strip.push(
-            widget::container(cagents::interaction::overflow_fade_x(
-                cagents::interaction::horizontal_wheel(
-                    widget::scrollable::horizontal(
-                        widget::row::with_children(tab_row)
-                            .spacing(4)
-                            .align_y(iced::Alignment::Center)
-                            .height(design::PRIMARY_CONTROL_SIZE),
-                    )
-                    .id(widget::Id::new("ceditor.tabs"))
-                    .direction(iced::widget::scrollable::Direction::Horizontal(
-                        iced::widget::scrollable::Scrollbar::hidden(),
-                    ))
-                    .width(Length::Fill)
-                    .height(design::PRIMARY_CONTROL_SIZE),
-                ),
-            ))
-            .padding([0.0, 8.0])
-            .center_y(Length::Fill)
-            .height(design::HEADER_HEIGHT)
-            .width(Length::Fill)
-            .into(),
-        );
-        strip.push(widget::divider::horizontal::default().into());
+        let strip = vec![
+            cagents::tab_strip::horizontal(
+                widget::Id::new("ceditor.tabs"),
+                {
+                    let mut tab_row = tabs;
+                    tab_row.push(
+                        icon_control(
+                            symbolic_icon("list-add-symbolic"),
+                            "New tab (Ctrl+T)",
+                            false,
+                            !self.modal_open(),
+                            Some(Message::NewTab),
+                        )
+                        .id(widget::Id::new("ceditor.tabs.new"))
+                        .into(),
+                    );
+                    tab_row
+                },
+                design::PRIMARY_CONTROL_SIZE,
+                design::HEADER_HEIGHT,
+            ),
+            widget::divider::horizontal::default().into(),
+        ];
         if let Some(tab) = self.current() {
             let mut editor = Vec::new();
             editor.extend(strip);

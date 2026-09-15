@@ -1259,7 +1259,9 @@ impl<Message> Widget<Message, Theme, Renderer> for Effect<'_, Message> {
             viewport,
         );
         if matches!(self.kind, Kind::Hover) {
-            let alpha = state.hover.interpolate(0.0, 0.06, state.now);
+            // Keep low-emphasis rows legible against neutral surfaces without
+            // turning hover feedback into a selected-state fill.
+            let alpha = state.hover.interpolate(0.0, 0.10, state.now);
             if alpha > 0.0 {
                 if let Some(bounds) = layout.bounds().intersection(viewport) {
                     let mut color: Color = theme.current_container().on.into();

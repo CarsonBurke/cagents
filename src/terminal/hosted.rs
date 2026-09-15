@@ -1300,6 +1300,27 @@ fn wait_before_reconnect(
         }
     }
 }
+fn coalesce_client_scroll_command(
+    command: ClientCommand,
+    commands: &Receiver<ClientCommand>,
+    carried: &mut Option<ClientCommand>,
+) -> ClientCommand {
+    let ClientCommand::Scroll(TerminalScroll::Lines(mut delta)) = command else {
+        return command;
+    };
+    while let Ok(next) = commands.try_recv() {
+        match next {
+            ClientCommand::Scroll(TerminalScroll::Lines(next_delta)) => {
+                delta = delta.saturating_add(next_delta);
+            }
+            other => {
+                *carried = Some(other);
+                break;
+            }
+        }
+    }
+    ClientCommand::Scroll(TerminalScroll::Lines(delta))
+}
 
 fn serve_connection(
     context: &ConnectionContext<'_>,
@@ -1545,11 +1566,12 @@ fn serve_connection(
             } else {
                 commands.try_recv()
             };
-            let command = match command {
+            let mut command = match command {
                 Ok(command) => command,
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => ClientCommand::Stop,
             };
+            command = coalesce_client_scroll_command(command, commands, carried);
             if stop.is_requested() {
                 connection.close();
                 return ConnectionEnd::Stop;
