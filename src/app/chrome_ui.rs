@@ -539,11 +539,13 @@ impl Cagents {
     }
 
     fn tab_strip_geometry(&self) -> (f32, f32) {
-        let available = (self.workspace.viewport_width() - self.workspace_header_width()).max(0.0);
-        let width = ((available - design::PRIMARY_CONTROL_SIZE - 2.0).max(0.0)
-            / self.workspace.cards().len().max(1) as f32)
-            .clamp(96.0, 200.0);
-        (available, width)
+        // The ceditor-equivalent wrapper contributes 8px on each side; keep
+        // that inset out of the scroll viewport and reveal calculation.
+        let available =
+            (self.workspace.viewport_width() - self.workspace_header_width() - 16.0).max(0.0);
+        // Match ceditor: tabs keep a readable fixed width and the strip
+        // scrolls as soon as the tab set no longer fits.
+        (available, 184.0)
     }
 
     pub(super) fn reveal_active_tab(&self) -> Task<Message> {
@@ -557,7 +559,7 @@ impl Cagents {
         let (available, width) = self.tab_strip_geometry();
         workspace_widget::scroll_to(
             widget::Id::new("workspace.tabs"),
-            ((index + 1) as f32 * (width + 2.0) - available).max(0.0),
+            ((index + 1) as f32 * (width + 4.0) - available).max(0.0),
         )
         .map(cosmic::Action::App)
     }
@@ -574,17 +576,23 @@ impl Cagents {
                 .map(|id| self.column_header(id, self.workspace.focused() == Some(id), tab_width)),
         )
         .push(self.new_tab_control())
-        .spacing(2)
+        .spacing(4)
         .height(design::PRIMARY_CONTROL_SIZE);
-        let tabs = crate::interaction::overflow_fade_x(crate::interaction::horizontal_wheel(
-            widget::scrollable::horizontal(tabs)
-                .id(widget::Id::new("workspace.tabs"))
-                .direction(iced::widget::scrollable::Direction::Horizontal(
-                    iced::widget::scrollable::Scrollbar::hidden(),
-                ))
-                .width(Length::Fill)
-                .height(design::PRIMARY_CONTROL_SIZE),
-        ));
+        let tabs = widget::container(crate::interaction::overflow_fade_x(
+            crate::interaction::horizontal_wheel(
+                widget::scrollable::horizontal(tabs)
+                    .id(widget::Id::new("workspace.tabs"))
+                    .direction(iced::widget::scrollable::Direction::Horizontal(
+                        iced::widget::scrollable::Scrollbar::hidden(),
+                    ))
+                    .width(Length::Fill)
+                    .height(design::PRIMARY_CONTROL_SIZE),
+            ),
+        ))
+        .padding([0.0, 8.0])
+        .center_y(Length::Fill)
+        .height(design::HEADER_HEIGHT)
+        .width(Length::Fill);
         let actions = widget::row::with_children(self.workflow_header())
             .spacing(2)
             .align_y(Alignment::Center);

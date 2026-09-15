@@ -620,6 +620,20 @@ fn dialog_surface<'a>(
     .into()
 }
 
+fn connected_dialog_surface<'a>(
+    content: impl Into<Element<'a, Message>>,
+    max_width: f32,
+) -> Element<'a, Message> {
+    cagents::interaction::opaque(
+        widget::container(content)
+            .class(cosmic::theme::Container::Dialog(false))
+            .width(Length::Fill)
+            .max_width(max_width)
+            .max_height(720),
+    )
+    .into()
+}
+
 fn dialog_overlay(surface: Element<'_, Message>, dismiss: Message) -> Element<'_, Message> {
     let background = widget::container(iced::widget::Space::new())
         .class(cosmic::theme::Container::custom(|_| {
@@ -3350,6 +3364,7 @@ impl Application for Editor {
                     .into(),
                 );
             }
+            toolbar_controls.push(iced::widget::Space::new().width(Length::Fill).into());
             toolbar_controls.push(
                 icon_control(
                     symbolic_icon("system-search-symbolic"),
@@ -3882,7 +3897,7 @@ impl Application for Editor {
         ])
         .width(Length::Fill)
         .height(Length::Fill);
-        let header = widget::row::with_children(vec![
+        let header = widget::container(widget::row::with_children(vec![
             widget::text::title3("Editor settings")
                 .width(Length::Fill)
                 .into(),
@@ -3894,11 +3909,12 @@ impl Application for Editor {
                 Some(Message::Settings),
             )
             .into(),
-        ])
+        ]))
+        .padding([2.0 * design::GRID_UNIT, 4.0 * design::GRID_UNIT])
         .align_y(iced::Alignment::Center)
         .height(design::HEADER_HEIGHT);
         Some(dialog_overlay(
-            dialog_surface(
+            connected_dialog_surface(
                 widget::column::with_children(vec![
                     header.into(),
                     widget::divider::horizontal::default().into(),

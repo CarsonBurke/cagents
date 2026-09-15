@@ -4138,29 +4138,31 @@ pub fn selected_file_toolbar(
     let editing = runtime.source_surface == SourceSurface::Editor
         && runtime.markdown_mode == MarkdownMode::Edit;
     let editable = matches!(runtime.document, DocumentState::Editable(_));
-    let title = selected
-        .path
-        .file_name()
-        .unwrap_or(selected.path.as_os_str())
-        .to_string_lossy();
-    let title = widget::container(crate::interaction::tooltip(
-        widget::row::with_children(vec![
-            crate::file_icon::icon(&selected.path).into(),
-            widget::text::body(title)
-                .wrapping(iced::widget::text::Wrapping::None)
-                .ellipsize(iced::widget::text::Ellipsize::End(
-                    iced::advanced::text::EllipsizeHeightLimit::Lines(1),
-                ))
-                .width(Length::Fill)
-                .into(),
-        ])
-        .spacing(8)
-        .align_y(Alignment::Center)
-        .width(Length::Fill),
-        selected.path.to_string_lossy(),
-    ))
-    .width(Length::FillPortion(1))
-    .max_width(220);
+    let title = (!runtime.standalone).then(|| {
+        let name = selected
+            .path
+            .file_name()
+            .unwrap_or(selected.path.as_os_str())
+            .to_string_lossy();
+        widget::container(crate::interaction::tooltip(
+            widget::row::with_children(vec![
+                crate::file_icon::icon(&selected.path).into(),
+                widget::text::body(name)
+                    .wrapping(iced::widget::text::Wrapping::None)
+                    .ellipsize(iced::widget::text::Ellipsize::End(
+                        iced::advanced::text::EllipsizeHeightLimit::Lines(1),
+                    ))
+                    .width(Length::Fill)
+                    .into(),
+            ])
+            .spacing(8)
+            .align_y(Alignment::Center)
+            .width(Length::Fill),
+            selected.path.to_string_lossy(),
+        ))
+        .width(Length::FillPortion(1))
+        .max_width(220)
+    });
     // Unsupported text has no preview renderer. Noneditable load/error states
     // still expose file information, so inspecting a binary diff is reversible.
     let file_information = !editable && !matches!(runtime.document, DocumentState::Image { .. });
@@ -4330,9 +4332,8 @@ pub fn selected_file_toolbar(
             ));
         }
     }
-    // Only the action lane scrolls when space is tight: document identity and
-    // external launch stay anchored. Its fill width also leaves breathing room
-    // between the contextual tools and right-aligned secondary actions.
+    // The action lane scrolls when space is tight while the secondary launch
+    // actions stay anchored on the right, leaving a clean left/right split.
     let actions = widget::scrollable(
         widget::row::with_children(controls)
             .spacing(12)
@@ -4344,7 +4345,11 @@ pub fn selected_file_toolbar(
     ))
     .width(Length::FillPortion(4))
     .height(crate::design::HEADER_HEIGHT);
-    let mut header = vec![title.into(), actions.into()];
+    let mut header = Vec::with_capacity(3);
+    if let Some(title) = title {
+        header.push(title.into());
+    }
+    header.push(actions.into());
     if !secondary.is_empty() {
         header.push(toolbar_group(secondary));
     }

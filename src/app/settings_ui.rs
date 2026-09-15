@@ -761,7 +761,7 @@ pub(super) fn settings_dialog<'a>(
     )
     .padding([2.0 * design::GRID_UNIT, gutter])
     .width(Length::Fill);
-    let surface = dialog_ui::surface(
+    let surface = dialog_ui::connected_surface(
         widget::column::with_children(vec![
             header.into(),
             widget::divider::horizontal::default().into(),
