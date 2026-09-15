@@ -28,8 +28,8 @@ use cosmic::{
 
 use super::{
     CellSnapshot, CursorShape, KeyAction, KeyInput, KeyModifiers, MouseAction, MouseButton,
-    MouseInput, RenderSnapshot, Rgb, RowSnapshot, TerminalKey, TerminalSendError, TerminalSize,
-    TerminalSurface, Underline,
+    MouseInput, RenderSnapshot, Rgb, RowSnapshot, ScrollSnapshot, TerminalKey, TerminalSendError,
+    TerminalSize, TerminalSurface, Underline,
 };
 
 use crate::{
@@ -782,6 +782,10 @@ struct WidgetState {
     last_cursor: Option<Point>,
     scrollbar_drag: Option<f32>,
     wheel_remainder: f32,
+    /// The viewport move the frame being composed owes this terminal, folded
+    /// across every wheel event, auto-scroll step, scrollbar sample and paging
+    /// key since the last redraw. `None` while nothing is owed.
+    owed_scroll: Option<ViewportScroll>,
     /// The grid cell the last reported motion landed in.
     last_motion_cell: Option<(u16, u16)>,
     /// When the current cursor-blink phase began, on the frame clock. `None`
@@ -847,6 +851,79 @@ impl WidgetState {
             return since + BLINK_PHASE * 2;
         }
         since + BLINK_PHASE
+    }
+
+    /// Converts one wheel event's `lines` into the work it implies, carrying
+    /// the sub-line remainder so that a high-resolution trackpad keeps moving
+    /// continuously instead of in whole-notch jumps.
+    ///
+    /// Terminal input is never folded, because a child counts notches, so the
+    /// two input cases report a notch count for the caller to send one by one.
+    /// A viewport move has no such observer and is returned for folding.
+    fn wheel_effect(&mut self, lines: f32, scroll: ScrollSnapshot) -> WheelEffect {
+        self.wheel_remainder -= lines;
+        let delta = (self.wheel_remainder.trunc() as isize).clamp(-128, 128);
+        self.wheel_remainder -= delta as f32;
+        if delta == 0 {
+            return WheelEffect::Idle;
+        }
+        if self.modifiers.shift {
+            return WheelEffect::Viewport(delta);
+        }
+        let notches = delta.unsigned_abs() as u32;
+        let up = delta < 0;
+        if scroll.mouse_tracking {
+            WheelEffect::Report {
+                button: if up {
+                    MouseButton::WheelUp
+                } else {
+                    MouseButton::WheelDown
+                },
+                notches,
+            }
+        } else if scroll.alternate_screen {
+            WheelEffect::Keys {
+                key: if up {
+                    TerminalKey::ArrowUp
+                } else {
+                    TerminalKey::ArrowDown
+                },
+                notches,
+            }
+        } else {
+            WheelEffect::Viewport(delta)
+        }
+    }
+
+    /// Folds `next` into the viewport move this frame already owes, returning
+    /// an earlier move that cannot be folded into it and so has to be sent
+    /// first.
+    ///
+    /// Deltas add. A newer absolute destination discards everything before it,
+    /// since nothing in between was ever presented. A delta after an absolute
+    /// destination cannot be folded at all, because only the terminal knows
+    /// which row that destination clamped to, so the pair is sent in order
+    /// rather than guessed at.
+    fn owe_scroll(&mut self, next: ViewportScroll) -> Option<ViewportScroll> {
+        match (self.owed_scroll, next) {
+            (Some(ViewportScroll::Lines(owed)), ViewportScroll::Lines(delta)) => {
+                self.owed_scroll = Some(ViewportScroll::Lines(owed.saturating_add(delta)));
+                None
+            }
+            (owed, ViewportScroll::Lines(_)) => {
+                self.owed_scroll = Some(next);
+                owed
+            }
+            _ => {
+                self.owed_scroll = Some(next);
+                None
+            }
+        }
+    }
+
+    /// Takes the viewport move owed to the frame now being drawn, if any.
+    fn take_owed_scroll(&mut self) -> Option<ViewportScroll> {
+        self.owed_scroll.take()
     }
 }
 
@@ -1103,6 +1180,41 @@ impl<Message> TerminalWidget<Message> {
         }
     }
 
+    /// Defers a viewport move to the frame it asks for, folding it into
+    /// whatever that frame already owes.
+    ///
+    /// A gesture on a 120 Hz trackpad or pointer produces several moves per
+    /// displayed frame, and only the last of them is ever seen. Applying the
+    /// rest would each cost a command, a viewport re-read, a snapshot
+    /// publication, a serialized grid on a hosted terminal and a redraw that
+    /// is overwritten before it reaches the screen.
+    ///
+    /// One case is observably different rather than merely cheaper: a gesture
+    /// that reverses direction against a bound inside a single frame now keeps
+    /// its net movement instead of sticking to the bound that the discarded
+    /// intermediate positions would have clamped against. Since none of those
+    /// positions was ever presented, the net result is the one the user asked
+    /// for.
+    fn defer_scroll(
+        &self,
+        state: &mut WidgetState,
+        next: ViewportScroll,
+        shell: &mut Shell<'_, Message>,
+    ) {
+        if let Some(superseded) = state.owe_scroll(next) {
+            self.apply_scroll(superseded, shell);
+        }
+        // The flush rides the frame requested here, so nothing owed is
+        // stranded by deferring it.
+        shell.request_redraw();
+    }
+
+    fn apply_scroll(&self, scroll: ViewportScroll, shell: &mut Shell<'_, Message>) {
+        if let Err(error) = scroll.apply(&self.handle) {
+            self.publish_error(error, shell);
+        }
+    }
+
     fn synchronize_focus(&self, state: &mut WidgetState, shell: &mut Shell<'_, Message>) {
         if self.model_focused {
             state.focus_requested = false;
@@ -1337,9 +1449,7 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for TerminalWidget<Message
                 _ => None,
             };
             if let Some(row) = target {
-                if let Err(error) = self.handle.scroll_to_row(row) {
-                    self.publish_error(error, shell);
-                }
+                self.defer_scroll(state, ViewportScroll::Row(row), shell);
                 shell.capture_event();
                 return;
             }
@@ -1389,9 +1499,7 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for TerminalWidget<Message
                 if self.snapshot.scroll.scrollable()
                     && let Some(scroll) = viewport_scroll(key, *modifiers, geometry.rows)
                 {
-                    if let Err(error) = scroll.apply(&self.handle) {
-                        self.publish_error(error, shell);
-                    }
+                    self.defer_scroll(state, scroll, shell);
                     shell.capture_event();
                     return;
                 }
@@ -1557,8 +1665,8 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for TerminalWidget<Message
                     0
                 };
                 let scrolled = step != 0 && self.snapshot.scroll.scrollable();
-                if scrolled && let Err(error) = self.handle.scroll_lines(step) {
-                    self.publish_error(error, shell);
+                if scrolled {
+                    self.defer_scroll(state, ViewportScroll::Lines(step), shell);
                 }
                 // Clamping happens in `cell_at`, so a pointer dragged outside
                 // the grid still extends along its nearest edge.
@@ -1608,36 +1716,30 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for TerminalWidget<Message
                     ScrollDelta::Lines { y, .. } => *y,
                     ScrollDelta::Pixels { y, .. } => *y / geometry.cell_height,
                 };
-                state.wheel_remainder -= lines;
-                let delta = (state.wheel_remainder.trunc() as isize).clamp(-128, 128);
-                state.wheel_remainder -= delta as f32;
-                if delta != 0 {
-                    if self.snapshot.scroll.mouse_tracking && !state.modifiers.shift {
+                match state.wheel_effect(lines, self.snapshot.scroll) {
+                    WheelEffect::Idle => {}
+                    WheelEffect::Viewport(delta) => {
+                        self.defer_scroll(state, ViewportScroll::Lines(delta), shell);
+                    }
+                    WheelEffect::Report { button, notches } => {
                         if let Some(position) = geometry.cursor_position(cursor) {
-                            for _ in 0..delta.unsigned_abs() {
+                            for _ in 0..notches {
                                 self.send_mouse(
                                     state,
                                     geometry,
                                     position,
                                     MouseAction::Press,
-                                    Some(if delta < 0 {
-                                        MouseButton::WheelUp
-                                    } else {
-                                        MouseButton::WheelDown
-                                    }),
+                                    Some(button),
                                     shell,
                                 );
                             }
                         }
-                    } else if self.snapshot.scroll.alternate_screen && !state.modifiers.shift {
-                        for _ in 0..delta.unsigned_abs() {
+                    }
+                    WheelEffect::Keys { key, notches } => {
+                        for _ in 0..notches {
                             let input = KeyInput {
                                 action: KeyAction::Press,
-                                key: if delta < 0 {
-                                    TerminalKey::ArrowUp
-                                } else {
-                                    TerminalKey::ArrowDown
-                                },
+                                key,
                                 modifiers: state.modifiers,
                                 text: None,
                                 unshifted_codepoint: None,
@@ -1647,13 +1749,18 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for TerminalWidget<Message
                                 break;
                             }
                         }
-                    } else if let Err(error) = self.handle.scroll_lines(delta) {
-                        self.publish_error(error, shell);
                     }
                 }
                 shell.capture_event();
             }
             Event::Window(window::Event::RedrawRequested(now)) => {
+                // Every viewport move folded since the last frame is applied
+                // exactly once, here, so that a gesture costs one command, one
+                // capture and one snapshot per displayed frame rather than one
+                // per input event.
+                if let Some(owed) = state.take_owed_scroll() {
+                    self.apply_scroll(owed, shell);
+                }
                 let caret = self.snapshot.cursor.filter(|caret| caret.visible);
                 let anchor = caret.map(|caret| (caret.column, caret.row));
                 if self.model_focused && caret.is_some_and(|caret| caret.blinking) {
@@ -2364,11 +2471,12 @@ fn map_iced_button(button: IcedMouseButton) -> MouseButton {
     }
 }
 
-/// A keyboard-driven viewport move, applied to this terminal instead of being
-/// encoded and sent to the child.
+/// A viewport move applied to this terminal instead of being encoded and sent
+/// to the child.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ViewportScroll {
     Lines(isize),
+    Row(u64),
     Top,
     Bottom,
 }
@@ -2377,10 +2485,26 @@ impl ViewportScroll {
     fn apply(self, handle: &TerminalSurface) -> Result<(), TerminalSendError> {
         match self {
             Self::Lines(delta) => handle.scroll_lines(delta),
+            Self::Row(row) => handle.scroll_to_row(row),
             Self::Top => handle.scroll_to_top(),
             Self::Bottom => handle.scroll_to_bottom(),
         }
     }
+}
+
+/// What one wheel event does to a terminal.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WheelEffect {
+    /// The gesture has not accumulated a whole line yet.
+    Idle,
+    /// A viewport move, safe to fold into the rest of the frame.
+    Viewport(isize),
+    /// One mouse report per notch, in gesture order, for a child that asked
+    /// to read the wheel itself.
+    Report { button: MouseButton, notches: u32 },
+    /// One arrow-key press per notch, in gesture order, for an
+    /// alternate-screen application that has no scrollback to move.
+    Keys { key: TerminalKey, notches: u32 },
 }
 
 /// The viewport move a key press performs instead of reaching the child, if
@@ -3608,5 +3732,171 @@ mod tests {
         );
         assert_eq!(normalize_paste("trailing\r\n"), "trailing\r");
         assert_eq!(normalize_paste("a\0b"), "ab");
+    }
+
+    /// One command the widget handed its terminal, in the order it did.
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    enum Sent {
+        Scroll(ViewportScroll),
+        Report(MouseButton),
+        Key(TerminalKey),
+    }
+
+    /// Replays what `update` does with wheel, drag and frame events so that a
+    /// test can count the commands a gesture actually produces. `Widget::update`
+    /// itself needs a live renderer, which no unit test can build.
+    struct ScrollPump {
+        state: WidgetState,
+        scroll: ScrollSnapshot,
+        sent: Vec<Sent>,
+    }
+
+    impl ScrollPump {
+        fn new(scroll: ScrollSnapshot) -> Self {
+            Self {
+                state: WidgetState::default(),
+                scroll,
+                sent: Vec::new(),
+            }
+        }
+
+        fn shifted(mut self) -> Self {
+            self.state.modifiers.shift = true;
+            self
+        }
+
+        fn wheel(&mut self, lines: f32) {
+            match self.state.wheel_effect(lines, self.scroll) {
+                WheelEffect::Idle => {}
+                WheelEffect::Viewport(delta) => self.owe(ViewportScroll::Lines(delta)),
+                WheelEffect::Report { button, notches } => self
+                    .sent
+                    .extend((0..notches).map(|_| Sent::Report(button))),
+                WheelEffect::Keys { key, notches } => {
+                    self.sent.extend((0..notches).map(|_| Sent::Key(key)));
+                }
+            }
+        }
+
+        fn drag_to(&mut self, row: u64) {
+            self.owe(ViewportScroll::Row(row));
+        }
+
+        fn owe(&mut self, next: ViewportScroll) {
+            if let Some(superseded) = self.state.owe_scroll(next) {
+                self.sent.push(Sent::Scroll(superseded));
+            }
+        }
+
+        fn frame(&mut self) {
+            if let Some(owed) = self.state.take_owed_scroll() {
+                self.sent.push(Sent::Scroll(owed));
+            }
+        }
+    }
+
+    const SCROLLBACK: ScrollSnapshot = ScrollSnapshot {
+        total: 1000,
+        offset: 500,
+        len: 24,
+        alternate_screen: false,
+        mouse_tracking: false,
+    };
+
+    #[test]
+    fn a_frame_of_wheel_events_is_one_viewport_command_but_still_one_report_per_notch() {
+        // Eight notches inside one frame move the viewport eight lines in one
+        // command; the seven positions in between are never presented, so
+        // applying them would buy nothing and cost eight of everything.
+        let mut pump = ScrollPump::new(SCROLLBACK);
+        for _ in 0..8 {
+            pump.wheel(1.0);
+        }
+        assert!(
+            pump.sent.is_empty(),
+            "a viewport move may not be sent before its frame"
+        );
+        pump.frame();
+        // A frame with nothing owed must stay silent, or an idle terminal
+        // would scroll itself.
+        pump.frame();
+        assert_eq!(pump.sent, vec![Sent::Scroll(ViewportScroll::Lines(-8))]);
+
+        // A child reading the wheel counts notches, so each one is still
+        // reported, in order, and none of it is deferred to a frame.
+        let mut reporting = ScrollPump::new(ScrollSnapshot {
+            mouse_tracking: true,
+            ..SCROLLBACK
+        });
+        for _ in 0..3 {
+            reporting.wheel(-1.0);
+        }
+        reporting.frame();
+        assert_eq!(reporting.sent, vec![Sent::Report(MouseButton::WheelDown); 3]);
+
+        // An alternate-screen application has no scrollback to move and gets
+        // one arrow key per notch instead, likewise unfolded.
+        let mut alternate = ScrollPump::new(ScrollSnapshot {
+            alternate_screen: true,
+            ..SCROLLBACK
+        });
+        for _ in 0..2 {
+            alternate.wheel(1.0);
+        }
+        alternate.frame();
+        assert_eq!(alternate.sent, vec![Sent::Key(TerminalKey::ArrowUp); 2]);
+
+        // Shift claims the gesture for the viewport even where the child is
+        // reading the wheel, and then it coalesces like any other.
+        let mut shifted = ScrollPump::new(ScrollSnapshot {
+            mouse_tracking: true,
+            ..SCROLLBACK
+        })
+        .shifted();
+        for _ in 0..4 {
+            shifted.wheel(1.0);
+        }
+        shifted.frame();
+        assert_eq!(shifted.sent, vec![Sent::Scroll(ViewportScroll::Lines(-4))]);
+    }
+
+    #[test]
+    fn a_trackpad_keeps_its_fraction_and_an_absolute_target_orders_against_deltas() {
+        // Sub-line pixel deltas accumulate instead of rounding away, so a
+        // high-resolution trackpad keeps moving, and only ever by whole lines.
+        let mut pump = ScrollPump::new(SCROLLBACK);
+        for _ in 0..5 {
+            pump.wheel(0.5);
+        }
+        pump.frame();
+        assert_eq!(pump.sent, vec![Sent::Scroll(ViewportScroll::Lines(-2))]);
+        // The half line left over is carried across the frame boundary rather
+        // than discarded, so one more tick of the same size completes a line.
+        pump.wheel(0.5);
+        pump.frame();
+        assert_eq!(pump.sent[1], Sent::Scroll(ViewportScroll::Lines(-1)));
+
+        // A scrollbar drag names an absolute row, which discards the deltas it
+        // supersedes.
+        let mut drag = ScrollPump::new(SCROLLBACK);
+        drag.wheel(3.0);
+        drag.drag_to(120);
+        drag.frame();
+        assert_eq!(drag.sent, vec![Sent::Scroll(ViewportScroll::Row(120))]);
+
+        // A delta after an absolute row cannot be folded into it, because only
+        // the terminal knows which row that one clamped to, so the two are
+        // sent in gesture order.
+        let mut mixed = ScrollPump::new(SCROLLBACK);
+        mixed.drag_to(120);
+        mixed.wheel(3.0);
+        mixed.frame();
+        assert_eq!(
+            mixed.sent,
+            vec![
+                Sent::Scroll(ViewportScroll::Row(120)),
+                Sent::Scroll(ViewportScroll::Lines(-3)),
+            ]
+        );
     }
 }

@@ -11,6 +11,9 @@ pub enum Action {
     CardFocus,
     PaletteOpen,
     PaletteQuery,
+    /// One frame's worth of terminal viewport scrolling, however many wheel
+    /// events, auto-scroll steps or scrollbar samples were folded into it.
+    TerminalScroll,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -20,6 +23,29 @@ pub struct LatencySummary {
     pub p95: Duration,
     pub p99: Duration,
     pub worst: Duration,
+}
+
+impl LatencySummary {
+    /// Summarizes `durations` in place, which is why it takes them mutably:
+    /// percentiles need the sorted order and a workload has no use for the
+    /// original arrival order once it is reporting.
+    pub fn from_durations(durations: &mut [Duration]) -> Option<Self> {
+        if durations.is_empty() {
+            return None;
+        }
+        durations.sort_unstable();
+        // Nearest-rank on the inclusive index range, matching the percentile
+        // the latency fixture and `scripts/run-redraw-latency` already report
+        // so numbers from the two harnesses can be compared directly.
+        let percentile = |percent: usize| durations[((durations.len() - 1) * percent).div_ceil(100)];
+        Some(Self {
+            samples: durations.len(),
+            median: percentile(50),
+            p95: percentile(95),
+            p99: percentile(99),
+            worst: durations[durations.len() - 1],
+        })
+    }
 }
 
 /// Compile-time recorder for ordinary builds. No state, clock, storage, or IDs.
@@ -64,8 +90,10 @@ impl NoopRecorder {
 pub type InteractionLatency = NoopRecorder;
 #[cfg(feature = "latency-harness")]
 pub use recording::Recorder as InteractionLatency;
-#[cfg(feature = "latency-harness")]
-pub use recording::{Outcome, Sample};
+// Workloads that are not the UI fixture - the terminal scroll workload in
+// `terminal::worker` - drive the recorder directly from a test build.
+#[cfg(any(feature = "latency-harness", test))]
+pub use recording::{Outcome, Recorder, Sample};
 
 #[cfg(any(feature = "latency-harness", test))]
 mod recording {
