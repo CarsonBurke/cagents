@@ -79,8 +79,11 @@ pub const INSPECTOR_DEFAULT_WIDTH: f32 = 380.0;
 pub const INSPECTOR_MAX_WIDTH: f32 = 480.0;
 
 /// Shared gutter geometry for native scrollables and custom-rendered content.
-pub const SCROLLBAR_GUTTER: f32 = 10.5;
-pub const SCROLLBAR_THUMB_WIDTH: f32 = 7.5;
+///
+/// Keep the reserved rail slightly wider than the visible thumb so content
+/// never crowds the scrollbar at fractional display scales.
+pub const SCROLLBAR_GUTTER: f32 = 12.0;
+pub const SCROLLBAR_THUMB_WIDTH: f32 = 6.0;
 pub const SCROLLBAR_MARGIN: f32 = 1.5;
 pub const BORDER_WIDTH: f32 = 1.0;
 
