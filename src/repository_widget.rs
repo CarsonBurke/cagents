@@ -35,7 +35,9 @@ use crate::{
         FileContent, FileIoError, ReadOnlyReason, SaveDurability, SaveOutcome, load_file,
         save_file, validate_repo_path,
     },
-    lsp::{LspCompletionEdit, LspCompletionItem, LspDocumentId, LspPosition},
+    lsp::{
+        LspCompletionEdit, LspCompletionItem, LspDocumentId, LspPosition, LspRange, LspTextEdit,
+    },
     model::{CardId, RepositoryView},
     repository::{
         CancellationToken, DiffBasis, DiffContent, DiffSide, HistoryRequest, HistoryRevision,
@@ -317,6 +319,22 @@ pub enum RepositoryAction {
         identity: AsyncIdentity,
         result: Result<Vec<RepositoryFile>, String>,
     },
+    /// A file-list read that found the worktree exactly as this card already
+    /// has it.
+    ///
+    /// Carries no list on purpose: rebuilding one would allocate a `PathBuf`
+    /// per file and invalidate the card's view for nothing. A variant of its
+    /// own rather than an empty [`RepositoryAction::FilesLoaded`], because
+    /// an empty list legitimately means "this repository has no files".
+    FileListUnchanged {
+        identity: AsyncIdentity,
+    },
+    /// The Markdown preview's debounce elapsed; re-parse if an edit
+    /// invalidated the items.
+    MarkdownDue {
+        card: CardId,
+        ticket: u64,
+    },
     OpenFile {
         card: CardId,
         path: PathBuf,
@@ -448,6 +466,26 @@ pub enum RepositoryAction {
         card: CardId,
         uri: markdown::Uri,
     },
+    /// Mounts the find bar over the open buffer and hands it the keyboard.
+    ///
+    /// Find is a strip, not a modal: it holds the editor in search mode so
+    /// the buffer cannot be typed into behind it, and nothing else.
+    OpenFind {
+        card: CardId,
+    },
+    CloseFind {
+        card: CardId,
+    },
+    FindQueryChanged {
+        card: CardId,
+        query: String,
+    },
+    FindNext {
+        card: CardId,
+    },
+    FindPrevious {
+        card: CardId,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -488,9 +526,16 @@ impl RepositoryAction {
             | Self::PreviousChange { card }
             | Self::NextChange { card }
             | Self::WorkingDiffDue { card, .. }
+            | Self::MarkdownDue { card, .. }
             | Self::RemovedViewport { card, .. }
-            | Self::MarkdownLink { card, .. } => *card,
+            | Self::MarkdownLink { card, .. }
+            | Self::OpenFind { card }
+            | Self::CloseFind { card }
+            | Self::FindQueryChanged { card, .. }
+            | Self::FindNext { card }
+            | Self::FindPrevious { card } => *card,
             Self::FilesLoaded { identity, .. }
+            | Self::FileListUnchanged { identity }
             | Self::DirectoryListed { identity, .. }
             | Self::FileLoaded { identity, .. }
             | Self::DiffLoaded { identity, .. }
@@ -521,6 +566,13 @@ struct EditorDocument {
     disk_hash: blake3::Hash,
     markdown: bool,
     markdown_items: Vec<markdown::Item>,
+    /// Whether [`EditorDocument::markdown_items`] still describes the buffer.
+    ///
+    /// Parsing is the whole document's work and only the preview surface
+    /// reads the result, so an edit records staleness and the parse happens
+    /// at the debounce boundary — or at the moment the preview is mounted,
+    /// whichever comes first.
+    markdown_stale: bool,
     dirty: bool,
     revision: u64,
     /// Version of this buffer as the language server counts it: monotonic and
@@ -561,6 +613,7 @@ impl EditorDocument {
             disk_hash,
             markdown,
             markdown_items,
+            markdown_stale: false,
             dirty: false,
             revision: 0,
             lsp_version: 1,
@@ -571,25 +624,33 @@ impl EditorDocument {
         }
     }
 
+    /// Applies one editor action and brings the derived state with it.
+    ///
+    /// Deliberately does *not* serialize the buffer.
+    /// [`text_editor::Content::text`] walks every line into a fresh `String`,
+    /// and a file is allowed to be 8 MiB, so answering "is this dirty?" that
+    /// way copies megabytes per keystroke on the COSMIC update thread.
+    /// Dirtiness is decided from the byte length first and Markdown is
+    /// re-parsed at a debounce boundary instead.
     fn apply(&mut self, action: text_editor::Action) {
         let is_edit = action.is_edit();
         self.content.perform(action);
         if is_edit {
             self.revision = self.revision.wrapping_add(1).max(1);
-            let text = self.content.text();
-            self.dirty = text != self.saved_text;
-            if self.markdown {
-                self.markdown_items = markdown::parse(&text).collect();
-            }
+            self.dirty = !content_matches(&self.content, &self.saved_text);
+            self.markdown_stale |= self.markdown;
         }
     }
 
     fn discard_edits(&mut self) {
+        // `Content::with_text` starts the viewport at the top of the file.
+        // This card maintains per-file anchors precisely so the user does not
+        // lose their place, and abandoning an edit is no reason to lose it.
+        let scroll = self.content.scroll_position();
         self.content = text_editor::Content::with_text(&self.saved_text);
+        self.content.restore_scroll_position(scroll);
         self.revision = self.revision.wrapping_add(1).max(1);
-        if self.markdown {
-            self.markdown_items = markdown::parse(&self.saved_text).collect();
-        }
+        self.markdown_stale |= self.markdown;
         self.dirty = false;
         debug_assert!(self.active_save.is_none());
         self.conflict = false;
@@ -618,12 +679,50 @@ impl EditorDocument {
     /// other way to express.
     fn replace_text(&mut self, text: &str) {
         self.content = text_editor::Content::with_text(text);
-        if self.markdown {
-            self.markdown_items = markdown::parse(text).collect();
-        }
+        self.markdown_stale |= self.markdown;
         self.dirty = text != self.saved_text;
         self.revision = self.revision.wrapping_add(1).max(1);
     }
+
+    /// Re-parses Markdown when an edit has invalidated the preview's items.
+    ///
+    /// Called from the preview debounce and from the moment the preview is
+    /// mounted, never from [`EditorDocument::apply`]: this is the one place
+    /// that pays for a full document walk, and nothing reads
+    /// [`EditorDocument::markdown_items`] until the preview is on screen.
+    fn sync_markdown(&mut self) {
+        if !std::mem::take(&mut self.markdown_stale) {
+            return;
+        }
+        self.markdown_items = markdown::parse(&self.content.text()).collect();
+    }
+}
+
+/// Whether the buffer's text equals `saved`, decided without building it.
+///
+/// [`text_editor::Content::text`] allocates the whole document, so comparing
+/// a keystroke against the saved text that way copies megabytes per
+/// character. The byte length settles almost every case in constant time,
+/// and the rare length-preserving edit falls through to a streaming
+/// comparison that allocates nothing and stops at the first differing byte.
+fn content_matches(content: &text_editor::Content<cosmic::Renderer>, saved: &str) -> bool {
+    if content.text_len() != saved.len() {
+        return false;
+    }
+    let lines = content.line_count();
+    let mut rest = saved;
+    for index in 0..lines {
+        let here = rest;
+        let matched = content.with_line(index, |text, ending| {
+            let tail = here.strip_prefix(text)?;
+            tail.strip_prefix(terminator_str(ending, index + 1 == lines))
+        });
+        let Some(Some(tail)) = matched else {
+            return false;
+        };
+        rest = tail;
+    }
+    rest.is_empty()
 }
 
 // Caret coordinates.
@@ -644,6 +743,12 @@ impl EditorDocument {
 /// the boundary before it rather than slicing: a caret can only sit between
 /// scalars, and panicking would throw away a position the editor considers
 /// perfectly valid.
+///
+/// Production code reads the caret straight off the buffer with
+/// [`caret_position`], which does the same arithmetic without materialising
+/// the document; this is the obvious-but-allocating reference the tests
+/// check that one against.
+#[cfg(test)]
 fn scalar_column(line: &str, byte_column: usize) -> u32 {
     let mut boundary = byte_column.min(line.len());
     while !line.is_char_boundary(boundary) {
@@ -700,6 +805,10 @@ fn byte_offset(text: &str, at: LspPosition) -> Option<usize> {
 }
 
 /// Protocol position of a byte offset into `text`.
+///
+/// The reference implementation [`caret_position`] is checked against; see
+/// [`scalar_column`].
+#[cfg(test)]
 fn position_for_offset(text: &str, offset: usize) -> LspPosition {
     let offset = char_boundary(text, offset);
     let line = u32::try_from(text[..offset].matches('\n').count()).unwrap_or(u32::MAX);
@@ -737,38 +846,25 @@ fn char_boundary(text: &str, offset: usize) -> usize {
 
 /// What [`text_editor::Content::text`] writes after this line: nothing after
 /// the last one, and a newline for an unterminated line in the middle.
-fn line_terminator(line: &text_editor::Line<'_>, last: bool) -> &'static str {
+fn terminator_str(ending: text_editor::LineEnding, last: bool) -> &'static str {
     if last {
         ""
-    } else if line.ending == text_editor::LineEnding::None {
+    } else if ending == text_editor::LineEnding::None {
         text_editor::LineEnding::default().as_str()
     } else {
-        line.ending.as_str()
+        ending.as_str()
     }
-}
-
-/// Byte offset, into the text the buffer would produce, of a caret expressed
-/// in the editor's own line and byte column.
-fn caret_offset(
-    content: &text_editor::Content<cosmic::Renderer>,
-    caret: text_editor::Position,
-) -> Option<usize> {
-    let lines = content.line_count();
-    let mut offset = 0;
-    for index in 0..lines {
-        let line = content.line(index)?;
-        if index == caret.line {
-            return Some(offset + char_boundary(&line.text, caret.column));
-        }
-        offset += line.text.len() + line_terminator(&line, index + 1 == lines).len();
-    }
-    None
 }
 
 /// The editor-native caret for a byte offset into the buffer's text.
 ///
 /// An offset past the end lands at the end of the last line, because a caret
 /// has to be somewhere.
+///
+/// Reads each line in place. The obvious loop over
+/// [`text_editor::Content::line`] allocates and frees one `String` per line
+/// of the document for every conversion, which is what a single hover used
+/// to cost on a hundred-thousand-line file.
 fn caret_for_offset(
     content: &text_editor::Content<cosmic::Renderer>,
     offset: usize,
@@ -777,20 +873,263 @@ fn caret_for_offset(
     let mut start = 0;
     let mut caret = text_editor::Position { line: 0, column: 0 };
     for index in 0..lines {
-        let Some(line) = content.line(index) else {
+        let Some((position, next, reached)) = content.with_line(index, |text, ending| {
+            let end = start + text.len();
+            (
+                text_editor::Position {
+                    line: index,
+                    column: char_boundary(text, offset.saturating_sub(start)),
+                },
+                end + terminator_str(ending, index + 1 == lines).len(),
+                offset <= end,
+            )
+        }) else {
             break;
         };
-        let end = start + line.text.len();
-        caret = text_editor::Position {
-            line: index,
-            column: char_boundary(&line.text, offset.saturating_sub(start)),
-        };
-        if offset <= end {
+        caret = position;
+        if reached {
             break;
         }
-        start = end + line_terminator(&line, index + 1 == lines).len();
+        start = next;
     }
     caret
+}
+
+/// The byte offset into [`text_editor::Content::text`] of an editor caret,
+/// and the length of the buffer for a caret beyond its last line.
+///
+/// The inverse of [`caret_for_offset`], walking the lines in place for the
+/// same reason: find asks for this on every open, and a conversion that
+/// allocated per line would charge the whole document for one keystroke.
+fn caret_byte_offset(
+    content: &text_editor::Content<cosmic::Renderer>,
+    caret: text_editor::Position,
+) -> usize {
+    let lines = content.line_count();
+    let mut offset = 0;
+    for index in 0..lines {
+        let Some(advance) = content.with_line(index, |text, ending| {
+            if index == caret.line {
+                return char_boundary(text, caret.column);
+            }
+            text.len() + terminator_str(ending, index + 1 == lines).len()
+        }) else {
+            break;
+        };
+        offset += advance;
+        if index == caret.line {
+            break;
+        }
+    }
+    offset
+}
+
+/// Index of the editor line whose bare `\r` terminator is the buffer's very
+/// last byte, if there is one.
+///
+/// [`line_span`] ends a protocol line before a `\r` that sits at its end,
+/// and the last protocol line ends at the end of the buffer — so a buffer
+/// finishing in a bare `\r` has one byte the protocol does not count. The
+/// editor disagrees: it breaks on that `\r` and will park a caret after it.
+/// This is the one place the two numberings have to be reconciled by hand.
+fn trailing_carriage_return(content: &text_editor::Content<cosmic::Renderer>) -> Option<usize> {
+    let last = content.line_count().checked_sub(1)?;
+    let previous = last.checked_sub(1)?;
+    if !content.with_line(last, |text, _| text.is_empty())? {
+        return None;
+    }
+    content
+        .with_line(previous, |_, ending| {
+            !terminator_str(ending, false).contains('\n')
+        })?
+        .then_some(previous)
+}
+
+/// Protocol position of the editor's caret, without serializing the buffer.
+///
+/// Equivalent to `position_for_offset(&content.text(), caret_offset(..))`,
+/// and deliberately so: a caret always sits inside a line's *content* and
+/// never on the `\r` of a `\r\n` that [`line_span`] excludes, so that clamp
+/// is a no-op here and the walk can accumulate scalars as it goes. Protocol
+/// lines break on `\n` alone while the editor also breaks on a bare `\r`,
+/// so one protocol line can span several editor lines and the scalar count
+/// only resets at a terminator containing `\n`.
+fn caret_position(
+    content: &text_editor::Content<cosmic::Renderer>,
+    caret: text_editor::Position,
+) -> Option<LspPosition> {
+    let lines = content.line_count();
+    if caret.line >= lines {
+        return None;
+    }
+    let trailing_cr = trailing_carriage_return(content);
+    let mut line = 0u32;
+    let mut scalars = 0usize;
+    for index in 0..caret.line {
+        let terminator = content.with_line(index, |text, ending| {
+            scalars += text.chars().count();
+            terminator_str(ending, index + 1 == lines)
+        })?;
+        if terminator.contains('\n') {
+            line = line.saturating_add(1);
+            scalars = 0;
+        } else if trailing_cr != Some(index) {
+            scalars += terminator.chars().count();
+        }
+    }
+    content.with_line(caret.line, |text, _| {
+        let column = scalars + text[..char_boundary(text, caret.column)].chars().count();
+        LspPosition::new(line, u32::try_from(column).unwrap_or(u32::MAX))
+    })
+}
+
+/// The editor-native caret for a protocol position, or `None` when it names a
+/// line the buffer does not have.
+///
+/// The inverse of [`caret_position`], and allocation-free for the same
+/// reason. A character past the end of the protocol line clamps to its end,
+/// which is what the protocol asks a client to do.
+fn caret_for_position(
+    content: &text_editor::Content<cosmic::Renderer>,
+    at: LspPosition,
+) -> Option<text_editor::Position> {
+    let lines = content.line_count();
+    let trailing_cr = trailing_carriage_return(content);
+    let target = usize::try_from(at.character).unwrap_or(usize::MAX);
+    let mut line = 0u32;
+    let mut consumed = 0usize;
+    let mut found = None;
+    for index in 0..lines {
+        if line > at.line {
+            break;
+        }
+        let Some((position, scalars, terminator)) = content.with_line(index, |text, ending| {
+            let remaining = target.saturating_sub(consumed);
+            (
+                text_editor::Position {
+                    line: index,
+                    column: text
+                        .char_indices()
+                        .nth(remaining)
+                        .map_or(text.len(), |(byte, _)| byte),
+                },
+                text.chars().count(),
+                terminator_str(ending, index + 1 == lines),
+            )
+        }) else {
+            break;
+        };
+        let on_target = line == at.line;
+        if on_target {
+            found = Some(position);
+            if consumed + scalars >= target {
+                break;
+            }
+        }
+        if trailing_cr == Some(index) {
+            // The protocol line ends at this `\r`; the empty editor line
+            // after it is not a place a protocol position can name.
+            break;
+        }
+        if terminator.contains('\n') {
+            if on_target {
+                break;
+            }
+            line = line.saturating_add(1);
+            consumed = 0;
+        } else {
+            consumed += scalars + terminator.chars().count();
+        }
+    }
+    found
+}
+
+/// The protocol position one scalar before `at`, or `None` at the start of
+/// the buffer.
+fn position_before(
+    content: &text_editor::Content<cosmic::Renderer>,
+    at: LspPosition,
+) -> Option<LspPosition> {
+    if at.character > 0 {
+        return Some(LspPosition::new(at.line, at.character - 1));
+    }
+    let previous = at.line.checked_sub(1)?;
+    // Clamps to the end of that line, which is where the caret lands when a
+    // backspace joins two lines.
+    let caret = caret_for_position(content, LspPosition::new(previous, u32::MAX))?;
+    caret_position(content, caret)
+}
+
+/// The protocol position one scalar after `at`, or `None` at the end of the
+/// buffer.
+fn position_after(
+    content: &text_editor::Content<cosmic::Renderer>,
+    at: LspPosition,
+) -> Option<LspPosition> {
+    let caret = caret_for_position(content, LspPosition::new(at.line, at.character + 1))?;
+    let resolved = caret_position(content, caret)?;
+    if resolved != at {
+        return Some(resolved);
+    }
+    // `at` is the end of its line, so the next scalar is the line break.
+    let following = LspPosition::new(at.line.checked_add(1)?, 0);
+    caret_for_position(content, following)?;
+    Some(following)
+}
+
+/// The protocol edit an editor action is about to perform, measured against
+/// the buffer as it stands *now*.
+///
+/// `None` where the transition cannot be described as one range — the caller
+/// then falls back to the full document, which [`LspIntent::Change`] carries
+/// regardless, so an undescribed edit costs a resynchronisation rather than
+/// a wrong one.
+fn describe_edit(
+    content: &text_editor::Content<cosmic::Renderer>,
+    edit: &text_editor::Edit,
+) -> Option<LspTextEdit> {
+    let cursor = content.cursor();
+    let caret = caret_position(content, cursor.position)?;
+    let anchor = match cursor.selection {
+        Some(anchor) => Some(caret_position(content, anchor)?),
+        None => None,
+    };
+    let (start, end) = match anchor {
+        Some(anchor) if (anchor.line, anchor.character) < (caret.line, caret.character) => {
+            (anchor, caret)
+        }
+        Some(anchor) => (caret, anchor),
+        None => (caret, caret),
+    };
+    let selected = start != end;
+    let (range, new_text) = match edit {
+        text_editor::Edit::Insert(character) => (LspRange::new(start, end), character.to_string()),
+        text_editor::Edit::Paste(text) => (LspRange::new(start, end), text.as_ref().clone()),
+        text_editor::Edit::Enter => (
+            LspRange::new(start, end),
+            content
+                .line_ending()
+                .unwrap_or_default()
+                .as_str()
+                .to_owned(),
+        ),
+        text_editor::Edit::Backspace if !selected => (
+            LspRange::new(position_before(content, start)?, end),
+            String::new(),
+        ),
+        text_editor::Edit::Delete if !selected => (
+            LspRange::new(start, position_after(content, end)?),
+            String::new(),
+        ),
+        text_editor::Edit::Backspace | text_editor::Edit::Delete => {
+            (LspRange::new(start, end), String::new())
+        }
+        // Indentation rewrites every line the selection touches, with a
+        // width this runtime does not know. Reporting it as one range would
+        // be a lie; a full resynchronisation is not.
+        text_editor::Edit::Indent | text_editor::Edit::Unindent => return None,
+    };
+    Some(LspTextEdit { range, new_text })
 }
 
 /// Byte range one completion edit replaces, or `None` when it cannot be
@@ -874,6 +1213,25 @@ struct WorkingDiffRefresh {
     additions: Vec<usize>,
     removals: Vec<usize>,
 }
+
+/// Coalescing timer for the Markdown preview's parse, shaped exactly like
+/// [`WorkingDiffRefresh`]: at most one timer is ever in flight and it always
+/// observes the latest deadline, so continuous typing parses once when the
+/// typing stops rather than once per character.
+#[derive(Debug, Default)]
+struct MarkdownDebounce {
+    timer: Option<u64>,
+    next_ticket: u64,
+    deadline: Option<Instant>,
+}
+
+/// How long the Markdown preview waits for typing to stop before re-parsing.
+/// The same window [`RepositoryRuntime::working_diff_task`] uses, for the
+/// same reason: a parse is the whole document's work.
+const MARKDOWN_DEBOUNCE: Duration = Duration::from_millis(180);
+
+/// A file-list read still outstanding after this long is presumed lost.
+const LOST_FILE_LIST_READ: Duration = Duration::from_secs(60);
 
 fn same_diff_revision(
     left: &Option<(u64, u64, Arc<str>)>,
@@ -985,6 +1343,23 @@ pub struct RepositoryRuntime {
     generation: u64,
     file_list_generation: u64,
     file_list_loading: bool,
+    /// When the outstanding file-list read started.
+    ///
+    /// A read whose result never comes back — a shell that filtered it away
+    /// while a modal was open, a cancelled subscription — would otherwise
+    /// leave `file_list_loading` set and stop this card refreshing for the
+    /// rest of the session. Being wrong costs one extra Git read.
+    file_list_started: Option<Instant>,
+    /// Digest of the raw Git output the current file list was built from, so
+    /// a refresh tick that finds nothing changed can say so without
+    /// rebuilding the list. `None` before the first successful read, and
+    /// after any read this card did not install.
+    file_list_digest: Option<blake3::Hash>,
+    /// Where the worker leaves the digest of the read in flight, tagged with
+    /// the generation that asked for it. Committed into
+    /// [`RepositoryRuntime::file_list_digest`] only once the matching list
+    /// has actually been installed.
+    file_list_deposit: Arc<std::sync::Mutex<Option<(u64, blake3::Hash)>>>,
     file_list_refresh_queued: bool,
     background_file_refresh: bool,
     mutation_refresh_pending: bool,
@@ -992,6 +1367,20 @@ pub struct RepositoryRuntime {
     selected: Option<RepositoryFile>,
     document: DocumentState,
     search_mode: bool,
+    find_open: bool,
+    /// The find bar's query exactly as the user typed it.
+    find_query: String,
+    /// Which occurrence of [`RepositoryRuntime::find_query`] is selected, and
+    /// how many there are.
+    ///
+    /// The total is recorded by the search that produced it rather than
+    /// recounted where it is displayed: counting means materialising the
+    /// whole rope and lowercasing a copy of it, which a redraw must not do
+    /// once per frame. It is therefore only true of the query and the buffer
+    /// revision it was measured against, and every path that changes either
+    /// renews it.
+    find_index: usize,
+    find_total: usize,
     /// One entry per comparison this selection has been asked for.
     ///
     /// A list rather than a map: at most six bases are live at once, and
@@ -1039,6 +1428,27 @@ pub struct RepositoryRuntime {
     /// tolerate being wrong. Every buffer mutation appends here, so a mutation
     /// that forgets is a desynchronised server rather than a silent nothing.
     lsp_intents: Vec<LspIntent>,
+    /// A recorded `didChange` whose text has not been produced yet.
+    ///
+    /// Serializing the buffer is work proportional to the document, so a
+    /// burst of edits inside one drain window materialises the text once, at
+    /// the drain, rather than once per keystroke. Any other intent flushes
+    /// this first: a `Close` followed by an `Open` names a different
+    /// document, and a change recorded before it can no longer be read off
+    /// the buffer afterwards.
+    pending_lsp_change: Option<i32>,
+    /// The edits behind [`RepositoryRuntime::pending_lsp_change`], in the
+    /// order they were applied, for incremental synchronisation.
+    ///
+    /// Empty means "this transition cannot be described as ranges"; the
+    /// application must then send the whole document, which is what
+    /// [`LspIntent::Change`] carries regardless.
+    lsp_edits: Vec<LspTextEdit>,
+    /// Whether [`RepositoryRuntime::lsp_edits`] still describes the whole
+    /// transition. One edit this runtime cannot express as a range makes the
+    /// batch unusable until the next drain.
+    lsp_edits_exact: bool,
+    markdown_debounce: MarkdownDebounce,
 }
 
 /// Owned, renderer-free projection of the active repository source surface.
@@ -1098,12 +1508,19 @@ impl RepositoryRuntime {
             generation: 0,
             file_list_generation: 0,
             file_list_loading: false,
+            file_list_started: None,
+            file_list_digest: None,
+            file_list_deposit: Arc::new(std::sync::Mutex::new(None)),
             file_list_refresh_queued: false,
             background_file_refresh: false,
             mutation_refresh_pending: false,
             files: FileListState::Loading,
             selected: None,
             search_mode: false,
+            find_open: false,
+            find_query: String::new(),
+            find_index: 0,
+            find_total: 0,
             document: DocumentState::None,
             diffs: Vec::new(),
             working_diff: WorkingDiffRefresh::default(),
@@ -1134,6 +1551,10 @@ impl RepositoryRuntime {
             next_save_ticket: 0,
             lsp_document: None,
             lsp_intents: Vec::new(),
+            pending_lsp_change: None,
+            lsp_edits: Vec::new(),
+            lsp_edits_exact: true,
+            markdown_debounce: MarkdownDebounce::default(),
         }
     }
 
@@ -1158,8 +1579,21 @@ impl RepositoryRuntime {
         self.wrap_lines = wrap_lines;
     }
 
+    /// Installs the syntax palette and drops every comparison coloured with
+    /// the old one.
+    ///
+    /// The Edit surface re-derives its highlighter in `view` and repaints at
+    /// once; a [`DiffModel`] carries baked spans and would keep showing the
+    /// previous palette until the next revision happened to rebuild it.
     pub fn set_syntax_theme(&mut self, theme: crate::settings::EditorSyntaxTheme) {
+        if self.syntax_theme == theme {
+            return;
+        }
         self.syntax_theme = theme;
+        self.diffs.clear();
+        self.working_diff.applied = None;
+        self.working_diff.additions.clear();
+        self.working_diff.removals.clear();
     }
 
     pub fn selected_text(&self) -> Option<String> {
@@ -1177,6 +1611,33 @@ impl RepositoryRuntime {
             return Task::none();
         }
         self.listed_directories.insert(path.clone());
+        self.directory_listing_task(card, path)
+    }
+
+    /// Re-lists every directory the user has expanded.
+    ///
+    /// A refresh replaces the root listing; without this the tree would keep
+    /// showing whatever the children looked like when they were first
+    /// expanded, and [`RepositoryRuntime::list_directory`]'s memo would never
+    /// let them be read again.
+    fn relist_expanded_directories(&mut self, card: CardId) -> Task<RepositoryAction> {
+        if !self.directory_only {
+            return Task::none();
+        }
+        let expanded: Vec<PathBuf> = self
+            .listed_directories
+            .iter()
+            .filter(|path| !path.as_os_str().is_empty())
+            .cloned()
+            .collect();
+        Task::batch(
+            expanded
+                .into_iter()
+                .map(|path| self.directory_listing_task(card, path)),
+        )
+    }
+
+    fn directory_listing_task(&self, card: CardId, path: PathBuf) -> Task<RepositoryAction> {
         let identity = AsyncIdentity {
             card,
             worktree: self.descriptor.worktree.clone(),
@@ -1193,6 +1654,91 @@ impl RepositoryRuntime {
                     .and_then(|result| result);
             RepositoryAction::DirectoryListed { identity, result }
         })
+    }
+
+    /// Folds a fresh root listing into the folder tree already on screen.
+    ///
+    /// A folder tab's expanded children exist only as rows appended by
+    /// [`RepositoryAction::DirectoryListed`], and
+    /// [`load_directory_files`] lists the root level alone, so installing its
+    /// result wholesale is what snapped every open folder shut on each
+    /// ten-second refresh tick. Rows under a still-expanded directory are
+    /// kept; rows whose parent has gone are dropped, and the expansion that
+    /// named it is forgotten with them.
+    fn merge_directory_listing(&mut self, root: Vec<RepositoryFile>) -> Vec<RepositoryFile> {
+        if !self.directory_only || self.listed_directories.len() <= 1 {
+            return root;
+        }
+        let FileListState::Ready(previous) = &self.files else {
+            return root;
+        };
+        let mut merged = root;
+        merged.extend(
+            previous
+                .iter()
+                .filter(|file| {
+                    file.path
+                        .parent()
+                        .is_some_and(|parent| !parent.as_os_str().is_empty())
+                })
+                .cloned(),
+        );
+        merged.sort_by(|left, right| left.path.cmp(&right.path));
+        merged.dedup_by(|left, right| left.path == right.path);
+        // A parent sorts before its children, so one pass decides which
+        // expansions still have a directory to hang from.
+        let listed = std::mem::take(&mut self.listed_directories);
+        let mut expanded = BTreeSet::from([PathBuf::new()]);
+        merged.retain(|file| {
+            if !expanded.contains(file.path.parent().unwrap_or(Path::new(""))) {
+                return false;
+            }
+            if file.directory && listed.contains(&file.path) {
+                expanded.insert(file.path.clone());
+            }
+            true
+        });
+        self.listed_directories = expanded;
+        merged
+    }
+
+    /// Performs the editor context menu's clipboard commands.
+    ///
+    /// Implemented here rather than deferred to the host because both shells
+    /// mount the same menu from [`editable_document_view`], and a host that
+    /// declines to act leaves four enabled-looking dead menu items. A host
+    /// that wants its own behaviour still has one: it can intercept
+    /// [`RepositoryAction::Clipboard`] before forwarding it here.
+    fn clipboard(&mut self, card: CardId, op: ClipboardOp) -> Task<RepositoryAction> {
+        match op {
+            ClipboardOp::Copy => self
+                .selected_text()
+                .map_or_else(Task::none, iced::clipboard::write),
+            ClipboardOp::Cut => {
+                let Some(text) = self.selected_text() else {
+                    return Task::none();
+                };
+                Task::batch([
+                    iced::clipboard::write(text),
+                    self.update(RepositoryAction::EditorAction {
+                        card,
+                        action: text_editor::Action::Edit(text_editor::Edit::Delete),
+                    }),
+                ])
+            }
+            // `clipboard::read` yields nothing at all for an empty clipboard,
+            // so there is no empty paste to guard against here.
+            ClipboardOp::Paste => iced::clipboard::read().and_then(move |text: String| {
+                cosmic::task::message(RepositoryAction::EditorAction {
+                    card,
+                    action: text_editor::Action::Edit(text_editor::Edit::Paste(Arc::new(text))),
+                })
+            }),
+            ClipboardOp::SelectAll => self.update(RepositoryAction::EditorAction {
+                card,
+                action: text_editor::Action::SelectAll,
+            }),
+        }
     }
 
     pub fn search_directory(&mut self, card: CardId, query: String) -> Task<RepositoryAction> {
@@ -1475,11 +2021,16 @@ impl RepositoryRuntime {
     }
 
     pub fn initial_load(&mut self, card: CardId) -> Task<RepositoryAction> {
-        if self.file_list_loading {
+        if self.file_list_read_outstanding() {
             self.file_list_refresh_queued = true;
             return Task::none();
         }
         self.files = FileListState::Loading;
+        // An explicit load has already thrown the mounted list away, so the
+        // "nothing changed" short-circuit would leave the card on `Loading`
+        // forever. Only a background refresh, which keeps its list, may take
+        // that path.
+        self.file_list_digest = None;
         self.background_file_refresh = false;
         self.load_files(card)
     }
@@ -1487,17 +2038,36 @@ impl RepositoryRuntime {
     /// Poll only visible panes. Keep the mounted list, viewport, and document
     /// intact while discovering external changes, and never overlap a read.
     pub fn refresh_visible(&mut self, card: CardId) -> Task<RepositoryAction> {
-        if self.file_list_loading {
+        if self.file_list_read_outstanding() {
             return Task::none();
         }
         self.background_file_refresh = true;
         self.load_files(card)
     }
 
+    /// Whether a file-list read is genuinely still in flight.
+    ///
+    /// A read whose result the shell dropped would otherwise wedge this card
+    /// on `file_list_loading` for the rest of the session, and a card that
+    /// silently stops refreshing is a far worse failure than one redundant
+    /// Git read a minute.
+    fn file_list_read_outstanding(&self) -> bool {
+        self.file_list_loading
+            && self
+                .file_list_started
+                .is_some_and(|started| started.elapsed() < LOST_FILE_LIST_READ)
+    }
+
     fn load_files(&mut self, card: CardId) -> Task<RepositoryAction> {
         self.file_list_loading = true;
+        self.file_list_started = Some(Instant::now());
         self.file_list_generation = self.file_list_generation.wrapping_add(1).max(1);
-        self.listed_directories.clear();
+        // The expanded set is deliberately *not* cleared. In a folder tab the
+        // children of an expanded directory exist only as rows this memo
+        // admitted, so forgetting them here is what made every open folder
+        // snap shut on each ten-second refresh tick. The root listing is
+        // merged into the existing tree instead, and every retained
+        // expansion is re-listed so external changes still show up.
         self.listed_directories.insert(PathBuf::new());
         let identity = AsyncIdentity {
             card,
@@ -1505,7 +2075,12 @@ impl RepositoryRuntime {
             path: PathBuf::from("."),
             generation: self.file_list_generation,
         };
-        files_task(identity, self.directory_only)
+        files_task(
+            identity,
+            self.directory_only,
+            self.file_list_digest,
+            Arc::clone(&self.file_list_deposit),
+        )
     }
 
     /// Refreshes Git's status and mutable comparisons without replacing the
@@ -1554,7 +2129,28 @@ impl RepositoryRuntime {
     /// [`crate::lsp::LspManager`]. Draining is destructive because a
     /// notification performed twice is worse than one performed late.
     pub fn take_lsp_intents(&mut self) -> Vec<LspIntent> {
+        self.flush_lsp_change();
         std::mem::take(&mut self.lsp_intents)
+    }
+
+    /// The editor edits behind the `didChange` this drain carries, oldest
+    /// first, so the boundary can send content ranges instead of the whole
+    /// document.
+    ///
+    /// Empty means the transition cannot be described as ranges — a buffer
+    /// rebuilt wholesale, a keystroke this runtime does not model — and the
+    /// caller must send the full text, which [`LspIntent::Change`] carries
+    /// regardless.
+    ///
+    /// Drain *after* [`RepositoryRuntime::take_lsp_intents`]: that call is
+    /// what materialises the change these edits describe.
+    #[must_use]
+    pub fn take_lsp_edits(&mut self) -> Vec<LspTextEdit> {
+        if !std::mem::replace(&mut self.lsp_edits_exact, true) {
+            self.lsp_edits.clear();
+            return Vec::new();
+        }
+        std::mem::take(&mut self.lsp_edits)
     }
 
     /// Identity of the open buffer at the LSP boundary, if the application
@@ -1580,8 +2176,7 @@ impl RepositoryRuntime {
         let DocumentState::Editable(document) = &self.document else {
             return None;
         };
-        let offset = caret_offset(&document.content, document.content.cursor().position)?;
-        Some(position_for_offset(&document.content.text(), offset))
+        caret_position(&document.content, document.content.cursor().position)
     }
 
     /// Moves the caret to a protocol position, for jump-to-location.
@@ -1596,10 +2191,9 @@ impl RepositoryRuntime {
         let DocumentState::Editable(document) = &mut self.document else {
             return false;
         };
-        let Some(offset) = byte_offset(&document.content.text(), at) else {
+        let Some(position) = caret_for_position(&document.content, at) else {
             return false;
         };
-        let position = caret_for_offset(&document.content, offset);
         // `move_to` leaves an existing selection installed, which would turn a
         // jump into a selection stretching from wherever the user last was.
         document
@@ -1662,18 +2256,23 @@ impl RepositoryRuntime {
 
     /// The focus target of the editable buffer while that buffer is the
     /// surface actually on screen, and `None` while it is not.
-    ///
-    /// A working-tree diff mounts the same native buffer as Edit. Historical
-    /// comparisons and Markdown preview have no editable focus target.
     #[must_use]
     pub fn editor_focus_target(&self, card: CardId) -> Option<widget::Id> {
+        self.editable_surface_visible()
+            .then(|| editor_focus_id(card))
+    }
+
+    /// Whether the editable buffer is the surface actually on screen.
+    ///
+    /// A working-tree diff mounts the same native buffer as Edit. Historical
+    /// comparisons and Markdown preview show no buffer to focus or search.
+    fn editable_surface_visible(&self) -> bool {
         let DocumentState::Editable(document) = &self.document else {
-            return None;
+            return false;
         };
-        let editing = self.editable_working_diff()
+        self.editable_working_diff()
             || (self.source_surface == SourceSurface::Editor
-                && !(document.markdown && self.markdown_mode == MarkdownMode::Preview));
-        editing.then(|| editor_focus_id(card))
+                && !(document.markdown && self.markdown_mode == MarkdownMode::Preview))
     }
 
     /// Gives the keyboard to the editable buffer.
@@ -1686,6 +2285,142 @@ impl RepositoryRuntime {
     pub fn focus_editor<Message: 'static>(&self, card: CardId) -> Task<Message> {
         self.editor_focus_target(card)
             .map_or_else(Task::none, iced::widget::operation::focus)
+    }
+
+    /// Whether the find strip is mounted over the open buffer.
+    ///
+    /// The shell consults this to route Ctrl+F and Escape: a card already
+    /// showing find owns them, and one that is not leaves them to the
+    /// project-wide meaning.
+    #[must_use]
+    pub fn find_is_open(&self) -> bool {
+        self.find_open
+    }
+
+    /// Mounts the find strip and selects the occurrence the user is looking
+    /// at.
+    ///
+    /// Seeding from the selection is why Ctrl+F feels instant, and starting
+    /// from the caret rather than from occurrence zero is why it does not
+    /// throw a reader a thousand lines back up the file. A selection
+    /// spanning lines seeds nothing: this search is a substring search, and
+    /// a paragraph is not a term anyone meant to look for.
+    fn open_find(&mut self, card: CardId) -> Task<RepositoryAction> {
+        if !self.editable_surface_visible() {
+            return Task::none();
+        }
+        if let Some(selection) = self.selected_text()
+            && !selection.trim().is_empty()
+            && !selection.contains('\n')
+        {
+            self.find_query = selection;
+        }
+        self.find_open = true;
+        self.set_search_mode(true);
+        let occurrence = self.occurrence_from_caret();
+        self.select_find_match(occurrence);
+        iced::widget::operation::focus(find_focus_id(card))
+    }
+
+    /// Dismisses the find strip and gives the keyboard back to the buffer.
+    fn close_find(&mut self, card: CardId) -> Task<RepositoryAction> {
+        self.clear_find();
+        self.focus_editor(card)
+    }
+
+    /// Drops the find strip and the search-mode hold that came with it.
+    ///
+    /// Every exit from find goes through here. `search_mode` refuses every
+    /// editor action that is not a scroll, so a strip that closes without
+    /// releasing it leaves a buffer that silently swallows the user's
+    /// keystrokes and looks, from the outside, simply broken.
+    fn clear_find(&mut self) {
+        self.find_open = false;
+        self.find_query.clear();
+        self.find_index = 0;
+        self.find_total = 0;
+        self.set_search_mode(false);
+    }
+
+    /// Selects one occurrence and records the count that search reported,
+    /// which is the only place the count is ever computed.
+    fn select_find_match(&mut self, occurrence: usize) {
+        // Taken rather than cloned: the search needs `&mut self` and the
+        // query goes straight back.
+        let query = std::mem::take(&mut self.find_query);
+        let total = self.select_text_match(&query, occurrence);
+        self.find_query = query;
+        match total {
+            Some(total) => {
+                self.find_index = occurrence % total;
+                self.find_total = total;
+            }
+            // No query, or none of it in the buffer: the search already
+            // cleared the selection, and there is no count to show.
+            None => {
+                self.find_index = 0;
+                self.find_total = 0;
+            }
+        }
+    }
+
+    /// Renews the cached count after something changed the buffer under an
+    /// open find strip, clamping the selected occurrence into the new total.
+    ///
+    /// Without this the strip keeps claiming "3 of 7" over text that no
+    /// longer contains seven of anything.
+    fn refresh_find_matches(&mut self) {
+        if !self.find_open {
+            return;
+        }
+        self.select_find_match(self.find_index);
+    }
+
+    /// Steps to the next or previous occurrence.
+    ///
+    /// Going backwards is written against the known total rather than as
+    /// `wrapping_sub`: `usize::MAX % total` is `total - 1` only when `total`
+    /// divides 2^64, so a wrapped index re-selects occurrence zero for a
+    /// total of three or five and Previous appears to do nothing at all.
+    fn step_find(&mut self, forward: bool) {
+        if self.find_total == 0 {
+            return;
+        }
+        let occurrence = if forward {
+            (self.find_index + 1) % self.find_total
+        } else {
+            self.find_index
+                .checked_sub(1)
+                .unwrap_or(self.find_total.saturating_sub(1))
+        };
+        self.select_find_match(occurrence);
+    }
+
+    /// Which occurrence of the current query the caret is sitting at or
+    /// before, and zero when the caret is past the last one — a search that
+    /// runs off the end of the buffer wraps to the top.
+    ///
+    /// A selection is measured from its own start, so opening find on a
+    /// selected word keeps that very word selected instead of jumping to the
+    /// next copy of it.
+    fn occurrence_from_caret(&self) -> usize {
+        let DocumentState::Editable(document) = &self.document else {
+            return 0;
+        };
+        let query = self.find_query.trim().to_ascii_lowercase();
+        if query.is_empty() {
+            return 0;
+        }
+        let cursor = document.content.cursor();
+        let mut origin = caret_byte_offset(&document.content, cursor.position);
+        if let Some(anchor) = cursor.selection {
+            origin = origin.min(caret_byte_offset(&document.content, anchor));
+        }
+        let mut text = document.content.text();
+        text.make_ascii_lowercase();
+        text.match_indices(&query)
+            .take_while(|(start, _)| *start < origin)
+            .count()
     }
 
     /// Applies a completion's edits to the open buffer.
@@ -1713,6 +2448,9 @@ impl RepositoryRuntime {
         if self.source_surface == SourceSurface::Diff && !self.editable_working_diff() {
             return false;
         }
+        // A keystroke recorded but not yet materialised describes the buffer
+        // as it was before this completion; it has to be said first.
+        self.flush_lsp_change();
         let DocumentState::Editable(document) = &mut self.document else {
             return false;
         };
@@ -1728,7 +2466,7 @@ impl RepositoryRuntime {
             let Some(span) = completion_span(&text, edit) else {
                 return false;
             };
-            edits.push((span, edit.new_text.as_str()));
+            edits.push((span, edit.new_text.as_str(), edit.range));
         }
         let primary = edits[0].0.clone();
         edits.sort_by(|left, right| left.0.start.cmp(&right.0.start));
@@ -1739,7 +2477,7 @@ impl RepositoryRuntime {
         }
 
         let mut updated = text;
-        for (span, new_text) in edits.iter().rev() {
+        for (span, new_text, _) in edits.iter().rev() {
             updated.replace_range(span.clone(), new_text);
         }
         // The caret belongs after the text the user chose. Edits that sit
@@ -1749,8 +2487,8 @@ impl RepositoryRuntime {
         // underflow.
         let (inserted, removed) = edits
             .iter()
-            .filter(|(span, _)| span.start < primary.start)
-            .fold((0, 0), |(inserted, removed), (span, new_text)| {
+            .filter(|(span, _, _)| span.start < primary.start)
+            .fold((0, 0), |(inserted, removed), (span, new_text, _)| {
                 (inserted + new_text.len(), removed + (span.end - span.start))
             });
         let caret = primary.start + item.edit.new_text.len() + inserted - removed;
@@ -1771,11 +2509,23 @@ impl RepositoryRuntime {
             selection: None,
         });
         if let Some(version) = version {
+            // Recorded highest-range-first, the order they were applied in:
+            // each range then still addresses the document the one before it
+            // produced.
+            self.lsp_edits
+                .extend(edits.iter().rev().map(|(_, new_text, range)| LspTextEdit {
+                    range: *range,
+                    new_text: (*new_text).to_owned(),
+                }));
             self.lsp_intents.push(LspIntent::Change {
                 version,
                 text: updated,
             });
         }
+        // The one buffer mutation that does not pass through
+        // `push_lsp_change`, because it owns its own version bookkeeping —
+        // and therefore the one that has to renew the find count by hand.
+        self.refresh_find_matches();
         true
     }
 
@@ -1787,6 +2537,11 @@ impl RepositoryRuntime {
     /// worktree-relative, as every [`AsyncIdentity`] carries it, and is joined
     /// here because a document URI cannot be built from a relative path.
     fn push_lsp_open(&mut self, worktree: &Path) {
+        self.flush_lsp_change();
+        // A new baseline: ranges measured against the previous document
+        // address nothing here.
+        self.lsp_edits.clear();
+        self.lsp_edits_exact = true;
         let DocumentState::Editable(document) = &self.document else {
             return;
         };
@@ -1871,15 +2626,103 @@ impl RepositoryRuntime {
         self.push_lsp_open(&worktree);
     }
 
-    /// Records that the open buffer's text changed, whatever changed it.
+    /// Arms the Markdown preview's parse, coalescing a burst of edits into
+    /// one parse once typing stops.
+    ///
+    /// Shaped like [`RepositoryRuntime::working_diff_task`]: at most one
+    /// timer exists at a time and it always observes the latest deadline,
+    /// so continuous typing in a large Markdown file parses once rather than
+    /// once per character.
+    fn markdown_task(&mut self, card: CardId) -> Task<RepositoryAction> {
+        let DocumentState::Editable(document) = &self.document else {
+            return Task::none();
+        };
+        if !document.markdown_stale {
+            return Task::none();
+        }
+        self.markdown_debounce.deadline = Some(Instant::now() + MARKDOWN_DEBOUNCE);
+        if self.markdown_debounce.timer.is_some() {
+            return Task::none();
+        }
+        self.markdown_debounce.next_ticket =
+            self.markdown_debounce.next_ticket.wrapping_add(1).max(1);
+        let ticket = self.markdown_debounce.next_ticket;
+        self.markdown_debounce.timer = Some(ticket);
+        cosmic::task::future(async move {
+            tokio::time::sleep(MARKDOWN_DEBOUNCE).await;
+            RepositoryAction::MarkdownDue { card, ticket }
+        })
+    }
+
+    fn finish_markdown(&mut self, card: CardId, ticket: u64) -> Task<RepositoryAction> {
+        if self.markdown_debounce.timer != Some(ticket) {
+            return Task::none();
+        }
+        self.markdown_debounce.timer = None;
+        if self
+            .markdown_debounce
+            .deadline
+            .is_some_and(|deadline| Instant::now() < deadline)
+        {
+            // Typing continued while this timer ran; wait out the newer
+            // deadline instead of parsing a document about to change again.
+            return self.markdown_task(card);
+        }
+        self.markdown_debounce.deadline = None;
+        if let DocumentState::Editable(document) = &mut self.document {
+            document.sync_markdown();
+        }
+        Task::none()
+    }
+
+    /// Records that the open buffer's text changed, whatever changed it, and
+    /// how — `None` where the change cannot be described as one range.
     ///
     /// Silent once the version space is spent: the buffer keeps working and
     /// the server keeps its last coherent version rather than being rewound.
-    fn push_lsp_change(&mut self) {
+    ///
+    /// The text is deliberately *not* produced here. Serializing the buffer
+    /// is work proportional to the document and a keystroke arrives on the
+    /// COSMIC update thread, so the whole burst of edits inside one drain
+    /// window collapses onto one serialization at
+    /// [`RepositoryRuntime::take_lsp_intents`]. Intermediate versions are
+    /// never sent, which is exactly what a full-text `didChange` allows.
+    fn push_lsp_change(&mut self, edit: Option<LspTextEdit>) {
+        // Every path that changes the buffer's text passes through here, so
+        // this is where the find strip's cached count is renewed rather than
+        // recounted per frame in `view`. It runs before the version
+        // bookkeeping because an exhausted version space stops that
+        // bookkeeping early and must not leave the strip counting text that
+        // is no longer there.
+        self.refresh_find_matches();
         let DocumentState::Editable(document) = &mut self.document else {
             return;
         };
         let Some(version) = document.bump_lsp_version() else {
+            return;
+        };
+        self.pending_lsp_change = Some(version);
+        match edit {
+            Some(edit) => self.lsp_edits.push(edit),
+            // One indescribable edit poisons the batch: every later range is
+            // measured against a document the server was never told about.
+            None => {
+                self.lsp_edits.clear();
+                self.lsp_edits_exact = false;
+            }
+        }
+    }
+
+    /// Materialises the text of a deferred `didChange`, if one is pending.
+    fn flush_lsp_change(&mut self) {
+        let Some(version) = self.pending_lsp_change.take() else {
+            return;
+        };
+        let DocumentState::Editable(document) = &self.document else {
+            // The buffer stopped existing before anyone drained; the close
+            // that replaced it is the only thing left worth saying.
+            self.lsp_edits.clear();
+            self.lsp_edits_exact = true;
             return;
         };
         let text = document.content.text();
@@ -1888,6 +2731,7 @@ impl RepositoryRuntime {
 
     /// Records that the open buffer reached disk.
     fn push_lsp_save(&mut self) {
+        self.flush_lsp_change();
         let DocumentState::Editable(document) = &self.document else {
             return;
         };
@@ -1904,9 +2748,16 @@ impl RepositoryRuntime {
     /// would drop the close of a document opened and abandoned between two
     /// drains, and leak that session.
     fn push_lsp_close(&mut self) {
+        self.flush_lsp_change();
+        self.lsp_edits.clear();
+        self.lsp_edits_exact = true;
         if matches!(&self.document, DocumentState::Editable(_)) {
             self.lsp_intents.push(LspIntent::Close);
         }
+        // The buffer the strip was searching is going away, and a strip left
+        // mounted over the next one would hold it in search mode while
+        // counting occurrences of a query nobody typed for it.
+        self.clear_find();
     }
 
     fn editable_working_diff(&self) -> bool {
@@ -2008,6 +2859,7 @@ impl RepositoryRuntime {
             return Task::none();
         }
         let cancellation = CancellationToken::new();
+        let syntax_theme = self.syntax_theme;
         self.working_diff.active = Some(WorkingDiffJob {
             identity: identity.clone(),
             revision,
@@ -2019,7 +2871,7 @@ impl RepositoryRuntime {
             let path = identity.path.clone();
             let baseline = Arc::clone(&before);
             let result = tokio::task::spawn_blocking(move || {
-                build_document_diff(baseline, &after, &path, &cancellation)
+                build_document_diff(baseline, &after, &path, syntax_theme, &cancellation)
             })
             .await
             .map_err(|error| format!("Diff worker failed: {error}"));
@@ -2393,7 +3245,7 @@ impl RepositoryRuntime {
         document.discard_edits();
         // Reached from the application's dirty-close dialog, which throws the
         // buffer away without the editor ever seeing an action for it.
-        self.push_lsp_change();
+        self.push_lsp_change(None);
         true
     }
 
@@ -2548,19 +3400,45 @@ impl RepositoryRuntime {
                 Task::none()
             }
             RepositoryAction::NewTerminal { .. }
-            | RepositoryAction::Clipboard { .. }
             | RepositoryAction::DirectorySearchLoaded { .. } => Task::none(),
+            RepositoryAction::Clipboard { card, op } => self.clipboard(card, op),
             RepositoryAction::StageSelected { .. } => Task::none(),
+            RepositoryAction::FileListUnchanged { identity } => {
+                if !self.accepts_file_list(&identity) || identity.path != Path::new(".") {
+                    return Task::none();
+                }
+                self.file_list_loading = false;
+                self.file_list_started = None;
+                self.background_file_refresh = false;
+                if std::mem::take(&mut self.file_list_refresh_queued) {
+                    return self.initial_load(identity.card);
+                }
+                // Nothing in the worktree moved, so nothing here moves
+                // either: no rebuild, no assignment to `files`, no repaint.
+                Task::none()
+            }
             RepositoryAction::FilesLoaded { identity, result } => {
                 if !self.accepts_file_list(&identity) || identity.path != Path::new(".") {
                     return Task::none();
                 }
                 self.file_list_loading = false;
+                self.file_list_started = None;
                 if std::mem::take(&mut self.file_list_refresh_queued) {
                     // A save or mutation happened after this read started.
                     // Discard its status and perform one authoritative follow-up.
                     return self.initial_load(identity.card);
                 }
+                // Committed only now: a digest recorded for a list this card
+                // never installed would make the next refresh believe the
+                // worktree it describes is already on screen.
+                let deposited = *self
+                    .file_list_deposit
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                self.file_list_digest = deposited
+                    .filter(|(generation, _)| *generation == identity.generation)
+                    .map(|(_, digest)| digest);
+                let result = result.map(|files| self.merge_directory_listing(files));
                 let changed = match (&result, &self.selected) {
                     (Ok(after), Some(selected)) => {
                         // A successful save already updates this snapshot.
@@ -2586,11 +3464,12 @@ impl RepositoryRuntime {
                 let refresh_selected =
                     (self.mutation_refresh_pending || background_changed) && result.is_ok();
                 self.files = result.map_or_else(FileListState::Failed, FileListState::Ready);
+                let relist = self.relist_expanded_directories(identity.card);
                 if refresh_selected {
                     self.mutation_refresh_pending = false;
-                    self.refresh_selected_status(identity.card)
+                    Task::batch([relist, self.refresh_selected_status(identity.card)])
                 } else {
-                    Task::none()
+                    relist
                 }
             }
             RepositoryAction::OpenFile { card, path } => {
@@ -2674,7 +3553,7 @@ impl RepositoryRuntime {
                 }
                 Task::none()
             }
-            RepositoryAction::EditorAction { action, .. } => {
+            RepositoryAction::EditorAction { card, action } => {
                 if self.search_mode && !matches!(action, text_editor::Action::Scroll { .. }) {
                     return Task::none();
                 }
@@ -2682,6 +3561,14 @@ impl RepositoryRuntime {
                     return Task::none();
                 }
                 let is_edit = action.is_edit();
+                // Measured before the action lands: an edit names the range
+                // it is about to replace, in the document the server holds.
+                let edit = match (&action, &self.document) {
+                    (text_editor::Action::Edit(edit), DocumentState::Editable(document)) => {
+                        describe_edit(&document.content, edit)
+                    }
+                    _ => None,
+                };
                 if let DocumentState::Editable(document) = &mut self.document {
                     document.apply(action);
                 }
@@ -2689,7 +3576,8 @@ impl RepositoryRuntime {
                 // version for one would leave every request the user makes
                 // next quoting a version the server has never been sent.
                 if is_edit {
-                    self.push_lsp_change();
+                    self.push_lsp_change(edit);
+                    return self.markdown_task(card);
                 }
                 Task::none()
             }
@@ -2824,7 +3712,7 @@ impl RepositoryRuntime {
                 };
                 self.open_file(card, path)
             }
-            RepositoryAction::DiscardEdits { .. } => {
+            RepositoryAction::DiscardEdits { card } => {
                 if !self.can_discard_edits() {
                     return Task::none();
                 }
@@ -2832,10 +3720,11 @@ impl RepositoryRuntime {
                     document.discard_edits();
                     // `discard_edits` rebuilds the buffer without going
                     // through an editor action, so nothing else here would
-                    // notice that the server's copy just became wrong.
-                    self.push_lsp_change();
+                    // notice that the server's copy just became wrong, and
+                    // no range describes a wholesale replacement.
+                    self.push_lsp_change(None);
                 }
-                Task::none()
+                self.markdown_task(card)
             }
             RepositoryAction::BackToFiles { card } => {
                 if self.blocks_navigation() {
@@ -2884,9 +3773,17 @@ impl RepositoryRuntime {
                 } else {
                     MarkdownMode::Edit
                 };
+                if preview && let DocumentState::Editable(document) = &mut self.document {
+                    // The only reader of the parsed items is about to be
+                    // mounted, so this is the deadline the debounce was
+                    // deferring to — and the one tick a shell may have
+                    // filtered away while a modal was open.
+                    document.sync_markdown();
+                }
                 self.restore_native_viewport();
                 self.restore_visible_scroll()
             }
+            RepositoryAction::MarkdownDue { card, ticket } => self.finish_markdown(card, ticket),
             RepositoryAction::ApplyDiffMode { split, .. } => {
                 if !self.can_change_diff_layout() {
                     return Task::none();
@@ -3083,6 +3980,24 @@ impl RepositoryRuntime {
                 before,
                 result,
             } => self.finish_working_diff(identity, revision, ticket, before, result),
+            RepositoryAction::OpenFind { card } => self.open_find(card),
+            RepositoryAction::CloseFind { card } => self.close_find(card),
+            RepositoryAction::FindQueryChanged { query, .. } => {
+                self.find_query = query;
+                // A new query knows nothing of where the last one had got
+                // to, so it starts at its own first occurrence.
+                self.find_index = 0;
+                self.refresh_find_matches();
+                Task::none()
+            }
+            RepositoryAction::FindNext { .. } => {
+                self.step_find(true);
+                Task::none()
+            }
+            RepositoryAction::FindPrevious { .. } => {
+                self.step_find(false);
+                Task::none()
+            }
         }
     }
 
@@ -3184,7 +4099,14 @@ impl RepositoryRuntime {
                 cancellation: cancellation.clone(),
             },
         );
-        diff_task(identity, basis, request, old_path, cancellation)
+        diff_task(
+            identity,
+            basis,
+            request,
+            old_path,
+            self.syntax_theme,
+            cancellation,
+        )
     }
 
     fn comparison_old_path(&self) -> Option<PathBuf> {
@@ -3524,20 +4446,52 @@ impl RepositoryRuntime {
     }
 }
 
-fn files_task(identity: AsyncIdentity, directory_only: bool) -> Task<RepositoryAction> {
+/// Reads the card's file list off the update thread.
+///
+/// `deposit` is where a successful read leaves the digest it produced,
+/// tagged with the generation that asked for it. It travels in a cell rather
+/// than in the action because [`RepositoryAction::FilesLoaded`] is matched by
+/// both shells and its shape is not this module's to change; the generation
+/// tag stops a superseded read committing its digest over a newer one's,
+/// which would leave the card believing a list it never installed.
+fn files_task(
+    identity: AsyncIdentity,
+    directory_only: bool,
+    previous: Option<blake3::Hash>,
+    deposit: Arc<std::sync::Mutex<Option<(u64, blake3::Hash)>>>,
+) -> Task<RepositoryAction> {
     let worktree = identity.worktree.clone();
+    let generation = identity.generation;
     cosmic::task::future(async move {
         let result = tokio::task::spawn_blocking(move || {
             if directory_only {
-                load_directory_files(&worktree)
+                load_directory_files(&worktree).map(|files| FileListRead::Listed(None, files))
             } else {
-                load_repository_files(&worktree)
+                read_repository_files(&worktree, previous)
             }
         })
         .await
         .map_err(|error| format!("file-list worker failed: {error}"))
         .and_then(|result| result);
-        RepositoryAction::FilesLoaded { identity, result }
+        match result {
+            Ok(FileListRead::Unchanged) => RepositoryAction::FileListUnchanged { identity },
+            Ok(FileListRead::Listed(digest, files)) => {
+                if let Some(digest) = digest {
+                    *deposit
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+                        Some((generation, digest));
+                }
+                RepositoryAction::FilesLoaded {
+                    identity,
+                    result: Ok(files),
+                }
+            }
+            Err(error) => RepositoryAction::FilesLoaded {
+                identity,
+                result: Err(error),
+            },
+        }
     })
 }
 
@@ -3558,6 +4512,7 @@ fn diff_task(
     basis: DiffBasis,
     request: u64,
     old_path: Option<PathBuf>,
+    syntax_theme: crate::settings::EditorSyntaxTheme,
     cancellation: CancellationToken,
 ) -> Task<RepositoryAction> {
     let worktree = identity.worktree.clone();
@@ -3570,6 +4525,7 @@ fn diff_task(
                 &path,
                 &requested,
                 old_path.as_deref(),
+                syntax_theme,
                 &cancellation,
             )
         })
@@ -3702,7 +4658,18 @@ pub fn search_directory_files_for_quick_open(
     root: &Path,
     query: &str,
 ) -> Result<Vec<RepositoryFile>, String> {
-    search_directory_files(root, query, &CancellationToken::default()).map(|(files, _)| files)
+    search_directory_files_for_quick_open_cancellable(root, query, &CancellationToken::default())
+}
+
+/// [`search_directory_files_for_quick_open`] with a caller-owned token, so a
+/// superseded quick-open query stops walking instead of finishing a scan
+/// nobody will read.
+pub fn search_directory_files_for_quick_open_cancellable(
+    root: &Path,
+    query: &str,
+    token: &CancellationToken,
+) -> Result<Vec<RepositoryFile>, String> {
+    search_directory_files(root, query, token).map(|(files, _)| files)
 }
 
 fn load_directory_listing(root: &Path, relative: &Path) -> Result<Vec<RepositoryFile>, String> {
@@ -3795,7 +4762,35 @@ fn search_directory_files(
     Ok((matches, hidden))
 }
 
+/// What one file-list read produced.
+enum FileListRead {
+    /// Git's raw output is byte-for-byte what the card already digested, so
+    /// there is nothing to rebuild and nothing to repaint.
+    Unchanged,
+    /// A fresh list, with the digest of the read behind it. Folder tabs
+    /// carry no digest: they list one level and are merged into the tree.
+    Listed(Option<blake3::Hash>, Vec<RepositoryFile>),
+}
+
 pub fn load_repository_files(worktree: &Path) -> Result<Vec<RepositoryFile>, String> {
+    match read_repository_files(worktree, None)? {
+        FileListRead::Listed(_, files) => Ok(files),
+        // A read with nothing to compare against always lists.
+        FileListRead::Unchanged => Ok(Vec::new()),
+    }
+}
+
+/// Reads the repository's file list, reporting [`FileListRead::Unchanged`]
+/// when Git's raw output is byte-for-byte what `previous` digested.
+///
+/// The digest is taken over the raw NUL-delimited output rather than over the
+/// assembled list, so an idle card's ten-second refresh tick costs three Git
+/// reads and a hash instead of a `BTreeMap` of every path in the repository,
+/// two `PathBuf` allocations per file, and a view invalidation.
+fn read_repository_files(
+    worktree: &Path,
+    previous: Option<blake3::Hash>,
+) -> Result<FileListRead, String> {
     let tracked = git_output(worktree, ["ls-files", "--cached", "-z"])?;
     let untracked = git_output(
         worktree,
@@ -3805,7 +4800,26 @@ pub fn load_repository_files(worktree: &Path) -> Result<Vec<RepositoryFile>, Str
         worktree,
         ["status", "--porcelain=v1", "--untracked-files=all", "-z"],
     )?;
-    assemble_repository_files(&tracked, &untracked, &status)
+    let digest = repository_file_digest(&tracked, &untracked, &status);
+    if previous == Some(digest) {
+        return Ok(FileListRead::Unchanged);
+    }
+    let files = assemble_repository_files(&tracked, &untracked, &status)?;
+    Ok(FileListRead::Listed(Some(digest), files))
+}
+
+/// Digest of one file-list read.
+///
+/// Each part is length-prefixed: the three outputs are concatenated, and
+/// without a length a path moving from the tracked list to the untracked one
+/// could hash the same as the state before it moved.
+fn repository_file_digest(tracked: &[u8], untracked: &[u8], status: &[u8]) -> blake3::Hash {
+    let mut hasher = blake3::Hasher::new();
+    for part in [tracked, untracked, status] {
+        hasher.update(&(part.len() as u64).to_le_bytes());
+        hasher.update(part);
+    }
+    hasher.finalize()
 }
 
 fn assemble_repository_files(
@@ -3855,19 +4869,43 @@ fn assemble_repository_files(
         .collect())
 }
 
-fn git_output<const N: usize>(worktree: &Path, arguments: [&str; N]) -> Result<Vec<u8>, String> {
-    let output = Command::new("git")
-        .arg("--literal-pathspecs")
+/// Git's global options for every invocation this module makes, ahead of
+/// `-C` because Git only accepts global options before the subcommand.
+///
+/// `--literal-pathspecs` stops a file literally named `:(top)x` from being
+/// read as a magic pathspec.
+///
+/// `core.fsmonitor=false` is set for the same reason
+/// [`crate::repository::RepositoryService::git_base`] sets it: it is a trust
+/// boundary, not a latency measure. Configured to anything but a boolean,
+/// `core.fsmonitor` names a program Git runs whenever it refreshes the index,
+/// and `ls-files` and `status` both refresh the index. A repository that
+/// arrived as an archive carries its own `.git/config`, so without this
+/// merely opening a card would run code the repository chose — no click
+/// required, since the card lists its files on creation and every ten
+/// seconds after. `GIT_OPTIONAL_LOCKS=0` only suppresses writing the
+/// refreshed index back; it does not stop the fsmonitor being asked.
+const GIT_GLOBAL_OPTIONS: [&str; 3] = ["--literal-pathspecs", "-c", "core.fsmonitor=false"];
+
+fn git_command(worktree: &Path) -> Command {
+    let mut command = Command::new("git");
+    command
+        .args(GIT_GLOBAL_OPTIONS)
         .arg("-C")
         .arg(worktree)
-        .args(arguments)
         .env("GIT_TERMINAL_PROMPT", "0")
         .env("GIT_PAGER", "cat")
         .env("GIT_OPTIONAL_LOCKS", "0")
         .env_remove("GIT_DIR")
         .env_remove("GIT_WORK_TREE")
         .env_remove("GIT_INDEX_FILE")
-        .env_remove("GIT_COMMON_DIR")
+        .env_remove("GIT_COMMON_DIR");
+    command
+}
+
+fn git_output<const N: usize>(worktree: &Path, arguments: [&str; N]) -> Result<Vec<u8>, String> {
+    let output = git_command(worktree)
+        .args(arguments)
         .output()
         .map_err(|error| error.to_string())?;
     if output.status.success() {
@@ -4076,6 +5114,14 @@ pub fn view(card: CardId, runtime: &RepositoryRuntime) -> Element<'_, Repository
 /// nothing — and so two repository cards never contend for one focus target.
 pub fn editor_focus_id(card: CardId) -> widget::Id {
     widget::Id::new(format!("repository.{card}.editor"))
+}
+
+/// Focus target of the find strip's query input, derived from the card for
+/// the same reason [`editor_focus_id`] is: the focus operation the open
+/// action returns is performed on a later frame than the one that asked for
+/// it.
+pub fn find_focus_id(card: CardId) -> widget::Id {
+    widget::Id::new(format!("repository.{card}.find"))
 }
 
 pub fn focus_restore_id(card: CardId) -> widget::Id {
@@ -4356,15 +5402,101 @@ pub fn selected_file_toolbar(
     if !secondary.is_empty() {
         header.push(toolbar_group(secondary));
     }
+    let toolbar = widget::container(
+        widget::row::with_children(header)
+            .spacing(12)
+            .align_y(Alignment::Center)
+            .width(Length::Fill),
+    )
+    .padding([0, 12])
+    .height(crate::design::HEADER_HEIGHT)
+    .width(Length::Fill);
+    // The strip is mounted here rather than beside the buffer because it is
+    // a subordinate row of this editor's chrome, not a surface of its own:
+    // it must sit under the toolbar and directly above the text it searches.
+    let Some(find) = find_strip(card, runtime) else {
+        return Some(toolbar.into());
+    };
+    Some(
+        widget::column::with_children(vec![toolbar.into(), find])
+            .width(Length::Fill)
+            .into(),
+    )
+}
+
+/// The find strip, while find is open over a buffer that is on screen.
+fn find_strip<'a>(
+    card: CardId,
+    runtime: &'a RepositoryRuntime,
+) -> Option<Element<'a, RepositoryAction>> {
+    if !runtime.find_open || !runtime.editable_surface_visible() {
+        return None;
+    }
+    let matched = runtime.find_total != 0;
+    let mut row: Vec<Element<'a, RepositoryAction>> = vec![
+        widget::text_input("Find in file", &runtime.find_query)
+            .id(find_focus_id(card))
+            .on_input(move |query| RepositoryAction::FindQueryChanged { card, query })
+            .on_submit(move |_| RepositoryAction::FindNext { card })
+            .size(crate::design::TEXT_BODY)
+            .padding([0.0, crate::design::GRID_UNIT * 2.0])
+            .width(Length::Fill)
+            .into(),
+    ];
+    // A count is read off the cache the search filled in; an empty query has
+    // not searched for anything and says nothing rather than "No results".
+    if !runtime.find_query.trim().is_empty() {
+        row.push(
+            crate::design::caption(if matched {
+                format!("{} of {}", runtime.find_index + 1, runtime.find_total)
+            } else {
+                "No results".to_owned()
+            })
+            .into(),
+        );
+    }
+    for (icon, label, action) in [
+        (
+            "go-up-symbolic",
+            "Previous match",
+            RepositoryAction::FindPrevious { card },
+        ),
+        (
+            "go-down-symbolic",
+            "Next match",
+            RepositoryAction::FindNext { card },
+        ),
+    ] {
+        row.push(
+            icon_control(
+                crate::ui_controls::symbolic_icon(icon),
+                label,
+                false,
+                matched,
+                Some(action),
+            )
+            .into(),
+        );
+    }
+    row.push(
+        icon_control(
+            crate::ui_controls::symbolic_icon("window-close-symbolic"),
+            "Close find",
+            false,
+            true,
+            Some(RepositoryAction::CloseFind { card }),
+        )
+        .into(),
+    );
     Some(
         widget::container(
-            widget::row::with_children(header)
-                .spacing(12)
+            widget::row::with_children(row)
+                .spacing(crate::design::GRID_UNIT * 2.0)
                 .align_y(Alignment::Center)
                 .width(Length::Fill),
         )
-        .padding([0, 12])
-        .height(crate::design::HEADER_HEIGHT)
+        .padding([0.0, crate::design::GRID_UNIT * 3.0])
+        .height(crate::design::DENSE_ROW_HEIGHT)
         .width(Length::Fill)
         .into(),
     )
@@ -6485,6 +7617,7 @@ mod tests {
                     new_label: "new".into(),
                 },
                 Path::new("kernel.cu"),
+                crate::settings::EditorSyntaxTheme::Auto,
                 &CancellationToken::new(),
             ) else {
                 panic!("text comparison must produce rows");
@@ -10004,5 +11137,303 @@ mod tests {
         let (none, _) =
             search_directory_files(root.path(), "missing", &CancellationToken::new()).unwrap();
         assert!(none.is_empty());
+    }
+
+    /// `core.fsmonitor` names a program Git runs on every index refresh, and
+    /// a repository that arrived as an archive chose it. A card lists its
+    /// files on creation and every ten seconds after, so a second copy of
+    /// the invocation block that forgets this is a local code-execution
+    /// vector reachable without a click.
+    #[test]
+    fn every_git_invocation_here_disables_the_repository_chosen_fsmonitor_hook() {
+        let command = git_command(Path::new("/repo"));
+        let argv: Vec<String> = std::iter::once(command.get_program())
+            .chain(command.get_args())
+            .map(|argument| argument.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            argv,
+            [
+                "git",
+                "--literal-pathspecs",
+                "-c",
+                "core.fsmonitor=false",
+                "-C",
+                "/repo",
+            ]
+        );
+    }
+
+    #[test]
+    fn an_unchanged_worktree_is_reported_without_rebuilding_the_file_list() {
+        let root = tempdir().unwrap();
+        git_fixture(root.path());
+        std::fs::write(root.path().join("tracked.txt"), "a").unwrap();
+        run_git(root.path(), ["add", "tracked.txt"]);
+
+        let FileListRead::Listed(Some(digest), files) =
+            read_repository_files(root.path(), None).unwrap()
+        else {
+            panic!("a read with nothing to compare against always lists");
+        };
+        assert_eq!(files.len(), 1);
+        assert!(
+            matches!(
+                read_repository_files(root.path(), Some(digest)).unwrap(),
+                FileListRead::Unchanged
+            ),
+            "an idle refresh tick must not rebuild a list nothing has moved"
+        );
+
+        std::fs::write(root.path().join("new.txt"), "b").unwrap();
+        assert!(matches!(
+            read_repository_files(root.path(), Some(digest)).unwrap(),
+            FileListRead::Listed(..)
+        ));
+    }
+
+    #[test]
+    fn a_refresh_tick_keeps_expanded_folders_expanded() {
+        let root = tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join("nested")).unwrap();
+        std::fs::write(root.path().join("top.txt"), "a").unwrap();
+        std::fs::write(root.path().join("nested/child.txt"), "b").unwrap();
+        let card = CardId::new();
+        let mut runtime = RepositoryRuntime::new_directory(RepositoryView {
+            project: ProjectId::new(),
+            repository: root.path().to_path_buf(),
+            worktree: root.path().to_path_buf(),
+        });
+        let identity = |runtime: &RepositoryRuntime, path: &str| AsyncIdentity {
+            card,
+            worktree: runtime.descriptor.worktree.clone(),
+            path: PathBuf::from(path),
+            generation: runtime.file_list_generation,
+        };
+
+        drop(runtime.initial_load(card));
+        drop(runtime.update(RepositoryAction::FilesLoaded {
+            identity: identity(&runtime, "."),
+            result: Ok(load_directory_files(root.path()).unwrap()),
+        }));
+        drop(runtime.update(RepositoryAction::ListDirectory {
+            card,
+            path: "nested".into(),
+        }));
+        drop(runtime.update(RepositoryAction::DirectoryListed {
+            identity: identity(&runtime, "nested"),
+            result: Ok(load_directory_listing(root.path(), Path::new("nested")).unwrap()),
+        }));
+        assert!(runtime.file(Path::new("nested/child.txt")).is_some());
+
+        drop(runtime.refresh_visible(card));
+        drop(runtime.update(RepositoryAction::FilesLoaded {
+            identity: identity(&runtime, "."),
+            result: Ok(load_directory_files(root.path()).unwrap()),
+        }));
+        assert!(
+            runtime.file(Path::new("nested/child.txt")).is_some(),
+            "a refresh must not collapse the tree the user opened"
+        );
+        assert!(runtime.listed_directories.contains(Path::new("nested")));
+
+        // A folder that disappeared underneath the card takes its rows and
+        // its expansion with it.
+        std::fs::remove_dir_all(root.path().join("nested")).unwrap();
+        drop(runtime.refresh_visible(card));
+        drop(runtime.update(RepositoryAction::FilesLoaded {
+            identity: identity(&runtime, "."),
+            result: Ok(load_directory_files(root.path()).unwrap()),
+        }));
+        assert!(runtime.file(Path::new("nested/child.txt")).is_none());
+        assert!(!runtime.listed_directories.contains(Path::new("nested")));
+    }
+
+    #[test]
+    fn discarding_edits_keeps_the_viewport_where_the_user_left_it() {
+        let text = "line\n".repeat(400);
+        let mut document = EditorDocument::new(
+            PathBuf::from("notes.txt"),
+            text.clone(),
+            blake3::hash(text.as_bytes()),
+            false,
+        );
+        let anchor = text_editor::ScrollPosition {
+            line: 120,
+            vertical: 0.0,
+            horizontal: 0.0,
+        };
+        document.apply(text_editor::Action::Edit(text_editor::Edit::Insert('x')));
+        assert!(document.dirty);
+
+        // Whatever the buffer was showing when the user gave up on the edit
+        // is what it must still be showing afterwards.
+        document.content.restore_scroll_position(anchor);
+        document.discard_edits();
+        assert!(!document.dirty);
+        assert_eq!(
+            document.content.scroll_position(),
+            anchor,
+            "abandoning an edit is no reason to throw the reader back to line one"
+        );
+    }
+
+    #[test]
+    fn an_edit_that_restores_the_saved_text_is_not_a_modification() {
+        let text = "hello\nworld\n";
+        let mut document = EditorDocument::new(
+            PathBuf::from("notes.txt"),
+            text.into(),
+            blake3::hash(text.as_bytes()),
+            false,
+        );
+        document.apply(text_editor::Action::Edit(text_editor::Edit::Insert('!')));
+        assert!(document.dirty);
+        document.apply(text_editor::Action::Edit(text_editor::Edit::Backspace));
+        assert!(
+            !document.dirty,
+            "dirtiness is the buffer against the saved text, not a count of keystrokes"
+        );
+
+        // Same length, different content: the cheap length check cannot
+        // answer this one and must not be trusted to.
+        document.apply(text_editor::Action::Edit(text_editor::Edit::Delete));
+        document.apply(text_editor::Action::Edit(text_editor::Edit::Insert('H')));
+        assert_eq!(document.content.text().len(), text.len());
+        assert!(document.dirty);
+    }
+
+    #[test]
+    fn stepping_back_from_the_first_match_wraps_to_the_last_one() {
+        // `index.wrapping_sub(1) % total` looks like it wraps and does not:
+        // `usize::MAX % total` is `total - 1` only where `total` divides
+        // 2^64, so Previous on three or five matches silently re-selects the
+        // first one and looks like a dead button.
+        for total in [1usize, 2, 3, 5, 7] {
+            let card = CardId::new();
+            let text = "alpha\n".repeat(total);
+            let (mut runtime, _) = RepositoryRuntime::open_fixture(card, "notes.txt", &text);
+            drop(runtime.update(RepositoryAction::OpenFind { card }));
+            drop(runtime.update(RepositoryAction::FindQueryChanged {
+                card,
+                query: "alpha".into(),
+            }));
+            assert_eq!(runtime.find_total, total);
+            assert_eq!(runtime.find_index, 0);
+
+            drop(runtime.update(RepositoryAction::FindPrevious { card }));
+            assert_eq!(
+                runtime.find_index,
+                total - 1,
+                "Previous from the first of {total} matches must land on the last"
+            );
+            let DocumentState::Editable(document) = &runtime.document else {
+                unreachable!();
+            };
+            assert_eq!(
+                document.content.cursor().position.line,
+                total - 1,
+                "the reported occurrence must be the one actually selected"
+            );
+        }
+    }
+
+    #[test]
+    fn closing_find_releases_the_buffer_it_was_holding_read_only() {
+        let card = CardId::new();
+        let (mut runtime, _) = RepositoryRuntime::open_fixture(card, "notes.txt", "alpha\n");
+        drop(runtime.update(RepositoryAction::OpenFind { card }));
+        assert!(runtime.find_is_open());
+
+        drop(runtime.update(RepositoryAction::EditorAction {
+            card,
+            action: text_editor::Action::Edit(text_editor::Edit::Insert('z')),
+        }));
+        let DocumentState::Editable(document) = &runtime.document else {
+            unreachable!();
+        };
+        assert_eq!(
+            document.content.text(),
+            "alpha\n",
+            "find holds the buffer read-only while it is open"
+        );
+
+        drop(runtime.update(RepositoryAction::CloseFind { card }));
+        assert!(!runtime.find_is_open());
+        drop(runtime.update(RepositoryAction::EditorAction {
+            card,
+            action: text_editor::Action::Edit(text_editor::Edit::Insert('z')),
+        }));
+        let DocumentState::Editable(document) = &runtime.document else {
+            unreachable!();
+        };
+        assert_eq!(
+            document.content.text(),
+            "zalpha\n",
+            "a closed find bar that left search mode on would swallow every keystroke that \
+             followed it"
+        );
+    }
+
+    #[test]
+    fn changing_the_buffer_under_find_renews_the_count_it_reports() {
+        let card = CardId::new();
+        let (mut runtime, _) =
+            RepositoryRuntime::open_fixture(card, "notes.txt", "alpha alpha alpha\n");
+        drop(runtime.update(RepositoryAction::EditorAction {
+            card,
+            action: text_editor::Action::Edit(text_editor::Edit::Paste(Arc::new("alpha ".into()))),
+        }));
+        drop(runtime.update(RepositoryAction::OpenFind { card }));
+        drop(runtime.update(RepositoryAction::FindQueryChanged {
+            card,
+            query: "alpha".into(),
+        }));
+        assert_eq!(runtime.find_total, 4);
+        drop(runtime.update(RepositoryAction::FindPrevious { card }));
+        assert_eq!(runtime.find_index, 3);
+
+        // Discarding rebuilds the buffer behind the open strip: one of the
+        // four occurrences it was counting no longer exists.
+        drop(runtime.update(RepositoryAction::DiscardEdits { card }));
+        assert_eq!(
+            runtime.find_total, 3,
+            "a stale total keeps claiming matches the buffer no longer has"
+        );
+        assert!(
+            runtime.find_index < runtime.find_total,
+            "the selected occurrence must stay inside the total"
+        );
+        let DocumentState::Editable(document) = &runtime.document else {
+            unreachable!();
+        };
+        assert_eq!(document.content.selection().as_deref(), Some("alpha"));
+    }
+
+    #[test]
+    fn an_empty_query_counts_nothing_and_selects_nothing() {
+        let card = CardId::new();
+        let (mut runtime, _) = RepositoryRuntime::open_fixture(card, "notes.txt", "alpha beta\n");
+        drop(runtime.update(RepositoryAction::OpenFind { card }));
+        drop(runtime.update(RepositoryAction::FindQueryChanged {
+            card,
+            query: "alpha".into(),
+        }));
+        assert_eq!(runtime.find_total, 1);
+
+        drop(runtime.update(RepositoryAction::FindQueryChanged {
+            card,
+            query: "   ".into(),
+        }));
+        assert_eq!(runtime.find_total, 0);
+        assert_eq!(runtime.find_index, 0);
+        let DocumentState::Editable(document) = &runtime.document else {
+            unreachable!();
+        };
+        assert_eq!(
+            document.content.cursor().selection,
+            None,
+            "a query the user cleared leaves nothing highlighted behind it"
+        );
     }
 }

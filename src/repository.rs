@@ -6267,9 +6267,10 @@ fn argv_summary(command: &CommandSpec) -> String {
 /// `diff.autoRefreshIndex=false` closes the hole the option leaves open.
 /// `git diff` against the working tree finishes by refreshing the index under
 /// the index lock, and it does that whatever the optional-lock setting says.
-/// With a filesystem watcher on the worktree, that write is seen as a change,
-/// which schedules another state read, which runs another `git diff`: a
-/// refresh loop that spins Git processes for as long as the window is open.
+/// Because the card re-reads state on a periodic freshness poll, that write is
+/// seen as a change, which schedules another state read, which runs another
+/// `git diff`: a refresh loop that spins Git processes for as long as the
+/// window is open.
 /// The comparison itself is unaffected, because a diff reads content rather
 /// than trusting the stat cache.
 fn read_options(command: CommandSpec) -> CommandSpec {
@@ -9801,11 +9802,11 @@ mod tests {
 
     /// `git status` rewrites `.git/index` whenever it finds the stat cache
     /// stale, and `git diff` against the working tree rewrites it whatever the
-    /// optional-lock setting says. A watcher sees either write as a change and
-    /// asks for another state read, which runs both commands again: an idle
-    /// window spinning Git processes by the hundred. Both suppressions
-    /// therefore belong on every read — and on no mutation, which is entitled
-    /// to the index lock and to the refresh.
+    /// optional-lock setting says. The card's freshness poll sees either write
+    /// as a change and asks for another state read, which runs both commands
+    /// again: an idle window spinning Git processes by the hundred. Both
+    /// suppressions therefore belong on every read — and on no mutation, which
+    /// is entitled to the index lock and to the refresh.
     #[test]
     fn every_read_declines_the_index_lock_and_the_index_refresh() {
         let service = fake_service(Vec::new());
