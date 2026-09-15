@@ -6018,8 +6018,18 @@ fn removed_context_view<'a>(
                 .height(visible.bottom_space)
                 .into(),
         );
-        // Either thumb floats over these rows, so each axis reserves its own
-        // rail and the corner where the two meet stays clear of any row.
+        // Both thumbs float over this content, so each axis reserves its own
+        // rail and the corner where they meet stays clear.
+        //
+        // Iced anchors a thumb to the viewport, not to the content, so the
+        // reservation only guarantees clearance once an axis is scrolled to its
+        // end. Deleted lines wider than the pane can still pass under the
+        // vertical thumb at an intermediate horizontal offset. Fixing that
+        // needs the viewport width at build time, and the only way to learn it
+        // here is `Responsive`, which does not implement `a11y_nodes` and would
+        // drop both this region's announcement and the removed source with it.
+        // The reservation is what keeps the common case - deletions narrower
+        // than the pane - correct.
         widget::scrollable(
             widget::column::with_children(lines)
                 .padding(crate::design::with_both_rails(iced::Padding::ZERO)),

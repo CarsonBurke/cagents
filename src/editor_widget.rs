@@ -1310,19 +1310,29 @@ where
                     state.focus = Some(Focus::now());
                     shell.capture_event();
                 }
-                Update::Scroll { lines, horizontal } => {
+                Update::Scroll {
+                    lines,
+                    horizontal,
+                    redirected,
+                } => {
                     let bounds = self.content.0.borrow().editor.bounds();
 
                     if bounds.height >= i32::MAX as f32 {
                         return;
                     }
 
-                    if self.pan_horizontally(layout.bounds(), horizontal) {
+                    let panned = self.pan_horizontally(layout.bounds(), horizontal);
+                    if panned {
                         shell.request_redraw();
                         shell.capture_event();
                     }
-
-                    let lines = lines + state.partial_scroll;
+                    // A redirect the horizontal axis could not absorb - a
+                    // wrapped buffer, or a document whose longest line already
+                    // fits - still has to scroll, or holding Shift would
+                    // appear to freeze the wheel. Only a pan that actually
+                    // moved consumes the vertical delta.
+                    let lines =
+                        if redirected && panned { 0.0 } else { lines } + state.partial_scroll;
                     state.partial_scroll = lines.fract();
 
                     shell.publish(on_edit(Action::Scroll {
@@ -1795,6 +1805,15 @@ enum Update<Message> {
         lines: f32,
         /// Horizontal movement, in logical pixels.
         horizontal: f32,
+        /// Whether `horizontal` was produced by redirecting the wheel's
+        /// vertical delta rather than by a real horizontal one.
+        ///
+        /// The handler needs this because only it knows the geometry: a
+        /// redirected gesture that the horizontal axis cannot absorb - a
+        /// wrapped buffer, or a file whose longest line already fits the
+        /// viewport - has to fall back to scrolling vertically, or holding
+        /// Shift would appear to freeze the wheel.
+        redirected: bool,
     },
     InputMethod(Ime),
     Binding(Binding<Message>),
@@ -1864,28 +1883,41 @@ impl<Message> Update<Message> {
                     // horizontal axis, which is the convention every native
                     // scrollable in the shell already follows and the only way
                     // a wheel that reports nothing but `y` can follow a long
-                    // unwrapped line. A real horizontal delta still wins
-                    // outright, because `interaction::wheel_as_horizontal`
-                    // established that picking an axis is the only safe
-                    // projection: summing the two components cancels an
-                    // opposite-sign diagonal exactly, discarding the gesture.
+                    // unwrapped line. Only one axis is ever taken, because
+                    // `interaction::wheel_as_horizontal` established that
+                    // picking an axis is the only safe projection: summing the
+                    // two components cancels an opposite-sign diagonal exactly,
+                    // discarding the gesture. The axis is chosen by magnitude
+                    // rather than by `x == 0`, because a high-resolution
+                    // trackpad reports a small nonzero `x` on a two-finger drag
+                    // that is plainly vertical, and testing for exact zero
+                    // would hand the whole gesture to that jitter.
+                    //
                     // Both axes are negated because a positive wheel delta asks
                     // for the content to move right or down, which moves the
                     // viewport the opposite way.
+                    //
+                    // `lines` stays the plain vertical delta in every case. The
+                    // handler suppresses it only once it has confirmed the
+                    // horizontal axis absorbed the gesture, so a redirect that
+                    // had nowhere to go still scrolls.
                     let shift = state.modifiers.shift();
-                    let pan = |x: f32, y: f32| -if shift && x == 0.0 { y } else { x };
+                    let redirect = move |x: f32, y: f32| shift && y.abs() > x.abs();
+                    let pan = move |x: f32, y: f32| -if redirect(x, y) { y } else { x };
                     Some(match *delta {
                         mouse::ScrollDelta::Lines { x, y } => Update::Scroll {
-                            lines: if shift || y == 0.0 {
+                            lines: if y == 0.0 {
                                 0.0
                             } else {
                                 y.signum() * -(y.abs() * 4.0).max(1.0)
                             },
                             horizontal: pan(x, y) * 60.0,
+                            redirected: redirect(x, y),
                         },
                         mouse::ScrollDelta::Pixels { x, y } => Update::Scroll {
-                            lines: if shift { 0.0 } else { -y / 4.0 },
+                            lines: -y / 4.0,
                             horizontal: pan(x, y),
+                            redirected: redirect(x, y),
                         },
                     })
                 }
@@ -2735,5 +2767,65 @@ mod tests {
             );
             assert_eq!(content.scroll_position().horizontal, 0.0);
         }
+        // The redirect had nowhere to go, so the gesture must still scroll.
+        // Swallowing it would make Shift freeze the wheel on every wrapped
+        // buffer and on every file whose longest line already fits.
+        assert_eq!(
+            published
+                .iter()
+                .filter_map(|action| match action {
+                    Action::Scroll { lines } => Some(*lines),
+                    _ => None,
+                })
+                .sum::<i32>(),
+            30,
+            "Shift+wheel must fall back to vertical scrolling when nothing can pan"
+        );
+    }
+
+    /// A high-resolution trackpad reports a small nonzero `x` on a drag that is
+    /// plainly vertical. Testing the horizontal component for exact zero would
+    /// hand the whole gesture to that jitter, panning by a fraction of a pixel
+    /// while the vertical delta was discarded.
+    #[test]
+    fn a_mostly_vertical_trackpad_drag_still_pans_by_its_dominant_axis() {
+        let renderer = headless_renderer();
+        let content = Content::with_text(&"abcdefghij".repeat(30));
+        let mut widget = wheel_editor(&content, Wrapping::None);
+        let mut tree =
+            widget::Tree::new(&widget as &dyn Widget<Action, cosmic::Theme, cosmic::Renderer>);
+        let bounds = Rectangle::new(Point::ORIGIN, WHEEL_VIEWPORT);
+        let node = widget.layout(
+            &mut tree,
+            &renderer,
+            &layout::Limits::new(Size::ZERO, WHEEL_VIEWPORT),
+        );
+        let mut published = Vec::new();
+        for event in [
+            Event::Keyboard(keyboard::Event::ModifiersChanged(
+                keyboard::Modifiers::SHIFT,
+            )),
+            Event::Mouse(mouse::Event::WheelScrolled {
+                delta: mouse::ScrollDelta::Pixels { x: -0.4, y: -40.0 },
+            }),
+        ] {
+            let mut clipboard = cosmic::iced::advanced::clipboard::Null;
+            let mut shell = Shell::new(&mut published);
+            widget.update(
+                &mut tree,
+                &event,
+                Layout::new(&node),
+                mouse::Cursor::Available(Point::new(100.0, 100.0)),
+                &renderer,
+                &mut clipboard,
+                &mut shell,
+                &bounds,
+            );
+        }
+        assert_eq!(
+            content.scroll_position().horizontal,
+            40.0,
+            "the dominant axis decides the pan, not a nonzero test on x"
+        );
     }
 }

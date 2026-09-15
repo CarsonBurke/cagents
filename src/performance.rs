@@ -11,8 +11,13 @@ pub enum Action {
     CardFocus,
     PaletteOpen,
     PaletteQuery,
-    /// One frame's worth of terminal viewport scrolling, however many wheel
-    /// events, auto-scroll steps or scrollbar samples were folded into it.
+    /// One terminal viewport scroll command, from the request to the frame the
+    /// worker publishes for it.
+    ///
+    /// Committed by the worker-side scroll workload, which is where the
+    /// pipeline this names actually lives: the UI's own wheel handling defers
+    /// and coalesces into `RedrawRequested`, so it is measured by the redraw
+    /// it schedules rather than by an action of its own.
     TerminalScroll,
 }
 

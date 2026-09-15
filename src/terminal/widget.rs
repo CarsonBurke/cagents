@@ -1721,7 +1721,18 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for TerminalWidget<Message
                     WheelEffect::Viewport(delta) => {
                         self.defer_scroll(state, ViewportScroll::Lines(delta), shell);
                     }
+                    // A viewport move folded earlier in this same frame is
+                    // still parked, and these arms write to the child now.
+                    // Applying the owed move first keeps the child's view of
+                    // the gesture in the order the user made it: a flick that
+                    // crosses a mode boundary - Shift released part-way, or an
+                    // application enabling mouse tracking mid-gesture - would
+                    // otherwise deliver its later notches before the scroll
+                    // that preceded them.
                     WheelEffect::Report { button, notches } => {
+                        if let Some(owed) = state.take_owed_scroll() {
+                            self.apply_scroll(owed, shell);
+                        }
                         if let Some(position) = geometry.cursor_position(cursor) {
                             for _ in 0..notches {
                                 self.send_mouse(
@@ -1736,6 +1747,9 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for TerminalWidget<Message
                         }
                     }
                     WheelEffect::Keys { key, notches } => {
+                        if let Some(owed) = state.take_owed_scroll() {
+                            self.apply_scroll(owed, shell);
+                        }
                         for _ in 0..notches {
                             let input = KeyInput {
                                 action: KeyAction::Press,
