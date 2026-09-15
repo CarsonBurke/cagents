@@ -5946,6 +5946,13 @@ fn working_diff_view<'a>(
 
 /// The active change's old text is selectable but has no editor action route.
 /// Deletions form a prefix of each inline change; only visible rows are mounted.
+///
+/// No sentence above the rows says that they are deleted and uneditable. The
+/// red row fill, the old-side-only line numbers and the absence of a caret
+/// already carry that, and a permanent caption competed for height with the
+/// very source it was describing. Assistive technology can see none of those
+/// cues, so the scroll region answers for the whole pane with its own name
+/// and description rather than with a rendered banner.
 fn removed_context_view<'a>(
     card: CardId,
     runtime: &'a RepositoryRuntime,
@@ -5964,18 +5971,8 @@ fn removed_context_view<'a>(
     let rows = model.inline_rows.get(start..end).unwrap_or_default();
     let removed = &rows[..rows.partition_point(|row| row.kind == DiffRowKind::Deletion)];
     let native_split = runtime.editable_working_diff() && runtime.diff_mode == DiffMode::Split;
-    let mut children: Vec<Element<'a, RepositoryAction>> = vec![
-        crate::design::caption(
-            if runtime.editable_working_diff() && !runtime.working_annotations_current() {
-                "Removed content · last computed change · read-only"
-            } else {
-                "Removed content · read-only · select to copy"
-            },
-        )
-        .into(),
-    ];
-    if removed.is_empty() {
-        children.push(crate::design::caption("No removed lines in this change.").into());
+    let body: Element<'a, RepositoryAction> = if removed.is_empty() {
+        crate::design::caption("No removed lines in this change.").into()
     } else {
         let visible = visible_rows(removed.len(), runtime.removed_viewport, DIFF_ROW_HEIGHT);
         let mut lines = Vec::with_capacity(visible.end - visible.start + 2);
@@ -5998,27 +5995,27 @@ fn removed_context_view<'a>(
                 .height(visible.bottom_space)
                 .into(),
         );
-        children.push(
-            widget::scrollable(widget::column::with_children(lines))
-                .id(runtime.removed_scroll_id.clone())
-                .direction(iced::widget::scrollable::Direction::Both {
-                    vertical: crate::design::scrollbar(),
-                    horizontal: crate::design::scrollbar(),
-                })
-                .on_scroll(move |viewport| RepositoryAction::RemovedViewport {
-                    card,
-                    offset: viewport.absolute_offset().y,
-                    height: viewport.bounds().height,
-                })
-                .height(if native_split {
-                    Length::Fill
-                } else {
-                    Length::Fixed(140.0)
-                })
-                .into(),
-        );
-    }
-    widget::container(widget::column::with_children(children).spacing(4))
+        widget::scrollable(widget::column::with_children(lines))
+            .id(runtime.removed_scroll_id.clone())
+            .direction(iced::widget::scrollable::Direction::Both {
+                vertical: crate::design::scrollbar(),
+                horizontal: crate::design::scrollbar(),
+            })
+            .on_scroll(move |viewport| RepositoryAction::RemovedViewport {
+                card,
+                offset: viewport.absolute_offset().y,
+                height: viewport.bounds().height,
+            })
+            .height(if native_split {
+                Length::Fill
+            } else {
+                Length::Fixed(140.0)
+            })
+            .name("Removed lines")
+            .description("Selectable, not editable")
+            .into()
+    };
+    widget::container(body)
         .padding(4)
         .width(Length::Fill)
         .height(if native_split {
@@ -7812,6 +7809,91 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// The removed side used to sit under a permanent caption that both paid
+    /// for its own height and was the only thing telling a screen reader what
+    /// the red rows were. Dropping it has to drop that height with it — a
+    /// column left holding a single child still charges for its spacing — has
+    /// to leave the deleted source readable, and must not open an edit route
+    /// into text that only exists on the old side of the change.
+    #[test]
+    fn the_removed_pane_costs_only_its_rows_and_takes_no_edits() {
+        use iced_accessibility::accesskit::Role;
+
+        let card = CardId::new();
+        let (runtime, _) = native_diff_runtime(card, "gone\nkept\n", "kept\n");
+        let model = runtime.diff_model().expect("the fixture computed a diff");
+        let renderer = headless_renderer();
+        let mut element = removed_context_view(card, &runtime, model);
+        let mut tree = Tree::new(element.as_widget());
+        let node = element.as_widget_mut().layout(
+            &mut tree,
+            &renderer,
+            &layout::Limits::new(iced::Size::ZERO, iced::Size::new(480.0, 600.0)),
+        );
+        assert_eq!(
+            node.size().height,
+            148.0,
+            "the pane is its 140px scroll region plus 4px of padding above and below"
+        );
+
+        let nodes = element.as_widget().a11y_nodes(
+            Layout::new(&node),
+            &tree,
+            iced::mouse::Cursor::Unavailable,
+        );
+        let nodes = nodes
+            .root()
+            .iter()
+            .chain(nodes.children())
+            .map(|node| node.node())
+            .filter(|node| !node.is_hidden())
+            .collect::<Vec<_>>();
+        let region = nodes
+            .iter()
+            .find(|node| node.role() == Role::ScrollView)
+            .expect("the removed side is one scroll region");
+        assert_eq!(region.label(), Some("Removed lines"));
+        assert_eq!(region.description(), Some("Selectable, not editable"));
+        assert!(
+            nodes.iter().any(|node| node.label() == Some("gone")),
+            "deleted source nobody can read is source nobody can select or copy"
+        );
+
+        // Click into the pane and type. An editor mounted over the old side
+        // would take focus from the press and turn the keystroke into an edit.
+        let viewport = iced::Rectangle::new(iced::Point::ORIGIN, node.size());
+        let cursor = iced::mouse::Cursor::Available(iced::Point::new(120.0, 20.0));
+        let mut messages = Vec::new();
+        for event in [
+            iced::Event::Mouse(iced::mouse::Event::ButtonPressed(iced::mouse::Button::Left)),
+            iced::Event::Mouse(iced::mouse::Event::ButtonReleased(iced::mouse::Button::Left)),
+            iced::Event::Keyboard(iced::keyboard::Event::KeyPressed {
+                key: iced::keyboard::Key::Character("x".into()),
+                modified_key: iced::keyboard::Key::Character("x".into()),
+                physical_key: iced::keyboard::key::Physical::Code(iced::keyboard::key::Code::KeyX),
+                location: iced::keyboard::Location::Standard,
+                modifiers: iced::keyboard::Modifiers::empty(),
+                text: Some("x".into()),
+                repeat: false,
+            }),
+        ] {
+            element.as_widget_mut().update(
+                &mut tree,
+                &event,
+                Layout::new(&node),
+                cursor,
+                &renderer,
+                &mut iced::advanced::clipboard::Null,
+                &mut Shell::new(&mut messages),
+                &viewport,
+            );
+        }
+        assert!(
+            messages.is_empty(),
+            "the removed side has no editor action route: {messages:?}"
+        );
     }
 
     #[test]
