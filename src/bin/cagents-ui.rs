@@ -9,8 +9,23 @@ const CONFIRM_DAEMON_STOP: &str = "--confirm-daemon-stop";
 const STARTUP_ERROR: &str = "--startup-error";
 /// argv has a hard size limit and a dialog cannot show a novel either.
 const MAX_REPORTED_ERROR_BYTES: usize = 2048;
+/// The internal `--confirm-daemon-stop` and `--startup-error` modes are
+/// deliberately absent: cagents spawns itself with those, and documenting them
+/// would invite a user to hand-craft a capability payload.
+const USAGE: &str = "\
+Usage: cagents-ui [OPTIONS]
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
+Open the cagents workspace window. Prefer `cagents ui`, which starts the
+daemon first and reuses an already-running window.
+
+Options:
+  --new-window              Open an additional window instead of reusing one
+  --window NAME             Open or focus the window saved under NAME
+  --from-window NAME        Adopt the session state of the window named NAME
+  -h, --help                Show this help
+";
+
+fn main() -> std::process::ExitCode {
     // Diagnostics come before every other statement. The startup sequence
     // below - window lease, session store, activation socket, daemon launch,
     // checkpoint restore - is exactly the region whose failures used to be
@@ -28,7 +43,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .first()
         .is_some_and(|argument| argument == CONFIRM_DAEMON_STOP || argument == STARTUP_ERROR);
     if standalone {
-        return run(&arguments);
+        return report(run(&arguments));
     }
 
     let main_thread = std::thread::current().id();
@@ -56,7 +71,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             ));
         }
     }
-    result
+    report(result)
+}
+
+/// Returning `Result` from `main` renders the error with `Debug`, which quotes
+/// the message and escapes its newlines; usage text came out as one line of
+/// literal `\n`. Every failure here is a message meant for a person to read.
+fn report(result: Result<(), Box<dyn std::error::Error>>) -> std::process::ExitCode {
+    match result {
+        Ok(()) => std::process::ExitCode::SUCCESS,
+        Err(error) => {
+            eprintln!("{PRODUCT}: {error}");
+            std::process::ExitCode::FAILURE
+        }
+    }
 }
 
 /// Makes a startup failure observable. Panics were already durable; an
@@ -132,7 +160,14 @@ fn run(arguments: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             "--new-window" => new_window = true,
             "--window" => slot = Some(arguments.next().ok_or("missing window name")?),
             "--from-window" => source = Some(arguments.next().ok_or("missing source window name")?),
-            _ => return Err(format!("unknown UI argument: {argument}").into()),
+            "--help" | "-h" => {
+                print!("{USAGE}");
+                return Ok(());
+            }
+            // Naming the accepted arguments matters more here than for most
+            // binaries: this one is normally launched by `cagents ui`, so
+            // anyone typing it directly has no usage text to fall back on.
+            _ => return Err(format!("unknown UI argument: {argument}\n\n{USAGE}").into()),
         }
     }
     if new_window && slot.is_some() {
