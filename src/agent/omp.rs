@@ -14,6 +14,7 @@ pub(super) const ADAPTER: ProviderAdapter = ProviderAdapter {
     },
     session_file_id: |stem| Some(stem.rsplit_once('_')?.1),
     session_root,
+    #[cfg(feature = "host")]
     session_directory: "sessions",
     activity_from_title,
     identity_options: &["--resume", "-r"],
@@ -55,6 +56,7 @@ pub(super) const ADAPTER: ProviderAdapter = ProviderAdapter {
     ],
     resume_flag: "--resume",
     resume_precedes_options: false,
+    #[cfg(feature = "host")]
     forwards_to_native_child: false,
     #[cfg(feature = "host")]
     create_chat: crate::chat::protocol::omp::create,
@@ -64,6 +66,7 @@ fn session_root(launch: &LaunchRecipe, home: &Path) -> Option<PathBuf> {
     storage_root(launch, home, "XDG_DATA_HOME")
 }
 
+#[cfg(feature = "host")]
 pub(super) fn state_root(launch: &LaunchRecipe, home: &Path) -> Option<PathBuf> {
     storage_root(launch, home, "XDG_STATE_HOME")
 }
@@ -179,6 +182,8 @@ mod tests {
             ]),
         };
         assert_eq!(session_root(&recipe, home), Some(data.clone()));
+        // Only the host resolves a state root; the UI lane compiles it out.
+        #[cfg(feature = "host")]
         assert_eq!(state_root(&recipe, home), Some(state));
         recipe.arguments = vec!["--profile".into(), "work".into()];
         assert_eq!(

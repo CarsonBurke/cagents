@@ -41,6 +41,7 @@ struct ProviderAdapter {
     recognizes_script: fn(&Path) -> bool,
     session_file_id: fn(&str) -> Option<&str>,
     session_root: fn(&LaunchRecipe, &Path) -> Option<PathBuf>,
+    #[cfg(feature = "host")]
     session_directory: &'static str,
     activity_from_title: fn(&str) -> Option<ActivityState>,
     identity_options: &'static [&'static str],
@@ -49,6 +50,7 @@ struct ProviderAdapter {
     switches: &'static [&'static str],
     resume_flag: &'static str,
     resume_precedes_options: bool,
+    #[cfg(feature = "host")]
     forwards_to_native_child: bool,
     #[cfg(feature = "host")]
     create_chat: fn(
@@ -133,6 +135,7 @@ impl Provider {
         )
     }
 
+    #[cfg(feature = "host")]
     pub(crate) fn forwards_to_native_child(self) -> bool {
         self.adapter().forwards_to_native_child
     }
@@ -204,6 +207,7 @@ impl Provider {
         }
     }
 
+    #[cfg(feature = "host")]
     pub(crate) fn session_directory(self) -> &'static str {
         self.adapter().session_directory
     }

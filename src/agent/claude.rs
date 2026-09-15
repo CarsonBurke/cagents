@@ -22,6 +22,7 @@ pub(super) const ADAPTER: ProviderAdapter = ProviderAdapter {
                 .unwrap_or_else(|| home.join(".claude")),
         )
     },
+    #[cfg(feature = "host")]
     session_directory: "projects",
     // No authoritative lifecycle title grammar: CLI activity uses its agents API.
     activity_from_title: |_| None,
@@ -43,6 +44,7 @@ pub(super) const ADAPTER: ProviderAdapter = ProviderAdapter {
     ],
     resume_flag: "--resume",
     resume_precedes_options: false,
+    #[cfg(feature = "host")]
     forwards_to_native_child: false,
     #[cfg(feature = "host")]
     create_chat: crate::chat::protocol::claude::create,
