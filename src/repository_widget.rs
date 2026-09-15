@@ -353,6 +353,18 @@ pub enum RepositoryAction {
         identity: AsyncIdentity,
         result: Result<FileContent, FileIoError>,
     },
+    /// Turn to a page of the open document, or re-render the current one after
+    /// the reader changes how its colors are adapted.
+    PdfPage {
+        card: CardId,
+        page: usize,
+        tone: crate::editor::PdfTone,
+    },
+    PdfPageRendered {
+        card: CardId,
+        request: u64,
+        result: Result<crate::editor::PdfPage, String>,
+    },
     DiffLoaded {
         identity: AsyncIdentity,
         basis: DiffBasis,
@@ -533,7 +545,9 @@ impl RepositoryAction {
             | Self::CloseFind { card }
             | Self::FindQueryChanged { card, .. }
             | Self::FindNext { card }
-            | Self::FindPrevious { card } => *card,
+            | Self::FindPrevious { card }
+            | Self::PdfPage { card, .. }
+            | Self::PdfPageRendered { card, .. } => *card,
             Self::FilesLoaded { identity, .. }
             | Self::FileListUnchanged { identity }
             | Self::DirectoryListed { identity, .. }
@@ -1160,6 +1174,22 @@ enum DocumentState {
         width: u32,
         height: u32,
     },
+    /// A paged document. `bytes` is kept so turning a page re-renders from the
+    /// document the reader opened rather than from whatever is on disk now.
+    Pdf {
+        bytes: crate::editor::PdfBytes,
+        pages: usize,
+        page: usize,
+        tone: crate::editor::PdfTone,
+        handle: iced::widget::image::Handle,
+        width: u32,
+        height: u32,
+        /// A page turn is rasterized off the UI thread; this is the request
+        /// whose result may still be accepted, so a slow page cannot overwrite
+        /// a later one the reader has already turned to.
+        rendering: Option<u64>,
+        message: Option<String>,
+    },
     ReadOnly {
         path: PathBuf,
         reason: ReadOnlyReason,
@@ -1342,6 +1372,9 @@ pub struct RepositoryRuntime {
     /// document operation.
     generation: u64,
     file_list_generation: u64,
+    /// Counter fencing PDF page renders. A page turn supersedes the render in
+    /// flight, and the reader can turn faster than a page rasterizes.
+    pdf_request: u64,
     file_list_loading: bool,
     /// When the outstanding file-list read started.
     ///
@@ -1507,6 +1540,7 @@ impl RepositoryRuntime {
             external_editors: Vec::new(),
             generation: 0,
             file_list_generation: 0,
+            pdf_request: 0,
             file_list_loading: false,
             file_list_started: None,
             file_list_digest: None,
@@ -3085,6 +3119,8 @@ impl RepositoryRuntime {
             DocumentState::Editable(_) if self.is_dirty() => "Unsaved changes",
             DocumentState::Editable(_) => "Editable",
             DocumentState::Image { .. } => "Image preview",
+            DocumentState::Pdf { rendering, .. } if rendering.is_some() => "Rendering page",
+            DocumentState::Pdf { .. } => "Document preview",
             DocumentState::ReadOnly { .. } => "Read-only",
             DocumentState::Failed { .. } => "Unavailable",
         };
@@ -3506,6 +3542,21 @@ impl RepositoryRuntime {
                         width,
                         height,
                     },
+                    Ok(FileContent::Pdf { bytes, pages, page }) => DocumentState::Pdf {
+                        handle: iced::widget::image::Handle::from_rgba(
+                            page.width,
+                            page.height,
+                            iced::advanced::graphics::core::Bytes::from_owner(page.rgba),
+                        ),
+                        width: page.width,
+                        height: page.height,
+                        page: page.index,
+                        tone: pdf_tone(),
+                        bytes,
+                        pages,
+                        rendering: None,
+                        message: None,
+                    },
                     Ok(FileContent::ReadOnly(reason)) => DocumentState::ReadOnly {
                         path: identity.path,
                         reason,
@@ -3525,6 +3576,77 @@ impl RepositoryRuntime {
                 // either of them.
                 self.push_lsp_open(&identity.worktree);
                 self.restore_visible_scroll()
+            }
+            RepositoryAction::PdfPage { card, page, tone } => {
+                let DocumentState::Pdf {
+                    bytes,
+                    pages,
+                    page: current,
+                    tone: current_tone,
+                    rendering,
+                    message,
+                    ..
+                } = &mut self.document
+                else {
+                    return Task::none();
+                };
+                if page >= *pages {
+                    return Task::none();
+                }
+                if page == *current && tone == *current_tone && rendering.is_none() {
+                    return Task::none();
+                }
+                // The page and tone move now so the controls reflect where the
+                // reader is going, while the image keeps showing the page they
+                // can still read until its replacement arrives.
+                *current = page;
+                *current_tone = tone;
+                *message = None;
+                self.pdf_request = self.pdf_request.wrapping_add(1);
+                let request = self.pdf_request;
+                *rendering = Some(request);
+                pdf_page_task(card, Arc::clone(bytes), page, tone, request)
+            }
+            RepositoryAction::PdfPageRendered {
+                card: _,
+                request,
+                result,
+            } => {
+                let DocumentState::Pdf {
+                    page,
+                    handle,
+                    width,
+                    height,
+                    rendering,
+                    message,
+                    ..
+                } = &mut self.document
+                else {
+                    return Task::none();
+                };
+                // One fence: a page the reader has already turned away from
+                // must not replace the one they are looking at now.
+                if *rendering != Some(request) {
+                    return Task::none();
+                }
+                *rendering = None;
+                match result {
+                    Ok(rendered) => {
+                        *page = rendered.index;
+                        *width = rendered.width;
+                        *height = rendered.height;
+                        *handle = iced::widget::image::Handle::from_rgba(
+                            rendered.width,
+                            rendered.height,
+                            iced::advanced::graphics::core::Bytes::from_owner(rendered.rgba),
+                        );
+                    }
+                    // The previously rendered page stays on screen. Replacing
+                    // it with an error state would take away the page the
+                    // reader could still read.
+                    Err(reason) => *message = Some(reason),
+                }
+                Task::none()
             }
             RepositoryAction::DiffLoaded {
                 identity,
@@ -4495,15 +4617,84 @@ fn files_task(
     })
 }
 
+/// How a PDF page's colors should be adapted for the shell as it is now.
+///
+/// A document is authored on white paper. Reading that on a dark shell at
+/// night is what the inverted tone exists for, so the default follows the
+/// active theme rather than making the reader ask for it every time, and the
+/// page's paper is the theme's own raised surface so a document reads as a
+/// sheet lying on the shell rather than a hole cut out of it.
+fn pdf_tone() -> crate::editor::PdfTone {
+    if cosmic::theme::active().theme_type.is_dark() {
+        pdf_tone_inverted()
+    } else {
+        crate::editor::PdfTone::Original
+    }
+}
+
+/// The inverted tone for the active theme.
+///
+/// Separate because the toolbar's toggle asks for it directly: the reader who
+/// presses it has decided they want the page adapted whatever the shell is.
+fn pdf_tone_inverted() -> crate::editor::PdfTone {
+    let paper = cosmic::theme::active().current_container().component.base;
+    crate::editor::PdfTone::Inverted {
+        paper: [
+            (paper.red * 255.0).round() as u8,
+            (paper.green * 255.0).round() as u8,
+            (paper.blue * 255.0).round() as u8,
+        ],
+    }
+}
+
+/// A hairline around a rendered document page.
+fn page_edge(theme: &cosmic::Theme) -> cosmic::widget::container::Style {
+    let container = theme.current_container();
+    cosmic::widget::container::Style {
+        border: iced::Border {
+            color: container.divider.into(),
+            width: crate::design::BORDER_WIDTH,
+            radius: 0.0.into(),
+        },
+        ..Default::default()
+    }
+}
+
 fn file_task(identity: AsyncIdentity) -> Task<RepositoryAction> {
     let worktree = identity.worktree.clone();
     let path = identity.path.clone();
+    let tone = pdf_tone();
     cosmic::task::future(async move {
-        let result = tokio::task::spawn_blocking(move || load_file(&worktree, &path))
+        let result = tokio::task::spawn_blocking(move || load_file(&worktree, &path, tone))
             .await
             .map_err(|error| FileIoError::Io(format!("file worker failed: {error}")))
             .and_then(|result| result);
         RepositoryAction::FileLoaded { identity, result }
+    })
+}
+
+/// Rasterizes one page off the UI thread.
+///
+/// A page is tens of milliseconds of CPU at reading resolution, and a complex
+/// one is considerably more, so it never runs on the thread that has to draw
+/// the next frame.
+fn pdf_page_task(
+    card: CardId,
+    bytes: crate::editor::PdfBytes,
+    page: usize,
+    tone: crate::editor::PdfTone,
+    request: u64,
+) -> Task<RepositoryAction> {
+    cosmic::task::future(async move {
+        let result =
+            tokio::task::spawn_blocking(move || crate::editor::render_pdf_page(&bytes, page, tone))
+                .await
+                .unwrap_or_else(|error| Err(format!("page worker failed: {error}")));
+        RepositoryAction::PdfPageRendered {
+            card,
+            request,
+            result,
+        }
     })
 }
 
@@ -5542,11 +5733,156 @@ fn editor_surface(card: CardId, runtime: &RepositoryRuntime) -> Element<'_, Repo
             format!("{width} × {height} pixels"),
         )
         .into(),
+        DocumentState::Pdf {
+            bytes: _,
+            pages,
+            page,
+            tone,
+            handle,
+            width,
+            height,
+            rendering,
+            message,
+        } => pdf_document_view(
+            card, *pages, *page, *tone, handle, *width, *height, *rendering, message,
+        ),
     };
     widget::column::with_children([content])
         .width(Length::Fill)
         .height(Length::Fill)
         .into()
+}
+
+/// A paged document: the page, and the controls for moving through it.
+///
+/// The page counter is a label rather than a field because a reader turning
+/// pages wants the next one, not a number entry; `Home` and `End` reach the
+/// ends in one press through the first and last controls.
+#[allow(clippy::too_many_arguments)]
+fn pdf_document_view<'a>(
+    card: CardId,
+    pages: usize,
+    page: usize,
+    tone: crate::editor::PdfTone,
+    handle: &iced::widget::image::Handle,
+    width: u32,
+    height: u32,
+    rendering: Option<u64>,
+    message: &'a Option<String>,
+) -> Element<'a, RepositoryAction> {
+    let inverted = matches!(tone, crate::editor::PdfTone::Inverted { .. });
+    let turn = |to: usize, glyph: &'static str, label: &'static str, enabled: bool| {
+        icon_control(
+            crate::ui_controls::symbolic_icon(glyph),
+            label,
+            false,
+            enabled,
+            Some(RepositoryAction::PdfPage {
+                card,
+                page: to,
+                tone,
+            }),
+        )
+    };
+    let mut controls: Vec<Element<'a, RepositoryAction>> = vec![
+        turn(0, "go-first-symbolic", "First page", page > 0).into(),
+        turn(
+            page.saturating_sub(1),
+            "go-previous-symbolic",
+            "Previous page",
+            page > 0,
+        )
+        .into(),
+        widget::text::body(format!("{} / {pages}", page + 1)).into(),
+        turn(page + 1, "go-next-symbolic", "Next page", page + 1 < pages).into(),
+        turn(pages - 1, "go-last-symbolic", "Last page", page + 1 < pages).into(),
+        iced::widget::Space::new().width(Length::Fill).into(),
+    ];
+    if let Some(message) = message {
+        controls.push(
+            widget::text::caption(message.as_str())
+                .class(cosmic::theme::Text::Custom(crate::design::muted_text))
+                .into(),
+        );
+    } else if rendering.is_some() {
+        controls.push(
+            widget::text::caption("Rendering…")
+                .class(cosmic::theme::Text::Custom(crate::design::muted_text))
+                .into(),
+        );
+    }
+    controls.push(
+        icon_control(
+            crate::ui_controls::symbolic_icon(if inverted {
+                "display-brightness-symbolic"
+            } else {
+                "weather-clear-night-symbolic"
+            }),
+            if inverted {
+                "Show the document's own colors"
+            } else {
+                "Adapt the document to a dark surface"
+            },
+            inverted,
+            true,
+            Some(RepositoryAction::PdfPage {
+                card,
+                page,
+                tone: if inverted {
+                    crate::editor::PdfTone::Original
+                } else {
+                    // Deliberately re-read rather than remembered: the reader
+                    // may have changed their theme since the page was opened.
+                    pdf_tone_inverted()
+                },
+            }),
+        )
+        .into(),
+    );
+    widget::column::with_children(vec![
+        widget::container(
+            widget::row::with_children(controls)
+                .spacing(crate::design::GRID_UNIT)
+                .align_y(Alignment::Center)
+                .width(Length::Fill),
+        )
+        .padding([0.0, crate::design::GRID_UNIT * 3.0])
+        .height(crate::design::DENSE_ROW_HEIGHT)
+        .width(Length::Fill)
+        .into(),
+        crate::interaction::tooltip(
+            widget::container(
+                widget::scrollable(
+                    // The page fills the pane's width and scrolls, rather than
+                    // being shrunk to fit its height: a document is read a
+                    // column at a time, and a whole page scaled into a wide
+                    // pane is too small to read.
+                    widget::container(
+                        iced::widget::image(handle.clone())
+                            .content_fit(iced::ContentFit::Contain)
+                            .width(Length::Fill),
+                    )
+                    // A hairline around the sheet, because a recolored page
+                    // is close in tone to the surface behind it and a reader
+                    // needs to see where the paper ends.
+                    .class(cosmic::theme::Container::Custom(Box::new(page_edge))),
+                )
+                .direction(iced::widget::scrollable::Direction::Vertical(
+                    crate::design::scrollbar(),
+                ))
+                .width(Length::Fill)
+                .height(Length::Fill),
+            )
+            .padding(crate::design::GRID_UNIT * 3.0)
+            .width(Length::Fill)
+            .height(Length::Fill),
+            format!("Page {} of {pages}, {width} × {height} pixels", page + 1),
+        )
+        .into(),
+    ])
+    .width(Length::Fill)
+    .height(Length::Fill)
+    .into()
 }
 
 fn editable_document_view<'a>(
@@ -6763,7 +7099,9 @@ fn read_only_state(path: &Path, reason: &ReadOnlyReason) -> Element<'static, Rep
         ),
         ReadOnlyReason::Binary => format!("{} contains binary data.", path.display()),
         ReadOnlyReason::InvalidUtf8 => format!("{} is not valid UTF-8.", path.display()),
-        ReadOnlyReason::Image(message) => format!("{}: {message}", path.display()),
+        ReadOnlyReason::Image(message) | ReadOnlyReason::Document(message) => {
+            format!("{}: {message}", path.display())
+        }
         ReadOnlyReason::Oversize { bytes, limit } => format!(
             "{} is {bytes} bytes; editable files are limited to {limit} bytes.",
             path.display()
@@ -6771,10 +7109,10 @@ fn read_only_state(path: &Path, reason: &ReadOnlyReason) -> Element<'static, Rep
         ReadOnlyReason::NotRegularFile => format!("{} is not a regular file.", path.display()),
     };
     information_state(
-        if matches!(reason, ReadOnlyReason::Image(_)) {
-            "Image preview unavailable"
-        } else {
-            "Read-only file"
+        match reason {
+            ReadOnlyReason::Image(_) => "Image preview unavailable",
+            ReadOnlyReason::Document(_) => "Document preview unavailable",
+            _ => "Read-only file",
         },
         &detail,
     )

@@ -4353,7 +4353,11 @@ mod tests {
                     path: file.into(),
                     generation: 1,
                 },
-                result: cagents::editor::load_file(root, Path::new(file)),
+                result: cagents::editor::load_file(
+                    root,
+                    Path::new(file),
+                    cagents::editor::PdfTone::Original,
+                ),
             })),
         );
         assert!(
@@ -4732,7 +4736,11 @@ mod tests {
                     path: "a.rs".into(),
                     generation: 1,
                 },
-                result: cagents::editor::load_file(directory.path(), Path::new("a.rs")),
+                result: cagents::editor::load_file(
+                    directory.path(),
+                    Path::new("a.rs"),
+                    cagents::editor::PdfTone::Original,
+                ),
             })),
         );
         assert!(app.tab(id).unwrap().runtime.lsp_document().is_none());
@@ -5048,7 +5056,11 @@ mod tests {
                     path: "a.txt".into(),
                     generation: 1,
                 },
-                result: cagents::editor::load_file(directory.path(), Path::new("a.txt")),
+                result: cagents::editor::load_file(
+                    directory.path(),
+                    Path::new("a.txt"),
+                    cagents::editor::PdfTone::Original,
+                ),
             })),
         );
         drop(
@@ -5307,7 +5319,11 @@ mod tests {
                     path: path.clone(),
                     generation: 1,
                 },
-                result: cagents::editor::load_file(&worktree, &path),
+                result: cagents::editor::load_file(
+                    &worktree,
+                    &path,
+                    cagents::editor::PdfTone::Original,
+                ),
             })),
         );
     }

@@ -2,7 +2,7 @@
 
 use std::{
     fs::{self, File, Permissions},
-    io::{self, Cursor, Read, Write},
+    io::{self, Cursor, Read, Seek, Write},
     path::{Component, Path, PathBuf},
 };
 
@@ -19,12 +19,39 @@ const MAX_IMAGE_PIXELS: u64 = 16 * 1024 * 1024;
 const MAX_IMAGE_DECODE_BYTES: u64 = 128 * 1024 * 1024;
 const MAX_SVG_BYTES: usize = 256 * 1024;
 
+/// A PDF page is rasterized at this many device pixels per PostScript point.
+///
+/// A point is 1/72 inch, so this puts a US Letter page at roughly 1224 by
+/// 1584 pixels: sharp enough to read body text on a high-density display,
+/// and well inside the same pixel budget the image preview already enforces.
+pub const PDF_PAGE_SCALE: f32 = 1.7;
+
+/// The most pages a document may declare before the preview refuses it.
+///
+/// Only one page is rasterized at a time, so the cost here is the page tree
+/// itself. The bound exists because a crafted document can declare an
+/// enormous tree, and the reader gains nothing from a page counter that
+/// cannot be navigated.
+const MAX_PDF_PAGES: usize = 4096;
+
+/// The most bytes a paged document may occupy.
+///
+/// Separate from `MAX_EDITABLE_FILE_BYTES` because that limit is about the
+/// cost of an editable text buffer and its undo history, which a document
+/// never becomes. Real documents are far larger than any text file worth
+/// editing - a scanned or figure-heavy textbook is routinely tens of
+/// megabytes - so holding them to the text limit would reject the ordinary
+/// case. The whole file is kept resident, because that is what turning to a
+/// page the reader has not seen yet needs.
+const MAX_DOCUMENT_BYTES: u64 = 192 * 1024 * 1024;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ReadOnlyReason {
     Symlink { target: PathBuf },
     Binary,
     InvalidUtf8,
     Image(String),
+    Document(String),
     Oversize { bytes: u64, limit: u64 },
     NotRegularFile,
 }
@@ -42,7 +69,30 @@ pub enum FileContent {
         height: u32,
         rgba: std::sync::Arc<[u8]>,
     },
+    /// A paged document, rasterized one page at a time.
+    ///
+    /// Unlike an image, a PDF is not fully decoded at open: a hundred-page
+    /// document at reading resolution is hundreds of megabytes of RGBA, and
+    /// the reader is looking at one page. The source bytes are carried
+    /// alongside the page that was rendered so the pages they turn to later
+    /// can be rasterized from the same document without reading the file
+    /// again, which also means a page cannot be served from a file that has
+    /// since changed underneath it.
+    Pdf {
+        bytes: PdfBytes,
+        pages: usize,
+        page: PdfPage,
+    },
     ReadOnly(ReadOnlyReason),
+}
+
+/// One rasterized PDF page.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PdfPage {
+    pub index: usize,
+    pub width: u32,
+    pub height: u32,
+    pub rgba: std::sync::Arc<[u8]>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
@@ -91,7 +141,37 @@ pub fn validate_repo_path(path: &Path) -> Result<(), FileIoError> {
     Ok(())
 }
 
-pub fn load_file(worktree: &Path, relative_path: &Path) -> Result<FileContent, FileIoError> {
+/// Whether the open file begins with a PDF header, leaving it rewound.
+///
+/// The header is read through a reference and the descriptor seeked back to
+/// the start, so the caller still reads the whole file from byte zero. A short
+/// file simply does not match.
+fn starts_with_pdf_header(file: &File) -> io::Result<bool> {
+    const HEADER: &[u8] = b"%PDF-";
+    let mut probe = [0u8; HEADER.len()];
+    let mut read = 0;
+    while read < probe.len() {
+        match (&*file).read(&mut probe[read..]) {
+            Ok(0) => break,
+            Ok(count) => read += count,
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error),
+        }
+    }
+    (&*file).seek(io::SeekFrom::Start(0))?;
+    Ok(&probe[..read] == HEADER)
+}
+
+/// Loads one file, already classified and decoded for the view.
+///
+/// `tone` only reaches the PDF path. A page is rasterized here rather than in
+/// the view, so the caller has to say which surface it is destined for; the
+/// alternative is rendering every page twice whenever the shell is dark.
+pub fn load_file(
+    worktree: &Path,
+    relative_path: &Path,
+    tone: PdfTone,
+) -> Result<FileContent, FileIoError> {
     validate_repo_path(relative_path)?;
     let root = worktree_root(worktree)?;
     // A symlink is the one classification that has to be made from the name
@@ -116,24 +196,39 @@ pub fn load_file(worktree: &Path, relative_path: &Path) -> Result<FileContent, F
     if !metadata.is_file() {
         return Ok(FileContent::ReadOnly(ReadOnlyReason::NotRegularFile));
     }
-    if metadata.len() > MAX_EDITABLE_FILE_BYTES {
+    // What the file is decides how large it is allowed to be, so the header is
+    // read from the open descriptor before any byte limit applies. A document
+    // held to the editable-text limit would reject the ordinary case, and
+    // raising that limit for everything would let an 8 megabyte text file
+    // become a 192 megabyte one.
+    let document = starts_with_pdf_header(&file).map_err(io_error)?;
+    let limit = if document {
+        MAX_DOCUMENT_BYTES
+    } else {
+        MAX_EDITABLE_FILE_BYTES
+    };
+    if metadata.len() > limit {
         return Ok(FileContent::ReadOnly(ReadOnlyReason::Oversize {
             bytes: metadata.len(),
-            limit: MAX_EDITABLE_FILE_BYTES,
+            limit,
         }));
     }
 
     // A file can grow after metadata was read. Bound the read itself, not only
     // its result, so a concurrently growing file cannot exhaust memory.
     let mut bytes = Vec::with_capacity(metadata.len() as usize);
-    file.take(MAX_EDITABLE_FILE_BYTES + 1)
+    file.take(limit + 1)
         .read_to_end(&mut bytes)
         .map_err(io_error)?;
-    if bytes.len() as u64 > MAX_EDITABLE_FILE_BYTES {
+    if bytes.len() as u64 > limit {
         return Ok(FileContent::ReadOnly(ReadOnlyReason::Oversize {
             bytes: bytes.len() as u64,
-            limit: MAX_EDITABLE_FILE_BYTES,
+            limit,
         }));
+    }
+    if document {
+        return Ok(decode_pdf(bytes, tone)
+            .unwrap_or_else(|reason| FileContent::ReadOnly(ReadOnlyReason::Document(reason))));
     }
     if relative_path
         .extension()
@@ -280,6 +375,135 @@ fn decode_svg(bytes: &[u8]) -> Result<FileContent, String> {
         width: size.width(),
         height: size.height(),
         rgba: pixmap.take().into(),
+    })
+}
+
+/// How a PDF page's colors are adapted to the surface it is read on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PdfTone {
+    /// The page exactly as the document specifies it.
+    Original,
+    /// The page adapted for reading on a dark surface, with `paper` as the
+    /// color the document's own white becomes.
+    ///
+    /// The color is carried rather than assumed because it is the shell's,
+    /// not the viewer's: a page recolored to absolute black is not the same
+    /// shade as anything else on screen, and a reader who changed their theme
+    /// changed this too.
+    Inverted { paper: [u8; 3] },
+}
+
+/// Adapts a page to a dark surface, leaving its hue and saturation alone.
+///
+/// Negating the channels instead would turn a dark red heading cyan and a
+/// blue diagram orange, which is why a plain inversion looks wrong on a
+/// document rather than merely dark. Shifting every channel by the same
+/// amount, chosen so the pixel's lightness maps to its complement, inverts
+/// the greys a page is mostly made of and leaves a fully saturated
+/// mid-lightness color where it was.
+///
+/// The inverted value is then held above `paper`, so the document's white
+/// lands on the shell's own surface color instead of absolute black, and its
+/// black still reaches white. That is four adds, a multiply and a shift per
+/// channel, which matters because it runs over every pixel of every page the
+/// reader turns to.
+fn invert_lightness(rgba: &mut [u8], paper: [u8; 3]) {
+    for pixel in rgba.chunks_exact_mut(4) {
+        let high = pixel[0].max(pixel[1]).max(pixel[2]) as i32;
+        let low = pixel[0].min(pixel[1]).min(pixel[2]) as i32;
+        // `255 - (high + low)` is `255 * (1 - 2L)` for lightness `L`, which is
+        // the shift that sends `L` to `1 - L`.
+        let shift = 255 - (high + low);
+        for (channel, floor) in pixel[..3].iter_mut().zip(paper) {
+            let inverted = (*channel as i32 + shift).clamp(0, 255) as u32;
+            let floor = floor as u32;
+            *channel = (floor + inverted * (255 - floor) / 255) as u8;
+        }
+    }
+}
+
+/// The document bytes, shared by every page rendered from them.
+///
+/// `Arc<Vec<u8>>` rather than `Arc<[u8]>` because that is what hayro's
+/// `PdfData` accepts without copying, and a multi-megabyte document should
+/// not be copied once per page turn.
+pub type PdfBytes = std::sync::Arc<Vec<u8>>;
+
+/// Rasterizes one page of an already-loaded PDF.
+///
+/// Separate from `load_file` because turning a page must not re-read the
+/// file: the bytes the reader opened are the bytes every page comes from,
+/// even if the document changes on disk while they are reading it.
+pub fn render_pdf_page(bytes: &PdfBytes, index: usize, tone: PdfTone) -> Result<PdfPage, String> {
+    let pdf = hayro::hayro_interpret::hayro_syntax::Pdf::new(std::sync::Arc::clone(bytes))
+        .map_err(|error| format!("This PDF could not be read: {error:?}."))?;
+    let pages = pdf.pages();
+    let page = pages
+        .get(index)
+        .ok_or_else(|| format!("This PDF has no page {}.", index + 1))?;
+    // The estimate is only a gate: it refuses an absurd page before anything
+    // is allocated for it. What the buffer actually measures is asked of the
+    // pixmap afterwards, because a declared size that disagrees with the
+    // buffer by even one column makes the upload silently draw nothing.
+    let (points_wide, points_high) = page.render_dimensions();
+    check_image_dimensions(
+        (points_wide * PDF_PAGE_SCALE).max(1.0) as u32,
+        (points_high * PDF_PAGE_SCALE).max(1.0) as u32,
+    )
+    .map_err(|_| format!("Page {} exceeds the preview size limit.", index + 1))?;
+    let pixmap = hayro::render(
+        page,
+        &hayro::RenderCache::new(),
+        &hayro::hayro_interpret::InterpreterSettings::default(),
+        &hayro::RenderSettings {
+            x_scale: PDF_PAGE_SCALE,
+            y_scale: PDF_PAGE_SCALE,
+            width: None,
+            height: None,
+            // A page describes ink on paper and says nothing about what is
+            // behind it, so the paper has to be supplied. White is what the
+            // document was authored against; `PdfTone::Inverted` then turns
+            // the rendered page over, paper included.
+            bg_color: hayro::vello_cpu::color::palette::css::WHITE,
+        },
+    );
+    // The background is opaque, so every pixel's alpha is 255 and the
+    // premultiplied buffer is already straight alpha. That is why this is one
+    // copy rather than the per-pixel unpremultiply `take_unpremultiplied`
+    // would do.
+    let mut rgba = pixmap.data_as_u8_slice().to_vec();
+    let width = u32::from(pixmap.width());
+    let height = u32::from(pixmap.height());
+    if let PdfTone::Inverted { paper } = tone {
+        invert_lightness(&mut rgba, paper);
+    }
+    Ok(PdfPage {
+        index,
+        width,
+        height,
+        rgba: rgba.into(),
+    })
+}
+
+fn decode_pdf(bytes: Vec<u8>, tone: PdfTone) -> Result<FileContent, String> {
+    let bytes: PdfBytes = std::sync::Arc::new(bytes);
+    let pages = {
+        let pdf = hayro::hayro_interpret::hayro_syntax::Pdf::new(std::sync::Arc::clone(&bytes))
+            .map_err(|error| format!("This PDF could not be read: {error:?}."))?;
+        pdf.pages().len()
+    };
+    if pages == 0 {
+        return Err("This PDF declares no pages.".into());
+    }
+    if pages > MAX_PDF_PAGES {
+        return Err(format!(
+            "This PDF declares {pages} pages, past the {MAX_PDF_PAGES} page preview limit."
+        ));
+    }
+    Ok(FileContent::Pdf {
+        page: render_pdf_page(&bytes, 0, tone)?,
+        bytes,
+        pages,
     })
 }
 
@@ -681,7 +905,7 @@ mod tests {
             width,
             height,
             rgba,
-        } = load_file(root.path(), Path::new("opaque.dat")).unwrap()
+        } = load_file(root.path(), Path::new("opaque.dat"), PdfTone::Original).unwrap()
         else {
             panic!("image magic must win over the filename extension");
         };
@@ -698,18 +922,18 @@ mod tests {
             .save_with_format(&path, image::ImageFormat::Png)
             .unwrap();
         assert!(matches!(
-            load_file(root.path(), Path::new("wide.png")).unwrap(),
+            load_file(root.path(), Path::new("wide.png"), PdfTone::Original).unwrap(),
             FileContent::ReadOnly(ReadOnlyReason::Image(_))
         ));
         let file = File::create(root.path().join("huge.png")).unwrap();
         file.set_len(MAX_EDITABLE_FILE_BYTES + 1).unwrap();
         assert!(matches!(
-            load_file(root.path(), Path::new("huge.png")).unwrap(),
+            load_file(root.path(), Path::new("huge.png"), PdfTone::Original).unwrap(),
             FileContent::ReadOnly(ReadOnlyReason::Oversize { .. })
         ));
         fs::write(root.path().join("broken.png"), b"not a valid image").unwrap();
         assert!(matches!(
-            load_file(root.path(), Path::new("broken.png")).unwrap(),
+            load_file(root.path(), Path::new("broken.png"), PdfTone::Original).unwrap(),
             FileContent::ReadOnly(ReadOnlyReason::Image(_))
         ));
     }
@@ -731,6 +955,172 @@ mod tests {
         };
         assert_eq!((width, height), (2, 2));
         assert_eq!(&rgba[..4], &[255, 0, 0, 128]);
+    }
+
+    /// A minimal one-page PDF whose page is a black rectangle on white paper.
+    fn one_page_pdf() -> Vec<u8> {
+        let objects: [&str; 5] = [
+            "<< /Type /Catalog /Pages 2 0 R >>",
+            "<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+            // 21 by 11 points deliberately: at the render scale both axes land
+            // between whole pixels, which is the case where a declared size
+            // computed independently of the renderer's own rounding would
+            // disagree with the buffer and silently draw nothing.
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 21 11] /Contents 4 0 R >>",
+            // The filled rectangle spans the page's full height and its left
+            // half, so every row of the raster is ink on the left and paper on
+            // the right whatever the rounding does.
+            "<< /Length 43 >>\nstream\n0 0 0 rg 0 0 10 11 re f\n1 1 1 rg\nendstream",
+            "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
+        ];
+        let mut pdf = String::from("%PDF-1.7\n");
+        let mut offsets = Vec::new();
+        for (index, body) in objects.iter().enumerate() {
+            offsets.push(pdf.len());
+            pdf.push_str(&format!("{} 0 obj\n{body}\nendobj\n", index + 1));
+        }
+        let start = pdf.len();
+        pdf.push_str(&format!(
+            "xref\n0 {}\n0000000000 65535 f \n",
+            objects.len() + 1
+        ));
+        for offset in &offsets {
+            pdf.push_str(&format!("{offset:010} 00000 n \n"));
+        }
+        pdf.push_str(&format!(
+            "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{start}\n%%EOF\n",
+            objects.len() + 1
+        ));
+        pdf.into_bytes()
+    }
+
+    #[test]
+    fn a_pdf_is_recognized_by_its_header_and_opens_on_its_first_page() {
+        let root = tempdir().unwrap();
+        // Deliberately not named `.pdf`: the header decides.
+        fs::write(root.path().join("report"), one_page_pdf()).unwrap();
+        let FileContent::Pdf { pages, page, .. } =
+            load_file(root.path(), Path::new("report"), PdfTone::Original).unwrap()
+        else {
+            panic!("a PDF header must open as a document, whatever the file is called");
+        };
+        assert_eq!(pages, 1);
+        assert_eq!(page.index, 0);
+        assert_eq!(page.rgba.len(), (page.width * page.height * 4) as usize);
+        // The left half of the page is the filled black rectangle and the
+        // right half is bare paper, so an untouched render is dark on white.
+        assert_eq!(&page.rgba[..4], &[0, 0, 0, 255]);
+        assert_eq!(
+            &page.rgba[(page.width as usize - 1) * 4..][..4],
+            &[255, 255, 255, 255]
+        );
+    }
+
+    #[test]
+    fn an_inverted_page_flips_paper_and_ink_but_a_text_file_named_pdf_stays_editable() {
+        let root = tempdir().unwrap();
+        fs::write(root.path().join("report.pdf"), one_page_pdf()).unwrap();
+        let FileContent::Pdf { page, .. } = load_file(
+            root.path(),
+            Path::new("report.pdf"),
+            PdfTone::Inverted { paper: [0, 0, 0] },
+        )
+        .unwrap() else {
+            panic!("a PDF should open as a document");
+        };
+        assert_eq!(&page.rgba[..4], &[255, 255, 255, 255]);
+        assert_eq!(
+            &page.rgba[(page.width as usize - 1) * 4..][..4],
+            &[0, 0, 0, 255]
+        );
+        fs::write(root.path().join("notes.pdf"), "not a document at all\n").unwrap();
+        assert!(matches!(
+            load_file(root.path(), Path::new("notes.pdf"), PdfTone::Original).unwrap(),
+            FileContent::Editable { .. }
+        ));
+        fs::write(root.path().join("truncated.pdf"), b"%PDF-1.7\nnonsense").unwrap();
+        assert!(matches!(
+            load_file(root.path(), Path::new("truncated.pdf"), PdfTone::Original).unwrap(),
+            FileContent::ReadOnly(ReadOnlyReason::Document(_))
+        ));
+    }
+
+    #[test]
+    fn inverting_tone_turns_lightness_over_without_moving_hue() {
+        let pixels = || {
+            vec![
+                255, 255, 255, 255, // paper
+                0, 0, 0, 255, // ink
+                230, 230, 230, 255, // a faint rule
+                200, 40, 40, 255, // a saturated mid-lightness red
+            ]
+        };
+        let mut absolute = pixels();
+        invert_lightness(&mut absolute, [0, 0, 0]);
+        assert_eq!(&absolute[..4], &[0, 0, 0, 255]);
+        assert_eq!(&absolute[4..8], &[255, 255, 255, 255]);
+        assert_eq!(&absolute[8..12], &[25, 25, 25, 255]);
+        // Red stays red: its channel order is unchanged and its lightness,
+        // already near the middle, barely moves. Negating the channels
+        // instead would have turned it cyan.
+        assert_eq!(&absolute[12..16], &[215, 55, 55, 255]);
+
+        // The shell's own surface color is where the document's white lands,
+        // so a page reads as a sheet on the shell and not a black hole in it.
+        // The ink still reaches white, because that is the contrast the
+        // reader is there for.
+        let paper = [40, 42, 48];
+        let mut themed = pixels();
+        invert_lightness(&mut themed, paper);
+        assert_eq!(&themed[..3], &paper);
+        assert_eq!(&themed[4..8], &[255, 255, 255, 255]);
+        assert!(
+            themed[8..11]
+                .iter()
+                .zip(paper)
+                .all(|(value, floor)| *value > floor && *value < floor + 40),
+            "a faint rule stays just off the paper it is printed on"
+        );
+    }
+
+    /// A real document is far larger than any text file worth editing, so the
+    /// editable-text limit must not be what decides whether it opens.
+    #[test]
+    fn a_document_larger_than_the_editable_limit_still_opens() {
+        let root = tempdir().unwrap();
+        let mut pdf = one_page_pdf();
+        // Comments are ignored by a PDF parser, so this pads the file past the
+        // editable-text limit without changing what it renders.
+        let padding = MAX_EDITABLE_FILE_BYTES as usize + 1;
+        let mut padded = Vec::with_capacity(pdf.len() + padding + 2);
+        padded.extend_from_slice(&pdf.split_off(9));
+        pdf.push(b'%');
+        pdf.extend(std::iter::repeat_n(b'p', padding));
+        pdf.push(b'\n');
+        pdf.extend_from_slice(&padded);
+        assert!(pdf.len() as u64 > MAX_EDITABLE_FILE_BYTES);
+        fs::write(root.path().join("big.pdf"), &pdf).unwrap();
+        assert!(
+            matches!(
+                load_file(root.path(), Path::new("big.pdf"), PdfTone::Original).unwrap(),
+                FileContent::Pdf { .. }
+            ),
+            "a document must be held to the document limit, not the text limit"
+        );
+        // A text file that size is still refused, because the larger bound
+        // belongs to documents alone.
+        fs::write(
+            root.path().join("big.txt"),
+            "x".repeat(MAX_EDITABLE_FILE_BYTES as usize + 1),
+        )
+        .unwrap();
+        assert!(matches!(
+            load_file(root.path(), Path::new("big.txt"), PdfTone::Original).unwrap(),
+            FileContent::ReadOnly(ReadOnlyReason::Oversize {
+                limit: MAX_EDITABLE_FILE_BYTES,
+                ..
+            })
+        ));
     }
 
     #[test]
@@ -757,15 +1147,15 @@ mod tests {
         symlink("binary.bin", root.path().join("link.txt")).unwrap();
 
         assert_eq!(
-            load_file(root.path(), Path::new("binary.bin")).unwrap(),
+            load_file(root.path(), Path::new("binary.bin"), PdfTone::Original).unwrap(),
             FileContent::ReadOnly(ReadOnlyReason::Binary)
         );
         assert_eq!(
-            load_file(root.path(), Path::new("invalid.txt")).unwrap(),
+            load_file(root.path(), Path::new("invalid.txt"), PdfTone::Original).unwrap(),
             FileContent::ReadOnly(ReadOnlyReason::InvalidUtf8)
         );
         assert_eq!(
-            load_file(root.path(), Path::new("link.txt")).unwrap(),
+            load_file(root.path(), Path::new("link.txt"), PdfTone::Original).unwrap(),
             FileContent::ReadOnly(ReadOnlyReason::Symlink {
                 target: PathBuf::from("binary.bin")
             })
@@ -1183,7 +1573,7 @@ mod tests {
     fn rejects_traversal() {
         let root = tempdir().unwrap();
         assert_eq!(
-            load_file(root.path(), Path::new("../outside")),
+            load_file(root.path(), Path::new("../outside"), PdfTone::Original),
             Err(FileIoError::InvalidRepositoryPath)
         );
     }
