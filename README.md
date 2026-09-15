@@ -344,13 +344,15 @@ cagents ui
   terminals launch a separate process and native chats start a separate
   conversation; browser and repository panes open at the same location.
   Cloning does not share the original running process or conversation.
-  **New thread** (`Alt+G` or the project header's thread-plus button)
+  **New channel** (`Alt+G` or the project header's channel-plus button)
   starts an independent native conversation in the project's main worktree.
-  Threads have their own sidebar rows and panes, separate from worktree panes;
-  select a thread again to return to the same conversation.
+  Channels have their own sidebar rows and panes, separate from worktree panes;
+  select a channel again to return to it. A channel is a container: it holds
+  the chats opened while it was selected, and its row shows how many when there
+  is more than one.
   In cagents, editor tabs use the ceditor mark; recognized agent terminals and
   native chats use their OMP, Claude, or Codex provider mark.
-  Each tab strip contains only its selected worktree or thread. The **New tab**
+  Each tab strip contains only its selected worktree or channel. The **New tab**
   menu offers a terminal, native chat, OMP, Claude Code, Codex, or browser tab,
   with provider icons and keyboard navigation; there is no Workspaces dropdown.
   Drag a project header to reorder projects; the order survives restarts.
@@ -756,7 +758,7 @@ editor_wrap_lines = false
 
 [keyboard_shortcuts]
 new_terminal = ["Ctrl+T"]
-new_thread = ["Alt+G"]
+new_channel = ["Alt+G"]
 clone_pane = ["Alt+E"]
 close_focused_column = ["Ctrl+W"]
 search_projects = ["Ctrl+F"]
@@ -788,7 +790,7 @@ cycle_pane_width = ["Alt+R"]
 | `managed_worktree_directory` | string | `"worktrees/"` | nonempty path without control characters; absolute or relative to the repository root |
 | `editor_auto_save` | boolean | `true` | `true` or `false`; automatically save edited files after a pause, stopping on conflicts or save errors |
 | `editor_wrap_lines` | boolean | `false` | wrap long native-editor lines instead of keeping a horizontally navigable line |
-| `keyboard_shortcuts.*` | array of strings | shown above | one or more chords, each containing Ctrl, Alt, or Super and one A-Z, 0-9, Left, or Right key; Shift is optional. Every chord in the table must be distinct, and a bound chord is reserved rather than forwarded to the process inside a card. `cycle_pane_width`, `new_thread`, and `clone_pane` may be empty to leave them unbound |
+| `keyboard_shortcuts.*` | array of strings | shown above | one or more chords, each containing Ctrl, Alt, or Super and one A-Z, 0-9, Left, or Right key; Shift is optional. Every chord in the table must be distinct, and a bound chord is reserved rather than forwarded to the process inside a card. `cycle_pane_width`, `new_channel`, and `clone_pane` may be empty to leave them unbound |
 
 Version 1 and 2 TOML files are upgraded while loading. Sidebar widths accepted
 by version 1 are clamped to the current visible range; other values are
@@ -796,10 +798,12 @@ preserved. Version 2 files receive the default inspector width.
 Older shortcut tables receive `cycle_pane_width = ["Alt+R"]` unless another
 action already owns Alt+R. In that case the existing binding is preserved and
 pane-width cycling remains unbound (`[]`) until you assign it a free chord.
-Likewise, older shortcut tables receive `new_thread = ["Alt+G"]` and
+Likewise, older shortcut tables receive `new_channel = ["Alt+G"]` and
 `clone_pane = ["Alt+E"]` for missing actions unless another action already owns
 the corresponding chord; then only that new action remains unbound until
-configured. Explicit bindings, including an existing `Ctrl+Shift+T` new-thread
+configured. A table that still spells the action `new_thread`, the name it had
+before channels were named, is read under the new key without losing its
+chords. Explicit bindings, including an existing `Ctrl+Shift+T` new-channel
 binding or an empty list, are preserved rather than replaced by the new defaults.
 An explicitly configured conflicting binding is still rejected.
 

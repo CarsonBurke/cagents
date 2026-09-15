@@ -35,7 +35,7 @@ pub enum WorkspaceViewportEvent {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GlobalShortcut {
     NewTerminal,
-    NewThread,
+    NewChannel,
     ClonePane,
     CloseFocusedCard,
     FocusProjectSearch,
@@ -57,8 +57,8 @@ pub const GLOBAL_SHORTCUT_DESCRIPTORS: &[ShortcutDescriptor] = &[
         repeatable: false,
     },
     ShortcutDescriptor {
-        action: GlobalShortcut::NewThread,
-        label: "New thread",
+        action: GlobalShortcut::NewChannel,
+        label: "New channel",
         repeatable: false,
     },
     ShortcutDescriptor {
@@ -104,7 +104,7 @@ pub fn shortcut_descriptor(action: GlobalShortcut) -> &'static ShortcutDescripto
 pub fn shortcut_keys(action: GlobalShortcut, shortcuts: &KeyboardShortcuts) -> &[String] {
     match action {
         GlobalShortcut::NewTerminal => &shortcuts.new_terminal,
-        GlobalShortcut::NewThread => &shortcuts.new_thread,
+        GlobalShortcut::NewChannel => &shortcuts.new_channel,
         GlobalShortcut::ClonePane => &shortcuts.clone_pane,
         GlobalShortcut::CloseFocusedCard => &shortcuts.close_focused_column,
         GlobalShortcut::FocusProjectSearch => &shortcuts.search_projects,
@@ -1701,7 +1701,7 @@ mod tests {
             Some(GlobalShortcut::NewTerminal)
         );
         for (character, code, action) in [
-            ("g", Code::KeyG, GlobalShortcut::NewThread),
+            ("g", Code::KeyG, GlobalShortcut::NewChannel),
             ("e", Code::KeyE, GlobalShortcut::ClonePane),
         ] {
             assert_eq!(
@@ -1846,12 +1846,12 @@ mod tests {
 
         let mut shortcuts = KeyboardShortcuts {
             clone_pane: vec!["Ctrl+Shift+E".into()],
-            new_thread: vec!["Ctrl+Shift+T".into()],
+            new_channel: vec!["Ctrl+Shift+T".into()],
             ..KeyboardShortcuts::default()
         };
         for (character, code, default_character, default_code, action) in [
             ("e", Code::KeyE, "e", Code::KeyE, GlobalShortcut::ClonePane),
-            ("t", Code::KeyT, "g", Code::KeyG, GlobalShortcut::NewThread),
+            ("t", Code::KeyT, "g", Code::KeyG, GlobalShortcut::NewChannel),
         ] {
             let modifiers = keyboard::Modifiers::CTRL | keyboard::Modifiers::SHIFT;
             assert_eq!(
@@ -1877,7 +1877,7 @@ mod tests {
         }
 
         shortcuts.clone_pane.clear();
-        shortcuts.new_thread.clear();
+        shortcuts.new_channel.clear();
         for (character, code) in [("e", Code::KeyE), ("t", Code::KeyT)] {
             assert!(!is_global_shortcut_chord(
                 &keyboard::Key::Character(character.into()),

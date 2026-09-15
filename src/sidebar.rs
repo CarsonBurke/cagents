@@ -27,7 +27,7 @@ use url::Url;
 use crate::{
     design::{self, NavigationLayout, ROW_ICON_SIZE, STATUS_ICON_SIZE},
     github::{PullRequest, PullRequestCheck},
-    model::{CardId, ProjectId, ProjectState, ThreadId, WorktreeId},
+    model::{CardId, ChannelId, ProjectId, ProjectState, WorktreeId},
     repository::{
         BranchComparison, ChangeArea, ChangeKind, ChangedPath, CommitIdentity, CommitSummary,
         ConflictKind, DirtyState, DiscardRequest, HISTORY_PAGE_SIZE, HeadState, Oid, PathSelection,
@@ -306,7 +306,7 @@ pub struct SidebarProject {
     pub name: String,
     pub repository: PathBuf,
     pub worktrees: Vec<SidebarWorktree>,
-    pub threads: Vec<SidebarThread>,
+    pub channels: Vec<SidebarChannel>,
     pub pull_requests: Vec<SidebarPullRequest>,
     pub github_status: String,
     pub github_ready: bool,
@@ -317,38 +317,53 @@ pub struct SidebarProject {
     chrome: ProjectChrome,
 }
 
+/// One project-level channel row.
+///
+/// A channel is a container: `chats` counts the conversations open inside it,
+/// which is what keeps the row distinguishable from a single conversation.
+/// [`ChannelId`] names the container, while each chat inside it is a card with
+/// its own `CardId`, so the two levels cannot be mistaken for one another.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SidebarThread {
-    pub id: ThreadId,
+pub struct SidebarChannel {
+    pub id: ChannelId,
     pub title: String,
     pub selected: bool,
     pub activity: Option<crate::agent::ActivityState>,
     pub unread: bool,
+    pub chats: usize,
     folded_title: Box<str>,
     open_id: Id,
     accessible_name: Box<str>,
+    tooltip: Box<str>,
 }
 
-impl SidebarThread {
+impl SidebarChannel {
     pub fn new(
-        id: ThreadId,
+        id: ChannelId,
         title: String,
         selected: bool,
         activity: Option<crate::agent::ActivityState>,
         unread: bool,
+        chats: usize,
     ) -> Self {
+        let contents = match chats {
+            1 => "1 chat".to_owned(),
+            other => format!("{other} chats"),
+        };
         Self {
             id,
             selected,
             activity,
             unread,
+            chats,
             folded_title: fold(&title),
-            open_id: entity_id("thread.open", id),
+            open_id: entity_id("channel.open", id),
             accessible_name: format!(
-                "Open thread {title}{}",
+                "Open channel {title}, {contents}{}",
                 if unread { ", unread agent update" } else { "" }
             )
             .into_boxed_str(),
+            tooltip: format!("{title} · {contents}").into_boxed_str(),
             title,
         }
     }
@@ -377,7 +392,7 @@ impl SidebarProject {
             name,
             repository,
             worktrees,
-            threads: Vec::new(),
+            channels: Vec::new(),
             pull_requests,
             github_status: "GitHub has not been refreshed.".into(),
             github_ready: false,
@@ -440,13 +455,13 @@ struct ProjectChrome {
     open_id: Id,
     toggle_id: Id,
     new_worktree_id: Id,
-    new_thread_id: Id,
+    new_channel_id: Id,
     open_name: Box<str>,
     compact_open_name: Box<str>,
     collapse_name: Box<str>,
     expand_name: Box<str>,
     new_worktree_name: Box<str>,
-    new_thread_name: Box<str>,
+    new_channel_name: Box<str>,
 }
 
 impl ProjectChrome {
@@ -457,13 +472,13 @@ impl ProjectChrome {
             open_id: entity_id("project.open", id),
             toggle_id: entity_id("project.toggle", id),
             new_worktree_id: entity_id("project.new_worktree", id),
-            new_thread_id: entity_id("project.new_thread", id),
+            new_channel_id: entity_id("project.new_channel", id),
             open_name: format!("Open project {name}").into_boxed_str(),
             compact_open_name: format!("Open {name}").into_boxed_str(),
             collapse_name: format!("Collapse {name} project").into_boxed_str(),
             expand_name: format!("Expand {name} project").into_boxed_str(),
             new_worktree_name: format!("New worktree for {name}").into_boxed_str(),
-            new_thread_name: format!("New thread for {name}").into_boxed_str(),
+            new_channel_name: format!("New channel for {name}").into_boxed_str(),
         }
     }
 }
@@ -2576,8 +2591,8 @@ impl SidebarState {
             | SidebarAction::OpenFileInEditor { .. }
             | SidebarAction::FileCommand { .. }
             | SidebarAction::NewWorktree { .. }
-            | SidebarAction::NewThread { .. }
-            | SidebarAction::OpenThread { .. }
+            | SidebarAction::NewChannel { .. }
+            | SidebarAction::OpenChannel { .. }
             | SidebarAction::ReorderProject { .. }
             | SidebarAction::DragWindow
             | SidebarAction::MaximizeWindow
@@ -2631,11 +2646,11 @@ pub enum SidebarAction {
     ToggleControls,
     ToggleProject(ProjectId),
     OpenRepositoryPicker,
-    NewThread {
+    NewChannel {
         project_id: ProjectId,
     },
-    OpenThread {
-        thread_id: ThreadId,
+    OpenChannel {
+        channel_id: ChannelId,
     },
     OpenRepository {
         project_id: ProjectId,
@@ -3385,7 +3400,7 @@ fn project_view<'a>(
     let entity = project.project;
     let chrome = &entity.chrome;
     let project_id = entity.id;
-    let selection = if entity.threads.iter().any(|thread| thread.selected) {
+    let selection = if entity.channels.iter().any(|channel| channel.selected) {
         None
     } else {
         selection
@@ -3396,7 +3411,7 @@ fn project_view<'a>(
 
     let spacing = cosmic::theme::spacing();
     let worktree_count = project.worktrees.len();
-    let has_children = worktree_count > 0 || !project.threads.is_empty();
+    let has_children = worktree_count > 0 || !project.channels.is_empty();
     let project_identity = button::custom(
         widget::row::with_children(vec![
             widget::container(project_icon(entity, ROW_ICON_SIZE))
@@ -3467,11 +3482,11 @@ fn project_view<'a>(
         ),
         chrome.new_worktree_id.clone(),
     );
-    let add_thread = icon_action(
-        "thread-add-symbolic",
-        &*chrome.new_thread_name,
-        gated(SidebarAction::NewThread { project_id }, modal_open),
-        chrome.new_thread_id.clone(),
+    let add_channel = icon_action(
+        "channel-add-symbolic",
+        &*chrome.new_channel_name,
+        gated(SidebarAction::NewChannel { project_id }, modal_open),
+        chrome.new_channel_id.clone(),
     );
     let identity = widget::row::with_children(vec![
         project_identity,
@@ -3484,7 +3499,7 @@ fn project_view<'a>(
     let header = RowInteraction::actions(
         identity.into(),
         widget::container(
-            widget::row::with_children(vec![disclosure, add_thread, add_worktree])
+            widget::row::with_children(vec![disclosure, add_channel, add_worktree])
                 .align_y(Alignment::Center)
                 .spacing(0)
                 .height(PROJECT_HEADER_HEIGHT),
@@ -3523,9 +3538,9 @@ fn project_view<'a>(
     }
 
     if expanded {
-        for thread in &project.threads {
+        for channel in &project.channels {
             column = column.push(
-                widget::container(thread_view(thread, modal_open, false)).padding([
+                widget::container(channel_view(channel, modal_open, false)).padding([
                     0.0,
                     0.0,
                     0.0,
@@ -3598,7 +3613,7 @@ fn compact_project<'a>(
         project.editors,
     ))
     .center_x(Length::Fill);
-    let selection = if entity.threads.iter().any(|thread| thread.selected) {
+    let selection = if entity.channels.iter().any(|channel| channel.selected) {
         None
     } else {
         selection
@@ -3628,8 +3643,8 @@ fn compact_project<'a>(
         );
         column = column.push(crate::interaction::tooltip(action, &operation.label));
     }
-    for thread in &project.threads {
-        column = column.push(thread_view(thread, modal_open, true));
+    for channel in &project.channels {
+        column = column.push(channel_view(channel, modal_open, true));
     }
     for &worktree in &project.worktrees {
         let selected = selection
@@ -3703,15 +3718,15 @@ fn compact_project<'a>(
         ));
     }
     column = column.push(icon_action(
-        "thread-add-symbolic",
-        &*chrome.new_thread_name,
+        "channel-add-symbolic",
+        &*chrome.new_channel_name,
         gated(
-            SidebarAction::NewThread {
+            SidebarAction::NewChannel {
                 project_id: entity.id,
             },
             modal_open,
         ),
-        chrome.new_thread_id.clone(),
+        chrome.new_channel_id.clone(),
     ));
     column = column.push(icon_action(
         "worktree-add-symbolic",
@@ -3735,19 +3750,19 @@ fn compact_project<'a>(
     .into()
 }
 
-fn thread_view(
-    thread: &SidebarThread,
+fn channel_view(
+    channel: &SidebarChannel,
     modal_open: bool,
     compact: bool,
 ) -> Element<'_, SidebarAction> {
-    let activity = thread.activity;
-    let unread = thread.unread;
+    let activity = channel.activity;
+    let unread = channel.unread;
     let mut content = widget::row::with_capacity(4)
         .align_y(Alignment::Center)
         .spacing(4)
         .push(
             widget::container(
-                widget::icon(crate::ui_controls::symbolic_icon("thread-symbolic"))
+                widget::icon(crate::ui_controls::symbolic_icon("channel-symbolic"))
                     .size(ROW_ICON_SIZE),
             )
             .class(theme::Container::custom(move |theme| {
@@ -3765,31 +3780,35 @@ fn thread_view(
         );
     if !compact {
         content = content.push(
-            design::body(&thread.title)
+            design::body(&channel.title)
                 .wrapping(cosmic::iced::widget::text::Wrapping::None)
                 .ellipsize(cosmic::iced::widget::text::Ellipsize::End(
                     EllipsizeHeightLimit::Lines(1),
                 ))
                 .width(Length::Fill),
         );
-        if thread.activity == Some(crate::agent::ActivityState::Working) {
+        if channel.activity == Some(crate::agent::ActivityState::Working) {
             content = content.push(crate::ui_controls::activity_spinner_tone(
                 f32::from(ROW_ICON_SIZE),
                 design::warning_color,
             ));
-        } else if thread.unread {
+        } else if channel.unread {
             content = content.push(status_icon(
                 "agent-waiting-symbolic",
-                "Thread needs attention",
+                "Channel needs attention",
                 BadgeTone::Danger,
             ));
+        } else if channel.chats > 1 {
+            // A channel holds conversations rather than being one, and the
+            // count is the only thing on the row that says so.
+            content = content.push(design::caption(channel.chats.to_string()));
         }
     }
     let action = button::custom(content)
-        .id(thread.open_id.clone())
-        .name(&*thread.accessible_name)
-        .class(sidebar_button_style(thread.selected))
-        .selected(thread.selected)
+        .id(channel.open_id.clone())
+        .name(&*channel.accessible_name)
+        .class(sidebar_button_style(channel.selected))
+        .selected(channel.selected)
         .padding([0, cosmic::theme::spacing().space_xxxs])
         .height(WORKTREE_ROW_HEIGHT)
         .width(if compact {
@@ -3798,12 +3817,12 @@ fn thread_view(
             Length::Fill
         })
         .on_press_maybe(gated(
-            SidebarAction::OpenThread {
-                thread_id: thread.id,
+            SidebarAction::OpenChannel {
+                channel_id: channel.id,
             },
             modal_open,
         ));
-    crate::interaction::tooltip(action, &thread.title)
+    crate::interaction::tooltip(action, &*channel.tooltip)
 }
 
 fn worktree_accessible_name(
@@ -6194,7 +6213,7 @@ fn check_indicator(status: CheckStatus) -> Element<'static, SidebarAction> {
 struct FilteredProject<'a> {
     project: &'a SidebarProject,
     worktrees: Vec<&'a SidebarWorktree>,
-    threads: Vec<&'a SidebarThread>,
+    channels: Vec<&'a SidebarChannel>,
     editors: &'a [SidebarEditor],
     state: &'a SidebarState,
 }
@@ -6216,14 +6235,14 @@ fn filtered_projects<'a>(
         .iter()
         .filter_map(|project| {
             let project_matches = query.is_empty() || project.matches(&query);
-            let threads = project
-                .threads
+            let channels = project
+                .channels
                 .iter()
-                .filter(|thread| {
-                    (project_matches || thread.folded_title.contains(&query))
+                .filter(|channel| {
+                    (project_matches || channel.folded_title.contains(&query))
                         && match state.filter {
                             SidebarFilter::All => true,
-                            SidebarFilter::Attention => thread.unread,
+                            SidebarFilter::Attention => channel.unread,
                             SidebarFilter::PullRequests => false,
                         }
                 })
@@ -6279,10 +6298,10 @@ fn filtered_projects<'a>(
             });
             let visible = match state.filter {
                 SidebarFilter::All => {
-                    project_matches || !worktrees.is_empty() || !threads.is_empty()
+                    project_matches || !worktrees.is_empty() || !channels.is_empty()
                 }
                 SidebarFilter::Attention | SidebarFilter::PullRequests => {
-                    !worktrees.is_empty() || !threads.is_empty()
+                    !worktrees.is_empty() || !channels.is_empty()
                 }
             };
             visible.then_some(FilteredProject {
@@ -6291,7 +6310,7 @@ fn filtered_projects<'a>(
                     .into_iter()
                     .map(|(_, worktree)| worktree)
                     .collect(),
-                threads,
+                channels,
                 editors: &model.external_editors,
                 state,
             })
@@ -7365,15 +7384,16 @@ mod tests {
     }
 
     #[test]
-    fn thread_attention_keeps_its_project_visible_without_unread_worktrees() {
+    fn channel_attention_keeps_its_project_visible_without_unread_worktrees() {
         let mut entry = project();
-        let thread_id = ThreadId::from_uuid(Uuid::from_u128(20));
-        entry.threads.push(SidebarThread::new(
-            thread_id,
+        let channel_id = ChannelId::from_uuid(Uuid::from_u128(20));
+        entry.channels.push(SidebarChannel::new(
+            channel_id,
             "Investigate login".into(),
             true,
             Some(crate::agent::ActivityState::Waiting),
             true,
+            2,
         ));
         let mut model = SidebarModel::ready(SidebarMode::Expanded, vec![entry]);
         let mut state = SidebarState::default();
@@ -7382,11 +7402,11 @@ mod tests {
         let projects = filtered_projects(&model, &state, false);
         assert_eq!(projects.len(), 1);
         assert!(projects[0].worktrees.is_empty());
-        assert_eq!(projects[0].threads[0].id, thread_id);
-        model.projects[0].threads[0].unread = false;
+        assert_eq!(projects[0].channels[0].id, channel_id);
+        model.projects[0].channels[0].unread = false;
         assert!(filtered_projects(&model, &state, false).is_empty());
         assert_eq!(
-            model.projects[0].threads[0].activity,
+            model.projects[0].channels[0].activity,
             Some(crate::agent::ActivityState::Waiting),
         );
     }

@@ -100,7 +100,7 @@ impl LinkOpenGesture {
 #[serde(default, deny_unknown_fields)]
 pub struct KeyboardShortcuts {
     pub new_terminal: Vec<String>,
-    pub new_thread: Vec<String>,
+    pub new_channel: Vec<String>,
     pub clone_pane: Vec<String>,
     pub close_focused_column: Vec<String>,
     pub search_projects: Vec<String>,
@@ -113,7 +113,7 @@ impl Default for KeyboardShortcuts {
     fn default() -> Self {
         Self {
             new_terminal: vec!["Ctrl+T".to_owned()],
-            new_thread: vec!["Alt+G".to_owned()],
+            new_channel: vec!["Alt+G".to_owned()],
             clone_pane: vec!["Alt+E".to_owned()],
             close_focused_column: vec!["Ctrl+W".to_owned()],
             search_projects: vec!["Ctrl+F".to_owned()],
@@ -132,7 +132,7 @@ impl KeyboardShortcuts {
     fn actions(&self) -> [&Vec<String>; 8] {
         [
             &self.new_terminal,
-            &self.new_thread,
+            &self.new_channel,
             &self.clone_pane,
             &self.close_focused_column,
             &self.search_projects,
@@ -629,13 +629,30 @@ fn preserve_existing_shortcut(shortcuts: &mut toml::Table, action: &str, default
     }
 }
 
+/// Accepts the pre-rename spelling of the channel-creation shortcut.
+///
+/// The action was stored as `new_thread` before the project-level container
+/// became a channel, and [`KeyboardShortcuts`] denies unknown fields, so an
+/// existing table would otherwise fail to load rather than migrate. The legacy
+/// key is moved rather than copied because leaving it behind would both be
+/// rejected as unknown and let two spellings of one action disagree; a table
+/// already carrying the new spelling keeps it and discards the stale one.
+fn adopt_legacy_channel_shortcut(shortcuts: &mut toml::Table) {
+    if let Some(legacy) = shortcuts.remove("new_thread")
+        && !shortcuts.contains_key("new_channel")
+    {
+        shortcuts.insert("new_channel".into(), legacy);
+    }
+}
+
 fn deserialize_keyboard_shortcuts<'de, D>(deserializer: D) -> Result<KeyboardShortcuts, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
     let mut shortcuts = toml::Table::deserialize(deserializer)?;
+    adopt_legacy_channel_shortcut(&mut shortcuts);
     preserve_existing_shortcut(&mut shortcuts, "cycle_pane_width", "Alt+R");
-    preserve_existing_shortcut(&mut shortcuts, "new_thread", "Alt+G");
+    preserve_existing_shortcut(&mut shortcuts, "new_channel", "Alt+G");
     preserve_existing_shortcut(&mut shortcuts, "clone_pane", "Alt+E");
     toml::Value::Table(shortcuts)
         .try_into()
@@ -647,13 +664,14 @@ where
     D: serde::Deserializer<'de>,
 {
     let mut shortcuts = toml::Table::deserialize(deserializer)?;
+    adopt_legacy_channel_shortcut(&mut shortcuts);
     for (_, binding) in &mut shortcuts {
         if let toml::Value::String(chord) = binding {
             *binding = toml::Value::Array(vec![toml::Value::String(std::mem::take(chord))]);
         }
     }
     preserve_existing_shortcut(&mut shortcuts, "cycle_pane_width", "Alt+R");
-    preserve_existing_shortcut(&mut shortcuts, "new_thread", "Alt+G");
+    preserve_existing_shortcut(&mut shortcuts, "new_channel", "Alt+G");
     preserve_existing_shortcut(&mut shortcuts, "clone_pane", "Alt+E");
     toml::Value::Table(shortcuts)
         .try_into()
@@ -1553,7 +1571,7 @@ next_column = ["Alt+W", "Alt+Right"]
         .unwrap();
         let migrated = load(&path).unwrap();
         assert_eq!(migrated.keyboard_shortcuts.new_terminal, ["Ctrl+Shift+T"]);
-        assert_eq!(migrated.keyboard_shortcuts.new_thread, ["Alt+G"]);
+        assert_eq!(migrated.keyboard_shortcuts.new_channel, ["Alt+G"]);
         assert_eq!(migrated.keyboard_shortcuts.clone_pane, ["Alt+E"]);
         assert_eq!(migrated.keyboard_shortcuts.previous_column, ["Alt+Q"]);
         assert_eq!(
@@ -1586,12 +1604,12 @@ next_column = ["Alt+W", "Alt+Right"]
     }
 
     #[test]
-    fn new_thread_migration_preserves_a_custom_chord_but_rejects_explicit_conflicts() {
+    fn new_channel_migration_preserves_a_custom_chord_but_rejects_explicit_conflicts() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("settings.toml");
         let mut table = toml::Value::try_from(AppSettings::default()).unwrap();
         let shortcuts = table["keyboard_shortcuts"].as_table_mut().unwrap();
-        shortcuts.remove("new_thread");
+        shortcuts.remove("new_channel");
         shortcuts.insert(
             "new_terminal".into(),
             toml::Value::Array(vec![toml::Value::String("Alt+g".into())]),
@@ -1599,12 +1617,12 @@ next_column = ["Alt+W", "Alt+Right"]
         fs::write(&path, toml::to_string(&table).unwrap()).unwrap();
         let migrated = load(&path).unwrap();
         assert_eq!(migrated.keyboard_shortcuts.new_terminal, ["Alt+g"]);
-        assert!(migrated.keyboard_shortcuts.new_thread.is_empty());
+        assert!(migrated.keyboard_shortcuts.new_channel.is_empty());
         save(&path, &migrated).unwrap();
         assert_eq!(load(&path).unwrap(), migrated);
 
         let mut conflicting = migrated;
-        conflicting.keyboard_shortcuts.new_thread = vec!["Alt+G".into()];
+        conflicting.keyboard_shortcuts.new_channel = vec!["Alt+G".into()];
         assert!(matches!(
             conflicting.validate(),
             Err(SettingsError::InvalidShortcut(message)) if message.contains("conflict")
@@ -1612,10 +1630,10 @@ next_column = ["Alt+W", "Alt+Right"]
     }
 
     #[test]
-    fn clone_pane_migration_preserves_owned_chords_and_existing_thread_bindings() {
+    fn clone_pane_migration_preserves_owned_chords_and_existing_channel_bindings() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("settings.toml");
-        for (version, terminal, thread) in [
+        for (version, terminal, channel) in [
             (2, "\"Alt+e\"", "\"Ctrl+Shift+T\""),
             (3, "[\"Alt+e\"]", "[\"Ctrl+Shift+T\"]"),
         ] {
@@ -1624,10 +1642,13 @@ next_column = ["Alt+W", "Alt+Right"]
             } else {
                 ""
             };
-            fs::write(&path, format!("schema_version = {version}\nmax_hot_cards = 6\nhibernation_delay_ms = 30000\nterminal_font_size = 14.0\nsidebar_width = 280.0\ndefault_column_fraction = 0.72\n{inspector}[keyboard_shortcuts]\nnew_terminal = {terminal}\nnew_thread = {thread}\n")).unwrap();
+            // The fixture spells the action `new_thread` on purpose: that is
+            // how every settings file written before the rename names it, at
+            // the current schema version as well as at version 2.
+            fs::write(&path, format!("schema_version = {version}\nmax_hot_cards = 6\nhibernation_delay_ms = 30000\nterminal_font_size = 14.0\nsidebar_width = 280.0\ndefault_column_fraction = 0.72\n{inspector}[keyboard_shortcuts]\nnew_terminal = {terminal}\nnew_thread = {channel}\n")).unwrap();
             let migrated = load(&path).unwrap();
             assert_eq!(migrated.keyboard_shortcuts.new_terminal, ["Alt+e"]);
-            assert_eq!(migrated.keyboard_shortcuts.new_thread, ["Ctrl+Shift+T"]);
+            assert_eq!(migrated.keyboard_shortcuts.new_channel, ["Ctrl+Shift+T"]);
             assert!(migrated.keyboard_shortcuts.clone_pane.is_empty());
             save(&path, &migrated).unwrap();
             assert_eq!(load(&path).unwrap(), migrated);
@@ -1645,13 +1666,13 @@ next_column = ["Alt+W", "Alt+Right"]
     fn explicit_creation_shortcuts_survive_loading_even_when_defaults_are_free() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("settings.toml");
-        for (clone_pane, new_thread) in [
+        for (clone_pane, new_channel) in [
             (vec!["Alt+Shift+E".into()], vec!["Ctrl+Shift+T".into()]),
             (Vec::new(), Vec::new()),
         ] {
             let mut settings = AppSettings::default();
             settings.keyboard_shortcuts.clone_pane = clone_pane;
-            settings.keyboard_shortcuts.new_thread = new_thread;
+            settings.keyboard_shortcuts.new_channel = new_channel;
             save(&path, &settings).unwrap();
             assert_eq!(load(&path).unwrap(), settings);
         }

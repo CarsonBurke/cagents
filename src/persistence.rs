@@ -18,10 +18,10 @@ use thiserror::Error;
 
 use crate::{
     model::{
-        BootId, BrowserRestoreFidelity, BrowserSession, CardId, CardKind, CardState, Existence,
-        Exposure, HostSessionProof, OperationId, ProjectId, ProjectState, ProjectThread, Residency,
-        TerminalContinuity, TerminalId, TerminalSession, ThreadId, Tombstone, TranscriptMetadata,
-        WorkspaceId, WorkspaceState, WorktreeId, WorktreeState, normalize_project_threads,
+        BootId, BrowserRestoreFidelity, BrowserSession, CardId, CardKind, CardState, ChannelId,
+        Existence, Exposure, HostSessionProof, OperationId, ProjectChannel, ProjectId, ProjectState,
+        Residency, TerminalContinuity, TerminalId, TerminalSession, Tombstone, TranscriptMetadata,
+        WorkspaceId, WorkspaceState, WorktreeId, WorktreeState, normalize_project_channels,
     },
     secure_file::{
         migrate_existing_private_file, open_existing_private_file, prepare_private_directory,
@@ -33,6 +33,19 @@ pub const CURRENT_SCHEMA_VERSION: u32 = 4;
 pub const DEFAULT_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 pub const MAX_BUSY_TIMEOUT: Duration = Duration::from_secs(10);
 const PRIVATE_FILE_MODE: u32 = 0o600;
+
+/// Metadata field names for a workspace's channel rows and its selected
+/// channel.
+///
+/// They still spell the concept `thread`, the name the project-level container
+/// carried before it was renamed to a channel. A key-value row has no serde
+/// alias to fall back on, so writing a new spelling would orphan the
+/// navigation state of every workspace an earlier build saved, and reading
+/// both spellings forever costs a permanent second lookup for no user-visible
+/// gain. The durable key is therefore deliberately independent of the Rust
+/// vocabulary.
+const CHANNELS_FIELD: &str = "threads";
+const ACTIVE_CHANNEL_FIELD: &str = "active_thread";
 
 #[derive(Debug, Error)]
 pub enum StoreError {
@@ -156,8 +169,8 @@ pub struct WorkspaceManifest {
     pub active_worktree: Option<PathBuf>,
     pub worktree_focus: HashMap<PathBuf, CardId>,
     pub project_order: Vec<ProjectId>,
-    pub threads: Vec<ProjectThread>,
-    pub active_thread: Option<ThreadId>,
+    pub channels: Vec<ProjectChannel>,
+    pub active_channel: Option<ChannelId>,
     pub cards: Vec<CardSummary>,
     pub updated_at_unix_ms: i64,
 }
@@ -708,7 +721,7 @@ impl StateStore {
     ///
     /// A corrupt *manifest* is deliberately still all-or-nothing. That is a
     /// different class of failure: without a trustworthy manifest there is no
-    /// card list, ordering, focus, or thread layout to restore cards *into*, so
+    /// card list, ordering, focus, or channel layout to restore cards *into*, so
     /// a partial result could not be distinguished from the user's real
     /// workspace and the next save would commit it over the intact rows.
     ///
@@ -769,8 +782,8 @@ impl StateStore {
             active_worktree: manifest.active_worktree,
             worktree_focus: manifest.worktree_focus,
             project_order: manifest.project_order,
-            threads: manifest.threads,
-            active_thread: manifest.active_thread,
+            channels: manifest.channels,
+            active_channel: manifest.active_channel,
         };
         if !warnings.is_empty() {
             retarget_dropped_cards(&mut state);
@@ -1951,13 +1964,13 @@ fn save_workspace_transaction(
     )?;
     set_metadata(
         transaction,
-        &format!("workspace:{workspace_id}:navigation:threads"),
-        &to_json(&state.threads)?,
+        &format!("workspace:{workspace_id}:navigation:{CHANNELS_FIELD}"),
+        &to_json(&state.channels)?,
     )?;
     set_metadata(
         transaction,
-        &format!("workspace:{workspace_id}:navigation:active_thread"),
-        &to_json(&state.active_thread)?,
+        &format!("workspace:{workspace_id}:navigation:{ACTIVE_CHANNEL_FIELD}"),
+        &to_json(&state.active_channel)?,
     )?;
 
     let existing = existing_cards(transaction, &workspace_id)?;
@@ -2667,41 +2680,41 @@ fn validate_workspace(state: &WorkspaceState) -> Result<()> {
             state.id, focused
         )));
     }
-    let mut thread_ids = BTreeSet::new();
+    let mut channel_ids = BTreeSet::new();
     let mut owned = BTreeSet::new();
-    for thread in &state.threads {
-        if !thread_ids.insert(thread.id) {
+    for channel in &state.channels {
+        if !channel_ids.insert(channel.id) {
             return Err(StoreError::InvalidState(format!(
-                "duplicate thread {}",
-                thread.id
+                "duplicate channel {}",
+                channel.id
             )));
         }
-        for id in &thread.cards {
+        for id in &channel.cards {
             if !ids.contains(id) || !owned.insert(*id) {
                 return Err(StoreError::InvalidState(format!(
-                    "thread {} references missing or multiply owned card {id}",
-                    thread.id
+                    "channel {} references missing or multiply owned card {id}",
+                    channel.id
                 )));
             }
         }
-        if thread.focused.is_some_and(|id| {
-            !thread.cards.contains(&id)
+        if channel.focused.is_some_and(|id| {
+            !channel.cards.contains(&id)
                 || !state
                     .cards
                     .iter()
                     .any(|card| card.id == id && card.existence.is_open())
         }) {
             return Err(StoreError::InvalidState(format!(
-                "thread {} has invalid focus",
-                thread.id
+                "channel {} has invalid focus",
+                channel.id
             )));
         }
     }
     if state
-        .active_thread
-        .is_some_and(|id| !thread_ids.contains(&id))
+        .active_channel
+        .is_some_and(|id| !channel_ids.contains(&id))
     {
-        return Err(StoreError::InvalidState("active thread is missing".into()));
+        return Err(StoreError::InvalidState("active channel is missing".into()));
     }
     Ok(())
 }
@@ -2709,7 +2722,7 @@ fn validate_workspace(state: &WorkspaceState) -> Result<()> {
 /// Repairs the navigation references a dropped card leaves dangling.
 ///
 /// Restoring a workspace without one of its cards is only useful if the result
-/// is still *savable*: [`validate_workspace`] rejects a focus or a thread
+/// is still *savable*: [`validate_workspace`] rejects a focus or a channel
 /// membership that names a card the workspace does not contain, so leaving
 /// them behind would trade one lost card for a workspace that can never be
 /// written again.
@@ -2730,7 +2743,7 @@ fn retarget_dropped_cards(state: &mut WorkspaceState) {
             .find(|card| card.existence.is_open())
             .map(|card| card.id);
     }
-    normalize_project_threads(&mut state.threads, &mut state.active_thread, &open);
+    normalize_project_channels(&mut state.channels, &mut state.active_channel, &open);
 }
 
 /// The stored shape of a card, as far as the save path needs to know it.
@@ -2862,20 +2875,20 @@ fn load_workspace_manifest_connection(
         });
     }
 
-    let mut threads = metadata(connection, &format!("workspace:{id}:navigation:threads"))?
-        .map(|value| from_json("workspace threads", &value))
+    let mut channels = metadata(connection, &format!("workspace:{id}:navigation:{CHANNELS_FIELD}"))?
+        .map(|value| from_json("workspace channels", &value))
         .transpose()?
         .unwrap_or_default();
-    let mut active_thread = metadata(
+    let mut active_channel = metadata(
         connection,
-        &format!("workspace:{id}:navigation:active_thread"),
+        &format!("workspace:{id}:navigation:{ACTIVE_CHANNEL_FIELD}"),
     )?
-    .map(|value| from_json("workspace active thread", &value))
+    .map(|value| from_json("workspace active channel", &value))
     .transpose()?
     .flatten();
-    normalize_project_threads(
-        &mut threads,
-        &mut active_thread,
+    normalize_project_channels(
+        &mut channels,
+        &mut active_channel,
         &cards
             .iter()
             .filter(|card| card.existence.is_open())
@@ -2915,8 +2928,8 @@ fn load_workspace_manifest_connection(
         .map(|value| from_json("workspace project order", &value))
         .transpose()?
         .unwrap_or_default(),
-        threads,
-        active_thread,
+        channels,
+        active_channel,
         cards,
         updated_at_unix_ms: updated_at,
     }))
@@ -3373,8 +3386,8 @@ mod tests {
             active_worktree: None,
             worktree_focus: HashMap::new(),
             project_order: Vec::new(),
-            threads: Vec::new(),
-            active_thread: None,
+            channels: Vec::new(),
+            active_channel: None,
         }
     }
 
@@ -3432,25 +3445,25 @@ mod tests {
     }
 
     #[test]
-    fn project_threads_round_trip_and_invalid_ownership_is_atomic() {
+    fn project_channels_round_trip_and_invalid_ownership_is_atomic() {
         let directory = tempdir().unwrap();
         let store =
-            StateStore::open(directory.path().join("threads.sqlite3"), boot("boot-a")).unwrap();
+            StateStore::open(directory.path().join("channels.sqlite3"), boot("boot-a")).unwrap();
         let mut workspace = workspace_with_terminal(&boot("boot-a"));
         let card = workspace.cards[0].id;
         let unrelated = workspace_with_terminal(&boot("boot-a")).cards.remove(0);
         let unrelated_id = unrelated.id;
         workspace.cards.push(unrelated);
         let project_id = ProjectId::new();
-        let id = ThreadId::new();
-        workspace.threads.push(ProjectThread {
+        let id = ChannelId::new();
+        workspace.channels.push(ProjectChannel {
             id,
             project_id,
             title: "Investigate startup".into(),
             cards: vec![card],
             focused: Some(card),
         });
-        workspace.active_thread = Some(id);
+        workspace.active_channel = Some(id);
         workspace.active_worktree = Some("/tmp".into());
         let mut lane = SaveLane::default();
         lane.save(&store, &workspace).unwrap();
@@ -3458,11 +3471,11 @@ mod tests {
             .load_workspace_manifest(workspace.id)
             .unwrap()
             .unwrap();
-        assert_eq!(manifest.threads, workspace.threads);
-        assert_eq!(manifest.active_thread, Some(id));
+        assert_eq!(manifest.channels, workspace.channels);
+        assert_eq!(manifest.active_channel, Some(id));
         let restored = store.load_workspace(workspace.id, None).unwrap().unwrap();
-        assert_eq!(restored.threads, workspace.threads);
-        assert_eq!(restored.active_thread, Some(id));
+        assert_eq!(restored.channels, workspace.channels);
+        assert_eq!(restored.active_channel, Some(id));
         assert_eq!(
             restored
                 .cards
@@ -3471,14 +3484,14 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![card, unrelated_id]
         );
-        workspace.threads.push(ProjectThread {
-            id: ThreadId::new(),
+        workspace.channels.push(ProjectChannel {
+            id: ChannelId::new(),
             project_id,
             title: "Conflicting owner".into(),
             cards: vec![card],
             focused: Some(card),
         });
-        workspace.active_thread = None;
+        workspace.active_channel = None;
         assert!(matches!(
             lane.save(&store, &workspace),
             Err(StoreError::InvalidState(_))
@@ -3487,8 +3500,8 @@ mod tests {
             .load_workspace_manifest(workspace.id)
             .unwrap()
             .unwrap();
-        assert_eq!(after.threads, manifest.threads);
-        assert_eq!(after.active_thread, Some(id));
+        assert_eq!(after.channels, manifest.channels);
+        assert_eq!(after.active_channel, Some(id));
         assert_eq!(after.generation, manifest.generation);
     }
 
@@ -3910,15 +3923,15 @@ mod tests {
             .worktree_focus
             .insert(PathBuf::from("/tmp/worktree-b"), workspace.cards[0].id);
         workspace.project_order = vec![ProjectId::new()];
-        let thread_id = ThreadId::new();
-        workspace.threads.push(ProjectThread {
-            id: thread_id,
+        let channel_id = ChannelId::new();
+        workspace.channels.push(ProjectChannel {
+            id: channel_id,
             project_id: workspace.project_order[0],
             title: "Legacy".into(),
             cards: vec![workspace.cards[0].id],
             focused: workspace.focused,
         });
-        workspace.active_thread = Some(thread_id);
+        workspace.active_channel = Some(channel_id);
         SaveLane::default().save(&store, &workspace).unwrap();
         {
             let inner = store.lock_inner().unwrap();
@@ -3930,8 +3943,8 @@ mod tests {
                         format!("workspace:{}:navigation:active_worktree", workspace.id),
                         format!("workspace:{}:navigation:worktree_focus", workspace.id),
                         format!("workspace:{}:navigation:project_order", workspace.id),
-                        format!("workspace:{}:navigation:threads", workspace.id),
-                        format!("workspace:{}:navigation:active_thread", workspace.id),
+                        format!("workspace:{}:navigation:{CHANNELS_FIELD}", workspace.id),
+                        format!("workspace:{}:navigation:{ACTIVE_CHANNEL_FIELD}", workspace.id),
                     ],
                 )
                 .unwrap();
@@ -3940,9 +3953,84 @@ mod tests {
         assert_eq!(restored.active_worktree, None);
         assert!(restored.worktree_focus.is_empty());
         assert!(restored.project_order.is_empty());
-        assert!(restored.threads.is_empty());
-        assert_eq!(restored.active_thread, None);
+        assert!(restored.channels.is_empty());
+        assert_eq!(restored.active_channel, None);
         assert_eq!(restored.cards[0].id, workspace.cards[0].id);
+    }
+
+    /// Restores the navigation rows a build from before the rename left on
+    /// disk.
+    ///
+    /// The metadata keys and their JSON are written here by hand, exactly as
+    /// the earlier build spelled them, so this fails if the durable
+    /// representation ever drifts from what existing installations hold. An
+    /// installed workspace has to come back with the same channel identity,
+    /// chats, focused chat, title, and selection, and stay savable afterwards.
+    #[test]
+    fn workspace_stored_before_the_channel_rename_restores_every_channel_field() {
+        let directory = tempdir().unwrap();
+        let store = StateStore::open(
+            directory.path().join("legacy-channels.sqlite3"),
+            boot("boot-a"),
+        )
+        .unwrap();
+        let mut workspace = workspace_with_terminal(&boot("boot-a"));
+        let planner = workspace.cards[0].id;
+        let reader = workspace_with_terminal(&boot("boot-a")).cards.remove(0);
+        let reader_id = reader.id;
+        workspace.cards.push(reader);
+        let project_id = ProjectId::new();
+        workspace.project_order = vec![project_id];
+        let mut lane = SaveLane::default();
+        lane.save(&store, &workspace).unwrap();
+
+        let channel_id = ChannelId::new();
+        {
+            let mut inner = store.lock_inner().unwrap();
+            let transaction = inner.connection.transaction().unwrap();
+            set_metadata(
+                &transaction,
+                &format!("workspace:{}:navigation:threads", workspace.id),
+                &format!(
+                    r#"[{{"id":"{channel_id}","project_id":"{project_id}","title":"Investigate startup","cards":["{planner}","{reader_id}"],"focused":"{reader_id}"}}]"#
+                ),
+            )
+            .unwrap();
+            set_metadata(
+                &transaction,
+                &format!("workspace:{}:navigation:active_thread", workspace.id),
+                &format!("\"{channel_id}\""),
+            )
+            .unwrap();
+            transaction.commit().unwrap();
+        }
+
+        let restored = store.load_workspace(workspace.id, None).unwrap().unwrap();
+        assert_eq!(restored.active_channel, Some(channel_id));
+        assert_eq!(restored.channels.len(), 1);
+        assert_eq!(restored.channels[0].id, channel_id);
+        assert_eq!(restored.channels[0].project_id, project_id);
+        assert_eq!(restored.channels[0].title, "Investigate startup");
+        assert_eq!(restored.channels[0].cards, vec![planner, reader_id]);
+        assert_eq!(restored.channels[0].focused, Some(reader_id));
+
+        lane.save(&store, &restored).unwrap();
+        let stored = {
+            let inner = store.lock_inner().unwrap();
+            metadata(
+                &inner.connection,
+                &format!("workspace:{}:navigation:threads", workspace.id),
+            )
+            .unwrap()
+        };
+        assert_eq!(
+            stored,
+            Some(to_json(&restored.channels).unwrap()),
+            "saving must keep writing the durable spelling an older build reads"
+        );
+        let reloaded = store.load_workspace(workspace.id, None).unwrap().unwrap();
+        assert_eq!(reloaded.channels, restored.channels);
+        assert_eq!(reloaded.active_channel, Some(channel_id));
     }
 
     #[test]
