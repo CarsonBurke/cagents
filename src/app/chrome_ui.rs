@@ -398,7 +398,10 @@ impl Cagents {
                     let body: Element<'_, Message> = if entry.repeats > 1 {
                         widget::column::with_children(vec![
                             super::notice_body(&entry.notice.message),
-                            super::notice_detail(format!("Repeated {} times", entry.repeats)),
+                            super::notice_surface_detail(
+                                entry.notice.severity,
+                                format!("Repeated {} times", entry.repeats),
+                            ),
                         ])
                         .spacing(design::GRID_UNIT)
                         .into()
@@ -408,16 +411,13 @@ impl Cagents {
                     notices.push(super::notice_surface(
                         entry.notice.severity,
                         body,
-                        Some(
-                            widget::button::text("Dismiss")
-                                .id(widget::Id::new(format!(
-                                    "chrome.notices.dismiss.{}",
-                                    entry.id
-                                )))
-                                .name("Dismiss application notice")
-                                .on_press(Message::DismissNotice(entry.id))
-                                .into(),
-                        ),
+                        Some(super::notice_surface_action(
+                            entry.notice.severity,
+                            "Dismiss",
+                            "Dismiss application notice",
+                            widget::Id::new(format!("chrome.notices.dismiss.{}", entry.id)),
+                            Message::DismissNotice(entry.id),
+                        )),
                         false,
                     ));
                 }

@@ -206,12 +206,21 @@ impl NoticeSeverity {
         }
     }
 
-    fn label(self) -> &'static str {
+    /// The component whose filled `base` a notice surface paints itself with.
+    fn component(self, theme: &cosmic::theme::CosmicTheme) -> &cosmic::cosmic_theme::Component {
         match self {
-            Self::Success => "success",
-            Self::Warning => "warning",
-            Self::Error => "error",
+            Self::Success => &theme.success,
+            Self::Warning => &theme.warning,
+            Self::Error => &theme.destructive,
         }
+    }
+
+    /// Subordinate text on that filled surface: the surface's own foreground,
+    /// dimmed, so the hierarchy reads without losing legibility.
+    fn detail_color(self) -> iced::Color {
+        let cosmic = cosmic::theme::active();
+        let on: iced::Color = self.component(cosmic.cosmic()).on.into();
+        on.scale_alpha(0.75)
     }
 }
 
@@ -221,14 +230,6 @@ struct TransientNotice {
     message: String,
 }
 
-/// How long a non-error notice stays on screen before it retires itself.
-const NOTICE_TOAST_LIFETIME: Duration = Duration::from_secs(6);
-/// Granularity of the retirement sweep; the slack it adds to a six-second
-/// lifetime is not worth a timer that restarts on every frame.
-const NOTICE_EXPIRY_INTERVAL: Duration = Duration::from_millis(500);
-/// Toasts visible at once. Beyond this the stack summarises the remainder and
-/// points at the notices popover, which holds the full log.
-const NOTICE_TOAST_VISIBLE: usize = 3;
 /// Notices retained for review. Bounded because nothing else bounds them: the
 /// shell raises a notice from almost a hundred call sites, several of them on
 /// per-frame or per-poll paths.
@@ -238,19 +239,9 @@ const NOTICE_LOG_CAPACITY: usize = 24;
 struct LoggedNotice {
     id: u64,
     notice: TransientNotice,
-    raised: Instant,
     /// Repeats of an identical message collapse onto one entry rather than
     /// flooding the log; a failing poll would otherwise evict everything else.
     repeats: u32,
-}
-
-impl LoggedNotice {
-    /// Errors persist until dismissed. A warning or a success is informational,
-    /// so it retires on its own rather than accumulating chrome the user has to
-    /// clear by hand.
-    fn expires_at(&self) -> Option<Instant> {
-        (self.notice.severity != NoticeSeverity::Error).then(|| self.raised + NOTICE_TOAST_LIFETIME)
-    }
 }
 
 /// The shell's notice history: a bounded ring plus the identity counter that
@@ -262,19 +253,22 @@ struct NoticeLog {
 }
 
 impl NoticeLog {
-    fn record(&mut self, notice: TransientNotice, now: Instant) {
-        if let Some(last) = self.entries.back_mut()
-            && last.notice == notice
-        {
-            last.repeats = last.repeats.saturating_add(1);
-            last.raised = now;
+    fn record(&mut self, notice: TransientNotice) {
+        // Scanning the whole log rather than only its tail is what makes
+        // deduplication survive interleaving: a poll that raises two failures
+        // in turn would otherwise alternate them forever and fill the log with
+        // copies. The repeat moves to the back because the user cares that it
+        // is happening now, and `recent` reads newest first.
+        if let Some(index) = self.entries.iter().position(|entry| entry.notice == notice) {
+            let mut entry = self.entries.remove(index).expect("index came from the log");
+            entry.repeats = entry.repeats.saturating_add(1);
+            self.entries.push_back(entry);
             return;
         }
         self.next_id = self.next_id.wrapping_add(1);
         self.entries.push_back(LoggedNotice {
             id: self.next_id,
             notice,
-            raised: now,
             repeats: 1,
         });
         while self.entries.len() > NOTICE_LOG_CAPACITY {
@@ -290,25 +284,11 @@ impl NoticeLog {
         self.entries.clear();
     }
 
-    /// Drops every entry whose lifetime has elapsed. Returns whether anything
-    /// was removed, so the caller can avoid an unnecessary redraw.
-    fn retire_expired(&mut self, now: Instant) -> bool {
-        let before = self.entries.len();
-        self.entries
-            .retain(|entry| entry.expires_at().is_none_or(|at| at > now));
-        self.entries.len() != before
-    }
-
-    /// The earliest deadline still pending, so the shell can tick exactly once
-    /// per expiry instead of polling while any notice exists.
-    fn next_deadline(&self) -> Option<Instant> {
-        self.entries
-            .iter()
-            .filter_map(LoggedNotice::expires_at)
-            .min()
-    }
-
-    /// Newest first: a toast stack reads downward from the most recent event.
+    /// Newest first: the log reads downward from the most recent event.
+    ///
+    /// Nothing retires on a timer. A notice the user never saw is worse than
+    /// one that waits: the header carries the severity until it is dismissed,
+    /// and capacity is what bounds the log.
     fn recent(&self) -> impl Iterator<Item = &LoggedNotice> {
         self.entries.iter().rev()
     }
@@ -479,12 +459,7 @@ fn notice_surface<'a>(
             .spacing(spacing.space_xxs),
     )
     .class(cosmic::theme::Container::custom(move |theme| {
-        let cosmic = theme.cosmic();
-        let component = match severity {
-            NoticeSeverity::Success => &cosmic.success,
-            NoticeSeverity::Warning => &cosmic.warning,
-            NoticeSeverity::Error => &cosmic.destructive,
-        };
+        let component = severity.component(theme.cosmic());
         cosmic::iced::widget::container::Style {
             icon_color: Some(component.on.into()),
             text_color: Some(component.on.into()),
@@ -525,15 +500,92 @@ fn notice_body<'a>(text: impl Into<Cow<'a, str>> + 'a) -> Element<'a, Message> {
         .width(Length::Fill)
         .into()
 }
-
 /// Selectable equivalent of `design::caption`: diagnostic detail the user
-/// needs to copy into a bug report, a shell, or a search.
+/// needs to copy into a bug report, a shell, or a search. For a plain dialog
+/// surface; subordinate text on a filled severity surface belongs in
+/// `notice_surface_detail`.
 fn notice_detail<'a>(text: impl Into<Cow<'a, str>> + 'a) -> Element<'a, Message> {
     widget::selectable_text(text)
         .size(design::TEXT_CAPTION)
         .wrapping(cosmic::iced::widget::text::Wrapping::WordOrGlyph)
         .width(Length::Fill)
         .class(cosmic::theme::Text::Custom(design::muted_text))
+        .into()
+}
+
+/// Subordinate text inside a `notice_surface`.
+///
+/// The tone comes from the surface's own foreground rather than
+/// `design::muted_text`, which resolves against the window background: on a
+/// filled severity surface that produced a near-illegible grey on pink.
+fn notice_surface_detail<'a>(
+    severity: NoticeSeverity,
+    text: impl Into<Cow<'a, str>> + 'a,
+) -> Element<'a, Message> {
+    widget::selectable_text(text)
+        .size(design::TEXT_CAPTION)
+        .wrapping(cosmic::iced::widget::text::Wrapping::WordOrGlyph)
+        .width(Length::Fill)
+        .class(cosmic::theme::Text::Color(severity.detail_color()))
+        .into()
+}
+
+/// Button styling for a control inside a `notice_surface`.
+///
+/// The default button classes resolve their text and hover fills against the
+/// window background, so on a filled severity surface they rendered close to
+/// invisible — a pink label on a pink error surface. Every colour here comes
+/// from the surface's own component instead.
+fn notice_surface_button(severity: NoticeSeverity) -> cosmic::theme::Button {
+    let appearance = move |theme: &cosmic::Theme| {
+        let component = severity.component(theme.cosmic());
+        let on: iced::Color = component.on.into();
+        widget::button::Style {
+            background: None,
+            text_color: Some(on),
+            icon_color: Some(on),
+            border_radius: theme.cosmic().corner_radii.radius_s.into(),
+            border_width: 1.0,
+            border_color: on.scale_alpha(0.4),
+            ..widget::button::Style::new()
+        }
+    };
+    // A wash of the surface's own foreground: the only fill guaranteed to read
+    // as raised whichever severity colour is underneath it.
+    let wash = move |theme: &cosmic::Theme, alpha: f32| {
+        let on: iced::Color = severity.component(theme.cosmic()).on.into();
+        iced::Background::Color(on.scale_alpha(alpha))
+    };
+    cosmic::theme::Button::Custom {
+        active: Box::new(move |_focused, theme| appearance(theme)),
+        disabled: Box::new(move |theme| widget::button::Style {
+            text_color: Some(severity.detail_color()),
+            icon_color: Some(severity.detail_color()),
+            ..appearance(theme)
+        }),
+        hovered: Box::new(move |_focused, theme| widget::button::Style {
+            background: Some(wash(theme, 0.12)),
+            ..appearance(theme)
+        }),
+        pressed: Box::new(move |_focused, theme| widget::button::Style {
+            background: Some(wash(theme, 0.2)),
+            ..appearance(theme)
+        }),
+    }
+}
+
+fn notice_surface_action<'a>(
+    severity: NoticeSeverity,
+    label: &'a str,
+    accessible_name: &'a str,
+    id: widget::Id,
+    message: Message,
+) -> Element<'a, Message> {
+    widget::button::text(label)
+        .id(id)
+        .name(accessible_name)
+        .class(notice_surface_button(severity))
+        .on_press(message)
         .into()
 }
 
@@ -578,13 +630,13 @@ fn save_health_view(health: &SaveHealthState) -> Option<Element<'_, Message>> {
             } else {
                 (
                     category.guidance(),
-                    Some(
-                        widget::button::standard("Retry save")
-                            .id(widget::Id::new("session-save.retry"))
-                            .name("Retry saving the session")
-                            .on_press(Message::RetrySessionSave)
-                            .into(),
-                    ),
+                    Some(notice_surface_action(
+                        NoticeSeverity::Error,
+                        "Retry save",
+                        "Retry saving the session",
+                        widget::Id::new("session-save.retry"),
+                        Message::RetrySessionSave,
+                    )),
                 )
             };
             (
@@ -614,6 +666,7 @@ fn save_health_view(health: &SaveHealthState) -> Option<Element<'_, Message>> {
                     .name("Acknowledge session save recovery")
                     .width(ICON_CONTROL_SIZE)
                     .height(ICON_CONTROL_SIZE)
+                    .class(notice_surface_button(NoticeSeverity::Success))
                     .on_press(Message::AcknowledgeSessionRecovery),
                 "Acknowledge recovery",
             )),
@@ -631,8 +684,8 @@ fn save_health_view(health: &SaveHealthState) -> Option<Element<'_, Message>> {
         severity,
         widget::column::with_children(vec![
             notice_body(title),
-            notice_detail(detail),
-            notice_detail(guidance),
+            notice_surface_detail(severity, detail),
+            notice_surface_detail(severity, guidance),
         ])
         .spacing(spacing.space_xxxs)
         .width(Length::Fill)
@@ -2501,8 +2554,6 @@ pub enum Message {
     /// Dismisses exactly one logged notice; a stale id is a no-op.
     DismissNotice(u64),
     DismissAllNotices,
-    /// Retires every notice whose lifetime has elapsed.
-    ExpireNotices,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -6261,111 +6312,6 @@ impl Cagents {
         }
     }
 
-    /// Ticks only while some notice can still retire itself.
-    ///
-    /// The interval is fixed rather than derived from the remaining time
-    /// because a `Subscription` is identified by its arguments: a shrinking
-    /// duration would tear down and rebuild the timer on every frame the
-    /// notice is on screen.
-    fn notice_expiry_subscription(&self) -> Subscription<Message> {
-        if self.notices.next_deadline().is_none() {
-            return Subscription::none();
-        }
-        iced::time::every(NOTICE_EXPIRY_INTERVAL).map(|_| Message::ExpireNotices)
-    }
-
-    /// The notice stack: the shell's only *unprompted* report surface.
-    ///
-    /// Without it every one of the shell's error notices is invisible until
-    /// the user happens to notice a small glyph appear in the header and clicks
-    /// it, which is indistinguishable from the action having silently failed.
-    fn notice_toasts(&self) -> Option<Element<'_, Message>> {
-        if self.notices.is_empty() || self.modal_is_open() {
-            return None;
-        }
-        let spacing = cosmic::theme::spacing();
-        let mut toasts: Vec<Element<'_, Message>> = self
-            .notices
-            .recent()
-            .take(NOTICE_TOAST_VISIBLE)
-            .map(|entry| {
-                let body: Element<'_, Message> = if entry.repeats > 1 {
-                    widget::column::with_children(vec![
-                        notice_body(&entry.notice.message),
-                        notice_detail(format!("Repeated {} times", entry.repeats)),
-                    ])
-                    .spacing(design::GRID_UNIT)
-                    .into()
-                } else {
-                    notice_body(&entry.notice.message)
-                };
-                notice_surface(
-                    entry.notice.severity,
-                    body,
-                    Some(
-                        crate::ui_controls::icon_control(
-                            crate::ui_controls::symbolic_icon("window-close-symbolic"),
-                            format!("Dismiss {} notice", entry.notice.severity.label()),
-                            false,
-                            true,
-                            Some(Message::DismissNotice(entry.id)),
-                        )
-                        .into(),
-                    ),
-                    // Not compact: a notice message is a sentence, and the
-                    // compact variant pins a fixed row height that clips it.
-                    false,
-                )
-            })
-            .collect();
-        let mut footer: Vec<Element<'_, Message>> = Vec::with_capacity(3);
-        // Pushes both controls to the trailing edge, under the toasts.
-        footer.push(iced::widget::Space::new().width(Length::Fill).into());
-        if self.notices.len() > NOTICE_TOAST_VISIBLE {
-            let hidden = self.notices.len() - NOTICE_TOAST_VISIBLE;
-            footer.push(
-                widget::button::text(format!("{hidden} more"))
-                    .id(widget::Id::new("notices.overflow"))
-                    .name("Show every application notice")
-                    .on_press(Message::ChromeUi(chrome_ui::Action::ToggleNotices))
-                    .into(),
-            );
-        }
-        footer.push(
-            widget::button::text("Dismiss all")
-                .id(widget::Id::new("notices.dismiss-all"))
-                .name("Dismiss every application notice")
-                .on_press(Message::DismissAllNotices)
-                .into(),
-        );
-        toasts.push(
-            widget::row::with_children(footer)
-                .spacing(spacing.space_xxs)
-                .width(Length::Fill)
-                .align_y(Alignment::Center)
-                .into(),
-        );
-        Some(
-            // Only the column is opaque. Making the full-size positioning
-            // container opaque would capture every click in the window, since
-            // `Kind::Opaque` captures any press inside its own bounds. The
-            // column takes a fixed width because `notice_surface` fills, and a
-            // filling child of a shrinking column collapses to its minimum.
-            widget::container(crate::interaction::opaque(
-                widget::column::with_children(toasts)
-                    .spacing(spacing.space_xxs)
-                    .align_x(Alignment::End)
-                    .width(Length::Fixed(STATUS_SURFACE_MAX_WIDTH)),
-            ))
-            .align_x(Alignment::End)
-            .align_y(Alignment::End)
-            .padding(3.0 * design::GRID_UNIT)
-            .width(Length::Fill)
-            .height(Length::Fill)
-            .into(),
-        )
-    }
-
     /// The focused card when it is a repository card showing an editable
     /// buffer, which is the only context in which the search chord means
     /// "find in this file" rather than "find a project".
@@ -7565,10 +7511,8 @@ impl Application for Cagents {
         // by message, so distinct failures stay distinct and a repeated one
         // collapses into a count. The alternative this replaces was losing
         // cards with no diagnostic anywhere in the UI.
-        let restored_at = Instant::now();
         for warning in restore_warnings {
-            app.notices
-                .record(TransientNotice::warning(warning), restored_at);
+            app.notices.record(TransientNotice::warning(warning));
         }
         if let Some(view) = window_view {
             app.sidebar_state.restore_view(view.sidebar);
@@ -9666,9 +9610,6 @@ impl Application for Cagents {
                 self.notices.dismiss(id);
                 self.reconcile_notice_popup()
             }
-            // Only the retirement sweep the tail of `update` performs anyway;
-            // the message exists so the deadline timer has something to fire.
-            Message::ExpireNotices => Task::none(),
             Message::SourceControlLoaded {
                 key,
                 request,
@@ -9775,11 +9716,9 @@ impl Application for Cagents {
         // notice by assigning it. Draining it here is what makes those notices
         // survive the next assignment instead of silently replacing each other,
         // and it is the one place that can bound the history.
-        let now = Instant::now();
         if let Some(notice) = self.status.take() {
-            self.notices.record(notice, now);
+            self.notices.record(notice);
         }
-        self.notices.retire_expired(now);
         if self.latency_focus != self.workspace.focused() {
             self.latency.abandon_pending();
         }
@@ -9818,7 +9757,6 @@ impl Application for Cagents {
             self.refresh_subscription(),
             self.terminal_agent_activity_subscription(),
             self.update_subscription(),
-            self.notice_expiry_subscription(),
             Subscription::run_with(
                 TerminalWakeSource(self.terminal_wake_rx.clone()),
                 terminal_wake_stream,
@@ -10445,13 +10383,6 @@ impl Application for Cagents {
                 .height(Length::Fill)
                 .width(Length::Fill)
                 .into()
-        };
-        // Above every pane and the inspector, below `dialog`: a notice reports
-        // on work the user already asked for, so it must never sit on top of a
-        // question the shell is asking them.
-        let surface = match self.notice_toasts() {
-            Some(toasts) => crate::interaction::layer(surface, toasts),
-            None => surface,
         };
         let surface = crate::interaction::drive_animation(
             surface,
@@ -11536,85 +11467,51 @@ mod tests {
         }
     }
 
-    /// The toast stack is laid over the whole window, so it has exactly two
-    /// ways to be wrong: collapse to nothing, or swallow every click in the
-    /// shell behind it. `notice_surface` fills its parent, so the column has to
-    /// be sized explicitly, and only the column may be opaque.
+    /// The log is what keeps a report from being overwritten by the next one,
+    /// and capacity is the only thing bounding it: the shell raises notices
+    /// from a per-poll path, so a repeating failure must not evict the history.
     #[test]
-    fn the_toast_stack_is_visible_without_swallowing_the_shell_behind_it() {
-        use cosmic::iced::advanced::{Layout, Shell, clipboard, layout, mouse, widget::Tree};
-        use cosmic::iced::{Event, Point, Rectangle, Size};
-        let renderer = headless_renderer();
-        let mut app = context_inspector_test_app(true);
-        let raised_at = Instant::now();
+    fn the_notice_log_collapses_repeats_and_bounds_itself() {
+        let mut log = NoticeLog::default();
         for message in ["first failure", "second failure"] {
-            app.notices
-                .record(TransientNotice::error(message.to_owned()), raised_at);
+            log.record(TransientNotice::error(message.to_owned()));
         }
-        // An identical message collapses onto the entry it repeats.
-        app.notices
-            .record(TransientNotice::error("second failure"), raised_at);
-        assert_eq!(app.notices.len(), 2);
+        // An identical message collapses onto the entry it repeats rather than
+        // adding a second one, and it does so wherever that entry already sits:
+        // a poll raising two failures in turn alternates them, which is exactly
+        // the case a tail-only comparison got wrong.
+        for _ in 0..5 {
+            log.record(TransientNotice::error("first failure"));
+            log.record(TransientNotice::error("second failure"));
+        }
+        assert_eq!(log.len(), 2);
+        let mut recent = log.recent();
+        // The collapse moves the repeat to the front, so the newest entry is
+        // whichever message was raised last.
+        let newest = recent.next().unwrap();
+        assert_eq!(newest.notice.message, "second failure");
+        assert_eq!(newest.repeats, 6);
+        assert_eq!(recent.next().unwrap().repeats, 6);
+        drop(recent);
+        assert_eq!(log.severity(), Some(NoticeSeverity::Error));
 
-        let toasts = app.notice_toasts().expect("a raised notice is displayed");
-        let underlying: Element<'_, Message> = widget::mouse_area(
-            widget::container(iced::widget::Space::new())
-                .width(Length::Fill)
-                .height(Length::Fill),
-        )
-        .on_press(Message::NewTerminal)
-        .into();
-        let mut element: Element<'_, Message> = crate::interaction::layer(underlying, toasts);
-        let mut tree = Tree::new(element.as_widget());
-        let viewport = Rectangle::with_size(Size::new(1_400.0, 900.0));
-        let node = element.as_widget_mut().layout(
-            &mut tree,
-            &renderer,
-            &layout::Limits::new(Size::ZERO, viewport.size()),
-        );
-        // The upper-left corner is the furthest point from a bottom-right
-        // stack, so a press there reaching the shell is what proves the
-        // full-size positioning container is not itself opaque.
-        let mut messages = Vec::new();
-        let mut shell = Shell::new(&mut messages);
-        element.as_widget_mut().update(
-            &mut tree,
-            &Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)),
-            Layout::new(&node),
-            mouse::Cursor::Available(Point::new(8.0, 8.0)),
-            &renderer,
-            &mut clipboard::Null,
-            &mut shell,
-            &viewport,
-        );
-        drop(shell);
-        assert!(
-            messages
-                .iter()
-                .any(|message| matches!(message, Message::NewTerminal)),
-            "the toast layer swallowed a click nowhere near a toast"
-        );
-        // The layered element borrows `app`; retirement needs it mutably.
-        drop(element);
+        // A dismissed entry names exactly one; a stale id is a no-op.
+        let newest = log.recent().next().unwrap().id;
+        log.dismiss(newest);
+        log.dismiss(newest);
+        assert_eq!(log.len(), 1);
 
-        // Errors are never retired on a timer; only the user dismisses them.
-        assert!(
-            !app.notices
-                .retire_expired(raised_at + 10 * NOTICE_TOAST_LIFETIME)
-        );
-        assert_eq!(app.notices.len(), 2);
-        let warned_at = Instant::now();
-        app.notices
-            .record(TransientNotice::warning("advisory"), warned_at);
-        assert!(
-            app.notices
-                .retire_expired(warned_at + NOTICE_TOAST_LIFETIME)
-        );
-        assert_eq!(
-            app.notices.len(),
-            2,
-            "the warning retired, the errors stayed"
-        );
+        // Distinct messages past capacity drop the oldest, never grow.
+        for index in 0..NOTICE_LOG_CAPACITY * 2 {
+            log.record(TransientNotice::warning(format!("failure {index}")));
+        }
+        assert_eq!(log.len(), NOTICE_LOG_CAPACITY);
+        // The surviving error was evicted, so the header must stop claiming one.
+        assert_eq!(log.severity(), Some(NoticeSeverity::Warning));
+
+        log.clear();
+        assert!(log.is_empty());
+        assert_eq!(log.severity(), None);
     }
 
     #[test]
