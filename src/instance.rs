@@ -11,7 +11,7 @@ use std::{
     },
     path::{Path, PathBuf},
     process,
-    time::Duration,
+    time::{Duration, SystemTime},
 };
 #[cfg(feature = "ui")]
 use std::{
@@ -239,6 +239,43 @@ pub fn report_ui_startup(result: &Result<(), String>) -> io::Result<()> {
         stdout.flush()?;
     }
     Ok(())
+}
+
+/// Persist an uncaught UI panic with enough context to diagnose a native crash
+/// after the compositor has closed the process's stderr.
+pub fn report_ui_panic(
+    message: &str,
+    thread_name: Option<&str>,
+    location: Option<&std::panic::Location<'static>>,
+    backtrace: &std::backtrace::Backtrace,
+) -> io::Result<()> {
+    let dirs = project_dirs().ok_or_else(|| io::Error::other("data directory unavailable"))?;
+    fs::create_dir_all(dirs.data_dir())?;
+    let path = dirs.data_dir().join("ui-crash.log");
+    let mut file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .mode(PRIVATE_FILE_MODE)
+        .open(path)?;
+    writeln!(
+        file,
+        "--- cagents UI panic pid={} at {:?} thread={} ---",
+        process::id(),
+        SystemTime::now(),
+        thread_name.unwrap_or("<unnamed>"),
+    )?;
+    if let Some(location) = location {
+        writeln!(
+            file,
+            "location: {}:{}:{}",
+            location.file(),
+            location.line(),
+            location.column()
+        )?;
+    }
+    writeln!(file, "message: {message}")?;
+    writeln!(file, "backtrace:\n{backtrace}")?;
+    file.flush()
 }
 
 pub fn window_database_path(slot: &str) -> io::Result<PathBuf> {

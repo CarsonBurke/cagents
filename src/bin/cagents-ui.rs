@@ -5,7 +5,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let previous_hook = std::panic::take_hook();
     let main_thread = std::thread::current().id();
     std::panic::set_hook(Box::new(move |panic| {
-        if std::thread::current().id() == main_thread {
+        let thread = std::thread::current();
+        let message = panic
+            .payload()
+            .downcast_ref::<&str>()
+            .copied()
+            .or_else(|| panic.payload().downcast_ref::<String>().map(String::as_str))
+            .unwrap_or("<non-string panic>");
+        let backtrace = std::backtrace::Backtrace::force_capture();
+        let _ = cagents::instance::report_ui_panic(
+            message,
+            thread.name(),
+            panic.location(),
+            &backtrace,
+        );
+        if thread.id() == main_thread {
             let _ = cagents::instance::report_ui_startup(&Err(format!(
                 "UI initialization failed: {panic}"
             )));
