@@ -7,6 +7,7 @@ use close_processes::{FrozenFamily, RootIdentity};
 use std::{
     cell::{Cell, RefCell},
     io::{BufWriter, Read, Write},
+    os::fd::{AsRawFd, FromRawFd, OwnedFd},
     path::PathBuf,
     rc::Rc,
     sync::{
@@ -14,17 +15,17 @@ use std::{
         atomic::{AtomicBool, AtomicU64, Ordering},
     },
     thread::{self, JoinHandle},
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use arc_swap::ArcSwap;
-use crossbeam_channel::{Receiver, Sender, TryRecvError, TrySendError};
+use crossbeam_channel::{Receiver, RecvTimeoutError, Sender, TryRecvError, TrySendError};
 use libghostty_vt::{
     Terminal, TerminalOptions, focus,
     key::{self, Encoder as KeyEncoder},
     mouse::{self, Encoder as MouseEncoder},
     style::{PaletteIndex, RgbColor},
-    terminal::{ColorScheme, Mode, ScrollViewport},
+    terminal::{ColorScheme, CompressionMode, CompressionResult, Mode, ScrollViewport},
 };
 use portable_pty::{
     ChildKiller, CommandBuilder, ExitStatus, MasterPty, PtySize, native_pty_system,
@@ -48,6 +49,17 @@ const PTY_READ_SIZE: usize = 16 * 1024;
 const PTY_BATCH_LIMIT: usize = 256 * 1024;
 /// Marker appended once when a transcript hits its size cap.
 const TRANSCRIPT_TRUNCATED_MARKER: &[u8] = b"\n[cagents transcript truncated: size cap reached]\n";
+/// Foreground observation cadence. Every tick descends `/proc` over the PTY
+/// foreground subtree, so it is only worth paying while that group is moving:
+/// an unchanged group backs the interval off, any change resets it, and a
+/// terminal nobody is watching is never observed on the timer at all.
+const FOREGROUND_POLL_MIN: Duration = Duration::from_secs(2);
+const FOREGROUND_POLL_MAX: Duration = Duration::from_secs(30);
+/// How long shutdown waits for the PTY reader to leave its blocking read
+/// before abandoning the thread. Closing its wake pipe releases the read
+/// immediately in every case we can construct; this only bounds the ones we
+/// cannot, because a hung join here wedges the daemon's dispatch thread.
+const READER_SHUTDOWN_GRACE: Duration = Duration::from_millis(500);
 
 #[derive(Debug)]
 enum Command {
@@ -610,6 +622,9 @@ struct Worker {
     launch: LaunchRecipe,
     resume_hint: Option<String>,
     resume_foreground: Option<libc::pid_t>,
+    /// Current timer interval for foreground observation. Grows while the
+    /// foreground process group is unchanged and no agent was found.
+    foreground_poll: Duration,
     agent_provider: Option<crate::agent::Provider>,
     agent_process: Option<AgentProcess>,
     display_title: String,
@@ -624,7 +639,15 @@ struct Worker {
     generation: u64,
     capture_dirty: bool,
     force_capture: bool,
+    /// Size the widget last asked for; the size a resumed or upgraded terminal
+    /// is rebuilt with.
     current_size: TerminalSize,
+    /// Sizes actually in effect. A failed ioctl must never be remembered as
+    /// applied: the widget re-sends the same steady-state size, and a cached
+    /// failure would short-circuit that retry and leave the child on its old
+    /// SIGWINCH dimensions forever.
+    applied_pty_size: TerminalSize,
+    applied_parser_size: TerminalSize,
     commands: Receiver<Command>,
     pty_rx: Receiver<PtyMessage>,
     events: Sender<TerminalEvent>,
@@ -638,6 +661,12 @@ struct Worker {
     checked_shutdown: bool,
     child_reaper: Option<JoinHandle<()>>,
     reader: Option<JoinHandle<()>>,
+    /// Write end of the reader's wake pipe. Closing it releases a read that a
+    /// disowned grandchild would otherwise hold open indefinitely.
+    reader_wake: Option<OwnedFd>,
+    /// Disconnects when the reader thread returns, so shutdown can wait for
+    /// it with a deadline instead of joining unconditionally.
+    reader_done: Receiver<()>,
 }
 
 impl Worker {
@@ -735,10 +764,22 @@ impl Worker {
             .take_writer()
             .map_err(|error| format!("take PTY writer: {error:#}"))?;
 
+        // `try_clone_reader` hides its descriptor, and closing the master does
+        // not release a read already blocked on the clone: a PTY master read
+        // only fails with EIO once the last slave descriptor closes, which a
+        // disowned grandchild can defer forever. Wait for readiness on a
+        // descriptor this worker hands over instead, alongside a pipe whose
+        // closure is the shutdown signal, so the reader always has a way out.
+        let readiness = duplicate_descriptor(&*pair.master)?;
+        let (wake_rx, wake_tx) = wake_pipe()?;
         let (pty_tx, pty_rx) = crossbeam_channel::bounded(config.pty_capacity.max(1));
+        let (reader_done_tx, reader_done) = crossbeam_channel::bounded::<()>(0);
         let reader_thread = thread::Builder::new()
             .name(format!("terminal-pty-reader-{:?}", session.id))
-            .spawn(move || read_pty(&mut reader, &pty_tx))
+            .spawn(move || {
+                let _done = reader_done_tx;
+                read_pty(&mut reader, &pty_tx, readiness, wake_rx);
+            })
             .map_err(|error| format!("start PTY reader: {error}"))?;
 
         let transcript = session
@@ -780,6 +821,7 @@ impl Worker {
             terminal_id: session.id,
             resume_hint: crate::model::agent_recovery::observed_hint_from_launch(&session.launch),
             resume_foreground: None,
+            foreground_poll: FOREGROUND_POLL_MIN,
             agent_provider: None,
             agent_process: None,
             display_title: String::new(),
@@ -796,6 +838,8 @@ impl Worker {
             capture_dirty: false,
             force_capture: false,
             current_size,
+            applied_pty_size: current_size,
+            applied_parser_size: current_size,
             commands,
             pty_rx,
             events,
@@ -809,6 +853,8 @@ impl Worker {
             checked_shutdown: false,
             child_reaper: Some(child_reaper),
             reader: Some(reader_thread),
+            reader_wake: Some(wake_tx),
+            reader_done,
         })
     }
 
@@ -833,6 +879,7 @@ impl Worker {
                         &self.published.capture_rx,
                         pty_open,
                         !exited,
+                        self.foreground_poll,
                     )
                 });
             match event {
@@ -845,7 +892,7 @@ impl Worker {
                 }
                 WorkerEvent::Command(None) => shutting_down = true,
                 WorkerEvent::Capture => self.capture_if_ready(),
-                WorkerEvent::ObserveForeground => self.refresh_resume_hint(true),
+                WorkerEvent::ObserveForeground => self.observe_foreground(),
                 WorkerEvent::Pty(message) => {
                     pty_open = self.handle_pty_message(message);
                 }
@@ -910,13 +957,24 @@ impl Worker {
             transcript.finish();
         }
 
-        // Drop the controlling descriptors before waiting for the blocking
-        // reader so shutdown reliably releases its read call.
+        // Release the reader's blocking wait before waiting on it, then bound
+        // that wait: a reader still stuck on a descriptor a disowned
+        // grandchild holds open is abandoned rather than joined forever,
+        // because a hung join here wedges the daemon's dispatch thread.
+        drop(self.reader_wake.take());
+        if let Some(reader) = self.reader.take() {
+            match self.reader_done.recv_timeout(READER_SHUTDOWN_GRACE) {
+                Err(RecvTimeoutError::Timeout) => tracing::warn!(
+                    terminal_id = %self.terminal_id,
+                    "abandoning PTY reader thread still blocked on its descriptor"
+                ),
+                _ => {
+                    let _ = reader.join();
+                }
+            }
+        }
         drop(self.writer);
         drop(self.master);
-        if let Some(reader) = self.reader.take() {
-            let _ = reader.join();
-        }
         // Terminal, render state, and every Ghostty encoder drop here, on the
         // same OS thread on which they were constructed and used.
     }
@@ -972,7 +1030,6 @@ impl Worker {
         if bytes.is_empty() {
             return;
         }
-        self.refresh_resume_hint(false);
         let observed_sequence = {
             let mut activity = self
                 .published
@@ -997,12 +1054,6 @@ impl Worker {
         {
             observer(sequence);
         }
-        if let Some(transcript) = &self.transcript
-            && transcript.send(bytes.clone()).is_err()
-        {
-            self.error("write transcript", "transcript writer closed".into());
-            self.transcript = None;
-        }
 
         let parse_started =
             tracing::enabled!(target: "cagents::terminal_pipeline", tracing::Level::TRACE)
@@ -1013,6 +1064,18 @@ impl Worker {
                 terminal_id = %self.terminal_id, bytes = bytes.len(),
                 elapsed_ns = started.elapsed().as_nanos() as u64);
         }
+
+        // Hand the batch over instead of copying up to PTY_BATCH_LIMIT bytes
+        // into a channel that drops them under exactly the flood that makes
+        // the copy expensive, and that records nothing at all past its cap.
+        if let Some(transcript) = &self.transcript
+            && transcript.accepts()
+            && transcript.send(bytes).is_err()
+        {
+            self.error("write transcript", "transcript writer closed".into());
+            self.transcript = None;
+        }
+
         self.drain_effects();
         self.publish_snapshot(false);
     }
@@ -1208,19 +1271,29 @@ impl Worker {
         size.rows = size.rows.max(1);
         size.cell_width_px = size.cell_width_px.max(1);
         size.cell_height_px = size.cell_height_px.max(1);
-        if size == self.current_size {
+        if size == self.applied_pty_size && size == self.applied_parser_size {
             return;
         }
-        if let Err(error) = self.master.resize(pty_size(size)) {
-            self.error("resize PTY", format!("{error:#}"));
+        // Record only what actually took effect. A failed ioctl cached as the
+        // current size would swallow every later identical request, including
+        // the steady-state size the widget re-sends, and the child would keep
+        // its old SIGWINCH dimensions for the rest of its life.
+        if size != self.applied_pty_size {
+            match self.master.resize(pty_size(size)) {
+                Ok(()) => self.applied_pty_size = size,
+                Err(error) => self.error("resize PTY", format!("{error:#}")),
+            }
         }
-        if let Err(error) = self.terminal.resize(
-            size.columns,
-            size.rows,
-            size.cell_width_px,
-            size.cell_height_px,
-        ) {
-            self.error("resize terminal", error.to_string());
+        if size != self.applied_parser_size {
+            match self.terminal.resize(
+                size.columns,
+                size.rows,
+                size.cell_width_px,
+                size.cell_height_px,
+            ) {
+                Ok(()) => self.applied_parser_size = size,
+                Err(error) => self.error("resize terminal", error.to_string()),
+            }
         }
         self.current_size = size;
         if self.visibility == Visibility::Visible {
@@ -1247,6 +1320,9 @@ impl Worker {
             }
         }
         self.visibility = Visibility::Visible;
+        // Observe promptly again: whatever ran in the background while this
+        // card was away is what the user is now looking at.
+        self.foreground_poll = FOREGROUND_POLL_MIN;
         self.published.visible.store(true, Ordering::Release);
         self.publish_snapshot(true);
     }
@@ -1257,6 +1333,31 @@ impl Worker {
         self.visual = None;
         self.generation = self.generation.saturating_add(1);
         self.published.detach(self.generation);
+        // Render state is the small half. The parser's scrollback pool is tens
+        // of MiB for a wide grid and, with `max_scrollback` fixed at
+        // construction, is otherwise retained for as long as the card exists.
+        //
+        // libghostty-vt 0.2.1 exposes no way to lower that limit or drop the
+        // history tail, and rebuilding the parser from the viewport is not an
+        // option for a card that can be revealed again: its child is still
+        // running, so modes, the alternate screen, cursor state and keyboard
+        // and mouse protocol state would all be lost under a live TUI. A full
+        // compression pass is the reclamation that keeps the contract - it
+        // changes only the storage representation, never the logical
+        // contents - and its one synchronous scan is affordable exactly here,
+        // where nothing is waiting on a frame.
+        match self.terminal.compress(CompressionMode::Full) {
+            Ok(CompressionResult::Unsupported) => tracing::debug!(
+                terminal_id = %self.terminal_id,
+                "scrollback reclamation is unavailable on this target"
+            ),
+            Ok(_) => {}
+            Err(error) => tracing::debug!(
+                terminal_id = %self.terminal_id,
+                %error,
+                "hibernated terminal could not compress its scrollback"
+            ),
+        }
     }
 
     fn restore_visuals(&mut self, visible: bool) {
@@ -1401,50 +1502,85 @@ impl Worker {
         ))
     }
 
+    fn foreground_group(&self) -> Option<libc::pid_t> {
+        self.master.as_raw_fd().and_then(|fd| {
+            // SAFETY: this worker owns the live master descriptor.
+            let group = unsafe { libc::tcgetpgrp(fd) };
+            (group > 0).then_some(group)
+        })
+    }
+
     fn observe_agent_process(&mut self) -> Option<&AgentProcess> {
-        let foreground = || {
-            self.master.as_raw_fd().and_then(|fd| {
-                // SAFETY: this worker owns the live master descriptor.
-                let group = unsafe { libc::tcgetpgrp(fd) };
-                (group > 0).then_some(group)
-            })
-        };
-        let group = foreground();
+        let group = self.foreground_group();
         let process = if self.agent_exited {
             None
         } else {
             group
                 .and_then(crate::model::agent_recovery::foreground_agent)
-                .filter(|_| foreground() == group)
+                // A group that moved mid-walk invalidates what the walk saw.
+                .filter(|_| self.foreground_group() == group)
         };
+        self.adopt_agent_process(process);
+        self.agent_process.as_ref()
+    }
+
+    fn adopt_agent_process(&mut self, process: Option<AgentProcess>) {
         if process.is_none() || process != self.agent_process {
             self.set_agent_activity(None);
         }
         self.agent_process = process;
-        self.agent_process.as_ref()
+    }
+
+    /// Timer-driven observation. The descent is only worth its cost while the
+    /// foreground group is moving, so an unchanged group backs the interval
+    /// off and skips the walk outright once it has found no agent to track.
+    /// A terminal nobody is watching is never observed here at all: it can
+    /// only change what a snapshot nobody reads would have shown.
+    fn observe_foreground(&mut self) {
+        if self.visibility != Visibility::Visible || self.agent_exited {
+            // Nothing here can change anything anyone reads, so let the timer
+            // settle to its longest interval rather than waking every 2s for
+            // the rest of this terminal's life.
+            self.foreground_poll = FOREGROUND_POLL_MAX;
+            return;
+        }
+        if self.foreground_group() == self.resume_foreground {
+            self.foreground_poll = (self.foreground_poll * 2).min(FOREGROUND_POLL_MAX);
+            if self.agent_process.is_none() {
+                return;
+            }
+        }
+        self.refresh_resume_hint(true);
     }
 
     fn refresh_resume_hint(&mut self, force: bool) {
-        let foreground = self
-            .master
-            .as_raw_fd()
-            .map(|fd| {
-                // SAFETY: this worker owns the live master descriptor.
-                unsafe { libc::tcgetpgrp(fd) }
-            })
-            .filter(|group| *group > 0);
+        let foreground = self.foreground_group();
         if !force && self.resume_foreground == foreground {
             return;
         }
+        if self.resume_foreground != foreground {
+            // The group moved: observe promptly again until it settles.
+            self.foreground_poll = FOREGROUND_POLL_MIN;
+        }
         self.resume_foreground = foreground;
-        let hint = if self.agent_exited {
+        // One descent answers both questions. Resolving them separately meant
+        // two full /proc walks - stat, cmdline, cwd, environ and children per
+        // node - for a single observation.
+        let observation = if self.agent_exited {
             None
         } else {
-            foreground.and_then(|group| {
-                crate::model::agent_recovery::foreground_hint(group, &self.launch)
-            })
+            foreground
+                .map(|group| {
+                    crate::model::agent_recovery::foreground_observation(group, &self.launch)
+                })
+                // A group that moved mid-walk invalidates what the walk saw.
+                .filter(|_| self.foreground_group() == foreground)
         };
-        self.agent_provider = self.observe_agent_process().map(|process| process.provider);
+        let (hint, process) = observation
+            .map(|observation| (observation.hint, observation.agent))
+            .unwrap_or_default();
+        self.adopt_agent_process(process);
+        self.agent_provider = self.agent_process.as_ref().map(|process| process.provider);
         if hint != self.resume_hint {
             self.resume_hint = hint.clone();
             self.emit(TerminalEvent::ResumeHintChanged(hint));
@@ -1595,6 +1731,7 @@ fn wait_for_worker_event(
     capture: &Receiver<()>,
     pty_open: bool,
     child_running: bool,
+    observe_after: Duration,
 ) -> WorkerEvent {
     match (pty_open, child_running) {
         (true, true) => crossbeam_channel::select! {
@@ -1602,7 +1739,7 @@ fn wait_for_worker_event(
             recv(capture) -> _ => WorkerEvent::Capture,
             recv(pty) -> message => WorkerEvent::Pty(message.ok()),
             recv(child_exit) -> message => WorkerEvent::ChildExit(message.ok()),
-            default(std::time::Duration::from_secs(2)) => WorkerEvent::ObserveForeground,
+            default(observe_after) => WorkerEvent::ObserveForeground,
         },
         (true, false) => crossbeam_channel::select! {
             recv(commands) -> message => WorkerEvent::Command(message.ok()),
@@ -1613,7 +1750,7 @@ fn wait_for_worker_event(
             recv(commands) -> message => WorkerEvent::Command(message.ok()),
             recv(capture) -> _ => WorkerEvent::Capture,
             recv(child_exit) -> message => WorkerEvent::ChildExit(message.ok()),
-            default(std::time::Duration::from_secs(2)) => WorkerEvent::ObserveForeground,
+            default(observe_after) => WorkerEvent::ObserveForeground,
         },
         (false, false) => WorkerEvent::Command(commands.recv().ok()),
     }
@@ -1826,9 +1963,99 @@ fn pty_size(size: TerminalSize) -> PtySize {
     }
 }
 
-fn read_pty(reader: &mut dyn Read, sender: &Sender<PtyMessage>) {
+/// Duplicate a master PTY descriptor for the reader's readiness wait.
+///
+/// Readiness is a property of the terminal, not of a particular descriptor, so
+/// a duplicate answers for the clone the reader actually reads from - and the
+/// reader owning it means shutdown never closes a descriptor out from under a
+/// thread that is still polling it.
+fn duplicate_descriptor(master: &dyn MasterPty) -> Result<OwnedFd, String> {
+    let fd = master.as_raw_fd().ok_or("PTY descriptor unavailable")?;
+    // SAFETY: `master` keeps `fd` open across this call, and F_DUPFD_CLOEXEC
+    // returns a fresh descriptor nobody else owns.
+    let duplicate = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 0) };
+    if duplicate < 0 {
+        return Err(format!(
+            "duplicate PTY descriptor: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    // SAFETY: `fcntl` just returned an owned descriptor.
+    Ok(unsafe { OwnedFd::from_raw_fd(duplicate) })
+}
+
+/// Read and write ends of the reader's shutdown pipe. Nothing is ever written
+/// to it: dropping the write end hangs the read end up, which is the one event
+/// a blocking reader can always observe.
+fn wake_pipe() -> Result<(OwnedFd, OwnedFd), String> {
+    let mut ends = [0 as libc::c_int; 2];
+    // SAFETY: `ends` is the two-element array `pipe2` writes into.
+    if unsafe { libc::pipe2(ends.as_mut_ptr(), libc::O_CLOEXEC) } != 0 {
+        return Err(format!(
+            "create PTY reader wake pipe: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    // SAFETY: `pipe2` filled both entries with fresh owned descriptors.
+    unsafe { Ok((OwnedFd::from_raw_fd(ends[0]), OwnedFd::from_raw_fd(ends[1]))) }
+}
+
+enum Readiness {
+    Readable,
+    Shutdown,
+    Failed(String),
+}
+
+/// Wait until the terminal has output, or until shutdown hangs up the wake
+/// pipe. A PTY master read only fails with EIO once the last slave descriptor
+/// closes, so a disowned grandchild can keep a blocking read - and therefore
+/// shutdown - waiting indefinitely; the pipe is the way out.
+fn wait_readable(readiness: &OwnedFd, wake: &OwnedFd) -> Readiness {
+    let mut fds = [
+        libc::pollfd {
+            fd: readiness.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        },
+        libc::pollfd {
+            fd: wake.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        },
+    ];
+    loop {
+        // SAFETY: this thread owns both descriptors for the whole call.
+        let ready = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, -1) };
+        if ready < 0 {
+            let error = std::io::Error::last_os_error();
+            if error.kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Readiness::Failed(error.to_string());
+        }
+        if fds[1].revents != 0 {
+            return Readiness::Shutdown;
+        }
+        if fds[0].revents != 0 {
+            // Hangup still needs one more read: the parser must see everything
+            // the child wrote before its slave closed, and an unreadable
+            // descriptor surfaces as EOF or an error from the read itself.
+            return Readiness::Readable;
+        }
+    }
+}
+
+fn read_pty(reader: &mut dyn Read, sender: &Sender<PtyMessage>, readiness: OwnedFd, wake: OwnedFd) {
     let mut buffer = vec![0u8; PTY_READ_SIZE];
     loop {
+        match wait_readable(&readiness, &wake) {
+            Readiness::Readable => {}
+            Readiness::Shutdown => return,
+            Readiness::Failed(error) => {
+                let _ = sender.send(PtyMessage::Error(error));
+                return;
+            }
+        }
         match reader.read(&mut buffer) {
             Ok(0) => {
                 let _ = sender.send(PtyMessage::Eof);
@@ -1853,6 +2080,9 @@ fn read_pty(reader: &mut dyn Read, sender: &Sender<PtyMessage>) {
 
 struct TranscriptWriter {
     sender: Sender<TranscriptMessage>,
+    /// Published by the writer once the size cap is reached, so the worker can
+    /// stop handing over batches the writer would only drop.
+    capped: Arc<AtomicBool>,
     worker: JoinHandle<()>,
 }
 
@@ -1862,6 +2092,8 @@ impl TranscriptWriter {
             .map_err(|error| format!("open transcript {}: {error}", path.display()))?;
         let written = file.metadata().map(|metadata| metadata.len()).unwrap_or(0);
         let (sender, receiver) = crossbeam_channel::bounded(capacity);
+        let capped_flag = Arc::new(AtomicBool::new(false));
+        let published_cap = Arc::clone(&capped_flag);
         let worker = thread::Builder::new()
             .name("terminal-transcript-writer".into())
             .spawn(move || {
@@ -1871,6 +2103,7 @@ impl TranscriptWriter {
                 // stays as-is and nothing more is recorded.
                 let mut capped = written >= max_bytes;
                 if capped {
+                    published_cap.store(true, Ordering::Relaxed);
                     let _ = writer.write_all(TRANSCRIPT_TRUNCATED_MARKER);
                     let _ = writer.flush();
                 }
@@ -1884,6 +2117,7 @@ impl TranscriptWriter {
                                 written.saturating_add(bytes.len() as u64) <= max_bytes;
                             if !within_cap {
                                 capped = true;
+                                published_cap.store(true, Ordering::Relaxed);
                                 let _ = writer.write_all(TRANSCRIPT_TRUNCATED_MARKER);
                                 let _ = writer.flush();
                                 continue;
@@ -1899,7 +2133,18 @@ impl TranscriptWriter {
                 let _ = writer.flush();
             })
             .map_err(|error| format!("start transcript writer: {error}"))?;
-        Ok(Self { sender, worker })
+        Ok(Self {
+            sender,
+            capped: capped_flag,
+            worker,
+        })
+    }
+
+    /// Whether handing over a batch can still record anything. Racy by
+    /// design and deliberately cheap: a full channel or a capped file means
+    /// the batch is dropped, and dropping it here costs nothing at all.
+    fn accepts(&self) -> bool {
+        !self.sender.is_full() && !self.capped.load(Ordering::Relaxed)
     }
 
     /// Best-effort and never blocking: output bursts faster than the disk
@@ -2481,6 +2726,37 @@ mod tests {
     }
 
     #[test]
+    fn foreground_observation_backs_off_and_skips_unwatched_terminals() {
+        // A long-lived child keeps the foreground group stable for the whole
+        // test, so every tick below takes its "nothing changed" path.
+        let (mut worker, _) = capture_worker_for(LaunchRecipe {
+            program: "/bin/sleep".into(),
+            arguments: vec!["10".into()],
+            working_directory: PathBuf::from("/"),
+            environment: BTreeMap::new(),
+        });
+        worker.resume_foreground = worker.foreground_group();
+        assert!(worker.agent_process.is_none());
+
+        // With the same group and no agent to track, the walk is skipped and
+        // the interval stretches instead of descending /proc every 2s forever.
+        worker.observe_foreground();
+        assert_eq!(worker.foreground_poll, FOREGROUND_POLL_MIN * 2);
+        worker.observe_foreground();
+        assert_eq!(worker.foreground_poll, FOREGROUND_POLL_MIN * 4);
+        assert_eq!(worker.resume_foreground, worker.foreground_group());
+
+        // A terminal nobody is watching is never observed on the timer.
+        worker.set_hidden();
+        worker.observe_foreground();
+        assert_eq!(worker.foreground_poll, FOREGROUND_POLL_MAX);
+
+        // Revealing it makes the next observation prompt again.
+        worker.reveal();
+        assert_eq!(worker.foreground_poll, FOREGROUND_POLL_MIN);
+    }
+
+    #[test]
     fn shutdown_preserves_already_parsed_dirty_contents() {
         let (mut worker, _) = capture_worker();
         worker.publish_snapshot(true);
@@ -2814,7 +3090,8 @@ mod tests {
                 &child_exit_rx,
                 &crossbeam_channel::never(),
                 false,
-                true
+                true,
+                FOREGROUND_POLL_MIN,
             ),
             WorkerEvent::Command(Some(Command::Hide))
         ));
@@ -2823,7 +3100,15 @@ mod tests {
             .send(Ok(ExitStatus::with_exit_code(7)))
             .unwrap();
         assert!(matches!(
-            wait_for_worker_event(&command_rx, &pty_rx, &child_exit_rx, &crossbeam_channel::never(), false, true),
+            wait_for_worker_event(
+                &command_rx,
+                &pty_rx,
+                &child_exit_rx,
+                &crossbeam_channel::never(),
+                false,
+                true,
+                FOREGROUND_POLL_MIN,
+            ),
             WorkerEvent::ChildExit(Some(Ok(status))) if status.exit_code() == 7
         ));
     }

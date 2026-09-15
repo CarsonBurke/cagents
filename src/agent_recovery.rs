@@ -385,11 +385,6 @@ pub(crate) fn fresh_omp_session(process: &AgentProcess) -> Option<std::path::Pat
     }
 }
 
-#[cfg(feature = "host")]
-fn process_launch(root: &Path, base: &LaunchRecipe) -> Option<(LaunchRecipe, u64, i32)> {
-    read_process_launch(root, Some(base))
-}
-
 fn observation_environment_key(name: &str) -> bool {
     matches!(
         name,
@@ -574,6 +569,7 @@ fn indirect_environment_key(name: &str) -> bool {
         .is_some_and(|prefix| prefix.eq_ignore_ascii_case("GIT_CONFIG"))
 }
 
+#[cfg(feature = "host")]
 fn sensitive_environment_key(name: &str) -> bool {
     credential_environment_key(name)
         || indirect_environment_key(name)
@@ -856,10 +852,24 @@ pub(crate) fn native_environment(
 }
 
 #[cfg(feature = "host")]
-fn read_process_launch(
-    root: &Path,
-    base: Option<&LaunchRecipe>,
-) -> Option<(LaunchRecipe, u64, i32)> {
+struct ForegroundLaunch {
+    /// Recovery view: the launcher's environment stays as a fallback for keys
+    /// the observed process does not expose. `None` when unrequested.
+    inherited: Option<LaunchRecipe>,
+    /// Activity view: only the process's own allowlisted environment. `None`
+    /// when unrequested, or when that environment could not be observed
+    /// exactly - which must never be completed from the launcher's.
+    exact: Option<LaunchRecipe>,
+    start: u64,
+    group: i32,
+}
+
+/// Read one process's argv, working directory and allowlisted environment
+/// once, then build every requested view from it. The views differ only in
+/// their environment, so resolving them from separate reads doubled the
+/// largest read in a descent - `environ`, up to 128 KiB - for no new fact.
+#[cfg(feature = "host")]
+fn read_process_launch(root: &Path, request: ForegroundRequest<'_>) -> Option<ForegroundLaunch> {
     let before = process_identity(&bounded_read(root.join("stat"), 4096)?)?;
     let bytes = bounded_read(root.join("cmdline"), MAX_ARGV_BYTES)?;
     let bytes = bytes.strip_suffix(&[0]).unwrap_or(&bytes);
@@ -868,20 +878,15 @@ fn read_process_launch(
         .map(|arg| std::str::from_utf8(arg).map(str::to_owned));
     let program = argv.next()?.ok()?;
     let arguments = argv.collect::<Result<Vec<_>, _>>().ok()?;
-    if base.is_none() && arguments.len() > 128 {
-        return None;
-    }
     let working_directory = fs::read_link(root.join("cwd")).ok()?;
-    let mut environment = base
-        .map(|base| base.environment.clone())
-        .unwrap_or_default();
+    let environ = bounded_read(root.join("environ"), 128 * 1024);
+    let mut inherited = request.hint.map(|base| base.environment.clone());
     // Recovery retains its existing fallback. Activity requires the actual
-    // allowlisted environment: missing keys must not inherit terminal overrides.
-    let bytes = bounded_read(root.join("environ"), 128 * 1024);
-    if base.is_none() && bytes.is_none() {
-        return None;
-    }
-    if let Some(bytes) = bytes {
+    // allowlisted environment: missing keys must not inherit terminal
+    // overrides, and an argv that long is not an agent invocation.
+    let mut exact = (request.agent && arguments.len() <= 128 && environ.is_some())
+        .then(std::collections::BTreeMap::new);
+    if let Some(bytes) = &environ {
         for entry in bytes.split(|byte| *byte == 0) {
             let Some(index) = entry.iter().position(|byte| *byte == b'=') else {
                 continue;
@@ -889,47 +894,198 @@ fn read_process_launch(
             let Ok(name) = std::str::from_utf8(&entry[..index]) else {
                 continue;
             };
-            if observation_environment_key(name) {
-                let value = match std::str::from_utf8(&entry[index + 1..]) {
-                    Ok(value) => value,
-                    Err(_) if base.is_some() => continue,
-                    Err(_) => return None,
-                };
-                environment.insert(name.into(), value.into());
+            if !observation_environment_key(name) {
+                continue;
+            }
+            match std::str::from_utf8(&entry[index + 1..]) {
+                Ok(value) => {
+                    if let Some(environment) = &mut inherited {
+                        environment.insert(name.into(), value.into());
+                    }
+                    if let Some(environment) = &mut exact {
+                        environment.insert(name.into(), value.into());
+                    }
+                }
+                // A key the process holds but we cannot decode is a gap in
+                // exact evidence, not a value to fall back on.
+                Err(_) => exact = None,
             }
         }
     }
-    let launch = LaunchRecipe {
+    let inherited = inherited.map(|environment| LaunchRecipe {
+        program: program.clone(),
+        arguments: arguments.clone(),
+        working_directory: working_directory.clone(),
+        environment,
+    });
+    let exact = exact.map(|environment| LaunchRecipe {
         program,
         arguments,
         working_directory,
         environment,
-    };
-    (before == process_identity(&bounded_read(root.join("stat"), 4096)?)?)
-        .then_some((launch, before.1, before.0))
+    });
+    (before == process_identity(&bounded_read(root.join("stat"), 4096)?)?).then_some(
+        ForegroundLaunch {
+            inherited,
+            exact,
+            start: before.1,
+            group: before.0,
+        },
+    )
 }
 
-/// Follow the actual PTY foreground group's launcher children, not unrelated
-/// processes or the shared Codex server (which can own many conversations).
+/// Which halves of a foreground observation a descent must resolve. A half
+/// that is not requested costs neither its per-node reads nor its observation.
 #[cfg(feature = "host")]
-pub(crate) fn foreground_hint(pid: libc::pid_t, base: &LaunchRecipe) -> Option<String> {
+#[derive(Clone, Copy)]
+struct ForegroundRequest<'a> {
+    /// Recovery authority, resolved against this launcher recipe's environment
+    /// as the fallback for keys the observed process does not expose. `None`
+    /// skips the recovery half entirely.
+    hint: Option<&'a LaunchRecipe>,
+    /// Exact, process-bound activity evidence.
+    agent: bool,
+}
+
+/// Outcome of one half of a descent. `Failed` is what the single-purpose
+/// walkers returned as `Err(())`: inspection was incomplete or conflicting,
+/// never "no agent", so a forwarding ancestor must not upgrade it to exact
+/// evidence from stale argv. The halves fail independently, because a process
+/// whose `environ` cannot be decoded defeats exact activity evidence while
+/// recovery can still complete from the launcher's environment.
+#[cfg(feature = "host")]
+enum Half<T> {
+    Missing,
+    Found(T),
+    Failed,
+}
+
+#[cfg(feature = "host")]
+impl<T: PartialEq> Half<T> {
+    fn failed(&self) -> bool {
+        matches!(self, Self::Failed)
+    }
+
+    /// Fold in a child's outcome. Two children that disagree are a conflict,
+    /// exactly as when each child's evidence was compared in turn, and a
+    /// failure anywhere under this node stays a failure.
+    fn merge(&mut self, child: Self) {
+        *self = match (std::mem::replace(self, Self::Failed), child) {
+            (Self::Failed, _) | (_, Self::Failed) => Self::Failed,
+            (Self::Missing, other) => other,
+            (found, Self::Missing) => found,
+            (Self::Found(previous), Self::Found(next)) if previous == next => Self::Found(previous),
+            (Self::Found(_), Self::Found(_)) => Self::Failed,
+        };
+    }
+
+    fn resolve(self) -> Result<Option<T>, ()> {
+        match self {
+            Self::Missing => Ok(None),
+            Self::Found(value) => Ok(Some(value)),
+            Self::Failed => Err(()),
+        }
+    }
+}
+
+#[cfg(feature = "host")]
+fn observed_half<T>(result: Result<Option<T>, ()>) -> Half<T> {
+    match result {
+        Ok(Some(value)) => Half::Found(value),
+        Ok(None) => Half::Missing,
+        Err(()) => Half::Failed,
+    }
+}
+
+#[cfg(feature = "host")]
+struct ForegroundEvidence {
+    hint: Half<String>,
+    agent: Half<AgentProcess>,
+}
+
+#[cfg(feature = "host")]
+impl ForegroundEvidence {
+    fn missing() -> Self {
+        Self {
+            hint: Half::Missing,
+            agent: Half::Missing,
+        }
+    }
+
+    fn failed() -> Self {
+        Self {
+            hint: Half::Failed,
+            agent: Half::Failed,
+        }
+    }
+
+    /// Nothing deeper in the subtree can change a requested half that already
+    /// failed, so the descent stops instead of spending its node budget.
+    fn settled(&self, request: ForegroundRequest<'_>) -> bool {
+        (request.hint.is_none() || self.hint.failed()) && (!request.agent || self.agent.failed())
+    }
+
+    fn merge(&mut self, child: Self) {
+        self.hint.merge(child.hint);
+        self.agent.merge(child.agent);
+    }
+}
+
+#[cfg(feature = "host")]
+fn foreground_group(pid: libc::pid_t) -> Option<i32> {
     if pid <= 0 {
         return None;
     }
     let (group, _) = process_identity(&bounded_read(format!("/proc/{pid}/stat"), 4096)?)?;
-    inspect_process(Path::new("/proc"), pid, group, base, &mut 64)
-        .ok()
-        .flatten()
+    Some(group)
+}
+
+/// Both kinds of foreground evidence, resolved from a single descent.
+#[cfg(feature = "host")]
+#[derive(Debug, Default)]
+pub(crate) struct ForegroundObservation {
+    /// Recovery authority for the foreground conversation, if it has any.
+    pub(crate) hint: Option<String>,
+    /// Raw executable/script/account identity of the foreground agent.
+    pub(crate) agent: Option<AgentProcess>,
+}
+
+/// Follow the actual PTY foreground group's launcher children once, answering
+/// both questions from the same walk.
+///
+/// Recovery authority and activity identity used to descend independently.
+/// Every node stats, reads `cmdline`, resolves `cwd`, reads up to 128 KiB of
+/// `environ` and lists its children, so the second descent doubled the cost of
+/// an observation without being able to see anything the first could not.
+#[cfg(feature = "host")]
+pub(crate) fn foreground_observation(
+    pid: libc::pid_t,
+    base: &LaunchRecipe,
+) -> ForegroundObservation {
+    let Some(group) = foreground_group(pid) else {
+        return ForegroundObservation::default();
+    };
+    let evidence = walk_foreground(
+        Path::new("/proc"),
+        pid,
+        group,
+        &mut 64,
+        ForegroundRequest {
+            hint: Some(base),
+            agent: true,
+        },
+    );
+    ForegroundObservation {
+        hint: evidence.hint.resolve().ok().flatten(),
+        agent: evidence.agent.resolve().ok().flatten(),
+    }
 }
 
 /// Observe raw executable/script/account identity through the same bounded
 /// foreground walker as recovery, without resolving conversation authority.
 #[cfg(feature = "host")]
 pub(crate) fn foreground_agent(pid: libc::pid_t) -> Option<AgentProcess> {
-    if pid <= 0 {
-        return None;
-    }
-    let (group, _) = process_identity(&bounded_read(format!("/proc/{pid}/stat"), 4096)?)?;
+    let group = foreground_group(pid)?;
     inspect_agent_process(Path::new("/proc"), pid, group, &mut 64)
         .ok()
         .flatten()
@@ -947,31 +1103,18 @@ fn inspect_agent_process(
         pid,
         group,
         remaining,
-        &|root| read_process_launch(root, None),
-        &|root, pid, mut launch, start| {
-            let provider = Provider::recognize_launch(&launch).ok_or(())?;
-            let recovery = Provider::normalize_launch(launch.clone()).ok_or(())?;
-            // Recognition uses argv, execution uses the actual installation.
-            // Native Claude installations can have a version-only exe basename.
-            launch.program = fs::read_link(root.join("exe"))
-                .map_err(|_| ())?
-                .to_str()
-                .ok_or(())?
-                .to_owned();
-            Ok(Some(AgentProcess {
-                pid,
-                start,
-                provider,
-                launch,
-                recovery,
-            }))
+        ForegroundRequest {
+            hint: None,
+            agent: true,
         },
     )
+    .agent
+    .resolve()
 }
 
-// Err means inspection is incomplete or conflicting, never "no agent": a
-// forwarding ancestor must not upgrade it to exact evidence from stale argv.
-#[cfg(feature = "host")]
+/// The recovery half of the shared descent, for tests that pin its exact
+/// conflict and incompleteness semantics against a planted `/proc` tree.
+#[cfg(all(test, feature = "host"))]
 fn inspect_process(
     proc_root: &Path,
     pid: i32,
@@ -984,31 +1127,74 @@ fn inspect_process(
         pid,
         group,
         remaining,
-        &|root| process_launch(root, base),
-        &recovery_observation,
+        ForegroundRequest {
+            hint: Some(base),
+            agent: true,
+        },
     )
+    .hint
+    .resolve()
 }
 
 #[cfg(feature = "host")]
-fn walk_foreground<T: PartialEq>(
+fn agent_observation(
+    root: &Path,
+    pid: i32,
+    mut launch: LaunchRecipe,
+    start: u64,
+) -> Result<Option<AgentProcess>, ()> {
+    let provider = Provider::recognize_launch(&launch).ok_or(())?;
+    let recovery = Provider::normalize_launch(launch.clone()).ok_or(())?;
+    // Recognition uses argv, execution uses the actual installation. Native
+    // Claude installations can have a version-only exe basename.
+    launch.program = fs::read_link(root.join("exe"))
+        .map_err(|_| ())?
+        .to_str()
+        .ok_or(())?
+        .to_owned();
+    Ok(Some(AgentProcess {
+        pid,
+        start,
+        provider,
+        launch,
+        recovery,
+    }))
+}
+
+#[cfg(feature = "host")]
+fn walk_foreground(
     proc_root: &Path,
     pid: i32,
     group: i32,
     remaining: &mut usize,
-    read_launch: &impl Fn(&Path) -> Option<(LaunchRecipe, u64, i32)>,
-    observe: &impl Fn(&Path, i32, LaunchRecipe, u64) -> Result<Option<T>, ()>,
-) -> Result<Option<T>, ()> {
-    *remaining = remaining.checked_sub(1).ok_or(())?;
+    request: ForegroundRequest<'_>,
+) -> ForegroundEvidence {
+    let Some(left) = remaining.checked_sub(1) else {
+        return ForegroundEvidence::failed();
+    };
+    *remaining = left;
     let root = proc_root.join(pid.to_string());
-    let (raw, start, observed_group) = read_launch(&root).ok_or(())?;
-    if observed_group != group {
-        return Ok(None);
+    let Some(launch) = read_process_launch(&root, request) else {
+        return ForegroundEvidence::failed();
+    };
+    let mut evidence = ForegroundEvidence::missing();
+    if request.agent && launch.exact.is_none() {
+        // Activity evidence is exact or it is nothing: an environment we
+        // cannot read exactly is a gap in this subtree, never an absence.
+        evidence.agent = Half::Failed;
     }
+    if launch.group != group {
+        return evidence;
+    }
+    // Structure decisions read argv, which every view of the launch shares.
+    let Some(raw) = launch.inherited.as_ref().or(launch.exact.as_ref()) else {
+        return ForegroundEvidence::failed();
+    };
     let interpreter = Provider::is_interpreter(&raw.program);
     let native_agent = Provider::from_program(&raw.program).is_some();
-    let recognized = Provider::recognize_launch(&raw);
+    let recognized = Provider::recognize_launch(raw);
     if native_agent && recognized.is_none() {
-        return Ok(None);
+        return evidence;
     }
     // Claude and OMP run directly inside their JS interpreters and own their
     // tool children just like native agents. Only Codex's recognized JS
@@ -1016,43 +1202,64 @@ fn walk_foreground<T: PartialEq>(
     let forwarding_launcher =
         interpreter && recognized.is_some_and(Provider::forwards_to_native_child);
     if forwarding_launcher || recognized.is_none() {
-        let mut child_hint = None;
-        let bytes = bounded_read(root.join(format!("task/{pid}/children")), 4096).ok_or(())?;
-        for child in std::str::from_utf8(&bytes)
-            .map_err(|_| ())?
-            .split_whitespace()
-        {
-            if let Some(hint) = walk_foreground(
-                proc_root,
-                child.parse().map_err(|_| ())?,
-                group,
-                remaining,
-                read_launch,
-                observe,
-            )? {
-                if child_hint
-                    .as_ref()
-                    .is_some_and(|previous| previous != &hint)
-                {
-                    return Err(());
-                }
-                child_hint = Some(hint);
+        let Some(bytes) = bounded_read(root.join(format!("task/{pid}/children")), 4096) else {
+            return ForegroundEvidence::failed();
+        };
+        let Ok(children) = std::str::from_utf8(&bytes) else {
+            return ForegroundEvidence::failed();
+        };
+        for child in children.split_whitespace() {
+            let Ok(child) = child.parse() else {
+                return ForegroundEvidence::failed();
+            };
+            evidence.merge(walk_foreground(proc_root, child, group, remaining, request));
+            if evidence.settled(request) {
+                return evidence;
             }
-        }
-        if child_hint.is_some() {
-            return Ok(child_hint);
         }
     }
     if recognized.is_none() {
-        return Ok(None);
+        return evidence;
     }
-    let observation = observe(&root, pid, raw, start)?;
-    if process_identity(&bounded_read(root.join("stat"), 4096).ok_or(())?).ok_or(())?
-        != (group, start)
+    // A half a child already answered is never re-observed here: the deepest
+    // owner of the conversation still wins, exactly as before.
+    let observe_hint = request.hint.is_some() && matches!(evidence.hint, Half::Missing);
+    let observe_agent = request.agent && matches!(evidence.agent, Half::Missing);
+    if !observe_hint && !observe_agent {
+        return evidence;
+    }
+    let ForegroundLaunch {
+        inherited,
+        exact,
+        start,
+        ..
+    } = launch;
+    if observe_hint {
+        evidence.hint = match inherited {
+            Some(launch) => observed_half(recovery_observation(&root, pid, launch, start)),
+            None => Half::Failed,
+        };
+    }
+    if observe_agent {
+        evidence.agent = match exact {
+            Some(launch) => observed_half(agent_observation(&root, pid, launch, start)),
+            None => Half::Failed,
+        };
+    }
+    // An observation is only evidence while it still describes the same
+    // process: a reused pid would otherwise donate someone else's identity.
+    // Halves a child answered are already settled and stay untouched.
+    if process_identity(&bounded_read(root.join("stat"), 4096).unwrap_or_default())
+        != Some((group, start))
     {
-        return Err(());
+        if observe_hint {
+            evidence.hint = Half::Failed;
+        }
+        if observe_agent {
+            evidence.agent = Half::Failed;
+        }
     }
-    Ok(observation)
+    evidence
 }
 
 #[cfg(feature = "host")]
@@ -2041,7 +2248,8 @@ mod tests {
         let base = launch("/bin/sh", &[]);
         let deadline = Instant::now() + Duration::from_secs(2);
         let recipe = loop {
-            if let Some(recipe) = foreground_hint(child.0.id() as libc::pid_t, &base)
+            if let Some(recipe) = foreground_observation(child.0.id() as libc::pid_t, &base)
+                .hint
                 .as_deref()
                 .and_then(recipe_from_hint)
             {
@@ -2057,6 +2265,6 @@ mod tests {
         assert_eq!(recipe.arguments, ["resume", id]);
         assert_eq!(recipe.working_directory, directory.path());
         drop(child);
-        assert!(foreground_hint(0, &base).is_none());
+        assert!(foreground_observation(0, &base).hint.is_none());
     }
 }
