@@ -337,6 +337,11 @@ pub struct SidebarProject {
     pub cached_display: Option<CachedDisplay>,
     pub operations: Vec<WorktreeOperationRow>,
     pub avatar: Option<cosmic::iced::advanced::image::Handle>,
+    /// Why this project's checkout could not be read, set only by a failed
+    /// load. A checkout that cannot be read is one unreadable project rather
+    /// than an unreadable pane, so the reason travels on the project's own row
+    /// and every other project stays listed beside it.
+    pub unreachable: Option<String>,
     chrome: ProjectChrome,
 }
 
@@ -423,6 +428,7 @@ impl SidebarProject {
             cached_display: None,
             operations: Vec::new(),
             avatar: None,
+            unreachable: None,
             chrome,
         }
     }
@@ -479,6 +485,7 @@ struct ProjectChrome {
     toggle_id: Id,
     new_worktree_id: Id,
     new_channel_id: Id,
+    retry_id: Id,
     open_name: Box<str>,
     compact_open_name: Box<str>,
     collapse_name: Box<str>,
@@ -496,6 +503,7 @@ impl ProjectChrome {
             toggle_id: entity_id("project.toggle", id),
             new_worktree_id: entity_id("project.new_worktree", id),
             new_channel_id: entity_id("project.new_channel", id),
+            retry_id: entity_id("project.retry", id),
             open_name: format!("Open project {name}").into_boxed_str(),
             compact_open_name: format!("Open {name}").into_boxed_str(),
             collapse_name: format!("Collapse {name} project").into_boxed_str(),
@@ -2621,6 +2629,7 @@ impl SidebarState {
             | SidebarAction::MaximizeWindow
             | SidebarAction::WindowMenu
             | SidebarAction::Refresh
+            | SidebarAction::RefreshProject { .. }
             | SidebarAction::RefreshWorktree { .. }
             | SidebarAction::CreatePullRequest { .. }
             | SidebarAction::OpenSettings
@@ -2695,6 +2704,14 @@ pub enum SidebarAction {
         url: Url,
     },
     Refresh,
+    /// Reads one project's repository again, leaving every other project's
+    /// data alone. `Refresh` re-reads all of them, and `OpenRepository` only
+    /// moves the workspace into a project, so neither is what a project that
+    /// could not be read has to offer.
+    RefreshProject {
+        project_id: ProjectId,
+        repository: PathBuf,
+    },
     CreatePullRequest {
         project_id: ProjectId,
         worktree: Option<PathBuf>,
@@ -3598,16 +3615,7 @@ fn project_identity_row<'a>(
 ) -> Element<'a, SidebarAction> {
     let chrome = &project.chrome;
     let grid = RowGrid::project(compact);
-    let label = (!compact).then(|| {
-        design::heading(project.name.as_str())
-            .class(theme::Text::Default)
-            .wrapping(cosmic::iced::widget::text::Wrapping::None)
-            .ellipsize(cosmic::iced::widget::text::Ellipsize::End(
-                EllipsizeHeightLimit::Lines(1),
-            ))
-            .width(Length::Fill)
-            .into()
-    });
+    let label = (!compact).then(|| project_name_label(project));
     let control = grid
         .control(
             grid.content(project_icon(project, ROW_ICON_SIZE), label, None),
@@ -3634,6 +3642,82 @@ fn project_identity_row<'a>(
     grid.mount(crate::interaction::tooltip(control, tip))
 }
 
+/// The project's name, on one line, ellipsized rather than wrapped so a long
+/// name cannot change a header's height.
+fn project_name_label(project: &SidebarProject) -> Element<'_, SidebarAction> {
+    design::heading(project.name.as_str())
+        .class(theme::Text::Default)
+        .wrapping(cosmic::iced::widget::text::Wrapping::None)
+        .ellipsize(cosmic::iced::widget::text::Ellipsize::End(
+            EllipsizeHeightLimit::Lines(1),
+        ))
+        .width(Length::Fill)
+        .into()
+}
+
+/// A project whose checkout could not be read.
+///
+/// The row keeps the project's name, because the reader's first question is
+/// which project is unreadable, states the reason under it, and offers a
+/// reload of just this project. Nothing is drawn below that: the read which
+/// would have listed this project's worktrees, channels and pull requests is
+/// the read that failed, so rows left over from an earlier one would claim a
+/// structure the project cannot currently be shown to have.
+fn unreachable_project<'a>(
+    project: &'a SidebarProject,
+    reason: &'a str,
+    compact: bool,
+    modal_open: bool,
+) -> Element<'a, SidebarAction> {
+    let chrome = &project.chrome;
+    let grid = RowGrid::project(compact);
+    let reload = gated(
+        SidebarAction::RefreshProject {
+            project_id: project.id,
+            repository: project.repository.clone(),
+        },
+        modal_open,
+    );
+    // A colon rather than a full stop, because the reason comes from git or
+    // the filesystem and those messages begin in lower case.
+    let description = format!(
+        "Couldn’t read project {}: {reason}. Try again",
+        project.name
+    );
+    let control = grid
+        .control(
+            grid.content(
+                toned_icon("dialog-warning-symbolic", BadgeTone::Warning),
+                (!compact).then(|| project_name_label(project)),
+                None,
+            ),
+            false,
+        )
+        .id(chrome.open_id.clone())
+        .name(description.clone())
+        .on_press_maybe(reload.clone());
+    let header = grid.mount(crate::interaction::tooltip(control, description));
+    let spacing = cosmic::theme::spacing();
+    if compact {
+        return widget::container(header)
+            .padding([spacing.space_xxxs, 0])
+            .width(Length::Fill)
+            .into();
+    }
+    widget::column::with_children(vec![
+        header,
+        design::caption(format!("Couldn’t read this project: {reason}"))
+            .wrapping(cosmic::iced::widget::text::Wrapping::Word)
+            .into(),
+        button::standard("Try again")
+            .id(chrome.retry_id.clone())
+            .on_press_maybe(reload)
+            .into(),
+    ])
+    .spacing(spacing.space_xxxs)
+    .into()
+}
+
 fn project_view<'a>(
     project: &FilteredProject<'a>,
     expanded: bool,
@@ -3645,6 +3729,9 @@ fn project_view<'a>(
     let entity = project.project;
     let chrome = &entity.chrome;
     let project_id = entity.id;
+    if let Some(reason) = entity.unreachable.as_deref() {
+        return unreachable_project(entity, reason, compact, modal_open);
+    }
     let selection = if entity.channels.iter().any(|channel| channel.selected) {
         None
     } else {
@@ -6358,12 +6445,13 @@ fn check_description(status: CheckStatus) -> &'static str {
     }
 }
 
-fn status_icon<'a>(
-    icon_name: &'static str,
-    label: &'a str,
-    tone: BadgeTone,
-) -> Element<'a, SidebarAction> {
-    let content = widget::container(
+/// A row icon in one of the semantic tones.
+///
+/// The tone is resolved by the drawing theme rather than read from the
+/// process-global one while the view is built, so a row that carries a tone
+/// costs no theme lock per frame.
+fn toned_icon<'a>(icon_name: &'static str, tone: BadgeTone) -> Element<'a, SidebarAction> {
+    widget::container(
         widget::icon(crate::ui_controls::symbolic_icon(icon_name)).size(ROW_ICON_SIZE),
     )
     .class(theme::Container::custom(move |theme| {
@@ -6377,8 +6465,16 @@ fn status_icon<'a>(
             }),
             ..Default::default()
         }
-    }));
-    crate::interaction::tooltip(content, label)
+    }))
+    .into()
+}
+
+fn status_icon<'a>(
+    icon_name: &'static str,
+    label: &'a str,
+    tone: BadgeTone,
+) -> Element<'a, SidebarAction> {
+    crate::interaction::tooltip(toned_icon(icon_name, tone), label)
 }
 
 fn check_indicator(status: CheckStatus) -> Element<'static, SidebarAction> {
@@ -6428,6 +6524,21 @@ fn filtered_projects<'a>(
         .iter()
         .filter_map(|project| {
             let project_matches = query.is_empty() || project.matches(&query);
+            // An unreachable project draws none of its children, so it must
+            // not be matched or counted through them either: an attention or
+            // pull-request filter asks which worktrees need looking at, and
+            // rows from a read that has since failed cannot answer that.
+            if project.unreachable.is_some() {
+                return (project_matches && state.filter == SidebarFilter::All).then_some(
+                    FilteredProject {
+                        project,
+                        worktrees: Vec::new(),
+                        channels: Vec::new(),
+                        editors: &model.external_editors,
+                        state,
+                    },
+                );
+            }
             let channels = project
                 .channels
                 .iter()
@@ -8743,6 +8854,77 @@ mod tests {
             assert!(
                 frame_enter_presses(&renderer, header(&model, &state, compact, false, true))
                     .is_empty()
+            );
+        }
+    }
+
+    /// The accessible names an element publishes, in tree order.
+    fn accessible_names(
+        renderer: &cosmic::Renderer,
+        mut element: Element<'_, SidebarAction>,
+    ) -> Vec<String> {
+        use cosmic::iced::advanced::mouse;
+
+        let mut tree = Tree::new(element.as_widget());
+        let node = element.as_widget_mut().layout(
+            &mut tree,
+            renderer,
+            &layout::Limits::new(Size::ZERO, Size::new(1280.0, 4_000.0)),
+        );
+        let nodes =
+            element
+                .as_widget()
+                .a11y_nodes(Layout::new(&node), &tree, mouse::Cursor::Unavailable);
+        nodes
+            .root()
+            .iter()
+            .chain(nodes.children())
+            .filter_map(|node| node.node().label().map(ToOwned::to_owned))
+            .collect()
+    }
+
+    /// A project whose checkout could not be read is still a row, and that row
+    /// offers exactly one thing: reading it again. Its worktrees, channels and
+    /// pull requests came from the read that failed, so nothing built from
+    /// them may be pressable.
+    #[test]
+    fn an_unreadable_project_keeps_its_row_and_offers_only_a_reload() {
+        let renderer = headless_renderer();
+        let mut entry = project();
+        entry.channels.push(SidebarChannel::new(
+            ChannelId::from_uuid(Uuid::from_u128(20)),
+            "Investigate login".into(),
+            false,
+            None,
+            true,
+            1,
+        ));
+        entry.unreachable = Some("fatal: not a git repository".into());
+        let reload = SidebarAction::RefreshProject {
+            project_id: entry.id,
+            repository: entry.repository.clone(),
+        };
+        let model = SidebarModel::ready(SidebarMode::Expanded, vec![entry]);
+        let state = SidebarState::default();
+        for compact in [false, true] {
+            let actions = frame_enter_presses(&renderer, body(&model, &state, compact, false));
+            assert!(
+                actions.contains(&reload),
+                "compact {compact}: the row cannot be read again: {actions:?}"
+            );
+            assert!(
+                actions.iter().all(|action| *action == reload),
+                "compact {compact}: an unreadable project offered more than a reload: {actions:?}"
+            );
+            assert!(
+                frame_enter_presses(&renderer, body(&model, &state, compact, true)).is_empty(),
+                "compact {compact}: the reload stays withheld while a modal is up"
+            );
+            let names = accessible_names(&renderer, body(&model, &state, compact, false));
+            assert!(
+                names.iter().any(|name| name
+                    == "Couldn’t read project Cagents: fatal: not a git repository. Try again"),
+                "compact {compact}: no accessible name reports the failure: {names:?}"
             );
         }
     }
