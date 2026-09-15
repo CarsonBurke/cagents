@@ -206,6 +206,23 @@ fn attached(state: &HostState, client: ClientId, id: TerminalId) -> Result<&Reco
     }
     Ok(record)
 }
+fn attached_mut(
+    state: &mut HostState,
+    client: ClientId,
+    id: TerminalId,
+) -> Result<&mut Record, ProtocolError> {
+    let record = state.chats.get_mut(&id).ok_or_else(|| {
+        unavailable("Exact native chat is not hosted; explicit recovery is required")
+    })?;
+    if !record.subscribers.contains_key(&client) {
+        return Err(ProtocolError::new(
+            ProtocolErrorCode::PermissionDenied,
+            "Client is not attached to this chat",
+            false,
+        ));
+    }
+    Ok(record)
+}
 fn changed(host: &Weak<Mutex<HostState>>, id: TerminalId, update: Update) {
     let Some(host) = host.upgrade() else {
         return;
@@ -800,7 +817,10 @@ fn start(
                 &handle,
                 &mut session.launch,
                 Instant::now() + Duration::from_secs(10),
-                || host.lock().unwrap_or_else(|p| p.into_inner()).shutting_down,
+                || {
+                    crate::daemon::termination_requested()
+                        || host.lock().unwrap_or_else(|p| p.into_inner()).shutting_down
+                },
             )
             .and_then(|()| {
                 if host.lock().unwrap_or_else(|p| p.into_inner()).shutting_down {
@@ -859,19 +879,21 @@ pub(super) fn process(
             let selection = {
                 let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
                 validate_proof(Some(&source), state.proof())?;
-                if !state
+                let matched = state
                     .chat_bindings
                     .get(&session.id)
-                    .is_some_and(|binding| binding.preview.token == token)
-                {
-                    return Err(error(
-                        "This selection has no matching preview; preview the conversation again",
-                    ));
-                }
-                state
-                    .chat_bindings
-                    .remove(&session.id)
-                    .expect("matched binding")
+                    .is_some_and(|binding| binding.preview.token == token);
+                // Consume the preview only for its own token: a mismatched
+                // request must leave the pending selection intact for the client
+                // that owns it.
+                matched
+                    .then(|| state.chat_bindings.remove(&session.id))
+                    .flatten()
+                    .ok_or_else(|| {
+                        error(
+                            "This selection has no matching preview; preview the conversation again",
+                        )
+                    })?
             };
             start(
                 host,
@@ -961,8 +983,7 @@ pub(super) fn process(
                 receipt.detach(client);
                 return Ok(ServerResponse::Detached);
             }
-            attached(&state, client, chat_id)?;
-            let record = state.chats.get_mut(&chat_id).expect("checked chat");
+            let record = attached_mut(&mut state, client, chat_id)?;
             record.subscribers.remove(&client);
             record.observations.remove(&client);
             record
@@ -987,8 +1008,7 @@ pub(super) fn process(
                 receipt.require_attached(client)?;
                 return Ok(ServerResponse::Accepted);
             }
-            attached(&state, client, chat_id)?;
-            let record = state.chats.get_mut(&chat_id).expect("checked chat");
+            let record = attached_mut(&mut state, client, chat_id)?;
             let observation = record.observations.entry(client).or_default();
             if epoch > observation.epoch {
                 observation.acknowledge(epoch, record.handle.observe_next_update());
@@ -1002,8 +1022,7 @@ pub(super) fn process(
                 receipt.subscribers.insert(client, visible);
                 return Ok(ServerResponse::Accepted);
             }
-            attached(&state, client, chat_id)?;
-            let record = state.chats.get_mut(&chat_id).expect("checked chat");
+            let record = attached_mut(&mut state, client, chat_id)?;
             let previous = record.subscribers.insert(client, visible);
             if previous != Some(visible) && !visible {
                 record.handle.observe_next_update();
@@ -1103,7 +1122,14 @@ pub(super) fn process(
             // back to the daemon's credentials or losing the exact identity.
             {
                 let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
-                let record = state.chats.get_mut(&chat_id).expect("attached chat");
+                // Another client can close this chat while the lock is released.
+                // Report that instead of panicking the per-client thread, which
+                // would take down every hosted PTY with it.
+                let Some(record) = state.chats.get_mut(&chat_id) else {
+                    return Err(unavailable(
+                        "The chat was closed while returning to terminal; no replacement terminal was started",
+                    ));
+                };
                 record.returning_terminal = true;
                 record.completion_observed = false;
                 state.inventory_generation += 1;
@@ -1127,14 +1153,40 @@ pub(super) fn process(
             )?;
             let retired = {
                 let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
-                let mut record = state.chats.remove(&chat_id).expect("attached chat");
+                // `returning_terminal` marks the record this request stamped while
+                // it last held the lock. A concurrent close removes that key, and
+                // explicit recovery re-inserts a different actor under it; neither
+                // may donate its subscribers to this replacement terminal.
+                let retained = state
+                    .chats
+                    .get(&chat_id)
+                    .is_some_and(|record| record.returning_terminal);
+                if !retained {
+                    // The replacement has no receipt to commit and no source to be
+                    // retried from, so retire it rather than leaving a PTY in the
+                    // inventory that no client can ever reach. Its wake callback
+                    // re-enters the host lock, so shut it down after releasing it.
+                    let orphan = state.terminals.remove(&terminal_id);
+                    state.inventory_generation += 1;
+                    drop(state);
+                    if let Some(orphan) = orphan {
+                        let _ = orphan.handle.shutdown();
+                    }
+                    return Err(unavailable(
+                        "The chat was closed while returning to terminal; the replacement terminal was retired",
+                    ));
+                }
+                let mut record = state.chats.remove(&chat_id);
                 state.chat_handoffs.insert(
                     chat_id,
                     TerminalHandoff {
                         source: session,
                         terminal: descriptor.session.clone(),
                         generation: snapshot.generation,
-                        subscribers: std::mem::take(&mut record.subscribers),
+                        subscribers: record
+                            .as_mut()
+                            .map(|record| std::mem::take(&mut record.subscribers))
+                            .unwrap_or_default(),
                     },
                 );
                 state.inventory_generation += 1;
@@ -1274,6 +1326,12 @@ fn restore_selection(
         .as_deref()
         .ok_or("Missing restored Codex thread")?;
     loop {
+        // Restore runs before the listener is bound, so a termination request is
+        // observable only through this atomic; a rebuild stop must not have to
+        // wait out the readiness deadline.
+        if crate::daemon::termination_requested() {
+            return Err("daemon termination was requested during upgrade restore".into());
+        }
         if handle.is_completed() {
             return Err("Restored Codex CLI exited before loading its exact thread".into());
         }
@@ -1390,19 +1448,23 @@ pub(super) fn restore_upgrade(
         ServerResponse::ChatAttached { session, .. } => session.id,
         _ => return Err("Native restore did not attach its exact session".into()),
     };
-    let handle = host
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .chats
-        .get(&id)
-        .expect("restored chat")
-        .handle
-        .clone();
+    let handle = {
+        let state = host.lock().unwrap_or_else(|p| p.into_inner());
+        let Some(record) = state.chats.get(&id) else {
+            return Err("Restored native chat disappeared before its confirmation".into());
+        };
+        record.handle.clone()
+    };
     // Startup, loaded-thread verification, and native confirmation share one deadline.
     loop {
-        let snapshot = handle.snapshot(None).expect("unconditional snapshot");
-        if let Some(error) = snapshot.error {
-            return Err(error);
+        // This polls at 50 Hz: only accessors that neither rebuild the transcript
+        // window nor clone a snapshot belong here, because the actor needs the
+        // very store and state locks to persist what this loop is waiting for.
+        if crate::daemon::termination_requested() {
+            return Err("daemon termination was requested during upgrade restore".into());
+        }
+        if let Some(failure) = handle.failure() {
+            return Err(failure);
         }
         if handle.is_completed() {
             return Err(
@@ -1426,10 +1488,9 @@ pub(super) fn restore_upgrade(
         thread::sleep(Duration::from_millis(20));
     }
     let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
-    let record = state
-        .chats
-        .get_mut(&saved.source.id)
-        .expect("restored chat");
+    let Some(record) = state.chats.get_mut(&saved.source.id) else {
+        return Err("Restored native chat disappeared before its confirmation".into());
+    };
     record.subscribers.remove(&0);
     record.observations.remove(&0);
     let mut sources = saved.previous_sources.clone();

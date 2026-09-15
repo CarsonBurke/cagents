@@ -13,17 +13,16 @@ use crate::{
     },
     terminal::{RenderSnapshot, TerminalConfig, TerminalEvent, TerminalHandle, TerminalSendError},
     terminal_ipc::{
-        PROTOCOL_VERSION, ProtocolError, ProtocolErrorCode, ServerEnvelope, ServerMessage,
-        ShutdownCapability, ShutdownOperation, ShutdownOutcome, ShutdownPreflight,
-        TerminalDescriptor, TerminalSnapshot, TerminalSpawnOptions, TerminalVisibility,
-        WireTerminalEvent,
+        ProtocolError, ProtocolErrorCode, ServerMessage, ShutdownCapability, ShutdownOperation,
+        ShutdownOutcome, ShutdownPreflight, TerminalDescriptor, TerminalSnapshot,
+        TerminalSpawnOptions, TerminalVisibility, WireTerminalEvent,
     },
 };
 
-use super::delivery::{DEFAULT_CLIENT_QUEUE_CAPACITY, DeliveryQueue};
+use super::delivery::{DEFAULT_CLIENT_QUEUE_CAPACITY, DeliveryQueue, Outbound};
 
 const EVENT_REPLAY_CAPACITY: usize = 256;
-const MAX_TERMINALS: usize = 1024;
+pub(super) const MAX_TERMINALS: usize = 1024;
 const SHUTDOWN_CONFIRMATION_TTL: Duration = Duration::from_secs(60);
 const MAX_SHUTDOWN_CAPABILITIES: usize = 32;
 
@@ -180,7 +179,10 @@ impl Subscriptions {
 }
 
 pub(crate) struct HostState {
-    proof: HostSessionProof,
+    /// Shared, never mutated: a redraw broadcast hands the same proof to every
+    /// subscriber's queue, and cloning three `String`s per subscriber per frame
+    /// made per-frame allocation scale with the number of attached views.
+    proof: Arc<HostSessionProof>,
     pub(super) terminals: BTreeMap<TerminalId, TerminalRecord>,
     spawning: BTreeSet<TerminalId>,
     pub(super) clients: BTreeMap<ClientId, Arc<DeliveryQueue>>,
@@ -207,7 +209,7 @@ pub(crate) struct HostState {
 impl HostState {
     pub(crate) fn new(proof: HostSessionProof) -> Self {
         Self {
-            proof,
+            proof: Arc::new(proof),
             terminals: BTreeMap::new(),
             spawning: BTreeSet::new(),
             clients: BTreeMap::new(),
@@ -231,8 +233,13 @@ impl HostState {
         &self.proof
     }
 
+    /// The shared proof, for a broadcast that must not clone it per subscriber.
+    pub(crate) fn proof_handle(&self) -> Arc<HostSessionProof> {
+        Arc::clone(&self.proof)
+    }
+
     pub(crate) fn register_client(&mut self, client_id: ClientId) -> Arc<DeliveryQueue> {
-        let delivery = Arc::new(DeliveryQueue::new(DEFAULT_CLIENT_QUEUE_CAPACITY));
+        let delivery = Arc::new(DeliveryQueue::new(client_id, DEFAULT_CLIENT_QUEUE_CAPACITY));
         self.clients.insert(client_id, Arc::clone(&delivery));
         delivery
     }
@@ -374,15 +381,13 @@ impl HostState {
         if requested == TerminalVisibility::Visible
             && let Some(delivery) = self.clients.get(&client_id)
         {
-            let _ = delivery.push(ServerEnvelope {
-                version: PROTOCOL_VERSION,
-                request_id: None,
-                proof: self.proof.clone(),
-                message: ServerMessage::Redraw {
+            let _ = delivery.push(Outbound::broadcast(
+                &self.proof,
+                ServerMessage::Redraw {
                     terminal_id,
                     generation: record.handle.generation(),
                 },
-            });
+            ));
         }
         if (old_requested == TerminalVisibility::Visible)
             != (requested == TerminalVisibility::Visible)
@@ -750,7 +755,7 @@ impl HostState {
         }
         let live_terminals = self.inventory_count();
         let capability = ShutdownCapability {
-            proof: self.proof.clone(),
+            proof: (*self.proof).clone(),
             token: uuid::Uuid::new_v4().to_string(),
             inventory_generation: self.inventory_generation,
             live_terminals,
@@ -770,7 +775,7 @@ impl HostState {
         if self.shutting_down {
             return Err("Daemon is already shutting down".into());
         }
-        if capability.proof != self.proof {
+        if capability.proof != *self.proof {
             return Err("Daemon changed; obtain a new upgrade preflight".into());
         }
         let Some((stored, deadline)) = self
@@ -803,15 +808,25 @@ impl HostState {
         now: Instant,
     ) -> ShutdownOutcome {
         let count = self.inventory_count();
-        if matches!(operation, ShutdownOperation::Stop { .. })
+        if let ShutdownOperation::Stop { require_empty, .. } = operation
             && (!self.chat_spawning.is_empty()
                 || self
                     .chats
                     .values()
                     .any(|record| record.handle.owns_work() || record.returning_terminal))
         {
-            return ShutdownOutcome::EmptyRequired {
-                current_count: count,
+            // Native chats own work, so this stop is refused for confirmation,
+            // not because the caller demanded an empty daemon. Reporting
+            // `EmptyRequired` for a plain `cagents daemon stop` told the user
+            // they had asked for something they never asked for.
+            return if require_empty {
+                ShutdownOutcome::EmptyRequired {
+                    current_count: count,
+                }
+            } else {
+                ShutdownOutcome::ConfirmationRequired {
+                    current_count: count,
+                }
             };
         }
         let (require_empty, expected_generation) = match operation {
@@ -820,7 +835,7 @@ impl HostState {
                 expected_generation,
             } => (require_empty, expected_generation),
             ShutdownOperation::Confirm { capability } => {
-                if capability.proof != self.proof {
+                if capability.proof != *self.proof {
                     return ShutdownOutcome::DaemonRestarted;
                 }
                 let Some((stored, deadline)) = self
@@ -1012,7 +1027,7 @@ fn prepare_upgrade_with(
                 launch,
             });
         }
-        (state.proof.clone(), terminals, chats, paired_codex)
+        ((*state.proof).clone(), terminals, chats, paired_codex)
     };
     let store = discover().map_err(upgrade_error)?;
     if let Some(previous) = store.load().map_err(upgrade_error)?
@@ -1173,6 +1188,21 @@ pub(super) fn restore_upgrade(host: &SharedHost) -> Result<(), String> {
     )
 }
 
+/// Sentinel restore failure for an operator-requested stop; see
+/// [`restore_upgrade_from`].
+const RESTORE_TERMINATED: &str = "daemon termination was requested during upgrade restore";
+
+/// Replays a checkpoint, abandoning the replay as soon as termination is
+/// requested.
+///
+/// The accept loop is the only other place that observes
+/// `daemon::termination_requested`, and it is not reached until this returns, so
+/// without these checks `cagents daemon stop-for-rebuild` reported "daemon
+/// stopping" while the daemon kept launching checkpointed processes, and a
+/// logout `SIGKILL` mid-restore left the checkpoint in `Phase::Restoring`, which
+/// is never automatically replayed for native sessions. Aborting through
+/// `close_failed_restore` positively closes whatever was already started and
+/// leaves the checkpoint in a replayable `Ready` phase.
 fn restore_upgrade_from(
     host: &SharedHost,
     store: crate::upgrade::handoff::Store,
@@ -1209,10 +1239,20 @@ fn restore_upgrade_from(
         };
         ensure_no_surviving_process(&terminal, std::process::id(), proc_root)?;
     }
+    if crate::daemon::termination_requested() {
+        tracing::warn!(
+            checkpoint = %store.path.display(),
+            "skipped upgrade restore because the daemon was asked to stop; the checkpoint remains replayable"
+        );
+        return Ok(());
+    }
     checkpoint.phase = Phase::Restoring;
     store.save(&checkpoint)?;
     let restored = (|| {
         for terminal in &checkpoint.terminals {
+            if crate::daemon::termination_requested() {
+                return Err(RESTORE_TERMINATED.to_owned());
+            }
             let mut session = terminal.source.clone();
             session.launch = terminal.recipe.clone();
             session.continuity = TerminalContinuity::RelaunchAvailable {
@@ -1234,6 +1274,9 @@ fn restore_upgrade_from(
                 .map_err(|error| error.message)?;
         }
         for chat in &checkpoint.chats {
+            if crate::daemon::termination_requested() {
+                return Err(RESTORE_TERMINATED.to_owned());
+            }
             super::chat::restore_upgrade(host, chat)?;
         }
         Ok::<_, String>(())
@@ -1242,9 +1285,20 @@ fn restore_upgrade_from(
         // A synchronous failure can be retried only after positively closing
         // every newly started writer. A crash has no such proof and retains
         // Restoring, which is never automatically replayed for native sessions.
-        if close_failed_restore(host).is_ok() {
+        let closed = close_failed_restore(host).is_ok();
+        if closed {
             checkpoint.phase = Phase::Ready;
             store.save(&checkpoint)?;
+        }
+        // Any failure observed while stopping is an abandoned replay, not a
+        // broken one: report the stop and let the caller shut down promptly.
+        if closed && crate::daemon::termination_requested() {
+            tracing::warn!(
+                checkpoint = %store.path.display(),
+                %error,
+                "abandoned upgrade restore because the daemon was asked to stop; the checkpoint remains replayable"
+            );
+            return Ok(());
         }
         return Err(format!(
             "Upgrade restore failed: {error}; checkpoint retained at {}",
@@ -1509,15 +1563,13 @@ fn broadcast_output(host: &Weak<Mutex<HostState>>, terminal_id: TerminalId, sequ
             && let Some(delivery) = clients.get(&client)
         {
             observation.notified = delivery
-                .push(ServerEnvelope {
-                    version: PROTOCOL_VERSION,
-                    request_id: None,
-                    proof: proof.clone(),
-                    message: ServerMessage::TerminalObserved {
+                .push(Outbound::broadcast(
+                    proof,
+                    ServerMessage::TerminalObserved {
                         terminal_id,
                         epoch: observation.epoch,
                     },
-                })
+                ))
                 .is_ok();
         }
         needs_output |= !observation.notified;
@@ -1531,22 +1583,40 @@ fn broadcast_output(host: &Weak<Mutex<HostState>>, terminal_id: TerminalId, sequ
     }
 }
 
+/// Publishes a repaint to every visible subscriber of `terminal_id`.
+///
+/// A subscriber for which the daemon already recorded the exact capture it last
+/// delivered receives the repaint itself, diff-encoded against that capture,
+/// rather than a `Redraw` notification the client would have to answer with a
+/// `ClientRequest::Snapshot` naming the very base the daemon already knew. That
+/// request carried no information and cost a socket round trip on every frame,
+/// so steady-state frame rate was set by IPC latency instead of by work.
+/// `Redraw` remains the message for a subscriber with no recorded base — attach,
+/// resume and reveal still fetch a full grid through the request path.
+///
+/// The acknowledge/credit protocol is untouched: the worker still withholds the
+/// next capture until the client acknowledges this generation, so the daemon
+/// cannot run ahead of the UI. `last_sent` advances at push time, which keeps
+/// every delta chained to the previous delivery; an unapplicable delta is
+/// detected by `base_generation` and answered with a full repaint, so a client
+/// that misses a push still recovers.
 fn broadcast_redraw(host: &Weak<Mutex<HostState>>, terminal_id: TerminalId, generation: u64) {
     let Some(host) = host.upgrade() else {
         return;
     };
-    let (proof, deliveries) = {
-        let state = host.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-        let deliveries = state
+    let mut pending = Vec::new();
+    {
+        let mut state = host.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let visible = state
             .subscriptions
             .by_terminal
             .get(&terminal_id)
             .into_iter()
             .flat_map(|clients| clients.iter())
             .filter(|(_, visibility)| **visibility == TerminalVisibility::Visible)
-            .filter_map(|(client_id, _)| state.clients.get(client_id).cloned())
+            .map(|(client_id, _)| *client_id)
             .collect::<Vec<_>>();
-        if deliveries.is_empty() {
+        if visible.is_empty() {
             // Serialize visibility commands with attachment/reveal changes.
             // Otherwise this Hide could overtake a newly attached UI's Reveal.
             if state.subscriptions.visibility(terminal_id) == TerminalVisibility::Hidden
@@ -1556,19 +1626,49 @@ fn broadcast_redraw(host: &Weak<Mutex<HostState>>, terminal_id: TerminalId, gene
             }
             return;
         }
-        (state.proof.clone(), deliveries)
-    };
-    let envelope = ServerEnvelope {
-        version: PROTOCOL_VERSION,
-        request_id: None,
-        proof,
-        message: ServerMessage::Redraw {
-            terminal_id,
-            generation,
-        },
-    };
-    for delivery in deliveries {
-        let _ = delivery.push(envelope.clone());
+        let proof = state.proof_handle();
+        // One capture serves every subscriber; only its encoding differs, and a
+        // row the worker did not rebuild is the same `Arc` in every delta.
+        let capture = state
+            .terminals
+            .get(&terminal_id)
+            .map(|record| record.handle.snapshot());
+        for client_id in visible {
+            let Some(delivery) = state.clients.get(&client_id).cloned() else {
+                continue;
+            };
+            let snapshot = match (
+                &capture,
+                state.subscriptions.last_sent(client_id, terminal_id),
+            ) {
+                (Some(capture), Some(base))
+                    if !capture.detached && capture.generation > base.generation =>
+                {
+                    Some(TerminalSnapshot::diff(capture, base))
+                }
+                _ => None,
+            };
+            let message = match snapshot {
+                Some(snapshot) => {
+                    let capture = capture.as_ref().expect("diffed capture");
+                    state
+                        .subscriptions
+                        .record_sent(client_id, terminal_id, Arc::clone(capture));
+                    ServerMessage::Snapshot {
+                        terminal_id,
+                        snapshot,
+                    }
+                }
+                None => ServerMessage::Redraw {
+                    terminal_id,
+                    generation,
+                },
+            };
+            pending.push((delivery, Outbound::broadcast(&proof, message)));
+        }
+    }
+    for (delivery, message) in pending {
+        let _ = delivery.push(message);
     }
 }
 
@@ -1580,7 +1680,7 @@ fn record_event(host: &Weak<Mutex<HostState>>, terminal_id: TerminalId, event: T
     let (proof, sequence, deliveries) = {
         let mut state = host.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         let client_ids = state.subscriptions.clients(terminal_id);
-        let proof = state.proof.clone();
+        let proof = state.proof_handle();
         let Some(record) = state.terminals.get_mut(&terminal_id) else {
             return;
         };
@@ -1607,18 +1707,13 @@ fn record_event(host: &Weak<Mutex<HostState>>, terminal_id: TerminalId, event: T
             .collect::<Vec<_>>();
         (proof, sequence, deliveries)
     };
-    let envelope = ServerEnvelope {
-        version: PROTOCOL_VERSION,
-        request_id: None,
-        proof,
-        message: ServerMessage::Event {
-            terminal_id,
-            sequence,
-            event: wire_event,
-        },
+    let message = ServerMessage::Event {
+        terminal_id,
+        sequence,
+        event: wire_event,
     };
     for delivery in deliveries {
-        let _ = delivery.push(envelope.clone());
+        let _ = delivery.push(Outbound::broadcast(&proof, message.clone()));
     }
 }
 
@@ -1662,12 +1757,16 @@ mod tests {
     use super::*;
     use crate::model::{BootId, HostIncarnation, HostSessionId};
 
-    fn test_host() -> HostState {
+    fn test_host_with_incarnation(incarnation: &str) -> HostState {
         HostState::new(HostSessionProof {
             host_session_id: HostSessionId::new("test-session"),
             boot_id: BootId::new("test-boot"),
-            host_incarnation: HostIncarnation::new("test-incarnation"),
+            host_incarnation: HostIncarnation::new(incarnation),
         })
+    }
+
+    fn test_host() -> HostState {
+        test_host_with_incarnation("test-incarnation")
     }
 
     #[test]
@@ -1786,8 +1885,7 @@ for line in sys.stdin:
         assert_eq!(saved.chats[0].launch.session_id.as_deref(), Some(B));
         let empty_proc = cwd.join("proc");
         fs::create_dir(&empty_proc).unwrap();
-        let mut replacement = test_host();
-        replacement.proof.host_incarnation = HostIncarnation::new("replacement-incarnation");
+        let replacement = test_host_with_incarnation("replacement-incarnation");
         let replacement = Arc::new(Mutex::new(replacement));
         restore_upgrade_from(&replacement, store, &empty_proc).unwrap();
         let restored = super::super::chat::resolve_upgrade(&replacement, &source).unwrap();
@@ -1856,8 +1954,7 @@ for line in sys.stdin:
         let mut forged = second.clone();
         forged.chats[0].previous_sources[0].source.proof = second.chats[0].source.proof.clone();
         assert!(forged.validate().is_err());
-        let mut third = test_host();
-        third.proof.host_incarnation = HostIncarnation::new("third-incarnation");
+        let third = test_host_with_incarnation("third-incarnation");
         let replacement = Arc::new(Mutex::new(third));
         restore_upgrade_from(&replacement, store, &empty_proc).unwrap();
         let third = super::super::chat::resolve_upgrade(&replacement, &source).unwrap();
@@ -2011,9 +2108,8 @@ for line in sys.stdin:
         checkpoint.phase = Phase::Ready;
         let store = Store::open(directory.path()).unwrap();
         store.save(&checkpoint).unwrap();
-        let mut replacement = test_host();
-        replacement.proof.host_incarnation = HostIncarnation::new("replacement-incarnation");
-        let expected = replacement.proof.clone();
+        let replacement = test_host_with_incarnation("replacement-incarnation");
+        let expected = (*replacement.proof).clone();
         let host = Arc::new(Mutex::new(replacement));
         restore_upgrade_from(&host, store, &empty_proc).unwrap();
         let descriptor = host
@@ -2048,8 +2144,7 @@ for line in sys.stdin:
         forged.terminals[0].previous_sources[0].continuity =
             second.terminals[0].source.continuity.clone();
         assert!(forged.validate().is_err());
-        let mut third = test_host();
-        third.proof.host_incarnation = HostIncarnation::new("third-incarnation");
+        let third = test_host_with_incarnation("third-incarnation");
         let host = Arc::new(Mutex::new(third));
         restore_upgrade_from(&host, store, &empty_proc).unwrap();
         let third = host
@@ -2286,10 +2381,118 @@ for line in sys.stdin:
         assert!(deliveries[2].pop().is_none());
     }
 
+    /// A visible subscriber whose delta base the daemon already recorded must
+    /// receive the repaint itself. Sending `Redraw` made the client request the
+    /// very base the daemon had just diffed against, which cost a socket round
+    /// trip on every frame.
+    #[test]
+    fn a_recorded_base_turns_a_redraw_edge_into_a_pushed_repaint() {
+        let directory = tempfile::tempdir().unwrap();
+        let recipe = crate::model::LaunchRecipe::shell(directory.path().to_owned()).unwrap();
+        let session = TerminalSession {
+            id: TerminalId::new(),
+            launch: recipe.clone(),
+            transcript_path: None,
+            resume_hint: None,
+            continuity: TerminalContinuity::RelaunchAvailable {
+                recipe,
+                last_exit: None,
+            },
+        };
+        let id = session.id;
+        let shared = Arc::new(Mutex::new(test_host()));
+        let (delivery, handle, base) = {
+            let mut state = shared.lock().unwrap_or_else(|error| error.into_inner());
+            let delivery = state.register_client(1);
+            state.reserve_spawn(id).unwrap();
+            let handle = TerminalHandle::spawn(
+                session.clone(),
+                TerminalConfig {
+                    initially_visible: true,
+                    ..TerminalConfig::default()
+                },
+                |_| {},
+            )
+            .unwrap();
+            state
+                .finish_spawn(1, session, handle.clone(), true)
+                .unwrap();
+            // Stand in for the request path that delivered this capture.
+            let base = handle.snapshot();
+            state.subscriptions.record_sent(1, id, Arc::clone(&base));
+            (delivery, handle, base)
+        };
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while handle.generation() <= base.generation {
+            assert!(Instant::now() < deadline, "the terminal never repainted");
+            // The worker withholds the next capture until the presented
+            // generation is acknowledged; the UI does this after drawing.
+            handle.acknowledge_redraw(handle.generation());
+            thread::sleep(Duration::from_millis(10));
+        }
+
+        broadcast_redraw(&Arc::downgrade(&shared), id, handle.generation());
+        delivery.close_after_drain();
+        let mut pushed = None;
+        while let Some(message) = delivery.pop() {
+            if let ServerMessage::Snapshot {
+                terminal_id,
+                snapshot,
+            } = message.message
+                && terminal_id == id
+            {
+                pushed = Some(snapshot);
+            }
+        }
+        let pushed = pushed.expect("the redraw edge did not carry the repaint");
+        assert!(pushed.generation > base.generation);
+        // Whatever encoding was chosen must resolve against the recorded base,
+        // or the saved round trip would cost a full repaint instead.
+        pushed.apply(Some(&base)).unwrap();
+        handle.shutdown().unwrap();
+    }
+
     fn empty_stop() -> ShutdownOperation {
         ShutdownOperation::Stop {
             require_empty: true,
             expected_generation: None,
+        }
+    }
+
+    /// A plain `cagents daemon stop` that native work refuses must say what it
+    /// actually wants — a confirmed stop — instead of reporting the
+    /// `require_empty` demand the caller never made.
+    #[test]
+    fn a_stop_refused_for_native_work_names_confirmation_unless_emptiness_was_demanded() {
+        let directory = tempfile::tempdir().unwrap();
+        let recipe = crate::model::LaunchRecipe::shell(directory.path().to_owned()).unwrap();
+        for (require_empty, expected) in [
+            (
+                false,
+                ShutdownOutcome::ConfirmationRequired { current_count: 1 },
+            ),
+            (true, ShutdownOutcome::EmptyRequired { current_count: 1 }),
+        ] {
+            let mut state = test_host();
+            state.chat_spawning.insert(
+                TerminalId::new(),
+                crate::chat::Launch {
+                    provider: crate::agent::Provider::Claude,
+                    recipe: recipe.clone(),
+                    session_id: None,
+                },
+            );
+            assert_eq!(
+                state.shutdown(
+                    ShutdownOperation::Stop {
+                        require_empty,
+                        expected_generation: None,
+                    },
+                    Instant::now()
+                ),
+                expected
+            );
+            assert!(!state.shutting_down);
         }
     }
 
@@ -2524,8 +2727,7 @@ for line in sys.stdin:
             ),
             ShutdownOutcome::InvalidCapability
         );
-        let mut restarted = test_host();
-        restarted.proof.host_incarnation = HostIncarnation::new("new-incarnation");
+        let mut restarted = test_host_with_incarnation("new-incarnation");
         assert_eq!(
             restarted.shutdown(
                 ShutdownOperation::Confirm {

@@ -81,7 +81,7 @@ pub(crate) fn serve(stream: UnixStream, client_id: ClientId, host: SharedHost) {
     {
         Ok(writer) => writer,
         Err(_) => {
-            delivery.abort();
+            delivery.abort("the client writer thread could not be started");
             disconnect_client(&host, client_id);
             return;
         }
@@ -352,7 +352,7 @@ impl AgentActivityJob {
                     // may commit before this thread starts. Once admitted, keep
                     // observation and its eventual apply inside the same barrier.
                     if ensure_control_open(&host).is_err() {
-                        delivery.abort();
+                        delivery.abort("the daemon committed an upgrade or shutdown");
                         return;
                     }
                     let process = {
@@ -382,7 +382,7 @@ impl AgentActivityJob {
                                 .get(&client_id)
                                 .is_some_and(|current| Arc::ptr_eq(current, &delivery))
                         {
-                            delivery.abort();
+                            delivery.abort("the client connection was replaced");
                             return;
                         }
                         state.handle(client_id, terminal_id)
@@ -970,8 +970,11 @@ fn push_error(
 fn writer_loop(mut stream: UnixStream, delivery: Arc<DeliveryQueue>) {
     let mut codec = FrameCodec::new(MAX_FRAME_BYTES);
     while let Some(message) = delivery.pop() {
-        if codec.write(&mut stream, &message).is_err() {
-            delivery.abort();
+        if codec.write(&mut stream, &message.wire()).is_err() {
+            // A five-second send timeout or a dead socket. Queued frames cannot
+            // be delivered, so there is nothing to drain and the peer only sees
+            // the EOF below; `abort` records why.
+            delivery.abort("the client socket could not be written within its send timeout");
             break;
         }
     }
