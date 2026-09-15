@@ -43,8 +43,18 @@ fn main() -> std::process::ExitCode {
         .first()
         .is_some_and(|argument| argument == CONFIRM_DAEMON_STOP || argument == STARTUP_ERROR);
     if standalone {
-        return report(run(&arguments));
+        return report(run_internal(&arguments));
     }
+
+    // Argv is settled before the handshake below is armed. A mistyped flag is
+    // a shell mistake, not a startup failure: routing it through
+    // `report_startup_failure` answered the launcher with an error and, on a
+    // redirected stderr, opened a detached dialog for a typo.
+    let options = match parse(&arguments) {
+        Ok(Some(options)) => options,
+        Ok(None) => return std::process::ExitCode::SUCCESS,
+        Err(error) => return report(Err(error)),
+    };
 
     let main_thread = std::thread::current().id();
     let previous_hook = std::panic::take_hook();
@@ -60,7 +70,7 @@ fn main() -> std::process::ExitCode {
         previous_hook(panic);
     }));
 
-    let result = run(&arguments);
+    let result = run(options);
     match &result {
         Err(error) => report_startup_failure(&error.to_string()),
         // The window reports readiness from its first frame, so reaching here
@@ -131,7 +141,9 @@ fn spawn_startup_error_dialog(message: &str) -> std::io::Result<()> {
         .map(|_| ())
 }
 
-fn run(arguments: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+/// The standalone modes cagents spawns for itself. They must not touch the
+/// window lease, the session store, or the launcher handshake.
+fn run_internal(arguments: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let mut arguments = arguments.iter().map(String::as_str).peekable();
     if arguments.peek() == Some(&CONFIRM_DAEMON_STOP) {
         arguments.next();
@@ -144,25 +156,39 @@ fn run(arguments: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         let capability: cagents::terminal::ipc::ShutdownCapability = serde_json::from_str(payload)?;
         return cagents::app::run_daemon_stop_confirmation(capability);
     }
-    if arguments.peek() == Some(&STARTUP_ERROR) {
-        arguments.next();
-        let message = arguments.next().ok_or("missing startup error message")?;
-        if arguments.next().is_some() {
-            return Err("invalid startup error arguments".into());
-        }
-        return run_startup_error_dialog(message);
+    arguments.next();
+    let message = arguments.next().ok_or("missing startup error message")?;
+    if arguments.next().is_some() {
+        return Err("invalid startup error arguments".into());
     }
-    let mut new_window = false;
-    let mut slot = None;
-    let mut source = None;
+    run_startup_error_dialog(message)
+}
+
+struct Options<'a> {
+    new_window: bool,
+    slot: Option<&'a str>,
+    source: Option<&'a str>,
+}
+
+/// `Ok(None)` means the request was answered without opening a window, which
+/// only `--help` does.
+fn parse<'a>(arguments: &'a [String]) -> Result<Option<Options<'a>>, Box<dyn std::error::Error>> {
+    let mut arguments = arguments.iter().map(String::as_str);
+    let mut options = Options {
+        new_window: false,
+        slot: None,
+        source: None,
+    };
     while let Some(argument) = arguments.next() {
         match argument {
-            "--new-window" => new_window = true,
-            "--window" => slot = Some(arguments.next().ok_or("missing window name")?),
-            "--from-window" => source = Some(arguments.next().ok_or("missing source window name")?),
+            "--new-window" => options.new_window = true,
+            "--window" => options.slot = Some(arguments.next().ok_or("missing window name")?),
+            "--from-window" => {
+                options.source = Some(arguments.next().ok_or("missing source window name")?);
+            }
             "--help" | "-h" => {
                 print!("{USAGE}");
-                return Ok(());
+                return Ok(None);
             }
             // Naming the accepted arguments matters more here than for most
             // binaries: this one is normally launched by `cagents ui`, so
@@ -170,9 +196,18 @@ fn run(arguments: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             _ => return Err(format!("unknown UI argument: {argument}\n\n{USAGE}").into()),
         }
     }
-    if new_window && slot.is_some() {
+    if options.new_window && options.slot.is_some() {
         return Err("--new-window and --window are mutually exclusive".into());
     }
+    Ok(Some(options))
+}
+
+fn run(options: Options<'_>) -> Result<(), Box<dyn std::error::Error>> {
+    let Options {
+        new_window,
+        slot,
+        source,
+    } = options;
     let fixture =
         cfg!(feature = "latency-harness") && std::env::var_os("CAGENTS_LATENCY_OUTPUT").is_some();
     let startup = (|| -> Result<_, Box<dyn std::error::Error>> {
