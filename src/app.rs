@@ -11536,6 +11536,87 @@ mod tests {
         }
     }
 
+    /// The toast stack is laid over the whole window, so it has exactly two
+    /// ways to be wrong: collapse to nothing, or swallow every click in the
+    /// shell behind it. `notice_surface` fills its parent, so the column has to
+    /// be sized explicitly, and only the column may be opaque.
+    #[test]
+    fn the_toast_stack_is_visible_without_swallowing_the_shell_behind_it() {
+        use cosmic::iced::advanced::{Layout, Shell, clipboard, layout, mouse, widget::Tree};
+        use cosmic::iced::{Event, Point, Rectangle, Size};
+        let renderer = headless_renderer();
+        let mut app = context_inspector_test_app(true);
+        let raised_at = Instant::now();
+        for message in ["first failure", "second failure"] {
+            app.notices
+                .record(TransientNotice::error(message.to_owned()), raised_at);
+        }
+        // An identical message collapses onto the entry it repeats.
+        app.notices
+            .record(TransientNotice::error("second failure"), raised_at);
+        assert_eq!(app.notices.len(), 2);
+
+        let toasts = app.notice_toasts().expect("a raised notice is displayed");
+        let underlying: Element<'_, Message> = widget::mouse_area(
+            widget::container(iced::widget::Space::new())
+                .width(Length::Fill)
+                .height(Length::Fill),
+        )
+        .on_press(Message::NewTerminal)
+        .into();
+        let mut element: Element<'_, Message> = crate::interaction::layer(underlying, toasts);
+        let mut tree = Tree::new(element.as_widget());
+        let viewport = Rectangle::with_size(Size::new(1_400.0, 900.0));
+        let node = element.as_widget_mut().layout(
+            &mut tree,
+            &renderer,
+            &layout::Limits::new(Size::ZERO, viewport.size()),
+        );
+        // The upper-left corner is the furthest point from a bottom-right
+        // stack, so a press there reaching the shell is what proves the
+        // full-size positioning container is not itself opaque.
+        let mut messages = Vec::new();
+        let mut shell = Shell::new(&mut messages);
+        element.as_widget_mut().update(
+            &mut tree,
+            &Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)),
+            Layout::new(&node),
+            mouse::Cursor::Available(Point::new(8.0, 8.0)),
+            &renderer,
+            &mut clipboard::Null,
+            &mut shell,
+            &viewport,
+        );
+        drop(shell);
+        assert!(
+            messages
+                .iter()
+                .any(|message| matches!(message, Message::NewTerminal)),
+            "the toast layer swallowed a click nowhere near a toast"
+        );
+        // The layered element borrows `app`; retirement needs it mutably.
+        drop(element);
+
+        // Errors are never retired on a timer; only the user dismisses them.
+        assert!(
+            !app.notices
+                .retire_expired(raised_at + 10 * NOTICE_TOAST_LIFETIME)
+        );
+        assert_eq!(app.notices.len(), 2);
+        let warned_at = Instant::now();
+        app.notices
+            .record(TransientNotice::warning("advisory"), warned_at);
+        assert!(
+            app.notices
+                .retire_expired(warned_at + NOTICE_TOAST_LIFETIME)
+        );
+        assert_eq!(
+            app.notices.len(),
+            2,
+            "the warning retired, the errors stayed"
+        );
+    }
+
     #[test]
     fn modal_controls_remain_available_to_assistive_technology() {
         use cosmic::iced::Size;
