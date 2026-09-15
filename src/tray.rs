@@ -79,6 +79,11 @@ mod production {
         let output = Command::new(&executable)
             .args(arguments)
             .stdin(Stdio::null())
+            // The tray lives in the daemon, which inherits the launcher
+            // handshake flag from whichever `cagents ui` started it. Left set,
+            // the child appends a startup-protocol line to the stdout this
+            // function shows the user as the shutdown result.
+            .env_remove(instance::UI_LAUNCH_HANDSHAKE_ENV)
             .process_group(0)
             .output()
             .map_err(|error| {
@@ -91,11 +96,19 @@ mod production {
         let stdout = String::from_utf8_lossy(stdout);
         let stderr = String::from_utf8_lossy(stderr);
         if !success {
-            return Err(format!(
-                "confirmation/action failed: {}{}",
-                stdout.trim(),
-                stderr.trim()
-            ));
+            // Both streams can carry a distinct failure; welded together they
+            // read as one nonsensical sentence.
+            let detail = [stdout.trim(), stderr.trim()]
+                .into_iter()
+                .filter(|part| !part.is_empty())
+                .collect::<Vec<_>>()
+                .join("; ");
+            let detail = if detail.is_empty() {
+                "no output".to_owned()
+            } else {
+                detail
+            };
+            return Err(format!("confirmation/action failed: {detail}"));
         }
         if stdout.trim().is_empty() {
             // A crashed or mismatched UI must not be presented as accepted.
@@ -137,6 +150,14 @@ mod production {
             assert_eq!(
                 child_outcome(false, b"", b"daemon restarted").unwrap_err(),
                 "confirmation/action failed: daemon restarted"
+            );
+            assert_eq!(
+                child_outcome(false, b"refused: 2 live\n", b"daemon restarted\n").unwrap_err(),
+                "confirmation/action failed: refused: 2 live; daemon restarted"
+            );
+            assert_eq!(
+                child_outcome(false, b" \n", b"").unwrap_err(),
+                "confirmation/action failed: no output"
             );
             assert_eq!(
                 child_outcome(true, b"Shutdown cancelled; no termination requested\n", b"")

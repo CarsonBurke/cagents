@@ -90,15 +90,21 @@ pub enum DaemonCommand {
     Start,
     /// Report whether the daemon is running.
     Status,
-    /// Request daemon termination (use --confirm for a counted interactive confirmation).
+    /// Request daemon termination (use --confirm for a counted confirmation).
     Stop {
         #[arg(long, conflicts_with = "confirm")]
         require_empty: bool,
         #[arg(long, conflicts_with = "confirm")]
         expected_generation: Option<u64>,
-        #[arg(long)]
-        confirm: bool,
+        /// Confirm termination of the counted hosted sessions. Bare, this
+        /// prompts on the terminal. A service unit or script has no terminal,
+        /// so it may pass a capability from `daemon preflight` instead — the
+        /// same counted authority `cagents-ui --confirm-daemon-stop` uses.
+        #[arg(long, value_name = "CAPABILITY_JSON", num_args = 0..=1)]
+        confirm: Option<Option<String>>,
     },
+    /// Print a short-lived shutdown capability for `daemon stop --confirm`.
+    Preflight,
     /// Checkpoint resumable sessions and stop for a full application upgrade.
     PrepareUpgrade {
         /// Authorize interruption and resumption of all supported hosted sessions.
@@ -1216,41 +1222,73 @@ fn execute_daemon(command: DaemonCommand) -> Result<CommandOutput, AppError> {
             let socket =
                 daemon_socket_path().map_err(|error| AppError::new("socket_path", error))?;
             let mut client = ControlClient::connect(&socket).map_err(protocol_error)?;
-            let outcome = if confirm {
-                if !io::stdin().is_terminal() {
-                    return Err(AppError::new(
-                        "confirmation_required",
-                        "interactive confirmation requires a terminal; use the cagents UI or --require-empty",
-                    ));
+            let outcome = match confirm {
+                // A capability is already a counted, daemon-bound, expiring
+                // authority over one observed inventory, so a script that
+                // obtained one has confirmed exactly what a prompt would.
+                Some(Some(capability)) => {
+                    let capability: ShutdownCapability = serde_json::from_str(&capability)
+                        .map_err(|error| {
+                            AppError::new(
+                                "invalid_capability",
+                                format!(
+                                    "--confirm value is not a capability from `cagents daemon preflight`: {error}"
+                                ),
+                            )
+                        })?;
+                    client
+                        .confirm_shutdown(capability)
+                        .map_err(protocol_error)?
                 }
-                let preflight = client.shutdown_preflight().map_err(protocol_error)?;
-                eprint!(
-                    "Stop daemon and terminate {} hosted terminal/chat sessions (including pending spawns and unconfirmed provider work)? Type yes to confirm: ",
-                    preflight.capability.live_terminals
-                );
-                io::stderr()
-                    .flush()
-                    .map_err(|error| AppError::new("confirmation_input", error))?;
-                let mut answer = String::new();
-                io::stdin()
-                    .read_line(&mut answer)
-                    .map_err(|error| AppError::new("confirmation_input", error))?;
-                if answer.trim() != "yes" {
-                    return Ok(CommandOutput {
-                        command: "daemon.stop",
-                        data: json!({ "outcome": "cancelled", "termination_requested": false }),
-                        human: "Shutdown cancelled; no termination requested".into(),
-                    });
+                Some(None) => {
+                    if !io::stdin().is_terminal() {
+                        return Err(AppError::new(
+                            "confirmation_required",
+                            "interactive confirmation requires a terminal; pass a capability from `cagents daemon preflight` to --confirm, or use --require-empty",
+                        ));
+                    }
+                    let preflight = client.shutdown_preflight().map_err(protocol_error)?;
+                    eprint!(
+                        "Stop daemon and terminate {} hosted terminal/chat sessions (including pending spawns and unconfirmed provider work)? Type yes to confirm: ",
+                        preflight.capability.live_terminals
+                    );
+                    io::stderr()
+                        .flush()
+                        .map_err(|error| AppError::new("confirmation_input", error))?;
+                    let mut answer = String::new();
+                    io::stdin()
+                        .read_line(&mut answer)
+                        .map_err(|error| AppError::new("confirmation_input", error))?;
+                    if answer.trim() != "yes" {
+                        return Ok(CommandOutput {
+                            command: "daemon.stop",
+                            data: json!({ "outcome": "cancelled", "termination_requested": false }),
+                            human: "Shutdown cancelled; no termination requested".into(),
+                        });
+                    }
+                    client
+                        .confirm_shutdown(preflight.capability)
+                        .map_err(protocol_error)?
                 }
-                client
-                    .confirm_shutdown(preflight.capability)
-                    .map_err(protocol_error)?
-            } else {
-                client
+                None => client
                     .shutdown_with_policy(require_empty, expected_generation)
-                    .map_err(protocol_error)?
+                    .map_err(protocol_error)?,
             };
             shutdown_output(outcome)
+        }
+        DaemonCommand::Preflight => {
+            let socket =
+                daemon_socket_path().map_err(|error| AppError::new("socket_path", error))?;
+            let mut client = ControlClient::connect(&socket).map_err(protocol_error)?;
+            let preflight = client.shutdown_preflight().map_err(protocol_error)?;
+            let capability = serde_json::to_string(&preflight.capability)
+                .map_err(|error| AppError::new("serialization", error))?;
+            Ok(CommandOutput {
+                command: "daemon.preflight",
+                data: json!({ "capability": preflight.capability }),
+                // The human form is the exact argument for `stop --confirm`.
+                human: capability,
+            })
         }
         DaemonCommand::PrepareUpgrade { yes } => {
             if !yes {
@@ -1341,13 +1379,23 @@ pub fn shutdown_outcome_json(outcome: &ShutdownOutcome) -> Value {
         ShutdownOutcome::InventoryChanged { current_count } => {
             json!({ "outcome": "inventory_changed", "current_count": current_count, "termination_requested": false })
         }
-        other => json!({ "outcome": match other {
-            ShutdownOutcome::Expired => "expired",
-            ShutdownOutcome::DaemonRestarted => "daemon_restarted",
-            ShutdownOutcome::InvalidCapability => "invalid_capability",
-            ShutdownOutcome::AlreadyShuttingDown => "already_shutting_down",
-            _ => unreachable!(),
-        }, "termination_requested": false }),
+        // Exhaustive by construction: a new rejection reason must be named
+        // here rather than collapse into an `unreachable!` catch-all.
+        ShutdownOutcome::ConfirmationRequired { current_count } => {
+            json!({ "outcome": "confirmation_required", "current_count": current_count, "termination_requested": false })
+        }
+        ShutdownOutcome::Expired => {
+            json!({ "outcome": "expired", "termination_requested": false })
+        }
+        ShutdownOutcome::DaemonRestarted => {
+            json!({ "outcome": "daemon_restarted", "termination_requested": false })
+        }
+        ShutdownOutcome::InvalidCapability => {
+            json!({ "outcome": "invalid_capability", "termination_requested": false })
+        }
+        ShutdownOutcome::AlreadyShuttingDown => {
+            json!({ "outcome": "already_shutting_down", "termination_requested": false })
+        }
     }
 }
 
@@ -1364,6 +1412,11 @@ pub fn shutdown_outcome_message(outcome: &ShutdownOutcome) -> String {
         ),
         ShutdownOutcome::InventoryChanged { current_count } => format!(
             "Shutdown rejected: inventory_changed, current_count={current_count}, termination_requested=false; refresh confirmation"
+        ),
+        ShutdownOutcome::ConfirmationRequired { current_count } => format!(
+            "Shutdown rejected: confirmation_required, current_count={current_count}, termination_requested=false; \
+             hosted sessions still own work — re-run with `cagents daemon stop --confirm`, or \
+             `cagents daemon stop --confirm \"$(cagents daemon preflight)\"` when no terminal is attached"
         ),
         ShutdownOutcome::Expired => {
             "Shutdown confirmation expired; refresh confirmation (termination_requested=false)"
@@ -1628,6 +1681,15 @@ mod tests {
         server.join().unwrap();
     }
 
+    fn parsed_confirm<const N: usize>(arguments: [&str; N]) -> Option<Option<String>> {
+        match Cli::try_parse_from(arguments).unwrap().command {
+            TopCommand::Daemon {
+                command: DaemonCommand::Stop { confirm, .. },
+            } => confirm,
+            other => panic!("expected a daemon stop command, got {other:?}"),
+        }
+    }
+
     #[test]
     fn shutdown_cli_policies_and_results_preserve_acceptance_not_completion() {
         let cli = Cli::try_parse_from([
@@ -1645,7 +1707,7 @@ mod tests {
                 command: DaemonCommand::Stop {
                     require_empty: true,
                     expected_generation: Some(9),
-                    confirm: false
+                    confirm: None
                 }
             }
         ));
@@ -1653,6 +1715,17 @@ mod tests {
             Cli::try_parse_from(["cagents", "daemon", "stop", "--require-empty", "--confirm"])
                 .is_err()
         );
+        // A service unit has no terminal, so `--confirm` must also accept the
+        // counted capability that replaces the prompt.
+        assert_eq!(
+            parsed_confirm(["cagents", "daemon", "stop", "--confirm", "{\"token\":1}"]),
+            Some(Some("{\"token\":1}".to_owned()))
+        );
+        assert_eq!(
+            parsed_confirm(["cagents", "daemon", "stop", "--confirm"]),
+            Some(None)
+        );
+        assert_eq!(parsed_confirm(["cagents", "daemon", "stop"]), None);
         let output = shutdown_output(ShutdownOutcome::Accepted {
             live_terminals_before: 7,
             termination_requested: true,

@@ -490,6 +490,13 @@ impl Card {
                     .truncate(self.restore.history_index + 1);
                 self.restore.history.push(url.clone());
                 self.restore.history_index = self.restore.history.len() - 1;
+                // Forget the oldest entries rather than letting one long-lived
+                // card turn every navigation into an ever larger serialize and
+                // SQLite blob write.
+                crate::model::trim_browser_history(
+                    &mut self.restore.history,
+                    &mut self.restore.history_index,
+                );
                 self.restore.url = url.clone();
                 self.restore.scroll_x = 0.0;
                 self.restore.scroll_y = 0.0;
@@ -1074,6 +1081,10 @@ impl BrowserDelegate {
 /// The card is retired regardless, because a callback that panicked halfway
 /// leaves logical state nobody should have to reason about.
 fn guarded_dispatch(events: &EventBus, faulted: &Cell<bool>, callback: impl FnOnce()) {
+    // Outside the closure, so it survives the unwind: the panic hook runs
+    // before unwinding, and without this scope every recovered delegate fault
+    // is filed in the crash log as a process crash, with a backtrace.
+    let _recovered = crate::instance::recovered_panic_scope();
     let Err(payload) = std::panic::catch_unwind(AssertUnwindSafe(callback)) else {
         return;
     };

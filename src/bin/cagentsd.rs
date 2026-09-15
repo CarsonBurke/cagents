@@ -1,12 +1,9 @@
-use tracing_subscriber::EnvFilter;
-
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| EnvFilter::new("cagentsd=info,cagents=info,warn")),
-        )
-        .init();
+    // Both of these come first: the daemon is spawned with stdout and stderr
+    // on /dev/null, so without a durable sink a panic in the process that owns
+    // every user PTY leaves nothing to diagnose, and `RUST_LOG` is inert.
+    cagents::instance::install_panic_hook("cagentsd");
+    cagents::instance::install_tracing("cagentsd", "cagentsd=info,cagents=info,warn");
     cagents::host::run()?;
     Ok(())
 }
