@@ -1362,8 +1362,13 @@ fn apply_result(content: &mut ItemContent, text: String, failed: bool) {
             *output = text;
             *status = result;
         }
-        ItemContent::Changes { status, .. } => *status = result,
-        ItemContent::Text { .. } | ItemContent::WebSearch { .. } | ItemContent::Image { .. } => {}
+        // `tool_content` maps a Claude tool call to `Command` or `Tool` and to
+        // nothing else, keeping even the edit tools a tool disclosure, so the
+        // remaining variants never hold a Claude tool result.
+        ItemContent::Text { .. }
+        | ItemContent::Changes { .. }
+        | ItemContent::WebSearch { .. }
+        | ItemContent::Image { .. } => {}
     }
 }
 fn image_content(block: &Value) -> ItemContent {

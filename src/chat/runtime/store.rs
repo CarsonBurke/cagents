@@ -464,6 +464,7 @@ impl Store {
         'records: for (id, ordinal, metadata, len0, len1, len2) in records {
             let base: Item = postcard::from_bytes(&metadata).map_err(|e| e.to_string())?;
             let total = len0 + len1;
+            let kind = layout(&base.content);
             let parts = total.max(1).div_ceil(PART_BYTES);
             let until = if self.end.is_some_and(|cursor| cursor.0 == ordinal) {
                 self.end.unwrap().1.min(parts)
@@ -477,20 +478,27 @@ impl Store {
                 } else {
                     self.boundary(&id, len0, (part + 1) * PART_BYTES)?
                 };
+                let (start0, end0) = (start.min(len0), end.min(len0));
+                let (start1, end1) = (start.saturating_sub(len0), end.saturating_sub(len0));
                 let mut item = base.clone();
                 if part > 0 {
-                    item.id = format!("{id}:native-part:{part}");
+                    // A part index names a position in a body rather than the bytes at
+                    // that position, and the slice moves while an item is live: a
+                    // command's output grows, and a finished tool call is rewritten into
+                    // a command, which drops the input from the body and re-slices what
+                    // is left. Since the reader's disclosure state is keyed by item id,
+                    // an index alone would hand a part the state its reader gave to
+                    // different bytes, so the id also carries the range each field is
+                    // read at and which variant decided that field's meaning. Neither
+                    // moves while a body only grows, so a part the reader expanded
+                    // stays expanded across frames.
+                    item.id =
+                        format!("{id}:native-part:{part}:{kind}:{start0}-{end0}:{start1}-{end1}");
                 }
-                let body0 =
-                    String::from_utf8(self.field(&id, 0, start.min(len0), end.min(len0))?)
-                        .map_err(|e| e.to_string())?;
-                let body1 = String::from_utf8(self.field(
-                    &id,
-                    1,
-                    start.saturating_sub(len0),
-                    end.saturating_sub(len0),
-                )?)
-                .map_err(|e| e.to_string())?;
+                let body0 = String::from_utf8(self.field(&id, 0, start0, end0)?)
+                    .map_err(|e| e.to_string())?;
+                let body1 = String::from_utf8(self.field(&id, 1, start1, end1)?)
+                    .map_err(|e| e.to_string())?;
                 // An inline attachment is never paged: half a base64 payload renders as
                 // nothing, so it is restored whole or replaced by an explanation.
                 let attachment =
@@ -709,6 +717,21 @@ fn brief(id: &str) -> &str {
         end -= 1;
     }
     &id[..end]
+}
+/// Names how a variant's payload is spread across the chunk fields, for the
+/// part IDs of a paged item. Which field a byte offset belongs to is decided by
+/// the variant, so a rewritten item can hold entirely different bytes at the
+/// same offset of the same field: a tool call keeps its input in field 0 and a
+/// command keeps its output there.
+fn layout(content: &ItemContent) -> &'static str {
+    match content {
+        ItemContent::Text { .. } => "text",
+        ItemContent::Command { .. } => "command",
+        ItemContent::Changes { .. } => "changes",
+        ItemContent::WebSearch { .. } => "search",
+        ItemContent::Tool { .. } => "tool",
+        ItemContent::Image { .. } => "image",
+    }
 }
 fn insert_body(
     transaction: &rusqlite::Transaction<'_>,
@@ -952,5 +975,69 @@ mod tests {
             }
         }
         assert_eq!(restored, original);
+    }
+    /// A part id is the key the view's disclosure state is held under, and a
+    /// provider rewrites a live item: a finished tool call arrives again as a
+    /// command, which drops the input from the body and re-slices what is left.
+    /// A part that kept its old id would open on its first paint because the
+    /// reader had expanded the different bytes that id used to name.
+    #[test]
+    fn re_sliced_parts_do_not_reuse_the_ids_of_different_bytes() {
+        let mut store = Store::at(std::env::temp_dir()).unwrap();
+        let output = "shell output line\n".repeat(19_445);
+        let input = "{\"command\":\"ls\"}".repeat(18_750);
+        // Both bodies span more than two parts, so a part lands wholly inside
+        // the call's input and the byte range it names outlives the rewrite
+        // that moves the output to where that input used to be.
+        assert!(output.len() > 2 * PART_BYTES && input.len() > 2 * PART_BYTES);
+        let parts = |window: Window| {
+            window
+                .items
+                .into_iter()
+                .map(|item| item.id)
+                .filter(|id| id.contains(":native-part:"))
+                .collect::<Vec<_>>()
+        };
+        store
+            .apply(Event::Item(Item {
+                id: "call".into(),
+                role: Role::Assistant,
+                content: ItemContent::Tool {
+                    name: "shell".into(),
+                    input,
+                    output: output.clone(),
+                    status: crate::chat::ToolStatus::Running,
+                },
+            }))
+            .unwrap();
+        let before = parts(store.window().unwrap());
+        assert!(before.len() > 1, "{before:?}");
+        // Nothing changed between the two windows, so every part keeps its id
+        // and a reader who expands one and scrolls does not lose it.
+        assert_eq!(parts(store.window().unwrap()), before);
+        store
+            .apply(Event::Item(Item {
+                id: "call".into(),
+                role: Role::Assistant,
+                content: ItemContent::Command {
+                    label: "shell".into(),
+                    command: "ls".into(),
+                    working_directory: "/repo".into(),
+                    action: crate::chat::CommandAction::Run,
+                    status: crate::chat::ToolStatus::Succeeded,
+                    exit_code: Some(0),
+                    duration_ms: Some(3),
+                    output,
+                },
+            }))
+            .unwrap();
+        let after = parts(store.window().unwrap());
+        assert!(after.len() > 1, "{after:?}");
+        for id in &after {
+            assert!(
+                !before.contains(id),
+                "part id {id} was reused for different bytes"
+            );
+        }
     }
 }

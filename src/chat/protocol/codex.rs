@@ -464,10 +464,10 @@ impl Codex {
                 ("Additional permissions", RequestKind::Permissions)
             }
             "item/tool/requestUserInput" => {
-                description = if params["isBlocking"]
-                    .as_bool()
-                    .ok_or("Missing Codex question blocking status")?
-                {
+                // A question whose blocking flag never arrived is described as
+                // the blocking kind, because overstating a question's urgency
+                // costs less than ending the session it was asked in.
+                description = if params["isBlocking"].as_bool().unwrap_or(true) {
                     "Codex is waiting for your answer."
                 } else {
                     "Optional question; Codex can continue while you answer."
@@ -782,13 +782,24 @@ impl Adapter for Codex {
                 Pending::Models => {
                     for value in array(result, "data")? {
                         let id = string(value, "model")?.to_owned();
-                        let reasoning = array(value, "supportedReasoningEfforts")?
-                            .iter()
-                            .map(|e| string(e, "reasoningEffort").map(str::to_owned))
-                            .collect::<Result<Vec<_>, _>>()?;
+                        // A catalog entry that does not describe its efforts,
+                        // or does not name itself for the picker, is still a
+                        // model the user can select, so the unreadable parts
+                        // are dropped rather than the whole catalog with the
+                        // session it arrived in.
+                        let reasoning: Vec<String> = value["supportedReasoningEfforts"]
+                            .as_array()
+                            .map(|efforts| {
+                                efforts
+                                    .iter()
+                                    .filter_map(|effort| effort["reasoningEffort"].as_str())
+                                    .map(str::to_owned)
+                                    .collect()
+                            })
+                            .unwrap_or_default();
                         let model = Model {
                             id: id.clone(),
-                            label: string(value, "displayName")?.into(),
+                            label: value["displayName"].as_str().unwrap_or(&id).into(),
                             reasoning,
                         };
                         if let Some(existing) = self.models.iter_mut().find(|m| m.id == id) {
@@ -985,14 +996,20 @@ impl Adapter for Codex {
             | "item/fileChange/outputDelta"
             | "item/mcpToolCall/progress" => {
                 let id = item_key(string(params, "turnId")?, string(params, "itemId")?);
+                // A delta for an item this adapter is not tracking belongs to
+                // an item that already completed, or to one that never
+                // streamed, and losing the tail of its output is better than
+                // ending the session over a delta nothing can render.
                 if let Some(item) = self.active_items.get_mut(&id) {
                     // A fileChange's content is its patch rather than a stream, so the
                     // deprecated textual delta that used to accompany one has nowhere to land.
                     if let ItemContent::Tool { output, .. } | ItemContent::Command { output, .. } =
                         &mut item.content
                     {
+                        // An MCP progress notification only carries a message
+                        // when the server wrote one.
                         let delta = if method.ends_with("progress") {
-                            string(params, "message")?
+                            params["message"].as_str().unwrap_or_default()
                         } else {
                             string(params, "delta")?
                         };
@@ -1002,18 +1019,16 @@ impl Adapter for Codex {
                         output.push_str(delta);
                         step.events.push(Event::Item(item.clone()));
                     }
-                } else {
-                    return Err(format!(
-                        "Codex tool delta arrived without a live item: {id}"
-                    ));
                 }
             }
             "item/fileChange/patchUpdated" => {
                 let id = item_key(string(params, "turnId")?, string(params, "itemId")?);
-                let updated = file_changes(params)?;
+                // The patch is parsed only once there is an item to hold it, so
+                // a notification for an item this adapter never tracked cannot
+                // fail the session over a patch nothing would render.
                 if let Some(item) = self.active_items.get_mut(&id) {
                     if let ItemContent::Changes { changes, .. } = &mut item.content {
-                        *changes = updated;
+                        *changes = file_changes(params)?;
                         step.events.push(Event::Item(item.clone()));
                     }
                 }
@@ -1079,8 +1094,9 @@ impl Adapter for Codex {
                 detail: "Codex's native queue changed".into(),
             }),
             "item/reasoning/summaryPartAdded" | "thread/compacted" => {}
-            // Auxiliary app-server notifications are not transcript data. Unknown
-            // item types and requests, in contrast, are visibly rejected above.
+            // Auxiliary app-server notifications are not transcript data.
+            // Unknown item types are shown as tool disclosures and unknown
+            // requests are visibly rejected above.
             _ => {}
         }
         Ok(step)
@@ -1226,7 +1242,7 @@ fn file_changes(value: &Value) -> Result<Vec<FileChange>, String> {
     for change in entries {
         let original = string(change, "path")?;
         let descriptor = &change["kind"];
-        let (path, kind) = match string(descriptor, "type")? {
+        let (path, kind) = match descriptor["type"].as_str().unwrap_or_default() {
             "add" => (original.to_owned(), ChangeKind::Added),
             "delete" => (original.to_owned(), ChangeKind::Deleted),
             "update" => match descriptor["move_path"].as_str() {
@@ -1238,7 +1254,11 @@ fn file_changes(value: &Value) -> Result<Vec<FileChange>, String> {
                 ),
                 None => (original.to_owned(), ChangeKind::Updated),
             },
-            other => return Err(format!("Unsupported Codex file change kind: {other}")),
+            // A kind this build does not know, and a kind an entry never
+            // stated, is still a file change, and rendering it as an update
+            // keeps the transcript alive where rejecting the patch would end
+            // the session.
+            _ => (original.to_owned(), ChangeKind::Updated),
         };
         changes.push(FileChange {
             path,
@@ -1305,7 +1325,7 @@ fn parse_item(value: &Value, done: bool, turn: &str) -> Result<Vec<Item>, String
             let mut items = Vec::new();
             for (index, content) in array(value, "content")?.iter().enumerate() {
                 let part_id = format!("{id}/input/{index}");
-                match string(content, "type")? {
+                match content["type"].as_str().unwrap_or_default() {
                     "text" => items.push(text(
                         part_id,
                         string(content, "text")?.into(),
@@ -1324,10 +1344,13 @@ fn parse_item(value: &Value, done: bool, turn: &str) -> Result<Vec<Item>, String
                             description: "User attachment".into(),
                         },
                     }),
-                    "mention" | "skill" | "audio" | "localAudio" => {
-                        items.push(text(part_id, content.to_string(), false, Role::User))
-                    }
-                    other => return Err(format!("Unsupported Codex user input item: {other}")),
+                    // A mention, skill or audio part has no rendering of its
+                    // own, and neither has a part type this build cannot name,
+                    // whether because a later Codex introduced it or because
+                    // the part never stated one. Showing the payload keeps the
+                    // user's own input in the transcript, where rejecting it
+                    // would end the session that received it.
+                    _ => items.push(text(part_id, content.to_string(), false, Role::User)),
                 }
             }
             items
@@ -1458,8 +1481,11 @@ fn parse_item(value: &Value, done: bool, turn: &str) -> Result<Vec<Item>, String
             false,
             Role::System,
         )],
-        "sleep" | "subAgentActivity" => tool(kind.into(), String::new(), value.to_string()),
-        other => return Err(format!("Unsupported Codex transcript item type: {other}")),
+        // Codex's own auxiliary items, `sleep` and `subAgentActivity` among
+        // them, and any item type a later Codex introduces, still belong to the
+        // turn. The tool disclosure exists to keep an unrecognized item
+        // renderable rather than ending the session over it.
+        other => tool(other.into(), String::new(), value.to_string()),
     };
     for item in &items {
         if item.content.byte_len() > MAX_ITEM_BYTES {
@@ -1822,7 +1848,28 @@ mod tests {
         assert_eq!(changes[1].kind, ChangeKind::Updated);
         assert_eq!(changes[2].kind, ChangeKind::Deleted);
         assert_eq!(changes[3].kind, ChangeKind::Added);
-        assert!(parse_item(&json!({"id":"0","type":"fileChange","status":"completed","changes":[{"path":"p","kind":{"type":"chmod"},"diff":""}]}), true, "turn").is_err());
+        let unknown = parse_item(&json!({"id":"0","type":"fileChange","status":"completed","changes":[{"path":"p","kind":{"type":"chmod"},"diff":"@@ -1 +1 @@\n"}]}), true, "turn").unwrap();
+        let ItemContent::Changes { changes, .. } = &unknown[0].content else {
+            panic!("A file change kind this build does not know is still a file change");
+        };
+        assert_eq!(changes[0].kind, ChangeKind::Updated);
+    }
+
+    #[test]
+    fn an_unrecognized_item_part_or_untracked_patch_cannot_end_the_session() {
+        let future = json!({"id":"0","type":"quantumThought","status":"completed","why":"new"});
+        let items = parse_item(&future, true, "turn").unwrap();
+        assert!(matches!(&items[0].content,
+            ItemContent::Tool { name, output, status: ToolStatus::Succeeded, .. }
+            if name == "quantumThought" && output.contains("quantumThought")));
+        let part = json!({"id":"1","type":"userMessage","content":[{"type":"hologram","n":3}]});
+        let items = parse_item(&part, true, "turn").unwrap();
+        assert!(matches!(&items[0].content,
+            ItemContent::Text { text, .. } if text.contains("hologram")));
+        assert_eq!(items[0].role, Role::User);
+        let mut adapter = adapter();
+        let ignored = adapter.receive(json!({"method":"item/fileChange/patchUpdated","params":{"threadId":"thread-exact","turnId":"turn-a","itemId":"0","changes":"not an array"}})).unwrap();
+        assert!(ignored.events.is_empty());
     }
 
     #[test]

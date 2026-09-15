@@ -5,9 +5,16 @@ use crate::chat::{
 };
 use base64::{Engine, engine::general_purpose::STANDARD};
 use serde_json::{Value, json};
-use std::{collections::HashMap, fs::File, io::Read};
+use std::{
+    collections::{HashMap, VecDeque},
+    fs::File,
+    io::Read,
+};
 
 const MAX_PAYLOAD: usize = 16 * 1024 * 1024;
+/// The same bound the Codex adapter puts on the items it keeps live, so the two
+/// adapters retain a comparable amount of a session's tool history.
+const MAX_CALLS: usize = 128;
 
 pub fn create(launch: &Launch) -> Result<(ProcessSpec, Box<dyn Adapter>), String> {
     let mut spec = ProcessSpec::from(&launch.recipe);
@@ -104,6 +111,7 @@ struct Omp {
     requests: HashMap<String, String>,
     chunks: HashMap<String, Chunk>,
     calls: HashMap<String, Call>,
+    call_order: VecDeque<String>,
     usage: chat::Usage,
 }
 struct Chunk {
@@ -269,12 +277,26 @@ impl Omp {
             .collect()
     }
     /// The item a tool call produces while it is still running.
+    ///
+    /// The first classification recorded for a call is the one kept. An update
+    /// frame repeats the call without repeating its arguments, so classifying
+    /// it again would replace the command the call started with by an empty
+    /// one, which is exactly what the recorded call exists to prevent.
     fn running(&mut self, id: &str, name: &str, args: &Value, output: String) -> ItemContent {
+        if let Some(call) = self.calls.get(id) {
+            // A running command has neither an exit status nor a duration.
+            return call.item(ToolStatus::Running, output, &Value::Null);
+        }
         match call(name, args) {
             Some(call) => {
-                // A running command has neither an exit status nor a duration.
                 let content = call.item(ToolStatus::Running, output, &Value::Null);
-                self.calls.insert(id.to_owned(), call);
+                // A classification that arrived without the arguments it was
+                // made from is not worth carrying to the call's result, and
+                // leaving it unrecorded lets a later frame that does carry
+                // them record the call instead.
+                if !call.command.is_empty() {
+                    self.record(id, call);
+                }
                 content
             }
             None => ItemContent::Tool {
@@ -283,6 +305,22 @@ impl Omp {
                 output,
                 status: ToolStatus::Running,
             },
+        }
+    }
+    /// Retain a classified call, evicting the oldest once the bound is reached.
+    ///
+    /// A finished call cannot be dropped when it finishes, because its result
+    /// arrives twice, so a day-long session would otherwise keep every command
+    /// it ever ran inside a daemon the user cannot restart.
+    fn record(&mut self, id: &str, call: Call) {
+        if !self.calls.contains_key(id) {
+            self.call_order.push_back(id.to_owned());
+        }
+        self.calls.insert(id.to_owned(), call);
+        while self.call_order.len() > MAX_CALLS {
+            if let Some(evicted) = self.call_order.pop_front() {
+                self.calls.remove(&evicted);
+            }
         }
     }
     /// The item a finished tool call produces.
@@ -584,6 +622,7 @@ impl Adapter for Omp {
                             self.history_request = None;
                             self.requests.clear();
                             self.calls.clear();
+                            self.call_order.clear();
                             self.usage = chat::Usage::default();
                             step.events.push(Event::Reset {
                                 reason: "OMP changed the current conversation.".into(),
@@ -1209,6 +1248,35 @@ mod tests {
         let repeated = adapter.receive(json!({"type":"message_end","message":{"role":"toolResult","toolCallId":"call","toolName":"bash","content":[{"type":"text","text":"error[E0425]"}],"isError":true,"details":{"exitCode":101,"wallTimeMs":1520.5}}})).unwrap();
         assert!(matches!(&repeated.events[0],
             Event::Item(Item { content: ItemContent::Command { command, .. }, .. }) if command == "cargo check"));
+    }
+
+    #[test]
+    fn an_argument_free_update_cannot_erase_the_command_a_call_started_with() {
+        let mut adapter = Omp::default();
+        adapter.receive(json!({"type":"tool_execution_start","toolCallId":"call","toolName":"bash","args":{"command":"cargo check","cwd":"/repo"}})).unwrap();
+        let progressed = adapter.receive(json!({"type":"tool_execution_update","toolCallId":"call","toolName":"bash","partialResult":{"content":[{"type":"text","text":"Checking cagents"}]}})).unwrap();
+        assert!(matches!(&progressed.events[0],
+            Event::Item(Item { content: ItemContent::Command { command, working_directory, status: ToolStatus::Running, output, .. }, .. })
+            if command == "cargo check" && working_directory == "/repo" && output == "Checking cagents"));
+        let finished = adapter.receive(json!({"type":"tool_execution_end","toolCallId":"call","toolName":"bash","result":{"content":[{"type":"text","text":"Finished"}],"details":{"exitCode":0}}})).unwrap();
+        assert!(matches!(&finished.events[0],
+            Event::Item(Item { content: ItemContent::Command { command, working_directory, status: ToolStatus::Succeeded, .. }, .. })
+            if command == "cargo check" && working_directory == "/repo"));
+    }
+
+    #[test]
+    fn a_long_session_stops_carrying_the_commands_of_its_oldest_calls() {
+        let mut adapter = Omp::default();
+        for index in 0..=MAX_CALLS {
+            adapter.receive(json!({"type":"tool_execution_start","toolCallId":format!("call-{index}"),"toolName":"bash","args":{"command":format!("echo {index}"),"cwd":"/repo"}})).unwrap();
+        }
+        let evicted = adapter.receive(json!({"type":"tool_execution_end","toolCallId":"call-0","toolName":"bash","result":{"content":[{"type":"text","text":"0"}],"details":{"exitCode":0}}})).unwrap();
+        assert!(matches!(&evicted.events[0],
+            Event::Item(Item { content: ItemContent::Tool { name, .. }, .. }) if name == "bash"));
+        let newest = adapter.receive(json!({"type":"tool_execution_end","toolCallId":format!("call-{MAX_CALLS}"),"toolName":"bash","result":{"content":[{"type":"text","text":"done"}],"details":{"exitCode":0}}})).unwrap();
+        assert!(matches!(&newest.events[0],
+            Event::Item(Item { content: ItemContent::Command { command, .. }, .. })
+            if command == &format!("echo {MAX_CALLS}")));
     }
 
     #[test]
