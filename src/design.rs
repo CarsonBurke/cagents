@@ -290,8 +290,8 @@ pub const INSPECTOR_MAX_WIDTH: f32 = 480.0;
 /// `SCROLLBAR_THUMB_WIDTH` and sits centred in that rail. Content is inset by
 /// the full rail, so a floating thumb never overlaps a label, icon, badge, or
 /// interactive target even at fractional display scales.
-pub const SCROLLBAR_GUTTER: f32 = 12.0;
-pub const SCROLLBAR_THUMB_WIDTH: f32 = 6.0;
+pub const SCROLLBAR_GUTTER: f32 = 8.0;
+pub const SCROLLBAR_THUMB_WIDTH: f32 = 4.0;
 /// Centres the thumb in the rail. Native scrollbars occupy
 /// `width + margin * 2`, which this makes exactly `SCROLLBAR_GUTTER`, so a
 /// native surface and a custom-drawn one reserve the same space.

@@ -1326,13 +1326,14 @@ where
                         shell.request_redraw();
                         shell.capture_event();
                     }
-                    // A redirect the horizontal axis could not absorb - a
-                    // wrapped buffer, or a document whose longest line already
-                    // fits - still has to scroll, or holding Shift would
-                    // appear to freeze the wheel. Only a pan that actually
-                    // moved consumes the vertical delta.
-                    let lines =
-                        if redirected && panned { 0.0 } else { lines } + state.partial_scroll;
+                    // Shift makes the gesture horizontal, so the vertical
+                    // delta is spent whether or not the pan had anywhere to
+                    // go. A redirect the horizontal axis cannot absorb - the
+                    // left or right bound, a wrapped buffer, a document whose
+                    // longest line already fits - used to fall back to
+                    // scrolling the document, which moved it along an axis the
+                    // user had explicitly modified away from.
+                    let lines = if redirected { 0.0 } else { lines } + state.partial_scroll;
                     state.partial_scroll = lines.fract();
 
                     shell.publish(on_edit(Action::Scroll {
@@ -2767,9 +2768,9 @@ mod tests {
             );
             assert_eq!(content.scroll_position().horizontal, 0.0);
         }
-        // The redirect had nowhere to go, so the gesture must still scroll.
-        // Swallowing it would make Shift freeze the wheel on every wrapped
-        // buffer and on every file whose longest line already fits.
+        // A wrapped buffer has no canvas, so the redirect has nowhere to go -
+        // and a gesture the user modified onto the horizontal axis must then
+        // do nothing at all rather than move the document vertically.
         assert_eq!(
             published
                 .iter()
@@ -2778,8 +2779,8 @@ mod tests {
                     _ => None,
                 })
                 .sum::<i32>(),
-            30,
-            "Shift+wheel must fall back to vertical scrolling when nothing can pan"
+            0,
+            "Shift+wheel must never scroll vertically, even with nothing to pan"
         );
     }
 
