@@ -1254,6 +1254,7 @@ fn finish_repository_load_failure(model: &mut SidebarModel, project_id: ProjectI
         .find(|project| project.id == project_id)
     {
         project.unreachable = Some(error);
+        project.reloading = false;
         model.data_state = SidebarDataState::Ready;
         return;
     }
@@ -3255,6 +3256,7 @@ impl Cagents {
         {
             project.github_status = GitHubAvailability::Loading.label().into();
             project.revoke_github();
+            project.reloading = true;
         }
         self.repository_read_task(path, project_id, generation, open_cards)
     }
@@ -8033,6 +8035,7 @@ impl Application for Cagents {
                             // whatever an earlier failure recorded about the
                             // row it landed on no longer holds.
                             existing.unreachable = None;
+                            existing.reloading = false;
                             for (record, status) in &loaded.worktrees {
                                 if existing.worktrees.iter().any(|known| known.id == record.id) {
                                     continue;
@@ -13177,11 +13180,14 @@ mod tests {
             github: GitHubAvailability::NotAssociated,
         };
 
+        // The failure lands last on purpose. A failure followed by a success
+        // would be rescued by the success setting the pane Ready, so only this
+        // order can catch a failure that blanks the pane.
+        drop(app.update(repository_load_result(healthy, Ok(loaded))));
         drop(app.update(repository_load_result(
             broken,
             Err("fatal: not a git repository".into()),
         )));
-        drop(app.update(repository_load_result(healthy, Ok(loaded))));
 
         assert_eq!(app.sidebar_model.data_state, SidebarDataState::Ready);
         assert_eq!(
