@@ -398,6 +398,34 @@ pub fn with_both_rails(padding: cosmic::iced::Padding) -> cosmic::iced::Padding 
     with_horizontal_rail(with_vertical_rail(padding))
 }
 
+/// The transcript minimap: the rail it occupies, and the marks drawn down it.
+///
+/// The minimap stands in for the scrollbar on a conversation, so its rail is
+/// wider than [`SCROLLBAR_GUTTER`]: a mark has to carry a tone and a length
+/// at a glance, and a 4pt thumb has room for neither. The two mark numbers
+/// are floors rather than sizes - a stretch of work is drawn as long as its
+/// share of the conversation, down to the shortest bar that still reads as
+/// ink, so a one-line exchange in an afternoon's history is still findable.
+pub const MINIMAP_WIDTH: f32 = 12.0;
+pub const MINIMAP_MARK_INSET: f32 = 3.0;
+pub const MINIMAP_MARK_MIN_HEIGHT: f32 = 2.0;
+/// The floor under the lens that reports the viewport's own extent, so a
+/// reader scrolling a very long conversation can still see where they are.
+pub const MINIMAP_LENS_MIN_HEIGHT: f32 = 8.0;
+
+/// How wide the model picker's popup is.
+///
+/// A picker is sized to the identifiers it lists rather than to the pane it
+/// hangs off: a provider offering `claude-sonnet-4-5-20250929` needs about
+/// this much, and a list that took its width from the pane put a three-word
+/// label on a row several hundred points long. It is a fixed width rather
+/// than a ceiling because a popup's content is free to fill the space it is
+/// given, and a panel that hugged its widest row would change width with
+/// every keystroke of the query.
+pub const MODEL_POPUP_WIDTH: f32 = 280.0;
+/// How tall the model list is allowed to grow before it scrolls.
+pub const MODEL_POPUP_CEILING: f32 = 280.0;
+
 pub const WIDE_BREAKPOINT: f32 = 1_440.0;
 pub const EXPANDED_NAVIGATION_BREAKPOINT: f32 = 1_200.0;
 pub const OVERLAY_DOCK_BREAKPOINT: f32 = 900.0;
