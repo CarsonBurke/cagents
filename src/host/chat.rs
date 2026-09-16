@@ -39,9 +39,56 @@ pub(super) struct TerminalHandoff {
     terminal: crate::model::TerminalSession,
     generation: u64,
     subscribers: BTreeMap<ClientId, bool>,
+    /// After this moment no window can still be waiting to save this
+    /// replacement, counted from the conversion or from the most recent replay
+    /// of its response, whichever happened last.
+    acknowledgement_deadline: Instant,
 }
 
+/// A window acknowledges a receipt one round trip after its own durable save,
+/// and it retries on every refresh and every start, so a receipt still
+/// outstanding long afterwards belongs to a window that will never save it: it
+/// crashed, it discarded the card, or its own store is permanently unwritable.
+/// Without this bound the daemon could never checkpoint again, which leaves
+/// terminating every hosted session as the only way to install a new build.
+pub(super) const ACKNOWLEDGEMENT_GRACE: Duration = Duration::from_secs(300);
+
 impl TerminalHandoff {
+    pub(super) fn new(
+        source: Session,
+        terminal: crate::model::TerminalSession,
+        generation: u64,
+        subscribers: BTreeMap<ClientId, bool>,
+        acknowledgement_deadline: Instant,
+    ) -> Self {
+        Self {
+            source,
+            terminal,
+            generation,
+            subscribers,
+            acknowledgement_deadline,
+        }
+    }
+
+    /// Whether no window can still be waiting to save this replacement.
+    ///
+    /// Attachment is deliberately not the question: a window drops its chat
+    /// connection as part of the conversion and acknowledges over a fresh one,
+    /// so every receipt is unattached from the moment it exists.
+    pub(super) fn unacknowledgeable(&self, now: Instant) -> bool {
+        now >= self.acknowledgement_deadline
+    }
+
+    /// A window that just received the replacement's identity again owes its
+    /// durable save from that moment, not from the original conversion.
+    pub(super) fn reissue(&mut self, now: Instant) {
+        self.acknowledgement_deadline = now + ACKNOWLEDGEMENT_GRACE;
+    }
+
+    pub(super) fn replacement(&self) -> &crate::model::TerminalSession {
+        &self.terminal
+    }
+
     fn snapshot(&self) -> chat::Snapshot {
         chat::Snapshot {
             generation: self.generation,
@@ -1118,12 +1165,13 @@ pub(super) fn process(
         }
         ClientRequest::ChatReturnTerminal { chat_id } => {
             let (handle, mut session) = {
-                let state = host.lock().unwrap_or_else(|p| p.into_inner());
+                let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
                 if state.shutting_down {
                     return Err(unavailable("Daemon is shutting down"));
                 }
-                if let Some(receipt) = state.chat_handoffs.get(&chat_id) {
+                if let Some(receipt) = state.chat_handoffs.get_mut(&chat_id) {
                     receipt.require_attached(client)?;
+                    receipt.reissue(Instant::now());
                     return Ok(ServerResponse::ChatTerminal {
                         chat_id,
                         session: receipt.terminal.clone(),
@@ -1229,15 +1277,16 @@ pub(super) fn process(
                 let mut record = state.chats.remove(&chat_id);
                 state.chat_handoffs.insert(
                     chat_id,
-                    TerminalHandoff {
-                        source: session,
-                        terminal: descriptor.session.clone(),
-                        generation: snapshot.generation,
-                        subscribers: record
+                    TerminalHandoff::new(
+                        session,
+                        descriptor.session.clone(),
+                        snapshot.generation,
+                        record
                             .as_mut()
                             .map(|record| std::mem::take(&mut record.subscribers))
                             .unwrap_or_default(),
-                    },
+                        Instant::now() + ACKNOWLEDGEMENT_GRACE,
+                    ),
                 );
                 state.inventory_generation += 1;
                 record
@@ -1792,12 +1841,13 @@ for line in sys.stdin:
             .chat_handoffs
             .insert(
                 source_id,
-                TerminalHandoff {
-                    source: saved.source,
+                TerminalHandoff::new(
+                    saved.source,
                     terminal,
-                    generation: 1,
-                    subscribers: BTreeMap::new(),
-                },
+                    1,
+                    BTreeMap::new(),
+                    Instant::now() + ACKNOWLEDGEMENT_GRACE,
+                ),
             );
         // No terminal record remains, but the proof-bound terminal ID still
         // names the durable replacement. EOF/terminal close did not consume it.

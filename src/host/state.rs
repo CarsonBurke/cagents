@@ -938,10 +938,30 @@ fn prepare_upgrade_with(
         state
             .validate_upgrade_capability(&capability, Instant::now())
             .map_err(upgrade_error)?;
-        if !state.chat_handoffs.is_empty() {
+        // A receipt is retained so a window that has not saved its replacement
+        // can still replay it, which is worth refusing an upgrade for while the
+        // window can still act. Nothing ever released a receipt whose window
+        // stopped acting, so one discarded card left this daemon unable to
+        // checkpoint for the rest of its life, and terminating every hosted
+        // session became the only way to install a new build. The receipt is
+        // left in place rather than deleted here: the checkpoint can still fail
+        // below, and a daemon that keeps running keeps its evidence replayable.
+        let now = Instant::now();
+        if state
+            .chat_handoffs
+            .values()
+            .any(|receipt| !receipt.unacknowledgeable(now))
+        {
             return Err(upgrade_error(
                 "A native-to-terminal handoff is not durably acknowledged; save its replacement before upgrading",
             ));
+        }
+        for (chat, receipt) in &state.chat_handoffs {
+            tracing::warn!(
+                chat = %chat,
+                terminal = %receipt.replacement().id,
+                "checkpointing past a native-to-terminal handoff no client acknowledged"
+            );
         }
         if state.chats.values().any(|record| record.returning_terminal) {
             return Err(upgrade_error(
@@ -2073,6 +2093,86 @@ for line in sys.stdin:
             .unwrap()
             .unwrap()
             .require_ready()
+            .unwrap();
+    }
+
+    #[test]
+    fn a_handoff_no_window_can_still_save_stops_refusing_the_upgrade() {
+        use crate::{
+            agent::Provider,
+            chat::{Launch, Session},
+            model::LaunchRecipe,
+            upgrade::handoff::Store,
+        };
+        let directory = tempfile::tempdir().unwrap();
+        let host = Arc::new(Mutex::new(test_host()));
+        let recipe = LaunchRecipe {
+            program: "omp".into(),
+            arguments: Vec::new(),
+            working_directory: directory.path().to_owned(),
+            environment: BTreeMap::new(),
+        };
+        let source = Session {
+            id: TerminalId::new(),
+            launch: Launch {
+                provider: Provider::Omp,
+                recipe: recipe.clone(),
+                session_id: Some("12345678-1234-4234-8234-123456789abc".into()),
+            },
+            proof: Some(
+                host.lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .proof()
+                    .clone(),
+            ),
+            terminal: None,
+        };
+        let replacement = TerminalSession {
+            id: TerminalId::new(),
+            launch: recipe.clone(),
+            transcript_path: None,
+            resume_hint: None,
+            continuity: TerminalContinuity::RelaunchAvailable {
+                recipe,
+                last_exit: None,
+            },
+        };
+        let chat = source.id;
+        let mut retain = |deadline| {
+            let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
+            state.chat_handoffs.insert(
+                chat,
+                crate::host::chat::TerminalHandoff::new(
+                    source.clone(),
+                    replacement.clone(),
+                    1,
+                    BTreeMap::new(),
+                    deadline,
+                ),
+            );
+            state.shutdown_preflight(Instant::now()).unwrap().capability
+        };
+        let live = retain(Instant::now() + Duration::from_secs(3600));
+        let failure =
+            prepare_upgrade_with(&host, live, || Store::open(directory.path())).unwrap_err();
+        assert!(failure.message.contains("not durably acknowledged"));
+        // Nothing is destroyed by a refused upgrade: the window this receipt
+        // belongs to can still replay its replacement afterwards.
+        assert!(
+            host.lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .chat_handoffs
+                .contains_key(&chat)
+        );
+        let expired = retain(Instant::now());
+        assert_eq!(
+            prepare_upgrade_with(&host, expired, || Store::open(directory.path())).unwrap(),
+            (0, 0)
+        );
+        Store::open(directory.path())
+            .unwrap()
+            .load()
+            .unwrap()
             .unwrap();
     }
 
