@@ -147,40 +147,64 @@ fn unreachable_and_duplicate_completions_never_remove_or_resend() {
     assert_eq!(app.terminal_close_attempts.len(), 1);
 }
 
+fn github_key() -> GitHubRepoKey {
+    GitHubRepoKey::new("github.com", None, "owner", "repo").unwrap()
+}
+
+/// A project whose last completed refresh confirmed `key`, which is the only
+/// thing that ever grants authority to mutate.
+fn authorized_project(app: &mut Cagents, key: &GitHubRepoKey) -> ProjectId {
+    let project = ProjectId::new();
+    app.repository_generations.insert(project, 1);
+    app.github_availability.insert(
+        project,
+        GitHubAvailability::Ready {
+            repository_key: key.clone(),
+            pull_requests: Vec::new(),
+            refreshed_at: 1,
+        },
+    );
+    project
+}
+
+fn open_draft(app: &mut Cagents, project: ProjectId) {
+    let _ = app.update(Message::Sidebar(SidebarAction::CreatePullRequest {
+        project_id: project,
+        worktree: None,
+    }));
+    let dialog = app
+        .pull_request_dialog
+        .as_mut()
+        .expect("a confirmed repository authorizes a draft");
+    dialog.head = "topic".into();
+    dialog.title = "Authored title".into();
+}
+
+fn confirmed_repository(app: &Cagents, project: ProjectId) -> Option<&GitHubRepoKey> {
+    app.github_availability
+        .get(&project)
+        .and_then(GitHubAvailability::repository_key)
+}
+
 #[test]
-fn every_degraded_github_refresh_revokes_prior_dialog_authority() {
+fn every_completed_degraded_github_refresh_revokes_prior_dialog_authority() {
     for unavailable in [
         GitHubAvailability::MissingCli,
         GitHubAvailability::Unauthenticated,
         GitHubAvailability::NotAssociated,
-        GitHubAvailability::Loading,
         GitHubAvailability::Failed {
             detail: "offline".into(),
         },
     ] {
         let mut app = tests::context_inspector_test_app(false);
-        let project = ProjectId::new();
-        let key = GitHubRepoKey::new("github.com", None, "owner", "repo").unwrap();
-        app.repository_generations.insert(project, 1);
-        app.github_availability.insert(
-            project,
-            GitHubAvailability::Ready {
-                repository_key: key.clone(),
-                pull_requests: Vec::new(),
-                refreshed_at: 1,
-            },
-        );
-        let _ = app.update(Message::Sidebar(SidebarAction::CreatePullRequest {
-            project_id: project,
-            worktree: None,
-        }));
-        app.pull_request_dialog.as_mut().unwrap().head = "topic".into();
-        app.pull_request_dialog.as_mut().unwrap().title = "Authored title".into();
+        let key = github_key();
+        let project = authorized_project(&mut app, &key);
+        open_draft(&mut app, project);
         app.github_availability.insert(project, unavailable);
         let _ = app.update(Message::SubmitPullRequest);
         assert!(
             app.pull_request_dialog.is_some(),
-            "stale draft was not submitted"
+            "a revoked draft was submitted"
         );
         let _ = app.update(Message::CancelDialog);
         let _ = app.update(Message::Sidebar(SidebarAction::CreatePullRequest {
@@ -189,39 +213,89 @@ fn every_degraded_github_refresh_revokes_prior_dialog_authority() {
         }));
         assert!(
             app.pull_request_dialog.is_none(),
-            "degraded identity cannot open a mutation"
+            "a revoked identity opened a mutation"
         );
     }
 }
 
 #[test]
-fn refresh_start_and_stale_completion_cannot_reauthorize() {
+fn an_in_flight_refresh_neither_revokes_nor_reauthorizes_authority() {
     let mut app = tests::context_inspector_test_app(false);
-    let project = ProjectId::new();
-    app.repository_generations.insert(project, 4);
-    app.github_availability.insert(
-        project,
-        GitHubAvailability::Ready {
-            repository_key: GitHubRepoKey::new("github.com", None, "owner", "repo").unwrap(),
-            pull_requests: Vec::new(),
-            refreshed_at: 0,
-        },
-    );
+    let key = github_key();
+    let project = authorized_project(&mut app, &key);
     let _unpolled = app.repository_load_task(PathBuf::from("/unaccessed"), Some(project), false);
     assert!(matches!(
         app.github_availability.get(&project),
-        Some(GitHubAvailability::Loading)
+        Some(GitHubAvailability::Loading { .. })
     ));
+    assert_eq!(
+        confirmed_repository(&app, project),
+        Some(&key),
+        "a poll starting is liveness and must not withdraw authorization"
+    );
+
+    // A completion the generation fence rejects reports nothing about this
+    // repository, so it may neither take authority away nor hand it back.
+    let stale = app.repository_generations[&project].wrapping_sub(1);
     let _ = app.update(Message::RepositoryLoaded {
         open_cards: false,
         project_id: project,
-        generation: 4,
-        result: Err("old failure".into()),
+        generation: stale,
+        result: Err("superseded failure".into()),
     });
-    assert!(matches!(
-        app.github_availability.get(&project),
-        Some(GitHubAvailability::Loading)
-    ));
+    assert_eq!(confirmed_repository(&app, project), Some(&key));
+
+    // The identical payload at the live generation is a completed refresh that
+    // reports failure, and that does revoke.
+    let live = app.repository_generations[&project];
+    let _ = app.update(Message::RepositoryLoaded {
+        open_cards: false,
+        project_id: project,
+        generation: live,
+        result: Err("refresh failed".into()),
+    });
+    assert_eq!(confirmed_repository(&app, project), None);
+}
+
+#[test]
+fn a_refresh_confirming_the_same_repository_leaves_an_open_draft_submittable() {
+    let mut app = tests::context_inspector_test_app(false);
+    let key = github_key();
+    let project = authorized_project(&mut app, &key);
+    open_draft(&mut app, project);
+    let _unpolled = app.repository_load_task(PathBuf::from("/unaccessed"), Some(project), false);
+    app.github_availability.insert(
+        project,
+        GitHubAvailability::Ready {
+            repository_key: key,
+            pull_requests: Vec::new(),
+            refreshed_at: 2,
+        },
+    );
+    // Not polled, so no gh process runs: taking the dialog is the whole
+    // observable difference between an accepted and a rejected submission.
+    let _unpolled = app.update(Message::SubmitPullRequest);
+    assert!(
+        app.pull_request_dialog.is_none(),
+        "a refresh confirming the same repository invalidated an authored draft"
+    );
+
+    // A different repository is a different authorization, and rejects.
+    let project = authorized_project(&mut app, &github_key());
+    open_draft(&mut app, project);
+    app.github_availability.insert(
+        project,
+        GitHubAvailability::Ready {
+            repository_key: GitHubRepoKey::new("github.com", None, "owner", "fork").unwrap(),
+            pull_requests: Vec::new(),
+            refreshed_at: 3,
+        },
+    );
+    let _ = app.update(Message::SubmitPullRequest);
+    assert!(
+        app.pull_request_dialog.is_some(),
+        "a draft authored against another repository was submitted"
+    );
 }
 
 #[test]

@@ -641,14 +641,20 @@ pub enum GitHubError {
     Inspection(String),
 }
 
-/// Only a completed refresh grants authority. Cached presentation rows deliberately
-/// live outside this value and cannot supply a repository to a mutation.
+/// Authority to mutate is the repository identity established by the last
+/// completed successful refresh. It therefore survives an in-flight refresh,
+/// which `Loading` carries forward, and is revoked only by a completed refresh
+/// that reports the repository unauthenticated, unassociated or unreadable.
+/// Cached presentation rows deliberately live outside this value and cannot
+/// supply a repository to a mutation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GitHubAvailability {
     MissingCli,
     Unauthenticated,
     NotAssociated,
-    Loading,
+    Loading {
+        confirmed: Option<GitHubRepoKey>,
+    },
     Ready {
         repository_key: GitHubRepoKey,
         pull_requests: Vec<(PullRequest, Vec<PullRequestCheck>)>,
@@ -663,6 +669,7 @@ impl GitHubAvailability {
     pub fn repository_key(&self) -> Option<&GitHubRepoKey> {
         match self {
             Self::Ready { repository_key, .. } => Some(repository_key),
+            Self::Loading { confirmed } => confirmed.as_ref(),
             _ => None,
         }
     }
@@ -674,7 +681,7 @@ impl GitHubAvailability {
                 "GitHub authentication is required; local Git remains available."
             }
             Self::NotAssociated => "No supported GitHub remote is associated.",
-            Self::Loading => "Refreshing GitHub; mutations are disabled.",
+            Self::Loading { .. } => "Refreshing GitHub.",
             Self::Ready { pull_requests, .. } if pull_requests.is_empty() => {
                 "GitHub is up to date; no open pull requests."
             }

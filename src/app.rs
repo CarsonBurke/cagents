@@ -1366,7 +1366,6 @@ struct WorktreeDialog {
 pub struct PullRequestDialog {
     repository: GitHubRepoKey,
     project_id: ProjectId,
-    refresh_generation: u64,
     base: String,
     head: String,
     title: String,
@@ -3246,18 +3245,27 @@ impl Cagents {
         let generation = self.repository_generations.entry(project_id).or_default();
         *generation = generation.wrapping_add(1);
         let generation = *generation;
-        self.github_availability
-            .insert(project_id, GitHubAvailability::Loading);
+        // Liveness is not authority. A poll starting says nothing about whether
+        // the user is still authorized against the same repository, so the last
+        // confirmed identity rides along and the sidebar keeps its pull-request
+        // actions until a refresh actually completes and reports otherwise.
+        let availability = GitHubAvailability::Loading {
+            confirmed: self
+                .github_availability
+                .get(&project_id)
+                .and_then(GitHubAvailability::repository_key)
+                .cloned(),
+        };
         if let Some(project) = self
             .sidebar_model
             .projects
             .iter_mut()
             .find(|project| project.id == project_id)
         {
-            project.github_status = GitHubAvailability::Loading.label().into();
-            project.revoke_github();
+            project.github_status = availability.label().into();
             project.reloading = true;
         }
+        self.github_availability.insert(project_id, availability);
         self.repository_read_task(path, project_id, generation, open_cards)
     }
 
@@ -8401,7 +8409,6 @@ impl Application for Cagents {
                             self.pull_request_dialog_generation.wrapping_add(1);
                         self.pull_request_dialog = Some(PullRequestDialog {
                             project_id,
-                            refresh_generation: self.repository_generations.get(&project_id).copied().unwrap_or_default(),
                             repository,
                             base: "main".into(),
                             head,
@@ -9402,13 +9409,16 @@ impl Application for Cagents {
                 let Some(dialog) = self.pull_request_dialog.take() else {
                     return Task::none();
                 };
-                if self.repository_generations.get(&dialog.project_id).copied()
-                    != Some(dialog.refresh_generation)
-                    || self
-                        .github_availability
-                        .get(&dialog.project_id)
-                        .and_then(GitHubAvailability::repository_key)
-                        != Some(&dialog.repository)
+                // The draft is fenced on identity, not on liveness: a refresh
+                // that completes while the dialog is open and confirms the same
+                // repository has changed nothing the user authored against, so
+                // only a changed key or a completed refresh that revoked
+                // authority may reject the submission.
+                if self
+                    .github_availability
+                    .get(&dialog.project_id)
+                    .and_then(GitHubAvailability::repository_key)
+                    != Some(&dialog.repository)
                 {
                     self.status = Some(TransientNotice::warning(
                         "GitHub identity is stale. Refresh and reopen Create pull request.",
@@ -10277,8 +10287,6 @@ impl Application for Cagents {
                 widget::button::suggested("Create")
                     .on_press_maybe(
                         (dialog.retry_confirmation != Some(false)
-                            && self.repository_generations.get(&dialog.project_id)
-                                == Some(&dialog.refresh_generation)
                             && self
                                 .github_availability
                                 .get(&dialog.project_id)
@@ -12191,7 +12199,6 @@ mod tests {
     fn pull_request_test_dialog() -> PullRequestDialog {
         PullRequestDialog {
             project_id: ProjectId::new(),
-            refresh_generation: 0,
             repository: GitHubRepoKey::new("github.com", None, "owner", "repo").unwrap(),
             base: "release".into(),
             head: "topic/authored-change".into(),
@@ -12203,8 +12210,6 @@ mod tests {
     }
 
     fn authorize_pull_request_test(app: &mut Cagents, dialog: &PullRequestDialog) {
-        app.repository_generations
-            .insert(dialog.project_id, dialog.refresh_generation);
         app.github_availability.insert(
             dialog.project_id,
             GitHubAvailability::Ready {
@@ -12653,7 +12658,6 @@ mod tests {
         app.inspector = None;
         app.pull_request_dialog = Some(PullRequestDialog {
             project_id: ProjectId::new(),
-            refresh_generation: 0,
             repository: GitHubRepoKey::new("github.com", None, "owner", "repo").unwrap(),
             base: "main".into(),
             head: "topic".into(),
