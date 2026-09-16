@@ -164,6 +164,20 @@ pub fn diff_removed_color(theme: &cosmic::Theme) -> cosmic::iced::Color {
     diff_tone(theme, theme.cosmic().destructive.base.into())
 }
 
+/// The wash an editor lays under a line the unsaved buffer has added.
+///
+/// Translucent rather than mixed toward a surface colour, because it is
+/// painted over the editor's own background rather than over the container
+/// [`diff_tone`] mixes against, and the glyphs are drawn on top of it: a fill
+/// strong enough to be seen down the side of the buffer still has to leave
+/// the code its contrast.
+pub fn added_line_wash(theme: &cosmic::Theme) -> cosmic::iced::Color {
+    cosmic::iced::Color {
+        a: 0.12,
+        ..success_color(theme)
+    }
+}
+
 pub fn success_color(theme: &cosmic::Theme) -> cosmic::iced::Color {
     theme.cosmic().success.base.into()
 }
@@ -399,6 +413,54 @@ impl ShellLayout {
                 dock: DockLayout::Overlay,
             }
         }
+    }
+}
+
+/// The leading and trailing inset of a header toolbar, and the gap between the
+/// control groups inside it.
+///
+/// A header reads as a single rhythm: the inset that holds its first group off
+/// the window edge is the same measure as the gap between two groups, so one
+/// number describes both. Naming it here is what stops an embedding shell from
+/// adding a second, different inset of its own on top of the toolbar's.
+pub const TOOLBAR_INSET: f32 = GRID_UNIT * 3.0;
+pub const TOOLBAR_GROUP_SPACING: f32 = TOOLBAR_INSET;
+
+/// Room for the widest label a counter wedged between two step controls can
+/// hold, so the control after it does not move as the count changes.
+pub const STEPPER_LABEL_WIDTH: f32 = GRID_UNIT * 12.0;
+
+/// A `+12 −4` change count, with each side carrying its own semantic tone.
+///
+/// [`crate::repository::line_change_counts`] joins the two sides with a single
+/// space and omits a side it measured as zero, so the position of that space
+/// is all that is needed to tell the added part from the removed part. The
+/// counts are the only place the shell states a magnitude of change, and a
+/// monochrome `+141 −3` makes the reader parse the sign to learn which
+/// direction it went.
+pub fn change_counts<'a, Message: 'a>(counts: &str) -> cosmic::Element<'a, Message> {
+    let tinted = |text: &str, style: fn(&cosmic::Theme) -> cosmic::iced::widget::text::Style| {
+        caption(text.to_owned())
+            .wrapping(cosmic::iced::widget::text::Wrapping::None)
+            .class(cosmic::theme::Text::Custom(style))
+    };
+    match counts.split_once(' ') {
+        Some((added, removed)) => cosmic::widget::row::with_children(vec![
+            tinted(added, added_text).into(),
+            tinted(removed, removed_text).into(),
+        ])
+        .spacing(GRID_UNIT)
+        .align_y(cosmic::iced::Alignment::Center)
+        .into(),
+        None => tinted(
+            counts,
+            if counts.starts_with('+') {
+                added_text
+            } else {
+                removed_text
+            },
+        )
+        .into(),
     }
 }
 

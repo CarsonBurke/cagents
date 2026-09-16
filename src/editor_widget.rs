@@ -64,7 +64,6 @@ where
     content: &'a Content<Renderer>,
     line_digits: u32,
     additions: &'a [usize],
-    removal_boundaries: &'a [usize],
     placeholder: Option<text::Fragment<'a>>,
     font: Option<Renderer::Font>,
     text_size: Option<Pixels>,
@@ -96,7 +95,6 @@ where
             content,
             line_digits: content.line_count().max(1).ilog10() + 1,
             additions: &[],
-            removal_boundaries: &[],
             placeholder: None,
             font: None,
             text_size: Some(Pixels(13.0)),
@@ -145,11 +143,10 @@ where
         self
     }
 
-    /// Zero-based source lines, sorted once when the diff completes. Deleted
-    /// text never enters the editor buffer; its boundary is only a decoration.
-    pub fn diff_lines(mut self, additions: &'a [usize], removals: &'a [usize]) -> Self {
+    /// Zero-based source lines the unsaved buffer has added, sorted once when
+    /// the working diff completes.
+    pub fn added_lines(mut self, additions: &'a [usize]) -> Self {
         self.additions = additions;
-        self.removal_boundaries = removals;
         self
     }
 
@@ -196,7 +193,6 @@ where
             content: self.content,
             line_digits: self.line_digits,
             additions: self.additions,
-            removal_boundaries: self.removal_boundaries,
             placeholder: self.placeholder,
             font: self.font,
             text_size: self.text_size,
@@ -1523,22 +1519,21 @@ where
         );
 
         let text_bounds = bounds.shrink(self.text_padding());
-        // Paint changes under selection and glyphs, using only shaped visible
-        // runs. Wrapped continuations share their logical source annotation.
-        let buffer = internal.editor.buffer();
-        let scroll = buffer.scroll();
-        let mut previous_line = None;
-        let mut logical_top = 0.0;
-        for run in internal.editor.buffer().layout_runs() {
-            if previous_line != Some(run.line_i) {
-                logical_top = if run.line_i == scroll.line {
-                    -scroll.vertical
-                } else {
-                    run.line_top
-                };
-                previous_line = Some(run.line_i);
-            }
-            if self.additions.binary_search(&run.line_i).is_ok() {
+        // Paint the added lines under selection and glyphs, using only shaped
+        // visible runs. Wrapped continuations share their logical source
+        // annotation.
+        //
+        // `draw` is generic over `Theme: Catalog`, and a `text_editor` style
+        // has no semantic slot for "this line is new", so the tint is read off
+        // the process-global active theme - the same theme this frame renders
+        // with. That read locks and clones, so it happens once per draw and
+        // only when there is a tint to paint.
+        if !self.additions.is_empty() {
+            let wash = crate::design::added_line_wash(&cosmic::theme::active());
+            for run in internal.editor.buffer().layout_runs() {
+                if self.additions.binary_search(&run.line_i).is_err() {
+                    continue;
+                }
                 let row = Rectangle::new(
                     Point::new(text_bounds.x, text_bounds.y + run.line_top),
                     Size::new(text_bounds.width, run.line_height),
@@ -1549,40 +1544,8 @@ where
                             bounds,
                             ..renderer::Quad::default()
                         },
-                        cosmic::iced::Color::from_rgba8(46, 160, 93, 0.12),
+                        wash,
                     );
-                }
-            }
-            let eof = run.line_i + 1 == buffer.lines.len();
-            let rows = buffer.lines[run.line_i]
-                .layout_opt()
-                .map_or(1, Vec::len)
-                .max(1);
-            let first_run = (run.line_top - logical_top).abs() < 0.1;
-            let last_run =
-                run.line_top + run.line_height >= logical_top + rows as f32 * run.line_height - 0.1;
-            let before = first_run && self.removal_boundaries.binary_search(&run.line_i).is_ok();
-            let after = eof
-                && last_run
-                && self
-                    .removal_boundaries
-                    .binary_search(&(run.line_i + 1))
-                    .is_ok();
-            for (visible, offset) in [(before, 0.0), (after, run.line_height - 2.0)] {
-                if visible {
-                    let boundary = Rectangle::new(
-                        Point::new(text_bounds.x, text_bounds.y + run.line_top + offset),
-                        Size::new(text_bounds.width, 2.0),
-                    );
-                    if let Some(bounds) = text_bounds.intersection(&boundary) {
-                        renderer.fill_quad(
-                            renderer::Quad {
-                                bounds,
-                                ..renderer::Quad::default()
-                            },
-                            cosmic::iced::Color::from_rgba8(220, 75, 75, 0.65),
-                        );
-                    }
                 }
             }
         }
