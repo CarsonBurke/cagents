@@ -6510,6 +6510,24 @@ impl Cagents {
         self.context_inspector_open || self.context_inspector_transition.is_some()
     }
 
+    /// The instant an animation in flight is measured against.
+    ///
+    /// The shell re-runs one `RedrawRequested` through update and layout
+    /// while any pass publishes a message, rebuilding the view between
+    /// passes. Reading the wall clock here gave every pass a slightly
+    /// different inspector width, so the strip surface measured a new width
+    /// each pass and reported it again: three full passes for one frame, and
+    /// the shell's relayout warning. The frame an animation is being drawn
+    /// for is the same for every pass over that frame.
+    ///
+    /// Starting a transition resets the frame clock, so the first redraw of
+    /// every transition has no frame yet. That redraw draws the animation's
+    /// starting point rather than a wall-clock sample, which is both stable
+    /// across its passes and where the animation genuinely begins.
+    fn animation_frame(&self, transition: &InspectorTransition) -> Instant {
+        self.frame_clock.frame().unwrap_or(transition.started_at)
+    }
+
     fn context_inspector_progress(&self) -> f32 {
         self.context_inspector_transition.map_or(
             if self.context_inspector_open {
@@ -6517,7 +6535,7 @@ impl Cagents {
             } else {
                 0.0
             },
-            |transition| transition.progress(Instant::now()),
+            |transition| transition.progress(self.animation_frame(&transition)),
         )
     }
 
@@ -10321,9 +10339,9 @@ impl Application for Cagents {
         }
 
         if let Some(inspector) = self.inspector {
-            let progress = self
-                .inspector_transition
-                .map_or(1.0, |transition| transition.progress(Instant::now()));
+            let progress = self.inspector_transition.map_or(1.0, |transition| {
+                transition.progress(self.animation_frame(&transition))
+            });
             return Some(match inspector {
                 Inspector::Settings => settings_dialog(
                     self.settings_category,
@@ -14139,6 +14157,46 @@ mod tests {
     fn settle_context_inspector_transition(app: &mut Cagents) {
         let _ =
             app.advance_context_inspector_transition(Instant::now() + DIALOG_TRANSITION_DURATION);
+    }
+
+    /// The shell re-runs one `RedrawRequested` through update and layout while
+    /// any pass publishes a message, rebuilding the view in between, and warns
+    /// once a frame has cost three such passes. Animated geometry therefore has
+    /// to be a function of the frame: when it was a function of the wall clock
+    /// the inspector was a few hundredths of a pixel wider on every pass, the
+    /// workspace strip measured a new viewport width each time and reported it,
+    /// and an animating frame never reached a fixed point.
+    #[test]
+    fn inspector_progress_is_the_same_for_every_pass_over_one_frame() {
+        let mut app = context_inspector_test_app(true);
+        let _ = app.update(Message::ToggleContextInspector);
+        assert!(
+            app.context_inspector_transition.is_some(),
+            "the toggle has to start a transition for this to measure anything",
+        );
+
+        let first = app.context_inspector_progress();
+        std::thread::sleep(Duration::from_millis(20));
+        assert_eq!(
+            app.context_inspector_progress(),
+            first,
+            "a second pass over the same frame has to measure the same progress",
+        );
+
+        let frame = Instant::now() + DIALOG_TRANSITION_DURATION / 2;
+        let _ = app.frame_clock.elapsed(frame);
+        let advanced = app.context_inspector_progress();
+        let target = app.context_inspector_transition.unwrap().to;
+        assert!(
+            (advanced - target).abs() < (first - target).abs(),
+            "a later frame does advance the animation towards {target}: {first} then {advanced}",
+        );
+        std::thread::sleep(Duration::from_millis(20));
+        assert_eq!(
+            app.context_inspector_progress(),
+            advanced,
+            "and every pass over that frame measures it identically",
+        );
     }
 
     pub(super) fn context_inspector_test_app(with_focused_card: bool) -> Cagents {
