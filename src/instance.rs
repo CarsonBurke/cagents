@@ -465,11 +465,15 @@ fn report_panic(product: &str, panic: &std::panic::PanicHookInfo<'_>) {
     }
     record.push_str(&format!("message: {message}\n"));
     if !recovered {
-        // `capture` honours RUST_BACKTRACE; a recovered fault is a routine
-        // event on some paths and must not pay for symbolization at all.
+        // A fatal panic is the one report nobody can reproduce on demand, and
+        // `capture` honours RUST_BACKTRACE, so a desktop launch - which never
+        // sets it - left every crash record with nothing but a location. The
+        // process is already dying here, so symbolization costs nothing that
+        // matters. A recovered fault is a routine event on some paths and
+        // still pays nothing.
         record.push_str(&format!(
             "backtrace:\n{}\n",
-            std::backtrace::Backtrace::capture()
+            std::backtrace::Backtrace::force_capture()
         ));
     }
     append_crash_record(&record);
