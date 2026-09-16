@@ -78,8 +78,39 @@ impl<Message: Clone + 'static> Widget<Message, Theme, Renderer> for MenuSurface<
         if opening {
             self.0.diff(tree);
         }
+        // The native widget records the anchor it opens at from this cursor,
+        // and the runtime drives the overlay it returns in window space. A
+        // scrollable, though, hands its content an untranslated layout and a
+        // cursor moved into content space, and the two spaces disagree by the
+        // scroll offset. Hand the native widget the window-space view of the
+        // same row, so that its anchor means to the overlay what the overlay
+        // takes it to mean: its menu initializes, paints and hits in one
+        // space, and keeps measuring its side, its slice and its own
+        // scrolling against the window the pointer is in. Its content here is
+        // a `Space`, so a childless node standing in for the row is all the
+        // native widget needs.
+        //
+        // The offset has to come from the layout metadata: the only other
+        // place the runtime states it is `overlay`'s translation, and by then
+        // the anchor is already recorded. That rests on the invariant
+        // `virtual_offset == -translation`, which the scrollable maintains,
+        // and on every widget between it and this one *re-applying* the
+        // offset to the layout it hands down. Reading it is not enough, and
+        // `Layout::children` resets it to zero, so a wrapper that translates
+        // an overlay without re-applying the offset would silently anchor
+        // that one menu in content space again.
+        let scroll = layout.virtual_offset();
+        let row = layout.bounds();
+        let anchor = layout::Node::new(row.size()).move_to(row.position() - scroll);
         self.0.update(
-            tree, event, layout, cursor, renderer, clipboard, shell, viewport,
+            tree,
+            event,
+            Layout::new(&anchor),
+            cursor - scroll,
+            renderer,
+            clipboard,
+            shell,
+            viewport,
         );
         if opening {
             shell.invalidate_layout();
@@ -107,9 +138,13 @@ impl<Message: Clone + 'static> Widget<Message, Theme, Renderer> for MenuSurface<
         layout: Layout<'a>,
         renderer: &Renderer,
         viewport: &Rectangle,
-        translation: Vector,
+        _translation: Vector,
     ) -> Option<overlay::Element<'a, Message, Theme, Renderer>> {
+        // The anchor is already a window-space point, which is the space the
+        // runtime drives overlays in, so the native menu needs no translation:
+        // it derives one offset for its layout and the opposite one for its
+        // hit tests, and the two only agree at none at all.
         self.0
-            .overlay(tree, layout, renderer, viewport, translation)
+            .overlay(tree, layout, renderer, viewport, Vector::ZERO)
     }
 }
