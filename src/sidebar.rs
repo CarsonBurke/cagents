@@ -335,7 +335,6 @@ pub struct SidebarProject {
     pub pull_requests: Vec<SidebarPullRequest>,
     pub github_status: String,
     pub github_ready: bool,
-    pub github_stale: bool,
     pub cached_display: Option<CachedDisplay>,
     pub operations: Vec<WorktreeOperationRow>,
     pub avatar: Option<cosmic::iced::advanced::image::Handle>,
@@ -431,7 +430,6 @@ impl SidebarProject {
             pull_requests,
             github_status: "GitHub has not been refreshed.".into(),
             github_ready: false,
-            github_stale: false,
             cached_display: None,
             operations: Vec::new(),
             avatar: None,
@@ -463,6 +461,9 @@ impl SidebarProject {
             .map_or(&self.pull_requests, |cached| &cached.rows)
     }
 
+    /// Only a completed refresh that reports the repository unusable revokes
+    /// authority. The rows it had already listed survive as presentation so a
+    /// revoked project still shows what it last knew.
     pub fn revoke_github(&mut self) {
         if !self.pull_requests.is_empty() {
             self.cached_display = Some(CachedDisplay {
@@ -470,10 +471,6 @@ impl SidebarProject {
             });
         }
         self.github_ready = false;
-        self.github_stale = self
-            .cached_display
-            .as_ref()
-            .is_some_and(|cached| !cached.rows.is_empty());
     }
 
     fn matches(&self, folded_query: &str) -> bool {
@@ -3916,12 +3913,6 @@ fn project_view<'a>(
         project.editors,
     );
     let mut column = widget::column::with_capacity(worktree_count + 2).spacing(0);
-    // GitHub availability belongs in the Changes panel, not between navigation rows.
-    if entity.github_stale {
-        column = column.push(design::caption(
-            "Cached pull requests — stale; not authorized for mutations.",
-        ));
-    }
     for row in operation_rows(entity, modal_open) {
         column = column.push(row);
     }

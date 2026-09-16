@@ -325,15 +325,11 @@ pub fn view(state: &State) -> Element<'_, Action> {
             .into(),
         );
     }
-    if state.loading {
-        children.push(
-            crate::design::caption(if state.pull_request.is_some() {
-                "Refreshing checks and discussion…"
-            } else {
-                "Loading pull request…"
-            })
-            .into(),
-        );
+    // Prose only where the panel would otherwise be empty. Narrating a poll over
+    // content the user is already reading tells them nothing they can act on,
+    // and the disabled Refresh control already reports that one is in flight.
+    if state.loading && state.pull_request.is_none() && state.preview.is_none() {
+        children.push(crate::design::caption("Loading pull request…").into());
     }
     if let Some(error) = &state.error {
         children.push(widget::text::body(format!("Unable to load pull request: {error}")).into());
@@ -344,7 +340,6 @@ pub fn view(state: &State) -> Element<'_, Action> {
     if state.pull_request.is_none()
         && let Some(pr) = &state.preview
     {
-        children.push(crate::design::caption("Cached pull request · refreshing").into());
         children.push(widget::text::title4(&pr.title).into());
         children.push(link("Open pull request on GitHub", &pr.url));
     }
