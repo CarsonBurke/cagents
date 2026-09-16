@@ -6,8 +6,8 @@
 use super::{Adapter, ProcessSpec, Step, TransportSpec};
 use crate::chat::{
     Answer, Attachment, Capabilities, ChangeKind, Choice, Command, CommandAction, Event, Field,
-    FileChange, Item, ItemContent, Launch, Model, Phase, PromptMode, Request, Role, SearchResult,
-    Skill, ToolStatus, Usage,
+    FileChange, Item, ItemContent, Launch, Model, Phase, PlanState, PlanStep, PromptMode, Request,
+    Role, SearchResult, Skill, ToolStatus, Usage,
 };
 use serde_json::{Value, json};
 use std::os::unix::fs::{DirBuilderExt, FileTypeExt, MetadataExt};
@@ -248,6 +248,10 @@ enum Pending {
     Skills,
     History,
     Turn,
+    /// Compaction rewrites the thread's history and its context occupancy, so
+    /// its acknowledgement is what a re-read hangs off: nothing else on the
+    /// wire announces that the figures a reader was looking at have moved.
+    Compact,
     Other,
 }
 struct PendingRequest {
@@ -379,6 +383,24 @@ impl Codex {
         self.call(step, "thread/turns/list", json!({"threadId":self.thread,"cursor":cursor,"limit":20,"sortDirection":"desc","itemsView":"full"}), Pending::History)?;
         self.history_loading = true;
         Ok(())
+    }
+    /// Re-reads the thread's metadata and its history.
+    ///
+    /// A history load already in flight will itself deliver the current
+    /// thread, so it is left running rather than refused. That matters
+    /// because this is also the path a compaction acknowledgement takes, and
+    /// an acknowledgement must not turn into an error the reader has to read.
+    fn reread(&mut self, step: &mut Step) -> Result<(), String> {
+        self.call(
+            step,
+            "thread/read",
+            json!({"threadId":self.thread,"includeTurns":false}),
+            Pending::Other,
+        )?;
+        if self.history_loading {
+            return Ok(());
+        }
+        self.history(step, None)
     }
     fn page(&mut self, page: &Value, step: &mut Step) -> Result<(), String> {
         self.cursor = page["nextCursor"].as_str().map(str::to_owned);
@@ -732,13 +754,12 @@ impl Adapter for Codex {
             Command::SetPermissionMode { .. } => return Err("Codex permission profiles cannot safely be represented by this control; existing permissions are preserved and individual approvals remain explicit".into()),
             Command::Compact => {
                 if !self.capabilities().compact || self.busy { return Err("Codex compaction requires an idle, writable thread".into()); }
-                self.call(&mut step, "thread/compact/start", json!({"threadId":self.thread}), Pending::Other)?;
+                self.call(&mut step, "thread/compact/start", json!({"threadId":self.thread}), Pending::Compact)?;
             }
             Command::Refresh => {
                 if self.history_loading { return Err("Codex history is already loading".into()); }
                 if self.pending.len() > MAX_PENDING - 2 { return Err("Too many outstanding Codex requests".into()); }
-                self.call(&mut step, "thread/read", json!({"threadId":self.thread,"includeTurns":false}), Pending::Other)?;
-                self.history(&mut step, None)?;
+                self.reread(&mut step)?;
             }
             Command::LoadEarlier => {
                 let cursor = self.cursor.clone().ok_or("No earlier Codex history is available")?;
@@ -964,6 +985,13 @@ impl Adapter for Codex {
                         detail: "Codex turn started".into(),
                     });
                 }
+                // The one visible effect of compaction is the context figure,
+                // and no notification announces that it has moved, so the
+                // acknowledgement re-reads the thread the way a refresh does.
+                // Without this the reader pressed a control and the gauge it
+                // exists to move kept its old reading until some later frame
+                // happened to carry a new one.
+                Pending::Compact => self.reread(&mut step)?,
                 Pending::Other => {
                     if result["thread"].is_object() {
                         self.thread_state(&result["thread"], &mut step)?;
@@ -1193,16 +1221,9 @@ impl Adapter for Codex {
                 },
                 at: None,
             })),
-            "turn/plan/updated" => step.events.push(Event::Item(Item {
-                id: format!("{}/plan", string(params, "turnId")?),
-                role: Role::Assistant,
-                content: ItemContent::Text {
-                    text: params["plan"].to_string(),
-                    thinking: false,
-                    phase: Phase::Final,
-                },
-                at: None,
-            })),
+            "turn/plan/updated" => step.events.push(Event::Plan {
+                steps: plan_steps(&params["plan"]),
+            }),
             "thread/queue/changed" => step.events.push(Event::Status {
                 busy: self.busy,
                 detail: "Codex's native queue changed".into(),
@@ -1287,6 +1308,42 @@ fn turn_detail(status: &Value) -> String {
         Some("failed") => "Turn failed".into(),
         _ => String::new(),
     }
+}
+
+/// A published plan as its steps.
+///
+/// The payload is accepted both as the bare array of steps and as the object
+/// that wraps one, because Codex's plan tool carries an explanation beside the
+/// steps and the notification has changed which of the two it sends. A step
+/// with no recognizable text is dropped rather than pinned as a blank row.
+fn plan_steps(value: &Value) -> Vec<PlanStep> {
+    let steps = value
+        .as_array()
+        .or_else(|| value["plan"].as_array())
+        .or_else(|| value["steps"].as_array());
+    steps
+        .into_iter()
+        .flatten()
+        .filter_map(|step| {
+            let text = step
+                .as_str()
+                .or_else(|| step["step"].as_str())
+                .or_else(|| step["text"].as_str())
+                .or_else(|| step["description"].as_str())?
+                .trim();
+            if text.is_empty() {
+                return None;
+            }
+            Some(PlanStep {
+                text: text.to_owned(),
+                status: match step["status"].as_str() {
+                    Some("completed" | "complete" | "done") => PlanState::Done,
+                    Some("in_progress" | "inProgress" | "active") => PlanState::Active,
+                    _ => PlanState::Pending,
+                },
+            })
+        })
+        .collect()
 }
 fn string<'a>(value: &'a Value, key: &str) -> Result<&'a str, String> {
     value[key]
@@ -2234,6 +2291,88 @@ mod tests {
         assert_eq!(
             answer.writes[0]["result"],
             json!({"answers":{"scope":{"answers":["One"]}}})
+        );
+    }
+
+    /// Compaction's only visible effect is the context figure the reader
+    /// pressed the control to move. Nothing on the wire announces that it
+    /// moved, so the acknowledgement has to re-read the thread; without this
+    /// the gauge kept its old reading until some later frame happened to
+    /// carry a new one.
+    #[test]
+    fn a_compaction_acknowledgement_re_reads_the_thread() {
+        let mut adapter = adapter();
+        let requested = adapter.command(Command::Compact).unwrap();
+        let start = requested
+            .writes
+            .iter()
+            .find(|frame| frame["method"] == "thread/compact/start")
+            .expect("compaction is requested");
+        let acknowledged = adapter
+            .receive(json!({"id":start["id"],"result":{}}))
+            .unwrap();
+        let methods = acknowledged
+            .writes
+            .iter()
+            .map(|frame| frame["method"].as_str().unwrap_or_default().to_owned())
+            .collect::<Vec<_>>();
+        assert!(
+            methods.contains(&"thread/read".to_owned()),
+            "the compacted thread's state is never asked for: {methods:?}"
+        );
+        assert!(
+            methods.contains(&"thread/turns/list".to_owned()),
+            "the rewritten history is never asked for: {methods:?}"
+        );
+    }
+
+    /// A plan reaches the surface as the steps it is made of. It used to
+    /// arrive as a transcript message holding the raw JSON of the payload,
+    /// which is the same information in the one shape nobody can read.
+    #[test]
+    fn a_published_plan_arrives_as_its_steps() {
+        let mut adapter = adapter();
+        let step = adapter
+            .receive(json!({"method":"turn/plan/updated","params":{"threadId":"thread-exact","turnId":"turn","plan":{
+                "explanation":"why",
+                "plan":[
+                    {"step":"Read the view","status":"completed"},
+                    {"step":"Split the status line","status":"in_progress"},
+                    {"step":"   ","status":"pending"},
+                    {"step":"Pin the plan","status":"pending"}]}}}))
+            .unwrap();
+        let steps = step
+            .events
+            .iter()
+            .find_map(|event| match event {
+                Event::Plan { steps } => Some(steps.clone()),
+                _ => None,
+            })
+            .expect("the plan reaches the surface");
+        assert_eq!(
+            steps,
+            vec![
+                PlanStep {
+                    text: "Read the view".into(),
+                    status: PlanState::Done
+                },
+                PlanStep {
+                    text: "Split the status line".into(),
+                    status: PlanState::Active
+                },
+                PlanStep {
+                    text: "Pin the plan".into(),
+                    status: PlanState::Pending
+                },
+            ],
+            "a step with no text of its own would pin a blank row"
+        );
+        assert!(
+            !step
+                .events
+                .iter()
+                .any(|event| matches!(event, Event::Item(_))),
+            "the raw payload still reaches the transcript"
         );
     }
 }

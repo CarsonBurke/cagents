@@ -31,10 +31,11 @@ pub(super) enum Slot {
     /// The agent's own reasoning, which is prose about prose: it is rendered
     /// inline and set back, never filed behind a disclosure row.
     Thinking,
-    /// Progress narration. Measured over this workstation's Codex history it
+    /// Progress narration, and the session notices the harness sends
+    /// alongside it. Measured over this workstation's Codex history narration
     /// outnumbers answers roughly seven to one, so it has to recede.
     Commentary,
-    /// The answer, or a user message, or a system notice.
+    /// The answer, or a user message.
     Prose,
 }
 
@@ -269,11 +270,7 @@ pub(super) fn group(items: &[Item], asked_after: &HashSet<String>) -> Vec<Turn> 
     let mut turns: Vec<Turn> = Vec::new();
     let mut state = Open::Closed;
     for (index, item) in items.iter().enumerate() {
-        // A notice is not part of any exchange: it says something about the
-        // session as a whole, so it is pinned above the transcript rather than
-        // scrolling away inside whichever group happened to be open when the
-        // provider sent it.
-        if !renders(&item.content) || item.role == Role::System {
+        if !renders(&item.content) {
             continue;
         }
         let asked = asked_after.contains(item.id.as_str());
@@ -299,7 +296,7 @@ pub(super) fn group(items: &[Item], asked_after: &HashSet<String>) -> Vec<Turn> 
         // `turns` is non-empty: the branch above pushes when it would be, and
         // the states that skip it only occur once a group exists.
         let turn = turns.last_mut().expect("a group is open");
-        let slot = slot_of(&item.content);
+        let slot = slot_of(item);
         turn.observe(item.content.status());
         turn.spans(item.at);
         match slot {
@@ -337,14 +334,25 @@ fn renders(content: &ItemContent) -> bool {
     }
 }
 
-fn slot_of(content: &ItemContent) -> Slot {
-    match content {
+/// Where an item belongs inside its group.
+///
+/// A session notice is filed with the agent's own narration: it is the
+/// harness saying something about the session rather than the agent
+/// addressing the reader, so it takes the one recessed line that treatment
+/// draws instead of being typeset like an answer. It used to be dropped from
+/// the transcript entirely and the newest one pinned above it as a heading,
+/// which read as the conversation's subtitle and cost a row on every frame.
+fn slot_of(item: &Item) -> Slot {
+    if item.role == Role::System {
+        return Slot::Commentary;
+    }
+    match &item.content {
         ItemContent::Text { thinking: true, .. } => Slot::Thinking,
         ItemContent::Text {
             phase: Phase::Commentary,
             ..
         } => Slot::Commentary,
-        _ if content.is_step() => Slot::Step,
+        content if content.is_step() => Slot::Step,
         _ => Slot::Prose,
     }
 }
@@ -708,19 +716,34 @@ mod tests {
         assert_eq!(turns[1].prompt, [1]);
     }
 
+    /// A notice used to be dropped from the transcript and the newest one
+    /// pinned above it as a heading. It belongs in the conversation, reading
+    /// as the aside it is, and it must not break the stretch of work it lands
+    /// in the middle of.
     #[test]
-    fn a_notice_is_not_an_exchange() {
+    fn a_notice_is_narration_inside_the_work_it_lands_in() {
         let items = vec![
-            text("s1", Role::System, Phase::Final, false),
             text("u1", Role::User, Phase::Final, false),
+            command("c1", ToolStatus::Succeeded),
+            text("s1", Role::System, Phase::Final, false),
+            command("c2", ToolStatus::Succeeded),
         ];
         let turns = group(&items, &unasked());
         assert_eq!(
             turns.len(),
             1,
-            "a session notice belongs to the session, not to a group of its own"
+            "a notice is not the agent handing control back, so it closes nothing"
         );
-        assert_eq!(turns[0].prompt, [1]);
+        assert_eq!(
+            slots(&turns[0]),
+            [(2, Slot::Commentary)],
+            "a notice recedes to the treatment narration gets"
+        );
+        assert_eq!(
+            steps(&turns[0]),
+            [1, 3],
+            "and it is not counted as work the agent did"
+        );
     }
 
     #[test]

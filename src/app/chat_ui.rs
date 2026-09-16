@@ -28,7 +28,7 @@ fn icon<'a>(
     message: Action,
 ) -> Element<'a, Message> {
     crate::ui_controls::icon_control(
-        widget::icon::from_name(name).handle(),
+        crate::ui_controls::symbolic_icon(name),
         label,
         false,
         enabled,

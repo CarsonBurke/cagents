@@ -49,6 +49,39 @@ pub const SPINNER_PERIOD: std::time::Duration = std::time::Duration::from_millis
 /// read at row-icon size.
 pub const SPINNER_ARC_SPAN: f32 = 0.75;
 
+/// The radial budget gauge: a ring the height of a status-line row, with its
+/// percentage set beside it.
+///
+/// Sized to the caption it sits next to rather than to a dial, because the
+/// figure is what a reader reads and the ring is only what makes the
+/// proportion visible without reading it. The stroke is heavy relative to the
+/// radius so the first few percent of a budget still register as ink.
+pub const RADIAL_GAUGE_SIZE: f32 = 16.0;
+pub const RADIAL_GAUGE_STROKE: f32 = 3.0;
+
+/// Where a budget stops being a detail and becomes a decision.
+///
+/// Below the first threshold the figure is background. Above the second the
+/// reader has to compact or lose the thread, so the gauge is drawn in the tone
+/// the shell uses for everything else that is about to go wrong.
+pub const BUDGET_WARNING: f32 = 0.75;
+pub const BUDGET_CRITICAL: f32 = 0.9;
+
+/// The tone a budget that is `used` full is drawn in.
+///
+/// Named here rather than at each gauge, so the context ring, its percentage
+/// and anything else reporting the same budget cannot disagree about when it
+/// has become urgent.
+pub fn budget_tone(used: f32) -> fn(&cosmic::Theme) -> cosmic::iced::Color {
+    if used > BUDGET_CRITICAL {
+        destructive_color
+    } else if used > BUDGET_WARNING {
+        warning_color
+    } else {
+        accent_color
+    }
+}
+
 /// A color resolved when a widget draws, rather than when a view is built.
 ///
 /// `cosmic::theme::active()` locks the process-global theme and clones the
@@ -551,5 +584,27 @@ mod tests {
         assert_eq!(ShellLayout::for_width(f32::NEG_INFINITY), constrained);
         assert_eq!(ShellLayout::for_width(f32::INFINITY), constrained);
         assert_eq!(ShellLayout::for_width(-1.0), constrained);
+    }
+
+    /// The reader acts on the ring's colour before they read its figure, so
+    /// the two thresholds are a contract: a budget that has crossed one must
+    /// not still be drawn as background.
+    #[test]
+    fn a_budget_changes_tone_where_it_becomes_a_decision() {
+        // Resolvers are compared by address, because the tone is a function of
+        // the fraction and a theme is not available in a unit test.
+        let tone = |used: f32| budget_tone(used) as *const () as usize;
+        let accent =
+            accent_color as fn(&cosmic::Theme) -> cosmic::iced::Color as *const () as usize;
+        let warning =
+            warning_color as fn(&cosmic::Theme) -> cosmic::iced::Color as *const () as usize;
+        let destructive =
+            destructive_color as fn(&cosmic::Theme) -> cosmic::iced::Color as *const () as usize;
+        assert_eq!(tone(0.0), accent);
+        assert_eq!(tone(BUDGET_WARNING), accent);
+        assert_eq!(tone(BUDGET_WARNING + 0.01), warning);
+        assert_eq!(tone(BUDGET_CRITICAL), warning);
+        assert_eq!(tone(BUDGET_CRITICAL + 0.01), destructive);
+        assert_eq!(tone(1.0), destructive);
     }
 }

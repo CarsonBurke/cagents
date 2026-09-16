@@ -155,6 +155,11 @@ pub struct Snapshot {
     pub open_url: Option<(String, String)>,
     /// Provider-confirmed user attention, including requests not yet delivered.
     pub waiting: bool,
+    /// The steps of the plan the conversation is working to, newest only.
+    ///
+    /// Defaulted so a snapshot written before plans were carried still loads.
+    #[serde(default)]
+    pub plan: Vec<PlanStep>,
 }
 
 impl Snapshot {
@@ -480,6 +485,27 @@ pub struct Usage {
     pub context_limit: u64,
     pub cost_microusd: Option<u64>,
 }
+
+/// One step of a plan a provider published, with the state it is in.
+///
+/// A plan is carried as its steps rather than as the document the provider
+/// wrote, because the surface pins it above the transcript and what a reader
+/// needs from a pinned plan is which step is being worked on now. Codex used
+/// to reach the transcript as a text item holding the raw JSON of its plan
+/// payload, which is the same information in the one shape nobody can read.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PlanStep {
+    pub text: String,
+    pub status: PlanState,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PlanState {
+    #[default]
+    Pending,
+    Active,
+    Done,
+}
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Event {
     /// A provider-confirmed conversation reset. The next Session event supplies
@@ -540,4 +566,11 @@ pub enum Event {
     },
     /// Authoritative provider attention independent of request presentation.
     Waiting(bool),
+    /// The plan the provider is now working to, replacing any earlier one.
+    ///
+    /// A plan is republished whole on every revision, so the newest event is
+    /// the plan: there is no incremental step state to merge.
+    Plan {
+        steps: Vec<PlanStep>,
+    },
 }

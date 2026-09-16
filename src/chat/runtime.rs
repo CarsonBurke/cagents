@@ -1050,11 +1050,13 @@ fn apply_event(state: &mut Snapshot, indices: &mut BTreeMap<String, usize>, even
             state.busy = false;
             state.waiting = false;
             state.error = None;
+            state.plan.clear();
         }
         Event::Session { id, title } => {
             state.session_id = Some(id);
             state.title = title;
         }
+        Event::Plan { steps } => state.plan = steps,
         Event::Capabilities(value) => state.capabilities = value,
         Event::Models {
             models,
