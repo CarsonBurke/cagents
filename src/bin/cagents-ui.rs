@@ -9,9 +9,10 @@ const CONFIRM_DAEMON_STOP: &str = "--confirm-daemon-stop";
 const STARTUP_ERROR: &str = "--startup-error";
 /// argv has a hard size limit and a dialog cannot show a novel either.
 const MAX_REPORTED_ERROR_BYTES: usize = 2048;
-/// The internal `--confirm-daemon-stop` and `--startup-error` modes are
-/// deliberately absent: cagents spawns itself with those, and documenting them
-/// would invite a user to hand-craft a capability payload.
+/// The internal `--confirm-daemon-stop`, `--startup-error` and
+/// `--internal-render-page` modes are deliberately absent: cagents spawns
+/// itself with those, and documenting them would invite a user to hand-craft
+/// a capability payload.
 const USAGE: &str = "\
 Usage: cagents-ui [OPTIONS]
 
@@ -26,6 +27,15 @@ Options:
 ";
 
 fn main() -> std::process::ExitCode {
+    // The document render helper answers before anything else exists. Its
+    // stdout is a binary page frame, so a tracing subscriber, a panic hook
+    // writing a crash record, the window lease or the launcher handshake
+    // putting a single line there would corrupt the page the reader is
+    // waiting for. It is also the one mode that must stay cheap: it runs
+    // once per page turn.
+    if let Some(code) = cagents::document_render::hook() {
+        return code;
+    }
     // Diagnostics come before every other statement. The startup sequence
     // below - window lease, session store, activation socket, daemon launch,
     // checkpoint restore - is exactly the region whose failures used to be

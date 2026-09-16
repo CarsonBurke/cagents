@@ -37,6 +37,7 @@ ui = [
     "dep:async-channel",
     "dep:async-lsp",
     "dep:blake3",
+    "dep:hayro",
     "dep:iced_accessibility",
     "dep:image",
     "image/jpeg",
@@ -102,7 +103,12 @@ clap = { version = "4.5", features = ["derive"] }
 crossbeam-channel = "0.5"
 dpi = { version = "=0.1.2", optional = true }
 directories = "6.0"
-euclid = { version = "=0.22.11", optional = true }
+euclid = { version = "=0.22.14", optional = true }
+# Pure-Rust PDF rendering. The editor previews a PDF the same way it previews
+# an SVG, by rasterizing to RGBA off the UI thread, so a document in a
+# worktree opens in place instead of handing the reader to an external viewer.
+# Only the `ui` lane resolves it; the CLI and the daemon never parse a PDF.
+hayro = { version = "0.7.1", optional = true }
 image = { version = "0.25", default-features = false, features = ["png"], optional = true }
 iced_accessibility = { git = "https://github.com/pop-os/libcosmic.git", rev = "caec74c2559924443f12fc6faf97a5bcefe6271d", optional = true }
 keyboard-types = { version = "=0.8.3", features = ["serde"], optional = true }

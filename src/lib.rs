@@ -13,6 +13,8 @@ pub mod design;
 #[cfg(feature = "ui")]
 pub mod diff_view;
 #[cfg(feature = "ui")]
+pub mod document_render;
+#[cfg(feature = "ui")]
 pub mod editor;
 #[cfg(feature = "ui")]
 pub mod external_editor;

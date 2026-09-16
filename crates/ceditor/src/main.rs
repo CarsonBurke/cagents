@@ -34,12 +34,34 @@ struct Arguments {
     settings_path: bool,
 }
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
+fn main() -> std::process::ExitCode {
+    // `ceditor` previews documents through the same helper, and the helper is
+    // whichever executable is running, so this binary answers the internal
+    // `--internal-render-page` mode too. It comes before diagnostics because
+    // the helper's stdout carries a binary page frame that any log line would
+    // corrupt. As in cagents-ui, the mode stays out of the usage text: it is
+    // a calling convention between two copies of one binary, not a feature.
+    if let Some(code) = cagents::document_render::hook() {
+        return code;
+    }
     // Diagnostics come before every other statement: a panic in a render or
     // worker thread used to take the window with it and leave nothing behind
     // in ceditor's data directory.
     cagents::instance::install_panic_hook(PRODUCT);
     cagents::instance::install_tracing(PRODUCT, DEFAULT_LOG_FILTER);
+    match run() {
+        Ok(()) => std::process::ExitCode::SUCCESS,
+        Err(error) => {
+            // Returning the `Result` from `main` instead would render the
+            // error with `Debug`, which quotes the message and escapes its
+            // newlines; every failure here is meant for a person to read.
+            eprintln!("{PRODUCT}: {error}");
+            std::process::ExitCode::FAILURE
+        }
+    }
+}
+
+fn run() -> Result<(), Box<dyn std::error::Error>> {
     let arguments = Arguments::parse();
     let settings_path = directories::ProjectDirs::from("io", "cagents", PRODUCT)
         .ok_or("ceditor configuration directory is unavailable")?

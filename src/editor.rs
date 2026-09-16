@@ -2,7 +2,7 @@
 
 use std::{
     fs::{self, File, Permissions},
-    io::{self, Cursor, Read, Write},
+    io::{self, Cursor, Read, Seek, Write},
     path::{Component, Path, PathBuf},
 };
 
@@ -10,23 +10,77 @@ use thiserror::Error;
 
 use crate::fs_safety::{self, ResolveError, Root};
 
+/// Rasterizing a page happens in a child process, so the reader's document
+/// lives behind the same module boundary either way: `load_file` opens one on
+/// its first page, and the view asks for the pages after that.
+pub use crate::document_render::{DocumentPage, render_document_page};
+
 /// Files above this size are never loaded into an editable buffer.
 pub const MAX_EDITABLE_FILE_BYTES: u64 = 8 * 1024 * 1024;
 
 /// Bound both decoder working memory and the final GPU upload.
-const MAX_IMAGE_DIMENSION: u32 = 4096;
+pub(crate) const MAX_IMAGE_DIMENSION: u32 = 4096;
 const MAX_IMAGE_PIXELS: u64 = 16 * 1024 * 1024;
 const MAX_IMAGE_DECODE_BYTES: u64 = 128 * 1024 * 1024;
 const MAX_SVG_BYTES: usize = 256 * 1024;
 
+/// A PDF page is rasterized at this many device pixels per PostScript point.
+///
+/// A point is 1/72 inch, so this puts a US Letter page at roughly 1224 by
+/// 1584 pixels: sharp enough to read body text on a high-density display,
+/// and well inside the same pixel budget the image preview already enforces.
+pub const PDF_PAGE_SCALE: f32 = 1.7;
+
+/// The most pages a document may declare before the preview refuses it.
+///
+/// What bounds the cost of a page tree is not this number but where the tree
+/// is materialised: the helper process parses it, so a tree that cannot be
+/// bounded at all costs one helper process rather than the window. This limit
+/// is about the reader instead, because a page counter that cannot be
+/// navigated is of no use to them. It is applied in the helper the moment the
+/// count is known, and again to the frame the helper sends back.
+pub(crate) const MAX_PDF_PAGES: usize = 4096;
+
+/// The most bytes a paged document may occupy.
+///
+/// Separate from `MAX_EDITABLE_FILE_BYTES` because that limit is about the
+/// cost of an editable text buffer and its undo history, which a document
+/// never becomes. Real documents are far larger than any text file worth
+/// editing - a scanned or figure-heavy textbook is routinely tens of
+/// megabytes - so holding them to the text limit would reject the ordinary
+/// case. None of those bytes stay in this process: the helper re-reads the
+/// file for each page it rasterizes, so this bounds how much work a page
+/// render may be handed rather than how much memory the window holds.
+pub(crate) const MAX_DOCUMENT_BYTES: u64 = 192 * 1024 * 1024;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ReadOnlyReason {
-    Symlink { target: PathBuf },
+    Symlink {
+        target: PathBuf,
+    },
     Binary,
     InvalidUtf8,
     Image(String),
-    Oversize { bytes: u64, limit: u64 },
+    Document(String),
+    /// Past the limit that applies to `kind`, which the refusal has to name:
+    /// the two limits differ by a factor of twenty-four, so a sentence about
+    /// editable files is plainly false about a refused document.
+    Oversize {
+        bytes: u64,
+        limit: u64,
+        kind: OversizeKind,
+    },
     NotRegularFile,
+}
+
+/// Which of the two size limits a file was held to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OversizeKind {
+    /// The file would have been loaded into an editable text buffer.
+    Editable,
+    /// The file is a paged document, which never becomes editable and is held
+    /// to the document limit instead.
+    Document,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -42,7 +96,28 @@ pub enum FileContent {
         height: u32,
         rgba: std::sync::Arc<[u8]>,
     },
+    /// A paged document, rasterized one page at a time in a helper process.
+    ///
+    /// No document bytes are retained: the helper re-reads the file per page,
+    /// which keeps up to `MAX_DOCUMENT_BYTES`, and the page-tree parsing a
+    /// crafted document can turn into a stack overflow, out of this process.
+    /// The cost is that a page turned to after the file changed on disk comes
+    /// from the new bytes, which is a far better trade than an abort that
+    /// takes every unsaved buffer in the window with it.
+    Pdf {
+        pages: usize,
+        page: PdfPage,
+    },
     ReadOnly(ReadOnlyReason),
+}
+
+/// One rasterized PDF page.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PdfPage {
+    pub index: usize,
+    pub width: u32,
+    pub height: u32,
+    pub rgba: std::sync::Arc<[u8]>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
@@ -91,7 +166,37 @@ pub fn validate_repo_path(path: &Path) -> Result<(), FileIoError> {
     Ok(())
 }
 
-pub fn load_file(worktree: &Path, relative_path: &Path) -> Result<FileContent, FileIoError> {
+/// Whether the open file begins with a PDF header, leaving it rewound.
+///
+/// The header is read through a reference and the descriptor seeked back to
+/// the start, so the caller still reads the whole file from byte zero. A short
+/// file simply does not match.
+fn starts_with_pdf_header(file: &File) -> io::Result<bool> {
+    const HEADER: &[u8] = b"%PDF-";
+    let mut probe = [0u8; HEADER.len()];
+    let mut read = 0;
+    while read < probe.len() {
+        match (&*file).read(&mut probe[read..]) {
+            Ok(0) => break,
+            Ok(count) => read += count,
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error),
+        }
+    }
+    (&*file).seek(io::SeekFrom::Start(0))?;
+    Ok(&probe[..read] == HEADER)
+}
+
+/// Loads one file, already classified and decoded for the view.
+///
+/// `tone` only reaches the document path. A page is rasterized before the
+/// view sees it, so the caller has to say which surface it is destined for;
+/// the alternative is rendering every page twice whenever the shell is dark.
+pub fn load_file(
+    worktree: &Path,
+    relative_path: &Path,
+    tone: PdfTone,
+) -> Result<FileContent, FileIoError> {
     validate_repo_path(relative_path)?;
     let root = worktree_root(worktree)?;
     // A symlink is the one classification that has to be made from the name
@@ -116,23 +221,56 @@ pub fn load_file(worktree: &Path, relative_path: &Path) -> Result<FileContent, F
     if !metadata.is_file() {
         return Ok(FileContent::ReadOnly(ReadOnlyReason::NotRegularFile));
     }
-    if metadata.len() > MAX_EDITABLE_FILE_BYTES {
+    // What the file is decides how large it is allowed to be, so the header is
+    // read from the open descriptor before any byte limit applies. A document
+    // held to the editable-text limit would reject the ordinary case, and
+    // raising that limit for everything would let an 8 megabyte text file
+    // become a 192 megabyte one.
+    let document = starts_with_pdf_header(&file).map_err(io_error)?;
+    let kind = if document {
+        OversizeKind::Document
+    } else {
+        OversizeKind::Editable
+    };
+    let limit = match kind {
+        OversizeKind::Document => MAX_DOCUMENT_BYTES,
+        OversizeKind::Editable => MAX_EDITABLE_FILE_BYTES,
+    };
+    if metadata.len() > limit {
         return Ok(FileContent::ReadOnly(ReadOnlyReason::Oversize {
             bytes: metadata.len(),
-            limit: MAX_EDITABLE_FILE_BYTES,
+            limit,
+            kind,
         }));
+    }
+    if document {
+        // The document's bytes deliberately never enter this process. The
+        // helper re-reads the file by name, which is what keeps both the
+        // document and hayro's page-tree parsing - the part a crafted
+        // document turns into an abort - outside the process holding the
+        // reader's unsaved work. The name was just resolved beneath the
+        // worktree root, and pointing the helper at a different file means
+        // already having write access to the worktree, which is enough to
+        // change the document itself.
+        drop(file);
+        let path = worktree.join(relative_path);
+        return Ok(match render_document_page(&path, 0, tone) {
+            Ok(DocumentPage { pages, page }) => FileContent::Pdf { pages, page },
+            Err(reason) => FileContent::ReadOnly(ReadOnlyReason::Document(reason)),
+        });
     }
 
     // A file can grow after metadata was read. Bound the read itself, not only
     // its result, so a concurrently growing file cannot exhaust memory.
     let mut bytes = Vec::with_capacity(metadata.len() as usize);
-    file.take(MAX_EDITABLE_FILE_BYTES + 1)
+    file.take(limit + 1)
         .read_to_end(&mut bytes)
         .map_err(io_error)?;
-    if bytes.len() as u64 > MAX_EDITABLE_FILE_BYTES {
+    if bytes.len() as u64 > limit {
         return Ok(FileContent::ReadOnly(ReadOnlyReason::Oversize {
             bytes: bytes.len() as u64,
-            limit: MAX_EDITABLE_FILE_BYTES,
+            limit,
+            kind,
         }));
     }
     if relative_path
@@ -169,7 +307,7 @@ pub fn load_file(worktree: &Path, relative_path: &Path) -> Result<FileContent, F
     })
 }
 
-fn check_image_dimensions(width: u32, height: u32) -> Result<(), String> {
+pub(crate) fn check_image_dimensions(width: u32, height: u32) -> Result<(), String> {
     if width == 0
         || height == 0
         || width > MAX_IMAGE_DIMENSION
@@ -281,6 +419,21 @@ fn decode_svg(bytes: &[u8]) -> Result<FileContent, String> {
         height: size.height(),
         rgba: pixmap.take().into(),
     })
+}
+
+/// How a PDF page's colors are adapted to the surface it is read on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PdfTone {
+    /// The page exactly as the document specifies it.
+    Original,
+    /// The page adapted for reading on a dark surface, with `paper` as the
+    /// color the document's own white becomes.
+    ///
+    /// The color is carried rather than assumed because it is the shell's,
+    /// not the viewer's: a page recolored to absolute black is not the same
+    /// shade as anything else on screen, and a reader who changed their theme
+    /// changed this too.
+    Inverted { paper: [u8; 3] },
 }
 
 fn check_svg_expansion<'a, 'input>(
@@ -681,7 +834,7 @@ mod tests {
             width,
             height,
             rgba,
-        } = load_file(root.path(), Path::new("opaque.dat")).unwrap()
+        } = load_file(root.path(), Path::new("opaque.dat"), PdfTone::Original).unwrap()
         else {
             panic!("image magic must win over the filename extension");
         };
@@ -698,18 +851,18 @@ mod tests {
             .save_with_format(&path, image::ImageFormat::Png)
             .unwrap();
         assert!(matches!(
-            load_file(root.path(), Path::new("wide.png")).unwrap(),
+            load_file(root.path(), Path::new("wide.png"), PdfTone::Original).unwrap(),
             FileContent::ReadOnly(ReadOnlyReason::Image(_))
         ));
         let file = File::create(root.path().join("huge.png")).unwrap();
         file.set_len(MAX_EDITABLE_FILE_BYTES + 1).unwrap();
         assert!(matches!(
-            load_file(root.path(), Path::new("huge.png")).unwrap(),
+            load_file(root.path(), Path::new("huge.png"), PdfTone::Original).unwrap(),
             FileContent::ReadOnly(ReadOnlyReason::Oversize { .. })
         ));
         fs::write(root.path().join("broken.png"), b"not a valid image").unwrap();
         assert!(matches!(
-            load_file(root.path(), Path::new("broken.png")).unwrap(),
+            load_file(root.path(), Path::new("broken.png"), PdfTone::Original).unwrap(),
             FileContent::ReadOnly(ReadOnlyReason::Image(_))
         ));
     }
@@ -731,6 +884,94 @@ mod tests {
         };
         assert_eq!((width, height), (2, 2));
         assert_eq!(&rgba[..4], &[255, 0, 0, 128]);
+    }
+
+    /// A PDF header and nothing else.
+    ///
+    /// What `load_file` does with a document is pick its size limit and hand
+    /// its name to a helper process, so the bytes after the header never
+    /// matter on this side. What a rendered page looks like is tested in
+    /// `document_render` against the code the helper runs, because the lib
+    /// test harness is not one of the binaries that answers the render flag:
+    /// here, every document render fails, which is the other half of the
+    /// contract and worth pinning too.
+    fn document_header(padding: usize) -> Vec<u8> {
+        let mut bytes = Vec::with_capacity(padding + 11);
+        // A comment is ignored by a PDF parser, so the padding changes the
+        // file's size without making it a different document.
+        bytes.extend_from_slice(b"%PDF-1.7\n%");
+        bytes.extend(std::iter::repeat_n(b'p', padding));
+        bytes.push(b'\n');
+        bytes
+    }
+
+    #[test]
+    fn a_pdf_header_decides_the_document_path_and_a_failed_render_is_never_text() {
+        let root = tempdir().unwrap();
+        // Deliberately not named `.pdf`: the header decides.
+        fs::write(root.path().join("report"), document_header(0)).unwrap();
+        assert!(
+            matches!(
+                load_file(root.path(), Path::new("report"), PdfTone::Original).unwrap(),
+                FileContent::ReadOnly(ReadOnlyReason::Document(_))
+            ),
+            "a document whose page cannot be produced is read-only for a document reason"
+        );
+        // The header decides in both directions: a text file that happens to
+        // be named like a document stays editable.
+        fs::write(root.path().join("notes.pdf"), "not a document at all\n").unwrap();
+        assert!(matches!(
+            load_file(root.path(), Path::new("notes.pdf"), PdfTone::Original).unwrap(),
+            FileContent::Editable { .. }
+        ));
+    }
+
+    /// A real document is far larger than any text file worth editing, so the
+    /// editable-text limit must not be what decides whether it opens, and a
+    /// refusal has to carry which limit it applied: the two differ by a
+    /// factor of twenty-four, and the reader is shown the sentence built from
+    /// this.
+    #[test]
+    fn the_size_limit_and_the_refusal_both_follow_the_kind_of_file() {
+        let root = tempdir().unwrap();
+        fs::write(
+            root.path().join("big.pdf"),
+            document_header(MAX_EDITABLE_FILE_BYTES as usize + 1),
+        )
+        .unwrap();
+        assert!(
+            matches!(
+                load_file(root.path(), Path::new("big.pdf"), PdfTone::Original).unwrap(),
+                FileContent::ReadOnly(ReadOnlyReason::Document(_))
+            ),
+            "a document must be held to the document limit, not the text limit"
+        );
+        let huge = File::create(root.path().join("huge.pdf")).unwrap();
+        (&huge).write_all(b"%PDF-1.7\n").unwrap();
+        huge.set_len(MAX_DOCUMENT_BYTES + 1).unwrap();
+        assert!(matches!(
+            load_file(root.path(), Path::new("huge.pdf"), PdfTone::Original).unwrap(),
+            FileContent::ReadOnly(ReadOnlyReason::Oversize {
+                limit: MAX_DOCUMENT_BYTES,
+                kind: OversizeKind::Document,
+                ..
+            })
+        ));
+        // A text file that size is still refused, because the larger bound
+        // belongs to documents alone.
+        fs::write(
+            root.path().join("big.txt"),
+            "x".repeat(MAX_EDITABLE_FILE_BYTES as usize + 1),
+        )
+        .unwrap();
+        assert!(matches!(
+            load_file(root.path(), Path::new("big.txt"), PdfTone::Original).unwrap(),
+            FileContent::ReadOnly(ReadOnlyReason::Oversize {
+                limit: MAX_EDITABLE_FILE_BYTES,
+                kind: OversizeKind::Editable,
+                ..
+            })
+        ));
     }
 
     #[test]
@@ -757,15 +998,15 @@ mod tests {
         symlink("binary.bin", root.path().join("link.txt")).unwrap();
 
         assert_eq!(
-            load_file(root.path(), Path::new("binary.bin")).unwrap(),
+            load_file(root.path(), Path::new("binary.bin"), PdfTone::Original).unwrap(),
             FileContent::ReadOnly(ReadOnlyReason::Binary)
         );
         assert_eq!(
-            load_file(root.path(), Path::new("invalid.txt")).unwrap(),
+            load_file(root.path(), Path::new("invalid.txt"), PdfTone::Original).unwrap(),
             FileContent::ReadOnly(ReadOnlyReason::InvalidUtf8)
         );
         assert_eq!(
-            load_file(root.path(), Path::new("link.txt")).unwrap(),
+            load_file(root.path(), Path::new("link.txt"), PdfTone::Original).unwrap(),
             FileContent::ReadOnly(ReadOnlyReason::Symlink {
                 target: PathBuf::from("binary.bin")
             })
@@ -1183,7 +1424,7 @@ mod tests {
     fn rejects_traversal() {
         let root = tempdir().unwrap();
         assert_eq!(
-            load_file(root.path(), Path::new("../outside")),
+            load_file(root.path(), Path::new("../outside"), PdfTone::Original),
             Err(FileIoError::InvalidRepositoryPath)
         );
     }

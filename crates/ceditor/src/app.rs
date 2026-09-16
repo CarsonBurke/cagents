@@ -107,6 +107,9 @@ pub enum Message {
     Reaped,
     WindowFocused(window::Id, bool),
     RefreshVisible,
+    /// The shell's light or dark mode changed, so a rendered document page no
+    /// longer matches the surface it sits on.
+    DocumentToneStale,
     Repository(RepositoryAction),
     ResolvedDiffBasis {
         card: CardId,
@@ -344,6 +347,10 @@ pub struct Editor {
     sidebar_open: bool,
     pending_save_as: Option<(CardId, String)>,
     sidebar_transition: Option<SidebarTransition>,
+    /// A shell theme change has landed that the open document pages were not
+    /// rendered for. It is recorded rather than acted on, because the notice
+    /// arrives on a path whose returned task libcosmic discards.
+    document_tone_stale: bool,
     sidebar_panel: WorktreePanel,
     /// Newest generation written per preference file. Storage work runs on the
     /// blocking pool, so two captures of the same file can finish out of
@@ -498,6 +505,32 @@ impl SidebarTransition {
 
 fn repository_task(task: iced::Task<RepositoryAction>) -> Task<Message> {
     task.map(Message::Repository).map(cosmic::Action::App)
+}
+
+/// Whether a repository action is allowed to land while a modal is up.
+///
+/// Input a reader could aim at the pane behind an overlay is refused, but a
+/// completion is not input: dropping one strands whatever it completes. A
+/// dropped page render leaves the document viewer reading "Rendering page"
+/// for a page it will never draw, because accepting the result is the only
+/// thing that clears the fence.
+fn repository_action_allowed_while_modal(action: &RepositoryAction) -> bool {
+    matches!(
+        action,
+        RepositoryAction::FilesLoaded { .. }
+            | RepositoryAction::DirectoryListed { .. }
+            | RepositoryAction::DirectorySearchLoaded { .. }
+            | RepositoryAction::FileLoaded { .. }
+            | RepositoryAction::DiffLoaded { .. }
+            | RepositoryAction::DiffBasisResolved { .. }
+            | RepositoryAction::WorkingDiffDue { .. }
+            | RepositoryAction::WorkingDiffLoaded { .. }
+            | RepositoryAction::SaveFinished { .. }
+            | RepositoryAction::PdfPageRendered { .. }
+            | RepositoryAction::AutoSaveDue { .. }
+            | RepositoryAction::Save { .. }
+            | RepositoryAction::Reload { .. }
+    )
 }
 
 fn language_server_failure(status: LspStatus) -> Option<String> {
@@ -1948,7 +1981,7 @@ impl Editor {
         )
     }
 
-    fn appearance(&self) -> Task<Message> {
+    fn appearance(&mut self) -> Task<Message> {
         let theme = match self.settings.app_theme {
             AppTheme::System => {
                 cosmic::Theme::system(Arc::new(self.core.system_theme().cosmic().clone()))
@@ -1956,12 +1989,55 @@ impl Editor {
             AppTheme::Dark => cosmic::Theme::dark(),
             AppTheme::Light => cosmic::Theme::light(),
         };
+        let documents = self.retone_documents(&theme);
         Task::batch([
             cosmic::command::set_theme(theme),
+            documents,
             Task::done(cosmic::Action::Cosmic(cosmic::app::Action::ScaleFactor(
                 self.settings.ui_scale,
             ))),
         ])
+    }
+
+    /// Re-renders every open document page for `theme`.
+    ///
+    /// A page's colours are rasterized into it, so the shell changing from
+    /// light to dark leaves exactly the glaring white sheet the adapted tone
+    /// exists to prevent until the page is rendered again. The theme is
+    /// passed rather than read from the global, because the global is set by
+    /// the command this is issued alongside and a page rendered for the
+    /// outgoing theme would be no better than not rendering one at all.
+    fn retone_documents(&mut self, theme: &cosmic::Theme) -> Task<Message> {
+        Task::batch(
+            self.tabs
+                .iter_mut()
+                .map(|tab| repository_task(tab.runtime.retone_document(tab.id, theme)))
+                .collect::<Vec<_>>(),
+        )
+    }
+
+    /// Renders the open document pages again for the theme now in force.
+    ///
+    /// The theme is read from the global here, which is the one case where
+    /// that is the right source: the shell's change has already been applied
+    /// to it by the time anything asks this.
+    fn flush_document_tone(&mut self) -> Task<Message> {
+        if !std::mem::take(&mut self.document_tone_stale) {
+            return Task::none();
+        }
+        let theme = cosmic::theme::active();
+        self.retone_documents(&theme)
+    }
+
+    /// Notices that the shell went from light to dark, or back.
+    ///
+    /// This watches the same configuration libcosmic watches, because the
+    /// hook libcosmic offers for it hands back a task that libcosmic itself
+    /// then discards on the path a light or dark flip actually takes.
+    fn document_tone_subscription(&self) -> Subscription<Message> {
+        self.core
+            .watch_config::<cosmic::cosmic_theme::ThemeMode>(cosmic::cosmic_theme::THEME_MODE_ID)
+            .map(|_| Message::DocumentToneStale)
     }
 
     fn can_refresh_visible(&self) -> bool {
@@ -2392,6 +2468,7 @@ impl Application for Editor {
             sidebar_open,
             pending_save_as: None,
             sidebar_transition: None,
+            document_tone_stale: false,
             sidebar_panel: WorktreePanel::Files,
             preference_lane: Arc::new(std::sync::Mutex::new([0; PreferenceFile::COUNT])),
             preference_generation: 0,
@@ -2416,6 +2493,21 @@ impl Application for Editor {
     }
     fn on_app_exit(&mut self) -> Option<Message> {
         Some(Message::CloseWindow)
+    }
+
+    /// The shell's own theme changed under us.
+    ///
+    /// Only the staleness is recorded, never the render: libcosmic discards
+    /// whatever this returns when the notice arrives as a theme change rather
+    /// than a mode change, so dispatching from here would leave a page
+    /// waiting on a render that was never started.
+    fn system_theme_update(
+        &mut self,
+        _keys: &[&'static str],
+        _theme: &cosmic::cosmic_theme::Theme,
+    ) -> Task<Message> {
+        self.document_tone_stale = self.settings.app_theme == AppTheme::System;
+        Task::none()
     }
 
     fn update(&mut self, message: Message) -> Task<Message> {
@@ -2487,7 +2579,15 @@ impl Application for Editor {
                     }
                     Task::none()
                 }
-                Message::RefreshVisible => self.refresh_visible(),
+                Message::RefreshVisible => {
+                    // A colour-only theme change reaches the hook but not the
+                    // mode watch, so the periodic refresh catches that one.
+                    Task::batch([self.refresh_visible(), self.flush_document_tone()])
+                }
+                Message::DocumentToneStale => {
+                    self.document_tone_stale = self.settings.app_theme == AppTheme::System;
+                    self.flush_document_tone()
+                }
                 Message::FileNameChanged(name) => {
                     if let Some(dialog) = self.file_dialog.as_mut().filter(|dialog| !dialog.busy) {
                         dialog.name = name;
@@ -2652,24 +2752,8 @@ impl Application for Editor {
                 }
                 Message::Repository(action) => {
                     let id = action.card();
-                    if self.modal_open() {
-                        if !matches!(
-                            action,
-                            RepositoryAction::FilesLoaded { .. }
-                                | RepositoryAction::DirectoryListed { .. }
-                                | RepositoryAction::DirectorySearchLoaded { .. }
-                                | RepositoryAction::FileLoaded { .. }
-                                | RepositoryAction::DiffLoaded { .. }
-                                | RepositoryAction::DiffBasisResolved { .. }
-                                | RepositoryAction::WorkingDiffDue { .. }
-                                | RepositoryAction::WorkingDiffLoaded { .. }
-                                | RepositoryAction::SaveFinished { .. }
-                                | RepositoryAction::AutoSaveDue { .. }
-                                | RepositoryAction::Save { .. }
-                                | RepositoryAction::Reload { .. }
-                        ) {
-                            return Task::none();
-                        }
+                    if self.modal_open() && !repository_action_allowed_while_modal(&action) {
+                        return Task::none();
                     }
                     if let RepositoryAction::Save { card, .. } = &action {
                         if self.tab(*card).is_some_and(|tab| self.tab_is_untitled(tab)) {
@@ -3481,7 +3565,7 @@ impl Application for Editor {
         } else {
             Subscription::none()
         };
-        Subscription::batch([events, refresh, frames])
+        Subscription::batch([events, refresh, frames, self.document_tone_subscription()])
     }
 
     fn header_start(&self) -> Vec<Element<'_, Message>> {
@@ -4308,6 +4392,7 @@ mod tests {
             sidebar_open: true,
             pending_save_as: None,
             sidebar_transition: None,
+            document_tone_stale: false,
             sidebar_panel: WorktreePanel::Files,
             preference_lane: Arc::new(std::sync::Mutex::new([0; PreferenceFile::COUNT])),
             preference_generation: 0,
@@ -4353,7 +4438,11 @@ mod tests {
                     path: file.into(),
                     generation: 1,
                 },
-                result: cagents::editor::load_file(root, Path::new(file)),
+                result: cagents::editor::load_file(
+                    root,
+                    Path::new(file),
+                    cagents::editor::PdfTone::Original,
+                ),
             })),
         );
         assert!(
@@ -4732,7 +4821,11 @@ mod tests {
                     path: "a.rs".into(),
                     generation: 1,
                 },
-                result: cagents::editor::load_file(directory.path(), Path::new("a.rs")),
+                result: cagents::editor::load_file(
+                    directory.path(),
+                    Path::new("a.rs"),
+                    cagents::editor::PdfTone::Original,
+                ),
             })),
         );
         assert!(app.tab(id).unwrap().runtime.lsp_document().is_none());
@@ -5048,7 +5141,11 @@ mod tests {
                     path: "a.txt".into(),
                     generation: 1,
                 },
-                result: cagents::editor::load_file(directory.path(), Path::new("a.txt")),
+                result: cagents::editor::load_file(
+                    directory.path(),
+                    Path::new("a.txt"),
+                    cagents::editor::PdfTone::Original,
+                ),
             })),
         );
         drop(
@@ -5307,7 +5404,11 @@ mod tests {
                     path: path.clone(),
                     generation: 1,
                 },
-                result: cagents::editor::load_file(&worktree, &path),
+                result: cagents::editor::load_file(
+                    &worktree,
+                    &path,
+                    cagents::editor::PdfTone::Original,
+                ),
             })),
         );
     }
@@ -5363,6 +5464,29 @@ mod tests {
         drop(app.update(Message::NewTab));
         assert!(app.tabs.is_empty());
         assert!(!directory.path().join("untitled").exists());
+    }
+
+    #[test]
+    fn a_modal_refuses_editor_input_but_never_an_async_completion() {
+        let card = CardId::new();
+        assert!(!repository_action_allowed_while_modal(
+            &RepositoryAction::EditorAction {
+                card,
+                action: widget::text_editor::Action::Edit(widget::text_editor::Edit::Paste(
+                    Arc::new("blocked".into()),
+                )),
+            }
+        ));
+        // A dropped page render leaves the document viewer reading "Rendering
+        // page" for a page it never draws, because accepting the result is
+        // the only thing that clears the fence.
+        assert!(repository_action_allowed_while_modal(
+            &RepositoryAction::PdfPageRendered {
+                card,
+                request: 1,
+                result: Err("fixture".into()),
+            }
+        ));
     }
 
     #[test]
