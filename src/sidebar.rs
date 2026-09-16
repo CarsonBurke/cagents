@@ -2629,6 +2629,7 @@ impl SidebarState {
             | SidebarAction::NewWorktree { .. }
             | SidebarAction::NewChannel { .. }
             | SidebarAction::OpenChannel { .. }
+            | SidebarAction::DeleteChannel { .. }
             | SidebarAction::ReorderProject { .. }
             | SidebarAction::DragWindow
             | SidebarAction::MaximizeWindow
@@ -2687,6 +2688,11 @@ pub enum SidebarAction {
         project_id: ProjectId,
     },
     OpenChannel {
+        channel_id: ChannelId,
+    },
+    /// Asks to delete a channel. The application confirms before removing
+    /// anything, because a channel's conversations live nowhere else.
+    DeleteChannel {
         channel_id: ChannelId,
     },
     OpenRepository {
@@ -3572,8 +3578,7 @@ impl RowGrid {
             .height(Length::Fixed(self.height()))
     }
 
-    /// Places a finished row on the grid: its hierarchy indent, and whatever
-    /// trailing reservation its kind owes.
+    /// Places a finished row on the grid at its hierarchy indent.
     ///
     /// The indent is padding around the control rather than inside it, so a
     /// selected row's background still starts at its own column instead of
@@ -3582,20 +3587,7 @@ impl RowGrid {
         self,
         control: impl Into<Element<'a, SidebarAction>>,
     ) -> Element<'a, SidebarAction> {
-        let control = control.into();
-        let row = if matches!(self.kind, RowKind::Project) && !self.compact {
-            widget::row::with_children(vec![
-                control,
-                cosmic::iced::widget::Space::new()
-                    .width(Length::Fixed(HEADER_ACTION_WIDTH))
-                    .into(),
-            ])
-            .align_y(Alignment::Center)
-            .height(Length::Fixed(self.height()))
-            .into()
-        } else {
-            control
-        };
+        let row = control.into();
         let indent = self.indent();
         if indent == 0.0 {
             return row;
@@ -3606,12 +3598,37 @@ impl RowGrid {
     }
 }
 
-/// A project header's identity row: its icon, its name, and the room its
-/// hover-revealed commands occupy on the right.
+/// A project header: its identity row, with the hover-revealed commands
+/// mounted over the row's own trailing edge.
 ///
-/// The commands themselves are mounted over this row by
-/// `RowInteraction::actions`, so the reservation - not the controls - is what
-/// keeps a long project name from running under them.
+/// The commands cover [`HEADER_ACTION_WIDTH`] of that edge, and the row is
+/// told so, which is what narrows the title for exactly as long as they are
+/// on screen and no longer.
+fn project_header_row<'a>(
+    identity: Element<'a, SidebarAction>,
+    commands: Vec<Element<'a, SidebarAction>>,
+) -> Element<'a, SidebarAction> {
+    RowInteraction::actions(
+        identity,
+        widget::container(
+            widget::row::with_children(commands)
+                .align_y(Alignment::Center)
+                .spacing(0)
+                .height(PROJECT_HEADER_HEIGHT),
+        )
+        .align_right(Length::Fill)
+        .into(),
+        HEADER_ACTION_WIDTH,
+    )
+}
+
+/// A project header's identity row: its icon and its name, across the whole
+/// row.
+///
+/// The hover-revealed commands are mounted over this row by
+/// `RowInteraction::actions`, which narrows it only while they are on screen,
+/// so a long project name reads in full until the moment it would run under
+/// them.
 fn project_identity_row<'a>(
     project: &'a SidebarProject,
     selected: bool,
@@ -3893,16 +3910,9 @@ fn project_view<'a>(
         gated(SidebarAction::NewChannel { project_id }, modal_open),
         chrome.new_channel_id.clone(),
     );
-    let header = RowInteraction::actions(
+    let header = project_header_row(
         project_identity,
-        widget::container(
-            widget::row::with_children(vec![disclosure, add_channel, add_worktree])
-                .align_y(Alignment::Center)
-                .spacing(0)
-                .height(PROJECT_HEADER_HEIGHT),
-        )
-        .align_right(Length::Fill)
-        .into(),
+        vec![disclosure, add_channel, add_worktree],
     );
     let header = context_controls(
         header,
@@ -4103,7 +4113,48 @@ fn channel_view(
             },
             modal_open,
         ));
-    grid.mount(crate::interaction::tooltip(action, &*channel.tooltip))
+    grid.mount(channel_context_controls(
+        crate::interaction::tooltip(action, &*channel.tooltip),
+        channel.id,
+        modal_open,
+    ))
+}
+
+/// The commands a channel row offers on right-click.
+///
+/// A channel is the only navigation row whose contents exist nowhere else, so
+/// deleting one is destructive and the entry says so with an ellipsis: the
+/// application answers it with a confirmation rather than a removal.
+fn channel_context_controls<'a>(
+    content: impl Into<Element<'a, SidebarAction>>,
+    channel_id: ChannelId,
+    modal_open: bool,
+) -> Element<'a, SidebarAction> {
+    use widget::menu::{Item, items};
+    let Some(menu) = (!modal_open).then(|| {
+        items(
+            &std::collections::HashMap::new(),
+            vec![Item::Button(
+                "Delete channel…".to_owned(),
+                None,
+                ChannelContextCommand(channel_id),
+            )],
+        )
+    }) else {
+        return content.into();
+    };
+    crate::interaction::context_menu(content, menu)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ChannelContextCommand(ChannelId);
+
+impl widget::menu::Action for ChannelContextCommand {
+    type Message = SidebarAction;
+
+    fn message(&self) -> SidebarAction {
+        SidebarAction::DeleteChannel { channel_id: self.0 }
+    }
 }
 
 fn worktree_accessible_name(
@@ -4123,6 +4174,29 @@ fn worktree_accessible_name(
     name
 }
 
+/// What a worktree's own state contributes to an indicator, as inputs rather
+/// than widgets.
+///
+/// The navigation rail's row and the context rail's tabs both resolve their
+/// badges through this, so the two rails cannot report the same worktree
+/// differently.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct WorktreeIndicators<'a> {
+    /// The dirty badge's label, which is also its change count.
+    pub dirty: Option<&'a str>,
+    pub pull_request: Option<&'a SidebarPullRequest>,
+    pub pending_checks: bool,
+}
+
+pub fn worktree_indicators(worktree: &SidebarWorktree) -> WorktreeIndicators<'_> {
+    let pull_request = worktree.chrome.pull_request.as_ref();
+    WorktreeIndicators {
+        dirty: worktree.chrome.dirty_badge.as_deref(),
+        pull_request,
+        pending_checks: pull_request.is_some_and(SidebarPullRequest::has_pending_checks),
+    }
+}
+
 /// The one live indicator a worktree row shows in its reserved slot.
 ///
 /// The rail folds pending checks into the same spinner: it has room for one
@@ -4135,13 +4209,10 @@ fn worktree_indicator(
     activity: Option<crate::agent::ActivityState>,
     compact: bool,
 ) -> Option<Element<'_, SidebarAction>> {
+    let indicators = worktree_indicators(worktree);
     let working = activity == Some(crate::agent::ActivityState::Working);
     let waiting_unread = activity == Some(crate::agent::ActivityState::Waiting) && agent_update;
-    let checks = worktree
-        .chrome
-        .pull_request
-        .as_ref()
-        .is_some_and(SidebarPullRequest::has_pending_checks);
+    let checks = indicators.pending_checks;
     if working || (compact && !waiting_unread && checks) {
         return Some(crate::interaction::tooltip(
             crate::ui_controls::activity_spinner_tone(
@@ -4163,10 +4234,8 @@ fn worktree_indicator(
         ));
     }
     if compact {
-        return worktree
-            .chrome
-            .dirty_badge
-            .as_deref()
+        return indicators
+            .dirty
             .map(|label| status_icon("document-edit-symbolic", label, BadgeTone::Warning));
     }
     None
@@ -4209,19 +4278,15 @@ fn worktree_view<'a>(
     // worktree rather than live activity, so none of them moves while an agent
     // starts or stops working. The rail has no room for any of them.
     if !compact {
-        if let Some(label) = chrome.dirty_badge.as_deref() {
+        let indicators = worktree_indicators(worktree);
+        if let Some(label) = indicators.dirty {
             content = content.push(status_icon(
                 "document-edit-symbolic",
                 label,
                 BadgeTone::Warning,
             ));
         }
-        if chrome
-            .pull_request
-            .as_ref()
-            .is_some_and(SidebarPullRequest::has_pending_checks)
-            && activity != Some(crate::agent::ActivityState::Working)
-        {
+        if indicators.pending_checks && activity != Some(crate::agent::ActivityState::Working) {
             content = content.push(check_indicator(CheckStatus::Pending));
         }
         if primary {
@@ -5478,7 +5543,7 @@ fn change_group_view<'a>(
     .height(PANEL_ROW_HEIGHT);
     let mut column = widget::column::with_capacity(tree.len() + 2)
         .spacing(0)
-        .push(RowInteraction::actions(header.into(), actions.into()));
+        .push(RowInteraction::actions(header.into(), actions.into(), 0.0));
     for file in tree {
         if file.directory {
             // An inert hierarchy label, like branch review above.
@@ -5646,6 +5711,7 @@ fn change_row_view<'a>(
             .padding([0, spacing.space_xxxs])
             .align_right(Length::Fill)
             .into(),
+        0.0,
     )
 }
 
@@ -6444,7 +6510,7 @@ fn resize_handle(width: f32, modal_open: bool) -> Splitter<'static, SidebarActio
 }
 
 #[derive(Debug, Clone, Copy)]
-enum BadgeTone {
+pub enum BadgeTone {
     Neutral,
     Success,
     Warning,
@@ -6510,7 +6576,7 @@ fn check_description(status: CheckStatus) -> &'static str {
 /// The tone is resolved by the drawing theme rather than read from the
 /// process-global one while the view is built, so a row that carries a tone
 /// costs no theme lock per frame.
-fn toned_icon<'a>(icon_name: &'static str, tone: BadgeTone) -> Element<'a, SidebarAction> {
+fn toned_icon<'a, Message: 'a>(icon_name: &'static str, tone: BadgeTone) -> Element<'a, Message> {
     widget::container(
         widget::icon(crate::ui_controls::symbolic_icon(icon_name)).size(ROW_ICON_SIZE),
     )
@@ -6529,15 +6595,20 @@ fn toned_icon<'a>(icon_name: &'static str, tone: BadgeTone) -> Element<'a, Sideb
     .into()
 }
 
-fn status_icon<'a>(
+/// A badge: a toned glyph that explains itself on hover.
+///
+/// Public and generic over the message because the context rail draws the very
+/// same badges as the navigation rail, and two rails describing one worktree
+/// differently is the defect this shares its way out of.
+pub fn status_icon<'a, Message: Clone + 'a>(
     icon_name: &'static str,
     label: &'a str,
     tone: BadgeTone,
-) -> Element<'a, SidebarAction> {
+) -> Element<'a, Message> {
     crate::interaction::tooltip(toned_icon(icon_name, tone), label)
 }
 
-fn check_indicator(status: CheckStatus) -> Element<'static, SidebarAction> {
+pub fn check_indicator<Message: Clone + 'static>(status: CheckStatus) -> Element<'static, Message> {
     if status == CheckStatus::Pending {
         return crate::interaction::tooltip(
             crate::ui_controls::activity_spinner_tone(
@@ -6783,7 +6854,13 @@ mod row_interaction {
         Group {
             viewport: StickyViewport,
         },
-        Actions,
+        /// `reserve` is the width the overlay controls cover at the row's
+        /// trailing edge. It is subtracted from the base row only while those
+        /// controls are on screen, which is the whole point of drawing them
+        /// over the row instead of beside it.
+        Actions {
+            reserve: f32,
+        },
     }
 
     #[derive(Default)]
@@ -6873,19 +6950,23 @@ mod row_interaction {
             })
         }
 
+        /// `reserve` is how much of the row's trailing edge `actions` covers
+        /// once it is visible; pass `0.0` when the strip paints its own
+        /// background and the base row may run underneath it.
         pub(super) fn actions(
             base: Element<'a, SidebarAction>,
             actions: Element<'a, SidebarAction>,
+            reserve: f32,
         ) -> Element<'a, SidebarAction> {
             Element::new(Self {
                 children: vec![base, actions],
-                kind: Kind::Actions,
+                kind: Kind::Actions { reserve },
             })
         }
 
         fn focus(&mut self, tree: &mut Tree, layout: Layout<'_>, renderer: &Renderer) {
             let mut focus = FocusWithin::default();
-            if !matches!(self.kind, Kind::Actions) {
+            if !matches!(self.kind, Kind::Actions { .. }) {
                 return;
             }
             for ((child, tree), layout) in self
@@ -7028,11 +7109,29 @@ mod row_interaction {
             renderer: &Renderer,
             limits: &layout::Limits,
         ) -> layout::Node {
-            let base =
-                self.children[0]
-                    .as_widget_mut()
-                    .layout(&mut tree.children[0], renderer, limits);
-            let size = base.size();
+            // Overlay controls are on screen only while the row is hovered or
+            // focused, so only then does the base row lose the width they
+            // cover. Every other frame the title is measured against the whole
+            // row, which is what keeps a reservation out of the resting state.
+            let reserve = match self.kind {
+                Kind::Actions { reserve } if reserve > 0.0 => {
+                    let state = tree.state.downcast_ref::<State>();
+                    if state.hovered || state.focused {
+                        reserve
+                    } else {
+                        0.0
+                    }
+                }
+                _ => 0.0,
+            };
+            let base = self.children[0].as_widget_mut().layout(
+                &mut tree.children[0],
+                renderer,
+                &limits.shrink(Size::new(reserve, 0.0)),
+            );
+            // The row itself never changes width: only what the title may use
+            // does, so the strip lands on the same trailing edge either way.
+            let size = Size::new(base.size().width + reserve, base.size().height);
             if matches!(self.kind, Kind::Group { .. }) {
                 let members = self.children[1]
                     .as_widget_mut()
@@ -7115,11 +7214,17 @@ mod row_interaction {
             {
                 sticky.0.set(viewport.y);
             }
+            let reserves = matches!(self.kind, Kind::Actions { reserve } if reserve > 0.0);
             let state = tree.state.downcast_mut::<State>();
             let hovered = cursor.is_over(layout.bounds()) && cursor.is_over(*viewport);
             if hovered != state.hovered {
                 state.hovered = hovered;
                 shell.request_redraw();
+                // The base row is measured against a narrower space while the
+                // controls show, so revealing them is a relayout, not a repaint.
+                if reserves {
+                    shell.invalidate_layout();
+                }
             }
             if matches!(self.kind, Kind::Projects { enabled: true, .. }) {
                 match event {
@@ -7234,7 +7339,7 @@ mod row_interaction {
                 .rev()
             {
                 if index == 1
-                    && matches!(self.kind, Kind::Actions)
+                    && matches!(self.kind, Kind::Actions { .. })
                     && !show_actions
                     && matches!(event, Event::Touch(_))
                 {
@@ -7258,7 +7363,11 @@ mod row_interaction {
                     break;
                 }
             }
+            let focused = tree.state.downcast_ref::<State>().focused;
             self.focus(tree, layout, renderer);
+            if reserves && tree.state.downcast_ref::<State>().focused != focused {
+                shell.invalidate_layout();
+            }
         }
 
         fn mouse_interaction(
@@ -7295,7 +7404,7 @@ mod row_interaction {
                 .rev()
                 .map(|(index, ((child, tree), child_layout))| {
                     let hidden_actions = index == 1
-                        && matches!(self.kind, Kind::Actions)
+                        && matches!(self.kind, Kind::Actions { .. })
                         && !(state.hovered || state.focused);
                     let covered_members = index == 1
                         && matches!(self.kind, Kind::Group { .. })
@@ -7437,7 +7546,7 @@ mod row_interaction {
             }
             let state = tree.state.downcast_ref::<State>();
             let hide_actions =
-                matches!(self.kind, Kind::Actions) && !(state.hovered || state.focused);
+                matches!(self.kind, Kind::Actions { .. }) && !(state.hovered || state.focused);
             let overlays = self
                 .children
                 .iter_mut()
@@ -7908,6 +8017,84 @@ mod tests {
                 "every rail row reserves the same indicator slot",
             );
         }
+    }
+
+    /// The whole point of drawing the header's commands over the row is that
+    /// they cost the title nothing until they appear. A reservation that is
+    /// always there is the same as no overlay at all.
+    #[test]
+    fn a_project_title_keeps_the_whole_row_until_its_commands_appear() {
+        use cosmic::iced::{
+            Event, Point, Rectangle,
+            advanced::{Shell, clipboard},
+            mouse,
+        };
+        let renderer = headless_renderer();
+        let model = grid_fixture();
+        let width = design::NAVIGATION_DEFAULT_WIDTH;
+        let limits = layout::Limits::new(Size::ZERO, Size::new(width, PROJECT_HEADER_HEIGHT));
+        let mut element = project_header_row(
+            project_identity_row(&model.projects[0], false, false, false),
+            vec![
+                icon_action(
+                    "go-down-symbolic",
+                    "Collapse",
+                    None,
+                    Id::new("test.collapse"),
+                ),
+                icon_action(
+                    "channel-add-symbolic",
+                    "New channel",
+                    None,
+                    Id::new("test.channel"),
+                ),
+                icon_action(
+                    "worktree-add-symbolic",
+                    "New worktree",
+                    None,
+                    Id::new("test.worktree"),
+                ),
+            ],
+        );
+        let mut tree = Tree::new(&element);
+        let label_edge = |element: &mut Element<'_, SidebarAction>, tree: &mut Tree| {
+            let node = element.as_widget_mut().layout(tree, &renderer, &limits);
+            let mut rows = Vec::new();
+            navigation_rows(Layout::new(&node), &mut rows);
+            assert_eq!(rows.len(), 1, "one header row");
+            let label = rows[0].1[1];
+            label.x + label.width
+        };
+
+        let resting = label_edge(&mut element, &mut tree);
+        let content_edge = width - RowGrid::project(false).gutter();
+        assert_eq!(
+            resting, content_edge,
+            "a hidden control reserves nothing: the title runs to the row's own content edge",
+        );
+
+        let viewport = Rectangle::with_size(Size::new(width, PROJECT_HEADER_HEIGHT));
+        let over = Point::new(width / 2.0, PROJECT_HEADER_HEIGHT / 2.0);
+        let node = element
+            .as_widget_mut()
+            .layout(&mut tree, &renderer, &limits);
+        element.as_widget_mut().update(
+            &mut tree,
+            &Event::Mouse(mouse::Event::CursorMoved { position: over }),
+            Layout::new(&node),
+            mouse::Cursor::Available(over),
+            &renderer,
+            &mut clipboard::Null,
+            &mut Shell::new(&mut Vec::new()),
+            &viewport,
+        );
+        let hovered = label_edge(&mut element, &mut tree);
+        assert_eq!(
+            hovered,
+            content_edge - HEADER_ACTION_WIDTH,
+            "once the commands are drawn the title stops exactly where they start, so nothing \
+             visible runs under them",
+        );
     }
 
     #[test]
@@ -8450,6 +8637,21 @@ mod tests {
             Self::sized(640.0)
         }
 
+        /// The same roomy rail, with a channel row above the project's
+        /// worktrees.
+        fn with_channel(channel: ChannelId) -> Self {
+            let mut sidebar = Self::roomy();
+            sidebar.model.projects[0].channels.push(SidebarChannel::new(
+                channel,
+                "Investigate login".into(),
+                false,
+                None,
+                false,
+                1,
+            ));
+            sidebar
+        }
+
         fn sized(height: f32) -> Self {
             let mut entry = project();
             entry.worktrees = (2..30)
@@ -8651,6 +8853,36 @@ mod tests {
             unscrolled_entry, scrolled_entry,
             "the same reach below the anchor has to land on the same entry, so the menu keeps \
              measuring itself against the window rather than against the scrolled-away content"
+        );
+    }
+
+    /// A channel is deletable from the row that shows it, like every other
+    /// navigation row, and the entry that says so has to reach the
+    /// application rather than fall through to the row underneath.
+    #[test]
+    fn a_channel_row_offers_deleting_the_channel_it_shows() {
+        use cosmic::iced::{Point, advanced::mouse};
+        let channel_id = ChannelId::from_uuid(Uuid::from_u128(20));
+        let mut sidebar = Sidebar::with_channel(channel_id);
+        // Find the channel row the way the user does, by clicking until the
+        // channel opens: its y depends on the rail's own chrome.
+        let row = (0..40)
+            .map(|step| Point::new(56.0, 8.0 * step as f32))
+            .find(|point| {
+                matches!(
+                    sidebar.click(mouse::Button::Left, *point).first(),
+                    Some(SidebarAction::OpenChannel { .. })
+                )
+            })
+            .expect("the rail draws the project's channel row");
+
+        sidebar.click(mouse::Button::Right, row);
+        let entry = Point::new(row.x + 30.0, row.y + 8.0);
+        sidebar.move_to(entry);
+        assert_eq!(
+            sidebar.click(mouse::Button::Left, entry).first(),
+            Some(&SidebarAction::DeleteChannel { channel_id }),
+            "the channel row's only menu entry deletes the channel it was opened over",
         );
     }
 
