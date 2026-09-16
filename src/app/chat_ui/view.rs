@@ -1219,7 +1219,7 @@ impl Runtime {
         .into()
     }
 
-    /// An assistant answer, its narration, or a system notice.
+    /// An assistant answer, its reasoning, its narration, or a system notice.
     ///
     /// Commentary recedes: it outnumbers answers several times over, and
     /// giving both the same weight is why a reader could not find the answer
@@ -1243,6 +1243,36 @@ impl Runtime {
                 }))
                 .width(Length::Fill)
                 .wrapping(iced::widget::text::Wrapping::None),
+            )
+            .padding(iced::Padding::ZERO.left(step::GAP_M))
+            .width(Length::Fill)
+            .into();
+        }
+        if slot == turn::Slot::Thinking {
+            // Reasoning is prose, so it is read rather than operated: it is
+            // rendered here, quoted onto the sunken surface at caption scale
+            // that the rest of the shell uses for text taken from elsewhere.
+            // Filed behind a disclosure row captioned "Thinking" it was one
+            // more accordion in a column of them, and the account of why the
+            // agent did what it did was the part the reader never opened.
+            return widget::container(
+                widget::container(
+                    markdown::view(
+                        cached.markdown.items(),
+                        markdown::Settings {
+                            text_size: design::TEXT_CAPTION.into(),
+                            ..settings
+                        },
+                    )
+                    .map(|uri| action(Action::OpenUrl(uri.to_string()))),
+                )
+                .class(design::surface(
+                    Some(design::sunken),
+                    [design::RADIUS_S; 4],
+                    false,
+                ))
+                .padding([step::GAP_S as u16, step::GAP_M as u16])
+                .max_width(design::READABLE_MEASURE),
             )
             .padding(iced::Padding::ZERO.left(step::GAP_M))
             .width(Length::Fill)

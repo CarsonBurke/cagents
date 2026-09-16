@@ -1019,14 +1019,10 @@ impl Write for ByteCounter {
         Ok(())
     }
 }
-/// Unix milliseconds for the moment the daemon observed an item change. A clock
-/// set before the unix epoch has nothing meaningful to report, so the stamp is
-/// absent rather than wrong.
+/// Unix milliseconds for the moment the daemon observed an item change, read
+/// from the same clock the surface measures an elapsed time against.
 pub(super) fn observed_at() -> Option<u64> {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .ok()
-        .map(|elapsed| u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX))
+    crate::chat::now_ms()
 }
 fn apply_event(state: &mut Snapshot, indices: &mut BTreeMap<String, usize>, event: Event) {
     match event {

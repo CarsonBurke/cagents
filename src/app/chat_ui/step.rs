@@ -35,22 +35,36 @@ const PATCH_GUTTER_WIDTH: f32 = 8.0;
 /// rather than per row, so it cannot break between rows.
 const RAIL_INSET: f32 = design::GRID_UNIT * 3.0;
 
-/// The glyph and tone a step's status draws as.
+/// The indicator and tone a group's status draws as.
 ///
-/// Status is information, not a control, so it is a plain icon rather than one
-/// of the buttons that used to line every row.
-fn status_glyph(status: ToolStatus) -> (&'static str, Option<design::Tone>) {
+/// Status is information, not a control, so it is a plain glyph rather than
+/// one of the buttons that used to line every row. Running is the exception:
+/// a static glyph for work in flight says only that something was running
+/// when the frame was drawn, so it is the animated indicator the rest of the
+/// shell uses for the same state.
+fn status_indicator<'a>(status: ToolStatus) -> (Element<'a, Message>, Option<design::Tone>) {
+    let glyph = |name: &'static str, tone: Option<design::Tone>| {
+        (
+            widget::icon(crate::ui_controls::symbolic_icon(name))
+                .size(design::COMPACT_ICON_SIZE)
+                .into(),
+            tone,
+        )
+    };
     match status {
         ToolStatus::Running => (
-            "content-loading-symbolic",
+            crate::ui_controls::activity_spinner_tone(
+                f32::from(design::COMPACT_ICON_SIZE),
+                design::warning_color,
+            ),
             Some(design::Tone::Themed(design::warning_color)),
         ),
-        ToolStatus::Succeeded => ("emblem-ok-symbolic", None),
-        ToolStatus::Failed => (
+        ToolStatus::Succeeded => glyph("emblem-ok-symbolic", None),
+        ToolStatus::Failed => glyph(
             "dialog-error-symbolic",
             Some(design::Tone::Themed(design::destructive_color)),
         ),
-        ToolStatus::Denied => (
+        ToolStatus::Denied => glyph(
             "action-unavailable-symbolic",
             Some(design::Tone::Themed(design::muted_color)),
         ),
@@ -327,11 +341,15 @@ fn search_result_view(result: &SearchResult) -> Element<'_, Message> {
 }
 
 impl Runtime {
-    /// A turn's activity: one summary line, disclosing the individual steps.
+    /// One group's activity: a summary line and how long the work took,
+    /// disclosing the individual steps.
     ///
-    /// A finished turn collapses, because what the reader wants from it is the
-    /// answer. A running turn opens, because what they want from it is to see
-    /// what is happening. An explicit toggle overrides both.
+    /// A group opens while it is running, because watching the work is the
+    /// point, and keeps whatever state it had reached when it stopped. The
+    /// automatic state is recorded once, when the group is first seen, so
+    /// this only reads it: resolving it here on every frame is what made a
+    /// strip the reader was reading spring shut the instant its last step
+    /// finished.
     pub(super) fn step_strip<'a>(
         &'a self,
         key: &'a str,
@@ -339,6 +357,9 @@ impl Runtime {
         settings: markdown::Settings,
     ) -> Element<'a, Message> {
         let target = self.target;
+        // Every rendered group has a record, written when the group was first
+        // seen. This fallback is the same value that record was seeded with,
+        // so the two cannot disagree.
         let open = self.opened.get(key).copied().unwrap_or(turn.running);
         let mut line: Vec<Element<'a, Message>> = vec![
             widget::icon(crate::ui_controls::symbolic_icon(if open {
@@ -346,27 +367,40 @@ impl Runtime {
             } else {
                 "pan-end-symbolic"
             }))
-            .size(12)
+            .size(design::COMPACT_ICON_SIZE)
             .into(),
         ];
-        let tone = match turn.glyph().map(status_glyph) {
-            Some((glyph, tone)) => {
-                line.push(
-                    widget::icon(crate::ui_controls::symbolic_icon(glyph))
-                        .size(12)
-                        .into(),
-                );
+        let tone = match turn.glyph().map(status_indicator) {
+            Some((indicator, tone)) => {
+                line.push(indicator);
                 tone
             }
             None => None,
         };
         line.push(design::caption(turn.summary.as_str()).into());
+        // How long this stretch of work has taken. It is measured as the view
+        // is built rather than stored on the group, so a running group's label
+        // advances with the frames the arriving provider items already cause
+        // and needs no clock of its own.
+        let elapsed = chat::now_ms()
+            .and_then(|now| turn.working_for(now))
+            .map(format_duration);
+        if let Some(elapsed) = &elapsed {
+            line.push(design::caption(elapsed.clone()).into());
+        }
+        // The duration is part of what the control says, so it belongs in the
+        // name as well: a reader on a screen reader is the one who cannot see
+        // the caption beside it.
+        let name = match &elapsed {
+            Some(elapsed) => format!("{} · {elapsed}", turn.summary),
+            None => turn.summary.clone(),
+        };
         let header = widget::button::custom(
             widget::row::with_children(line)
                 .spacing(GAP_S)
                 .align_y(Alignment::Center),
         )
-        .name(turn.summary.clone())
+        .name(name)
         .class(crate::ui_controls::control_style(false, tone))
         .padding([GAP_XS as u16, GAP_S as u16])
         .on_press(action(Action::ToggleTurn(target, key.to_owned())));

@@ -103,8 +103,8 @@ pub enum Action {
     Command(Target, Command),
     CommandFinished(Target, u64, Result<(), String>),
     Toggle(Target, String),
-    /// Opens or closes a whole turn's step strip, addressed by the id of the
-    /// turn's first item.
+    /// Opens or closes one group's step strip, addressed by the id of the item
+    /// that started the group.
     ToggleTurn(Target, String),
     Copy(Target, String, CopyPart),
     OpenUrl(String),
@@ -489,16 +489,40 @@ impl CodeScan {
     }
 }
 
-/// A step's elapsed time at the precision a reader can act on.
+/// An elapsed time at the precision a reader can act on.
 ///
 /// Sub-second work is reported in milliseconds because the difference between
 /// 4 ms and 400 ms is the difference between a cache hit and a process launch;
 /// past a second the milliseconds stop carrying information.
-fn format_duration(millis: u64) -> String {
+pub(super) fn format_duration(millis: u64) -> String {
     match millis {
         0..1_000 => format!("{millis}ms"),
         0..60_000 => format!("{:.1}s", millis as f64 / 1_000.0),
         _ => format!("{}m {}s", millis / 60_000, (millis % 60_000) / 1_000),
+    }
+}
+
+/// Settles which step strips are open for the groups that now exist.
+///
+/// Two jobs, and they have to happen together. A group is forgotten once the
+/// store's window no longer produces it, because the map would otherwise grow
+/// for the life of the card. A group that is new gets its automatic state
+/// written here, once: open while it is running, because watching the work is
+/// the point, and closed otherwise, because a finished group is read for its
+/// answer.
+///
+/// Writing that state instead of resolving it per frame is the whole point.
+/// The surface used to fall back to "open if running" whenever the reader had
+/// not toggled anything, which meant a strip the reader was reading collapsed
+/// under them the instant its last step finished - and a group they had
+/// deliberately opened reverted as soon as its key was rederived.
+fn reconcile_disclosure(opened: &mut HashMap<String, bool>, turns: &[turn::Turn]) {
+    let keys: HashSet<&str> = turns.iter().map(|turn| turn.key.as_str()).collect();
+    opened.retain(|key, _| keys.contains(key.as_str()));
+    for turn in turns {
+        if !opened.contains_key(&turn.key) {
+            opened.insert(turn.key.clone(), turn.running);
+        }
     }
 }
 
@@ -675,16 +699,33 @@ pub(super) struct Runtime {
     handle: Arc<ClientHandle>,
     snapshot: Arc<Snapshot>,
     cache: HashMap<String, CachedItem>,
-    /// The snapshot's items grouped into turns, rebuilt only when the snapshot
-    /// changes rather than once per frame.
+    /// The snapshot's items grouped into stretches of work, rebuilt only when
+    /// the snapshot changes rather than once per frame.
     turns: Vec<turn::Turn>,
-    /// The reader's explicit choice to open or close a turn's step strip,
-    /// keyed by the turn's first item id.
+    /// The ids of items the reader was asked something after.
     ///
-    /// An override rather than a set, because the useful default is not
-    /// constant: a running turn shows its steps, because watching them is the
-    /// point, and a finished turn hides them, because the answer is. Only a
-    /// deliberate toggle is recorded here.
+    /// A question or an approval request is the agent handing control back, so
+    /// it ends the stretch of work that asked and the answer starts a new one.
+    /// Requests never enter the transcript and vanish the moment they are
+    /// resolved, while the grouping is recomputed from the whole item list on
+    /// every snapshot, so the boundary has to be remembered here or answering
+    /// a question would merge the work before it into the work after.
+    asked_after: HashSet<String>,
+    /// The requests whose boundary has already been recorded.
+    ///
+    /// An optional question stays pending while the agent carries on working,
+    /// so without this every refresh would record whatever item was newest
+    /// and each item would become a stretch of work of its own. A resolved
+    /// request is dropped from here, and a request id is never reused, so the
+    /// set stays the size of what is actually pending.
+    asked: HashSet<String>,
+    /// Whether each group's step strip is open, keyed by the group.
+    ///
+    /// A group's state is written once, when the group is first seen: open
+    /// while it is running, because watching the work is the point, and
+    /// closed otherwise, because the answer is what a finished group is read
+    /// for. From then on only a toggle changes it, so a group the reader
+    /// opened does not shut itself the moment its last step finishes.
     opened: HashMap<String, bool>,
     composer: text_editor::Content<cosmic::Renderer>,
     revision: u64,
@@ -713,6 +754,8 @@ impl Runtime {
             handle,
             cache: HashMap::new(),
             turns: Vec::new(),
+            asked_after: HashSet::new(),
+            asked: HashSet::new(),
             opened: HashMap::new(),
             composer: text_editor::Content::new(),
             revision: 0,
@@ -741,12 +784,12 @@ impl Runtime {
         }
         let live_ids: HashSet<&str> = snapshot.items.iter().map(|item| item.id.as_str()).collect();
         self.cache.retain(|id, _| live_ids.contains(id.as_str()));
-        // The disclosure sets are keyed by item id and the store drops items
-        // past its window, so without this they grow for the life of the card:
-        // one entry per step the reader ever opened, held after the step it
-        // named stopped existing.
+        // Both sets are keyed by item id and the store drops items past its
+        // window, so without this they grow for the life of the card: one
+        // entry per step the reader ever opened and per question they were
+        // ever asked, held after the item it named stopped existing.
         self.expanded.retain(|id| live_ids.contains(id.as_str()));
-        self.opened.retain(|id, _| live_ids.contains(id.as_str()));
+        self.asked_after.retain(|id| live_ids.contains(id.as_str()));
         for item in &snapshot.items {
             let token = ChangeToken::of(&item.content);
             if let Some(cached) = self.cache.get_mut(&item.id) {
@@ -788,7 +831,22 @@ impl Runtime {
         if snapshot.session_id.is_some() || self.snapshot.session_id.is_some() {
             self.session.launch.session_id = snapshot.session_id.clone();
         }
-        self.turns = turn::group(&snapshot.items);
+        // Each question's boundary is recorded once, against whatever item was
+        // newest when it arrived, so it lands where the reader was actually
+        // asked. The daemon coalesces presentation, so a request delivered in
+        // the same batch as the work it interrupted can be recorded one item
+        // late; that costs a step its group, never the disclosure state of one.
+        self.asked
+            .retain(|id| snapshot.requests.iter().any(|request| &request.id == id));
+        for request in &snapshot.requests {
+            if self.asked.insert(request.id.clone())
+                && let Some(last) = snapshot.items.last()
+            {
+                self.asked_after.insert(last.id.clone());
+            }
+        }
+        self.turns = turn::group(&snapshot.items, &self.asked_after);
+        reconcile_disclosure(&mut self.opened, &self.turns);
         self.snapshot = snapshot;
     }
     pub(super) fn set_visible(&self, visible: bool) -> Result<(), String> {
@@ -803,15 +861,6 @@ impl Runtime {
             self.refresh();
         }
     }
-    /// Whether the turn keyed by `key` still has a step in flight, which is
-    /// the default disclosure state a toggle inverts.
-    fn turn_running(&self, key: &str) -> bool {
-        self.turns
-            .iter()
-            .find(|turn| turn.key == key)
-            .is_some_and(|turn| turn.running)
-    }
-
     /// Why this chat cannot be swapped for its terminal view right now.
     ///
     /// An unsent draft is deliberately absent: `Cagents::chat_forget` stashes
@@ -1983,15 +2032,15 @@ impl Cagents {
             }
             Action::ToggleTurn(target, key) => {
                 if let Some(runtime) = self.chat_runtime_mut(target) {
-                    // The default depends on whether the turn is still
-                    // running, so the toggle is recorded against what is
-                    // currently shown rather than against a fixed value.
-                    let open = runtime
-                        .opened
-                        .get(&key)
-                        .copied()
-                        .unwrap_or_else(|| runtime.turn_running(&key));
-                    runtime.opened.insert(key, !open);
+                    // Every rendered group has a recorded state, written when
+                    // the group was first seen, so a toggle inverts exactly
+                    // what the reader is looking at. A key with no record
+                    // names a group that no longer exists, and inventing a
+                    // state for it would resurrect a strip under a group the
+                    // transcript has moved past.
+                    if let Some(open) = runtime.opened.get_mut(&key) {
+                        *open = !*open;
+                    }
                 }
             }
             Action::Copy(target, id, part) => {
@@ -2335,6 +2384,83 @@ mod tests {
             thinking: false,
             phase: chat::Phase::Final,
         }
+    }
+
+    /// The reader's view of a group's steps must change when they say so, and
+    /// at no other time. A group that opened because it was running stays
+    /// open when it finishes, and a group they closed stays closed while the
+    /// agent keeps adding to it.
+    #[test]
+    fn a_groups_disclosure_survives_the_work_finishing_and_continuing() {
+        let item = |id: &str, role: chat::Role, content: ItemContent| chat::Item {
+            id: id.to_owned(),
+            role,
+            content,
+            at: None,
+        };
+        let shell = |status: chat::ToolStatus| ItemContent::Command {
+            label: String::new(),
+            command: "cargo check".to_owned(),
+            working_directory: String::new(),
+            action: chat::CommandAction::Run,
+            status,
+            exit_code: None,
+            duration_ms: None,
+            output: String::new(),
+        };
+        let transcript = |status: chat::ToolStatus, extra: bool| {
+            let mut items = vec![
+                item("u1", chat::Role::User, text("look at this")),
+                item("c1", chat::Role::Assistant, shell(status)),
+            ];
+            if extra {
+                items.push(item(
+                    "c2",
+                    chat::Role::Assistant,
+                    shell(chat::ToolStatus::Succeeded),
+                ));
+            }
+            items
+        };
+        let mut opened = HashMap::new();
+        let running = turn::group(
+            &transcript(chat::ToolStatus::Running, false),
+            &HashSet::new(),
+        );
+        reconcile_disclosure(&mut opened, &running);
+        assert_eq!(
+            opened.get("u1"),
+            Some(&true),
+            "a group with work in flight shows it without being asked"
+        );
+        let finished = turn::group(
+            &transcript(chat::ToolStatus::Succeeded, false),
+            &HashSet::new(),
+        );
+        reconcile_disclosure(&mut opened, &finished);
+        assert_eq!(
+            opened.get("u1"),
+            Some(&true),
+            "a group the reader never touched must not shut itself when the work ends"
+        );
+        // What `Action::ToggleTurn` does, which is the only other way this
+        // state is allowed to change.
+        *opened.get_mut("u1").expect("the group has a record") = false;
+        let extended = turn::group(
+            &transcript(chat::ToolStatus::Succeeded, true),
+            &HashSet::new(),
+        );
+        reconcile_disclosure(&mut opened, &extended);
+        assert_eq!(
+            opened.get("u1"),
+            Some(&false),
+            "a group the reader closed stays closed when another step arrives"
+        );
+        reconcile_disclosure(&mut opened, &[]);
+        assert!(
+            opened.is_empty(),
+            "a group the store no longer produces is forgotten rather than held for the session"
+        );
     }
 
     /// A conversation that is not in doubt must not be answered with a

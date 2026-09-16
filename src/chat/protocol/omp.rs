@@ -149,6 +149,10 @@ impl Call {
             working_directory: self.working_directory.clone(),
             action: self.action,
             status,
+            // Reported, never classified: the status comes from OMP's own
+            // `isError` flag, so a command that exits non-zero to answer the
+            // question it was asked - a grep with no matches, a `git diff
+            // --quiet` - shows its code without being called a failure.
             exit_code: details["exitCode"]
                 .as_i64()
                 .and_then(|code| i32::try_from(code).ok()),
