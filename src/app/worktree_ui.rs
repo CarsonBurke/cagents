@@ -1508,4 +1508,146 @@ mod tests {
             matches!(&terminal.kind, CardKind::Terminal(session) if session.launch.working_directory == nested)
         );
     }
+
+    /// The sidebar draws worktrees newest first, and a worktree the user has
+    /// just made is the newest one there is. Its only creation evidence used
+    /// to be the destination's filesystem birth time, which overlay and
+    /// network mounts do not keep, so the created row reached the sidebar
+    /// timeless, sorted after every row that had a time, and among the
+    /// timeless rows fell back to path - which put a new `zulu-new` below an
+    /// older `alpha-old` until a later reload happened to patch it from the
+    /// journal. The creation instant now travels with the created record.
+    #[test]
+    fn a_created_worktree_renders_below_the_primary_and_above_an_older_sibling() {
+        let root = tempfile::tempdir().unwrap();
+        let repository = root.path().join("repo");
+        std::fs::create_dir(&repository).unwrap();
+        // Git records the destination it was given, and the journal settles
+        // against canonical paths, so the fixture has to agree with both.
+        let repository = repository.canonicalize().unwrap();
+        let git = |arguments: &[&str]| {
+            let output = std::process::Command::new("git")
+                .arg("-C")
+                .arg(&repository)
+                .args(arguments)
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+        git(&["init", "-b", "main"]);
+        git(&[
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.invalid",
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "--allow-empty",
+            "-m",
+            "base",
+        ]);
+        git(&["worktree", "add", "-b", "alpha-old", "worktrees/alpha-old"]);
+
+        let service = RepositoryService::system("git");
+        let store = crate::persistence::StateStore::open(
+            root.path().join("state.sqlite"),
+            crate::model::BootId::new("worktree-order-test"),
+        )
+        .unwrap();
+        let destination = repository.join("worktrees/zulu-new");
+        let request = CreateWorktreeRequest {
+            repository: repository.clone(),
+            managed_root: repository.join("worktrees"),
+            destination: destination.clone(),
+            branch: crate::repository::ValidatedBranchName::parse("zulu-new").unwrap(),
+            base: crate::repository::BaseRevision::LocalBranch(
+                crate::repository::ValidatedBranchName::parse("main").unwrap(),
+            ),
+            track: false,
+            operation_id: crate::model::OperationId::new(),
+        };
+        let (progress, _progress) = async_channel::bounded(8);
+        let report = service.create_worktree_journaled(
+            &store,
+            &request,
+            1,
+            &CancellationToken::new(),
+            &progress,
+        );
+        assert_eq!(
+            report.state,
+            crate::repository::WorktreeOperationState::Created,
+            "{report:?}"
+        );
+
+        // Stand in for a filesystem that keeps no birth time: strip the listed
+        // time out of the durable journal and recover the operation from it,
+        // so the creation instant can only reach the sidebar by being carried
+        // through the outcome.
+        let journaled = store.journaled_worktree_operations().unwrap().remove(0);
+        let mut timeless = journaled.payload.clone();
+        timeless["outcome"]["worktree"]["created_at_unix_ms"] = serde_json::Value::Null;
+        store
+            .update_operation(
+                journaled.id,
+                &journaled.payload,
+                &timeless,
+                journaled.status,
+            )
+            .unwrap();
+        let report = service
+            .rehydrate_worktree_operations(&store)
+            .unwrap()
+            .remove(0);
+
+        let older = repository.join("worktrees/alpha-old");
+        let project = ProjectId::new();
+        let mut app = super::super::tests::context_inspector_test_app(false);
+        app.sidebar_model.projects = vec![SidebarProject::new(
+            project,
+            RepositoryId::new(),
+            "repo".into(),
+            repository.clone(),
+            service
+                .list_worktrees(&repository, &CancellationToken::new())
+                .unwrap()
+                .into_iter()
+                .filter(|record| record.path != destination)
+                .map(|mut record| {
+                    // Same filesystem, so the rows Git listed are timeless too.
+                    record.created_at_unix_ms = None;
+                    SidebarWorktree::from_repository(&record, None)
+                })
+                .collect(),
+            Vec::new(),
+        )];
+        let _ = app.restore_worktree_scope();
+        let _ = app.update(Message::WorktreeCreated {
+            project_id: project,
+            repository: repository.clone(),
+            result: Ok(report
+                .outcome
+                .expect("a created operation reports its outcome")),
+        });
+
+        let entry = &app.sidebar_model.projects[0];
+        assert_eq!(
+            sidebar::worktrees_in_display_order(
+                &entry.repository,
+                crate::settings::WorktreeSort::Newest,
+                entry.worktrees.iter(),
+            )
+            .iter()
+            .map(|row| row.path.as_path())
+            .collect::<Vec<_>>(),
+            vec![repository.as_path(), destination.as_path(), older.as_path()]
+        );
+    }
 }

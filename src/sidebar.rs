@@ -6683,55 +6683,23 @@ fn filtered_projects<'a>(
                         }
                 })
                 .collect::<Vec<_>>();
-            // The primary-worktree test compares paths, and the comparator ran
-            // it for both sides of every comparison: a fact that is one per row
-            // cost O(n log n) path comparisons per project per frame, on a list
-            // rebuilt by every terminal wake. Resolve it once per row instead.
-            let mut worktrees = project
-                .worktrees
-                .iter()
-                .filter(|worktree| match state.filter {
-                    SidebarFilter::All => true,
-                    SidebarFilter::PullRequests => {
-                        worktree.pull_request_state.is_some()
-                            || matching_pull_request(worktree, project.display_pull_requests())
-                                .is_some()
-                    }
-                    SidebarFilter::Attention => state.has_agent_update(project.id, worktree.id),
-                })
-                .filter(|worktree| project_matches || worktree.matches(&query))
-                .map(|worktree| {
-                    (
-                        is_primary_worktree(&project.repository, &worktree.path),
-                        worktree,
-                    )
-                })
-                .collect::<Vec<_>>();
-            worktrees.sort_by(|(left_primary, left), (right_primary, right)| {
-                right_primary
-                    .cmp(left_primary)
-                    .then_with(|| {
-                        use crate::settings::WorktreeSort;
-                        match state.worktree_sort {
-                            WorktreeSort::Alphabetical => {
-                                left.chrome.label.cmp(&right.chrome.label)
-                            }
-                            order => match (left.created_at_unix_ms, right.created_at_unix_ms) {
-                                (Some(left), Some(right)) => {
-                                    if order == WorktreeSort::Newest {
-                                        right.cmp(&left)
-                                    } else {
-                                        left.cmp(&right)
-                                    }
-                                }
-                                (Some(_), None) => std::cmp::Ordering::Less,
-                                (None, Some(_)) => std::cmp::Ordering::Greater,
-                                (None, None) => std::cmp::Ordering::Equal,
-                            },
+            let worktrees = worktrees_in_display_order(
+                &project.repository,
+                state.worktree_sort,
+                project
+                    .worktrees
+                    .iter()
+                    .filter(|worktree| match state.filter {
+                        SidebarFilter::All => true,
+                        SidebarFilter::PullRequests => {
+                            worktree.pull_request_state.is_some()
+                                || matching_pull_request(worktree, project.display_pull_requests())
+                                    .is_some()
                         }
+                        SidebarFilter::Attention => state.has_agent_update(project.id, worktree.id),
                     })
-                    .then_with(|| left.path.cmp(&right.path))
-            });
+                    .filter(|worktree| project_matches || worktree.matches(&query)),
+            );
             let visible = match state.filter {
                 SidebarFilter::All => {
                     project_matches || !worktrees.is_empty() || !channels.is_empty()
@@ -6742,16 +6710,67 @@ fn filtered_projects<'a>(
             };
             visible.then_some(FilteredProject {
                 project,
-                worktrees: worktrees
-                    .into_iter()
-                    .map(|(_, worktree)| worktree)
-                    .collect(),
+                worktrees,
                 channels,
                 editors: &model.external_editors,
                 state,
             })
         })
         .collect()
+}
+
+/// The one place a project's worktree rows are ordered for display.
+///
+/// The primary worktree is pinned first whatever order is asked for: it is the
+/// repository itself rather than one of its branches and it is never the
+/// newest, so letting the order move it would hide the row every other row is
+/// read relative to.
+///
+/// A row with no creation time sorts after every row that has one, under both
+/// time orders. Creation time is the only evidence a time order can use, and
+/// the creation path stamps the instant it created a worktree, so a row
+/// without one is a worktree Git listed on a filesystem that keeps no birth
+/// time - an import this cannot place in time at all. Sorting those last
+/// leaves them out of an answer they cannot contribute to; sorting them first
+/// would lift every row of such a filesystem above the worktree the user just
+/// made, which is the complaint this ordering exists to answer. Among
+/// themselves they fall back to path, which is the same across frames,
+/// reloads and restarts.
+pub(crate) fn worktrees_in_display_order<'a>(
+    repository: &Path,
+    sort: crate::settings::WorktreeSort,
+    rows: impl IntoIterator<Item = &'a SidebarWorktree>,
+) -> Vec<&'a SidebarWorktree> {
+    use crate::settings::WorktreeSort;
+    // The primary-worktree test compares paths, and the comparator ran it for
+    // both sides of every comparison: a fact that is one per row cost
+    // O(n log n) path comparisons per project per frame, on a list rebuilt by
+    // every terminal wake. Resolve it once per row instead.
+    let mut keyed = rows
+        .into_iter()
+        .map(|worktree| (is_primary_worktree(repository, &worktree.path), worktree))
+        .collect::<Vec<_>>();
+    keyed.sort_by(|(left_primary, left), (right_primary, right)| {
+        right_primary
+            .cmp(left_primary)
+            .then_with(|| match sort {
+                WorktreeSort::Alphabetical => left.chrome.label.cmp(&right.chrome.label),
+                order => match (left.created_at_unix_ms, right.created_at_unix_ms) {
+                    (Some(left), Some(right)) => {
+                        if order == WorktreeSort::Newest {
+                            right.cmp(&left)
+                        } else {
+                            left.cmp(&right)
+                        }
+                    }
+                    (Some(_), None) => std::cmp::Ordering::Less,
+                    (None, Some(_)) => std::cmp::Ordering::Greater,
+                    (None, None) => std::cmp::Ordering::Equal,
+                },
+            })
+            .then_with(|| left.path.cmp(&right.path))
+    });
+    keyed.into_iter().map(|(_, worktree)| worktree).collect()
 }
 
 /// Case-folds a filter key. Entities store the result so the free-text filter
