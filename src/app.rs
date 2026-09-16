@@ -1593,6 +1593,10 @@ fn repository_action_allowed_while_modal(action: &RepositoryAction) -> bool {
             | RepositoryAction::DiffLoaded { .. }
             | RepositoryAction::DiffBasisResolved { .. }
             | RepositoryAction::SaveFinished { .. }
+            // A dropped page render leaves the viewer reading "Rendering
+            // page" for a page it will never draw, because the fence that
+            // accepts the result is the only thing that clears it.
+            | RepositoryAction::PdfPageRendered { .. }
             | RepositoryAction::WorkingDiffDue { .. }
             | RepositoryAction::WorkingDiffLoaded { .. }
             | RepositoryAction::AutoSaveDue { .. }
@@ -2549,6 +2553,9 @@ pub enum Message {
     ChannelUi(channel_ui::Action),
     BranchUi(branch_ui::Action),
     RefreshUi(refresh_ui::Action),
+    /// The shell's light or dark mode changed, so a rendered document page no
+    /// longer matches the surface it sits on.
+    DocumentToneStale,
     /// Opens the confirmation; `ConfirmResetSettings` performs the reset.
     ResetSettings,
     ConfirmResetSettings,
@@ -2917,6 +2924,11 @@ pub struct Cagents {
     update_flush_pending: bool,
     update_generation: u64,
     update_committed: bool,
+    /// A shell theme change has landed that the open document pages were not
+    /// rendered for. It is recorded rather than acted on, because the notice
+    /// arrives on a path whose returned task libcosmic discards, and it is
+    /// cleared only where the render is actually dispatched.
+    document_tone_stale: bool,
     // These owners are declared before `core`: application Drop empties and
     // joins them explicitly, and field drop order is the final backstop.
     #[cfg(feature = "integrated-browser")]
@@ -7082,13 +7094,60 @@ impl Cagents {
             AppTheme::Light => cosmic::Theme::light(),
         };
         let overlay = self.sync_context_overlay_state();
+        let documents = self.retone_documents(&theme);
         Task::batch([
             cosmic::command::set_theme(theme),
             overlay,
+            documents,
             Task::done(cosmic::Action::Cosmic(cosmic::app::Action::ScaleFactor(
                 self.settings.ui_scale,
             ))),
         ])
+    }
+
+    /// Re-renders every open document page for `theme`.
+    ///
+    /// A page's colours are rasterized into it, so the shell changing from
+    /// light to dark leaves exactly the glaring white sheet the adapted tone
+    /// exists to prevent until the page is rendered again. The theme is
+    /// passed rather than read from the global, because the global is set by
+    /// the command this is issued alongside and a page rendered for the
+    /// outgoing theme would be no better than not rendering one at all.
+    fn retone_documents(&mut self, theme: &cosmic::Theme) -> Task<Message> {
+        Task::batch(self.cards.iter_mut().filter_map(|(&card, runtime)| {
+            if let CardRuntime::Repository(runtime) = runtime {
+                Some(repository_task(runtime.retone_document(card, theme)))
+            } else {
+                None
+            }
+        }))
+    }
+
+    /// Renders the open document pages again for the theme now in force.
+    ///
+    /// The theme is read from the global here, which is the one case where
+    /// that is the right source: the shell's change has already been applied
+    /// to it by the time anything asks this, and the notice that it changed
+    /// carried no theme this application is allowed to keep.
+    fn flush_document_tone(&mut self) -> Task<Message> {
+        if !std::mem::take(&mut self.document_tone_stale) {
+            return Task::none();
+        }
+        let theme = cosmic::theme::active();
+        self.retone_documents(&theme)
+    }
+
+    /// Notices that the shell went from light to dark, or back.
+    ///
+    /// This watches the same configuration libcosmic watches, because the
+    /// hook libcosmic offers for it hands back a task that libcosmic itself
+    /// then discards on the path a light or dark flip actually takes. A
+    /// message of this application's own reaches `update`, where a returned
+    /// task is honoured.
+    fn document_tone_subscription(&self) -> Subscription<Message> {
+        self.core
+            .watch_config::<cosmic::cosmic_theme::ThemeMode>(cosmic::cosmic_theme::THEME_MODE_ID)
+            .map(|_| Message::DocumentToneStale)
     }
 
     fn refresh_settings_feedback(&mut self) {
@@ -7342,6 +7401,30 @@ impl Application for Cagents {
         Some(Message::WindowCloseRequested(id))
     }
 
+    /// The shell's own theme changed under us.
+    ///
+    /// An open document page has the tone it was rendered with baked into its
+    /// pixels, so a shell that went from light to dark leaves the reader with
+    /// exactly the glaring page this feature exists to prevent. Only the
+    /// staleness is recorded here, and never the render itself: libcosmic
+    /// discards whatever this returns when the notice arrives as a theme
+    /// change rather than a mode change (`app/cosmic.rs` returns its own
+    /// window commands and drops this task), so dispatching from here would
+    /// leave a page waiting on a render that was never started.
+    ///
+    /// The theme applied to the window is only the shell's while the
+    /// preference follows the system. An explicit Dark or Light choice keeps
+    /// the theme this application already set, and that path re-tones through
+    /// `synchronize_appearance`, whose task is honoured.
+    fn system_theme_update(
+        &mut self,
+        _keys: &[&'static str],
+        _theme: &cosmic::cosmic_theme::Theme,
+    ) -> Task<Message> {
+        self.document_tone_stale = self.settings.app_theme == AppTheme::System;
+        Task::none()
+    }
+
     fn init(mut core: Core, (activation_rx, startup): Self::Flags) -> (Self, Task<Message>) {
         core.window.show_headerbar = false;
         core.window.border_padding = Some(0);
@@ -7432,6 +7515,7 @@ impl Application for Cagents {
             update_flush_pending: false,
             update_generation: 0,
             update_committed: false,
+            document_tone_stale: false,
             settings,
             #[cfg(feature = "integrated-browser")]
             browser_teardowns: Vec::new(),
@@ -9574,7 +9658,15 @@ impl Application for Cagents {
             Message::ChromeUi(action) => self.update_chrome(action),
             Message::ChannelUi(action) => self.handle_channel_ui(action),
             Message::BranchUi(action) => self.update_branch_ui(action),
-            Message::RefreshUi(action) => self.update_refresh(action),
+            Message::RefreshUi(action) => {
+                // A colour-only theme change reaches the hook but not the mode
+                // watch, so the periodic refresh is where that one is caught.
+                Task::batch([self.update_refresh(action), self.flush_document_tone()])
+            }
+            Message::DocumentToneStale => {
+                self.document_tone_stale = self.settings.app_theme == AppTheme::System;
+                self.flush_document_tone()
+            }
             Message::NativeWindowAction(action) => Task::done(cosmic::Action::Cosmic(action)),
             Message::ChatUi(action) => self.handle_chat_ui(action),
             Message::ResetSettings => {
@@ -9766,6 +9858,7 @@ impl Application for Cagents {
         let mut subscriptions = vec![
             self.chat_subscription(),
             self.refresh_subscription(),
+            self.document_tone_subscription(),
             self.terminal_agent_activity_subscription(),
             self.update_subscription(),
             Subscription::run_with(
@@ -12335,6 +12428,17 @@ mod tests {
                 result: Err(crate::editor::FileIoError::Io("fixture".into())),
             }
         ));
+        // A dropped page render is not a lost frame: the viewer reads
+        // "Rendering page" until the result lands, so refusing it while an
+        // inspector or a dialog is open would strand the document viewer on a
+        // page it never draws.
+        assert!(repository_action_allowed_while_modal(
+            &RepositoryAction::PdfPageRendered {
+                card,
+                request: 1,
+                result: Err("fixture".into()),
+            }
+        ));
         for message in [
             Message::NewTerminal,
             Message::NewBrowser,
@@ -13840,6 +13944,7 @@ mod tests {
             update_flush_pending: false,
             update_generation: 0,
             update_committed: false,
+            document_tone_stale: false,
             settings,
             #[cfg(feature = "integrated-browser")]
             browser_teardowns: Vec::new(),

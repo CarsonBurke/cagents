@@ -32,8 +32,8 @@ use crate::{
         highlighter_settings, load_repository_diff,
     },
     editor::{
-        FileContent, FileIoError, ReadOnlyReason, SaveDurability, SaveOutcome, load_file,
-        save_file, validate_repo_path,
+        FileContent, FileIoError, OversizeKind, ReadOnlyReason, SaveDurability, SaveOutcome,
+        load_file, save_file, validate_repo_path,
     },
     lsp::{
         LspCompletionEdit, LspCompletionItem, LspDocumentId, LspPosition, LspRange, LspTextEdit,
@@ -360,10 +360,17 @@ pub enum RepositoryAction {
         page: usize,
         tone: crate::editor::PdfTone,
     },
+    /// The reader chose a tone for the open document, which stops the shell's
+    /// theme deciding it. Separate from `PdfPage` so the state can tell a
+    /// deliberate choice from the tone a page turn or a theme change carries.
+    PdfTone {
+        card: CardId,
+        tone: crate::editor::PdfTone,
+    },
     PdfPageRendered {
         card: CardId,
         request: u64,
-        result: Result<crate::editor::PdfPage, String>,
+        result: Result<crate::editor::DocumentPage, String>,
     },
     DiffLoaded {
         identity: AsyncIdentity,
@@ -547,6 +554,7 @@ impl RepositoryAction {
             | Self::FindNext { card }
             | Self::FindPrevious { card }
             | Self::PdfPage { card, .. }
+            | Self::PdfTone { card, .. }
             | Self::PdfPageRendered { card, .. } => *card,
             Self::FilesLoaded { identity, .. }
             | Self::FileListUnchanged { identity }
@@ -1174,21 +1182,29 @@ enum DocumentState {
         width: u32,
         height: u32,
     },
-    /// A paged document. `bytes` is kept so turning a page re-renders from the
-    /// document the reader opened rather than from whatever is on disk now.
+    /// A paged document. `path` is the file the pages are read from, because
+    /// no document bytes are kept in this process: each page is rendered by a
+    /// child process that re-reads the file, which is what keeps a damaged or
+    /// hostile document from taking the window down with it.
     Pdf {
-        bytes: crate::editor::PdfBytes,
+        path: PathBuf,
         pages: usize,
         page: usize,
         tone: crate::editor::PdfTone,
         handle: iced::widget::image::Handle,
         width: u32,
         height: u32,
-        /// A page turn is rasterized off the UI thread; this is the request
-        /// whose result may still be accepted, so a slow page cannot overwrite
-        /// a later one the reader has already turned to.
-        rendering: Option<u64>,
+        /// The page turn being rendered now, if any. A page is rasterized in
+        /// another process, and the reader can turn faster than that, so only
+        /// one render runs at a time and the newest turn waits in it.
+        rendering: Option<PdfRender>,
         message: Option<String>,
+        /// The tone the reader asked for with the toolbar toggle, which the
+        /// shell's theme then stops deciding. Following the theme is the right
+        /// default and the wrong override: a reader who turned a figure back
+        /// to its own colours did so to read the figure, and a theme change
+        /// is no reason to take that away.
+        chosen_tone: Option<crate::editor::PdfTone>,
     },
     ReadOnly {
         path: PathBuf,
@@ -1198,6 +1214,27 @@ enum DocumentState {
         path: PathBuf,
         message: String,
     },
+}
+
+/// The page turn a child process is rendering now.
+struct PdfRender {
+    /// Which request this is, so a result the reader has already turned away
+    /// from cannot replace the page they are looking at now.
+    request: u64,
+    /// The page and tone being rendered, which become the drawn ones once the
+    /// render succeeds.
+    requested: (usize, crate::editor::PdfTone),
+    /// The page and tone actually on screen. A render can fail - a page past
+    /// the renderer's pixel limit does - and the counter, the tooltip and the
+    /// tone toggle then have to describe the page that is still drawn rather
+    /// than the one that never arrived.
+    drawn: (usize, crate::editor::PdfTone),
+    /// The newest turn the reader asked for while this render was in flight.
+    ///
+    /// Turning twenty pages must cost the two renders the reader can see, not
+    /// twenty that each reparse the document, so intermediate turns replace
+    /// this one and only the last of them is dispatched.
+    pending: Option<(usize, crate::editor::PdfTone)>,
 }
 
 enum DiffState {
@@ -1375,6 +1412,14 @@ pub struct RepositoryRuntime {
     /// Counter fencing PDF page renders. A page turn supersedes the render in
     /// flight, and the reader can turn faster than a page rasterizes.
     pdf_request: u64,
+    /// The tone the open file's load rendered its first document page with.
+    ///
+    /// Taken when the load is dispatched rather than when it completes,
+    /// because a document takes as long to rasterize as it takes and the
+    /// reader may change their shell theme while it does. Reading the theme
+    /// again at completion would record a tone the pixels do not have, and
+    /// the theme-change re-render would then decide there was nothing to do.
+    document_tone: crate::editor::PdfTone,
     file_list_loading: bool,
     /// When the outstanding file-list read started.
     ///
@@ -1541,6 +1586,7 @@ impl RepositoryRuntime {
             generation: 0,
             file_list_generation: 0,
             pdf_request: 0,
+            document_tone: crate::editor::PdfTone::Original,
             file_list_loading: false,
             file_list_started: None,
             file_list_digest: None,
@@ -1628,6 +1674,37 @@ impl RepositoryRuntime {
         self.working_diff.applied = None;
         self.working_diff.additions.clear();
         self.working_diff.removals.clear();
+    }
+
+    /// Re-renders the open document page for `theme`.
+    ///
+    /// A page's colours are baked into its pixels when it is rasterized, so a
+    /// document opened under a light shell stays a glaring white sheet on a
+    /// dark one until the page is rendered again. Anything that is not a
+    /// document, and a page whose tone the theme does not change, renders
+    /// nothing.
+    pub fn retone_document(
+        &mut self,
+        card: CardId,
+        theme: &cosmic::Theme,
+    ) -> Task<RepositoryAction> {
+        let DocumentState::Pdf {
+            page, chosen_tone, ..
+        } = &self.document
+        else {
+            return Task::none();
+        };
+        // A tone the reader picked is theirs to keep.
+        if chosen_tone.is_some() {
+            return Task::none();
+        }
+        let page = *page;
+        let tone = pdf_tone(theme);
+        // The tone the application's theme now asks for. Recording it is what
+        // lets a render that lands afterwards tell whether it was rasterized
+        // for the theme in force or for the one on its way out.
+        self.document_tone = tone;
+        self.update(RepositoryAction::PdfPage { card, page, tone })
     }
 
     pub fn selected_text(&self) -> Option<String> {
@@ -3542,7 +3619,7 @@ impl RepositoryRuntime {
                         width,
                         height,
                     },
-                    Ok(FileContent::Pdf { bytes, pages, page }) => DocumentState::Pdf {
+                    Ok(FileContent::Pdf { pages, page }) => DocumentState::Pdf {
                         handle: iced::widget::image::Handle::from_rgba(
                             page.width,
                             page.height,
@@ -3551,11 +3628,19 @@ impl RepositoryRuntime {
                         width: page.width,
                         height: page.height,
                         page: page.index,
-                        tone: pdf_tone(),
-                        bytes,
+                        // The tone the load baked into these pixels, not the
+                        // theme as it is now: the two differ when the reader
+                        // changed their shell while the document rendered.
+                        tone: self.document_tone,
+                        // The same absolute path the load resolved, because
+                        // every later page is read from the file again.
+                        path: identity.worktree.join(&identity.path),
                         pages,
                         rendering: None,
                         message: None,
+                        // A freshly opened document follows the theme until
+                        // the reader says otherwise.
+                        chosen_tone: None,
                     },
                     Ok(FileContent::ReadOnly(reason)) => DocumentState::ReadOnly {
                         path: identity.path,
@@ -3575,11 +3660,26 @@ impl RepositoryRuntime {
                 // server can serve, and `push_lsp_open` reports nothing for
                 // either of them.
                 self.push_lsp_open(&identity.worktree);
-                self.restore_visible_scroll()
+                // A theme change while the document was rendering had no page
+                // to re-render, so the page reconciles with the shell as it is
+                // now. Nothing to reconcile renders nothing.
+                let retone = self.retone_document(identity.card, &cosmic::theme::active());
+                Task::batch([retone, self.restore_visible_scroll()])
+            }
+            RepositoryAction::PdfTone { card, tone } => {
+                let DocumentState::Pdf {
+                    page, chosen_tone, ..
+                } = &mut self.document
+                else {
+                    return Task::none();
+                };
+                *chosen_tone = Some(tone);
+                let page = *page;
+                self.update(RepositoryAction::PdfPage { card, page, tone })
             }
             RepositoryAction::PdfPage { card, page, tone } => {
                 let DocumentState::Pdf {
-                    bytes,
+                    path,
                     pages,
                     page: current,
                     tone: current_tone,
@@ -3596,57 +3696,121 @@ impl RepositoryRuntime {
                 if page == *current && tone == *current_tone && rendering.is_none() {
                     return Task::none();
                 }
+                // What is drawn right now, which is what the display fields
+                // hold whenever no render is in flight.
+                let drawn = (*current, *current_tone);
                 // The page and tone move now so the controls reflect where the
                 // reader is going, while the image keeps showing the page they
                 // can still read until its replacement arrives.
                 *current = page;
                 *current_tone = tone;
                 *message = None;
+                if let Some(active) = rendering {
+                    // A render is already running. Starting a second one would
+                    // reparse the document and rasterize a page nobody will
+                    // see, so this turn waits, and replaces whichever turn was
+                    // waiting before it. Asking again for what is already
+                    // being rendered queues nothing.
+                    active.pending = (active.requested != (page, tone)).then_some((page, tone));
+                    return Task::none();
+                }
                 self.pdf_request = self.pdf_request.wrapping_add(1);
                 let request = self.pdf_request;
-                *rendering = Some(request);
-                pdf_page_task(card, Arc::clone(bytes), page, tone, request)
+                let path = path.clone();
+                *rendering = Some(PdfRender {
+                    request,
+                    requested: (page, tone),
+                    drawn,
+                    pending: None,
+                });
+                pdf_page_task(card, path, page, tone, request)
             }
             RepositoryAction::PdfPageRendered {
-                card: _,
+                card,
                 request,
                 result,
             } => {
+                // Read before the document is borrowed, because the intent
+                // lives beside it rather than in it.
+                let intended = self.document_tone;
                 let DocumentState::Pdf {
+                    path,
+                    pages,
                     page,
+                    tone,
                     handle,
                     width,
                     height,
                     rendering,
                     message,
-                    ..
+                    chosen_tone,
                 } = &mut self.document
                 else {
                     return Task::none();
                 };
                 // One fence: a page the reader has already turned away from
                 // must not replace the one they are looking at now.
-                if *rendering != Some(request) {
+                let Some(active) = rendering.take_if(|active| active.request == request) else {
                     return Task::none();
-                }
-                *rendering = None;
-                match result {
+                };
+                // What the next render, if the reader queued one, will have to
+                // put back should it fail.
+                let drawn = match result {
                     Ok(rendered) => {
-                        *page = rendered.index;
-                        *width = rendered.width;
-                        *height = rendered.height;
+                        // The child re-read the file, so its page count is
+                        // newer than the one the open reported and the counter
+                        // follows it rather than a count from before.
+                        *pages = rendered.pages;
+                        let raster = rendered.page;
+                        *width = raster.width;
+                        *height = raster.height;
                         *handle = iced::widget::image::Handle::from_rgba(
-                            rendered.width,
-                            rendered.height,
-                            iced::advanced::graphics::core::Bytes::from_owner(rendered.rgba),
+                            raster.width,
+                            raster.height,
+                            iced::advanced::graphics::core::Bytes::from_owner(raster.rgba),
                         );
+                        // The index the child rendered, not the one it was
+                        // asked for, because the drawn page is what the
+                        // counter has to name.
+                        (raster.index, active.requested.1)
                     }
-                    // The previously rendered page stays on screen. Replacing
-                    // it with an error state would take away the page the
-                    // reader could still read.
-                    Err(reason) => *message = Some(reason),
-                }
-                Task::none()
+                    Err(reason) => {
+                        // The previously rendered page stays on screen, so the
+                        // page and tone that describe it go back too: a
+                        // counter, a tooltip and a tone toggle that name a
+                        // page nobody drew would also make the next turn skip
+                        // one. The message is only worth showing while the
+                        // reader is still on the page it is about; a turn they
+                        // have already made replaces it.
+                        if active.pending.is_none() {
+                            *message = Some(reason);
+                        }
+                        active.drawn
+                    }
+                };
+                // A theme change and the raster it invalidates do not arrive
+                // in a defined order, so a page can land rendered for the
+                // theme that was on its way out. Comparing what was drawn
+                // against the tone the application last asked for converges
+                // without assuming either order, and without consulting a
+                // global whose own update is a separate command.
+                let pending = active.pending.or_else(|| {
+                    (chosen_tone.is_none() && drawn.1 != intended).then_some((drawn.0, intended))
+                });
+                let Some((next_page, next_tone)) = pending else {
+                    (*page, *tone) = drawn;
+                    return Task::none();
+                };
+                self.pdf_request = self.pdf_request.wrapping_add(1);
+                let request = self.pdf_request;
+                let path = path.clone();
+                *rendering = Some(PdfRender {
+                    request,
+                    requested: (next_page, next_tone),
+                    drawn,
+                    pending: None,
+                });
+                pdf_page_task(card, path, next_page, next_tone, request)
             }
             RepositoryAction::DiffLoaded {
                 identity,
@@ -4326,8 +4490,9 @@ impl RepositoryRuntime {
         };
         self.source_surface = SourceSurface::Editor;
         self.markdown_mode = MarkdownMode::Edit;
+        self.document_tone = pdf_tone(&cosmic::theme::active());
         let identity = self.next_identity(card, path);
-        file_task(identity)
+        file_task(identity, self.document_tone)
     }
 
     fn diff_mode_index(&self) -> usize {
@@ -4617,27 +4782,31 @@ fn files_task(
     })
 }
 
-/// How a PDF page's colors should be adapted for the shell as it is now.
+/// How a PDF page's colors should be adapted for `theme`.
 ///
 /// A document is authored on white paper. Reading that on a dark shell at
 /// night is what the inverted tone exists for, so the default follows the
-/// active theme rather than making the reader ask for it every time, and the
-/// page's paper is the theme's own raised surface so a document reads as a
-/// sheet lying on the shell rather than a hole cut out of it.
-fn pdf_tone() -> crate::editor::PdfTone {
-    if cosmic::theme::active().theme_type.is_dark() {
-        pdf_tone_inverted()
+/// theme rather than making the reader ask for it every time, and the page's
+/// paper is the theme's own raised surface so a document reads as a sheet
+/// lying on the shell rather than a hole cut out of it.
+///
+/// The theme is a parameter rather than read from the global here, because a
+/// shell theme change has to re-render the open page with the theme it is
+/// changing to, which the application knows before the global is updated.
+fn pdf_tone(theme: &cosmic::Theme) -> crate::editor::PdfTone {
+    if theme.theme_type.is_dark() {
+        pdf_tone_inverted(theme)
     } else {
         crate::editor::PdfTone::Original
     }
 }
 
-/// The inverted tone for the active theme.
+/// The inverted tone for `theme`.
 ///
 /// Separate because the toolbar's toggle asks for it directly: the reader who
 /// presses it has decided they want the page adapted whatever the shell is.
-fn pdf_tone_inverted() -> crate::editor::PdfTone {
-    let paper = cosmic::theme::active().current_container().component.base;
+fn pdf_tone_inverted(theme: &cosmic::Theme) -> crate::editor::PdfTone {
+    let paper = theme.current_container().component.base;
     crate::editor::PdfTone::Inverted {
         paper: [
             (paper.red * 255.0).round() as u8,
@@ -4660,10 +4829,10 @@ fn page_edge(theme: &cosmic::Theme) -> cosmic::widget::container::Style {
     }
 }
 
-fn file_task(identity: AsyncIdentity) -> Task<RepositoryAction> {
+/// Reads the file, rendering a document's first page with `tone`.
+fn file_task(identity: AsyncIdentity, tone: crate::editor::PdfTone) -> Task<RepositoryAction> {
     let worktree = identity.worktree.clone();
     let path = identity.path.clone();
-    let tone = pdf_tone();
     cosmic::task::future(async move {
         let result = tokio::task::spawn_blocking(move || load_file(&worktree, &path, tone))
             .await
@@ -4673,23 +4842,25 @@ fn file_task(identity: AsyncIdentity) -> Task<RepositoryAction> {
     })
 }
 
-/// Rasterizes one page off the UI thread.
+/// Rasterizes one page in a child process.
 ///
-/// A page is tens of milliseconds of CPU at reading resolution, and a complex
+/// A page is tens of milliseconds of CPU at reading resolution and a complex
 /// one is considerably more, so it never runs on the thread that has to draw
-/// the next frame.
+/// the next frame; and because a damaged document can take its renderer down
+/// with it, the renderer is not this process.
 fn pdf_page_task(
     card: CardId,
-    bytes: crate::editor::PdfBytes,
+    path: PathBuf,
     page: usize,
     tone: crate::editor::PdfTone,
     request: u64,
 ) -> Task<RepositoryAction> {
     cosmic::task::future(async move {
-        let result =
-            tokio::task::spawn_blocking(move || crate::editor::render_pdf_page(&bytes, page, tone))
-                .await
-                .unwrap_or_else(|error| Err(format!("page worker failed: {error}")));
+        let result = tokio::task::spawn_blocking(move || {
+            crate::editor::render_document_page(&path, page, tone)
+        })
+        .await
+        .unwrap_or_else(|error| Err(format!("page worker failed: {error}")));
         RepositoryAction::PdfPageRendered {
             card,
             request,
@@ -5734,7 +5905,7 @@ fn editor_surface(card: CardId, runtime: &RepositoryRuntime) -> Element<'_, Repo
         )
         .into(),
         DocumentState::Pdf {
-            bytes: _,
+            path: _,
             pages,
             page,
             tone,
@@ -5743,8 +5914,17 @@ fn editor_surface(card: CardId, runtime: &RepositoryRuntime) -> Element<'_, Repo
             height,
             rendering,
             message,
+            chosen_tone: _,
         } => pdf_document_view(
-            card, *pages, *page, *tone, handle, *width, *height, *rendering, message,
+            card,
+            *pages,
+            *page,
+            *tone,
+            handle,
+            *width,
+            *height,
+            rendering.is_some(),
+            message,
         ),
     };
     widget::column::with_children([content])
@@ -5767,7 +5947,7 @@ fn pdf_document_view<'a>(
     handle: &iced::widget::image::Handle,
     width: u32,
     height: u32,
-    rendering: Option<u64>,
+    rendering: bool,
     message: &'a Option<String>,
 ) -> Element<'a, RepositoryAction> {
     let inverted = matches!(tone, crate::editor::PdfTone::Inverted { .. });
@@ -5804,7 +5984,7 @@ fn pdf_document_view<'a>(
                 .class(cosmic::theme::Text::Custom(crate::design::muted_text))
                 .into(),
         );
-    } else if rendering.is_some() {
+    } else if rendering {
         controls.push(
             widget::text::caption("Rendering…")
                 .class(cosmic::theme::Text::Custom(crate::design::muted_text))
@@ -5825,15 +6005,14 @@ fn pdf_document_view<'a>(
             },
             inverted,
             true,
-            Some(RepositoryAction::PdfPage {
+            Some(RepositoryAction::PdfTone {
                 card,
-                page,
                 tone: if inverted {
                     crate::editor::PdfTone::Original
                 } else {
                     // Deliberately re-read rather than remembered: the reader
                     // may have changed their theme since the page was opened.
-                    pdf_tone_inverted()
+                    pdf_tone_inverted(&cosmic::theme::active())
                 },
             }),
         )
@@ -7102,16 +7281,27 @@ fn read_only_state(path: &Path, reason: &ReadOnlyReason) -> Element<'static, Rep
         ReadOnlyReason::Image(message) | ReadOnlyReason::Document(message) => {
             format!("{}: {message}", path.display())
         }
-        ReadOnlyReason::Oversize { bytes, limit } => format!(
-            "{} is {bytes} bytes; editable files are limited to {limit} bytes.",
-            path.display()
+        // The limit that refused the file is not the same limit for a
+        // document as for a text buffer, so the sentence names what was
+        // actually applied rather than claiming the editable one for both.
+        ReadOnlyReason::Oversize { bytes, limit, kind } => format!(
+            "{} is {bytes} bytes; {} are limited to {limit} bytes.",
+            path.display(),
+            match kind {
+                OversizeKind::Editable => "editable files",
+                OversizeKind::Document => "documents",
+            }
         ),
         ReadOnlyReason::NotRegularFile => format!("{} is not a regular file.", path.display()),
     };
     information_state(
         match reason {
             ReadOnlyReason::Image(_) => "Image preview unavailable",
-            ReadOnlyReason::Document(_) => "Document preview unavailable",
+            ReadOnlyReason::Document(_)
+            | ReadOnlyReason::Oversize {
+                kind: OversizeKind::Document,
+                ..
+            } => "Document preview unavailable",
             _ => "Read-only file",
         },
         &detail,
@@ -10008,6 +10198,289 @@ mod tests {
         assert!(runtime.take_lsp_intents().is_empty());
         assert_eq!(runtime.inspector_context().document, "Image preview");
         assert!(matches!(runtime.document, DocumentState::Image { .. }));
+    }
+
+    /// A card with `book.pdf` open at its first page.
+    fn document_runtime(card: CardId, pages: usize) -> RepositoryRuntime {
+        let (mut runtime, identity) = RepositoryRuntime::selection_fixture(card, "book.pdf");
+        // What `open_file` records before dispatching the read, so the load
+        // lands on the tone the test process's theme asks for and does not
+        // immediately reconcile itself.
+        runtime.document_tone = pdf_tone(&cosmic::theme::active());
+        drop(runtime.update(RepositoryAction::FileLoaded {
+            identity,
+            result: Ok(FileContent::Pdf {
+                pages,
+                page: rendered_document_page(0, pages).page,
+            }),
+        }));
+        runtime
+    }
+
+    fn rendered_document_page(index: usize, pages: usize) -> crate::editor::DocumentPage {
+        crate::editor::DocumentPage {
+            pages,
+            page: crate::editor::PdfPage {
+                index,
+                width: 2,
+                height: 2,
+                rgba: vec![255; 16].into(),
+            },
+        }
+    }
+
+    /// The page, tone, in-flight request and message the viewer is showing.
+    fn document_view_state(
+        runtime: &RepositoryRuntime,
+    ) -> (
+        usize,
+        crate::editor::PdfTone,
+        Option<(usize, crate::editor::PdfTone)>,
+        Option<String>,
+    ) {
+        let DocumentState::Pdf {
+            page,
+            tone,
+            rendering,
+            message,
+            ..
+        } = &runtime.document
+        else {
+            panic!("the fixture opens a document");
+        };
+        (
+            *page,
+            *tone,
+            rendering.as_ref().map(|active| active.requested),
+            message.clone(),
+        )
+    }
+
+    /// A tone that is not `tone`, so a test can tell a restored tone from the
+    /// one it asked for whichever theme the test process runs under.
+    fn other_document_tone(tone: crate::editor::PdfTone) -> crate::editor::PdfTone {
+        match tone {
+            crate::editor::PdfTone::Original => crate::editor::PdfTone::Inverted {
+                paper: [16, 16, 16],
+            },
+            crate::editor::PdfTone::Inverted { .. } => crate::editor::PdfTone::Original,
+        }
+    }
+
+    #[test]
+    fn page_turns_taken_during_a_render_cost_one_more_render_and_land_on_the_last_one() {
+        let card = CardId::new();
+        let mut runtime = document_runtime(card, 30);
+        let tone = document_view_state(&runtime).1;
+        for page in 1..=20 {
+            drop(runtime.update(RepositoryAction::PdfPage { card, page, tone }));
+        }
+        let first = runtime.pdf_request;
+        assert_eq!(
+            first, 1,
+            "each render reparses the document and rasterizes a page, so twenty turns over one \
+             render must dispatch one render, not twenty"
+        );
+        let (page, _, requested, _) = document_view_state(&runtime);
+        assert_eq!(page, 20, "the counter follows the reader, not the renderer");
+        assert_eq!(requested, Some((1, tone)));
+        drop(runtime.update(RepositoryAction::PdfPageRendered {
+            card,
+            request: first,
+            result: Ok(rendered_document_page(1, 30)),
+        }));
+        assert_eq!(
+            document_view_state(&runtime).2,
+            Some((20, tone)),
+            "the turn that was waiting is the last one the reader asked for"
+        );
+        assert_eq!(runtime.pdf_request, first + 1);
+        drop(runtime.update(RepositoryAction::PdfPageRendered {
+            card,
+            request: first + 1,
+            result: Ok(rendered_document_page(20, 30)),
+        }));
+        let (page, _, requested, _) = document_view_state(&runtime);
+        assert_eq!(page, 20, "the reader ends on the page they last asked for");
+        assert_eq!(requested, None, "nothing is left queued or in flight");
+        assert_eq!(runtime.pdf_request, first + 1);
+    }
+
+    #[test]
+    fn a_failed_page_render_puts_back_the_page_and_tone_that_are_still_drawn() {
+        let card = CardId::new();
+        let mut runtime = document_runtime(card, 30);
+        let (drawn_page, drawn_tone, ..) = document_view_state(&runtime);
+        drop(runtime.update(RepositoryAction::PdfPage {
+            card,
+            page: 7,
+            tone: other_document_tone(drawn_tone),
+        }));
+        assert_eq!(document_view_state(&runtime).0, 7);
+        drop(runtime.update(RepositoryAction::PdfPageRendered {
+            card,
+            request: runtime.pdf_request,
+            result: Err("page 8 is too large to render".into()),
+        }));
+        let (page, tone, requested, message) = document_view_state(&runtime);
+        assert_eq!(
+            page, drawn_page,
+            "the counter has to describe the page that is on screen"
+        );
+        assert_eq!(
+            tone, drawn_tone,
+            "the tone toggle has to describe the page that is on screen"
+        );
+        assert_eq!(requested, None);
+        assert_eq!(message.as_deref(), Some("page 8 is too large to render"));
+        drop(runtime.update(RepositoryAction::PdfPage {
+            card,
+            page: drawn_page + 1,
+            tone: drawn_tone,
+        }));
+        assert_eq!(
+            document_view_state(&runtime).2,
+            Some((drawn_page + 1, drawn_tone)),
+            "the next turn moves one page from the drawn one rather than skipping it"
+        );
+    }
+
+    #[test]
+    fn a_render_that_fails_under_a_queued_turn_still_takes_the_reader_there() {
+        let card = CardId::new();
+        let mut runtime = document_runtime(card, 30);
+        let tone = document_view_state(&runtime).1;
+        drop(runtime.update(RepositoryAction::PdfPage {
+            card,
+            page: 9,
+            tone,
+        }));
+        let failing = runtime.pdf_request;
+        drop(runtime.update(RepositoryAction::PdfPage {
+            card,
+            page: 4,
+            tone,
+        }));
+        drop(runtime.update(RepositoryAction::PdfPageRendered {
+            card,
+            request: failing,
+            result: Err("page 10 is too large to render".into()),
+        }));
+        let (page, _, requested, message) = document_view_state(&runtime);
+        assert_eq!(requested, Some((4, tone)), "the queued turn still happens");
+        assert_eq!(page, 4);
+        assert_eq!(
+            message, None,
+            "a failure the reader has already turned away from is not worth a notice"
+        );
+        drop(runtime.update(RepositoryAction::PdfPageRendered {
+            card,
+            request: runtime.pdf_request,
+            result: Ok(rendered_document_page(4, 30)),
+        }));
+        assert_eq!(document_view_state(&runtime).0, 4);
+    }
+
+    /// A shell that changes under an open document leaves the page rendered
+    /// for the other one, so the page is rendered again exactly once, and a
+    /// theme that asks for the tone already drawn asks for no render at all.
+    #[test]
+    fn a_shell_theme_change_renders_the_open_page_again_for_the_new_theme() {
+        let card = CardId::new();
+        let mut runtime = document_runtime(card, 4);
+        // The tone the open baked, which is the one the test process's theme
+        // asks for, so nothing is stale before the shell changes.
+        let opened = runtime.document_tone;
+        drop(runtime.update(RepositoryAction::PdfPageRendered {
+            card,
+            request: runtime.pdf_request,
+            result: Ok(rendered_document_page(0, 4)),
+        }));
+        assert_eq!(document_view_state(&runtime).1, opened);
+        let dispatched = runtime.pdf_request;
+        // The shell the open was not rendered for. Which of the two it is
+        // follows from the theme the test process runs under, so the other
+        // one is chosen rather than named.
+        let (other, other_tone) = [cosmic::Theme::dark(), cosmic::Theme::light()]
+            .into_iter()
+            .map(|theme| (theme.clone(), pdf_tone(&theme)))
+            .find(|(_, tone)| *tone != opened)
+            .expect("the two shells ask for different tones");
+        drop(runtime.retone_document(card, &other));
+        let (_, tone, requested, _) = document_view_state(&runtime);
+        assert_eq!(
+            tone, other_tone,
+            "a page rendered for one shell is wrong on the other"
+        );
+        assert_eq!(requested, Some((0, other_tone)));
+        assert_eq!(runtime.pdf_request, dispatched + 1);
+        drop(runtime.update(RepositoryAction::PdfPageRendered {
+            card,
+            request: runtime.pdf_request,
+            result: Ok(rendered_document_page(0, 4)),
+        }));
+        drop(runtime.retone_document(card, &other));
+        assert_eq!(
+            runtime.pdf_request,
+            dispatched + 1,
+            "a theme that leaves the tone alone must not rasterize the page again"
+        );
+    }
+
+    #[test]
+    fn a_theme_change_while_the_first_page_rendered_is_reconciled_when_it_arrives() {
+        let card = CardId::new();
+        let (mut runtime, identity) = RepositoryRuntime::selection_fixture(card, "book.pdf");
+        let shell = pdf_tone(&cosmic::theme::active());
+        // The load was dispatched under the other shell and the reader changed
+        // it while the first page rasterized, when there was no page to
+        // re-render.
+        runtime.document_tone = other_document_tone(shell);
+        drop(runtime.update(RepositoryAction::FileLoaded {
+            identity,
+            result: Ok(FileContent::Pdf {
+                pages: 4,
+                page: rendered_document_page(0, 4).page,
+            }),
+        }));
+        let (page, tone, requested, _) = document_view_state(&runtime);
+        assert_eq!(page, 0);
+        assert_eq!(
+            tone, shell,
+            "the page the load baked for the old shell has to be rendered again for this one"
+        );
+        assert_eq!(requested, Some((0, shell)));
+    }
+
+    /// A reader who turns a page back to its own colours did so to read it.
+    /// The shell changing underneath is no reason to take that away, and it
+    /// is the only thing that stops following the theme being right.
+    #[test]
+    fn a_tone_the_reader_chose_outlives_a_theme_change() {
+        let card = CardId::new();
+        let mut runtime = document_runtime(card, 4);
+        drop(runtime.update(RepositoryAction::PdfPageRendered {
+            card,
+            request: runtime.pdf_request,
+            result: Ok(rendered_document_page(0, 4)),
+        }));
+        let chosen = other_document_tone(runtime.document_tone);
+        drop(runtime.update(RepositoryAction::PdfTone { card, tone: chosen }));
+        drop(runtime.update(RepositoryAction::PdfPageRendered {
+            card,
+            request: runtime.pdf_request,
+            result: Ok(rendered_document_page(0, 4)),
+        }));
+        let settled = runtime.pdf_request;
+        assert_eq!(document_view_state(&runtime).1, chosen);
+        for theme in [cosmic::Theme::dark(), cosmic::Theme::light()] {
+            drop(runtime.retone_document(card, &theme));
+        }
+        assert_eq!(
+            runtime.pdf_request, settled,
+            "neither shell may rasterize over the tone the reader asked for"
+        );
+        assert_eq!(document_view_state(&runtime).1, chosen);
     }
 
     #[test]
