@@ -987,6 +987,15 @@ pub struct ProjectChannel {
     pub id: ChannelId,
     pub project_id: ProjectId,
     pub title: String,
+    /// The creation rank the shared registry assigned, mirrored here so the
+    /// order survives a restart without a daemon round trip.
+    ///
+    /// A workspace serialized before the shared model existed has no rank, and
+    /// zero is the right default for it: such a channel predates every ranked
+    /// one, and ties keep their durable order, so the pre-existing channels stay
+    /// in the order they were created in.
+    #[serde(default)]
+    pub ordinal: u32,
     pub cards: Vec<CardId>,
     pub focused: Option<CardId>,
 }
@@ -1223,6 +1232,7 @@ mod tests {
                 id: a,
                 project_id,
                 title: "A".into(),
+                ordinal: 1,
                 cards: vec![first, first, missing],
                 focused: Some(missing),
             },
@@ -1230,6 +1240,7 @@ mod tests {
                 id: b,
                 project_id,
                 title: "B".into(),
+                ordinal: 2,
                 cards: vec![first, second],
                 focused: Some(first),
             },

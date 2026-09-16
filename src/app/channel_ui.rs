@@ -2,6 +2,7 @@ use super::*;
 use crate::agent::ActivityState;
 use crate::model::{ChannelId, ProjectChannel};
 use crate::sidebar::SidebarChannel;
+use crate::workspace_model::{ModelEdit, PENDING_ORDINAL};
 
 #[derive(Debug, Clone, Copy)]
 pub enum Action {
@@ -111,9 +112,15 @@ impl Cagents {
                         // Empty means awaiting the conversation's first meaningful title.
                         // Nonempty names, including user edits, are never replaced here.
                         title: String::new(),
+                        // The registry assigns the real rank and this window
+                        // learns it from the answer to the publish below. Until
+                        // then the channel outranks every ranked one, which is
+                        // the truth about something created a moment ago.
+                        ordinal: PENDING_ORDINAL,
                         cards: Vec::new(),
                         focused: None,
                     });
+                self.publish_channel_creation(id, project_id);
                 self.sidebar_state.reveal_project(project_id);
                 self.show_workspace_for_action();
                 let scope = self.select_channel(id);
@@ -178,7 +185,7 @@ impl Cagents {
     /// retired with it rather than left behind as durable cards no scope can
     /// show - the same treatment worktree deletion gives the cards of the
     /// directory it removes.
-    fn delete_channel(&mut self, id: ChannelId) -> Task<Message> {
+    pub(super) fn delete_channel(&mut self, id: ChannelId) -> Task<Message> {
         let Some(index) = self
             .durable
             .channels
@@ -188,23 +195,35 @@ impl Cagents {
             return Task::none();
         };
         let project_id = self.durable.channels[index].project_id;
+        let ordinal = self.durable.channels[index].ordinal;
         let was_active = self.durable.active_channel == Some(id);
-        let siblings: Vec<(usize, ChannelId)> = self
+        // The channel below the deleted one in the sidebar, or the one above it
+        // when the project's oldest channel is the one going away. Below means
+        // the next lower rank, because the sidebar renders newest first.
+        let mut below = None::<&ProjectChannel>;
+        let mut above = None::<&ProjectChannel>;
+        for channel in self
             .durable
             .channels
             .iter()
-            .enumerate()
-            .filter(|(position, channel)| *position != index && channel.project_id == project_id)
-            .map(|(position, channel)| (position, channel.id))
-            .collect();
-        // The channel that takes the deleted one's place, or the one above it
-        // when the project's last channel is the one going away.
-        let successor = siblings
-            .iter()
-            .find(|(position, _)| *position > index)
-            .or_else(|| siblings.last())
-            .map(|(_, id)| *id);
+            .filter(|channel| channel.id != id && channel.project_id == project_id)
+        {
+            if channel.ordinal <= ordinal {
+                if below.is_none_or(|best| channel.ordinal > best.ordinal) {
+                    below = Some(channel);
+                }
+            } else if above.is_none_or(|best| channel.ordinal < best.ordinal) {
+                above = Some(channel);
+            }
+        }
+        let successor = below.or(above).map(|channel| channel.id);
         let channel = Arc::make_mut(&mut self.durable).channels.remove(index);
+        // Every window loses the channel, not only this one. A deletion that
+        // arrived from the registry publishes it right back, which the registry
+        // answers as a no-op because the channel is already gone - cheaper than
+        // threading an origin flag through the one path that must behave
+        // identically whoever asked.
+        self.publish_model_edit(ModelEdit::DeleteChannel { id });
         for card in channel.cards {
             self.retire_lsp_card(card);
             self.cards.remove(&card);
@@ -289,7 +308,7 @@ impl Cagents {
     /// Refresh cached rows after state changes, never during rendering. A channel's
     /// conversation supplies its initial name, but cannot overwrite a saved name.
     pub(super) fn refresh_sidebar_channels(&mut self) {
-        let mut renamed = false;
+        let mut renamed = Vec::new();
         for index in 0..self.durable.channels.len() {
             let channel = &self.durable.channels[index];
             if !channel.title.is_empty() {
@@ -306,11 +325,19 @@ impl Cagents {
                 normalize_card_name(&card.title)
             });
             if let Some(title) = title {
-                Arc::make_mut(&mut self.durable).channels[index].title = title;
-                renamed = true;
+                let durable = Arc::make_mut(&mut self.durable);
+                durable.channels[index].title = title.clone();
+                renamed.push((durable.channels[index].id, title));
             }
         }
-        if renamed {
+        if !renamed.is_empty() {
+            // The window that derives a title is the shared title's writer for
+            // that moment, and a window that receives one adopts it even where
+            // its own derivation would differ. The guard above is what stops a
+            // later derivation from fighting a title that already exists.
+            for (id, title) in renamed {
+                self.publish_model_edit(ModelEdit::RetitleChannel { id, title });
+            }
             self.persist();
         }
 
@@ -318,10 +345,15 @@ impl Cagents {
         let state = &self.sidebar_state;
         for project in &mut self.sidebar_model.projects {
             let mut index = 0;
+            // Newest first. The durable vector keeps the registry's ascending
+            // creation ranks, because that is the order the registry assigns and
+            // the order a seed donates; display inverts it, because a channel is
+            // created to be used now and belongs where the pointer already is.
             for channel in durable
                 .channels
                 .iter()
                 .filter(|channel| channel.project_id == project.id)
+                .rev()
             {
                 let title = channel_display_title(channel);
                 let selected = durable.active_channel == Some(channel.id);
@@ -395,6 +427,41 @@ fn channel_display_title(channel: &ProjectChannel) -> &str {
 mod tests {
     use super::*;
 
+    /// A channel is created to be used now, so the newest belongs at the top of
+    /// its project rather than at the bottom of a list that only grows.
+    #[test]
+    fn a_newly_created_channel_renders_above_the_ones_before_it() {
+        let mut app = super::super::tests::context_inspector_test_app(true);
+        let project = ProjectId::new();
+        app.sidebar_model.projects.push(SidebarProject::new(
+            project,
+            RepositoryId::new(),
+            "project".into(),
+            "/repo".into(),
+            vec![crate::sidebar::SidebarWorktree::from_durable(
+                crate::model::WorktreeId::new(),
+                "/repo".into(),
+                Some("main".into()),
+            )],
+            Vec::new(),
+        ));
+
+        let _ = app.handle_channel_ui(Action::Create(project));
+        let first = app.durable.active_channel.expect("the first channel opens");
+        let _ = app.handle_channel_ui(Action::Create(project));
+        let second = app
+            .durable
+            .active_channel
+            .expect("the second channel opens");
+        assert_ne!(first, second);
+
+        app.refresh_sidebar_channels();
+        let rows = &app.sidebar_model.projects[0].channels;
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].id, second, "the newest channel is the top row");
+        assert_eq!(rows[1].id, first);
+    }
+
     #[test]
     fn channel_waits_for_a_conversation_name_and_preserves_saved_names() {
         let mut app = super::super::tests::context_inspector_test_app(true);
@@ -410,6 +477,7 @@ mod tests {
             id,
             project_id: project,
             title: String::new(),
+            ordinal: 0,
             cards: vec![card],
             focused: Some(card),
         });
@@ -490,6 +558,7 @@ mod tests {
             id,
             project_id: project,
             title: "Investigation".into(),
+            ordinal: 0,
             cards: vec![terminal, first, second],
             focused: Some(first),
         });
@@ -540,6 +609,7 @@ mod tests {
             id: doomed,
             project_id: project,
             title: "Investigation".into(),
+            ordinal: 0,
             cards: vec![conversation],
             focused: Some(conversation),
         });
@@ -547,6 +617,7 @@ mod tests {
             id: survivor,
             project_id: project,
             title: "Migration".into(),
+            ordinal: 0,
             cards: Vec::new(),
             focused: None,
         });

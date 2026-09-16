@@ -1,0 +1,713 @@
+//! The daemon's durable registry for the shared half of the sidebar model.
+//!
+//! A window is not the authority for which projects and channels exist: two
+//! windows are two processes with two databases, and the CLI has neither. The
+//! daemon is the one process that outlives a window and that every client can
+//! already talk to, so it owns the shared model and every window mirrors it.
+//!
+//! The store lives in the data directory rather than the runtime directory,
+//! because a channel a user created must still be there after a reboot, while
+//! the runtime directory is deliberately swept when the session ends.
+
+use std::{
+    fs, io,
+    os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt},
+    path::{Path, PathBuf},
+    time::Duration,
+};
+
+use rusqlite::{Connection, OptionalExtension, params};
+
+use crate::{
+    model::ChannelId,
+    workspace_model::{ModelChannel, ModelEdit, ModelProject, WorkspaceModel},
+};
+
+/// A writer that loses a race waits rather than failing. Only the daemon writes
+/// this store, so contention is between its own client threads and is measured
+/// in microseconds; the timeout exists for the WAL checkpoint, not for a rival.
+const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
+
+const DIRECTORY_MODE: u32 = 0o700;
+const FILE_MODE: u32 = 0o600;
+
+/// The outcome of one edit.
+#[derive(Debug)]
+pub(crate) struct Applied {
+    pub(crate) model: WorkspaceModel,
+    /// Whether the edit changed anything. A retitle to the same title, or a
+    /// delete of a channel that is already gone, must neither bump `sequence`
+    /// nor wake a watcher: a window that reacted to it would redraw for nothing
+    /// and, worse, could not tell the no-op apart from a real edge.
+    pub(crate) changed: bool,
+}
+
+pub(crate) struct Registry {
+    db: Connection,
+}
+
+impl Registry {
+    /// Opens the registry in this installation's data directory.
+    pub(crate) fn open() -> Result<Self, String> {
+        let dirs = crate::instance::project_dirs()
+            .ok_or_else(|| "the data directory is unavailable".to_owned())?;
+        Self::at(&dirs.data_dir().join("workspace-model.sqlite3"))
+    }
+
+    /// Opens or creates the registry at `path`.
+    pub(crate) fn at(path: &Path) -> Result<Self, String> {
+        if let Some(parent) = path.parent() {
+            create_private_directory(parent)
+                .map_err(|error| format!("cannot create {}: {error}", parent.display()))?;
+        }
+        prepare_private_file(path)
+            .map_err(|error| format!("cannot prepare {}: {error}", path.display()))?;
+        let db = Connection::open(path).map_err(|error| error.to_string())?;
+        configure(&db)?;
+        migrate(&db)?;
+        Ok(Self { db })
+    }
+
+    /// The whole model, ordered by the ranks the registry assigned.
+    pub(crate) fn model(&self) -> Result<WorkspaceModel, String> {
+        let sequence: i64 = self
+            .db
+            .query_row("SELECT sequence FROM metadata WHERE key = 0", [], |row| {
+                row.get(0)
+            })
+            .map_err(|error| error.to_string())?;
+        let mut projects = self
+            .db
+            .prepare("SELECT repository, name, ordinal FROM projects ORDER BY ordinal")
+            .map_err(|error| error.to_string())?;
+        let projects = projects
+            .query_map([], |row| {
+                Ok(ModelProject {
+                    repository: PathBuf::from(row.get::<_, String>(0)?),
+                    name: row.get(1)?,
+                    ordinal: row.get::<_, i64>(2)? as u32,
+                })
+            })
+            .and_then(Iterator::collect::<rusqlite::Result<Vec<_>>>)
+            .map_err(|error| error.to_string())?;
+        let mut channels = self
+            .db
+            .prepare("SELECT id, repository, title, ordinal FROM channels ORDER BY ordinal")
+            .map_err(|error| error.to_string())?;
+        let rows = channels
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, i64>(3)?,
+                ))
+            })
+            .and_then(Iterator::collect::<rusqlite::Result<Vec<_>>>)
+            .map_err(|error| error.to_string())?;
+        let channels = rows
+            .into_iter()
+            .map(|(id, repository, title, ordinal)| {
+                Ok(ModelChannel {
+                    id: parse_channel_id(&id)?,
+                    repository: PathBuf::from(repository),
+                    title,
+                    ordinal: ordinal as u32,
+                })
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+        Ok(WorkspaceModel {
+            sequence: sequence as u64,
+            projects,
+            channels,
+        })
+    }
+
+    /// Applies one edit as a single transaction, bumping `sequence` when it
+    /// changed anything.
+    ///
+    /// The caller has already resolved the edit's repository key; this never
+    /// touches the filesystem, so an edit is decided entirely from the store.
+    pub(crate) fn apply(&mut self, edit: &ModelEdit) -> Result<Applied, String> {
+        let transaction = self.db.transaction().map_err(|error| error.to_string())?;
+        let changed = match edit {
+            ModelEdit::OpenProject { repository, name } => {
+                let key = repository_key(repository)?;
+                let existing: Option<String> = transaction
+                    .query_row(
+                        "SELECT name FROM projects WHERE repository = ?1",
+                        params![key],
+                        |row| row.get(0),
+                    )
+                    .optional()
+                    .map_err(|error| error.to_string())?;
+                match existing {
+                    Some(current) if current == *name => false,
+                    Some(_) => {
+                        transaction
+                            .execute(
+                                "UPDATE projects SET name = ?2 WHERE repository = ?1",
+                                params![key, name],
+                            )
+                            .map_err(|error| error.to_string())?;
+                        true
+                    }
+                    None => {
+                        let ordinal = take_ordinal(&transaction, "next_project_ordinal")?;
+                        transaction
+                            .execute(
+                                "INSERT INTO projects(repository, name, ordinal) \
+                                 VALUES (?1, ?2, ?3)",
+                                params![key, name, ordinal],
+                            )
+                            .map_err(|error| error.to_string())?;
+                        true
+                    }
+                }
+            }
+            // The channels go with it through the foreign key's cascade, which
+            // `foreign_keys = ON` is verified to enforce: a channel in a project
+            // nobody has open is reachable from no window's sidebar.
+            ModelEdit::CloseProject { repository } => {
+                let key = repository_key(repository)?;
+                transaction
+                    .execute("DELETE FROM projects WHERE repository = ?1", params![key])
+                    .map_err(|error| error.to_string())?
+                    > 0
+            }
+            ModelEdit::CreateChannel {
+                id,
+                repository,
+                title,
+            } => {
+                let key = repository_key(repository)?;
+                let exists: bool = transaction
+                    .query_row(
+                        "SELECT EXISTS(SELECT 1 FROM channels WHERE id = ?1)",
+                        params![id.to_string()],
+                        |row| row.get(0),
+                    )
+                    .map_err(|error| error.to_string())?;
+                if exists {
+                    false
+                } else {
+                    let owned: bool = transaction
+                        .query_row(
+                            "SELECT EXISTS(SELECT 1 FROM projects WHERE repository = ?1)",
+                            params![key],
+                            |row| row.get(0),
+                        )
+                        .map_err(|error| error.to_string())?;
+                    if !owned {
+                        return Err(format!(
+                            "no project owns `{key}`; open the project before creating a channel \
+                             in it"
+                        ));
+                    }
+                    let ordinal = take_ordinal(&transaction, "next_channel_ordinal")?;
+                    transaction
+                        .execute(
+                            "INSERT INTO channels(id, repository, title, ordinal) \
+                             VALUES (?1, ?2, ?3, ?4)",
+                            params![id.to_string(), key, title, ordinal],
+                        )
+                        .map_err(|error| error.to_string())?;
+                    true
+                }
+            }
+            // An unknown id is a no-op rather than an error: a retitle that
+            // raced a delete must not resurrect the channel the delete removed,
+            // and the window that issued it has nothing useful to do with a
+            // failure.
+            ModelEdit::RetitleChannel { id, title } => {
+                transaction
+                    .execute(
+                        "UPDATE channels SET title = ?2 WHERE id = ?1 AND title <> ?2",
+                        params![id.to_string(), title],
+                    )
+                    .map_err(|error| error.to_string())?
+                    > 0
+            }
+            ModelEdit::DeleteChannel { id } => {
+                transaction
+                    .execute(
+                        "DELETE FROM channels WHERE id = ?1",
+                        params![id.to_string()],
+                    )
+                    .map_err(|error| error.to_string())?
+                    > 0
+            }
+        };
+        if changed {
+            transaction
+                .execute(
+                    "UPDATE metadata SET sequence = sequence + 1 WHERE key = 0",
+                    [],
+                )
+                .map_err(|error| error.to_string())?;
+        }
+        transaction.commit().map_err(|error| error.to_string())?;
+        Ok(Applied {
+            model: self.model()?,
+            changed,
+        })
+    }
+
+    /// Adopts a window's existing sidebar state, once and only once.
+    ///
+    /// This is the migration path for a workspace that predates the registry.
+    /// The window sends its projects and channels in its own durable order -
+    /// oldest first - and the registry assigns the ranks, because the ranks are
+    /// what two windows have to agree on and a window's own numbering is not
+    /// comparable with another's.
+    ///
+    /// Returns the edits it actually applied, so the daemon can announce them to
+    /// every other watcher: a seed is defined as a batch of upserts, so its
+    /// edges are exactly those upserts.
+    pub(crate) fn seed(
+        &mut self,
+        projects: &[ModelProject],
+        channels: &[ModelChannel],
+    ) -> Result<(WorkspaceModel, Vec<ModelEdit>), String> {
+        if self.seeded()? {
+            return Ok((self.model()?, Vec::new()));
+        }
+        let mut applied = Vec::new();
+        for project in projects {
+            let edit = ModelEdit::OpenProject {
+                repository: project.repository.clone(),
+                name: project.name.clone(),
+            };
+            // One unrepresentable row must not abandon the migration: the rest
+            // of the window's state is still worth adopting, and a row that
+            // cannot be stored is reported rather than retried forever.
+            match self.apply(&edit) {
+                Ok(outcome) if outcome.changed => applied.push(edit),
+                Ok(_) => {}
+                Err(error) => tracing::warn!(%error, "a seeded project was not adopted"),
+            }
+        }
+        for channel in channels {
+            let edit = ModelEdit::CreateChannel {
+                id: channel.id,
+                repository: channel.repository.clone(),
+                title: channel.title.clone(),
+            };
+            match self.apply(&edit) {
+                Ok(outcome) if outcome.changed => applied.push(edit),
+                Ok(_) => {}
+                Err(error) => tracing::warn!(%error, "a seeded channel was not adopted"),
+            }
+        }
+        // Marked regardless of what was adopted. A window with nothing to donate
+        // still answers the question the flag exists to answer - has any window
+        // ever offered its state - and leaving it unset would make every window
+        // keep offering, and keep refusing to converge on a registry it is
+        // entitled to treat as authoritative.
+        self.db
+            .execute("UPDATE metadata SET seeded = 1 WHERE key = 0", [])
+            .map_err(|error| error.to_string())?;
+        Ok((self.model()?, applied))
+    }
+
+    fn seeded(&self) -> Result<bool, String> {
+        self.db
+            .query_row("SELECT seeded FROM metadata WHERE key = 0", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .map(|seeded| seeded != 0)
+            .map_err(|error| error.to_string())
+    }
+}
+
+/// Reserves the next rank of `column` and returns it.
+///
+/// A rank is never reused, so deleting the newest channel does not hand its
+/// number to the next one: two windows compare ranks to agree on order, and a
+/// reused rank would make a new channel sort where the deleted one used to be.
+fn take_ordinal(transaction: &rusqlite::Transaction<'_>, column: &str) -> Result<i64, String> {
+    let ordinal: i64 = transaction
+        .query_row(
+            &format!("SELECT {column} FROM metadata WHERE key = 0"),
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|error| error.to_string())?;
+    transaction
+        .execute(
+            &format!("UPDATE metadata SET {column} = {column} + 1 WHERE key = 0"),
+            [],
+        )
+        .map_err(|error| error.to_string())?;
+    Ok(ordinal)
+}
+
+/// The stored spelling of a repository key.
+///
+/// Every key that can reach the daemon over the wire is already UTF-8, because
+/// serde cannot serialize a non-UTF-8 `PathBuf` at all. Storing text rather than
+/// bytes therefore loses nothing and keeps the store readable with `sqlite3`,
+/// which is worth a great deal when diagnosing what two windows disagree about.
+fn repository_key(repository: &Path) -> Result<&str, String> {
+    repository.to_str().ok_or_else(|| {
+        format!(
+            "repository path `{}` is not valid UTF-8",
+            repository.display()
+        )
+    })
+}
+
+fn parse_channel_id(value: &str) -> Result<ChannelId, String> {
+    value
+        .parse::<ChannelId>()
+        .map_err(|error| format!("stored channel id `{value}` is unreadable: {error}"))
+}
+
+fn create_private_directory(path: &Path) -> io::Result<()> {
+    match fs::DirBuilder::new()
+        .recursive(true)
+        .mode(DIRECTORY_MODE)
+        .create(path)
+    {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
+/// Creates the store file with a private mode, or re-asserts the mode of one
+/// that already exists.
+///
+/// The model names every repository the user has open, which is nobody else's
+/// business on a shared machine.
+fn prepare_private_file(path: &Path) -> io::Result<()> {
+    match fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(FILE_MODE)
+        .open(path)
+    {
+        Ok(_) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+            fs::set_permissions(path, fs::Permissions::from_mode(FILE_MODE))
+        }
+        Err(error) => Err(error),
+    }
+}
+
+/// Applies the pragmas this store depends on, and verifies each one.
+///
+/// `foreign_keys` is load-bearing rather than hygienic: closing a project
+/// removes its channels through the cascade, so an unenforced foreign key would
+/// silently leave channels behind that no sidebar can reach. `NORMAL` is the
+/// documented companion to WAL and is durable across an application crash,
+/// which is the failure this store has to survive.
+fn configure(db: &Connection) -> Result<(), String> {
+    db.busy_timeout(BUSY_TIMEOUT)
+        .map_err(|error| error.to_string())?;
+    db.execute_batch(
+        "PRAGMA foreign_keys = ON;
+         PRAGMA journal_mode = WAL;
+         PRAGMA synchronous = NORMAL;",
+    )
+    .map_err(|error| error.to_string())?;
+    let foreign_keys: i64 = db
+        .pragma_query_value(None, "foreign_keys", |row| row.get(0))
+        .map_err(|error| error.to_string())?;
+    if foreign_keys != 1 {
+        return Err("SQLite foreign key enforcement could not be enabled".into());
+    }
+    let journal_mode: String = db
+        .pragma_query_value(None, "journal_mode", |row| row.get(0))
+        .map_err(|error| error.to_string())?;
+    if !journal_mode.eq_ignore_ascii_case("wal") {
+        return Err(format!(
+            "SQLite journal mode is `{journal_mode}`, but write-ahead logging is required"
+        ));
+    }
+    // 0 = OFF, 1 = NORMAL, 2 = FULL, 3 = EXTRA.
+    let synchronous: i64 = db
+        .pragma_query_value(None, "synchronous", |row| row.get(0))
+        .map_err(|error| error.to_string())?;
+    if synchronous != 1 {
+        return Err(format!(
+            "SQLite synchronous mode is {synchronous}, but NORMAL (1) is required"
+        ));
+    }
+    Ok(())
+}
+
+fn migrate(db: &Connection) -> Result<(), String> {
+    db.execute_batch(
+        "CREATE TABLE IF NOT EXISTS projects(
+             repository TEXT PRIMARY KEY,
+             name TEXT NOT NULL,
+             ordinal INTEGER NOT NULL
+         ) STRICT;
+         CREATE TABLE IF NOT EXISTS channels(
+             id TEXT PRIMARY KEY,
+             repository TEXT NOT NULL REFERENCES projects(repository) ON DELETE CASCADE,
+             title TEXT NOT NULL,
+             ordinal INTEGER NOT NULL
+         ) STRICT;
+         CREATE INDEX IF NOT EXISTS channels_by_repository ON channels(repository);
+         CREATE TABLE IF NOT EXISTS metadata(
+             key INTEGER PRIMARY KEY CHECK(key = 0),
+             sequence INTEGER NOT NULL,
+             seeded INTEGER NOT NULL,
+             next_project_ordinal INTEGER NOT NULL,
+             next_channel_ordinal INTEGER NOT NULL
+         ) STRICT;
+         INSERT OR IGNORE INTO metadata(
+             key, sequence, seeded, next_project_ordinal, next_channel_ordinal
+         ) VALUES (0, 0, 0, 1, 1);",
+    )
+    .map_err(|error| error.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn registry() -> (Registry, tempfile::TempDir) {
+        let directory = tempfile::tempdir().unwrap();
+        let registry = Registry::at(&directory.path().join("model.sqlite3")).unwrap();
+        (registry, directory)
+    }
+
+    fn open(repository: &str) -> ModelEdit {
+        ModelEdit::OpenProject {
+            repository: PathBuf::from(repository),
+            name: repository.rsplit('/').next().unwrap().to_owned(),
+        }
+    }
+
+    fn create(id: ChannelId, repository: &str, title: &str) -> ModelEdit {
+        ModelEdit::CreateChannel {
+            id,
+            repository: PathBuf::from(repository),
+            title: title.to_owned(),
+        }
+    }
+
+    /// Every real edit advances the sequence a watcher orders edges by, and
+    /// creating a channel that already exists is not a real edit: the CLI, the
+    /// window that made it and a reconnecting window all send the same create.
+    #[test]
+    fn sequence_advances_once_per_real_edit_and_a_repeated_create_is_not_one() {
+        let (mut registry, _directory) = registry();
+        assert_eq!(registry.model().unwrap().sequence, 0);
+        let first = registry.apply(&open("/tmp/repo")).unwrap();
+        assert!(first.changed);
+        assert_eq!(first.model.sequence, 1);
+
+        let id = ChannelId::new();
+        let created = registry.apply(&create(id, "/tmp/repo", "probe")).unwrap();
+        assert!(created.changed);
+        assert_eq!(created.model.sequence, 2);
+        assert_eq!(created.model.channels.len(), 1);
+
+        let repeated = registry.apply(&create(id, "/tmp/repo", "other")).unwrap();
+        assert!(!repeated.changed, "a create is idempotent by id");
+        assert_eq!(
+            repeated.model.sequence, 2,
+            "a no-op cannot bump the sequence"
+        );
+        assert_eq!(repeated.model.channels.len(), 1);
+        assert_eq!(
+            repeated.model.channels[0].title, "probe",
+            "the first create's title stands; a repeat is not a retitle"
+        );
+    }
+
+    /// A channel lives inside a project. Closing the project has to take its
+    /// channels with it, or they would survive as rows no sidebar can reach.
+    #[test]
+    fn closing_a_project_takes_its_channels_and_leaves_its_neighbours() {
+        let (mut registry, _directory) = registry();
+        registry.apply(&open("/tmp/one")).unwrap();
+        registry.apply(&open("/tmp/two")).unwrap();
+        let doomed = ChannelId::new();
+        let survivor = ChannelId::new();
+        registry.apply(&create(doomed, "/tmp/one", "a")).unwrap();
+        registry.apply(&create(survivor, "/tmp/two", "b")).unwrap();
+
+        let closed = registry
+            .apply(&ModelEdit::CloseProject {
+                repository: PathBuf::from("/tmp/one"),
+            })
+            .unwrap();
+        assert!(closed.changed);
+        assert!(closed.model.channel(doomed).is_none());
+        assert!(closed.model.channel(survivor).is_some());
+        assert_eq!(closed.model.projects.len(), 1);
+    }
+
+    /// An edit that changes nothing must be indistinguishable from not having
+    /// been sent, because a retitle racing a delete and a second window's
+    /// duplicate delete both arrive as one.
+    #[test]
+    fn an_edit_on_an_unknown_channel_changes_nothing_and_does_not_advance() {
+        let (mut registry, _directory) = registry();
+        registry.apply(&open("/tmp/repo")).unwrap();
+        let sequence = registry.model().unwrap().sequence;
+        let unknown = ChannelId::new();
+
+        let retitled = registry
+            .apply(&ModelEdit::RetitleChannel {
+                id: unknown,
+                title: "ghost".into(),
+            })
+            .unwrap();
+        assert!(!retitled.changed);
+        assert_eq!(retitled.model.sequence, sequence);
+        assert!(retitled.model.channel(unknown).is_none());
+
+        let deleted = registry
+            .apply(&ModelEdit::DeleteChannel { id: unknown })
+            .unwrap();
+        assert!(!deleted.changed);
+        assert_eq!(deleted.model.sequence, sequence);
+    }
+
+    /// A retitle to the title the channel already has is equally a no-op: every
+    /// window derives a title from its own cards, and the second one to derive
+    /// the same title must not wake every other window.
+    #[test]
+    fn retitling_to_the_current_title_changes_nothing() {
+        let (mut registry, _directory) = registry();
+        registry.apply(&open("/tmp/repo")).unwrap();
+        let id = ChannelId::new();
+        registry.apply(&create(id, "/tmp/repo", "")).unwrap();
+        let renamed = registry
+            .apply(&ModelEdit::RetitleChannel {
+                id,
+                title: "Explain the parser".into(),
+            })
+            .unwrap();
+        assert!(renamed.changed);
+
+        let repeated = registry
+            .apply(&ModelEdit::RetitleChannel {
+                id,
+                title: "Explain the parser".into(),
+            })
+            .unwrap();
+        assert!(!repeated.changed);
+        assert_eq!(repeated.model.sequence, renamed.model.sequence);
+    }
+
+    /// The seed is a migration, and a migration runs once. A second window must
+    /// not be able to donate a stale snapshot over a registry that windows and
+    /// the CLI have been editing since.
+    #[test]
+    fn a_seed_is_adopted_once_and_a_later_seed_changes_nothing() {
+        let (mut registry, _directory) = registry();
+        let first = ChannelId::new();
+        let (model, applied) = registry
+            .seed(
+                &[ModelProject {
+                    repository: PathBuf::from("/tmp/repo"),
+                    name: "repo".into(),
+                    ordinal: 0,
+                }],
+                &[ModelChannel {
+                    id: first,
+                    repository: PathBuf::from("/tmp/repo"),
+                    title: "donated".into(),
+                    ordinal: 0,
+                }],
+            )
+            .unwrap();
+        assert_eq!(applied.len(), 2, "the project and its channel were adopted");
+        assert!(model.channel(first).is_some());
+
+        let stale = ChannelId::new();
+        let (after, applied) = registry
+            .seed(
+                &[ModelProject {
+                    repository: PathBuf::from("/tmp/other"),
+                    name: "other".into(),
+                    ordinal: 0,
+                }],
+                &[ModelChannel {
+                    id: stale,
+                    repository: PathBuf::from("/tmp/other"),
+                    title: "stale".into(),
+                    ordinal: 0,
+                }],
+            )
+            .unwrap();
+        assert!(applied.is_empty(), "a seeded registry adopts nothing more");
+        assert!(after.channel(stale).is_none());
+        assert_eq!(after.projects.len(), 1);
+        assert_eq!(after.sequence, model.sequence);
+    }
+
+    /// A rank is the creation order two windows agree on, so it has to keep
+    /// increasing and a deleted channel's number can never come back: reusing it
+    /// would make a brand new channel sort where the deleted one used to be.
+    #[test]
+    fn a_rank_increases_and_is_never_reused_after_a_delete() {
+        let (mut registry, _directory) = registry();
+        registry.apply(&open("/tmp/repo")).unwrap();
+        let older = ChannelId::new();
+        let newer = ChannelId::new();
+        registry.apply(&create(older, "/tmp/repo", "a")).unwrap();
+        let second = registry.apply(&create(newer, "/tmp/repo", "b")).unwrap();
+        let older_rank = second.model.channel(older).unwrap().ordinal;
+        let newer_rank = second.model.channel(newer).unwrap().ordinal;
+        assert!(
+            newer_rank > older_rank,
+            "a later channel outranks an earlier"
+        );
+
+        registry
+            .apply(&ModelEdit::DeleteChannel { id: newer })
+            .unwrap();
+        let replacement = ChannelId::new();
+        let after = registry
+            .apply(&create(replacement, "/tmp/repo", "c"))
+            .unwrap();
+        assert!(
+            after.model.channel(replacement).unwrap().ordinal > newer_rank,
+            "the deleted channel's rank is retired with it"
+        );
+    }
+
+    /// A channel in a project nobody has open is reachable from no sidebar, so
+    /// creating one is refused rather than stored where it cannot be seen.
+    #[test]
+    fn a_channel_needs_its_project() {
+        let (mut registry, _directory) = registry();
+        let error = registry
+            .apply(&create(ChannelId::new(), "/tmp/unknown", "orphan"))
+            .expect_err("an unowned channel is refused");
+        assert!(error.contains("no project owns"), "{error}");
+        assert_eq!(registry.model().unwrap().sequence, 0);
+    }
+
+    /// The registry is durable: a channel the CLI created with no window running
+    /// has to still be there when a window finally starts, which means surviving
+    /// the daemon that created it.
+    #[test]
+    fn the_model_survives_reopening_the_store() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("model.sqlite3");
+        let id = ChannelId::new();
+        {
+            let mut registry = Registry::at(&path).unwrap();
+            registry.apply(&open("/tmp/repo")).unwrap();
+            registry.apply(&create(id, "/tmp/repo", "probe")).unwrap();
+            registry.seed(&[], &[]).unwrap();
+        }
+        let reopened = Registry::at(&path).unwrap();
+        let model = reopened.model().unwrap();
+        assert_eq!(model.channel(id).unwrap().title, "probe");
+        assert!(
+            reopened.seeded().unwrap(),
+            "a seeded registry stays seeded across a restart, or every window \
+             would donate its state again"
+        );
+    }
+}

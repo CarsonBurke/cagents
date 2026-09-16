@@ -17,6 +17,7 @@ mod settings_ui;
 mod terminal_adoption;
 mod terminal_close;
 mod update_ui;
+mod workspace_model_sync;
 mod worktree_operations;
 mod worktree_ui;
 pub use daemon_stop::run_daemon_stop_confirmation;
@@ -724,6 +725,39 @@ impl std::hash::Hash for HostedTerminalSource {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
         std::hash::Hash::hash(&"cagents-hosted-terminals", state);
     }
+}
+
+/// Shared workspace model updates, from the observer and publisher threads.
+#[derive(Clone)]
+struct WorkspaceModelSource(async_channel::Receiver<workspace_model_sync::ModelUpdate>);
+
+impl PartialEq for WorkspaceModelSource {
+    fn eq(&self, _other: &Self) -> bool {
+        true
+    }
+}
+
+impl Eq for WorkspaceModelSource {}
+
+impl std::hash::Hash for WorkspaceModelSource {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        std::hash::Hash::hash(&"cagents-workspace-model", state);
+    }
+}
+
+fn workspace_model_stream(
+    source: &WorkspaceModelSource,
+) -> Pin<
+    Box<
+        dyn cosmic::iced::futures::Stream<Item = workspace_model_sync::ModelUpdate>
+            + Send
+            + 'static,
+    >,
+> {
+    Box::pin(cosmic::iced::futures::stream::unfold(
+        source.0.clone(),
+        |receiver| async move { receiver.recv().await.ok().map(|update| (update, receiver)) },
+    ))
 }
 
 #[derive(Clone)]
@@ -2435,6 +2469,8 @@ pub enum Message {
         generation: u64,
         result: Result<Box<LoadedRepository>, String>,
     },
+    /// One shared sidebar model update, from the daemon observer or publisher.
+    WorkspaceModelObserved(workspace_model_sync::ModelUpdate),
     Repository(RepositoryAction),
     ResolvedDiffBasis {
         card: CardId,
@@ -2992,6 +3028,20 @@ pub struct Cagents {
     terminal_starts: std::sync::atomic::AtomicUsize,
     /// Observations held back while a start was outstanding.
     pending_adoptions: Vec<TerminalSession>,
+    /// The shared sidebar model as this window last saw it.
+    workspace_model: crate::workspace_model::WorkspaceModel,
+    /// Whether the registry has adopted this window's state and may therefore
+    /// be treated as the authority on which channels exist.
+    ///
+    /// False until the seed is answered, and false again on every reconnection:
+    /// a new connection may be to a registry that has never heard of anything,
+    /// and an empty registry is not a licence to delete.
+    workspace_model_seeded: bool,
+    /// Repositories this window has already been asked to open on the shared
+    /// model's behalf. Asking twice would mint a second project on one checkout.
+    workspace_model_opens: HashSet<PathBuf>,
+    workspace_model_rx: async_channel::Receiver<workspace_model_sync::ModelUpdate>,
+    workspace_model_tx: async_channel::Sender<workspace_model_sync::ModelPublish>,
     activation_rx: async_channel::Receiver<instance::UiActivation>,
     session: Option<SessionRuntime>,
     save_health: Option<SaveHealthState>,
@@ -7625,6 +7675,17 @@ impl Application for Cagents {
         // than with the first card that happens to need a daemon.
         let (hosted_terminals_tx, hosted_terminals_rx) = async_channel::unbounded();
         terminal_adoption::observe_hosted_inventory(hosted_terminals_tx);
+        // The daemon owns the shared sidebar model for the same reason it owns
+        // the terminal inventory: it outlives every window. Both threads start
+        // with the window, so a channel created elsewhere appears without the
+        // window having to do anything first.
+        let (workspace_model_updates, workspace_model_rx) = async_channel::unbounded();
+        let (workspace_model_tx, workspace_model_requests) = async_channel::unbounded();
+        workspace_model_sync::observe_workspace_model(workspace_model_updates.clone());
+        workspace_model_sync::publish_workspace_model(
+            workspace_model_updates,
+            workspace_model_requests,
+        );
         let activation_rx = activation_rx.unwrap_or_else(|| async_channel::unbounded().1);
         let window_scale_factor = core.scale_factor().max(0.01);
         let settings_draft = SettingsDraft::from_settings(&settings);
@@ -7648,6 +7709,11 @@ impl Application for Cagents {
             hosted_terminals_rx,
             terminal_starts: std::sync::atomic::AtomicUsize::new(0),
             pending_adoptions: Vec::new(),
+            workspace_model: crate::workspace_model::WorkspaceModel::default(),
+            workspace_model_seeded: false,
+            workspace_model_opens: HashSet::new(),
+            workspace_model_rx,
+            workspace_model_tx,
             activation_rx,
             session,
             save_health,
@@ -7935,6 +8001,7 @@ impl Application for Cagents {
                 }
             }
             Message::HostedTerminalsObserved(terminals) => self.observe_hosted_terminals(terminals),
+            Message::WorkspaceModelObserved(update) => self.apply_workspace_model_update(update),
             Message::TerminalStarted {
                 card,
                 terminal,
@@ -8281,7 +8348,15 @@ impl Application for Cagents {
                                 self.select_worktree(active, false)
                             };
                         }
-                        task = Task::batch([task, self.project_avatar_task(project_id)]);
+                        // Every window shares which projects exist, and a
+                        // channel the shared model named in this repository
+                        // could not be adopted until the project existed here.
+                        self.publish_project_opened(project_id);
+                        task = Task::batch([
+                            task,
+                            self.project_avatar_task(project_id),
+                            self.reconcile_workspace_model(),
+                        ]);
                     }
                     Err(error) => {
                         let unavailable = GitHubAvailability::Failed {
@@ -10040,6 +10115,11 @@ impl Application for Cagents {
                 hosted_terminal_stream,
             )
             .map(Message::HostedTerminalsObserved),
+            Subscription::run_with(
+                WorkspaceModelSource(self.workspace_model_rx.clone()),
+                workspace_model_stream,
+            )
+            .map(Message::WorkspaceModelObserved),
             Subscription::run_with(
                 UiActivationSource(self.activation_rx.clone()),
                 ui_activation_stream,
@@ -14341,6 +14421,13 @@ mod tests {
             hosted_terminals_rx: async_channel::unbounded().1,
             terminal_starts: std::sync::atomic::AtomicUsize::new(0),
             pending_adoptions: Vec::new(),
+            workspace_model: crate::workspace_model::WorkspaceModel::default(),
+            workspace_model_seeded: false,
+            workspace_model_opens: HashSet::new(),
+            workspace_model_rx: async_channel::unbounded().1,
+            // Unbounded and unread: a fixture publishes into a queue nobody
+            // drains, which is what keeps a test off the daemon entirely.
+            workspace_model_tx: async_channel::unbounded().0,
             activation_rx: async_channel::unbounded().1,
             session: None,
             save_health: None,

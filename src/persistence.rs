@@ -3479,6 +3479,7 @@ mod tests {
             id,
             project_id,
             title: "Investigate startup".into(),
+            ordinal: 0,
             cards: vec![card],
             focused: Some(card),
         });
@@ -3507,6 +3508,7 @@ mod tests {
             id: ChannelId::new(),
             project_id,
             title: "Conflicting owner".into(),
+            ordinal: 0,
             cards: vec![card],
             focused: Some(card),
         });
@@ -3947,6 +3949,7 @@ mod tests {
             id: channel_id,
             project_id: workspace.project_order[0],
             title: "Legacy".into(),
+            ordinal: 0,
             cards: vec![workspace.cards[0].id],
             focused: workspace.focused,
         });

@@ -1,6 +1,7 @@
 mod chat;
 mod client;
 mod delivery;
+mod model;
 mod state;
 
 use std::{
@@ -171,6 +172,20 @@ pub fn run() -> Result<(), HostError> {
     let paths = RuntimePaths::discover()?;
     let _lease = HostLease::acquire(&paths, &proof)?;
     let host: SharedHost = Arc::new(Mutex::new(HostState::new(proof)));
+    // A daemon that cannot open the shared-model store still hosts terminals.
+    // The model is reported unavailable to the clients that ask for it, which is
+    // what keeps a window from mistaking a broken store for an empty registry
+    // and donating its state over and over.
+    match model::Registry::open() {
+        Ok(registry) => host
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .install_model(registry),
+        Err(error) => {
+            tracing::error!(%error, "the shared workspace model is unavailable; channels will \
+                                    not be shared between windows")
+        }
+    }
     state::restore_upgrade(&host).map_err(io::Error::other)?;
     let listener = UnixListener::bind(&paths.socket)?;
     fs::set_permissions(&paths.socket, fs::Permissions::from_mode(0o600))?;

@@ -66,5 +66,8 @@ pub mod upgrade;
 pub use terminal::ipc as terminal_ipc;
 #[cfg(feature = "ui")]
 pub mod workspace;
+/// The shared half of the sidebar model. Ungated: the CLI mutates it, the
+/// daemon owns it and the UI mirrors it, so all three lanes name these types.
+pub mod workspace_model;
 #[cfg(feature = "ui")]
 pub mod workspace_widget;
