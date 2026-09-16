@@ -1240,8 +1240,33 @@ fn reconcile_restored_projects(
     }
 }
 
-fn finish_repository_load_failure(data_state: &mut SidebarDataState, error: String) {
-    *data_state = SidebarDataState::Error(error);
+/// Record a failed repository read on the project it belongs to.
+///
+/// One checkout that cannot be read is one unreadable project. Replacing the
+/// whole list with a pane-wide error took every healthy project down with the
+/// broken one, so the reason is written onto that project's own row and the
+/// pane-wide error is kept for the single case it describes truthfully: no
+/// project row is left to carry it.
+fn finish_repository_load_failure(model: &mut SidebarModel, project_id: ProjectId, error: String) {
+    if let Some(project) = model
+        .projects
+        .iter_mut()
+        .find(|project| project.id == project_id)
+    {
+        project.unreachable = Some(error);
+        project.reloading = false;
+        model.data_state = SidebarDataState::Ready;
+        return;
+    }
+    // A failure with no row of its own is the first read of a freshly picked
+    // path, which has no durable project yet, or a project closed while its
+    // read was in flight. Either way there is nothing to mark, and the status
+    // notice already carries the reason.
+    model.data_state = if model.projects.is_empty() {
+        SidebarDataState::Error(error)
+    } else {
+        SidebarDataState::Ready
+    };
 }
 
 fn update_workspace_viewport(
@@ -3231,6 +3256,7 @@ impl Cagents {
         {
             project.github_status = GitHubAvailability::Loading.label().into();
             project.revoke_github();
+            project.reloading = true;
         }
         self.repository_read_task(path, project_id, generation, open_cards)
     }
@@ -8005,6 +8031,11 @@ impl Application for Cagents {
                                         }))
                             })
                         {
+                            // This read reached the same repository, so
+                            // whatever an earlier failure recorded about the
+                            // row it landed on no longer holds.
+                            existing.unreachable = None;
+                            existing.reloading = false;
                             for (record, status) in &loaded.worktrees {
                                 if existing.worktrees.iter().any(|known| known.id == record.id) {
                                     continue;
@@ -8140,7 +8171,7 @@ impl Application for Cagents {
                         }
                         self.github_availability.insert(project_id, unavailable);
                         self.status = Some(TransientNotice::error(error.clone()));
-                        finish_repository_load_failure(&mut self.sidebar_model.data_state, error);
+                        finish_repository_load_failure(&mut self.sidebar_model, project_id, error);
                     }
                 }
                 task
@@ -8346,6 +8377,10 @@ impl Application for Cagents {
                             self.repository_load_task(repository, Some(id), false)
                         }))
                     }
+                    SidebarAction::RefreshProject {
+                        project_id,
+                        repository,
+                    } => self.repository_load_task(repository, Some(project_id), false),
                     SidebarAction::CreatePullRequest {
                         project_id,
                         worktree,
@@ -13087,13 +13122,101 @@ mod tests {
         );
     }
 
+    /// A row for each project, as session restoration builds them before any
+    /// repository has been read.
+    fn restored_sidebar_project(id: ProjectId, name: &str, repository: &Path) -> SidebarProject {
+        SidebarProject::new(
+            id,
+            RepositoryId::new(),
+            name.to_owned(),
+            repository.to_path_buf(),
+            Vec::new(),
+            Vec::new(),
+        )
+    }
+
+    fn repository_load_result(
+        project_id: ProjectId,
+        result: Result<LoadedRepository, String>,
+    ) -> Message {
+        Message::RepositoryLoaded {
+            open_cards: false,
+            project_id,
+            generation: 1,
+            result: result.map(Box::new),
+        }
+    }
+
+    #[test]
+    fn one_unreadable_project_keeps_every_other_project_listed() {
+        let mut app = context_inspector_test_app(false);
+        let broken = ProjectId::new();
+        let healthy = ProjectId::new();
+        let healthy_path = PathBuf::from("/repositories/healthy");
+        app.sidebar_model.projects = vec![
+            restored_sidebar_project(broken, "broken", Path::new("/repositories/broken")),
+            restored_sidebar_project(healthy, "healthy", &healthy_path),
+        ];
+        app.sidebar_model.data_state = SidebarDataState::Loading;
+        app.repository_generations.insert(broken, 1);
+        app.repository_generations.insert(healthy, 1);
+        let loaded = LoadedRepository {
+            project: ProjectState {
+                id: healthy,
+                generation: 0,
+                name: "healthy".into(),
+                repository: healthy_path.clone(),
+                existence: Existence::Open,
+            },
+            repository: RepositoryInfo {
+                id: RepositoryId::new(),
+                selected_path: healthy_path.clone(),
+                common_dir: healthy_path.join(".git"),
+                git_dir: healthy_path.join(".git"),
+                worktree_root: Some(healthy_path.clone()),
+                is_bare: false,
+            },
+            worktrees: Vec::new(),
+            github: GitHubAvailability::NotAssociated,
+        };
+
+        // The failure lands last on purpose. A failure followed by a success
+        // would be rescued by the success setting the pane Ready, so only this
+        // order can catch a failure that blanks the pane.
+        drop(app.update(repository_load_result(healthy, Ok(loaded))));
+        drop(app.update(repository_load_result(
+            broken,
+            Err("fatal: not a git repository".into()),
+        )));
+
+        assert_eq!(app.sidebar_model.data_state, SidebarDataState::Ready);
+        assert_eq!(
+            app.sidebar_model
+                .projects
+                .iter()
+                .map(|project| (project.id, project.unreachable.clone()))
+                .collect::<Vec<_>>(),
+            vec![
+                (broken, Some("fatal: not a git repository".to_owned())),
+                (healthy, None),
+            ]
+        );
+    }
+
     #[test]
     fn failed_sidebar_refresh_finishes_loading_with_an_error() {
-        let mut data_state = SidebarDataState::Loading;
+        let mut app = context_inspector_test_app(false);
+        let picked = ProjectId::new();
+        app.sidebar_model.data_state = SidebarDataState::Loading;
+        app.repository_generations.insert(picked, 1);
 
-        finish_repository_load_failure(&mut data_state, "refresh failed".into());
+        drop(app.update(repository_load_result(picked, Err("refresh failed".into()))));
 
-        assert_eq!(data_state, SidebarDataState::Error("refresh failed".into()));
+        assert!(app.sidebar_model.projects.is_empty());
+        assert_eq!(
+            app.sidebar_model.data_state,
+            SidebarDataState::Error("refresh failed".into())
+        );
     }
 
     #[test]
