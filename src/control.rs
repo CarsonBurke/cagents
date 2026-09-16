@@ -1755,6 +1755,10 @@ fn protocol_error(error: ControlError) -> AppError {
 /// point of the shared model is that a channel exists whether or not a window
 /// is running to show it.
 fn execute_channel(command: ChannelCommand) -> Result<CommandOutput, AppError> {
+    // Resolved before any daemon is started. A path that names no repository is
+    // an argument error, and an argument error must not leave behind a daemon
+    // the user never asked for.
+    let command = command.resolved()?;
     let socket =
         terminal::ensure_daemon_ready().map_err(|error| AppError::new("daemon_start", error))?;
     let mut client = ControlClient::connect(&socket)
@@ -1762,13 +1766,44 @@ fn execute_channel(command: ChannelCommand) -> Result<CommandOutput, AppError> {
     channel_output(&mut client, command)
 }
 
+/// A channel verb whose repository is already the shared key.
+///
+/// A distinct type rather than a convention, so the resolution cannot drift
+/// back inside the request path - where it would run after the daemon was
+/// started, and where `list` would resolve a key the caller had already
+/// resolved.
+enum ResolvedChannel {
+    Spawn { repository: PathBuf, title: String },
+    List { repository: Option<PathBuf> },
+    Close { channel_id: ChannelId },
+}
+
+impl ChannelCommand {
+    fn resolved(self) -> Result<ResolvedChannel, AppError> {
+        Ok(match self {
+            Self::Spawn { repository, title } => ResolvedChannel::Spawn {
+                repository: resolve_repository(repository)?,
+                title,
+            },
+            // Only an explicit filter is resolved: no `--repository` means every
+            // repository, so defaulting to the one containing the current
+            // directory would silently hide channels the user asked to see.
+            Self::List { repository } => ResolvedChannel::List {
+                repository: repository
+                    .map(|path| resolve_repository(Some(path)))
+                    .transpose()?,
+            },
+            Self::Close { channel_id } => ResolvedChannel::Close { channel_id },
+        })
+    }
+}
+
 fn channel_output(
     client: &mut ControlClient,
-    command: ChannelCommand,
+    command: ResolvedChannel,
 ) -> Result<CommandOutput, AppError> {
     match command {
-        ChannelCommand::Spawn { repository, title } => {
-            let repository = resolve_repository(repository)?;
+        ResolvedChannel::Spawn { repository, title } => {
             // The project comes first: a channel in a repository no project owns
             // is reachable from no window's sidebar. `OpenProject` is an upsert,
             // so this is a no-op when a window already has the project open.
@@ -1802,10 +1837,7 @@ fn channel_output(
                 human,
             })
         }
-        ChannelCommand::List { repository } => {
-            let filter = repository
-                .map(|path| resolve_repository(Some(path)))
-                .transpose()?;
+        ResolvedChannel::List { repository: filter } => {
             let model = client.read_workspace_model().map_err(protocol_error)?;
             // Newest first, which is the order the sidebar renders: a listing
             // that disagreed with the window about which channel is on top would
@@ -1831,7 +1863,7 @@ fn channel_output(
                 human,
             })
         }
-        ChannelCommand::Close { channel_id } => {
+        ResolvedChannel::Close { channel_id } => {
             client
                 .edit_workspace_model(ModelEdit::DeleteChannel { id: channel_id })
                 .map_err(protocol_error)?;
@@ -1892,6 +1924,12 @@ fn resolve_repository(repository: Option<PathBuf>) -> Result<PathBuf, AppError> 
 /// a single query would be a dependency for a question the `git` on the user's
 /// path already answers, with the user's own configuration applied.
 pub fn repository_key(directory: &Path) -> Result<PathBuf, String> {
+    // Checked before spawning, because `current_dir` on a path that is not
+    // there fails as a spawn error and would be reported as a broken `git`
+    // install - sending the user to look at the wrong thing entirely.
+    if !directory.is_dir() {
+        return Err(format!("`{}` is not a directory", directory.display()));
+    }
     let output = Command::new("git")
         .args(["rev-parse", "--path-format=absolute", "--git-common-dir"])
         .current_dir(directory)
@@ -2230,14 +2268,15 @@ mod tests {
             id
         });
         let mut client = ControlClient::from_stream(client_stream).unwrap();
-        let output = channel_output(
-            &mut client,
-            ChannelCommand::Spawn {
-                repository: Some(repository),
-                title: "probe".into(),
-            },
-        )
+        // Through the real resolution, so the test proves the key the CLI sends
+        // is the one `git` derives rather than the one the test hands it.
+        let resolved = ChannelCommand::Spawn {
+            repository: Some(repository),
+            title: "probe".into(),
+        }
+        .resolved()
         .unwrap();
+        let output = channel_output(&mut client, resolved).unwrap();
         let id = server.join().unwrap();
         assert_eq!(output.command, "channel.spawn");
         assert_eq!(output.data["channel"]["id"], json!(id.to_string()));
