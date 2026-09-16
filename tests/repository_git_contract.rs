@@ -2415,6 +2415,77 @@ fn a_git_directory_selected_as_the_repository_resolves_to_the_work_tree() {
     );
 }
 
+/// The shared workspace model keys a project by its repository, and the CLI and
+/// a window derive that key independently: the CLI asks `git` directly, because
+/// the shipped `cagents` binary has no Git library, while a window takes the
+/// common directory discovery resolved. They must produce the same string.
+///
+/// They did not. The CLI asked `--show-toplevel` and got the work tree, while a
+/// project stores its common directory, so a channel the CLI created was keyed
+/// on `/repo` while every window's project was keyed on `/repo/.git`. No window
+/// could find an owner for it, and the channel - the whole feature - never
+/// appeared. This holds the two derivations to each other instead.
+#[test]
+fn the_cli_and_a_window_derive_one_repository_key_for_one_checkout() {
+    let Some(fixture) = Fixture::new() else {
+        return;
+    };
+    fixture.write("src/main.rs", b"one\n");
+    fixture.git_in_work(&["add", "-A"]);
+    fixture.commit("initial");
+    fixture.write("nested/deeper/file.txt", b"two\n");
+    let linked = fixture.root.path().join("linked");
+    fixture.git_in_work(&[
+        "worktree",
+        "add",
+        "-b",
+        "linked",
+        linked.to_str().expect("UTF-8 fixture path"),
+    ]);
+
+    let service = fixture.service();
+    let cancellation = CancellationToken::new();
+    // What a window stores for a project it opened, which is what it publishes
+    // as `ModelEdit::OpenProject` and compares an adopted channel against.
+    let published = canonical(
+        &service
+            .discover(&fixture.work(), &cancellation)
+            .expect("discovery")
+            .common_dir,
+    );
+
+    // Every place a user can be standing when they run the CLI. The key is the
+    // repository, not the directory, so all of them have to agree - including a
+    // linked worktree, whose own Git directory is `<common>/worktrees/<name>`
+    // and would have keyed one project once per worktree.
+    for from in [
+        fixture.work(),
+        fixture.work().join("nested/deeper"),
+        fixture.work().join(".git"),
+        linked.clone(),
+    ] {
+        let key = cagents::control::repository_key(&from)
+            .unwrap_or_else(|error| panic!("the CLI keys {}: {error}", from.display()));
+        assert_eq!(
+            canonical(&key),
+            published,
+            "the CLI key from {} must be the key a window publishes",
+            from.display()
+        );
+    }
+
+    // And the name the CLI supplies for that key has to be the checkout, not
+    // the key's own last component, which is `.git` and names nothing.
+    assert_eq!(
+        cagents::workspace_model::repository_display_name(&published),
+        fixture
+            .work()
+            .file_name()
+            .expect("the fixture checkout is named")
+            .to_string_lossy(),
+    );
+}
+
 /// `git ls-files -o` lists *others*, i.e. untracked files, so counting the
 /// combined listing claimed one extra tracked file for every untracked one:
 /// the overview read "6 files tracked" where `git ls-files` returned five.

@@ -455,10 +455,13 @@ impl Cagents {
         if !self.workspace_model_opens.insert(repository.to_path_buf()) {
             return Adoption::Retained;
         }
-        if !repository.join(".git").exists() {
-            // Not a checkout this window can read - it may live on a filesystem
-            // that is not mounted here. The row stays in the model and renders
-            // nothing, rather than becoming a project that cannot be loaded.
+        if !repository.is_dir() {
+            // Not a repository this window can read - it may live on a
+            // filesystem that is not mounted here. The row stays in the model
+            // and renders nothing, rather than becoming a project that cannot
+            // be loaded. The key is a Git directory, so the directory itself is
+            // what has to be there; testing `repository/.git` would test for a
+            // Git directory inside a Git directory and never find one.
             return Adoption::Retained;
         }
         Adoption::Opening(self.repository_load_task(repository.to_path_buf(), None, true))
@@ -598,10 +601,15 @@ impl Cagents {
 mod tests {
     use super::*;
 
+    /// A window whose project is keyed the way a real one is: by the common Git
+    /// directory, which is what `ProjectState.repository` holds and therefore
+    /// what the shared model keys a channel on. Keying the fixture on the work
+    /// tree instead is what let a channel that no window could adopt pass every
+    /// test in this module.
     fn app_with_project() -> (Cagents, ProjectId, PathBuf) {
         let mut app = super::super::tests::context_inspector_test_app(true);
         let project = ProjectId::new();
-        let repository = PathBuf::from("/repo");
+        let repository = PathBuf::from("/repo/.git");
         app.sidebar_model.projects.push(SidebarProject::new(
             project,
             RepositoryId::new(),
@@ -660,6 +668,11 @@ mod tests {
     /// A channel another window created arrives as a scope, not as a
     /// conversation: N windows adopting one channel must not start N chats in
     /// it, and the cards inside a channel are each window's own business.
+    ///
+    /// It also has to reach the sidebar. The key the channel carries is the
+    /// project's common Git directory, and when the CLI keyed it on the work
+    /// tree instead, adoption found no owner and retained the channel forever:
+    /// the model held it, the store never did, and no window showed it.
     #[test]
     fn an_adopted_channel_arrives_empty_and_starts_no_conversation() {
         let (mut app, project, repository) = app_with_project();
@@ -687,6 +700,15 @@ mod tests {
             app.durable.cards.len(),
             cards,
             "adoption starts no conversation, so no card appears"
+        );
+        app.refresh_sidebar_channels();
+        let rows = crate::sidebar::channels_in_display_order(
+            app.sidebar_model.projects[0].channels.iter(),
+        );
+        assert_eq!(
+            rows.iter().map(|row| row.id).collect::<Vec<_>>(),
+            vec![id],
+            "an adopted channel is a row, not just a record"
         );
     }
 

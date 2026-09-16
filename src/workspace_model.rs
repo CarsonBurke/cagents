@@ -230,13 +230,30 @@ pub fn canonical_repository(path: &Path) -> Result<PathBuf, String> {
     Ok(std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf()))
 }
 
-/// The name a repository path presents when no window has supplied one.
+/// The name a repository key presents when no window has supplied one.
 ///
-/// The final component is what the sidebar shows and what a user typed to get
-/// here, so a CLI-opened project reads the same as a window-opened one.
+/// The key and the name deliberately come from different places. The key is the
+/// common Git directory, because that is the one form every window and the CLI
+/// resolve to identically; its own last component is `.git`, which names
+/// nothing. The name is the checkout that directory belongs to, which is what
+/// the sidebar shows and what a user typed to get here - the same derivation
+/// `load_repository` uses for a project it opened itself.
+///
+/// A bare repository has no checkout, and its key ends in the repository's own
+/// name rather than `.git`, so that component is the name. Taking the parent
+/// there would name the directory the repository happens to sit in.
+///
+/// Either way this is only a fallback: `OpenProject` is an upsert that updates
+/// the name, so a window opening the same repository replaces a CLI-supplied
+/// name with the one it derived itself.
 pub fn repository_display_name(repository: &Path) -> String {
-    repository
-        .file_name()
+    let component = repository.file_name();
+    let checkout = if component.is_some_and(|name| name == ".git") {
+        repository.parent().and_then(Path::file_name)
+    } else {
+        component
+    };
+    checkout
         .map(|name| name.to_string_lossy().into_owned())
         .unwrap_or_else(|| repository.display().to_string())
 }

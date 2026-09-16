@@ -1857,29 +1857,43 @@ fn channel_line(channel: &ModelChannel) -> String {
     )
 }
 
-/// Resolves the repository a channel verb refers to.
+/// Resolves the repository a channel verb refers to into the shared key.
+///
+/// Both forms go through Git, including an explicit `--repository`: a user
+/// names a checkout, and the key is not the checkout's path. A path that is not
+/// inside a repository is an error rather than a key, because no window could
+/// ever own a project there.
 fn resolve_repository(repository: Option<PathBuf>) -> Result<PathBuf, AppError> {
-    let path = match repository {
-        Some(path) => absolute_working_directory(Some(path))
-            .map_err(|error| AppError::new("repository", error))?,
-        None => {
-            let current =
-                std::env::current_dir().map_err(|error| AppError::new("repository", error))?;
-            repository_root(&current).map_err(|error| AppError::new("repository", error))?
-        }
-    };
-    canonical_repository(&path).map_err(|error| AppError::new("repository", error))
+    let from = absolute_working_directory(repository)
+        .map_err(|error| AppError::new("repository", error))?;
+    repository_key(&from).map_err(|error| AppError::new("repository", error))
 }
 
-/// The repository containing `directory`, asked of Git itself.
+/// The shared project key for the repository containing `directory`, asked of
+/// Git itself.
 ///
+/// `--git-common-dir` and nothing else. A project's identity in the window is
+/// `ProjectState.repository`, which the repository loader fills from the same
+/// query, so asking Git the same question here makes the two representations
+/// coincide by construction rather than by a fixup. The alternatives are both
+/// wrong: `--show-toplevel` is the work tree rather than the repository, and
+/// `--absolute-git-dir` answers `<root>/.git/worktrees/<name>` inside a linked
+/// worktree, so the same project would get one key per worktree the CLI
+/// happened to be invoked from. The common directory is the one form that is
+/// identical from the work tree root, from a subdirectory, from a linked
+/// worktree and from inside the Git directory itself. `repository_git_contract`
+/// holds the two derivations to each other, because a key that agrees with the
+/// window only by inspection is a key that will drift.
+///
+/// Public so that contract can be stated against the real `git` rather than
+/// against a copy of this logic.
 /// The crate's own repository helpers are `ui`-gated - the shipped `cagents`
 /// binary has no Git library in its dependency graph at all - and adding one for
 /// a single query would be a dependency for a question the `git` on the user's
 /// path already answers, with the user's own configuration applied.
-fn repository_root(directory: &Path) -> Result<PathBuf, String> {
+pub fn repository_key(directory: &Path) -> Result<PathBuf, String> {
     let output = Command::new("git")
-        .args(["rev-parse", "--path-format=absolute", "--show-toplevel"])
+        .args(["rev-parse", "--path-format=absolute", "--git-common-dir"])
         .current_dir(directory)
         .stdin(Stdio::null())
         .stderr(Stdio::null())
@@ -1891,13 +1905,15 @@ fn repository_root(directory: &Path) -> Result<PathBuf, String> {
             directory.display()
         ));
     }
-    let root = String::from_utf8(output.stdout)
+    let key = String::from_utf8(output.stdout)
         .map_err(|_| "git reported a repository path that is not valid UTF-8".to_owned())?;
-    let root = root.trim_end();
-    if root.is_empty() {
-        return Err("git reported an empty repository root".to_owned());
+    let key = key.trim_end();
+    if key.is_empty() {
+        return Err("git reported an empty repository path".to_owned());
     }
-    Ok(PathBuf::from(root))
+    // Canonicalized here rather than by the caller, so the public derivation is
+    // the whole key and nothing is left for a producer to remember to do.
+    canonical_repository(Path::new(key))
 }
 
 fn descriptor_line(terminal: &TerminalDescriptor) -> String {
@@ -2116,13 +2132,42 @@ mod tests {
     /// `channel spawn` opens the project before creating the channel in it,
     /// mints the id itself, and reports the created channel under the
     /// `channel.spawn` envelope every automation keys on.
+    ///
+    /// The fixture is a real repository because the key is whatever `git`
+    /// resolves, not the path the user named: a fixture that never ran `git`
+    /// could not tell the two apart, which is how a key no window could match
+    /// shipped.
     #[test]
     fn channel_spawn_opens_the_project_then_creates_the_channel_it_minted() {
         let (client_stream, mut server_stream) = UnixStream::pair().unwrap();
         let peer_proof = proof("session", "boot", "incarnation");
-        let repository = std::env::temp_dir().join("cagents-channel-spawn-fixture");
-        let expected = crate::workspace_model::canonical_repository(&repository).unwrap();
+        let checkout = tempfile::tempdir().unwrap();
+        let initialized = Command::new("git")
+            .args(["init", "--quiet"])
+            .current_dir(checkout.path())
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+        if !initialized.is_ok_and(|status| status.success()) {
+            // No usable `git`, so there is no key to derive and nothing this
+            // test can assert. Every lane that runs it has one.
+            return;
+        }
+        let repository = checkout.path().to_path_buf();
+        // The common Git directory, which is what a window stores for a project
+        // and therefore what the channel has to be keyed on.
+        let expected =
+            crate::workspace_model::canonical_repository(&repository.join(".git")).unwrap();
         let server_repository = expected.clone();
+        // Derived the same way the CLI derives it, from the checkout the key's
+        // Git directory belongs to.
+        let expected_name = checkout
+            .path()
+            .file_name()
+            .expect("the fixture checkout is named")
+            .to_string_lossy()
+            .into_owned();
         let server = thread::spawn(move || {
             let _: ClientEnvelope = read_frame(&mut server_stream).unwrap().unwrap();
             write_frame(
@@ -2136,7 +2181,9 @@ mod tests {
                 ClientRequest::EditWorkspaceModel {
                     edit: ModelEdit::OpenProject {
                         repository: server_repository.clone(),
-                        name: "cagents-channel-spawn-fixture".into(),
+                        // The checkout's name, never the key's own last
+                        // component, which is `.git` and names nothing.
+                        name: expected_name.clone(),
                     },
                 },
                 "the project a channel needs is opened first"
