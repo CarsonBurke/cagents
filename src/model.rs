@@ -1038,6 +1038,15 @@ pub struct WorkspaceState {
     pub channels: Vec<ProjectChannel>,
     #[serde(default, alias = "active_thread")]
     pub active_channel: Option<ChannelId>,
+    /// The workspace scope a card was filed under when its launch directory
+    /// belongs to no known worktree.
+    ///
+    /// Adopting a daemon-owned terminal is the only producer: the launch recipe
+    /// is never rewritten to relocate a card, so a terminal started outside
+    /// every project needs its filing recorded somewhere durable or the user
+    /// would find it somewhere else after a restart.
+    #[serde(default)]
+    pub card_scopes: HashMap<CardId, PathBuf>,
 }
 
 impl Default for WorkspaceState {
@@ -1054,6 +1063,7 @@ impl Default for WorkspaceState {
             project_order: Vec::new(),
             channels: Vec::new(),
             active_channel: None,
+            card_scopes: HashMap::new(),
         }
     }
 }

@@ -1343,6 +1343,7 @@ mod tests {
             project_order: Vec::new(),
             channels: Vec::new(),
             active_channel: None,
+            card_scopes: HashMap::new(),
             cards: vec![CardState {
                 id: CardId::new(),
                 generation: 0,
