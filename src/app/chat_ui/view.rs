@@ -470,6 +470,11 @@ impl Runtime {
         // transcript it scrolled away from the reader it was addressed to,
         // and a single sentence about the account does not need a glyph and an
         // accent sliver to be read.
+        //
+        // Only the newest one is pinned. A retrying or hook-heavy provider
+        // emits a notice per frame, and every one of them held above a
+        // transcript that fills the rest of the pane squeezes the
+        // conversation itself out of the card.
         let mut content: Vec<Element<'_, Message>> = snapshot
             .title
             .iter()
@@ -478,11 +483,16 @@ impl Runtime {
                 snapshot
                     .items
                     .iter()
+                    .rev()
                     .filter(|item| item.role == chat::Role::System)
-                    .filter_map(|item| match &item.content {
+                    .find_map(|item| match &item.content {
                         ItemContent::Text { text, .. } if !text.trim().is_empty() => Some(
-                            design::caption(text.as_str())
+                            design::caption(turn::first_line(text.as_str()))
                                 .class(cosmic::theme::Text::Custom(design::muted_text))
+                                // One row, whatever the provider put in it: a
+                                // wrapped paragraph of frame JSON would push
+                                // the transcript out of the card.
+                                .wrapping(iced::widget::text::Wrapping::None)
                                 .width(Length::Fill)
                                 .into(),
                         ),

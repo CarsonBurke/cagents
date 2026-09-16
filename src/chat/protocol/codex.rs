@@ -21,6 +21,10 @@ const MAX_ITEM_BYTES: usize = 512 * 1024;
 /// list. A directory tree with a pathological number of skill files must not
 /// grow the snapshot without bound.
 const MAX_SKILLS: usize = 256;
+/// How much of a skill's name is carried. A name is the skill file's own, so
+/// it is provider-controlled text of no guaranteed length, and a completion
+/// row has no use for more than this.
+const MAX_SKILL_NAME: usize = 64;
 
 fn remote_socket(address: &str) -> Result<Option<PathBuf>, String> {
     let path = address.strip_prefix("unix://").ok_or(
@@ -230,6 +234,7 @@ pub fn create(launch: &Launch) -> Result<(ProcessSpec, Box<dyn Adapter>), String
             direct_input: false,
             cursor: None,
             history_loading: false,
+            skills_stale: false,
             materialized: launch.session_id.is_some(),
         }),
     ))
@@ -278,6 +283,9 @@ struct Codex {
     direct_input: bool,
     cursor: Option<String>,
     history_loading: bool,
+    /// Whether the catalog was invalidated again while a request for it was
+    /// still outstanding, so exactly one refetch follows that answer.
+    skills_stale: bool,
     materialized: bool,
 }
 impl Drop for Codex {
@@ -337,6 +345,19 @@ impl Codex {
     /// the thread's own working directory and requested again whenever the
     /// server reports that the watched skill files changed.
     fn skills(&mut self, step: &mut Step) -> Result<(), String> {
+        // One catalog request at a time. A watcher over a churning skills
+        // directory sends a burst of invalidations, and a request per
+        // invalidation would fill the pending map and fail the conversation
+        // over a completion list.
+        if self
+            .pending
+            .values()
+            .any(|pending| matches!(pending, Pending::Skills))
+        {
+            self.skills_stale = true;
+            return Ok(());
+        }
+        self.skills_stale = false;
         let cwd = self.cwd.clone();
         self.call(step, "skills/list", json!({"cwds":[cwd]}), Pending::Skills)
     }
@@ -880,8 +901,14 @@ impl Adapter for Codex {
                 }
                 Pending::Skills => {
                     let mut skills: Vec<Skill> = Vec::new();
-                    for entry in result["data"].as_array().unwrap_or(&Vec::new()) {
+                    // The cap has to stop the outer walk as well: a catalog
+                    // split across many directories would otherwise add one
+                    // more skill per directory after the cap was reached.
+                    'catalog: for entry in result["data"].as_array().unwrap_or(&Vec::new()) {
                         for value in entry["skills"].as_array().unwrap_or(&Vec::new()) {
+                            if skills.len() >= MAX_SKILLS {
+                                break 'catalog;
+                            }
                             let Some(name) = value["name"].as_str().filter(|n| !n.is_empty())
                             else {
                                 continue;
@@ -891,6 +918,10 @@ impl Adapter for Codex {
                             {
                                 continue;
                             }
+                            // A name is a file name in the working tree, so it
+                            // is as much provider-controlled text as the
+                            // description and is bounded the same way.
+                            let name = name.chars().take(MAX_SKILL_NAME).collect::<String>();
                             // The short description is the one written for a
                             // picker; the long one is written for the model
                             // and runs to paragraphs.
@@ -900,7 +931,6 @@ impl Adapter for Codex {
                                 .or_else(|| value["description"].as_str())
                                 .unwrap_or_default();
                             skills.push(Skill {
-                                name: name.into(),
                                 description: description
                                     .lines()
                                     .next()
@@ -912,13 +942,14 @@ impl Adapter for Codex {
                                 // a leading dollar sign. It has no command for
                                 // one, so there is nothing to dispatch.
                                 invocation: format!("${name}"),
+                                name,
                             });
-                            if skills.len() >= MAX_SKILLS {
-                                break;
-                            }
                         }
                     }
                     step.events.push(Event::Skills(skills));
+                    if std::mem::take(&mut self.skills_stale) {
+                        self.skills(&mut step)?;
+                    }
                 }
                 Pending::History => self.page(result, &mut step)?,
                 Pending::Turn => {
@@ -1803,6 +1834,7 @@ mod tests {
             direct_input: true,
             cursor: None,
             history_loading: false,
+            skills_stale: false,
             materialized: true,
         }
     }
@@ -1892,6 +1924,39 @@ mod tests {
             .unwrap();
         assert_eq!(start["params"]["sandbox"], json!("danger-full-access"));
         assert_eq!(start["params"]["approvalPolicy"], json!("never"));
+    }
+
+    /// The completion list is bounded whatever the account's skill tree looks
+    /// like. A catalog arrives grouped by directory, so a cap that stopped only
+    /// the walk within one group grew by one skill per directory.
+    #[test]
+    fn a_catalog_split_across_directories_still_stops_at_the_cap() {
+        let mut adapter = adapter();
+        let initialize = adapter.initialize().unwrap();
+        let setup = adapter
+            .receive(json!({"id":initialize.writes[0]["id"],"result":{"userAgent":"codex","codexHome":"/tmp"}}))
+            .unwrap();
+        let list = setup
+            .writes
+            .iter()
+            .find(|frame| frame["method"] == "skills/list")
+            .unwrap();
+        let data = (0..MAX_SKILLS * 2)
+            .map(|group| json!({"skills":[{"name":format!("skill-{group}")}]}))
+            .collect::<Vec<_>>();
+        let answered = adapter
+            .receive(json!({"id":list["id"],"result":{"data":data}}))
+            .unwrap();
+        let skills = answered
+            .events
+            .iter()
+            .find_map(|event| match event {
+                Event::Skills(skills) => Some(skills),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(skills.len(), MAX_SKILLS);
+        assert_eq!(skills[0].invocation, "$skill-0");
     }
 
     #[test]

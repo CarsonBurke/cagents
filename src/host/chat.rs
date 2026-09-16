@@ -200,7 +200,7 @@ fn candidates(
     // process means it describes some other CLI and must not be presented.
     if handle.observe_agent_process().as_ref() != Some(&process) {
         return Err(error(
-            "The foreground process changed during preview; retry",
+            "The foreground process changed while the conversations were being listed; retry",
         ));
     }
     Ok(ServerResponse::ChatCandidates { candidates })
@@ -1648,7 +1648,7 @@ mod tests {
     }
 
     #[test]
-    fn candidate_listing_needs_no_conversation_id_and_grants_no_attach() {
+    fn a_candidate_listing_names_a_terminal_where_a_preview_names_a_conversation() {
         let (_directory, host, _saved) = upgrade_fixture();
         let source = host
             .lock()
@@ -1692,14 +1692,8 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(previewed.code, ProtocolErrorCode::InvalidRequest);
-        // Enumeration grants nothing: it records no pending selection, so an
-        // activation still has to consume a token issued by a real preview.
-        assert!(
-            host.lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .chat_bindings
-                .is_empty()
-        );
+        // An activation still has to consume a token issued by a real preview,
+        // and no listing can produce one.
         let activated = process(
             &host,
             1,

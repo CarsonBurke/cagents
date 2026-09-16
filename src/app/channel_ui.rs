@@ -77,7 +77,7 @@ impl Cagents {
                 self.sidebar_state.reveal_project(project_id);
                 self.show_workspace_for_action();
                 let scope = self.select_channel(id);
-                let chat = self.new_native_chat(self.preferred_chat_provider());
+                let chat = self.new_native_chat(self.preferred_chat_provider(), None);
                 self.persist();
                 Task::batch([scope, chat])
             }

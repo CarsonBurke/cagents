@@ -10,6 +10,9 @@ use tungstenite::{
     protocol::WebSocketConfig,
 };
 
+/// How many of an account's open threads the conversation chooser describes.
+const MAX_DESCRIBED: usize = 64;
+
 pub(super) fn endpoint(recipe: &LaunchRecipe, home: &Path) -> ProbeResult<PathBuf> {
     let mut endpoint = home.join("app-server-control/app-server-control.sock");
     let mut args = recipe.arguments.iter();
@@ -241,8 +244,11 @@ pub(super) fn candidates(key: &Key) -> ProbeResult<Vec<(String, String, PathBuf)
     socket::verify_account(&result, &key.home).map_err(|_| ())?;
     client.send(json!({"method":"initialized","params":{}}))?;
     let ids = client.loaded()?;
-    let mut candidates = Vec::with_capacity(ids.len());
-    for id in &ids {
+    let mut candidates = Vec::with_capacity(ids.len().min(MAX_DESCRIBED));
+    // Each description costs a round trip inside this probe's single deadline,
+    // and a reader choosing from a list has no use for a longer one. A thread
+    // past this is still reachable by its identifier.
+    for id in ids.iter().take(MAX_DESCRIBED) {
         let result = client.call("thread/read", json!({"threadId":id,"includeTurns":false}))?;
         let thread = &result["thread"];
         if thread["id"].as_str() != Some(id.as_str()) {

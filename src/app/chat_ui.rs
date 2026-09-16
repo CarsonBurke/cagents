@@ -109,6 +109,9 @@ pub enum Action {
     BindingNew(CardId),
     BindingCancel(CardId),
     Ready(Target, Ready),
+    /// The result of closing a conversation that started for a card which
+    /// could no longer hold it, so a stranded writer is not left behind.
+    Discarded(Result<(), String>),
     Wake(Target, Wake),
     UpdatesAcknowledged(Target, Result<(), String>),
     Reconnect(Target),
@@ -206,10 +209,6 @@ struct Binding {
     /// choice a reader can make.
     candidates: Vec<chat::BindingCandidate>,
     scanning: bool,
-    /// Set when the listing resolved the conversation on its own, so the
-    /// preview that follows is confirmed without asking the reader to approve
-    /// a choice they never made.
-    resolved: bool,
     preview: Option<chat::BindingPreview>,
     loading: bool,
     error: Option<String>,
@@ -903,6 +902,23 @@ pub(super) fn placeholder_card_title(title: &str) -> bool {
             .any(|provider| title == chat_card_title(*provider))
 }
 
+/// The draft with the word being typed replaced by `invocation`.
+///
+/// A skill is named inside a message rather than instead of one, so the text
+/// already written stays and a trailing space follows the name, ready for the
+/// rest of the sentence.
+fn mention_replaced(draft: &str, invocation: &str) -> String {
+    // The split has to land on a character boundary: a no-break space pasted
+    // in with a quotation is whitespace more than one byte wide, and a byte
+    // offset taken from it would slice inside the character.
+    let kept = draft
+        .char_indices()
+        .rev()
+        .find(|(_, character)| character.is_whitespace())
+        .map_or(0, |(index, character)| index + character.len_utf8());
+    format!("{}{invocation} ", &draft[..kept])
+}
+
 fn observed_launch(session: &TerminalSession) -> Option<LaunchRecipe> {
     session
         .resume_hint
@@ -994,11 +1010,21 @@ impl Cagents {
             .unwrap_or(Provider::Codex)
     }
 
-    pub(super) fn new_native_chat(&mut self, provider: Provider) -> Task<Message> {
+    /// Opens a new native conversation in a new card.
+    ///
+    /// `directory` is the conversation's root. A caller that already knows it,
+    /// such as the chooser offering a new conversation beside a terminal,
+    /// passes it rather than letting the workspace's own idea of a current
+    /// directory answer for a terminal that runs somewhere else.
+    pub(super) fn new_native_chat(
+        &mut self,
+        provider: Provider,
+        directory: Option<PathBuf>,
+    ) -> Task<Message> {
         if self.project_ui.deleting() {
             return Task::none();
         }
-        let Some(working_directory) = self.terminal_directory() else {
+        let Some(working_directory) = directory.or_else(|| self.terminal_directory()) else {
             return cosmic::task::message(Message::OpenRepository);
         };
         let mut recipe = LaunchRecipe {
@@ -1320,14 +1346,15 @@ impl Cagents {
                 }
             }
             Action::BindingScanned(target, result) => {
-                let Some(binding) = self
-                    .chat_ui
-                    .bindings
-                    .get_mut(&target.card)
-                    .filter(|binding| binding.target == target)
-                else {
+                let Some(binding) = self.chat_ui.bindings.get_mut(&target.card) else {
                     return Task::none();
                 };
+                // A listing adopts nothing by itself, so it is accepted even
+                // when the reader typed in the identifier field while it was
+                // in flight. Matching the whole target there left the panel
+                // reading "Reading this account's open conversations…" for as
+                // long as the card lived.
+                let current = binding.target == target;
                 binding.scanning = false;
                 let candidates = match result {
                     Ok(candidates) => candidates,
@@ -1336,12 +1363,15 @@ impl Cagents {
                         return Task::none();
                     }
                 };
+                let typed = !binding.input.trim().is_empty();
                 binding.candidates = candidates;
-                // A terminal is looking at a conversation rooted in its own
-                // directory. Where exactly one of the account's open
-                // conversations is, there is nothing for the reader to
-                // disambiguate, so the choice is made for them and still goes
-                // through the daemon's own preview and confirmation.
+                // A terminal is usually looking at a conversation rooted in
+                // its own directory, so where exactly one of the account's
+                // open conversations is, that one is offered ready to confirm.
+                // It is only ever a suggestion: a directory does not identify
+                // a thread, and a second terminal of the same account in the
+                // same worktree would match just as well. The reader confirms
+                // a conversation the panel has named.
                 let directory = binding
                     .session
                     .terminal
@@ -1356,9 +1386,10 @@ impl Cagents {
                     (Some(only), None) => Some(only.session_id.clone()),
                     _ => None,
                 };
-                if let Some(id) = resolved {
+                // An identifier the terminal's own launch named, or one the
+                // reader typed, is theirs and is never overwritten.
+                if let Some(id) = resolved.filter(|_| current && !typed) {
                     binding.input = id;
-                    binding.resolved = true;
                     return self.handle_chat_ui(Action::BindingPreview(target.card));
                 }
             }
@@ -1370,7 +1401,6 @@ impl Cagents {
                 binding.preview = None;
                 binding.error = None;
                 binding.loading = false;
-                binding.resolved = false;
                 self.chat_ui.generation = self.chat_ui.generation.wrapping_add(1).max(1);
                 if let Some(binding) = self.chat_ui.bindings.get_mut(&card) {
                     binding.target.generation = self.chat_ui.generation;
@@ -1428,13 +1458,6 @@ impl Cagents {
                     ),
                     Err(error) => binding.error = Some(error),
                 }
-                if binding.resolved && binding.preview.is_some() {
-                    // The reader asked for this terminal's conversation and
-                    // the account had exactly one here, so there is no choice
-                    // left to present. Stopping to ask them to approve the
-                    // only answer is the prompt this replaced.
-                    return self.handle_chat_ui(Action::BindingConfirm(target.card));
-                }
             }
             Action::BindingConfirm(card) => {
                 let Some(binding) = self
@@ -1461,7 +1484,14 @@ impl Cagents {
                 // The source terminal keeps running and keeps its own
                 // conversation; this opens a second card beside it rather than
                 // taking anything over.
-                return self.new_native_chat(binding.session.launch.provider);
+                return self.new_native_chat(
+                    binding.session.launch.provider,
+                    binding
+                        .session
+                        .terminal
+                        .as_ref()
+                        .map(|terminal| terminal.launch.working_directory.clone()),
+                );
             }
             Action::BindingCancel(card) => {
                 self.chat_ui.bindings.remove(&card);
@@ -1486,19 +1516,42 @@ impl Cagents {
                             // configuration opens a new conversation natively.
                             // Refusing here rejected the one case that needs no
                             // live process, which left a stopped agent terminal
-                            // with no way into the chat at all. The stopped
-                            // thread is deliberately not resumed: joining an
+                            // with no way into the chat at all.
+                            //
+                            // A new conversation is a new session, so it gets
+                            // its own identity: the daemon will not implicitly
+                            // replace a terminal record it still holds, and it
+                            // holds this one until the card is closed. The
+                            // stopped terminal stays named as this card's
+                            // source, because that is what a switch back
+                            // returns to and what proves which card this
+                            // conversation belongs to. The stopped thread is
+                            // deliberately not resumed, because joining an
                             // existing thread means joining whichever process
-                            // holds it, and no process holds this one.
-                            if let Some(recipe) =
+                            // holds it and no process holds this one.
+                            let Some(recipe) =
                                 crate::model::agent_recovery::fresh_recipe(&session.launch.recipe)
-                            {
-                                session.launch.recipe = recipe;
-                            }
+                            else {
+                                self.status = Some(TransientNotice::error(
+                                    "This terminal's launch options cannot be reused for a native conversation.",
+                                ));
+                                return Task::none();
+                            };
+                            // A carried bypass is named rather than applied
+                            // quietly: it is the one launch option that decides
+                            // the agent may act without asking.
+                            let unrestricted = recipe.arguments.iter().any(|argument| {
+                                argument == "--dangerously-bypass-approvals-and-sandbox"
+                                    || argument == "--yolo"
+                            });
+                            session.launch.recipe = recipe;
                             session.launch.session_id = None;
-                            self.status = Some(TransientNotice::warning(
-                                "This terminal's agent is not running, so a new conversation was opened here.",
-                            ));
+                            session.id = crate::model::TerminalId::new();
+                            self.status = Some(TransientNotice::warning(if unrestricted {
+                                "This terminal's agent is not running, so a new conversation was opened here, with this terminal's approvals and sandbox left off."
+                            } else {
+                                "This terminal's agent is not running, so a new conversation was opened here."
+                            }));
                             return self.start_chat(card, session, true, None, false);
                         }
                         if session.launch.provider == Provider::Codex {
@@ -1519,7 +1572,6 @@ impl Cagents {
                                     input,
                                     candidates: Vec::new(),
                                     scanning: true,
-                                    resolved: false,
                                     preview: None,
                                     loading: false,
                                     error: None,
@@ -1617,6 +1669,20 @@ impl Cagents {
                             _ => false,
                         }
                 }) {
+                    // The conversation started, but this card can no longer
+                    // hold it. Leaving it alone left a daemon writer and its
+                    // provider process running with nothing on screen able to
+                    // reach them, so the start is undone here.
+                    if let Ok(handle) = result {
+                        return cosmic::task::future(async move {
+                            let closed = tokio::task::spawn_blocking(move || handle.close()).await;
+                            Message::ChatUi(Action::Discarded(
+                                closed
+                                    .map_err(|error| error.to_string())
+                                    .and_then(|result| result),
+                            ))
+                        });
+                    }
                     return Task::none();
                 }
                 match result {
@@ -1692,6 +1758,15 @@ impl Cagents {
                         }
                         return self.drain_terminal(target.card, 0);
                     }
+                }
+            }
+            Action::Discarded(result) => {
+                // Nothing is on screen for this conversation, so only a
+                // failure to end it is worth saying anything about.
+                if let Err(error) = result {
+                    self.status = Some(TransientNotice::error(format!(
+                        "A conversation that no longer has a card could not be closed: {error}"
+                    )));
                 }
             }
             Action::UpdatesAcknowledged(target, result) => {
@@ -2149,12 +2224,8 @@ impl Cagents {
                 // A skill is named inside a message rather than instead of
                 // one, so only the word the reader was typing is replaced and
                 // whatever they had already written stays.
-                let draft = runtime.composer.text();
-                let kept = draft
-                    .rfind(|character: char| character.is_whitespace())
-                    .map_or(0, |index| index + 1);
-                runtime.composer =
-                    text_editor::Content::with_text(&format!("{}{invocation} ", &draft[..kept]));
+                let draft = mention_replaced(&runtime.composer.text(), &invocation);
+                runtime.composer = text_editor::Content::with_text(&draft);
                 runtime.revision = runtime.revision.wrapping_add(1);
             }
             Action::HandoffFinished(target, result) => {
@@ -2219,6 +2290,27 @@ mod tests {
         }
     }
 
+    /// Picking a skill replaces the word being typed and nothing else, for any
+    /// text a reader can put in the composer. A byte offset taken from the last
+    /// whitespace character would slice inside a no-break space and panic the
+    /// whole window.
+    #[test]
+    fn choosing_a_skill_replaces_only_the_word_being_typed() {
+        assert_eq!(mention_replaced("", "$commits"), "$commits ");
+        assert_eq!(mention_replaced("/comm", "$commits"), "$commits ");
+        assert_eq!(
+            mention_replaced("please run /comm", "$commits"),
+            "please run $commits "
+        );
+        assert_eq!(
+            mention_replaced("quoted\u{a0}/comm", "$commits"),
+            "quoted\u{a0}$commits "
+        );
+        assert_eq!(
+            mention_replaced("first line\n/comm", "$commits"),
+            "first line\n$commits "
+        );
+    }
     /// A message that arrives byte by byte must present exactly as one that
     /// arrived whole. The incremental fence scan is the only difference, and a
     /// mistake in it would show the wrong code behind a copy control rather

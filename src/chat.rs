@@ -85,6 +85,12 @@ pub struct BindingPreview {
 /// One conversation a Codex account's shared server is currently holding open.
 /// Listing carries no token because enumeration authorizes nothing; an attach
 /// still requires the separate confirmed preview capability.
+///
+/// `title` is the thread's own name where it has one and the server's own
+/// preview of the conversation where it does not, because an unnamed thread
+/// has nothing else to tell one conversation from another by. Listing
+/// therefore carries a little conversation text, within the same account and
+/// the same user, in exchange for being choosable at all.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BindingCandidate {
     pub session_id: String,

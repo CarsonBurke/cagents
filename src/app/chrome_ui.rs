@@ -262,7 +262,7 @@ impl Cagents {
                 self.chrome_ui.close();
                 match kind {
                     NewTab::Terminal => cosmic::task::message(Message::NewTerminal),
-                    NewTab::NativeChat(provider) => self.new_native_chat(provider),
+                    NewTab::NativeChat(provider) => self.new_native_chat(provider, None),
                     NewTab::Browser => cosmic::task::message(Message::NewBrowser),
                     NewTab::Agent(provider) => {
                         self.show_workspace_for_action();
