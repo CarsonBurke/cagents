@@ -209,6 +209,10 @@ struct Binding {
     /// choice a reader can make.
     candidates: Vec<chat::BindingCandidate>,
     scanning: bool,
+    /// The generation the listing was requested with. Typing in the identifier
+    /// field moves `target`, so this is what tells a listing for this panel
+    /// apart from one left over from a panel that was cancelled and reopened.
+    scan: u64,
     preview: Option<chat::BindingPreview>,
     loading: bool,
     error: Option<String>,
@@ -1353,7 +1357,12 @@ impl Cagents {
                 // when the reader typed in the identifier field while it was
                 // in flight. Matching the whole target there left the panel
                 // reading "Reading this account's open conversations…" for as
-                // long as the card lived.
+                // long as the card lived. A listing for a panel that was
+                // cancelled and reopened is a different request, though, and
+                // describes what the account held open before.
+                if binding.scan != target.generation {
+                    return Task::none();
+                }
                 let current = binding.target == target;
                 binding.scanning = false;
                 let candidates = match result {
@@ -1572,6 +1581,7 @@ impl Cagents {
                                     input,
                                     candidates: Vec::new(),
                                     scanning: true,
+                                    scan: target.generation,
                                     preview: None,
                                     loading: false,
                                     error: None,

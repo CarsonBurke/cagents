@@ -624,11 +624,21 @@ fn start(
     }
     // All adapter validation happens before a source terminal can be changed.
     let (mut spec, mut adapter) = chat::protocol::create(&session.launch).map_err(error)?;
-    if source.is_none() && session.terminal.is_none() {
-        // Standalone conversations receive transient execution configuration from
-        // the GUI, including credentials unavailable in the daemon environment.
-        // Keep these values in the process spec only, never the durable session.
-        // Explicit selected configuration takes precedence over daemon defaults.
+    if source.is_none() {
+        // A conversation with no proven source has no proven environment to
+        // preserve, so it starts from the daemon's own native configuration
+        // whether or not it names a stopped terminal. Requiring the absence of
+        // a descriptor here left a conversation converted from a stopped agent
+        // terminal with nothing but that terminal's recorded recipe, which is
+        // empty for a terminal whose resume hint was discarded when its agent
+        // exited.
+        //
+        // Standalone conversations also receive transient execution
+        // configuration from the GUI, including credentials unavailable in the
+        // daemon environment. Keep these values in the process spec only,
+        // never the durable session. Explicit selected configuration takes
+        // precedence over daemon defaults, and the recipe's own environment
+        // takes precedence over both.
         let mut environment =
             crate::model::agent_recovery::fresh_native_environment(session.launch.provider, false);
         for (name, value) in execution_environment.0 {
