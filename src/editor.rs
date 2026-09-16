@@ -83,7 +83,7 @@ pub enum OversizeKind {
     Document,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum FileContent {
     Editable {
         text: String,
@@ -112,11 +112,20 @@ pub enum FileContent {
 }
 
 /// One rasterized PDF page.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct PdfPage {
     pub index: usize,
     pub width: u32,
     pub height: u32,
+    /// How wide the page is in PostScript points, which is what it would
+    /// print at.
+    ///
+    /// Carried alongside the raster because the raster's own width is not a
+    /// reliable stand-in: a page large enough to reach the preview's pixel
+    /// limit is rasterized at a smaller scale than was asked for, and a
+    /// viewer sizing the sheet from the pixels would then draw every step
+    /// past that limit at the same size while telling the reader otherwise.
+    pub points_wide: f32,
     pub rgba: std::sync::Arc<[u8]>,
 }
 
@@ -254,10 +263,14 @@ pub fn load_file(
         // change the document itself.
         drop(file);
         let path = worktree.join(relative_path);
-        return Ok(match render_document_page(&path, 0, tone) {
-            Ok(DocumentPage { pages, page }) => FileContent::Pdf { pages, page },
-            Err(reason) => FileContent::ReadOnly(ReadOnlyReason::Document(reason)),
-        });
+        // Opening is always at the default zoom, because the reader has not
+        // had a chance to ask for anything else yet.
+        return Ok(
+            match render_document_page(&path, 0, tone, PdfZoom::default()) {
+                Ok(DocumentPage { pages, page }) => FileContent::Pdf { pages, page },
+                Err(reason) => FileContent::ReadOnly(ReadOnlyReason::Document(reason)),
+            },
+        );
     }
 
     // A file can grow after metadata was read. Bound the read itself, not only
@@ -434,6 +447,113 @@ pub enum PdfTone {
     /// shade as anything else on screen, and a reader who changed their theme
     /// changed this too.
     Inverted { paper: [u8; 3] },
+}
+
+/// Logical pixels per PostScript point at 100% zoom.
+///
+/// A point is 1/72 inch and the conventional screen inch is 96 pixels, so
+/// 100% puts a page on screen at the size it would print. `PDF_PAGE_SCALE` is
+/// deliberately larger than this: the raster is supersampled so the page stays
+/// sharp, and the viewer then draws it at the size the reader asked for.
+pub const PDF_LOGICAL_SCALE: f32 = 96.0 / 72.0;
+
+/// How large a page is drawn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PdfZoom {
+    /// As wide as the pane reading it, which is what the viewer did before the
+    /// size could be changed at all, and the only setting whose result depends
+    /// on the window rather than on the document.
+    #[default]
+    Fit,
+    /// A fraction of the page's printed size, indexed into [`PdfZoom::STEPS`].
+    Scaled(u8),
+}
+
+impl PdfZoom {
+    /// The steps a reader moves through, smallest first.
+    ///
+    /// Discrete steps rather than a continuous scale, because each change
+    /// costs a rasterization in another process, and a reader dragging a
+    /// slider would ask for renders they never look at.
+    const STEPS: [f32; 7] = [0.5, 0.75, 1.0, 1.25, 1.5, 2.0, 3.0];
+    /// Where `STEPS` holds the printed size, which is where stepping away
+    /// from [`PdfZoom::Fit`] enters the list.
+    const PRINTED: u8 = 2;
+
+    /// How much of the page's printed size this draws, which is also the
+    /// resolution the raster is rendered at. `Fit` renders at the printed
+    /// size and is then drawn to the pane's width.
+    ///
+    /// The table is reached through `get`, because the step is a public field
+    /// of a public variant and so any caller can name one that is not a step.
+    pub fn factor(self) -> f32 {
+        let printed = Self::STEPS[usize::from(Self::PRINTED)];
+        match self {
+            Self::Fit => printed,
+            Self::Scaled(step) => Self::STEPS
+                .get(usize::from(step))
+                .copied()
+                .unwrap_or(printed),
+        }
+    }
+
+    /// The step as a reader reads it, or `None` for `Fit`, whose size is the
+    /// pane's and so cannot be stated as a fraction of the page.
+    pub fn percent(self) -> Option<u32> {
+        match self {
+            Self::Fit => None,
+            Self::Scaled(_) => Some((self.factor() * 100.0).round() as u32),
+        }
+    }
+
+    /// The next step in, or `None` at the largest, so a control can be
+    /// withheld rather than press to no effect.
+    ///
+    /// Stepping away from `Fit` skips the printed size, because a pane is
+    /// usually about one page wide and landing on the step nearest to what is
+    /// already on screen would spend a press without changing anything the
+    /// reader can see. The printed size is still reachable from either
+    /// neighbour.
+    ///
+    /// Neither control can promise a direction while leaving `Fit`, because
+    /// how large a fitted page is drawn depends on the pane, which nothing
+    /// here measures. A page fitted into a pane much wider than itself is
+    /// already past 125%, and stepping in then draws it smaller. The steps
+    /// either side of the printed size are the closest thing to the fitted
+    /// size that can be named without measuring.
+    pub fn larger(self) -> Option<Self> {
+        let step = match self {
+            Self::Fit => Self::PRINTED + 1,
+            Self::Scaled(step) => step.checked_add(1)?,
+        };
+        (usize::from(step) < Self::STEPS.len()).then_some(Self::Scaled(step))
+    }
+
+    pub fn smaller(self) -> Option<Self> {
+        match self {
+            Self::Fit => Some(Self::Scaled(Self::PRINTED - 1)),
+            Self::Scaled(step) => step.checked_sub(1).map(Self::Scaled),
+        }
+    }
+
+    pub fn is_fit(self) -> bool {
+        matches!(self, Self::Fit)
+    }
+
+    /// How wide the page is drawn, in logical pixels, for a page `points_wide`
+    /// points wide. `None` is `Fit`, which takes the pane's width instead.
+    ///
+    /// Taken from the page's printed width rather than from the raster, so a
+    /// page whose scale the helper had to clamp is still drawn at the size the
+    /// label reports, by stretching the raster it could produce. Sizing from
+    /// the pixels instead would draw every step past that limit identically
+    /// while the label went on counting up.
+    pub fn logical_width(self, points_wide: f32) -> Option<f32> {
+        match self {
+            Self::Fit => None,
+            Self::Scaled(_) => Some((points_wide * PDF_LOGICAL_SCALE * self.factor()).max(1.0)),
+        }
+    }
 }
 
 fn check_svg_expansion<'a, 'input>(

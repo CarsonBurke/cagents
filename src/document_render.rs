@@ -29,7 +29,7 @@ use std::{
 
 use crate::editor::{
     MAX_DOCUMENT_BYTES, MAX_IMAGE_DIMENSION, MAX_PDF_PAGES, PDF_PAGE_SCALE, PdfPage, PdfTone,
-    check_image_dimensions,
+    PdfZoom, check_image_dimensions,
 };
 
 /// The argument that turns this executable into the render helper.
@@ -87,10 +87,18 @@ const FRAME_MAGIC: [u8; 8] = *b"CGDOCPAG";
 /// Bumped if the header's shape ever changes. Parent and helper are the same
 /// build in every supported case, so a mismatch means something other than
 /// this protocol is writing to the pipe.
-const FRAME_VERSION: u32 = 1;
+const FRAME_VERSION: u32 = 2;
 
-/// Magic, version, page count, page index, width, height, and RGBA length.
-const FRAME_HEADER_BYTES: usize = 8 + 4 + 8 + 8 + 4 + 4 + 8;
+/// Magic, version, page count, page index, width, height, printed width, and
+/// RGBA length.
+const FRAME_HEADER_BYTES: usize = 8 + 4 + 8 + 8 + 4 + 4 + 4 + 8;
+
+/// The widest page the parent will believe, in PostScript points.
+///
+/// The format's own ceiling is 14400 points, and a page is drawn at its
+/// printed width times the reader's zoom, so a helper claiming an absurd
+/// width would otherwise ask the layout for a sheet of absurd size.
+const MAX_PAGE_POINTS: f32 = 14_400.0;
 
 /// The largest raster the parent will accept, which is the ceiling the image
 /// preview already enforces. Kept independent of the header's own length
@@ -115,7 +123,7 @@ const REAP_GRACE: Duration = Duration::from_millis(500);
 const REAP_POLL: Duration = Duration::from_millis(1);
 
 /// One page raster plus how many pages the document has.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct DocumentPage {
     pub pages: usize,
     pub page: PdfPage,
@@ -136,16 +144,18 @@ pub fn hook() -> Option<ExitCode> {
     let path = arguments.next().map(PathBuf::from);
     let index = arguments.next();
     let tone = arguments.next();
+    let zoom = arguments.next();
     if arguments.next().is_some() {
         return Some(refuse("The document render request was malformed."));
     }
-    let Some(((path, index), tone)) = path.zip(index).zip(tone) else {
+    let Some((((path, index), tone), zoom)) = path.zip(index).zip(tone).zip(zoom) else {
         return Some(refuse("The document render request was incomplete."));
     };
-    let Some((index, tone)) = index
+    let Some(((index, tone), zoom)) = index
         .to_str()
         .and_then(|index| index.parse::<usize>().ok())
         .zip(tone.to_str().and_then(parse_tone))
+        .zip(zoom.to_str().and_then(parse_zoom))
     else {
         return Some(refuse("The document render request was not understood."));
     };
@@ -157,7 +167,7 @@ pub fn hook() -> Option<ExitCode> {
         )));
     }
     Some(
-        match render_page(&path, index, tone).and_then(|page| write_frame(&page)) {
+        match render_page(&path, index, tone, zoom).and_then(|page| write_frame(&page)) {
             Ok(()) => ExitCode::SUCCESS,
             Err(message) => refuse(&message),
         },
@@ -182,10 +192,11 @@ pub fn render_document_page(
     path: &Path,
     index: usize,
     tone: PdfTone,
+    zoom: PdfZoom,
 ) -> Result<DocumentPage, String> {
     let helper = std::env::current_exe()
         .map_err(|error| format!("This document could not be rendered: {error}."))?;
-    render_with_helper(&helper, path, index, tone, RENDER_TIMEOUT)
+    render_with_helper(&helper, path, index, tone, zoom, RENDER_TIMEOUT)
 }
 
 fn render_with_helper(
@@ -193,6 +204,7 @@ fn render_with_helper(
     path: &Path,
     index: usize,
     tone: PdfTone,
+    zoom: PdfZoom,
     timeout: Duration,
 ) -> Result<DocumentPage, String> {
     let mut command = Command::new(helper);
@@ -201,6 +213,7 @@ fn render_with_helper(
         .arg(path)
         .arg(index.to_string())
         .arg(tone_argument(tone))
+        .arg(format!("{:.4}", zoom.factor()))
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -258,6 +271,18 @@ fn parse_tone(argument: &str) -> Option<PdfTone> {
         .next()
         .is_none()
         .then_some(PdfTone::Inverted { paper })
+}
+
+/// The zoom step the parent asked for, as a plain multiplier.
+///
+/// The helper is told a number rather than a step, because which steps a
+/// reader can move through is the viewer's business and the helper only has
+/// to rasterize at a scale. The bounds are wider than the viewer's own steps
+/// and exist so a malformed argument cannot ask for a scale of zero, an
+/// infinity, or a page nothing can hold.
+fn parse_zoom(argument: &str) -> Option<f32> {
+    let zoom = argument.parse::<f32>().ok()?;
+    (zoom.is_finite() && (0.05..=8.0).contains(&zoom)).then_some(zoom)
 }
 
 struct HelperOutput {
@@ -438,7 +463,12 @@ fn lower_limit(resource: libc::__rlimit_resource_t, value: libc::rlim_t) -> Resu
 ///
 /// Everything here runs behind the limits `restrict_helper_resources`
 /// installed, which is what makes reading a hostile page tree survivable.
-fn render_page(path: &Path, index: usize, tone: PdfTone) -> Result<DocumentPage, String> {
+fn render_page(
+    path: &Path,
+    index: usize,
+    tone: PdfTone,
+    zoom: f32,
+) -> Result<DocumentPage, String> {
     let bytes = read_document(path)?;
     let pdf = hayro::hayro_interpret::hayro_syntax::Pdf::new(std::sync::Arc::new(bytes))
         .map_err(|error| format!("This PDF could not be read: {error:?}."))?;
@@ -458,23 +488,21 @@ fn render_page(path: &Path, index: usize, tone: PdfTone) -> Result<DocumentPage,
     let page = pages
         .get(index)
         .ok_or_else(|| format!("This PDF has no page {}.", index + 1))?;
-    // The estimate is only a gate: it refuses an absurd page before anything
-    // is allocated for it. What the buffer actually measures is asked of the
-    // pixmap afterwards, because a declared size that disagrees with the
-    // buffer by even one column makes the upload silently draw nothing.
+    // The reader's zoom raises the raster's resolution along with the size
+    // the page is drawn at, so text stays as sharp magnified as it was at the
+    // pane's width. What the buffer actually measures is asked of the pixmap
+    // afterwards, because a declared size that disagrees with the buffer by
+    // even one column makes the upload silently draw nothing.
     let (points_wide, points_high) = page.render_dimensions();
-    check_image_dimensions(
-        (points_wide * PDF_PAGE_SCALE).max(1.0) as u32,
-        (points_high * PDF_PAGE_SCALE).max(1.0) as u32,
-    )
-    .map_err(|_| format!("Page {} exceeds the preview size limit.", index + 1))?;
+    let scale = render_scale(points_wide, points_high, PDF_PAGE_SCALE * zoom)
+        .ok_or_else(|| format!("Page {} has no size to render.", index + 1))?;
     let pixmap = hayro::render(
         page,
         &hayro::RenderCache::new(),
         &hayro::hayro_interpret::InterpreterSettings::default(),
         &hayro::RenderSettings {
-            x_scale: PDF_PAGE_SCALE,
-            y_scale: PDF_PAGE_SCALE,
+            x_scale: scale,
+            y_scale: scale,
             width: None,
             height: None,
             // A page describes ink on paper and says nothing about what is
@@ -500,9 +528,42 @@ fn render_page(path: &Path, index: usize, tone: PdfTone) -> Result<DocumentPage,
             index,
             width,
             height,
+            points_wide,
             rgba: rgba.into(),
         },
     })
+}
+
+/// The scale a page is actually rasterized at.
+///
+/// The reader asks for `wanted`, and both ends are bounded. A page large
+/// enough that `wanted` would put it past `MAX_IMAGE_DIMENSION` is drawn as
+/// sharply as the limit allows instead of being refused, because a reader
+/// zooming into a poster-sized plan wants to see it rather than to be told its
+/// dimensions. The pixel budget the parent also checks needs no term of its
+/// own, because `MAX_IMAGE_PIXELS` is `MAX_IMAGE_DIMENSION` squared and the
+/// per-axis clamp therefore implies it. A page under a point tall is scaled
+/// up instead, because `hayro` floors its pixmap and a zero-height page is
+/// refused by the parent with a message about being too large.
+///
+/// `None` is a page no scale can render: one with no size, or one whose two
+/// axes are so far apart that a single pixel on the short one already puts
+/// the long one past the limit.
+fn render_scale(points_wide: f32, points_high: f32, wanted: f32) -> Option<f32> {
+    if !points_wide.is_finite()
+        || !points_high.is_finite()
+        || points_wide <= 0.0
+        || points_high <= 0.0
+        || !wanted.is_finite()
+        || wanted <= 0.0
+    {
+        return None;
+    }
+    let most = MAX_IMAGE_DIMENSION as f32 / points_wide.max(points_high);
+    // A shade over one pixel, because the pixmap's dimensions are floored and
+    // `points * (1.0 / points)` is not always exactly one in `f32`.
+    let least = 1.000_01 / points_wide.min(points_high);
+    (least <= most).then(|| wanted.clamp(least, most))
 }
 
 /// Reads the document in the helper, bounded again.
@@ -582,6 +643,7 @@ fn frame_header(page: &DocumentPage) -> Vec<u8> {
     header.extend_from_slice(&(page.page.index as u64).to_le_bytes());
     header.extend_from_slice(&page.page.width.to_le_bytes());
     header.extend_from_slice(&page.page.height.to_le_bytes());
+    header.extend_from_slice(&page.page.points_wide.to_le_bytes());
     header.extend_from_slice(&(page.page.rgba.len() as u64).to_le_bytes());
     header
 }
@@ -610,7 +672,13 @@ fn decode_frame(frame: &[u8], requested: usize) -> Result<DocumentPage, String> 
     let index = u64_at(header, 20);
     let width = u32_at(header, 28);
     let height = u32_at(header, 32);
-    let declared = u64_at(header, 36);
+    let points_wide = f32::from_le_bytes([header[36], header[37], header[38], header[39]]);
+    let declared = u64_at(header, 40);
+    if !points_wide.is_finite() || points_wide <= 0.0 || points_wide > MAX_PAGE_POINTS {
+        return Err(format!(
+            "the page declared a printed width of {points_wide}"
+        ));
+    }
     if declared > MAX_RGBA_BYTES {
         return Err(format!(
             "the page declared {declared} bytes, past the {MAX_RGBA_BYTES} byte limit"
@@ -644,6 +712,7 @@ fn decode_frame(frame: &[u8], requested: usize) -> Result<DocumentPage, String> 
             index: requested,
             width,
             height,
+            points_wide,
             rgba: rgba.into(),
         },
     })
@@ -729,7 +798,7 @@ mod tests {
         let root = tempdir().unwrap();
         let path = root.path().join("report.pdf");
         std::fs::write(&path, one_page_pdf()).unwrap();
-        let rendered = render_page(&path, 0, PdfTone::Original).unwrap();
+        let rendered = render_page(&path, 0, PdfTone::Original, 1.0).unwrap();
         assert_eq!(rendered.pages, 1);
         assert_eq!(rendered.page.index, 0);
         let width = rendered.page.width as usize;
@@ -745,7 +814,7 @@ mod tests {
             &[255, 255, 255, 255]
         );
 
-        let inverted = render_page(&path, 0, PdfTone::Inverted { paper: [0, 0, 0] }).unwrap();
+        let inverted = render_page(&path, 0, PdfTone::Inverted { paper: [0, 0, 0] }, 1.0).unwrap();
         assert_eq!(
             (inverted.page.width, inverted.page.height),
             (rendered.page.width, rendered.page.height),
@@ -754,9 +823,58 @@ mod tests {
         assert_eq!(&inverted.page.rgba[..4], &[255, 255, 255, 255]);
         assert_eq!(&inverted.page.rgba[(width - 1) * 4..][..4], &[0, 0, 0, 255]);
 
-        assert!(render_page(&path, 1, PdfTone::Original).is_err());
+        assert!(render_page(&path, 1, PdfTone::Original, 1.0).is_err());
         std::fs::write(&path, b"%PDF-1.7\nnonsense").unwrap();
-        assert!(render_page(&path, 0, PdfTone::Original).is_err());
+        assert!(render_page(&path, 0, PdfTone::Original, 1.0).is_err());
+    }
+
+    #[test]
+    fn a_zoomed_page_is_rasterized_larger_and_never_past_the_preview_limits() {
+        let root = tempdir().unwrap();
+        let path = root.path().join("report.pdf");
+        std::fs::write(&path, one_page_pdf()).unwrap();
+        let fit = render_page(&path, 0, PdfTone::Original, 1.0).unwrap();
+        let zoomed = render_page(&path, 0, PdfTone::Original, 2.0).unwrap();
+        assert!(
+            zoomed.page.width > fit.page.width && zoomed.page.height > fit.page.height,
+            "zooming in has to raise the raster's resolution, not just its layout size: {} by {} \
+             against {} by {}",
+            zoomed.page.width,
+            zoomed.page.height,
+            fit.page.width,
+            fit.page.height
+        );
+        assert_eq!(
+            zoomed.page.rgba.len(),
+            zoomed.page.width as usize * zoomed.page.height as usize * 4
+        );
+
+        // A page this size at the largest zoom would be far past the limit,
+        // and a reader zooming into a poster wants to see it rather than to be
+        // told its dimensions.
+        let poster = render_scale(2400.0, 3600.0, PDF_PAGE_SCALE * 3.0).unwrap();
+        let (width, height) = (2400.0 * poster, 3600.0 * poster);
+        assert!(
+            width <= MAX_IMAGE_DIMENSION as f32 && height <= MAX_IMAGE_DIMENSION as f32,
+            "{width} by {height} is past the per-axis limit the parent enforces"
+        );
+        // A page under a point tall is scaled up instead, because hayro floors
+        // its pixmap and the parent refuses a zero-height page with a message
+        // about it being too large.
+        let sliver = render_scale(600.0, 0.4, PDF_PAGE_SCALE * 0.5).unwrap();
+        assert!(
+            (0.4 * sliver) as u32 >= 1,
+            "a {}-pixel axis would be refused as oversize",
+            0.4 * sliver
+        );
+        assert!(600.0 * sliver <= MAX_IMAGE_DIMENSION as f32);
+        assert_eq!(render_scale(0.0, 10.0, 1.0), None);
+        assert_eq!(render_scale(10.0, 10.0, f32::INFINITY), None);
+        assert_eq!(
+            render_scale(f32::MAX, 0.000_001, 1.0),
+            None,
+            "a page no scale can fit in the limit has to be refused rather than clamped"
+        );
     }
 
     #[test]
@@ -807,6 +925,7 @@ mod tests {
                 index: 1,
                 width: 2,
                 height: 1,
+                points_wide: 612.0,
                 rgba: vec![1, 2, 3, 4, 5, 6, 7, 8].into(),
             },
         };
@@ -827,11 +946,24 @@ mod tests {
         // A length past the preview ceiling is refused on the header alone,
         // before the parent could be talked into allocating for it.
         let mut enormous = whole.clone();
-        enormous[36..44].copy_from_slice(&(MAX_RGBA_BYTES + 1).to_le_bytes());
+        enormous[40..48].copy_from_slice(&(MAX_RGBA_BYTES + 1).to_le_bytes());
         assert!(decode_frame(&enormous, 1).unwrap_err().contains("past the"));
         let mut wide = whole.clone();
         wide[28..32].copy_from_slice(&(MAX_IMAGE_DIMENSION + 1).to_le_bytes());
         assert!(decode_frame(&wide, 1).is_err());
+
+        // A printed width is what every zoom step is a fraction of, so a
+        // helper that declares nonsense there is refused as well.
+        for nonsense in [0.0, -1.0, f32::NAN, MAX_PAGE_POINTS + 1.0] {
+            let mut absurd = whole.clone();
+            absurd[36..40].copy_from_slice(&nonsense.to_le_bytes());
+            assert!(
+                decode_frame(&absurd, 1)
+                    .unwrap_err()
+                    .contains("printed width"),
+                "a printed width of {nonsense} has to be refused"
+            );
+        }
 
         // Dimensions and length have to agree, or the upload draws nothing.
         let mut mismatched = whole.clone();
@@ -869,7 +1001,14 @@ mod tests {
             &format!("echo 'This PDF declares no pages.' >&2\nexit {EXIT_DOCUMENT_REFUSED}"),
         );
         assert_eq!(
-            render_with_helper(&refusing, &document, 0, PdfTone::Original, patience),
+            render_with_helper(
+                &refusing,
+                &document,
+                0,
+                PdfTone::Original,
+                PdfZoom::default(),
+                patience
+            ),
             Err("This PDF declares no pages.".to_owned())
         );
 
@@ -880,8 +1019,15 @@ mod tests {
             "abort",
             "echo 'fatal runtime error: stack overflow, aborting' >&2\nkill -ABRT $$",
         );
-        let message =
-            render_with_helper(&aborting, &document, 0, PdfTone::Original, patience).unwrap_err();
+        let message = render_with_helper(
+            &aborting,
+            &document,
+            0,
+            PdfTone::Original,
+            PdfZoom::default(),
+            patience,
+        )
+        .unwrap_err();
         assert!(
             message.contains("killed by signal 6") && message.contains("stack overflow"),
             "a crashed helper must report its signal and its last words: {message}"
@@ -894,10 +1040,17 @@ mod tests {
         let babbling = helper(
             root.path(),
             "babble",
-            "printf 'not a frame not a frame not a frame not a frame'",
+            "printf 'not a frame not a frame not a frame not a frame not a frame'",
         );
-        let message =
-            render_with_helper(&babbling, &document, 0, PdfTone::Original, patience).unwrap_err();
+        let message = render_with_helper(
+            &babbling,
+            &document,
+            0,
+            PdfTone::Original,
+            PdfZoom::default(),
+            patience,
+        )
+        .unwrap_err();
         assert!(
             message.contains("exit status 0") && message.contains("not a page"),
             "a helper that answers with nonsense must say so: {message}"
@@ -919,6 +1072,7 @@ mod tests {
                 &document,
                 0,
                 PdfTone::Original,
+                PdfZoom::default(),
                 Duration::from_millis(250)
             ),
             Err("This document could not be rendered in time.".to_owned())
