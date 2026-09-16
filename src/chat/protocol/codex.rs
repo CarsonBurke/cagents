@@ -1439,13 +1439,15 @@ fn parse_item(value: &Value, done: bool, turn: &str) -> Result<Vec<Item>, String
         },
         at: None,
     };
+    // A non-zero exit code is deliberately not a failure here. `grep` with no
+    // matches exits 1, `git diff --quiet` exits 1 when there is a diff, and a
+    // test runner exits non-zero to report the result it was asked for: all of
+    // them are the step doing its job. The code itself reaches the step's
+    // detail line, which is where a reader who needs it looks, and only what
+    // Codex itself reports as an error - a failed status, an error payload, an
+    // explicit `success: false` - marks the step failed.
     let status = match value["status"].as_str() {
-        _ if value["success"] == false
-            || value["error"].is_object()
-            || value["exitCode"].as_i64().is_some_and(|code| code != 0) =>
-        {
-            ToolStatus::Failed
-        }
+        _ if value["success"] == false || value["error"].is_object() => ToolStatus::Failed,
         Some("failed") => ToolStatus::Failed,
         Some("declined") => ToolStatus::Denied,
         Some("inProgress") => ToolStatus::Running,
@@ -2141,6 +2143,34 @@ mod tests {
         assert_eq!(*status, ToolStatus::Running);
         assert_eq!(*exit_code, None);
         assert_eq!(*duration_ms, None);
+    }
+
+    #[test]
+    fn a_non_zero_exit_code_is_a_result_rather_than_a_failure() {
+        let no_matches = json!({"id":"0","type":"commandExecution","command":"grep -n todo src","cwd":"/repo","status":"completed","exitCode":1,"durationMs":8,"aggregatedOutput":""});
+        let items = parse_item(&no_matches, true, "turn").unwrap();
+        let ItemContent::Command {
+            status, exit_code, ..
+        } = &items[0].content
+        else {
+            panic!("A Codex commandExecution must map to a command");
+        };
+        assert_eq!(
+            *status,
+            ToolStatus::Succeeded,
+            "a grep with no matches exits 1 and has not failed at anything"
+        );
+        assert_eq!(*exit_code, Some(1), "the code itself stays visible");
+        let reported = json!({"id":"1","type":"commandExecution","command":"cargo build","cwd":"/repo","status":"failed","exitCode":101});
+        let items = parse_item(&reported, true, "turn").unwrap();
+        let ItemContent::Command { status, .. } = &items[0].content else {
+            panic!("A Codex commandExecution must map to a command");
+        };
+        assert_eq!(
+            *status,
+            ToolStatus::Failed,
+            "what Codex itself calls a failure is still a failure"
+        );
     }
 
     #[test]

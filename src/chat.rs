@@ -30,6 +30,20 @@ pub fn clock_label(unix_ms: u64) -> String {
     format!("{:02}:{:02}", parts.tm_hour, parts.tm_min)
 }
 
+/// Unix milliseconds now, or `None` from a clock set before the epoch.
+///
+/// The daemon stamps every item it observes with this, and the surface
+/// measures how long a stretch of work has been running against it, so both
+/// sides have to read the same clock: an elapsed time taken from a different
+/// one would report the difference between two clocks rather than the time the
+/// agent spent.
+pub fn now_ms() -> Option<u64> {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .map(|elapsed| u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX))
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Launch {
     pub provider: Provider,
@@ -362,17 +376,21 @@ impl ItemContent {
         }
     }
 
-    /// Whether the item is a step of a turn rather than conversation prose.
+    /// Whether the item is something the agent did rather than something it
+    /// wrote.
     ///
-    /// Steps collapse into the turn's activity strip; prose does not.
+    /// Steps collapse into a group's activity strip, one click-to-open row
+    /// each. Text never does, reasoning included: filing a paragraph of
+    /// reasoning behind a row captioned "Thinking" hid the one part of a
+    /// turn that explains why the agent did what it did, and made the
+    /// transcript an accordion the reader had to operate to read prose.
     pub fn is_step(&self) -> bool {
         match self {
-            Self::Text { thinking, .. } => *thinking,
             Self::Command { .. }
             | Self::Changes { .. }
             | Self::WebSearch { .. }
             | Self::Tool { .. } => true,
-            Self::Image { .. } => false,
+            Self::Text { .. } | Self::Image { .. } => false,
         }
     }
 
