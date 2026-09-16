@@ -171,7 +171,17 @@ struct PublishedState {
     activity: Mutex<Option<TerminalOutputActivity>>,
     agent_activity: Mutex<Option<crate::agent::Activity>>,
     completed: AtomicBool,
-    wake_pending: AtomicBool,
+    /// The newest generation a wake has already announced to the subscriber
+    /// side of this protocol.
+    ///
+    /// Announcing each published generation exactly once is still one wake per
+    /// drawn frame, because `capture_if_ready` withholds the next capture until
+    /// that generation is acknowledged. A "a wake is pending" flag measured the
+    /// same thing but could only be cleared by an acknowledgement, so an edge
+    /// its callback dropped - a repaint broadcast while no subscriber was
+    /// visible - suppressed every later generation, including the capture a
+    /// reveal forces.
+    announced_generation: AtomicU64,
     visible: AtomicBool,
     wake: Arc<WakeCallback>,
     output_observer: OnceLock<Arc<dyn Fn(u64) + Send + Sync>>,
@@ -190,7 +200,7 @@ impl PublishedState {
             activity: Mutex::new(None),
             agent_activity: Mutex::new(None),
             completed: AtomicBool::new(false),
-            wake_pending: AtomicBool::new(false),
+            announced_generation: AtomicU64::new(0),
             visible: AtomicBool::new(visible),
             wake,
             output_observer: OnceLock::new(),
@@ -219,24 +229,26 @@ impl PublishedState {
             return;
         }
         if self
-            .wake_pending
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .is_ok()
+            .announced_generation
+            .fetch_max(generation, Ordering::AcqRel)
+            < generation
         {
-            if self.visible.load(Ordering::Acquire) {
-                (self.wake)(TerminalWake { generation });
-            } else {
-                self.wake_pending.store(false, Ordering::Release);
-            }
+            (self.wake)(TerminalWake { generation });
         }
     }
 
     fn suppress_wakes(&self) {
         self.visible.store(false, Ordering::Release);
-        self.wake_pending.store(false, Ordering::Release);
     }
 
+    /// Records the generation the subscriber drew and releases the capture
+    /// credit for the next one.
+    ///
+    /// It re-arms nothing: a publication announces its own generation, so
+    /// there is no edge for an acknowledgement to re-open.
     fn acknowledge(&self, observed_generation: u64) {
+        // A subscriber cannot acknowledge a generation this worker never
+        // published; that would let the capture loop run ahead of the UI.
         let observed_generation =
             observed_generation.min(self.published_generation.load(Ordering::Acquire));
         let previous = self
@@ -244,11 +256,6 @@ impl PublishedState {
             .fetch_max(observed_generation, Ordering::AcqRel);
         if observed_generation > previous {
             let _ = self.capture_tx.try_send(());
-        }
-        self.wake_pending.store(false, Ordering::Release);
-        let latest = self.published_generation.load(Ordering::Acquire);
-        if latest > observed_generation && self.visible.load(Ordering::Acquire) {
-            self.request_wake(latest);
         }
     }
 }
@@ -2713,7 +2720,7 @@ mod tests {
         let (_commands, receiver) = command_channel(1);
         worker.commands = receiver;
         worker.run();
-        assert!(!published.wake_pending.load(Ordering::Acquire));
+        assert_eq!(published.announced_generation.load(Ordering::Acquire), 0);
         assert_eq!(
             published.snapshot.load().lines[0]
                 .cells
@@ -2901,19 +2908,25 @@ mod tests {
         assert_eq!(repeat, b"\x1b[1;1:2B");
     }
 
+    /// A generation the subscriber has not acknowledged must not silence the
+    /// next one. `capture_if_ready` is what holds this protocol to one wake
+    /// per drawn frame, so the announcement itself must not also wait for a
+    /// draw: an edge the callback dropped - a repaint broadcast while no
+    /// subscriber was visible - would otherwise freeze the terminal until
+    /// something unrelated repainted it.
     #[test]
-    fn wake_coalescing_generation_recheck_closes_ack_race() {
+    fn each_published_generation_is_announced_once_without_an_acknowledgement() {
         let wakes = Arc::new(AtomicUsize::new(0));
         let published = test_published(true, Arc::clone(&wakes));
 
         published.publish(snapshot(1));
         published.publish(snapshot(2));
-        assert_eq!(wakes.load(Ordering::SeqCst), 1);
-
-        published.acknowledge(1);
         assert_eq!(wakes.load(Ordering::SeqCst), 2);
+
+        // Acknowledging returns capture credit and announces nothing.
         published.acknowledge(2);
         assert_eq!(wakes.load(Ordering::SeqCst), 2);
+        assert_eq!(published.capture_rx.try_recv(), Ok(()));
     }
 
     #[test]
@@ -2938,20 +2951,6 @@ mod tests {
         published.request_wake(4);
 
         assert_eq!(wakes.load(Ordering::SeqCst), 1);
-    }
-
-    #[test]
-    fn hiding_clears_an_unacknowledged_wake_edge_before_reveal() {
-        let wakes = Arc::new(AtomicUsize::new(0));
-        let published = test_published(true, Arc::clone(&wakes));
-        published.publish(snapshot(1));
-        assert_eq!(wakes.load(Ordering::SeqCst), 1);
-
-        published.suppress_wakes();
-        published.visible.store(true, Ordering::Release);
-        published.request_wake(1);
-
-        assert_eq!(wakes.load(Ordering::SeqCst), 2);
     }
 
     #[test]

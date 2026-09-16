@@ -147,7 +147,18 @@ struct HostedPublishedState {
     acknowledged_generation: AtomicU64,
     acknowledgement_tx: Sender<()>,
     acknowledgement_rx: Receiver<()>,
-    wake_pending: AtomicBool,
+    /// The newest generation, or repaint reason, a wake has already announced
+    /// to the UI.
+    ///
+    /// A published generation is announced exactly once, which is what keeps a
+    /// terminal at full output rate to one wake per drawn frame: the daemon
+    /// withholds the next capture until the UI acknowledges this generation,
+    /// so generations arrive no faster than frames are drawn. Coalescing on a
+    /// bare "a wake is pending" flag did the same arithmetic but could only be
+    /// cleared by a draw, so a wake that no draw ever answered suppressed
+    /// every later generation - the terminal then stayed frozen until an
+    /// unrelated pointer event repainted the widget from this snapshot.
+    announced_generation: AtomicU64,
     semantic_wake_pending: AtomicBool,
     output_observation: Mutex<OutputObservation>,
     visibility: AtomicU8,
@@ -176,7 +187,7 @@ impl HostedPublishedState {
             acknowledged_generation: AtomicU64::new(0),
             acknowledgement_tx,
             acknowledgement_rx,
-            wake_pending: AtomicBool::new(false),
+            announced_generation: AtomicU64::new(0),
             semantic_wake_pending: AtomicBool::new(false),
             output_observation: Mutex::new(OutputObservation::default()),
             visibility: AtomicU8::new(Self::visibility_code(if visible {
@@ -203,7 +214,12 @@ impl HostedPublishedState {
         self.snapshot.store(Arc::new(snapshot));
         self.generation.store(generation, Ordering::Release);
         self.observe_activity(activity);
-        if self.is_visible() {
+        if generation == current_generation {
+            // Past the guard above, a repeat of the current generation is a
+            // hibernated view being repopulated. The grid's own number cannot
+            // express that, so only a repaint announcement carries it.
+            self.announce_repaint(generation);
+        } else {
             self.request_wake(generation);
         }
     }
@@ -237,13 +253,15 @@ impl HostedPublishedState {
         self.activity_current.store(true, Ordering::Release);
         drop(activity);
         if changed {
-            self.request_wake(self.generation.load(Ordering::Acquire));
+            // An activity fact changes what the card chrome reads without
+            // advancing the grid, so the generation cannot carry it.
+            self.announce_repaint(self.generation.load(Ordering::Acquire));
         }
     }
 
     fn invalidate_activity(&self) {
         if self.activity_current.swap(false, Ordering::AcqRel) {
-            self.request_wake(self.generation.load(Ordering::Acquire));
+            self.announce_repaint(self.generation.load(Ordering::Acquire));
         }
     }
 
@@ -309,20 +327,46 @@ impl HostedPublishedState {
         let generation = self.generation.load(Ordering::Acquire);
         self.snapshot
             .store(Arc::new(RenderSnapshot::detached(generation)));
-        self.request_wake(generation);
+        // The marker replaces the grid under the generation it already had,
+        // so only a repaint announcement can carry it to the UI.
+        self.announce_repaint(generation);
     }
 
+    /// Announces a newly published generation, at most once.
+    ///
+    /// The watermark is the whole of the coalescing: the daemon withholds the
+    /// next capture until the UI acknowledges this generation, so announcing
+    /// each generation once is one wake per drawn frame. Crucially it does not
+    /// depend on a draw ever happening - a generation the UI never drew cannot
+    /// silence the generation after it.
     fn request_wake(&self, generation: u64) {
         if !self.is_visible() {
             return;
         }
         if self
-            .wake_pending
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .is_ok()
+            .announced_generation
+            .fetch_max(generation, Ordering::AcqRel)
+            < generation
         {
             (self.wake)(TerminalWake { generation });
         }
+    }
+
+    /// Announces a repaint the grid's generation cannot express: a reveal, a
+    /// detached marker, or an activity fact that changed under the generation
+    /// already announced.
+    ///
+    /// These are transitions rather than output, so they are announced
+    /// unconditionally. A transition that coincides with a publication still
+    /// costs one wake, because the watermark it advances is what makes that
+    /// publication's own announcement a no-op.
+    fn announce_repaint(&self, generation: u64) {
+        if !self.is_visible() {
+            return;
+        }
+        self.announced_generation
+            .fetch_max(generation, Ordering::AcqRel);
+        (self.wake)(TerminalWake { generation });
     }
 
     fn request_semantic_wake(&self) {
@@ -383,6 +427,13 @@ impl HostedPublishedState {
         }
     }
 
+    /// Records that the UI drew `observed_generation`, returning the redraw
+    /// credit the daemon withholds its next capture for.
+    ///
+    /// It deliberately re-arms nothing. Every published generation announces
+    /// itself exactly once, so there is no announcement for a draw to release
+    /// - and no window between clearing a flag and re-reading the published
+    /// generation for a publication to fall into.
     fn acknowledge(&self, observed_generation: u64) {
         let previous = self
             .acknowledged_generation
@@ -393,11 +444,6 @@ impl HostedPublishedState {
             // The atomic carries the newest generation; one queued edge is
             // sufficient regardless of how many frames the UI acknowledges.
             let _ = self.acknowledgement_tx.try_send(());
-        }
-        self.wake_pending.store(false, Ordering::Release);
-        let latest = self.generation.load(Ordering::Acquire);
-        if latest > observed_generation && self.is_visible() {
-            self.request_wake(latest);
         }
     }
 
@@ -412,11 +458,10 @@ impl HostedPublishedState {
     fn set_visibility(&self, visibility: TerminalVisibility) {
         self.visibility
             .store(Self::visibility_code(visibility), Ordering::Release);
-        let generation = self.generation.load(Ordering::Acquire);
         if visibility == TerminalVisibility::Visible {
-            self.request_wake(generation);
-        } else {
-            self.wake_pending.store(false, Ordering::Release);
+            // A revealed view holds a detached marker or a grid the UI has
+            // already drawn, so no generation is owed to it; the repaint is.
+            self.announce_repaint(self.generation.load(Ordering::Acquire));
         }
     }
 
@@ -2787,6 +2832,49 @@ mod tests {
         assert_eq!(event_rx.try_recv(), Ok(TerminalEvent::Bell));
     }
 
+    /// A published state whose wake callback records the generation of every
+    /// wake it emits, so a test can assert what the UI was actually told
+    /// rather than only how often it was woken.
+    fn recording_published_state(
+        visible: bool,
+    ) -> (HostedPublishedState, impl Fn() -> Vec<u64> + Clone) {
+        let announced = Arc::new(Mutex::new(Vec::new()));
+        let recorder = Arc::clone(&announced);
+        let published = HostedPublishedState::new(
+            None,
+            visible,
+            Arc::new(move |wake: TerminalWake| {
+                recorder
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .push(wake.generation);
+            }),
+        );
+        (published, move || {
+            announced
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .clone()
+        })
+    }
+
+    fn published_grid(generation: u64, text: &str) -> RenderSnapshot {
+        use crate::terminal::{CellSnapshot, CellText, RowSnapshot};
+        RenderSnapshot {
+            generation,
+            columns: 1,
+            rows: 1,
+            lines: vec![Arc::new(RowSnapshot {
+                cells: vec![CellSnapshot {
+                    text: CellText::new(text),
+                    ..CellSnapshot::default()
+                }],
+            })]
+            .into(),
+            ..RenderSnapshot::empty()
+        }
+    }
+
     #[test]
     fn visual_and_semantic_wake_edges_are_independent() {
         let (published, wake_count) = published_state(true);
@@ -2796,12 +2884,68 @@ mod tests {
         accept_server_event(&event_tx, &published, 1, TerminalEvent::Bell).unwrap();
 
         assert_eq!(wake_count.load(Ordering::Relaxed), 2);
-        assert!(published.wake_pending.load(Ordering::Acquire));
+        assert_eq!(published.announced_generation.load(Ordering::Acquire), 1);
         assert!(published.semantic_wake_pending.load(Ordering::Acquire));
         published.begin_event_drain();
-        assert!(published.wake_pending.load(Ordering::Acquire));
+        assert_eq!(published.announced_generation.load(Ordering::Acquire), 1);
         assert!(!published.semantic_wake_pending.load(Ordering::Acquire));
         assert_eq!(published.acknowledged_generation.load(Ordering::Acquire), 0);
+    }
+
+    /// The defect this protects against: a wake the UI was handed but never
+    /// answered with a draw - the card was not mounted in the view that wake
+    /// produced - used to suppress every later generation, so the terminal
+    /// stayed frozen until an unrelated pointer event repainted the widget
+    /// from this snapshot.
+    #[test]
+    fn a_generation_no_draw_answered_does_not_silence_the_next_one() {
+        let (published, announced) = recording_published_state(true);
+
+        published.publish(published_grid(1, "a"));
+        assert_eq!(announced(), vec![1]);
+
+        published.publish(published_grid(2, "b"));
+
+        assert_eq!(announced(), vec![1, 2]);
+        assert_eq!(published.snapshot.load().lines[0].cells[0].text, "b");
+        // The draw that second wake produces is what returns the redraw credit
+        // the daemon withholds its next capture for.
+        published.acknowledge(2);
+        assert_eq!(published.acknowledgement_rx.try_recv(), Ok(()));
+    }
+
+    /// A terminal at full output rate must still cost one wake per drawn
+    /// frame, which is the reason the announcement is a watermark rather than
+    /// an unconditional edge: a capture that also carries a new activity fact
+    /// is still one repaint.
+    #[test]
+    fn a_published_generation_is_announced_once_even_when_its_activity_changed() {
+        let (published, announced) = recording_published_state(true);
+
+        published.publish(RenderSnapshot {
+            activity: Some(crate::model::TerminalOutputActivity {
+                sequence: 7,
+                last_output_at_unix_ms: 1,
+            }),
+            ..published_grid(1, "a")
+        });
+
+        assert_eq!(announced(), vec![1]);
+        assert_eq!(published.activity().map(|fact| fact.sequence), Some(7));
+    }
+
+    /// Reveal owes the UI a repaint that no generation can carry: the grid it
+    /// holds is a detached marker, or one the UI drew before it was hidden.
+    /// The announcement for that generation has already been spent.
+    #[test]
+    fn a_reveal_announces_a_repaint_after_an_unanswered_generation() {
+        let (published, announced) = recording_published_state(true);
+
+        published.publish(published_grid(1, "a"));
+        published.set_visible(false);
+        published.set_visible(true);
+
+        assert_eq!(announced(), vec![1, 1]);
     }
 
     #[test]
