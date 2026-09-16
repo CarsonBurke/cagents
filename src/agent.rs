@@ -71,6 +71,10 @@ impl Provider {
         &ADAPTERS[self as usize]
     }
 
+    /// Every provider in declaration order, for menus and for recognizing the
+    /// placeholder titles a card carries before its conversation names itself.
+    pub const ALL: [Self; 3] = [Self::Omp, Self::Claude, Self::Codex];
+
     pub fn executable(self) -> &'static str {
         self.adapter().executable
     }

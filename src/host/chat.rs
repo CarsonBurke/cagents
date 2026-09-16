@@ -167,6 +167,45 @@ fn preview(
     Ok(ServerResponse::ChatPreviewed { preview })
 }
 
+/// Enumerates the source account's open conversations without issuing a token
+/// or recording a pending binding, because listing must grant no attach right.
+fn candidates(
+    host: &SharedHost,
+    session: Session,
+    source: HostSessionProof,
+) -> Result<ServerResponse, ProtocolError> {
+    if session.launch.provider != Provider::Codex {
+        return Err(error(
+            "Explicit shared-server selection is only supported for Codex",
+        ));
+    }
+    let handle = {
+        let state = host.lock().unwrap_or_else(|p| p.into_inner());
+        validate_proof(Some(&source), state.proof())?;
+        state
+            .terminals
+            .get(&session.id)
+            .filter(|record| !record.handle.is_completed())
+            .ok_or_else(|| unavailable("The source terminal is no longer running"))?
+            .handle
+            .clone()
+    };
+    let process = handle
+        .observe_agent_process()
+        .filter(|process| process.provider == Provider::Codex)
+        .ok_or_else(|| unavailable("The source is no longer a foreground Codex CLI"))?;
+    let candidates =
+        crate::agent::observe::codex_candidates(&process.recovery).map_err(unavailable)?;
+    // The listing describes the account observed above, so a replaced foreground
+    // process means it describes some other CLI and must not be presented.
+    if handle.observe_agent_process().as_ref() != Some(&process) {
+        return Err(error(
+            "The foreground process changed while the conversations were being listed; retry",
+        ));
+    }
+    Ok(ServerResponse::ChatCandidates { candidates })
+}
+
 #[derive(Default)]
 pub(super) struct Observation {
     epoch: u64,
@@ -585,11 +624,21 @@ fn start(
     }
     // All adapter validation happens before a source terminal can be changed.
     let (mut spec, mut adapter) = chat::protocol::create(&session.launch).map_err(error)?;
-    if source.is_none() && session.terminal.is_none() {
-        // Standalone conversations receive transient execution configuration from
-        // the GUI, including credentials unavailable in the daemon environment.
-        // Keep these values in the process spec only, never the durable session.
-        // Explicit selected configuration takes precedence over daemon defaults.
+    if source.is_none() {
+        // A conversation with no proven source has no proven environment to
+        // preserve, so it starts from the daemon's own native configuration
+        // whether or not it names a stopped terminal. Requiring the absence of
+        // a descriptor here left a conversation converted from a stopped agent
+        // terminal with nothing but that terminal's recorded recipe, which is
+        // empty for a terminal whose resume hint was discarded when its agent
+        // exited.
+        //
+        // Standalone conversations also receive transient execution
+        // configuration from the GUI, including credentials unavailable in the
+        // daemon environment. Keep these values in the process spec only,
+        // never the durable session. Explicit selected configuration takes
+        // precedence over daemon defaults, and the recipe's own environment
+        // takes precedence over both.
         let mut environment =
             crate::model::agent_recovery::fresh_native_environment(session.launch.provider, false);
         for (name, value) in execution_environment.0 {
@@ -871,6 +920,7 @@ pub(super) fn process(
 ) -> Result<ServerResponse, ProtocolError> {
     match request {
         ClientRequest::ChatPreview { session, source } => preview(host, session, source),
+        ClientRequest::ChatCandidates { session, source } => candidates(host, session, source),
         ClientRequest::ChatStartSelected {
             session,
             source,
@@ -1605,6 +1655,66 @@ mod tests {
             .environment
             .insert("HOME".into(), "/other-account".into());
         assert!(!binding.authorizes(&other_account, id, now));
+    }
+
+    #[test]
+    fn a_candidate_listing_names_a_terminal_where_a_preview_names_a_conversation() {
+        let (_directory, host, _saved) = upgrade_fixture();
+        let source = host
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .proof()
+            .clone();
+        let session = Session {
+            id: TerminalId::new(),
+            launch: chat::Launch {
+                provider: Provider::Codex,
+                recipe: LaunchRecipe {
+                    program: "codex".into(),
+                    arguments: Vec::new(),
+                    working_directory: "/project".into(),
+                    environment: BTreeMap::new(),
+                },
+                session_id: None,
+            },
+            proof: Some(source.clone()),
+            terminal: None,
+        };
+        // A listing names a terminal, never a conversation, so the missing ID
+        // that a preview rejects outright still reaches the terminal lookup.
+        let listed = process(
+            &host,
+            1,
+            ClientRequest::ChatCandidates {
+                session: session.clone(),
+                source: source.clone(),
+            },
+        )
+        .unwrap_err();
+        assert_eq!(listed.code, ProtocolErrorCode::TerminalUnavailable);
+        let previewed = process(
+            &host,
+            1,
+            ClientRequest::ChatPreview {
+                session: session.clone(),
+                source: source.clone(),
+            },
+        )
+        .unwrap_err();
+        assert_eq!(previewed.code, ProtocolErrorCode::InvalidRequest);
+        // An activation still has to consume a token issued by a real preview,
+        // and no listing can produce one.
+        let activated = process(
+            &host,
+            1,
+            ClientRequest::ChatStartSelected {
+                session,
+                source,
+                token: "forged".into(),
+            },
+        )
+        .unwrap_err();
+        assert_eq!(activated.code, ProtocolErrorCode::InvalidRequest);
     }
 
     fn upgrade_fixture() -> (tempfile::TempDir, SharedHost, crate::upgrade::handoff::Chat) {

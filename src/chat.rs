@@ -82,6 +82,22 @@ pub struct BindingPreview {
     pub working_directory: std::path::PathBuf,
 }
 
+/// One conversation a Codex account's shared server is currently holding open.
+/// Listing carries no token because enumeration authorizes nothing; an attach
+/// still requires the separate confirmed preview capability.
+///
+/// `title` is the thread's own name where it has one and the server's own
+/// preview of the conversation where it does not, because an unnamed thread
+/// has nothing else to tell one conversation from another by. Listing
+/// therefore carries a little conversation text, within the same account and
+/// the same user, in exchange for being choosable at all.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BindingCandidate {
+    pub session_id: String,
+    pub title: String,
+    pub working_directory: std::path::PathBuf,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Snapshot {
     pub generation: u64,
@@ -92,6 +108,7 @@ pub struct Snapshot {
     pub selected_model: Option<String>,
     pub reasoning: Option<String>,
     pub commands: Vec<SlashCommand>,
+    pub skills: Vec<Skill>,
     pub usage: Usage,
     pub busy: bool,
     pub detail: String,
@@ -354,6 +371,10 @@ pub struct Item {
     pub id: String,
     pub role: Role,
     pub content: ItemContent,
+    /// Unix milliseconds when the daemon last saw this item change, which is
+    /// when it finished for an item that is no longer being written to.
+    #[serde(default)]
+    pub at: Option<u64>,
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Choice {
@@ -391,6 +412,19 @@ pub struct SlashCommand {
     pub name: String,
     pub description: String,
 }
+/// Something the provider will do on request that is not one of its own
+/// commands: a repository skill, a saved prompt, a workflow.
+///
+/// The invocation is carried rather than derived from the name because each
+/// provider spells it differently. Codex acts on a skill named in the message
+/// text as `$Name`, which is not a command dispatch at all, so a client that
+/// assumed a leading slash would send something the provider ignores.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Skill {
+    pub name: String,
+    pub description: String,
+    pub invocation: String,
+}
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Capabilities {
     pub steer: bool,
@@ -427,6 +461,7 @@ pub enum Event {
         reasoning: Option<String>,
     },
     Commands(Vec<SlashCommand>),
+    Skills(Vec<Skill>),
     /// Upsert a completed/history item without duplicating a streamed item.
     Item(Item),
     ItemsRemoved {

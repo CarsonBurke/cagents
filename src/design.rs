@@ -18,6 +18,13 @@ pub const SECONDARY_CONTROL_MIN_SIZE: f32 = 30.0;
 pub const ROW_ICON_SIZE: u16 = 16;
 /// Icons that stand alone as the illustration of a whole pane state.
 pub const STATUS_ICON_SIZE: u16 = 20;
+/// A control that sits inside prose rather than in a toolbar, and its icon.
+///
+/// A message's own controls belong to the message, so they are drawn at
+/// caption scale. At the primary size they read as a button bar under every
+/// answer and competed with the answer itself.
+pub const COMPACT_CONTROL_SIZE: f32 = 20.0;
+pub const COMPACT_ICON_SIZE: u16 = 12;
 
 pub const TEXT_BODY: f32 = 13.0;
 pub const TEXT_CAPTION: f32 = 11.0;
@@ -221,6 +228,16 @@ pub fn sunken(theme: &cosmic::Theme) -> cosmic::iced::Color {
     } else {
         mix(base(theme), on, 0.06)
     }
+}
+
+/// The unfilled part of a gauge.
+///
+/// A gauge has to read as a whole even where it is empty, so its track is
+/// tinted toward the ink rather than away from it. A track one step below the
+/// surface vanished into the pane, which left a small fill looking like a
+/// stray dot with nothing to measure it against.
+pub fn track(theme: &cosmic::Theme) -> cosmic::iced::Color {
+    mix(base(theme), theme.current_container().on.into(), 0.18)
 }
 
 /// The accent at reading strength: enough to claim a surface as the user's

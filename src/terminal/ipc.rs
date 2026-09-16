@@ -42,7 +42,12 @@ use crate::{
 /// neither the shifted variant indices nor the added field can be tolerated by a peer
 /// that predates them - a `serde(default)` never fires because a missing trailing field
 /// is indistinguishable from the next value in the frame.
-pub const PROTOCOL_VERSION: u16 = 11;
+/// Version 12 adds read-only conversation listing, a provider skill catalog and an
+/// observation stamp on every item. The listing request and response sit beside their
+/// preview neighbours rather than at the end of their enums, and both `Snapshot` and
+/// `Item` gained a field, so a peer that predates this reads the wrong layout at the
+/// same advertised version unless the version itself moves.
+pub const PROTOCOL_VERSION: u16 = 12;
 /// Postcard encodes an 80x24 grid in roughly 20 KiB and a typical single-row
 /// delta in a few hundred bytes, but a full repaint of a very large grid after
 /// a resize still has to fit, so keep generous headroom.
@@ -224,6 +229,12 @@ pub enum ClientRequest {
         source: crate::chat::Session,
     },
     ChatPreview {
+        session: crate::chat::Session,
+        source: HostSessionProof,
+    },
+    /// Read-only listing of the source account's open conversations. It issues
+    /// no token, so it cannot stand in for ChatPreview when authorizing.
+    ChatCandidates {
         session: crate::chat::Session,
         source: HostSessionProof,
     },
@@ -471,6 +482,9 @@ pub enum ServerResponse {
     },
     ChatPreviewed {
         preview: crate::chat::BindingPreview,
+    },
+    ChatCandidates {
+        candidates: Vec<crate::chat::BindingCandidate>,
     },
     ChatTerminal {
         chat_id: TerminalId,

@@ -884,6 +884,7 @@ fn response_name(response: &ServerResponse) -> &'static str {
         ServerResponse::ChatClosed { .. } => "chat_closed",
         ServerResponse::ChatTerminal { .. } => "chat_terminal",
         ServerResponse::ChatPreviewed { .. } => "chat_previewed",
+        ServerResponse::ChatCandidates { .. } => "chat_candidates",
         ServerResponse::TerminalCloseChecked { .. } => "terminal_close_checked",
         ServerResponse::AgentActivity { .. } => "agent_activity",
         ServerResponse::UpgradePrepared { .. } => "upgrade_prepared",

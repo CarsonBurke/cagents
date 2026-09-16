@@ -80,7 +80,9 @@ const COMPACT_ROW_WIDTH: f32 = ROW_ICON_WIDTH + ROW_STATUS_WIDTH;
 /// the same three controls stay out of the group's drag region.
 const HEADER_ACTION_WIDTH: f32 = 3.0 * ICON_CONTROL_SIZE;
 
-fn worktree_icon() -> widget::icon::Handle {
+/// The glyph for "a worktree on a branch", shared with the chat status line so
+/// the same idea is not drawn two ways.
+pub(crate) fn worktree_icon() -> widget::icon::Handle {
     static ICON: LazyLock<widget::icon::Handle> = LazyLock::new(|| {
         widget::icon::from_svg_bytes(&br#"<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 16 16"><g fill="none" stroke="black" stroke-width="1.5" stroke-linecap="round"><circle cx="4" cy="3" r="1.5"/><circle cx="4" cy="13" r="1.5"/><circle cx="12" cy="3" r="1.5"/><path d="M4 4.5v7M12 4.5v1a4 4 0 0 1-4 4H4"/></g></svg>"#[..]).symbolic(true)
     });

@@ -3648,7 +3648,7 @@ impl Cagents {
                 session.launch.session_id = None;
                 session.proof = None;
                 session.terminal = None;
-                card.title = "Native chat".into();
+                card.title = crate::app::chat_ui::chat_card_title(session.launch.provider).into();
             }
             CardKind::Browser(session) => {
                 session.id = crate::model::BrowserId::new();

@@ -1019,6 +1019,15 @@ impl Write for ByteCounter {
         Ok(())
     }
 }
+/// Unix milliseconds for the moment the daemon observed an item change. A clock
+/// set before the unix epoch has nothing meaningful to report, so the stamp is
+/// absent rather than wrong.
+pub(super) fn observed_at() -> Option<u64> {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .map(|elapsed| u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX))
+}
 fn apply_event(state: &mut Snapshot, indices: &mut BTreeMap<String, usize>, event: Event) {
     match event {
         Event::ItemsRemoved { ids } => {
@@ -1067,7 +1076,11 @@ fn apply_event(state: &mut Snapshot, indices: &mut BTreeMap<String, usize>, even
             }
         }
         Event::Commands(value) => state.commands = value,
+        Event::Skills(value) => state.skills = value,
         Event::Item(mut item) => {
+            // The adapters do not know wall-clock time, so the item is stamped
+            // here, where the daemon actually observes the change.
+            item.at = observed_at();
             if let Some(&index) = indices.get(&item.id) {
                 if let (
                     ItemContent::Tool { name, input, .. },
@@ -1117,9 +1130,11 @@ fn apply_event(state: &mut Snapshot, indices: &mut BTreeMap<String, usize>, even
             thinking,
             delta,
         } => {
+            let at = observed_at();
             if let Some(&index) = indices.get(&id) {
                 if let ItemContent::Text { text, .. } = &mut state.items[index].content {
                     text.push_str(&delta);
+                    state.items[index].at = at;
                 } else {
                     state.error = Some(format!(
                         "Provider reused non-text item ID {id} for a text delta"
@@ -1138,6 +1153,7 @@ fn apply_event(state: &mut Snapshot, indices: &mut BTreeMap<String, usize>, even
                         thinking,
                         phase: Phase::Final,
                     },
+                    at,
                 });
             }
         }
@@ -1202,7 +1218,20 @@ mod tests {
                 thinking: false,
                 phase: Phase::Final,
             },
+            at: None,
         }
+    }
+    /// Stamps are wall-clock readings, so structural comparisons drop them and
+    /// leave the timing contract to the test that is actually about timing.
+    fn unstamped(items: &[Item]) -> Vec<Item> {
+        items
+            .iter()
+            .cloned()
+            .map(|mut item| {
+                item.at = None;
+                item
+            })
+            .collect()
     }
     #[test]
     fn outstanding_decisions_remain_waiting_after_streaming_stops() {
@@ -1296,7 +1325,7 @@ mod tests {
             },
         );
         assert_eq!(
-            state.items,
+            unstamped(&state.items),
             vec![text("older", "history"), text("live", "live update")]
         );
         apply_event(
@@ -1313,7 +1342,41 @@ mod tests {
             &mut indices,
             Event::Item(text("live", "new conversation")),
         );
-        assert_eq!(state.items, vec![text("live", "new conversation")]);
+        assert_eq!(
+            unstamped(&state.items),
+            vec![text("live", "new conversation")]
+        );
+    }
+    #[test]
+    fn observed_items_are_stamped_and_replayed_history_is_not() {
+        let mut state = Snapshot::default();
+        let mut indices = BTreeMap::new();
+        apply_event(&mut state, &mut indices, Event::Item(text("live", "first")));
+        let created = state.items[0].at.expect("an observed item carries a stamp");
+        apply_event(
+            &mut state,
+            &mut indices,
+            Event::TextDelta {
+                id: "live".into(),
+                role: Role::Assistant,
+                thinking: false,
+                delta: " more".into(),
+            },
+        );
+        let streamed = state.items[0]
+            .at
+            .expect("accumulating a delta keeps the item stamped");
+        assert!(streamed >= created);
+        apply_event(
+            &mut state,
+            &mut indices,
+            Event::History {
+                items: vec![text("older", "replay")],
+                has_earlier: false,
+            },
+        );
+        assert_eq!(state.items[0].at, None);
+        assert_eq!(state.items[1].at, Some(streamed));
     }
 
     #[test]
@@ -1506,13 +1569,13 @@ mod tests {
             Update::Presentation
         );
         assert_eq!(
-            handle.snapshot(None).unwrap().items,
+            unstamped(&handle.snapshot(None).unwrap().items),
             vec![text("echo", "hello world world")]
         );
         handle.close().unwrap();
         assert!(handle.is_completed());
         assert_eq!(
-            handle.snapshot(None).unwrap().items,
+            unstamped(&handle.snapshot(None).unwrap().items),
             vec![text("echo", "hello world world")]
         );
     }
@@ -1623,7 +1686,7 @@ mod tests {
         })
         .unwrap();
         until(&handle, |snapshot| {
-            snapshot.busy && snapshot.items == vec![text("echo", "hello")]
+            snapshot.busy && unstamped(&snapshot.items) == vec![text("echo", "hello")]
         });
         pong_received.recv_timeout(Duration::from_secs(5)).unwrap();
         assert!(matches!(
@@ -1659,7 +1722,10 @@ mod tests {
         let snapshot = handle.snapshot(None).unwrap();
         assert!(snapshot.exited);
         assert!(!snapshot.busy);
-        assert_eq!(snapshot.items, vec![text("echo", "hello stopped")]);
+        assert_eq!(
+            unstamped(&snapshot.items),
+            vec![text("echo", "hello stopped")]
+        );
     }
 
     #[test]

@@ -1,5 +1,6 @@
 //! Private, disk-backed transcript. Stable provider IDs and byte-addressed chunks
 //! keep both long conversations and a single enormous tool result pageable.
+use super::observed_at;
 use crate::chat::{Event, Item, ItemContent, Phase, Role};
 use rusqlite::{Connection, OptionalExtension, params};
 use std::{
@@ -111,6 +112,13 @@ impl Store {
             .map_err(|e| e.to_string())?;
         if older && previous.is_some() {
             return Ok(None);
+        }
+        // An adapter cannot know wall-clock time, so a live observation is
+        // stamped where the daemon actually sees it. Replayed history is not
+        // something the daemon just watched happen, so it keeps whatever the
+        // provider supplied.
+        if !older {
+            item.at = observed_at();
         }
         let mut preserve_input = false;
         if let Some((_, metadata, _)) = &previous {
@@ -350,6 +358,7 @@ impl Store {
                         thinking,
                         phase: Phase::Final,
                     },
+                    at: None,
                 },
                 false,
             )?;
@@ -364,19 +373,23 @@ impl Store {
                 Ok((row.get(0)?, row.get(1)?))
             })
             .map_err(|e| e.to_string())?;
-        let item: Item = postcard::from_bytes(&metadata).map_err(|e| e.to_string())?;
+        let mut item: Item = postcard::from_bytes(&metadata).map_err(|e| e.to_string())?;
         if !matches!(item.content, ItemContent::Text { .. }) {
             return Err(format!(
                 "Provider reused non-text item ID {id} for a text delta"
             ));
         }
         if !delta.is_empty() {
+            // A streaming item is restamped by every delta, so the stamp a
+            // finished item carries is the moment its last delta arrived.
+            item.at = observed_at();
+            let stamped = postcard::to_stdvec(&item).map_err(|e| e.to_string())?;
             let transaction = self.db.transaction().map_err(|e| e.to_string())?;
             insert_body(&transaction, id, 0, length, delta)?;
             transaction
                 .execute(
-                    "UPDATE items SET len0=len0+?2 WHERE id=?1",
-                    params![id, delta.len() as i64],
+                    "UPDATE items SET len0=len0+?2,metadata=?3 WHERE id=?1",
+                    params![id, delta.len() as i64, stamped],
                 )
                 .map_err(|e| e.to_string())?;
             transaction.commit().map_err(|e| e.to_string())?;
@@ -779,6 +792,7 @@ mod tests {
                     thinking: false,
                     phase: Phase::Final,
                 },
+                at: None,
             }))
             .unwrap();
         let mut pages = Vec::new();
@@ -818,6 +832,7 @@ mod tests {
                     path: payload.clone(),
                     description: "screenshot".into(),
                 },
+                at: None,
             }))
             .unwrap();
         assert!(warnings.is_empty(), "{warnings:?}");
@@ -840,6 +855,7 @@ mod tests {
                     thinking: false,
                     phase: Phase::Final,
                 },
+                at: None,
             }))
             .unwrap();
         assert_eq!(store.window().unwrap().items.len(), 2);
@@ -858,6 +874,7 @@ mod tests {
                     output: String::new(),
                     status: crate::chat::ToolStatus::Running,
                 },
+                at: None,
             }))
             .unwrap();
         assert!(
@@ -896,6 +913,7 @@ mod tests {
                     }],
                     status: crate::chat::ToolStatus::Succeeded,
                 },
+                at: None,
             }))
             .unwrap();
         assert!(
@@ -951,6 +969,7 @@ mod tests {
                     duration_ms: Some(12),
                     output: original.clone(),
                 },
+                at: None,
             }))
             .unwrap();
         let window = store.window().unwrap();
@@ -1008,6 +1027,7 @@ mod tests {
                     output: output.clone(),
                     status: crate::chat::ToolStatus::Running,
                 },
+                at: None,
             }))
             .unwrap();
         let before = parts(store.window().unwrap());
@@ -1029,6 +1049,7 @@ mod tests {
                     duration_ms: Some(3),
                     output,
                 },
+                at: None,
             }))
             .unwrap();
         let after = parts(store.window().unwrap());
@@ -1039,5 +1060,47 @@ mod tests {
                 "part id {id} was reused for different bytes"
             );
         }
+    }
+    /// The stamp is read as the moment an item finished, and a running daemon
+    /// reaches its transcript through this cache, so the stamp has to survive
+    /// caching, streaming and paging back out.
+    #[test]
+    fn cached_items_are_stamped_and_replayed_history_is_not() {
+        let mut store = Store::at(std::env::temp_dir()).unwrap();
+        let text = |id: &str, text: &str| Item {
+            id: id.into(),
+            role: Role::Assistant,
+            content: ItemContent::Text {
+                text: text.into(),
+                thinking: false,
+                phase: Phase::Final,
+            },
+            at: None,
+        };
+        store.apply(Event::Item(text("live", "first"))).unwrap();
+        let created = store.window().unwrap().items[0]
+            .at
+            .expect("a cached observation carries a stamp");
+        store
+            .apply(Event::TextDelta {
+                id: "live".into(),
+                role: Role::Assistant,
+                thinking: false,
+                delta: " more".into(),
+            })
+            .unwrap();
+        let streamed = store.window().unwrap().items[0]
+            .at
+            .expect("accumulating a delta keeps the item stamped");
+        assert!(streamed >= created);
+        store
+            .apply(Event::History {
+                items: vec![text("older", "replay")],
+                has_earlier: false,
+            })
+            .unwrap();
+        let items = store.window().unwrap().items;
+        assert_eq!(items[0].at, None);
+        assert_eq!(items[1].at, Some(streamed));
     }
 }

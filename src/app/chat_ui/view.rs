@@ -46,6 +46,24 @@ const PROMPT_MEASURE: f32 = 560.0;
 const GAUGE_WIDTH: f32 = 72.0;
 const GAUGE_HEIGHT: f32 = 6.0;
 
+/// The padding a status-line control is drawn with.
+///
+/// The default dropdown padding is sized for a settings page; on a status line
+/// it made a caption-height row twice the height of its own text.
+const CONTROL_PADDING: [f32; 2] = [2.0, 6.0];
+
+/// How tall the completion list is allowed to grow.
+///
+/// The list sits between the transcript and the composer, so it is bounded:
+/// an agent with forty commands must not push the conversation off screen.
+const COMPLETION_CEILING: f32 = 180.0;
+
+/// How tall the conversation chooser is allowed to grow.
+///
+/// The panel sits over the card, so it is bounded and scrolls: an account with
+/// twenty open conversations must not cover the whole surface.
+const BINDING_CEILING: f32 = 360.0;
+
 /// The composer editor, drawing no surface of its own.
 ///
 /// The composer is one surface that holds the editor and its controls
@@ -137,90 +155,274 @@ fn submit_chord(
         None
     }
 }
+
+/// The editing binding for a word-wise delete chord, or `None` for any other
+/// press.
+///
+/// The default bindings map Ctrl+Backspace to deleting one character, so the
+/// chord every other text field on the desktop uses to remove a word silently
+/// did the same thing as Backspace alone. Selecting the word first and then
+/// deleting the selection is how the editor already removes a range, so this
+/// needs no new editing primitive. Ctrl+Delete is included because the two
+/// directions are one habit.
+fn word_delete(press: &text_editor::KeyPress) -> Option<text_editor::Binding<Message>> {
+    if !matches!(press.status, text_editor::Status::Focused { .. })
+        || !press.modifiers.command()
+        || press.modifiers.alt()
+        || press.modifiers.shift()
+    {
+        return None;
+    }
+    let motion = match press.key {
+        keyboard::Key::Named(keyboard::key::Named::Backspace) => {
+            iced::advanced::text::editor::Motion::WordLeft
+        }
+        keyboard::Key::Named(keyboard::key::Named::Delete) => {
+            iced::advanced::text::editor::Motion::WordRight
+        }
+        _ => return None,
+    };
+    Some(text_editor::Binding::Sequence(vec![
+        text_editor::Binding::Select(motion),
+        text_editor::Binding::Backspace,
+    ]))
+}
+
+/// The completion query the draft ends on: the text after a `/` that opens the
+/// draft's last word, or `None` when the reader is not naming something.
+///
+/// The trigger follows the end of the draft rather than the start of it,
+/// because that is where typing happens, and a reader who wants a command
+/// after a sentence of context should still get the list.
+fn mention_query(draft: &str) -> Option<&str> {
+    draft
+        .rsplit(|character: char| character.is_whitespace())
+        .next()
+        .and_then(|word| word.strip_prefix('/'))
+}
+/// One row of the composer's completion list.
+///
+/// A completion row names the thing and says what it does, because a list of
+/// bare slugs makes a reader guess.
+fn completion_row<'a>(
+    label: String,
+    description: &'a str,
+    message: Option<Message>,
+) -> Element<'a, Message> {
+    widget::button::custom(
+        widget::row::with_children(vec![
+            design::body(label).into(),
+            design::caption(description)
+                .class(cosmic::theme::Text::Custom(design::muted_text))
+                .width(Length::Fill)
+                .wrapping(iced::widget::text::Wrapping::None)
+                .into(),
+        ])
+        .spacing(step::GAP_S)
+        .align_y(Alignment::Center),
+    )
+    .class(cosmic::theme::Button::MenuItem)
+    .padding(iced::Padding::from([step::GAP_XS, step::GAP_S]))
+    .width(Length::Fill)
+    .on_press_maybe(message)
+    .into()
+}
 fn command(target: Target, value: Command) -> Message {
     action(Action::Command(target, value))
 }
 
 impl Cagents {
+    /// Choosing which of a Codex account's open conversations a terminal is
+    /// looking at.
+    ///
+    /// This used to be a bare text field demanding a 36-character UUID copied
+    /// out of another program's `/status` output. The account's own server
+    /// knows what it is holding open, so the reader picks from that list, and
+    /// the common case - one conversation rooted in this terminal's directory
+    /// - resolves without the panel appearing at all.
     pub(in crate::app) fn chat_binding_view(&self, card: CardId) -> Option<Element<'_, Message>> {
         let binding = self.chat_ui.bindings.get(&card)?;
         let valid =
             binding.input.trim().len() == 36 && uuid::Uuid::parse_str(binding.input.trim()).is_ok();
-        let mut rows: Vec<Element<'_, Message>> = vec![
-            design::heading("Select the exact Codex conversation").into(),
-            body(
-                "The shared server does not identify which thread this terminal is viewing. Copy the full thread ID from /status in the intended CLI. Preview is read-only; nothing is resumed or sent.",
-            ),
-            iced::widget::text_input("Full conversation UUID", &binding.input)
+        let here = binding
+            .session
+            .terminal
+            .as_ref()
+            .map(|terminal| terminal.launch.working_directory.clone());
+        let mut rows: Vec<Element<'_, Message>> =
+            vec![design::heading("Which conversation is this terminal viewing?").into()];
+        // One sentence about the state of the list, not two: an error and an
+        // "it is empty" line together told the reader two different stories
+        // about the same failure.
+        if binding.scanning {
+            rows.push(body("Reading this account's open conversations…"));
+        } else if let Some(error) = &binding.error {
+            rows.push(body(error.as_str()));
+        } else if binding.candidates.is_empty() {
+            rows.push(body(
+                "This account's shared Codex server is holding no conversation open. Start one in the terminal, or paste its identifier below.",
+            ));
+        } else {
+            rows.push(body(
+                "Reading a conversation is read-only; nothing is resumed or sent until you confirm.",
+            ));
+        }
+        // The terminal's own directory comes first, because a conversation
+        // rooted anywhere else is almost never the one being looked at.
+        let mut listed = binding.candidates.iter().collect::<Vec<_>>();
+        listed.sort_by_key(|candidate| here.as_ref() != Some(&candidate.working_directory));
+        for candidate in listed {
+            let chosen = binding.input.trim() == candidate.session_id;
+            let directory = candidate
+                .working_directory
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_else(|| candidate.working_directory.display().to_string());
+            rows.push(
+                widget::button::custom(
+                    widget::column::with_children(vec![
+                        design::body(candidate.title.as_str())
+                            .wrapping(iced::widget::text::Wrapping::None)
+                            .into(),
+                        design::caption(directory)
+                            .class(cosmic::theme::Text::Custom(design::muted_text))
+                            .into(),
+                    ])
+                    .width(Length::Fill),
+                )
+                .class(if chosen {
+                    cosmic::theme::Button::Suggested
+                } else {
+                    cosmic::theme::Button::MenuItem
+                })
+                .padding(iced::Padding::from([step::GAP_XS, step::GAP_S]))
+                .width(Length::Fill)
+                .on_press_maybe((!binding.loading).then_some(action(Action::BindingChoose(
+                    card,
+                    candidate.session_id.clone(),
+                ))))
+                .into(),
+            );
+        }
+        if let Some(preview) = &binding.preview {
+            rows.push(body(format!(
+                "{}\n{}\n{}",
+                preview.title,
+                preview.session_id,
+                preview.working_directory.display()
+            )));
+            rows.push(body(
+                "Confirming attaches to this conversation's existing shared backend with its current permissions. The source terminal stays running; no duplicate agent is launched.",
+            ));
+        }
+        // Manual entry stays as the last resort, for a conversation the server
+        // is not holding open and can therefore not list.
+        rows.push(
+            design::caption("Not listed? Paste its identifier.")
+                .class(cosmic::theme::Text::Custom(design::muted_text))
+                .into(),
+        );
+        rows.push(
+            iced::widget::text_input("Conversation identifier", &binding.input)
                 .on_input(move |input| action(Action::BindingInput(card, input)))
                 .on_submit_maybe(
                     (valid && !binding.loading).then_some(action(Action::BindingPreview(card))),
                 )
                 .into(),
-        ];
-        if let Some(preview) = &binding.preview {
-            rows.push(body(format!(
-                "Conversation: {}\nID: {}\nDirectory: {}",
-                preview.title,
-                preview.session_id,
-                preview.working_directory.display()
-            )));
-            rows.push(body("Confirm only if this is the conversation you intend to control. This attaches to its existing shared backend with its current permissions. The source terminal stays running; no duplicate agent is launched."));
-        }
-        if let Some(error) = &binding.error {
-            rows.push(body(error.as_str()));
-        }
+        );
         rows.push(
-            widget::column::with_children(vec![
-                widget::button::text(if binding.loading {
-                    "Reading conversation…"
-                } else {
-                    "Preview conversation"
-                })
-                .on_press_maybe(
-                    (valid && !binding.loading).then_some(action(Action::BindingPreview(card))),
-                )
-                .into(),
-                widget::button::text("Confirm selected conversation")
+            widget::row::with_children(vec![
+                widget::button::suggested("Confirm")
                     .on_press_maybe(
                         (binding.preview.is_some() && !binding.loading)
                             .then_some(action(Action::BindingConfirm(card))),
                     )
                     .into(),
+                widget::button::text(if binding.loading {
+                    "Reading…"
+                } else {
+                    "Read conversation"
+                })
+                .on_press_maybe(
+                    (valid && !binding.loading).then_some(action(Action::BindingPreview(card))),
+                )
+                .into(),
+                // Attaching needs the account's shared server. Where there is
+                // none, this is the only thing that can still be done here,
+                // and it was previously left for the reader to work out.
+                widget::button::text("New conversation here")
+                    .on_press_maybe((!binding.loading).then_some(action(Action::BindingNew(card))))
+                    .into(),
                 widget::button::text("Cancel")
                     .on_press(action(Action::BindingCancel(card)))
                     .into(),
             ])
-            .spacing(8)
+            .spacing(step::GAP_S)
             .into(),
         );
         Some(
             widget::container(
-                widget::scrollable(widget::column::with_children(rows).spacing(8).padding(12))
-                    .direction(cosmic::iced::widget::scrollable::Direction::Vertical(
-                        crate::design::scrollbar(),
-                    ))
-                    .height(Length::Shrink),
+                widget::scrollable(
+                    widget::column::with_children(rows)
+                        .spacing(step::GAP_S)
+                        .padding(step::GAP_M),
+                )
+                .direction(iced::widget::scrollable::Direction::Vertical(
+                    design::scrollbar(),
+                ))
+                .height(Length::Shrink),
             )
-            .max_height(320)
+            .max_height(BINDING_CEILING)
             .width(Length::Fill)
             .into(),
         )
     }
 
+    /// Where a conversation is working, as the status line reports it.
+    ///
+    /// A chat pane names no location of its own, so a reader with several
+    /// panes open could not tell which worktree an agent was about to change.
+    /// The directory's own name is used rather than its path, because the path
+    /// is long, repetitive between worktrees, and already in the tab tooltip.
+    fn chat_place(&self, directory: &Path) -> Place {
+        Place {
+            name: directory
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_default(),
+            branch: self
+                .sidebar_model
+                .projects
+                .iter()
+                .flat_map(|project| project.worktrees.iter())
+                .find(|worktree| worktree.path == directory)
+                .and_then(|worktree| worktree.branch.clone()),
+        }
+    }
+
     pub(in crate::app) fn chat_view(&self, card: CardId) -> Element<'_, Message> {
         match self.cards.get(&card) {
-            Some(CardRuntime::Chat(runtime)) => runtime.view(
-                self.chat_start_pending(card) || self.chat_ui.closed.contains(&card),
-                self.settings.chat_enter_sends,
-            ),
+            Some(CardRuntime::Chat(runtime)) => {
+                let place = self.chat_place(&runtime.session.launch.recipe.working_directory);
+                runtime.view(
+                    self.chat_start_pending(card) || self.chat_ui.closed.contains(&card),
+                    self.settings.chat_enter_sends,
+                    place,
+                )
+            }
             _ => widget::text::body("Connecting to native chat…").into(),
         }
     }
 }
 
+/// The worktree a conversation runs in.
+struct Place {
+    name: String,
+    branch: Option<String>,
+}
+
 impl Runtime {
-    fn view(&self, transitioning: bool, enter_sends: bool) -> Element<'_, Message> {
+    fn view(&self, transitioning: bool, enter_sends: bool, place: Place) -> Element<'_, Message> {
         let target = self.target;
         let available =
             !transitioning && !self.disconnected && !self.snapshot.exited && self.pending.is_none();
@@ -247,14 +449,14 @@ impl Runtime {
             );
         }
         if self.turns.is_empty() {
+            // The empty state says what to do. It used to show whatever the
+            // adapter's last status detail was, which meant an empty
+            // conversation greeted the reader with a connection state instead
+            // of an invitation; the status line is where a state belongs.
             transcript.push(
                 widget::container(
-                    design::body(if snapshot.detail.is_empty() {
-                        "Your conversation appears here. Send a message to begin."
-                    } else {
-                        &snapshot.detail
-                    })
-                    .class(cosmic::theme::Text::Custom(design::muted_text)),
+                    design::body("Your conversation appears here. Send a message to begin.")
+                        .class(cosmic::theme::Text::Custom(design::muted_text)),
                 )
                 .center_x(Length::Fill)
                 .padding(design::GRID_UNIT * 8.0)
@@ -264,14 +466,41 @@ impl Runtime {
         for turn in &self.turns {
             transcript.push(self.turn_view(turn, markdown_settings));
         }
-        let mut content = vec![
-            widget::column::with_children(
+        // A notice belongs to the session, so it is pinned here: inside the
+        // transcript it scrolled away from the reader it was addressed to,
+        // and a single sentence about the account does not need a glyph and an
+        // accent sliver to be read.
+        //
+        // Only the newest one is pinned. A retrying or hook-heavy provider
+        // emits a notice per frame, and every one of them held above a
+        // transcript that fills the rest of the pane squeezes the
+        // conversation itself out of the card.
+        let mut content: Vec<Element<'_, Message>> = snapshot
+            .title
+            .iter()
+            .map(|title| -> Element<'_, Message> { design::heading(title.as_str()).into() })
+            .chain(
                 snapshot
-                    .title
+                    .items
                     .iter()
-                    .map(|title| design::heading(title.as_str()).into()),
+                    .rev()
+                    .filter(|item| item.role == chat::Role::System)
+                    .find_map(|item| match &item.content {
+                        ItemContent::Text { text, .. } if !text.trim().is_empty() => Some(
+                            design::caption(turn::first_line(text.as_str()))
+                                .class(cosmic::theme::Text::Custom(design::muted_text))
+                                // One row, whatever the provider put in it: a
+                                // wrapped paragraph of frame JSON would push
+                                // the transcript out of the card.
+                                .wrapping(iced::widget::text::Wrapping::None)
+                                .width(Length::Fill)
+                                .into(),
+                        ),
+                        _ => None,
+                    }),
             )
-            .into(),
+            .collect();
+        content.push(
             widget::scrollable(
                 widget::column::with_children(transcript)
                     // Turns are held apart further than anything inside one,
@@ -292,7 +521,7 @@ impl Runtime {
             .height(Length::Fill)
             .width(Length::Fill)
             .into(),
-        ];
+        );
         if snapshot.has_later {
             content.push(
                 widget::button::text("Jump to latest")
@@ -373,92 +602,6 @@ impl Runtime {
                 .into(),
             );
         }
-        let mut controls = Vec::new();
-        if snapshot.capabilities.model_selection && !snapshot.models.is_empty() {
-            let labels = snapshot
-                .models
-                .iter()
-                .map(|model| model.label.clone())
-                .collect::<Vec<_>>();
-            let selected = snapshot
-                .models
-                .iter()
-                .position(|model| Some(&model.id) == snapshot.selected_model.as_ref());
-            let ids = snapshot
-                .models
-                .iter()
-                .map(|model| model.id.clone())
-                .collect::<Vec<_>>();
-            controls.push(if transitioning {
-                widget::button::standard(
-                    selected.map_or_else(|| "Model".to_owned(), |index| labels[index].clone()),
-                )
-                .into()
-            } else {
-                widget::dropdown(labels, selected, move |index| {
-                    action(Action::Model(target, ids[index].clone()))
-                })
-                .into()
-            });
-        }
-        if snapshot.capabilities.reasoning_selection
-            && let Some(model) = snapshot
-                .models
-                .iter()
-                .find(|model| Some(&model.id) == snapshot.selected_model.as_ref())
-            && !model.reasoning.is_empty()
-        {
-            let selected = model
-                .reasoning
-                .iter()
-                .position(|reasoning| Some(reasoning) == snapshot.reasoning.as_ref());
-            let reasoning = model.reasoning.clone();
-            let model_id = model.id.clone();
-            controls.push(if transitioning {
-                widget::button::standard(
-                    selected.map_or("Reasoning", |index| model.reasoning[index].as_str()),
-                )
-                .into()
-            } else {
-                widget::dropdown(model.reasoning.clone(), selected, move |index| {
-                    action(Action::Reasoning(
-                        target,
-                        model_id.clone(),
-                        reasoning[index].clone(),
-                    ))
-                })
-                .into()
-            });
-        }
-        if !snapshot.capabilities.permission_modes.is_empty() {
-            let selected = snapshot
-                .capabilities
-                .permission_modes
-                .iter()
-                .position(|mode| Some(mode) == self.permission_mode.as_ref());
-            let modes = snapshot.capabilities.permission_modes.clone();
-            controls.push(if transitioning {
-                widget::button::standard(selected.map_or("Permissions", |index| {
-                    snapshot.capabilities.permission_modes[index].as_str()
-                }))
-                .into()
-            } else {
-                widget::dropdown(
-                    snapshot.capabilities.permission_modes.clone(),
-                    selected,
-                    move |index| action(Action::PermissionMode(target, modes[index].clone())),
-                )
-                .into()
-            });
-        }
-        if !controls.is_empty() {
-            content.push(
-                widget::row::with_children(controls)
-                    .spacing(6)
-                    .align_y(Alignment::Center)
-                    .into(),
-            );
-        }
         let draft = self.composer.text();
         if let Some(provided) = &snapshot.composer
             && !provided.trim().is_empty()
@@ -472,40 +615,63 @@ impl Runtime {
                     .into(),
             );
         }
-        if draft.trim_start().starts_with('/') && !snapshot.commands.is_empty() {
-            let query = draft.trim().trim_start_matches('/');
-            let commands = snapshot
+        if let Some(query) = mention_query(&draft) {
+            let matches = |candidate: &str| {
+                // Matching case-insensitively, because a reader typing a
+                // completion query is not thinking about how the skill's
+                // author capitalized it.
+                candidate.to_lowercase().starts_with(&query.to_lowercase())
+            };
+            let mut rows: Vec<Element<'_, Message>> = snapshot
                 .commands
                 .iter()
-                .filter(|command| command.name.trim_start_matches('/').starts_with(query))
+                .filter(|command| matches(command.name.trim_start_matches('/')))
                 .map(|command| {
-                    widget::button::text(format!(
-                        "/{}  {}",
-                        command.name.trim_start_matches('/'),
-                        command.description
-                    ))
-                    .on_press_maybe(
+                    completion_row(
+                        format!("/{}", command.name.trim_start_matches('/')),
+                        command.description.as_str(),
                         (!transitioning)
                             .then_some(action(Action::Slash(target, command.name.clone()))),
                     )
-                    .into()
                 })
-                .collect::<Vec<Element<'_, Message>>>();
-            if !commands.is_empty() {
+                .collect();
+            // Skills sit in the same list as the commands, because a reader
+            // opening it is asking what this agent can be told to do, not
+            // which of those things happens to be a built-in command. The
+            // row shows the invocation the provider actually answers to.
+            rows.extend(
+                snapshot
+                    .skills
+                    .iter()
+                    .filter(|skill| matches(&skill.name))
+                    .map(|skill| {
+                        completion_row(
+                            skill.invocation.clone(),
+                            skill.description.as_str(),
+                            (!transitioning).then_some(action(Action::Mention(
+                                target,
+                                skill.invocation.clone(),
+                            ))),
+                        )
+                    }),
+            );
+            if !rows.is_empty() {
                 content.push(
                     widget::container(
                         widget::scrollable(
-                            widget::column::with_children(commands)
-                                .spacing(0)
-                                .padding(crate::design::with_vertical_rail(iced::Padding::ZERO)),
+                            widget::column::with_children(rows)
+                                .padding(design::with_vertical_rail(iced::Padding::ZERO)),
                         )
                         .direction(
-                            cosmic::iced::widget::scrollable::Direction::Vertical(
-                                crate::design::scrollbar(),
-                            ),
+                            iced::widget::scrollable::Direction::Vertical(design::scrollbar()),
                         ),
                     )
-                    .max_height(120)
+                    .max_height(COMPLETION_CEILING)
+                    .class(design::surface(
+                        Some(design::raised),
+                        [design::RADIUS_M; 4],
+                        true,
+                    ))
                     .into(),
                 );
             }
@@ -550,18 +716,17 @@ impl Runtime {
         } else {
             &[PromptMode::Send]
         };
-        let placeholder = match (modes.first(), enter_sends) {
-            (Some(PromptMode::Send), true) => {
-                "Message · Enter to send · Shift+Enter for a new line"
-            }
-            (Some(PromptMode::Send), false) => {
-                "Message · Ctrl+Enter to send · Enter for a new line"
-            }
-            (Some(PromptMode::Steer), true) => "Message · Enter to steer this turn",
-            (Some(PromptMode::Steer), false) => "Message · Ctrl+Enter to steer this turn",
-            (Some(PromptMode::Queue), true) => "Message · Enter to queue for the next turn",
-            (Some(PromptMode::Queue), false) => "Message · Ctrl+Enter to queue for the next turn",
-            (None, _) => "Message · this turn accepts no further input",
+        // The placeholder names what the field is for. Spelling out both
+        // chords on it meant the one piece of text in an empty composer was
+        // keyboard documentation, repeated on every pane, and it went stale
+        // the moment the preference changed. The steering and queueing modes
+        // still say so, because there the mode is not what a reader expects
+        // Enter to do.
+        let placeholder = match modes.first() {
+            Some(PromptMode::Send) => "Message",
+            Some(PromptMode::Steer) => "Steer this turn",
+            Some(PromptMode::Queue) => "Queue for the next turn",
+            None => "This turn accepts no further input",
         };
         // A chord only submits what a send control would accept right now.
         let submit = if available && has_draft {
@@ -612,12 +777,12 @@ impl Runtime {
                 )))
                 .on_action(move |event| action(Action::Composer(target, event)))
                 .key_binding(move |press| {
-                    match submit_chord(&press, submit.0, submit.1, enter_sends) {
-                        Some(mode) => Some(text_editor::Binding::Custom(action(Action::Submit(
+                    if let Some(mode) = submit_chord(&press, submit.0, submit.1, enter_sends) {
+                        return Some(text_editor::Binding::Custom(action(Action::Submit(
                             target, mode,
-                        )))),
-                        None => text_editor::Binding::from_key_press(press),
+                        ))));
                     }
+                    word_delete(&press).or_else(|| text_editor::Binding::from_key_press(press))
                 })
                 .into()
         };
@@ -638,33 +803,10 @@ impl Runtime {
                 Action::Command(target, Command::Compact),
             ));
         }
-        if !snapshot.commands.is_empty() {
-            let commands = snapshot
-                .commands
-                .iter()
-                .map(|command| command.name.clone())
-                .collect::<Vec<_>>();
-            actions.push(if transitioning {
-                widget::button::standard("Slash commands").into()
-            } else {
-                widget::dropdown(
-                    snapshot
-                        .commands
-                        .iter()
-                        .map(|command| {
-                            format!(
-                                "/{} — {}",
-                                command.name.trim_start_matches('/'),
-                                command.description
-                            )
-                        })
-                        .collect::<Vec<_>>(),
-                    None,
-                    move |index| action(Action::Slash(target, commands[index].clone())),
-                )
-                .into()
-            });
-        }
+        // Commands are reached by typing `/`, which is how every agent surface
+        // a user arrives from works and what the composer already answers to.
+        // A dropdown listing them duplicated that path in a control that was
+        // permanently present for something used occasionally.
         actions.push(iced::widget::Space::new().width(Length::Fill).into());
         for (slot, mode) in modes.iter().enumerate() {
             let (name, label) = submit_control(*mode, slot, enter_sends);
@@ -710,33 +852,68 @@ impl Runtime {
             .into(),
         );
         let usage = &snapshot.usage;
-        let detail = if transitioning {
-            "Session transition in progress"
+        // The status line is one caption-height row: what the agent is doing,
+        // where it is doing it, the settings a reader changes mid-conversation,
+        // and what the conversation has cost. It scrolls sideways rather than
+        // wrapping, because a chat pane is often narrow and a status line that
+        // grows to three rows takes the space from the transcript.
+        let mut status: Vec<Element<'_, Message>> = Vec::new();
+        let activity = if transitioning {
+            Some(("agent-working-symbolic", "Switching session"))
         } else if self.attachment_chooser_pending {
-            "Choosing attachments"
+            Some(("agent-working-symbolic", "Choosing attachments"))
         } else if self.pending.is_some() {
-            "Awaiting acknowledgement"
-        } else {
-            &snapshot.detail
-        };
-        let (glyph, state) = if snapshot.waiting || !snapshot.requests.is_empty() {
-            ("agent-waiting-symbolic", "Waiting for you")
+            Some(("agent-working-symbolic", "Awaiting acknowledgement"))
+        } else if snapshot.waiting || !snapshot.requests.is_empty() {
+            Some(("agent-waiting-symbolic", "Waiting for you"))
         } else if snapshot.busy {
-            ("agent-working-symbolic", "Working")
+            Some(("agent-working-symbolic", "Replying"))
         } else {
-            ("emblem-ok-symbolic", "Ready")
+            // An idle agent needs no announcement. "Ready" was on screen for
+            // the whole time nothing was happening, which is most of the time,
+            // and said nothing the empty composer did not already say.
+            None
         };
-        // The state is named as well as drawn. An icon alone put the one piece
-        // of information a reader checks most often behind a hover.
-        let mut status: Vec<Element<'_, Message>> = vec![
-            widget::icon(crate::ui_controls::symbolic_icon(glyph))
-                .size(12)
-                .into(),
-            design::caption(if detail.is_empty() { state } else { detail })
-                .width(Length::Fill)
+        if let Some((glyph, state)) = activity {
+            status.push(
+                widget::icon(crate::ui_controls::symbolic_icon(glyph))
+                    .size(12)
+                    .into(),
+            );
+            status.push(
+                design::caption(if snapshot.busy && !snapshot.detail.is_empty() {
+                    snapshot.detail.as_str()
+                } else {
+                    state
+                })
                 .wrapping(iced::widget::text::Wrapping::None)
                 .into(),
-        ];
+            );
+        }
+        if !place.name.is_empty() {
+            status.push(
+                design::caption(place.name.clone())
+                    .wrapping(iced::widget::text::Wrapping::None)
+                    .into(),
+            );
+        }
+        if let Some(branch) = &place.branch {
+            status.push(
+                widget::row::with_children(vec![
+                    widget::icon(crate::sidebar::worktree_icon())
+                        .size(12)
+                        .into(),
+                    design::caption(branch.clone())
+                        .class(cosmic::theme::Text::Custom(design::muted_text))
+                        .wrapping(iced::widget::text::Wrapping::None)
+                        .into(),
+                ])
+                .spacing(step::GAP_XS)
+                .align_y(Alignment::Center)
+                .into(),
+            );
+        }
+        status.extend(self.session_controls(transitioning));
         if usage.context_limit > 0 {
             // A context budget is a quantity a reader acts on - compact now,
             // or lose the thread - so it is drawn as a gauge rather than
@@ -779,7 +956,7 @@ impl Runtime {
                 )
                 .width(GAUGE_WIDTH)
                 .height(GAUGE_HEIGHT)
-                .class(design::surface(Some(design::sunken), [radius; 4], false))
+                .class(design::surface(Some(design::track), [radius; 4], false))
                 .into(),
             );
             status.push(design::caption(format!("{:.0}%", used * 100.0)).into());
@@ -789,16 +966,29 @@ impl Runtime {
                 "{} in · {} out",
                 usage.input_tokens, usage.output_tokens
             ))
+            .wrapping(iced::widget::text::Wrapping::None)
             .into(),
         );
         if let Some(cost) = usage.cost_microusd {
-            status.push(design::caption(format!("${:.4}", cost as f64 / 1_000_000.0)).into());
+            // Two decimals, because the figure is money a reader is spending
+            // and four decimals of a dollar is a number nobody reads.
+            status.push(design::caption(format!("${:.2}", cost as f64 / 1_000_000.0)).into());
         }
         content.push(
-            widget::row::with_children(status)
-                .spacing(step::GAP_S)
-                .align_y(Alignment::Center)
-                .into(),
+            widget::scrollable(
+                widget::row::with_children(status)
+                    .spacing(step::GAP_S)
+                    .align_y(Alignment::Center)
+                    // The thumb floats over the row it belongs to, so its rail
+                    // is reserved below the content the way every other
+                    // scrollable in the app reserves one.
+                    .padding(design::with_horizontal_rail(iced::Padding::ZERO)),
+            )
+            .direction(iced::widget::scrollable::Direction::Horizontal(
+                design::scrollbar(),
+            ))
+            .width(Length::Fill)
+            .into(),
         );
         widget::container(
             widget::column::with_children(content)
@@ -810,6 +1000,111 @@ impl Runtime {
         .width(Length::Fill)
         .height(Length::Fill)
         .into()
+    }
+
+    /// The model, reasoning effort, and permission mode, at the status line's
+    /// own scale.
+    ///
+    /// These were three full-size dropdowns stacked above the composer, which
+    /// gave settings a reader changes occasionally more room than the message
+    /// they were about to send. While a session is switching they are drawn as
+    /// plain text: the values still matter, and a row of disabled controls
+    /// says nothing a reader can act on.
+    fn session_controls(&self, transitioning: bool) -> Vec<Element<'_, Message>> {
+        let target = self.target;
+        let snapshot = &self.snapshot;
+        let mut controls: Vec<Element<'_, Message>> = Vec::new();
+        if snapshot.capabilities.model_selection && !snapshot.models.is_empty() {
+            let selected = snapshot
+                .models
+                .iter()
+                .position(|model| Some(&model.id) == snapshot.selected_model.as_ref());
+            if transitioning {
+                controls.push(
+                    design::caption(
+                        selected.map_or("Model", |index| snapshot.models[index].label.as_str()),
+                    )
+                    .into(),
+                );
+            } else {
+                let labels = snapshot
+                    .models
+                    .iter()
+                    .map(|model| model.label.clone())
+                    .collect::<Vec<_>>();
+                let ids = snapshot
+                    .models
+                    .iter()
+                    .map(|model| model.id.clone())
+                    .collect::<Vec<_>>();
+                controls.push(
+                    widget::dropdown(labels, selected, move |index| {
+                        action(Action::Model(target, ids[index].clone()))
+                    })
+                    .text_size(design::TEXT_CAPTION)
+                    .padding(CONTROL_PADDING)
+                    .into(),
+                );
+            }
+        }
+        if snapshot.capabilities.reasoning_selection
+            && let Some(model) = snapshot
+                .models
+                .iter()
+                .find(|model| Some(&model.id) == snapshot.selected_model.as_ref())
+            && !model.reasoning.is_empty()
+        {
+            let selected = model
+                .reasoning
+                .iter()
+                .position(|reasoning| Some(reasoning) == snapshot.reasoning.as_ref());
+            if transitioning {
+                controls.push(
+                    design::caption(
+                        selected.map_or("Reasoning", |index| model.reasoning[index].as_str()),
+                    )
+                    .into(),
+                );
+            } else {
+                let reasoning = model.reasoning.clone();
+                let model_id = model.id.clone();
+                controls.push(
+                    widget::dropdown(model.reasoning.clone(), selected, move |index| {
+                        action(Action::Reasoning(
+                            target,
+                            model_id.clone(),
+                            reasoning[index].clone(),
+                        ))
+                    })
+                    .text_size(design::TEXT_CAPTION)
+                    .padding(CONTROL_PADDING)
+                    .into(),
+                );
+            }
+        }
+        if !snapshot.capabilities.permission_modes.is_empty() {
+            let modes = &snapshot.capabilities.permission_modes;
+            let selected = modes
+                .iter()
+                .position(|mode| Some(mode) == self.permission_mode.as_ref());
+            if transitioning {
+                controls.push(
+                    design::caption(selected.map_or("Permissions", |index| modes[index].as_str()))
+                        .into(),
+                );
+            } else {
+                let chosen = modes.clone();
+                controls.push(
+                    widget::dropdown(modes.clone(), selected, move |index| {
+                        action(Action::PermissionMode(target, chosen[index].clone()))
+                    })
+                    .text_size(design::TEXT_CAPTION)
+                    .padding(CONTROL_PADDING)
+                    .into(),
+                );
+            }
+        }
+        controls
     }
 
     /// One exchange: what was asked, what was done, and what came back.
@@ -945,83 +1240,38 @@ impl Runtime {
             .width(Length::Fill)
             .into();
         }
-        if item.role == chat::Role::System {
-            // A notice is chrome, not conversation: one line, a small glyph,
-            // and an accent sliver to mark where it starts. The card it used
-            // to be drew a rectangle around a single sentence.
-            return widget::container(
-                widget::row::with_children(vec![
-                    widget::container(iced::widget::Space::new().height(Length::Fill))
-                        .width(design::BORDER_WIDTH * 2.0)
-                        .height(Length::Fill)
-                        .class(design::surface(Some(design::accent_color), [1.0; 4], false))
-                        .into(),
-                    widget::icon(crate::ui_controls::symbolic_icon(
-                        "dialog-information-symbolic",
-                    ))
-                    .size(14)
-                    .into(),
-                    design::caption(match &item.content {
-                        ItemContent::Text { text, .. } => text.as_str(),
-                        content => turn::step_label(content),
-                    })
-                    .width(Length::Fill)
-                    .into(),
-                ])
-                .spacing(step::GAP_S)
-                .align_y(Alignment::Center),
-            )
-            .padding([step::GAP_XS as u16, 0])
-            .width(Length::Fill)
-            .into();
-        }
-        let ItemContent::Text { text, .. } = &item.content else {
+        let ItemContent::Text { .. } = &item.content else {
             // Anything else in the answer slot is a step the grouping did not
             // recognize; render it the way a step renders rather than
             // inventing a second treatment for it.
             return self.step_view(item, cached, settings);
         };
-        let mut rows: Vec<Element<'a, Message>> = Vec::new();
-        if self.raw.contains(&item.id) {
-            rows.push(
-                widget::selectable_text(text.as_str())
-                    .size(design::TEXT_BODY)
-                    .font(iced::Font::MONOSPACE)
-                    .width(Length::Fill)
-                    .into(),
-            );
-        } else {
-            rows.push(
-                markdown::view(cached.markdown.items(), settings)
-                    .map(|uri| action(Action::OpenUrl(uri.to_string())))
+        let mut rows: Vec<Element<'a, Message>> = vec![
+            markdown::view(cached.markdown.items(), settings)
+                .map(|uri| action(Action::OpenUrl(uri.to_string())))
+                .into(),
+        ];
+        // An answer's footer says when it finished and offers to copy it, and
+        // nothing else: a reader of an answer reaches for those two, and the
+        // Markdown source of a rendered answer was a developer's control on a
+        // reader's surface.
+        let mut controls: Vec<Element<'a, Message>> = Vec::new();
+        if let Some(stamp) = item.at.map(clock_label).filter(|at| !at.is_empty()) {
+            controls.push(
+                design::caption(stamp)
+                    .class(cosmic::theme::Text::Custom(design::muted_text))
                     .into(),
             );
         }
-        // The answer's own controls, at its foot rather than above it, and
-        // only the two a reader of an answer reaches for.
-        let mut controls: Vec<Element<'a, Message>> = vec![
-            icon(
-                "edit-copy-symbolic",
-                "Copy this message",
-                true,
-                Action::Copy(target, item.id.clone(), CopyPart::Text),
-            ),
-            icon(
-                "text-x-generic-symbolic",
-                if self.raw.contains(&item.id) {
-                    "Show formatted text"
-                } else {
-                    "Show Markdown source"
-                },
-                true,
-                Action::Raw(target, item.id.clone()),
-            ),
-        ];
+        controls.push(small_icon(
+            "edit-copy-symbolic",
+            "Copy this message",
+            Action::Copy(target, item.id.clone(), CopyPart::Text),
+        ));
         for index in 0..cached.code.codes.len() {
-            controls.push(icon(
+            controls.push(small_icon(
                 "edit-copy-symbolic",
                 code_label(index),
-                true,
                 Action::Copy(target, item.id.clone(), CopyPart::Code(index)),
             ));
         }

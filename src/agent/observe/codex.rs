@@ -10,6 +10,9 @@ use tungstenite::{
     protocol::WebSocketConfig,
 };
 
+/// How many of an account's open threads the conversation chooser describes.
+const MAX_DESCRIBED: usize = 64;
+
 pub(super) fn endpoint(recipe: &LaunchRecipe, home: &Path) -> ProbeResult<PathBuf> {
     let mut endpoint = home.join("app-server-control/app-server-control.sock");
     let mut args = recipe.arguments.iter();
@@ -228,6 +231,47 @@ pub(super) fn preview(key: &Key, id: &str) -> ProbeResult<(String, PathBuf)> {
         .or_else(|| thread["preview"].as_str())
         .unwrap_or("Untitled conversation");
     Ok((title.chars().take(240).collect(), cwd))
+}
+
+/// Every thread this account's shared server holds open, for user selection.
+/// This reads metadata only: it never resumes, subscribes to or writes a thread.
+pub(super) fn candidates(key: &Key) -> ProbeResult<Vec<(String, String, PathBuf)>> {
+    let mut client = Client::connect(key)?;
+    let result = client.call("initialize", json!({
+        "clientInfo":{"name":"cagents_selection","title":"cagents conversation selection","version":env!("CARGO_PKG_VERSION")},
+        "capabilities":{"experimentalApi":true}
+    }))?;
+    socket::verify_account(&result, &key.home).map_err(|_| ())?;
+    client.send(json!({"method":"initialized","params":{}}))?;
+    let ids = client.loaded()?;
+    let mut candidates = Vec::with_capacity(ids.len().min(MAX_DESCRIBED));
+    // Each description costs a round trip inside this probe's single deadline,
+    // and a reader choosing from a list has no use for a longer one. A thread
+    // past this is still reachable by its identifier.
+    for id in ids.iter().take(MAX_DESCRIBED) {
+        let result = client.call("thread/read", json!({"threadId":id,"includeTurns":false}))?;
+        let thread = &result["thread"];
+        if thread["id"].as_str() != Some(id.as_str()) {
+            return Err(());
+        }
+        let cwd = PathBuf::from(thread["cwd"].as_str().ok_or(())?);
+        // A relative cwd cannot be shown or compared against the terminal's own
+        // directory, so drop that one row rather than losing the whole listing.
+        if !cwd.is_absolute() {
+            continue;
+        }
+        let title = thread["name"]
+            .as_str()
+            .filter(|name| !name.is_empty())
+            .or_else(|| thread["preview"].as_str())
+            .unwrap_or("Untitled conversation");
+        candidates.push((id.clone(), title.chars().take(240).collect(), cwd));
+    }
+    // Pagination is not an atomic listing. Membership changes invalidate this sweep.
+    if client.loaded()? != ids {
+        return Err(());
+    }
+    Ok(candidates)
 }
 
 pub(super) fn census(key: &Key) -> ProbeResult<Census> {

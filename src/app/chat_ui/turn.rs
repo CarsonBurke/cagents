@@ -194,7 +194,11 @@ impl Turn {
 pub(super) fn group(items: &[Item]) -> Vec<Turn> {
     let mut turns: Vec<Turn> = Vec::new();
     for (index, item) in items.iter().enumerate() {
-        if !renders(&item.content) {
+        // A notice is not part of any exchange: it says something about the
+        // session as a whole, so it is pinned above the transcript rather than
+        // scrolling away inside whichever turn happened to be open when the
+        // provider sent it.
+        if !renders(&item.content) || item.role == Role::System {
             continue;
         }
         let opens = item.role == Role::User && !item.content.is_step();
@@ -330,6 +334,7 @@ mod tests {
                 thinking,
                 phase,
             },
+            at: None,
         }
     }
 
@@ -347,6 +352,7 @@ mod tests {
                 duration_ms: None,
                 output: String::new(),
             },
+            at: None,
         }
     }
 
@@ -392,6 +398,7 @@ mod tests {
                     path: "/home/reader/diagram.png".into(),
                     description: "User attachment".into(),
                 },
+                at: None,
             },
             command("c1", ToolStatus::Succeeded),
             text("a1", Role::Assistant, Phase::Final, false),
@@ -444,7 +451,7 @@ mod tests {
     #[test]
     fn activity_before_any_user_message_forms_a_promptless_turn() {
         let items = vec![
-            text("s1", Role::System, Phase::Final, false),
+            text("a1", Role::Assistant, Phase::Final, false),
             text("u1", Role::User, Phase::Final, false),
         ];
         let turns = group(&items);
@@ -455,6 +462,21 @@ mod tests {
         );
         assert_eq!(turns[0].prose.len(), 1);
         assert_eq!(turns[1].prompt, [1]);
+    }
+
+    #[test]
+    fn a_notice_is_not_an_exchange() {
+        let items = vec![
+            text("s1", Role::System, Phase::Final, false),
+            text("u1", Role::User, Phase::Final, false),
+        ];
+        let turns = group(&items);
+        assert_eq!(
+            turns.len(),
+            1,
+            "a session notice belongs to the session, not to a turn of its own"
+        );
+        assert_eq!(turns[0].prompt, [1]);
     }
 
     #[test]
@@ -495,6 +517,7 @@ mod tests {
                 thinking: false,
                 phase: Phase::Final,
             },
+            at: None,
         };
         assert_eq!(group(std::slice::from_ref(&empty)).len(), 0);
         assert_eq!(group(&[]).len(), 0);
