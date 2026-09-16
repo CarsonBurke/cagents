@@ -35,6 +35,20 @@ pub fn warning_color(theme: &cosmic::Theme) -> cosmic::iced::Color {
     theme.cosmic().warning.base.into()
 }
 
+/// One full turn of the activity spinner.
+///
+/// The shell's indicator reports only that work is in flight, never how much
+/// of it is left, so the arc turns at a constant rate. An indicator that eases
+/// or breathes reads as progress the shell cannot actually measure.
+pub const SPINNER_PERIOD: std::time::Duration = std::time::Duration::from_millis(1_200);
+
+/// How much of the circle the spinner's arc covers, in turns.
+///
+/// The gap is what makes the rotation legible - a closed ring looks static
+/// however fast it spins - and three quarters leaves the arc heavy enough to
+/// read at row-icon size.
+pub const SPINNER_ARC_SPAN: f32 = 0.75;
+
 /// A color resolved when a widget draws, rather than when a view is built.
 ///
 /// `cosmic::theme::active()` locks the process-global theme and clones the
@@ -60,9 +74,14 @@ impl Tone {
 }
 
 /// Secondary labels stay readable without competing with active content.
+///
+/// The margin between this and full strength is deliberately small. At a
+/// heavier mute the sidebar's own rows read as disabled controls, which is the
+/// one thing a navigable row must not look like; `sidebar_button_style` keeps
+/// its disabled alpha well below this so the two states stay distinguishable.
 pub fn muted_color(theme: &cosmic::Theme) -> cosmic::iced::Color {
     let mut color: cosmic::iced::Color = theme.current_container().on.into();
-    color.a *= 0.75;
+    color.a *= 0.88;
     color
 }
 
@@ -92,14 +111,15 @@ pub fn removed_text(theme: &cosmic::Theme) -> cosmic::iced::widget::text::Style 
 }
 
 /// Symbolic icons ignore alpha in their SVG recoloring. Blend them toward the
-/// surface instead so muted navigation glyphs stay visibly quieter than text.
+/// surface instead so muted navigation glyphs stay visibly quieter than text
+/// while still carrying most of the foreground's contrast.
 pub fn muted_icon_color(theme: &cosmic::Theme) -> cosmic::iced::Color {
     let on: cosmic::iced::Color = theme.current_container().on.into();
     let base: cosmic::iced::Color = theme.current_container().base.into();
     cosmic::iced::Color {
-        r: on.r * 0.38 + base.r * 0.62,
-        g: on.g * 0.38 + base.g * 0.62,
-        b: on.b * 0.38 + base.b * 0.62,
+        r: on.r * 0.72 + base.r * 0.28,
+        g: on.g * 0.72 + base.g * 0.28,
+        b: on.b * 0.72 + base.b * 0.28,
         a: 1.0,
     }
 }

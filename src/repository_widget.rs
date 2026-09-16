@@ -7515,9 +7515,7 @@ fn read_only_state(path: &Path, reason: &ReadOnlyReason) -> Element<'static, Rep
 fn loading(message: impl Into<String>) -> Element<'static, RepositoryAction> {
     widget::container(
         widget::column::with_children(vec![
-            widget::progress_bar::circular::Circular::new()
-                .size(24.0)
-                .into(),
+            crate::ui_controls::activity_spinner_tone(24.0, crate::design::accent_color),
             widget::text::body(message.into()).into(),
         ])
         .align_x(Alignment::Center)
