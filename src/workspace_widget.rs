@@ -150,6 +150,17 @@ impl FrameClock {
         Some(elapsed.min(Duration::from_millis(250)))
     }
 
+    /// The frame this clock last advanced to.
+    ///
+    /// The shell re-runs the whole update-and-layout pass for one
+    /// `RedrawRequested` while any pass publishes a message, rebuilding the
+    /// view in between, so a view that read the wall clock would measure a
+    /// different animation on every pass and never settle. Animated geometry
+    /// reads the frame instead, which makes the view a function of the frame.
+    pub fn frame(&self) -> Option<Instant> {
+        self.last
+    }
+
     pub fn reset(&mut self) {
         self.last = None;
     }
@@ -447,7 +458,8 @@ where
     WorkspaceSurface::new(
         cosmic::widget::id_container(scrollable, scroll_id),
         shortcuts,
-        move |size: Size| on_viewport(WorkspaceViewportEvent::Resized(size.width)),
+        viewport_width,
+        move |width: f32| on_viewport(WorkspaceViewportEvent::Resized(width)),
     )
     .into()
 }
@@ -1081,18 +1093,27 @@ impl<'a, Message: 'a> From<VirtualStrip<'a, Message>> for Element<'a, Message> {
 struct WorkspaceSurface<'a, Message> {
     content: Element<'a, Message>,
     shortcuts: &'a KeyboardShortcuts,
-    on_resize: Box<dyn Fn(Size) -> Message + 'a>,
+    /// The strip viewport width the owner already holds, which is what the
+    /// enclosing `view` laid this surface's content out against.
+    ///
+    /// Size reporting lives in this widget instead of a `widget::sensor`
+    /// wrapper because `sensor` reports no accessibility nodes, and wrapping
+    /// the strip in one hid every card from screen readers.
+    reported_width: f32,
+    on_resize: Box<dyn Fn(f32) -> Message + 'a>,
 }
 
 impl<'a, Message> WorkspaceSurface<'a, Message> {
     fn new(
         content: impl Into<Element<'a, Message>>,
         shortcuts: &'a KeyboardShortcuts,
-        on_resize: impl Fn(Size) -> Message + 'a,
+        reported_width: f32,
+        on_resize: impl Fn(f32) -> Message + 'a,
     ) -> Self {
         Self {
             content: content.into(),
             shortcuts,
+            reported_width,
             on_resize: Box::new(on_resize),
         }
     }
@@ -1106,26 +1127,7 @@ impl<'a, Message> WorkspaceSurface<'a, Message> {
     }
 }
 
-#[derive(Default)]
-struct WorkspaceSurfaceState {
-    /// Last reported bounds. Size reporting lives in this widget instead of a
-    /// `widget::sensor` wrapper because `sensor` reports no accessibility
-    /// nodes, and wrapping the strip in one hid every card from screen
-    /// readers. The whole size is retained, not just the width, to keep
-    /// `sensor`'s notification points: it published whenever its bounds
-    /// changed in either axis.
-    last_size: Option<Size>,
-}
-
 impl<Message> Widget<Message, Theme, Renderer> for WorkspaceSurface<'_, Message> {
-    fn tag(&self) -> tree::Tag {
-        tree::Tag::of::<WorkspaceSurfaceState>()
-    }
-
-    fn state(&self) -> tree::State {
-        tree::State::new(WorkspaceSurfaceState::default())
-    }
-
     fn children(&self) -> Vec<Tree> {
         vec![Tree::new(&self.content)]
     }
@@ -1182,7 +1184,6 @@ impl<Message> Widget<Message, Theme, Renderer> for WorkspaceSurface<'_, Message>
         viewport: &Rectangle,
     ) {
         let content_layout = Self::child_layout(layout);
-        let state = tree.state.downcast_mut::<WorkspaceSurfaceState>();
 
         match event {
             Event::Keyboard(
@@ -1226,11 +1227,20 @@ impl<Message> Widget<Message, Theme, Renderer> for WorkspaceSurface<'_, Message>
         // reflow it triggers.
         // Publish after native scroll feedback from the old layout, so that
         // feedback cannot cancel the newly computed focused-card reveal.
+        //
+        // The comparison is against the width the owner already holds rather
+        // than against a width remembered here, because the shell re-runs
+        // this whole pass for the same frame while any pass publishes, and
+        // rebuilds the view in between. A remembered width would be reported
+        // afresh by a pass that changed nothing the owner reads - a height
+        // change, or a strip remounted with fresh widget state - and each
+        // such report costs another full update-and-layout pass. Comparing
+        // against the owner's own value makes the second pass over one frame
+        // silent as soon as the owner has stored what was reported.
         if let Event::Window(window::Event::RedrawRequested(_)) = event {
-            let size = layout.bounds().size();
-            if state.last_size != Some(size) {
-                state.last_size = Some(size);
-                shell.publish((self.on_resize)(size));
+            let measured = layout.bounds().width;
+            if measured.is_finite() && measured >= 0.0 && measured != self.reported_width {
+                shell.publish((self.on_resize)(measured));
             }
         }
     }
@@ -1985,6 +1995,120 @@ mod tests {
         )));
     }
 
+    /// The shell re-runs one `RedrawRequested` through update and layout while
+    /// any pass publishes a message, rebuilding the view in between, and warns
+    /// once a frame has cost three of those passes. The strip surface reports
+    /// its own measured width from that pass, so the report has to be a fixed
+    /// point: once the owner holds the reported width, a further pass over the
+    /// same frame must publish nothing - including a pass whose height changed,
+    /// and a pass whose strip was remounted with fresh widget state, neither of
+    /// which changes the width the owner reads.
+    #[test]
+    fn a_reported_viewport_width_is_not_reported_twice_in_one_frame() {
+        use cosmic::iced::advanced::{clipboard, renderer::Headless};
+        use cosmic::iced::runtime::{UserInterface, user_interface::Cache};
+        use cosmic::iced::{Font, Pixels};
+        use std::time::Instant;
+
+        let mut renderer = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(Renderer::new(
+                Font::default(),
+                Pixels(14.0),
+                Some("tiny-skia"),
+            ))
+            .unwrap();
+        let mut workspace = Workspace::default();
+        for index in 0..4 {
+            workspace
+                .add_card(
+                    WorkspaceCard::new(CardId::new(), "Card", CardWidth::Fraction(0.5)).unwrap(),
+                    index,
+                    index == 0,
+                )
+                .unwrap();
+        }
+        let shortcuts = KeyboardShortcuts::default();
+        let scroll_id = widget::Id::unique();
+        let redraw = Event::Window(window::Event::RedrawRequested(Instant::now()));
+
+        // One pass of the shell's loop: build the view the owner would build
+        // for the width it currently holds, deliver the frame to it, and
+        // report back what the surface asked of the owner.
+        let mut pass = |workspace: &Workspace, cache: Cache, height: f32| {
+            let mut messages: Vec<WorkspaceViewportEvent> = Vec::new();
+            let mut interface = UserInterface::build(
+                view(
+                    workspace,
+                    &shortcuts,
+                    false,
+                    workspace.viewport_width(),
+                    scroll_id.clone(),
+                    |_| {
+                        widget::Space::new()
+                            .width(Length::Fill)
+                            .height(Length::Fill)
+                            .into()
+                    },
+                    card_widget_id,
+                    Events {
+                        viewport: |event| event,
+                    },
+                ),
+                Size::new(900.0, height),
+                cache,
+                &mut renderer,
+            );
+            let _ = interface.update(
+                std::slice::from_ref(&redraw),
+                mouse::Cursor::Unavailable,
+                &mut renderer,
+                &mut clipboard::Null,
+                &mut messages,
+            );
+            let widths: Vec<f32> = messages
+                .iter()
+                .filter_map(|message| match message {
+                    WorkspaceViewportEvent::Resized(width) => Some(*width),
+                    _ => None,
+                })
+                .collect();
+            (interface.into_cache(), widths)
+        };
+
+        let (cache, reported) = pass(&workspace, Cache::new(), 600.0);
+        assert_eq!(
+            reported,
+            vec![900.0],
+            "a surface whose measured width disagrees with the owner's has to say so once",
+        );
+        for width in reported {
+            let _ = workspace.resize_viewport(width);
+        }
+
+        let (cache, settled) = pass(&workspace, cache, 600.0);
+        assert!(
+            settled.is_empty(),
+            "the owner already holds this width, so a second pass over the same frame must \
+             publish nothing; it reported {settled:?}",
+        );
+
+        let (_, after_height_change) = pass(&workspace, cache, 400.0);
+        assert!(
+            after_height_change.is_empty(),
+            "a shorter surface is the same viewport width, so reporting it again buys the owner \
+             nothing and costs the frame a whole extra pass; it reported {after_height_change:?}",
+        );
+
+        let (_, after_remount) = pass(&workspace, Cache::new(), 600.0);
+        assert!(
+            after_remount.is_empty(),
+            "a strip remounted with fresh widget state still measures the width the owner holds; \
+             it reported {after_remount:?}",
+        );
+    }
     struct AccessibleProbe {
         node: u64,
         expected_virtual_offset: Vector,
@@ -2132,7 +2256,7 @@ mod tests {
         };
         let shortcuts = KeyboardShortcuts::default();
         let surface: Element<'_, ()> =
-            Element::new(WorkspaceSurface::new(strip, &shortcuts, |_| ()));
+            Element::new(WorkspaceSurface::new(strip, &shortcuts, 0.0, |_| ()));
         let tree = Tree::new(&surface);
         let card_node = || {
             layout::Node::with_children(
