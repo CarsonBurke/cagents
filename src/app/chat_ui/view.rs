@@ -537,27 +537,48 @@ impl Runtime {
             content.push(body(error.as_str()));
         }
         if self.disconnected || snapshot.exited {
-            content.push(
-                widget::row::with_children(vec![
-                    crate::design::caption(if snapshot.exited {
-                        "Agent process exited. The transcript and draft are retained."
-                    } else {
-                        "Disconnected. The daemon may still be working; your draft is retained."
-                    })
-                    .width(Length::Fill)
-                    .into(),
-                    icon(
-                        "view-refresh-symbolic",
-                        "Reconnect to this session",
-                        !transitioning
-                            && self.pending.is_none()
-                            && !self.attachment_chooser_pending,
-                        Action::Reconnect(target),
-                    ),
-                ])
-                .spacing(8)
-                .align_y(Alignment::Center)
+            let unresumable = self.offers_fresh_conversation();
+            let enabled =
+                !transitioning && self.pending.is_none() && !self.attachment_chooser_pending;
+            let mut controls = vec![
+                crate::design::caption(if unresumable {
+                    // The provider's own sentence is already above this line,
+                    // so this says what it means for the card, and what the
+                    // second control does and does not do: the old
+                    // conversation is left alone, but this card stops being
+                    // the way back to it.
+                    "The saved conversation did not load. Retry resumes it, or start a new one beside it - the old conversation stays on disk, but this card stops pointing at it."
+                } else if snapshot.exited {
+                    "Agent process exited. The transcript and draft are retained."
+                } else {
+                    "Disconnected. The daemon may still be working; your draft is retained."
+                })
+                .width(Length::Fill)
                 .into(),
+                icon(
+                    "view-refresh-symbolic",
+                    if unresumable {
+                        "Resume this conversation again"
+                    } else {
+                        "Reconnect to this session"
+                    },
+                    enabled,
+                    Action::Reconnect(target),
+                ),
+            ];
+            if unresumable {
+                controls.push(icon(
+                    "list-add-symbolic",
+                    "Start a new conversation beside it",
+                    enabled,
+                    Action::StartFresh(target.card),
+                ));
+            }
+            content.push(
+                widget::row::with_children(controls)
+                    .spacing(8)
+                    .align_y(Alignment::Center)
+                    .into(),
             );
         }
         if let Some((url, instructions)) = &snapshot.open_url {

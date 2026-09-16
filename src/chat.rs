@@ -90,6 +90,86 @@ impl Launch {
     }
 }
 
+/// What a card is asking the daemon to do with a conversation.
+///
+/// The distinction is not "spawn or attach": a saved card cannot know which of
+/// those is possible, because only the daemon's live proof says whether the
+/// incarnation that hosted the conversation is still running. The card states
+/// its intent and the connection works out how to honour it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Intent {
+    /// Begin this launch. A conversation the launch names by id is resumed by
+    /// the provider's own argv rather than by attaching to a daemon writer.
+    Start,
+    /// Put a saved card back on the conversation it was showing, by whichever
+    /// route the live daemon still supports.
+    Restore,
+}
+
+/// A conversation that could not be put on screen, and the one thing left that
+/// would recover it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StartFailure {
+    /// The provider's, the adapter's or the daemon's own words. A card renders
+    /// this verbatim, because a summary of a failure the reader has to act on
+    /// is worth less than the sentence that named it.
+    pub message: String,
+    pub recovery: Recovery,
+}
+
+/// What the reader can still do about a conversation that did not come back.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Recovery {
+    /// Running the same start again is a real next step, because what refused
+    /// it - a stopped daemon, a busy writer, a provider that failed to launch -
+    /// can succeed on the next attempt.
+    Retry,
+    /// The saved conversation cannot be reached by any retry. Only a new
+    /// conversation in the same place is left, and the reader has to ask for
+    /// it rather than find one started on their behalf.
+    ///
+    /// Asking for it destroys nothing. A provider keeps one conversation per
+    /// file, named after its own identifier, and a new conversation takes a
+    /// new identifier and therefore a new file; the session directory is a
+    /// multi-conversation store that every native card of the same provider
+    /// already shares. What the reader gives up is this card's pointer to the
+    /// old conversation, because no surface re-opens a conversation by
+    /// identifier afterwards except the Codex binding panel. So a card
+    /// offering this says the old conversation stays on disk and that it will
+    /// stop being the way back to it, rather than implying either a deletion
+    /// or a round trip that is not there.
+    Fresh,
+}
+
+impl StartFailure {
+    pub fn retry(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            recovery: Recovery::Retry,
+        }
+    }
+    pub fn fresh(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            recovery: Recovery::Fresh,
+        }
+    }
+}
+
+/// Every bare string error on the start path is a condition that can pass, so
+/// `?` classifies one as retryable without each call site saying so.
+impl From<String> for StartFailure {
+    fn from(message: String) -> Self {
+        Self::retry(message)
+    }
+}
+
+impl From<&str> for StartFailure {
+    fn from(message: &str) -> Self {
+        Self::retry(message)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Attachment {
     pub path: std::path::PathBuf,
@@ -573,4 +653,43 @@ pub enum Event {
     Plan {
         steps: Vec<PlanStep>,
     },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The daemon refuses to checkpoint a conversation whose launch cannot be
+    /// rebuilt into an exact resume, and a refused checkpoint is what leaves a
+    /// card with no upgrade lineage to be restored through. A native card that
+    /// records its conversation in `session_id` and its storage in
+    /// `--session-dir` has to pass that gate, including for a UUIDv7.
+    #[test]
+    fn the_persisted_native_launch_rebuilds_an_exact_resume_for_the_checkpoint() {
+        let launch = Launch {
+            provider: crate::agent::Provider::Omp,
+            recipe: LaunchRecipe {
+                program: "omp".into(),
+                arguments: vec![
+                    "--session-dir".into(),
+                    "/home/user/.omp/agent/sessions/native".into(),
+                ],
+                working_directory: "/home/user".into(),
+                environment: Default::default(),
+            },
+            session_id: Some("01a0ab66-21d6-7065-9fe5-95f302b669e1".into()),
+        };
+        let recipe = launch
+            .terminal_recipe()
+            .expect("a native launch naming its conversation is resumable");
+        assert_eq!(
+            recipe.arguments,
+            [
+                "--session-dir",
+                "/home/user/.omp/agent/sessions/native",
+                "--resume",
+                "01a0ab66-21d6-7065-9fe5-95f302b669e1",
+            ]
+        );
+    }
 }
