@@ -128,7 +128,10 @@ fn code_surface<'a>(
                 widget::row::with_children(match copy {
                     Some(copy) => vec![
                         design::caption(caption).width(Length::Fill).into(),
-                        icon("edit-copy-symbolic", "Copy this block", true, copy),
+                        // At the primary control size this one button was
+                        // taller than the caption row it sits in, which made
+                        // every code block look like it carried a toolbar.
+                        small_icon("edit-copy-symbolic", "Copy this block", copy),
                     ],
                     None => vec![design::caption(caption).into()],
                 })

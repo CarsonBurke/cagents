@@ -242,6 +242,14 @@ impl Cagents {
     /// - resolves without the panel appearing at all.
     pub(in crate::app) fn chat_binding_view(&self, card: CardId) -> Option<Element<'_, Message>> {
         let binding = self.chat_ui.bindings.get(&card)?;
+        // A panel that appears for a moment and then answers its own question
+        // is worse than no panel: the reader reads a heading, loses the
+        // terminal they were looking at, and gets the conversation they asked
+        // for anyway. While the resolution is still unambiguous the card is
+        // left exactly as it was.
+        if binding.auto {
+            return None;
+        }
         let valid =
             binding.input.trim().len() == 36 && uuid::Uuid::parse_str(binding.input.trim()).is_ok();
         let here = binding

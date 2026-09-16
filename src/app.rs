@@ -12560,7 +12560,7 @@ mod tests {
     }
 
     #[test]
-    fn switching_inactive_codex_terminal_reveals_and_focuses_conversation_binding() {
+    fn switching_inactive_codex_terminal_reveals_and_focuses_its_card() {
         use crate::model::{BootId, HostIncarnation, HostSessionId};
 
         let mut app = context_inspector_test_app(false);
@@ -12602,7 +12602,9 @@ mod tests {
         assert_eq!(app.workspace.focused(), Some(target));
         assert_eq!(app.durable.focused, Some(target));
         assert!(app.workspace.camera().target() > app.workspace.camera().offset());
-        assert!(app.chat_binding_view(target).is_some());
+        // The card is revealed while its conversation is resolved, and the
+        // chooser only appears where there is something to choose.
+        assert!(app.chat_binding_view(target).is_none());
         assert!(!app.sidebar_state.has_card_update(target));
         assert!(app.sidebar_state.has_card_update(unrelated));
         let update = app.workspace.tick(Duration::from_secs(1));
@@ -12612,14 +12614,14 @@ mod tests {
             Some(VisibilityClass::Visible)
         );
 
-        // Opening the selector must not choose a conversation or replace its source terminal.
+        // Confirming before the account has named a conversation must adopt
+        // nothing and must not replace the source terminal.
         let _ = app.update(Message::ChatUi(chat_ui::Action::BindingConfirm(target)));
         assert_eq!(
             app.card_state(target).unwrap().kind,
             CardKind::Terminal(source)
         );
         assert!(!app.chat_start_pending(target));
-        assert!(app.chat_binding_view(target).is_some());
     }
 
     #[test]
@@ -13249,7 +13251,7 @@ mod tests {
         assert!(workspace.camera().is_animating());
     }
 
-    fn terminal_card_state() -> CardState {
+    pub(super) fn terminal_card_state() -> CardState {
         let launch = launch_recipe("/tmp");
         CardState {
             id: CardId::new(),

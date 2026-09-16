@@ -1,7 +1,7 @@
 use super::*;
 use crate::agent::{Activity, Provider};
 use crate::chat::client::{ClientHandle, Wake};
-use crate::chat::{self, Attachment, Command, ItemContent, PromptMode, Snapshot};
+use crate::chat::{self, Attachment, Command, ItemContent, PromptMode, Snapshot, clock_label};
 use base64::Engine as _;
 use cosmic::widget::{markdown, text_editor};
 use std::sync::{
@@ -53,24 +53,6 @@ fn small_icon<'a>(
         Some(action(message)),
     )
     .into()
-}
-
-/// Local wall-clock time for a transcript stamp, as `14:32`.
-///
-/// A transcript is read while the work is happening, so the hour and minute
-/// are what a reader needs; a date would repeat itself on every row of a
-/// conversation that lasts an afternoon. `localtime_r` is used because the
-/// application carries no date library, and a hand-rolled offset would be
-/// wrong across every daylight-saving boundary.
-fn clock_label(unix_ms: u64) -> String {
-    let seconds = (unix_ms / 1000) as libc::time_t;
-    let mut parts: libc::tm = unsafe { std::mem::zeroed() };
-    // SAFETY: `localtime_r` writes into the caller's `tm` and reads only the
-    // time it is given, so it is sound for any `time_t` value.
-    if unsafe { libc::localtime_r(&seconds, &mut parts) }.is_null() {
-        return String::new();
-    }
-    format!("{:02}:{:02}", parts.tm_hour, parts.tm_min)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -215,6 +197,13 @@ struct Binding {
     scan: u64,
     preview: Option<chat::BindingPreview>,
     loading: bool,
+    /// True while the panel is still trying to resolve the terminal's
+    /// conversation without asking. Switching a terminal whose own launch
+    /// named a conversation, or whose account holds exactly one open in this
+    /// worktree, is not a choice - it is the answer - so the panel stays off
+    /// screen and the conversation is adopted. It clears the moment the
+    /// resolution is not unambiguous, which is when there is something to ask.
+    auto: bool,
     error: Option<String>,
 }
 
@@ -1342,6 +1331,8 @@ impl Cagents {
             Action::BindingInput(card, input) => {
                 if let Some(binding) = self.chat_ui.bindings.get_mut(&card) {
                     binding.input = input;
+                    // A reader typing here has taken the question over.
+                    binding.auto = false;
                     binding.preview = None;
                     binding.error = None;
                     binding.loading = false;
@@ -1368,6 +1359,9 @@ impl Cagents {
                 let candidates = match result {
                     Ok(candidates) => candidates,
                     Err(error) => {
+                        // Nothing can be resolved from a listing that failed,
+                        // so the panel has to appear and say so.
+                        binding.auto = false;
                         binding.error = Some(error);
                         return Task::none();
                     }
@@ -1376,11 +1370,10 @@ impl Cagents {
                 binding.candidates = candidates;
                 // A terminal is usually looking at a conversation rooted in
                 // its own directory, so where exactly one of the account's
-                // open conversations is, that one is offered ready to confirm.
-                // It is only ever a suggestion: a directory does not identify
-                // a thread, and a second terminal of the same account in the
-                // same worktree would match just as well. The reader confirms
-                // a conversation the panel has named.
+                // open conversations is, that one is the conversation being
+                // switched to and is adopted without asking. Where there are
+                // two, a directory no longer identifies a thread, and the
+                // reader is the only one who can say which.
                 let directory = binding
                     .session
                     .terminal
@@ -1401,12 +1394,22 @@ impl Cagents {
                     binding.input = id;
                     return self.handle_chat_ui(Action::BindingPreview(target.card));
                 }
+                // Whatever is left is a question: the account holds several
+                // conversations here, or none, or the reader is already typing
+                // one in. The panel appears for that.
+                if !typed {
+                    binding.auto = false;
+                }
             }
             Action::BindingChoose(card, id) => {
                 let Some(binding) = self.chat_ui.bindings.get_mut(&card) else {
                     return Task::none();
                 };
                 binding.input = id;
+                // A reader picking from the list is answering the question the
+                // panel asked, and the panel stays up to say what confirming
+                // that choice does.
+                binding.auto = false;
                 binding.preview = None;
                 binding.error = None;
                 binding.loading = false;
@@ -1425,6 +1428,9 @@ impl Cagents {
                 }
                 let id = binding.input.trim();
                 if id.len() != 36 || uuid::Uuid::parse_str(id).is_err() {
+                    // A conversation that cannot even be named is not one this
+                    // can adopt quietly.
+                    binding.auto = false;
                     binding.error = Some("Enter the full conversation UUID shown by /status in the intended Codex CLI.".into());
                     return Task::none();
                 }
@@ -1454,18 +1460,33 @@ impl Cagents {
                     return Task::none();
                 };
                 binding.loading = false;
+                let auto = binding.auto;
                 match result {
                     Ok(preview)
                         if binding.session.launch.session_id.as_ref()
                             == Some(&preview.session_id) =>
                     {
-                        binding.preview = Some(preview)
+                        binding.preview = Some(preview);
+                        // The conversation the terminal is looking at has been
+                        // named and read back by its own account's server.
+                        // Asking a reader to confirm what they already asked
+                        // for is a dialog for the sake of one.
+                        if auto {
+                            return self.handle_chat_ui(Action::BindingConfirm(target.card));
+                        }
                     }
-                    Ok(_) => binding.error = Some(
-                        "The preview returned a different identity; no conversation was activated."
-                            .into(),
-                    ),
-                    Err(error) => binding.error = Some(error),
+                    Ok(_) => {
+                        binding.auto = false;
+                        binding.error = Some(
+                            "The preview returned a different identity; no conversation was \
+                             activated."
+                                .into(),
+                        );
+                    }
+                    Err(error) => {
+                        binding.auto = false;
+                        binding.error = Some(error);
+                    }
                 }
             }
             Action::BindingConfirm(card) => {
@@ -1571,6 +1592,7 @@ impl Cagents {
                                 generation: self.chat_ui.generation,
                             };
                             let input = session.launch.session_id.clone().unwrap_or_default();
+                            let named = !input.is_empty();
                             let source = source.expect("checked source");
                             self.chat_ui.bindings.insert(
                                 card,
@@ -1584,13 +1606,18 @@ impl Cagents {
                                     scan: target.generation,
                                     preview: None,
                                     loading: false,
+                                    auto: true,
                                     error: None,
                                 },
                             );
                             // The account's shared server knows which
-                            // conversations it is holding open, so the reader
-                            // is asked to choose from those rather than to
-                            // copy an identifier out of another program.
+                            // conversations it is holding open, so a reader
+                            // who has to choose chooses from those rather than
+                            // copying an identifier out of another program.
+                            // The listing is read even when the terminal's own
+                            // launch named a conversation, because it is what
+                            // the panel falls back to if that name no longer
+                            // resolves.
                             let scan = cosmic::task::future(async move {
                                 let result = tokio::task::spawn_blocking(move || {
                                     ClientHandle::candidates(session, source)
@@ -1600,10 +1627,20 @@ impl Cagents {
                                 .and_then(|result| result);
                                 Message::ChatUi(Action::BindingScanned(target, result))
                             });
+                            // A terminal whose launch recorded its conversation
+                            // has already answered the question this panel
+                            // exists to ask, so that identity is read back at
+                            // once rather than after a listing the reader does
+                            // not need.
+                            let named = named
+                                .then(|| self.handle_chat_ui(Action::BindingPreview(card)))
+                                .unwrap_or_else(Task::none);
                             return match self.workspace.focus(card) {
-                                Ok(update) => {
-                                    Task::batch([self.apply_viewport(update, true, false), scan])
-                                }
+                                Ok(update) => Task::batch([
+                                    self.apply_viewport(update, true, false),
+                                    scan,
+                                    named,
+                                ]),
                                 Err(error) => {
                                     self.status = Some(TransientNotice::error(error.to_string()));
                                     Task::none()
@@ -2298,6 +2335,98 @@ mod tests {
             thinking: false,
             phase: chat::Phase::Final,
         }
+    }
+
+    /// A conversation that is not in doubt must not be answered with a
+    /// question. Switching a Codex terminal whose account holds exactly one
+    /// conversation in that terminal's own worktree adopts it: no chooser, no
+    /// confirmation. Two conversations rooted in the same directory is a real
+    /// question - a directory does not identify a thread - so the chooser
+    /// appears for that one and adopts nothing by itself.
+    #[test]
+    fn an_unambiguous_codex_conversation_is_adopted_without_being_asked_about() {
+        use crate::model::{BootId, HostIncarnation, HostSessionId};
+
+        let directory = std::path::PathBuf::from("/tmp");
+        let conversation = |index: u128| uuid::Uuid::from_u128(index).to_string();
+        let candidate = |session_id: String| chat::BindingCandidate {
+            session_id,
+            title: "Conversation".into(),
+            working_directory: directory.clone(),
+        };
+        // Everything up to the account's answer is the same in both cases, so
+        // the difference the test is about is the listing itself.
+        let scanned = |candidates: Vec<chat::BindingCandidate>| {
+            let mut app = crate::app::tests::context_inspector_test_app(false);
+            let mut card = crate::app::tests::terminal_card_state();
+            let id = card.id;
+            let CardKind::Terminal(terminal) = &mut card.kind else {
+                unreachable!("the fixture is a terminal card");
+            };
+            terminal.launch.program = "codex".into();
+            terminal.continuity = TerminalContinuity::Live {
+                host_session_id: HostSessionId::new("codex-host"),
+                boot_id: BootId::new("boot"),
+                host_incarnation: HostIncarnation::new("incarnation"),
+            };
+            app.durable = Arc::new(WorkspaceState {
+                focused: Some(id),
+                cards: vec![card],
+                ..WorkspaceState::default()
+            });
+            app.workspace = Cagents::rebuild_workspace(&app.durable);
+            app.workspace.resize_viewport(600.0);
+            let _ = app.update(Message::ChatUi(Action::Switch(id)));
+            let target = app
+                .chat_ui
+                .bindings
+                .get(&id)
+                .expect("switching a live Codex terminal opens a binding")
+                .target;
+            assert!(
+                app.chat_binding_view(id).is_none(),
+                "the chooser stays off screen while the conversation is still being looked up"
+            );
+            let _ = app.update(Message::ChatUi(Action::BindingScanned(
+                target,
+                Ok(candidates),
+            )));
+            (app, id, target)
+        };
+
+        let only = conversation(1);
+        let (mut app, card, target) = scanned(vec![candidate(only.clone())]);
+        assert!(
+            app.chat_binding_view(card).is_none(),
+            "one conversation in this worktree is the answer, not a choice"
+        );
+        let _ = app.update(Message::ChatUi(Action::BindingPreviewed(
+            target,
+            Ok(chat::BindingPreview {
+                token: "capability".into(),
+                session_id: only.clone(),
+                title: "Conversation".into(),
+                working_directory: directory.clone(),
+            }),
+        )));
+        assert!(
+            app.chat_start_pending(card),
+            "the resolved conversation is adopted without a confirmation step"
+        );
+        assert!(
+            app.chat_binding_view(card).is_none(),
+            "an adopted conversation leaves no panel behind"
+        );
+
+        let (app, card, _) = scanned(vec![candidate(only), candidate(conversation(2))]);
+        assert!(
+            app.chat_binding_view(card).is_some(),
+            "two conversations in the same worktree is a question only the reader can answer"
+        );
+        assert!(
+            !app.chat_start_pending(card),
+            "an ambiguous listing adopts nothing by itself"
+        );
     }
 
     /// Picking a skill replaces the word being typed and nothing else, for any

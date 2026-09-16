@@ -6,6 +6,7 @@ use super::{Adapter, ProcessSpec, Step};
 use crate::chat::{
     Answer, Attachment, Capabilities, Choice, Command, CommandAction, Event, Field, Item,
     ItemContent, Launch, Model, Phase, PromptMode, Request, Role, SlashCommand, ToolStatus, Usage,
+    clock_label,
 };
 use base64::Engine as _;
 use serde_json::{Value, json};
@@ -1237,15 +1238,41 @@ impl Adapter for Claude {
                 )));
             }
             "rate_limit_event" => {
-                step.events.push(Event::Status {
-                    busy: self.busy,
-                    detail: format!("Claude rate limit: {}", frame["rate_limit_info"]),
-                });
+                let detail = rate_limit_detail(&frame["rate_limit_info"]);
+                if !detail.is_empty() {
+                    step.events.push(Event::Status {
+                        busy: self.busy,
+                        detail,
+                    });
+                }
             }
             "keep_alive" => {}
             other => return Err(format!("Unsupported Claude stream-json frame type {other}")),
         }
         Ok(step)
+    }
+}
+
+/// A usage-limit notice as a sentence, or nothing while the limit is not
+/// biting.
+///
+/// The frame carries a tagged object, and interpolating it put a JSON object
+/// on the status line - the one row a reader watches while a turn runs. An
+/// allowed request is silent for the same reason an idle thread is: a session
+/// inside its limit has nothing to report. The reset time is named where the
+/// frame carries one, because "wait" without "until when" is not actionable;
+/// both spellings are read because the field has travelled under each.
+fn rate_limit_detail(info: &Value) -> String {
+    let resets = info["resets_at"]
+        .as_u64()
+        .or_else(|| info["resetsAt"].as_u64())
+        .map(|at| format!(", resets at {}", clock_label(at * 1_000)))
+        .unwrap_or_default();
+    match info["status"].as_str() {
+        Some("allowed") | None => String::new(),
+        Some("allowed_warning") => format!("Approaching Claude's usage limit{resets}"),
+        Some("rejected") => format!("Claude's usage limit is reached{resets}"),
+        Some(other) => format!("Claude usage limit {other}{resets}"),
     }
 }
 
@@ -2366,6 +2393,37 @@ mod tests {
     use super::*;
     use crate::agent::Provider;
     use std::io::Write as _;
+
+    /// The status line is one row of prose a reader watches while a turn
+    /// runs. A usage-limit frame has to reach it as a sentence, and has to
+    /// stay off it entirely while the limit is not biting.
+    #[test]
+    fn a_usage_limit_frame_reaches_the_status_line_as_a_sentence() {
+        assert_eq!(rate_limit_detail(&json!({"status": "allowed"})), "");
+        assert_eq!(rate_limit_detail(&json!({})), "");
+        assert_eq!(
+            rate_limit_detail(&json!({"status": "allowed_warning"})),
+            "Approaching Claude's usage limit"
+        );
+        // Both spellings of the reset field are read, and the time is the
+        // reader's own: an absolute epoch is not something to act on.
+        for key in ["resets_at", "resetsAt"] {
+            let at = 1_700_000_000_u64;
+            assert_eq!(
+                rate_limit_detail(&json!({"status": "rejected", key: at})),
+                format!(
+                    "Claude's usage limit is reached, resets at {}",
+                    clock_label(at * 1_000)
+                )
+            );
+        }
+        // An unrecognized status still says which state it is, because a
+        // limit the reader cannot name is one they cannot wait out.
+        assert_eq!(
+            rate_limit_detail(&json!({"status": "throttled"})),
+            "Claude usage limit throttled"
+        );
+    }
 
     #[test]
     fn align_resume_identity_rewrites_space_and_inline_forms() {
