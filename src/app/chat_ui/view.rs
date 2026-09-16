@@ -41,10 +41,13 @@ const COMPOSER_PADDING: f32 = design::GRID_UNIT * 2.0;
 /// visible while scrolling.
 const PROMPT_MEASURE: f32 = 560.0;
 
-/// The context gauge's track: wide enough to read a proportion off, short
-/// enough that it stays a detail in the status line.
-const GAUGE_WIDTH: f32 = 72.0;
-const GAUGE_HEIGHT: f32 = 6.0;
+/// How tall the pinned plan is allowed to grow.
+///
+/// The plan sits above the transcript, so it stays a reference a reader
+/// glances at rather than becoming the pane: past this height it scrolls, and
+/// a twenty-step plan therefore costs the conversation no more room than a
+/// three-step one.
+const PLAN_CEILING: f32 = 120.0;
 
 /// The padding a status-line control is drawn with.
 ///
@@ -474,40 +477,25 @@ impl Runtime {
         for turn in &self.turns {
             transcript.push(self.turn_view(turn, markdown_settings));
         }
-        // A notice belongs to the session, so it is pinned here: inside the
-        // transcript it scrolled away from the reader it was addressed to,
-        // and a single sentence about the account does not need a glyph and an
-        // accent sliver to be read.
+        // A chat's heading is the conversation's own name or nothing at all.
         //
-        // Only the newest one is pinned. A retrying or hook-heavy provider
-        // emits a notice per frame, and every one of them held above a
-        // transcript that fills the rest of the pane squeezes the
-        // conversation itself out of the card.
+        // It used to be followed by the newest system item's first line,
+        // pinned on every frame. That row was status narration of the kind
+        // this surface has been shedding: it cost the transcript a row
+        // whatever the provider had put in it, a reader could not act on it,
+        // and a genuine failure reaches them through the error surface
+        // further down. Notices are prose in the transcript now, beside the
+        // rest of what the session said.
         let mut content: Vec<Element<'_, Message>> = snapshot
             .title
             .iter()
             .map(|title| -> Element<'_, Message> { design::heading(title.as_str()).into() })
-            .chain(
-                snapshot
-                    .items
-                    .iter()
-                    .rev()
-                    .filter(|item| item.role == chat::Role::System)
-                    .find_map(|item| match &item.content {
-                        ItemContent::Text { text, .. } if !text.trim().is_empty() => Some(
-                            design::caption(turn::first_line(text.as_str()))
-                                .class(cosmic::theme::Text::Custom(design::muted_text))
-                                // One row, whatever the provider put in it: a
-                                // wrapped paragraph of frame JSON would push
-                                // the transcript out of the card.
-                                .wrapping(iced::widget::text::Wrapping::None)
-                                .width(Length::Fill)
-                                .into(),
-                        ),
-                        _ => None,
-                    }),
-            )
             .collect();
+        // A plan is consulted rather than read, so it is pinned above the
+        // transcript that scrolls under it. Inside the transcript it went out
+        // of reach with the first thing the agent did after publishing it,
+        // which is precisely when a reader starts asking what is left.
+        content.extend(self.plan_view());
         content.push(
             widget::scrollable(
                 widget::column::with_children(transcript)
@@ -804,9 +792,14 @@ impl Runtime {
             ));
         }
         if snapshot.capabilities.compact {
+            // A four-corner collapse glyph reads as a window control, which is
+            // what made the one control here that rewrites the conversation
+            // look like something that resizes it. The tooltip names the
+            // effect rather than the mechanism: what a reader wants from this
+            // is the context figure back.
             actions.push(icon(
-                "view-restore-symbolic",
-                "Compact conversation context",
+                "view-compress-symbolic",
+                "Compact the conversation: summarize earlier turns to free context",
                 available && !snapshot.busy,
                 Action::Command(target, Command::Compact),
             ));
@@ -816,14 +809,17 @@ impl Runtime {
         // A dropdown listing them duplicated that path in a control that was
         // permanently present for something used occasionally.
         actions.push(iced::widget::Space::new().width(Length::Fill).into());
-        for (slot, mode) in modes.iter().enumerate() {
-            let (name, label) = submit_control(*mode, slot, enter_sends);
-            actions.push(icon(
-                name,
-                label,
-                available && has_draft,
-                Action::Submit(target, *mode),
-            ));
+        // Only the modes that can act right now are drawn. A permanently
+        // present send control that is merely disabled is a control a reader
+        // cannot use and cannot interpret: the queue button in particular was
+        // a bare plus that never responded and never said what it was for.
+        // The chords are gated on this same condition, so the keyboard path
+        // is unchanged.
+        if submit.0.is_some() {
+            for (slot, mode) in modes.iter().enumerate() {
+                let (name, label) = submit_control(*mode, slot, enter_sends);
+                actions.push(icon(name, label, true, Action::Submit(target, *mode)));
+            }
         }
         if snapshot.busy {
             actions.push(icon(
@@ -860,11 +856,11 @@ impl Runtime {
             .into(),
         );
         let usage = &snapshot.usage;
-        // The status line is one caption-height row: what the agent is doing,
-        // where it is doing it, the settings a reader changes mid-conversation,
-        // and what the conversation has cost. It scrolls sideways rather than
-        // wrapping, because a chat pane is often narrow and a status line that
-        // grows to three rows takes the space from the transcript.
+        // The status line has two halves. What the agent is doing, where it is
+        // doing it and the settings a reader changes mid-conversation scroll
+        // sideways rather than wrapping, because a chat pane is often narrow
+        // and a status line that grows to three rows takes that space from the
+        // transcript.
         let mut status: Vec<Element<'_, Message>> = Vec::new();
         let activity = if transitioning {
             Some(("agent-working-symbolic", "Switching session"))
@@ -922,80 +918,83 @@ impl Runtime {
             );
         }
         status.extend(self.session_controls(transitioning));
+        // What the conversation has spent is pinned to the pane's right edge
+        // instead of joining that run. The budget and the money are the two
+        // figures a reader consults deliberately, and mixing them into the
+        // same left-to-right sequence as a transient activity line pushed them
+        // out of reach exactly when the agent was busy enough for them to
+        // matter.
+        let mut spend: Vec<Element<'_, Message>> = Vec::new();
         if usage.context_limit > 0 {
             // A context budget is a quantity a reader acts on - compact now,
-            // or lose the thread - so it is drawn as a gauge rather than
-            // buried in a sentence of digits. A capsule, because a squared
-            // bar four pixels tall reads as a crack in the layout.
+            // or lose the thread - so it is drawn as a ring with its figure
+            // beside it. The linear capsule this replaces spent the width of a
+            // whole caption saying what the percentage already said.
             let used = (usage.context_tokens as f32 / usage.context_limit as f32).clamp(0.0, 1.0);
-            let radius = GAUGE_HEIGHT / 2.0;
-            status.push(
-                widget::container(
-                    // The fill and the remainder both carry a portion, because
-                    // a single proportional child of a container is resolved
-                    // against the whole width and would draw a full gauge at
-                    // any occupancy.
-                    widget::row::with_children(vec![
-                        widget::container(iced::widget::Space::new().height(Length::Fill))
-                            .width(Length::FillPortion((used * 1000.0).round() as u16))
-                            .height(Length::Fill)
-                            .class(cosmic::theme::Container::custom(move |theme| {
-                                cosmic::widget::container::Style {
-                                    background: Some(iced::Background::Color(if used > 0.9 {
-                                        design::destructive_color(theme)
-                                    } else if used > 0.75 {
-                                        design::warning_color(theme)
-                                    } else {
-                                        design::accent_color(theme)
-                                    })),
-                                    border: iced::Border {
-                                        radius: radius.into(),
-                                        ..Default::default()
-                                    },
-                                    ..Default::default()
-                                }
-                            }))
-                            .into(),
-                        iced::widget::Space::new()
-                            .width(Length::FillPortion(((1.0 - used) * 1000.0).round() as u16))
-                            .into(),
-                    ])
-                    .height(Length::Fill),
-                )
-                .width(GAUGE_WIDTH)
-                .height(GAUGE_HEIGHT)
-                .class(design::surface(Some(design::track), [radius; 4], false))
+            spend.push(crate::interaction::tooltip(
+                widget::row::with_children(vec![
+                    crate::ui_controls::budget_radial(used, design::budget_tone(used)),
+                    design::caption(format!("{:.0}%", used * 100.0))
+                        .wrapping(iced::widget::text::Wrapping::None)
+                        .into(),
+                ])
+                .spacing(step::GAP_XS)
+                .align_y(Alignment::Center),
+                // The raw counts are checked once, if ever, so they are held
+                // here rather than spending a permanent run of status-line
+                // width: the ring and its percentage are what a reader acts on.
+                format!(
+                    "{} of {} context tokens · {} in · {} out",
+                    usage.context_tokens,
+                    usage.context_limit,
+                    usage.input_tokens,
+                    usage.output_tokens
+                ),
+            ));
+        } else if usage.input_tokens + usage.output_tokens > 0 {
+            // Without a context window there is no proportion to draw, so the
+            // figures the provider does report stay legible as text.
+            spend.push(
+                design::caption(format!(
+                    "{} in · {} out",
+                    usage.input_tokens, usage.output_tokens
+                ))
+                .wrapping(iced::widget::text::Wrapping::None)
                 .into(),
             );
-            status.push(design::caption(format!("{:.0}%", used * 100.0)).into());
         }
-        status.push(
-            design::caption(format!(
-                "{} in · {} out",
-                usage.input_tokens, usage.output_tokens
-            ))
-            .wrapping(iced::widget::text::Wrapping::None)
-            .into(),
-        );
         if let Some(cost) = usage.cost_microusd {
             // Two decimals, because the figure is money a reader is spending
             // and four decimals of a dollar is a number nobody reads.
-            status.push(design::caption(format!("${:.2}", cost as f64 / 1_000_000.0)).into());
+            spend.push(design::caption(format!("${:.2}", cost as f64 / 1_000_000.0)).into());
         }
         content.push(
-            widget::scrollable(
-                widget::row::with_children(status)
+            widget::row::with_children(vec![
+                widget::scrollable(
+                    widget::row::with_children(status)
+                        .spacing(step::GAP_S)
+                        .align_y(Alignment::Center)
+                        // The thumb floats over the row it belongs to, so its
+                        // rail is reserved below the content the way every
+                        // other scrollable in the app reserves one.
+                        .padding(design::with_horizontal_rail(iced::Padding::ZERO)),
+                )
+                .direction(iced::widget::scrollable::Direction::Horizontal(
+                    design::scrollbar(),
+                ))
+                .width(Length::Fill)
+                .into(),
+                widget::row::with_children(spend)
                     .spacing(step::GAP_S)
                     .align_y(Alignment::Center)
-                    // The thumb floats over the row it belongs to, so its rail
-                    // is reserved below the content the way every other
-                    // scrollable in the app reserves one.
-                    .padding(design::with_horizontal_rail(iced::Padding::ZERO)),
-            )
-            .direction(iced::widget::scrollable::Direction::Horizontal(
-                design::scrollbar(),
-            ))
-            .width(Length::Fill)
+                    // The scrolling half reserves a rail under itself, so the
+                    // pinned half reserves the same strip and the two read as
+                    // one line rather than sitting half a rail apart.
+                    .padding(design::with_horizontal_rail(iced::Padding::ZERO))
+                    .into(),
+            ])
+            .spacing(step::GAP_S)
+            .align_y(Alignment::Center)
             .into(),
         );
         widget::container(
@@ -1008,6 +1007,90 @@ impl Runtime {
         .width(Length::Fill)
         .height(Length::Fill)
         .into()
+    }
+
+    /// The plan the conversation is working to, or nothing where the provider
+    /// has published none.
+    ///
+    /// Only the newest plan is drawn, and only as its steps' current state:
+    /// the point of a pinned plan is what is left, not the document the agent
+    /// wrote about it. Each step is one unwrapped line, and the block scrolls
+    /// past [`PLAN_CEILING`], so a plan cannot take the pane from the
+    /// conversation it is about.
+    fn plan_view(&self) -> Option<Element<'_, Message>> {
+        let plan = self.snapshot.plan.as_slice();
+        if plan.is_empty() {
+            return None;
+        }
+        let done = plan
+            .iter()
+            .filter(|entry| entry.status == chat::PlanState::Done)
+            .count();
+        let mut rows: Vec<Element<'_, Message>> = vec![
+            design::caption(format!("Plan · {done} of {} done", plan.len()))
+                .class(cosmic::theme::Text::Custom(design::muted_text))
+                .into(),
+        ];
+        rows.extend(plan.iter().map(|entry| -> Element<'_, Message> {
+            // The step in hand carries the same live indicator the rest of the
+            // shell uses for work in flight, so a reader can tell where the
+            // agent is without reading the plan at all.
+            let marker: Element<'_, Message> = match entry.status {
+                chat::PlanState::Active => crate::ui_controls::activity_spinner_tone(
+                    f32::from(design::COMPACT_ICON_SIZE),
+                    design::accent_color,
+                ),
+                chat::PlanState::Done => {
+                    widget::icon(crate::ui_controls::symbolic_icon("emblem-ok-symbolic"))
+                        .size(design::COMPACT_ICON_SIZE)
+                        .into()
+                }
+                chat::PlanState::Pending => {
+                    widget::icon(crate::ui_controls::symbolic_icon("list-remove-symbolic"))
+                        .size(design::COMPACT_ICON_SIZE)
+                        .into()
+                }
+            };
+            let text = design::caption(entry.text.as_str())
+                .wrapping(iced::widget::text::Wrapping::None)
+                .width(Length::Fill);
+            widget::row::with_children(vec![
+                marker,
+                // The step in hand keeps the reader's ink; what is finished and
+                // what has not started are context for it.
+                match entry.status {
+                    chat::PlanState::Active => text,
+                    _ => text.class(cosmic::theme::Text::Custom(design::muted_text)),
+                }
+                .into(),
+            ])
+            .spacing(step::GAP_XS)
+            .align_y(Alignment::Center)
+            .into()
+        }));
+        Some(
+            widget::container(
+                widget::scrollable(
+                    widget::column::with_children(rows)
+                        .spacing(step::GAP_XS)
+                        .padding(design::with_vertical_rail(iced::Padding::from([
+                            step::GAP_XS,
+                            step::GAP_S,
+                        ]))),
+                )
+                .direction(iced::widget::scrollable::Direction::Vertical(
+                    design::scrollbar(),
+                )),
+            )
+            .max_height(PLAN_CEILING)
+            .class(design::surface(
+                Some(design::raised),
+                [design::RADIUS_M; 4],
+                true,
+            ))
+            .width(Length::Fill)
+            .into(),
+        )
     }
 
     /// The model, reasoning effort, and permission mode, at the status line's

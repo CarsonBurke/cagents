@@ -117,6 +117,13 @@ pub fn symbolic_icon(name: &str) -> widget::icon::Handle {
     static SEARCH: LazyLock<widget::icon::Handle> = LazyLock::new(|| {
         widget::icon::from_svg_bytes(br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16"><circle cx="7" cy="7" r="4.25" fill="none" stroke="black" stroke-width="1.4"/><path d="m10.25 10.25 3.25 3.25" fill="none" stroke="black" stroke-width="1.4" stroke-linecap="round"/></svg>"#.as_slice()).symbolic(true)
     });
+    // Two edges with the content closing between them. The desktop themes
+    // answer "compact" with a window-restore glyph, which is what made the
+    // one control here that rewrites a conversation look like a control that
+    // resizes a pane.
+    static COMPRESS: LazyLock<widget::icon::Handle> = LazyLock::new(|| {
+        widget::icon::from_svg_bytes(br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16"><g fill="none" stroke="black" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"><path d="M2.5 2.5h11M2.5 13.5h11M8 4.4V7.1M5.9 5.2 8 7.3l2.1-2.1M8 11.6V8.9M5.9 10.8 8 8.7l2.1 2.1"/></g></svg>"#.as_slice()).symbolic(true)
+    });
     match name {
         "edit-find-symbolic" | "system-search-symbolic" => SEARCH.clone(),
         "document-edit-symbolic" => CHANGES.clone(),
@@ -129,6 +136,7 @@ pub fn symbolic_icon(name: &str) -> widget::icon::Handle {
         "view-reveal-symbolic" => PREVIEW.clone(),
         "view-split-right-symbolic" => SPLIT_PANEL.clone(),
         "view-sidebar-start-symbolic" => SIDEBAR.clone(),
+        "view-compress-symbolic" => COMPRESS.clone(),
         "pull-request-symbolic" => PULL_REQUEST.clone(),
         "merged-pull-request-symbolic" => MERGED_PULL_REQUEST.clone(),
         "closed-pull-request-symbolic" => CLOSED_PULL_REQUEST.clone(),
@@ -608,6 +616,120 @@ impl<Message> cosmic::iced::advanced::Widget<Message, cosmic::Theme, cosmic::Ren
     }
 }
 
+/// The sweep a radial gauge fills for `fraction`, as start and end angles in
+/// radians measured from twelve o'clock, or `None` when nothing is used.
+///
+/// A fraction outside the unit range is clamped rather than wrapped: a
+/// provider reporting more context than its own window says the reader is
+/// full, not that the ring should start a second lap. A non-finite figure
+/// fills nothing, because a ring is a claim about a proportion and there is
+/// none to make.
+fn radial_sweep(fraction: f32) -> Option<(f32, f32)> {
+    use std::f32::consts::{FRAC_PI_2, TAU};
+
+    let filled = if fraction.is_finite() {
+        fraction.clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    (filled > 0.0).then(|| (-FRAC_PI_2, -FRAC_PI_2 + filled * TAU))
+}
+
+/// A ring whose filled sweep is the fraction of a budget in use.
+///
+/// `tone` is read from the drawing theme, so a gauge whose urgency changes
+/// does not have to be rebuilt to change colour.
+///
+/// The linear capsule this replaces cost a status line the width of a whole
+/// caption and, at the height a caption row allows, read as a crack in the
+/// layout. A ring carries the same proportion in the space of a glyph, which
+/// is what lets the budget stay pinned to the pane's right edge however
+/// narrow the pane gets.
+pub fn budget_radial<'a, Message: 'a>(
+    fraction: f32,
+    tone: fn(&cosmic::Theme) -> iced::Color,
+) -> Element<'a, Message> {
+    Element::new(BudgetRadial {
+        fraction,
+        tone: crate::design::Tone::Themed(tone),
+    })
+}
+
+struct BudgetRadial {
+    fraction: f32,
+    tone: crate::design::Tone,
+}
+
+impl<Message> cosmic::iced::advanced::Widget<Message, cosmic::Theme, cosmic::Renderer>
+    for BudgetRadial
+{
+    fn size(&self) -> cosmic::iced::Size<Length> {
+        cosmic::iced::Size {
+            width: Length::Fixed(crate::design::RADIAL_GAUGE_SIZE),
+            height: Length::Fixed(crate::design::RADIAL_GAUGE_SIZE),
+        }
+    }
+
+    fn layout(
+        &mut self,
+        _tree: &mut cosmic::iced::advanced::widget::Tree,
+        _renderer: &cosmic::Renderer,
+        limits: &cosmic::iced::advanced::layout::Limits,
+    ) -> cosmic::iced::advanced::layout::Node {
+        cosmic::iced::advanced::layout::atomic(
+            limits,
+            crate::design::RADIAL_GAUGE_SIZE,
+            crate::design::RADIAL_GAUGE_SIZE,
+        )
+    }
+
+    fn draw(
+        &self,
+        _tree: &cosmic::iced::advanced::widget::Tree,
+        renderer: &mut cosmic::Renderer,
+        theme: &cosmic::Theme,
+        _style: &cosmic::iced::advanced::renderer::Style,
+        layout: cosmic::iced::advanced::Layout<'_>,
+        _cursor: cosmic::iced::mouse::Cursor,
+        _viewport: &cosmic::iced::Rectangle,
+    ) {
+        use cosmic::iced::advanced::Renderer as _;
+        use cosmic::iced::advanced::graphics::geometry::Renderer as _;
+        use cosmic::widget::canvas;
+
+        let bounds = layout.bounds();
+        let radius = (bounds.width.min(bounds.height) - crate::design::RADIAL_GAUGE_STROKE) / 2.0;
+        if radius <= 0.0 {
+            return;
+        }
+        let stroke = canvas::Stroke::default().with_width(crate::design::RADIAL_GAUGE_STROKE);
+        let mut frame = canvas::Frame::new(&*renderer, bounds.size());
+        // The unfilled ring is drawn whatever the occupancy, because a gauge
+        // has to read as a whole for its filled part to mean anything.
+        let mut track = canvas::path::Builder::new();
+        track.circle(frame.center(), radius);
+        frame.stroke(
+            &track.build(),
+            stroke.with_color(crate::design::track(theme)),
+        );
+        if let Some((start, end)) = radial_sweep(self.fraction) {
+            let mut used = canvas::path::Builder::new();
+            used.arc(canvas::path::Arc {
+                center: frame.center(),
+                radius,
+                start_angle: cosmic::iced::Radians(start),
+                end_angle: cosmic::iced::Radians(end),
+            });
+            frame.stroke(&used.build(), stroke.with_color(self.tone.resolve(theme)));
+        }
+        let geometry = frame.into_geometry();
+
+        renderer.with_translation(cosmic::iced::Vector::new(bounds.x, bounds.y), |renderer| {
+            renderer.draw_geometry(geometry);
+        });
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -711,6 +833,27 @@ mod tests {
         let (hidden, frozen) = requested(Point::new(8.0, 900.0));
         assert_eq!(hidden, window::RedrawRequest::Wait);
         assert_eq!(frozen, Duration::ZERO, "the hidden arc advanced anyway");
+    }
+
+    /// The ring is the only thing a reader looks at before deciding to
+    /// compact, so a full budget has to look full and an empty one has to
+    /// draw no sweep at all rather than a stray dot at twelve o'clock.
+    #[test]
+    fn the_radial_sweep_is_the_fraction_of_the_budget_in_use() {
+        let quarter = radial_sweep(0.25).expect("a quarter of a budget is a sweep");
+        assert!((quarter.1 - quarter.0 - TAU / 4.0).abs() < 1e-4);
+        let full = radial_sweep(1.0).expect("a full budget is a whole ring");
+        assert!((full.1 - full.0 - TAU).abs() < 1e-4);
+        // A provider reporting past its own window still means "full".
+        let over = radial_sweep(2.5).expect("an overrun budget is a whole ring");
+        assert_eq!(over, full);
+        for nothing in [0.0, -1.0, f32::NAN] {
+            assert_eq!(
+                radial_sweep(nothing),
+                None,
+                "{nothing} drew a sweep of its own"
+            );
+        }
     }
 
     fn headless_renderer() -> cosmic::Renderer {

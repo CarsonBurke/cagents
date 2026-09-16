@@ -649,7 +649,7 @@ impl Adapter for Omp {
                         }
                         step.events.push(Event::Session {
                             id: id.into(),
-                            title: data["sessionName"].as_str().map(str::to_owned),
+                            title: session_title(&data["sessionName"]),
                         });
                         step.events.push(Event::Status {
                             busy: self.busy,
@@ -874,6 +874,33 @@ impl Adapter for Omp {
 fn text<'a>(value: &'a Value, key: &str) -> &'a str {
     value[key].as_str().unwrap_or_default()
 }
+/// The conversation's own name, or `None` when OMP labelled the session with
+/// something else.
+///
+/// The surface draws this as the chat's heading, and `sessionName` carries
+/// whatever last labelled the session. A harness that routes a stream of
+/// events through a session labels it with the kind of the event - `irc`,
+/// `system_notice` - and the reader then reads an internal event kind as the
+/// name of their own conversation. A heading is the conversation's title or
+/// nothing, so the label is refused here, where it enters the model, rather
+/// than being dressed up in the view.
+///
+/// The refusal is by shape rather than by a list of known kinds, because a
+/// harness is free to invent one: a title is written for a person and reads
+/// as prose, while an event kind, a channel and a notice category are single
+/// lower-case slugs.
+fn session_title(value: &Value) -> Option<String> {
+    let name = value.as_str()?.trim();
+    if name.is_empty() {
+        return None;
+    }
+    let slug = name.chars().all(|character| {
+        character.is_ascii_lowercase()
+            || character.is_ascii_digit()
+            || matches!(character, '_' | '-' | '.' | '/' | ':' | '#')
+    });
+    (!slug).then(|| name.to_owned())
+}
 fn model_id(value: &Value) -> Option<String> {
     Some(format!(
         "{}/{}",
@@ -1029,6 +1056,68 @@ mod tests {
         let step = adapter.receive(json!({"type":"response","command":"get_session_stats","success":true,"data":{"tokens":{"input":120,"output":23},"cost":0.02}})).unwrap();
         assert!(step.events.iter().any(|event| matches!(event, Event::Usage(usage)
             if usage.output_tokens == 23 && usage.context_tokens == 400 && usage.context_limit == 1000)));
+    }
+
+    /// The heading the surface draws over a conversation is the conversation's
+    /// own name. A reader saw `irc` there, because the harness had labelled
+    /// the session with the kind of event it was carrying.
+    #[test]
+    fn a_session_label_that_is_an_event_kind_is_not_a_heading() {
+        let titled = |name: Value| {
+            let mut adapter = Omp::default();
+            let request = adapter.request("get_state");
+            let step = adapter
+                .receive(json!({"type":"response","id":request["id"],"command":"get_state","success":true,
+                    "data":{"sessionId":"session","sessionName":name}}))
+                .unwrap();
+            step.events.iter().find_map(|event| match event {
+                Event::Session { title, .. } => Some(title.clone()),
+                _ => None,
+            })
+        };
+
+        for label in ["irc", "system_notice", "#general", "notify:3", ""] {
+            assert_eq!(
+                titled(json!(label)),
+                Some(None),
+                "{label:?} is an internal label, not the name of a conversation"
+            );
+        }
+        assert_eq!(
+            titled(json!("Rework the status line")),
+            Some(Some("Rework the status line".into())),
+            "a conversation the reader named keeps its heading"
+        );
+        assert_eq!(titled(Value::Null), Some(None));
+    }
+
+    /// Compaction's only visible effect is the context figure, so the reply
+    /// to one has to ask for the session's state again. The surface draws
+    /// that figure as a ring beside the composer's compact control, and a
+    /// control whose effect never arrives reads as a control that does
+    /// nothing.
+    #[test]
+    fn a_compaction_reply_asks_for_the_session_state_again() {
+        let mut adapter = Omp {
+            ready: true,
+            ..Omp::default()
+        };
+        let requested = adapter.command(Command::Compact).unwrap();
+        assert_eq!(requested.writes[0]["type"], "compact");
+        let step = adapter
+            .receive(json!({"type":"response","id":requested.writes[0]["id"],"command":"compact","success":true,"data":{}}))
+            .unwrap();
+        let kinds = step
+            .writes
+            .iter()
+            .map(|frame| frame["type"].as_str().unwrap_or_default().to_owned())
+            .collect::<Vec<_>>();
+        for expected in ["get_state", "get_session_stats"] {
+            assert!(
+                kinds.contains(&expected.to_owned()),
+                "the compacted session's {expected} is never asked for: {kinds:?}"
+            );
+        }
     }
 
     #[test]

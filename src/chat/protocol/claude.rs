@@ -1816,8 +1816,24 @@ impl Claude {
                 self.tool(item.clone());
                 step.events.push(Event::Item(item));
             }
-            "compact_boundary"
-            | "informational"
+            // Compaction is the one frame here a reader acts on, and its only
+            // visible effect is the context figure. Nothing else on the wire
+            // announces that the figure has moved, so the boundary asks for
+            // the usage again exactly as a refresh does, rather than
+            // narrating itself into the transcript.
+            "compact_boundary" => {
+                let usage = self.control(json!({"subtype":"get_context_usage"}))?;
+                step.writes.extend(usage.writes);
+            }
+            // Auxiliary session frames are not transcript data. Each one used
+            // to reach the transcript as a system item holding the raw JSON of
+            // the frame, so a session with hooks, a retry or a background task
+            // narrated its own plumbing at the reader - and the surface pinned
+            // the newest of them above the conversation as though it were the
+            // chat's subtitle. A failure still reaches the reader through the
+            // error surface, and what the session is doing is the status
+            // line's job.
+            "informational"
             | "notification"
             | "hook_started"
             | "hook_progress"
@@ -1825,18 +1841,7 @@ impl Claude {
             | "api_retry"
             | "thinking_tokens"
             | "background_tasks_changed"
-            | "elicitation_complete" => {
-                let id = frame["uuid"]
-                    .as_str()
-                    .map(str::to_owned)
-                    .unwrap_or_else(|| format!("claude-system:{}", string(frame, "subtype")));
-                step.events.push(Event::Item(text_item(
-                    id,
-                    Role::System,
-                    frame.to_string(),
-                    false,
-                )));
-            }
+            | "elicitation_complete" => {}
             other => step.events.push(Event::Error {
                 message: format!("Unsupported Claude system event {other}: {frame}"),
                 fatal: false,
@@ -3147,5 +3152,39 @@ mod tests {
         assert_eq!(history.offset, 1);
         assert_eq!(history.page().unwrap()[0]["uuid"], "earlier");
         assert_eq!(history.offset, 0);
+    }
+
+    /// Compaction rewrites what the session is carrying, and the context
+    /// figure is the only place a reader sees that. The boundary frame
+    /// therefore has to ask for the usage again - and must not spend a
+    /// transcript row narrating itself, which is what every auxiliary session
+    /// frame used to do with the raw JSON of the frame.
+    #[test]
+    fn a_compaction_boundary_asks_for_the_context_usage_and_says_nothing() {
+        let mut adapter = Claude::default();
+        let step = adapter
+            .receive(
+                json!({"type":"system","subtype":"compact_boundary","uuid":"c1","compact_metadata":{"trigger":"manual"}}),
+            )
+            .unwrap();
+        assert!(
+            step.writes
+                .iter()
+                .any(|frame| frame["request"]["subtype"] == "get_context_usage"),
+            "the compacted usage is never asked for: {:?}",
+            step.writes
+        );
+        assert!(
+            step.events.is_empty(),
+            "compaction narrated itself into the conversation: {:?}",
+            step.events
+        );
+        let quiet = adapter
+            .receive(json!({"type":"system","subtype":"hook_started","uuid":"h1","hook_name":"PreToolUse"}))
+            .unwrap();
+        assert!(
+            quiet.events.is_empty() && quiet.writes.is_empty(),
+            "an auxiliary frame is not transcript data: {quiet:?}"
+        );
     }
 }
