@@ -281,7 +281,8 @@ pub enum ItemContent {
 }
 
 impl ItemContent {
-    /// Byte cost of the payload, used by the transcript store's paging window.
+    /// Byte cost of the payload, which is what an adapter charges an item
+    /// against its per-item ceiling before the item reaches the store.
     pub fn byte_len(&self) -> usize {
         fn diff_bytes(changes: &[FileChange]) -> usize {
             changes.iter().fold(0, |total, change| {
