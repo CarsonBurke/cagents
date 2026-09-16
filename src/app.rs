@@ -5347,9 +5347,7 @@ impl Cagents {
             Some(CardRuntime::Loading) | None => widget::container(
                 widget::container(
                     widget::column::with_children(vec![
-                        widget::progress_bar::circular::Circular::new()
-                            .size(24.0)
-                            .into(),
+                        crate::ui_controls::activity_spinner_tone(24.0, design::accent_color),
                         widget::text::title3(labels.starting).into(),
                         design::caption("Preparing this workspace column…")
                             .wrapping(cosmic::iced::widget::text::Wrapping::Word)

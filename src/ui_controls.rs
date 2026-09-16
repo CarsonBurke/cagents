@@ -431,13 +431,35 @@ fn muted_icon_color(theme: &cosmic::Theme) -> iced::Color {
     }
 }
 
-/// A small activity glyph that redraws only while mounted, visible and focused.
-/// The widget owns its clock: there is no application subscription or view rebuild.
+/// The instant every activity spinner measures its rotation from.
 ///
-/// `color` is the tone the indicator draws in. The pinned COSMIC spinner takes
-/// its bar color from the active accent and has no style of its own, so the
-/// tone is applied by substituting the accent for this subtree rather than
-/// dropped on the floor.
+/// Phase has to come from one value shared by the whole process rather than
+/// from each widget's own mount time, so two indicators that appear a second
+/// apart still draw the same arc instead of chasing each other.
+static SPINNER_EPOCH: std::sync::LazyLock<cosmic::iced::time::Instant> =
+    std::sync::LazyLock::new(cosmic::iced::time::Instant::now);
+
+/// The arc the spinner draws `elapsed` after [`SPINNER_EPOCH`], as start and
+/// end angles in radians measured from twelve o'clock.
+///
+/// Deriving the angle from elapsed time rather than accumulating a per-frame
+/// delta means a dropped frame skips ahead instead of rewinding, and two
+/// spinners mounted at different moments stay in phase. The reduction to a
+/// single turn happens in `f64` because a shell left running overnight
+/// accumulates enough seconds that `f32` can no longer resolve a frame.
+fn spinner_arc(elapsed: std::time::Duration) -> (f32, f32) {
+    use std::f32::consts::TAU;
+
+    let period = crate::design::SPINNER_PERIOD.as_secs_f64();
+    let turns = (elapsed.as_secs_f64() % period) / period;
+    let start = turns as f32 * TAU - std::f32::consts::FRAC_PI_2;
+    (start, start + crate::design::SPINNER_ARC_SPAN * TAU)
+}
+
+/// A small activity glyph that owns its clock: there is no application
+/// subscription and no view rebuild behind its motion.
+///
+/// `color` is the tone the arc draws in.
 pub fn activity_spinner<'a, Message: Clone + 'a>(
     size: f32,
     color: iced::Color,
@@ -458,8 +480,251 @@ pub fn activity_spinner_tone<'a, Message: Clone + 'a>(
 }
 
 fn spinner<'a, Message: Clone + 'a>(size: f32, tone: crate::design::Tone) -> Element<'a, Message> {
-    crate::interaction::accent_tint(
-        cosmic::widget::progress_bar::indeterminate_circular().size(size),
-        tone,
-    )
+    Element::new(ActivitySpinner { size, tone })
+}
+
+/// An arc of fixed span turning at a fixed rate.
+///
+/// COSMIC's own indeterminate indicator grows its arc to nearly a full circle
+/// and shrinks it back twice a second on top of the rotation. That pulse reads
+/// as a progress report the shell has no way to make, so the shell draws its
+/// own indicator instead of restyling the pinned one.
+struct ActivitySpinner {
+    size: f32,
+    tone: crate::design::Tone,
+}
+
+#[derive(Default)]
+struct SpinnerState {
+    /// Time since [`SPINNER_EPOCH`] as of the last frame, kept here because
+    /// `draw` is handed no clock of its own.
+    elapsed: std::time::Duration,
+}
+
+impl<Message> cosmic::iced::advanced::Widget<Message, cosmic::Theme, cosmic::Renderer>
+    for ActivitySpinner
+{
+    fn tag(&self) -> cosmic::iced::advanced::widget::tree::Tag {
+        cosmic::iced::advanced::widget::tree::Tag::of::<SpinnerState>()
+    }
+
+    fn state(&self) -> cosmic::iced::advanced::widget::tree::State {
+        cosmic::iced::advanced::widget::tree::State::new(SpinnerState::default())
+    }
+
+    fn size(&self) -> cosmic::iced::Size<Length> {
+        cosmic::iced::Size {
+            width: Length::Fixed(self.size),
+            height: Length::Fixed(self.size),
+        }
+    }
+
+    fn layout(
+        &mut self,
+        _tree: &mut cosmic::iced::advanced::widget::Tree,
+        _renderer: &cosmic::Renderer,
+        limits: &cosmic::iced::advanced::layout::Limits,
+    ) -> cosmic::iced::advanced::layout::Node {
+        cosmic::iced::advanced::layout::atomic(limits, self.size, self.size)
+    }
+
+    fn update(
+        &mut self,
+        tree: &mut cosmic::iced::advanced::widget::Tree,
+        event: &cosmic::iced::Event,
+        layout: cosmic::iced::advanced::Layout<'_>,
+        _cursor: cosmic::iced::mouse::Cursor,
+        _renderer: &cosmic::Renderer,
+        _clipboard: &mut dyn cosmic::iced::advanced::Clipboard,
+        shell: &mut cosmic::iced::advanced::Shell<'_, Message>,
+        viewport: &cosmic::iced::Rectangle,
+    ) {
+        // A spinner nobody can see must not hold the frame clock. Indicators
+        // are mounted in cards sitting in an off-screen workspace column and
+        // in strips scrolled past their own viewport, and asking for the next
+        // frame from each of them pins the whole window to the compositor's
+        // cadence on behalf of nothing - worst exactly when many agents are
+        // working at once, which is when the shell can least afford it.
+        if !layout.bounds().intersects(viewport) {
+            return;
+        }
+        if let cosmic::iced::Event::Window(cosmic::iced::window::Event::RedrawRequested(now)) =
+            event
+        {
+            let state = tree.state.downcast_mut::<SpinnerState>();
+            state.elapsed = now.saturating_duration_since(*SPINNER_EPOCH);
+            shell.request_redraw();
+        }
+    }
+
+    fn draw(
+        &self,
+        tree: &cosmic::iced::advanced::widget::Tree,
+        renderer: &mut cosmic::Renderer,
+        theme: &cosmic::Theme,
+        _style: &cosmic::iced::advanced::renderer::Style,
+        layout: cosmic::iced::advanced::Layout<'_>,
+        _cursor: cosmic::iced::mouse::Cursor,
+        _viewport: &cosmic::iced::Rectangle,
+    ) {
+        use cosmic::iced::advanced::Renderer as _;
+        use cosmic::iced::advanced::graphics::geometry::Renderer as _;
+        use cosmic::widget::canvas;
+
+        let bounds = layout.bounds();
+        if bounds.width < 1.0 || bounds.height < 1.0 {
+            return;
+        }
+        // The stroke and radius are the pinned indicator's, so replacing the
+        // animation does not resize any indicator already on screen.
+        let bar_height = (bounds.width / 12.0).max(2.0);
+        let radius = (bounds.width - bar_height) / 2.0;
+        if radius <= 0.0 {
+            return;
+        }
+
+        let state = tree.state.downcast_ref::<SpinnerState>();
+        let (start, end) = spinner_arc(state.elapsed);
+        let mut frame = canvas::Frame::new(&*renderer, bounds.size());
+        let mut builder = canvas::path::Builder::new();
+        builder.arc(canvas::path::Arc {
+            center: frame.center(),
+            radius,
+            start_angle: cosmic::iced::Radians(start),
+            end_angle: cosmic::iced::Radians(end),
+        });
+        frame.stroke(
+            &builder.build(),
+            canvas::Stroke::default()
+                .with_color(self.tone.resolve(theme))
+                .with_width(bar_height)
+                .with_line_cap(canvas::LineCap::Round),
+        );
+        let geometry = frame.into_geometry();
+
+        renderer.with_translation(cosmic::iced::Vector::new(bounds.x, bounds.y), |renderer| {
+            renderer.draw_geometry(geometry);
+        });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::f32::consts::TAU;
+    use std::time::Duration;
+
+    /// The defect the spinner replaced was an arc that grew and shrank while
+    /// it turned, so both halves of "constant span, constant rate" are worth
+    /// holding onto.
+    #[test]
+    fn the_arc_keeps_its_span_and_turns_at_a_constant_rate() {
+        let period = crate::design::SPINNER_PERIOD;
+        let span = crate::design::SPINNER_ARC_SPAN * TAU;
+        let step = period / 8;
+
+        let mut previous: Option<f32> = None;
+        for tick in 0..8 {
+            let (start, end) = spinner_arc(step * tick);
+            assert!(
+                (end - start - span).abs() < 1e-4,
+                "the arc spans {} rad at tick {tick}, not {span}",
+                end - start
+            );
+            if let Some(previous) = previous {
+                assert!(
+                    (start - previous - span_per(step, period)).abs() < 1e-4,
+                    "the arc advanced {} rad over one step at tick {tick}",
+                    start - previous
+                );
+            }
+            previous = Some(start);
+        }
+    }
+
+    fn span_per(step: Duration, period: Duration) -> f32 {
+        step.as_secs_f32() / period.as_secs_f32() * TAU
+    }
+
+    /// A spinner that has been turning all day has to draw the same arc as
+    /// one mounted a moment ago, which is what keeps several of them in phase
+    /// and what stops the angle losing resolution as the shell stays open.
+    #[test]
+    fn the_angle_depends_only_on_time_within_the_period() {
+        let period = crate::design::SPINNER_PERIOD;
+        for offset in [Duration::ZERO, period / 3, period / 2] {
+            let (fresh, _) = spinner_arc(offset);
+            let (aged, _) = spinner_arc(offset + period * 72_000);
+            assert!(
+                (fresh - aged).abs() < 1e-4,
+                "a whole number of turns later the arc starts at {aged} rather than {fresh}"
+            );
+        }
+    }
+
+    /// A spinner mounted in an off-screen card or scrolled past the end of a
+    /// strip must not keep asking for the next frame: several of those at
+    /// once pin the whole window to the compositor's cadence for motion
+    /// nobody can see.
+    #[test]
+    fn an_offscreen_spinner_stops_asking_for_frames() {
+        use cosmic::iced::advanced::{Layout, Shell, clipboard, layout, mouse, widget::Tree};
+        use cosmic::iced::{Event, Point, Rectangle, Size, window};
+
+        let renderer = headless_renderer();
+        let viewport = Rectangle::new(Point::ORIGIN, Size::new(400.0, 300.0));
+        // Half a period after the shared epoch, so a spinner that does read
+        // the clock lands on a distinctly non-zero angle.
+        let redraw = Event::Window(window::Event::RedrawRequested(
+            *SPINNER_EPOCH + crate::design::SPINNER_PERIOD / 2,
+        ));
+
+        let requested = |origin: Point| {
+            let mut element: Element<'_, ()> = spinner(
+                24.0,
+                crate::design::Tone::Themed(crate::design::accent_color),
+            );
+            let mut tree = Tree::new(element.as_widget());
+            let node = layout::Node::new(Size::new(24.0, 24.0)).move_to(origin);
+            let mut messages = Vec::new();
+            let mut shell = Shell::new(&mut messages);
+            element.as_widget_mut().update(
+                &mut tree,
+                &redraw,
+                Layout::new(&node),
+                mouse::Cursor::Unavailable,
+                &renderer,
+                &mut clipboard::Null,
+                &mut shell,
+                &viewport,
+            );
+            (
+                shell.redraw_request(),
+                tree.state.downcast_ref::<SpinnerState>().elapsed,
+            )
+        };
+
+        let (visible, advanced) = requested(Point::new(8.0, 8.0));
+        assert_eq!(visible, window::RedrawRequest::NextFrame);
+        assert_ne!(advanced, Duration::ZERO, "the visible arc did not advance");
+
+        let (hidden, frozen) = requested(Point::new(8.0, 900.0));
+        assert_eq!(hidden, window::RedrawRequest::Wait);
+        assert_eq!(frozen, Duration::ZERO, "the hidden arc advanced anyway");
+    }
+
+    fn headless_renderer() -> cosmic::Renderer {
+        use cosmic::iced::advanced::renderer::Headless;
+
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(<cosmic::Renderer as Headless>::new(
+                cosmic::iced::Font::DEFAULT,
+                cosmic::iced::Pixels::from(16),
+                Some("tiny-skia"),
+            ))
+            .expect("create a headless renderer")
+    }
 }

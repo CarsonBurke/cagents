@@ -819,9 +819,7 @@ impl Cagents {
         };
         if let Some((label, busy)) = status {
             let indicator: Element<'_, Message> = if busy {
-                widget::progress_bar::circular::Circular::new()
-                    .size(14.0)
-                    .into()
+                crate::ui_controls::activity_spinner_tone(14.0, design::accent_color)
             } else {
                 widget::icon::from_name("dialog-warning-symbolic")
                     .size(14)
@@ -837,18 +835,18 @@ impl Cagents {
                 "Needs attention",
             ));
         } else if let Some(activity) = self.sidebar_state.card_activity(id) {
-            let indicator = match activity.state {
-                crate::agent::ActivityState::Working => Some(("agent-working-symbolic", "Working")),
-                crate::agent::ActivityState::Waiting => {
-                    Some(("agent-waiting-symbolic", "Waiting for input"))
-                }
-                _ => None,
-            };
-            if let Some((icon, label)) = indicator {
-                children.push(tooltip(
-                    crate::ui_controls::symbolic_icon(icon).icon().size(14),
-                    label,
-                ));
+            match activity.state {
+                crate::agent::ActivityState::Working => children.push(tooltip(
+                    crate::ui_controls::activity_spinner_tone(14.0, design::warning_color),
+                    "Working",
+                )),
+                crate::agent::ActivityState::Waiting => children.push(tooltip(
+                    crate::ui_controls::symbolic_icon("agent-waiting-symbolic")
+                        .icon()
+                        .size(14),
+                    "Waiting for input",
+                )),
+                _ => {}
             }
         }
         if self.chat_switch_available(id) {
