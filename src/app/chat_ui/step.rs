@@ -493,21 +493,12 @@ impl Runtime {
         let target = self.target;
         let mut rows: Vec<Element<'a, Message>> = Vec::new();
         match &item.content {
-            ItemContent::Text { text, .. } => {
-                if self.raw.contains(&item.id) {
-                    rows.push(code_surface(
-                        text.as_str(),
-                        Some("Markdown"),
-                        Some(Self::OUTPUT_HEIGHT),
-                        None,
-                    ));
-                } else {
-                    rows.push(
-                        markdown::view(cached.markdown.items(), settings)
-                            .map(|uri| action(Action::OpenUrl(uri.to_string())))
-                            .into(),
-                    );
-                }
+            ItemContent::Text { .. } => {
+                rows.push(
+                    markdown::view(cached.markdown.items(), settings)
+                        .map(|uri| action(Action::OpenUrl(uri.to_string())))
+                        .into(),
+                );
             }
             ItemContent::Command {
                 command,
@@ -596,34 +587,10 @@ impl Runtime {
                 }
             }
         }
-        // A step's controls appear with its detail rather than beside every
-        // collapsed row, which is what put twelve unconditional buttons on a
-        // surface whose reader wanted two.
-        let mut controls: Vec<Element<'a, Message>> = Vec::new();
-        if matches!(item.content, ItemContent::Text { .. }) {
-            controls.push(icon(
-                "text-x-generic-symbolic",
-                if self.raw.contains(&item.id) {
-                    "Show formatted text"
-                } else {
-                    "Show Markdown source"
-                },
-                true,
-                Action::Raw(target, item.id.clone()),
-            ));
-        }
-        controls.push(icon(
-            "edit-copy-symbolic",
-            "Copy this step",
-            true,
-            Action::Copy(target, item.id.clone(), CopyPart::Text),
-        ));
-        rows.push(
-            widget::row::with_children(controls)
-                .spacing(design::GRID_UNIT)
-                .align_y(Alignment::Center)
-                .into(),
-        );
+        // A step carries no controls of its own. Copying belongs to an answer,
+        // and the pieces of a step a reader actually copies - a command, its
+        // output, a tool's input - each carry their own control on the surface
+        // that holds them.
         widget::column::with_children(rows)
             .spacing(design::GRID_UNIT)
             .width(Length::Fill)

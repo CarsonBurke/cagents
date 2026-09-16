@@ -220,6 +220,30 @@ pub fn icon_control<'a, Message: Clone + 'a>(
     }
 }
 
+/// The same target at caption scale, for controls that belong to a message
+/// rather than to a toolbar.
+pub fn compact_icon_control<'a, Message: Clone + 'a>(
+    icon: widget::icon::Handle,
+    label: impl Into<Cow<'a, str>>,
+    on_press: Option<Message>,
+) -> IconControl<'a, Message> {
+    let label = label.into();
+    let content = widget::container(widget::icon(icon).size(crate::design::COMPACT_ICON_SIZE))
+        .center(Length::Fill);
+    IconControl {
+        button: widget::button::custom(content)
+            .name(label.clone())
+            .class(control_style(false, None))
+            .width(crate::design::COMPACT_CONTROL_SIZE)
+            .height(crate::design::COMPACT_CONTROL_SIZE)
+            .padding(0)
+            .on_press_maybe(on_press),
+        label,
+        selected: false,
+        enabled: true,
+    }
+}
+
 impl<'a, Message: Clone + 'a> IconControl<'a, Message> {
     pub fn id(mut self, id: widget::Id) -> Self {
         self.button = self.button.id(id);

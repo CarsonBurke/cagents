@@ -77,7 +77,7 @@ impl Cagents {
                 self.sidebar_state.reveal_project(project_id);
                 self.show_workspace_for_action();
                 let scope = self.select_channel(id);
-                let chat = self.new_native_chat();
+                let chat = self.new_native_chat(self.preferred_chat_provider());
                 self.persist();
                 Task::batch([scope, chat])
             }
@@ -101,7 +101,7 @@ impl Cagents {
                 let card = self.card_state(*id)?;
                 if !card.existence.is_open()
                     || !matches!(&card.kind, CardKind::Chat(_))
-                    || matches!(card.title.trim(), "" | "Native chat" | "Agent" | "Terminal")
+                    || super::chat_ui::placeholder_card_title(&card.title)
                 {
                     return None;
                 }

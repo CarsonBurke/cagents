@@ -37,6 +37,42 @@ fn icon<'a>(
     .into()
 }
 
+/// A message's own control, at caption scale.
+///
+/// An answer's footer sits directly under prose, so its controls are drawn
+/// smaller than the composer's: at the primary size a single copy button
+/// looked like a toolbar bolted to every answer.
+fn small_icon<'a>(
+    name: &'static str,
+    label: impl Into<Cow<'a, str>>,
+    message: Action,
+) -> Element<'a, Message> {
+    crate::ui_controls::compact_icon_control(
+        crate::ui_controls::symbolic_icon(name),
+        label,
+        Some(action(message)),
+    )
+    .into()
+}
+
+/// Local wall-clock time for a transcript stamp, as `14:32`.
+///
+/// A transcript is read while the work is happening, so the hour and minute
+/// are what a reader needs; a date would repeat itself on every row of a
+/// conversation that lasts an afternoon. `localtime_r` is used because the
+/// application carries no date library, and a hand-rolled offset would be
+/// wrong across every daylight-saving boundary.
+fn clock_label(unix_ms: u64) -> String {
+    let seconds = (unix_ms / 1000) as libc::time_t;
+    let mut parts: libc::tm = unsafe { std::mem::zeroed() };
+    // SAFETY: `localtime_r` writes into the caller's `tm` and reads only the
+    // time it is given, so it is sound for any `time_t` value.
+    if unsafe { libc::localtime_r(&seconds, &mut parts) }.is_null() {
+        return String::new();
+    }
+    format!("{:02}:{:02}", parts.tm_hour, parts.tm_min)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Target {
     pub card: CardId,
@@ -63,9 +99,14 @@ pub enum CopyPart {
 pub enum Action {
     Switch(CardId),
     BindingInput(CardId, String),
+    BindingScanned(Target, Result<Vec<chat::BindingCandidate>, String>),
+    BindingChoose(CardId, String),
     BindingPreview(CardId),
     BindingPreviewed(Target, Result<chat::BindingPreview, String>),
     BindingConfirm(CardId),
+    /// Leaves the terminal alone and opens a new conversation in its
+    /// directory, which is the only thing left when nothing attachable exists.
+    BindingNew(CardId),
     BindingCancel(CardId),
     Ready(Target, Ready),
     Wake(Target, Wake),
@@ -80,7 +121,6 @@ pub enum Action {
     /// Opens or closes a whole turn's step strip, addressed by the id of the
     /// turn's first item.
     ToggleTurn(Target, String),
-    Raw(Target, String),
     Copy(Target, String, CopyPart),
     OpenUrl(String),
     Attach(Target),
@@ -93,6 +133,9 @@ pub enum Action {
     Choice(Target, String, String, String),
     Answer(Target, String, String),
     Slash(Target, String),
+    /// Names a provider skill in the draft rather than dispatching a command,
+    /// because that is how a skill is invoked.
+    Mention(Target, String),
     HandoffFinished(Target, Result<TerminalSession, String>),
     CloseFinished(Target, Result<(), String>),
     UrlFinished(Result<(), String>),
@@ -121,6 +164,7 @@ impl Action {
                 | Self::CloseFinished(..)
                 | Self::UrlFinished(..)
                 | Self::BindingPreviewed(..)
+                | Self::BindingScanned(..)
         )
     }
 
@@ -140,7 +184,8 @@ impl Action {
             | Self::Field(target, _, _, _)
             | Self::Choice(target, _, _, _)
             | Self::Answer(target, _, _)
-            | Self::Slash(target, _) => Some(*target),
+            | Self::Slash(target, _)
+            | Self::Mention(target, _) => Some(*target),
             _ => None,
         }
     }
@@ -156,6 +201,15 @@ struct Binding {
     session: chat::Session,
     source: HostSessionProof,
     input: String,
+    /// What the account's shared server is holding open, as the daemon last
+    /// reported it. Listing is what turns this from a UUID prompt into a
+    /// choice a reader can make.
+    candidates: Vec<chat::BindingCandidate>,
+    scanning: bool,
+    /// Set when the listing resolved the conversation on its own, so the
+    /// preview that follows is confirmed without asking the reader to approve
+    /// a choice they never made.
+    resolved: bool,
     preview: Option<chat::BindingPreview>,
     loading: bool,
     error: Option<String>,
@@ -645,7 +699,6 @@ pub(super) struct Runtime {
     attachments: Vec<Attachment>,
     attachment_chooser_pending: bool,
     expanded: HashSet<String>,
-    raw: HashSet<String>,
     answers: HashMap<(String, String), Vec<String>>,
     pending: Option<PendingCommand>,
     next_command: u64,
@@ -674,7 +727,6 @@ impl Runtime {
             attachments: Vec::new(),
             attachment_chooser_pending: false,
             expanded: HashSet::new(),
-            raw: HashSet::new(),
             answers: HashMap::new(),
             pending: None,
             next_command: 0,
@@ -702,7 +754,6 @@ impl Runtime {
         // one entry per step the reader ever opened, held after the step it
         // named stopped existing.
         self.expanded.retain(|id| live_ids.contains(id.as_str()));
-        self.raw.retain(|id| live_ids.contains(id.as_str()));
         self.opened.retain(|id, _| live_ids.contains(id.as_str()));
         for item in &snapshot.items {
             let token = ChangeToken::of(&item.content);
@@ -826,6 +877,32 @@ fn stream(source: &Source) -> Pin<Box<dyn iced::futures::Stream<Item = (Target, 
     ))
 }
 
+/// The tab title a native chat starts with.
+///
+/// It names the provider because three providers now front a native chat and
+/// a bare "Native chat" left the reader unable to tell which agent a tab was
+/// talking to.
+pub(super) fn chat_card_title(provider: Provider) -> &'static str {
+    match provider {
+        Provider::Omp => "OMP chat",
+        Provider::Claude => "Claude chat",
+        Provider::Codex => "Codex chat",
+    }
+}
+
+/// Whether a card title is still the one the application chose for it.
+///
+/// A channel takes its name from a conversation that has named itself, so
+/// every title the application assigns has to be recognized here or a channel
+/// would be named after the agent rather than the work.
+pub(super) fn placeholder_card_title(title: &str) -> bool {
+    let title = title.trim();
+    matches!(title, "" | "Native chat" | "Agent" | "Terminal")
+        || Provider::ALL
+            .iter()
+            .any(|provider| title == chat_card_title(*provider))
+}
+
 fn observed_launch(session: &TerminalSession) -> Option<LaunchRecipe> {
     session
         .resume_hint
@@ -898,35 +975,55 @@ fn return_terminal(session: &chat::Session) -> Result<TerminalSession, String> {
 }
 
 impl Cagents {
-    pub(super) fn new_native_chat(&mut self) -> Task<Message> {
+    /// The provider a new channel's conversation should use.
+    ///
+    /// The menu names the provider explicitly, but a channel is created from
+    /// the sidebar with no such choice, so it follows the most recent
+    /// conversation in the workspace. That is state the workspace already
+    /// persists, so the answer survives a restart without a second setting
+    /// for the same decision.
+    pub(super) fn preferred_chat_provider(&self) -> Provider {
+        self.durable
+            .cards
+            .iter()
+            .rev()
+            .find_map(|card| match &card.kind {
+                CardKind::Chat(session) => Some(session.launch.provider),
+                _ => None,
+            })
+            .unwrap_or(Provider::Codex)
+    }
+
+    pub(super) fn new_native_chat(&mut self, provider: Provider) -> Task<Message> {
         if self.project_ui.deleting() {
             return Task::none();
         }
         let Some(working_directory) = self.terminal_directory() else {
             return cosmic::task::message(Message::OpenRepository);
         };
-        let provider = Provider::Omp;
         let mut recipe = LaunchRecipe {
             program: provider.executable().into(),
             arguments: Vec::new(),
             working_directory: working_directory.clone(),
             environment: crate::model::agent_recovery::fresh_native_environment(provider, true),
         };
-        let Some(root) = provider.session_root(&recipe) else {
-            self.status = Some(TransientNotice::error(
-                "Cannot locate the configured OMP account for a new native chat.",
-            ));
-            return Task::none();
-        };
-        // An explicit session directory bypasses OMP's auto-resume setting.
-        // Never let a new tab select an established conversation implicitly.
-        recipe.arguments.extend([
-            "--session-dir".into(),
-            root.join("sessions")
-                .join("native")
-                .to_string_lossy()
-                .into_owned(),
-        ]);
+        if provider == Provider::Omp {
+            let Some(root) = provider.session_root(&recipe) else {
+                self.status = Some(TransientNotice::error(
+                    "Cannot locate the configured OMP account for a new native chat.",
+                ));
+                return Task::none();
+            };
+            // An explicit session directory bypasses OMP's auto-resume setting.
+            // Never let a new tab select an established conversation implicitly.
+            recipe.arguments.extend([
+                "--session-dir".into(),
+                root.join("sessions")
+                    .join("native")
+                    .to_string_lossy()
+                    .into_owned(),
+            ]);
+        }
         let session = chat::Session {
             id: TerminalId::new(),
             launch: chat::Launch {
@@ -941,7 +1038,7 @@ impl Cagents {
         let card = CardState {
             id: card_id,
             generation: self.durable.generation,
-            title: "Native chat".into(),
+            title: chat_card_title(provider).into(),
             width_fraction: self.settings.default_column_fraction,
             existence: Existence::Open,
             exposure: Exposure::Visible,
@@ -1222,6 +1319,64 @@ impl Cagents {
                     binding.target.generation = self.chat_ui.generation;
                 }
             }
+            Action::BindingScanned(target, result) => {
+                let Some(binding) = self
+                    .chat_ui
+                    .bindings
+                    .get_mut(&target.card)
+                    .filter(|binding| binding.target == target)
+                else {
+                    return Task::none();
+                };
+                binding.scanning = false;
+                let candidates = match result {
+                    Ok(candidates) => candidates,
+                    Err(error) => {
+                        binding.error = Some(error);
+                        return Task::none();
+                    }
+                };
+                binding.candidates = candidates;
+                // A terminal is looking at a conversation rooted in its own
+                // directory. Where exactly one of the account's open
+                // conversations is, there is nothing for the reader to
+                // disambiguate, so the choice is made for them and still goes
+                // through the daemon's own preview and confirmation.
+                let directory = binding
+                    .session
+                    .terminal
+                    .as_ref()
+                    .map(|terminal| terminal.launch.working_directory.clone());
+                let mut here = binding.candidates.iter().filter(|candidate| {
+                    directory
+                        .as_ref()
+                        .is_some_and(|directory| &candidate.working_directory == directory)
+                });
+                let resolved = match (here.next(), here.next()) {
+                    (Some(only), None) => Some(only.session_id.clone()),
+                    _ => None,
+                };
+                if let Some(id) = resolved {
+                    binding.input = id;
+                    binding.resolved = true;
+                    return self.handle_chat_ui(Action::BindingPreview(target.card));
+                }
+            }
+            Action::BindingChoose(card, id) => {
+                let Some(binding) = self.chat_ui.bindings.get_mut(&card) else {
+                    return Task::none();
+                };
+                binding.input = id;
+                binding.preview = None;
+                binding.error = None;
+                binding.loading = false;
+                binding.resolved = false;
+                self.chat_ui.generation = self.chat_ui.generation.wrapping_add(1).max(1);
+                if let Some(binding) = self.chat_ui.bindings.get_mut(&card) {
+                    binding.target.generation = self.chat_ui.generation;
+                }
+                return self.handle_chat_ui(Action::BindingPreview(card));
+            }
             Action::BindingPreview(card) => {
                 let Some(binding) = self.chat_ui.bindings.get_mut(&card) else {
                     return Task::none();
@@ -1251,18 +1406,34 @@ impl Cagents {
                 });
             }
             Action::BindingPreviewed(target, result) => {
-                if let Some(binding) = self
+                let Some(binding) = self
                     .chat_ui
                     .bindings
                     .get_mut(&target.card)
                     .filter(|binding| binding.target == target)
-                {
-                    binding.loading = false;
-                    match result {
-                        Ok(preview) if binding.session.launch.session_id.as_ref() == Some(&preview.session_id) => binding.preview = Some(preview),
-                        Ok(_) => binding.error = Some("The preview returned a different identity; no conversation was activated.".into()),
-                        Err(error) => binding.error = Some(error),
+                else {
+                    return Task::none();
+                };
+                binding.loading = false;
+                match result {
+                    Ok(preview)
+                        if binding.session.launch.session_id.as_ref()
+                            == Some(&preview.session_id) =>
+                    {
+                        binding.preview = Some(preview)
                     }
+                    Ok(_) => binding.error = Some(
+                        "The preview returned a different identity; no conversation was activated."
+                            .into(),
+                    ),
+                    Err(error) => binding.error = Some(error),
+                }
+                if binding.resolved && binding.preview.is_some() {
+                    // The reader asked for this terminal's conversation and
+                    // the account had exactly one here, so there is no choice
+                    // left to present. Stopping to ask them to approve the
+                    // only answer is the prompt this replaced.
+                    return self.handle_chat_ui(Action::BindingConfirm(target.card));
                 }
             }
             Action::BindingConfirm(card) => {
@@ -1283,6 +1454,15 @@ impl Cagents {
                 let source = binding.source.clone();
                 return self.start_chat(card, session, true, Some(source), false);
             }
+            Action::BindingNew(card) => {
+                let Some(binding) = self.chat_ui.bindings.remove(&card) else {
+                    return Task::none();
+                };
+                // The source terminal keeps running and keeps its own
+                // conversation; this opens a second card beside it rather than
+                // taking anything over.
+                return self.new_native_chat(binding.session.launch.provider);
+            }
             Action::BindingCancel(card) => {
                 self.chat_ui.bindings.remove(&card);
             }
@@ -1293,7 +1473,7 @@ impl Cagents {
                 match self.card_state(card).map(|state| &state.kind) {
                     Some(CardKind::Terminal(terminal)) => {
                         let source = terminal.continuity.live_proof();
-                        let session = match conversion(terminal) {
+                        let mut session = match conversion(terminal) {
                             Ok(session) => session,
                             Err(error) => {
                                 self.status = Some(TransientNotice::error(error));
@@ -1301,32 +1481,67 @@ impl Cagents {
                             }
                         };
                         if source.is_none() {
-                            self.status = Some(TransientNotice::error(
-                                "Reconnect the original terminal before switching its active conversation.",
+                            // Nothing is running, so there is nothing to take
+                            // over and no handoff to authorize: the same
+                            // configuration opens a new conversation natively.
+                            // Refusing here rejected the one case that needs no
+                            // live process, which left a stopped agent terminal
+                            // with no way into the chat at all. The stopped
+                            // thread is deliberately not resumed: joining an
+                            // existing thread means joining whichever process
+                            // holds it, and no process holds this one.
+                            if let Some(recipe) =
+                                crate::model::agent_recovery::fresh_recipe(&session.launch.recipe)
+                            {
+                                session.launch.recipe = recipe;
+                            }
+                            session.launch.session_id = None;
+                            self.status = Some(TransientNotice::warning(
+                                "This terminal's agent is not running, so a new conversation was opened here.",
                             ));
-                            return Task::none();
+                            return self.start_chat(card, session, true, None, false);
                         }
                         if session.launch.provider == Provider::Codex {
                             self.chat_ui.generation =
                                 self.chat_ui.generation.wrapping_add(1).max(1);
+                            let target = Target {
+                                card,
+                                generation: self.chat_ui.generation,
+                            };
                             let input = session.launch.session_id.clone().unwrap_or_default();
+                            let source = source.expect("checked source");
                             self.chat_ui.bindings.insert(
                                 card,
                                 Binding {
-                                    target: Target {
-                                        card,
-                                        generation: self.chat_ui.generation,
-                                    },
-                                    session,
-                                    source: source.expect("checked source"),
+                                    target,
+                                    session: session.clone(),
+                                    source: source.clone(),
                                     input,
+                                    candidates: Vec::new(),
+                                    scanning: true,
+                                    resolved: false,
                                     preview: None,
                                     loading: false,
                                     error: None,
                                 },
                             );
+                            // The account's shared server knows which
+                            // conversations it is holding open, so the reader
+                            // is asked to choose from those rather than to
+                            // copy an identifier out of another program.
+                            let scan = cosmic::task::future(async move {
+                                let result = tokio::task::spawn_blocking(move || {
+                                    ClientHandle::candidates(session, source)
+                                })
+                                .await
+                                .map_err(|error| error.to_string())
+                                .and_then(|result| result);
+                                Message::ChatUi(Action::BindingScanned(target, result))
+                            });
                             return match self.workspace.focus(card) {
-                                Ok(update) => self.apply_viewport(update, true, false),
+                                Ok(update) => {
+                                    Task::batch([self.apply_viewport(update, true, false), scan])
+                                }
                                 Err(error) => {
                                     self.status = Some(TransientNotice::error(error.to_string()));
                                     Task::none()
@@ -1657,13 +1872,6 @@ impl Cagents {
                     runtime.opened.insert(key, !open);
                 }
             }
-            Action::Raw(target, id) => {
-                if let Some(runtime) = self.chat_runtime_mut(target) {
-                    if !runtime.raw.remove(&id) {
-                        runtime.raw.insert(id);
-                    }
-                }
-            }
             Action::Copy(target, id, part) => {
                 let Some(runtime) = self.chat_runtime_mut(target) else {
                     return Task::none();
@@ -1925,6 +2133,29 @@ impl Cagents {
                         runtime.revision = runtime.revision.wrapping_add(1);
                     }
                 }
+            }
+            Action::Mention(target, invocation) => {
+                let Some(runtime) = self.chat_runtime_mut(target) else {
+                    return Task::none();
+                };
+                if !runtime
+                    .snapshot
+                    .skills
+                    .iter()
+                    .any(|skill| skill.invocation == invocation)
+                {
+                    return Task::none();
+                }
+                // A skill is named inside a message rather than instead of
+                // one, so only the word the reader was typing is replaced and
+                // whatever they had already written stays.
+                let draft = runtime.composer.text();
+                let kept = draft
+                    .rfind(|character: char| character.is_whitespace())
+                    .map_or(0, |index| index + 1);
+                runtime.composer =
+                    text_editor::Content::with_text(&format!("{}{invocation} ", &draft[..kept]));
+                runtime.revision = runtime.revision.wrapping_add(1);
             }
             Action::HandoffFinished(target, result) => {
                 if self.chat_runtime_mut(target).is_none() {

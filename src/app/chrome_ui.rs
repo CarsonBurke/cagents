@@ -1,5 +1,5 @@
 use super::*;
-use crate::interaction::tooltip;
+use crate::{agent::Provider, interaction::tooltip};
 
 #[derive(Debug, Default)]
 pub(super) struct State {
@@ -33,14 +33,18 @@ enum Popup {
 #[derive(Debug, Clone, Copy)]
 pub enum NewTab {
     Terminal,
-    NativeChat,
-    Omp,
-    Claude,
-    Codex,
+    /// A conversation hosted inside the application, driven by this provider.
+    NativeChat(Provider),
+    /// The provider's own terminal program, in a hosted terminal.
+    Agent(Provider),
     Browser,
 }
 
-const NEW_TAB_CHOICES: [(&str, &str, NewTab, &str); 6] = [
+// A native chat and a terminal agent are different surfaces onto the same
+// three providers, so the menu names the provider in the label and the
+// surface in the icon. Native chats come first because they are the surface
+// the application is for; a terminal agent is the escape hatch.
+const NEW_TAB_CHOICES: [(&str, &str, NewTab, &str); 8] = [
     (
         "Terminal",
         "Shell in the current worktree",
@@ -48,28 +52,40 @@ const NEW_TAB_CHOICES: [(&str, &str, NewTab, &str); 6] = [
         "chrome.new-tab.terminal",
     ),
     (
-        "Native chat",
-        "Conversation inside cagents",
-        NewTab::NativeChat,
-        "chrome.new-tab.native",
+        "Codex chat",
+        "OpenAI agent inside cagents",
+        NewTab::NativeChat(Provider::Codex),
+        "chrome.new-tab.native-codex",
     ),
     (
-        "OMP",
-        "Oh My Pi terminal agent",
-        NewTab::Omp,
-        "chrome.new-tab.omp",
+        "Claude chat",
+        "Anthropic agent inside cagents",
+        NewTab::NativeChat(Provider::Claude),
+        "chrome.new-tab.native-claude",
     ),
     (
-        "Claude Code",
-        "Anthropic terminal agent",
-        NewTab::Claude,
+        "OMP chat",
+        "Oh My Pi agent inside cagents",
+        NewTab::NativeChat(Provider::Omp),
+        "chrome.new-tab.native-omp",
+    ),
+    (
+        "Codex terminal",
+        "OpenAI agent in a terminal",
+        NewTab::Agent(Provider::Codex),
+        "chrome.new-tab.codex",
+    ),
+    (
+        "Claude Code terminal",
+        "Anthropic agent in a terminal",
+        NewTab::Agent(Provider::Claude),
         "chrome.new-tab.claude",
     ),
     (
-        "Codex",
-        "OpenAI terminal agent",
-        NewTab::Codex,
-        "chrome.new-tab.codex",
+        "OMP terminal",
+        "Oh My Pi agent in a terminal",
+        NewTab::Agent(Provider::Omp),
+        "chrome.new-tab.omp",
     ),
     (
         "Browser",
@@ -166,8 +182,11 @@ impl Cagents {
             _ => None,
         });
         if let Some(backwards) = backwards {
-            let ids = match popup {
-                Popup::NewTab => NEW_TAB_CHOICES.map(|(_, _, _, id)| Some(id)),
+            // The two popups have unrelated row counts, and padding the
+            // shorter one to the longer one's length made the menu's length a
+            // hidden constraint on unrelated code.
+            let ids: Vec<&str> = match popup {
+                Popup::NewTab => NEW_TAB_CHOICES.iter().map(|(_, _, _, id)| *id).collect(),
                 Popup::Notices => {
                     let action =
                         self.save_health
@@ -187,26 +206,21 @@ impl Cagents {
                         Some("chrome.notices.close"),
                         (!self.notices.is_empty()).then_some("chrome.notices.dismiss"),
                         action,
-                        None,
-                        None,
-                        None,
                     ]
+                    .into_iter()
+                    .flatten()
+                    .collect()
                 }
             };
-            let count = ids.iter().flatten().count();
+            let count = ids.len();
             self.chrome_ui.focus_index = if backwards {
                 (self.chrome_ui.focus_index + count - 1) % count
             } else {
                 (self.chrome_ui.focus_index + 1) % count
             };
             return Some(
-                iced::widget::operation::focus(widget::Id::new(
-                    ids.into_iter()
-                        .flatten()
-                        .nth(self.chrome_ui.focus_index)
-                        .unwrap(),
-                ))
-                .map(cosmic::Action::App),
+                iced::widget::operation::focus(widget::Id::new(ids[self.chrome_ui.focus_index]))
+                    .map(cosmic::Action::App),
             );
         }
         Some(Task::none())
@@ -248,21 +262,15 @@ impl Cagents {
                 self.chrome_ui.close();
                 match kind {
                     NewTab::Terminal => cosmic::task::message(Message::NewTerminal),
-                    NewTab::NativeChat => self.new_native_chat(),
+                    NewTab::NativeChat(provider) => self.new_native_chat(provider),
                     NewTab::Browser => cosmic::task::message(Message::NewBrowser),
-                    NewTab::Omp | NewTab::Claude | NewTab::Codex => {
+                    NewTab::Agent(provider) => {
                         self.show_workspace_for_action();
                         let Some(working_directory) = self.terminal_directory() else {
                             return cosmic::task::message(Message::OpenRepository);
                         };
                         self.add_terminal_recipe(LaunchRecipe {
-                            program: match kind {
-                                NewTab::Omp => "omp",
-                                NewTab::Claude => "claude",
-                                NewTab::Codex => "codex",
-                                _ => unreachable!(),
-                            }
-                            .to_owned(),
+                            program: provider.executable().to_owned(),
                             arguments: Vec::new(),
                             working_directory,
                             environment: Default::default(),
@@ -293,16 +301,8 @@ impl Cagents {
                         NewTab::Terminal => {
                             crate::ui_controls::symbolic_icon("utilities-terminal-symbolic")
                         }
-                        NewTab::NativeChat => chat_icon(),
-                        NewTab::Omp => {
-                            crate::ui_controls::provider_icon(crate::agent::Provider::Omp)
-                        }
-                        NewTab::Claude => {
-                            crate::ui_controls::provider_icon(crate::agent::Provider::Claude)
-                        }
-                        NewTab::Codex => {
-                            crate::ui_controls::provider_icon(crate::agent::Provider::Codex)
-                        }
+                        NewTab::NativeChat(_) => chat_icon(),
+                        NewTab::Agent(provider) => crate::ui_controls::provider_icon(provider),
                         NewTab::Browser => browser_icon(),
                     };
                     crate::ui_controls::popover_item(
