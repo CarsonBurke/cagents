@@ -206,10 +206,11 @@ fn replacing_the_fish_package_does_not_make_its_idle_shell_active() {
     let replacement = package.path().join("fish.new");
     fs::copy(&fish, &replacement).unwrap();
     fs::rename(replacement, &installed).unwrap();
-    assert_eq!(
-        shell.terminal.close_checked(false),
-        TerminalCloseResult::Closed
-    );
+    // A shell that is still finishing its own startup work is legitimately
+    // active, so this waits for it to settle exactly as the test for an
+    // untouched fish does. Asserting on the first inspection made the result
+    // depend on how much a given fish release does after its first prompt.
+    shell.assert_unconfirmed_close();
 }
 
 #[test]
