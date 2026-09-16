@@ -9,6 +9,9 @@ pub(super) struct State {
     checking: bool,
     applying: bool,
     polling: bool,
+    /// The installed UI executable this window has been left behind by.
+    superseded: Option<PathBuf>,
+    restarting: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -19,6 +22,10 @@ pub enum Action {
     Applied(Result<UpdateJob, String>),
     Poll,
     Polled(Option<String>, Result<Option<UpdateJob>, String>),
+    InspectInstallation,
+    Restart,
+    Restarted(Result<(), String>),
+    RestartLapsed,
 }
 
 impl State {
@@ -63,19 +70,30 @@ impl Cagents {
     pub(super) fn has_update_control(&self) -> bool {
         self.update_ui.updating()
             || self.update_ui.error.is_some()
+            || self.update_ui.superseded.is_some()
             || matches!(self.update_ui.result, Some(UpdateState::Available { .. }))
     }
 
     pub(super) fn update_subscription(&self) -> Subscription<Message> {
+        // An install performed under this window breaks every terminal it owns
+        // the moment the daemon restarts, so the window has to notice on its
+        // own timescale rather than on the release check's. This needs no
+        // instance gate: it is inert unless the running executable is itself
+        // inside an installation tree, which a source build never is.
+        let installation = iced::time::every(Duration::from_secs(5))
+            .map(|_| Message::UpdateUi(Action::InspectInstallation));
+        // Release discovery talks to GitHub and drives the installer, neither
+        // of which a development instance may do.
         if crate::instance::NAME == "development" {
-            return Subscription::none();
+            return installation;
         }
-        if self.update_ui.updating() {
+        let progress = if self.update_ui.updating() {
             iced::time::every(Duration::from_secs(1)).map(|_| Message::UpdateUi(Action::Poll))
         } else {
             iced::time::every(Duration::from_secs(6 * 60 * 60))
                 .map(|_| Message::UpdateUi(Action::Check))
-        }
+        };
+        Subscription::batch([progress, installation])
     }
 
     pub(super) fn update_control(&self) -> Option<Element<'_, Message>> {
@@ -88,6 +106,18 @@ impl Cagents {
                     |job| format!("Updating to {}: {}", job.version, job.message),
                 ),
                 None,
+            )
+        } else if state.restarting {
+            (
+                "software-update-available-symbolic",
+                "Saving and reopening windows with the installed build".to_owned(),
+                None,
+            )
+        } else if state.superseded.is_some() {
+            (
+                "software-update-available-symbolic",
+                "A newer build is installed; reopen windows to use it".to_owned(),
+                Some(Message::UpdateUi(Action::Restart)),
             )
         } else if let Some(error) = &state.error {
             match &state.result {
@@ -121,9 +151,12 @@ impl Cagents {
         // window would refuse the update; without consulting it here the
         // control stays live, `update::apply` runs, and the refusal only
         // surfaces asynchronously through the notices popover.
-        let blocker = matches!(action, Some(Message::UpdateUi(Action::Apply)))
-            .then(|| self.window_update_blocker())
-            .flatten();
+        let blocker = matches!(
+            action,
+            Some(Message::UpdateUi(Action::Apply | Action::Restart))
+        )
+        .then(|| self.window_update_blocker())
+        .flatten();
         let label = match blocker {
             Some(reason) => format!("{label} — {reason}"),
             None => label,
@@ -258,6 +291,107 @@ impl Cagents {
                 }
                 Task::none()
             }
+            Action::InspectInstallation => {
+                if self.update_ui.restarting
+                    || self.update_ui.updating()
+                    // A release update owns the same launch fence and reopens
+                    // the windows itself when it finishes.
+                    || crate::instance::update_in_progress()
+                {
+                    return Task::none();
+                }
+                // A handful of stats against a warm dentry cache, and a task
+                // round-trip would have to re-read all of it before acting.
+                self.update_ui.superseded = crate::update::superseding_ui();
+                if self.update_ui.superseded.is_none() {
+                    return Task::none();
+                }
+                self.update_update_ui(Action::Restart)
+            }
+            Action::Restart => {
+                let Some(installed) = self.update_ui.superseded.clone() else {
+                    return Task::none();
+                };
+                // Unsaved editor work, an open dialog or a running worktree
+                // operation all outrank the restart: the control keeps naming
+                // the reason, and the next inspection retries once it clears.
+                if self.update_ui.restarting
+                    || self.update_ui.updating()
+                    || self.window_update_blocker().is_some()
+                {
+                    return Task::none();
+                }
+                self.update_ui.restarting = true;
+                self.update_ui.error = None;
+                cosmic::task::future(async move {
+                    let result = tokio::task::spawn_blocking(move || {
+                        crate::update::restart_into_installed(&installed)
+                            .map_err(|error| error.to_string())
+                    })
+                    .await
+                    .map_err(|error| error.to_string())
+                    .and_then(|result| result);
+                    Message::UpdateUi(Action::Restarted(result))
+                })
+            }
+            Action::Restarted(result) => match result {
+                // The helper now owns the close; this window ordinarily exits
+                // inside it. Time the wait out rather than leaving the window
+                // permanently convinced a restart is still coming, since a
+                // helper can lose the fence to another window's operation.
+                Ok(()) => cosmic::task::future(async {
+                    tokio::time::sleep(Duration::from_secs(60)).await;
+                    Message::UpdateUi(Action::RestartLapsed)
+                }),
+                Err(error) => {
+                    self.update_ui.restarting = false;
+                    self.status = Some(TransientNotice::error(error.clone()));
+                    self.update_ui.error = Some(error);
+                    Task::none()
+                }
+            },
+            Action::RestartLapsed => {
+                self.update_ui.restarting = false;
+                Task::none()
+            }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The restart saves and closes every window, so it must lose to anything
+    /// that would refuse to be saved, and it must run exactly once.
+    #[test]
+    fn a_superseded_window_reopens_only_when_nothing_holds_it_open() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let installed = PathBuf::from("/nonexistent/current/bin/cagents-ui");
+        app.update_ui.superseded = Some(installed.clone());
+        app.settings_reset_confirm = true;
+
+        drop(app.update_update_ui(Action::Restart));
+        assert!(
+            !app.update_ui.restarting,
+            "a window showing a confirmation dialog must not be closed under it"
+        );
+        assert!(app.has_update_control());
+
+        app.settings_reset_confirm = false;
+        drop(app.update_update_ui(Action::Restart));
+        assert!(app.update_ui.restarting);
+
+        // A second tick must neither re-spawn the helper nor forget which
+        // executable this window is being replaced by.
+        drop(app.update_update_ui(Action::InspectInstallation));
+        drop(app.update_update_ui(Action::Restart));
+        assert_eq!(app.update_ui.superseded, Some(installed));
+
+        drop(app.update_update_ui(Action::RestartLapsed));
+        assert!(
+            !app.update_ui.restarting,
+            "a helper that never closed this window must not block later attempts"
+        );
     }
 }

@@ -115,6 +115,65 @@ struct GitHubRelease {
     assets: Vec<Asset>,
 }
 
+/// One version directory inside an installation tree, established from a path
+/// alone: `<prefix>/versions/<version>/bin/<executable>` under a privately
+/// owned root that carries the installer's marker.
+///
+/// This deliberately says nothing about which version the installation is
+/// currently serving. A release update needs the running tree to be the served
+/// one ([`Installation`]); noticing that the served tree has *changed*
+/// ([`superseding_ui`]) needs exactly the opposite.
+struct InstallLayout {
+    prefix: PathBuf,
+    version_root: PathBuf,
+    version: String,
+}
+
+fn locate(executable: &Path) -> Result<InstallLayout, UpdateError> {
+    let executable = executable.canonicalize()?;
+    let bin = executable.parent().ok_or_else(unsupported_install)?;
+    if bin.file_name().is_none_or(|name| name != "bin") {
+        return Err(unsupported_install());
+    }
+    let version_root = bin.parent().ok_or_else(unsupported_install)?;
+    let version = version_root
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(unsupported_install)?;
+    let versions = version_root.parent().ok_or_else(unsupported_install)?;
+    if versions.file_name().is_none_or(|name| name != "versions") {
+        return Err(unsupported_install());
+    }
+    let prefix = versions.parent().ok_or_else(unsupported_install)?;
+    let marker = prefix.join(".cagents-install-root");
+    let meta = fs::symlink_metadata(&marker).map_err(|_| unsupported_install())?;
+    if !meta.is_file()
+        || meta.uid() != unsafe { libc::geteuid() }
+        || meta.len() > 64
+        || fs::read_to_string(marker)?.trim_end_matches('\n') != "cagents install root"
+        || !matched_set(bin)
+    {
+        return Err(unsupported_install());
+    }
+    let prefix_meta = fs::metadata(prefix)?;
+    if prefix_meta.uid() != unsafe { libc::geteuid() } || prefix_meta.mode() & 0o022 != 0 {
+        return Err(invalid("installation root is not privately owned"));
+    }
+    Ok(InstallLayout {
+        prefix: prefix.to_owned(),
+        version_root: version_root.to_owned(),
+        version: version.to_owned(),
+    })
+}
+
+/// The three executables are released, installed and spoken as one set: a
+/// version directory holding only some of them cannot host a window.
+fn matched_set(bin: &Path) -> bool {
+    ["cagents", "cagents-ui", "cagentsd"]
+        .iter()
+        .all(|name| bin.join(name).is_file())
+}
+
 struct Installation {
     prefix: PathBuf,
     version: String,
@@ -139,48 +198,20 @@ impl Installation {
     }
 
     fn from_executable(executable: &Path) -> Result<Self, UpdateError> {
-        let executable = executable.canonicalize()?;
-        let bin = executable.parent().ok_or_else(unsupported_install)?;
-        if bin.file_name().is_none_or(|name| name != "bin") {
-            return Err(unsupported_install());
-        }
-        let version_root = bin.parent().ok_or_else(unsupported_install)?;
-        let version = version_root
-            .file_name()
-            .and_then(|name| name.to_str())
-            .ok_or_else(unsupported_install)?;
-        stable_version(version)?;
-        let versions = version_root.parent().ok_or_else(unsupported_install)?;
-        if versions.file_name().is_none_or(|name| name != "versions") {
-            return Err(unsupported_install());
-        }
-        let prefix = versions.parent().ok_or_else(unsupported_install)?;
-        let marker = prefix.join(".cagents-install-root");
-        let meta = fs::symlink_metadata(&marker).map_err(|_| unsupported_install())?;
-        if !meta.is_file()
-            || meta.uid() != unsafe { libc::geteuid() }
-            || meta.len() > 64
-            || fs::read_to_string(marker)?.trim_end_matches('\n') != "cagents install root"
-            || prefix.join("current").canonicalize()? != version_root
-            || !bin.join("cagents").is_file()
-            || !bin.join("cagents-ui").is_file()
-            || !bin.join("cagentsd").is_file()
-        {
+        let layout = locate(executable)?;
+        stable_version(&layout.version)?;
+        if layout.prefix.join("current").canonicalize()? != layout.version_root {
             return Err(unsupported_install());
         }
         // Source builds copied into an old release tree must not impersonate it.
-        if version != env!("CARGO_PKG_VERSION") {
+        if layout.version != env!("CARGO_PKG_VERSION") {
             return Err(invalid(
                 "installed directory and running binary versions differ; reinstall manually",
             ));
         }
-        let prefix_meta = fs::metadata(prefix)?;
-        if prefix_meta.uid() != unsafe { libc::geteuid() } || prefix_meta.mode() & 0o022 != 0 {
-            return Err(invalid("installation root is not privately owned"));
-        }
         Ok(Self {
-            prefix: prefix.to_owned(),
-            version: version.to_owned(),
+            prefix: layout.prefix,
+            version: layout.version,
         })
     }
 
@@ -403,6 +434,82 @@ pub fn status() -> Result<Option<UpdateJob>, UpdateError> {
         }
     }
     Ok(Some(job))
+}
+
+/// The installed UI executable, when the installation this window runs from has
+/// since switched `current` to another version.
+///
+/// An install performed under a running window - `install.sh`, a package
+/// upgrade, or this application's own updater working on behalf of a window
+/// that has since been replaced - leaves that window speaking the previous
+/// wire protocol to a daemon that already speaks the new one. Every terminal it
+/// owns then fails its handshake, and no amount of retrying can succeed,
+/// because the mismatch is between two executables rather than two processes.
+///
+/// Unlike [`Installation`] this accepts any version string, including the
+/// `+local` builds a developer installs, since nothing here is downloaded: the
+/// bytes are already installed under a privately owned root.
+pub fn superseding_ui() -> Option<PathBuf> {
+    superseding_ui_from(&std::env::current_exe().ok()?)
+}
+
+fn superseding_ui_from(executable: &Path) -> Option<PathBuf> {
+    let layout = locate(executable).ok()?;
+    let served = layout.prefix.join("current").canonicalize().ok()?;
+    if served == layout.version_root {
+        return None;
+    }
+    let bin = served.join("bin");
+    matched_set(&bin).then(|| bin.join("cagents-ui"))
+}
+
+/// Hands the relaunch to a detached helper from the installed version.
+///
+/// The window cannot orchestrate its own replacement: closing the windows waits
+/// for every one of them to exit, and this process is one of them. The helper
+/// outlives it, and comes from the installed tree so that the windows it
+/// reopens and the daemon they attach to are one matched set.
+pub fn restart_into_installed(installed_ui: &Path) -> Result<(), UpdateError> {
+    let mut command = Command::new(installed_ui.with_file_name("cagents"));
+    command
+        .arg("restart-windows")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    // SAFETY: `setsid` is async-signal-safe and the only call after fork.
+    unsafe {
+        command.pre_exec(|| {
+            if libc::setsid() == -1 {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let mut child = command.spawn()?;
+    thread::spawn(move || {
+        let _ = child.wait();
+    });
+    Ok(())
+}
+
+/// Hidden CLI entrypoint for [`restart_into_installed`].
+///
+/// Saves and closes every running window, then reopens each one from this
+/// executable's own tree. It holds the same launch fence the updater uses, so a
+/// release update in flight and this relaunch can never interleave, and a
+/// window with unsaved editor work vetoes the close and stays open.
+pub fn restart_windows() -> Result<(), UpdateError> {
+    let layout = locate(&std::env::current_exe()?)?;
+    if layout.prefix.join("current").canonicalize()? != layout.version_root {
+        return Err(invalid(
+            "only the installed version may reopen saved windows",
+        ));
+    }
+    let mut guard = crate::instance::UiUpdateGuard::acquire()?;
+    let windows = guard.prepare_and_close_windows(Duration::from_secs(45))?;
+    guard
+        .relaunch_windows(&windows, &layout.version_root.join("bin/cagents-ui"))
+        .map_err(UpdateError::from)
 }
 
 /// Hidden CLI entrypoint. Only a worker spawned by `apply` has the inherited
@@ -985,6 +1092,63 @@ mod tests {
             fs::create_dir_all(path.parent().unwrap()).unwrap();
             fs::write(&path, b"binary").unwrap();
             assert!(Installation::from_executable(&path).is_err());
+        }
+    }
+
+    /// Builds `<root>/{.cagents-install-root,versions/<v>/bin/{cagents,cagents-ui,cagentsd}}`
+    /// and points `current` at `served`.
+    fn install_tree(root: &Path, versions: &[&str], served: &str) {
+        fs::write(root.join(".cagents-install-root"), b"cagents install root").unwrap();
+        for version in versions {
+            let bin = root.join("versions").join(version).join("bin");
+            fs::create_dir_all(&bin).unwrap();
+            for name in ["cagents", "cagents-ui", "cagentsd"] {
+                fs::write(bin.join(name), b"binary").unwrap();
+            }
+        }
+        std::os::unix::fs::symlink(
+            root.join("versions").join(served),
+            root.join("current-next"),
+        )
+        .unwrap();
+        fs::rename(root.join("current-next"), root.join("current")).unwrap();
+    }
+
+    #[test]
+    fn a_window_left_behind_by_an_install_finds_the_installed_ui() {
+        let root = tempfile::tempdir().unwrap();
+        let root = root.path();
+        install_tree(root, &["0.1.0", "0.2.0+local.abc"], "0.1.0");
+        let running = root.join("versions/0.1.0/bin/cagents-ui");
+        assert_eq!(superseding_ui_from(&running), None);
+
+        install_tree(root, &[], "0.2.0+local.abc");
+        assert_eq!(
+            superseding_ui_from(&running),
+            Some(
+                root.canonicalize()
+                    .unwrap()
+                    .join("versions/0.2.0+local.abc/bin/cagents-ui")
+            ),
+            "a local install is still an install, and the running window is still stale"
+        );
+
+        // Half of a version directory cannot host a window: its daemon or CLI
+        // would come from somewhere else.
+        fs::remove_file(root.join("versions/0.2.0+local.abc/bin/cagentsd")).unwrap();
+        assert_eq!(superseding_ui_from(&running), None);
+    }
+
+    #[test]
+    fn a_source_build_is_never_superseded_by_a_directory_beside_it() {
+        let root = tempfile::tempdir().unwrap();
+        let root = root.path();
+        install_tree(root, &["0.1.0"], "0.1.0");
+        for relative in ["target/dev-runtime/cagents-ui", "usr/bin/cagents-ui"] {
+            let path = root.join(relative);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(&path, b"binary").unwrap();
+            assert_eq!(superseding_ui_from(&path), None);
         }
     }
 
