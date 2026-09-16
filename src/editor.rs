@@ -20,7 +20,7 @@ pub const MAX_EDITABLE_FILE_BYTES: u64 = 8 * 1024 * 1024;
 
 /// Bound both decoder working memory and the final GPU upload.
 pub(crate) const MAX_IMAGE_DIMENSION: u32 = 4096;
-const MAX_IMAGE_PIXELS: u64 = 16 * 1024 * 1024;
+pub(crate) const MAX_IMAGE_PIXELS: u64 = 16 * 1024 * 1024;
 const MAX_IMAGE_DECODE_BYTES: u64 = 128 * 1024 * 1024;
 const MAX_SVG_BYTES: usize = 256 * 1024;
 
@@ -254,10 +254,14 @@ pub fn load_file(
         // change the document itself.
         drop(file);
         let path = worktree.join(relative_path);
-        return Ok(match render_document_page(&path, 0, tone) {
-            Ok(DocumentPage { pages, page }) => FileContent::Pdf { pages, page },
-            Err(reason) => FileContent::ReadOnly(ReadOnlyReason::Document(reason)),
-        });
+        // Opening is always at the default zoom, because the reader has not
+        // had a chance to ask for anything else yet.
+        return Ok(
+            match render_document_page(&path, 0, tone, PdfZoom::default()) {
+                Ok(DocumentPage { pages, page }) => FileContent::Pdf { pages, page },
+                Err(reason) => FileContent::ReadOnly(ReadOnlyReason::Document(reason)),
+            },
+        );
     }
 
     // A file can grow after metadata was read. Bound the read itself, not only
@@ -434,6 +438,57 @@ pub enum PdfTone {
     /// shade as anything else on screen, and a reader who changed their theme
     /// changed this too.
     Inverted { paper: [u8; 3] },
+}
+
+/// How large a page is drawn, as a multiple of the width of the pane reading
+/// it.
+///
+/// The scale is relative to the pane rather than to the page's printed size,
+/// because a page on screen has no printed size: the reader sees a sheet in a
+/// column, and what they adjust is how much of that column one page takes.
+/// `PdfZoom::default()` is exactly the pane's width, which is what the viewer
+/// did before it could be changed at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PdfZoom(u8);
+
+impl PdfZoom {
+    /// The steps a reader moves through, smallest first.
+    ///
+    /// Discrete steps rather than a continuous scale, because each change
+    /// costs a rasterization in another process, and a reader dragging a
+    /// slider would ask for renders they never look at.
+    const STEPS: [f32; 7] = [0.5, 0.75, 1.0, 1.25, 1.5, 2.0, 3.0];
+    const FIT: u8 = 2;
+
+    /// How much of the pane's width one page takes.
+    pub fn factor(self) -> f32 {
+        Self::STEPS[usize::from(self.0)]
+    }
+
+    /// The step as a reader reads it, where 100% is the pane's width.
+    pub fn percent(self) -> u32 {
+        (self.factor() * 100.0).round() as u32
+    }
+
+    /// The next step in, or `None` at the largest, so a control can be
+    /// withheld rather than press to no effect.
+    pub fn larger(self) -> Option<Self> {
+        (usize::from(self.0) + 1 < Self::STEPS.len()).then_some(Self(self.0 + 1))
+    }
+
+    pub fn smaller(self) -> Option<Self> {
+        self.0.checked_sub(1).map(Self)
+    }
+
+    pub fn is_fit(self) -> bool {
+        self.0 == Self::FIT
+    }
+}
+
+impl Default for PdfZoom {
+    fn default() -> Self {
+        Self(Self::FIT)
+    }
 }
 
 fn check_svg_expansion<'a, 'input>(

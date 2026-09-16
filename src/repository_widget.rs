@@ -354,11 +354,12 @@ pub enum RepositoryAction {
         result: Result<FileContent, FileIoError>,
     },
     /// Turn to a page of the open document, or re-render the current one after
-    /// the reader changes how its colors are adapted.
+    /// the reader changes how its colors are adapted or how large it is drawn.
     PdfPage {
         card: CardId,
         page: usize,
         tone: crate::editor::PdfTone,
+        zoom: crate::editor::PdfZoom,
     },
     /// The reader chose a tone for the open document, which stops the shell's
     /// theme deciding it. Separate from `PdfPage` so the state can tell a
@@ -366,6 +367,11 @@ pub enum RepositoryAction {
     PdfTone {
         card: CardId,
         tone: crate::editor::PdfTone,
+    },
+    /// The reader changed how much of the pane one page takes.
+    PdfZoom {
+        card: CardId,
+        zoom: crate::editor::PdfZoom,
     },
     PdfPageRendered {
         card: CardId,
@@ -555,6 +561,7 @@ impl RepositoryAction {
             | Self::FindPrevious { card }
             | Self::PdfPage { card, .. }
             | Self::PdfTone { card, .. }
+            | Self::PdfZoom { card, .. }
             | Self::PdfPageRendered { card, .. } => *card,
             Self::FilesLoaded { identity, .. }
             | Self::FileListUnchanged { identity }
@@ -1191,6 +1198,11 @@ enum DocumentState {
         pages: usize,
         page: usize,
         tone: crate::editor::PdfTone,
+        /// How much of the pane's width one page takes. Not part of the
+        /// raster's identity by accident: a page rendered at one zoom and
+        /// drawn at another is either soft or needlessly large, so a change
+        /// here re-renders exactly as a page turn does.
+        zoom: crate::editor::PdfZoom,
         handle: iced::widget::image::Handle,
         width: u32,
         height: u32,
@@ -1216,25 +1228,38 @@ enum DocumentState {
     },
 }
 
+/// Everything about the open document that decides which raster belongs on
+/// screen.
+///
+/// One value rather than three fields compared pairwise, because every place
+/// that asks "is this the page the reader is looking at" has to ask about all
+/// three, and a comparison that forgets one silently accepts a stale raster.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PdfView {
+    pub page: usize,
+    pub tone: crate::editor::PdfTone,
+    pub zoom: crate::editor::PdfZoom,
+}
+
 /// The page turn a child process is rendering now.
 struct PdfRender {
     /// Which request this is, so a result the reader has already turned away
     /// from cannot replace the page they are looking at now.
     request: u64,
-    /// The page and tone being rendered, which become the drawn ones once the
-    /// render succeeds.
-    requested: (usize, crate::editor::PdfTone),
-    /// The page and tone actually on screen. A render can fail - a page past
-    /// the renderer's pixel limit does - and the counter, the tooltip and the
-    /// tone toggle then have to describe the page that is still drawn rather
-    /// than the one that never arrived.
-    drawn: (usize, crate::editor::PdfTone),
-    /// The newest turn the reader asked for while this render was in flight.
+    /// The view being rendered, which becomes the drawn one once the render
+    /// succeeds.
+    requested: PdfView,
+    /// The view actually on screen. A render can fail - a document the helper
+    /// cannot parse does - and the counter, the tooltip, the tone toggle and
+    /// the zoom controls then have to describe the page that is still drawn
+    /// rather than the one that never arrived.
+    drawn: PdfView,
+    /// The newest view the reader asked for while this render was in flight.
     ///
     /// Turning twenty pages must cost the two renders the reader can see, not
     /// twenty that each reparse the document, so intermediate turns replace
     /// this one and only the last of them is dispatched.
-    pending: Option<(usize, crate::editor::PdfTone)>,
+    pending: Option<PdfView>,
 }
 
 enum DiffState {
@@ -1689,7 +1714,10 @@ impl RepositoryRuntime {
         theme: &cosmic::Theme,
     ) -> Task<RepositoryAction> {
         let DocumentState::Pdf {
-            page, chosen_tone, ..
+            page,
+            zoom,
+            chosen_tone,
+            ..
         } = &self.document
         else {
             return Task::none();
@@ -1698,13 +1726,18 @@ impl RepositoryRuntime {
         if chosen_tone.is_some() {
             return Task::none();
         }
-        let page = *page;
+        let (page, zoom) = (*page, *zoom);
         let tone = pdf_tone(theme);
         // The tone the application's theme now asks for. Recording it is what
         // lets a render that lands afterwards tell whether it was rasterized
         // for the theme in force or for the one on its way out.
         self.document_tone = tone;
-        self.update(RepositoryAction::PdfPage { card, page, tone })
+        self.update(RepositoryAction::PdfPage {
+            card,
+            page,
+            tone,
+            zoom,
+        })
     }
 
     pub fn selected_text(&self) -> Option<String> {
@@ -3628,6 +3661,9 @@ impl RepositoryRuntime {
                         width: page.width,
                         height: page.height,
                         page: page.index,
+                        // A freshly opened document is drawn at the pane's
+                        // width, which is the zoom the load rendered it for.
+                        zoom: crate::editor::PdfZoom::default(),
                         // The tone the load baked into these pixels, not the
                         // theme as it is now: the two differ when the reader
                         // changed their shell while the document rendered.
@@ -3668,21 +3704,47 @@ impl RepositoryRuntime {
             }
             RepositoryAction::PdfTone { card, tone } => {
                 let DocumentState::Pdf {
-                    page, chosen_tone, ..
+                    page,
+                    zoom,
+                    chosen_tone,
+                    ..
                 } = &mut self.document
                 else {
                     return Task::none();
                 };
                 *chosen_tone = Some(tone);
-                let page = *page;
-                self.update(RepositoryAction::PdfPage { card, page, tone })
+                let (page, zoom) = (*page, *zoom);
+                self.update(RepositoryAction::PdfPage {
+                    card,
+                    page,
+                    tone,
+                    zoom,
+                })
             }
-            RepositoryAction::PdfPage { card, page, tone } => {
+            RepositoryAction::PdfZoom { card, zoom } => {
+                let DocumentState::Pdf { page, tone, .. } = &self.document else {
+                    return Task::none();
+                };
+                let (page, tone) = (*page, *tone);
+                self.update(RepositoryAction::PdfPage {
+                    card,
+                    page,
+                    tone,
+                    zoom,
+                })
+            }
+            RepositoryAction::PdfPage {
+                card,
+                page,
+                tone,
+                zoom,
+            } => {
                 let DocumentState::Pdf {
                     path,
                     pages,
                     page: current,
                     tone: current_tone,
+                    zoom: current_zoom,
                     rendering,
                     message,
                     ..
@@ -3693,17 +3755,23 @@ impl RepositoryRuntime {
                 if page >= *pages {
                     return Task::none();
                 }
-                if page == *current && tone == *current_tone && rendering.is_none() {
-                    return Task::none();
-                }
+                let wanted = PdfView { page, tone, zoom };
                 // What is drawn right now, which is what the display fields
                 // hold whenever no render is in flight.
-                let drawn = (*current, *current_tone);
-                // The page and tone move now so the controls reflect where the
-                // reader is going, while the image keeps showing the page they
-                // can still read until its replacement arrives.
+                let drawn = PdfView {
+                    page: *current,
+                    tone: *current_tone,
+                    zoom: *current_zoom,
+                };
+                if wanted == drawn && rendering.is_none() {
+                    return Task::none();
+                }
+                // The page, tone and zoom move now so the controls reflect
+                // where the reader is going, while the image keeps showing the
+                // page they can still read until its replacement arrives.
                 *current = page;
                 *current_tone = tone;
+                *current_zoom = zoom;
                 *message = None;
                 if let Some(active) = rendering {
                     // A render is already running. Starting a second one would
@@ -3711,7 +3779,7 @@ impl RepositoryRuntime {
                     // see, so this turn waits, and replaces whichever turn was
                     // waiting before it. Asking again for what is already
                     // being rendered queues nothing.
-                    active.pending = (active.requested != (page, tone)).then_some((page, tone));
+                    active.pending = (active.requested != wanted).then_some(wanted);
                     return Task::none();
                 }
                 self.pdf_request = self.pdf_request.wrapping_add(1);
@@ -3719,11 +3787,11 @@ impl RepositoryRuntime {
                 let path = path.clone();
                 *rendering = Some(PdfRender {
                     request,
-                    requested: (page, tone),
+                    requested: wanted,
                     drawn,
                     pending: None,
                 });
-                pdf_page_task(card, path, page, tone, request)
+                pdf_page_task(card, path, wanted, request)
             }
             RepositoryAction::PdfPageRendered {
                 card,
@@ -3738,6 +3806,7 @@ impl RepositoryRuntime {
                     pages,
                     page,
                     tone,
+                    zoom,
                     handle,
                     width,
                     height,
@@ -3769,19 +3838,22 @@ impl RepositoryRuntime {
                             raster.height,
                             iced::advanced::graphics::core::Bytes::from_owner(raster.rgba),
                         );
-                        // The index the child rendered, not the one it was
-                        // asked for, because the drawn page is what the
-                        // counter has to name.
-                        (raster.index, active.requested.1)
+                        PdfView {
+                            // The index the child rendered, not the one it was
+                            // asked for, because the drawn page is what the
+                            // counter has to name.
+                            page: raster.index,
+                            ..active.requested
+                        }
                     }
                     Err(reason) => {
-                        // The previously rendered page stays on screen, so the
-                        // page and tone that describe it go back too: a
-                        // counter, a tooltip and a tone toggle that name a
-                        // page nobody drew would also make the next turn skip
-                        // one. The message is only worth showing while the
-                        // reader is still on the page it is about; a turn they
-                        // have already made replaces it.
+                        // The previously rendered page stays on screen, so
+                        // everything that describes it goes back too: a
+                        // counter, a tooltip, a tone toggle or a zoom control
+                        // naming a page nobody drew would also make the next
+                        // turn skip one. The message is only worth showing
+                        // while the reader is still on the page it is about; a
+                        // turn they have already made replaces it.
                         if active.pending.is_none() {
                             *message = Some(reason);
                         }
@@ -3795,10 +3867,13 @@ impl RepositoryRuntime {
                 // without assuming either order, and without consulting a
                 // global whose own update is a separate command.
                 let pending = active.pending.or_else(|| {
-                    (chosen_tone.is_none() && drawn.1 != intended).then_some((drawn.0, intended))
+                    (chosen_tone.is_none() && drawn.tone != intended).then_some(PdfView {
+                        tone: intended,
+                        ..drawn
+                    })
                 });
-                let Some((next_page, next_tone)) = pending else {
-                    (*page, *tone) = drawn;
+                let Some(next) = pending else {
+                    (*page, *tone, *zoom) = (drawn.page, drawn.tone, drawn.zoom);
                     return Task::none();
                 };
                 self.pdf_request = self.pdf_request.wrapping_add(1);
@@ -3806,11 +3881,11 @@ impl RepositoryRuntime {
                 let path = path.clone();
                 *rendering = Some(PdfRender {
                     request,
-                    requested: (next_page, next_tone),
+                    requested: next,
                     drawn,
                     pending: None,
                 });
-                pdf_page_task(card, path, next_page, next_tone, request)
+                pdf_page_task(card, path, next, request)
             }
             RepositoryAction::DiffLoaded {
                 identity,
@@ -4851,13 +4926,12 @@ fn file_task(identity: AsyncIdentity, tone: crate::editor::PdfTone) -> Task<Repo
 fn pdf_page_task(
     card: CardId,
     path: PathBuf,
-    page: usize,
-    tone: crate::editor::PdfTone,
+    view: PdfView,
     request: u64,
 ) -> Task<RepositoryAction> {
     cosmic::task::future(async move {
         let result = tokio::task::spawn_blocking(move || {
-            crate::editor::render_document_page(&path, page, tone)
+            crate::editor::render_document_page(&path, view.page, view.tone, view.zoom)
         })
         .await
         .unwrap_or_else(|error| Err(format!("page worker failed: {error}")));
@@ -5909,6 +5983,7 @@ fn editor_surface(card: CardId, runtime: &RepositoryRuntime) -> Element<'_, Repo
             pages,
             page,
             tone,
+            zoom,
             handle,
             width,
             height,
@@ -5918,8 +5993,11 @@ fn editor_surface(card: CardId, runtime: &RepositoryRuntime) -> Element<'_, Repo
         } => pdf_document_view(
             card,
             *pages,
-            *page,
-            *tone,
+            PdfView {
+                page: *page,
+                tone: *tone,
+                zoom: *zoom,
+            },
             handle,
             *width,
             *height,
@@ -5942,14 +6020,14 @@ fn editor_surface(card: CardId, runtime: &RepositoryRuntime) -> Element<'_, Repo
 fn pdf_document_view<'a>(
     card: CardId,
     pages: usize,
-    page: usize,
-    tone: crate::editor::PdfTone,
+    view: PdfView,
     handle: &iced::widget::image::Handle,
     width: u32,
     height: u32,
     rendering: bool,
     message: &'a Option<String>,
 ) -> Element<'a, RepositoryAction> {
+    let PdfView { page, tone, zoom } = view;
     let inverted = matches!(tone, crate::editor::PdfTone::Inverted { .. });
     let turn = |to: usize, glyph: &'static str, label: &'static str, enabled: bool| {
         icon_control(
@@ -5961,6 +6039,7 @@ fn pdf_document_view<'a>(
                 card,
                 page: to,
                 tone,
+                zoom,
             }),
         )
     };
@@ -5991,6 +6070,28 @@ fn pdf_document_view<'a>(
                 .into(),
         );
     }
+    let step = |to: Option<crate::editor::PdfZoom>, glyph: &'static str, label: &'static str| {
+        icon_control(
+            crate::ui_controls::symbolic_icon(glyph),
+            label,
+            false,
+            to.is_some(),
+            to.map(|zoom| RepositoryAction::PdfZoom { card, zoom }),
+        )
+    };
+    controls.push(step(zoom.smaller(), "zoom-out-symbolic", "Draw the page smaller").into());
+    controls.push(
+        crate::interaction::tooltip(
+            widget::text::body(if zoom.is_fit() {
+                "Fit".to_owned()
+            } else {
+                format!("{}%", zoom.percent())
+            }),
+            "How much of the pane's width one page takes",
+        )
+        .into(),
+    );
+    controls.push(step(zoom.larger(), "zoom-in-symbolic", "Draw the page larger").into());
     controls.push(
         icon_control(
             crate::ui_controls::symbolic_icon(if inverted {
@@ -6030,31 +6131,10 @@ fn pdf_document_view<'a>(
         .width(Length::Fill)
         .into(),
         crate::interaction::tooltip(
-            widget::container(
-                widget::scrollable(
-                    // The page fills the pane's width and scrolls, rather than
-                    // being shrunk to fit its height: a document is read a
-                    // column at a time, and a whole page scaled into a wide
-                    // pane is too small to read.
-                    widget::container(
-                        iced::widget::image(handle.clone())
-                            .content_fit(iced::ContentFit::Contain)
-                            .width(Length::Fill),
-                    )
-                    // A hairline around the sheet, because a recolored page
-                    // is close in tone to the surface behind it and a reader
-                    // needs to see where the paper ends.
-                    .class(cosmic::theme::Container::Custom(Box::new(page_edge))),
-                )
-                .direction(iced::widget::scrollable::Direction::Vertical(
-                    crate::design::scrollbar(),
-                ))
+            widget::container(pdf_page_surface(handle.clone(), zoom))
+                .padding(crate::design::GRID_UNIT * 3.0)
                 .width(Length::Fill)
                 .height(Length::Fill),
-            )
-            .padding(crate::design::GRID_UNIT * 3.0)
-            .width(Length::Fill)
-            .height(Length::Fill),
             format!("Page {} of {pages}, {width} × {height} pixels", page + 1),
         )
         .into(),
@@ -6062,6 +6142,87 @@ fn pdf_document_view<'a>(
     .width(Length::Fill)
     .height(Length::Fill)
     .into()
+}
+
+/// The sheet the page is drawn on, sized against the pane reading it.
+///
+/// At the default zoom the page fills the pane's width and scrolls, rather
+/// than being shrunk to fit its height: a document is read a column at a
+/// time, and a whole page scaled into a wide pane is too small to read. Any
+/// other zoom is a multiple of that same width, which is why the pane has to
+/// be measured. `responsive` is what measures it, and it is safe here in a
+/// way it is not in the diff panes: the accessible name for this region sits
+/// on the container outside it, so nothing is lost by `Responsive` not
+/// implementing `a11y_nodes`.
+fn pdf_page_surface(
+    handle: iced::widget::image::Handle,
+    zoom: crate::editor::PdfZoom,
+) -> Element<'static, RepositoryAction> {
+    if zoom.is_fit() {
+        return pdf_page_sheet(handle, None);
+    }
+    let factor = zoom.factor();
+    iced::widget::responsive(move |size| {
+        pdf_page_sheet(
+            handle.clone(),
+            Some(PageSizing {
+                page: (size.width * factor).max(1.0),
+                pane: size.width.max(1.0),
+            }),
+        )
+    })
+    .into()
+}
+
+/// How wide the page is drawn, and how wide the pane drawing it is.
+///
+/// The pane's own width is carried rather than filled, because a scrollable
+/// that can move on both axes gives its content an unbounded cross axis, so
+/// `Length::Fill` inside one resolves to the content's own width and centres
+/// nothing.
+#[derive(Clone, Copy)]
+struct PageSizing {
+    page: f32,
+    pane: f32,
+}
+
+fn pdf_page_sheet(
+    handle: iced::widget::image::Handle,
+    sizing: Option<PageSizing>,
+) -> Element<'static, RepositoryAction> {
+    let sheet = widget::container(
+        iced::widget::image(handle)
+            .content_fit(iced::ContentFit::Contain)
+            .width(sizing.map_or(Length::Fill, |sizing| Length::Fixed(sizing.page))),
+    )
+    // A hairline around the sheet, because a recolored page is close in tone
+    // to the surface behind it and a reader needs to see where the paper ends.
+    .class(cosmic::theme::Container::Custom(Box::new(page_edge)));
+    // Only a page wider than the pane needs to move sideways. A narrower one
+    // is centred in the pane instead, so shrinking a page does not leave it
+    // hugging an edge with dead space beside it.
+    let (direction, sheet) = match sizing {
+        Some(sizing) if sizing.page > sizing.pane => (
+            iced::widget::scrollable::Direction::Both {
+                vertical: crate::design::scrollbar(),
+                horizontal: crate::design::scrollbar(),
+            },
+            widget::container(sheet),
+        ),
+        Some(sizing) => (
+            iced::widget::scrollable::Direction::Vertical(crate::design::scrollbar()),
+            widget::container(sheet).center_x(Length::Fixed(sizing.pane)),
+        ),
+        None => (
+            iced::widget::scrollable::Direction::Vertical(crate::design::scrollbar()),
+            widget::container(sheet),
+        ),
+    };
+    widget::scrollable(sheet)
+        .direction(direction)
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .into()
 }
 
 fn editable_document_view<'a>(
@@ -10235,7 +10396,7 @@ mod tests {
     ) -> (
         usize,
         crate::editor::PdfTone,
-        Option<(usize, crate::editor::PdfTone)>,
+        Option<PdfView>,
         Option<String>,
     ) {
         let DocumentState::Pdf {
@@ -10256,6 +10417,24 @@ mod tests {
         )
     }
 
+    /// The zoom the viewer is drawing the open page at.
+    fn document_zoom(runtime: &RepositoryRuntime) -> crate::editor::PdfZoom {
+        let DocumentState::Pdf { zoom, .. } = &runtime.document else {
+            panic!("the fixture opens a document");
+        };
+        *zoom
+    }
+
+    /// The view a test expects to be rendering, at the zoom a document opens
+    /// at.
+    fn rendering_view(page: usize, tone: crate::editor::PdfTone) -> PdfView {
+        PdfView {
+            page,
+            tone,
+            zoom: crate::editor::PdfZoom::default(),
+        }
+    }
+
     /// A tone that is not `tone`, so a test can tell a restored tone from the
     /// one it asked for whichever theme the test process runs under.
     fn other_document_tone(tone: crate::editor::PdfTone) -> crate::editor::PdfTone {
@@ -10273,7 +10452,12 @@ mod tests {
         let mut runtime = document_runtime(card, 30);
         let tone = document_view_state(&runtime).1;
         for page in 1..=20 {
-            drop(runtime.update(RepositoryAction::PdfPage { card, page, tone }));
+            drop(runtime.update(RepositoryAction::PdfPage {
+                card,
+                page,
+                tone,
+                zoom: crate::editor::PdfZoom::default(),
+            }));
         }
         let first = runtime.pdf_request;
         assert_eq!(
@@ -10283,7 +10467,7 @@ mod tests {
         );
         let (page, _, requested, _) = document_view_state(&runtime);
         assert_eq!(page, 20, "the counter follows the reader, not the renderer");
-        assert_eq!(requested, Some((1, tone)));
+        assert_eq!(requested, Some(rendering_view(1, tone)));
         drop(runtime.update(RepositoryAction::PdfPageRendered {
             card,
             request: first,
@@ -10291,7 +10475,7 @@ mod tests {
         }));
         assert_eq!(
             document_view_state(&runtime).2,
-            Some((20, tone)),
+            Some(rendering_view(20, tone)),
             "the turn that was waiting is the last one the reader asked for"
         );
         assert_eq!(runtime.pdf_request, first + 1);
@@ -10307,6 +10491,70 @@ mod tests {
     }
 
     #[test]
+    fn a_zoom_the_reader_asks_for_renders_that_page_again_at_the_new_size() {
+        let card = CardId::new();
+        let mut runtime = document_runtime(card, 30);
+        let (page, tone, requested, _) = document_view_state(&runtime);
+        assert_eq!(requested, None, "the fixture opens with nothing in flight");
+        let opened = document_zoom(&runtime);
+        assert!(opened.is_fit(), "a document opens at the pane's width");
+        let larger = opened.larger().expect("the default zoom can grow");
+        drop(runtime.update(RepositoryAction::PdfZoom { card, zoom: larger }));
+        assert_eq!(
+            document_view_state(&runtime).2,
+            Some(PdfView {
+                page,
+                tone,
+                zoom: larger
+            }),
+            "a page drawn at one size and rendered for another is either soft or too large"
+        );
+        assert_eq!(document_zoom(&runtime), larger);
+    }
+
+    #[test]
+    fn a_failed_zoom_leaves_the_controls_describing_the_size_still_drawn() {
+        let card = CardId::new();
+        let mut runtime = document_runtime(card, 30);
+        let opened = document_zoom(&runtime);
+        let larger = opened.larger().expect("the default zoom can grow");
+        drop(runtime.update(RepositoryAction::PdfZoom { card, zoom: larger }));
+        drop(runtime.update(RepositoryAction::PdfPageRendered {
+            card,
+            request: runtime.pdf_request,
+            result: Err("this page could not be rendered".into()),
+        }));
+        assert_eq!(
+            document_zoom(&runtime),
+            opened,
+            "the zoom control has to describe the page that is on screen"
+        );
+    }
+
+    #[test]
+    fn the_zoom_steps_stay_ordered_and_bounded() {
+        let mut zoom = crate::editor::PdfZoom::default();
+        while let Some(smaller) = zoom.smaller() {
+            assert!(
+                smaller.factor() < zoom.factor(),
+                "stepping out has to draw the page smaller"
+            );
+            zoom = smaller;
+        }
+        assert_eq!(zoom.smaller(), None, "the smallest step offers no press");
+        let mut zoom = crate::editor::PdfZoom::default();
+        while let Some(larger) = zoom.larger() {
+            assert!(
+                larger.factor() > zoom.factor(),
+                "stepping in has to draw the page larger"
+            );
+            zoom = larger;
+        }
+        assert_eq!(zoom.larger(), None, "the largest step offers no press");
+        assert_eq!(crate::editor::PdfZoom::default().percent(), 100);
+    }
+
+    #[test]
     fn a_failed_page_render_puts_back_the_page_and_tone_that_are_still_drawn() {
         let card = CardId::new();
         let mut runtime = document_runtime(card, 30);
@@ -10315,6 +10563,7 @@ mod tests {
             card,
             page: 7,
             tone: other_document_tone(drawn_tone),
+            zoom: crate::editor::PdfZoom::default(),
         }));
         assert_eq!(document_view_state(&runtime).0, 7);
         drop(runtime.update(RepositoryAction::PdfPageRendered {
@@ -10337,10 +10586,11 @@ mod tests {
             card,
             page: drawn_page + 1,
             tone: drawn_tone,
+            zoom: crate::editor::PdfZoom::default(),
         }));
         assert_eq!(
             document_view_state(&runtime).2,
-            Some((drawn_page + 1, drawn_tone)),
+            Some(rendering_view(drawn_page + 1, drawn_tone)),
             "the next turn moves one page from the drawn one rather than skipping it"
         );
     }
@@ -10354,12 +10604,14 @@ mod tests {
             card,
             page: 9,
             tone,
+            zoom: crate::editor::PdfZoom::default(),
         }));
         let failing = runtime.pdf_request;
         drop(runtime.update(RepositoryAction::PdfPage {
             card,
             page: 4,
             tone,
+            zoom: crate::editor::PdfZoom::default(),
         }));
         drop(runtime.update(RepositoryAction::PdfPageRendered {
             card,
@@ -10367,7 +10619,11 @@ mod tests {
             result: Err("page 10 is too large to render".into()),
         }));
         let (page, _, requested, message) = document_view_state(&runtime);
-        assert_eq!(requested, Some((4, tone)), "the queued turn still happens");
+        assert_eq!(
+            requested,
+            Some(rendering_view(4, tone)),
+            "the queued turn still happens"
+        );
         assert_eq!(page, 4);
         assert_eq!(
             message, None,
@@ -10412,7 +10668,7 @@ mod tests {
             tone, other_tone,
             "a page rendered for one shell is wrong on the other"
         );
-        assert_eq!(requested, Some((0, other_tone)));
+        assert_eq!(requested, Some(rendering_view(0, other_tone)));
         assert_eq!(runtime.pdf_request, dispatched + 1);
         drop(runtime.update(RepositoryAction::PdfPageRendered {
             card,
@@ -10449,7 +10705,7 @@ mod tests {
             tone, shell,
             "the page the load baked for the old shell has to be rendered again for this one"
         );
-        assert_eq!(requested, Some((0, shell)));
+        assert_eq!(requested, Some(rendering_view(0, shell)));
     }
 
     /// A reader who turns a page back to its own colours did so to read it.
