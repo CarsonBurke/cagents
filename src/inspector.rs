@@ -200,14 +200,39 @@ impl<Message> Widget<Message, Theme, Renderer> for ModalOverlay<'_, Message> {
         viewport: &Rectangle,
         translation: cosmic::iced::Vector,
     ) -> Option<overlay::Element<'a, Message, Theme, Renderer>> {
-        let foreground = layout.children().nth(1)?;
-        self.foreground.as_widget_mut().overlay(
-            &mut tree.children[1],
-            foreground,
+        let mut children = layout.children();
+        let (background_layout, foreground_layout) = (children.next()?, children.next()?);
+        let (background_tree, foreground_tree) = tree.children.split_at_mut(1);
+        // The background is painted, so whatever it raises has to be painted
+        // too: dropping its overlay drew a card's dropdown as a closed button
+        // with no menu. It stays inert, because this layer withholds events and
+        // operations from the background and an overlay that took them would
+        // hand a frozen subtree the clicks aimed at the modal. The foreground's
+        // overlay is grouped last so it composites above it.
+        let background = self
+            .background
+            .as_widget_mut()
+            .overlay(
+                &mut background_tree[0],
+                background_layout,
+                renderer,
+                viewport,
+                translation,
+            )
+            .map(|overlay| overlay::Element::new(Box::new(Inert { overlay })));
+        let foreground = self.foreground.as_widget_mut().overlay(
+            &mut foreground_tree[0],
+            foreground_layout,
             renderer,
             viewport,
             translation,
-        )
+        );
+        match (background, foreground) {
+            (Some(background), Some(foreground)) => {
+                Some(overlay::Group::with_children(vec![background, foreground]).overlay())
+            }
+            (background, foreground) => background.or(foreground),
+        }
     }
 
     fn a11y_nodes(
@@ -230,6 +255,44 @@ impl<Message> Widget<Message, Theme, Renderer> for ModalOverlay<'_, Message> {
 impl<'a, Message: 'a> From<ModalOverlay<'a, Message>> for Element<'a, Message> {
     fn from(overlay: ModalOverlay<'a, Message>) -> Self {
         Self::new(overlay)
+    }
+}
+
+/// An overlay that is drawn but never operated.
+///
+/// [`ModalOverlay`] paints its background while withholding every event and
+/// operation from it. This wrapper extends that same split to the overlays the
+/// background raises, so a control that was already open keeps its painted
+/// shape without stealing input from the modal in front of it.
+struct Inert<'a, Message> {
+    overlay: overlay::Element<'a, Message, Theme, Renderer>,
+}
+
+impl<Message> overlay::Overlay<Message, Theme, Renderer> for Inert<'_, Message> {
+    fn layout(&mut self, renderer: &Renderer, bounds: Size) -> layout::Node {
+        self.overlay.as_overlay_mut().layout(renderer, bounds)
+    }
+
+    fn draw(
+        &self,
+        renderer: &mut Renderer,
+        theme: &Theme,
+        style: &renderer::Style,
+        layout: Layout<'_>,
+        _cursor: mouse::Cursor,
+    ) {
+        // The obscured tree is drawn with no cursor, exactly as `Widget::draw`
+        // does for the background itself.
+        self.overlay
+            .as_overlay()
+            .draw(renderer, theme, style, layout, mouse::Cursor::Unavailable);
+    }
+
+    /// Sorts below any overlay the foreground raises. `overlay::Group` orders
+    /// its children by this index with an unstable sort, so equal indices would
+    /// leave the compositing order of the two layers to chance.
+    fn index(&self) -> f32 {
+        self.overlay.as_overlay().index() - 1.0
     }
 }
 
@@ -2183,6 +2246,128 @@ mod tests {
         assert_eq!(
             accessible.root()[0].node().label(),
             Some("Foreground splitter")
+        );
+    }
+
+    /// A leaf whose overlay answers a click, so a test can tell an overlay
+    /// that was dropped from one that was raised but held inert.
+    struct Talkative;
+
+    struct TalkativeOverlay;
+
+    impl Widget<&'static str, Theme, Renderer> for Talkative {
+        fn size(&self) -> Size<Length> {
+            Size::new(Length::Fill, Length::Fill)
+        }
+        fn layout(
+            &mut self,
+            _tree: &mut Tree,
+            _renderer: &Renderer,
+            limits: &layout::Limits,
+        ) -> layout::Node {
+            layout::Node::new(limits.max())
+        }
+        fn draw(
+            &self,
+            _tree: &Tree,
+            _renderer: &mut Renderer,
+            _theme: &Theme,
+            _style: &renderer::Style,
+            _layout: Layout<'_>,
+            _cursor: mouse::Cursor,
+            _viewport: &Rectangle,
+        ) {
+        }
+        fn overlay<'a>(
+            &'a mut self,
+            _tree: &'a mut Tree,
+            _layout: Layout<'a>,
+            _renderer: &Renderer,
+            _viewport: &Rectangle,
+            _translation: cosmic::iced::Vector,
+        ) -> Option<overlay::Element<'a, &'static str, Theme, Renderer>> {
+            Some(overlay::Element::new(Box::new(TalkativeOverlay)))
+        }
+    }
+
+    impl overlay::Overlay<&'static str, Theme, Renderer> for TalkativeOverlay {
+        fn layout(&mut self, _renderer: &Renderer, _bounds: Size) -> layout::Node {
+            layout::Node::new(Size::new(16.0, 16.0))
+        }
+        fn draw(
+            &self,
+            _renderer: &mut Renderer,
+            _theme: &Theme,
+            _style: &renderer::Style,
+            _layout: Layout<'_>,
+            _cursor: mouse::Cursor,
+        ) {
+        }
+        fn update(
+            &mut self,
+            _event: &Event,
+            _layout: Layout<'_>,
+            _cursor: mouse::Cursor,
+            _renderer: &Renderer,
+            _clipboard: &mut dyn Clipboard,
+            shell: &mut Shell<'_, &'static str>,
+        ) {
+            shell.publish("background overlay took the event");
+        }
+    }
+
+    #[test]
+    fn modal_overlay_paints_the_background_overlay_without_letting_it_take_input() {
+        use cosmic::iced::advanced::{clipboard, renderer::Headless};
+        let renderer = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(Renderer::new(
+                cosmic::iced::Font::default(),
+                cosmic::iced::Pixels(14.0),
+                Some("tiny-skia"),
+            ))
+            .unwrap();
+        let mut element: Element<'_, &'static str> = ModalOverlay::new(
+            Element::new(Talkative),
+            widget::container(cosmic::iced::widget::Space::new())
+                .width(Length::Fill)
+                .height(Length::Fill),
+        )
+        .into();
+        let mut tree = Tree::new(&element);
+        let node = element.as_widget_mut().layout(
+            &mut tree,
+            &renderer,
+            &layout::Limits::new(Size::ZERO, Size::new(400.0, 300.0)),
+        );
+        let viewport = Rectangle::new(cosmic::iced::Point::ORIGIN, Size::new(400.0, 300.0));
+        let mut raised = element
+            .as_widget_mut()
+            .overlay(
+                &mut tree,
+                Layout::new(&node),
+                &renderer,
+                &viewport,
+                cosmic::iced::Vector::ZERO,
+            )
+            .expect("the painted background keeps the overlay it raised");
+        let laid_out = raised.as_overlay_mut().layout(&renderer, viewport.size());
+        assert_eq!(laid_out.size(), Size::new(16.0, 16.0));
+
+        let mut messages = Vec::new();
+        raised.as_overlay_mut().update(
+            &Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)),
+            Layout::new(&laid_out),
+            mouse::Cursor::Available(cosmic::iced::Point::new(8.0, 8.0)),
+            &renderer,
+            &mut clipboard::Null,
+            &mut Shell::new(&mut messages),
+        );
+        assert!(
+            messages.is_empty(),
+            "the obscured background must not answer input aimed at the modal"
         );
     }
 

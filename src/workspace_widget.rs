@@ -684,7 +684,15 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for CardSurface<'_, Messag
         viewport: &Rectangle,
         translation: Vector,
     ) -> Option<overlay::Element<'a, Message, Theme, Renderer>> {
-        let clipped = clipped_viewport(layout.bounds(), viewport)?;
+        // `overlay` is the one pass whose layout is not already on screen: the
+        // workspace scrollable leaves card layouts in content space and reports
+        // the camera separately as `translation`, so the card's visible
+        // rectangle is its bounds plus that translation. Testing the
+        // untranslated bounds against the screen-space viewport dropped every
+        // overlay raised inside a card whose content-space position sat outside
+        // the visible rect, which is every card past the second one however far
+        // the camera had scrolled it into view.
+        let clipped = clipped_viewport(layout.bounds() + translation, viewport)?;
         self.content.as_widget_mut().overlay(
             &mut tree.children[0],
             Self::child_layout(layout),
@@ -1300,7 +1308,12 @@ impl<Message> Widget<Message, Theme, Renderer> for WorkspaceSurface<'_, Message>
         viewport: &Rectangle,
         translation: Vector,
     ) -> Option<overlay::Element<'a, Message, Theme, Renderer>> {
-        let clipped = clipped_viewport(layout.bounds(), viewport)?;
+        // Same contract as the card surface: during `overlay` the layout is in
+        // the coordinate space of whatever scrolls this surface, and
+        // `translation` is what puts it on screen. The strip mounts above the
+        // workspace scrollable so the translation is usually zero, but reading
+        // it keeps the surface correct the day something scrolls it.
+        let clipped = clipped_viewport(layout.bounds() + translation, viewport)?;
         self.content.as_widget_mut().overlay(
             &mut tree.children[0],
             Self::child_layout(layout),
@@ -2486,5 +2499,183 @@ mod tests {
             clock.elapsed(start + Duration::from_millis(2_016)),
             Some(Duration::from_millis(16))
         );
+    }
+
+    /// A leaf that always raises an overlay anchored to its own translated
+    /// bounds, so a test can tell whether the pane chain forwards `overlay`
+    /// and with which translation.
+    struct OverlayProbe;
+
+    struct ProbeOverlay {
+        anchor: Rectangle,
+    }
+
+    impl Widget<(), Theme, Renderer> for OverlayProbe {
+        fn size(&self) -> Size<Length> {
+            Size::new(Length::Fill, Length::Fill)
+        }
+        fn layout(
+            &mut self,
+            _tree: &mut Tree,
+            _renderer: &Renderer,
+            limits: &layout::Limits,
+        ) -> layout::Node {
+            layout::Node::new(limits.max())
+        }
+        fn draw(
+            &self,
+            _tree: &Tree,
+            _renderer: &mut Renderer,
+            _theme: &Theme,
+            _style: &renderer::Style,
+            _layout: Layout<'_>,
+            _cursor: mouse::Cursor,
+            _viewport: &Rectangle,
+        ) {
+        }
+        fn overlay<'a>(
+            &'a mut self,
+            _tree: &'a mut Tree,
+            layout: Layout<'a>,
+            _renderer: &Renderer,
+            _viewport: &Rectangle,
+            translation: Vector,
+        ) -> Option<overlay::Element<'a, (), Theme, Renderer>> {
+            Some(overlay::Element::new(Box::new(ProbeOverlay {
+                anchor: layout.bounds() + translation,
+            })))
+        }
+    }
+
+    impl overlay::Overlay<(), Theme, Renderer> for ProbeOverlay {
+        fn layout(&mut self, _renderer: &Renderer, _bounds: Size) -> layout::Node {
+            layout::Node::new(Size::new(10.0, 10.0)).move_to(self.anchor.position())
+        }
+        fn draw(
+            &self,
+            _renderer: &mut Renderer,
+            _theme: &Theme,
+            _style: &renderer::Style,
+            _layout: Layout<'_>,
+            _cursor: mouse::Cursor,
+        ) {
+        }
+    }
+
+    /// Every card an overlay can be raised from, paired with the screen
+    /// position its overlay has to land on.
+    fn expected_overlay_positions(projection: &ViewportProjection, viewport: f32) -> Vec<f32> {
+        let mut positions: Vec<f32> = projection
+            .mounted
+            .iter()
+            .map(|card| card.start - projection.offset)
+            .filter(|x| *x < viewport && x + 400.0 > 0.0)
+            .collect();
+        positions.sort_by(f32::total_cmp);
+        positions
+    }
+
+    #[test]
+    fn card_overlays_survive_a_camera_that_moved_them_into_view() {
+        use cosmic::iced::advanced::{renderer::Headless, widget::operation};
+        const VIEWPORT: f32 = 600.0;
+        const HEIGHT: f32 = 400.0;
+        let renderer = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(Renderer::new(
+                cosmic::iced::Font::default(),
+                cosmic::iced::Pixels(14.0),
+                Some("tiny-skia"),
+            ))
+            .unwrap();
+        let mut workspace = Workspace::default();
+        workspace.resize_viewport(VIEWPORT);
+        for index in 0..4 {
+            workspace
+                .add_card(
+                    WorkspaceCard::new(
+                        CardId::new(),
+                        format!("Pane {index}"),
+                        CardWidth::Fixed(400.0),
+                    )
+                    .unwrap(),
+                    index,
+                    false,
+                )
+                .unwrap();
+        }
+        // Park the camera at the far end. The cards now on screen sit at
+        // content-space positions well outside the visible rect, which is the
+        // only arrangement that tells a correct visibility test from one that
+        // compares content space against screen space: a workspace of one or
+        // two cards has the two spaces on top of each other.
+        let offset = workspace.geometry().max_offset(VIEWPORT);
+        assert!(
+            offset > VIEWPORT,
+            "the fixture must scroll past a screenful"
+        );
+        workspace.native_scroll(offset, VIEWPORT);
+        let projection = workspace.projection(VIEWPORT);
+        let expected = expected_overlay_positions(&projection, VIEWPORT);
+        assert!(
+            expected.iter().any(|x| *x > 0.0),
+            "the fixture must place a card the camera moved into view"
+        );
+
+        let scroll_id = widget::Id::new("workspace.scroll");
+        let shortcuts = KeyboardShortcuts::default();
+        let mut element: Element<'_, ()> = view(
+            &workspace,
+            &shortcuts,
+            false,
+            VIEWPORT,
+            scroll_id.clone(),
+            |_| Element::new(OverlayProbe),
+            card_widget_id,
+            Events { viewport: |_| () },
+        );
+        let mut tree = Tree::new(&element);
+        let node = element.as_widget_mut().layout(
+            &mut tree,
+            &renderer,
+            &layout::Limits::new(Size::ZERO, Size::new(VIEWPORT, HEIGHT)),
+        );
+        // The camera the workspace reports and the offset the native
+        // scrollable holds are two halves of the same scroll; the widget chain
+        // only learns about the second one through `translation`.
+        element.as_widget_mut().operate(
+            &mut tree,
+            Layout::new(&node),
+            &renderer,
+            &mut operation::scrollable::scroll_to::<()>(
+                scroll_id,
+                operation::scrollable::AbsoluteOffset {
+                    x: Some(offset),
+                    y: None,
+                },
+            ),
+        );
+
+        let visible = Rectangle::new(Point::ORIGIN, Size::new(VIEWPORT, HEIGHT));
+        let mut raised = element
+            .as_widget_mut()
+            .overlay(
+                &mut tree,
+                Layout::new(&node),
+                &renderer,
+                &visible,
+                Vector::ZERO,
+            )
+            .expect("a mounted card raised an overlay");
+        let raised = raised.as_overlay_mut().layout(&renderer, visible.size());
+        let mut positions: Vec<f32> = raised
+            .children()
+            .iter()
+            .map(|child| child.bounds().x)
+            .collect();
+        positions.sort_by(f32::total_cmp);
+        assert_eq!(positions, expected);
     }
 }
