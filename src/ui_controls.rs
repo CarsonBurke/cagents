@@ -730,6 +730,289 @@ impl<Message> cosmic::iced::advanced::Widget<Message, cosmic::Theme, cosmic::Ren
     }
 }
 
+/// What a minimap mark says about the stretch of work it stands for.
+///
+/// Only two of these are things a reader scrolls back for - their own
+/// prompts, which is how they find where a subject was raised, and work that
+/// failed or was refused, which is what they go back to read - so those two
+/// carry a tone of their own and everything else recedes into the shape of
+/// the conversation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MarkTone {
+    Prompt,
+    Failed,
+    Work,
+}
+
+/// One stretch of work as the minimap draws it.
+///
+/// `at` and `span` are fractions of the loaded conversation rather than
+/// pixels, because the same overview has to be drawn at whatever height the
+/// pane gives the rail.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct TranscriptMark {
+    pub at: f32,
+    pub span: f32,
+    pub tone: MarkTone,
+}
+
+/// The lens the minimap draws for the viewport: where it starts down the rail
+/// and how much of the rail it covers, both as fractions.
+///
+/// `position` is how far through the scrollable extent the viewport sits and
+/// `window` is the share of the conversation it shows, which is why the two
+/// cannot simply be added: a viewport scrolled fully down sits at the bottom
+/// of the rail rather than starting there.
+fn lens(position: f32, window: f32) -> (f32, f32) {
+    let window = if window.is_finite() {
+        window.clamp(0.0, 1.0)
+    } else {
+        1.0
+    };
+    let position = if position.is_finite() {
+        position.clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    (position * (1.0 - window), window)
+}
+
+/// The scroll position a press at `pointer` down the rail asks for, as a
+/// fraction of the scrollable extent.
+///
+/// The lens is centred on the press rather than started at it: a reader
+/// pressing a mark means "show me that", and a lens whose top lands on the
+/// mark leaves the thing they pressed at the very edge of the viewport.
+fn scrub(pointer: f32, window: f32) -> f32 {
+    let window = if window.is_finite() {
+        window.clamp(0.0, 1.0)
+    } else {
+        1.0
+    };
+    let travel = 1.0 - window;
+    if travel <= 0.0 {
+        return 0.0;
+    }
+    ((pointer.clamp(0.0, 1.0) - window / 2.0) / travel).clamp(0.0, 1.0)
+}
+
+/// An overview of a conversation down the trailing edge of the surface that
+/// scrolls it, which is also the control that scrolls it.
+///
+/// `marks` are the stretches of work in the order they happened, `position`
+/// is how far through the scrollable extent the viewport sits, and `window`
+/// is the share of the conversation on screen. `on_scrub` is handed the
+/// scroll position a press or a drag asks for.
+///
+/// This replaces the pagination controls a transcript used to carry. A button
+/// captioned "jump to latest" is a scrollbar with one position on it; a rail
+/// that says where the exchanges are lets a reader go back to the one they
+/// mean, which is the thing they were actually trying to do.
+pub fn transcript_minimap<'a, Message: 'a>(
+    marks: &'a [TranscriptMark],
+    position: f32,
+    window: f32,
+    on_scrub: impl Fn(f32) -> Message + 'a,
+) -> Element<'a, Message> {
+    Element::new(Minimap {
+        marks,
+        position,
+        window,
+        on_scrub: Box::new(on_scrub),
+    })
+}
+
+struct Minimap<'a, Message> {
+    marks: &'a [TranscriptMark],
+    position: f32,
+    window: f32,
+    on_scrub: Box<dyn Fn(f32) -> Message + 'a>,
+}
+
+#[derive(Default)]
+struct MinimapState {
+    /// Set while the pointer that pressed the rail is still down, because a
+    /// drag that leaves the rail must keep scrolling rather than stopping at
+    /// the edge the pointer crossed.
+    dragging: bool,
+}
+
+impl<Message> cosmic::iced::advanced::Widget<Message, cosmic::Theme, cosmic::Renderer>
+    for Minimap<'_, Message>
+{
+    fn tag(&self) -> cosmic::iced::advanced::widget::tree::Tag {
+        cosmic::iced::advanced::widget::tree::Tag::of::<MinimapState>()
+    }
+
+    fn state(&self) -> cosmic::iced::advanced::widget::tree::State {
+        cosmic::iced::advanced::widget::tree::State::new(MinimapState::default())
+    }
+
+    fn size(&self) -> cosmic::iced::Size<Length> {
+        cosmic::iced::Size {
+            width: Length::Fixed(crate::design::MINIMAP_WIDTH),
+            height: Length::Fill,
+        }
+    }
+
+    fn layout(
+        &mut self,
+        _tree: &mut cosmic::iced::advanced::widget::Tree,
+        _renderer: &cosmic::Renderer,
+        limits: &cosmic::iced::advanced::layout::Limits,
+    ) -> cosmic::iced::advanced::layout::Node {
+        cosmic::iced::advanced::layout::Node::new(limits.resolve(
+            Length::Fixed(crate::design::MINIMAP_WIDTH),
+            Length::Fill,
+            cosmic::iced::Size::ZERO,
+        ))
+    }
+
+    fn update(
+        &mut self,
+        tree: &mut cosmic::iced::advanced::widget::Tree,
+        event: &cosmic::iced::Event,
+        layout: cosmic::iced::advanced::Layout<'_>,
+        cursor: cosmic::iced::mouse::Cursor,
+        _renderer: &cosmic::Renderer,
+        _clipboard: &mut dyn cosmic::iced::advanced::Clipboard,
+        shell: &mut cosmic::iced::advanced::Shell<'_, Message>,
+        _viewport: &cosmic::iced::Rectangle,
+    ) {
+        use cosmic::iced::{Event, mouse};
+
+        let bounds = layout.bounds();
+        let state = tree.state.downcast_mut::<MinimapState>();
+        let asked = |point: cosmic::iced::Point| {
+            scrub(
+                ((point.y - bounds.y) / bounds.height.max(1.0)).clamp(0.0, 1.0),
+                self.window,
+            )
+        };
+        match event {
+            Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)) => {
+                if let Some(point) = cursor.position_over(bounds) {
+                    state.dragging = true;
+                    shell.publish((self.on_scrub)(asked(point)));
+                    shell.capture_event();
+                }
+            }
+            Event::Mouse(mouse::Event::CursorMoved { .. }) => {
+                if state.dragging
+                    && let Some(point) = cursor.position()
+                {
+                    shell.publish((self.on_scrub)(asked(point)));
+                    shell.capture_event();
+                }
+            }
+            Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)) => {
+                if std::mem::take(&mut state.dragging) {
+                    shell.capture_event();
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn mouse_interaction(
+        &self,
+        tree: &cosmic::iced::advanced::widget::Tree,
+        layout: cosmic::iced::advanced::Layout<'_>,
+        cursor: cosmic::iced::mouse::Cursor,
+        _viewport: &cosmic::iced::Rectangle,
+        _renderer: &cosmic::Renderer,
+    ) -> cosmic::iced::mouse::Interaction {
+        if tree.state.downcast_ref::<MinimapState>().dragging || cursor.is_over(layout.bounds()) {
+            cosmic::iced::mouse::Interaction::Pointer
+        } else {
+            cosmic::iced::mouse::Interaction::default()
+        }
+    }
+
+    fn draw(
+        &self,
+        _tree: &cosmic::iced::advanced::widget::Tree,
+        renderer: &mut cosmic::Renderer,
+        theme: &cosmic::Theme,
+        _style: &cosmic::iced::advanced::renderer::Style,
+        layout: cosmic::iced::advanced::Layout<'_>,
+        _cursor: cosmic::iced::mouse::Cursor,
+        _viewport: &cosmic::iced::Rectangle,
+    ) {
+        use crate::design;
+        use cosmic::iced::advanced::Renderer as _;
+        use cosmic::iced::advanced::renderer::Quad;
+        use cosmic::iced::{Border, Rectangle};
+
+        let bounds = layout.bounds();
+        if bounds.width < 1.0 || bounds.height < 1.0 {
+            return;
+        }
+        // Rounded rectangles are what a renderer quad already is, so the
+        // minimap draws itself with quads rather than tessellating a path per
+        // mark per frame the way an arc has to.
+        let quad = |bounds: Rectangle| Quad {
+            bounds,
+            border: Border {
+                radius: design::RADIUS_XS.into(),
+                ..Border::default()
+            },
+            ..Quad::default()
+        };
+        // The track is the extent of what is loaded: without it a sparse
+        // conversation's marks would float with nothing to measure them
+        // against.
+        renderer.fill_quad(quad(bounds), design::raised(theme));
+        for mark in self.marks {
+            // A prompt spans the whole rail and work is inset, so the
+            // reader's own messages are legible as a rhythm down the edge
+            // even where tone alone is hard to read.
+            let (color, inset) = match mark.tone {
+                MarkTone::Prompt => (design::accent_color(theme), 0.0),
+                MarkTone::Failed => (design::destructive_color(theme), 0.0),
+                MarkTone::Work => (design::muted_color(theme), design::MINIMAP_MARK_INSET),
+            };
+            let top = bounds.y + mark.at.clamp(0.0, 1.0) * bounds.height;
+            let height = (mark.span.clamp(0.0, 1.0) * bounds.height)
+                .max(design::MINIMAP_MARK_MIN_HEIGHT)
+                .min((bounds.y + bounds.height - top).max(0.0));
+            if height <= 0.0 {
+                continue;
+            }
+            renderer.fill_quad(
+                quad(Rectangle {
+                    x: bounds.x + inset,
+                    y: top,
+                    width: bounds.width - inset * 2.0,
+                    height,
+                }),
+                color,
+            );
+        }
+        // The viewport is outlined rather than filled, so the marks it is
+        // over stay readable through it: the lens says where the reader is,
+        // and the marks say what is there.
+        let (start, span) = lens(self.position, self.window);
+        let height = (span * bounds.height).max(design::MINIMAP_LENS_MIN_HEIGHT);
+        renderer.fill_quad(
+            Quad {
+                bounds: Rectangle {
+                    y: bounds.y + (start * bounds.height).min(bounds.height - height).max(0.0),
+                    height: height.min(bounds.height),
+                    ..bounds
+                },
+                border: Border {
+                    color: design::muted_color(theme),
+                    width: design::BORDER_WIDTH,
+                    radius: design::RADIUS_XS.into(),
+                },
+                ..Quad::default()
+            },
+            iced::Color::TRANSPARENT,
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -854,6 +1137,103 @@ mod tests {
                 "{nothing} drew a sweep of its own"
             );
         }
+    }
+
+    /// The lens is the reader's answer to "where am I in this conversation",
+    /// so it has to reach the bottom of the rail when the viewport reaches
+    /// the end of the transcript rather than stopping a lens-height short.
+    #[test]
+    fn the_lens_reports_where_the_viewport_sits_and_how_much_it_covers() {
+        let quarter = 0.25;
+        assert_eq!(lens(0.0, quarter), (0.0, quarter));
+        assert_eq!(lens(0.5, quarter), (0.375, quarter));
+        assert_eq!(lens(1.0, quarter), (0.75, quarter));
+        // A conversation that fits on screen is entirely on screen: the lens
+        // covers the rail instead of sitting somewhere along it.
+        assert_eq!(lens(0.0, 1.0), (0.0, 1.0));
+        assert_eq!(lens(f32::NAN, f32::NAN), (0.0, 1.0));
+    }
+
+    /// Pressing the rail is the whole of the minimap's use as a control: the
+    /// point pressed has to end up on screen, which means the middle of the
+    /// rail is the middle of the conversation and the ends are the ends.
+    #[test]
+    fn a_press_brings_what_was_pressed_onto_the_screen() {
+        let window = 0.2;
+        assert!((scrub(0.5, window) - 0.5).abs() < 1e-6);
+        assert_eq!(scrub(0.0, window), 0.0);
+        assert_eq!(scrub(1.0, window), 1.0);
+        // Half a lens from the top is already the top, because the lens
+        // cannot hang off the end of the conversation.
+        assert_eq!(scrub(window / 2.0, window), 0.0);
+        // Nothing to scroll: every press asks for the one position there is.
+        assert_eq!(scrub(0.7, 1.0), 0.0);
+    }
+
+    /// The minimap is the transcript's scroll control, so a press has to ask
+    /// for the position pressed and a drag has to keep asking after the
+    /// pointer has left the rail - a reader dragging a 12pt rail leaves it
+    /// constantly, and a control that stopped there would be unusable.
+    #[test]
+    fn pressing_and_dragging_the_rail_asks_the_transcript_to_move() {
+        use cosmic::iced::advanced::{Layout, Shell, clipboard, layout, mouse, widget::Tree};
+        use cosmic::iced::{Event, Point, Rectangle, Size};
+
+        let renderer = headless_renderer();
+        let viewport = Rectangle::new(Point::ORIGIN, Size::new(400.0, 400.0));
+        let marks = [TranscriptMark {
+            at: 0.0,
+            span: 1.0,
+            tone: MarkTone::Work,
+        }];
+        let window = 0.5;
+        let node = layout::Node::new(Size::new(crate::design::MINIMAP_WIDTH, 400.0));
+        let mut element: Element<'_, f32> =
+            transcript_minimap(&marks, 0.0, window, |fraction| fraction);
+        let mut tree = Tree::new(element.as_widget());
+        let mut update = |event: Event, cursor: Point| {
+            let mut asked = Vec::new();
+            let mut shell = Shell::new(&mut asked);
+            element.as_widget_mut().update(
+                &mut tree,
+                &event,
+                Layout::new(&node),
+                mouse::Cursor::Available(cursor),
+                &renderer,
+                &mut clipboard::Null,
+                &mut shell,
+                &viewport,
+            );
+            asked
+        };
+
+        let pressed = update(
+            Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)),
+            Point::new(6.0, 300.0),
+        );
+        assert_eq!(pressed, vec![scrub(0.75, window)]);
+
+        let dragged = update(
+            Event::Mouse(mouse::Event::CursorMoved {
+                position: Point::new(90.0, 700.0),
+            }),
+            Point::new(90.0, 700.0),
+        );
+        assert_eq!(dragged, vec![1.0], "a drag past the rail's end is its end");
+
+        let released = update(
+            Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)),
+            Point::new(90.0, 700.0),
+        );
+        assert!(released.is_empty());
+        // The gesture is over, so the pointer moving is nobody's business.
+        let after = update(
+            Event::Mouse(mouse::Event::CursorMoved {
+                position: Point::new(90.0, 40.0),
+            }),
+            Point::new(90.0, 40.0),
+        );
+        assert!(after.is_empty(), "a released rail kept scrolling");
     }
 
     fn headless_renderer() -> cosmic::Renderer {

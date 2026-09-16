@@ -101,7 +101,7 @@ fn kind_glyph(content: &ItemContent) -> &'static str {
 /// rather than floating above it. `copy` puts a copy control on that same
 /// header, which is where a reader looks for it and the only way to take a
 /// command's output without dragging a selection through a scrolling box.
-fn code_surface<'a>(
+pub(super) fn code_surface<'a>(
     text: &'a str,
     caption: Option<&'a str>,
     limit: Option<f32>,

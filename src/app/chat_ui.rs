@@ -131,6 +131,15 @@ pub enum Action {
     HandoffFinished(Target, Result<TerminalSession, String>),
     CloseFinished(Target, Result<(), String>),
     UrlFinished(Result<(), String>),
+    /// Where the transcript's viewport has moved to, which is what asks for
+    /// another page of history and what places the minimap's lens.
+    Scrolled(Target, view::Scroll),
+    /// Scrolls the transcript to a fraction of its extent, measured from the
+    /// oldest loaded message.
+    ScrollTranscript(Target, f32),
+    /// Opens or closes the model search.
+    ModelPicker(Target, bool),
+    ModelQuery(Target, String),
 }
 
 impl std::fmt::Debug for Action {
@@ -177,7 +186,11 @@ impl Action {
             | Self::Choice(target, _, _, _)
             | Self::Answer(target, _, _)
             | Self::Slash(target, _)
-            | Self::Mention(target, _) => Some(*target),
+            | Self::Mention(target, _)
+            | Self::Scrolled(target, _)
+            | Self::ScrollTranscript(target, _)
+            | Self::ModelPicker(target, _)
+            | Self::ModelQuery(target, _) => Some(*target),
             _ => None,
         }
     }
@@ -712,6 +725,10 @@ struct PendingCommand {
     draft_revision: Option<u64>,
     request: Option<String>,
     permission_mode: Option<String>,
+    /// Which end of the history this command is extending, where it is a
+    /// page request at all. The transcript says so at the edge the rows will
+    /// appear at, so it has to know which edge is waiting.
+    page: Option<view::Page>,
 }
 pub(super) struct Runtime {
     pub(super) target: Target,
@@ -752,13 +769,34 @@ pub(super) struct Runtime {
     attachments: Vec<Attachment>,
     attachment_chooser_pending: bool,
     expanded: HashSet<String>,
-    answers: HashMap<(String, String), Vec<String>>,
+    answers: view::Answers,
     pending: Option<PendingCommand>,
     next_command: u64,
     disconnected: bool,
     visible: AtomicBool,
     error: Option<String>,
     permission_mode: Option<String>,
+    /// The transcript's minimap marks, derived from `turns` when the snapshot
+    /// changes rather than on the frames that draw them.
+    marks: Vec<crate::ui_controls::TranscriptMark>,
+    /// Where the transcript's viewport sat when it last moved, which places
+    /// the minimap's lens and answers whether the reader has reached the end
+    /// of the loaded history.
+    scroll: view::Scroll,
+    /// The loaded transcript's height when a page of history was last asked
+    /// for from that end, and `None` while the reader is not at that end.
+    ///
+    /// This is what makes the gesture ask once. A viewport signal arrives
+    /// whenever the transcript moves or grows, and a reader parked at the top
+    /// of a streaming conversation would otherwise ask for the same page
+    /// again on each of them. Recording the height rather than a bare flag is
+    /// what lets a pane taller than its own history keep paging: there, the
+    /// reader never leaves the boundary, so the arrival of the page is the
+    /// only thing that can arm the next one.
+    earlier_asked: Option<f32>,
+    later_asked: Option<f32>,
+    /// The model search's query while its popup is open, `None` when closed.
+    model_picker: Option<String>,
 }
 impl Runtime {
     fn new(
@@ -789,6 +827,11 @@ impl Runtime {
             visible: AtomicBool::new(visible),
             error: None,
             permission_mode: None,
+            marks: Vec::new(),
+            scroll: view::Scroll::default(),
+            earlier_asked: None,
+            later_asked: None,
+            model_picker: None,
         };
         runtime.refresh();
         runtime
@@ -867,6 +910,10 @@ impl Runtime {
         }
         self.turns = turn::group(&snapshot.items, &self.asked_after);
         reconcile_disclosure(&mut self.opened, &self.turns);
+        // The minimap is drawn on every frame of a streaming turn and changes
+        // only when the grouping does, so it is derived here, beside the
+        // grouping, rather than walked out of the item list per frame.
+        self.marks = view::minimap_marks(&self.turns);
         self.snapshot = snapshot;
     }
     pub(super) fn set_visible(&self, visible: bool) -> Result<(), String> {
@@ -1406,11 +1453,17 @@ impl Cagents {
         } else {
             None
         };
+        let page = match &command {
+            Command::LoadEarlier => Some(view::Page::Earlier),
+            Command::Refresh => Some(view::Page::Newer),
+            _ => None,
+        };
         runtime.pending = Some(PendingCommand {
             id,
             draft_revision: clear_draft.then_some(runtime.revision),
             request,
             permission_mode,
+            page,
         });
         runtime.error = None;
         let handle = runtime.handle.clone();
@@ -2261,6 +2314,9 @@ impl Cagents {
                 let Some(runtime) = self.chat_runtime_mut(target) else {
                     return Task::none();
                 };
+                // Choosing is what the search was opened for, so the popup
+                // closes on the answer rather than waiting to be dismissed.
+                runtime.model_picker = None;
                 let Some(model) = runtime.snapshot.models.iter().find(|model| model.id == id)
                 else {
                     return Task::none();
@@ -2489,6 +2545,76 @@ impl Cagents {
                 self.chat_ui.closed.insert(target.card);
                 self.observe_agent_activity_for_card(target.card, None);
                 return cosmic::task::message(Message::CommitClose(target.card));
+            }
+            Action::Scrolled(target, scroll) => {
+                let Some(runtime) = self.chat_runtime_mut(target) else {
+                    return Task::none();
+                };
+                runtime.scroll = scroll;
+                let (at_top, at_bottom) = (scroll.at_top(), scroll.at_bottom());
+                // Leaving an end is what arms the page at it, so a reader who
+                // scrolls away and comes back asks again, while one who stays
+                // put asks once.
+                if !at_top {
+                    runtime.earlier_asked = None;
+                }
+                if !at_bottom {
+                    runtime.later_asked = None;
+                }
+                let height = Some(scroll.content());
+                // The earlier end wins where both are in reach at once, which
+                // happens on a window shorter than the pane it is drawn in: a
+                // reader whose transcript does not fill its own pane is
+                // looking for the rest of the conversation, and what came
+                // before this window is the part they cannot reach.
+                if at_top && runtime.snapshot.has_earlier && runtime.earlier_asked != height {
+                    runtime.earlier_asked = height;
+                    return self.chat_send(target, Command::LoadEarlier, false);
+                }
+                if at_bottom && runtime.snapshot.has_later && runtime.later_asked != height {
+                    runtime.later_asked = height;
+                    return self.chat_send(target, Command::Refresh, false);
+                }
+            }
+            Action::ScrollTranscript(target, fraction) => {
+                if self.chat_runtime_mut(target).is_none() {
+                    return Task::none();
+                }
+                // The transcript is anchored to its newest message, so a
+                // relative offset is measured from the bottom: asking for the
+                // start of the conversation is asking for the far end of it.
+                return iced::widget::scrollable::snap_to(
+                    card_control_id(target.card, "chat-transcript"),
+                    iced::widget::scrollable::RelativeOffset {
+                        x: None,
+                        y: Some(1.0 - fraction.clamp(0.0, 1.0)),
+                    },
+                )
+                .map(cosmic::Action::App);
+            }
+            Action::ModelPicker(target, open) => {
+                let Some(runtime) = self.chat_runtime_mut(target) else {
+                    return Task::none();
+                };
+                // A reopened search starts empty: the query a reader typed
+                // last time is not the model they are looking for now.
+                runtime.model_picker = open.then(String::new);
+                if open {
+                    // The field takes focus with the popup, so opening the
+                    // picker and naming a model are one gesture.
+                    return widget::text_input::focus(card_control_id(
+                        target.card,
+                        "chat-model-search",
+                    ))
+                    .map(cosmic::Action::App);
+                }
+            }
+            Action::ModelQuery(target, query) => {
+                if let Some(runtime) = self.chat_runtime_mut(target)
+                    && let Some(current) = runtime.model_picker.as_mut()
+                {
+                    *current = query;
+                }
             }
         }
         Task::none()
