@@ -872,11 +872,7 @@ impl HealthPublisher {
     }
 
     fn failed(&mut self, errors: &[StoreError], exhausted: bool) {
-        let category = errors
-            .iter()
-            .map(save_failure_category)
-            .min_by_key(|category| category.selection_rank())
-            .unwrap_or(SaveFailureCategory::Database);
+        let category = select_failure_category(errors);
         let incident = self.incident.get_or_insert_with(|| FailureIncident {
             category,
             first_failed_at_unix_ms: unix_millis(),
@@ -1075,6 +1071,12 @@ fn persistence_loop(
             || due.is_some_and(|deadline| Instant::now() >= deadline);
         drop(state);
 
+        // A refusal has to name a cause, and the raw store error may not leave
+        // this thread: it retains the connection string a failing SQLite call
+        // reports, secrets included, which is why the health lane publishes a
+        // category instead. The category is the same redacted classification,
+        // so it travels to a dialog and to the log safely.
+        let mut failure = None;
         if should_persist {
             let errors = writes.flush(&store);
             record_flush_errors(&last_error, &errors);
@@ -1091,6 +1093,21 @@ fn persistence_loop(
             } else {
                 attempts_this_cycle = attempts_this_cycle.saturating_add(1);
                 retry_exhausted = attempts_this_cycle >= config.max_automatic_attempts;
+                failure = Some(select_failure_category(&errors));
+                // A failing write lane used to be entirely silent: the error
+                // reached `last_error` for the UI alone, so a window that had
+                // stopped saving left nothing in the log to explain it after
+                // the fact. One line per attempt would be a flood, so only the
+                // first failure of a cycle and the attempt that gives up are
+                // recorded.
+                if attempts_this_cycle == 1 || retry_exhausted {
+                    tracing::warn!(
+                        attempts = attempts_this_cycle,
+                        exhausted = retry_exhausted,
+                        category = failure.map(SaveFailureCategory::label),
+                        "a cagents workspace write could not be stored"
+                    );
+                }
                 health.failed(&errors, retry_exhausted);
                 due = (!retry_exhausted).then(|| Instant::now() + retry_delay);
                 retry_delay = retry_delay.saturating_mul(2).min(config.retry_max);
@@ -1100,7 +1117,7 @@ fn persistence_loop(
             let result = if writes.is_empty() {
                 Ok(())
             } else {
-                Err("workspace could not be saved; resolve save errors before updating".into())
+                Err(save_refusal(failure))
             };
             let _ = checkpoint.send(result);
         }
@@ -1170,6 +1187,34 @@ fn record_flush_errors(last_error: &Mutex<Option<String>>, errors: &[StoreError]
                 .collect::<Vec<_>>()
                 .join("; ")
         });
+    }
+}
+
+/// The one category a batch of failures is reported as.
+///
+/// The most actionable failure wins rather than the newest: a full disk beside
+/// an incidental busy database is what the reader has to fix.
+fn select_failure_category(errors: &[StoreError]) -> SaveFailureCategory {
+    errors
+        .iter()
+        .map(save_failure_category)
+        .min_by_key(|category| category.selection_rank())
+        .unwrap_or(SaveFailureCategory::Database)
+}
+
+/// Why an explicit save checkpoint could not be honoured.
+///
+/// The refusal reaches a dialog that asks the reader to resolve something, so
+/// it has to say what and what to do about it. The category carries both and
+/// is already redacted, unlike the store error it was derived from.
+fn save_refusal(failure: Option<SaveFailureCategory>) -> String {
+    match failure {
+        Some(category) => format!(
+            "workspace could not be saved: {}. {}",
+            category.label(),
+            category.guidance()
+        ),
+        None => "workspace could not be saved; its last attempt is still pending".to_owned(),
     }
 }
 
@@ -1415,6 +1460,50 @@ mod tests {
                 attempts: 3,
             }
         );
+    }
+
+    #[test]
+    fn a_refused_checkpoint_names_the_cause_without_the_store_error() {
+        let (response, receiver) = std::sync::mpsc::sync_channel(1);
+        let queue = Arc::new((
+            Mutex::new(QueueState {
+                latest: Some(Arc::new(workspace())),
+                checkpoints: vec![response],
+                ..QueueState::default()
+            }),
+            Condvar::new(),
+        ));
+        let (health_tx, _health_rx) = async_channel::unbounded();
+        let worker_queue = Arc::clone(&queue);
+        let worker = thread::spawn(move || {
+            run_persistence_worker(
+                FakeStore::new([FakeWrite::Fail]),
+                PendingWrites::restored(0, BTreeMap::new(), HashMap::new(), HashMap::new()),
+                worker_queue,
+                Arc::new(Mutex::new(None)),
+                HealthPublisher::new(health_tx),
+                fast_persistence_config(2),
+            );
+        });
+
+        let refusal = receiver
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the checkpoint is answered rather than dropped")
+            .expect_err("a failed flush cannot report a saved workspace");
+        assert!(
+            refusal.contains(SaveFailureCategory::PermissionDenied.label())
+                && refusal.contains(SaveFailureCategory::PermissionDenied.guidance()),
+            "a refusal that asks the reader to resolve something must say what and how: {refusal}"
+        );
+        assert!(
+            !refusal.contains("TOKEN=secret"),
+            "the raw store error retains secrets and must not reach a dialog: {refusal}"
+        );
+
+        let (lock, changed) = &*queue;
+        lock.lock().unwrap().shutdown = true;
+        changed.notify_one();
+        worker.join().unwrap();
     }
 
     #[test]
