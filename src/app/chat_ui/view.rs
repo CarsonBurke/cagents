@@ -385,25 +385,60 @@ pub(super) fn minimap_marks(turns: &[turn::Turn]) -> Vec<TranscriptMark> {
 
 /// A question, and the material it is about.
 ///
-/// Every provider hands the surface one description string: the reason it is
-/// asking on the first line, and whatever the question refers to - a command,
-/// a path, a requested permission set, a JSON payload - on the lines after
-/// it. Drawn as one block that put a shell command in the middle of a
-/// sentence. Split, the question can be set as prose and the material as the
-/// literal text it is.
+/// Every provider hands the surface one description string with both in it:
+/// the reason it is asking, and whatever the question refers to - a command,
+/// a path, a requested permission set, a JSON payload. Drawn as one block
+/// that put a shell command in the middle of a sentence. Split, the question
+/// can be set as prose and the material as the literal text it is.
 ///
-/// A provider that gave no reason of its own starts its description with the
-/// material, and then the request's title is the whole question: a command
-/// set as a sentence reads as neither one.
+/// The split is only ever made where the provider put a boundary: a fenced
+/// block, or a blank line between paragraphs. A single line break is not a
+/// boundary - it is how a sentence wraps - and splitting on one set the
+/// second half of a sentence in a monospaced block as though it were an
+/// argv. Where the description carries no boundary at all, the whole of it
+/// is prose: a payload set as a paragraph is untidy, where a sentence set as
+/// a command is a lie about what the provider said.
 fn question_and_context(description: &str) -> (&str, &str) {
-    let trimmed = description.trim_end();
-    if trimmed.starts_with('\n') || trimmed.starts_with("\r\n") {
-        return ("", trimmed.trim_start());
+    let text = description.trim();
+    fenced(text)
+        .or_else(|| paragraphed(text))
+        .unwrap_or((text, ""))
+}
+
+/// The question and material either side of the first fenced block.
+///
+/// A fence is the provider saying in so many words that what follows is not
+/// prose, so it is the boundary to prefer where there is one.
+fn fenced(text: &str) -> Option<(&str, &str)> {
+    const FENCE: &str = "```";
+    let start = text.find(FENCE)?;
+    // Only a fence that opens a line opens a block. Three backticks inside a
+    // sentence are being talked about rather than fencing anything.
+    if start != 0 && !text[..start].ends_with('\n') {
+        return None;
     }
-    match trimmed.split_once('\n') {
-        Some((question, context)) => (question.trim_end(), context.trim()),
-        None => (trimmed, ""),
+    // The rest of the opening fence names a language, which is markup rather
+    // than material, so the block starts at the line after it.
+    let (_, body) = text[start + FENCE.len()..].split_once('\n')?;
+    let body = body.trim_end();
+    let body = body.strip_suffix(FENCE).unwrap_or(body);
+    Some((text[..start].trim_end(), body.trim()))
+}
+
+/// The question and material either side of the first blank line.
+fn paragraphed(text: &str) -> Option<(&str, &str)> {
+    let mut from = 0;
+    while let Some(index) = text[from..].find('\n') {
+        let at = from + index;
+        // A line holding nothing but whitespace is still a blank line, and a
+        // carriage return is not content either.
+        let rest = text[at + 1..].trim_start_matches([' ', '\t', '\r']);
+        if rest.starts_with('\n') {
+            return Some((text[..at].trim_end(), rest.trim()));
+        }
+        from = at + 1;
     }
+    None
 }
 
 /// How much an answer commits the reader to.
@@ -1158,6 +1193,7 @@ impl Runtime {
             .width(Length::Fill)
             .into(),
         );
+        content.extend(self.model_search());
         let usage = &snapshot.usage;
         // The status line has two halves. What the agent is doing, where it is
         // doing it and the settings a reader changes mid-conversation scroll
@@ -1493,7 +1529,7 @@ impl Runtime {
     /// them offers every dated snapshot it has ever published - and a popup
     /// listing all of them left the reader scrolling a wall of near-identical
     /// slugs for one they could have named in three keystrokes. The field
-    /// takes focus with the popup, narrows the list as they type, answers
+    /// takes focus with the panel, narrows the list as they type, answers
     /// Enter with the top match and Escape by dismissing, so a model can be
     /// changed without the pointer ever entering the list.
     ///
@@ -1502,8 +1538,8 @@ impl Runtime {
     /// to know is which one they are already using.
     fn model_picker<'a>(&'a self, current: Option<&'a chat::Model>) -> Element<'a, Message> {
         let target = self.target;
-        let query = self.model_picker.as_deref();
-        let anchor = widget::button::custom(
+        let open = self.model_picker.is_some();
+        widget::button::custom(
             widget::row::with_children(vec![
                 design::caption(current.map_or("Model", |model| model.label.as_str()))
                     .wrapping(iced::widget::text::Wrapping::None)
@@ -1516,24 +1552,44 @@ impl Runtime {
             .align_y(Alignment::Center),
         )
         .name("Choose a model")
-        .class(crate::ui_controls::control_style(query.is_some(), None))
+        .class(crate::ui_controls::control_style(open, None))
         .padding(CONTROL_PADDING)
-        .on_press(action(Action::ModelPicker(target, query.is_none())));
-        let popup = query.map(|query| {
-            model_list(
-                target,
-                &self.snapshot.models,
-                self.snapshot.selected_model.as_deref(),
-                query,
+        .on_press(action(Action::ModelPicker(target, !open)))
+        .into()
+    }
+
+    /// The search field and list, pinned above the status line the picker
+    /// sits on, or nothing while the picker is closed.
+    ///
+    /// This is a panel in the pane's own column rather than a popup floating
+    /// over it, because an overlay raised from inside a card never reaches
+    /// the screen in this shell - the reasoning dropdown beside it has the
+    /// same problem - and a search a reader cannot see is not a search. Above
+    /// the status line it still reads as belonging to the control that opened
+    /// it, and the transcript it displaces is restored the moment it closes.
+    fn model_search(&self) -> Option<Element<'_, Message>> {
+        let query = self.model_picker.as_deref()?;
+        Some(
+            widget::container(
+                widget::container(model_list(
+                    self.target,
+                    &self.snapshot.models,
+                    self.snapshot.selected_model.as_deref(),
+                    query,
+                ))
+                .class(design::surface(
+                    Some(design::raised),
+                    [design::RADIUS_M; 4],
+                    true,
+                ))
+                .padding(step::GAP_S),
             )
-        });
-        crate::ui_controls::popover(
-            anchor,
-            popup,
-            // The status line sits at the foot of the pane, so the list opens
-            // over the conversation rather than off the bottom of the window.
-            widget::popover::Position::Top,
-            action(Action::ModelPicker(target, false)),
+            // The panel keeps the picker's own corner of the pane instead of
+            // stretching across it, so the eye travels from the control to
+            // the list rather than across a full-width band.
+            .align_x(Alignment::End)
+            .width(Length::Fill)
+            .into(),
         )
     }
 
@@ -2154,9 +2210,7 @@ fn model_list<'a>(
         widget::search_input("Search models", query)
             .id(card_control_id(target.card, "chat-model-search"))
             .size(design::TEXT_BODY)
-            // The field is the floor under the popup's width: the query
-            // is typed into it, so it cannot shrink to the widest label.
-            .width(design::MODEL_SEARCH_WIDTH)
+            .width(Length::Fill)
             .on_input(move |query| action(Action::ModelQuery(target, query)))
             // Enter takes the top match, which is what makes three keystrokes
             // enough to change model.
@@ -2181,9 +2235,10 @@ fn model_list<'a>(
         .into(),
     ])
     .spacing(step::GAP_XS)
-    // The list is as wide as the identifiers in it, up to a ceiling, so a
-    // picker in a maximised pane is not a full-width wall of slugs.
-    .max_width(design::MODEL_POPUP_MAX_WIDTH)
+    // The width is stated rather than left to the content: without it the
+    // panel spanned the pane and the list became the wall of slugs this
+    // replaces.
+    .width(design::MODEL_POPUP_WIDTH)
     .into()
 }
 
@@ -2473,22 +2528,44 @@ mod tests {
     }
 
     /// A question's own prose and the command or payload it is about read as
-    /// two different things, so the surface has to be handed them separately.
+    /// two different things, so the surface has to be handed them separately
+    /// - but only where the provider drew the line itself.
     #[test]
-    fn a_question_is_split_from_the_material_it_is_about() {
+    fn a_question_is_split_only_where_the_provider_drew_a_boundary() {
         assert_eq!(
-            question_and_context("Claude wants to run a command.\n{\"cmd\":\"rm -rf .\"}"),
-            ("Claude wants to run a command.", "{\"cmd\":\"rm -rf .\"}")
+            question_and_context(
+                "Claude wants to run a command.\n\n{\"cmd\":\"rm -rf .\"}\nIn: /tmp"
+            ),
+            (
+                "Claude wants to run a command.",
+                "{\"cmd\":\"rm -rf .\"}\nIn: /tmp"
+            )
         );
-        // A provider that gave no reason of its own leaves the title as the
-        // whole question, so none of the material is promoted into prose.
         assert_eq!(
-            question_and_context("\ngit push --force\nWorking directory: /tmp"),
-            ("", "git push --force\nWorking directory: /tmp")
+            question_and_context("Codex wants to apply a patch.\n```diff\n-old\n+new\n```"),
+            ("Codex wants to apply a patch.", "-old\n+new")
+        );
+        // The case this rule exists for: a sentence that ran over two lines
+        // is one sentence, and setting its second half as an argv would be a
+        // lie about what the provider said.
+        assert_eq!(
+            question_and_context(
+                "Claude wants to run a command in a directory\nit has not been given access to."
+            ),
+            (
+                "Claude wants to run a command in a directory\nit has not been given access to.",
+                ""
+            )
         );
         assert_eq!(
             question_and_context("Codex is waiting for your answer."),
             ("Codex is waiting for your answer.", "")
+        );
+        // A description that is nothing but material leaves the request's own
+        // title as the whole question.
+        assert_eq!(
+            question_and_context("```\ngit push --force\n```"),
+            ("", "git push --force")
         );
     }
 

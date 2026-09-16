@@ -413,16 +413,16 @@ pub const MINIMAP_MARK_MIN_HEIGHT: f32 = 2.0;
 /// reader scrolling a very long conversation can still see where they are.
 pub const MINIMAP_LENS_MIN_HEIGHT: f32 = 8.0;
 
-/// The model picker's search field, and the widest its popup may grow.
+/// How wide the model picker's popup is.
 ///
 /// A picker is sized to the identifiers it lists rather than to the pane it
 /// hangs off: a provider offering `claude-sonnet-4-5-20250929` needs about
-/// this much, and stretching the list to a maximised pane's width put a
-/// three-word label on a row several hundred points long. The field's width
-/// is the floor because the query is typed into it; the ceiling stops one
-/// pathological identifier from claiming the pane after all.
-pub const MODEL_SEARCH_WIDTH: f32 = 240.0;
-pub const MODEL_POPUP_MAX_WIDTH: f32 = 420.0;
+/// this much, and a list that took its width from the pane put a three-word
+/// label on a row several hundred points long. It is a fixed width rather
+/// than a ceiling because a popup's content is free to fill the space it is
+/// given, and a panel that hugged its widest row would change width with
+/// every keystroke of the query.
+pub const MODEL_POPUP_WIDTH: f32 = 280.0;
 /// How tall the model list is allowed to grow before it scrolls.
 pub const MODEL_POPUP_CEILING: f32 = 280.0;
 
