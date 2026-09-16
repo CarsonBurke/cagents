@@ -53,6 +53,16 @@ const UNFOCUSED_CURSOR_ALPHA: f32 = 0.45;
 /// the text it covers any harder to read than the text beside it.
 const SELECTION_ALPHA: f32 = 0.35;
 
+/// Rows the viewport moves for one notch of a discrete wheel.
+///
+/// A wheel reports notches rather than distance, so the notch has to be given
+/// a size, and one row per notch makes a pane that every other terminal and
+/// this application's own editor outrun by several rows a notch. Three is the
+/// size xterm, Ghostty and the desktop toolkits settle on. A trackpad is
+/// deliberately exempt: it reports the finger's real distance, which has to
+/// stay 1:1 or the content no longer tracks the hand moving it.
+const ROWS_PER_WHEEL_NOTCH: isize = 3;
+
 /// Text metrics for one terminal grid at one scale factor.
 ///
 /// The grid pitch is snapped to whole physical pixels so that backgrounds, the
@@ -853,24 +863,36 @@ impl WidgetState {
         since + BLINK_PHASE
     }
 
-    /// Converts one wheel event's `lines` into the work it implies, carrying
-    /// the sub-line remainder so that a high-resolution trackpad keeps moving
+    /// Converts one wheel event's `travel` into the work it implies, carrying
+    /// the sub-unit remainder so that a high-resolution trackpad keeps moving
     /// continuously instead of in whole-notch jumps.
     ///
-    /// Terminal input is never folded, because a child counts notches, so the
-    /// two input cases report a notch count for the caller to send one by one.
-    /// A viewport move has no such observer and is returned for folding.
-    fn wheel_effect(&mut self, lines: f32, scroll: ScrollSnapshot) -> WheelEffect {
-        self.wheel_remainder -= lines;
+    /// The remainder accumulates in the unit the device reports, and the notch
+    /// size is applied afterwards to whatever moves the document: the
+    /// scrollback viewport, and the cursor keys an alternate-screen
+    /// application reads instead. A mouse report is the one case left
+    /// unscaled, because there the application counts detents itself and the
+    /// protocol means one report per detent.
+    ///
+    /// Terminal input is never folded, because a child counts what it
+    /// receives, so the two input cases return a count for the caller to send
+    /// one by one. A viewport move has no such observer and is returned for
+    /// folding.
+    fn wheel_effect(&mut self, travel: WheelTravel, scroll: ScrollSnapshot) -> WheelEffect {
+        let (units, rows_per_unit) = match travel {
+            WheelTravel::Notches(notches) => (notches, ROWS_PER_WHEEL_NOTCH),
+            WheelTravel::Rows(rows) => (rows, 1),
+        };
+        self.wheel_remainder -= units;
         let delta = (self.wheel_remainder.trunc() as isize).clamp(-128, 128);
         self.wheel_remainder -= delta as f32;
         if delta == 0 {
             return WheelEffect::Idle;
         }
+        let rows = delta * rows_per_unit;
         if self.modifiers.shift {
-            return WheelEffect::Viewport(delta);
+            return WheelEffect::Viewport(rows);
         }
-        let notches = delta.unsigned_abs() as u32;
         let up = delta < 0;
         if scroll.mouse_tracking {
             WheelEffect::Report {
@@ -879,7 +901,7 @@ impl WidgetState {
                 } else {
                     MouseButton::WheelDown
                 },
-                notches,
+                notches: delta.unsigned_abs() as u32,
             }
         } else if scroll.alternate_screen {
             WheelEffect::Keys {
@@ -888,10 +910,10 @@ impl WidgetState {
                 } else {
                     TerminalKey::ArrowDown
                 },
-                notches,
+                presses: rows.unsigned_abs() as u32,
             }
         } else {
-            WheelEffect::Viewport(delta)
+            WheelEffect::Viewport(rows)
         }
     }
 
@@ -1712,11 +1734,11 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for TerminalWidget<Message
                 }
             }
             Event::Mouse(mouse::Event::WheelScrolled { delta }) if cursor.is_over(bounds) => {
-                let lines = match delta {
-                    ScrollDelta::Lines { y, .. } => *y,
-                    ScrollDelta::Pixels { y, .. } => *y / geometry.cell_height,
+                let travel = match delta {
+                    ScrollDelta::Lines { y, .. } => WheelTravel::Notches(*y),
+                    ScrollDelta::Pixels { y, .. } => WheelTravel::Rows(*y / geometry.cell_height),
                 };
-                match state.wheel_effect(lines, self.snapshot.scroll) {
+                match state.wheel_effect(travel, self.snapshot.scroll) {
                     WheelEffect::Idle => {}
                     WheelEffect::Viewport(delta) => {
                         self.defer_scroll(state, ViewportScroll::Lines(delta), shell);
@@ -1746,11 +1768,11 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for TerminalWidget<Message
                             }
                         }
                     }
-                    WheelEffect::Keys { key, notches } => {
+                    WheelEffect::Keys { key, presses } => {
                         if let Some(owed) = state.take_owed_scroll() {
                             self.apply_scroll(owed, shell);
                         }
-                        for _ in 0..notches {
+                        for _ in 0..presses {
                             let input = KeyInput {
                                 action: KeyAction::Press,
                                 key,
@@ -2506,6 +2528,21 @@ impl ViewportScroll {
     }
 }
 
+/// One wheel event's vertical travel, in the unit the device that produced it
+/// actually measures.
+///
+/// A wheel and a trackpad are not the same gesture wearing different numbers:
+/// one counts detents, the other measures a finger. Keeping them apart here is
+/// what lets the viewport give a detent a useful size without also stretching
+/// a trackpad's real distance.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum WheelTravel {
+    /// Notches of a discrete wheel, each worth `ROWS_PER_WHEEL_NOTCH` rows.
+    Notches(f32),
+    /// A trackpad's distance, already divided down to rows of the grid.
+    Rows(f32),
+}
+
 /// What one wheel event does to a terminal.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum WheelEffect {
@@ -2516,9 +2553,11 @@ enum WheelEffect {
     /// One mouse report per notch, in gesture order, for a child that asked
     /// to read the wheel itself.
     Report { button: MouseButton, notches: u32 },
-    /// One arrow-key press per notch, in gesture order, for an
-    /// alternate-screen application that has no scrollback to move.
-    Keys { key: TerminalKey, notches: u32 },
+    /// Arrow-key presses, in gesture order, for an alternate-screen
+    /// application that has no scrollback to move. One press per row the
+    /// gesture asked for, so the cursor covers the same distance the
+    /// scrollback viewport would have.
+    Keys { key: TerminalKey, presses: u32 },
 }
 
 /// The viewport move a key press performs instead of reaching the child, if
@@ -3779,15 +3818,25 @@ mod tests {
             self
         }
 
-        fn wheel(&mut self, lines: f32) {
-            match self.state.wheel_effect(lines, self.scroll) {
+        /// One wheel event of `notches` detents.
+        fn wheel(&mut self, notches: f32) {
+            self.feed(WheelTravel::Notches(notches));
+        }
+
+        /// One trackpad event, already divided down to `rows` of the grid.
+        fn trackpad(&mut self, rows: f32) {
+            self.feed(WheelTravel::Rows(rows));
+        }
+
+        fn feed(&mut self, travel: WheelTravel) {
+            match self.state.wheel_effect(travel, self.scroll) {
                 WheelEffect::Idle => {}
                 WheelEffect::Viewport(delta) => self.owe(ViewportScroll::Lines(delta)),
                 WheelEffect::Report { button, notches } => {
                     self.sent.extend((0..notches).map(|_| Sent::Report(button)))
                 }
-                WheelEffect::Keys { key, notches } => {
-                    self.sent.extend((0..notches).map(|_| Sent::Key(key)));
+                WheelEffect::Keys { key, presses } => {
+                    self.sent.extend((0..presses).map(|_| Sent::Key(key)));
                 }
             }
         }
@@ -3819,9 +3868,10 @@ mod tests {
 
     #[test]
     fn a_frame_of_wheel_events_is_one_viewport_command_but_still_one_report_per_notch() {
-        // Eight notches inside one frame move the viewport eight lines in one
-        // command; the seven positions in between are never presented, so
-        // applying them would buy nothing and cost eight of everything.
+        // Eight notches inside one frame move the viewport eight notches'
+        // worth of rows in one command; the seven positions in between are
+        // never presented, so applying them would buy nothing and cost eight
+        // of everything.
         let mut pump = ScrollPump::new(SCROLLBACK);
         for _ in 0..8 {
             pump.wheel(1.0);
@@ -3834,10 +3884,50 @@ mod tests {
         // A frame with nothing owed must stay silent, or an idle terminal
         // would scroll itself.
         pump.frame();
-        assert_eq!(pump.sent, vec![Sent::Scroll(ViewportScroll::Lines(-8))]);
+        assert_eq!(
+            pump.sent,
+            vec![Sent::Scroll(ViewportScroll::Lines(
+                -8 * ROWS_PER_WHEEL_NOTCH
+            ))]
+        );
 
-        // A child reading the wheel counts notches, so each one is still
-        // reported, in order, and none of it is deferred to a frame.
+        // One detent, three destinations, so the notch size cannot be right
+        // for the scrollback and wrong for the pane the user is actually
+        // looking at. Scrollback and the alternate screen both move a whole
+        // notch of rows - a pager or a full-screen editor would otherwise
+        // crawl a row at a time while the scrollback kept up. A mouse report
+        // stays at one, because there the application counts detents itself
+        // and the protocol means exactly one report per detent.
+        let mut scrollback = ScrollPump::new(SCROLLBACK);
+        scrollback.wheel(1.0);
+        scrollback.frame();
+        assert_eq!(
+            scrollback.sent,
+            vec![Sent::Scroll(ViewportScroll::Lines(-ROWS_PER_WHEEL_NOTCH))]
+        );
+
+        let mut full_screen = ScrollPump::new(ScrollSnapshot {
+            alternate_screen: true,
+            ..SCROLLBACK
+        });
+        full_screen.wheel(1.0);
+        full_screen.frame();
+        assert_eq!(
+            full_screen.sent,
+            vec![Sent::Key(TerminalKey::ArrowUp); ROWS_PER_WHEEL_NOTCH as usize]
+        );
+
+        let mut tracked = ScrollPump::new(ScrollSnapshot {
+            mouse_tracking: true,
+            ..SCROLLBACK
+        });
+        tracked.wheel(1.0);
+        tracked.frame();
+        assert_eq!(tracked.sent, vec![Sent::Report(MouseButton::WheelUp)]);
+
+        // Reports are counted in detents and sent one by one: three downward
+        // detents are three downward reports, in gesture order, none of it
+        // deferred to a frame.
         let mut reporting = ScrollPump::new(ScrollSnapshot {
             mouse_tracking: true,
             ..SCROLLBACK
@@ -3851,18 +3941,6 @@ mod tests {
             vec![Sent::Report(MouseButton::WheelDown); 3]
         );
 
-        // An alternate-screen application has no scrollback to move and gets
-        // one arrow key per notch instead, likewise unfolded.
-        let mut alternate = ScrollPump::new(ScrollSnapshot {
-            alternate_screen: true,
-            ..SCROLLBACK
-        });
-        for _ in 0..2 {
-            alternate.wheel(1.0);
-        }
-        alternate.frame();
-        assert_eq!(alternate.sent, vec![Sent::Key(TerminalKey::ArrowUp); 2]);
-
         // Shift claims the gesture for the viewport even where the child is
         // reading the wheel, and then it coalesces like any other.
         let mut shifted = ScrollPump::new(ScrollSnapshot {
@@ -3874,22 +3952,29 @@ mod tests {
             shifted.wheel(1.0);
         }
         shifted.frame();
-        assert_eq!(shifted.sent, vec![Sent::Scroll(ViewportScroll::Lines(-4))]);
+        assert_eq!(
+            shifted.sent,
+            vec![Sent::Scroll(ViewportScroll::Lines(
+                -4 * ROWS_PER_WHEEL_NOTCH
+            ))]
+        );
     }
 
     #[test]
     fn a_trackpad_keeps_its_fraction_and_an_absolute_target_orders_against_deltas() {
-        // Sub-line pixel deltas accumulate instead of rounding away, so a
-        // high-resolution trackpad keeps moving, and only ever by whole lines.
+        // Sub-row trackpad deltas accumulate instead of rounding away, so a
+        // high-resolution trackpad keeps moving, and only ever by whole rows.
+        // The notch size is not applied here: a finger reports the distance it
+        // actually travelled and the content has to stay under it.
         let mut pump = ScrollPump::new(SCROLLBACK);
         for _ in 0..5 {
-            pump.wheel(0.5);
+            pump.trackpad(0.5);
         }
         pump.frame();
         assert_eq!(pump.sent, vec![Sent::Scroll(ViewportScroll::Lines(-2))]);
-        // The half line left over is carried across the frame boundary rather
-        // than discarded, so one more tick of the same size completes a line.
-        pump.wheel(0.5);
+        // The half row left over is carried across the frame boundary rather
+        // than discarded, so one more tick of the same size completes a row.
+        pump.trackpad(0.5);
         pump.frame();
         assert_eq!(pump.sent[1], Sent::Scroll(ViewportScroll::Lines(-1)));
 
@@ -3912,7 +3997,7 @@ mod tests {
             mixed.sent,
             vec![
                 Sent::Scroll(ViewportScroll::Row(120)),
-                Sent::Scroll(ViewportScroll::Lines(-3)),
+                Sent::Scroll(ViewportScroll::Lines(-3 * ROWS_PER_WHEEL_NOTCH)),
             ]
         );
     }
