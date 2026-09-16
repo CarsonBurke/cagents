@@ -2,7 +2,7 @@ use super::*;
 use crate::agent::ActivityState;
 use crate::model::{ChannelId, ProjectChannel};
 use crate::sidebar::SidebarChannel;
-use crate::workspace_model::{ModelEdit, PENDING_ORDINAL};
+use crate::workspace_model::ModelEdit;
 
 #[derive(Debug, Clone, Copy)]
 pub enum Action {
@@ -104,6 +104,12 @@ impl Cagents {
                     return Task::none();
                 }
                 let id = ChannelId::new();
+                // The registry assigns the real rank and this window learns it
+                // from the answer to the publish below. Until then it takes one
+                // more than the highest rank it knows, which is what the
+                // registry would assign and what keeps two channels created
+                // before any answer arrives in the order they were made.
+                let ordinal = self.next_provisional_ordinal();
                 Arc::make_mut(&mut self.durable)
                     .channels
                     .push(ProjectChannel {
@@ -112,11 +118,7 @@ impl Cagents {
                         // Empty means awaiting the conversation's first meaningful title.
                         // Nonempty names, including user edits, are never replaced here.
                         title: String::new(),
-                        // The registry assigns the real rank and this window
-                        // learns it from the answer to the publish below. Until
-                        // then the channel outranks every ranked one, which is
-                        // the truth about something created a moment ago.
-                        ordinal: PENDING_ORDINAL,
+                        ordinal,
                         // Not shared until the registry answers the publish
                         // below. Claiming it early would let a registry that
                         // never received the create retire it on a reconnect.
@@ -349,15 +351,14 @@ impl Cagents {
         let state = &self.sidebar_state;
         for project in &mut self.sidebar_model.projects {
             let mut index = 0;
-            // Newest first. The durable vector keeps the registry's ascending
-            // creation ranks, because that is the order the registry assigns and
-            // the order a seed donates; display inverts it, because a channel is
-            // created to be used now and belongs where the pointer already is.
+            // Built in the durable vector's own order, which is the registry's
+            // ascending creation ranks. Display order is not decided here:
+            // `sidebar::channels_in_display_order` owns it, one named ordering
+            // helper per row kind beside the one the worktree rows use.
             for channel in durable
                 .channels
                 .iter()
                 .filter(|channel| channel.project_id == project.id)
-                .rev()
             {
                 let title = channel_display_title(channel);
                 let selected = durable.active_channel == Some(channel.id);
@@ -393,6 +394,7 @@ impl Cagents {
                         && row.activity == activity
                         && row.unread == unread
                         && row.chats == chats
+                        && row.ordinal == channel.ordinal
                 });
                 if !unchanged {
                     let row = SidebarChannel::new(
@@ -402,6 +404,7 @@ impl Cagents {
                         activity,
                         unread,
                         chats,
+                        channel.ordinal,
                     );
                     if index < project.channels.len() {
                         project.channels[index] = row;
@@ -460,7 +463,9 @@ mod tests {
         assert_ne!(first, second);
 
         app.refresh_sidebar_channels();
-        let rows = &app.sidebar_model.projects[0].channels;
+        let rows = crate::sidebar::channels_in_display_order(
+            app.sidebar_model.projects[0].channels.iter(),
+        );
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].id, second, "the newest channel is the top row");
         assert_eq!(rows[1].id, first);

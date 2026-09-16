@@ -499,6 +499,29 @@ impl Cagents {
             .sort_by_key(|channel| channel.ordinal);
     }
 
+    /// The rank a channel created here takes until the registry answers.
+    ///
+    /// One more than the highest rank this window knows, which is what the
+    /// registry itself would assign when the two are in step - and when they
+    /// are not, the answer to the publish corrects it. A single sentinel rank
+    /// would not do: two channels created before either answer arrived would
+    /// tie, and the newer of them would not be the one on top.
+    pub(super) fn next_provisional_ordinal(&self) -> u32 {
+        self.durable
+            .channels
+            .iter()
+            .map(|channel| channel.ordinal)
+            .chain(
+                self.workspace_model
+                    .channels
+                    .iter()
+                    .map(|channel| channel.ordinal),
+            )
+            .max()
+            .unwrap_or(0)
+            .saturating_add(1)
+    }
+
     /// Publishes this window's creation of a channel.
     pub(super) fn publish_channel_creation(&mut self, id: ChannelId, project_id: ProjectId) {
         let Some(project) = self.sidebar_model.project(project_id) else {
@@ -686,7 +709,9 @@ mod tests {
         let _ = app.reconcile_workspace_model();
         app.refresh_sidebar_channels();
 
-        let rows = &app.sidebar_model.projects[0].channels;
+        let rows = crate::sidebar::channels_in_display_order(
+            app.sidebar_model.projects[0].channels.iter(),
+        );
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].id, adopted, "the newer channel is on top");
         assert_eq!(rows[1].id, mine);
@@ -877,9 +902,11 @@ mod tests {
     fn the_registry_rank_replaces_the_provisional_one_and_records_the_sharing() {
         let (mut app, project, _repository) = app_with_project();
         let id = ChannelId::new();
+        let provisional = app.next_provisional_ordinal();
         Arc::make_mut(&mut app.durable)
             .channels
-            .push(local(id, project, "", PENDING_ORDINAL));
+            .push(local(id, project, "", provisional));
+        assert_ne!(provisional, 11);
 
         let _ = app.apply_workspace_model_update(ModelUpdate::Ranked {
             channel: id,
