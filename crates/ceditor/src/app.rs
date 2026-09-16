@@ -3725,7 +3725,7 @@ impl Application for Editor {
             }
             if tab.runtime.lsp_document().is_some() {
                 toolbar_controls.push(
-                    widget::container(segmented_controls(vec![
+                    segmented_controls(vec![
                         icon_control(
                             symbolic_icon("insert-text-symbolic"),
                             "Complete (Ctrl+Space)",
@@ -3742,11 +3742,7 @@ impl Application for Editor {
                             Some(Message::Hover),
                         )
                         .into(),
-                    ]))
-                    .padding(iced::Padding {
-                        right: 12.0,
-                        ..iced::Padding::ZERO
-                    })
+                    ])
                     .into(),
                 );
             }
@@ -3765,11 +3761,20 @@ impl Application for Editor {
                 editor.push(
                     widget::container(
                         widget::row::with_children(toolbar_controls)
-                            .spacing(8)
+                            .spacing(design::TOOLBAR_GROUP_SPACING)
                             .align_y(iced::Alignment::Center)
                             .width(Length::Fill),
                     )
-                    .padding([0.0, 8.0])
+                    // The file toolbar carries the header's leading inset
+                    // itself, so this row adds none: a second inset here put
+                    // the file name at 20px while everything below it started
+                    // at 12. Only the trailing edge needs one, because the
+                    // controls this shell appends past the toolbar have no
+                    // container of their own to provide it.
+                    .padding(iced::Padding {
+                        right: design::TOOLBAR_INSET,
+                        ..iced::Padding::ZERO
+                    })
                     .center_y(Length::Fill)
                     .height(design::HEADER_HEIGHT)
                     .width(Length::Fill)

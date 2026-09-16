@@ -395,11 +395,6 @@ pub enum RepositoryAction {
         before: Arc<str>,
         result: Result<Option<DiffModel>, String>,
     },
-    RemovedViewport {
-        card: CardId,
-        offset: f32,
-        height: f32,
-    },
     EditorAction {
         card: CardId,
         action: text_editor::Action,
@@ -552,7 +547,6 @@ impl RepositoryAction {
             | Self::NextChange { card }
             | Self::WorkingDiffDue { card, .. }
             | Self::MarkdownDue { card, .. }
-            | Self::RemovedViewport { card, .. }
             | Self::MarkdownLink { card, .. }
             | Self::OpenFind { card }
             | Self::CloseFind { card }
@@ -1308,7 +1302,6 @@ struct WorkingDiffRefresh {
     active: Option<WorkingDiffJob>,
     error: Option<String>,
     additions: Vec<usize>,
-    removals: Vec<usize>,
 }
 
 /// Coalescing timer for the Markdown preview's parse, shaped exactly like
@@ -1341,21 +1334,20 @@ fn same_diff_revision(
     }
 }
 
-fn source_annotations(model: &DiffModel) -> (Vec<usize>, Vec<usize>) {
+/// The source lines an unsaved buffer has added, for the editor to tint.
+///
+/// Deleted lines are not in the buffer at all, so they have no source line to
+/// name: the comparison surface is where a reader sees them, with their text.
+fn added_source_lines(model: &DiffModel) -> Vec<usize> {
     let mut additions = Vec::new();
-    let mut removals = Vec::new();
-    let mut next_line = 0;
     for row in &model.inline_rows {
-        if let Some(line) = row.new_line {
-            next_line = line as usize;
-            if row.kind == DiffRowKind::Addition {
-                additions.push(next_line.saturating_sub(1));
-            }
-        } else if row.kind == DiffRowKind::Deletion && removals.last() != Some(&next_line) {
-            removals.push(next_line);
+        if let Some(line) = row.new_line
+            && row.kind == DiffRowKind::Addition
+        {
+            additions.push((line as usize).saturating_sub(1));
         }
     }
-    (additions, removals)
+    additions
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -1377,7 +1369,6 @@ struct FileViewportAnchors {
     editor: text_editor::ScrollPosition,
     preview: f32,
     diff: [Option<DiffViewportAnchor>; 2],
-    native_diff: [Option<text_editor::ScrollPosition>; 2],
 }
 
 const MAX_RETAINED_FILE_VIEWPORTS: usize = 128;
@@ -1499,8 +1490,6 @@ pub struct RepositoryRuntime {
     /// name and an object id.
     diffs: Vec<(DiffBasis, DiffState)>,
     working_diff: WorkingDiffRefresh,
-    removed_viewport: ListViewport,
-    removed_scroll_id: widget::Id,
     source_surface: SourceSurface,
     markdown_mode: MarkdownMode,
     diff_mode: DiffMode,
@@ -1637,8 +1626,6 @@ impl RepositoryRuntime {
             document: DocumentState::None,
             diffs: Vec::new(),
             working_diff: WorkingDiffRefresh::default(),
-            removed_viewport: ListViewport::default(),
-            removed_scroll_id: widget::Id::new(format!("repository.removed.{identity}")),
             next_diff_request: 0,
             source_surface: SourceSurface::Editor,
             markdown_mode: MarkdownMode::Edit,
@@ -1706,7 +1693,6 @@ impl RepositoryRuntime {
         self.diffs.clear();
         self.working_diff.applied = None;
         self.working_diff.additions.clear();
-        self.working_diff.removals.clear();
     }
 
     /// Re-renders the open document page for `theme`.
@@ -2416,15 +2402,15 @@ impl RepositoryRuntime {
 
     /// Whether the editable buffer is the surface actually on screen.
     ///
-    /// A working-tree diff mounts the same native buffer as Edit. Historical
-    /// comparisons and Markdown preview show no buffer to focus or search.
+    /// Only Edit mounts it. The comparison surface renders the diff model, and
+    /// Markdown preview renders the parsed document, so neither has a buffer
+    /// to focus or search.
     fn editable_surface_visible(&self) -> bool {
         let DocumentState::Editable(document) = &self.document else {
             return false;
         };
-        self.editable_working_diff()
-            || (self.source_surface == SourceSurface::Editor
-                && !(document.markdown && self.markdown_mode == MarkdownMode::Preview))
+        self.source_surface == SourceSurface::Editor
+            && !(document.markdown && self.markdown_mode == MarkdownMode::Preview)
     }
 
     /// Gives the keyboard to the editable buffer.
@@ -2597,7 +2583,7 @@ impl RepositoryRuntime {
     /// consequently nothing to refuse on that ground, and pretending to check
     /// would only suggest the field exists.
     pub fn apply_completion(&mut self, item: &LspCompletionItem) -> bool {
-        if self.source_surface == SourceSurface::Diff && !self.editable_working_diff() {
+        if self.source_surface != SourceSurface::Editor {
             return false;
         }
         // A keystroke recorded but not yet materialised describes the buffer
@@ -2912,9 +2898,16 @@ impl RepositoryRuntime {
         self.clear_find();
     }
 
+    /// Whether the working-tree comparison is taken from the live buffer
+    /// rather than from the file on disk.
+    ///
+    /// It is taken from the buffer whenever the index baseline is already
+    /// known, on either surface: the comparison then keeps step with unsaved
+    /// edits, and the editor can tint the lines the author added while they
+    /// are still typing them. Without a loaded comparison there is no baseline
+    /// to diff against, and loading one is the comparison surface's own job.
     fn editable_working_diff(&self) -> bool {
-        self.source_surface == SourceSurface::Diff
-            && self.diff_basis == DiffBasis::IndexToWorktree
+        self.diff_basis == DiffBasis::IndexToWorktree
             && self.basis_resolution.is_none()
             && matches!(self.document, DocumentState::Editable(_))
             && self.diff_model().is_some()
@@ -2938,6 +2931,16 @@ impl RepositoryRuntime {
         self.editable_working_diff()
             && same_diff_revision(&self.working_diff.applied, &self.wanted_working_diff())
             && self.working_diff.error.is_none()
+    }
+
+    /// The live-buffer comparison's failure, while that comparison is the one
+    /// the surface would show.
+    fn working_diff_failure(&self) -> Option<&str> {
+        (self.diff_basis == DiffBasis::IndexToWorktree
+            && self.basis_resolution.is_none()
+            && matches!(self.document, DocumentState::Editable(_)))
+        .then_some(self.working_diff.error.as_deref())
+        .flatten()
     }
 
     /// Call after repository actions and LSP edits, alongside autosave. At most
@@ -3068,11 +3071,9 @@ impl RepositoryRuntime {
             match result {
                 Ok(Some(mut model)) => {
                     model.before = before;
-                    (self.working_diff.additions, self.working_diff.removals) =
-                        source_annotations(&model);
+                    self.working_diff.additions = added_source_lines(&model);
                     if let DocumentState::Editable(document) = &self.document {
                         let lines = document.content.source_line_ranges();
-                        let line_count = document.content.line_count();
                         self.working_diff.additions = self
                             .working_diff
                             .additions
@@ -3081,9 +3082,6 @@ impl RepositoryRuntime {
                             .cloned()
                             .flatten()
                             .collect();
-                        for boundary in &mut self.working_diff.removals {
-                            *boundary = lines.get(*boundary).map_or(line_count, |line| line.start);
-                        }
                     }
                     self.working_diff.applied = completed;
                     self.working_diff.error = None;
@@ -3932,7 +3930,10 @@ impl RepositoryRuntime {
                 if self.search_mode && !matches!(action, text_editor::Action::Scroll { .. }) {
                     return Task::none();
                 }
-                if self.source_surface == SourceSurface::Diff && !self.editable_working_diff() {
+                // No buffer is mounted outside Edit, so an action arriving
+                // from any other surface is a stale message about a surface
+                // that has already been replaced.
+                if self.source_surface != SourceSurface::Editor {
                     return Task::none();
                 }
                 let is_edit = action.is_edit();
@@ -4341,10 +4342,6 @@ impl RepositoryRuntime {
             RepositoryAction::MarkdownLink { .. } | RepositoryAction::OpenExternal { .. } => {
                 Task::none()
             }
-            RepositoryAction::RemovedViewport { offset, height, .. } => {
-                self.removed_viewport = ListViewport { offset, height };
-                Task::none()
-            }
             RepositoryAction::WorkingDiffDue { card, ticket } => {
                 self.start_working_diff(card, ticket)
             }
@@ -4615,32 +4612,22 @@ impl RepositoryRuntime {
         self.apply_diff_viewport(DiffViewportAnchor::default());
     }
 
+    /// The editable buffer's scroll position, retained while a surface that
+    /// does not mount it is on screen.
     fn capture_native_viewport(&mut self) {
-        let native_diff = self.editable_working_diff();
-        let mode = self.diff_mode_index();
+        if !self.editable_surface_visible() {
+            return;
+        }
         if let DocumentState::Editable(document) = &self.document {
-            let position = document.content.scroll_position();
-            if native_diff {
-                self.viewports.native_diff[mode] = Some(position);
-            } else if self.source_surface == SourceSurface::Editor
-                && !(document.markdown && self.markdown_mode == MarkdownMode::Preview)
-            {
-                self.viewports.editor = position;
-            }
+            self.viewports.editor = document.content.scroll_position();
         }
     }
 
     fn restore_native_viewport(&mut self) {
-        let position = if self.editable_working_diff() {
-            let mode = self.diff_mode_index();
-            self.viewports.native_diff[mode]
-                .or(self.viewports.native_diff[1 - mode])
-                .unwrap_or(self.viewports.editor)
-        } else if self.source_surface == SourceSurface::Editor {
-            self.viewports.editor
-        } else {
+        if !self.editable_surface_visible() {
             return;
-        };
+        }
+        let position = self.viewports.editor;
         if let DocumentState::Editable(document) = &mut self.document {
             document.content.restore_scroll_position(position);
         }
@@ -4670,7 +4657,6 @@ impl RepositoryRuntime {
     /// rows also requires the runtime offset, set before building that surface.
     fn restore_visible_scroll(&self) -> Task<RepositoryAction> {
         let (id, x, y) = match self.source_surface {
-            SourceSurface::Diff if self.editable_working_diff() => return Task::none(),
             SourceSurface::Diff if self.diff_model().is_some() => (
                 &self.diff_scroll_id,
                 self.diff_horizontal,
@@ -4749,39 +4735,6 @@ impl RepositoryRuntime {
     }
 
     fn realize_current_change(&mut self) {
-        self.removed_viewport.offset = 0.0;
-        if self.editable_working_diff() {
-            let line = self.diff_model().and_then(|model| {
-                let start = *model.inline_change_starts.get(self.diff_change)?;
-                model.inline_rows[start..]
-                    .iter()
-                    .find_map(|row| row.new_line)
-            });
-            if let DocumentState::Editable(document) = &mut self.document {
-                let lines = document.content.source_line_ranges();
-                let line = line
-                    .and_then(|line| lines.get(line.saturating_sub(1) as usize))
-                    .map_or_else(
-                        || document.content.line_count().saturating_sub(1),
-                        |line| line.start,
-                    );
-                document
-                    .content
-                    .perform(text_editor::Action::ClearSelection);
-                document.content.move_to(text_editor::Cursor {
-                    position: text_editor::Position { line, column: 0 },
-                    selection: None,
-                });
-                document
-                    .content
-                    .restore_scroll_position(text_editor::ScrollPosition {
-                        line,
-                        vertical: 0.0,
-                        horizontal: 0.0,
-                    });
-            }
-            return;
-        }
         let row = self
             .diff_model()
             .and_then(|model| model.change_starts(self.diff_mode).get(self.diff_change))
@@ -4792,33 +4745,22 @@ impl RepositoryRuntime {
     }
 
     fn scroll_to_change(&self) -> Task<RepositoryAction> {
-        let removed = iced::widget::scrollable::scroll_to(
-            self.removed_scroll_id.clone(),
-            iced::widget::scrollable::AbsoluteOffset {
-                x: Some(0.0),
-                y: Some(0.0),
-            },
-        );
-        if self.editable_working_diff() {
-            return removed;
-        }
         let Some(model) = self.diff_model() else {
-            return removed;
+            return Task::none();
         };
         let starts = model.change_starts(self.diff_mode);
         let Some(row) = starts.get(self.diff_change) else {
-            return removed;
+            return Task::none();
         };
         let denominator = model.row_count(self.diff_mode).saturating_sub(1).max(1);
         let y = *row as f32 / denominator as f32;
-        let diff = iced::widget::scrollable::snap_to(
+        iced::widget::scrollable::snap_to(
             self.diff_scroll_id.clone(),
             iced::widget::scrollable::RelativeOffset {
                 x: None,
                 y: Some(y),
             },
-        );
-        Task::batch([diff, removed])
+        )
     }
 }
 
@@ -5835,7 +5777,7 @@ pub fn selected_file_toolbar(
     // actions stay anchored on the right, leaving a clean left/right split.
     let actions = widget::scrollable(
         widget::row::with_children(controls)
-            .spacing(12)
+            .spacing(crate::design::TOOLBAR_GROUP_SPACING)
             .align_y(Alignment::Center)
             .height(Length::Fill)
             // Reserve the rail instead of embedding the scrollbar: an embedded
@@ -5858,11 +5800,11 @@ pub fn selected_file_toolbar(
     }
     let toolbar = widget::container(
         widget::row::with_children(header)
-            .spacing(12)
+            .spacing(crate::design::TOOLBAR_GROUP_SPACING)
             .align_y(Alignment::Center)
             .width(Length::Fill),
     )
-    .padding([0, 12])
+    .padding([0.0, crate::design::TOOLBAR_INSET])
     .height(crate::design::HEADER_HEIGHT)
     .width(Length::Fill);
     // The strip is mounted here rather than beside the buffer because it is
@@ -6368,18 +6310,11 @@ fn editable_document_view<'a>(
             )
             .font(Font::MONOSPACE)
             .size(14.0)
-            .diff_lines(
-                if runtime.working_annotations_current() {
-                    &runtime.working_diff.additions
-                } else {
-                    &[]
-                },
-                if runtime.working_annotations_current() {
-                    &runtime.working_diff.removals
-                } else {
-                    &[]
-                },
-            )
+            .added_lines(if runtime.working_annotations_current() {
+                &runtime.working_diff.additions
+            } else {
+                &[]
+            })
             .wrapping(if runtime.wrap_lines {
                 iced::advanced::text::Wrapping::WordOrGlyph
             } else {
@@ -6508,33 +6443,47 @@ fn diff_review_controls(
             )
             .into(),
         ]),
-        icon_control(
-            crate::ui_controls::symbolic_icon("go-up-symbolic"),
-            "Previous change",
-            false,
-            runtime.can_navigate_diff(),
-            Some(RepositoryAction::PreviousChange { card }),
-        )
-        .into(),
-        crate::interaction::tooltip(
-            crate::design::caption(if change_count == 0 {
-                "0/0".into()
-            } else {
-                format!("{}/{change_count}", runtime.diff_change + 1)
-            }),
-            basis_label(&runtime.diff_basis),
-        ),
-        icon_control(
-            crate::ui_controls::symbolic_icon("go-down-symbolic"),
-            "Next change",
-            false,
-            runtime.can_navigate_diff(),
-            Some(RepositoryAction::NextChange { card }),
-        )
-        .into(),
+        // Change navigation is one cluster, segmented like the layout and
+        // basis groups beside it, so the header reads as groups at one rhythm
+        // rather than as loose buttons next to boxed ones.
+        toolbar_group(vec![
+            icon_control(
+                crate::ui_controls::symbolic_icon("go-up-symbolic"),
+                "Previous change",
+                false,
+                runtime.can_navigate_diff(),
+                Some(RepositoryAction::PreviousChange { card }),
+            )
+            .into(),
+            crate::interaction::tooltip(
+                // A fixed width, because this label sits between the two
+                // controls a reader presses repeatedly and "1/4" and "12/128"
+                // are different widths. The text fills that width so the
+                // label, not its box, is what is centred.
+                widget::container(
+                    crate::design::caption(if change_count == 0 {
+                        "0/0".into()
+                    } else {
+                        format!("{}/{change_count}", runtime.diff_change + 1)
+                    })
+                    .width(Length::Fill)
+                    .center(),
+                )
+                .width(Length::Fixed(crate::design::STEPPER_LABEL_WIDTH)),
+                basis_label(&runtime.diff_basis),
+            ),
+            icon_control(
+                crate::ui_controls::symbolic_icon("go-down-symbolic"),
+                "Next change",
+                false,
+                runtime.can_navigate_diff(),
+                Some(RepositoryAction::NextChange { card }),
+            )
+            .into(),
+        ]),
     ];
     if runtime.can_retry_diff() {
-        controls.push(
+        controls.push(toolbar_group(vec![
             icon_control(
                 crate::ui_controls::symbolic_icon("view-refresh-symbolic"),
                 "Retry diff",
@@ -6543,7 +6492,7 @@ fn diff_review_controls(
                 Some(RepositoryAction::RetryDiff { card }),
             )
             .into(),
-        );
+        ]));
     }
     if let Some(model) = model
         && let counts = crate::repository::line_change_counts(
@@ -6553,7 +6502,7 @@ fn diff_review_controls(
         && !counts.is_empty()
     {
         controls.push(crate::interaction::tooltip(
-            crate::design::caption(counts),
+            crate::design::change_counts(&counts),
             match runtime.diff_state(&runtime.diff_basis) {
                 Some(DiffState::Ready(RenderedDiff::Text {
                     old_label,
@@ -6568,7 +6517,7 @@ fn diff_review_controls(
         ));
     }
     widget::row::with_children(controls)
-        .spacing(2)
+        .spacing(crate::design::TOOLBAR_GROUP_SPACING)
         .align_y(Alignment::Center)
         .into()
 }
@@ -6586,6 +6535,12 @@ fn diff_surface(card: CardId, runtime: &RepositoryRuntime) -> Element<'_, Reposi
             }
             _ => loading("Refreshing file status…"),
         };
+    }
+    // A failed live-buffer comparison has to be said rather than papered over
+    // with the model it superseded, which describes text the buffer no longer
+    // holds.
+    if let Some(error) = runtime.working_diff_failure() {
+        return information_state("Could not compare the working buffer", error.to_owned());
     }
     match &runtime.basis_resolution {
         Some(BasisResolution::Resolving(choice)) => {
@@ -6612,175 +6567,17 @@ fn diff_surface(card: CardId, runtime: &RepositoryRuntime) -> Element<'_, Reposi
                     .map_or_else(String::new, |file| file.path.display().to_string()),
                 basis_label(&runtime.diff_basis),
             )),
-            Some(DiffState::Ready(RenderedDiff::Text { model, .. }))
-                if runtime.editable_working_diff() =>
-            {
-                working_diff_view(card, runtime, model)
-            }
             Some(DiffState::Ready(RenderedDiff::Text {
                 model,
                 old_label,
                 new_label,
-            })) => widget::column::with_children([
-                diff_model_view(card, runtime, model, old_label, new_label),
-                removed_context_view(card, runtime, model),
-            ])
-            .height(Length::Fill)
-            .into(),
+            })) => diff_model_view(card, runtime, model, old_label, new_label),
             Some(DiffState::Ready(RenderedDiff::NoText(content))) => no_text_view(content),
             Some(DiffState::Ready(RenderedDiff::Error(error))) => {
                 information_state("Could not compute diff", error.clone())
             }
         },
     }
-}
-fn working_diff_view<'a>(
-    card: CardId,
-    runtime: &'a RepositoryRuntime,
-    model: &'a DiffModel,
-) -> Element<'a, RepositoryAction> {
-    let DocumentState::Editable(document) = &runtime.document else {
-        return loading("Loading working source…");
-    };
-    let status = runtime.working_diff.error.as_deref().unwrap_or_else(|| {
-        if runtime.working_annotations_current() {
-            "Working source · editable · green lines added; red rules mark removed content"
-        } else {
-            "Working source · editable · updating change markers…"
-        }
-    });
-    let editor = widget::column::with_children([
-        crate::design::caption(status).into(),
-        editable_document_view(card, runtime, document),
-    ])
-    .width(Length::Fill)
-    .height(Length::Fill)
-    .into();
-    let removed = removed_context_view(card, runtime, model);
-    match runtime.diff_mode {
-        DiffMode::Inline => widget::column::with_children([editor, removed])
-            .height(Length::Fill)
-            .into(),
-        DiffMode::Split => widget::row::with_children([removed, editor])
-            .height(Length::Fill)
-            .into(),
-    }
-}
-
-/// The active change's old text is selectable but has no editor action route.
-/// Deletions form a prefix of each inline change; only visible rows are mounted.
-///
-/// No sentence above the rows says that they are deleted and uneditable. The
-/// red row fill, the old-side-only line numbers and the absence of a caret
-/// already carry that, and a permanent caption competed for height with the
-/// very source it was describing. Assistive technology can see none of those
-/// cues, so the scroll region answers for the whole pane with its own name
-/// and description rather than with a rendered banner.
-fn removed_context_view<'a>(
-    card: CardId,
-    runtime: &'a RepositoryRuntime,
-    model: &'a DiffModel,
-) -> Element<'a, RepositoryAction> {
-    let start = model
-        .inline_change_starts
-        .get(runtime.diff_change)
-        .copied()
-        .unwrap_or(0);
-    let end = model
-        .inline_change_starts
-        .get(runtime.diff_change + 1)
-        .copied()
-        .unwrap_or(model.inline_rows.len());
-    let rows = model.inline_rows.get(start..end).unwrap_or_default();
-    let removed = &rows[..rows.partition_point(|row| row.kind == DiffRowKind::Deletion)];
-    let native_split = runtime.editable_working_diff() && runtime.diff_mode == DiffMode::Split;
-    let body: Element<'a, RepositoryAction> = if removed.is_empty() {
-        crate::design::caption("No removed lines in this change.").into()
-    } else {
-        let visible = visible_rows(removed.len(), runtime.removed_viewport, DIFF_ROW_HEIGHT);
-        let mut lines = Vec::with_capacity(visible.end - visible.start + 2);
-        // `Direction::Both` gives its content an infinite, compressed cross
-        // axis, so a column of width-fluid rows takes its width from nothing:
-        // `diff_container` was `FillPortion`, and the two virtualization
-        // spacers cannot help because `Column::push` drops any child whose
-        // size hint is void, which a zero-height spacer is. Every row
-        // therefore laid out zero pixels wide and the pane was invisible while
-        // still costing its height. Stating the rows' width fixes the column's
-        // cross size, and sizing it to the widest line is what makes the
-        // horizontal rail below them reachable.
-        //
-        // `diff_model_view` fixes its canvas width for the same reason, but it
-        // can afford `responsive` to learn the viewport first because it has no
-        // accessibility nodes to lose. `Responsive` does not implement
-        // `a11y_nodes`, so measuring this pane that way would silently drop
-        // both the region's announcement and the removed source itself.
-        let code_width =
-            (model.max_line_width[usize::from(cosmic::theme::is_dark())] as f32).max(1.0);
-        let content_width = REMOVED_GUTTER_WIDTH + code_width + 2.0 * DIFF_ROW_PADDING;
-        lines.push(iced::widget::Space::new().height(visible.top_space).into());
-        for row in &removed[visible.start..visible.end] {
-            lines.push(diff_container(
-                widget::row::with_children([
-                    diff_gutter(row.old_line, REMOVED_GUTTER_WIDTH),
-                    widget::selectable_text(row.text.as_str())
-                        .font(Font::MONOSPACE)
-                        .size(DIFF_FONT_SIZE)
-                        .wrapping(iced::widget::text::Wrapping::None)
-                        .into(),
-                ]),
-                DiffRowKind::Deletion,
-                Length::Fixed(content_width),
-            ));
-        }
-        lines.push(
-            iced::widget::Space::new()
-                .height(visible.bottom_space)
-                .into(),
-        );
-        // Both thumbs float over this content, so each axis reserves its own
-        // rail and the corner where they meet stays clear.
-        //
-        // Iced anchors a thumb to the viewport, not to the content, so the
-        // reservation only guarantees clearance once an axis is scrolled to its
-        // end. Deleted lines wider than the pane can still pass under the
-        // vertical thumb at an intermediate horizontal offset. Fixing that
-        // needs the viewport width at build time, and the only way to learn it
-        // here is `Responsive`, which does not implement `a11y_nodes` and would
-        // drop both this region's announcement and the removed source with it.
-        // The reservation is what keeps the common case - deletions narrower
-        // than the pane - correct.
-        widget::scrollable(
-            widget::column::with_children(lines)
-                .padding(crate::design::with_both_rails(iced::Padding::ZERO)),
-        )
-        .id(runtime.removed_scroll_id.clone())
-        .direction(iced::widget::scrollable::Direction::Both {
-            vertical: crate::design::scrollbar(),
-            horizontal: crate::design::scrollbar(),
-        })
-        .on_scroll(move |viewport| RepositoryAction::RemovedViewport {
-            card,
-            offset: viewport.absolute_offset().y,
-            height: viewport.bounds().height,
-        })
-        .height(if native_split {
-            Length::Fill
-        } else {
-            Length::Fixed(140.0)
-        })
-        .name("Removed lines")
-        .description("Selectable, not editable")
-        .into()
-    };
-    widget::container(body)
-        .padding(4)
-        .width(Length::Fill)
-        .height(if native_split {
-            Length::Fill
-        } else {
-            Length::Shrink
-        })
-        .into()
 }
 
 /// A comparison with no text rows, reported as the fact it is.
@@ -6977,9 +6774,6 @@ fn diff_model_view<'a>(
 const DIFF_ROW_PADDING: f32 = 4.0;
 const DIFF_MARKER_WIDTH: f32 = 16.0;
 const DIFF_SPLIT_DIVIDER: f32 = 1.0;
-/// The removed pane numbers only the old side, so it sizes its gutter itself
-/// rather than sharing the diff's digit-derived width.
-const REMOVED_GUTTER_WIDTH: f32 = 48.0;
 
 #[derive(Debug, Clone, Copy)]
 struct DiffScrollGeometry {
@@ -7558,7 +7352,12 @@ mod tests {
     use crate::lsp::{LspRange, LspSnippet, LspSnippetStop};
     use crate::model::ProjectId;
 
-    fn native_diff_runtime(
+    /// A runtime whose working-tree comparison describes the live buffer.
+    ///
+    /// The file is open for editing and the index baseline is known, which is
+    /// what keeps that comparison in step with unsaved edits and what lets the
+    /// editor tint the lines the author added.
+    fn working_diff_runtime(
         card: CardId,
         before: &str,
         after: &str,
@@ -7566,10 +7365,7 @@ mod tests {
         let (mut runtime, identity) = RepositoryRuntime::lsp_open_fixture(card, after);
         runtime.source_surface = SourceSurface::Diff;
         let model = crate::diff_view::build_diff(before, after);
-        (
-            runtime.working_diff.additions,
-            runtime.working_diff.removals,
-        ) = source_annotations(&model);
+        runtime.working_diff.additions = added_source_lines(&model);
         runtime.set_diff_state(
             DiffBasis::IndexToWorktree,
             DiffState::Ready(staged_text_diff(model)),
@@ -7579,12 +7375,18 @@ mod tests {
         (runtime, identity)
     }
 
+    /// The added-line tint only tells the truth while the comparison it came
+    /// from still describes the buffer, so an edit has to retire it until the
+    /// next working diff lands.
     #[test]
-    fn native_diff_selection_and_paste_edit_only_the_real_working_source() {
+    fn editing_the_working_source_retires_the_added_line_tint() {
         let card = CardId::new();
-        let (mut runtime, _) = native_diff_runtime(card, "removed\nkept\n", "added\nkept\n");
+        let (mut runtime, _) = working_diff_runtime(card, "removed\nkept\n", "added\nkept\n");
+        // The tint belongs to the buffer the author is typing into, which is
+        // the Edit surface. Diff renders the comparison instead.
+        runtime.source_surface = SourceSurface::Editor;
         assert_eq!(runtime.working_diff.additions, vec![0]);
-        assert_eq!(runtime.working_diff.removals, vec![0]);
+        assert!(runtime.working_annotations_current());
         drop(runtime.update(RepositoryAction::EditorAction {
             card,
             action: text_editor::Action::Move(text_editor::Motion::DocumentStart),
@@ -7611,16 +7413,18 @@ mod tests {
         assert_eq!(&*runtime.diff_model().unwrap().before, "removed\nkept\n");
         assert!(
             !runtime.working_annotations_current(),
-            "old row numbers must disappear after an edit"
+            "a tint drawn from a superseded comparison must go out with it"
         );
-        assert_eq!(runtime.source_surface, SourceSurface::Diff);
     }
 
+    /// The comparison surface mounts no buffer, so an editor action arriving
+    /// while it is up is a stale message from a surface that is gone.
     #[test]
-    fn staged_and_committed_comparisons_reject_native_edit_actions() {
+    fn the_comparison_surface_takes_no_editor_actions() {
         let card = CardId::new();
-        let (mut runtime, _) = native_diff_runtime(card, "old\n", "working\n");
+        let (mut runtime, _) = working_diff_runtime(card, "old\n", "working\n");
         for basis in [
+            DiffBasis::IndexToWorktree,
             DiffBasis::HeadToIndex,
             DiffBasis::CommitToParent {
                 oid: fixture_oid(1),
@@ -7649,31 +7453,12 @@ mod tests {
     }
 
     #[test]
-    fn native_change_navigation_reveals_source_lines_not_inline_deletion_rows() {
-        let card = CardId::new();
-        let (mut runtime, _) = native_diff_runtime(
-            card,
-            "one\nold\nmiddle\nlast\n",
-            "one\nnew\nmiddle\nlast\nadded\n",
-        );
-        drop(runtime.update(RepositoryAction::NextChange { card }));
-        let DocumentState::Editable(document) = &runtime.document else {
-            panic!("native buffer")
-        };
-        assert_eq!(document.content.cursor().position.line, 4);
-        assert_eq!(document.content.scroll_position().line, 4);
-        drop(runtime.update(RepositoryAction::PreviousChange { card }));
-        let DocumentState::Editable(document) = &runtime.document else {
-            panic!("native buffer")
-        };
-        assert_eq!(document.content.cursor().position.line, 1);
-        assert_eq!(document.content.scroll_position().line, 1);
-    }
-
-    #[test]
     fn working_diff_coalesces_edits_and_rejects_cancelled_revision_results() {
         let card = CardId::new();
-        let (mut runtime, identity) = native_diff_runtime(card, "old\n", "first\n");
+        let (mut runtime, identity) = working_diff_runtime(card, "old\n", "first\n");
+        // Edits arrive from the Edit surface; the comparison surface mounts no
+        // buffer to type into.
+        runtime.source_surface = SourceSurface::Editor;
         runtime.working_diff.applied = None;
         drop(runtime.working_diff_task(card));
         let timer = runtime.working_diff.timer.unwrap();
@@ -7734,7 +7519,7 @@ mod tests {
     #[test]
     fn equal_baseline_bytes_from_a_new_basis_request_cannot_accept_an_old_worker() {
         let card = CardId::new();
-        let (mut runtime, identity) = native_diff_runtime(card, "old\n", "new\n");
+        let (mut runtime, identity) = working_diff_runtime(card, "old\n", "new\n");
         runtime.working_diff.applied = None;
         drop(runtime.working_diff_task(card));
         let ticket = runtime.working_diff.timer.unwrap();
@@ -7768,15 +7553,9 @@ mod tests {
     }
 
     #[test]
-    fn removed_boundaries_include_the_end_of_the_actual_source() {
-        let model = crate::diff_view::build_diff("gone\nkeep\nold\n", "keep\n");
-        assert_eq!(source_annotations(&model), (Vec::new(), vec![0, 1]));
-    }
-
-    #[test]
     fn unrelated_status_changes_do_not_invalidate_the_selected_diff() {
         let card = CardId::new();
-        let (mut runtime, _) = native_diff_runtime(card, "old\n", "new\n");
+        let (mut runtime, _) = working_diff_runtime(card, "old\n", "new\n");
         let baseline = Arc::clone(&runtime.diff_model().unwrap().before);
         let FileListState::Ready(files) = &runtime.files else {
             panic!("file list")
@@ -7809,9 +7588,9 @@ mod tests {
     }
 
     #[test]
-    fn status_refresh_after_our_save_keeps_the_visible_native_diff() {
+    fn status_refresh_after_our_save_keeps_the_visible_working_diff() {
         let card = CardId::new();
-        let (mut runtime, _) = native_diff_runtime(card, "old\n", "new\n");
+        let (mut runtime, _) = working_diff_runtime(card, "old\n", "new\n");
         // SaveFinished updates the selected file before the next status read,
         // while the list can still contain its pre-save clean status.
         let selected = runtime.selected.clone().unwrap();
@@ -7853,77 +7632,9 @@ mod tests {
     }
 
     #[test]
-    fn native_diff_layouts_retain_independent_scroll_positions() {
-        let card = CardId::new();
-        let source = format!("{}\n", "long source line ".repeat(30)).repeat(200);
-        let (mut runtime, _) = native_diff_runtime(card, "", &source);
-        let renderer = headless_renderer();
-        let layout_native = |runtime: &RepositoryRuntime, width| {
-            let mut element = editor_surface(card, runtime);
-            let mut tree = Tree::new(element.as_widget());
-            element.as_widget_mut().layout(
-                &mut tree,
-                &renderer,
-                &layout::Limits::new(iced::Size::ZERO, iced::Size::new(width, 200.0)),
-            );
-        };
-        let DocumentState::Editable(document) = &mut runtime.document else {
-            panic!("native buffer")
-        };
-        document
-            .content
-            .restore_scroll_position(text_editor::ScrollPosition {
-                line: 40,
-                vertical: 0.0,
-                horizontal: 180.5,
-            });
-        layout_native(&runtime, 520.0);
-        drop(runtime.update(RepositoryAction::ApplyDiffMode { card, split: true }));
-        layout_native(&runtime, 260.0);
-        let DocumentState::Editable(document) = &mut runtime.document else {
-            panic!("native buffer")
-        };
-        assert_eq!(document.content.scroll_position().line, 40);
-        document
-            .content
-            .restore_scroll_position(text_editor::ScrollPosition {
-                line: 120,
-                vertical: 0.0,
-                horizontal: 420.25,
-            });
-        layout_native(&runtime, 260.0);
-        drop(runtime.update(RepositoryAction::ApplyDiffMode { card, split: false }));
-        layout_native(&runtime, 520.0);
-        let DocumentState::Editable(document) = &runtime.document else {
-            panic!("native buffer")
-        };
-        assert_eq!(
-            document.content.scroll_position(),
-            text_editor::ScrollPosition {
-                line: 40,
-                vertical: 0.0,
-                horizontal: 180.5,
-            }
-        );
-        drop(runtime.update(RepositoryAction::ApplyDiffMode { card, split: true }));
-        layout_native(&runtime, 260.0);
-        let DocumentState::Editable(document) = &runtime.document else {
-            panic!("native buffer")
-        };
-        assert_eq!(
-            document.content.scroll_position(),
-            text_editor::ScrollPosition {
-                line: 120,
-                vertical: 0.0,
-                horizontal: 420.25,
-            }
-        );
-    }
-
-    #[test]
     fn branch_only_paths_open_read_only_and_keep_rename_identity_for_retry() {
         let card = CardId::new();
-        let (mut runtime, identity) = native_diff_runtime(card, "old\n", "working\n");
+        let (mut runtime, identity) = working_diff_runtime(card, "old\n", "working\n");
         let basis = DiffBasis::MergeBaseToHead {
             base_ref: ValidatedRefName::parse("refs/heads/main").unwrap(),
             head: fixture_oid(1),
@@ -7963,7 +7674,10 @@ mod tests {
     #[test]
     fn branch_navigation_cannot_discard_an_unsaved_or_saving_native_buffer() {
         let card = CardId::new();
-        let (mut runtime, _) = native_diff_runtime(card, "old\n", "working\n");
+        let (mut runtime, _) = working_diff_runtime(card, "old\n", "working\n");
+        // The buffer is dirtied through the Edit surface, which is the only
+        // surface that mounts it.
+        runtime.source_surface = SourceSurface::Editor;
         let open = RepositoryAction::OpenBranchFile {
             card,
             path: RepoPath::parse("deleted.txt").unwrap(),
@@ -7991,7 +7705,7 @@ mod tests {
             Path::new("notes.txt")
         );
         assert!(runtime.is_saving());
-        assert_eq!(runtime.source_surface, SourceSurface::Diff);
+        assert_eq!(runtime.source_surface, SourceSurface::Editor);
     }
 
     #[test]
@@ -8561,7 +8275,7 @@ mod tests {
         let card = CardId::new();
         let line = "let value = compute(argument, another_argument, third_argument);";
         let before = format!("{}kept\n", format!("{line}\n").repeat(24));
-        let (runtime, _) = native_diff_runtime(card, &before, "kept\n");
+        let (runtime, _) = working_diff_runtime(card, &before, "kept\n");
         let model = runtime.diff_model().expect("a text comparison");
 
         // Two axes: the diff canvas, whose rails are the ones editor content
@@ -8753,107 +8467,57 @@ mod tests {
         }
     }
 
-    /// The removed side used to sit under a permanent caption that both paid
-    /// for its own height and was the only thing telling a screen reader what
-    /// the red rows were. Dropping it has to drop that height with it — a
-    /// column left holding a single child still charges for its spacing — has
-    /// to leave the deleted source readable, and must not open an edit route
-    /// into text that only exists on the old side of the change.
+    /// The working-tree comparison is a comparison, so its deleted lines are
+    /// rows in it like any other basis's.
+    ///
+    /// It used to mount the live editable buffer instead. A buffer cannot show
+    /// a line the file no longer contains, so deletions were marked with a
+    /// rule and relegated to a second pane holding only the selected hunk's,
+    /// which is why a deletion was almost never on screen. The comparison
+    /// surface therefore has to lay out exactly what the diff renderer lays
+    /// out for the same model, on both layouts.
     #[test]
-    fn the_removed_pane_costs_only_its_rows_and_takes_no_edits() {
-        use iced_accessibility::accesskit::Role;
-
+    fn the_working_comparison_lays_out_its_deleted_lines_as_rows() {
         let card = CardId::new();
-        let (runtime, _) = native_diff_runtime(card, "gone\nkept\n", "kept\n");
-        let model = runtime.diff_model().expect("the fixture computed a diff");
+        let (mut runtime, _) = working_diff_runtime(card, "gone\nkept\nalso gone\n", "kept\n");
         let renderer = headless_renderer();
-        let mut element = removed_context_view(card, &runtime, model);
-        let mut tree = Tree::new(element.as_widget());
-        let node = element.as_widget_mut().layout(
-            &mut tree,
-            &renderer,
-            &layout::Limits::new(iced::Size::ZERO, iced::Size::new(480.0, 600.0)),
-        );
-        assert_eq!(
-            node.size().height,
-            148.0,
-            "the pane is its 140px scroll region plus 4px of padding above and below"
-        );
-        // `Direction::Both` compresses its content's cross axis, so a column of
-        // width-fluid rows collapses to nothing and renders an invisible pane
-        // that still costs its height. Every deletion row must carry a real
-        // width, and the widest one must reach the widest line's extent.
-        let rows = row_widths(Layout::new(&node));
-        assert!(
-            !rows.is_empty() && rows.iter().all(|width| *width > 0.0),
-            "every removed row must lay out with a real width, got {rows:?}"
-        );
-        let code_width =
-            (model.max_line_width[usize::from(cosmic::theme::is_dark())] as f32).max(1.0);
-        let widest = rows.iter().copied().fold(0.0_f32, f32::max);
-        assert!(
-            (widest - (REMOVED_GUTTER_WIDTH + code_width + 2.0 * DIFF_ROW_PADDING)).abs() < 1.0,
-            "the rows must span the widest line, got {widest}"
-        );
-
-        let nodes = element.as_widget().a11y_nodes(
-            Layout::new(&node),
-            &tree,
-            iced::mouse::Cursor::Unavailable,
-        );
-        let nodes = nodes
-            .root()
-            .iter()
-            .chain(nodes.children())
-            .map(|node| node.node())
-            .filter(|node| !node.is_hidden())
-            .collect::<Vec<_>>();
-        let region = nodes
-            .iter()
-            .find(|node| node.role() == Role::ScrollView)
-            .expect("the removed side is one scroll region");
-        assert_eq!(region.label(), Some("Removed lines"));
-        assert_eq!(region.description(), Some("Selectable, not editable"));
-        assert!(
-            nodes.iter().any(|node| node.label() == Some("gone")),
-            "deleted source nobody can read is source nobody can select or copy"
-        );
-
-        // Click into the pane and type. An editor mounted over the old side
-        // would take focus from the press and turn the keystroke into an edit.
-        let viewport = iced::Rectangle::new(iced::Point::ORIGIN, node.size());
-        let cursor = iced::mouse::Cursor::Available(iced::Point::new(120.0, 20.0));
-        let mut messages = Vec::new();
-        for event in [
-            iced::Event::Mouse(iced::mouse::Event::ButtonPressed(iced::mouse::Button::Left)),
-            iced::Event::Mouse(iced::mouse::Event::ButtonReleased(
-                iced::mouse::Button::Left,
-            )),
-            iced::Event::Keyboard(iced::keyboard::Event::KeyPressed {
-                key: iced::keyboard::Key::Character("x".into()),
-                modified_key: iced::keyboard::Key::Character("x".into()),
-                physical_key: iced::keyboard::key::Physical::Code(iced::keyboard::key::Code::KeyX),
-                location: iced::keyboard::Location::Standard,
-                modifiers: iced::keyboard::Modifiers::empty(),
-                text: Some("x".into()),
-                repeat: false,
-            }),
-        ] {
-            element.as_widget_mut().update(
-                &mut tree,
-                &event,
-                Layout::new(&node),
-                cursor,
+        let size = iced::Size::new(720.0, 600.0);
+        fn diff_rows(layout: Layout<'_>) -> usize {
+            let mut rows = usize::from((layout.bounds().height - DIFF_ROW_HEIGHT).abs() < 0.01);
+            for child in layout.children() {
+                rows += diff_rows(child);
+            }
+            rows
+        }
+        for mode in [DiffMode::Inline, DiffMode::Split] {
+            runtime.diff_mode = mode;
+            let model = runtime.diff_model().expect("the fixture computed a diff");
+            assert_eq!(
+                model
+                    .inline_rows
+                    .iter()
+                    .filter(|row| row.kind == DiffRowKind::Deletion)
+                    .count(),
+                2,
+                "the fixture has to delete lines for this to mean anything"
+            );
+            let rendered = laid_out(
+                diff_model_view(card, &runtime, model, "Index", "Working buffer"),
                 &renderer,
-                &mut iced::advanced::clipboard::Null,
-                &mut Shell::new(&mut messages),
-                &viewport,
+                size,
+            );
+            let mounted = laid_out(diff_surface(card, &runtime), &renderer, size);
+            let rendered = diff_rows(Layout::new(&rendered));
+            assert!(
+                rendered >= model.row_count(mode),
+                "{mode:?} carries one row per model row, got {rendered}"
+            );
+            assert_eq!(
+                diff_rows(Layout::new(&mounted)),
+                rendered,
+                "{mode:?} must mount the comparison, not the buffer"
             );
         }
-        assert!(
-            messages.is_empty(),
-            "the removed side has no editor action route: {messages:?}"
-        );
     }
 
     #[test]
@@ -12096,24 +11760,6 @@ mod tests {
                 Some("tiny-skia"),
             ))
             .expect("a headless renderer")
-    }
-
-    /// Widths of the laid-out deletion rows. `DIFF_ROW_HEIGHT` identifies them
-    /// uniquely: `diff_container` is the only node fixed to that height, and
-    /// its own padding leaves every descendant shorter.
-    fn row_widths(layout: Layout<'_>) -> Vec<f32> {
-        fn walk(layout: Layout<'_>, widths: &mut Vec<f32>) {
-            let bounds = layout.bounds();
-            if (bounds.height - DIFF_ROW_HEIGHT).abs() < 0.01 {
-                widths.push(bounds.width);
-            }
-            for child in layout.children() {
-                walk(child, widths);
-            }
-        }
-        let mut widths = Vec::new();
-        walk(layout, &mut widths);
-        widths
     }
 
     #[test]
