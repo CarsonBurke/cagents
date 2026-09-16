@@ -87,10 +87,18 @@ const FRAME_MAGIC: [u8; 8] = *b"CGDOCPAG";
 /// Bumped if the header's shape ever changes. Parent and helper are the same
 /// build in every supported case, so a mismatch means something other than
 /// this protocol is writing to the pipe.
-const FRAME_VERSION: u32 = 1;
+const FRAME_VERSION: u32 = 2;
 
-/// Magic, version, page count, page index, width, height, and RGBA length.
-const FRAME_HEADER_BYTES: usize = 8 + 4 + 8 + 8 + 4 + 4 + 8;
+/// Magic, version, page count, page index, width, height, printed width, and
+/// RGBA length.
+const FRAME_HEADER_BYTES: usize = 8 + 4 + 8 + 8 + 4 + 4 + 4 + 8;
+
+/// The widest page the parent will believe, in PostScript points.
+///
+/// The format's own ceiling is 14400 points, and a page is drawn at its
+/// printed width times the reader's zoom, so a helper claiming an absurd
+/// width would otherwise ask the layout for a sheet of absurd size.
+const MAX_PAGE_POINTS: f32 = 14_400.0;
 
 /// The largest raster the parent will accept, which is the ceiling the image
 /// preview already enforces. Kept independent of the header's own length
@@ -115,7 +123,7 @@ const REAP_GRACE: Duration = Duration::from_millis(500);
 const REAP_POLL: Duration = Duration::from_millis(1);
 
 /// One page raster plus how many pages the document has.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct DocumentPage {
     pub pages: usize,
     pub page: PdfPage,
@@ -520,6 +528,7 @@ fn render_page(
             index,
             width,
             height,
+            points_wide,
             rgba: rgba.into(),
         },
     })
@@ -551,7 +560,9 @@ fn render_scale(points_wide: f32, points_high: f32, wanted: f32) -> Option<f32> 
         return None;
     }
     let most = MAX_IMAGE_DIMENSION as f32 / points_wide.max(points_high);
-    let least = 1.0 / points_wide.min(points_high);
+    // A shade over one pixel, because the pixmap's dimensions are floored and
+    // `points * (1.0 / points)` is not always exactly one in `f32`.
+    let least = 1.000_01 / points_wide.min(points_high);
     (least <= most).then(|| wanted.clamp(least, most))
 }
 
@@ -632,6 +643,7 @@ fn frame_header(page: &DocumentPage) -> Vec<u8> {
     header.extend_from_slice(&(page.page.index as u64).to_le_bytes());
     header.extend_from_slice(&page.page.width.to_le_bytes());
     header.extend_from_slice(&page.page.height.to_le_bytes());
+    header.extend_from_slice(&page.page.points_wide.to_le_bytes());
     header.extend_from_slice(&(page.page.rgba.len() as u64).to_le_bytes());
     header
 }
@@ -660,7 +672,13 @@ fn decode_frame(frame: &[u8], requested: usize) -> Result<DocumentPage, String> 
     let index = u64_at(header, 20);
     let width = u32_at(header, 28);
     let height = u32_at(header, 32);
-    let declared = u64_at(header, 36);
+    let points_wide = f32::from_le_bytes([header[36], header[37], header[38], header[39]]);
+    let declared = u64_at(header, 40);
+    if !points_wide.is_finite() || points_wide <= 0.0 || points_wide > MAX_PAGE_POINTS {
+        return Err(format!(
+            "the page declared a printed width of {points_wide}"
+        ));
+    }
     if declared > MAX_RGBA_BYTES {
         return Err(format!(
             "the page declared {declared} bytes, past the {MAX_RGBA_BYTES} byte limit"
@@ -694,6 +712,7 @@ fn decode_frame(frame: &[u8], requested: usize) -> Result<DocumentPage, String> 
             index: requested,
             width,
             height,
+            points_wide,
             rgba: rgba.into(),
         },
     })
@@ -906,6 +925,7 @@ mod tests {
                 index: 1,
                 width: 2,
                 height: 1,
+                points_wide: 612.0,
                 rgba: vec![1, 2, 3, 4, 5, 6, 7, 8].into(),
             },
         };
@@ -926,11 +946,24 @@ mod tests {
         // A length past the preview ceiling is refused on the header alone,
         // before the parent could be talked into allocating for it.
         let mut enormous = whole.clone();
-        enormous[36..44].copy_from_slice(&(MAX_RGBA_BYTES + 1).to_le_bytes());
+        enormous[40..48].copy_from_slice(&(MAX_RGBA_BYTES + 1).to_le_bytes());
         assert!(decode_frame(&enormous, 1).unwrap_err().contains("past the"));
         let mut wide = whole.clone();
         wide[28..32].copy_from_slice(&(MAX_IMAGE_DIMENSION + 1).to_le_bytes());
         assert!(decode_frame(&wide, 1).is_err());
+
+        // A printed width is what every zoom step is a fraction of, so a
+        // helper that declares nonsense there is refused as well.
+        for nonsense in [0.0, -1.0, f32::NAN, MAX_PAGE_POINTS + 1.0] {
+            let mut absurd = whole.clone();
+            absurd[36..40].copy_from_slice(&nonsense.to_le_bytes());
+            assert!(
+                decode_frame(&absurd, 1)
+                    .unwrap_err()
+                    .contains("printed width"),
+                "a printed width of {nonsense} has to be refused"
+            );
+        }
 
         // Dimensions and length have to agree, or the upload draws nothing.
         let mut mismatched = whole.clone();
@@ -1007,7 +1040,7 @@ mod tests {
         let babbling = helper(
             root.path(),
             "babble",
-            "printf 'not a frame not a frame not a frame not a frame'",
+            "printf 'not a frame not a frame not a frame not a frame not a frame'",
         );
         let message = render_with_helper(
             &babbling,

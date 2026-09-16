@@ -83,7 +83,7 @@ pub enum OversizeKind {
     Document,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum FileContent {
     Editable {
         text: String,
@@ -112,11 +112,20 @@ pub enum FileContent {
 }
 
 /// One rasterized PDF page.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct PdfPage {
     pub index: usize,
     pub width: u32,
     pub height: u32,
+    /// How wide the page is in PostScript points, which is what it would
+    /// print at.
+    ///
+    /// Carried alongside the raster because the raster's own width is not a
+    /// reliable stand-in: a page large enough to reach the preview's pixel
+    /// limit is rasterized at a smaller scale than was asked for, and a
+    /// viewer sizing the sheet from the pixels would then draw every step
+    /// past that limit at the same size while telling the reader otherwise.
+    pub points_wide: f32,
     pub rgba: std::sync::Arc<[u8]>,
 }
 
@@ -474,10 +483,17 @@ impl PdfZoom {
     /// How much of the page's printed size this draws, which is also the
     /// resolution the raster is rendered at. `Fit` renders at the printed
     /// size and is then drawn to the pane's width.
+    ///
+    /// The table is reached through `get`, because the step is a public field
+    /// of a public variant and so any caller can name one that is not a step.
     pub fn factor(self) -> f32 {
+        let printed = Self::STEPS[usize::from(Self::PRINTED)];
         match self {
-            Self::Fit => Self::STEPS[usize::from(Self::PRINTED)],
-            Self::Scaled(step) => Self::STEPS[usize::from(step)],
+            Self::Fit => printed,
+            Self::Scaled(step) => Self::STEPS
+                .get(usize::from(step))
+                .copied()
+                .unwrap_or(printed),
         }
     }
 
@@ -498,10 +514,17 @@ impl PdfZoom {
     /// already on screen would spend a press without changing anything the
     /// reader can see. The printed size is still reachable from either
     /// neighbour.
+    ///
+    /// Neither control can promise a direction while leaving `Fit`, because
+    /// how large a fitted page is drawn depends on the pane, which nothing
+    /// here measures. A page fitted into a pane much wider than itself is
+    /// already past 125%, and stepping in then draws it smaller. The steps
+    /// either side of the printed size are the closest thing to the fitted
+    /// size that can be named without measuring.
     pub fn larger(self) -> Option<Self> {
         let step = match self {
             Self::Fit => Self::PRINTED + 1,
-            Self::Scaled(step) => step + 1,
+            Self::Scaled(step) => step.checked_add(1)?,
         };
         (usize::from(step) < Self::STEPS.len()).then_some(Self::Scaled(step))
     }
@@ -517,18 +540,18 @@ impl PdfZoom {
         matches!(self, Self::Fit)
     }
 
-    /// How wide the page is drawn, in logical pixels, given the raster the
-    /// helper produced. `None` is `Fit`, which takes the pane's width instead.
+    /// How wide the page is drawn, in logical pixels, for a page `points_wide`
+    /// points wide. `None` is `Fit`, which takes the pane's width instead.
     ///
-    /// Derived from the raster rather than from the page's points, so the
-    /// drawn sheet and the border around it always agree, including when the
-    /// helper had to clamp its scale to stay inside the preview's limits.
-    pub fn logical_width(self, raster_width: u32) -> Option<f32> {
+    /// Taken from the page's printed width rather than from the raster, so a
+    /// page whose scale the helper had to clamp is still drawn at the size the
+    /// label reports, by stretching the raster it could produce. Sizing from
+    /// the pixels instead would draw every step past that limit identically
+    /// while the label went on counting up.
+    pub fn logical_width(self, points_wide: f32) -> Option<f32> {
         match self {
             Self::Fit => None,
-            Self::Scaled(_) => {
-                Some((raster_width as f32 * PDF_LOGICAL_SCALE / PDF_PAGE_SCALE).max(1.0))
-            }
+            Self::Scaled(_) => Some((points_wide * PDF_LOGICAL_SCALE * self.factor()).max(1.0)),
         }
     }
 }

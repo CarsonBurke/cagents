@@ -368,7 +368,7 @@ pub enum RepositoryAction {
         card: CardId,
         tone: crate::editor::PdfTone,
     },
-    /// The reader changed how much of the pane one page takes.
+    /// The reader changed how large the page is drawn.
     PdfZoom {
         card: CardId,
         zoom: crate::editor::PdfZoom,
@@ -1198,14 +1198,19 @@ enum DocumentState {
         pages: usize,
         page: usize,
         tone: crate::editor::PdfTone,
-        /// How much of the pane's width one page takes. Not part of the
-        /// raster's identity by accident: a page rendered at one zoom and
-        /// drawn at another is either soft or needlessly large, so a change
-        /// here re-renders exactly as a page turn does.
+        /// How large the page is drawn: the pane's width at
+        /// `PdfZoom::Fit`, and a fraction of the page's printed size
+        /// otherwise. Not part of the raster's identity by accident: a page
+        /// rendered at one size and drawn at another is either soft or
+        /// needlessly large, so a change here re-renders exactly as a page
+        /// turn does.
         zoom: crate::editor::PdfZoom,
         handle: iced::widget::image::Handle,
         width: u32,
         height: u32,
+        /// The drawn page's printed width in points, which is what a zoom
+        /// step is a fraction of.
+        points_wide: f32,
         /// The page turn being rendered now, if any. A page is rasterized in
         /// another process, and the reader can turn faster than that, so only
         /// one render runs at a time and the newest turn waits in it.
@@ -3663,6 +3668,7 @@ impl RepositoryRuntime {
                         ),
                         width: page.width,
                         height: page.height,
+                        points_wide: page.points_wide,
                         page: page.index,
                         // A freshly opened document is drawn at the pane's
                         // width, which is the zoom the load rendered it for.
@@ -3813,6 +3819,7 @@ impl RepositoryRuntime {
                     handle,
                     width,
                     height,
+                    points_wide,
                     rendering,
                     message,
                     chosen_tone,
@@ -3836,6 +3843,10 @@ impl RepositoryRuntime {
                         let raster = rendered.page;
                         *width = raster.width;
                         *height = raster.height;
+                        // A page's printed width can differ from the last
+                        // one's, because a document may mix page sizes, and
+                        // every zoom step is a fraction of it.
+                        *points_wide = raster.points_wide;
                         *handle = iced::widget::image::Handle::from_rgba(
                             raster.width,
                             raster.height,
@@ -5990,6 +6001,7 @@ fn editor_surface(card: CardId, runtime: &RepositoryRuntime) -> Element<'_, Repo
             handle,
             width,
             height,
+            points_wide,
             rendering,
             message,
             chosen_tone: _,
@@ -6004,6 +6016,7 @@ fn editor_surface(card: CardId, runtime: &RepositoryRuntime) -> Element<'_, Repo
             handle,
             *width,
             *height,
+            *points_wide,
             rendering.is_some(),
             message,
         ),
@@ -6027,6 +6040,7 @@ fn pdf_document_view<'a>(
     handle: &iced::widget::image::Handle,
     width: u32,
     height: u32,
+    points_wide: f32,
     rendering: bool,
     message: &'a Option<String>,
 ) -> Element<'a, RepositoryAction> {
@@ -6064,20 +6078,24 @@ fn pdf_document_view<'a>(
     // ones a reader presses repeatedly, and a caption appearing beneath the
     // cursor between two presses would put the second press on a different
     // control.
+    //
+    // A caption takes the gap rather than its own width, because a row lays
+    // out its rigid children against what the ones before them left: a long
+    // failure message sized to its text would leave the controls after it
+    // nothing and collapse them to nothing at all.
+    let caption = |text: String| {
+        widget::text::caption(text)
+            .width(Length::Fill)
+            .wrapping(iced::widget::text::Wrapping::None)
+            .class(cosmic::theme::Text::Custom(crate::design::muted_text))
+    };
     if let Some(message) = message {
-        controls.push(
-            widget::text::caption(message.as_str())
-                .class(cosmic::theme::Text::Custom(crate::design::muted_text))
-                .into(),
-        );
+        controls.push(caption(message.clone()).into());
     } else if rendering {
-        controls.push(
-            widget::text::caption("Rendering…")
-                .class(cosmic::theme::Text::Custom(crate::design::muted_text))
-                .into(),
-        );
+        controls.push(caption("Rendering…".to_owned()).into());
+    } else {
+        controls.push(iced::widget::Space::new().width(Length::Fill).into());
     }
-    controls.push(iced::widget::Space::new().width(Length::Fill).into());
     let step = |to: Option<crate::editor::PdfZoom>, glyph: &'static str, label: &'static str| {
         icon_control(
             crate::ui_controls::symbolic_icon(glyph),
@@ -6092,12 +6110,14 @@ fn pdf_document_view<'a>(
         crate::interaction::tooltip(
             // A fixed width, because the label is between the two controls a
             // reader presses repeatedly and "Fit", "50%" and "125%" are three
-            // different widths.
+            // different widths. The text fills that width so that it is the
+            // label rather than the box that is centred on.
             widget::container(
                 widget::text::body(
                     zoom.percent()
                         .map_or_else(|| "Fit".to_owned(), |percent| format!("{percent}%")),
                 )
+                .width(Length::Fill)
                 .center(),
             )
             .width(Length::Fixed(ZOOM_LABEL_WIDTH)),
@@ -6107,12 +6127,16 @@ fn pdf_document_view<'a>(
     );
     controls.push(step(zoom.larger(), "zoom-in-symbolic", "Draw the page larger").into());
     controls.push(
+        // Enabled even while fitted, because this is the mode the viewer is
+        // in rather than an action: pressing it again asks for what is already
+        // drawn, which the update rejects, and staying enabled is what lets
+        // the selected surface say that fitting is what the size means now.
         icon_control(
             crate::ui_controls::symbolic_icon("zoom-fit-best-symbolic"),
             "Fit the page to the pane",
             zoom.is_fit(),
-            !zoom.is_fit(),
-            (!zoom.is_fit()).then_some(RepositoryAction::PdfZoom {
+            true,
+            Some(RepositoryAction::PdfZoom {
                 card,
                 zoom: crate::editor::PdfZoom::Fit,
             }),
@@ -6158,10 +6182,16 @@ fn pdf_document_view<'a>(
         .width(Length::Fill)
         .into(),
         crate::interaction::tooltip(
-            widget::container(pdf_page_surface(handle.clone(), zoom, width, height))
-                .padding(crate::design::GRID_UNIT * 3.0)
-                .width(Length::Fill)
-                .height(Length::Fill),
+            widget::container(pdf_page_surface(
+                handle.clone(),
+                zoom,
+                points_wide,
+                width,
+                height,
+            ))
+            .padding(crate::design::GRID_UNIT * 3.0)
+            .width(Length::Fill)
+            .height(Length::Fill),
             format!("Page {} of {pages}, {width} × {height} pixels", page + 1),
         )
         .into(),
@@ -6176,23 +6206,24 @@ fn pdf_document_view<'a>(
 /// At `PdfZoom::Fit` the page fills the pane's width and scrolls, rather than
 /// being shrunk to fit its height: a document is read a column at a time, and
 /// a whole page scaled into a wide pane is too small to read. Every other step
-/// is a fraction of the page's printed size, taken from the raster the helper
-/// produced rather than from the pane, so the sheet and the hairline around it
-/// agree even when the helper had to clamp its scale, and so nothing here has
-/// to measure the pane. Measuring it would mean `Responsive`, which implements
-/// no `a11y_nodes` and would take this region's scroll view and image out of
-/// the accessibility tree.
+/// is a fraction of the page's printed width, so nothing here measures the
+/// pane. Measuring it would mean `Responsive`, which implements no
+/// `a11y_nodes` and would take this region's scroll view and image out of the
+/// accessibility tree.
 fn pdf_page_surface(
     handle: iced::widget::image::Handle,
     zoom: crate::editor::PdfZoom,
+    points_wide: f32,
     raster_width: u32,
     raster_height: u32,
 ) -> Element<'static, RepositoryAction> {
-    let drawn = zoom.logical_width(raster_width).map(|width| {
-        // The height is stated rather than shrunk to the raster, because
-        // `ContentFit::Contain` only ever scales down: a box left at the
-        // raster's own height would draw the paper smaller than the box and
-        // leave the border standing off it.
+    let drawn = zoom.logical_width(points_wide).map(|width| {
+        // Both axes are stated, at the raster's own aspect, so that
+        // `ContentFit::Contain` fills the box exactly whichever way it has to
+        // scale and the hairline sits on the paper rather than around a
+        // letterboxed image. Left to `Length::Shrink` the height would
+        // collapse to the raster's pixel height, which is the wrong shape for
+        // any page drawn wider than it was rendered.
         let height = width * raster_height.max(1) as f32 / raster_width.max(1) as f32;
         (width, height)
     });
@@ -6208,7 +6239,10 @@ fn pdf_page_surface(
     // Both rails are reserved rather than left to float, because a thumb over
     // the page is a thumb over the text the reader zoomed in to read. A page
     // drawn at a fixed size may need either axis, so a scrollable that can
-    // move on both is used whenever the size is the reader's choice.
+    // move on both is used whenever the size is the reader's choice. As in the
+    // removed-lines pane, the reservation is an inset on the content and the
+    // thumbs are anchored to the viewport, so it clears a thumb whenever the
+    // other axis is at its end and only narrows the overlap elsewhere.
     //
     // The page's top left corner stays at the pane's, at every size the reader
     // chooses. Centring a page narrower than the pane would need the pane's
@@ -10394,6 +10428,7 @@ mod tests {
                 index,
                 width: 2,
                 height: 2,
+                points_wide: 612.0,
                 rgba: vec![255; 16].into(),
             },
         }
@@ -10572,18 +10607,25 @@ mod tests {
             zoom = larger;
         }
         assert_eq!(zoom.larger(), None, "the largest step offers no press");
-        // A page drawn at a size of its own is as wide as the raster asks for,
-        // so the sheet and the border around it cannot disagree, while a
-        // fitted page takes the pane's width instead.
-        assert_eq!(fit.logical_width(1000), None);
+        // A fitted page takes the pane's width, and every other step is the
+        // size the page would print at times the step.
+        assert_eq!(fit.logical_width(612.0), None);
         let printed = crate::editor::PdfZoom::Scaled(2);
         assert_eq!(printed.percent(), Some(100));
-        let width = printed.logical_width(1700).unwrap();
+        // A point is 1/72 inch against a 96 pixel inch, so a 1000 point page
+        // prints 1333.3 logical pixels wide however coarse or fine the raster
+        // behind it turned out to be.
+        let width = printed.logical_width(1000.0).unwrap();
         assert!(
-            (width - 1700.0 * crate::editor::PDF_LOGICAL_SCALE / crate::editor::PDF_PAGE_SCALE)
-                .abs()
-                < 0.01,
-            "{width} does not undo the supersampling the helper rendered at"
+            (width - 1333.33).abs() < 0.01,
+            "{width} is not the width a 1000 point page prints at"
+        );
+        let doubled = crate::editor::PdfZoom::Scaled(5)
+            .logical_width(1000.0)
+            .unwrap();
+        assert!(
+            (doubled - 2.0 * width).abs() < 0.01,
+            "{doubled} is not twice the printed width the 200% step promises"
         );
     }
 
