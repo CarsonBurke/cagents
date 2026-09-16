@@ -5,42 +5,100 @@
 //! Menus actually reconcile their items in `LocalState.menu_bar_state.inner`.
 //! Declare the real stateless Space child here from the first frame, and leave
 //! event handling, menu reconciliation and overlays to the native widget.
+//!
+//! The native widget's whole state therefore lives one level down, under a node
+//! of ours that remembers how many items the menu had. See [`MenuSurface::diff`]
+//! for why that indirection is load-bearing.
 
 use super::*;
 
 pub(super) fn surface<'a, Message: Clone + 'static>(
     menu: Vec<widget::menu::Tree<Message>>,
 ) -> Element<'a, Message> {
-    Element::new(MenuSurface(widget::context_menu(
-        cosmic::iced::widget::Space::new()
-            .width(Length::Fill)
-            .height(Length::Fill),
-        Some(menu),
-    )))
+    let items = menu.len();
+    Element::new(MenuSurface {
+        native: widget::context_menu(
+            cosmic::iced::widget::Space::new()
+                .width(Length::Fill)
+                .height(Length::Fill),
+            Some(menu),
+        ),
+        items,
+    })
 }
 
-struct MenuSurface<'a, Message>(widget::ContextMenu<'a, Message>);
+/// How many items the menu had when the native widget last measured it.
+///
+/// This is the only quantity the retained menu geometry is indexed by: the
+/// native widget stores one `MenuState` per open level, and its `MenuBounds`
+/// holds a position and a size per item of the list that level was opened on.
+/// Our menus are flat, so the top-level item count is their entire shape.
+struct MenuItems(usize);
+
+struct MenuSurface<'a, Message> {
+    native: widget::ContextMenu<'a, Message>,
+    items: usize,
+}
+
+impl<Message: Clone + 'static> MenuSurface<'_, Message> {
+    /// The native widget's own tree, as `ContextMenu::diff` leaves it.
+    ///
+    /// `ContextMenu::children` also declares the legacy menu subtree, which the
+    /// very first `diff` truncates away after cloning every menu item into it,
+    /// so build the surviving shape directly instead.
+    fn native_tree(&self) -> Tree {
+        Tree {
+            id: None,
+            tag: self.native.tag(),
+            state: self.native.state(),
+            // The only content is Space, whose native tree is stateless and empty.
+            children: vec![Tree::empty()],
+        }
+    }
+}
 
 impl<Message: Clone + 'static> Widget<Message, Theme, Renderer> for MenuSurface<'_, Message> {
     fn tag(&self) -> tree::Tag {
-        self.0.tag()
+        tree::Tag::of::<MenuItems>()
     }
 
     fn state(&self) -> tree::State {
-        self.0.state()
+        tree::State::new(MenuItems(self.items))
     }
 
     fn children(&self) -> Vec<Tree> {
-        // The only content is Space, whose native tree is stateless and empty.
-        vec![Tree::empty()]
+        vec![self.native_tree()]
     }
 
     fn diff(&mut self, tree: &mut Tree) {
-        self.0.diff(tree);
+        // An open menu measures its items once, at the click that opens it, and
+        // then keeps that geometry in the state its overlay reads every frame.
+        // The roots the overlay walks are this frame's, though: `ContextMenu::
+        // diff` reconciles the item widget trees against them and the overlay
+        // clones them. A row whose menu gains or loses an item while it is open
+        // therefore hands the overlay a list of a different length than the
+        // geometry describing it, and the overlay indexes one by the other.
+        //
+        // Holding the native state in a child makes that unrepresentable rather
+        // than merely unlikely: the item count the geometry was measured for is
+        // recorded beside that child, and a count that no longer matches
+        // discards the geometry and the roots together, leaving a closed menu
+        // and nothing stale to read. Reconciling the retained geometry in place
+        // is not ours to do, since the native `LocalState` is opaque to us, and
+        // an open menu that silently restructures under the pointer is a
+        // mis-click waiting to happen either way.
+        let measured = tree.state.downcast_mut::<MenuItems>();
+        let remeasured = measured.0 != self.items;
+        measured.0 = self.items;
+        if remeasured || tree.children.is_empty() {
+            tree.children = vec![self.native_tree()];
+        }
+        let native: &mut dyn Widget<Message, Theme, Renderer> = &mut self.native;
+        tree.children[0].diff(native);
     }
 
     fn size(&self) -> Size<Length> {
-        self.0.size()
+        self.native.size()
     }
 
     fn layout(
@@ -49,7 +107,7 @@ impl<Message: Clone + 'static> Widget<Message, Theme, Renderer> for MenuSurface<
         renderer: &Renderer,
         limits: &layout::Limits,
     ) -> layout::Node {
-        self.0.layout(tree, renderer, limits)
+        self.native.layout(&mut tree.children[0], renderer, limits)
     }
 
     fn update(
@@ -76,7 +134,7 @@ impl<Message: Clone + 'static> Widget<Message, Theme, Renderer> for MenuSurface<
             .intersection(viewport)
             .is_some_and(|bounds| cursor.is_over(bounds));
         if opening {
-            self.0.diff(tree);
+            self.native.diff(&mut tree.children[0]);
         }
         // The native widget records the anchor it opens at from this cursor,
         // and the runtime drives the overlay it returns in window space. A
@@ -102,8 +160,8 @@ impl<Message: Clone + 'static> Widget<Message, Theme, Renderer> for MenuSurface<
         let scroll = layout.virtual_offset();
         let row = layout.bounds();
         let anchor = layout::Node::new(row.size()).move_to(row.position() - scroll);
-        self.0.update(
-            tree,
+        self.native.update(
+            &mut tree.children[0],
             event,
             Layout::new(&anchor),
             cursor - scroll,
@@ -128,8 +186,15 @@ impl<Message: Clone + 'static> Widget<Message, Theme, Renderer> for MenuSurface<
         cursor: mouse::Cursor,
         viewport: &Rectangle,
     ) {
-        self.0
-            .draw(tree, renderer, theme, style, layout, cursor, viewport);
+        self.native.draw(
+            &tree.children[0],
+            renderer,
+            theme,
+            style,
+            layout,
+            cursor,
+            viewport,
+        );
     }
 
     fn overlay<'a>(
@@ -144,7 +209,12 @@ impl<Message: Clone + 'static> Widget<Message, Theme, Renderer> for MenuSurface<
         // runtime drives overlays in, so the native menu needs no translation:
         // it derives one offset for its layout and the opposite one for its
         // hit tests, and the two only agree at none at all.
-        self.0
-            .overlay(tree, layout, renderer, viewport, Vector::ZERO)
+        self.native.overlay(
+            &mut tree.children[0],
+            layout,
+            renderer,
+            viewport,
+            Vector::ZERO,
+        )
     }
 }

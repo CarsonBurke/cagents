@@ -1426,6 +1426,260 @@ mod tests {
         assert_eq!(overflow_edges(12.0, 200.0, 400.0), (true, true));
         assert_eq!(overflow_edges(200.0, 200.0, 400.0), (true, false));
     }
+
+    /// Whole frames of a real context menu, driven the way the runtime drives
+    /// them: build (which diffs and lays out), then update (which builds the
+    /// overlay, lays it out and feeds it the events). Menu state, overlays and
+    /// reconciliation therefore interleave exactly as they do in the app.
+    mod context_menus {
+        use super::*;
+        use cosmic::iced::advanced::clipboard;
+        use cosmic::iced::event::Status;
+        use cosmic::iced::runtime::{UserInterface, user_interface::Cache};
+
+        #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+        enum Act {
+            Item(usize),
+        }
+
+        impl widget::menu::Action for Act {
+            type Message = Act;
+            fn message(&self) -> Self::Message {
+                *self
+            }
+        }
+
+        /// A flat menu of `items` buttons, the shape every menu in this app has.
+        fn menu(items: usize) -> Vec<widget::menu::Tree<Act>> {
+            let entries = (0..items)
+                .map(|index| {
+                    widget::menu::Item::Button(format!("Item {index}"), None, Act::Item(index))
+                })
+                .collect();
+            widget::menu::items(&std::collections::HashMap::new(), entries)
+        }
+
+        fn row(items: usize) -> Element<'static, Act> {
+            context_menu(bare_row(), menu(items))
+        }
+
+        fn bare_row() -> Element<'static, Act> {
+            cosmic::iced::widget::Space::new()
+                .width(Length::Fill)
+                .height(ROW_HEIGHT)
+                .into()
+        }
+
+        const ROW_HEIGHT: f32 = 32.0;
+        const WINDOW: Size = Size {
+            width: 400.0,
+            height: 400.0,
+        };
+        /// Inside the first row, so a right click here opens that row's menu.
+        const ANCHOR: Point = Point { x: 20.0, y: 16.0 };
+        /// Inside the menu the anchor opens, so an open menu captures motion
+        /// here and a dismissed one does not.
+        const OVER_MENU: Point = Point { x: 60.0, y: 60.0 };
+
+        fn headless_renderer() -> Renderer {
+            use cosmic::iced::advanced::renderer::Headless;
+            use cosmic::iced::{Font, Pixels};
+
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("executor")
+                .block_on(Renderer::new(
+                    Font::default(),
+                    Pixels(14.0),
+                    Some("tiny-skia"),
+                ))
+                .expect("a headless renderer")
+        }
+
+        struct Frames {
+            renderer: Renderer,
+            cache: Cache,
+            messages: Vec<Act>,
+        }
+
+        impl Frames {
+            fn new() -> Self {
+                Self {
+                    renderer: headless_renderer(),
+                    cache: Cache::new(),
+                    messages: Vec::new(),
+                }
+            }
+
+            fn frame(
+                &mut self,
+                element: Element<'static, Act>,
+                events: &[Event],
+                cursor: Point,
+            ) -> Vec<Status> {
+                let mut ui = UserInterface::build(
+                    element,
+                    WINDOW,
+                    std::mem::replace(&mut self.cache, Cache::new()),
+                    &mut self.renderer,
+                );
+                let (_, statuses) = ui.update(
+                    events,
+                    mouse::Cursor::Available(cursor),
+                    &mut self.renderer,
+                    &mut clipboard::Null,
+                    &mut self.messages,
+                );
+                self.cache = ui.into_cache();
+                statuses
+            }
+
+            /// Whether the menu anchored at [`ANCHOR`] is on screen, asked the
+            /// way a user asks: only an open menu swallows the pointer.
+            fn menu_is_open(&mut self, element: Element<'static, Act>) -> bool {
+                self.frame(element, &[moved(OVER_MENU)], OVER_MENU)
+                    .contains(&Status::Captured)
+            }
+
+            /// Mounts the row, right-clicks it and lets the requested frame
+            /// arrive, which is when the native widget measures the menu.
+            fn open_menu(&mut self, items: usize) {
+                let _ = self.frame(row(items), &[], ANCHOR);
+                let _ = self.frame(row(items), &right_click(), ANCHOR);
+                let _ = self.frame(row(items), &[redraw()], ANCHOR);
+                assert!(
+                    self.menu_is_open(row(items)),
+                    "a right click on the row should have opened its {items}-item menu"
+                );
+            }
+        }
+
+        fn moved(position: Point) -> Event {
+            Event::Mouse(mouse::Event::CursorMoved { position })
+        }
+
+        /// The frame the opening right click asks for. The native widget only
+        /// measures its menu while the pointer is still over the row, so this
+        /// is the event that puts the menu on screen.
+        fn redraw() -> Event {
+            Event::Window(window::Event::RedrawRequested(Instant::now()))
+        }
+
+        fn right_click() -> Vec<Event> {
+            vec![
+                Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Right)),
+                Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Right)),
+            ]
+        }
+
+        #[test]
+        fn an_open_menu_outlives_frames_that_leave_its_items_alone() {
+            // The dismissal below must cost something, or it would be no fix at
+            // all: a menu that closes on the next frame regardless is useless.
+            let mut frames = Frames::new();
+            frames.open_menu(6);
+            for _ in 0..3 {
+                assert!(
+                    frames.menu_is_open(row(6)),
+                    "an unchanged menu should stay open across frames"
+                );
+            }
+        }
+
+        #[test]
+        fn an_open_menu_losing_items_dismisses_itself() {
+            // The native widget measures a position and a size per item once,
+            // when the menu opens, and then reads that geometry against every
+            // later frame's item list. Shrinking the list used to leave the
+            // overlay indexing the new list by the old geometry.
+            let mut frames = Frames::new();
+            frames.open_menu(6);
+            assert!(
+                !frames.menu_is_open(row(4)),
+                "a menu missing two of its items is not the menu that was opened"
+            );
+            for items in [3, 1] {
+                assert!(!frames.menu_is_open(row(items)));
+            }
+        }
+
+        #[test]
+        fn an_open_menu_gaining_items_dismisses_itself() {
+            let mut frames = Frames::new();
+            frames.open_menu(2);
+            assert!(!frames.menu_is_open(row(9)));
+        }
+
+        #[test]
+        fn a_row_that_loses_its_menu_entirely_can_get_it_back() {
+            // Sidebar and file rows drop the whole wrapper when a modal opens
+            // or the host forbids the commands, so the menu leaves and returns.
+            let mut frames = Frames::new();
+            frames.open_menu(5);
+            assert!(!frames.menu_is_open(bare_row()));
+            let _ = frames.frame(row(5), &right_click(), ANCHOR);
+            let _ = frames.frame(row(5), &[redraw()], ANCHOR);
+            assert!(
+                frames.menu_is_open(row(5)),
+                "the row should open a fresh menu once its wrapper is back"
+            );
+        }
+
+        #[test]
+        fn a_dismissed_menu_leaves_the_row_able_to_open_another() {
+            let mut frames = Frames::new();
+            frames.open_menu(6);
+            assert!(!frames.menu_is_open(row(3)));
+            let _ = frames.frame(row(3), &right_click(), ANCHOR);
+            let _ = frames.frame(row(3), &[redraw()], ANCHOR);
+            assert!(
+                frames.menu_is_open(row(3)),
+                "the surface should still open the menu it now has"
+            );
+        }
+
+        /// `rows` rows in a scrollable, the one at `anchored` carrying `items`.
+        fn scrolled(rows: usize, anchored: usize, items: usize) -> Element<'static, Act> {
+            let children = (0..rows)
+                .map(|index| {
+                    if index == anchored {
+                        row(items)
+                    } else {
+                        row(items + 1)
+                    }
+                })
+                .collect::<Vec<_>>();
+            widget::scrollable(widget::column::with_children(children))
+                .height(Length::Fixed(WINDOW.height))
+                .into()
+        }
+
+        #[test]
+        fn a_menu_in_a_scrollable_survives_its_row_moving_and_leaving() {
+            // A row can scroll away, or be replaced at its index by a row whose
+            // menu is a different length, while its menu is still up.
+            let mut frames = Frames::new();
+            let _ = frames.frame(scrolled(40, 0, 5), &[], ANCHOR);
+            let _ = frames.frame(scrolled(40, 0, 5), &right_click(), ANCHOR);
+            let _ = frames.frame(scrolled(40, 0, 5), &[redraw()], ANCHOR);
+            for events in [
+                vec![Event::Mouse(mouse::Event::WheelScrolled {
+                    delta: mouse::ScrollDelta::Pixels { x: 0.0, y: -240.0 },
+                })],
+                vec![moved(OVER_MENU)],
+            ] {
+                let _ = frames.frame(scrolled(40, 0, 5), &events, OVER_MENU);
+            }
+            // The anchored row's menu grows, then the row is gone altogether.
+            let _ = frames.frame(scrolled(40, 0, 8), &[moved(OVER_MENU)], OVER_MENU);
+            let _ = frames.frame(scrolled(3, 2, 8), &[moved(OVER_MENU)], OVER_MENU);
+            assert!(
+                !frames.menu_is_open(scrolled(3, 9, 5)),
+                "no menu should survive its row being replaced"
+            );
+        }
+    }
 }
 
 // Keep the wrapper anonymous: giving it its child's ID would register two
