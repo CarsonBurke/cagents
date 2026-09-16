@@ -28,8 +28,8 @@ use std::{
 };
 
 use crate::editor::{
-    MAX_DOCUMENT_BYTES, MAX_IMAGE_DIMENSION, MAX_IMAGE_PIXELS, MAX_PDF_PAGES, PDF_PAGE_SCALE,
-    PdfPage, PdfTone, PdfZoom, check_image_dimensions,
+    MAX_DOCUMENT_BYTES, MAX_IMAGE_DIMENSION, MAX_PDF_PAGES, PDF_PAGE_SCALE, PdfPage, PdfTone,
+    PdfZoom, check_image_dimensions,
 };
 
 /// The argument that turns this executable into the render helper.
@@ -527,13 +527,19 @@ fn render_page(
 
 /// The scale a page is actually rasterized at.
 ///
-/// The reader asks for `wanted`; a page large enough that `wanted` would put
-/// it past the preview's pixel limits is drawn as sharply as those allow
-/// instead of being refused, because a reader zooming into a poster-sized
-/// plan wants to see it rather than to be told its dimensions. Both limits
-/// the parent checks the arriving frame against are applied here, so the
-/// helper cannot send a page its own parent will reject. `None` means the
-/// page declares no size to scale, which no amount of scaling fixes.
+/// The reader asks for `wanted`, and both ends are bounded. A page large
+/// enough that `wanted` would put it past `MAX_IMAGE_DIMENSION` is drawn as
+/// sharply as the limit allows instead of being refused, because a reader
+/// zooming into a poster-sized plan wants to see it rather than to be told its
+/// dimensions. The pixel budget the parent also checks needs no term of its
+/// own, because `MAX_IMAGE_PIXELS` is `MAX_IMAGE_DIMENSION` squared and the
+/// per-axis clamp therefore implies it. A page under a point tall is scaled
+/// up instead, because `hayro` floors its pixmap and a zero-height page is
+/// refused by the parent with a message about being too large.
+///
+/// `None` is a page no scale can render: one with no size, or one whose two
+/// axes are so far apart that a single pixel on the short one already puts
+/// the long one past the limit.
 fn render_scale(points_wide: f32, points_high: f32, wanted: f32) -> Option<f32> {
     if !points_wide.is_finite()
         || !points_high.is_finite()
@@ -544,9 +550,9 @@ fn render_scale(points_wide: f32, points_high: f32, wanted: f32) -> Option<f32> 
     {
         return None;
     }
-    let by_axis = MAX_IMAGE_DIMENSION as f32 / points_wide.max(points_high);
-    let by_area = (MAX_IMAGE_PIXELS as f32 / (points_wide * points_high)).sqrt();
-    Some(wanted.min(by_axis).min(by_area))
+    let most = MAX_IMAGE_DIMENSION as f32 / points_wide.max(points_high);
+    let least = 1.0 / points_wide.min(points_high);
+    (least <= most).then(|| wanted.clamp(least, most))
 }
 
 /// Reads the document in the helper, bounded again.
@@ -824,7 +830,7 @@ mod tests {
             zoomed.page.width as usize * zoomed.page.height as usize * 4
         );
 
-        // A page this size at the largest zoom would be far past both limits,
+        // A page this size at the largest zoom would be far past the limit,
         // and a reader zooming into a poster wants to see it rather than to be
         // told its dimensions.
         let poster = render_scale(2400.0, 3600.0, PDF_PAGE_SCALE * 3.0).unwrap();
@@ -833,12 +839,23 @@ mod tests {
             width <= MAX_IMAGE_DIMENSION as f32 && height <= MAX_IMAGE_DIMENSION as f32,
             "{width} by {height} is past the per-axis limit the parent enforces"
         );
+        // A page under a point tall is scaled up instead, because hayro floors
+        // its pixmap and the parent refuses a zero-height page with a message
+        // about it being too large.
+        let sliver = render_scale(600.0, 0.4, PDF_PAGE_SCALE * 0.5).unwrap();
         assert!(
-            (width * height) as u64 <= MAX_IMAGE_PIXELS,
-            "{width} by {height} is past the pixel budget the parent enforces"
+            (0.4 * sliver) as u32 >= 1,
+            "a {}-pixel axis would be refused as oversize",
+            0.4 * sliver
         );
+        assert!(600.0 * sliver <= MAX_IMAGE_DIMENSION as f32);
         assert_eq!(render_scale(0.0, 10.0, 1.0), None);
         assert_eq!(render_scale(10.0, 10.0, f32::INFINITY), None);
+        assert_eq!(
+            render_scale(f32::MAX, 0.000_001, 1.0),
+            None,
+            "a page no scale can fit in the limit has to be refused rather than clamped"
+        );
     }
 
     #[test]

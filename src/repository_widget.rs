@@ -1235,10 +1235,10 @@ enum DocumentState {
 /// that asks "is this the page the reader is looking at" has to ask about all
 /// three, and a comparison that forgets one silently accepts a stale raster.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct PdfView {
-    pub page: usize,
-    pub tone: crate::editor::PdfTone,
-    pub zoom: crate::editor::PdfZoom,
+struct PdfView {
+    page: usize,
+    tone: crate::editor::PdfTone,
+    zoom: crate::editor::PdfZoom,
 }
 
 /// The page turn a child process is rendering now.
@@ -1388,6 +1388,9 @@ struct VisibleRows {
 const DIFF_ROW_HEIGHT: f32 = 30.0;
 const VISIBLE_ROW_OVERSCAN: usize = 6;
 const INITIAL_VIEWPORT_HEIGHT: f32 = 900.0;
+/// Room for the widest zoom step the viewer's label can hold, so the controls
+/// either side of it do not move when the step changes.
+const ZOOM_LABEL_WIDTH: f32 = 48.0;
 /// How many committed comparisons one open file keeps.
 ///
 /// Viewed working bases stay cached until a save or mutation invalidates them.
@@ -6055,8 +6058,12 @@ fn pdf_document_view<'a>(
         widget::text::body(format!("{} / {pages}", page + 1)).into(),
         turn(page + 1, "go-next-symbolic", "Next page", page + 1 < pages).into(),
         turn(pages - 1, "go-last-symbolic", "Last page", page + 1 < pages).into(),
-        iced::widget::Space::new().width(Length::Fill).into(),
     ];
+    // The status sits on the flexible gap's left, so that a render starting or
+    // landing cannot move the controls on its right. The zoom controls are the
+    // ones a reader presses repeatedly, and a caption appearing beneath the
+    // cursor between two presses would put the second press on a different
+    // control.
     if let Some(message) = message {
         controls.push(
             widget::text::caption(message.as_str())
@@ -6070,6 +6077,7 @@ fn pdf_document_view<'a>(
                 .into(),
         );
     }
+    controls.push(iced::widget::Space::new().width(Length::Fill).into());
     let step = |to: Option<crate::editor::PdfZoom>, glyph: &'static str, label: &'static str| {
         icon_control(
             crate::ui_controls::symbolic_icon(glyph),
@@ -6082,16 +6090,35 @@ fn pdf_document_view<'a>(
     controls.push(step(zoom.smaller(), "zoom-out-symbolic", "Draw the page smaller").into());
     controls.push(
         crate::interaction::tooltip(
-            widget::text::body(if zoom.is_fit() {
-                "Fit".to_owned()
-            } else {
-                format!("{}%", zoom.percent())
-            }),
-            "How much of the pane's width one page takes",
+            // A fixed width, because the label is between the two controls a
+            // reader presses repeatedly and "Fit", "50%" and "125%" are three
+            // different widths.
+            widget::container(
+                widget::text::body(
+                    zoom.percent()
+                        .map_or_else(|| "Fit".to_owned(), |percent| format!("{percent}%")),
+                )
+                .center(),
+            )
+            .width(Length::Fixed(ZOOM_LABEL_WIDTH)),
+            "How large the page is drawn, against the size it would print",
         )
         .into(),
     );
     controls.push(step(zoom.larger(), "zoom-in-symbolic", "Draw the page larger").into());
+    controls.push(
+        icon_control(
+            crate::ui_controls::symbolic_icon("zoom-fit-best-symbolic"),
+            "Fit the page to the pane",
+            zoom.is_fit(),
+            !zoom.is_fit(),
+            (!zoom.is_fit()).then_some(RepositoryAction::PdfZoom {
+                card,
+                zoom: crate::editor::PdfZoom::Fit,
+            }),
+        )
+        .into(),
+    );
     controls.push(
         icon_control(
             crate::ui_controls::symbolic_icon(if inverted {
@@ -6131,7 +6158,7 @@ fn pdf_document_view<'a>(
         .width(Length::Fill)
         .into(),
         crate::interaction::tooltip(
-            widget::container(pdf_page_surface(handle.clone(), zoom))
+            widget::container(pdf_page_surface(handle.clone(), zoom, width, height))
                 .padding(crate::design::GRID_UNIT * 3.0)
                 .width(Length::Fill)
                 .height(Length::Fill),
@@ -6144,82 +6171,64 @@ fn pdf_document_view<'a>(
     .into()
 }
 
-/// The sheet the page is drawn on, sized against the pane reading it.
+/// The sheet the page is drawn on.
 ///
-/// At the default zoom the page fills the pane's width and scrolls, rather
-/// than being shrunk to fit its height: a document is read a column at a
-/// time, and a whole page scaled into a wide pane is too small to read. Any
-/// other zoom is a multiple of that same width, which is why the pane has to
-/// be measured. `responsive` is what measures it, and it is safe here in a
-/// way it is not in the diff panes: the accessible name for this region sits
-/// on the container outside it, so nothing is lost by `Responsive` not
-/// implementing `a11y_nodes`.
+/// At `PdfZoom::Fit` the page fills the pane's width and scrolls, rather than
+/// being shrunk to fit its height: a document is read a column at a time, and
+/// a whole page scaled into a wide pane is too small to read. Every other step
+/// is a fraction of the page's printed size, taken from the raster the helper
+/// produced rather than from the pane, so the sheet and the hairline around it
+/// agree even when the helper had to clamp its scale, and so nothing here has
+/// to measure the pane. Measuring it would mean `Responsive`, which implements
+/// no `a11y_nodes` and would take this region's scroll view and image out of
+/// the accessibility tree.
 fn pdf_page_surface(
     handle: iced::widget::image::Handle,
     zoom: crate::editor::PdfZoom,
+    raster_width: u32,
+    raster_height: u32,
 ) -> Element<'static, RepositoryAction> {
-    if zoom.is_fit() {
-        return pdf_page_sheet(handle, None);
-    }
-    let factor = zoom.factor();
-    iced::widget::responsive(move |size| {
-        pdf_page_sheet(
-            handle.clone(),
-            Some(PageSizing {
-                page: (size.width * factor).max(1.0),
-                pane: size.width.max(1.0),
-            }),
-        )
-    })
-    .into()
-}
-
-/// How wide the page is drawn, and how wide the pane drawing it is.
-///
-/// The pane's own width is carried rather than filled, because a scrollable
-/// that can move on both axes gives its content an unbounded cross axis, so
-/// `Length::Fill` inside one resolves to the content's own width and centres
-/// nothing.
-#[derive(Clone, Copy)]
-struct PageSizing {
-    page: f32,
-    pane: f32,
-}
-
-fn pdf_page_sheet(
-    handle: iced::widget::image::Handle,
-    sizing: Option<PageSizing>,
-) -> Element<'static, RepositoryAction> {
+    let drawn = zoom.logical_width(raster_width).map(|width| {
+        // The height is stated rather than shrunk to the raster, because
+        // `ContentFit::Contain` only ever scales down: a box left at the
+        // raster's own height would draw the paper smaller than the box and
+        // leave the border standing off it.
+        let height = width * raster_height.max(1) as f32 / raster_width.max(1) as f32;
+        (width, height)
+    });
     let sheet = widget::container(
         iced::widget::image(handle)
             .content_fit(iced::ContentFit::Contain)
-            .width(sizing.map_or(Length::Fill, |sizing| Length::Fixed(sizing.page))),
+            .width(drawn.map_or(Length::Fill, |(width, _)| Length::Fixed(width)))
+            .height(drawn.map_or(Length::Shrink, |(_, height)| Length::Fixed(height))),
     )
     // A hairline around the sheet, because a recolored page is close in tone
     // to the surface behind it and a reader needs to see where the paper ends.
     .class(cosmic::theme::Container::Custom(Box::new(page_edge)));
-    // Only a page wider than the pane needs to move sideways. A narrower one
-    // is centred in the pane instead, so shrinking a page does not leave it
-    // hugging an edge with dead space beside it.
-    let (direction, sheet) = match sizing {
-        Some(sizing) if sizing.page > sizing.pane => (
+    // Both rails are reserved rather than left to float, because a thumb over
+    // the page is a thumb over the text the reader zoomed in to read. A page
+    // drawn at a fixed size may need either axis, so a scrollable that can
+    // move on both is used whenever the size is the reader's choice.
+    //
+    // The page's top left corner stays at the pane's, at every size the reader
+    // chooses. Centring a page narrower than the pane would need the pane's
+    // width, which a two-axis scrollable does not report while its content
+    // fits, and it would move the page sideways as it crossed the pane's width
+    // on the way in.
+    let sheet = widget::container(sheet).padding(if drawn.is_some() {
+        crate::design::with_both_rails(iced::Padding::ZERO)
+    } else {
+        crate::design::with_vertical_rail(iced::Padding::ZERO)
+    });
+    widget::scrollable(sheet)
+        .direction(if drawn.is_some() {
             iced::widget::scrollable::Direction::Both {
                 vertical: crate::design::scrollbar(),
                 horizontal: crate::design::scrollbar(),
-            },
-            widget::container(sheet),
-        ),
-        Some(sizing) => (
-            iced::widget::scrollable::Direction::Vertical(crate::design::scrollbar()),
-            widget::container(sheet).center_x(Length::Fixed(sizing.pane)),
-        ),
-        None => (
-            iced::widget::scrollable::Direction::Vertical(crate::design::scrollbar()),
-            widget::container(sheet),
-        ),
-    };
-    widget::scrollable(sheet)
-        .direction(direction)
+            }
+        } else {
+            iced::widget::scrollable::Direction::Vertical(crate::design::scrollbar())
+        })
         .width(Length::Fill)
         .height(Length::Fill)
         .into()
@@ -10533,7 +10542,19 @@ mod tests {
 
     #[test]
     fn the_zoom_steps_stay_ordered_and_bounded() {
-        let mut zoom = crate::editor::PdfZoom::default();
+        let fit = crate::editor::PdfZoom::default();
+        assert!(fit.is_fit(), "a document opens fitted to its pane");
+        assert_eq!(
+            fit.percent(),
+            None,
+            "a fitted page has no size of its own to report"
+        );
+        // Either control has to leave Fit for a size the reader can see is
+        // different, which means skipping the printed size a fitted page is
+        // usually already close to.
+        assert_eq!(fit.smaller().and_then(|zoom| zoom.percent()), Some(75));
+        assert_eq!(fit.larger().and_then(|zoom| zoom.percent()), Some(125));
+        let mut zoom = fit.smaller().unwrap();
         while let Some(smaller) = zoom.smaller() {
             assert!(
                 smaller.factor() < zoom.factor(),
@@ -10542,7 +10563,7 @@ mod tests {
             zoom = smaller;
         }
         assert_eq!(zoom.smaller(), None, "the smallest step offers no press");
-        let mut zoom = crate::editor::PdfZoom::default();
+        let mut zoom = fit.larger().unwrap();
         while let Some(larger) = zoom.larger() {
             assert!(
                 larger.factor() > zoom.factor(),
@@ -10551,7 +10572,19 @@ mod tests {
             zoom = larger;
         }
         assert_eq!(zoom.larger(), None, "the largest step offers no press");
-        assert_eq!(crate::editor::PdfZoom::default().percent(), 100);
+        // A page drawn at a size of its own is as wide as the raster asks for,
+        // so the sheet and the border around it cannot disagree, while a
+        // fitted page takes the pane's width instead.
+        assert_eq!(fit.logical_width(1000), None);
+        let printed = crate::editor::PdfZoom::Scaled(2);
+        assert_eq!(printed.percent(), Some(100));
+        let width = printed.logical_width(1700).unwrap();
+        assert!(
+            (width - 1700.0 * crate::editor::PDF_LOGICAL_SCALE / crate::editor::PDF_PAGE_SCALE)
+                .abs()
+                < 0.01,
+            "{width} does not undo the supersampling the helper rendered at"
+        );
     }
 
     #[test]
