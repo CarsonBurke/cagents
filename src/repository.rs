@@ -10165,12 +10165,27 @@ fn git_locks_present(common: &Path) -> io::Result<bool> {
 
 impl WorktreeJournal {
     fn report(&self, created_at_unix_ms: i64) -> WorktreeOperationReport {
+        let mut outcome = self.outcome.clone();
+        // A worktree this operation created must never be reported without
+        // its creation time. The record carries the destination's filesystem
+        // birth time, which several filesystems - overlay and network mounts
+        // among them - do not keep, and a caller that orders worktrees by
+        // creation can only put a timeless row last. This journal already
+        // holds the instant the operation began, which is the creation
+        // instant to within the seconds Git spent on it, so fill the gap from
+        // the record this operation owns rather than by re-stating a
+        // filesystem that has already answered.
+        if let Some(WorktreeCreationOutcome::Created { worktree, .. }) = &mut outcome {
+            worktree
+                .created_at_unix_ms
+                .get_or_insert(created_at_unix_ms);
+        }
         WorktreeOperationReport {
             operation_id: self.request.operation_id,
             generation: self.generation,
             request: Some(self.request.clone()),
             state: self.state,
-            outcome: self.outcome.clone(),
+            outcome,
             detail: self.detail.clone(),
             created_at_unix_ms,
         }
