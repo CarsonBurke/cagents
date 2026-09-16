@@ -62,7 +62,7 @@ pub struct Target {
 }
 
 #[derive(Clone)]
-pub struct Ready(Arc<Mutex<Option<Result<Arc<ClientHandle>, String>>>>);
+pub struct Ready(Arc<Mutex<Option<Result<Arc<ClientHandle>, chat::StartFailure>>>>);
 impl std::fmt::Debug for Ready {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("ChatReady")
@@ -97,6 +97,13 @@ pub enum Action {
     Wake(Target, Wake),
     UpdatesAcknowledged(Target, Result<(), String>),
     Reconnect(Target),
+    /// Starts a new conversation in the same session directory and working
+    /// directory as a saved one that cannot be resumed.
+    ///
+    /// Separate from `Reconnect` because the two are not interchangeable: one
+    /// asks for the saved conversation again, the other gives it up. A card
+    /// that cannot resume offers both and does neither on its own.
+    StartFresh(CardId),
     Composer(Target, text_editor::Action),
     Submit(Target, PromptMode),
     AppendProviderDraft(Target),
@@ -224,6 +231,17 @@ pub(super) struct State {
     /// refused. Holding the draft here makes the round trip lossless, so the
     /// refusal is only needed where the process itself is about to restart.
     drafts: HashMap<CardId, String>,
+    /// The cards whose saved conversation cannot be resumed by trying again.
+    ///
+    /// A card in this set has no chat runtime to hold the offer, because its
+    /// start never produced one, so the failed card itself has to carry it.
+    fresh_offers: HashSet<CardId>,
+    /// The new conversation a card is waiting to start once the one it could
+    /// not resume has been closed.
+    ///
+    /// The daemon keys a conversation by this card's chat id, so the failed
+    /// conversation has to be given up before the replacement can claim it.
+    restarting: HashMap<CardId, chat::Session>,
 }
 impl Default for State {
     fn default() -> Self {
@@ -238,6 +256,8 @@ impl Default for State {
             closing: HashSet::new(),
             closed: HashSet::new(),
             drafts: HashMap::new(),
+            fresh_offers: HashSet::new(),
+            restarting: HashMap::new(),
         }
     }
 }
@@ -861,6 +881,21 @@ impl Runtime {
             self.refresh();
         }
     }
+    /// Whether this card should offer to start a new conversation beside the
+    /// one it was asked to resume.
+    ///
+    /// The offer belongs to a card whose launch names a saved conversation and
+    /// whose provider has since stopped without ever reporting that
+    /// conversation: it is not on screen, and no amount of waiting will put it
+    /// there, because the process that would have loaded it is gone. A card
+    /// that merely lost its daemon connection is not in that position - its
+    /// conversation is still being held for it - so it keeps only the
+    /// reconnect.
+    fn offers_fresh_conversation(&self) -> bool {
+        self.session.launch.session_id.is_some()
+            && self.snapshot.exited
+            && self.snapshot.session_id != self.session.launch.session_id
+    }
     /// Why this chat cannot be swapped for its terminal view right now.
     ///
     /// An unsent draft is deliberately absent: `Cagents::chat_forget` stashes
@@ -1149,7 +1184,7 @@ impl Cagents {
         self.persist();
         Task::batch([
             scope,
-            self.start_chat(card_id, session, true, None, false),
+            self.start_chat(card_id, session, chat::Intent::Start, None, false),
             self.apply_viewport(update, true, false),
         ])
     }
@@ -1174,6 +1209,7 @@ impl Cagents {
         self.chat_ui.bindings.remove(&card);
         self.chat_ui.handoffs.retain(|target| target.card != card);
         self.chat_ui.closing.retain(|target| target.card != card);
+        self.chat_ui.restarting.remove(&card);
         self.observe_agent_activity_for_card(card, None);
     }
     /// Forgets a chat runtime whose card is going away for good.
@@ -1185,6 +1221,7 @@ impl Cagents {
     pub(super) fn chat_discard(&mut self, card: CardId) {
         self.chat_forget(card);
         self.chat_ui.drafts.remove(&card);
+        self.chat_ui.fresh_offers.remove(&card);
     }
     pub(super) fn chat_start_pending(&self, card: CardId) -> bool {
         self.chat_ui.attempts.contains_key(&card)
@@ -1198,6 +1235,21 @@ impl Cagents {
                 .closing
                 .iter()
                 .any(|target| target.card == card)
+    }
+    /// Whether a card that could not put its saved conversation back on screen
+    /// should offer to start a new one in the same place.
+    ///
+    /// A failed card carries the offer itself because its start never built a
+    /// runtime to hold it; a card whose provider exited after starting asks
+    /// its runtime instead.
+    pub(super) fn chat_offers_fresh_conversation(&self, card: CardId) -> bool {
+        if self.chat_start_pending(card) {
+            return false;
+        }
+        match self.cards.get(&card) {
+            Some(CardRuntime::Chat(runtime)) => runtime.offers_fresh_conversation(),
+            _ => self.chat_ui.fresh_offers.contains(&card),
+        }
     }
     pub(super) fn chat_switch_available(&self, card: CardId) -> bool {
         match self.card_state(card).map(|state| &state.kind) {
@@ -1249,7 +1301,7 @@ impl Cagents {
         &mut self,
         card: CardId,
         session: chat::Session,
-        spawn: bool,
+        intent: chat::Intent,
         source: Option<HostSessionProof>,
         terminate_source: bool,
     ) -> Task<Message> {
@@ -1277,7 +1329,7 @@ impl Cagents {
             let result = tokio::task::spawn_blocking(move || {
                 ClientHandle::connect(
                     session,
-                    spawn,
+                    intent,
                     source,
                     terminate_source,
                     selection,
@@ -1288,7 +1340,7 @@ impl Cagents {
                 .map(Arc::new)
             })
             .await
-            .map_err(|error| error.to_string())
+            .map_err(|error| chat::StartFailure::retry(error.to_string()))
             .and_then(|result| result);
             Message::ChatUi(Action::Ready(
                 target,
@@ -1554,7 +1606,7 @@ impl Cagents {
                 }
                 let session = binding.session.clone();
                 let source = binding.source.clone();
-                return self.start_chat(card, session, true, Some(source), false);
+                return self.start_chat(card, session, chat::Intent::Start, Some(source), false);
             }
             Action::BindingNew(card) => {
                 let Some(binding) = self.chat_ui.bindings.remove(&card) else {
@@ -1631,7 +1683,13 @@ impl Cagents {
                             } else {
                                 "This terminal's agent is not running, so a new conversation was opened here."
                             }));
-                            return self.start_chat(card, session, true, None, false);
+                            return self.start_chat(
+                                card,
+                                session,
+                                chat::Intent::Start,
+                                None,
+                                false,
+                            );
                         }
                         if session.launch.provider == Provider::Codex {
                             self.chat_ui.generation =
@@ -1697,7 +1755,13 @@ impl Cagents {
                             };
                         }
                         let terminate = session.launch.provider != Provider::Codex;
-                        return self.start_chat(card, session, true, source, terminate);
+                        return self.start_chat(
+                            card,
+                            session,
+                            chat::Intent::Start,
+                            source,
+                            terminate,
+                        );
                     }
                     Some(CardKind::Chat(_)) => {
                         let Some(CardRuntime::Chat(runtime)) = self.cards.get(&card) else {
@@ -1783,6 +1847,7 @@ impl Cagents {
                 }
                 match result {
                     Ok(handle) => {
+                        self.chat_ui.fresh_offers.remove(&target.card);
                         let mut session = handle.session();
                         session.proof = handle.proof();
                         let title = handle.snapshot().title.clone();
@@ -1836,21 +1901,31 @@ impl Cagents {
                         ))
                         .map(cosmic::Action::App);
                     }
-                    Err(error) => {
+                    Err(failure) => {
+                        // A card that cannot resume has to say what refused it
+                        // and offer the action that answers that refusal, so
+                        // the classification travels with the message rather
+                        // than being re-guessed from its wording.
+                        if failure.recovery == chat::Recovery::Fresh {
+                            self.chat_ui.fresh_offers.insert(target.card);
+                        } else {
+                            self.chat_ui.fresh_offers.remove(&target.card);
+                        }
                         if let Some(CardRuntime::Chat(runtime)) = self.cards.get_mut(&target.card) {
-                            runtime.error = Some(error);
+                            runtime.error = Some(failure.message);
                             runtime.disconnected = true;
                             self.observe_agent_activity_for_card(target.card, None);
                         } else if matches!(
                             self.card_state(target.card).map(|state| &state.kind),
                             Some(CardKind::Chat(_))
                         ) {
-                            self.fail_runtime(target.card, error.clone());
-                            self.status = Some(TransientNotice::error(error));
+                            self.fail_runtime(target.card, failure.message.clone());
+                            self.status = Some(TransientNotice::error(failure.message));
                         } else {
                             // Failed recognition/attachment must never replace or
                             // tear down the user's still-running terminal.
-                            self.status = Some(TransientNotice::error(error));
+                            self.chat_ui.fresh_offers.remove(&target.card);
+                            self.status = Some(TransientNotice::error(failure.message));
                         }
                         return self.drain_terminal(target.card, 0);
                     }
@@ -1926,7 +2001,44 @@ impl Cagents {
                     return Task::none();
                 }
                 let session = runtime.session.clone();
-                return self.start_chat(target.card, session, false, None, false);
+                return self.start_chat(target.card, session, chat::Intent::Restore, None, false);
+            }
+            Action::StartFresh(card) => {
+                let Some(CardKind::Chat(session)) = self.card_state(card).map(|state| &state.kind)
+                else {
+                    return Task::none();
+                };
+                if self.chat_start_pending(card) || self.chat_ui.closed.contains(&card) {
+                    return Task::none();
+                }
+                // The new conversation runs the saved launch verbatim - same
+                // program, same options including the session directory, same
+                // working directory and environment - with only the
+                // conversation it was resuming dropped. That is what makes
+                // this a new conversation in the same place rather than a
+                // different launch.
+                let mut session = session.clone();
+                session.launch.session_id = None;
+                session.proof = None;
+                self.chat_ui.fresh_offers.remove(&card);
+                // A chat runtime whose provider has exited still holds the
+                // daemon's record for the conversation that failed. Closing it
+                // is what frees this chat's id for the fresh start.
+                if let Some(CardRuntime::Chat(runtime)) = self.cards.get(&card) {
+                    let handle = runtime.handle.clone();
+                    let target = runtime.target;
+                    self.chat_ui.closing.insert(target);
+                    self.chat_ui.restarting.insert(card, session);
+                    return cosmic::task::future(async move {
+                        let result = tokio::task::spawn_blocking(move || handle.close())
+                            .await
+                            .map_err(|error| error.to_string())
+                            .and_then(|result| result);
+                        Message::ChatUi(Action::CloseFinished(target, result))
+                    });
+                }
+                self.cards.insert(card, CardRuntime::Loading);
+                return self.start_chat(card, session, chat::Intent::Start, None, false);
             }
             Action::Composer(target, action) => {
                 if let Some(runtime) = self.chat_runtime_mut(target) {
@@ -2362,8 +2474,17 @@ impl Cagents {
                     return Task::none();
                 }
                 if let Err(error) = result {
+                    self.chat_ui.restarting.remove(&target.card);
                     self.status = Some(TransientNotice::error(error));
                     return Task::none();
+                }
+                if let Some(session) = self.chat_ui.restarting.remove(&target.card) {
+                    // Only the conversation is being given up here; the card
+                    // stays and immediately starts its replacement, so it is
+                    // never left showing a conversation that no longer exists.
+                    self.chat_forget(target.card);
+                    self.cards.insert(target.card, CardRuntime::Loading);
+                    return self.start_chat(target.card, session, chat::Intent::Start, None, false);
                 }
                 self.chat_ui.closed.insert(target.card);
                 self.observe_agent_activity_for_card(target.card, None);

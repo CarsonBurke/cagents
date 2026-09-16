@@ -1408,4 +1408,40 @@ mod tests {
         );
         assert_eq!(changes[0].diff, "@@ -1 +1 @@\n-old\n+new");
     }
+
+    /// The exact launch a live installation persisted for a native OMP card:
+    /// a session directory, no other options, and a UUIDv7 conversation. The
+    /// rebuild has to carry that conversation into the resumed argv, because a
+    /// restore after a daemon restart has nothing else to put the card back on
+    /// the transcript it was showing.
+    #[test]
+    fn the_persisted_native_recipe_rebuilds_into_an_exact_resume() {
+        use crate::{agent::Provider, model::LaunchRecipe};
+        const CONVERSATION: &str = "01a0ab66-21d6-7065-9fe5-95f302b669e1";
+        let launch = Launch {
+            provider: Provider::Omp,
+            recipe: LaunchRecipe {
+                program: "omp".into(),
+                arguments: vec![
+                    "--session-dir".into(),
+                    "/home/user/.omp/agent/sessions/native".into(),
+                ],
+                working_directory: "/home/user".into(),
+                environment: Default::default(),
+            },
+            session_id: Some(CONVERSATION.into()),
+        };
+        let (spec, _) = create(&launch).expect("the persisted native recipe is resumable");
+        assert_eq!(
+            spec.arguments,
+            [
+                "--session-dir",
+                "/home/user/.omp/agent/sessions/native",
+                "--mode",
+                "rpc-ui",
+                "--resume",
+                CONVERSATION,
+            ]
+        );
+    }
 }

@@ -1,5 +1,5 @@
 //! Native chat connection to the same authenticated daemon as hosted terminals.
-use super::{Command, Session, Snapshot};
+use super::{Command, Intent, Session, Snapshot, StartFailure};
 use crate::{
     agent::ActivityState,
     model::{HostSessionProof, TerminalId},
@@ -161,6 +161,98 @@ fn receive(
         _ => Err("Unexpected daemon handshake frame".into()),
     }
 }
+
+/// The daemon's own native configuration, which is what a conversation with no
+/// proven source terminal has to start from.
+fn native_environment(session: &Session, standalone: bool) -> ipc::ChatExecutionEnvironment {
+    ipc::ChatExecutionEnvironment(if standalone && session.terminal.is_none() {
+        crate::model::agent_recovery::fresh_native_environment(session.launch.provider, false)
+    } else {
+        BTreeMap::new()
+    })
+}
+
+/// Works out how a saved card rejoins its conversation, and returns the request
+/// that does it.
+///
+/// The saved proof names the daemon incarnation that was hosting the
+/// conversation. An application update replaces the executables and restarts
+/// the daemon, so after one every saved proof is stale by definition and an
+/// exact attach can only be refused. Attaching is therefore conditional on the
+/// live proof; the daemon's own upgrade checkpoint is the second chance; and
+/// starting the provider again on the saved conversation id is the answer when
+/// neither holds, because the conversation itself is on disk and the provider
+/// is the thing that can read it back.
+fn restore(
+    stream: &mut UnixStream,
+    codec: &mut FrameCodec,
+    attach_request: &mut u64,
+    proof: &HostSessionProof,
+    mut session: Session,
+) -> Result<ClientRequest, StartFailure> {
+    if session.proof.as_ref() == Some(proof) {
+        return Ok(ClientRequest::ChatAttach { session });
+    }
+    let mut refusal = None;
+    if session
+        .proof
+        .as_ref()
+        .is_some_and(HostSessionProof::is_complete)
+    {
+        let request_id = *attach_request;
+        *attach_request += 1;
+        codec
+            .write(
+                stream,
+                &ClientEnvelope {
+                    version: PROTOCOL_VERSION,
+                    request_id,
+                    proof: Some(proof.clone()),
+                    request: ClientRequest::ResolveUpgradeChat {
+                        source: session.clone(),
+                    },
+                },
+            )
+            .map_err(|error| error.to_string())?;
+        match receive(stream, codec, request_id, Some(proof)) {
+            Ok(ServerResponse::UpgradeChatResolved { session: restored })
+                if restored.id == session.id
+                    && restored.proof.as_ref() == Some(proof)
+                    && restored.launch.provider == session.launch.provider =>
+            {
+                return Ok(ClientRequest::ChatAttach { session: restored });
+            }
+            Ok(_) => {
+                refusal = Some(
+                    "The daemon answered this chat's upgrade lineage with a different conversation."
+                        .to_owned(),
+                );
+            }
+            // A daemon an installer stopped and restarted never wrote an
+            // upgrade checkpoint, which is the ordinary case after an
+            // application update rather than a reason to give up.
+            Err(message) => refusal = Some(message),
+        }
+    }
+    if session.launch.session_id.is_none() {
+        return Err(StartFailure::fresh(format!(
+            "The daemon that was hosting this conversation is no longer running, and this card never recorded a conversation to resume. {}",
+            refusal.unwrap_or_else(|| "No saved daemon proof was available either.".to_owned())
+        )));
+    }
+    // The live daemon proved its identity during the handshake, so the start
+    // carries that proof rather than the one this card saved before the
+    // restart; the daemon validates it whenever it still holds a closed record
+    // under this chat's id.
+    session.proof = Some(proof.clone());
+    let execution_environment = native_environment(&session, true);
+    Ok(ClientRequest::ChatStart {
+        session,
+        source: None,
+        terminate_source: false,
+        execution_environment,
+    })
+}
 impl ClientHandle {
     /// Read-only metadata lookup. Does not subscribe, resume, or write a turn.
     pub fn preview(
@@ -268,32 +360,40 @@ impl ClientHandle {
     }
 
     pub fn connect(
-        mut session: Session,
-        spawn: bool,
+        session: Session,
+        intent: Intent,
         source: Option<HostSessionProof>,
         terminate_source: bool,
         selection: Option<String>,
         wake: impl Fn(Wake) + Send + Sync + 'static,
-    ) -> Result<Self, String> {
-        let wake: Arc<dyn Fn(Wake) + Send + Sync> = Arc::new(wake);
-        if !spawn
-            && session
-                .proof
-                .as_ref()
-                .is_none_or(|proof| !proof.is_complete())
-        {
-            return Err(
-                "Exact chat attachment requires the saved daemon proof; explicitly recover instead"
-                    .into(),
-            );
-        }
-        let socket = if spawn {
-            crate::terminal::ensure_daemon_ready().map_err(|e| e.to_string())?
-        } else {
-            ipc::daemon_socket_path().map_err(|e| e.to_string())?
-        };
-        let mut stream = UnixStream::connect(socket)
+    ) -> Result<Self, StartFailure> {
+        // A restore runs right after an application update has stopped the
+        // daemon it is about to ask for, so it starts one for the same reason a
+        // new conversation does instead of failing on an absent socket.
+        let socket = crate::terminal::ensure_daemon_ready().map_err(|e| e.to_string())?;
+        let stream = UnixStream::connect(socket)
             .map_err(|e| format!("Cannot connect to the proven chat daemon: {e}"))?;
+        Self::connect_on(
+            stream,
+            session,
+            intent,
+            source,
+            terminate_source,
+            selection,
+            wake,
+        )
+    }
+
+    fn connect_on(
+        mut stream: UnixStream,
+        session: Session,
+        intent: Intent,
+        source: Option<HostSessionProof>,
+        terminate_source: bool,
+        selection: Option<String>,
+        wake: impl Fn(Wake) + Send + Sync + 'static,
+    ) -> Result<Self, StartFailure> {
+        let wake: Arc<dyn Fn(Wake) + Send + Sync> = Arc::new(wake);
         stream
             .set_read_timeout(Some(Duration::from_secs(20)))
             .map_err(|e| e.to_string())?;
@@ -301,7 +401,7 @@ impl ClientHandle {
             .set_write_timeout(Some(Duration::from_secs(5)))
             .map_err(|e| e.to_string())?;
         let mut codec = FrameCodec::new(ipc::MAX_FRAME_BYTES);
-        let expected = if spawn { source.clone() } else { None };
+        let expected = source.clone();
         codec
             .write(
                 &mut stream,
@@ -323,38 +423,10 @@ impl ClientHandle {
         if !proof.is_complete() {
             return Err("Daemon returned an incomplete native chat ownership proof".into());
         }
-        let mut attach_request = 2;
-        if !spawn && session.proof.as_ref() != Some(&proof) {
-            // Discovery does not authorize a new writer. Only a daemon-owned
-            // upgrade checkpoint can map the saved source to a restored actor.
-            codec
-                .write(
-                    &mut stream,
-                    &ClientEnvelope {
-                        version: PROTOCOL_VERSION,
-                        request_id: attach_request,
-                        proof: Some(proof.clone()),
-                        request: ClientRequest::ResolveUpgradeChat {
-                            source: session.clone(),
-                        },
-                    },
-                )
-                .map_err(|error| error.to_string())?;
-            session = match receive(&mut stream, &mut codec, attach_request, Some(&proof))? {
-                ServerResponse::UpgradeChatResolved { session: restored }
-                    if restored.id == session.id
-                        && restored.proof.as_ref() == Some(&proof)
-                        && restored.launch.provider == session.launch.provider =>
-                {
-                    restored
-                }
-                _ => return Err("Daemon did not prove the saved chat's upgrade lineage".into()),
-            };
-            attach_request += 1;
-        }
         let id = session.id;
+        let mut attach_request = 2;
         let request = if let Some(token) = selection {
-            if !spawn || terminate_source {
+            if intent != Intent::Start || terminate_source {
                 return Err("Selected conversation activation requires a non-destructive shared-server attachment".into());
             }
             ClientRequest::ChatStartSelected {
@@ -363,16 +435,8 @@ impl ClientHandle {
                     .ok_or("Selected conversation activation requires a proven source terminal")?,
                 token,
             }
-        } else if spawn {
-            let execution_environment =
-                ipc::ChatExecutionEnvironment(if source.is_none() && session.terminal.is_none() {
-                    crate::model::agent_recovery::fresh_native_environment(
-                        session.launch.provider,
-                        false,
-                    )
-                } else {
-                    BTreeMap::new()
-                });
+        } else if intent == Intent::Start {
+            let execution_environment = native_environment(&session, source.is_none());
             ClientRequest::ChatStart {
                 session,
                 source,
@@ -380,7 +444,13 @@ impl ClientHandle {
                 execution_environment,
             }
         } else {
-            ClientRequest::ChatAttach { session }
+            restore(
+                &mut stream,
+                &mut codec,
+                &mut attach_request,
+                &proof,
+                session,
+            )?
         };
         codec
             .write(
@@ -425,7 +495,7 @@ impl ClientHandle {
                     break (session, snapshot);
                 }
                 ServerMessage::Error(error) if envelope.request_id == Some(attach_request) => {
-                    return Err(error.message);
+                    return Err(error.message.into());
                 }
                 _ => return Err("Daemon did not attach the exact native chat".into()),
             }
@@ -606,9 +676,20 @@ impl ClientHandle {
         *inner.reader.lock().unwrap_or_else(|p| p.into_inner()) = Some(worker);
         Ok(Self { inner })
     }
+    /// The durable descriptor for this chat, with the conversation the
+    /// provider has confirmed.
+    ///
+    /// A conversation the provider has not named yet is not evidence that the
+    /// saved one is gone: a start that is still loading reports nothing, and
+    /// so does one that failed to resume. Overwriting the saved identifier
+    /// with that absence would leave the card with nothing to resume on its
+    /// next attempt, which is how a single failed restore used to turn a
+    /// recoverable conversation into a permanently blank one.
     pub fn session(&self) -> Session {
         let mut session = self.inner.session.clone();
-        session.launch.session_id = self.snapshot().session_id.clone();
+        if let Some(id) = self.snapshot().session_id.clone() {
+            session.launch.session_id = Some(id);
+        }
         session
     }
     pub fn snapshot(&self) -> Arc<Snapshot> {
@@ -857,6 +938,10 @@ impl Drop for Inner {
 mod tests {
     use super::*;
 
+    /// The conversation the live installation's card was showing: a UUIDv7,
+    /// which every identifier gate on the restore path has to accept.
+    const CONVERSATION: &str = "01a0ab66-21d6-7065-9fe5-95f302b669e1";
+
     #[test]
     fn exited_terminal_commit_discovers_host_but_pins_the_acknowledgement() {
         use crate::model::{
@@ -1004,5 +1089,363 @@ mod tests {
         assert!(!activity.observe(8, ActivityState::Idle));
         assert!(activity.observe(9, ActivityState::Working));
         assert_eq!(activity.take(), ActivityState::Working);
+    }
+
+    fn host_proof(incarnation: &str) -> HostSessionProof {
+        use crate::model::{BootId, HostIncarnation, HostSessionId};
+        HostSessionProof {
+            host_session_id: HostSessionId::new("session"),
+            boot_id: BootId::new("boot"),
+            host_incarnation: HostIncarnation::new(incarnation),
+        }
+    }
+
+    /// The live installation's own card: a native OMP conversation whose
+    /// persisted launch names its session directory and nothing else.
+    fn omp_card(conversation: Option<&str>, proof: Option<HostSessionProof>) -> Session {
+        Session {
+            id: TerminalId::new(),
+            launch: crate::chat::Launch {
+                provider: crate::agent::Provider::Omp,
+                recipe: crate::model::LaunchRecipe {
+                    program: "omp".into(),
+                    arguments: vec![
+                        "--session-dir".into(),
+                        "/home/user/.omp/agent/sessions/native".into(),
+                    ],
+                    working_directory: "/".into(),
+                    environment: BTreeMap::new(),
+                },
+                session_id: conversation.map(str::to_owned),
+            },
+            proof,
+            terminal: None,
+        }
+    }
+
+    /// Runs the restore negotiation against a daemon that answers the upgrade
+    /// lineage question with `answer`, and returns what it was asked.
+    fn negotiate(
+        live: &HostSessionProof,
+        session: Session,
+        answer: ServerMessage,
+    ) -> (Result<ClientRequest, StartFailure>, ClientRequest) {
+        let (mut client, mut server) = UnixStream::pair().unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let proof = live.clone();
+        let worker = thread::spawn(move || {
+            let mut codec = FrameCodec::new(ipc::MAX_FRAME_BYTES);
+            let envelope: ClientEnvelope = codec.read(&mut server).unwrap().unwrap();
+            codec
+                .write(
+                    &mut server,
+                    &ServerEnvelope {
+                        version: PROTOCOL_VERSION,
+                        request_id: Some(envelope.request_id),
+                        proof,
+                        message: answer,
+                    },
+                )
+                .unwrap();
+            envelope.request
+        });
+        let mut codec = FrameCodec::new(ipc::MAX_FRAME_BYTES);
+        let mut request_id = 2;
+        let outcome = restore(&mut client, &mut codec, &mut request_id, live, session);
+        (outcome, worker.join().unwrap())
+    }
+
+    /// An application update replaces the executables and restarts the daemon,
+    /// so every saved chat proof is stale afterwards and the daemon holds no
+    /// upgrade checkpoint for a restart it did not perform itself. A card that
+    /// treated that as an exact-attach failure never started the provider that
+    /// would have read its conversation back.
+    #[test]
+    fn a_restarted_daemon_still_resumes_the_conversation_a_card_was_showing() {
+        let live = host_proof("live");
+        let stale = host_proof("before-the-update");
+
+        // The hosting daemon is still the live one, so its writer is there to
+        // attach to and nothing needs to be asked first.
+        let (mut client, _server) = UnixStream::pair().unwrap();
+        let mut codec = FrameCodec::new(ipc::MAX_FRAME_BYTES);
+        let mut request_id = 2;
+        let attach = restore(
+            &mut client,
+            &mut codec,
+            &mut request_id,
+            &live,
+            omp_card(Some(CONVERSATION), Some(live.clone())),
+        )
+        .expect("a live proof attaches");
+        assert!(matches!(attach, ClientRequest::ChatAttach { .. }));
+        assert_eq!(request_id, 2, "an attach asks the daemon nothing first");
+
+        // The saved proof is stale and the restart left no lineage, which is
+        // every card after an installer-driven update.
+        let (outcome, asked) = negotiate(
+            &live,
+            omp_card(Some(CONVERSATION), Some(stale.clone())),
+            ServerMessage::Error(crate::terminal_ipc::ProtocolError::new(
+                crate::terminal_ipc::ProtocolErrorCode::TerminalUnavailable,
+                "No durable upgrade replacement exists for this native chat",
+                false,
+            )),
+        );
+        assert!(
+            matches!(asked, ClientRequest::ResolveUpgradeChat { .. }),
+            "a stale proof asks the daemon for its upgrade lineage before giving up on attaching"
+        );
+        let ClientRequest::ChatStart {
+            session,
+            source,
+            terminate_source,
+            ..
+        } = outcome.expect("a refused lineage resumes rather than failing")
+        else {
+            panic!("a card with a saved conversation must start the provider on it");
+        };
+        assert_eq!(
+            session.launch.session_id.as_deref(),
+            Some(CONVERSATION),
+            "the exact saved conversation is what the provider is started on"
+        );
+        assert_eq!(
+            session.proof.as_ref(),
+            Some(&live),
+            "the start carries the proof the live daemon just gave, not the saved one"
+        );
+        assert!(source.is_none() && !terminate_source);
+
+        // A conversation converted from a terminal resumes the same way, but
+        // must carry no client-chosen execution environment: the daemon
+        // refuses one outright for any chat that still names a source
+        // terminal, and a refused start is a card that does not come back.
+        let mut converted = omp_card(Some(CONVERSATION), Some(stale));
+        converted.terminal = Some(crate::model::TerminalSession {
+            id: converted.id,
+            launch: converted.launch.recipe.clone(),
+            continuity: crate::model::TerminalContinuity::RelaunchAvailable {
+                recipe: converted.launch.recipe.clone(),
+                last_exit: None,
+            },
+            resume_hint: None,
+            transcript_path: None,
+        });
+        let (outcome, _) = negotiate(
+            &live,
+            converted,
+            ServerMessage::Error(crate::terminal_ipc::ProtocolError::new(
+                crate::terminal_ipc::ProtocolErrorCode::TerminalUnavailable,
+                "No durable upgrade replacement exists for this native chat",
+                false,
+            )),
+        );
+        let ClientRequest::ChatStart {
+            execution_environment,
+            ..
+        } = outcome.expect("a terminal-derived card resumes too")
+        else {
+            panic!("a card with a saved conversation must start the provider on it");
+        };
+        assert!(
+            execution_environment.0.is_empty(),
+            "a chat naming a source terminal takes the daemon's environment, never a client's"
+        );
+    }
+
+    /// A daemon that did upgrade itself can still map the saved descriptor onto
+    /// the conversation it restarted under, and that attachment wins over
+    /// starting a second provider on the same conversation.
+    #[test]
+    fn a_proven_upgrade_lineage_attaches_instead_of_starting_a_second_provider() {
+        let live = host_proof("live");
+        let saved = omp_card(Some(CONVERSATION), Some(host_proof("before-the-upgrade")));
+        let mut restored = saved.clone();
+        restored.proof = Some(live.clone());
+        let (outcome, _) = negotiate(
+            &live,
+            saved.clone(),
+            ServerMessage::Response {
+                response: ServerResponse::UpgradeChatResolved {
+                    session: restored.clone(),
+                },
+            },
+        );
+        let ClientRequest::ChatAttach { session } = outcome.expect("a proven lineage attaches")
+        else {
+            panic!("a proven lineage must attach");
+        };
+        assert_eq!(session, restored);
+
+        // A replacement for a different chat proves nothing about this one.
+        // The conversation identifier deliberately is not part of that
+        // comparison: the daemon reports the conversation its restarted writer
+        // actually holds, which is the answer being asked for.
+        let mut other = restored.clone();
+        other.id = TerminalId::new();
+        let (outcome, _) = negotiate(
+            &live,
+            saved,
+            ServerMessage::Response {
+                response: ServerResponse::UpgradeChatResolved { session: other },
+            },
+        );
+        assert!(
+            matches!(outcome, Ok(ClientRequest::ChatStart { .. })),
+            "a mismatched lineage falls back to resuming, never to attaching"
+        );
+    }
+
+    /// A conversation that cannot be resumed and cannot be named is the one
+    /// case where retrying is not a real answer, so the card is told to offer
+    /// the only thing left instead of being handed a retry that cannot work.
+    #[test]
+    fn a_card_with_nothing_to_resume_asks_for_a_new_conversation_in_the_daemons_words() {
+        let live = host_proof("live");
+        let (outcome, _) = negotiate(
+            &live,
+            omp_card(None, Some(host_proof("before-the-update"))),
+            ServerMessage::Error(crate::terminal_ipc::ProtocolError::new(
+                crate::terminal_ipc::ProtocolErrorCode::TerminalUnavailable,
+                "No durable upgrade replacement exists for this native chat",
+                false,
+            )),
+        );
+        let failure = outcome.expect_err("nothing can be resumed here");
+        assert_eq!(failure.recovery, crate::chat::Recovery::Fresh);
+        assert!(
+            failure
+                .message
+                .contains("No durable upgrade replacement exists for this native chat"),
+            "the daemon's own refusal has to reach the card: {}",
+            failure.message
+        );
+    }
+
+    /// Drives a whole restore against a daemon that has just restarted: it
+    /// proves a new identity, holds no upgrade checkpoint for a restart it did
+    /// not perform, and then answers the resume with `answer`.
+    fn restore_against(
+        session: Session,
+        answer: impl FnOnce(ClientRequest) -> ServerMessage + Send + 'static,
+    ) -> Result<ClientHandle, StartFailure> {
+        use crate::terminal_ipc::{ProtocolError, ProtocolErrorCode};
+        let live = host_proof("live");
+        let (client, mut server) = UnixStream::pair().unwrap();
+        let proof = live.clone();
+        let worker = thread::spawn(move || {
+            server
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            server
+                .set_write_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let mut codec = FrameCodec::new(ipc::MAX_FRAME_BYTES);
+            let respond = |codec: &mut FrameCodec, server: &mut UnixStream, id, message| {
+                codec
+                    .write(
+                        server,
+                        &ServerEnvelope {
+                            version: PROTOCOL_VERSION,
+                            request_id: Some(id),
+                            proof: proof.clone(),
+                            message,
+                        },
+                    )
+                    .unwrap();
+            };
+            let connect: ClientEnvelope = codec.read(&mut server).unwrap().unwrap();
+            respond(
+                &mut codec,
+                &mut server,
+                connect.request_id,
+                ServerMessage::Response {
+                    response: ServerResponse::Connected {
+                        proof: proof.clone(),
+                        resumed: Vec::new(),
+                    },
+                },
+            );
+            let lineage: ClientEnvelope = codec.read(&mut server).unwrap().unwrap();
+            respond(
+                &mut codec,
+                &mut server,
+                lineage.request_id,
+                ServerMessage::Error(ProtocolError::new(
+                    ProtocolErrorCode::TerminalUnavailable,
+                    "No durable upgrade replacement exists for this native chat",
+                    false,
+                )),
+            );
+            let start: ClientEnvelope = codec.read(&mut server).unwrap().unwrap();
+            respond(
+                &mut codec,
+                &mut server,
+                start.request_id,
+                answer(start.request),
+            );
+        });
+        let result =
+            ClientHandle::connect_on(client, session, Intent::Restore, None, false, None, |_| {});
+        worker.join().unwrap();
+        result
+    }
+
+    /// A card that cannot bring its conversation back has to show what refused
+    /// it word for word, because the reader decides what to do next from that
+    /// sentence and a generic failure tells them nothing.
+    #[test]
+    fn a_refused_resume_reports_the_daemons_own_sentence() {
+        let failure = restore_against(
+            omp_card(Some(CONVERSATION), Some(host_proof("before-the-update"))),
+            |_| {
+                ServerMessage::Error(crate::terminal_ipc::ProtocolError::new(
+                    crate::terminal_ipc::ProtocolErrorCode::InvalidRequest,
+                    "Provider executable omp is not executable in the preserved launch environment",
+                    false,
+                ))
+            },
+        )
+        .err()
+        .expect("the daemon refused this resume");
+        assert_eq!(
+            failure.message,
+            "Provider executable omp is not executable in the preserved launch environment"
+        );
+        assert_eq!(
+            failure.recovery,
+            crate::chat::Recovery::Retry,
+            "a refusal that can pass leaves the card a retry that runs the same resume"
+        );
+    }
+
+    /// A conversation the provider has not named yet - one still loading, or
+    /// one whose resume is about to fail - must not overwrite the identifier
+    /// the card needs for its next attempt, or one failed restore would turn a
+    /// recoverable conversation into a permanently blank card.
+    #[test]
+    fn a_resume_that_names_no_conversation_yet_keeps_the_saved_one() {
+        let handle = restore_against(
+            omp_card(Some(CONVERSATION), Some(host_proof("before-the-update"))),
+            |request| {
+                let ClientRequest::ChatStart { session, .. } = request else {
+                    panic!("a saved conversation is resumed by starting the provider on it");
+                };
+                ServerMessage::Response {
+                    response: ServerResponse::ChatAttached {
+                        session,
+                        snapshot: Snapshot::default(),
+                    },
+                }
+            },
+        )
+        .expect("the daemon accepted this resume");
+        assert_eq!(
+            handle.session().launch.session_id.as_deref(),
+            Some(CONVERSATION)
+        );
     }
 }
