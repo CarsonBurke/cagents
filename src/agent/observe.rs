@@ -35,6 +35,25 @@ pub(crate) fn codex_preview(recipe: &LaunchRecipe, id: &str) -> Result<(String, 
         .map_err(|_| "Cannot verify this Codex account and local endpoint.")?;
     codex::preview(&key, id).map_err(|_| "The exact thread is not loaded on this account's shared Codex server, or its metadata could not be verified. Copy the full ID from the intended live CLI and retry.".into())
 }
+
+/// Read-only enumeration for user selection; grants no attach authority.
+pub(crate) fn codex_candidates(
+    recipe: &LaunchRecipe,
+) -> Result<Vec<crate::chat::BindingCandidate>, String> {
+    let key = key(Provider::Codex, recipe)
+        .map_err(|_| "Cannot verify this Codex account and local endpoint.")?;
+    let rows = codex::candidates(&key).map_err(|_| "This account's shared Codex server did not report a verifiable list of open conversations. Retry, or enter the full ID from the intended live CLI.".to_owned())?;
+    Ok(rows
+        .into_iter()
+        .map(
+            |(session_id, title, working_directory)| crate::chat::BindingCandidate {
+                session_id,
+                title,
+                working_directory,
+            },
+        )
+        .collect())
+}
 type ProbeResult<T> = Result<T, ()>;
 
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord)]

@@ -227,6 +227,12 @@ pub enum ClientRequest {
         session: crate::chat::Session,
         source: HostSessionProof,
     },
+    /// Read-only listing of the source account's open conversations. It issues
+    /// no token, so it cannot stand in for ChatPreview when authorizing.
+    ChatCandidates {
+        session: crate::chat::Session,
+        source: HostSessionProof,
+    },
     ChatStartSelected {
         session: crate::chat::Session,
         source: HostSessionProof,
@@ -471,6 +477,9 @@ pub enum ServerResponse {
     },
     ChatPreviewed {
         preview: crate::chat::BindingPreview,
+    },
+    ChatCandidates {
+        candidates: Vec<crate::chat::BindingCandidate>,
     },
     ChatTerminal {
         chat_id: TerminalId,

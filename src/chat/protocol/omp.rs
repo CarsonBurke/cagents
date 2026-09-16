@@ -212,6 +212,7 @@ impl Omp {
                 id: format!("tool:{id}"),
                 role: Role::Assistant,
                 content,
+                at: None,
             }];
         }
         let key = message_key(message);
@@ -224,6 +225,7 @@ impl Omp {
                     thinking: false,
                     phase: Phase::Final,
                 },
+                at: None,
             }];
         }
         message["content"]
@@ -272,7 +274,12 @@ impl Omp {
                     ),
                     _ => return None,
                 };
-                Some(Item { id, role, content })
+                Some(Item {
+                    id,
+                    role,
+                    content,
+                    at: None,
+                })
             })
             .collect()
     }
@@ -428,6 +435,7 @@ impl Omp {
                         thinking: false,
                         phase: Phase::Final,
                     },
+                    at: None,
                 }));
             }
             "setStatus" => step.events.push(Event::Status {
@@ -450,6 +458,7 @@ impl Omp {
                         thinking: false,
                         phase: Phase::Final,
                     },
+                    at: None,
                 }));
             }
             "setTitle" => {}
@@ -780,6 +789,7 @@ impl Adapter for Omp {
                     id: format!("tool:{id}"),
                     role: Role::Assistant,
                     content,
+                    at: None,
                 }));
             }
             "command_output" => {
@@ -792,6 +802,7 @@ impl Adapter for Omp {
                         thinking: false,
                         phase: Phase::Final,
                     },
+                    at: None,
                 }));
             }
             "tool_stream_update" => {
@@ -804,6 +815,7 @@ impl Adapter for Omp {
                         output: frame["update"].to_string(),
                         status: ToolStatus::Running,
                     },
+                    at: None,
                 }));
             }
             "subagent_lifecycle" | "subagent_progress" => {
@@ -822,6 +834,7 @@ impl Adapter for Omp {
                         output: payload.to_string(),
                         status,
                     },
+                    at: None,
                 }));
             }
             "agent_start" | "auto_compaction_start" => {

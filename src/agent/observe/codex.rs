@@ -230,6 +230,44 @@ pub(super) fn preview(key: &Key, id: &str) -> ProbeResult<(String, PathBuf)> {
     Ok((title.chars().take(240).collect(), cwd))
 }
 
+/// Every thread this account's shared server holds open, for user selection.
+/// This reads metadata only: it never resumes, subscribes to or writes a thread.
+pub(super) fn candidates(key: &Key) -> ProbeResult<Vec<(String, String, PathBuf)>> {
+    let mut client = Client::connect(key)?;
+    let result = client.call("initialize", json!({
+        "clientInfo":{"name":"cagents_selection","title":"cagents conversation selection","version":env!("CARGO_PKG_VERSION")},
+        "capabilities":{"experimentalApi":true}
+    }))?;
+    socket::verify_account(&result, &key.home).map_err(|_| ())?;
+    client.send(json!({"method":"initialized","params":{}}))?;
+    let ids = client.loaded()?;
+    let mut candidates = Vec::with_capacity(ids.len());
+    for id in &ids {
+        let result = client.call("thread/read", json!({"threadId":id,"includeTurns":false}))?;
+        let thread = &result["thread"];
+        if thread["id"].as_str() != Some(id.as_str()) {
+            return Err(());
+        }
+        let cwd = PathBuf::from(thread["cwd"].as_str().ok_or(())?);
+        // A relative cwd cannot be shown or compared against the terminal's own
+        // directory, so drop that one row rather than losing the whole listing.
+        if !cwd.is_absolute() {
+            continue;
+        }
+        let title = thread["name"]
+            .as_str()
+            .filter(|name| !name.is_empty())
+            .or_else(|| thread["preview"].as_str())
+            .unwrap_or("Untitled conversation");
+        candidates.push((id.clone(), title.chars().take(240).collect(), cwd));
+    }
+    // Pagination is not an atomic listing. Membership changes invalidate this sweep.
+    if client.loaded()? != ids {
+        return Err(());
+    }
+    Ok(candidates)
+}
+
 pub(super) fn census(key: &Key) -> ProbeResult<Census> {
     let mut client = Client::connect(key)?;
     let result = client.call("initialize", json!({

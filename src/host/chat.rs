@@ -167,6 +167,45 @@ fn preview(
     Ok(ServerResponse::ChatPreviewed { preview })
 }
 
+/// Enumerates the source account's open conversations without issuing a token
+/// or recording a pending binding, because listing must grant no attach right.
+fn candidates(
+    host: &SharedHost,
+    session: Session,
+    source: HostSessionProof,
+) -> Result<ServerResponse, ProtocolError> {
+    if session.launch.provider != Provider::Codex {
+        return Err(error(
+            "Explicit shared-server selection is only supported for Codex",
+        ));
+    }
+    let handle = {
+        let state = host.lock().unwrap_or_else(|p| p.into_inner());
+        validate_proof(Some(&source), state.proof())?;
+        state
+            .terminals
+            .get(&session.id)
+            .filter(|record| !record.handle.is_completed())
+            .ok_or_else(|| unavailable("The source terminal is no longer running"))?
+            .handle
+            .clone()
+    };
+    let process = handle
+        .observe_agent_process()
+        .filter(|process| process.provider == Provider::Codex)
+        .ok_or_else(|| unavailable("The source is no longer a foreground Codex CLI"))?;
+    let candidates =
+        crate::agent::observe::codex_candidates(&process.recovery).map_err(unavailable)?;
+    // The listing describes the account observed above, so a replaced foreground
+    // process means it describes some other CLI and must not be presented.
+    if handle.observe_agent_process().as_ref() != Some(&process) {
+        return Err(error(
+            "The foreground process changed during preview; retry",
+        ));
+    }
+    Ok(ServerResponse::ChatCandidates { candidates })
+}
+
 #[derive(Default)]
 pub(super) struct Observation {
     epoch: u64,
@@ -871,6 +910,7 @@ pub(super) fn process(
 ) -> Result<ServerResponse, ProtocolError> {
     match request {
         ClientRequest::ChatPreview { session, source } => preview(host, session, source),
+        ClientRequest::ChatCandidates { session, source } => candidates(host, session, source),
         ClientRequest::ChatStartSelected {
             session,
             source,
@@ -1605,6 +1645,72 @@ mod tests {
             .environment
             .insert("HOME".into(), "/other-account".into());
         assert!(!binding.authorizes(&other_account, id, now));
+    }
+
+    #[test]
+    fn candidate_listing_needs_no_conversation_id_and_grants_no_attach() {
+        let (_directory, host, _saved) = upgrade_fixture();
+        let source = host
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .proof()
+            .clone();
+        let session = Session {
+            id: TerminalId::new(),
+            launch: chat::Launch {
+                provider: Provider::Codex,
+                recipe: LaunchRecipe {
+                    program: "codex".into(),
+                    arguments: Vec::new(),
+                    working_directory: "/project".into(),
+                    environment: BTreeMap::new(),
+                },
+                session_id: None,
+            },
+            proof: Some(source.clone()),
+            terminal: None,
+        };
+        // A listing names a terminal, never a conversation, so the missing ID
+        // that a preview rejects outright still reaches the terminal lookup.
+        let listed = process(
+            &host,
+            1,
+            ClientRequest::ChatCandidates {
+                session: session.clone(),
+                source: source.clone(),
+            },
+        )
+        .unwrap_err();
+        assert_eq!(listed.code, ProtocolErrorCode::TerminalUnavailable);
+        let previewed = process(
+            &host,
+            1,
+            ClientRequest::ChatPreview {
+                session: session.clone(),
+                source: source.clone(),
+            },
+        )
+        .unwrap_err();
+        assert_eq!(previewed.code, ProtocolErrorCode::InvalidRequest);
+        // Enumeration grants nothing: it records no pending selection, so an
+        // activation still has to consume a token issued by a real preview.
+        assert!(
+            host.lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .chat_bindings
+                .is_empty()
+        );
+        let activated = process(
+            &host,
+            1,
+            ClientRequest::ChatStartSelected {
+                session,
+                source,
+                token: "forged".into(),
+            },
+        )
+        .unwrap_err();
+        assert_eq!(activated.code, ProtocolErrorCode::InvalidRequest);
     }
 
     fn upgrade_fixture() -> (tempfile::TempDir, SharedHost, crate::upgrade::handoff::Chat) {

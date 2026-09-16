@@ -696,6 +696,7 @@ impl Claude {
                                 &block["input"],
                                 &self.cwd,
                             ),
+                            at: None,
                         };
                         // Replayed assistant envelopes must not reset a completed tool result.
                         if !self.tools.get(&item.id).is_some_and(|old| {
@@ -718,6 +719,7 @@ impl Claude {
                                 output: String::new(),
                                 status: ToolStatus::Running,
                             },
+                            at: None,
                         });
                         apply_result(
                             &mut item.content,
@@ -734,6 +736,7 @@ impl Claude {
                                     id: format!("{}:image:{index}", item.id),
                                     role: Role::Assistant,
                                     content: image_content(attachment),
+                                    at: None,
                                 }));
                             }
                         }
@@ -744,6 +747,7 @@ impl Claude {
                         id: format!("{id}:{index}"),
                         role,
                         content: image_content(block),
+                        at: None,
                     })),
                     "document" => step.events.push(Event::Item(Item {
                         id: format!("{id}:{index}"),
@@ -752,6 +756,7 @@ impl Claude {
                             path: String::new(),
                             description: format!("Claude document: {}", string(block, "title")),
                         },
+                        at: None,
                     })),
                     other => step.events.push(Event::Item(text_item(
                         format!("{id}:{index}"),
@@ -1275,6 +1280,7 @@ fn text_item(id: String, role: Role, text: String, thinking: bool) -> Item {
             thinking,
             phase: Phase::Final,
         },
+        at: None,
     }
 }
 /// Map a Claude tool call onto the transcript's richer variants.
@@ -1591,6 +1597,7 @@ impl Claude {
                             output: String::new(),
                             status: ToolStatus::Running,
                         },
+                        at: None,
                     },
                     other => {
                         step.events.push(Event::Error {
@@ -1740,6 +1747,7 @@ impl Claude {
                         output: String::new(),
                         status: ToolStatus::Running,
                     },
+                    at: None,
                 });
                 let patch = if frame["patch"].is_object() {
                     &frame["patch"]

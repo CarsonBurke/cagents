@@ -7,7 +7,7 @@ use super::{Adapter, ProcessSpec, Step, TransportSpec};
 use crate::chat::{
     Answer, Attachment, Capabilities, ChangeKind, Choice, Command, CommandAction, Event, Field,
     FileChange, Item, ItemContent, Launch, Model, Phase, PromptMode, Request, Role, SearchResult,
-    ToolStatus, Usage,
+    Skill, ToolStatus, Usage,
 };
 use serde_json::{Value, json};
 use std::os::unix::fs::{DirBuilderExt, FileTypeExt, MetadataExt};
@@ -17,6 +17,10 @@ const MAX_PENDING: usize = 128;
 const MAX_MODELS: usize = 512;
 const MAX_ACTIVE_ITEMS: usize = 128;
 const MAX_ITEM_BYTES: usize = 512 * 1024;
+/// How many skills one conversation will carry into the composer's completion
+/// list. A directory tree with a pathological number of skill files must not
+/// grow the snapshot without bound.
+const MAX_SKILLS: usize = 256;
 
 fn remote_socket(address: &str) -> Result<Option<PathBuf>, String> {
     let path = address.strip_prefix("unix://").ok_or(
@@ -99,8 +103,17 @@ pub fn create(launch: &Launch) -> Result<(ProcessSpec, Box<dyn Adapter>), String
                 args.next()
                     .ok_or_else(|| format!("Missing value for Codex {arg}"))?;
             }
-            "--search" | "--dangerously-bypass-approvals-and-sandbox"
-                if launch.session_id.is_some() => {}
+            "--search" if launch.session_id.is_some() => {}
+            "--dangerously-bypass-approvals-and-sandbox" | "--yolo" => {
+                // A new thread has no live configuration to protect, so the
+                // terminal's own bypass carries over as this thread's
+                // equivalent settings. Refusing it stranded a terminal started
+                // in that mode with no way into a native conversation.
+                if launch.session_id.is_none() {
+                    start["sandbox"] = json!("danger-full-access");
+                    start["approvalPolicy"] = json!("never");
+                }
+            }
             _ => {
                 return Err(format!(
                     "Codex launch option {arg:?} cannot safely be translated to native app-server mode"
@@ -131,55 +144,69 @@ pub fn create(launch: &Launch) -> Result<(ProcessSpec, Box<dyn Adapter>), String
             home.display()
         )
     })?;
-    let socket =
-        explicit_socket.unwrap_or_else(|| home.join("app-server-control/app-server-control.sock"));
-    let socket = if socket.is_absolute() {
-        socket
-    } else {
-        spec.working_directory.join(socket)
-    };
-    let metadata = std::fs::metadata(&socket).map_err(|error| format!("Cannot join existing Codex daemon at {}: {error}. Start the Codex shared daemon first; no private fallback is launched.", socket.display()))?;
-    if !metadata.file_type().is_socket() {
-        return Err(format!(
-            "Codex endpoint {} is not a Unix socket",
-            socket.display()
-        ));
-    }
-    // Linux sun_path is 108 bytes. The symlink resolves to this exact verified
-    // socket, not a discovered/newest daemon or a different CODEX_HOME.
+    // Joining a thread that already exists means joining whichever process
+    // owns it, so it needs the shared control socket. A brand-new
+    // conversation owns nothing, so it runs as this application's own `codex
+    // app-server` child over stdio: demanding the shared daemon there made a
+    // fresh native chat impossible on installs that cannot host that daemon,
+    // and bought no safety, because there is no existing thread to collide
+    // with. An explicitly named socket is still honoured for a fresh thread,
+    // because naming one is a request to use that server.
     let mut alias = None;
-    let connect_socket = if socket.as_os_str().as_encoded_bytes().len() >= 108 {
-        let directory =
-            PathBuf::from("/tmp").join(format!("cagents-codex-{}", uuid::Uuid::new_v4().simple()));
-        std::fs::DirBuilder::new()
-            .mode(0o700)
-            .create(&directory)
-            .map_err(|e| format!("Creating private Codex socket alias: {e}"))?;
-        let link = directory.join("s");
-        if let Err(error) = std::os::unix::fs::symlink(&socket, &link) {
-            let _ = std::fs::remove_dir(&directory);
-            return Err(format!("Creating exact Codex socket alias: {error}"));
+    if launch.session_id.is_some() || explicit_socket.is_some() {
+        let socket = explicit_socket
+            .unwrap_or_else(|| home.join("app-server-control/app-server-control.sock"));
+        let socket = if socket.is_absolute() {
+            socket
+        } else {
+            spec.working_directory.join(socket)
+        };
+        let metadata = std::fs::metadata(&socket).map_err(|error| format!("Cannot join existing Codex daemon at {}: {error}. Start the Codex shared daemon first; no private fallback is launched.", socket.display()))?;
+        if !metadata.file_type().is_socket() {
+            return Err(format!(
+                "Codex endpoint {} is not a Unix socket",
+                socket.display()
+            ));
         }
-        let verified = std::fs::metadata(&link)
-            .is_ok_and(|m| m.dev() == metadata.dev() && m.ino() == metadata.ino());
-        if !verified {
-            let _ = std::fs::remove_file(&link);
-            let _ = std::fs::remove_dir(&directory);
-            return Err(
-                "Codex socket changed during alias verification; reconnect explicitly".into(),
-            );
-        }
-        alias = Some(directory);
-        link
+        // Linux sun_path is 108 bytes. The symlink resolves to this exact
+        // verified socket, not a discovered/newest daemon or a different
+        // CODEX_HOME.
+        let connect_socket = if socket.as_os_str().as_encoded_bytes().len() >= 108 {
+            let directory = PathBuf::from("/tmp")
+                .join(format!("cagents-codex-{}", uuid::Uuid::new_v4().simple()));
+            std::fs::DirBuilder::new()
+                .mode(0o700)
+                .create(&directory)
+                .map_err(|e| format!("Creating private Codex socket alias: {e}"))?;
+            let link = directory.join("s");
+            if let Err(error) = std::os::unix::fs::symlink(&socket, &link) {
+                let _ = std::fs::remove_dir(&directory);
+                return Err(format!("Creating exact Codex socket alias: {error}"));
+            }
+            let verified = std::fs::metadata(&link)
+                .is_ok_and(|m| m.dev() == metadata.dev() && m.ino() == metadata.ino());
+            if !verified {
+                let _ = std::fs::remove_file(&link);
+                let _ = std::fs::remove_dir(&directory);
+                return Err(
+                    "Codex socket changed during alias verification; reconnect explicitly".into(),
+                );
+            }
+            alias = Some(directory);
+            link
+        } else {
+            socket
+        };
+        spec.arguments.clear();
+        spec.transport = TransportSpec::UnixWebSocket {
+            socket: connect_socket,
+            device: metadata.dev(),
+            inode: metadata.ino(),
+        };
     } else {
-        socket
-    };
-    spec.arguments.clear();
-    spec.transport = TransportSpec::UnixWebSocket {
-        socket: connect_socket,
-        device: metadata.dev(),
-        inode: metadata.ino(),
-    };
+        spec.arguments.clear();
+        spec.arguments.push("app-server".into());
+    }
     Ok((
         spec,
         Box::new(Codex {
@@ -213,6 +240,7 @@ enum Pending {
     Initialize,
     Attach,
     Models,
+    Skills,
     History,
     Turn,
     Other,
@@ -301,6 +329,16 @@ impl Codex {
                 && model.is_some_and(|m| !m.reasoning.is_empty()),
             permission_modes: Vec::new(),
         }
+    }
+    /// Ask the account's server which skills apply to this conversation's
+    /// directory.
+    ///
+    /// The catalog is per directory, not per account, so it is requested with
+    /// the thread's own working directory and requested again whenever the
+    /// server reports that the watched skill files changed.
+    fn skills(&mut self, step: &mut Step) -> Result<(), String> {
+        let cwd = self.cwd.clone();
+        self.call(step, "skills/list", json!({"cwds":[cwd]}), Pending::Skills)
     }
     fn model_events(&self, step: &mut Step) {
         step.events.push(Event::Models {
@@ -708,6 +746,12 @@ impl Adapter for Codex {
                 self.history_loading = false;
             }
             if let Some(error) = frame.get("error") {
+                if matches!(pending, Pending::Skills) {
+                    // An app-server without a skills catalog answers with an
+                    // error, and a composer that offers no completions is not
+                    // worth putting a failure in the transcript over.
+                    return Ok(step);
+                }
                 let fatal = matches!(pending, Pending::Initialize | Pending::Attach);
                 step.events.push(Event::Error {
                     message: format!(
@@ -745,6 +789,7 @@ impl Adapter for Codex {
                         json!({"limit":100}),
                         Pending::Models,
                     )?;
+                    self.skills(&mut step)?;
                 }
                 Pending::Attach => {
                     let thread = &result["thread"];
@@ -769,7 +814,7 @@ impl Adapter for Codex {
                     });
                     step.events.push(Event::Status {
                         busy: self.busy,
-                        detail: "Connected to Codex shared daemon".into(),
+                        detail: "Connected to Codex".into(),
                     });
                     step.events.push(Event::Commands(Vec::new()));
                     self.model_events(&mut step);
@@ -833,6 +878,48 @@ impl Adapter for Codex {
                     }
                     self.model_events(&mut step);
                 }
+                Pending::Skills => {
+                    let mut skills: Vec<Skill> = Vec::new();
+                    for entry in result["data"].as_array().unwrap_or(&Vec::new()) {
+                        for value in entry["skills"].as_array().unwrap_or(&Vec::new()) {
+                            let Some(name) = value["name"].as_str().filter(|n| !n.is_empty())
+                            else {
+                                continue;
+                            };
+                            if value["enabled"].as_bool() == Some(false)
+                                || skills.iter().any(|skill| skill.name == name)
+                            {
+                                continue;
+                            }
+                            // The short description is the one written for a
+                            // picker; the long one is written for the model
+                            // and runs to paragraphs.
+                            let description = value["interface"]["shortDescription"]
+                                .as_str()
+                                .or_else(|| value["shortDescription"].as_str())
+                                .or_else(|| value["description"].as_str())
+                                .unwrap_or_default();
+                            skills.push(Skill {
+                                name: name.into(),
+                                description: description
+                                    .lines()
+                                    .next()
+                                    .unwrap_or_default()
+                                    .chars()
+                                    .take(160)
+                                    .collect(),
+                                // Codex acts on a skill the message names with
+                                // a leading dollar sign. It has no command for
+                                // one, so there is nothing to dispatch.
+                                invocation: format!("${name}"),
+                            });
+                            if skills.len() >= MAX_SKILLS {
+                                break;
+                            }
+                        }
+                    }
+                    step.events.push(Event::Skills(skills));
+                }
                 Pending::History => self.page(result, &mut step)?,
                 Pending::Turn => {
                     self.materialized = true;
@@ -877,10 +964,7 @@ impl Adapter for Codex {
                 }
                 step.events.push(Event::Status {
                     busy: self.busy,
-                    detail: params["status"]["type"]
-                        .as_str()
-                        .unwrap_or("unknown")
-                        .into(),
+                    detail: status_detail(&params["status"]),
                 });
             }
             "thread/name/updated" => step.events.push(Event::Session {
@@ -928,10 +1012,7 @@ impl Adapter for Codex {
                 }
                 step.events.push(Event::Status {
                     busy: self.busy,
-                    detail: turn["status"]
-                        .as_str()
-                        .unwrap_or("Codex turn updated")
-                        .into(),
+                    detail: turn_detail(&turn["status"]),
                 });
                 if turn["error"].is_object() {
                     step.events.push(Event::Error {
@@ -1079,6 +1160,7 @@ impl Adapter for Codex {
                     output: string(params, "diff")?.into(),
                     status: ToolStatus::Succeeded,
                 },
+                at: None,
             })),
             "turn/plan/updated" => step.events.push(Event::Item(Item {
                 id: format!("{}/plan", string(params, "turnId")?),
@@ -1088,11 +1170,15 @@ impl Adapter for Codex {
                     thinking: false,
                     phase: Phase::Final,
                 },
+                at: None,
             })),
             "thread/queue/changed" => step.events.push(Event::Status {
                 busy: self.busy,
                 detail: "Codex's native queue changed".into(),
             }),
+            // The catalog is a cache the server watches for itself, so a
+            // change notification is an invalidation and nothing more.
+            "skills/changed" => self.skills(&mut step)?,
             "item/reasoning/summaryPartAdded" | "thread/compacted" => {}
             // Auxiliary app-server notifications are not transcript data.
             // Unknown item types are shown as tool disclosures and unknown
@@ -1118,7 +1204,7 @@ impl Codex {
         });
         step.events.push(Event::Status {
             busy: self.busy,
-            detail: thread["status"].to_string(),
+            detail: status_detail(&thread["status"]),
         });
         step.events.push(Event::Capabilities(self.capabilities()));
         Ok(())
@@ -1134,6 +1220,42 @@ fn waiting_on_user(status: &Value) -> bool {
                 )
             })
         })
+}
+
+/// A thread status as a line a reader can act on, or nothing where the state
+/// speaks for itself.
+///
+/// The protocol's status is a tagged object, and handing it to the status line
+/// unrendered put `{"type":"idle"}` on screen and into the transcript as a
+/// notice. Idle produces no text at all, because a resting session has nothing
+/// to report and the status line already says as much by being quiet.
+fn status_detail(status: &Value) -> String {
+    let flag = |name: &str| {
+        status["activeFlags"]
+            .as_array()
+            .is_some_and(|flags| flags.iter().any(|flag| flag.as_str() == Some(name)))
+    };
+    match status["type"].as_str() {
+        Some("active") if flag("waitingOnApproval") => "Waiting for your approval".into(),
+        Some("active") if flag("waitingOnUserInput") => "Waiting for your answer".into(),
+        Some("active") => String::new(),
+        Some("notLoaded") => "Thread not loaded".into(),
+        Some("systemError") => "Codex reported a system error".into(),
+        _ => String::new(),
+    }
+}
+
+/// A turn status as a line a reader can act on.
+///
+/// The successful states are silent: an in-progress turn is already drawn as
+/// activity and a completed one is drawn by its answer, so naming either one
+/// only spends a row of the status line on a word the reader can see.
+fn turn_detail(status: &Value) -> String {
+    match status.as_str() {
+        Some("interrupted") => "Turn interrupted".into(),
+        Some("failed") => "Turn failed".into(),
+        _ => String::new(),
+    }
 }
 fn string<'a>(value: &'a Value, key: &str) -> Result<&'a str, String> {
     value[key]
@@ -1284,6 +1406,7 @@ fn parse_item(value: &Value, done: bool, turn: &str) -> Result<Vec<Item>, String
             thinking,
             phase: Phase::Final,
         },
+        at: None,
     };
     let status = match value["status"].as_str() {
         _ if value["success"] == false
@@ -1309,6 +1432,7 @@ fn parse_item(value: &Value, done: bool, turn: &str) -> Result<Vec<Item>, String
                 output,
                 status,
             },
+            at: None,
         }]
     };
     let items = match kind {
@@ -1320,6 +1444,7 @@ fn parse_item(value: &Value, done: bool, turn: &str) -> Result<Vec<Item>, String
                 thinking: false,
                 phase: message_phase(value),
             },
+            at: None,
         }],
         "userMessage" => {
             let mut items = Vec::new();
@@ -1343,6 +1468,7 @@ fn parse_item(value: &Value, done: bool, turn: &str) -> Result<Vec<Item>, String
                                 .into(),
                             description: "User attachment".into(),
                         },
+                        at: None,
                     }),
                     // A mention, skill or audio part has no rendering of its
                     // own, and neither has a part type this build cannot name,
@@ -1388,6 +1514,7 @@ fn parse_item(value: &Value, done: bool, turn: &str) -> Result<Vec<Item>, String
                     duration_ms: value["durationMs"].as_u64(),
                     output: value["aggregatedOutput"].as_str().unwrap_or("").into(),
                 },
+                at: None,
             }]
         }
         "fileChange" => vec![Item {
@@ -1397,6 +1524,7 @@ fn parse_item(value: &Value, done: bool, turn: &str) -> Result<Vec<Item>, String
                 changes: file_changes(value)?,
                 status,
             },
+            at: None,
         }],
         "mcpToolCall" => tool(
             format!("{} / {}", string(value, "server")?, string(value, "tool")?),
@@ -1441,6 +1569,7 @@ fn parse_item(value: &Value, done: bool, turn: &str) -> Result<Vec<Item>, String
                     })
                     .unwrap_or_default(),
             },
+            at: None,
         }],
         "functionCallOutput" => tool(
             string(value, "name")?.into(),
@@ -1454,6 +1583,7 @@ fn parse_item(value: &Value, done: bool, turn: &str) -> Result<Vec<Item>, String
                 path: string(value, "path")?.into(),
                 description: "Codex image".into(),
             },
+            at: None,
         }],
         "imageGeneration" => tool(
             "Image generation".into(),
@@ -1730,6 +1860,38 @@ mod tests {
         let wrong = adapter
             .receive(json!({"id":resume["id"],"result":{"thread":{"id":"tree-id-not-thread"}}}));
         assert!(wrong.is_err());
+    }
+
+    #[test]
+    fn a_new_thread_carries_the_terminal_bypass_into_its_own_settings() {
+        let directory = tempfile::tempdir().unwrap();
+        let launch = Launch {
+            provider: crate::agent::Provider::Codex,
+            session_id: None,
+            recipe: crate::model::LaunchRecipe {
+                program: "codex".into(),
+                arguments: ["--dangerously-bypass-approvals-and-sandbox"]
+                    .into_iter()
+                    .map(str::to_owned)
+                    .collect(),
+                working_directory: directory.path().into(),
+                environment: BTreeMap::from([(
+                    "CODEX_HOME".into(),
+                    directory.path().to_str().unwrap().into(),
+                )]),
+            },
+        };
+        let (spec, mut adapter) = create(&launch).unwrap();
+        assert_eq!(spec.arguments, vec!["app-server"]);
+        let initialize = adapter.initialize().unwrap();
+        let step = adapter.receive(json!({"id":initialize.writes[0]["id"],"result":{"userAgent":"codex","codexHome":directory.path()}})).unwrap();
+        let start = step
+            .writes
+            .iter()
+            .find(|frame| frame["method"] == "thread/start")
+            .unwrap();
+        assert_eq!(start["params"]["sandbox"], json!("danger-full-access"));
+        assert_eq!(start["params"]["approvalPolicy"], json!("never"));
     }
 
     #[test]
