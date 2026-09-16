@@ -1735,7 +1735,7 @@ fn user_workspace_message_blocked_while_modal(message: &Message) -> bool {
         Message::Repository(action) => !repository_action_allowed_while_modal(action),
         Message::ChatUi(action) => !action.allowed_while_modal(),
         Message::ChromeUi(action) => !matches!(action, chrome_ui::Action::Close),
-        Message::ChannelUi(_) => true,
+        Message::ChannelUi(action) => !action.answers_own_dialog(),
         Message::UpdateUi(update_ui::Action::Apply) => true,
         Message::PullRequestUi(action) => !action.allowed_while_modal(),
         Message::Sidebar(action) => !answers_discard_confirmation(action),
@@ -1791,6 +1791,11 @@ fn user_message_blocked_during_update(message: &Message) -> bool {
                         | project_ui::Action::ConfirmDelete
                         | project_ui::Action::Dismiss
                 )
+                | Message::ChannelUi(
+                    channel_ui::Action::Delete(_)
+                        | channel_ui::Action::ConfirmDelete
+                        | channel_ui::Action::Dismiss
+                )
         )
 }
 
@@ -1810,13 +1815,17 @@ fn resolve_restore_card(
 }
 
 fn workspace_navigation_blocked_during_save(message: &Message) -> bool {
+    // The channel deletion dialog is the one channel command that navigates
+    // nowhere, so a save in flight must not strand it with no way out.
+    if let Message::ChannelUi(action) = message {
+        return !action.answers_own_dialog();
+    }
     matches!(
         message,
         Message::NewTerminal
             | Message::NewBrowser
             | Message::OpenBrowser(_)
             | Message::ChromeUi(chrome_ui::Action::Launch(_))
-            | Message::ChannelUi(_)
             | Message::FocusCard(_)
             | Message::FocusAdjacent(_)
             | Message::Viewport {
@@ -2975,6 +2984,7 @@ pub struct Cagents {
     notices: NoticeLog,
     sidebar_model: SidebarModel,
     project_ui: project_ui::State,
+    channel_ui: channel_ui::State,
     chat_ui: chat_ui::State,
     update_ui: update_ui::State,
     branch_ui: branch_ui::State,
@@ -6413,6 +6423,7 @@ impl Cagents {
             || self.terminal_close.is_some()
             || self.settings_reset_confirm
             || self.project_ui.modal_open()
+            || self.channel_ui.modal_open()
             // Mounted by `dialog` from the sidebar's own state, so nothing
             // beneath it can learn about it any other way. Leaving it out is
             // how the one dialog that is on screen *because* it is about to
@@ -6864,6 +6875,8 @@ impl Cagents {
             Some(sidebar::discard_confirm_id())
         } else if self.project_ui.modal_open() {
             Some(self.project_ui.focus_target())
+        } else if self.channel_ui.modal_open() {
+            Some(channel_ui::State::focus_target())
         } else if self.worktree_dialog.is_some() {
             Some(worktree_dialog_focus_id())
         } else if self.inspector.is_some() {
@@ -7564,6 +7577,7 @@ impl Application for Cagents {
             sidebar_model: SidebarModel::ready(SidebarMode::Expanded, sidebar_projects),
             sidebar_state: SidebarState::default(),
             project_ui: project_ui::State::default(),
+            channel_ui: channel_ui::State::default(),
             chat_ui: chat_ui::State::default(),
             update_ui: update_ui::State::default(),
             branch_ui: branch_ui::State::default(),
@@ -8423,6 +8437,9 @@ impl Application for Cagents {
                     }
                     SidebarAction::OpenChannel { channel_id } => {
                         self.handle_channel_ui(channel_ui::Action::Open(channel_id))
+                    }
+                    SidebarAction::DeleteChannel { channel_id } => {
+                        self.handle_channel_ui(channel_ui::Action::Delete(channel_id))
                     }
                     SidebarAction::ToggleFilesFilter { key } => {
                         if self.source_control_is_bound(&key) && self.sidebar_state.files_filter_open() {
@@ -10129,6 +10146,13 @@ impl Application for Cagents {
                 1.0,
             ));
         }
+        if let Some(surface) = self.channel_dialog_view() {
+            return Some(dialog_ui::overlay(
+                surface,
+                Some(Message::ChannelUi(channel_ui::Action::Dismiss)),
+                1.0,
+            ));
+        }
         if let Some(dialog) = self.worktree_dialog.as_ref() {
             let mut rows: Vec<Element<'_, Message>> = vec![
                 widget::text::title3("Create worktree").into(),
@@ -10838,6 +10862,7 @@ fn unix_millis() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::WorktreeId;
     use cosmic::iced::futures::StreamExt;
 
     #[test]
@@ -14093,6 +14118,7 @@ mod tests {
             sidebar_model: SidebarModel::ready(SidebarMode::Expanded, Vec::new()),
             sidebar_state: SidebarState::default(),
             project_ui: project_ui::State::default(),
+            channel_ui: channel_ui::State::default(),
             chat_ui: chat_ui::State::default(),
             update_ui: update_ui::State::default(),
             chrome_ui: chrome_ui::State::default(),
@@ -15121,6 +15147,184 @@ mod tests {
         app.sidebar_state.apply(&SidebarAction::CancelDiscard);
         assert!(!app.modal_is_open());
         assert!(app.dialog().is_none());
+    }
+
+    /// Every accessible label the dialog the runtime mounts exposes.
+    ///
+    /// libcosmic's `view_main` puts `Application::dialog` in a popover popup,
+    /// and a popup is an overlay, so walking the frame's widget tree never
+    /// reaches it. The dialog element itself is what the runtime asks for, so
+    /// that is what these tests read.
+    fn dialog_labels(app: &Cagents, renderer: &cosmic::Renderer) -> Vec<String> {
+        use cosmic::iced::Size;
+        use cosmic::iced::advanced::{Layout, layout, mouse, widget::Tree};
+        let mut element = app.dialog().expect("a mounted dialog");
+        let mut tree = Tree::new(element.as_widget());
+        let node = element.as_widget_mut().layout(
+            &mut tree,
+            renderer,
+            &layout::Limits::new(Size::ZERO, Size::new(1600.0, 1200.0)),
+        );
+        let nodes =
+            element
+                .as_widget()
+                .a11y_nodes(Layout::new(&node), &tree, mouse::Cursor::Unavailable);
+        nodes
+            .root()
+            .iter()
+            .chain(nodes.children())
+            .filter_map(|node| node.node().label().map(str::to_owned))
+            .collect()
+    }
+
+    /// A project with one deletable worktree beside its primary one, and a
+    /// session to record the deletion against, which is what the pre-flight
+    /// refusal asks for first.
+    fn deletable_worktree_app() -> (Cagents, tempfile::TempDir, ProjectId, WorktreeId) {
+        let mut app = context_inspector_test_app(false);
+        let directory = tempfile::tempdir().unwrap();
+        let (session, _) = SessionRuntime::open(
+            directory.path().join("state.sqlite3"),
+            crate::model::BootId::new("boot-test"),
+        )
+        .unwrap();
+        app.session = Some(session);
+        let project = ProjectId::new();
+        let worktree = WorktreeId::new();
+        app.sidebar_model.projects.push(SidebarProject::new(
+            project,
+            RepositoryId::new(),
+            "repo".into(),
+            "/repo".into(),
+            vec![
+                sidebar::SidebarWorktree::from_durable(
+                    WorktreeId::new(),
+                    "/repo".into(),
+                    Some("main".into()),
+                ),
+                sidebar::SidebarWorktree::from_durable(
+                    worktree,
+                    "/repo/feature".into(),
+                    Some("feature".into()),
+                ),
+            ],
+            Vec::new(),
+        ));
+        (app, directory, project, worktree)
+    }
+
+    /// "Delete worktree…" is a request for a confirmation, and a confirmation
+    /// nobody can answer is the same as no command at all: the dialog the
+    /// runtime mounts has to carry the question and its confirming button,
+    /// and answering it has to start the deletion.
+    #[test]
+    fn deleting_a_worktree_mounts_its_confirmation_and_confirming_starts_the_deletion() {
+        let renderer = headless_renderer();
+        let (mut app, _directory, project_id, worktree_id) = deletable_worktree_app();
+
+        let _ = app.update(Message::Sidebar(SidebarAction::ProjectCommand {
+            project_id,
+            worktree_id: Some(worktree_id),
+            command: sidebar::ProjectCommand::Delete,
+        }));
+        assert!(
+            app.modal_is_open(),
+            "the command opens a modal rather than deleting outright"
+        );
+        let labels = dialog_labels(&app, &renderer);
+        assert!(
+            labels.iter().any(|label| label == "Delete worktree?"),
+            "the confirmation the runtime mounts asks the question: {labels:?}"
+        );
+        assert!(
+            labels.iter().any(|label| label == "Delete worktree"),
+            "with nothing blocking it, the confirming button is offered: {labels:?}"
+        );
+
+        let _ = app.update(Message::ProjectUi(project_ui::Action::ConfirmDelete));
+        assert!(
+            app.project_ui.deleting(),
+            "confirming hands the worktree to the deletion path"
+        );
+        assert!(
+            dialog_labels(&app, &renderer)
+                .iter()
+                .any(|label| label == "Deleting…"),
+            "and the dialog stays up to report it"
+        );
+    }
+
+    /// Both rails speak for one worktree. The context rail's Changes and Pull
+    /// Request tabs read the indicators the navigation row draws, so a glance
+    /// at either rail reports the same thing.
+    #[test]
+    fn the_context_rail_indicates_what_the_navigation_row_indicates() {
+        let mut app = context_inspector_test_app(false);
+        let project = ProjectId::new();
+        let worktree = WorktreeId::new();
+        let path = PathBuf::from("/repo/feature");
+        let row = sidebar::SidebarWorktree::new(
+            worktree,
+            path.clone(),
+            Some("feature".into()),
+            false,
+            false,
+            Some(crate::repository::DirtyState {
+                staged: 1,
+                unstaged: 2,
+                untracked: 0,
+                conflicted: 0,
+                submodule: 0,
+            }),
+            None,
+            None,
+        );
+        app.sidebar_model.projects.push(SidebarProject::new(
+            project,
+            RepositoryId::new(),
+            "repo".into(),
+            "/repo".into(),
+            vec![
+                sidebar::SidebarWorktree::from_durable(
+                    WorktreeId::new(),
+                    "/repo".into(),
+                    Some("main".into()),
+                ),
+                row,
+            ],
+            vec![SidebarPullRequest::new(
+                project,
+                42,
+                "Polish the rail".into(),
+                Url::parse("https://github.com/example/cagents/pull/42").unwrap(),
+                "feature".into(),
+                None,
+                false,
+                sidebar::CheckStatus::Pending,
+            )],
+        ));
+        app.sidebar_state.sync_active_worktree(
+            &app.sidebar_model,
+            &SidebarFocus::Repository {
+                worktree: path.clone(),
+            },
+        );
+
+        let navigation = sidebar::worktree_indicators(&app.sidebar_model.projects[0].worktrees[1]);
+        assert_eq!(
+            navigation.dirty,
+            Some("3 changes"),
+            "the navigation row counts the worktree's changes"
+        );
+        assert!(
+            navigation.pending_checks,
+            "and reports its pull request's checks as in flight"
+        );
+        assert_eq!(
+            app.context_rail_indicators(),
+            navigation,
+            "the context rail indicates exactly what the navigation row indicates"
+        );
     }
 
     #[test]

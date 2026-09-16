@@ -7,6 +7,46 @@ use crate::sidebar::SidebarChannel;
 pub enum Action {
     Create(ProjectId),
     Open(ChannelId),
+    /// Asks to delete a channel. Nothing is removed until the confirmation is
+    /// answered, because a channel's conversations exist nowhere else.
+    Delete(ChannelId),
+    ConfirmDelete,
+    Dismiss,
+}
+
+impl Action {
+    /// Whether this action is the deletion dialog's own answer.
+    ///
+    /// Everything else a channel can be asked to do is a navigation command
+    /// and stands down behind any modal; refusing the dialog's own answers
+    /// would strand it with no way out.
+    pub fn answers_own_dialog(self) -> bool {
+        matches!(self, Self::ConfirmDelete | Self::Dismiss)
+    }
+}
+
+/// The pending deletion, held while its confirmation is on screen.
+#[derive(Debug, Default)]
+pub struct State {
+    dialog: Option<Deletion>,
+}
+
+#[derive(Debug, Clone)]
+struct Deletion {
+    channel: ChannelId,
+    title: String,
+    /// Open conversations the deletion closes, reported before it happens.
+    chats: usize,
+}
+
+impl State {
+    pub fn modal_open(&self) -> bool {
+        self.dialog.is_some()
+    }
+
+    pub(super) fn focus_target() -> widget::Id {
+        widget::Id::new("dialog.channel.confirm")
+    }
 }
 
 impl Cagents {
@@ -46,9 +86,9 @@ impl Cagents {
 
     pub(super) fn handle_channel_ui(&mut self, action: Action) -> Task<Message> {
         if self.update_prepared
-            || self.modal_is_open()
             || self.focused_repository_is_saving()
             || self.project_ui.deleting()
+            || (self.modal_is_open() && !action.answers_own_dialog())
         {
             return Task::none();
         }
@@ -85,7 +125,165 @@ impl Cagents {
                 self.show_workspace_for_action();
                 self.select_channel(id)
             }
+            Action::Delete(id) => {
+                let Some(channel) = self
+                    .durable
+                    .channels
+                    .iter()
+                    .find(|channel| channel.id == id)
+                else {
+                    return Task::none();
+                };
+                let title = channel_display_title(channel).to_owned();
+                let chats = channel
+                    .cards
+                    .iter()
+                    .filter(|card| {
+                        self.durable.cards.iter().any(|state| {
+                            state.id == **card
+                                && state.existence.is_open()
+                                && matches!(&state.kind, CardKind::Chat(_))
+                        })
+                    })
+                    .count();
+                self.channel_ui.dialog = Some(Deletion {
+                    channel: id,
+                    title,
+                    chats,
+                });
+                iced::widget::operation::focus(State::focus_target()).map(cosmic::Action::App)
+            }
+            Action::ConfirmDelete => {
+                let Some(deletion) = self.channel_ui.dialog.take() else {
+                    return Task::none();
+                };
+                self.delete_channel(deletion.channel)
+            }
+            Action::Dismiss => {
+                self.channel_ui.dialog = None;
+                let focus = self.nested_modal_focus_target().unwrap_or_else(|| {
+                    self.workspace
+                        .focused()
+                        .map(workspace_widget::card_focus_id)
+                        .unwrap_or_else(|| widget::Id::new(TOOLBAR_FOCUS_ID))
+                });
+                iced::widget::operation::focus(focus).map(cosmic::Action::App)
+            }
         }
+    }
+
+    /// Removes a channel along with everything that existed only inside it.
+    ///
+    /// A channel's conversations are reachable nowhere else, so they are
+    /// retired with it rather than left behind as durable cards no scope can
+    /// show - the same treatment worktree deletion gives the cards of the
+    /// directory it removes.
+    fn delete_channel(&mut self, id: ChannelId) -> Task<Message> {
+        let Some(index) = self
+            .durable
+            .channels
+            .iter()
+            .position(|channel| channel.id == id)
+        else {
+            return Task::none();
+        };
+        let project_id = self.durable.channels[index].project_id;
+        let was_active = self.durable.active_channel == Some(id);
+        let siblings: Vec<(usize, ChannelId)> = self
+            .durable
+            .channels
+            .iter()
+            .enumerate()
+            .filter(|(position, channel)| *position != index && channel.project_id == project_id)
+            .map(|(position, channel)| (position, channel.id))
+            .collect();
+        // The channel that takes the deleted one's place, or the one above it
+        // when the project's last channel is the one going away.
+        let successor = siblings
+            .iter()
+            .find(|(position, _)| *position > index)
+            .or_else(|| siblings.last())
+            .map(|(_, id)| *id);
+        let channel = Arc::make_mut(&mut self.durable).channels.remove(index);
+        for card in channel.cards {
+            self.retire_lsp_card(card);
+            self.cards.remove(&card);
+            self.lifecycle.remove(card);
+            if let Some(state) = self.card_state_mut(card) {
+                state.existence = super::project_ui::removed_existence("channel deleted by user");
+            }
+        }
+        let select = if was_active {
+            // A scope that no longer exists cannot stay selected, and the
+            // workspace has to land on something the user can still reach.
+            match successor {
+                Some(next) => self.select_channel(next),
+                None => match self.project_primary_worktree(project_id) {
+                    Some(path) => self.select_worktree(path, false),
+                    None => {
+                        Arc::make_mut(&mut self.durable).active_channel = None;
+                        Task::none()
+                    }
+                },
+            }
+        } else {
+            Task::none()
+        };
+        // After the reselection: leaving a scope records its camera against
+        // the channel it is leaving, including this one.
+        self.channel_offsets.remove(&id);
+        self.refresh_sidebar_channels();
+        self.persist();
+        Task::batch([select, self.lifecycle_sweep(), self.sync_chrome()])
+    }
+
+    /// Where a project's workspace falls back to when no channel is selected.
+    fn project_primary_worktree(&self, project_id: ProjectId) -> Option<PathBuf> {
+        let project = self.sidebar_model.project(project_id)?;
+        Some(
+            project
+                .worktrees
+                .iter()
+                .find(|worktree| sidebar::is_primary_worktree(&project.repository, &worktree.path))
+                .map_or_else(
+                    || project.repository.clone(),
+                    |worktree| worktree.path.clone(),
+                ),
+        )
+    }
+
+    pub(super) fn channel_dialog_view(&self) -> Option<Element<'_, Message>> {
+        let dialog = self.channel_ui.dialog.as_ref()?;
+        let rows: Vec<Element<'_, Message>> = vec![
+            widget::text::title3("Delete channel?").into(),
+            super::notice_body(dialog.title.clone()),
+            super::notice_body(match dialog.chats {
+                0 => "It holds no conversations.".to_owned(),
+                1 => "Deleting it closes the one conversation inside it.".to_owned(),
+                chats => format!("Deleting it closes the {chats} conversations inside it."),
+            }),
+            super::notice_detail(
+                "The channel and the conversations it holds are removed from this workspace. \
+                 Nothing outside the channel is touched.",
+            ),
+            widget::row::with_children(vec![
+                iced::widget::Space::new().width(Length::Fill).into(),
+                widget::button::standard("Cancel")
+                    .id(widget::Id::new("dialog.channel.close"))
+                    .on_press(Message::ChannelUi(Action::Dismiss))
+                    .into(),
+                widget::button::destructive("Delete channel")
+                    .id(State::focus_target())
+                    .on_press(Message::ChannelUi(Action::ConfirmDelete))
+                    .into(),
+            ])
+            .spacing(cosmic::theme::spacing().space_xxs)
+            .into(),
+        ];
+        Some(super::dialog_ui::surface(
+            widget::column::with_children(rows).spacing(3.0 * design::GRID_UNIT),
+            480.0,
+        ))
     }
 
     /// Refresh cached rows after state changes, never during rendering. A channel's
@@ -125,11 +323,7 @@ impl Cagents {
                 .iter()
                 .filter(|channel| channel.project_id == project.id)
             {
-                let title = if channel.title.is_empty() {
-                    "New channel"
-                } else {
-                    &channel.title
-                };
+                let title = channel_display_title(channel);
                 let selected = durable.active_channel == Some(channel.id);
                 let mut activity = None;
                 let mut unread = false;
@@ -183,6 +377,17 @@ impl Cagents {
             }
             project.channels.truncate(index);
         }
+    }
+}
+
+/// A channel still waiting for its conversation's name has to be nameable
+/// anyway: a row has to label it, and a dialog about to destroy it has to say
+/// which one it means.
+fn channel_display_title(channel: &ProjectChannel) -> &str {
+    if channel.title.is_empty() {
+        "New channel"
+    } else {
+        &channel.title
     }
 }
 
@@ -313,5 +518,88 @@ mod tests {
         app.refresh_sidebar_channels();
         assert_eq!(app.sidebar_model.projects[0].channels[0].chats, 1);
         assert_eq!(app.sidebar_model.projects[0].channels[0].id, id);
+    }
+
+    /// A channel's conversations are reachable nowhere else, so deleting one
+    /// has to take them with it, say so first, and leave the workspace on a
+    /// scope that still exists.
+    #[test]
+    fn deleting_the_active_channel_retires_its_chats_and_lands_on_a_survivor() {
+        let mut app = super::super::tests::context_inspector_test_app(true);
+        let project = ProjectId::new();
+        let doomed = ChannelId::new();
+        let survivor = ChannelId::new();
+        let conversation = CardId::new();
+        let durable = Arc::make_mut(&mut app.durable);
+        let mut chat = durable.cards[0].clone();
+        chat.id = conversation;
+        chat.kind = crate::model::CardKind::Chat(chat_session());
+        chat.title = "Explain the parser".into();
+        durable.cards.push(chat);
+        durable.channels.push(ProjectChannel {
+            id: doomed,
+            project_id: project,
+            title: "Investigation".into(),
+            cards: vec![conversation],
+            focused: Some(conversation),
+        });
+        durable.channels.push(ProjectChannel {
+            id: survivor,
+            project_id: project,
+            title: "Migration".into(),
+            cards: Vec::new(),
+            focused: None,
+        });
+        durable.active_channel = Some(doomed);
+        app.sidebar_model.projects.push(SidebarProject::new(
+            project,
+            RepositoryId::new(),
+            "project".into(),
+            "/repo".into(),
+            vec![crate::sidebar::SidebarWorktree::from_durable(
+                crate::model::WorktreeId::new(),
+                "/repo".into(),
+                Some("main".into()),
+            )],
+            Vec::new(),
+        ));
+        app.refresh_sidebar_channels();
+        assert_eq!(app.sidebar_model.projects[0].channels.len(), 2);
+
+        // Asking is not doing: a channel holding a live conversation says what
+        // it is about to close before it closes anything.
+        let _ = app.handle_channel_ui(Action::Delete(doomed));
+        assert!(app.modal_is_open(), "deletion confirms before it destroys");
+        assert!(
+            app.dialog().is_some(),
+            "and the confirmation reaches the frame the runtime mounts"
+        );
+        assert!(app.durable.channels.iter().any(|row| row.id == doomed));
+
+        let _ = app.handle_channel_ui(Action::ConfirmDelete);
+        assert!(
+            !app.durable.channels.iter().any(|row| row.id == doomed),
+            "the confirmed deletion removes the channel"
+        );
+        assert_eq!(
+            app.durable.active_channel,
+            Some(survivor),
+            "a deleted scope cannot stay selected, so a surviving sibling takes over"
+        );
+        let chat = app
+            .durable
+            .cards
+            .iter()
+            .find(|card| card.id == conversation)
+            .expect("the card is tombstoned rather than forgotten");
+        assert!(
+            !chat.existence.is_open(),
+            "a conversation that lived only in the channel goes with it"
+        );
+        assert_eq!(app.sidebar_model.projects[0].channels.len(), 1);
+        assert_eq!(
+            app.durable.active_worktree, app.active_workspace,
+            "the deletion persisted the workspace it left behind"
+        );
     }
 }

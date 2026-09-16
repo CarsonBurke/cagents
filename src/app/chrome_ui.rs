@@ -905,11 +905,32 @@ impl Cagents {
         )
     }
 
+    /// The navigation row the context rail speaks for: the active worktree's
+    /// own row, so the rail reads one worktree rather than re-deriving it.
+    pub(super) fn context_rail_indicators(&self) -> sidebar::WorktreeIndicators<'_> {
+        let Some(key) = self.sidebar_state.active_worktree() else {
+            return sidebar::WorktreeIndicators::default();
+        };
+        self.sidebar_model
+            .projects
+            .iter()
+            .find(|project| project.id == key.project_id)
+            .and_then(|project| {
+                project
+                    .worktrees
+                    .iter()
+                    .find(|worktree| worktree.id == key.worktree_id)
+            })
+            .map(sidebar::worktree_indicators)
+            .unwrap_or_default()
+    }
+
     pub(super) fn context_panel(
         &self,
         model: Option<inspector::InspectorModel>,
         width: f32,
     ) -> Element<'_, Message> {
+        let indicators = self.context_rail_indicators();
         let tabs = widget::row::with_children(ContextTab::ALL.into_iter().map(|tab| {
             let selected = self.context_tab == tab;
             let enabled = !self.modal_is_open()
@@ -921,24 +942,11 @@ impl Cagents {
                 ContextTab::Details => "dialog-information-symbolic",
             };
             let visual = (tab == ContextTab::PullRequest)
-                .then(|| {
-                    let key = self.sidebar_state.active_worktree()?;
-                    let project = self
-                        .sidebar_model
-                        .projects
-                        .iter()
-                        .find(|project| project.id == key.project_id)?;
-                    let worktree = project
-                        .worktrees
-                        .iter()
-                        .find(|worktree| worktree.path == key.canonical_path)?;
-                    let branch = worktree.branch.as_deref()?;
-                    project
-                        .pull_requests
-                        .iter()
-                        .find(|pr| pr.head_ref == branch)
-                        .map(sidebar::pull_request_visual)
-                })
+                .then_some(indicators.pull_request)
+                .flatten()
+                .map(sidebar::pull_request_visual);
+            let dirty = (tab == ContextTab::Changes)
+                .then_some(indicators.dirty)
                 .flatten();
             let control = crate::ui_controls::icon_control(
                 visual.as_ref().map_or_else(
@@ -950,21 +958,34 @@ impl Cagents {
                 enabled,
                 enabled.then_some(Message::SelectContextTab(tab)),
             );
-            let changes = tab == ContextTab::Changes
-                && self
-                    .sidebar_model
-                    .source_control
-                    .as_ref()
-                    .is_some_and(|source| {
-                        self.sidebar_state.active_worktree() == Some(&source.key)
-                            && source.has_changes()
-                    });
-            match visual {
-                Some((_, color)) => control.icon_color(color).into(),
-                None if changes => control
+            let control: Element<'_, Message> = match (&visual, dirty) {
+                (Some((_, color)), _) => control.icon_color(*color).into(),
+                (None, Some(_)) => control
                     .icon_color(cosmic::theme::active().cosmic().warning.base.into())
                     .into(),
-                None => control.into(),
+                (None, None) => control.into(),
+            };
+            // A tint says "something", a badge says what. These are the
+            // navigation rail's own badges, so one glance at either rail
+            // reports the same worktree.
+            let badge: Option<Element<'_, Message>> = match tab {
+                ContextTab::Changes => dirty.map(|label| {
+                    sidebar::status_icon(
+                        "document-edit-symbolic",
+                        label,
+                        sidebar::BadgeTone::Warning,
+                    )
+                }),
+                ContextTab::PullRequest if indicators.pending_checks => {
+                    Some(sidebar::check_indicator(sidebar::CheckStatus::Pending))
+                }
+                _ => None,
+            };
+            match badge {
+                Some(badge) => widget::row::with_children(vec![control, badge])
+                    .align_y(Alignment::Center)
+                    .into(),
+                None => control,
             }
         }))
         .spacing(2)

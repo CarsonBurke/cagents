@@ -355,7 +355,7 @@ impl Cagents {
                         self.cards.remove(&id);
                         self.lifecycle.remove(id);
                         if let Some(card) = self.card_state_mut(id) {
-                            card.existence = removed_existence();
+                            card.existence = removed_existence("worktree deleted by user");
                         }
                     }
                     self.worktree_offsets.remove(&target.path);
@@ -565,12 +565,14 @@ fn launch_task(executable: PathBuf, path: PathBuf, editor: bool) -> Task<Message
     })
 }
 
-fn removed_existence() -> Existence {
+/// The tombstone a card gets when the container it lived in is deleted
+/// outright, rather than the card itself being closed.
+pub(super) fn removed_existence(reason: &str) -> Existence {
     Existence::Closed {
         tombstone: crate::model::Tombstone {
             operation_id: None,
             closed_at_unix_ms: unix_millis(),
-            reason: Some("worktree deleted by user".into()),
+            reason: Some(reason.into()),
         },
     }
 }
@@ -681,7 +683,7 @@ fn delete_worktree(
             .load_worktree(id)
             .map_err(|error| error.to_string())?
             .ok_or("Removed worktree was not present in durable catalog.")?;
-        worktree.existence = removed_existence();
+        worktree.existence = removed_existence("worktree deleted by user");
         store
             .save_worktree(&worktree)
             .map_err(|error| error.to_string())?;
