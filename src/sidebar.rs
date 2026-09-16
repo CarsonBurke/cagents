@@ -8408,6 +8408,312 @@ mod tests {
         assert_eq!(messages, vec![SidebarAction::OpenRepositoryPicker]);
     }
 
+    /// One frame's worth of the real sidebar, laid out the way the runtime
+    /// lays it out.
+    fn interface<'a>(
+        model: &'a SidebarModel,
+        state: &'a SidebarState,
+        bounds: Size,
+        cache: cosmic::iced::runtime::user_interface::Cache,
+        renderer: &mut cosmic::Renderer,
+    ) -> cosmic::iced::runtime::UserInterface<'a, SidebarAction, cosmic::Theme, cosmic::Renderer>
+    {
+        cosmic::iced::runtime::UserInterface::build(
+            view(
+                model,
+                state,
+                SidebarMode::Expanded,
+                design::NAVIGATION_DEFAULT_WIDTH,
+                false,
+            ),
+            bounds,
+            cache,
+            renderer,
+        )
+    }
+
+    /// Drives the real sidebar the way the runtime does, so that a gesture can
+    /// be judged by the messages it publishes and the frame it paints. A
+    /// window shorter than the project list is what makes a scroll offset, and
+    /// the menu geometry that depends on it, observable at all.
+    struct Sidebar {
+        model: SidebarModel,
+        state: SidebarState,
+        renderer: cosmic::Renderer,
+        cache: cosmic::iced::runtime::user_interface::Cache,
+        bounds: Size,
+    }
+
+    impl Sidebar {
+        /// A window shorter than a row menu, so the menu has to choose its
+        /// side and slice itself the way it would on screen.
+        fn scrolling() -> Self {
+            Self::sized(320.0)
+        }
+
+        /// A window with room below the anchor for the whole menu, so its
+        /// placement is fixed by the anchor alone. Nothing then moves the menu
+        /// if a font or a theme makes it a few pixels taller, which is what
+        /// makes measuring it in pixels reliable.
+        fn roomy() -> Self {
+            Self::sized(640.0)
+        }
+
+        fn sized(height: f32) -> Self {
+            let mut entry = project();
+            entry.worktrees = (2..30)
+                .map(|id| worktree(id, &format!("branch-{id}"), false))
+                .collect();
+            let mut model = SidebarModel::ready(SidebarMode::Expanded, vec![entry]);
+            // Enough editors that the menu is taller than the short window.
+            model.external_editors = (0..6)
+                .map(|index| SidebarEditor {
+                    id: format!("editor-{index}"),
+                    name: format!("Editor {index}"),
+                    icon: "text-editor-symbolic".to_owned(),
+                })
+                .collect();
+            Self {
+                model,
+                state: SidebarState::default(),
+                renderer: headless_renderer(),
+                cache: Default::default(),
+                bounds: Size::new(design::NAVIGATION_DEFAULT_WIDTH, height),
+            }
+        }
+
+        fn feed(
+            &mut self,
+            events: &[cosmic::iced::Event],
+            cursor: cosmic::iced::Point,
+        ) -> Vec<SidebarAction> {
+            use cosmic::iced::advanced::{clipboard, mouse};
+            let mut messages = Vec::new();
+            let mut interface = interface(
+                &self.model,
+                &self.state,
+                self.bounds,
+                std::mem::take(&mut self.cache),
+                &mut self.renderer,
+            );
+            interface.update(
+                events,
+                mouse::Cursor::Available(cursor),
+                &mut self.renderer,
+                &mut clipboard::Null,
+                &mut messages,
+            );
+            self.cache = interface.into_cache();
+            messages
+        }
+
+        fn scroll(&mut self, pixels: f32, at: cosmic::iced::Point) {
+            use cosmic::iced::{Event, advanced::mouse};
+            self.feed(
+                &[Event::Mouse(mouse::Event::WheelScrolled {
+                    delta: mouse::ScrollDelta::Pixels { x: 0.0, y: pixels },
+                })],
+                at,
+            );
+        }
+
+        fn click(
+            &mut self,
+            button: cosmic::iced::advanced::mouse::Button,
+            at: cosmic::iced::Point,
+        ) -> Vec<SidebarAction> {
+            use cosmic::iced::{Event, advanced::mouse};
+            self.feed(
+                &[
+                    Event::Mouse(mouse::Event::ButtonPressed(button)),
+                    Event::Mouse(mouse::Event::ButtonReleased(button)),
+                ],
+                at,
+            )
+        }
+
+        fn move_to(&mut self, at: cosmic::iced::Point) {
+            use cosmic::iced::{Event, advanced::mouse};
+            self.feed(
+                &[Event::Mouse(mouse::Event::CursorMoved { position: at })],
+                at,
+            );
+        }
+
+        /// The window rows an open row menu paints on, measured against the
+        /// same frame with the menu closed and the pointer absent from both,
+        /// so that neither the list's scroll position nor hover feedback can
+        /// be mistaken for the menu.
+        fn menu_rows(scroll: f32) -> Vec<(usize, usize)> {
+            use cosmic::iced::{
+                Color,
+                advanced::{
+                    clipboard, mouse,
+                    renderer::{Headless, Style},
+                },
+            };
+            let frame = |open: bool| {
+                let mut sidebar = Self::roomy();
+                sidebar.scroll(scroll, MENU_ROW);
+                if open {
+                    sidebar.click(mouse::Button::Right, MENU_ROW);
+                }
+                sidebar.move_to(MENU_ROW);
+                // The frame that draws has to be the frame that updated: the
+                // runtime keeps an overlay's layout from its own update pass.
+                let mut interface = interface(
+                    &sidebar.model,
+                    &sidebar.state,
+                    sidebar.bounds,
+                    std::mem::take(&mut sidebar.cache),
+                    &mut sidebar.renderer,
+                );
+                interface.update(
+                    &[],
+                    mouse::Cursor::Unavailable,
+                    &mut sidebar.renderer,
+                    &mut clipboard::Null,
+                    &mut Vec::new(),
+                );
+                interface.draw(
+                    &mut sidebar.renderer,
+                    &cosmic::Theme::dark(),
+                    &Style::default(),
+                    mouse::Cursor::Unavailable,
+                );
+                let size = Size::new(sidebar.bounds.width as u32, sidebar.bounds.height as u32);
+                (sidebar.renderer.screenshot(size, 1.0, Color::BLACK), size)
+            };
+            let (closed, size) = frame(false);
+            let (opened, _) = frame(true);
+            let width = 4 * size.width as usize;
+            let mut rows: Vec<(usize, usize)> = Vec::new();
+            for y in 0..closed.len() / width {
+                let row = y * width..(y + 1) * width;
+                if closed[row.clone()] == opened[row] {
+                    continue;
+                }
+                match rows.last_mut() {
+                    Some((_, last)) if *last + 1 == y => *last = y,
+                    _ => rows.push((y, y)),
+                }
+            }
+            rows
+        }
+    }
+
+    /// A worktree row under the pointer whether the list is scrolled or not,
+    /// and far enough down the short window that a menu taller than it has to
+    /// open upwards.
+    const MENU_ROW: cosmic::iced::Point = cosmic::iced::Point::new(56.0, 136.0);
+    /// How far the wheel moves the list in the scrolled half of each case.
+    const MENU_SCROLL: f32 = -80.0;
+
+    #[test]
+    fn a_row_menu_in_a_scrolled_list_runs_the_entry_for_its_row() {
+        use cosmic::iced::{Point, advanced::mouse};
+        // A menu opens over its anchor, so a short reach below the point that
+        // opened it lands on an entry under either placement.
+        let entry_cursor = Point::new(86.0, 144.0);
+        let mut outcomes = Vec::new();
+        for scroll in [0.0, MENU_SCROLL] {
+            let mut sidebar = Sidebar::scrolling();
+            sidebar.scroll(scroll, MENU_ROW);
+            let activated = sidebar.click(mouse::Button::Left, MENU_ROW);
+            let Some(SidebarAction::OpenWorktree { worktree_id, .. }) = activated.first() else {
+                panic!("a worktree row sits under the pointer (scroll={scroll}): {activated:?}");
+            };
+            let under_pointer = *worktree_id;
+            sidebar.click(mouse::Button::Right, MENU_ROW);
+            sidebar.move_to(entry_cursor);
+            let chosen = sidebar.click(mouse::Button::Left, entry_cursor);
+            let (worktree, command) = match chosen.first() {
+                Some(SidebarAction::ProjectCommand {
+                    worktree_id,
+                    command,
+                    ..
+                }) => (*worktree_id, command.clone()),
+                other => panic!(
+                    "choosing a menu entry must run a row command, not fall through to the row \
+                     underneath (scroll={scroll}): {other:?}"
+                ),
+            };
+            assert_eq!(
+                worktree,
+                Some(under_pointer),
+                "the menu belongs to the row the pointer opened it over (scroll={scroll})"
+            );
+            outcomes.push((under_pointer, command));
+        }
+        let [
+            (unscrolled_row, unscrolled_entry),
+            (scrolled_row, scrolled_entry),
+        ] = outcomes.as_slice()
+        else {
+            unreachable!("one outcome per scroll state");
+        };
+        assert_ne!(
+            unscrolled_row, scrolled_row,
+            "the wheel has to move the list, or the scrolled case tests nothing"
+        );
+        assert_eq!(
+            unscrolled_entry, scrolled_entry,
+            "the same reach below the anchor has to land on the same entry, so the menu keeps \
+             measuring itself against the window rather than against the scrolled-away content"
+        );
+    }
+
+    #[test]
+    fn a_row_menu_paints_where_it_answers_the_pointer() {
+        // The band a menu paints on starts at the pointer and runs down the
+        // window. Opening it also repaints the row it was opened on, which
+        // borders that band from above, so the two cases are compared by how
+        // far the menu reaches rather than by where the repainting starts.
+        let band = |painted: Vec<(usize, usize)>, list: &str| {
+            painted
+                .iter()
+                .copied()
+                .find(|(from, to)| *from <= MENU_ROW.y as usize && *to > MENU_ROW.y as usize)
+                .unwrap_or_else(|| {
+                    panic!("{list} row's menu paints where the pointer opened it: {painted:?}")
+                })
+        };
+        let (_, unscrolled) = band(Sidebar::menu_rows(0.0), "an unscrolled");
+        let (_, scrolled) = band(Sidebar::menu_rows(MENU_SCROLL), "a scrolled");
+        assert_eq!(
+            scrolled, unscrolled,
+            "a scrolled row's menu has to reach as far down the window as an unscrolled one, or \
+             it is drawn somewhere other than where it takes clicks"
+        );
+    }
+
+    #[test]
+    fn clicking_beside_an_open_row_menu_only_dismisses_it() {
+        use cosmic::iced::{Point, advanced::mouse};
+        // A header control above the scrolled list, inside the band a menu
+        // anchored in window space leaves behind if it stops covering the
+        // whole window.
+        let beside = Point::new(210.0, 20.0);
+        for scroll in [0.0, MENU_SCROLL] {
+            let mut sidebar = Sidebar::scrolling();
+            sidebar.scroll(scroll, MENU_ROW);
+            sidebar.click(mouse::Button::Right, MENU_ROW);
+            sidebar.move_to(MENU_ROW);
+            let dismissing = sidebar.click(mouse::Button::Left, beside);
+            assert_eq!(
+                dismissing,
+                Vec::new(),
+                "a click beside an open menu dismisses it rather than reaching the control it \
+                 covers (scroll={scroll})"
+            );
+            let reachable = sidebar.click(mouse::Button::Left, beside);
+            assert!(
+                !reachable.is_empty(),
+                "the dismissed menu leaves that control usable again (scroll={scroll})"
+            );
+        }
+    }
+
     #[test]
     fn project_drag_does_not_activate_the_pressed_header() {
         use cosmic::iced::{
