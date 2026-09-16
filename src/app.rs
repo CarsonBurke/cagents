@@ -14,6 +14,7 @@ mod refresh_ui;
 #[cfg(test)]
 mod safety_tests;
 mod settings_ui;
+mod terminal_adoption;
 mod terminal_close;
 mod update_ui;
 mod worktree_operations;
@@ -707,6 +708,24 @@ struct TerminalWakeSource(async_channel::Receiver<TerminalWakeup>);
 #[derive(Clone)]
 struct UiActivationSource(async_channel::Receiver<instance::UiActivation>);
 
+/// Hosted terminals observed on the daemon, from the inventory observer thread.
+#[derive(Clone)]
+struct HostedTerminalSource(async_channel::Receiver<Vec<TerminalSession>>);
+
+impl PartialEq for HostedTerminalSource {
+    fn eq(&self, _other: &Self) -> bool {
+        true
+    }
+}
+
+impl Eq for HostedTerminalSource {}
+
+impl std::hash::Hash for HostedTerminalSource {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        std::hash::Hash::hash(&"cagents-hosted-terminals", state);
+    }
+}
+
 #[derive(Clone)]
 struct SessionHealthSource(async_channel::Receiver<SessionSaveHealthEvent>);
 
@@ -789,6 +808,21 @@ fn terminal_wake_stream(
     Box::pin(cosmic::iced::futures::stream::unfold(
         source.0.clone(),
         |receiver| async move { receiver.recv().await.ok().map(|wake| (wake, receiver)) },
+    ))
+}
+
+fn hosted_terminal_stream(
+    source: &HostedTerminalSource,
+) -> Pin<Box<dyn cosmic::iced::futures::Stream<Item = Vec<TerminalSession>> + Send + 'static>> {
+    Box::pin(cosmic::iced::futures::stream::unfold(
+        source.0.clone(),
+        |receiver| async move {
+            receiver
+                .recv()
+                .await
+                .ok()
+                .map(|observed| (observed, receiver))
+        },
     ))
 }
 
@@ -2382,6 +2416,9 @@ pub enum Message {
         terminals: Vec<TerminalSession>,
         result: Result<(), String>,
     },
+    /// Hosted terminals the daemon reports, either as its full inventory on
+    /// connect or as one terminal another client just created.
+    HostedTerminalsObserved(Vec<TerminalSession>),
     TerminalWake {
         card: CardId,
         generation: u64,
@@ -2944,6 +2981,17 @@ pub struct Cagents {
     lifecycle_sweep_generation: u64,
     terminal_wake_tx: async_channel::Sender<TerminalWakeup>,
     terminal_wake_rx: async_channel::Receiver<TerminalWakeup>,
+    hosted_terminals_rx: async_channel::Receiver<Vec<TerminalSession>>,
+    /// Terminal starts this window has dispatched and not yet accounted for.
+    ///
+    /// Adoption must not claim a terminal a start is about to claim, and a
+    /// start can change the identity it ends up with, so the only safe answer
+    /// is to know whether any start is outstanding. The counter is atomic for
+    /// interior mutability - the start path holds `&self` - and never for
+    /// concurrency: every mutation happens on the update thread.
+    terminal_starts: std::sync::atomic::AtomicUsize,
+    /// Observations held back while a start was outstanding.
+    pending_adoptions: Vec<TerminalSession>,
     activation_rx: async_channel::Receiver<instance::UiActivation>,
     session: Option<SessionRuntime>,
     save_health: Option<SaveHealthState>,
@@ -3466,6 +3514,9 @@ impl Cagents {
         visible: bool,
         explicit_retry: bool,
     ) -> Task<Message> {
+        // Recovery can replace the identity this start ends up with, so
+        // adoption has to know a start is outstanding before the task runs.
+        self.begin_terminal_start();
         let max_scrollback = self.settings.terminal_scrollback_lines;
         let theme = self.settings.terminal_theme;
         let sender = self.terminal_wake_tx.clone();
@@ -7551,6 +7602,11 @@ impl Application for Cagents {
             .collect();
         let workspace = Self::rebuild_workspace(&durable);
         let (terminal_wake_tx, terminal_wake_rx) = async_channel::unbounded();
+        // The daemon owns the terminal inventory; this window observes it for
+        // the whole of its life, so the observer starts with the window rather
+        // than with the first card that happens to need a daemon.
+        let (hosted_terminals_tx, hosted_terminals_rx) = async_channel::unbounded();
+        terminal_adoption::observe_hosted_inventory(hosted_terminals_tx);
         let activation_rx = activation_rx.unwrap_or_else(|| async_channel::unbounded().1);
         let window_scale_factor = core.scale_factor().max(0.01);
         let settings_draft = SettingsDraft::from_settings(&settings);
@@ -7571,6 +7627,9 @@ impl Application for Cagents {
             next_lsp_document: 0,
             terminal_wake_tx,
             terminal_wake_rx,
+            hosted_terminals_rx,
+            terminal_starts: std::sync::atomic::AtomicUsize::new(0),
+            pending_adoptions: Vec::new(),
             activation_rx,
             session,
             save_health,
@@ -7857,6 +7916,7 @@ impl Application for Cagents {
                     }
                 }
             }
+            Message::HostedTerminalsObserved(terminals) => self.observe_hosted_terminals(terminals),
             Message::TerminalStarted {
                 card,
                 terminal,
@@ -7874,7 +7934,9 @@ impl Application for Cagents {
                     {
                         self.begin_terminal_teardown(started.handle);
                     }
-                    return Task::none();
+                    // Nothing will claim this identity, so a held observation
+                    // is free to decide about it.
+                    return self.finish_terminal_start();
                 }
 
                 let mut tasks = Vec::new();
@@ -7964,6 +8026,9 @@ impl Application for Cagents {
                 }
                 self.persist();
                 tasks.push(self.commit_terminal_handoffs());
+                // Released last: until the card holds the identity this start
+                // settled on, adoption would see an unclaimed live terminal.
+                tasks.push(self.finish_terminal_start());
                 Task::batch(tasks)
             }
             Message::TerminalWake { card, generation } => {
@@ -9952,6 +10017,11 @@ impl Application for Cagents {
                 card: wake.card,
                 generation: wake.generation,
             }),
+            Subscription::run_with(
+                HostedTerminalSource(self.hosted_terminals_rx.clone()),
+                hosted_terminal_stream,
+            )
+            .map(Message::HostedTerminalsObserved),
             Subscription::run_with(
                 UiActivationSource(self.activation_rx.clone()),
                 ui_activation_stream,
@@ -14106,6 +14176,9 @@ mod tests {
             lifecycle_sweep_generation: 0,
             terminal_wake_tx,
             terminal_wake_rx,
+            hosted_terminals_rx: async_channel::unbounded().1,
+            terminal_starts: std::sync::atomic::AtomicUsize::new(0),
+            pending_adoptions: Vec::new(),
             activation_rx: async_channel::unbounded().1,
             session: None,
             save_health: None,

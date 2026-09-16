@@ -115,6 +115,8 @@ fn scope_descriptor(
         project_order: state.project_order.clone(),
         channels: Vec::new(),
         active_channel: None,
+        // A projected strip is a view, never a place to file a card.
+        card_scopes: HashMap::new(),
     }
 }
 
@@ -302,6 +304,11 @@ impl Cagents {
             .iter()
             .filter(|card| card.existence.is_open())
             .filter_map(|card| {
+                // An explicit filing outranks discovery: it exists precisely
+                // because no root contains this card's launch directory.
+                if let Some(scope) = self.durable.card_scopes.get(&card.id) {
+                    return Some((card.id, scope.clone()));
+                }
                 let directory = card_directory(card)?;
                 let owner = directories
                     .entry(directory)
@@ -322,24 +329,28 @@ impl Cagents {
             return None;
         }
         let directory = card_directory(card)?;
-        Some(self.worktree_owners.get(&card.id).map_or_else(
-            || {
-                worktree_root(
-                    directory,
-                    self.known_worktree_roots
-                        .iter()
-                        .map(PathBuf::as_path)
-                        .chain(self.sidebar_model.projects.iter().flat_map(|project| {
-                            project
-                                .worktrees
-                                .iter()
-                                .map(|worktree| worktree.path.as_path())
-                        })),
-                )
-                .unwrap_or(directory)
-            },
-            PathBuf::as_path,
-        ))
+        if let Some(scope) = self
+            .worktree_owners
+            .get(&card.id)
+            .or_else(|| self.durable.card_scopes.get(&card.id))
+        {
+            return Some(scope.as_path());
+        }
+        Some(
+            worktree_root(
+                directory,
+                self.known_worktree_roots
+                    .iter()
+                    .map(PathBuf::as_path)
+                    .chain(self.sidebar_model.projects.iter().flat_map(|project| {
+                        project
+                            .worktrees
+                            .iter()
+                            .map(|worktree| worktree.path.as_path())
+                    })),
+            )
+            .unwrap_or(directory),
+        )
     }
 
     pub(super) fn select_worktree(

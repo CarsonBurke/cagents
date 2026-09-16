@@ -273,7 +273,7 @@ fn disconnect_client(host: &SharedHost, client_id: ClientId) {
             // Shutdown owns the remaining session state. Removing delivery is
             // safe, but unregistering would enqueue visibility/redraw effects
             // after the upgrade's terminal snapshots have been committed.
-            state.clients.remove(&client_id);
+            state.forget_client_delivery(client_id);
             Vec::new()
         } else {
             state.unregister_client(client_id)
@@ -514,12 +514,23 @@ fn process_request(
                 .list(client_id);
             Ok((ServerResponse::Listed { terminals }, Vec::new(), false))
         }
+        ClientRequest::WatchTerminals => {
+            host.lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .watch_terminals(client_id);
+            Ok((ServerResponse::Accepted, Vec::new(), false))
+        }
         ClientRequest::Spawn { session, options } => {
             let terminal = spawn_terminal(host, client_id, session, options)?;
-            let snapshot = host
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .snapshot(client_id, terminal.session.id, 0)?;
+            let snapshot = {
+                let mut state = host.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+                let snapshot = state.snapshot(client_id, terminal.session.id, 0)?;
+                // Every other observer learns that this terminal exists here,
+                // and only here: a spawn is the one inventory edge that no
+                // redraw, event or snapshot broadcast implies.
+                state.announce_created(client_id, terminal.session.id);
+                snapshot
+            };
             let mut extras = snapshot
                 .map(|snapshot| ServerMessage::Snapshot {
                     terminal_id: terminal.session.id,
@@ -1513,5 +1524,95 @@ mod tests {
         let error =
             remaining_handshake_timeout(deadline, deadline + Duration::from_secs(1)).unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+    }
+
+    /// A terminal starts existing when some client spawns it, and no redraw,
+    /// event or snapshot edge says so. Without this announcement a connected
+    /// view cannot learn that another client - the CLI - created a terminal.
+    #[test]
+    fn spawning_announces_the_terminal_to_observers_but_never_to_its_creator() {
+        use crate::model::{BootId, HostIncarnation, HostSessionId, TerminalContinuity};
+
+        let directory = tempfile::tempdir().unwrap();
+        let recipe = crate::model::LaunchRecipe::shell(directory.path().to_owned()).unwrap();
+        let session = crate::model::TerminalSession {
+            id: crate::model::TerminalId::new(),
+            launch: recipe.clone(),
+            transcript_path: None,
+            resume_hint: None,
+            continuity: TerminalContinuity::RelaunchAvailable {
+                recipe,
+                last_exit: None,
+            },
+        };
+        let terminal_id = session.id;
+        let host = Arc::new(Mutex::new(super::super::state::HostState::new(
+            HostSessionProof {
+                host_session_id: HostSessionId::new("announce-session"),
+                boot_id: BootId::new("boot"),
+                host_incarnation: HostIncarnation::new("incarnation"),
+            },
+        )));
+        let (creator, observer, unsubscribed) = {
+            let mut state = host.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            let creator = state.register_client(1);
+            let observer = state.register_client(2);
+            let unsubscribed = state.register_client(3);
+            state.watch_terminals(1);
+            state.watch_terminals(2);
+            (creator, observer, unsubscribed)
+        };
+
+        let (response, _, _) = process_request(
+            &host,
+            1,
+            ClientRequest::Spawn {
+                session,
+                options: crate::terminal_ipc::TerminalSpawnOptions::default(),
+            },
+        )
+        .unwrap();
+        assert!(matches!(response, ServerResponse::Spawned { .. }));
+
+        let announced = |delivery: &Arc<DeliveryQueue>| {
+            delivery.close_after_drain();
+            std::iter::from_fn(|| delivery.pop())
+                .filter_map(|queued| match queued.message {
+                    ServerMessage::TerminalCreated { terminal } => Some(terminal),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+        let observed = announced(&observer);
+        assert_eq!(observed.len(), 1);
+        assert_eq!(observed[0].session.id, terminal_id);
+        assert_eq!(
+            observed[0].session.launch.working_directory,
+            directory.path()
+        );
+        // The recipient is not attached, so it is owed the proof it needs to
+        // attach rather than a claim that it already has.
+        assert!(!observed[0].attached);
+        assert!(matches!(
+            observed[0].session.continuity,
+            TerminalContinuity::DetachedSameBoot { .. }
+        ));
+        assert!(
+            announced(&creator).is_empty(),
+            "a spawning client already holds the descriptor its own spawn returned"
+        );
+        assert!(
+            announced(&unsubscribed).is_empty(),
+            "a client that never asked for inventory edges must not receive one"
+        );
+
+        // The terminal worker's wake callback takes the host lock, so joining
+        // it while holding that lock would deadlock the shutdown.
+        let handle = host
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .handle(1, terminal_id)
+            .unwrap();
+        handle.shutdown().unwrap();
     }
 }

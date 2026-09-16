@@ -172,6 +172,7 @@ pub struct WorkspaceManifest {
     pub project_order: Vec<ProjectId>,
     pub channels: Vec<ProjectChannel>,
     pub active_channel: Option<ChannelId>,
+    pub card_scopes: HashMap<CardId, PathBuf>,
     pub cards: Vec<CardSummary>,
     pub updated_at_unix_ms: i64,
 }
@@ -785,6 +786,7 @@ impl StateStore {
             project_order: manifest.project_order,
             channels: manifest.channels,
             active_channel: manifest.active_channel,
+            card_scopes: manifest.card_scopes,
         };
         if !warnings.is_empty() {
             retarget_dropped_cards(&mut state);
@@ -1973,6 +1975,11 @@ fn save_workspace_transaction(
         &format!("workspace:{workspace_id}:navigation:{ACTIVE_CHANNEL_FIELD}"),
         &to_json(&state.active_channel)?,
     )?;
+    set_metadata(
+        transaction,
+        &format!("workspace:{workspace_id}:navigation:card_scopes"),
+        &to_json(&state.card_scopes)?,
+    )?;
 
     let existing = existing_cards(transaction, &workspace_id)?;
     let incoming_ids = state
@@ -2932,6 +2939,13 @@ fn load_workspace_manifest_connection(
         .map(|value| from_json("workspace project order", &value))
         .transpose()?
         .unwrap_or_default(),
+        card_scopes: metadata(
+            connection,
+            &format!("workspace:{id}:navigation:card_scopes"),
+        )?
+        .map(|value| from_json("workspace card scopes", &value))
+        .transpose()?
+        .unwrap_or_default(),
         channels,
         active_channel,
         cards,
@@ -3392,6 +3406,7 @@ mod tests {
             project_order: Vec::new(),
             channels: Vec::new(),
             active_channel: None,
+            card_scopes: HashMap::new(),
         }
     }
 

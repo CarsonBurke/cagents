@@ -47,6 +47,12 @@ use crate::{
 /// preview neighbours rather than at the end of their enums, and both `Snapshot` and
 /// `Item` gained a field, so a peer that predates this reads the wrong layout at the
 /// same advertised version unless the version itself moves.
+/// Terminal-inventory observation - `ClientRequest::WatchTerminals` and
+/// `ServerMessage::TerminalCreated` - deliberately does not move the version.
+/// Both are appended variants, so no existing variant index shifts, and the
+/// broadcast only ever reaches a connection that subscribed with a request a
+/// peer predating this change cannot issue. Such a peer therefore never has to
+/// decode a variant index it does not know.
 pub const PROTOCOL_VERSION: u16 = 12;
 /// Postcard encodes an 80x24 grid in roughly 20 KiB and a typical single-row
 /// delta in a few hundred bytes, but a full repaint of a very large grid after
@@ -251,6 +257,11 @@ pub enum ClientRequest {
     ChatCommitTerminal {
         terminal_id: TerminalId,
     },
+    /// Subscribe this connection to terminal-inventory edges caused by other
+    /// clients. A connection that never asks receives none, so a strict
+    /// request/response client - every CLI invocation - can never be surprised
+    /// by an unsolicited frame its state machine has no place for.
+    WatchTerminals,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -422,6 +433,15 @@ pub enum ServerMessage {
         chat_id: TerminalId,
         state: crate::agent::ActivityState,
         generation: u64,
+    },
+    /// A terminal some other client created, delivered only to a connection
+    /// that subscribed with [`ClientRequest::WatchTerminals`].
+    ///
+    /// The descriptor is the one an unattached observer is given, so a receiver
+    /// holds the launch recipe and the continuity proof it needs to decide
+    /// whether it cares and to attach, without listing the whole inventory.
+    TerminalCreated {
+        terminal: TerminalDescriptor,
     },
 }
 

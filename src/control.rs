@@ -1,5 +1,5 @@
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, VecDeque},
     ffi::{OsStr, OsString},
     io::{self, IsTerminal, Read, Write},
     os::{
@@ -236,6 +236,12 @@ pub struct ControlClient {
     stream: UnixStream,
     proof: HostSessionProof,
     next_request_id: u64,
+    /// Inventory edges that arrived while a correlated response was pending.
+    ///
+    /// A subscribed connection can be told about a terminal between sending a
+    /// request and reading its answer. Buffering keeps the request/response
+    /// discipline intact without losing the edge that motivated subscribing.
+    observed: VecDeque<TerminalDescriptor>,
 }
 
 impl ControlClient {
@@ -261,6 +267,7 @@ impl ControlClient {
             stream: client.stream,
             proof,
             next_request_id: client.next_request_id,
+            observed: VecDeque::new(),
         })
     }
 
@@ -272,6 +279,51 @@ impl ControlClient {
         match self.request_strict(ClientRequest::List)? {
             ServerResponse::Listed { terminals } => Ok(terminals),
             response => Err(unexpected_response("a terminal list", &response)),
+        }
+    }
+
+    /// Subscribes this connection to terminals created by other clients.
+    ///
+    /// Subscribe before listing: an edge that arrives between the two is
+    /// buffered rather than lost, while the reverse order would miss a spawn
+    /// that happened in the gap.
+    pub fn watch_terminals(&mut self) -> Result<(), ControlError> {
+        match self.request_strict(ClientRequest::WatchTerminals)? {
+            ServerResponse::Accepted => Ok(()),
+            response => Err(unexpected_response("inventory observation", &response)),
+        }
+    }
+
+    /// Blocks until another client creates a terminal.
+    ///
+    /// An inventory edge has no deadline, so this drops the read timeout
+    /// instead of polling: a timeout that expired mid-frame would desynchronize
+    /// the stream, and a subscribed connection issues no further requests.
+    pub fn next_created_terminal(&mut self) -> Result<TerminalDescriptor, ControlError> {
+        if let Some(terminal) = self.observed.pop_front() {
+            return Ok(terminal);
+        }
+        self.stream
+            .set_read_timeout(None)
+            .map_err(ControlError::Configure)?;
+        loop {
+            let envelope = self.read_envelope()?;
+            self.validate_pinned_envelope(&envelope)?;
+            match envelope.message {
+                ServerMessage::TerminalCreated { terminal } => return Ok(terminal),
+                // The daemon is about to close this connection. Reporting it as
+                // a closed connection is what makes an observer reconnect and
+                // resynchronize against the successor's inventory.
+                ServerMessage::HostShuttingDown => return Err(ControlError::ConnectionClosed),
+                ServerMessage::Error(error) => {
+                    return Err(ControlError::Remote {
+                        code: error.code,
+                        message: error.message,
+                        retryable: error.retryable,
+                    });
+                }
+                _ => {}
+            }
         }
     }
 
@@ -600,6 +652,9 @@ impl ControlClient {
                     terminal_id: actual,
                     ..
                 } if actual == terminal_id => {}
+                // A subscribed connection can be told about another client's
+                // terminal at any point, including mid-replay.
+                ServerMessage::TerminalCreated { terminal } => self.observed.push_back(terminal),
                 ServerMessage::Synchronized {
                     terminal_id: actual,
                     ..
@@ -712,14 +767,21 @@ impl ControlClient {
                     });
                 }
                 Some(_) => return response_from_message(envelope.message),
-                None if streaming_terminal
-                    .is_some_and(|id| message_targets(&envelope.message, id)) => {}
-                None => {
-                    return Err(ControlError::RequestIdMismatch {
-                        expected: request_id,
-                        actual: None,
-                    });
-                }
+                // Only a connection that subscribed receives this, and it must
+                // survive the request it interrupted.
+                None => match envelope.message {
+                    ServerMessage::TerminalCreated { terminal } => {
+                        self.observed.push_back(terminal);
+                    }
+                    message
+                        if streaming_terminal.is_some_and(|id| message_targets(&message, id)) => {}
+                    _ => {
+                        return Err(ControlError::RequestIdMismatch {
+                            expected: request_id,
+                            actual: None,
+                        });
+                    }
+                },
             }
         }
     }
@@ -853,6 +915,7 @@ fn message_targets(message: &ServerMessage, expected: TerminalId) -> bool {
         | ServerMessage::ChatChanged { .. }
         | ServerMessage::ChatObserved { .. }
         | ServerMessage::ChatActivity { .. }
+        | ServerMessage::TerminalCreated { .. }
         | ServerMessage::Error(_) => false,
     }
 }
@@ -870,6 +933,7 @@ fn message_name(message: &ServerMessage) -> &'static str {
         ServerMessage::ChatObserved { .. } => "chat_observed",
         ServerMessage::ChatActivity { .. } => "chat_activity",
         ServerMessage::TerminalObserved { .. } => "terminal_observed",
+        ServerMessage::TerminalCreated { .. } => "terminal_created",
     }
 }
 
@@ -2021,6 +2085,104 @@ mod tests {
             ));
             server.join().unwrap();
         }
+    }
+
+    /// The CLI's spawn contract is the descriptor it returns. An inventory edge
+    /// can land between the request and its answer on a subscribed connection,
+    /// and neither the answer nor the edge may be lost.
+    #[test]
+    fn a_spawn_returns_its_descriptor_while_an_interleaved_inventory_edge_survives() {
+        let (client_stream, mut server_stream) = UnixStream::pair().unwrap();
+        let pinned = proof("session", "boot", "incarnation");
+        let recipe = LaunchRecipe {
+            program: "/bin/sh".into(),
+            arguments: Vec::new(),
+            working_directory: PathBuf::from("/tmp"),
+            environment: BTreeMap::new(),
+        };
+        let session = TerminalSession {
+            id: TerminalId::new(),
+            launch: recipe.clone(),
+            transcript_path: None,
+            resume_hint: None,
+            continuity: TerminalContinuity::RelaunchAvailable {
+                recipe: recipe.clone(),
+                last_exit: None,
+            },
+        };
+        let spawned = session.id;
+        let elsewhere = TerminalId::new();
+        let peer_proof = pinned.clone();
+        let peer_recipe = recipe.clone();
+        let server = thread::spawn(move || {
+            let _: ClientEnvelope = read_frame(&mut server_stream).unwrap().unwrap();
+            write_frame(
+                &mut server_stream,
+                &connected_envelope(1, peer_proof.clone(), peer_proof.clone()),
+            )
+            .unwrap();
+            let watch: ClientEnvelope = read_frame(&mut server_stream).unwrap().unwrap();
+            assert!(matches!(watch.request, ClientRequest::WatchTerminals));
+            write_frame(
+                &mut server_stream,
+                &ServerEnvelope {
+                    version: PROTOCOL_VERSION,
+                    request_id: Some(watch.request_id),
+                    proof: peer_proof.clone(),
+                    message: ServerMessage::Response {
+                        response: ServerResponse::Accepted,
+                    },
+                },
+            )
+            .unwrap();
+            let spawn: ClientEnvelope = read_frame(&mut server_stream).unwrap().unwrap();
+            assert!(matches!(spawn.request, ClientRequest::Spawn { .. }));
+            for message in [
+                ServerMessage::TerminalCreated {
+                    terminal: TerminalDescriptor::relaunchable(
+                        elsewhere,
+                        peer_recipe.clone(),
+                        None,
+                    ),
+                },
+                ServerMessage::Response {
+                    response: ServerResponse::Spawned {
+                        terminal: TerminalDescriptor::relaunchable(spawned, peer_recipe, None),
+                    },
+                },
+                ServerMessage::Synchronized {
+                    terminal_id: spawned,
+                    generation: 0,
+                    event_sequence: 0,
+                },
+            ] {
+                let request_id =
+                    matches!(message, ServerMessage::Response { .. }).then_some(spawn.request_id);
+                write_frame(
+                    &mut server_stream,
+                    &ServerEnvelope {
+                        version: PROTOCOL_VERSION,
+                        request_id,
+                        proof: peer_proof.clone(),
+                        message,
+                    },
+                )
+                .unwrap();
+            }
+        });
+
+        let mut client = ControlClient::from_stream(client_stream).unwrap();
+        client.watch_terminals().unwrap();
+        let descriptor = client
+            .spawn(session, TerminalSpawnOptions::default())
+            .unwrap();
+        assert_eq!(descriptor.session.id, spawned);
+        assert_eq!(descriptor.session.launch, recipe);
+        assert_eq!(
+            client.next_created_terminal().unwrap().session.id,
+            elsewhere
+        );
+        server.join().unwrap();
     }
     #[test]
     fn ui_launch_handshake_surfaces_child_startup_errors() {

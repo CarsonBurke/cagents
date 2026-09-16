@@ -186,6 +186,10 @@ pub(crate) struct HostState {
     pub(super) terminals: BTreeMap<TerminalId, TerminalRecord>,
     spawning: BTreeSet<TerminalId>,
     pub(super) clients: BTreeMap<ClientId, Arc<DeliveryQueue>>,
+    /// Connections that asked for terminal-inventory edges. A client that never
+    /// asked receives none, which is what keeps every strict request/response
+    /// client free of unsolicited frames.
+    watchers: BTreeSet<ClientId>,
     subscriptions: Subscriptions,
     pub(super) shutting_down: bool,
     shutdown_requested: bool,
@@ -213,6 +217,7 @@ impl HostState {
             terminals: BTreeMap::new(),
             spawning: BTreeSet::new(),
             clients: BTreeMap::new(),
+            watchers: BTreeSet::new(),
             subscriptions: Subscriptions::default(),
             shutting_down: false,
             shutdown_requested: false,
@@ -242,6 +247,47 @@ impl HostState {
         let delivery = Arc::new(DeliveryQueue::new(client_id, DEFAULT_CLIENT_QUEUE_CAPACITY));
         self.clients.insert(client_id, Arc::clone(&delivery));
         delivery
+    }
+
+    /// Subscribes `client_id` to terminal-inventory edges. Repeating it is
+    /// harmless, so a reconnecting observer never has to track whether its
+    /// previous subscription survived.
+    pub(crate) fn watch_terminals(&mut self, client_id: ClientId) {
+        self.watchers.insert(client_id);
+    }
+
+    /// Drops a departing client's delivery identity without unregistering its
+    /// subscriptions, which is all a committed shutdown may still do.
+    pub(crate) fn forget_client_delivery(&mut self, client_id: ClientId) {
+        self.clients.remove(&client_id);
+        self.watchers.remove(&client_id);
+    }
+
+    /// Tells every observing client except `creator` that a terminal now
+    /// exists.
+    ///
+    /// The creator is excluded because it already holds the descriptor its own
+    /// `Spawn` returned; announcing it back would ask every spawning client to
+    /// recognise and discard its own work. One descriptor serves the whole
+    /// fan-out: a recipient cannot be attached to a terminal that was created
+    /// by someone else a moment ago.
+    pub(crate) fn announce_created(&self, creator: ClientId, terminal_id: TerminalId) {
+        let Ok(terminal) = self.descriptor_as(false, terminal_id) else {
+            return;
+        };
+        for client_id in &self.watchers {
+            if *client_id == creator {
+                continue;
+            }
+            if let Some(delivery) = self.clients.get(client_id) {
+                let _ = delivery.push(Outbound::broadcast(
+                    &self.proof,
+                    ServerMessage::TerminalCreated {
+                        terminal: terminal.clone(),
+                    },
+                ));
+            }
+        }
     }
 
     pub(crate) fn unregister_client(&mut self, client_id: ClientId) -> Vec<TerminalHandle> {
@@ -280,6 +326,7 @@ impl HostState {
         if let Some(delivery) = self.clients.remove(&client_id) {
             delivery.close_after_drain();
         }
+        self.watchers.remove(&client_id);
         handles
     }
 
@@ -466,12 +513,27 @@ impl HostState {
         client_id: ClientId,
         terminal_id: TerminalId,
     ) -> Result<TerminalDescriptor, ProtocolError> {
+        self.descriptor_as(
+            self.subscriptions.attached(client_id, terminal_id),
+            terminal_id,
+        )
+    }
+
+    /// The descriptor an observer with attachment state `attached` is owed.
+    ///
+    /// Attachment is the only per-client input, so a broadcast to observers
+    /// that are all unattached by construction can build one descriptor
+    /// instead of one per recipient.
+    fn descriptor_as(
+        &self,
+        attached: bool,
+        terminal_id: TerminalId,
+    ) -> Result<TerminalDescriptor, ProtocolError> {
         let record = self
             .terminals
             .get(&terminal_id)
             .ok_or_else(|| not_found(terminal_id))?;
         let mut session = record.session.clone();
-        let attached = self.subscriptions.attached(client_id, terminal_id);
         session.continuity = if record.running && attached {
             TerminalContinuity::Live {
                 host_session_id: self.proof.host_session_id.clone(),
