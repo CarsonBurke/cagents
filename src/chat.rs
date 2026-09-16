@@ -11,6 +11,25 @@ pub mod protocol;
 #[cfg(feature = "host")]
 pub mod runtime;
 
+/// Local wall-clock time for a conversation stamp, as `14:32`.
+///
+/// A transcript is read while the work is happening, so the hour and minute
+/// are what place an entry; the date would be noise in a conversation that
+/// lasts an afternoon. `localtime_r` is used because the reader's own
+/// timezone is the only one that answers "when did this happen", and the
+/// daemon that writes a stamp runs on the same machine as the surface that
+/// reads it.
+pub fn clock_label(unix_ms: u64) -> String {
+    let seconds = (unix_ms / 1000) as libc::time_t;
+    let mut parts: libc::tm = unsafe { std::mem::zeroed() };
+    // SAFETY: `localtime_r` writes into the caller's `tm` and reads only the
+    // time it is given, so it is sound for any `time_t` value.
+    if unsafe { libc::localtime_r(&seconds, &mut parts) }.is_null() {
+        return String::new();
+    }
+    format!("{:02}:{:02}", parts.tm_hour, parts.tm_min)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Launch {
     pub provider: Provider,
