@@ -79,7 +79,11 @@ pub enum TopCommand {
     UpdateWorker { job_id: String },
     /// Save, close and reopen every window with this installation's executables.
     #[command(hide = true)]
-    RestartWindows,
+    RestartWindows {
+        /// The instance the asking window belongs to.
+        #[arg(long)]
+        instance: String,
+    },
 }
 
 fn parse_window_slot(value: &str) -> Result<String, String> {
@@ -1025,11 +1029,12 @@ fn execute(command: TopCommand) -> Result<CommandOutput, AppError> {
                 human: "Application update complete".into(),
             })
         }
-        TopCommand::RestartWindows => {
-            crate::update::restart_windows().map_err(|error| AppError::new("update", error))?;
+        TopCommand::RestartWindows { instance } => {
+            crate::update::restart_windows(&instance)
+                .map_err(|error| AppError::new("update", error))?;
             Ok(CommandOutput {
                 command: "update.restart_windows",
-                data: json!({ "reopened": true }),
+                data: json!({ "instance": instance, "reopened": true }),
                 human: "Saved windows reopened with the installed build".into(),
             })
         }

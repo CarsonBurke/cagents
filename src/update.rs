@@ -455,12 +455,26 @@ pub fn superseding_ui() -> Option<PathBuf> {
 
 fn superseding_ui_from(executable: &Path) -> Option<PathBuf> {
     let layout = locate(executable).ok()?;
-    let served = layout.prefix.join("current").canonicalize().ok()?;
-    if served == layout.version_root {
-        return None;
+    let served = served_version_root(&layout).ok()?;
+    (served != layout.version_root).then(|| served.join("bin/cagents-ui"))
+}
+
+/// The version directory this installation currently serves.
+///
+/// The served tree must be another version of this same installation and as
+/// complete as the one running: closing every window in favour of a tree that
+/// cannot open one is far worse than staying stale. `install.sh` only ever
+/// renames `current` over a finished version directory, so an incomplete
+/// candidate means something else wrote the link.
+fn served_version_root(layout: &InstallLayout) -> Result<PathBuf, UpdateError> {
+    let served = layout.prefix.join("current").canonicalize()?;
+    let served_layout = locate(&served.join("bin/cagents-ui"))?;
+    if served_layout.prefix != layout.prefix || served_layout.version_root != served {
+        return Err(invalid(
+            "the installation does not serve a complete version of itself",
+        ));
     }
-    let bin = served.join("bin");
-    matched_set(&bin).then(|| bin.join("cagents-ui"))
+    Ok(served)
 }
 
 /// Hands the relaunch to a detached helper from the installed version.
@@ -472,7 +486,7 @@ fn superseding_ui_from(executable: &Path) -> Option<PathBuf> {
 pub fn restart_into_installed(installed_ui: &Path) -> Result<(), UpdateError> {
     let mut command = Command::new(installed_ui.with_file_name("cagents"));
     command
-        .arg("restart-windows")
+        .args(["restart-windows", "--instance", crate::instance::NAME])
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
@@ -494,21 +508,35 @@ pub fn restart_into_installed(installed_ui: &Path) -> Result<(), UpdateError> {
 
 /// Hidden CLI entrypoint for [`restart_into_installed`].
 ///
-/// Saves and closes every running window, then reopens each one from this
-/// executable's own tree. It holds the same launch fence the updater uses, so a
-/// release update in flight and this relaunch can never interleave, and a
-/// window with unsaved editor work vetoes the close and stays open.
-pub fn restart_windows() -> Result<(), UpdateError> {
+/// Saves and closes every running window, then reopens each one from the served
+/// tree. It holds the same launch fence the updater uses, so a release update in
+/// flight and this relaunch can never interleave, and a window with unsaved
+/// editor work vetoes the close and stays open.
+pub fn restart_windows(instance: &str) -> Result<(), UpdateError> {
+    // The window that asked and this helper have to agree about which instance
+    // they belong to: a development build sitting in a version directory would
+    // otherwise have the production helper close windows that are not its own,
+    // while its own window stayed open and asked again.
+    if instance != crate::instance::NAME {
+        return Err(invalid(format!(
+            "a {instance} window cannot be reopened by the {} installation",
+            crate::instance::NAME
+        )));
+    }
     let layout = locate(&std::env::current_exe()?)?;
-    if layout.prefix.join("current").canonicalize()? != layout.version_root {
+    if served_version_root(&layout)? != layout.version_root {
         return Err(invalid(
             "only the installed version may reopen saved windows",
         ));
     }
     let mut guard = crate::instance::UiUpdateGuard::acquire()?;
     let windows = guard.prepare_and_close_windows(Duration::from_secs(45))?;
+    // Saving and closing takes as long as the windows need, and another install
+    // can land inside it. Reopen whatever is served now, so this relaunch does
+    // not hand the reader a window that is already stale again.
+    let served = served_version_root(&layout)?;
     guard
-        .relaunch_windows(&windows, &layout.version_root.join("bin/cagents-ui"))
+        .relaunch_windows(&windows, &served.join("bin/cagents-ui"))
         .map_err(UpdateError::from)
 }
 
@@ -1136,6 +1164,18 @@ mod tests {
         // Half of a version directory cannot host a window: its daemon or CLI
         // would come from somewhere else.
         fs::remove_file(root.join("versions/0.2.0+local.abc/bin/cagentsd")).unwrap();
+        assert_eq!(superseding_ui_from(&running), None);
+
+        // Nor can a complete tree that belongs to some other installation:
+        // reopening the windows there would abandon this one.
+        let elsewhere = tempfile::tempdir().unwrap();
+        install_tree(elsewhere.path(), &["0.3.0"], "0.3.0");
+        fs::remove_file(root.join("current")).unwrap();
+        std::os::unix::fs::symlink(
+            elsewhere.path().join("versions/0.3.0"),
+            root.join("current"),
+        )
+        .unwrap();
         assert_eq!(superseding_ui_from(&running), None);
     }
 
