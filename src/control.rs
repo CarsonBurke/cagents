@@ -32,8 +32,7 @@ use crate::{
         },
     },
     workspace_model::{
-        ModelChannel, ModelEdit, ModelProject, WorkspaceModel, canonical_repository,
-        repository_display_name,
+        ModelChannel, ModelEdit, WorkspaceModel, canonical_repository, repository_display_name,
     },
 };
 
@@ -387,16 +386,6 @@ impl ControlClient {
         edit: ModelEdit,
     ) -> Result<WorkspaceModel, ControlError> {
         self.expect_model(ClientRequest::EditWorkspaceModel { edit })
-    }
-
-    /// Offers this window's sidebar state to a registry no window has seeded.
-    /// The daemon ignores it once one has, so a window may always send it.
-    pub fn seed_workspace_model(
-        &mut self,
-        projects: Vec<ModelProject>,
-        channels: Vec<ModelChannel>,
-    ) -> Result<WorkspaceModel, ControlError> {
-        self.expect_model(ClientRequest::SeedWorkspaceModel { projects, channels })
     }
 
     /// Blocks until another client edits the shared model.
@@ -2176,6 +2165,7 @@ mod tests {
             assert_eq!(asked, server_repository);
             assert_eq!(title, "probe");
             let model = WorkspaceModel {
+                identity: uuid::Uuid::new_v4(),
                 sequence: 2,
                 projects: Vec::new(),
                 channels: vec![ModelChannel {

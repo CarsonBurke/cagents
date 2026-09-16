@@ -54,7 +54,7 @@ use crate::{
 /// peer predating this change cannot issue. Such a peer therefore never has to
 /// decode a variant index it does not know.
 /// The shared workspace model - `ClientRequest::WatchWorkspaceModel`,
-/// `ReadWorkspaceModel`, `EditWorkspaceModel` and `SeedWorkspaceModel`,
+/// `ReadWorkspaceModel` and `EditWorkspaceModel`,
 /// `ServerResponse::WorkspaceModel` and `ServerMessage::WorkspaceModelEdited` -
 /// deliberately does not move the version either, for the same two reasons
 /// terminal-inventory observation did not. Every one of them is appended at the
@@ -288,17 +288,6 @@ pub enum ClientRequest {
     /// connection is not sent its own echo.
     EditWorkspaceModel {
         edit: crate::workspace_model::ModelEdit,
-    },
-    /// Adopt a window's existing sidebar state, applied only while the registry
-    /// has never been seeded.
-    ///
-    /// This is the migration path: the first window to connect donates the
-    /// projects and channels it restored from its own store, so a workspace that
-    /// predates the registry keeps its channels instead of being emptied by an
-    /// authority that has never heard of them.
-    SeedWorkspaceModel {
-        projects: Vec<crate::workspace_model::ModelProject>,
-        channels: Vec<crate::workspace_model::ModelChannel>,
     },
 }
 

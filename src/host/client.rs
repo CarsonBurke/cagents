@@ -541,13 +541,6 @@ fn process_request(
                 .edit_model(client_id, edit)?;
             Ok((ServerResponse::WorkspaceModel { model }, Vec::new(), false))
         }
-        ClientRequest::SeedWorkspaceModel { projects, channels } => {
-            let model = host
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .seed_model(client_id, projects, channels)?;
-            Ok((ServerResponse::WorkspaceModel { model }, Vec::new(), false))
-        }
         ClientRequest::Spawn { session, options } => {
             let terminal = spawn_terminal(host, client_id, session, options)?;
             let snapshot = {

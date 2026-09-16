@@ -1344,6 +1344,7 @@ mod tests {
             channels: Vec::new(),
             active_channel: None,
             card_scopes: HashMap::new(),
+            workspace_model_identity: None,
             cards: vec![CardState {
                 id: CardId::new(),
                 generation: 0,

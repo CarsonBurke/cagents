@@ -996,6 +996,20 @@ pub struct ProjectChannel {
     /// in the order they were created in.
     #[serde(default)]
     pub ordinal: u32,
+    /// Whether the registry this window last reconciled against is known to
+    /// hold this channel.
+    ///
+    /// This is what makes the registry's silence about a channel mean something.
+    /// A channel the registry lacks and this window never shared is new to the
+    /// registry, so it is published; a channel the registry lacks that this
+    /// window did share was deleted somewhere else, so it retires. Without the
+    /// flag the two cases are indistinguishable, and treating them alike either
+    /// tombstones a diverged window's cards or never honours a deletion.
+    ///
+    /// A workspace serialized before the shared model existed has shared
+    /// nothing, so `false` is both the default and the truth.
+    #[serde(default)]
+    pub shared: bool,
     pub cards: Vec<CardId>,
     pub focused: Option<CardId>,
 }
@@ -1056,6 +1070,14 @@ pub struct WorkspaceState {
     /// would find it somewhere else after a restart.
     #[serde(default)]
     pub card_scopes: HashMap<CardId, PathBuf>,
+    /// The shared registry this window last reconciled against.
+    ///
+    /// Paired with [`ProjectChannel::shared`]: a flag only means anything
+    /// relative to the registry it was set against. A daemon whose data
+    /// directory was replaced presents a new identity, and every flag has to be
+    /// cleared then, because nothing local has been shared with *that* registry.
+    #[serde(default)]
+    pub workspace_model_identity: Option<uuid::Uuid>,
 }
 
 impl Default for WorkspaceState {
@@ -1073,6 +1095,7 @@ impl Default for WorkspaceState {
             channels: Vec::new(),
             active_channel: None,
             card_scopes: HashMap::new(),
+            workspace_model_identity: None,
         }
     }
 }
@@ -1233,6 +1256,7 @@ mod tests {
                 project_id,
                 title: "A".into(),
                 ordinal: 1,
+                shared: false,
                 cards: vec![first, first, missing],
                 focused: Some(missing),
             },
@@ -1241,6 +1265,7 @@ mod tests {
                 project_id,
                 title: "B".into(),
                 ordinal: 2,
+                shared: false,
                 cards: vec![first, second],
                 focused: Some(first),
             },

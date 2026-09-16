@@ -344,52 +344,6 @@ impl HostState {
         Ok(applied.model)
     }
 
-    /// Adopts a window's sidebar state while the registry has never been
-    /// seeded, and announces whatever that adoption actually added.
-    pub(crate) fn seed_model(
-        &mut self,
-        origin: ClientId,
-        projects: Vec<crate::workspace_model::ModelProject>,
-        channels: Vec<crate::workspace_model::ModelChannel>,
-    ) -> Result<WorkspaceModel, ProtocolError> {
-        let projects = projects
-            .into_iter()
-            .map(|project| {
-                crate::workspace_model::canonical_repository(&project.repository).map(
-                    |repository| crate::workspace_model::ModelProject {
-                        repository,
-                        ..project
-                    },
-                )
-            })
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|error| ProtocolError::new(ProtocolErrorCode::InvalidRequest, error, false))?;
-        let channels = channels
-            .into_iter()
-            .map(|channel| {
-                crate::workspace_model::canonical_repository(&channel.repository).map(
-                    |repository| crate::workspace_model::ModelChannel {
-                        repository,
-                        ..channel
-                    },
-                )
-            })
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|error| ProtocolError::new(ProtocolErrorCode::InvalidRequest, error, false))?;
-        let (model, applied) = self
-            .registry()?
-            .seed(&projects, &channels)
-            .map_err(model_unavailable)?;
-        // The sequence after the whole batch labels every edge it produced. A
-        // receiver adopts each edit rather than ordering them against one
-        // another, and the batch committed as one adoption, so one label is the
-        // truthful one: no intermediate state was ever observable.
-        for edit in &applied {
-            self.announce_model_edit(origin, model.sequence, edit);
-        }
-        Ok(model)
-    }
-
     fn registry(&mut self) -> Result<&mut super::model::Registry, ProtocolError> {
         self.model.as_mut().ok_or_else(missing_registry)
     }

@@ -117,6 +117,9 @@ fn scope_descriptor(
         active_channel: None,
         // A projected strip is a view, never a place to file a card.
         card_scopes: HashMap::new(),
+        // A projection carries no channels, so it has nothing to say about what
+        // was shared with which registry.
+        workspace_model_identity: None,
     }
 }
 
@@ -625,6 +628,7 @@ mod tests {
                 project_id: app.sidebar_model.projects[0].id,
                 title: "Channel".into(),
                 ordinal: 0,
+                shared: false,
                 cards: vec![channeled.id],
                 focused: Some(channeled.id),
             }],
@@ -675,6 +679,7 @@ mod tests {
                     project_id,
                     title: "A".into(),
                     ordinal: 0,
+                    shared: false,
                     cards: vec![first.id, focused.id],
                     focused: Some(focused.id),
                 },
@@ -683,6 +688,7 @@ mod tests {
                     project_id,
                     title: "B".into(),
                     ordinal: 0,
+                    shared: false,
                     cards: vec![second.id],
                     focused: Some(second.id),
                 },
@@ -732,6 +738,7 @@ mod tests {
                 project_id,
                 title: "Channel".into(),
                 ordinal: 0,
+                shared: false,
                 cards: vec![closed.id],
                 focused: Some(closed.id),
             }],

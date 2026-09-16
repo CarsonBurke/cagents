@@ -9,7 +9,8 @@ use super::*;
 use crate::control::{ControlClient, ControlError};
 use crate::model::{ChannelId, ProjectChannel};
 use crate::workspace_model::{
-    ModelChannel, ModelEdit, ModelProject, PENDING_ORDINAL, WorkspaceModel, canonical_repository,
+    ModelChannel, ModelEdit, ModelProject, NO_REGISTRY, PENDING_ORDINAL, WorkspaceModel,
+    canonical_repository,
 };
 
 /// How long a thread waits before reconnecting.
@@ -26,36 +27,24 @@ pub enum ModelUpdate {
     /// The registry as it stood when the watcher connected.
     ///
     /// This is the only update that means "a connection just began", which is
-    /// why it is distinct from [`ModelUpdate::Read`]: it is what makes the
-    /// window offer its own state again to a registry that may have been
-    /// replaced, rather than trusting a flag from a previous connection.
+    /// why it is distinct from [`ModelUpdate::Read`]: it is where the window
+    /// compares the registry's identity against the one it recorded and decides
+    /// whether anything it holds has ever been shared with this registry.
     Connected(WorkspaceModel),
     /// A fresh read, taken because an edge does not carry the ranks it changed.
     Read(WorkspaceModel),
-    /// The registry's answer to this window's seed.
-    ///
-    /// From here the registry is authoritative: it has heard everything this
-    /// window had, so a channel missing from it was deleted somewhere rather
-    /// than never known.
-    Seeded(WorkspaceModel),
     Edited {
         sequence: u64,
         edit: ModelEdit,
     },
     /// The rank the registry gave a channel this window created.
+    ///
+    /// It is also the proof that the registry holds the channel, which is what
+    /// marks it shared: from here on, the registry's silence about that channel
+    /// means it was deleted somewhere rather than never known.
     Ranked {
         channel: ChannelId,
         ordinal: u32,
-    },
-}
-
-/// What the window asks the publisher to send.
-#[derive(Debug, Clone)]
-pub enum ModelPublish {
-    Edit(ModelEdit),
-    Seed {
-        projects: Vec<ModelProject>,
-        channels: Vec<ModelChannel>,
     },
 }
 
@@ -120,7 +109,7 @@ fn observe(sender: &async_channel::Sender<ModelUpdate>) -> Result<(), String> {
 /// Publishes this window's shared-model mutations.
 pub(super) fn publish_workspace_model(
     updates: async_channel::Sender<ModelUpdate>,
-    requests: async_channel::Receiver<ModelPublish>,
+    requests: async_channel::Receiver<ModelEdit>,
 ) {
     let publisher = std::thread::Builder::new()
         .name("cagents-workspace-model-publisher".into())
@@ -144,8 +133,8 @@ pub(super) fn publish_workspace_model(
 
 fn publish(
     updates: &async_channel::Sender<ModelUpdate>,
-    requests: &async_channel::Receiver<ModelPublish>,
-    pending: &mut Option<ModelPublish>,
+    requests: &async_channel::Receiver<ModelEdit>,
+    pending: &mut Option<ModelEdit>,
 ) -> Result<(), String> {
     // Unlike the observer, the publisher starts a daemon: a channel the user
     // just created has to reach the registry, and there is no registry without
@@ -185,32 +174,24 @@ fn publish(
 
 fn send(
     client: &mut ControlClient,
-    request: ModelPublish,
+    edit: ModelEdit,
     updates: &async_channel::Sender<ModelUpdate>,
 ) -> Result<(), ControlError> {
-    match request {
-        ModelPublish::Edit(edit) => {
-            let created = match &edit {
-                ModelEdit::CreateChannel { id, .. } => Some(*id),
-                _ => None,
-            };
-            let model = client.edit_workspace_model(edit)?;
-            // The originating client is deliberately not sent its own echo, so
-            // this response is how the window that minted the channel learns the
-            // rank the registry gave it.
-            if let Some(id) = created
-                && let Some(channel) = model.channel(id)
-            {
-                let _ = updates.send_blocking(ModelUpdate::Ranked {
-                    channel: id,
-                    ordinal: channel.ordinal,
-                });
-            }
-        }
-        ModelPublish::Seed { projects, channels } => {
-            let model = client.seed_workspace_model(projects, channels)?;
-            let _ = updates.send_blocking(ModelUpdate::Seeded(model));
-        }
+    let created = match &edit {
+        ModelEdit::CreateChannel { id, .. } => Some(*id),
+        _ => None,
+    };
+    let model = client.edit_workspace_model(edit)?;
+    // The originating client is deliberately not sent its own echo, so this
+    // response is how the window that minted the channel learns the rank the
+    // registry gave it - and learns that the registry now holds it.
+    if let Some(id) = created
+        && let Some(channel) = model.channel(id)
+    {
+        let _ = updates.send_blocking(ModelUpdate::Ranked {
+            channel: id,
+            ordinal: channel.ordinal,
+        });
     }
     Ok(())
 }
@@ -230,29 +211,19 @@ impl Cagents {
     pub(super) fn apply_workspace_model_update(&mut self, update: ModelUpdate) -> Task<Message> {
         match update {
             ModelUpdate::Connected(model) => {
-                // A new connection may be to a new registry - a replaced daemon,
-                // or a data directory that was wiped - so authority is earned
-                // again rather than carried over from the previous one.
-                self.workspace_model_seeded = false;
+                self.join_workspace_model(model.identity);
                 self.workspace_model = model;
-                let reconciled = self.reconcile_workspace_model();
-                self.offer_workspace_model_seed();
-                reconciled
+                self.reconcile_workspace_model()
             }
             ModelUpdate::Read(model) => {
                 self.workspace_model = model;
                 self.reconcile_workspace_model()
             }
-            ModelUpdate::Seeded(model) => {
-                self.workspace_model_seeded = true;
-                self.workspace_model = model;
-                self.reconcile_workspace_model()
-            }
             ModelUpdate::Edited { sequence, edit } => {
                 // An explicit delete is an instruction rather than an absence,
-                // so folding it in retires the channel even before this window
-                // has seeded - which is exactly the case absence may not be
-                // trusted in.
+                // so folding it in retires the channel whether or not this
+                // window had recorded the channel as shared - which is exactly
+                // the case absence may not be trusted in.
                 let deleted = match &edit {
                     ModelEdit::DeleteChannel { id } => Some(*id),
                     _ => None,
@@ -270,10 +241,16 @@ impl Cagents {
                 else {
                     return Task::none();
                 };
-                if self.durable.channels[index].ordinal == ordinal {
+                let local = &self.durable.channels[index];
+                if local.ordinal == ordinal && local.shared {
                     return Task::none();
                 }
-                Arc::make_mut(&mut self.durable).channels[index].ordinal = ordinal;
+                let local = &mut Arc::make_mut(&mut self.durable).channels[index];
+                local.ordinal = ordinal;
+                // The registry answered about this channel, so it holds it. From
+                // here its absence from a later model is a deletion rather than
+                // ignorance, which is the whole point of recording the fact.
+                local.shared = true;
                 if let Some(shared) = self
                     .workspace_model
                     .channels
@@ -290,48 +267,51 @@ impl Cagents {
         }
     }
 
-    /// Offers this window's sidebar state to a registry no window has seeded.
+    /// Settles what this window has shared with the registry it just reached.
     ///
-    /// The registry applies it only while it has never been seeded, so sending
-    /// it unconditionally is safe and saves the window a flag it would have to
-    /// read across the wire. The projects and channels go in this window's own
-    /// durable order, oldest first, because that is the order the registry ranks
-    /// them in.
-    fn offer_workspace_model_seed(&mut self) {
-        let projects = self
-            .sidebar_model
-            .projects
-            .iter()
-            .map(|project| ModelProject {
-                repository: project.repository.clone(),
-                name: project.name.clone(),
-                ordinal: 0,
-            })
-            .collect::<Vec<_>>();
-        let channels = self
-            .durable
-            .channels
-            .iter()
-            .filter_map(|channel| {
-                let project = self.sidebar_model.project(channel.project_id)?;
-                Some(ModelChannel {
-                    id: channel.id,
-                    repository: project.repository.clone(),
-                    title: channel.title.clone(),
-                    ordinal: 0,
-                })
-            })
-            .collect::<Vec<_>>();
-        self.queue_workspace_model_publish(ModelPublish::Seed { projects, channels });
+    /// A [`ProjectChannel::shared`] flag only means anything relative to the
+    /// registry it was set against, so an identity this window has not recorded
+    /// means it has shared nothing at all: with a replaced daemon or a wiped
+    /// data directory, every flag is a claim about a registry that no longer
+    /// exists. Clearing them is what keeps the next reconciliation from reading
+    /// a fresh registry's silence as a deletion and tombstoning the cards in
+    /// every channel the user has.
+    fn join_workspace_model(&mut self, identity: uuid::Uuid) {
+        if self.durable.workspace_model_identity == Some(identity) {
+            return;
+        }
+        let durable = Arc::make_mut(&mut self.durable);
+        durable.workspace_model_identity = Some(identity);
+        for channel in durable.channels.iter_mut() {
+            channel.shared = false;
+        }
+        self.persist();
     }
 
     /// Mirrors the cached shared model into this window's own store.
     ///
-    /// Additive until the registry has been seeded. An empty registry means no
-    /// window has ever offered its state, not that everything was deleted, so
-    /// deleting on absence before that would let a fresh registry - a replaced
-    /// daemon, a wiped data directory - retire every channel the user has.
+    /// A channel the registry lacks is decided by whether this window recorded
+    /// having shared it. Never shared means new to the registry, so it is
+    /// published; shared means it was deleted somewhere else, so it retires.
+    /// The distinction is the whole join rule: before a window has shared a
+    /// channel, the registry's silence about that channel carries no
+    /// information, and retiring on it would tombstone the cards inside a
+    /// channel nobody deleted.
+    ///
+    /// The first window to reach an empty registry therefore publishes
+    /// everything it has, because nothing is flagged - the migration for a
+    /// workspace that predates the registry, arrived at by the general rule
+    /// rather than by a request of its own.
+    ///
+    /// Nothing happens at all until a registry has answered. The window
+    /// reconciles on its own events too - a repository finishing loading is one
+    /// - and the cached model starts out as a [`WorkspaceModel::default`], whose
+    /// emptiness is not a registry's emptiness. Publishing against it would be
+    /// premature and retiring against it would be destruction.
     pub(super) fn reconcile_workspace_model(&mut self) -> Task<Message> {
+        if self.workspace_model.identity == NO_REGISTRY {
+            return Task::none();
+        }
         // Taken rather than cloned: reconciling needs `&mut self` for the
         // window's own store, and the model is put back untouched.
         let model = std::mem::take(&mut self.workspace_model);
@@ -365,21 +345,35 @@ impl Cagents {
                 },
             }
         }
-        if self.workspace_model_seeded {
-            let retired = self
-                .durable
-                .channels
-                .iter()
-                .filter(|local| !model.channels.iter().any(|shared| shared.id == local.id))
-                .map(|local| local.id)
-                .collect::<Vec<_>>();
-            for id in retired {
+        let mut republished = Vec::new();
+        let retired = self
+            .durable
+            .channels
+            .iter()
+            .filter(|local| !model.channels.iter().any(|shared| shared.id == local.id))
+            .map(|local| (local.id, local.shared))
+            .collect::<Vec<_>>();
+        for (id, shared) in retired {
+            if shared {
                 // The window's own deletion path, so a channel that disappeared
                 // elsewhere retires its cards exactly as a local delete retires
                 // them.
                 tasks.push(self.delete_channel(id));
                 changed = true;
+            } else {
+                republished.push(id);
             }
+        }
+        // Published in ascending local rank, so channels this window is
+        // introducing keep their relative order under the fresh ranks the
+        // registry assigns them. Those ranks are higher than everything the
+        // registry already held, so a rejoining window's channels sort above
+        // channels that may be older in wall-clock terms: a rank is the order
+        // the registry learned of a channel, not the order a user made one, and
+        // that is the only order two windows can agree on without a clock they
+        // share.
+        for id in republished {
+            self.publish_shared_channel(id);
         }
         self.workspace_model = model;
         if changed {
@@ -402,7 +396,10 @@ impl Cagents {
         // has, which is what a folded create carries until a read supplies the
         // real one.
         let rerank = shared.ordinal != PENDING_ORDINAL && local.ordinal != shared.ordinal;
-        if !retitle && !rerank {
+        // The registry naming a channel is the proof this window is looking for:
+        // from here its absence is a deletion rather than ignorance.
+        let record = !local.shared;
+        if !retitle && !rerank && !record {
             return false;
         }
         let channel = &mut Arc::make_mut(&mut self.durable).channels[index];
@@ -412,6 +409,7 @@ impl Cagents {
         if rerank {
             channel.ordinal = shared.ordinal;
         }
+        channel.shared = true;
         true
     }
 
@@ -427,6 +425,9 @@ impl Cagents {
                 project_id,
                 title: shared.title.clone(),
                 ordinal: shared.ordinal,
+                // Adopted from the registry, so the registry demonstrably holds
+                // it: this window may retire it when it later disappears.
+                shared: true,
                 // Adoption creates the scope, never a conversation. A local
                 // creation opens one because the user just asked for somewhere
                 // to talk; N windows adopting one channel must not start N
@@ -508,15 +509,43 @@ impl Cagents {
         // The project first: a channel in a repository no project owns is
         // reachable from no sidebar. Both edits go through one queue, so the
         // registry sees them in this order.
-        self.queue_workspace_model_publish(ModelPublish::Edit(ModelEdit::OpenProject {
+        self.publish_model_edit(ModelEdit::OpenProject {
             repository: repository.clone(),
             name,
-        }));
-        self.queue_workspace_model_publish(ModelPublish::Edit(ModelEdit::CreateChannel {
+        });
+        self.publish_model_edit(ModelEdit::CreateChannel {
             id,
             repository,
             title: String::new(),
-        }));
+        });
+    }
+
+    /// Publishes a channel this window holds and the registry has never heard
+    /// of, which is how a window that predates the registry - or that was open
+    /// while a replacement one was created - introduces what it already has.
+    fn publish_shared_channel(&mut self, id: ChannelId) {
+        let Some(channel) = self.durable.channels.iter().find(|local| local.id == id) else {
+            return;
+        };
+        let title = channel.title.clone();
+        let project_id = channel.project_id;
+        let Some(project) = self.sidebar_model.project(project_id) else {
+            return;
+        };
+        let repository = project.repository.clone();
+        let name = project.name.clone();
+        self.publish_model_edit(ModelEdit::OpenProject {
+            repository: repository.clone(),
+            name,
+        });
+        // Carrying the title this window already derived, unlike a fresh
+        // creation: a channel being reintroduced has a name the user has seen,
+        // and publishing it empty would blank it in every other window.
+        self.publish_model_edit(ModelEdit::CreateChannel {
+            id,
+            repository,
+            title,
+        });
     }
 
     /// Publishes a project this window opened.
@@ -524,11 +553,10 @@ impl Cagents {
         let Some(project) = self.sidebar_model.project(project_id) else {
             return;
         };
-        let edit = ModelEdit::OpenProject {
+        self.publish_model_edit(ModelEdit::OpenProject {
             repository: project.repository.clone(),
             name: project.name.clone(),
-        };
-        self.queue_workspace_model_publish(ModelPublish::Edit(edit));
+        });
     }
 
     /// Queues one shared-model edit without waiting for it.
@@ -537,11 +565,7 @@ impl Cagents {
     /// publisher thread owns the connection and the retry, and the window learns
     /// the outcome as an update like any other.
     pub(super) fn publish_model_edit(&mut self, edit: ModelEdit) {
-        self.queue_workspace_model_publish(ModelPublish::Edit(edit));
-    }
-
-    fn queue_workspace_model_publish(&mut self, request: ModelPublish) {
-        if let Err(error) = self.workspace_model_tx.try_send(request) {
+        if let Err(error) = self.workspace_model_tx.try_send(edit) {
             tracing::debug!(%error, "a shared workspace model edit was not queued");
         }
     }
@@ -575,6 +599,41 @@ mod tests {
         }
     }
 
+    fn local(id: ChannelId, project: ProjectId, title: &str, ordinal: u32) -> ProjectChannel {
+        ProjectChannel {
+            id,
+            project_id: project,
+            title: title.to_owned(),
+            ordinal,
+            shared: false,
+            cards: Vec::new(),
+            focused: None,
+        }
+    }
+
+    /// A registry with an identity and the channels it holds, as a window that
+    /// has reconciled against it would have recorded.
+    fn registry(channels: Vec<ModelChannel>) -> WorkspaceModel {
+        WorkspaceModel {
+            identity: uuid::Uuid::new_v4(),
+            sequence: channels.len() as u64,
+            projects: Vec::new(),
+            channels,
+        }
+    }
+
+    /// Replaces the publish queue with one the test can read, which is how the
+    /// window's side of a publish is observed without a daemon.
+    fn intercept_publishes(app: &mut Cagents) -> async_channel::Receiver<ModelEdit> {
+        let (tx, rx) = async_channel::unbounded();
+        app.workspace_model_tx = tx;
+        rx
+    }
+
+    fn drain(rx: &async_channel::Receiver<ModelEdit>) -> Vec<ModelEdit> {
+        std::iter::from_fn(|| rx.try_recv().ok()).collect()
+    }
+
     /// A channel another window created arrives as a scope, not as a
     /// conversation: N windows adopting one channel must not start N chats in
     /// it, and the cards inside a channel are each window's own business.
@@ -583,9 +642,7 @@ mod tests {
         let (mut app, project, repository) = app_with_project();
         let cards = app.durable.cards.len();
         let id = ChannelId::new();
-        app.workspace_model
-            .channels
-            .push(shared(id, &repository, "created elsewhere", 7));
+        app.workspace_model = registry(vec![shared(id, &repository, "created elsewhere", 7)]);
 
         let _ = app.reconcile_workspace_model();
 
@@ -616,24 +673,15 @@ mod tests {
     #[test]
     fn a_newer_adopted_channel_renders_above_an_older_local_one() {
         let (mut app, project, repository) = app_with_project();
-        let local = ChannelId::new();
+        let mine = ChannelId::new();
         Arc::make_mut(&mut app.durable)
             .channels
-            .push(ProjectChannel {
-                id: local,
-                project_id: project,
-                title: "mine".into(),
-                ordinal: 3,
-                cards: Vec::new(),
-                focused: None,
-            });
+            .push(local(mine, project, "mine", 3));
         let adopted = ChannelId::new();
-        app.workspace_model
-            .channels
-            .push(shared(local, &repository, "mine", 3));
-        app.workspace_model
-            .channels
-            .push(shared(adopted, &repository, "theirs", 9));
+        app.workspace_model = registry(vec![
+            shared(mine, &repository, "mine", 3),
+            shared(adopted, &repository, "theirs", 9),
+        ]);
 
         let _ = app.reconcile_workspace_model();
         app.refresh_sidebar_channels();
@@ -641,7 +689,7 @@ mod tests {
         let rows = &app.sidebar_model.projects[0].channels;
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].id, adopted, "the newer channel is on top");
-        assert_eq!(rows[1].id, local);
+        assert_eq!(rows[1].id, mine);
     }
 
     /// A channel deleted anywhere disappears everywhere, and its cards are
@@ -651,20 +699,11 @@ mod tests {
         let (mut app, project, repository) = app_with_project();
         let id = ChannelId::new();
         let conversation = app.durable.cards[0].id;
-        Arc::make_mut(&mut app.durable)
-            .channels
-            .push(ProjectChannel {
-                id,
-                project_id: project,
-                title: "doomed".into(),
-                ordinal: 4,
-                cards: vec![conversation],
-                focused: Some(conversation),
-            });
-        app.workspace_model
-            .channels
-            .push(shared(id, &repository, "doomed", 4));
-        app.workspace_model_seeded = true;
+        let mut channel = local(id, project, "doomed", 4);
+        channel.cards = vec![conversation];
+        channel.focused = Some(conversation);
+        Arc::make_mut(&mut app.durable).channels.push(channel);
+        app.workspace_model = registry(vec![shared(id, &repository, "doomed", 4)]);
 
         let _ = app.apply_workspace_model_update(ModelUpdate::Edited {
             sequence: 5,
@@ -687,64 +726,200 @@ mod tests {
         );
     }
 
-    /// An empty registry means no window has seeded it, not that every channel
-    /// was deleted. Retiring a user's channels because a fresh daemon has never
-    /// heard of them would destroy exactly what the shared model exists to keep.
+    /// Before a window has shared a channel, the registry's silence about that
+    /// channel carries no information at all. Retiring on it would tombstone the
+    /// cards inside a channel nobody deleted, so the channel is published
+    /// instead - which is also the whole migration for a workspace that predates
+    /// the registry.
     #[test]
-    fn an_unseeded_registry_never_retires_a_local_channel() {
+    fn a_window_joining_with_an_unshared_channel_keeps_and_publishes_it() {
+        let (mut app, project, repository) = app_with_project();
+        let id = ChannelId::new();
+        let conversation = app.durable.cards[0].id;
+        let mut channel = local(id, project, "mine", 0);
+        channel.cards = vec![conversation];
+        channel.focused = Some(conversation);
+        Arc::make_mut(&mut app.durable).channels.push(channel);
+        let published = intercept_publishes(&mut app);
+
+        let _ = app.apply_workspace_model_update(ModelUpdate::Connected(registry(Vec::new())));
+
+        let kept = app
+            .durable
+            .channels
+            .iter()
+            .find(|channel| channel.id == id)
+            .expect("a registry that never held a channel cannot retire it");
+        assert_eq!(
+            kept.cards,
+            vec![conversation],
+            "the cards inside it are untouched"
+        );
+        assert!(
+            app.durable
+                .cards
+                .iter()
+                .find(|card| card.id == conversation)
+                .is_some_and(|card| card.existence.is_open()),
+            "nothing was tombstoned"
+        );
+        assert_eq!(
+            drain(&published),
+            vec![
+                ModelEdit::OpenProject {
+                    repository: repository.clone(),
+                    name: "repo".into(),
+                },
+                ModelEdit::CreateChannel {
+                    id,
+                    repository,
+                    // The title the user has already seen, not an empty one: a
+                    // channel being introduced is not a channel being created.
+                    title: "mine".into(),
+                },
+            ],
+            "the project comes first, or the channel would have no owner"
+        );
+    }
+
+    /// Once this window has recorded that the registry holds a channel, the
+    /// registry's silence about it does mean something: it was deleted somewhere
+    /// else, and this window honours that through its own deletion path.
+    #[test]
+    fn a_window_joining_after_a_shared_channel_was_deleted_elsewhere_retires_it() {
         let (mut app, project, _repository) = app_with_project();
         let id = ChannelId::new();
-        Arc::make_mut(&mut app.durable)
-            .channels
-            .push(ProjectChannel {
-                id,
-                project_id: project,
-                title: "mine".into(),
-                ordinal: 0,
-                cards: Vec::new(),
-                focused: None,
-            });
+        let conversation = app.durable.cards[0].id;
+        let identity = uuid::Uuid::new_v4();
+        let mut channel = local(id, project, "shared then deleted", 4);
+        channel.shared = true;
+        channel.cards = vec![conversation];
+        channel.focused = Some(conversation);
+        let durable = Arc::make_mut(&mut app.durable);
+        durable.channels.push(channel);
+        durable.workspace_model_identity = Some(identity);
+        let published = intercept_publishes(&mut app);
 
-        let _ = app.apply_workspace_model_update(ModelUpdate::Connected(WorkspaceModel::default()));
+        let _ = app.apply_workspace_model_update(ModelUpdate::Connected(WorkspaceModel {
+            identity,
+            ..registry(Vec::new())
+        }));
 
         assert!(
-            app.durable.channels.iter().any(|channel| channel.id == id),
-            "an unseeded registry is not an authority to delete by"
+            !app.durable.channels.iter().any(|channel| channel.id == id),
+            "a channel this window shared and the registry no longer has was \
+             deleted elsewhere"
         );
-        assert!(!app.workspace_model_seeded);
+        assert!(
+            app.durable
+                .cards
+                .iter()
+                .find(|card| card.id == conversation)
+                .is_some_and(|card| !card.existence.is_open()),
+            "it retires through the local deletion path, which tombstones its \
+             cards rather than erasing them"
+        );
+        // The retirement goes through `delete_channel`, which publishes the
+        // deletion right back - a no-op the registry answers cheaply, and the
+        // price of one deletion path that behaves identically whoever asked.
+        // What must never happen is a create: that would argue with a deletion
+        // and resurrect the channel in every other window.
+        assert!(
+            !drain(&published)
+                .iter()
+                .any(|edit| matches!(edit, ModelEdit::CreateChannel { .. })),
+            "a deletion is honoured, never argued with by republishing"
+        );
+    }
+
+    /// A shared flag is a claim about one registry. A replaced daemon or a wiped
+    /// data directory is a different registry, so every flag is stale and
+    /// nothing may be retired on its authority.
+    #[test]
+    fn a_replaced_registry_retires_nothing_and_is_told_what_this_window_has() {
+        let (mut app, project, _repository) = app_with_project();
+        let id = ChannelId::new();
+        let mut channel = local(id, project, "mine", 4);
+        channel.shared = true;
+        let durable = Arc::make_mut(&mut app.durable);
+        durable.channels.push(channel);
+        durable.workspace_model_identity = Some(uuid::Uuid::new_v4());
+        let published = intercept_publishes(&mut app);
+
+        let replacement = registry(Vec::new());
+        let identity = replacement.identity;
+        let _ = app.apply_workspace_model_update(ModelUpdate::Connected(replacement));
+
+        let kept = app
+            .durable
+            .channels
+            .iter()
+            .find(|channel| channel.id == id)
+            .expect("a registry this window never shared with cannot retire it");
+        assert!(
+            !kept.shared,
+            "the flag was a claim about the registry that is gone"
+        );
+        assert_eq!(app.durable.workspace_model_identity, Some(identity));
+        assert!(
+            drain(&published)
+                .iter()
+                .any(|edit| matches!(edit, ModelEdit::CreateChannel { id: published, .. } if *published == id)),
+            "the replacement registry is told about it instead"
+        );
     }
 
     /// The rank the registry assigns replaces the provisional one a local
     /// creation started with, so the window that created a channel and the
-    /// window that adopted it agree on where it sorts.
+    /// window that adopted it agree on where it sorts. The same answer is the
+    /// proof the registry holds it.
     #[test]
-    fn the_registry_rank_replaces_the_provisional_one() {
+    fn the_registry_rank_replaces_the_provisional_one_and_records_the_sharing() {
         let (mut app, project, _repository) = app_with_project();
         let id = ChannelId::new();
         Arc::make_mut(&mut app.durable)
             .channels
-            .push(ProjectChannel {
-                id,
-                project_id: project,
-                title: String::new(),
-                ordinal: PENDING_ORDINAL,
-                cards: Vec::new(),
-                focused: None,
-            });
+            .push(local(id, project, "", PENDING_ORDINAL));
 
         let _ = app.apply_workspace_model_update(ModelUpdate::Ranked {
             channel: id,
             ordinal: 11,
         });
 
-        assert_eq!(
-            app.durable
-                .channels
-                .iter()
-                .find(|channel| channel.id == id)
-                .unwrap()
-                .ordinal,
-            11
+        let ranked = app
+            .durable
+            .channels
+            .iter()
+            .find(|channel| channel.id == id)
+            .unwrap();
+        assert_eq!(ranked.ordinal, 11);
+        assert!(
+            ranked.shared,
+            "the registry answered about it, so it holds it"
         );
+    }
+
+    /// A window reconciles on its own events too - a repository finishing
+    /// loading is one - and those can happen before any daemon has answered.
+    /// The cached model is empty then, and that emptiness is the window's own,
+    /// not a registry's: acting on it would publish prematurely and, for a
+    /// channel a previous session had shared, retire it against nobody's word.
+    #[test]
+    fn a_window_that_has_reached_no_registry_yet_neither_retires_nor_publishes() {
+        let (mut app, project, _repository) = app_with_project();
+        let id = ChannelId::new();
+        let mut channel = local(id, project, "mine", 4);
+        channel.shared = true;
+        Arc::make_mut(&mut app.durable).channels.push(channel);
+        let published = intercept_publishes(&mut app);
+        assert_eq!(app.workspace_model.identity, NO_REGISTRY);
+
+        let _ = app.reconcile_workspace_model();
+
+        assert!(
+            app.durable.channels.iter().any(|channel| channel.id == id),
+            "no registry has spoken, so nothing it did not say can be acted on"
+        );
+        assert!(drain(&published).is_empty());
     }
 }

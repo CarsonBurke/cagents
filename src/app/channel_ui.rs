@@ -117,6 +117,10 @@ impl Cagents {
                         // then the channel outranks every ranked one, which is
                         // the truth about something created a moment ago.
                         ordinal: PENDING_ORDINAL,
+                        // Not shared until the registry answers the publish
+                        // below. Claiming it early would let a registry that
+                        // never received the create retire it on a reconnect.
+                        shared: false,
                         cards: Vec::new(),
                         focused: None,
                     });
@@ -478,6 +482,7 @@ mod tests {
             project_id: project,
             title: String::new(),
             ordinal: 0,
+            shared: false,
             cards: vec![card],
             focused: Some(card),
         });
@@ -559,6 +564,7 @@ mod tests {
             project_id: project,
             title: "Investigation".into(),
             ordinal: 0,
+            shared: false,
             cards: vec![terminal, first, second],
             focused: Some(first),
         });
@@ -610,6 +616,7 @@ mod tests {
             project_id: project,
             title: "Investigation".into(),
             ordinal: 0,
+            shared: false,
             cards: vec![conversation],
             focused: Some(conversation),
         });
@@ -618,6 +625,7 @@ mod tests {
             project_id: project,
             title: "Migration".into(),
             ordinal: 0,
+            shared: false,
             cards: Vec::new(),
             focused: None,
         });

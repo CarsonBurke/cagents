@@ -3030,18 +3030,11 @@ pub struct Cagents {
     pending_adoptions: Vec<TerminalSession>,
     /// The shared sidebar model as this window last saw it.
     workspace_model: crate::workspace_model::WorkspaceModel,
-    /// Whether the registry has adopted this window's state and may therefore
-    /// be treated as the authority on which channels exist.
-    ///
-    /// False until the seed is answered, and false again on every reconnection:
-    /// a new connection may be to a registry that has never heard of anything,
-    /// and an empty registry is not a licence to delete.
-    workspace_model_seeded: bool,
     /// Repositories this window has already been asked to open on the shared
     /// model's behalf. Asking twice would mint a second project on one checkout.
     workspace_model_opens: HashSet<PathBuf>,
     workspace_model_rx: async_channel::Receiver<workspace_model_sync::ModelUpdate>,
-    workspace_model_tx: async_channel::Sender<workspace_model_sync::ModelPublish>,
+    workspace_model_tx: async_channel::Sender<crate::workspace_model::ModelEdit>,
     activation_rx: async_channel::Receiver<instance::UiActivation>,
     session: Option<SessionRuntime>,
     save_health: Option<SaveHealthState>,
@@ -7710,7 +7703,6 @@ impl Application for Cagents {
             terminal_starts: std::sync::atomic::AtomicUsize::new(0),
             pending_adoptions: Vec::new(),
             workspace_model: crate::workspace_model::WorkspaceModel::default(),
-            workspace_model_seeded: false,
             workspace_model_opens: HashSet::new(),
             workspace_model_rx,
             workspace_model_tx,
@@ -14422,7 +14414,6 @@ mod tests {
             terminal_starts: std::sync::atomic::AtomicUsize::new(0),
             pending_adoptions: Vec::new(),
             workspace_model: crate::workspace_model::WorkspaceModel::default(),
-            workspace_model_seeded: false,
             workspace_model_opens: HashSet::new(),
             workspace_model_rx: async_channel::unbounded().1,
             // Unbounded and unread: a fixture publishes into a queue nobody

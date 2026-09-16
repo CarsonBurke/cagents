@@ -14,6 +14,7 @@
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
+use uuid::Uuid;
 
 use crate::model::ChannelId;
 
@@ -59,9 +60,28 @@ pub struct ModelChannel {
     pub ordinal: u32,
 }
 
+/// The identity of a registry that has never been created.
+///
+/// A window compares the identity it recorded against the one the model carries
+/// to decide whether it has ever shared anything with *this* registry. The nil
+/// identity can only come from a [`WorkspaceModel::default`], never from a real
+/// registry, and it matches no recorded identity - so it takes the safe branch,
+/// where nothing local counts as shared and therefore nothing is retired.
+pub const NO_REGISTRY: Uuid = Uuid::nil();
+
 /// The shared sidebar model as the registry currently holds it.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkspaceModel {
+    /// Minted when the registry's store is first created and durable from then
+    /// on.
+    ///
+    /// A window records the identity it last reconciled against, which is the
+    /// only way to tell "the registry I have been talking to" from a replaced
+    /// daemon or a wiped data directory. Without it, an empty model is
+    /// indistinguishable from a registry that deliberately holds nothing, and a
+    /// window would retire channels - tombstoning the cards inside them - on the
+    /// strength of silence that carries no information.
+    pub identity: Uuid,
     /// Monotonic, bumped by every applied edit. An edit that changes nothing
     /// does not bump it, so a watcher can tell a real edge from a no-op.
     pub sequence: u64,

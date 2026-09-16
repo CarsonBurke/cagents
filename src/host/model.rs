@@ -17,6 +17,7 @@ use std::{
 };
 
 use rusqlite::{Connection, OptionalExtension, params};
+use uuid::Uuid;
 
 use crate::{
     model::ChannelId,
@@ -70,12 +71,17 @@ impl Registry {
 
     /// The whole model, ordered by the ranks the registry assigned.
     pub(crate) fn model(&self) -> Result<WorkspaceModel, String> {
-        let sequence: i64 = self
+        let (identity, sequence) = self
             .db
-            .query_row("SELECT sequence FROM metadata WHERE key = 0", [], |row| {
-                row.get(0)
-            })
+            .query_row(
+                "SELECT identity, sequence FROM metadata WHERE key = 0",
+                [],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+            )
             .map_err(|error| error.to_string())?;
+        let identity = identity.parse::<Uuid>().map_err(|error| {
+            format!("stored registry identity `{identity}` is unreadable: {error}")
+        })?;
         let mut projects = self
             .db
             .prepare("SELECT repository, name, ordinal FROM projects ORDER BY ordinal")
@@ -117,6 +123,7 @@ impl Registry {
             })
             .collect::<Result<Vec<_>, String>>()?;
         Ok(WorkspaceModel {
+            identity,
             sequence: sequence as u64,
             projects,
             channels,
@@ -251,72 +258,6 @@ impl Registry {
             model: self.model()?,
             changed,
         })
-    }
-
-    /// Adopts a window's existing sidebar state, once and only once.
-    ///
-    /// This is the migration path for a workspace that predates the registry.
-    /// The window sends its projects and channels in its own durable order -
-    /// oldest first - and the registry assigns the ranks, because the ranks are
-    /// what two windows have to agree on and a window's own numbering is not
-    /// comparable with another's.
-    ///
-    /// Returns the edits it actually applied, so the daemon can announce them to
-    /// every other watcher: a seed is defined as a batch of upserts, so its
-    /// edges are exactly those upserts.
-    pub(crate) fn seed(
-        &mut self,
-        projects: &[ModelProject],
-        channels: &[ModelChannel],
-    ) -> Result<(WorkspaceModel, Vec<ModelEdit>), String> {
-        if self.seeded()? {
-            return Ok((self.model()?, Vec::new()));
-        }
-        let mut applied = Vec::new();
-        for project in projects {
-            let edit = ModelEdit::OpenProject {
-                repository: project.repository.clone(),
-                name: project.name.clone(),
-            };
-            // One unrepresentable row must not abandon the migration: the rest
-            // of the window's state is still worth adopting, and a row that
-            // cannot be stored is reported rather than retried forever.
-            match self.apply(&edit) {
-                Ok(outcome) if outcome.changed => applied.push(edit),
-                Ok(_) => {}
-                Err(error) => tracing::warn!(%error, "a seeded project was not adopted"),
-            }
-        }
-        for channel in channels {
-            let edit = ModelEdit::CreateChannel {
-                id: channel.id,
-                repository: channel.repository.clone(),
-                title: channel.title.clone(),
-            };
-            match self.apply(&edit) {
-                Ok(outcome) if outcome.changed => applied.push(edit),
-                Ok(_) => {}
-                Err(error) => tracing::warn!(%error, "a seeded channel was not adopted"),
-            }
-        }
-        // Marked regardless of what was adopted. A window with nothing to donate
-        // still answers the question the flag exists to answer - has any window
-        // ever offered its state - and leaving it unset would make every window
-        // keep offering, and keep refusing to converge on a registry it is
-        // entitled to treat as authoritative.
-        self.db
-            .execute("UPDATE metadata SET seeded = 1 WHERE key = 0", [])
-            .map_err(|error| error.to_string())?;
-        Ok((self.model()?, applied))
-    }
-
-    fn seeded(&self) -> Result<bool, String> {
-        self.db
-            .query_row("SELECT seeded FROM metadata WHERE key = 0", [], |row| {
-                row.get::<_, i64>(0)
-            })
-            .map(|seeded| seeded != 0)
-            .map_err(|error| error.to_string())
     }
 }
 
@@ -453,16 +394,25 @@ fn migrate(db: &Connection) -> Result<(), String> {
          CREATE INDEX IF NOT EXISTS channels_by_repository ON channels(repository);
          CREATE TABLE IF NOT EXISTS metadata(
              key INTEGER PRIMARY KEY CHECK(key = 0),
+             identity TEXT NOT NULL,
              sequence INTEGER NOT NULL,
-             seeded INTEGER NOT NULL,
              next_project_ordinal INTEGER NOT NULL,
              next_channel_ordinal INTEGER NOT NULL
-         ) STRICT;
-         INSERT OR IGNORE INTO metadata(
-             key, sequence, seeded, next_project_ordinal, next_channel_ordinal
-         ) VALUES (0, 0, 0, 1, 1);",
+         ) STRICT;",
     )
-    .map_err(|error| error.to_string())
+    .map_err(|error| error.to_string())?;
+    // The identity is minted here rather than in `at`, because this is the only
+    // place that can tell a store being created from one being reopened: the
+    // ignored insert is what makes minting happen exactly once, and a reopened
+    // registry has to keep the identity every window recorded against it.
+    db.execute(
+        "INSERT OR IGNORE INTO metadata(
+             key, identity, sequence, next_project_ordinal, next_channel_ordinal
+         ) VALUES (0, ?1, 0, 1, 1)",
+        [Uuid::new_v4().to_string()],
+    )
+    .map_err(|error| error.to_string())?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -597,51 +547,37 @@ mod tests {
         assert_eq!(repeated.model.sequence, renamed.model.sequence);
     }
 
-    /// The seed is a migration, and a migration runs once. A second window must
-    /// not be able to donate a stale snapshot over a registry that windows and
-    /// the CLI have been editing since.
+    /// The identity is what lets a window tell "the registry I have been
+    /// talking to" from a replaced daemon or a wiped data directory. It must be
+    /// minted once and survive every reopening, because a window that saw a new
+    /// identity treats everything it holds as never shared.
     #[test]
-    fn a_seed_is_adopted_once_and_a_later_seed_changes_nothing() {
-        let (mut registry, _directory) = registry();
-        let first = ChannelId::new();
-        let (model, applied) = registry
-            .seed(
-                &[ModelProject {
-                    repository: PathBuf::from("/tmp/repo"),
-                    name: "repo".into(),
-                    ordinal: 0,
-                }],
-                &[ModelChannel {
-                    id: first,
-                    repository: PathBuf::from("/tmp/repo"),
-                    title: "donated".into(),
-                    ordinal: 0,
-                }],
-            )
-            .unwrap();
-        assert_eq!(applied.len(), 2, "the project and its channel were adopted");
-        assert!(model.channel(first).is_some());
+    fn the_identity_is_minted_once_and_never_changes() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("model.sqlite3");
+        let minted = {
+            let registry = Registry::at(&path).unwrap();
+            registry.model().unwrap().identity
+        };
+        assert_ne!(
+            minted,
+            crate::workspace_model::NO_REGISTRY,
+            "a real registry never presents the nil identity, which is what a \
+             window reads as having no registry at all"
+        );
+        let reopened = Registry::at(&path).unwrap().model().unwrap().identity;
+        assert_eq!(minted, reopened);
 
-        let stale = ChannelId::new();
-        let (after, applied) = registry
-            .seed(
-                &[ModelProject {
-                    repository: PathBuf::from("/tmp/other"),
-                    name: "other".into(),
-                    ordinal: 0,
-                }],
-                &[ModelChannel {
-                    id: stale,
-                    repository: PathBuf::from("/tmp/other"),
-                    title: "stale".into(),
-                    ordinal: 0,
-                }],
-            )
-            .unwrap();
-        assert!(applied.is_empty(), "a seeded registry adopts nothing more");
-        assert!(after.channel(stale).is_none());
-        assert_eq!(after.projects.len(), 1);
-        assert_eq!(after.sequence, model.sequence);
+        let replacement = Registry::at(&directory.path().join("other.sqlite3"))
+            .unwrap()
+            .model()
+            .unwrap()
+            .identity;
+        assert_ne!(
+            minted, replacement,
+            "a different store is a different registry, or a window would trust \
+             a wiped data directory about channels it never shared with it"
+        );
     }
 
     /// A rank is the creation order two windows agree on, so it has to keep
@@ -699,15 +635,14 @@ mod tests {
             let mut registry = Registry::at(&path).unwrap();
             registry.apply(&open("/tmp/repo")).unwrap();
             registry.apply(&create(id, "/tmp/repo", "probe")).unwrap();
-            registry.seed(&[], &[]).unwrap();
         }
         let reopened = Registry::at(&path).unwrap();
         let model = reopened.model().unwrap();
         assert_eq!(model.channel(id).unwrap().title, "probe");
-        assert!(
-            reopened.seeded().unwrap(),
-            "a seeded registry stays seeded across a restart, or every window \
-             would donate its state again"
+        assert_eq!(
+            model.channel(id).unwrap().ordinal,
+            1,
+            "the rank is durable too"
         );
     }
 }
