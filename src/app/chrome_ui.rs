@@ -564,7 +564,9 @@ impl Cagents {
         } else {
             0.0
         };
-        let notice = if !self.context_inspector_open && self.has_chrome_notices() {
+        // Same predicate `workflow_header` mounts the notice control behind,
+        // so the strip never reserves room for a control the panel is holding.
+        let notice = if !self.context_inspector_visible() && self.has_chrome_notices() {
             design::PRIMARY_CONTROL_SIZE + 2.0
         } else {
             0.0
@@ -710,6 +712,21 @@ impl Cagents {
                 )),
             ));
         }
+        // The inspector panel's own header mounts the notice control and the
+        // inspector toggle as well, and the two headers must never mount the
+        // same one at once: a custom `widget::Id` may name only one node in a
+        // frame. The pinned runtime lifts every named node's state into one
+        // thread-local map keyed by that name before diffing, hands it to the
+        // first widget that asks for the name, and leaves any later claimant
+        // holding the `State::None` the lift left behind - which the next
+        // draw downcasts, aborting the process.
+        //
+        // Ownership therefore changes hands when the panel mounts and
+        // unmounts, not when it is asked to open or close. Those differ for
+        // the whole of the collapse animation: `context_inspector_open` goes
+        // false at the click, while the panel stays mounted and keeps drawing
+        // its header until the transition ends.
+        let panel_owns_shared_controls = self.context_inspector_visible();
         vec![
             widget::row::with_children(actions)
                 .spacing(2)
@@ -717,13 +734,13 @@ impl Cagents {
                 .into(),
             widget::row::with_children(self.update_control()).into(),
             widget::row::with_children(
-                (!self.context_inspector_open)
+                (!panel_owns_shared_controls)
                     .then(|| self.notice_control())
                     .flatten(),
             )
             .into(),
             widget::row::with_children(
-                (!self.context_inspector_open).then(|| self.sidebar_toggle()),
+                (!panel_owns_shared_controls).then(|| self.sidebar_toggle()),
             )
             .into(),
         ]

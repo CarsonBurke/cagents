@@ -11463,6 +11463,110 @@ mod tests {
             .expect("a headless renderer")
     }
 
+    /// Collapsing the contextual inspector must not mount two nodes under one
+    /// custom `widget::Id`, and must survive the frames that do it.
+    ///
+    /// The panel's own header and the workspace chrome's header offer the same
+    /// notice control and the same inspector toggle, and each carries the id
+    /// the application focuses it by. The pinned runtime lifts every named
+    /// node's state into one thread-local map keyed by name before it diffs,
+    /// gives it to the first widget that asks for that name, and leaves any
+    /// later claimant holding the `State::None` the lift left behind. Nothing
+    /// downstream can recover from that: the tag still matches, so the node is
+    /// never rebuilt, and the first draw downcasts a stateless state and
+    /// aborts the process. Asserting the absence of that abort is the whole
+    /// contract here, so this test lays out and draws every frame of the
+    /// collapse rather than only inspecting the view.
+    #[test]
+    fn collapsing_the_inspector_leaves_every_widget_id_naming_one_node() {
+        use cosmic::iced::advanced::widget::{Tree, tree};
+        use cosmic::iced::advanced::{Layout, layout, mouse, renderer};
+        use cosmic::iced::{Rectangle, Size};
+        use iced_accessibility::id::Internal;
+
+        fn tally(tree: &Tree, out: &mut HashMap<String, usize>) {
+            if let Some(widget::Id(Internal::Custom(_, name))) = &tree.id {
+                *out.entry(name.to_string()).or_default() += 1;
+            }
+            for child in &tree.children {
+                tally(child, out);
+            }
+        }
+
+        let renderer = headless_renderer();
+        let mut app = context_inspector_test_app(true);
+        let card = app.workspace.focused().unwrap();
+        app.cards.insert(
+            card,
+            CardRuntime::Repository(Box::new(RepositoryRuntime::dirty_fixture(card))),
+        );
+        assert!(
+            app.context_inspector_open,
+            "the inspector starts open, which is what makes the collapse reachable"
+        );
+        let bounds = Size::new(1600.0, 1000.0);
+        let mut state = Tree::empty();
+        // Open with a file selected, collapse, then let the collapse settle:
+        // the middle frame is the one where the panel is still mounted while
+        // the chrome header already believes the inspector is closed.
+        for frame in 0..4 {
+            {
+                let mut element = app.view();
+                let mut counts = HashMap::new();
+                tally(&Tree::new(element.as_widget_mut()), &mut counts);
+                let mut repeated: Vec<&String> = counts
+                    .iter()
+                    .filter(|(_, count)| **count > 1)
+                    .map(|(name, _)| name)
+                    .collect();
+                repeated.sort();
+                assert!(
+                    repeated.is_empty(),
+                    "frame {frame} mounts {repeated:?} more than once",
+                );
+            }
+
+            let mut element = app.view();
+            tree::NAMED.with(|named| {
+                *named.borrow_mut() = state.take_all_named();
+            });
+            state.diff(element.as_widget_mut());
+            let node = element.as_widget_mut().layout(
+                &mut state,
+                &renderer,
+                &layout::Limits::new(Size::ZERO, bounds),
+            );
+            tree::NAMED.with(|named| named.borrow_mut().clear());
+            element.as_widget().draw(
+                &state,
+                &mut headless_renderer(),
+                &cosmic::theme::active(),
+                &renderer::Style::default(),
+                Layout::new(&node),
+                mouse::Cursor::Unavailable,
+                &Rectangle::with_size(bounds),
+            );
+            drop(node);
+            drop(element);
+
+            match frame {
+                0 => {
+                    let _ = app.update(Message::ContextInspector(
+                        InspectorAction::ShowRepositoryEditor(card),
+                    ));
+                }
+                1 => {
+                    let _ = app.update(Message::ToggleContextInspector);
+                    assert!(
+                        !app.context_inspector_open && app.context_inspector_visible(),
+                        "the collapse leaves the panel mounted while the chrome reopens its slots"
+                    );
+                }
+                _ => app.context_inspector_transition = None,
+            }
+        }
+    }
+
     pub(super) fn settle_settings_task(app: &mut Cagents, task: Task<Message>) {
         tokio::runtime::Builder::new_current_thread()
             .enable_all()
