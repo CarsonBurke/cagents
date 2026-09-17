@@ -32,6 +32,12 @@ const PERSIST_MAX_AUTOMATIC_ATTEMPTS: u32 = 4;
 /// writing does not change. If the write is rejected a second time the
 /// generations are moving underneath the writer, and reading them again would
 /// be a spin rather than a recovery, so the second rejection is reported.
+///
+/// The budget is per batch, not per session, which is what keeps it right now
+/// that a shared-model edge can drive a save with no user action behind it. A
+/// busier lane produces more batches, each with its own recovery, and the
+/// snapshot queue coalesces, so a burst of edges refreshes the pending content
+/// of the current batch rather than consuming recoveries.
 const PERSIST_REBASES_PER_BATCH: u32 = 1;
 
 /// How long the final flush at shutdown keeps retrying before abandoning what
@@ -807,6 +813,14 @@ impl PendingWrites {
     /// window contains and storage is only the authority for the generations
     /// that content is written against, which is what makes moving the bases
     /// under an unchanged snapshot a recovery rather than a guess.
+    ///
+    /// The shared workspace model does not weaken that. It lives in the
+    /// daemon's own registry database, and an edge from it reaches this window
+    /// as an event the window folds into its own state before persisting, so a
+    /// snapshot the daemon caused is still this window's content and no other
+    /// process writes these rows. Nor does it add a base: the channel list and
+    /// the model identity are `metadata` rows inside the workspace commit,
+    /// guarded by the workspace generation this rebase re-reads.
     ///
     /// Rebasing cannot lose a card. `save_workspace` decides which card rows to
     /// write from the snapshot's card set alone, and tombstones the stored rows

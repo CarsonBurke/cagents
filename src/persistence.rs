@@ -425,6 +425,17 @@ impl StateStore {
     /// ones from the rejection: the error names the workspace that moved, not
     /// every card row. This returns the whole base instead, so the lane can
     /// write the same content against it.
+    ///
+    /// A workspace generation and its card rows are the whole base, because
+    /// they are the only compare-and-set counters a snapshot is checked
+    /// against. Everything `save_workspace_transaction` keeps in `metadata` -
+    /// the navigation fields, the channel list and selected channel, the card
+    /// scopes, and the shared workspace model identity - has no generation of
+    /// its own: those rows are written inside the same transaction and are
+    /// therefore guarded by the workspace generation returned here. A rebase
+    /// that reseats the workspace and its cards consequently covers them too,
+    /// and nothing has to be added here when a new navigation field is
+    /// persisted alongside them.
     pub fn stored_generations(&self, id: WorkspaceId) -> Result<StoredGenerations> {
         let inner = self.lock_inner()?;
         ensure_open(&inner)?;
