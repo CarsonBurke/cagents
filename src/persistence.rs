@@ -259,6 +259,20 @@ pub struct WorkspaceCommit {
     pub card_generations: BTreeMap<CardId, u64>,
 }
 
+/// The generations storage holds right now for a workspace and every card row
+/// it owns.
+///
+/// This is [`WorkspaceCommit`] read back rather than returned by a commit, and
+/// it exists for one caller: a writer whose base storage rejected as stale
+/// needs the live generations to retry its own unchanged content against.
+/// Tombstoned cards are included because the save path checks a snapshot
+/// against every card row the workspace owns, not only the open ones.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct StoredGenerations {
+    pub workspace: u64,
+    pub cards: BTreeMap<CardId, u64>,
+}
+
 struct StoreInner {
     connection: Connection,
     closed: bool,
@@ -402,6 +416,65 @@ impl StateStore {
         let commit = save_workspace_transaction(&transaction, state, base)?;
         transaction.commit()?;
         Ok(commit)
+    }
+
+    /// Reads the generations a rejected write has to be rebased onto.
+    ///
+    /// [`Self::save_workspace`] rejects a snapshot whose base generations are
+    /// not the ones storage holds, and the writer lane cannot derive the live
+    /// ones from the rejection: the error names the workspace that moved, not
+    /// every card row. This returns the whole base instead, so the lane can
+    /// write the same content against it.
+    pub fn stored_generations(&self, id: WorkspaceId) -> Result<StoredGenerations> {
+        let inner = self.lock_inner()?;
+        ensure_open(&inner)?;
+        let workspace_id = id.to_string();
+        // A workspace with no row yet is written against generation zero, the
+        // same base a never-committed snapshot starts from.
+        let workspace = select_generation(
+            &inner.connection,
+            SELECT_WORKSPACE_GENERATION,
+            &workspace_id,
+        )?
+        .unwrap_or(0);
+        let mut statement = inner
+            .connection
+            .prepare_cached(SELECT_WORKSPACE_CARD_GENERATIONS)?;
+        let rows = statement.query_map([&workspace_id], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+        })?;
+        let mut cards = BTreeMap::new();
+        for row in rows {
+            let (card_id, generation) = row?;
+            cards.insert(
+                parse_id("card", &card_id)?,
+                i64_to_u64(generation, "card generation")?,
+            );
+        }
+        Ok(StoredGenerations { workspace, cards })
+    }
+
+    /// The generation storage holds for one project, or `None` when it holds no
+    /// row for it. Companion to [`Self::stored_generations`] for the catalog
+    /// entities, which carry their base inside the state they write.
+    pub fn stored_project_generation(&self, id: ProjectId) -> Result<Option<u64>> {
+        let inner = self.lock_inner()?;
+        ensure_open(&inner)?;
+        select_generation(
+            &inner.connection,
+            SELECT_PROJECT_GENERATION,
+            &id.to_string(),
+        )
+    }
+
+    pub fn stored_worktree_generation(&self, id: WorktreeId) -> Result<Option<u64>> {
+        let inner = self.lock_inner()?;
+        ensure_open(&inner)?;
+        select_generation(
+            &inner.connection,
+            SELECT_WORKTREE_GENERATION,
+            &id.to_string(),
+        )
     }
 
     /// Atomically replaces the terminal identity owned by an existing terminal card.
@@ -1806,6 +1879,8 @@ fn reconcile_startup(connection: &mut Connection, boot_id: &BootId) -> Result<Re
 /// and column names structurally incapable of being interpolated.
 const SELECT_WORKSPACE_GENERATION: &str =
     "SELECT generation FROM workspaces WHERE workspace_id = ?1";
+const SELECT_WORKSPACE_CARD_GENERATIONS: &str =
+    "SELECT card_id, generation FROM cards WHERE workspace_id = ?1";
 const SELECT_WORKSPACE_EXISTENCE: &str =
     "SELECT existence_json FROM workspaces WHERE workspace_id = ?1";
 const SELECT_PROJECT_GENERATION: &str = "SELECT generation FROM projects WHERE project_id = ?1";
@@ -3227,12 +3302,11 @@ fn card_kind(kind: &CardKind) -> PersistedCardKind {
     }
 }
 
-fn select_generation(
-    transaction: &Transaction<'_>,
-    sql: &'static str,
-    id: &str,
-) -> Result<Option<u64>> {
-    transaction
+/// Reads one stored generation. Takes a connection rather than a transaction so
+/// the save path's checks and the rebase path's plain read share it; a
+/// `Transaction` derefs to its `Connection`.
+fn select_generation(connection: &Connection, sql: &'static str, id: &str) -> Result<Option<u64>> {
+    connection
         .prepare_cached(sql)?
         .query_row([id], |row| row.get::<_, i64>(0))
         .optional()?
