@@ -19,7 +19,9 @@ use thiserror::Error;
 
 use crate::{
     instance::{self, UI_LAUNCH_ERROR_PREFIX, UI_LAUNCH_HANDSHAKE_ENV, UI_LAUNCH_READY},
-    model::{HostSessionProof, LaunchRecipe, TerminalContinuity, TerminalId, TerminalSession},
+    model::{
+        ChannelId, HostSessionProof, LaunchRecipe, TerminalContinuity, TerminalId, TerminalSession,
+    },
     terminal::{
         self, TerminalSpawnOptions,
         ipc::{
@@ -28,6 +30,9 @@ use crate::{
             ShutdownOperation, ShutdownOutcome, ShutdownPreflight, TerminalDescriptor,
             TerminalSnapshot, TerminalVisibility, daemon_socket_path, read_frame, write_frame,
         },
+    },
+    workspace_model::{
+        ModelChannel, ModelEdit, WorkspaceModel, canonical_repository, repository_display_name,
     },
 };
 
@@ -73,6 +78,11 @@ pub enum TopCommand {
     Terminal {
         #[command(subcommand)]
         command: TerminalCommand,
+    },
+    /// Manage the channels every window shares.
+    Channel {
+        #[command(subcommand)]
+        command: ChannelCommand,
     },
     /// Run the detached updater started by an explicit application Update action.
     #[command(hide = true)]
@@ -164,6 +174,29 @@ pub enum TerminalCommand {
     },
 }
 
+#[derive(Debug, Subcommand)]
+pub enum ChannelCommand {
+    /// Create a channel in a repository, with or without a window running.
+    Spawn {
+        /// Repository the channel belongs to (defaults to the repository
+        /// containing the current directory).
+        #[arg(long)]
+        repository: Option<PathBuf>,
+        /// Channel title. Empty - the default - leaves the channel awaiting its
+        /// conversation's first title, exactly as one created in a window does.
+        #[arg(long, default_value = "")]
+        title: String,
+    },
+    /// List shared channels, newest first.
+    List {
+        /// Only list channels in this repository.
+        #[arg(long)]
+        repository: Option<PathBuf>,
+    },
+    /// Delete a channel everywhere.
+    Close { channel_id: ChannelId },
+}
+
 fn parse_positive_seconds(value: &str) -> Result<f64, String> {
     let seconds = value
         .parse::<f64>()
@@ -242,6 +275,9 @@ pub struct ControlClient {
     /// request and reading its answer. Buffering keeps the request/response
     /// discipline intact without losing the edge that motivated subscribing.
     observed: VecDeque<TerminalDescriptor>,
+    /// Shared-model edges that arrived while a correlated response was pending,
+    /// buffered for the same reason `observed` buffers an inventory edge.
+    observed_model: VecDeque<(u64, ModelEdit)>,
 }
 
 impl ControlClient {
@@ -268,6 +304,7 @@ impl ControlClient {
             proof,
             next_request_id: client.next_request_id,
             observed: VecDeque::new(),
+            observed_model: VecDeque::new(),
         })
     }
 
@@ -324,6 +361,72 @@ impl ControlClient {
                 }
                 _ => {}
             }
+        }
+    }
+
+    /// Subscribes to shared-model edges and returns the model in one round trip.
+    ///
+    /// Unlike `watch_terminals` this needs no separate read: the daemon answers
+    /// the subscription with the model itself, so there is no gap between
+    /// subscribing and reading for an edit to fall into.
+    pub fn watch_workspace_model(&mut self) -> Result<WorkspaceModel, ControlError> {
+        self.expect_model(ClientRequest::WatchWorkspaceModel)
+    }
+
+    /// Reads the shared model without subscribing, for a client whose state
+    /// machine has no place for an unsolicited frame.
+    pub fn read_workspace_model(&mut self) -> Result<WorkspaceModel, ControlError> {
+        self.expect_model(ClientRequest::ReadWorkspaceModel)
+    }
+
+    /// Applies one edit and returns the resulting model, which is how the
+    /// client that minted a channel learns the rank the registry gave it.
+    pub fn edit_workspace_model(
+        &mut self,
+        edit: ModelEdit,
+    ) -> Result<WorkspaceModel, ControlError> {
+        self.expect_model(ClientRequest::EditWorkspaceModel { edit })
+    }
+
+    /// Blocks until another client edits the shared model.
+    ///
+    /// A model edge has no deadline, so this drops the read timeout rather than
+    /// polling: a timeout expiring mid-frame would desynchronize the stream, and
+    /// a subscribed connection issues no further requests.
+    pub fn next_workspace_model_edit(&mut self) -> Result<(u64, ModelEdit), ControlError> {
+        if let Some(edge) = self.observed_model.pop_front() {
+            return Ok(edge);
+        }
+        self.stream
+            .set_read_timeout(None)
+            .map_err(ControlError::Configure)?;
+        loop {
+            let envelope = self.read_envelope()?;
+            self.validate_pinned_envelope(&envelope)?;
+            match envelope.message {
+                ServerMessage::WorkspaceModelEdited { sequence, edit } => {
+                    return Ok((sequence, edit));
+                }
+                // The daemon is about to close this connection. Reporting it as
+                // a closed connection is what makes a watcher reconnect and
+                // resynchronize against the successor's registry.
+                ServerMessage::HostShuttingDown => return Err(ControlError::ConnectionClosed),
+                ServerMessage::Error(error) => {
+                    return Err(ControlError::Remote {
+                        code: error.code,
+                        message: error.message,
+                        retryable: error.retryable,
+                    });
+                }
+                _ => {}
+            }
+        }
+    }
+
+    fn expect_model(&mut self, request: ClientRequest) -> Result<WorkspaceModel, ControlError> {
+        match self.request_strict(request)? {
+            ServerResponse::WorkspaceModel { model } => Ok(model),
+            response => Err(unexpected_response("the shared workspace model", &response)),
         }
     }
 
@@ -655,6 +758,9 @@ impl ControlClient {
                 // A subscribed connection can be told about another client's
                 // terminal at any point, including mid-replay.
                 ServerMessage::TerminalCreated { terminal } => self.observed.push_back(terminal),
+                ServerMessage::WorkspaceModelEdited { sequence, edit } => {
+                    self.observed_model.push_back((sequence, edit));
+                }
                 ServerMessage::Synchronized {
                     terminal_id: actual,
                     ..
@@ -772,6 +878,9 @@ impl ControlClient {
                 None => match envelope.message {
                     ServerMessage::TerminalCreated { terminal } => {
                         self.observed.push_back(terminal);
+                    }
+                    ServerMessage::WorkspaceModelEdited { sequence, edit } => {
+                        self.observed_model.push_back((sequence, edit));
                     }
                     message
                         if streaming_terminal.is_some_and(|id| message_targets(&message, id)) => {}
@@ -916,6 +1025,7 @@ fn message_targets(message: &ServerMessage, expected: TerminalId) -> bool {
         | ServerMessage::ChatObserved { .. }
         | ServerMessage::ChatActivity { .. }
         | ServerMessage::TerminalCreated { .. }
+        | ServerMessage::WorkspaceModelEdited { .. }
         | ServerMessage::Error(_) => false,
     }
 }
@@ -934,6 +1044,7 @@ fn message_name(message: &ServerMessage) -> &'static str {
         ServerMessage::ChatActivity { .. } => "chat_activity",
         ServerMessage::TerminalObserved { .. } => "terminal_observed",
         ServerMessage::TerminalCreated { .. } => "terminal_created",
+        ServerMessage::WorkspaceModelEdited { .. } => "workspace_model_edited",
     }
 }
 
@@ -960,6 +1071,7 @@ fn response_name(response: &ServerResponse) -> &'static str {
         ServerResponse::AgentActivity { .. } => "agent_activity",
         ServerResponse::UpgradePrepared { .. } => "upgrade_prepared",
         ServerResponse::UpgradeChatResolved { .. } => "upgrade_chat_resolved",
+        ServerResponse::WorkspaceModel { .. } => "workspace_model",
     }
 }
 
@@ -1085,6 +1197,7 @@ fn execute(command: TopCommand) -> Result<CommandOutput, AppError> {
         TopCommand::Ui { new_window, window } => launch_ui(new_window, window.as_deref()),
         TopCommand::Daemon { command } => execute_daemon(command),
         TopCommand::Terminal { command } => execute_terminal(command),
+        TopCommand::Channel { command } => execute_channel(command),
         TopCommand::UpdateWorker { job_id } => {
             crate::update::run_worker(&job_id).map_err(|error| AppError::new("update", error))?;
             Ok(CommandOutput {
@@ -1636,6 +1749,211 @@ fn protocol_error(error: ControlError) -> AppError {
     }
 }
 
+/// Runs a shared-channel verb against the daemon's registry.
+///
+/// Every verb here is a registry edit or read, never a window instruction: the
+/// point of the shared model is that a channel exists whether or not a window
+/// is running to show it.
+fn execute_channel(command: ChannelCommand) -> Result<CommandOutput, AppError> {
+    // Resolved before any daemon is started. A path that names no repository is
+    // an argument error, and an argument error must not leave behind a daemon
+    // the user never asked for.
+    let command = command.resolved()?;
+    let socket =
+        terminal::ensure_daemon_ready().map_err(|error| AppError::new("daemon_start", error))?;
+    let mut client = ControlClient::connect(&socket)
+        .map_err(|error| AppError::new("daemon_connection", error))?;
+    channel_output(&mut client, command)
+}
+
+/// A channel verb whose repository is already the shared key.
+///
+/// A distinct type rather than a convention, so the resolution cannot drift
+/// back inside the request path - where it would run after the daemon was
+/// started, and where `list` would resolve a key the caller had already
+/// resolved.
+enum ResolvedChannel {
+    Spawn { repository: PathBuf, title: String },
+    List { repository: Option<PathBuf> },
+    Close { channel_id: ChannelId },
+}
+
+impl ChannelCommand {
+    fn resolved(self) -> Result<ResolvedChannel, AppError> {
+        Ok(match self {
+            Self::Spawn { repository, title } => ResolvedChannel::Spawn {
+                repository: resolve_repository(repository)?,
+                title,
+            },
+            // Only an explicit filter is resolved: no `--repository` means every
+            // repository, so defaulting to the one containing the current
+            // directory would silently hide channels the user asked to see.
+            Self::List { repository } => ResolvedChannel::List {
+                repository: repository
+                    .map(|path| resolve_repository(Some(path)))
+                    .transpose()?,
+            },
+            Self::Close { channel_id } => ResolvedChannel::Close { channel_id },
+        })
+    }
+}
+
+fn channel_output(
+    client: &mut ControlClient,
+    command: ResolvedChannel,
+) -> Result<CommandOutput, AppError> {
+    match command {
+        ResolvedChannel::Spawn { repository, title } => {
+            // The project comes first: a channel in a repository no project owns
+            // is reachable from no window's sidebar. `OpenProject` is an upsert,
+            // so this is a no-op when a window already has the project open.
+            client
+                .edit_workspace_model(ModelEdit::OpenProject {
+                    repository: repository.clone(),
+                    name: repository_display_name(&repository),
+                })
+                .map_err(protocol_error)?;
+            // The id is minted here, exactly as `terminal spawn` mints its
+            // `TerminalId`, so the caller names what it created without having
+            // to correlate a server-assigned identity back to its request.
+            let id = ChannelId::new();
+            let model = client
+                .edit_workspace_model(ModelEdit::CreateChannel {
+                    id,
+                    repository,
+                    title,
+                })
+                .map_err(protocol_error)?;
+            let channel = model.channel(id).cloned().ok_or_else(|| {
+                AppError::new(
+                    "protocol",
+                    "the daemon accepted the channel but did not report it",
+                )
+            })?;
+            let human = channel_line(&channel);
+            Ok(CommandOutput {
+                command: "channel.spawn",
+                data: json!({ "channel": channel, "sequence": model.sequence }),
+                human,
+            })
+        }
+        ResolvedChannel::List { repository: filter } => {
+            let model = client.read_workspace_model().map_err(protocol_error)?;
+            // Newest first, which is the order the sidebar renders: a listing
+            // that disagreed with the window about which channel is on top would
+            // be a second answer to a question with one.
+            let mut channels = model
+                .channels
+                .iter()
+                .filter(|channel| {
+                    filter
+                        .as_ref()
+                        .is_none_or(|repository| channel.repository == *repository)
+                })
+                .collect::<Vec<_>>();
+            channels.sort_by(|left, right| right.ordinal.cmp(&left.ordinal));
+            let human = channels
+                .iter()
+                .map(|channel| channel_line(channel))
+                .collect::<Vec<_>>()
+                .join("\n");
+            Ok(CommandOutput {
+                command: "channel.list",
+                data: json!({ "channels": channels, "sequence": model.sequence }),
+                human,
+            })
+        }
+        ResolvedChannel::Close { channel_id } => {
+            client
+                .edit_workspace_model(ModelEdit::DeleteChannel { id: channel_id })
+                .map_err(protocol_error)?;
+            Ok(CommandOutput {
+                command: "channel.close",
+                data: json!({ "channel_id": channel_id, "closed": true }),
+                human: format!("closed {channel_id}"),
+            })
+        }
+    }
+}
+
+/// One channel per line: id, repository, title.
+///
+/// Tab separated and in that order, following `descriptor_line`, so the same
+/// `cut -f1` that names a terminal names a channel.
+fn channel_line(channel: &ModelChannel) -> String {
+    format!(
+        "{}\t{}\t{}",
+        channel.id,
+        channel.repository.display(),
+        channel.title,
+    )
+}
+
+/// Resolves the repository a channel verb refers to into the shared key.
+///
+/// Both forms go through Git, including an explicit `--repository`: a user
+/// names a checkout, and the key is not the checkout's path. A path that is not
+/// inside a repository is an error rather than a key, because no window could
+/// ever own a project there.
+fn resolve_repository(repository: Option<PathBuf>) -> Result<PathBuf, AppError> {
+    let from = absolute_working_directory(repository)
+        .map_err(|error| AppError::new("repository", error))?;
+    repository_key(&from).map_err(|error| AppError::new("repository", error))
+}
+
+/// The shared project key for the repository containing `directory`, asked of
+/// Git itself.
+///
+/// `--git-common-dir` and nothing else. A project's identity in the window is
+/// `ProjectState.repository`, which the repository loader fills from the same
+/// query, so asking Git the same question here makes the two representations
+/// coincide by construction rather than by a fixup. The alternatives are both
+/// wrong: `--show-toplevel` is the work tree rather than the repository, and
+/// `--absolute-git-dir` answers `<root>/.git/worktrees/<name>` inside a linked
+/// worktree, so the same project would get one key per worktree the CLI
+/// happened to be invoked from. The common directory is the one form that is
+/// identical from the work tree root, from a subdirectory, from a linked
+/// worktree and from inside the Git directory itself. `repository_git_contract`
+/// holds the two derivations to each other, because a key that agrees with the
+/// window only by inspection is a key that will drift.
+///
+/// Public so that contract can be stated against the real `git` rather than
+/// against a copy of this logic.
+/// The crate's own repository helpers are `ui`-gated - the shipped `cagents`
+/// binary has no Git library in its dependency graph at all - and adding one for
+/// a single query would be a dependency for a question the `git` on the user's
+/// path already answers, with the user's own configuration applied.
+pub fn repository_key(directory: &Path) -> Result<PathBuf, String> {
+    // Checked before spawning, because `current_dir` on a path that is not
+    // there fails as a spawn error and would be reported as a broken `git`
+    // install - sending the user to look at the wrong thing entirely.
+    if !directory.is_dir() {
+        return Err(format!("`{}` is not a directory", directory.display()));
+    }
+    let output = Command::new("git")
+        .args(["rev-parse", "--path-format=absolute", "--git-common-dir"])
+        .current_dir(directory)
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+        .map_err(|error| format!("could not run git: {error}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "`{}` is not inside a Git repository; pass --repository",
+            directory.display()
+        ));
+    }
+    let key = String::from_utf8(output.stdout)
+        .map_err(|_| "git reported a repository path that is not valid UTF-8".to_owned())?;
+    let key = key.trim_end();
+    if key.is_empty() {
+        return Err("git reported an empty repository path".to_owned());
+    }
+    // Canonicalized here rather than by the caller, so the public derivation is
+    // the whole key and nothing is left for a producer to remember to do.
+    canonical_repository(Path::new(key))
+}
+
 fn descriptor_line(terminal: &TerminalDescriptor) -> String {
     format!(
         "{}\t{}\t{}\t{}",
@@ -1845,6 +2163,143 @@ mod tests {
                     proof: response_proof,
                     resumed: Vec::new(),
                 },
+            },
+        }
+    }
+
+    /// `channel spawn` opens the project before creating the channel in it,
+    /// mints the id itself, and reports the created channel under the
+    /// `channel.spawn` envelope every automation keys on.
+    ///
+    /// The fixture is a real repository because the key is whatever `git`
+    /// resolves, not the path the user named: a fixture that never ran `git`
+    /// could not tell the two apart, which is how a key no window could match
+    /// shipped.
+    #[test]
+    fn channel_spawn_opens_the_project_then_creates_the_channel_it_minted() {
+        let (client_stream, mut server_stream) = UnixStream::pair().unwrap();
+        let peer_proof = proof("session", "boot", "incarnation");
+        let checkout = tempfile::tempdir().unwrap();
+        let initialized = Command::new("git")
+            .args(["init", "--quiet"])
+            .current_dir(checkout.path())
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+        if !initialized.is_ok_and(|status| status.success()) {
+            // No usable `git`, so there is no key to derive and nothing this
+            // test can assert. Every lane that runs it has one.
+            return;
+        }
+        let repository = checkout.path().to_path_buf();
+        // The common Git directory, which is what a window stores for a project
+        // and therefore what the channel has to be keyed on.
+        let expected =
+            crate::workspace_model::canonical_repository(&repository.join(".git")).unwrap();
+        let server_repository = expected.clone();
+        // Derived the same way the CLI derives it, from the checkout the key's
+        // Git directory belongs to.
+        let expected_name = checkout
+            .path()
+            .file_name()
+            .expect("the fixture checkout is named")
+            .to_string_lossy()
+            .into_owned();
+        let server = thread::spawn(move || {
+            let _: ClientEnvelope = read_frame(&mut server_stream).unwrap().unwrap();
+            write_frame(
+                &mut server_stream,
+                &connected_envelope(1, peer_proof.clone(), peer_proof.clone()),
+            )
+            .unwrap();
+            let opened: ClientEnvelope = read_frame(&mut server_stream).unwrap().unwrap();
+            assert_eq!(
+                opened.request,
+                ClientRequest::EditWorkspaceModel {
+                    edit: ModelEdit::OpenProject {
+                        repository: server_repository.clone(),
+                        // The checkout's name, never the key's own last
+                        // component, which is `.git` and names nothing.
+                        name: expected_name.clone(),
+                    },
+                },
+                "the project a channel needs is opened first"
+            );
+            write_frame(
+                &mut server_stream,
+                &model_envelope(
+                    opened.request_id,
+                    peer_proof.clone(),
+                    WorkspaceModel::default(),
+                ),
+            )
+            .unwrap();
+            let created: ClientEnvelope = read_frame(&mut server_stream).unwrap().unwrap();
+            let ClientRequest::EditWorkspaceModel {
+                edit:
+                    ModelEdit::CreateChannel {
+                        id,
+                        repository: asked,
+                        title,
+                    },
+            } = created.request
+            else {
+                panic!("expected a channel creation, got {:?}", created.request);
+            };
+            assert_eq!(asked, server_repository);
+            assert_eq!(title, "probe");
+            let model = WorkspaceModel {
+                identity: uuid::Uuid::new_v4(),
+                sequence: 2,
+                projects: Vec::new(),
+                channels: vec![ModelChannel {
+                    id,
+                    repository: server_repository,
+                    title,
+                    ordinal: 4,
+                }],
+            };
+            write_frame(
+                &mut server_stream,
+                &model_envelope(created.request_id, peer_proof, model),
+            )
+            .unwrap();
+            id
+        });
+        let mut client = ControlClient::from_stream(client_stream).unwrap();
+        // Through the real resolution, so the test proves the key the CLI sends
+        // is the one `git` derives rather than the one the test hands it.
+        let resolved = ChannelCommand::Spawn {
+            repository: Some(repository),
+            title: "probe".into(),
+        }
+        .resolved()
+        .unwrap();
+        let output = channel_output(&mut client, resolved).unwrap();
+        let id = server.join().unwrap();
+        assert_eq!(output.command, "channel.spawn");
+        assert_eq!(output.data["channel"]["id"], json!(id.to_string()));
+        assert_eq!(output.data["channel"]["ordinal"], json!(4));
+        assert_eq!(output.data["sequence"], json!(2));
+        assert_eq!(
+            output.human,
+            format!("{id}\t{}\tprobe", expected.display()),
+            "one tab-separated line: id, repository, title"
+        );
+    }
+
+    fn model_envelope(
+        request_id: u64,
+        envelope_proof: HostSessionProof,
+        model: WorkspaceModel,
+    ) -> ServerEnvelope {
+        ServerEnvelope {
+            version: PROTOCOL_VERSION,
+            request_id: Some(request_id),
+            proof: envelope_proof,
+            message: ServerMessage::Response {
+                response: ServerResponse::WorkspaceModel { model },
             },
         }
     }

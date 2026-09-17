@@ -17,6 +17,7 @@ use crate::{
         ShutdownOutcome, ShutdownPreflight, TerminalDescriptor, TerminalSnapshot,
         TerminalSpawnOptions, TerminalVisibility, WireTerminalEvent,
     },
+    workspace_model::{ModelEdit, WorkspaceModel},
 };
 
 use super::delivery::{DEFAULT_CLIENT_QUEUE_CAPACITY, DeliveryQueue, Outbound};
@@ -25,6 +26,23 @@ const EVENT_REPLAY_CAPACITY: usize = 256;
 pub(super) const MAX_TERMINALS: usize = 1024;
 const SHUTDOWN_CONFIRMATION_TTL: Duration = Duration::from_secs(60);
 const MAX_SHUTDOWN_CAPABILITIES: usize = 32;
+
+/// Why the shared model cannot be served.
+///
+/// Reported rather than answered with an empty model: an empty model is a
+/// meaningful answer - no window has seeded the registry yet - and a window
+/// that believed it would offer to donate its state over and over.
+fn missing_registry() -> ProtocolError {
+    ProtocolError::new(
+        ProtocolErrorCode::Internal,
+        "the shared workspace model store is unavailable",
+        false,
+    )
+}
+
+fn model_unavailable(error: String) -> ProtocolError {
+    ProtocolError::new(ProtocolErrorCode::Internal, error, false)
+}
 
 pub(crate) type ClientId = u64;
 pub(crate) type SharedHost = Arc<Mutex<HostState>>;
@@ -190,6 +208,19 @@ pub(crate) struct HostState {
     /// asked receives none, which is what keeps every strict request/response
     /// client free of unsolicited frames.
     watchers: BTreeSet<ClientId>,
+    /// The durable shared sidebar model, installed by the daemon's entry point.
+    ///
+    /// `None` when its store could not be opened, and deliberately not an empty
+    /// model: a window reads an empty model as "no window has seeded this yet"
+    /// and answers by donating its own state, so serving one from a broken store
+    /// would invite every window to re-seed on every connection. A failure is
+    /// reported instead, and terminals keep working meanwhile.
+    model: Option<super::model::Registry>,
+    /// Connections that asked for shared-model edges, kept separately from
+    /// `watchers` because watching terminals and watching the model are
+    /// independent subscriptions with independent clients - the CLI reads the
+    /// model without subscribing at all.
+    model_watchers: BTreeSet<ClientId>,
     subscriptions: Subscriptions,
     pub(super) shutting_down: bool,
     shutdown_requested: bool,
@@ -218,6 +249,8 @@ impl HostState {
             spawning: BTreeSet::new(),
             clients: BTreeMap::new(),
             watchers: BTreeSet::new(),
+            model: None,
+            model_watchers: BTreeSet::new(),
             subscriptions: Subscriptions::default(),
             shutting_down: false,
             shutdown_requested: false,
@@ -261,6 +294,81 @@ impl HostState {
     pub(crate) fn forget_client_delivery(&mut self, client_id: ClientId) {
         self.clients.remove(&client_id);
         self.watchers.remove(&client_id);
+        self.model_watchers.remove(&client_id);
+    }
+
+    /// Installs the durable shared sidebar model.
+    ///
+    /// The daemon's entry point opens the store, not [`HostState::new`]: a host
+    /// constructed for a test must not reach into the user's data directory, and
+    /// a daemon that cannot open the store still has terminals to host.
+    pub(crate) fn install_model(&mut self, registry: super::model::Registry) {
+        self.model = Some(registry);
+    }
+
+    /// Subscribes `client_id` to shared-model edges and returns the model.
+    ///
+    /// Both happen under one lock, so an edit applied between subscribing and
+    /// reading cannot fall into a gap: a client either sees it in the model it
+    /// is handed or receives it as an edge afterwards, never neither.
+    pub(crate) fn watch_model(
+        &mut self,
+        client_id: ClientId,
+    ) -> Result<WorkspaceModel, ProtocolError> {
+        let model = self.registry()?.model().map_err(model_unavailable)?;
+        self.model_watchers.insert(client_id);
+        Ok(model)
+    }
+
+    pub(crate) fn read_model(&self) -> Result<WorkspaceModel, ProtocolError> {
+        self.model
+            .as_ref()
+            .ok_or_else(missing_registry)?
+            .model()
+            .map_err(model_unavailable)
+    }
+
+    /// Applies one edit and tells every other watcher about it.
+    pub(crate) fn edit_model(
+        &mut self,
+        origin: ClientId,
+        edit: ModelEdit,
+    ) -> Result<WorkspaceModel, ProtocolError> {
+        let edit = edit
+            .canonicalized()
+            .map_err(|error| ProtocolError::new(ProtocolErrorCode::InvalidRequest, error, false))?;
+        let applied = self.registry()?.apply(&edit).map_err(model_unavailable)?;
+        if applied.changed {
+            self.announce_model_edit(origin, applied.model.sequence, &edit);
+        }
+        Ok(applied.model)
+    }
+
+    fn registry(&mut self) -> Result<&mut super::model::Registry, ProtocolError> {
+        self.model.as_mut().ok_or_else(missing_registry)
+    }
+
+    /// Tells every model watcher except `origin` about an applied edit.
+    ///
+    /// The edges go through the per-client delivery queue rather than a redraw
+    /// broadcast, because a redraw broadcast returns early for a subscriber that
+    /// is not visible and a sidebar edge is not a repaint - a hidden window that
+    /// missed one would show a channel that no longer exists until it restarted.
+    fn announce_model_edit(&self, origin: ClientId, sequence: u64, edit: &ModelEdit) {
+        for client_id in &self.model_watchers {
+            if *client_id == origin {
+                continue;
+            }
+            if let Some(delivery) = self.clients.get(client_id) {
+                let _ = delivery.push(Outbound::broadcast(
+                    &self.proof,
+                    ServerMessage::WorkspaceModelEdited {
+                        sequence,
+                        edit: edit.clone(),
+                    },
+                ));
+            }
+        }
     }
 
     /// Tells every observing client except `creator` that a terminal now
@@ -327,6 +435,7 @@ impl HostState {
             delivery.close_after_drain();
         }
         self.watchers.remove(&client_id);
+        self.model_watchers.remove(&client_id);
         handles
     }
 

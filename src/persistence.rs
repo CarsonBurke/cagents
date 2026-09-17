@@ -173,6 +173,7 @@ pub struct WorkspaceManifest {
     pub channels: Vec<ProjectChannel>,
     pub active_channel: Option<ChannelId>,
     pub card_scopes: HashMap<CardId, PathBuf>,
+    pub workspace_model_identity: Option<uuid::Uuid>,
     pub cards: Vec<CardSummary>,
     pub updated_at_unix_ms: i64,
 }
@@ -787,6 +788,7 @@ impl StateStore {
             channels: manifest.channels,
             active_channel: manifest.active_channel,
             card_scopes: manifest.card_scopes,
+            workspace_model_identity: manifest.workspace_model_identity,
         };
         if !warnings.is_empty() {
             retarget_dropped_cards(&mut state);
@@ -1980,6 +1982,11 @@ fn save_workspace_transaction(
         &format!("workspace:{workspace_id}:navigation:card_scopes"),
         &to_json(&state.card_scopes)?,
     )?;
+    set_metadata(
+        transaction,
+        &format!("workspace:{workspace_id}:navigation:workspace_model_identity"),
+        &to_json(&state.workspace_model_identity)?,
+    )?;
 
     let existing = existing_cards(transaction, &workspace_id)?;
     let incoming_ids = state
@@ -2946,6 +2953,13 @@ fn load_workspace_manifest_connection(
         .map(|value| from_json("workspace card scopes", &value))
         .transpose()?
         .unwrap_or_default(),
+        workspace_model_identity: metadata(
+            connection,
+            &format!("workspace:{id}:navigation:workspace_model_identity"),
+        )?
+        .map(|value| from_json("workspace model identity", &value))
+        .transpose()?
+        .unwrap_or_default(),
         channels,
         active_channel,
         cards,
@@ -3407,6 +3421,7 @@ mod tests {
             channels: Vec::new(),
             active_channel: None,
             card_scopes: HashMap::new(),
+            workspace_model_identity: None,
         }
     }
 
@@ -3479,11 +3494,18 @@ mod tests {
             id,
             project_id,
             title: "Investigate startup".into(),
+            ordinal: 0,
+            // Both halves of the join rule have to survive a restart. If they
+            // did not, a reopened window would treat every channel as unshared
+            // and republish the ones that were deleted while it was closed.
+            shared: true,
             cards: vec![card],
             focused: Some(card),
         });
         workspace.active_channel = Some(id);
         workspace.active_worktree = Some("/tmp".into());
+        let identity = uuid::Uuid::new_v4();
+        workspace.workspace_model_identity = Some(identity);
         let mut lane = SaveLane::default();
         lane.save(&store, &workspace).unwrap();
         let manifest = store
@@ -3495,6 +3517,7 @@ mod tests {
         let restored = store.load_workspace(workspace.id, None).unwrap().unwrap();
         assert_eq!(restored.channels, workspace.channels);
         assert_eq!(restored.active_channel, Some(id));
+        assert_eq!(restored.workspace_model_identity, Some(identity));
         assert_eq!(
             restored
                 .cards
@@ -3507,6 +3530,8 @@ mod tests {
             id: ChannelId::new(),
             project_id,
             title: "Conflicting owner".into(),
+            ordinal: 0,
+            shared: false,
             cards: vec![card],
             focused: Some(card),
         });
@@ -3947,6 +3972,8 @@ mod tests {
             id: channel_id,
             project_id: workspace.project_order[0],
             title: "Legacy".into(),
+            ordinal: 0,
+            shared: false,
             cards: vec![workspace.cards[0].id],
             focused: workspace.focused,
         });

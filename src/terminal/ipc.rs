@@ -53,6 +53,18 @@ use crate::{
 /// broadcast only ever reaches a connection that subscribed with a request a
 /// peer predating this change cannot issue. Such a peer therefore never has to
 /// decode a variant index it does not know.
+/// The shared workspace model - `ClientRequest::WatchWorkspaceModel`,
+/// `ReadWorkspaceModel` and `EditWorkspaceModel`,
+/// `ServerResponse::WorkspaceModel` and `ServerMessage::WorkspaceModelEdited` -
+/// deliberately does not move the version either, for the same two reasons
+/// terminal-inventory observation did not. Every one of them is appended at the
+/// end of its enum, so no existing variant index shifts and no field is added
+/// to a type a peer already decodes. And none of them ever reaches a peer that
+/// predates them: the edge only goes to a connection that subscribed with a
+/// request such a peer cannot issue, and the response only answers a request
+/// such a peer cannot issue. A peer therefore never has to decode a variant
+/// index it does not know, which is the only thing the version could warn it
+/// about.
 pub const PROTOCOL_VERSION: u16 = 12;
 /// Postcard encodes an 80x24 grid in roughly 20 KiB and a typical single-row
 /// delta in a few hundred bytes, but a full repaint of a very large grid after
@@ -262,6 +274,21 @@ pub enum ClientRequest {
     /// request/response client - every CLI invocation - can never be surprised
     /// by an unsolicited frame its state machine has no place for.
     WatchTerminals,
+    /// Subscribe this connection to shared-workspace-model edges and return the
+    /// model in the same response.
+    ///
+    /// One request does both so a client cannot miss an edge in the gap between
+    /// subscribing and reading - the ordering hazard `watch_terminals` then
+    /// `list` has to work around with two requests.
+    WatchWorkspaceModel,
+    /// Read the shared model without subscribing, for a client - every CLI
+    /// invocation - whose state machine has no place for an unsolicited frame.
+    ReadWorkspaceModel,
+    /// Apply one edit and return the resulting model. The originating
+    /// connection is not sent its own echo.
+    EditWorkspaceModel {
+        edit: crate::workspace_model::ModelEdit,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -443,6 +470,17 @@ pub enum ServerMessage {
     TerminalCreated {
         terminal: TerminalDescriptor,
     },
+    /// One shared-model edit some other client applied, delivered only to a
+    /// connection that subscribed with [`ClientRequest::WatchWorkspaceModel`].
+    ///
+    /// The edit travels rather than the whole model so an edge stays the size
+    /// of what changed, and `sequence` is the registry's value after applying
+    /// it, which is what lets a receiver tell an edge it has already seen from
+    /// one it has not.
+    WorkspaceModelEdited {
+        sequence: u64,
+        edit: crate::workspace_model::ModelEdit,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -510,6 +548,9 @@ pub enum ServerResponse {
         chat_id: TerminalId,
         session: TerminalSession,
         snapshot: crate::chat::Snapshot,
+    },
+    WorkspaceModel {
+        model: crate::workspace_model::WorkspaceModel,
     },
 }
 

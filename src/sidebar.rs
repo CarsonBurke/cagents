@@ -365,6 +365,10 @@ pub struct SidebarChannel {
     pub activity: Option<crate::agent::ActivityState>,
     pub unread: bool,
     pub chats: usize,
+    /// The creation rank the shared registry assigned. Carried on the row
+    /// because the row is what gets ordered, and the registry's rank is the
+    /// only order two windows can agree on.
+    pub ordinal: u32,
     folded_title: Box<str>,
     open_id: Id,
     accessible_name: Box<str>,
@@ -379,6 +383,7 @@ impl SidebarChannel {
         activity: Option<crate::agent::ActivityState>,
         unread: bool,
         chats: usize,
+        ordinal: u32,
     ) -> Self {
         let contents = match chats {
             1 => "1 chat".to_owned(),
@@ -390,6 +395,7 @@ impl SidebarChannel {
             activity,
             unread,
             chats,
+            ordinal,
             folded_title: fold(&title),
             open_id: entity_id("channel.open", id),
             accessible_name: format!(
@@ -6671,18 +6677,14 @@ fn filtered_projects<'a>(
                     state,
                 });
             }
-            let channels = project
-                .channels
-                .iter()
-                .filter(|channel| {
-                    (project_matches || channel.folded_title.contains(&query))
-                        && match state.filter {
-                            SidebarFilter::All => true,
-                            SidebarFilter::Attention => channel.unread,
-                            SidebarFilter::PullRequests => false,
-                        }
-                })
-                .collect::<Vec<_>>();
+            let channels = channels_in_display_order(project.channels.iter().filter(|channel| {
+                (project_matches || channel.folded_title.contains(&query))
+                    && match state.filter {
+                        SidebarFilter::All => true,
+                        SidebarFilter::Attention => channel.unread,
+                        SidebarFilter::PullRequests => false,
+                    }
+            }));
             let worktrees = worktrees_in_display_order(
                 &project.repository,
                 state.worktree_sort,
@@ -6771,6 +6773,26 @@ pub(crate) fn worktrees_in_display_order<'a>(
             .then_with(|| left.path.cmp(&right.path))
     });
     keyed.into_iter().map(|(_, worktree)| worktree).collect()
+}
+
+/// The one place a project's channel rows are ordered for display.
+///
+/// Newest first, by the creation rank the shared registry assigned. A channel
+/// is created to be used now, so it belongs where the pointer already is; and
+/// the rank is the registry's, so two windows showing one project show it in
+/// one order whichever of them created which channel.
+///
+/// A channel created here holds a provisional rank one above the highest this
+/// window knows until the registry answers, so a channel created a moment ago
+/// sorts where its real rank will put it. `sort_by_key` is stable, so two rows
+/// that do share a rank keep the order the window built them in rather than
+/// swapping between frames.
+pub(crate) fn channels_in_display_order<'a>(
+    rows: impl IntoIterator<Item = &'a SidebarChannel>,
+) -> Vec<&'a SidebarChannel> {
+    let mut rows = rows.into_iter().collect::<Vec<_>>();
+    rows.sort_by_key(|channel| std::cmp::Reverse(channel.ordinal));
+    rows
 }
 
 /// Case-folds a filter key. Entities store the result so the free-text filter
@@ -7887,6 +7909,7 @@ mod tests {
             Some(crate::agent::ActivityState::Waiting),
             true,
             2,
+            1,
         ));
         let mut model = SidebarModel::ready(SidebarMode::Expanded, vec![entry]);
         let mut state = SidebarState::default();
@@ -7940,6 +7963,7 @@ mod tests {
             false,
             None,
             false,
+            1,
             1,
         ));
         SidebarModel::ready(SidebarMode::Expanded, vec![entry])
@@ -8127,6 +8151,7 @@ mod tests {
                 activity,
                 unread,
                 chats,
+                1,
             )
         };
         let label_slot = |channel: &SidebarChannel| {
@@ -8666,6 +8691,7 @@ mod tests {
                 false,
                 None,
                 false,
+                1,
                 1,
             ));
             sidebar
@@ -9515,6 +9541,7 @@ mod tests {
             false,
             None,
             true,
+            1,
             1,
         ));
         entry.unreachable = Some("fatal: not a git repository".into());

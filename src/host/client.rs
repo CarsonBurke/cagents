@@ -520,6 +520,27 @@ fn process_request(
                 .watch_terminals(client_id);
             Ok((ServerResponse::Accepted, Vec::new(), false))
         }
+        ClientRequest::WatchWorkspaceModel => {
+            let model = host
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .watch_model(client_id)?;
+            Ok((ServerResponse::WorkspaceModel { model }, Vec::new(), false))
+        }
+        ClientRequest::ReadWorkspaceModel => {
+            let model = host
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .read_model()?;
+            Ok((ServerResponse::WorkspaceModel { model }, Vec::new(), false))
+        }
+        ClientRequest::EditWorkspaceModel { edit } => {
+            let model = host
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .edit_model(client_id, edit)?;
+            Ok((ServerResponse::WorkspaceModel { model }, Vec::new(), false))
+        }
         ClientRequest::Spawn { session, options } => {
             let terminal = spawn_terminal(host, client_id, session, options)?;
             let snapshot = {
@@ -1614,5 +1635,96 @@ mod tests {
             .handle(1, terminal_id)
             .unwrap();
         handle.shutdown().unwrap();
+    }
+
+    /// A shared-model edit reaches every window watching the model and never
+    /// its originator, which already has the model the edit returned. A client
+    /// that only reads - every CLI invocation - receives nothing at all.
+    #[test]
+    fn editing_the_model_announces_to_watchers_but_never_to_its_originator() {
+        use crate::model::{BootId, HostIncarnation, HostSessionId};
+
+        let directory = tempfile::tempdir().unwrap();
+        let host = Arc::new(Mutex::new(super::super::state::HostState::new(
+            HostSessionProof {
+                host_session_id: HostSessionId::new("model-session"),
+                boot_id: BootId::new("boot"),
+                host_incarnation: HostIncarnation::new("incarnation"),
+            },
+        )));
+        let (editor, watcher, unsubscribed) = {
+            let mut state = host.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            state.install_model(
+                super::super::model::Registry::at(&directory.path().join("model.sqlite3")).unwrap(),
+            );
+            let editor = state.register_client(1);
+            let watcher = state.register_client(2);
+            let unsubscribed = state.register_client(3);
+            (editor, watcher, unsubscribed)
+        };
+        // Subscribing returns the model in the same response, so the watcher
+        // cannot miss an edit applied between subscribing and reading.
+        let (subscribed, _, _) =
+            process_request(&host, 2, ClientRequest::WatchWorkspaceModel).unwrap();
+        let ServerResponse::WorkspaceModel { model } = subscribed else {
+            panic!("subscribing must answer with the model");
+        };
+        assert_eq!(model.sequence, 0);
+
+        let repository = directory.path().join("repo");
+        std::fs::create_dir(&repository).unwrap();
+        let opened = process_request(
+            &host,
+            1,
+            ClientRequest::EditWorkspaceModel {
+                edit: crate::workspace_model::ModelEdit::OpenProject {
+                    repository: repository.clone(),
+                    name: "repo".into(),
+                },
+            },
+        )
+        .unwrap();
+        assert!(matches!(opened.0, ServerResponse::WorkspaceModel { .. }));
+        let channel = crate::model::ChannelId::new();
+        process_request(
+            &host,
+            1,
+            ClientRequest::EditWorkspaceModel {
+                edit: crate::workspace_model::ModelEdit::CreateChannel {
+                    id: channel,
+                    repository,
+                    title: "shared".into(),
+                },
+            },
+        )
+        .unwrap();
+
+        let edges = |delivery: &Arc<DeliveryQueue>| {
+            delivery.close_after_drain();
+            std::iter::from_fn(|| delivery.pop())
+                .filter_map(|queued| match queued.message {
+                    ServerMessage::WorkspaceModelEdited { sequence, edit } => {
+                        Some((sequence, edit))
+                    }
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+        let observed = edges(&watcher);
+        assert_eq!(observed.len(), 2, "both edits are edges");
+        assert_eq!(observed[0].0, 1);
+        assert_eq!(observed[1].0, 2, "the sequence advances once per edit");
+        assert!(matches!(
+            &observed[1].1,
+            crate::workspace_model::ModelEdit::CreateChannel { id, .. } if *id == channel
+        ));
+        assert!(
+            edges(&editor).is_empty(),
+            "an editing client already holds the model its own edit returned"
+        );
+        assert!(
+            edges(&unsubscribed).is_empty(),
+            "a client that never asked for model edges must not receive one"
+        );
     }
 }

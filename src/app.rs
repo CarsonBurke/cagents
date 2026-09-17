@@ -17,6 +17,7 @@ mod settings_ui;
 mod terminal_adoption;
 mod terminal_close;
 mod update_ui;
+mod workspace_model_sync;
 mod worktree_operations;
 mod worktree_ui;
 pub use daemon_stop::run_daemon_stop_confirmation;
@@ -724,6 +725,39 @@ impl std::hash::Hash for HostedTerminalSource {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
         std::hash::Hash::hash(&"cagents-hosted-terminals", state);
     }
+}
+
+/// Shared workspace model updates, from the observer and publisher threads.
+#[derive(Clone)]
+struct WorkspaceModelSource(async_channel::Receiver<workspace_model_sync::ModelUpdate>);
+
+impl PartialEq for WorkspaceModelSource {
+    fn eq(&self, _other: &Self) -> bool {
+        true
+    }
+}
+
+impl Eq for WorkspaceModelSource {}
+
+impl std::hash::Hash for WorkspaceModelSource {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        std::hash::Hash::hash(&"cagents-workspace-model", state);
+    }
+}
+
+fn workspace_model_stream(
+    source: &WorkspaceModelSource,
+) -> Pin<
+    Box<
+        dyn cosmic::iced::futures::Stream<Item = workspace_model_sync::ModelUpdate>
+            + Send
+            + 'static,
+    >,
+> {
+    Box::pin(cosmic::iced::futures::stream::unfold(
+        source.0.clone(),
+        |receiver| async move { receiver.recv().await.ok().map(|update| (update, receiver)) },
+    ))
 }
 
 #[derive(Clone)]
@@ -2435,6 +2469,8 @@ pub enum Message {
         generation: u64,
         result: Result<Box<LoadedRepository>, String>,
     },
+    /// One shared sidebar model update, from the daemon observer or publisher.
+    WorkspaceModelObserved(workspace_model_sync::ModelUpdate),
     Repository(RepositoryAction),
     ResolvedDiffBasis {
         card: CardId,
@@ -2992,6 +3028,13 @@ pub struct Cagents {
     terminal_starts: std::sync::atomic::AtomicUsize,
     /// Observations held back while a start was outstanding.
     pending_adoptions: Vec<TerminalSession>,
+    /// The shared sidebar model as this window last saw it.
+    workspace_model: crate::workspace_model::WorkspaceModel,
+    /// Repositories this window has already been asked to open on the shared
+    /// model's behalf. Asking twice would mint a second project on one checkout.
+    workspace_model_opens: HashSet<PathBuf>,
+    workspace_model_rx: async_channel::Receiver<workspace_model_sync::ModelUpdate>,
+    workspace_model_tx: async_channel::Sender<crate::workspace_model::ModelEdit>,
     activation_rx: async_channel::Receiver<instance::UiActivation>,
     session: Option<SessionRuntime>,
     save_health: Option<SaveHealthState>,
@@ -7625,6 +7668,17 @@ impl Application for Cagents {
         // than with the first card that happens to need a daemon.
         let (hosted_terminals_tx, hosted_terminals_rx) = async_channel::unbounded();
         terminal_adoption::observe_hosted_inventory(hosted_terminals_tx);
+        // The daemon owns the shared sidebar model for the same reason it owns
+        // the terminal inventory: it outlives every window. Both threads start
+        // with the window, so a channel created elsewhere appears without the
+        // window having to do anything first.
+        let (workspace_model_updates, workspace_model_rx) = async_channel::unbounded();
+        let (workspace_model_tx, workspace_model_requests) = async_channel::unbounded();
+        workspace_model_sync::observe_workspace_model(workspace_model_updates.clone());
+        workspace_model_sync::publish_workspace_model(
+            workspace_model_updates,
+            workspace_model_requests,
+        );
         let activation_rx = activation_rx.unwrap_or_else(|| async_channel::unbounded().1);
         let window_scale_factor = core.scale_factor().max(0.01);
         let settings_draft = SettingsDraft::from_settings(&settings);
@@ -7648,6 +7702,10 @@ impl Application for Cagents {
             hosted_terminals_rx,
             terminal_starts: std::sync::atomic::AtomicUsize::new(0),
             pending_adoptions: Vec::new(),
+            workspace_model: crate::workspace_model::WorkspaceModel::default(),
+            workspace_model_opens: HashSet::new(),
+            workspace_model_rx,
+            workspace_model_tx,
             activation_rx,
             session,
             save_health,
@@ -7935,6 +7993,7 @@ impl Application for Cagents {
                 }
             }
             Message::HostedTerminalsObserved(terminals) => self.observe_hosted_terminals(terminals),
+            Message::WorkspaceModelObserved(update) => self.apply_workspace_model_update(update),
             Message::TerminalStarted {
                 card,
                 terminal,
@@ -8281,7 +8340,15 @@ impl Application for Cagents {
                                 self.select_worktree(active, false)
                             };
                         }
-                        task = Task::batch([task, self.project_avatar_task(project_id)]);
+                        // Every window shares which projects exist, and a
+                        // channel the shared model named in this repository
+                        // could not be adopted until the project existed here.
+                        self.publish_project_opened(project_id);
+                        task = Task::batch([
+                            task,
+                            self.project_avatar_task(project_id),
+                            self.reconcile_workspace_model(),
+                        ]);
                     }
                     Err(error) => {
                         let unavailable = GitHubAvailability::Failed {
@@ -10041,6 +10108,11 @@ impl Application for Cagents {
             )
             .map(Message::HostedTerminalsObserved),
             Subscription::run_with(
+                WorkspaceModelSource(self.workspace_model_rx.clone()),
+                workspace_model_stream,
+            )
+            .map(Message::WorkspaceModelObserved),
+            Subscription::run_with(
                 UiActivationSource(self.activation_rx.clone()),
                 ui_activation_stream,
             )
@@ -11463,6 +11535,43 @@ mod tests {
             .expect("a headless renderer")
     }
 
+    /// The custom `widget::Id`s that name more than one node in `element`.
+    ///
+    /// A custom id may name at most one node per frame: the pinned runtime
+    /// lifts every named node's state into one thread-local map keyed by name
+    /// before it diffs, gives it to the first widget that asks for that name,
+    /// and leaves any later claimant holding the `State::None` the lift left
+    /// behind. Nothing downstream can recover from that - the tag still
+    /// matches, so the node is never rebuilt, and the first draw downcasts a
+    /// stateless state and aborts the process.
+    ///
+    /// Shared rather than written per surface, because every surface that
+    /// mounts ids from a list is exposed to the same invariant and a per-test
+    /// copy of the walk would drift from the runtime it is modelling.
+    fn duplicate_widget_ids(element: &mut Element<'_, Message>) -> Vec<String> {
+        use cosmic::iced::advanced::widget::Tree;
+        use iced_accessibility::id::Internal;
+
+        fn tally(tree: &Tree, out: &mut HashMap<String, usize>) {
+            if let Some(widget::Id(Internal::Custom(_, name))) = &tree.id {
+                *out.entry(name.to_string()).or_default() += 1;
+            }
+            for child in &tree.children {
+                tally(child, out);
+            }
+        }
+
+        let mut counts = HashMap::new();
+        tally(&Tree::new(element.as_widget_mut()), &mut counts);
+        let mut repeated = counts
+            .into_iter()
+            .filter(|(_, count)| *count > 1)
+            .map(|(name, _)| name)
+            .collect::<Vec<_>>();
+        repeated.sort();
+        repeated
+    }
+
     /// Collapsing the contextual inspector must not mount two nodes under one
     /// custom `widget::Id`, and must survive the frames that do it.
     ///
@@ -11482,16 +11591,6 @@ mod tests {
         use cosmic::iced::advanced::widget::{Tree, tree};
         use cosmic::iced::advanced::{Layout, layout, mouse, renderer};
         use cosmic::iced::{Rectangle, Size};
-        use iced_accessibility::id::Internal;
-
-        fn tally(tree: &Tree, out: &mut HashMap<String, usize>) {
-            if let Some(widget::Id(Internal::Custom(_, name))) = &tree.id {
-                *out.entry(name.to_string()).or_default() += 1;
-            }
-            for child in &tree.children {
-                tally(child, out);
-            }
-        }
 
         let renderer = headless_renderer();
         let mut app = context_inspector_test_app(true);
@@ -11511,15 +11610,7 @@ mod tests {
         // the chrome header already believes the inspector is closed.
         for frame in 0..4 {
             {
-                let mut element = app.view();
-                let mut counts = HashMap::new();
-                tally(&Tree::new(element.as_widget_mut()), &mut counts);
-                let mut repeated: Vec<&String> = counts
-                    .iter()
-                    .filter(|(_, count)| **count > 1)
-                    .map(|(name, _)| name)
-                    .collect();
-                repeated.sort();
+                let repeated = duplicate_widget_ids(&mut app.view());
                 assert!(
                     repeated.is_empty(),
                     "frame {frame} mounts {repeated:?} more than once",
@@ -11565,6 +11656,128 @@ mod tests {
                 _ => app.context_inspector_transition = None,
             }
         }
+    }
+
+    /// Channel rows carry a custom `widget::Id` keyed on the channel, and they
+    /// now appear, disappear and change rank from a daemon edge rather than
+    /// from a local click. Every such frame must still leave each id naming one
+    /// node, or the pinned runtime aborts the process on the next draw.
+    ///
+    /// Two ways this could go wrong are worth drawing rather than reasoning
+    /// about: a row arriving while another leaves in the same frame, and a
+    /// reorder that moves a row past one already mounted. Both are laid out and
+    /// drawn here, because the failure is a panic inside `draw` that inspecting
+    /// the view cannot see.
+    #[test]
+    fn shared_channel_edges_leave_every_channel_id_naming_one_node() {
+        use cosmic::iced::advanced::widget::{Tree, tree};
+        use cosmic::iced::advanced::{Layout, layout, mouse, renderer};
+        use cosmic::iced::{Rectangle, Size};
+
+        let renderer = headless_renderer();
+        let mut app = context_inspector_test_app(true);
+        let project = crate::model::ProjectId::new();
+        let repository = std::path::PathBuf::from("/repo/.git");
+        app.sidebar_model
+            .projects
+            .push(sidebar::SidebarProject::new(
+                project,
+                crate::repository::RepositoryId(uuid::Uuid::new_v4()),
+                "repo".into(),
+                repository.clone(),
+                Vec::new(),
+                Vec::new(),
+            ));
+        app.sidebar_state.reveal_project(project);
+        let older = crate::model::ChannelId::new();
+        let newer = crate::model::ChannelId::new();
+        let identity = uuid::Uuid::new_v4();
+        let shared = |id, title: &str, ordinal| crate::workspace_model::ModelChannel {
+            id,
+            repository: repository.clone(),
+            title: title.to_owned(),
+            ordinal,
+        };
+
+        let bounds = Size::new(1600.0, 1000.0);
+        let mut state = Tree::empty();
+        for frame in 0..4 {
+            {
+                let repeated = duplicate_widget_ids(&mut app.view());
+                assert!(
+                    repeated.is_empty(),
+                    "frame {frame} mounts {repeated:?} more than once",
+                );
+            }
+
+            let mut element = app.view();
+            tree::NAMED.with(|named| {
+                *named.borrow_mut() = state.take_all_named();
+            });
+            state.diff(element.as_widget_mut());
+            let node = element.as_widget_mut().layout(
+                &mut state,
+                &renderer,
+                &layout::Limits::new(Size::ZERO, bounds),
+            );
+            tree::NAMED.with(|named| named.borrow_mut().clear());
+            element.as_widget().draw(
+                &state,
+                &mut headless_renderer(),
+                &cosmic::theme::active(),
+                &renderer::Style::default(),
+                Layout::new(&node),
+                mouse::Cursor::Unavailable,
+                &Rectangle::with_size(bounds),
+            );
+            drop(node);
+            drop(element);
+
+            let model = |channels| crate::workspace_model::WorkspaceModel {
+                identity,
+                sequence: frame as u64 + 1,
+                projects: Vec::new(),
+                channels,
+            };
+            match frame {
+                // One adopted row.
+                0 => {
+                    let _ = app.apply_workspace_model_update(
+                        workspace_model_sync::ModelUpdate::Connected(model(vec![shared(
+                            older, "older", 1,
+                        )])),
+                    );
+                }
+                // A second row arrives above the first, so the mounted row is
+                // pushed down past a newly mounted one.
+                1 => {
+                    let _ =
+                        app.apply_workspace_model_update(workspace_model_sync::ModelUpdate::Read(
+                            model(vec![shared(older, "older", 1), shared(newer, "newer", 2)]),
+                        ));
+                }
+                // One leaves while the other is reranked past where it was, in
+                // a single update.
+                _ => {
+                    let _ =
+                        app.apply_workspace_model_update(workspace_model_sync::ModelUpdate::Read(
+                            model(vec![shared(newer, "newer", 9)]),
+                        ));
+                }
+            }
+            app.refresh_sidebar_channels();
+        }
+
+        // The rows really were mounted, or the walk above proved nothing.
+        assert_eq!(
+            app.sidebar_model.projects[0]
+                .channels
+                .iter()
+                .map(|row| row.id)
+                .collect::<Vec<_>>(),
+            vec![newer],
+            "the departed channel is gone and the survivor kept its identity"
+        );
     }
 
     pub(super) fn settle_settings_task(app: &mut Cagents, task: Task<Message>) {
@@ -14341,6 +14554,12 @@ mod tests {
             hosted_terminals_rx: async_channel::unbounded().1,
             terminal_starts: std::sync::atomic::AtomicUsize::new(0),
             pending_adoptions: Vec::new(),
+            workspace_model: crate::workspace_model::WorkspaceModel::default(),
+            workspace_model_opens: HashSet::new(),
+            workspace_model_rx: async_channel::unbounded().1,
+            // Unbounded and unread: a fixture publishes into a queue nobody
+            // drains, which is what keeps a test off the daemon entirely.
+            workspace_model_tx: async_channel::unbounded().0,
             activation_rx: async_channel::unbounded().1,
             session: None,
             save_health: None,
