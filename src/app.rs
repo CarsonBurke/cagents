@@ -10967,12 +10967,11 @@ fn load_repository(
         })
     })()
     .unwrap_or_else(|unavailable| unavailable);
-    let name = repository
-        .common_dir
-        .parent()
-        .and_then(Path::file_name)
-        .map(|name| name.to_string_lossy().into_owned())
-        .unwrap_or_else(|| repository.common_dir.display().to_string());
+    // The shared model's own derivation, not a second copy of it: a project
+    // this window opened and one the CLI opened are one row in the registry,
+    // and two rules for its name would make the sidebar show whichever of them
+    // wrote last.
+    let name = crate::workspace_model::repository_display_name(&repository.common_dir);
     Ok(LoadedRepository {
         project: ProjectState {
             id: project_id.unwrap_or_default(),

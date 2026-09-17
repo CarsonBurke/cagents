@@ -32,7 +32,8 @@ use crate::{
         },
     },
     workspace_model::{
-        ModelChannel, ModelEdit, WorkspaceModel, canonical_repository, repository_display_name,
+        ModelChannel, ModelEdit, ModelProject, WorkspaceModel, canonical_repository,
+        repository_display_name,
     },
 };
 
@@ -78,6 +79,11 @@ pub enum TopCommand {
     Terminal {
         #[command(subcommand)]
         command: TerminalCommand,
+    },
+    /// Manage the projects every window shares.
+    Project {
+        #[command(subcommand)]
+        command: ProjectCommand,
     },
     /// Manage the channels every window shares.
     Channel {
@@ -171,6 +177,28 @@ pub enum TerminalCommand {
         /// Maximum time to wait, in seconds.
         #[arg(long, default_value_t = 30.0, value_parser = parse_positive_seconds)]
         timeout: f64,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum ProjectCommand {
+    /// Open a project in every window's sidebar, with or without a window
+    /// running.
+    Open {
+        /// A path inside the repository (defaults to the current directory).
+        path: Option<PathBuf>,
+    },
+    /// List shared projects, newest first.
+    List,
+    /// Close a project and every channel in it.
+    Close {
+        /// A path inside the repository (defaults to the current directory).
+        path: Option<PathBuf>,
+        /// Confirm deleting the channels the project still holds. Closing a
+        /// project takes its channels with it in every window, and a shell has
+        /// no sidebar to see them in first.
+        #[arg(long)]
+        yes: bool,
     },
 }
 
@@ -1197,6 +1225,7 @@ fn execute(command: TopCommand) -> Result<CommandOutput, AppError> {
         TopCommand::Ui { new_window, window } => launch_ui(new_window, window.as_deref()),
         TopCommand::Daemon { command } => execute_daemon(command),
         TopCommand::Terminal { command } => execute_terminal(command),
+        TopCommand::Project { command } => execute_project(command),
         TopCommand::Channel { command } => execute_channel(command),
         TopCommand::UpdateWorker { job_id } => {
             crate::update::run_worker(&job_id).map_err(|error| AppError::new("update", error))?;
@@ -1749,6 +1778,183 @@ fn protocol_error(error: ControlError) -> AppError {
     }
 }
 
+/// Runs a shared-project verb against the daemon's registry.
+///
+/// A project is a registry row rather than a window instruction, exactly as a
+/// channel is: the sidebar shows what the registry holds, whether or not a
+/// window was running when it was put there. No request of its own was needed
+/// for any of this - the shared model travels as `ReadWorkspaceModel` and
+/// `EditWorkspaceModel`, which carry whichever [`ModelEdit`] the verb means, so
+/// the wire protocol and the daemon's handler are untouched.
+fn execute_project(command: ProjectCommand) -> Result<CommandOutput, AppError> {
+    // Resolved before any daemon is started, for the same reason a channel verb
+    // resolves first: an argument error must not leave behind a daemon the user
+    // never asked for.
+    let command = command.resolved()?;
+    let socket =
+        terminal::ensure_daemon_ready().map_err(|error| AppError::new("daemon_start", error))?;
+    let mut client = ControlClient::connect(&socket)
+        .map_err(|error| AppError::new("daemon_connection", error))?;
+    project_output(&mut client, command)
+}
+
+/// A project verb whose repository is already the shared key.
+enum ResolvedProject {
+    Open {
+        repository: PathBuf,
+    },
+    List,
+    Close {
+        repository: PathBuf,
+        confirmed: bool,
+    },
+}
+
+impl ProjectCommand {
+    fn resolved(self) -> Result<ResolvedProject, AppError> {
+        Ok(match self {
+            Self::Open { path } => ResolvedProject::Open {
+                repository: resolve_repository(path)?,
+            },
+            Self::List => ResolvedProject::List,
+            Self::Close { path, yes } => ResolvedProject::Close {
+                repository: resolve_repository(path)?,
+                confirmed: yes,
+            },
+        })
+    }
+}
+
+fn project_output(
+    client: &mut ControlClient,
+    command: ResolvedProject,
+) -> Result<CommandOutput, AppError> {
+    match command {
+        ResolvedProject::Open { repository } => {
+            // The same upsert a window publishes when it opens a repository,
+            // carrying the name derived from the same key, so a project opened
+            // from a shell and one opened in a window are one row that no
+            // sidebar can tell apart.
+            let model = client
+                .edit_workspace_model(ModelEdit::OpenProject {
+                    repository: repository.clone(),
+                    name: repository_display_name(&repository),
+                })
+                .map_err(protocol_error)?;
+            let project = model.project(&repository).cloned().ok_or_else(|| {
+                AppError::new(
+                    "protocol",
+                    "the daemon accepted the project but did not report it",
+                )
+            })?;
+            let human = project_line(&project);
+            Ok(CommandOutput {
+                command: "project.open",
+                data: json!({ "project": project, "sequence": model.sequence }),
+                human,
+            })
+        }
+        ResolvedProject::List => {
+            let model = client.read_workspace_model().map_err(protocol_error)?;
+            // Newest first, the order `channel list` answers in and the order
+            // the sidebar renders.
+            let mut projects = model.projects.iter().collect::<Vec<_>>();
+            projects.sort_by(|left, right| right.ordinal.cmp(&left.ordinal));
+            let human = projects
+                .iter()
+                .map(|project| project_line(project))
+                .collect::<Vec<_>>()
+                .join("\n");
+            Ok(CommandOutput {
+                command: "project.list",
+                data: json!({ "projects": projects, "sequence": model.sequence }),
+                human,
+            })
+        }
+        ResolvedProject::Close {
+            repository,
+            confirmed,
+        } => close_project(client, repository, confirmed),
+    }
+}
+
+/// Closes a project and reports every row that went with it.
+///
+/// The read comes first because the answer to the close cannot name what the
+/// close destroyed: the registry removes the project's channels through its
+/// foreign key's cascade, and every window folds the same edit and retires
+/// those channels - tombstoning the cards inside them. That is real work
+/// disappearing from windows the caller cannot see, so a project that still
+/// holds channels is refused until `--yes` confirms it, and the refusal names
+/// the channels rather than counting them. An empty project is not destructive
+/// at all and needs no flag: a confirmation demanded where nothing can be lost
+/// is a confirmation the user learns to pass without reading.
+fn close_project(
+    client: &mut ControlClient,
+    repository: PathBuf,
+    confirmed: bool,
+) -> Result<CommandOutput, AppError> {
+    let model = client.read_workspace_model().map_err(protocol_error)?;
+    let project = model.project(&repository).cloned();
+    let mut channels = model
+        .channels
+        .iter()
+        .filter(|channel| channel.repository == repository)
+        .cloned()
+        .collect::<Vec<_>>();
+    channels.sort_by(|left, right| right.ordinal.cmp(&left.ordinal));
+    if !channels.is_empty() && !confirmed {
+        let listed = channels
+            .iter()
+            .map(channel_line)
+            .collect::<Vec<_>>()
+            .join("\n");
+        return Err(AppError {
+            kind: "confirmation",
+            message: format!(
+                "closing `{}` deletes {} channel(s) in every window; pass --yes to confirm:\n{listed}",
+                repository.display(),
+                channels.len(),
+            ),
+            details: Some(json!({ "channels": channels })),
+        });
+    }
+    client
+        .edit_workspace_model(ModelEdit::CloseProject {
+            repository: repository.clone(),
+        })
+        .map_err(protocol_error)?;
+    // Exactly what was removed, in the spellings `project list` and
+    // `channel list` print: the project's own line, then one line per channel
+    // that went with it. A project the registry did not hold removed nothing
+    // and prints nothing.
+    let human = project
+        .iter()
+        .map(project_line)
+        .chain(channels.iter().map(channel_line))
+        .collect::<Vec<_>>()
+        .join("\n");
+    Ok(CommandOutput {
+        command: "project.close",
+        data: json!({
+            "repository": repository,
+            "closed": project.is_some(),
+            "project": project,
+            "channels": channels,
+        }),
+        human,
+    })
+}
+
+/// One project per line: repository, name.
+///
+/// The key comes first, following `channel_line`, so the `cut -f1` that names a
+/// channel names a project - and names it in the spelling `project close`
+/// takes.
+fn project_line(project: &ModelProject) -> String {
+    format!("{}\t{}", project.repository.display(), project.name)
+}
+
 /// Runs a shared-channel verb against the daemon's registry.
 ///
 /// Every verb here is a registry edit or read, never a window instruction: the
@@ -1889,12 +2095,13 @@ fn channel_line(channel: &ModelChannel) -> String {
     )
 }
 
-/// Resolves the repository a channel verb refers to into the shared key.
+/// Resolves the directory a project or channel verb refers to into the shared
+/// key.
 ///
-/// Both forms go through Git, including an explicit `--repository`: a user
-/// names a checkout, and the key is not the checkout's path. A path that is not
-/// inside a repository is an error rather than a key, because no window could
-/// ever own a project there.
+/// Both forms go through Git, including a path the user named: a user names a
+/// checkout, and the key is not the checkout's path. A path that is not inside
+/// a repository is an error rather than a key, because no window could ever own
+/// a project there.
 fn resolve_repository(repository: Option<PathBuf>) -> Result<PathBuf, AppError> {
     let from = absolute_working_directory(repository)
         .map_err(|error| AppError::new("repository", error))?;
@@ -1938,8 +2145,11 @@ pub fn repository_key(directory: &Path) -> Result<PathBuf, String> {
         .output()
         .map_err(|error| format!("could not run git: {error}"))?;
     if !output.status.success() {
+        // Named without a hint about which argument to correct: the same
+        // derivation serves `channel --repository` and a positional `project`
+        // path, and a hint that names the wrong one is worse than none.
         return Err(format!(
-            "`{}` is not inside a Git repository; pass --repository",
+            "`{}` is not inside a Git repository",
             directory.display()
         ));
     }
@@ -2179,19 +2389,11 @@ mod tests {
     fn channel_spawn_opens_the_project_then_creates_the_channel_it_minted() {
         let (client_stream, mut server_stream) = UnixStream::pair().unwrap();
         let peer_proof = proof("session", "boot", "incarnation");
-        let checkout = tempfile::tempdir().unwrap();
-        let initialized = Command::new("git")
-            .args(["init", "--quiet"])
-            .current_dir(checkout.path())
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status();
-        if !initialized.is_ok_and(|status| status.success()) {
-            // No usable `git`, so there is no key to derive and nothing this
-            // test can assert. Every lane that runs it has one.
+        // No usable `git` means there is no key to derive and nothing this test
+        // can assert. Every lane that runs it has one.
+        let Some(checkout) = git_checkout() else {
             return;
-        }
+        };
         let repository = checkout.path().to_path_buf();
         // The common Git directory, which is what a window stores for a project
         // and therefore what the channel has to be keyed on.
@@ -2301,6 +2503,408 @@ mod tests {
             message: ServerMessage::Response {
                 response: ServerResponse::WorkspaceModel { model },
             },
+        }
+    }
+
+    /// A real repository, because every key here is whatever `git` resolves
+    /// rather than the path the test names. `None` when there is no usable
+    /// `git`, so the suite skips instead of failing on a machine without one.
+    fn git_checkout() -> Option<tempfile::TempDir> {
+        let checkout = tempfile::tempdir().unwrap();
+        let initialized = Command::new("git")
+            .args(["init", "--quiet"])
+            .current_dir(checkout.path())
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+        initialized
+            .is_ok_and(|status| status.success())
+            .then_some(checkout)
+    }
+
+    fn git(checkout: &Path, arguments: &[&str]) {
+        let status = Command::new("git")
+            .args(arguments)
+            .current_dir(checkout)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_SYSTEM", "/dev/null")
+            .env("GIT_AUTHOR_NAME", "Cagents")
+            .env("GIT_AUTHOR_EMAIL", "cagents@example.invalid")
+            .env("GIT_COMMITTER_NAME", "Cagents")
+            .env("GIT_COMMITTER_EMAIL", "cagents@example.invalid")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .expect("git runs");
+        assert!(status.success(), "git {arguments:?}");
+    }
+
+    /// The project a shell opens is the project a window opens, from wherever
+    /// the shell happened to be standing.
+    ///
+    /// A linked worktree is the case that discriminates: its own Git directory
+    /// is `<common>/worktrees/<name>`, so keying on that would give one
+    /// checkout one project per worktree the user ever ran the verb from, and
+    /// the sidebar would fill with duplicates of the same repository.
+    #[test]
+    fn project_open_keys_one_project_from_every_worktree_of_one_checkout() {
+        let Some(checkout) = git_checkout() else {
+            return;
+        };
+        std::fs::write(checkout.path().join("file"), b"one\n").unwrap();
+        git(checkout.path(), &["add", "-A"]);
+        git(checkout.path(), &["commit", "--quiet", "-m", "initial"]);
+        let linked = checkout.path().join("linked");
+        git(
+            checkout.path(),
+            &["worktree", "add", "-b", "linked", linked.to_str().unwrap()],
+        );
+
+        let key = |path: &Path| {
+            let ResolvedProject::Open { repository } = ProjectCommand::Open {
+                path: Some(path.to_path_buf()),
+            }
+            .resolved()
+            .unwrap_or_else(|error| panic!("{} resolves: {}", path.display(), error.message)) else {
+                panic!("`project open` resolves to an open");
+            };
+            repository
+        };
+
+        let expected = canonical_repository(&checkout.path().join(".git")).unwrap();
+        assert_eq!(key(checkout.path()), expected);
+        assert_eq!(
+            key(&linked),
+            expected,
+            "a linked worktree is the same project as the checkout it belongs to"
+        );
+    }
+
+    /// Both argument errors are settled by the argument alone, so they answer
+    /// without a daemon: starting one for a command that cannot succeed leaves
+    /// a process behind that the user never asked for and did not get a result
+    /// from. `ResolvedProject` is the proof this ordering cannot drift -
+    /// `project_output` takes nothing else, and only `resolved` makes one.
+    #[test]
+    fn a_project_path_that_names_no_repository_fails_before_any_daemon() {
+        let directory = tempfile::tempdir().unwrap();
+        let file = directory.path().join("file");
+        std::fs::write(&file, b"not a directory\n").unwrap();
+
+        let Err(error) = (ProjectCommand::Open {
+            path: Some(file.clone()),
+        })
+        .resolved() else {
+            panic!("a file is not a repository");
+        };
+        assert_eq!(error.kind, "repository");
+        assert_eq!(
+            error.message,
+            format!("`{}` is not a directory", file.display())
+        );
+
+        if Command::new("git").arg("--version").output().is_err() {
+            return;
+        }
+        let Err(error) = (ProjectCommand::Close {
+            path: Some(directory.path().to_path_buf()),
+            yes: true,
+        })
+        .resolved() else {
+            panic!("a directory outside any repository is not a project");
+        };
+        assert_eq!(
+            error.message,
+            format!(
+                "`{}` is not inside a Git repository",
+                directory.path().display()
+            )
+        );
+    }
+
+    /// `project open` is the upsert a window publishes, with the key `git`
+    /// resolves and the name the checkout carries, and it reports the project
+    /// the registry ended up holding - including the rank, which only the
+    /// registry knows.
+    #[test]
+    fn project_open_publishes_the_upsert_a_window_would_and_reports_the_row() {
+        let Some(checkout) = git_checkout() else {
+            return;
+        };
+        let (client_stream, mut server_stream) = UnixStream::pair().unwrap();
+        let peer_proof = proof("session", "boot", "incarnation");
+        let expected = canonical_repository(&checkout.path().join(".git")).unwrap();
+        let name = checkout
+            .path()
+            .file_name()
+            .expect("the fixture checkout is named")
+            .to_string_lossy()
+            .into_owned();
+        let served = expected.clone();
+        let served_name = name.clone();
+        let server = thread::spawn(move || {
+            let _: ClientEnvelope = read_frame(&mut server_stream).unwrap().unwrap();
+            write_frame(
+                &mut server_stream,
+                &connected_envelope(1, peer_proof.clone(), peer_proof.clone()),
+            )
+            .unwrap();
+            let opened: ClientEnvelope = read_frame(&mut server_stream).unwrap().unwrap();
+            assert_eq!(
+                opened.request,
+                ClientRequest::EditWorkspaceModel {
+                    edit: ModelEdit::OpenProject {
+                        repository: served.clone(),
+                        // The checkout's name, never the key's own last
+                        // component, which is `.git` and names nothing.
+                        name: served_name.clone(),
+                    },
+                },
+                "the CLI opens a project exactly as a window publishes one"
+            );
+            let model = WorkspaceModel {
+                identity: uuid::Uuid::new_v4(),
+                sequence: 4,
+                projects: vec![ModelProject {
+                    repository: served,
+                    name: served_name,
+                    ordinal: 2,
+                }],
+                channels: Vec::new(),
+            };
+            write_frame(
+                &mut server_stream,
+                &model_envelope(opened.request_id, peer_proof, model),
+            )
+            .unwrap();
+        });
+        let mut client = ControlClient::from_stream(client_stream).unwrap();
+        let resolved = ProjectCommand::Open {
+            path: Some(checkout.path().to_path_buf()),
+        }
+        .resolved()
+        .unwrap();
+        let output = project_output(&mut client, resolved).unwrap();
+        server.join().unwrap();
+        assert_eq!(output.command, "project.open");
+        assert_eq!(output.data["project"]["ordinal"], json!(2));
+        assert_eq!(output.data["sequence"], json!(4));
+        assert_eq!(
+            output.human,
+            format!("{}\t{name}", expected.display()),
+            "one tab-separated line: repository, name"
+        );
+    }
+
+    /// A listing is of the registry, which records no source: a project a
+    /// window opened and one a shell opened are the same row, listed by the
+    /// same rule, newest first.
+    #[test]
+    fn project_list_answers_newest_first_and_tells_no_source_apart() {
+        let (client_stream, mut server_stream) = UnixStream::pair().unwrap();
+        let peer_proof = proof("session", "boot", "incarnation");
+        let window_opened = ModelProject {
+            repository: PathBuf::from("/window/.git"),
+            name: "window".into(),
+            ordinal: 1,
+        };
+        let cli_opened = ModelProject {
+            repository: PathBuf::from("/shell/.git"),
+            name: "shell".into(),
+            ordinal: 2,
+        };
+        let served = vec![window_opened.clone(), cli_opened.clone()];
+        let server = thread::spawn(move || {
+            let _: ClientEnvelope = read_frame(&mut server_stream).unwrap().unwrap();
+            write_frame(
+                &mut server_stream,
+                &connected_envelope(1, peer_proof.clone(), peer_proof.clone()),
+            )
+            .unwrap();
+            let listed: ClientEnvelope = read_frame(&mut server_stream).unwrap().unwrap();
+            assert_eq!(listed.request, ClientRequest::ReadWorkspaceModel);
+            let model = WorkspaceModel {
+                identity: uuid::Uuid::new_v4(),
+                sequence: 7,
+                projects: served,
+                channels: Vec::new(),
+            };
+            write_frame(
+                &mut server_stream,
+                &model_envelope(listed.request_id, peer_proof, model),
+            )
+            .unwrap();
+        });
+        let mut client = ControlClient::from_stream(client_stream).unwrap();
+        let output = project_output(&mut client, ProjectCommand::List.resolved().unwrap()).unwrap();
+        server.join().unwrap();
+        assert_eq!(output.command, "project.list");
+        assert_eq!(
+            output.human, "/shell/.git\tshell\n/window/.git\twindow",
+            "newest first, one tab-separated line each, whoever opened them"
+        );
+        assert_eq!(output.data["projects"], json!([cli_opened, window_opened]));
+    }
+
+    /// Closing a project deletes every channel in it, in every window, and the
+    /// shell it was asked from has no sidebar to see them in. So a project that
+    /// still holds channels is refused until `--yes`, the refusal names them,
+    /// and no edit is sent - the daemon never hears about a close the user did
+    /// not confirm.
+    #[test]
+    fn project_close_refuses_to_take_channels_with_it_unconfirmed() {
+        let (client_stream, mut server_stream) = UnixStream::pair().unwrap();
+        let peer_proof = proof("session", "boot", "incarnation");
+        let repository = PathBuf::from("/repo/.git");
+        let doomed = ChannelId::new();
+        let served = model_with_channels(&repository, &[(doomed, "review", 3)]);
+        let server = thread::spawn(move || {
+            let _: ClientEnvelope = read_frame(&mut server_stream).unwrap().unwrap();
+            write_frame(
+                &mut server_stream,
+                &connected_envelope(1, peer_proof.clone(), peer_proof.clone()),
+            )
+            .unwrap();
+            let read: ClientEnvelope = read_frame(&mut server_stream).unwrap().unwrap();
+            assert_eq!(read.request, ClientRequest::ReadWorkspaceModel);
+            write_frame(
+                &mut server_stream,
+                &model_envelope(read.request_id, peer_proof, served),
+            )
+            .unwrap();
+            // Nothing else may arrive: the client drops the connection without
+            // ever sending an edit.
+            read_frame::<ClientEnvelope>(&mut server_stream).unwrap()
+        });
+        let mut client = ControlClient::from_stream(client_stream).unwrap();
+        let Err(error) = project_output(
+            &mut client,
+            ResolvedProject::Close {
+                repository,
+                confirmed: false,
+            },
+        ) else {
+            panic!("an unconfirmed close of a project with channels is refused");
+        };
+        drop(client);
+        assert_eq!(
+            server.join().unwrap(),
+            None,
+            "a refused close sends the daemon no edit at all"
+        );
+        assert_eq!(error.kind, "confirmation");
+        assert!(
+            error.message.contains(&doomed.to_string()),
+            "the refusal names the channels rather than counting them: {}",
+            error.message
+        );
+        assert_eq!(error.details.unwrap()["channels"][0]["title"], "review");
+    }
+
+    /// Confirmed, the close reports exactly what it removed: the project and
+    /// every channel that went with it, in the spellings `project list` and
+    /// `channel list` print. The registry's answer cannot say - the cascade has
+    /// already taken them - so the report is read first.
+    #[test]
+    fn a_confirmed_project_close_reports_the_channels_it_took() {
+        let (client_stream, mut server_stream) = UnixStream::pair().unwrap();
+        let peer_proof = proof("session", "boot", "incarnation");
+        let repository = PathBuf::from("/repo/.git");
+        let older = ChannelId::new();
+        let newer = ChannelId::new();
+        let served = model_with_channels(&repository, &[(older, "older", 1), (newer, "newer", 5)]);
+        let closed = repository.clone();
+        let server = thread::spawn(move || {
+            let _: ClientEnvelope = read_frame(&mut server_stream).unwrap().unwrap();
+            write_frame(
+                &mut server_stream,
+                &connected_envelope(1, peer_proof.clone(), peer_proof.clone()),
+            )
+            .unwrap();
+            let read: ClientEnvelope = read_frame(&mut server_stream).unwrap().unwrap();
+            write_frame(
+                &mut server_stream,
+                &model_envelope(read.request_id, peer_proof.clone(), served),
+            )
+            .unwrap();
+            let edit: ClientEnvelope = read_frame(&mut server_stream).unwrap().unwrap();
+            assert_eq!(
+                edit.request,
+                ClientRequest::EditWorkspaceModel {
+                    edit: ModelEdit::CloseProject {
+                        repository: closed.clone(),
+                    },
+                },
+            );
+            // What the registry is left with: the project and its channels are
+            // gone together, through the store's own cascade.
+            write_frame(
+                &mut server_stream,
+                &model_envelope(
+                    edit.request_id,
+                    peer_proof,
+                    WorkspaceModel {
+                        identity: uuid::Uuid::new_v4(),
+                        sequence: 9,
+                        projects: Vec::new(),
+                        channels: Vec::new(),
+                    },
+                ),
+            )
+            .unwrap();
+        });
+        let mut client = ControlClient::from_stream(client_stream).unwrap();
+        let output = project_output(
+            &mut client,
+            ResolvedProject::Close {
+                repository: repository.clone(),
+                confirmed: true,
+            },
+        )
+        .unwrap();
+        server.join().unwrap();
+        assert_eq!(output.command, "project.close");
+        assert_eq!(output.data["closed"], json!(true));
+        assert_eq!(
+            output.human,
+            format!("/repo/.git\trepo\n{newer}\t/repo/.git\tnewer\n{older}\t/repo/.git\tolder"),
+            "the project's line, then every channel it took, newest first"
+        );
+        let channels = output.data["channels"].as_array().unwrap();
+        assert_eq!(
+            channels
+                .iter()
+                .map(|channel| channel["id"].as_str().unwrap().to_owned())
+                .collect::<Vec<_>>(),
+            vec![newer.to_string(), older.to_string()],
+            "and names them under the field name `channel list` uses"
+        );
+    }
+
+    /// A registry holding one project and the channels named in it.
+    fn model_with_channels(
+        repository: &Path,
+        channels: &[(ChannelId, &str, u32)],
+    ) -> WorkspaceModel {
+        WorkspaceModel {
+            identity: uuid::Uuid::new_v4(),
+            sequence: 8,
+            projects: vec![ModelProject {
+                repository: repository.to_path_buf(),
+                name: repository_display_name(repository),
+                ordinal: 1,
+            }],
+            channels: channels
+                .iter()
+                .map(|(id, title, ordinal)| ModelChannel {
+                    id: *id,
+                    repository: repository.to_path_buf(),
+                    title: (*title).to_owned(),
+                    ordinal: *ordinal,
+                })
+                .collect(),
         }
     }
 
