@@ -11,11 +11,12 @@ use thiserror::Error;
 use crate::{
     instance,
     model::{
-        BootId, CardId, ProjectId, ProjectState, TerminalId, TerminalSession, WorkspaceState,
-        WorktreeId, WorktreeState,
+        BootId, CardId, ProjectId, ProjectState, TerminalId, TerminalSession, WorkspaceId,
+        WorkspaceState, WorktreeId, WorktreeState,
     },
     persistence::{
-        SnapshotBase, StateStore, StoreError, TranscriptPruneReport, TranscriptRetention,
+        SnapshotBase, StateStore, StoreError, StoredGenerations, TranscriptPruneReport,
+        TranscriptRetention,
     },
 };
 
@@ -23,6 +24,21 @@ const PERSIST_DEBOUNCE: Duration = Duration::from_millis(250);
 const PERSIST_RETRY_INITIAL: Duration = Duration::from_millis(100);
 const PERSIST_RETRY_MAX: Duration = Duration::from_secs(2);
 const PERSIST_MAX_AUTOMATIC_ATTEMPTS: u32 = 4;
+
+/// How many times one batch may be rebased onto freshly read generations.
+///
+/// One. A base that fell behind needs a single fresh read, because the window
+/// process is the only writer of its own database and the snapshot it is
+/// writing does not change. If the write is rejected a second time the
+/// generations are moving underneath the writer, and reading them again would
+/// be a spin rather than a recovery, so the second rejection is reported.
+///
+/// The budget is per batch, not per session, which is what keeps it right now
+/// that a shared-model edge can drive a save with no user action behind it. A
+/// busier lane produces more batches, each with its own recovery, and the
+/// snapshot queue coalesces, so a burst of edges refreshes the pending content
+/// of the current batch rather than consuming recoveries.
+const PERSIST_REBASES_PER_BATCH: u32 = 1;
 
 /// How long the final flush at shutdown keeps retrying before abandoning what
 /// it could not write.
@@ -79,7 +95,17 @@ impl SaveFailureCategory {
                 "Restore the database directory or mounted storage, then retry."
             }
             Self::Corrupt => "Back up the database and restart cagents before making more changes.",
-            Self::Conflict => "Restart cagents so it can reload the current saved state.",
+            // Restarting is no longer the remedy: the writer re-reads the
+            // stored generations and retries the same snapshot itself, so a
+            // conflict only reaches the reader when the write was rejected
+            // again against generations read moments earlier. Retrying is what
+            // the reader can still do, since it re-arms that recovery; beyond
+            // that, a second writer on this window's database is the remaining
+            // explanation and the failure is worth reporting.
+            Self::Conflict => {
+                "Retry the save; if this repeats, close anything else using the database and \
+                 report the failure category and database path."
+            }
             Self::Serialization | Self::InvalidData => {
                 "Restart cagents; if this repeats, report the failure category and database path."
             }
@@ -625,6 +651,12 @@ trait SessionStore {
     ) -> Result<crate::persistence::WorkspaceCommit, StoreError>;
     fn save_project(&self, project: &ProjectState) -> Result<u64, StoreError>;
     fn save_worktree(&self, worktree: &WorktreeState) -> Result<u64, StoreError>;
+    /// Reads the generations storage currently holds for a workspace, so a
+    /// write rejected against a stale base can be retried against the live
+    /// one.
+    fn stored_generations(&self, workspace: WorkspaceId) -> Result<StoredGenerations, StoreError>;
+    fn stored_project_generation(&self, project: ProjectId) -> Result<Option<u64>, StoreError>;
+    fn stored_worktree_generation(&self, worktree: WorktreeId) -> Result<Option<u64>, StoreError>;
     fn shutdown(&self) -> Result<(), StoreError>;
     /// Housekeeping the writer lane runs after a flush lands. Storage with no
     /// write-ahead log of its own has nothing to do here.
@@ -657,6 +689,18 @@ impl SessionStore for StateStore {
         Self::save_worktree(self, worktree)
     }
 
+    fn stored_generations(&self, workspace: WorkspaceId) -> Result<StoredGenerations, StoreError> {
+        Self::stored_generations(self, workspace)
+    }
+
+    fn stored_project_generation(&self, project: ProjectId) -> Result<Option<u64>, StoreError> {
+        Self::stored_project_generation(self, project)
+    }
+
+    fn stored_worktree_generation(&self, worktree: WorktreeId) -> Result<Option<u64>, StoreError> {
+        Self::stored_worktree_generation(self, worktree)
+    }
+
     fn shutdown(&self) -> Result<(), StoreError> {
         Self::shutdown(self)
     }
@@ -687,6 +731,15 @@ impl SessionStore for Arc<StateStore> {
     }
     fn save_worktree(&self, worktree: &WorktreeState) -> Result<u64, StoreError> {
         StateStore::save_worktree(self, worktree)
+    }
+    fn stored_generations(&self, workspace: WorkspaceId) -> Result<StoredGenerations, StoreError> {
+        StateStore::stored_generations(self, workspace)
+    }
+    fn stored_project_generation(&self, project: ProjectId) -> Result<Option<u64>, StoreError> {
+        StateStore::stored_project_generation(self, project)
+    }
+    fn stored_worktree_generation(&self, worktree: WorktreeId) -> Result<Option<u64>, StoreError> {
+        StateStore::stored_worktree_generation(self, worktree)
     }
     fn shutdown(&self) -> Result<(), StoreError> {
         StateStore::shutdown(self)
@@ -732,6 +785,91 @@ impl PendingWrites {
             && self.projects.is_empty()
             && self.worktrees.is_empty()
             && self.terminal_replacements.is_empty()
+    }
+
+    /// The workspace every pending snapshot in this batch belongs to.
+    ///
+    /// One window process owns one window, so the conversion queue and the
+    /// coalesced autosave are snapshots of the same workspace; the first one
+    /// present names it.
+    fn pending_workspace(&self) -> Option<WorkspaceId> {
+        self.conversions
+            .iter()
+            .find_map(|checkpoint| match checkpoint {
+                ConversionCheckpoint::Snapshot(snapshot) => Some(snapshot.id),
+                ConversionCheckpoint::TerminalReplacement(_) => None,
+            })
+            .or_else(|| self.workspace.as_ref().map(|snapshot| snapshot.id))
+    }
+
+    /// Reseats the bases the next attempt writes against on the generations
+    /// storage holds now, leaving every pending snapshot exactly as it is.
+    ///
+    /// One window process owns one window's database: `WindowLease` admits a
+    /// single process per slot and every slot has its own file. A base storage
+    /// rejects is therefore never a rival writer's edit - it means a commit of
+    /// this lane's own landed while the lane believed it had not, or a batch
+    /// applied in part. The in-memory snapshot is the authority for what the
+    /// window contains and storage is only the authority for the generations
+    /// that content is written against, which is what makes moving the bases
+    /// under an unchanged snapshot a recovery rather than a guess.
+    ///
+    /// The shared workspace model does not weaken that. It lives in the
+    /// daemon's own registry database, and an edge from it reaches this window
+    /// as an event the window folds into its own state before persisting, so a
+    /// snapshot the daemon caused is still this window's content and no other
+    /// process writes these rows. Nor does it add a base: the channel list and
+    /// the model identity are `metadata` rows inside the workspace commit,
+    /// guarded by the workspace generation this rebase re-reads.
+    ///
+    /// Rebasing cannot lose a card. `save_workspace` decides which card rows to
+    /// write from the snapshot's card set alone, and tombstones the stored rows
+    /// that set does not contain using the generation on the stored row rather
+    /// than the base, so the base changes no write decision - only the
+    /// generation each decided write is checked against. A card whose stored
+    /// generation moved is therefore rewritten from the snapshot at the new
+    /// generation, and a card storage no longer holds is written as new. That
+    /// last part is why the base must name every stored row, tombstones
+    /// included: a stored card the base does not know is checked as new and
+    /// rejected. `stored_generations` returns exactly that set.
+    ///
+    /// The read and the retry are separate transactions, which is safe for the
+    /// same reason the rebase is correct rather than clever: the retry is still
+    /// a compare-and-set against the generations it was given, so anything that
+    /// moved in between is rejected again instead of overwritten.
+    fn rebase(&mut self, store: &impl SessionStore) -> Result<(), StoreError> {
+        if let Some(workspace) = self.pending_workspace() {
+            let stored = store.stored_generations(workspace)?;
+            self.workspace_generation = stored.workspace;
+            self.card_generations = stored.cards;
+        }
+        // A catalog entity carries its base inside the state it writes, so
+        // reseating it means replacing the remembered generation. No stored row
+        // means storage has never seen the entity, and `flush` writes an entity
+        // with no remembered generation as a new one.
+        for id in self.projects.keys().copied() {
+            let stored = store.stored_project_generation(id)?;
+            match stored {
+                Some(generation) => {
+                    self.project_generations.insert(id, generation);
+                }
+                None => {
+                    self.project_generations.remove(&id);
+                }
+            }
+        }
+        for id in self.worktrees.keys().copied() {
+            let stored = store.stored_worktree_generation(id)?;
+            match stored {
+                Some(generation) => {
+                    self.worktree_generations.insert(id, generation);
+                }
+                None => {
+                    self.worktree_generations.remove(&id);
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Applies everything still pending, leaving whatever failed queued for a
@@ -989,6 +1127,7 @@ fn persistence_loop(
     let mut retry_delay = config.retry_initial;
     let mut attempts_this_cycle = 0_u32;
     let mut retry_exhausted = false;
+    let mut rebases_remaining = PERSIST_REBASES_PER_BATCH;
 
     loop {
         let (lock, changed) = &*queue;
@@ -1052,6 +1191,9 @@ fn persistence_loop(
         if retry_requested && !writes.is_empty() {
             retry_exhausted = false;
             attempts_this_cycle = 0;
+            // An explicit retry is the reader re-arming the lane, so it also
+            // restores the recovery the failed cycle may have spent.
+            rebases_remaining = PERSIST_REBASES_PER_BATCH;
             retry_delay = config.retry_initial;
             due = Some(Instant::now());
         } else {
@@ -1078,7 +1220,7 @@ fn persistence_loop(
         // so it travels to a dialog and to the log safely.
         let mut failure = None;
         if should_persist {
-            let errors = writes.flush(&store);
+            let errors = flush_rebasing_stale_bases(&mut writes, &store, &mut rebases_remaining);
             record_flush_errors(&last_error, &errors);
             if writes.is_empty() {
                 health.flushed();
@@ -1089,6 +1231,7 @@ fn persistence_loop(
                 due = None;
                 retry_delay = config.retry_initial;
                 attempts_this_cycle = 0;
+                rebases_remaining = PERSIST_REBASES_PER_BATCH;
                 retry_exhausted = false;
             } else {
                 attempts_this_cycle = attempts_this_cycle.saturating_add(1);
@@ -1128,6 +1271,11 @@ fn persistence_loop(
             // this once made discarded the user's final snapshot the first time
             // storage was momentarily unwritable.
             let deadline = Instant::now() + config.shutdown_flush_budget;
+            // The last flush of the session gets a recovery of its own,
+            // whatever the steady-state lane already spent: losing the final
+            // snapshot to a base that fell behind is exactly the loss this
+            // retry loop exists to prevent.
+            let mut shutdown_rebases = PERSIST_REBASES_PER_BATCH;
             while !writes.is_empty() {
                 let remaining = deadline.saturating_duration_since(Instant::now());
                 if remaining.is_zero() {
@@ -1137,7 +1285,7 @@ fn persistence_loop(
                 // process holds, so retrying instantly would only burn the
                 // budget; the steady-state backoff already paces that wait.
                 thread::sleep(retry_delay.min(remaining));
-                let errors = writes.flush(&store);
+                let errors = flush_rebasing_stale_bases(&mut writes, &store, &mut shutdown_rebases);
                 record_flush_errors(&last_error, &errors);
                 if writes.is_empty() {
                     health.flushed();
@@ -1158,6 +1306,68 @@ fn persistence_loop(
             return WriterExit::Shutdown;
         }
     }
+}
+
+/// Whether every failure in a batch is a rejected base generation, the one
+/// cause re-reading generations can address.
+///
+/// Nothing else qualifies. A full disk, a read-only or corrupt database, or a
+/// snapshot that does not encode is unaffected by which generation the write is
+/// checked against, so rebasing on one of those would replace a failure the
+/// reader has to be told about with a retry that silently repeats it. A batch
+/// that mixes a stale base with a harder failure is left alone for the same
+/// reason: the harder failure is the one that has to be fixed, and
+/// `select_failure_category` already ranks it above a conflict. Once the harder
+/// write succeeds, a batch of nothing but stale bases is what remains, and that
+/// one does rebase.
+fn only_stale_bases(errors: &[StoreError]) -> bool {
+    !errors.is_empty()
+        && errors
+            .iter()
+            .all(|error| matches!(error, StoreError::StaleGeneration { .. }))
+}
+
+/// Flushes the batch, and on a rejected base re-reads the generations storage
+/// holds and flushes the very same content against them once.
+///
+/// `rebases_remaining` is deliberately a separate budget from the retry count
+/// for transient errors. A transient failure is worth several spaced attempts
+/// because the condition clears on its own; a rejected base is worth one
+/// immediate retry, because the snapshot does not change and the fresh base
+/// either lets it through or something is moving the generations under this
+/// lane. The budget is only spent once a rebase has actually reseated the
+/// bases, so a store that momentarily cannot be read keeps its recovery for
+/// the ordinary retry instead of losing it to a failed read.
+fn flush_rebasing_stale_bases(
+    writes: &mut PendingWrites,
+    store: &impl SessionStore,
+    rebases_remaining: &mut u32,
+) -> Vec<StoreError> {
+    let errors = writes.flush(store);
+    if *rebases_remaining == 0 || !only_stale_bases(&errors) {
+        return errors;
+    }
+    if let Err(error) = writes.rebase(store) {
+        // The recovery could not read storage. The batch's own cause is still
+        // the conflict, so it is reported as one, and the read is retried with
+        // the next attempt rather than charged to the rebase budget.
+        tracing::warn!(
+            %error,
+            "could not re-read the generations a cagents workspace write was rejected against"
+        );
+        return errors;
+    }
+    *rebases_remaining -= 1;
+    // A conflict the lane resolves by itself is not a failure the reader has to
+    // act on, so it never reaches the health lane. It is not nothing either:
+    // this is the state #124 was reported from, and the log is the only place a
+    // resolved conflict can be seen after the fact.
+    tracing::info!(
+        rejections = errors.len(),
+        "a cagents workspace write was rejected against a stale base; \
+         retrying it against the stored generations"
+    );
+    writes.flush(store)
 }
 
 fn schedule_flush_after_changes(
@@ -1226,7 +1436,10 @@ pub fn current_boot_id() -> Result<BootId, SessionError> {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::{BTreeMap, HashSet, VecDeque};
+    use std::{
+        collections::{BTreeMap, HashSet, VecDeque},
+        sync::atomic::{AtomicUsize, Ordering},
+    };
 
     use rusqlite::Connection;
 
@@ -1239,21 +1452,41 @@ mod tests {
 
     use super::*;
 
-    #[derive(Debug)]
+    #[derive(Debug, Clone, Copy)]
     enum FakeWrite {
         Succeed,
         Fail,
+        /// A failure no rebase can address.
+        FailDiskFull,
+        /// A base generation storage rejected.
+        FailStale,
         Panic,
     }
 
     struct FakeStore {
         writes: Mutex<VecDeque<FakeWrite>>,
+        /// What every write past the scripted ones does, so a test can describe
+        /// a store that never accepts a write without scripting each attempt.
+        exhausted: FakeWrite,
+        /// Counts the generation re-reads the writer lane performed, which is
+        /// what tells a rebase apart from an ordinary retry.
+        rebases: Arc<AtomicUsize>,
     }
 
     impl FakeStore {
         fn new(writes: impl IntoIterator<Item = FakeWrite>) -> Self {
             Self {
                 writes: Mutex::new(writes.into_iter().collect()),
+                exhausted: FakeWrite::Succeed,
+                rebases: Arc::new(AtomicUsize::new(0)),
+            }
+        }
+
+        fn always(write: FakeWrite) -> Self {
+            Self {
+                writes: Mutex::new(VecDeque::new()),
+                exhausted: write,
+                rebases: Arc::new(AtomicUsize::new(0)),
             }
         }
 
@@ -1263,13 +1496,21 @@ mod tests {
                 .lock()
                 .unwrap()
                 .pop_front()
-                .unwrap_or(FakeWrite::Succeed)
+                .unwrap_or(self.exhausted)
             {
                 FakeWrite::Succeed => Ok(()),
                 FakeWrite::Fail => Err(StoreError::Io(std::io::Error::new(
                     std::io::ErrorKind::PermissionDenied,
                     "TOKEN=secret terminal output must never reach health",
                 ))),
+                FakeWrite::FailDiskFull => Err(StoreError::Io(std::io::Error::from_raw_os_error(
+                    libc::ENOSPC,
+                ))),
+                FakeWrite::FailStale => Err(StoreError::StaleGeneration {
+                    entity: "workspace".to_owned(),
+                    expected: 1,
+                    actual: 2,
+                }),
                 FakeWrite::Panic => panic!("injected writer panic"),
             }
         }
@@ -1300,6 +1541,28 @@ mod tests {
 
         fn save_worktree(&self, _worktree: &WorktreeState) -> Result<u64, StoreError> {
             self.write().map(|()| 1)
+        }
+
+        fn stored_generations(
+            &self,
+            _workspace: WorkspaceId,
+        ) -> Result<StoredGenerations, StoreError> {
+            self.rebases.fetch_add(1, Ordering::Relaxed);
+            Ok(StoredGenerations::default())
+        }
+
+        fn stored_project_generation(
+            &self,
+            _project: ProjectId,
+        ) -> Result<Option<u64>, StoreError> {
+            Ok(None)
+        }
+
+        fn stored_worktree_generation(
+            &self,
+            _worktree: WorktreeId,
+        ) -> Result<Option<u64>, StoreError> {
+            Ok(None)
         }
 
         fn shutdown(&self) -> Result<(), StoreError> {
@@ -2085,5 +2348,210 @@ mod tests {
                 .is_some(),
             "the final snapshot must survive a shutdown flush that failed once"
         );
+    }
+
+    #[test]
+    fn a_stale_base_is_rebased_and_the_snapshot_still_lands() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("stale-base.sqlite3");
+        let boot = BootId::new("boot-stale-base");
+        let store = StateStore::open(&path, boot.clone()).unwrap();
+        let mut state = workspace();
+        // A commit the writer lane never learns about: storage ends up one
+        // generation ahead of the bases the lane is about to write against,
+        // which is what a batch that applied without the lane seeing it leaves
+        // behind.
+        store
+            .save_workspace(
+                &state,
+                SnapshotBase {
+                    workspace: 0,
+                    cards: &BTreeMap::new(),
+                },
+            )
+            .unwrap();
+
+        state.cards[0].title = "written after the conflict".into();
+        state.focused = Some(state.cards[0].id);
+        let snapshot = Arc::new(state);
+        let queue = Arc::new((
+            Mutex::new(QueueState {
+                latest: Some(Arc::clone(&snapshot)),
+                shutdown: true,
+                ..QueueState::default()
+            }),
+            Condvar::new(),
+        ));
+        let last_error = Arc::new(Mutex::new(None));
+        let (health_tx, _health_rx) = async_channel::unbounded();
+        let mut health = HealthPublisher::new(health_tx);
+
+        persistence_loop(
+            store,
+            PendingWrites::restored(0, BTreeMap::new(), HashMap::new(), HashMap::new()),
+            queue,
+            Arc::clone(&last_error),
+            &mut health,
+            fast_persistence_config(4),
+        );
+        assert_eq!(
+            last_error.lock().unwrap().clone(),
+            None,
+            "a base the writer can re-read is not a save failure"
+        );
+
+        let reopened = StateStore::open(&path, boot).unwrap();
+        let stored = reopened.load_workspace(snapshot.id, None).unwrap().unwrap();
+        assert_eq!(stored.cards.len(), snapshot.cards.len());
+        assert_eq!(stored.cards[0].id, snapshot.cards[0].id);
+        assert_eq!(stored.cards[0].title, snapshot.cards[0].title);
+        assert_eq!(stored.focused, snapshot.focused);
+    }
+
+    #[test]
+    fn a_checkpoint_is_honoured_after_the_base_went_stale() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("stale-checkpoint.sqlite3");
+        let boot = BootId::new("boot-stale-checkpoint");
+        let (mut runtime, _) = SessionRuntime::open(&path, boot.clone()).unwrap();
+        let mut state = workspace();
+        runtime.snapshot(Arc::new(state.clone()));
+        runtime.flush(Duration::from_secs(5)).unwrap();
+
+        // Advance the stored generation behind the writer lane's back, through
+        // the very store it writes through. The lane's base is now one commit
+        // behind, and the close path cannot tell: it only asks for a barrier.
+        let mut cards = BTreeMap::new();
+        cards.insert(state.cards[0].id, 1);
+        runtime
+            .operation_store()
+            .save_workspace(
+                &state,
+                SnapshotBase {
+                    workspace: 1,
+                    cards: &cards,
+                },
+            )
+            .unwrap();
+
+        state.cards[0].width_fraction = 0.25;
+        runtime.snapshot(Arc::new(state.clone()));
+        runtime
+            .flush(Duration::from_secs(5))
+            .expect("a checkpoint must still be satisfied after the base went stale");
+        assert_eq!(runtime.last_error(), None);
+        runtime.shutdown();
+
+        let (mut reopened, restored) = SessionRuntime::open(&path, boot).unwrap();
+        let restored = restored.expect("the workspace survives the conflict");
+        assert_eq!(restored.cards[0].width_fraction, 0.25);
+        reopened.shutdown();
+    }
+
+    #[test]
+    fn a_failure_no_rebase_can_fix_is_reported_instead_of_rebased() {
+        let store = FakeStore::always(FakeWrite::FailDiskFull);
+        let rebases = Arc::clone(&store.rebases);
+        let (response, receiver) = std::sync::mpsc::sync_channel(1);
+        let queue = Arc::new((
+            Mutex::new(QueueState {
+                latest: Some(Arc::new(workspace())),
+                checkpoints: vec![response],
+                shutdown: true,
+                ..QueueState::default()
+            }),
+            Condvar::new(),
+        ));
+        let (health_tx, health_rx) = async_channel::unbounded();
+        let mut health = HealthPublisher::new(health_tx);
+
+        persistence_loop(
+            store,
+            PendingWrites::restored(0, BTreeMap::new(), HashMap::new(), HashMap::new()),
+            queue,
+            Arc::new(Mutex::new(None)),
+            &mut health,
+            fast_persistence_config(2),
+        );
+
+        let refusal = receiver
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the checkpoint is answered rather than dropped")
+            .expect_err("a full disk cannot report a saved workspace");
+        assert!(
+            refusal.contains(SaveFailureCategory::DiskFull.label())
+                && refusal.contains(SaveFailureCategory::DiskFull.guidance()),
+            "a full disk has to reach the reader as one: {refusal}"
+        );
+        assert_eq!(
+            rebases.load(Ordering::Relaxed),
+            0,
+            "re-reading generations cannot free disk space, so no rebase may be attempted"
+        );
+        let mut categories = Vec::new();
+        while let Ok(event) = health_rx.try_recv() {
+            match event.health {
+                SessionSaveHealth::Retrying { category, .. }
+                | SessionSaveHealth::RetryExhausted { category, .. } => categories.push(category),
+                _ => {}
+            }
+        }
+        assert!(
+            !categories.is_empty()
+                && categories
+                    .iter()
+                    .all(|category| *category == SaveFailureCategory::DiskFull),
+            "a hard failure must never be reported as a conflict: {categories:?}"
+        );
+    }
+
+    #[test]
+    fn a_conflict_the_rebase_cannot_resolve_still_reports_its_category() {
+        let store = FakeStore::always(FakeWrite::FailStale);
+        let rebases = Arc::clone(&store.rebases);
+        let queue = Arc::new((
+            Mutex::new(QueueState {
+                latest: Some(Arc::new(workspace())),
+                ..QueueState::default()
+            }),
+            Condvar::new(),
+        ));
+        let (health_tx, health_rx) = async_channel::unbounded();
+        let health = HealthPublisher::new(health_tx);
+        let worker_queue = Arc::clone(&queue);
+        let worker = thread::spawn(move || {
+            run_persistence_worker(
+                store,
+                PendingWrites::restored(0, BTreeMap::new(), HashMap::new(), HashMap::new()),
+                worker_queue,
+                Arc::new(Mutex::new(None)),
+                health,
+                fast_persistence_config(2),
+            );
+        });
+
+        let exhausted = loop {
+            match next_health(&health_rx).health {
+                SessionSaveHealth::RetryExhausted {
+                    category, attempts, ..
+                } => break (category, attempts),
+                _ => continue,
+            }
+        };
+        assert_eq!(
+            exhausted,
+            (SaveFailureCategory::Conflict, 2),
+            "a conflict the rebase could not resolve still has to surface as one"
+        );
+        assert_eq!(
+            rebases.load(Ordering::Relaxed),
+            1,
+            "a batch is rebased once however often it is retried"
+        );
+
+        let (lock, changed) = &*queue;
+        lock.lock().unwrap().shutdown = true;
+        changed.notify_one();
+        worker.join().unwrap();
     }
 }
