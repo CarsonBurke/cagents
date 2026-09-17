@@ -90,6 +90,8 @@ impl RestoreFixture {
             project_order: Vec::new(),
             channels: Vec::new(),
             active_channel: None,
+            card_scopes: HashMap::new(),
+            workspace_model_identity: None,
             cards: vec![
                 CardState {
                     id: terminal_card_id,
@@ -405,6 +407,12 @@ fn a_selected_channel_restores_its_chats_focus_and_title() {
         id: channel_id,
         project_id: fixture.project.id,
         title: "Investigate startup".into(),
+        // A channel this window created and has already shared, which is the
+        // ordinary state of a channel that has been alive long enough to be
+        // restored: the rank the registry gave it has to survive a restart, or
+        // a window would resort its sidebar on every launch.
+        ordinal: 7,
+        shared: true,
         cards: vec![fixture.terminal_card_id, fixture.browser_card_id],
         focused: Some(fixture.browser_card_id),
     }];
@@ -424,6 +432,13 @@ fn a_selected_channel_restores_its_chats_focus_and_title() {
         vec![fixture.terminal_card_id, fixture.browser_card_id]
     );
     assert_eq!(restored.channels[0].focused, Some(fixture.browser_card_id));
+    // The rank and the share flag are what let a restarted window render its
+    // sidebar in the shared order before the registry has answered, and tell a
+    // channel the registry has never seen from one it deleted while this window
+    // was down. Losing either across a restore turns the second case into the
+    // first, which republishes a deleted channel.
+    assert_eq!(restored.channels[0].ordinal, 7);
+    assert!(restored.channels[0].shared);
     runtime.shutdown();
     assert_eq!(runtime.last_error(), None);
 }
