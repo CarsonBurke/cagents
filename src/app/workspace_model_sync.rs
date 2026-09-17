@@ -464,7 +464,16 @@ impl Cagents {
             // Git directory inside a Git directory and never find one.
             return Adoption::Retained;
         }
-        Adoption::Opening(self.repository_load_task(repository.to_path_buf(), None, true))
+        // Without cards. `open_cards` asks the load to select the repository's
+        // worktree and start a terminal in it, which is what a user opening a
+        // project in this window asked for and is exactly what an adoption did
+        // not: the project was opened in another window or from a shell, and
+        // the user of this window is in the middle of something else. Opening
+        // cards here moved their active worktree out from under them and left a
+        // terminal they never started - in every window at once. The project
+        // still reaches the sidebar, because that is the load's own result
+        // rather than a card's.
+        Adoption::Opening(self.repository_load_task(repository.to_path_buf(), None, false))
     }
 
     /// The local project that is the face of `repository`.
@@ -663,6 +672,107 @@ mod tests {
 
     fn drain(rx: &async_channel::Receiver<ModelEdit>) -> Vec<ModelEdit> {
         std::iter::from_fn(|| rx.try_recv().ok()).collect()
+    }
+
+    /// A real checkout, because adopting a project runs the repository loader
+    /// for real: what is being asserted is what that load does to this window.
+    ///
+    /// `None` when there is no usable `git`, so the suite skips rather than
+    /// failing on a machine without one.
+    fn git_checkout() -> Option<tempfile::TempDir> {
+        let checkout = tempfile::tempdir().expect("temporary directory");
+        let initialized = std::process::Command::new("git")
+            .args(["init", "--quiet"])
+            .current_dir(checkout.path())
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+        initialized
+            .is_ok_and(|status| status.success())
+            .then_some(checkout)
+    }
+
+    /// Runs a task to its first window message.
+    ///
+    /// The repository load is the whole subject here - the window does nothing
+    /// observable until it finishes - so the test drives it rather than
+    /// synthesising the message it produces, which is the one thing that would
+    /// hide the flag under test.
+    fn first_message(task: Task<Message>) -> Option<Message> {
+        use cosmic::iced::futures::StreamExt;
+
+        let mut stream = cosmic::iced::runtime::task::into_stream(task)?;
+        // A tokio runtime rather than a bare executor: the loader runs on
+        // `spawn_blocking`, which panics outside one.
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("a tokio runtime")
+            .block_on(async move {
+                while let Some(action) = stream.next().await {
+                    if let cosmic::iced::runtime::Action::Output(cosmic::Action::App(message)) =
+                        action
+                    {
+                        return Some(message);
+                    }
+                }
+                None
+            })
+    }
+
+    /// A project this window has never seen - opened from a shell with
+    /// `cagents project open`, or in another window - arrives as a sidebar row
+    /// and nothing else.
+    ///
+    /// Adoption used to read the repository the way a user opening one in this
+    /// window does, which selects its worktree and starts a terminal in it. In
+    /// every window at once: the user's active worktree was replaced under
+    /// them by a repository someone else named, and a terminal they never
+    /// started appeared in it. A project the registry names is news, not an
+    /// instruction.
+    #[test]
+    fn an_adopted_project_is_a_sidebar_row_and_takes_neither_a_card_nor_the_place() {
+        let Some(checkout) = git_checkout() else {
+            eprintln!("skipping: `git` is not available on PATH");
+            return;
+        };
+        let (mut app, _, _) = app_with_project();
+        let cards = app.durable.cards.len();
+        let focused = app.workspace.focused();
+        // The key the CLI and a window both derive: the common Git directory.
+        let repository =
+            canonical_repository(&checkout.path().join(".git")).expect("an absolute key");
+        app.workspace_model = WorkspaceModel {
+            projects: vec![ModelProject {
+                repository: repository.clone(),
+                name: "opened elsewhere".into(),
+                ordinal: 1,
+            }],
+            ..registry(Vec::new())
+        };
+
+        let loaded = first_message(app.reconcile_workspace_model())
+            .expect("adopting a project reads the repository it names");
+        let _ = app.update(loaded);
+
+        assert!(
+            app.sidebar_model
+                .projects
+                .iter()
+                .any(|project| project.repository == repository),
+            "the adopted project is in this window's sidebar"
+        );
+        assert_eq!(
+            app.durable.cards.len(),
+            cards,
+            "adoption starts no terminal, so no card appears"
+        );
+        assert_eq!(
+            app.active_workspace, None,
+            "and it does not move the user into the repository it just heard about"
+        );
+        assert_eq!(app.workspace.focused(), focused);
     }
 
     /// A channel another window created arrives as a scope, not as a
