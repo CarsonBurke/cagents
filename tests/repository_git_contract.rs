@@ -2454,10 +2454,11 @@ fn the_cli_and_a_window_derive_one_repository_key_for_one_checkout() {
             .common_dir,
     );
 
-    // Every place a user can be standing when they run the CLI. The key is the
-    // repository, not the directory, so all of them have to agree - including a
-    // linked worktree, whose own Git directory is `<common>/worktrees/<name>`
-    // and would have keyed one project once per worktree.
+    // Every place a user can be standing when they run the CLI, and every place
+    // a window can be opened from. The key is the repository, not the
+    // directory, so all of them have to agree - including a linked worktree,
+    // whose own Git directory is `<common>/worktrees/<name>` and would have
+    // keyed one project once per worktree.
     for from in [
         fixture.work(),
         fixture.work().join("nested/deeper"),
@@ -2470,6 +2471,23 @@ fn the_cli_and_a_window_derive_one_repository_key_for_one_checkout() {
             canonical(&key),
             published,
             "the CLI key from {} must be the key a window publishes",
+            from.display()
+        );
+        // The window's half of the same claim. `cagents project open` in a
+        // linked worktree and a window opened on the main checkout are the two
+        // sides of the sidebar this shares, and a project each of them opened
+        // has to be one row: discovery from anywhere in the checkout resolves
+        // the same common directory the CLI derives.
+        let discovered = canonical(
+            &service
+                .discover(&from, &cancellation)
+                .unwrap_or_else(|error| panic!("a window opens {}: {error}", from.display()))
+                .common_dir,
+        );
+        assert_eq!(
+            discovered,
+            published,
+            "a window opened from {} must key the same project",
             from.display()
         );
     }
