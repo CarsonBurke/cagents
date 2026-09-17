@@ -11535,6 +11535,43 @@ mod tests {
             .expect("a headless renderer")
     }
 
+    /// The custom `widget::Id`s that name more than one node in `element`.
+    ///
+    /// A custom id may name at most one node per frame: the pinned runtime
+    /// lifts every named node's state into one thread-local map keyed by name
+    /// before it diffs, gives it to the first widget that asks for that name,
+    /// and leaves any later claimant holding the `State::None` the lift left
+    /// behind. Nothing downstream can recover from that - the tag still
+    /// matches, so the node is never rebuilt, and the first draw downcasts a
+    /// stateless state and aborts the process.
+    ///
+    /// Shared rather than written per surface, because every surface that
+    /// mounts ids from a list is exposed to the same invariant and a per-test
+    /// copy of the walk would drift from the runtime it is modelling.
+    fn duplicate_widget_ids(element: &mut Element<'_, Message>) -> Vec<String> {
+        use cosmic::iced::advanced::widget::Tree;
+        use iced_accessibility::id::Internal;
+
+        fn tally(tree: &Tree, out: &mut HashMap<String, usize>) {
+            if let Some(widget::Id(Internal::Custom(_, name))) = &tree.id {
+                *out.entry(name.to_string()).or_default() += 1;
+            }
+            for child in &tree.children {
+                tally(child, out);
+            }
+        }
+
+        let mut counts = HashMap::new();
+        tally(&Tree::new(element.as_widget_mut()), &mut counts);
+        let mut repeated = counts
+            .into_iter()
+            .filter(|(_, count)| *count > 1)
+            .map(|(name, _)| name)
+            .collect::<Vec<_>>();
+        repeated.sort();
+        repeated
+    }
+
     /// Collapsing the contextual inspector must not mount two nodes under one
     /// custom `widget::Id`, and must survive the frames that do it.
     ///
@@ -11554,16 +11591,6 @@ mod tests {
         use cosmic::iced::advanced::widget::{Tree, tree};
         use cosmic::iced::advanced::{Layout, layout, mouse, renderer};
         use cosmic::iced::{Rectangle, Size};
-        use iced_accessibility::id::Internal;
-
-        fn tally(tree: &Tree, out: &mut HashMap<String, usize>) {
-            if let Some(widget::Id(Internal::Custom(_, name))) = &tree.id {
-                *out.entry(name.to_string()).or_default() += 1;
-            }
-            for child in &tree.children {
-                tally(child, out);
-            }
-        }
 
         let renderer = headless_renderer();
         let mut app = context_inspector_test_app(true);
@@ -11583,15 +11610,7 @@ mod tests {
         // the chrome header already believes the inspector is closed.
         for frame in 0..4 {
             {
-                let mut element = app.view();
-                let mut counts = HashMap::new();
-                tally(&Tree::new(element.as_widget_mut()), &mut counts);
-                let mut repeated: Vec<&String> = counts
-                    .iter()
-                    .filter(|(_, count)| **count > 1)
-                    .map(|(name, _)| name)
-                    .collect();
-                repeated.sort();
+                let repeated = duplicate_widget_ids(&mut app.view());
                 assert!(
                     repeated.is_empty(),
                     "frame {frame} mounts {repeated:?} more than once",
@@ -11637,6 +11656,128 @@ mod tests {
                 _ => app.context_inspector_transition = None,
             }
         }
+    }
+
+    /// Channel rows carry a custom `widget::Id` keyed on the channel, and they
+    /// now appear, disappear and change rank from a daemon edge rather than
+    /// from a local click. Every such frame must still leave each id naming one
+    /// node, or the pinned runtime aborts the process on the next draw.
+    ///
+    /// Two ways this could go wrong are worth drawing rather than reasoning
+    /// about: a row arriving while another leaves in the same frame, and a
+    /// reorder that moves a row past one already mounted. Both are laid out and
+    /// drawn here, because the failure is a panic inside `draw` that inspecting
+    /// the view cannot see.
+    #[test]
+    fn shared_channel_edges_leave_every_channel_id_naming_one_node() {
+        use cosmic::iced::advanced::widget::{Tree, tree};
+        use cosmic::iced::advanced::{Layout, layout, mouse, renderer};
+        use cosmic::iced::{Rectangle, Size};
+
+        let renderer = headless_renderer();
+        let mut app = context_inspector_test_app(true);
+        let project = crate::model::ProjectId::new();
+        let repository = std::path::PathBuf::from("/repo/.git");
+        app.sidebar_model
+            .projects
+            .push(sidebar::SidebarProject::new(
+                project,
+                crate::repository::RepositoryId(uuid::Uuid::new_v4()),
+                "repo".into(),
+                repository.clone(),
+                Vec::new(),
+                Vec::new(),
+            ));
+        app.sidebar_state.reveal_project(project);
+        let older = crate::model::ChannelId::new();
+        let newer = crate::model::ChannelId::new();
+        let identity = uuid::Uuid::new_v4();
+        let shared = |id, title: &str, ordinal| crate::workspace_model::ModelChannel {
+            id,
+            repository: repository.clone(),
+            title: title.to_owned(),
+            ordinal,
+        };
+
+        let bounds = Size::new(1600.0, 1000.0);
+        let mut state = Tree::empty();
+        for frame in 0..4 {
+            {
+                let repeated = duplicate_widget_ids(&mut app.view());
+                assert!(
+                    repeated.is_empty(),
+                    "frame {frame} mounts {repeated:?} more than once",
+                );
+            }
+
+            let mut element = app.view();
+            tree::NAMED.with(|named| {
+                *named.borrow_mut() = state.take_all_named();
+            });
+            state.diff(element.as_widget_mut());
+            let node = element.as_widget_mut().layout(
+                &mut state,
+                &renderer,
+                &layout::Limits::new(Size::ZERO, bounds),
+            );
+            tree::NAMED.with(|named| named.borrow_mut().clear());
+            element.as_widget().draw(
+                &state,
+                &mut headless_renderer(),
+                &cosmic::theme::active(),
+                &renderer::Style::default(),
+                Layout::new(&node),
+                mouse::Cursor::Unavailable,
+                &Rectangle::with_size(bounds),
+            );
+            drop(node);
+            drop(element);
+
+            let model = |channels| crate::workspace_model::WorkspaceModel {
+                identity,
+                sequence: frame as u64 + 1,
+                projects: Vec::new(),
+                channels,
+            };
+            match frame {
+                // One adopted row.
+                0 => {
+                    let _ = app.apply_workspace_model_update(
+                        workspace_model_sync::ModelUpdate::Connected(model(vec![shared(
+                            older, "older", 1,
+                        )])),
+                    );
+                }
+                // A second row arrives above the first, so the mounted row is
+                // pushed down past a newly mounted one.
+                1 => {
+                    let _ =
+                        app.apply_workspace_model_update(workspace_model_sync::ModelUpdate::Read(
+                            model(vec![shared(older, "older", 1), shared(newer, "newer", 2)]),
+                        ));
+                }
+                // One leaves while the other is reranked past where it was, in
+                // a single update.
+                _ => {
+                    let _ =
+                        app.apply_workspace_model_update(workspace_model_sync::ModelUpdate::Read(
+                            model(vec![shared(newer, "newer", 9)]),
+                        ));
+                }
+            }
+            app.refresh_sidebar_channels();
+        }
+
+        // The rows really were mounted, or the walk above proved nothing.
+        assert_eq!(
+            app.sidebar_model.projects[0]
+                .channels
+                .iter()
+                .map(|row| row.id)
+                .collect::<Vec<_>>(),
+            vec![newer],
+            "the departed channel is gone and the survivor kept its identity"
+        );
     }
 
     pub(super) fn settle_settings_task(app: &mut Cagents, task: Task<Message>) {
