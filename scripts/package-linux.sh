@@ -105,6 +105,14 @@ if [ "${CAGENTS_SKIP_BUILD:-0}" != 1 ]; then
     PATH=${ZIG_EXECUTABLE%/*}:$PATH
     export PATH
 
+    # The archive is named after the version's build metadata (the part after
+    # `+`, e.g. `local.3d80e6d`), and the binaries inside it report the same
+    # string from `--version`. A bare release version carries none, and an
+    # empty value tells build.rs to look at the checkout instead.
+    CAGENTS_BUILD_METADATA=${VERSION#*+}
+    [ "$CAGENTS_BUILD_METADATA" != "$VERSION" ] || CAGENTS_BUILD_METADATA=
+    export CAGENTS_BUILD_METADATA
+
     build_target() {
         cargo build \
             --manifest-path "$ROOT_DIR/Cargo.toml" \

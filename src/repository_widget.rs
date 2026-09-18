@@ -1176,7 +1176,7 @@ enum FileListState {
 
 enum DocumentState {
     None,
-    Loading(PathBuf),
+    Loading,
     Editable(EditorDocument),
     Image {
         handle: iced::widget::image::Handle,
@@ -3225,7 +3225,7 @@ impl RepositoryRuntime {
         let selected_status = self.selected.as_ref().and_then(|file| file.status.clone());
         let document = match &self.document {
             DocumentState::None => "No file selected",
-            DocumentState::Loading(_) => "Loading",
+            DocumentState::Loading => "Loading",
             DocumentState::Editable(_) if self.is_saving() => "Saving",
             DocumentState::Editable(document) if document.conflict => "Save conflict",
             DocumentState::Editable(document) if document.durability_warning.is_some() => {
@@ -3366,7 +3366,7 @@ impl RepositoryRuntime {
             FileListState::Ready(_) => {}
         }
         match &self.document {
-            DocumentState::Loading(_) => RepositoryRuntimeStatus::Loading,
+            DocumentState::Loading => RepositoryRuntimeStatus::Loading,
             DocumentState::Failed { .. } => RepositoryRuntimeStatus::Unavailable,
             _ if self.source_surface == SourceSurface::Diff => match &self.basis_resolution {
                 Some(BasisResolution::Resolving(_)) => RepositoryRuntimeStatus::Loading,
@@ -4565,7 +4565,7 @@ impl RepositoryRuntime {
         self.push_lsp_close();
         self.branch_selection = None;
         self.selected = Some(file.clone());
-        self.document = DocumentState::Loading(path.clone());
+        self.document = DocumentState::Loading;
         self.diffs.clear();
         self.basis_resolution = None;
         self.apply_diff_viewport(self.viewports.diff[self.diff_mode_index()].unwrap_or_default());
@@ -5467,7 +5467,7 @@ pub fn view(card: CardId, runtime: &RepositoryRuntime) -> Element<'_, Repository
         selected_file_view(card, runtime)
     } else {
         match &runtime.files {
-            FileListState::Loading => loading("Loading tracked and changed files…"),
+            FileListState::Loading => loading(),
             FileListState::Failed(error) => widget::container(
                 widget::column::with_children(vec![
                     information_state("Could not list files", error.clone()).into(),
@@ -5911,7 +5911,7 @@ fn editor_surface(card: CardId, runtime: &RepositoryRuntime) -> Element<'_, Repo
             "No file selected",
             "Choose a file from the repository list.",
         ),
-        DocumentState::Loading(path) => loading(format!("Loading {}…", path.display())),
+        DocumentState::Loading => loading(),
         DocumentState::Failed { path, message } => {
             information_state(format!("Could not open {}", path.display()), message)
         }
@@ -6533,7 +6533,7 @@ fn diff_surface(card: CardId, runtime: &RepositoryRuntime) -> Element<'_, Reposi
             FileListState::Failed(error) => {
                 information_state("Could not refresh file status", error.clone())
             }
-            _ => loading("Refreshing file status…"),
+            _ => loading(),
         };
     }
     // A failed live-buffer comparison has to be said rather than papered over
@@ -6543,9 +6543,7 @@ fn diff_surface(card: CardId, runtime: &RepositoryRuntime) -> Element<'_, Reposi
         return information_state("Could not compare the working buffer", error.to_owned());
     }
     match &runtime.basis_resolution {
-        Some(BasisResolution::Resolving(choice)) => {
-            loading(format!("Resolving the {} comparison…", choice.label()))
-        }
+        Some(BasisResolution::Resolving(_)) => loading(),
         Some(BasisResolution::NeedsBase(candidates)) => base_choice_view(card, candidates),
         Some(BasisResolution::NoCommits) => information_state(
             "Comparison unavailable",
@@ -6559,14 +6557,7 @@ fn diff_surface(card: CardId, runtime: &RepositoryRuntime) -> Element<'_, Reposi
                 "Nothing to compare",
                 "This file has nothing to show for the selected comparison.",
             ),
-            Some(DiffState::Loading { .. }) => loading(format!(
-                "Computing the diff for {} ({})…",
-                runtime
-                    .selected
-                    .as_ref()
-                    .map_or_else(String::new, |file| file.path.display().to_string()),
-                basis_label(&runtime.diff_basis),
-            )),
+            Some(DiffState::Loading { .. }) => loading(),
             Some(DiffState::Ready(RenderedDiff::Text {
                 model,
                 old_label,
@@ -7306,15 +7297,15 @@ fn read_only_state(path: &Path, reason: &ReadOnlyReason) -> Element<'static, Rep
     )
 }
 
-fn loading(message: impl Into<String>) -> Element<'static, RepositoryAction> {
-    widget::container(
-        widget::column::with_children(vec![
-            crate::ui_controls::activity_spinner_tone(24.0, crate::design::accent_color),
-            widget::text::body(message.into()).into(),
-        ])
-        .align_x(Alignment::Center)
-        .spacing(cosmic::theme::spacing().space_xs),
-    )
+/// The card while its file list is still on its way: one spinner, and no
+/// caption. The wait is usually a fraction of a second, and a sentence that
+/// flashes up and is replaced before it can be read is a flicker rather than
+/// a state; the spinner alone says the card is alive and about to fill.
+fn loading() -> Element<'static, RepositoryAction> {
+    widget::container(crate::ui_controls::activity_spinner_tone(
+        24.0,
+        crate::design::accent_color,
+    ))
     .center(Length::Fill)
     .into()
 }
@@ -7879,7 +7870,7 @@ mod tests {
             identity: stale,
             result: loaded(),
         }));
-        assert!(matches!(runtime.document, DocumentState::Loading(_)));
+        assert!(matches!(runtime.document, DocumentState::Loading));
         let identity = runtime.current_identity(card, "notes.md".into());
         drop(runtime.update(RepositoryAction::FileLoaded {
             identity,
@@ -9252,7 +9243,7 @@ mod tests {
             status: Some(" M".into()),
             directory: false,
         });
-        runtime.document = DocumentState::Loading(path.clone());
+        runtime.document = DocumentState::Loading;
 
         let _refresh = runtime.update(RepositoryAction::RefreshFiles { card });
         assert_eq!(runtime.generation, 4);
@@ -9793,7 +9784,7 @@ mod tests {
             status: Some(" M".into()),
             directory: false,
         });
-        runtime.document = DocumentState::Loading(PathBuf::from("current.rs"));
+        runtime.document = DocumentState::Loading;
         let stale = AsyncIdentity {
             card: CardId::new(),
             worktree: PathBuf::from("/repo"),
@@ -9809,7 +9800,13 @@ mod tests {
             }),
         });
         assert!(
-            matches!(runtime.document, DocumentState::Loading(ref path) if path == Path::new("current.rs"))
+            matches!(runtime.document, DocumentState::Loading),
+            "a stale load neither fills nor clears the document still on its way"
+        );
+        assert_eq!(
+            runtime.selected.as_ref().map(|file| file.path.as_path()),
+            Some(Path::new("current.rs")),
+            "the selection the load is for is untouched"
         );
     }
 

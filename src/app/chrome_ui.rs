@@ -965,44 +965,40 @@ impl Cagents {
             let dirty = (tab == ContextTab::Changes)
                 .then_some(indicators.dirty)
                 .flatten();
+            // The tab's one icon carries the worktree's state: the pull
+            // request's own glyph and tone, the changes tab tinted while the
+            // tree is dirty. What the tint means is said by the tab's name,
+            // which is the tooltip and the accessible name; a second icon
+            // beside the tab was the same fact drawn twice.
+            let mut name = format!("{} panel tab", tab.label());
+            match tab {
+                ContextTab::Changes => {
+                    if let Some(label) = dirty {
+                        name.push_str(": ");
+                        name.push_str(label);
+                    }
+                }
+                ContextTab::PullRequest if indicators.pending_checks => {
+                    name.push_str(": checks pending");
+                }
+                _ => {}
+            }
             let control = crate::ui_controls::icon_control(
                 visual.as_ref().map_or_else(
                     || crate::ui_controls::symbolic_icon(icon),
                     |(icon, _)| icon.clone(),
                 ),
-                format!("{} panel tab", tab.label()),
+                name,
                 selected,
                 enabled,
                 enabled.then_some(Message::SelectContextTab(tab)),
             );
-            let control: Element<'_, Message> = match (&visual, dirty) {
+            match (&visual, dirty) {
                 (Some((_, color)), _) => control.icon_color(*color).into(),
                 (None, Some(_)) => control
-                    .icon_color(cosmic::theme::active().cosmic().warning.base.into())
+                    .icon_tone(design::Tone::Themed(design::warning_color))
                     .into(),
                 (None, None) => control.into(),
-            };
-            // A tint says "something", a badge says what. These are the
-            // navigation rail's own badges, so one glance at either rail
-            // reports the same worktree.
-            let badge: Option<Element<'_, Message>> = match tab {
-                ContextTab::Changes => dirty.map(|label| {
-                    sidebar::status_icon(
-                        "document-edit-symbolic",
-                        label,
-                        sidebar::BadgeTone::Warning,
-                    )
-                }),
-                ContextTab::PullRequest if indicators.pending_checks => {
-                    Some(sidebar::check_indicator(sidebar::CheckStatus::Pending))
-                }
-                _ => None,
-            };
-            match badge {
-                Some(badge) => widget::row::with_children(vec![control, badge])
-                    .align_y(Alignment::Center)
-                    .into(),
-                None => control,
             }
         }))
         .spacing(2)

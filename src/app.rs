@@ -7443,9 +7443,15 @@ impl Cagents {
                     }
                     SettingsField::EditorWrapLines | SettingsField::EditorSyntaxTheme => {
                         for runtime in self.cards.values_mut() {
-                            if let CardRuntime::Repository(runtime) = runtime {
-                                runtime.set_wrap_lines(self.settings.editor_wrap_lines);
-                                runtime.set_syntax_theme(self.settings.editor_syntax_theme);
+                            match runtime {
+                                CardRuntime::Repository(runtime) => {
+                                    runtime.set_wrap_lines(self.settings.editor_wrap_lines);
+                                    runtime.set_syntax_theme(self.settings.editor_syntax_theme);
+                                }
+                                CardRuntime::Chat(runtime) => {
+                                    runtime.set_syntax_theme(self.settings.editor_syntax_theme);
+                                }
+                                _ => {}
                             }
                         }
                         Task::none()
@@ -7541,6 +7547,9 @@ impl Cagents {
         let sweep = self.lifecycle_sweep();
         let appearance = self.synchronize_appearance(previous_scale);
         let auto_save = Task::batch(self.cards.iter_mut().filter_map(|(&card, runtime)| {
+            if let CardRuntime::Chat(runtime) = runtime {
+                runtime.set_syntax_theme(self.settings.editor_syntax_theme);
+            }
             if let CardRuntime::Repository(runtime) = runtime {
                 runtime.set_auto_save(self.settings.editor_auto_save);
                 runtime.set_wrap_lines(self.settings.editor_wrap_lines);
@@ -8521,6 +8530,7 @@ impl Application for Cagents {
                         Task::none()
                     }
                     SidebarAction::CancelWorktreeOperation(id) => self.cancel_worktree_operation(id),
+                    SidebarAction::DismissWorktreeOperation(id) => self.dismiss_worktree_operation(id),
                     SidebarAction::OpenRepositoryPicker => {
                         cosmic::task::message(Message::OpenRepository)
                     }
@@ -9221,13 +9231,14 @@ impl Application for Cagents {
                         },
                     };
                 }
-                match self.workspace.commit_close(id) {
+                let closed = match self.workspace.commit_close(id) {
                     Ok(update) => self.apply_viewport(update, true, true),
                     Err(error) => {
                         self.status = Some(TransientNotice::error(error.to_string()));
                         Task::none()
                     }
-                }
+                };
+                Task::batch([closed, self.close_emptied_channels(&[id])])
             }
             Message::Viewport { generation, event } => {
                 // Native callbacks already queued by an unmounted worktree
@@ -11571,43 +11582,22 @@ mod tests {
         repeated
     }
 
-    /// Collapsing the contextual inspector must not mount two nodes under one
-    /// custom `widget::Id`, and must survive the frames that do it.
-    ///
-    /// The panel's own header and the workspace chrome's header offer the same
-    /// notice control and the same inspector toggle, and each carries the id
-    /// the application focuses it by. The pinned runtime lifts every named
-    /// node's state into one thread-local map keyed by name before it diffs,
-    /// gives it to the first widget that asks for that name, and leaves any
-    /// later claimant holding the `State::None` the lift left behind. Nothing
-    /// downstream can recover from that: the tag still matches, so the node is
-    /// never rebuilt, and the first draw downcasts a stateless state and
-    /// aborts the process. Asserting the absence of that abort is the whole
-    /// contract here, so this test lays out and draws every frame of the
-    /// collapse rather than only inspecting the view.
-    #[test]
-    fn collapsing_the_inspector_leaves_every_widget_id_naming_one_node() {
+    /// Lays out and draws `frames` frames of `app` the way the pinned runtime
+    /// does - lifting every named node's state, diffing, laying out, drawing -
+    /// asserting before each that no custom `widget::Id` names two nodes, and
+    /// applying `between(app, frame)` once the frame is drawn so the next one
+    /// sees a transition. The abort a duplicate id causes lives in `draw`, so
+    /// inspecting the view alone proves nothing; this is the one place every
+    /// surface that can mount two subtrees at once is driven through it.
+    fn draw_frames(app: &mut Cagents, frames: usize, mut between: impl FnMut(&mut Cagents, usize)) {
         use cosmic::iced::advanced::widget::{Tree, tree};
         use cosmic::iced::advanced::{Layout, layout, mouse, renderer};
         use cosmic::iced::{Rectangle, Size};
 
         let renderer = headless_renderer();
-        let mut app = context_inspector_test_app(true);
-        let card = app.workspace.focused().unwrap();
-        app.cards.insert(
-            card,
-            CardRuntime::Repository(Box::new(RepositoryRuntime::dirty_fixture(card))),
-        );
-        assert!(
-            app.context_inspector_open,
-            "the inspector starts open, which is what makes the collapse reachable"
-        );
         let bounds = Size::new(1600.0, 1000.0);
         let mut state = Tree::empty();
-        // Open with a file selected, collapse, then let the collapse settle:
-        // the middle frame is the one where the panel is still mounted while
-        // the chrome header already believes the inspector is closed.
-        for frame in 0..4 {
+        for frame in 0..frames {
             {
                 let repeated = duplicate_widget_ids(&mut app.view());
                 assert!(
@@ -11639,22 +11629,87 @@ mod tests {
             drop(node);
             drop(element);
 
-            match frame {
-                0 => {
-                    let _ = app.update(Message::ContextInspector(
-                        InspectorAction::ShowRepositoryEditor(card),
-                    ));
-                }
-                1 => {
-                    let _ = app.update(Message::ToggleContextInspector);
-                    assert!(
-                        !app.context_inspector_open && app.context_inspector_visible(),
-                        "the collapse leaves the panel mounted while the chrome reopens its slots"
-                    );
-                }
-                _ => app.context_inspector_transition = None,
-            }
+            between(app, frame);
         }
+    }
+
+    /// Collapsing the contextual inspector must not mount two nodes under one
+    /// custom `widget::Id`, and must survive the frames that do it.
+    ///
+    /// The panel's own header and the workspace chrome's header offer the same
+    /// notice control and the same inspector toggle, and each carries the id
+    /// the application focuses it by. The pinned runtime lifts every named
+    /// node's state into one thread-local map keyed by name before it diffs,
+    /// gives it to the first widget that asks for that name, and leaves any
+    /// later claimant holding the `State::None` the lift left behind. Nothing
+    /// downstream can recover from that: the tag still matches, so the node is
+    /// never rebuilt, and the first draw downcasts a stateless state and
+    /// aborts the process. Asserting the absence of that abort is the whole
+    /// contract here, so this test lays out and draws every frame of the
+    /// collapse rather than only inspecting the view.
+    #[test]
+    fn collapsing_the_inspector_leaves_every_widget_id_naming_one_node() {
+        let mut app = context_inspector_test_app(true);
+        let card = app.workspace.focused().unwrap();
+        app.cards.insert(
+            card,
+            CardRuntime::Repository(Box::new(RepositoryRuntime::dirty_fixture(card))),
+        );
+        assert!(
+            app.context_inspector_open,
+            "the inspector starts open, which is what makes the collapse reachable"
+        );
+        // Open with a file selected, collapse, then let the collapse settle:
+        // the middle frame is the one where the panel is still mounted while
+        // the chrome header already believes the inspector is closed.
+        draw_frames(&mut app, 4, |app, frame| match frame {
+            0 => {
+                let _ = app.update(Message::ContextInspector(
+                    InspectorAction::ShowRepositoryEditor(card),
+                ));
+            }
+            1 => {
+                let _ = app.update(Message::ToggleContextInspector);
+                assert!(
+                    !app.context_inspector_open && app.context_inspector_visible(),
+                    "the collapse leaves the panel mounted while the chrome reopens its slots"
+                );
+            }
+            _ => app.context_inspector_transition = None,
+        });
+    }
+
+    /// The inspector's Files and Changes tabs mount the same file and source
+    /// control panels the rail mounts for the worktree it is bound to, with
+    /// the same `sidebar.*` ids on their controls. The rail and the inspector
+    /// are on screen together the whole time, so every tab switch is a frame
+    /// in which two subtrees could claim one id. Drawn rather than reasoned
+    /// about, because the abort is in `draw` and points at the wrong widget.
+    #[test]
+    fn inspector_tabs_leave_every_widget_id_naming_one_node() {
+        let mut app = context_inspector_test_app(true);
+        let card = app.workspace.focused().unwrap();
+        app.cards.insert(
+            card,
+            CardRuntime::Repository(Box::new(RepositoryRuntime::dirty_fixture(card))),
+        );
+        app.sidebar_model = sidebar::tests::panel_model();
+        app.sidebar_state = sidebar::tests::panel_state(&app.sidebar_model);
+        assert!(app.context_inspector_open);
+        assert!(
+            sidebar::bound_source_control(&app.sidebar_model, &app.sidebar_state).is_some(),
+            "the fixture binds a worktree, or the panels draw their empty chrome and prove nothing"
+        );
+        let tabs = [
+            ContextTab::Files,
+            ContextTab::Changes,
+            ContextTab::PullRequest,
+            ContextTab::Changes,
+            ContextTab::Files,
+        ];
+        draw_frames(&mut app, tabs.len(), |app, frame| {
+            let _ = app.update(Message::SelectContextTab(tabs[frame]));
+        });
     }
 
     /// Channel rows carry a custom `widget::Id` keyed on the channel, and they
@@ -11669,11 +11724,6 @@ mod tests {
     /// the view cannot see.
     #[test]
     fn shared_channel_edges_leave_every_channel_id_naming_one_node() {
-        use cosmic::iced::advanced::widget::{Tree, tree};
-        use cosmic::iced::advanced::{Layout, layout, mouse, renderer};
-        use cosmic::iced::{Rectangle, Size};
-
-        let renderer = headless_renderer();
         let mut app = context_inspector_test_app(true);
         let project = crate::model::ProjectId::new();
         let repository = std::path::PathBuf::from("/repo/.git");
@@ -11698,40 +11748,7 @@ mod tests {
             ordinal,
         };
 
-        let bounds = Size::new(1600.0, 1000.0);
-        let mut state = Tree::empty();
-        for frame in 0..4 {
-            {
-                let repeated = duplicate_widget_ids(&mut app.view());
-                assert!(
-                    repeated.is_empty(),
-                    "frame {frame} mounts {repeated:?} more than once",
-                );
-            }
-
-            let mut element = app.view();
-            tree::NAMED.with(|named| {
-                *named.borrow_mut() = state.take_all_named();
-            });
-            state.diff(element.as_widget_mut());
-            let node = element.as_widget_mut().layout(
-                &mut state,
-                &renderer,
-                &layout::Limits::new(Size::ZERO, bounds),
-            );
-            tree::NAMED.with(|named| named.borrow_mut().clear());
-            element.as_widget().draw(
-                &state,
-                &mut headless_renderer(),
-                &cosmic::theme::active(),
-                &renderer::Style::default(),
-                Layout::new(&node),
-                mouse::Cursor::Unavailable,
-                &Rectangle::with_size(bounds),
-            );
-            drop(node);
-            drop(element);
-
+        draw_frames(&mut app, 4, |app, frame| {
             let model = |channels| crate::workspace_model::WorkspaceModel {
                 identity,
                 sequence: frame as u64 + 1,
@@ -11765,7 +11782,7 @@ mod tests {
                 }
             }
             app.refresh_sidebar_channels();
-        }
+        });
 
         // The rows really were mounted, or the walk above proved nothing.
         assert_eq!(

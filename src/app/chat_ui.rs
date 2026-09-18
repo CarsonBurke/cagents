@@ -52,6 +52,9 @@ fn small_icon<'a>(
         label,
         Some(action(message)),
     )
+    // Muted at rest: these sit at the foot of every answer, and drawn in the
+    // text color they competed with the answer for attention.
+    .icon_tone(crate::design::Tone::Themed(crate::design::muted_icon_color))
     .into()
 }
 
@@ -106,6 +109,10 @@ pub enum Action {
     StartFresh(CardId),
     Composer(Target, text_editor::Action),
     Submit(Target, PromptMode),
+    /// Recalls the message sent before the one the composer shows, or the
+    /// unsent draft again once the recall has walked forward past the newest.
+    HistoryOlder(Target),
+    HistoryNewer(Target),
     AppendProviderDraft(Target),
     Command(Target, Command),
     CommandFinished(Target, u64, Result<(), String>),
@@ -632,22 +639,28 @@ struct CachedItem {
     token: ChangeToken,
     markdown: markdown::Content,
     code: CodeScan,
+    /// The highlighted spans of each fenced block the Markdown parsed, keyed
+    /// by the block's language and text: what a frame looks a block up by.
+    /// The palette is the runtime's, applied when the block is highlighted,
+    /// so a change of syntax theme rehighlights rather than restyles.
+    blocks: HashMap<u64, crate::diff_view::SyntaxLines>,
     /// A step's trailing metadata — exit status and duration — formed once per
     /// change rather than once per frame.
     detail: Option<String>,
     image: Option<iced::widget::image::Handle>,
 }
 impl CachedItem {
-    fn new(content: &ItemContent) -> Self {
+    fn new(content: &ItemContent, theme: crate::settings::EditorSyntaxTheme) -> Self {
         let mut cached = Self {
             token: ChangeToken::of(content),
             markdown: markdown::Content::new(),
             code: CodeScan::default(),
+            blocks: HashMap::new(),
             detail: None,
             image: None,
         };
         match content {
-            ItemContent::Text { text, .. } => cached.extend(text, 0),
+            ItemContent::Text { text, .. } => cached.extend(text, 0, theme),
             ItemContent::Command {
                 status,
                 exit_code,
@@ -714,9 +727,150 @@ impl CachedItem {
     /// `markdown::Content` re-parses only its trailing block, and the fence
     /// scan resumes from its own cursor, so a streamed answer costs its new
     /// bytes per frame instead of its whole length.
-    fn extend(&mut self, body: &str, parsed: usize) {
+    fn extend(&mut self, body: &str, parsed: usize, theme: crate::settings::EditorSyntaxTheme) {
         self.markdown.push_str(&body[parsed..]);
         self.code.feed(body);
+        self.highlight(theme);
+    }
+
+    /// A fence larger than this is drawn plain: a syntect pass over it would
+    /// stall the frame it is cached on, and a block that size is a file the
+    /// agent pasted rather than a snippet it is showing.
+    const HIGHLIGHT_LIMIT: usize = 64 * 1024;
+
+    /// Highlights every fenced block the Markdown now holds, keeping the
+    /// spans of blocks that are unchanged since the last pass. A streamed
+    /// block changes on every refresh until its fence closes, so it is the
+    /// one block a refresh usually rehighlights.
+    fn highlight(&mut self, theme: crate::settings::EditorSyntaxTheme) {
+        let mut previous = std::mem::take(&mut self.blocks);
+        let mut blocks = HashMap::new();
+        for_each_fence(self.markdown.items(), &mut |language, code| {
+            if code.len() > Self::HIGHLIGHT_LIMIT {
+                return;
+            }
+            let key = fence_key(language, code);
+            let spans = previous
+                .remove(&key)
+                .unwrap_or_else(|| crate::diff_view::highlight_snippet(code, language, theme));
+            blocks.insert(key, spans);
+        });
+        self.blocks = blocks;
+    }
+
+    /// Discards the highlighting and does it again in `theme`.
+    fn rehighlight(&mut self, theme: crate::settings::EditorSyntaxTheme) {
+        self.blocks.clear();
+        self.highlight(theme);
+    }
+
+    /// The highlighted lines of the fence whose info string is `language`
+    /// and whose text is `code`, where the cache holds them.
+    fn block(&self, language: Option<&str>, code: &str) -> Option<&crate::diff_view::SyntaxLines> {
+        self.blocks.get(&fence_key(language?, code))
+    }
+}
+
+/// Visits every fenced block among `items` that names a language, in the
+/// order the Markdown draws them, descending into lists and quotes the way
+/// the drawing does.
+fn for_each_fence<'a>(
+    items: impl IntoIterator<Item = &'a markdown::Item>,
+    visit: &mut impl FnMut(&'a str, &'a str),
+) {
+    for item in items {
+        match item {
+            markdown::Item::CodeBlock {
+                language: Some(language),
+                code,
+                ..
+            } => visit(language, code),
+            markdown::Item::List { bullets, .. } => {
+                for bullet in bullets {
+                    let (markdown::Bullet::Point { items } | markdown::Bullet::Task { items, .. }) =
+                        bullet;
+                    for_each_fence(items, visit);
+                }
+            }
+            markdown::Item::Quote(items) => for_each_fence(items, visit),
+            _ => {}
+        }
+    }
+}
+
+/// The identity of a fenced block, as its highlighting is looked up by: the
+/// language it declares and the text it holds.
+fn fence_key(language: &str, code: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::hash::DefaultHasher::new();
+    language.hash(&mut hasher);
+    code.hash(&mut hasher);
+    hasher.finish()
+}
+
+/// The transcript's Markdown, drawn with the shell's own code blocks.
+///
+/// Everything but a fenced block is iced's rendering; a fence is drawn from
+/// its cached highlighting on the sunken surface commands and outputs use, in
+/// the palette the editor's syntax theme chose for the current appearance.
+struct Prose<'a> {
+    cached: &'a CachedItem,
+}
+
+impl<'a> Prose<'a> {
+    fn view(cached: &'a CachedItem, settings: markdown::Settings) -> Element<'a, Message> {
+        markdown::view_with(cached.markdown.items(), settings, &Self { cached })
+    }
+}
+
+impl<'a> markdown::Viewer<'a, Message, cosmic::Theme, cosmic::Renderer> for Prose<'a> {
+    fn on_link_click(uri: markdown::Uri) -> Message {
+        action(Action::OpenUrl(uri.to_string()))
+    }
+
+    fn code_block(
+        &self,
+        settings: markdown::Settings,
+        language: Option<&'a str>,
+        code: &'a str,
+        _lines: &'a [markdown::Text],
+    ) -> Element<'a, Message> {
+        let palette = self
+            .cached
+            .block(language, code)
+            .map(|lines| &lines[usize::from(cosmic::theme::is_dark())]);
+        let rows: Vec<Element<'a, Message>> = code
+            .lines()
+            .enumerate()
+            .map(|(index, line)| {
+                let spans = palette
+                    .and_then(|lines| lines.get(index))
+                    .map_or(&[][..], Vec::as_slice);
+                let line: Element<'a, Message> =
+                    iced::widget::rich_text(crate::diff_view::syntax_spans(line, spans))
+                        .font(settings.style.code_block_font)
+                        .size(settings.code_size)
+                        .wrapping(iced::widget::text::Wrapping::None)
+                        .into();
+                line
+            })
+            .collect();
+        widget::container(
+            widget::scrollable(
+                widget::container(widget::column::with_children(rows))
+                    .padding([step::GAP_S as u16, step::GAP_M as u16]),
+            )
+            .direction(iced::widget::scrollable::Direction::Horizontal(
+                design::scrollbar(),
+            )),
+        )
+        .class(design::surface(
+            Some(design::sunken),
+            [design::RADIUS_S; 4],
+            true,
+        ))
+        .width(Length::Fill)
+        .into()
     }
 }
 
@@ -725,6 +879,10 @@ struct PendingCommand {
     draft_revision: Option<u64>,
     request: Option<String>,
     permission_mode: Option<String>,
+    /// The message this command sends, kept for the composer's history once
+    /// the provider has accepted it. A rejected send is not history: the
+    /// draft it came from is still in the composer.
+    sent: Option<String>,
     /// Which end of the history this command is extending, where it is a
     /// page request at all. The transcript says so at the edge the rows will
     /// appear at, so it has to know which edge is waiting.
@@ -736,6 +894,8 @@ pub(super) struct Runtime {
     handle: Arc<ClientHandle>,
     snapshot: Arc<Snapshot>,
     cache: HashMap<String, CachedItem>,
+    /// The palette the cache's code blocks are highlighted in.
+    syntax_theme: crate::settings::EditorSyntaxTheme,
     /// The snapshot's items grouped into stretches of work, rebuilt only when
     /// the snapshot changes rather than once per frame.
     turns: Vec<turn::Turn>,
@@ -776,6 +936,15 @@ pub(super) struct Runtime {
     visible: AtomicBool,
     error: Option<String>,
     permission_mode: Option<String>,
+    /// Messages the provider accepted, oldest first, for Up and Down in the
+    /// composer to walk through the way a shell does.
+    history: Vec<String>,
+    /// Which entry the composer is showing while the reader walks the
+    /// history; `None` while they are writing.
+    history_cursor: Option<usize>,
+    /// The draft that was in the composer when the walk began, restored when
+    /// the walk goes past the newest message.
+    history_stash: String,
     /// The transcript's minimap marks, derived from `turns` when the snapshot
     /// changes rather than on the frames that draw them.
     marks: Vec<crate::ui_controls::TranscriptMark>,
@@ -798,12 +967,106 @@ pub(super) struct Runtime {
     /// The model search's query while its popup is open, `None` when closed.
     model_picker: Option<String>,
 }
+/// The name the composer accepts for compaction where the provider offers it
+/// as a capability rather than as one of its listed commands.
+pub(super) const COMPACT_COMMAND: &str = "compact";
+
+/// What a draft beginning with `/` asks for.
+enum SlashInvocation {
+    /// One of the provider's own commands, sent through its dispatcher.
+    Command(String),
+    /// Compaction, offered as a command wherever the provider can do it.
+    Compact,
+    /// A skill, as the message the provider invokes it with: `/review src`
+    /// becomes `$review src` for Codex and stays as it is for a provider whose
+    /// skills are slash commands.
+    Skill(String),
+}
+
+/// Resolves a draft's leading `/name` against what the provider offers.
+///
+/// Names match without regard to case and to the `/` or `$` the provider
+/// prefixes its own form with, because a reader completing from the picker
+/// and a reader typing from memory should reach the same skill.
+fn slash_invocation(draft: &str, snapshot: &Snapshot) -> Option<SlashInvocation> {
+    let draft = draft.trim();
+    let rest = draft.strip_prefix('/')?;
+    let end = rest.find(char::is_whitespace).unwrap_or(rest.len());
+    let (name, arguments) = (&rest[..end], rest[end..].trim_start());
+    if name.is_empty() {
+        return None;
+    }
+    fn bare(candidate: &str) -> &str {
+        candidate.trim_start_matches(['/', '$'])
+    }
+    if snapshot
+        .commands
+        .iter()
+        .any(|command| bare(&command.name).eq_ignore_ascii_case(name))
+    {
+        return Some(SlashInvocation::Command(draft.to_owned()));
+    }
+    if let Some(skill) = snapshot.skills.iter().find(|skill| {
+        skill.name.eq_ignore_ascii_case(name) || bare(&skill.invocation).eq_ignore_ascii_case(name)
+    }) {
+        let mut text = skill.invocation.clone();
+        if !arguments.is_empty() {
+            text.push(' ');
+            text.push_str(arguments);
+        }
+        return Some(SlashInvocation::Skill(text));
+    }
+    if name.eq_ignore_ascii_case(COMPACT_COMMAND) && snapshot.capabilities.compact {
+        return Some(SlashInvocation::Compact);
+    }
+    None
+}
+
 impl Runtime {
+    /// Records a message the provider accepted. The same message sent twice
+    /// in a row is one entry, as a shell keeps it, and the walk restarts
+    /// from the newest.
+    fn remember(&mut self, sent: String) {
+        if self.history.last() != Some(&sent) {
+            self.history.push(sent);
+        }
+        self.history_cursor = None;
+        self.history_stash.clear();
+    }
+
+    /// Walks the history one message older or newer, showing it in the
+    /// composer. Walking older from the draft keeps the draft; walking newer
+    /// past the newest message brings it back.
+    fn recall(&mut self, older: bool) {
+        let next = match (self.history_cursor, older) {
+            (None, true) => {
+                let Some(newest) = self.history.len().checked_sub(1) else {
+                    return;
+                };
+                self.history_stash = self.composer.text();
+                Some(newest)
+            }
+            (None, false) => return,
+            (Some(0), true) => return,
+            (Some(index), true) => Some(index - 1),
+            (Some(index), false) if index + 1 < self.history.len() => Some(index + 1),
+            (Some(_), false) => None,
+        };
+        let text = match next {
+            Some(index) => self.history[index].clone(),
+            None => std::mem::take(&mut self.history_stash),
+        };
+        self.history_cursor = next;
+        self.composer = text_editor::Content::with_text(text.trim_end_matches('\n'));
+        self.revision = self.revision.wrapping_add(1);
+    }
+
     fn new(
         target: Target,
         session: chat::Session,
         handle: Arc<ClientHandle>,
         visible: bool,
+        syntax_theme: crate::settings::EditorSyntaxTheme,
     ) -> Self {
         let mut runtime = Self {
             target,
@@ -811,6 +1074,7 @@ impl Runtime {
             snapshot: Arc::new(Snapshot::default()),
             handle,
             cache: HashMap::new(),
+            syntax_theme,
             turns: Vec::new(),
             asked_after: HashSet::new(),
             asked: HashSet::new(),
@@ -827,6 +1091,9 @@ impl Runtime {
             visible: AtomicBool::new(visible),
             error: None,
             permission_mode: None,
+            history: Vec::new(),
+            history_cursor: None,
+            history_stash: String::new(),
             marks: Vec::new(),
             scroll: view::Scroll::default(),
             earlier_asked: None,
@@ -835,6 +1102,16 @@ impl Runtime {
         };
         runtime.refresh();
         runtime
+    }
+    /// Highlights the transcript's code blocks in `theme` from now on.
+    pub(super) fn set_syntax_theme(&mut self, theme: crate::settings::EditorSyntaxTheme) {
+        if self.syntax_theme == theme {
+            return;
+        }
+        self.syntax_theme = theme;
+        for cached in self.cache.values_mut() {
+            cached.rehighlight(theme);
+        }
     }
     fn refresh(&mut self) {
         if !self.visible.load(Ordering::Relaxed) {
@@ -861,13 +1138,15 @@ impl Runtime {
                 }
                 if let Some(body) = cached.token.appended(&item.content) {
                     let parsed = cached.token.body;
-                    cached.extend(body, parsed);
+                    cached.extend(body, parsed, self.syntax_theme);
                     cached.token = token;
                     continue;
                 }
             }
-            self.cache
-                .insert(item.id.clone(), CachedItem::new(&item.content));
+            self.cache.insert(
+                item.id.clone(),
+                CachedItem::new(&item.content, self.syntax_theme),
+            );
         }
         self.answers
             .retain(|(id, _), _| snapshot.requests.iter().any(|request| &request.id == id));
@@ -1458,12 +1737,18 @@ impl Cagents {
             Command::Refresh => Some(view::Page::Newer),
             _ => None,
         };
+        let sent = match &command {
+            Command::Prompt { text, .. } if !text.trim().is_empty() => Some(text.clone()),
+            Command::Slash { command } => Some(command.clone()),
+            _ => None,
+        };
         runtime.pending = Some(PendingCommand {
             id,
             draft_revision: clear_draft.then_some(runtime.revision),
             request,
             permission_mode,
             page,
+            sent,
         });
         runtime.error = None;
         let handle = runtime.handle.clone();
@@ -1920,8 +2205,13 @@ impl Cagents {
                             runtime.error = None;
                             runtime.show(visible);
                         } else {
-                            let mut runtime =
-                                Runtime::new(target, session.clone(), handle, visible);
+                            let mut runtime = Runtime::new(
+                                target,
+                                session.clone(),
+                                handle,
+                                visible,
+                                self.settings.editor_syntax_theme,
+                            );
                             // Whatever was typed before this card last left the
                             // chat surface comes back with it.
                             if let Some(draft) = self.chat_ui.drafts.remove(&target.card)
@@ -2097,6 +2387,9 @@ impl Cagents {
                 if let Some(runtime) = self.chat_runtime_mut(target) {
                     if action.is_edit() {
                         runtime.revision = runtime.revision.wrapping_add(1);
+                        // Typing into a recalled message makes it the draft,
+                        // so the next Up starts again from the newest.
+                        runtime.history_cursor = None;
                     }
                     runtime.composer.perform(action);
                 }
@@ -2128,34 +2421,49 @@ impl Cagents {
                     return Task::none();
                 }
                 let text = runtime.composer.text();
-                let slash_name = text
-                    .trim()
-                    .strip_prefix('/')
-                    .and_then(|command| command.split_whitespace().next());
-                let command = if mode == PromptMode::Send
-                    && slash_name.is_some_and(|name| {
-                        runtime
-                            .snapshot
-                            .commands
-                            .iter()
-                            .any(|command| command.name.trim_start_matches('/') == name)
-                    }) {
-                    if !runtime.attachments.is_empty() {
-                        runtime.error =
-                            Some("Send attachments with a message, not a slash command.".into());
-                        return Task::none();
+                let command = match (mode, slash_invocation(&text, &runtime.snapshot)) {
+                    (PromptMode::Send, Some(SlashInvocation::Command(command))) => {
+                        if !runtime.attachments.is_empty() {
+                            runtime.error = Some(
+                                "Send attachments with a message, not a slash command.".into(),
+                            );
+                            return Task::none();
+                        }
+                        Command::Slash { command }
                     }
-                    Command::Slash {
-                        command: text.trim().to_owned(),
+                    (PromptMode::Send, Some(SlashInvocation::Compact)) => {
+                        if !runtime.attachments.is_empty() {
+                            runtime.error =
+                                Some("Send attachments with a message, not a compaction.".into());
+                            return Task::none();
+                        }
+                        Command::Compact
                     }
-                } else {
-                    Command::Prompt {
+                    // A skill is asked for the way the provider asks for it,
+                    // whatever the reader typed: the slash form is the
+                    // composer's, the invocation is the provider's.
+                    (_, Some(SlashInvocation::Skill(text))) => Command::Prompt {
                         text,
                         attachments: runtime.attachments.clone(),
                         mode,
-                    }
+                    },
+                    _ => Command::Prompt {
+                        text,
+                        attachments: runtime.attachments.clone(),
+                        mode,
+                    },
                 };
                 return self.chat_send(target, command, true);
+            }
+            Action::HistoryOlder(target) => {
+                if let Some(runtime) = self.chat_runtime_mut(target) {
+                    runtime.recall(true);
+                }
+            }
+            Action::HistoryNewer(target) => {
+                if let Some(runtime) = self.chat_runtime_mut(target) {
+                    runtime.recall(false);
+                }
             }
             Action::Command(target, command) => return self.chat_send(target, command, false),
             Action::CommandFinished(target, id, result) => {
@@ -2179,6 +2487,9 @@ impl Cagents {
                             runtime.composer = text_editor::Content::new();
                             runtime.attachments.clear();
                             runtime.revision = runtime.revision.wrapping_add(1);
+                        }
+                        if let Some(sent) = pending.sent {
+                            runtime.remember(sent);
                         }
                         if let Some(request) = pending.request {
                             runtime.answers.retain(|(id, _), _| id != &request);
@@ -2464,6 +2775,8 @@ impl Cagents {
                         .commands
                         .iter()
                         .any(|command| command.name == name)
+                        || (name.trim_start_matches('/') == COMPACT_COMMAND
+                            && runtime.snapshot.capabilities.compact)
                     {
                         runtime.composer = text_editor::Content::with_text(&format!(
                             "/{} ",
@@ -2477,12 +2790,15 @@ impl Cagents {
                 let Some(runtime) = self.chat_runtime_mut(target) else {
                     return Task::none();
                 };
-                if !runtime
-                    .snapshot
-                    .skills
-                    .iter()
-                    .any(|skill| skill.invocation == invocation)
-                {
+                // The picker names a skill in the composer's slash form, and
+                // the provider's own invocation is accepted as well, because
+                // a reader who knows it can type it.
+                if !runtime.snapshot.skills.iter().any(|skill| {
+                    skill.invocation == invocation
+                        || invocation
+                            .strip_prefix('/')
+                            .is_some_and(|name| skill.name.eq_ignore_ascii_case(name))
+                }) {
                     return Task::none();
                 }
                 // A skill is named inside a message rather than instead of
@@ -2829,9 +3145,10 @@ mod tests {
     /// than fail loudly.
     #[test]
     fn streamed_body_finds_the_same_code_blocks_as_a_whole_one() {
+        const THEME: crate::settings::EditorSyntaxTheme = crate::settings::EditorSyntaxTheme::Auto;
         const BODY: &str =
             "Intro\n\n```rust\nfn main() {}\nlet total = 1;\n```\n\nAfter\n\n~~~\nplain\n~~~\n";
-        let whole = CachedItem::new(&text(BODY));
+        let whole = CachedItem::new(&text(BODY), THEME);
         assert_eq!(
             whole.code.codes,
             vec![
@@ -2840,7 +3157,7 @@ mod tests {
             ]
         );
 
-        let mut streamed = CachedItem::new(&text(""));
+        let mut streamed = CachedItem::new(&text(""), THEME);
         for end in 1..=BODY.len() {
             if !BODY.is_char_boundary(end) {
                 continue;
@@ -2850,18 +3167,79 @@ mod tests {
                 panic!("a longer prefix of the same body must read as an append");
             };
             let parsed = streamed.token.body;
-            streamed.extend(body, parsed);
+            streamed.extend(body, parsed, THEME);
             streamed.token = ChangeToken::of(&content);
         }
         assert_eq!(streamed.code.codes, whole.code.codes);
         assert_eq!(streamed.token, whole.token);
+        assert_eq!(
+            streamed.blocks.keys().collect::<HashSet<_>>(),
+            whole.blocks.keys().collect::<HashSet<_>>(),
+            "the streamed fences are highlighted under the same identities"
+        );
+    }
+
+    /// A fence that names its language is highlighted in both of the
+    /// editor's palettes the moment it is cached, and looked up by exactly
+    /// what the Markdown hands the viewer; a fence without one is left to
+    /// draw plain rather than guessed at.
+    #[test]
+    fn a_named_fence_is_highlighted_in_both_palettes() {
+        const THEME: crate::settings::EditorSyntaxTheme = crate::settings::EditorSyntaxTheme::Auto;
+        let cached = CachedItem::new(
+            &text(
+                "```rust
+fn main() {}
+```
+
+```
+plain
+```
+",
+            ),
+            THEME,
+        );
+        let lines = cached
+            .block(
+                Some("rust"),
+                "fn main() {}
+",
+            )
+            .expect("the Rust fence is highlighted");
+        for palette in lines {
+            assert_eq!(palette.len(), 1, "one line of spans per line of code");
+            assert!(
+                crate::diff_view::syntax_spans("fn main() {}", &palette[0])
+                    .iter()
+                    .any(|span| span.color.is_some()),
+                "a keyword takes a color"
+            );
+        }
+        assert!(
+            cached
+                .block(
+                    None, "plain
+"
+                )
+                .is_none()
+        );
+        assert!(
+            cached
+                .block(
+                    Some("rust"),
+                    "fn other() {}
+"
+                )
+                .is_none()
+        );
     }
 
     /// The token is what licenses reusing a parse, so it must refuse anything
     /// that is not bytes added to the end.
     #[test]
     fn change_token_refuses_a_rewritten_body() {
-        let cached = CachedItem::new(&text("hello world"));
+        const THEME: crate::settings::EditorSyntaxTheme = crate::settings::EditorSyntaxTheme::Auto;
+        let cached = CachedItem::new(&text("hello world"), THEME);
         assert_eq!(
             cached.token.appended(&text("hello world and more")),
             Some("hello world and more")

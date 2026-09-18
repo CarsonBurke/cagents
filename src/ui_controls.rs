@@ -964,18 +964,26 @@ impl<Message> cosmic::iced::advanced::Widget<Message, cosmic::Theme, cosmic::Ren
         // against.
         renderer.fill_quad(quad(bounds), design::raised(theme));
         for mark in self.marks {
-            // A prompt spans the whole rail and work is inset, so the
-            // reader's own messages are legible as a rhythm down the edge
-            // even where tone alone is hard to read.
-            let (color, inset) = match mark.tone {
-                MarkTone::Prompt => (design::accent_color(theme), 0.0),
-                MarkTone::Failed => (design::destructive_color(theme), 0.0),
-                MarkTone::Work => (design::muted_color(theme), design::MINIMAP_MARK_INSET),
+            // A message is a tick at the point it sits, whatever the length
+            // of the work it started: the rail is read as a rhythm of the
+            // reader's own messages, the way a conversation is remembered.
+            // Work, where a caller still marks it, spans its stretch inset.
+            let (color, inset, tick) = match mark.tone {
+                MarkTone::Prompt => (design::accent_color(theme), 0.0, true),
+                MarkTone::Failed => (design::destructive_color(theme), 0.0, true),
+                MarkTone::Work => (
+                    design::muted_color(theme),
+                    design::MINIMAP_MARK_INSET,
+                    false,
+                ),
             };
             let top = bounds.y + mark.at.clamp(0.0, 1.0) * bounds.height;
-            let height = (mark.span.clamp(0.0, 1.0) * bounds.height)
-                .max(design::MINIMAP_MARK_MIN_HEIGHT)
-                .min((bounds.y + bounds.height - top).max(0.0));
+            let height = if tick {
+                design::MINIMAP_TICK_HEIGHT
+            } else {
+                (mark.span.clamp(0.0, 1.0) * bounds.height).max(design::MINIMAP_MARK_MIN_HEIGHT)
+            }
+            .min((bounds.y + bounds.height - top).max(0.0));
             if height <= 0.0 {
                 continue;
             }

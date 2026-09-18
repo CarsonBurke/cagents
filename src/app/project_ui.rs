@@ -345,19 +345,30 @@ impl Cagents {
                 }
                 Ok(warning) => {
                     self.project_ui.dialog = None;
-                    // No terminals can reach this point; clean repository cards are
-                    // tombstoned without manufacturing terminal-close acknowledgments.
-                    let ids = self.durable.cards.iter().filter(|card| card.existence.is_open()
-                        && matches!(&card.kind, CardKind::Repository(view) if view.worktree.starts_with(&target.path)))
-                        .map(|card| card.id).collect::<Vec<_>>();
-                    for id in ids {
+                    // The daemon has already closed every terminal and chat in
+                    // the directory, so their cards are tombstoned here without
+                    // a second close request: dropping a runtime only detaches.
+                    let ids = self
+                        .durable
+                        .cards
+                        .iter()
+                        .filter(|card| {
+                            card.existence.is_open() && card_belongs_to(card, &target.path)
+                        })
+                        .map(|card| card.id)
+                        .collect::<Vec<_>>();
+                    for &id in &ids {
                         self.retire_lsp_card(id);
+                        self.sidebar_state.clear_agent_activity(id);
+                        self.sidebar_state.acknowledge_agent_update(id);
+                        self.chat_discard(id);
                         self.cards.remove(&id);
                         self.lifecycle.remove(id);
                         if let Some(card) = self.card_state_mut(id) {
                             card.existence = removed_existence("worktree deleted by user");
                         }
                     }
+                    let emptied = self.close_emptied_channels(&ids);
                     self.worktree_offsets.remove(&target.path);
                     self.worktree_focus.remove(&target.path);
                     if let Some(project) = self
@@ -387,6 +398,7 @@ impl Cagents {
                         self.repository_load_task(target.repository, Some(target.project), false);
                     return Task::batch([
                         select,
+                        emptied,
                         refresh,
                         self.lifecycle_sweep(),
                         self.sync_chrome(),
@@ -443,31 +455,16 @@ impl Cagents {
                 "Commit, stash, or discard the worktree changes before deleting it.".into(),
             );
         }
-        if self
-            .durable
-            .cards
-            .iter()
-            .any(|card| card.existence.is_open() && self.pending_terminal_spawn(card.id))
-        {
-            return Some(
-                "Wait for pending terminals to finish starting before deleting a worktree.".into(),
-            );
-        }
+        // A terminal that has no daemon identity yet cannot be closed by
+        // anyone; it gets one within moments of starting.
         if self.durable.cards.iter().any(|card| {
             card.existence.is_open()
-                && match &card.kind {
-                    CardKind::Terminal(session) => {
-                        session.launch.working_directory.starts_with(&target.path)
-                    }
-                    CardKind::Chat(session) => session
-                        .launch
-                        .recipe
-                        .working_directory
-                        .starts_with(&target.path),
-                    _ => false,
-                }
+                && card_belongs_to(card, &target.path)
+                && self.pending_terminal_spawn(card.id)
         }) {
-            return Some("Close this worktree’s terminal and chat cards first. Running, hidden, and detached sessions are never terminated by deletion.".into());
+            return Some(
+                "A terminal in this worktree is still starting. Try again in a moment.".into(),
+            );
         }
         if self.cards.values().any(|runtime| {
             matches!(runtime, CardRuntime::Repository(runtime)
@@ -480,6 +477,37 @@ impl Cagents {
         None
     }
 
+    /// What the deletion takes with it: the open terminal and chat cards
+    /// inside the worktree, counted so the user knows before confirming.
+    fn worktree_cascade_summary(&self, target: &Target) -> Option<String> {
+        let (mut terminals, mut chats) = (0, 0);
+        for card in &self.durable.cards {
+            if !card.existence.is_open() || !card_belongs_to(card, &target.path) {
+                continue;
+            }
+            match &card.kind {
+                CardKind::Terminal(_) => terminals += 1,
+                CardKind::Chat(_) => chats += 1,
+                _ => {}
+            }
+        }
+        let count =
+            |n: usize, one: &str, many: &str| format!("{n} {}", if n == 1 { one } else { many });
+        let parts = match (terminals, chats) {
+            (0, 0) => return None,
+            (t, 0) => count(t, "terminal", "terminals"),
+            (0, c) => count(c, "chat", "chats"),
+            (t, c) => format!(
+                "{} and {}",
+                count(t, "terminal", "terminals"),
+                count(c, "chat", "chats")
+            ),
+        };
+        Some(format!(
+            "This closes {parts} in the worktree and ends their sessions."
+        ))
+    }
+
     pub(super) fn project_dialog_view(&self) -> Option<Element<'_, Message>> {
         let dialog = self.project_ui.dialog.as_ref()?;
         let target = &dialog.target;
@@ -489,9 +517,13 @@ impl Cagents {
             super::notice_detail(target.path.display().to_string()),
             super::notice_detail(
                 "Git will remove this clean worktree directory. The branch is retained. \
-                 Primary, locked, dirty, and in-use worktrees are never removed.",
+                 Terminals and chats running in it, including detached ones, are closed \
+                 first. Primary, locked, and dirty worktrees are never removed.",
             ),
         ];
+        if let Some(cascade) = self.worktree_cascade_summary(target) {
+            rows.push(super::notice_body(cascade));
+        }
         if let Some(message) = dialog.message() {
             rows.push(super::notice_body(message));
         }
@@ -577,6 +609,100 @@ pub(super) fn removed_existence(reason: &str) -> Existence {
     }
 }
 
+/// Whether a card lives inside the worktree at `path`: its process runs there,
+/// or it views files there.
+fn card_belongs_to(card: &CardState, path: &Path) -> bool {
+    match &card.kind {
+        CardKind::Terminal(session) => session.launch.working_directory.starts_with(path),
+        CardKind::Chat(session) => session.launch.recipe.working_directory.starts_with(path),
+        CardKind::Repository(view) => view.worktree.starts_with(path),
+        _ => false,
+    }
+}
+
+/// Ends every daemon terminal and chat running inside the worktree, the
+/// detached and hidden ones included, so the directory can go.
+///
+/// Deleting a worktree is a decision about everything in it; a session that
+/// survived would be a shell in a directory that no longer exists. The
+/// terminals are closed through the checked path with active work allowed,
+/// which is the same request the close dialog sends once the user has
+/// confirmed. A close the daemon cannot confirm stops the deletion: the
+/// directory is not removed from under a process whose fate is unknown.
+fn close_worktree_sessions(target: &Target) -> Result<(), String> {
+    let socket = crate::terminal::ipc::daemon_socket_path().map_err(|error| error.to_string())?;
+    let mut client = match crate::control::ControlClient::connect(&socket) {
+        Ok(client) => client,
+        // No daemon means no sessions to close.
+        Err(crate::control::ControlError::Connect(error))
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
+            ) =>
+        {
+            return Ok(());
+        }
+        Err(error) => {
+            return Err(format!(
+                "Cannot reach the daemon to close sessions: {error}"
+            ));
+        }
+    };
+    let canonical_target = target
+        .path
+        .canonicalize()
+        .map_err(|error| format!("Cannot resolve worktree identity: {error}"))?;
+    let inside = |directory: &Path| {
+        directory.starts_with(&target.path)
+            || directory
+                .canonicalize()
+                .is_ok_and(|directory| directory.starts_with(&canonical_target))
+    };
+    for terminal in client
+        .list()
+        .map_err(|error| format!("Cannot list the worktree's terminals: {error}"))?
+    {
+        if !inside(&terminal.session.launch.working_directory)
+            || matches!(
+                terminal.session.continuity,
+                TerminalContinuity::Exited { .. }
+                    | TerminalContinuity::RelaunchAvailable {
+                        last_exit: Some(_),
+                        ..
+                    }
+            )
+        {
+            continue;
+        }
+        let id = terminal.session.id;
+        match client
+            .close_terminal_checked(id, true)
+            .map_err(|error| format!("Could not close terminal {id}: {error}"))?
+        {
+            crate::terminal::ipc::TerminalCloseResult::Closed => {}
+            crate::terminal::ipc::TerminalCloseResult::Active => {
+                return Err(format!("Terminal {id} declined to close while active."));
+            }
+            crate::terminal::ipc::TerminalCloseResult::Unknown(detail) => {
+                return Err(format!("Terminal {id} may still be running: {detail}"));
+            }
+        }
+    }
+    for session in client
+        .list_chats()
+        .map_err(|error| format!("Cannot list the worktree's chats: {error}"))?
+    {
+        if !inside(&session.launch.recipe.working_directory) {
+            continue;
+        }
+        let id = session.id;
+        client
+            .close_chat(session)
+            .map_err(|error| format!("Could not close chat {id}: {error}"))?;
+    }
+    Ok(())
+}
+
 fn delete_worktree(
     target: &Target,
     store: &crate::persistence::StateStore,
@@ -617,49 +743,9 @@ fn delete_worktree(
     {
         return Err("The worktree has changes; commit, stash, or discard them first.".into());
     }
-    let socket = crate::terminal::ipc::daemon_socket_path().map_err(|error| error.to_string())?;
-    let mut client = crate::control::ControlClient::connect(&socket)
-        .map_err(|error| format!("Cannot verify detached terminals: {error}"))?;
-    let canonical_target = target
-        .path
-        .canonicalize()
-        .map_err(|error| format!("Cannot resolve worktree identity: {error}"))?;
-    for terminal in client
-        .list()
-        .map_err(|error| format!("Cannot verify detached terminals: {error}"))?
-    {
-        let directory = &terminal.session.launch.working_directory;
-        let owns_target = directory.starts_with(&target.path)
-            || directory
-                .canonicalize()
-                .is_ok_and(|directory| directory.starts_with(&canonical_target));
-        if owns_target
-            && !matches!(
-                terminal.session.continuity,
-                TerminalContinuity::Exited { .. }
-                    | TerminalContinuity::RelaunchAvailable {
-                        last_exit: Some(_),
-                        ..
-                    }
-            )
-        {
-            return Err("A daemon terminal still belongs to this worktree. Close it explicitly before deleting.".into());
-        }
-    }
-    for session in crate::chat::client::inventory()
-        .map_err(|error| format!("Cannot verify detached chats: {error}"))?
-    {
-        let directory = &session.launch.recipe.working_directory;
-        if directory.starts_with(&target.path)
-            || directory
-                .canonicalize()
-                .is_ok_and(|directory| directory.starts_with(&canonical_target))
-        {
-            return Err("A daemon chat still belongs to this worktree. Close it explicitly before deleting.".into());
-        }
-    }
+    close_worktree_sessions(target)?;
     // Git itself rechecks cleanliness/locks and owns directory removal; no force,
-    // rm -rf, branch deletion, shell interpolation, or terminal termination.
+    // rm -rf, branch deletion, or shell interpolation.
     let command = CommandSpec::new("git")
         .cwd(&target.repository)
         .args(["worktree", "remove", "--"])

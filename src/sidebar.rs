@@ -311,12 +311,29 @@ impl SidebarModel {
     }
 }
 
-/// A project row derived from durable project state and repository discovery.
+/// A worktree that is being created, or whose creation ended without one.
+///
+/// The row stands where the worktree will: the same grid, the same name, with
+/// the creation's progress in the reserved status slot. What the creation is
+/// doing goes in the tooltip and the accessible name; the label never carries
+/// a journal identifier, a stage name, or an elapsed time.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorktreeOperationRow {
     pub id: crate::model::OperationId,
+    /// The worktree's display name, as its row will read once it exists.
     pub label: String,
+    /// What the creation is doing, or why it stopped.
+    pub detail: String,
+    pub phase: WorktreeOperationPhase,
     pub cancellable: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorktreeOperationPhase {
+    /// Still running, or created and waiting for the checkout to list it.
+    Working,
+    /// Ended without a worktree. The row stays until it is dismissed.
+    Failed,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -726,7 +743,7 @@ impl SidebarWorktree {
     }
 }
 
-fn worktree_display_name(path: &Path, branch: Option<&str>, detached: bool) -> String {
+pub(crate) fn worktree_display_name(path: &Path, branch: Option<&str>, detached: bool) -> String {
     let name = branch
         .filter(|_| !detached)
         .and_then(|branch| branch.rsplit('/').next())
@@ -2629,6 +2646,7 @@ impl SidebarState {
             SidebarAction::CancelPublish | SidebarAction::Push { .. } => self.publish = None,
             SidebarAction::OpenRepositoryPicker
             | SidebarAction::CancelWorktreeOperation(_)
+            | SidebarAction::DismissWorktreeOperation(_)
             | SidebarAction::ProjectCommand { .. }
             | SidebarAction::OpenFileInEditor { .. }
             | SidebarAction::FileCommand { .. }
@@ -2685,6 +2703,8 @@ pub enum SidebarAction {
         command: ProjectCommand,
     },
     CancelWorktreeOperation(crate::model::OperationId),
+    /// Removes the row of a creation that ended without a worktree.
+    DismissWorktreeOperation(crate::model::OperationId),
     SearchChanged(String),
     SetFilter(SidebarFilter),
     ToggleControls,
@@ -3683,32 +3703,49 @@ fn project_name_label(project: &SidebarProject) -> Element<'_, SidebarAction> {
         .into()
 }
 
-/// The progress rows for a project's in-flight worktree operations.
+/// The rows for a project's worktree creations that have no worktree row yet.
 ///
 /// These do not come from reading the checkout: they are rebuilt from the
 /// application's own record of what it is running, so they outlive a failed
-/// read and are shown beside the failure.
+/// read and are shown beside the failure. A running creation looks like the
+/// worktree row it is about to become, muted and with a spinner, so a slow
+/// `git worktree add` shows up the moment it is asked for.
 fn operation_rows<'a>(
     project: &'a SidebarProject,
     modal_open: bool,
 ) -> impl Iterator<Item = Element<'a, SidebarAction>> {
+    let grid = RowGrid::child(false);
     project.operations.iter().map(move |operation| {
-        widget::row::with_children(vec![
-            design::caption(&operation.label).width(Length::Fill).into(),
-            button::standard("Cancel")
-                .on_press_maybe(
-                    (operation.cancellable && !modal_open)
-                        .then_some(SidebarAction::CancelWorktreeOperation(operation.id)),
-                )
-                .into(),
-        ])
-        .spacing(4)
-        .into()
+        let label = design::body(&*operation.label)
+            .class(theme::Text::Custom(design::muted_text))
+            .wrapping(cosmic::iced::widget::text::Wrapping::None)
+            .ellipsize(cosmic::iced::widget::text::Ellipsize::End(
+                EllipsizeHeightLimit::Lines(1),
+            ))
+            .width(Length::Fill)
+            .into();
+        let content = grid.content(
+            operation_icon(operation.phase, false),
+            Some(label),
+            operation_status(operation.phase),
+        );
+        let control = grid
+            .control(content, false)
+            .name(operation_accessible_name(operation))
+            .width(Length::Fill);
+        let control = crate::interaction::tooltip(control, &*operation.detail);
+        let trailing = operation_control(operation, modal_open);
+        grid.mount(
+            widget::row::with_capacity(2)
+                .align_y(Alignment::Center)
+                .push(control)
+                .push_maybe(trailing),
+        )
     })
 }
 
 /// The same operation rows as [`operation_rows`], reduced to the icon rail the
-/// compact sidebar is made of.
+/// compact sidebar is made of: the one glyph is also the row's one control.
 fn compact_operation_rows<'a>(
     project: &'a SidebarProject,
     modal_open: bool,
@@ -3717,32 +3754,107 @@ fn compact_operation_rows<'a>(
     project.operations.iter().map(move |operation| {
         let control = grid
             .control(
-                grid.content(
-                    widget::icon(
-                        icon::from_name(if operation.cancellable {
-                            "process-stop-symbolic"
-                        } else {
-                            "dialog-information-symbolic"
-                        })
-                        .handle(),
-                    )
-                    .size(ROW_ICON_SIZE),
-                    None,
-                    None,
-                ),
+                grid.content(operation_icon(operation.phase, true), None, None),
                 false,
             )
-            .name(if operation.cancellable {
-                format!("Cancel worktree operation: {}", operation.label)
-            } else {
-                operation.label.clone()
-            })
-            .on_press_maybe(
-                (operation.cancellable && !modal_open)
-                    .then_some(SidebarAction::CancelWorktreeOperation(operation.id)),
-            );
-        grid.mount(crate::interaction::tooltip(control, &operation.label))
+            .name(operation_accessible_name(operation))
+            .on_press_maybe(gated_operation_action(operation, modal_open));
+        grid.mount(crate::interaction::tooltip(control, &*operation.detail))
     })
+}
+
+/// The leading glyph: the worktree icon the row will keep, muted, while the
+/// creation runs; a warning once it has failed. The rail has no status slot,
+/// so there the spinner takes the glyph's place.
+fn operation_icon<'a>(phase: WorktreeOperationPhase, compact: bool) -> Element<'a, SidebarAction> {
+    match phase {
+        WorktreeOperationPhase::Working if compact => crate::ui_controls::activity_spinner_tone(
+            f32::from(ROW_ICON_SIZE),
+            design::muted_icon_color,
+        ),
+        WorktreeOperationPhase::Working => {
+            widget::container(widget::icon(worktree_icon()).size(ROW_ICON_SIZE))
+                .class(theme::Container::custom(|theme| {
+                    cosmic::iced::widget::container::Style {
+                        icon_color: Some(design::muted_icon_color(theme)),
+                        ..Default::default()
+                    }
+                }))
+                .into()
+        }
+        WorktreeOperationPhase::Failed => toned_icon("dialog-warning-symbolic", BadgeTone::Warning),
+    }
+}
+
+fn operation_status<'a>(phase: WorktreeOperationPhase) -> Option<Element<'a, SidebarAction>> {
+    match phase {
+        WorktreeOperationPhase::Working => Some(crate::ui_controls::activity_spinner_tone(
+            f32::from(ROW_ICON_SIZE),
+            design::muted_icon_color,
+        )),
+        WorktreeOperationPhase::Failed => None,
+    }
+}
+
+/// Cancel while the creation can still be stopped; dismiss once it has failed.
+fn gated_operation_action(
+    operation: &WorktreeOperationRow,
+    modal_open: bool,
+) -> Option<SidebarAction> {
+    if operation.cancellable {
+        gated(
+            SidebarAction::CancelWorktreeOperation(operation.id),
+            modal_open,
+        )
+    } else if operation.phase == WorktreeOperationPhase::Failed {
+        gated(
+            SidebarAction::DismissWorktreeOperation(operation.id),
+            modal_open,
+        )
+    } else {
+        None
+    }
+}
+
+fn operation_control<'a>(
+    operation: &'a WorktreeOperationRow,
+    modal_open: bool,
+) -> Option<Element<'a, SidebarAction>> {
+    let action = gated_operation_action(operation, modal_open)?;
+    let (icon_name, label) = if operation.cancellable {
+        (
+            "process-stop-symbolic",
+            format!("Cancel creating {}", operation.label),
+        )
+    } else {
+        (
+            "window-close-symbolic",
+            format!("Dismiss {}", operation.label),
+        )
+    };
+    Some(icon_action(
+        icon_name,
+        label,
+        Some(action),
+        stable_id(format!("operation.{}.control", operation.id)),
+    ))
+}
+
+fn operation_accessible_name(operation: &WorktreeOperationRow) -> String {
+    match operation.phase {
+        WorktreeOperationPhase::Working => {
+            format!(
+                "Creating worktree {}: {}",
+                operation.label, operation.detail
+            )
+        }
+        WorktreeOperationPhase::Failed => {
+            format!(
+                "Worktree {} was not created: {}",
+                operation.label, operation.detail
+            )
+        }
+    }
 }
 
 /// A project whose checkout could not be read.
@@ -4758,7 +4870,7 @@ fn worktree_panel<'a>(
         .into()
 }
 
-fn bound_source_control<'a>(
+pub(crate) fn bound_source_control<'a>(
     model: &'a SidebarModel,
     state: &SidebarState,
 ) -> Option<&'a SourceControlModel> {
@@ -4895,11 +5007,10 @@ fn source_control_panel<'a>(
 
     match &source.data_state {
         SidebarDataState::Loading => {
-            notices = notices.push(design::caption(if matches!(panel, WorktreePanel::Files) {
-                "Loading files…"
-            } else {
-                "Loading source control…"
-            }));
+            // A read usually finishes within a frame or two, and a caption
+            // that says "loading" for that long is a flash of text where the
+            // files are about to be. The panel stays blank under its header;
+            // the header's own busy spinner is what says a read is running.
             return worktree_panel_chrome(header.into(), notices.into(), None);
         }
         SidebarDataState::Error(message) => {
@@ -7678,7 +7789,7 @@ mod row_interaction {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::{
         github::RemoteValue,
@@ -9630,7 +9741,9 @@ mod tests {
         entry.unreachable = Some("fatal: not a git repository".into());
         entry.operations.push(WorktreeOperationRow {
             id: operation,
-            label: "Adding worktree review".into(),
+            label: "review".into(),
+            detail: "Running git".into(),
+            phase: WorktreeOperationPhase::Working,
             cancellable: true,
         });
         let model = SidebarModel::ready(SidebarMode::Expanded, vec![entry]);
@@ -9640,6 +9753,33 @@ mod tests {
             assert!(
                 actions.contains(&SidebarAction::CancelWorktreeOperation(operation)),
                 "compact {compact}: a running operation lost its cancel: {actions:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_failed_worktree_operation_offers_dismiss_and_nothing_else() {
+        let renderer = headless_renderer();
+        let mut entry = project();
+        let operation = crate::model::OperationId::new();
+        entry.operations.push(WorktreeOperationRow {
+            id: operation,
+            label: "review".into(),
+            detail: "Cancelled before git ran".into(),
+            phase: WorktreeOperationPhase::Failed,
+            cancellable: false,
+        });
+        let model = SidebarModel::ready(SidebarMode::Expanded, vec![entry]);
+        let state = SidebarState::default();
+        for compact in [false, true] {
+            let actions = frame_enter_presses(&renderer, body(&model, &state, compact, false));
+            assert!(
+                actions.contains(&SidebarAction::DismissWorktreeOperation(operation)),
+                "compact {compact}: a failed operation cannot be dismissed: {actions:?}"
+            );
+            assert!(
+                !actions.contains(&SidebarAction::CancelWorktreeOperation(operation)),
+                "compact {compact}: a finished operation still offers cancel: {actions:?}"
             );
         }
     }
@@ -10349,7 +10489,7 @@ mod tests {
 
     /// A project holding both fixture worktrees, so the panel has somewhere to
     /// bind and somewhere to rebind to.
-    fn panel_model() -> SidebarModel {
+    pub(crate) fn panel_model() -> SidebarModel {
         SidebarModel::ready(
             SidebarMode::Expanded,
             vec![SidebarProject::new(
@@ -10374,7 +10514,7 @@ mod tests {
     }
 
     /// A pane bound to `main` with every panel section open.
-    fn panel_state(model: &SidebarModel) -> SidebarState {
+    pub(crate) fn panel_state(model: &SidebarModel) -> SidebarState {
         let mut state = SidebarState::default();
         assert!(state.sync_active_worktree(model, &focus_on(&main_key())));
         for section in PanelSection::ALL {

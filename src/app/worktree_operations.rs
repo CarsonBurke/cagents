@@ -1,7 +1,11 @@
 use super::*;
 use crate::{
     model::OperationId,
-    repository::{WorktreeOperationReport, WorktreeProgressEvent, WorktreeProgressStage},
+    repository::{
+        WorktreeOperationReport, WorktreeOperationState, WorktreeProgressEvent,
+        WorktreeProgressStage,
+    },
+    sidebar::{WorktreeOperationPhase, WorktreeOperationRow},
 };
 
 pub(super) struct ActiveWorktreeOperation {
@@ -18,6 +22,65 @@ pub(super) struct ActiveWorktreeOperation {
     finished: bool,
     detail: String,
     created_worktree: Option<(PathBuf, i64)>,
+    /// The name the worktree's sidebar row will have, known from the request.
+    label: String,
+    /// The journal's verdict once the operation has finished.
+    state: Option<WorktreeOperationState>,
+}
+
+impl ActiveWorktreeOperation {
+    /// How the sidebar shows this operation, if at all.
+    ///
+    /// A creation that succeeded is shown by the worktree row itself as soon
+    /// as the checkout lists it, and one restored from the journal after a
+    /// restart has either been listed long ago or been deleted since: neither
+    /// needs a row. The same goes for a restored creation that was cleanly
+    /// rolled back. Everything else - a creation still running, one that
+    /// failed in this session, or a journal entry that could not be settled
+    /// - is shown until it resolves or is dismissed.
+    fn row(
+        &self,
+        worktrees: &[crate::sidebar::SidebarWorktree],
+    ) -> Option<(WorktreeOperationPhase, String)> {
+        if !self.finished {
+            let detail = if self.termination_requested {
+                "Cancelling".to_owned()
+            } else {
+                format!("{} ({}s)", self.detail, self.started.elapsed().as_secs())
+            };
+            return Some((WorktreeOperationPhase::Working, detail));
+        }
+        match self.state {
+            Some(WorktreeOperationState::Created) => {
+                let listed = self.created_worktree.as_ref().is_some_and(|(path, _)| {
+                    worktrees.iter().any(|worktree| worktree.path == *path)
+                });
+                (!self.restored && !listed).then(|| {
+                    (
+                        WorktreeOperationPhase::Working,
+                        "Created; waiting for the checkout to list it".to_owned(),
+                    )
+                })
+            }
+            Some(WorktreeOperationState::NotCreated) if self.restored => None,
+            _ => Some((WorktreeOperationPhase::Failed, self.detail.clone())),
+        }
+    }
+}
+
+/// The sidebar name of the worktree a request creates: what its row will read
+/// once the checkout lists it, so the pending row turns into it in place.
+fn worktree_operation_label(request: Option<&CreateWorktreeRequest>) -> String {
+    request.map_or_else(
+        || "Unknown worktree".to_owned(),
+        |request| {
+            crate::sidebar::worktree_display_name(
+                &request.destination,
+                Some(request.branch.as_str()),
+                false,
+            )
+        },
+    )
 }
 
 #[derive(Clone)]
@@ -43,11 +106,11 @@ fn elapsed_stream(_: &u8) -> Pin<Box<dyn cosmic::iced::futures::Stream<Item = ()
 }
 fn stage_label(stage: WorktreeProgressStage) -> &'static str {
     match stage {
-        WorktreeProgressStage::Validating => "validating",
-        WorktreeProgressStage::ResolvingBase => "resolving_base",
-        WorktreeProgressStage::RunningGit => "running_git",
-        WorktreeProgressStage::Reconciling => "reconciling",
-        WorktreeProgressStage::Finished => "finished; awaiting durable outcome",
+        WorktreeProgressStage::Validating => "Validating the request",
+        WorktreeProgressStage::ResolvingBase => "Resolving the base revision",
+        WorktreeProgressStage::RunningGit => "Running git worktree add",
+        WorktreeProgressStage::Reconciling => "Checking the result",
+        WorktreeProgressStage::Finished => "Recording the outcome",
     }
 }
 fn stage_order(stage: WorktreeProgressStage) -> u8 {
@@ -145,6 +208,7 @@ impl Cagents {
             ActiveWorktreeOperation {
                 project,
                 generation,
+                label: worktree_operation_label(Some(&request)),
                 request: Some(request.clone()),
                 token: Some(token.clone()),
                 receiver: Some(receiver),
@@ -152,10 +216,11 @@ impl Cagents {
                 started: Instant::now(),
                 termination_requested: false,
                 finished: false,
-                detail: "Accepted; waiting for the durable service".into(),
+                detail: "Starting".into(),
                 completed_elapsed: None,
                 restored: false,
                 created_worktree: None,
+                state: None,
             },
         );
         self.sync_worktree_operation_rows();
@@ -190,6 +255,20 @@ impl Cagents {
         operation.stage = Some(event.stage);
         operation.detail = stage_label(event.stage).into();
         self.sync_worktree_operation_rows();
+        Task::none()
+    }
+    /// Drops the row of a creation that has finished without a worktree. A
+    /// running creation keeps its row: cancel is the way to stop it, and its
+    /// outcome is what says whether anything was left behind.
+    pub(super) fn dismiss_worktree_operation(&mut self, id: OperationId) -> Task<Message> {
+        if self
+            .worktree_operations
+            .get(&id)
+            .is_some_and(|operation| operation.finished && operation.created_worktree.is_none())
+        {
+            self.worktree_operations.remove(&id);
+            self.sync_worktree_operation_rows();
+        }
         Task::none()
     }
     pub(super) fn cancel_worktree_operation(&mut self, id: OperationId) -> Task<Message> {
@@ -241,11 +320,13 @@ impl Cagents {
                     }
                     _ => None,
                 };
-                operation.detail = format!("{:?}: {}", report.state, report.detail);
+                operation.state = Some(report.state);
+                operation.detail = report.detail;
                 report.outcome
             }
             Err(error) => {
-                operation.detail = format!("OutcomeUnknown: {error}");
+                operation.state = Some(WorktreeOperationState::OutcomeUnknown);
+                operation.detail = error;
                 None
             }
         };
@@ -315,6 +396,7 @@ impl Cagents {
                                 _ => None,
                             },
                             generation: report.generation,
+                            label: worktree_operation_label(report.request.as_ref()),
                             request: report.request,
                             token: None,
                             receiver: None,
@@ -324,10 +406,8 @@ impl Cagents {
                             finished: true,
                             completed_elapsed: None,
                             restored: true,
-                            detail: format!(
-                                "Restored {:?}: {} (journaled at {})",
-                                report.state, report.detail, report.created_at_unix_ms
-                            ),
+                            detail: report.detail,
+                            state: Some(report.state),
                         },
                     );
                 }
@@ -365,39 +445,25 @@ impl Cagents {
     }
     pub(super) fn sync_worktree_operation_rows(&mut self) {
         for project in &mut self.sidebar_model.projects {
-            project.operations = self
+            let mut rows: Vec<_> = self
                 .worktree_operations
                 .iter()
                 .filter(|(_, operation)| operation.project == project.id)
-                .map(|(&id, operation)| crate::sidebar::WorktreeOperationRow {
-                    id,
-                    label: format!(
-                        "{} — {}{}{}",
+                .filter_map(|(&id, operation)| {
+                    let (phase, detail) = operation.row(&project.worktrees)?;
+                    Some(WorktreeOperationRow {
                         id,
-                        operation.detail,
-                        if operation.termination_requested {
-                            "; termination requested; reconciliation determines the outcome"
-                        } else {
-                            ""
-                        },
-                        if operation.restored {
-                            String::new()
-                        } else {
-                            format!(
-                                " — elapsed {}s",
-                                operation
-                                    .completed_elapsed
-                                    .unwrap_or_else(|| operation.started.elapsed())
-                                    .as_secs()
-                            )
-                        }
-                    ),
-                    cancellable: !operation.finished
-                        && !operation.termination_requested
-                        && operation.token.is_some(),
+                        label: operation.label.clone(),
+                        detail,
+                        phase,
+                        cancellable: !operation.finished
+                            && !operation.termination_requested
+                            && operation.token.is_some(),
+                    })
                 })
                 .collect();
-            project.operations.sort_by_key(|row| row.id);
+            rows.sort_by_key(|row| row.id);
+            project.operations = rows;
         }
         self.sidebar_model.apply_worktree_creation_times(
             self.worktree_operations.values().filter_map(|operation| {
@@ -440,6 +506,8 @@ mod tests {
                     detail: "accepted".into(),
                     completed_elapsed: None,
                     restored: false,
+                    label: "review".into(),
+                    state: None,
                 },
             );
             let _ = app.cancel_worktree_operation(id);
@@ -467,10 +535,10 @@ mod tests {
             let _ =
                 app.finish_worktree_operation(id, 2, Err("worker lost; reconcile journal".into()));
             assert!(app.worktree_operations[&id].finished);
-            assert!(
-                app.worktree_operations[&id]
-                    .detail
-                    .starts_with("OutcomeUnknown")
+            assert_eq!(
+                app.worktree_operations[&id].state,
+                Some(WorktreeOperationState::OutcomeUnknown),
+                "a lost worker leaves the outcome unknown until the journal settles it"
             );
             assert!(app.worktree_operations[&id].token.is_none());
         }

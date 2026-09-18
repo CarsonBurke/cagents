@@ -268,6 +268,24 @@ pub(crate) fn belongs_to_owner(
     false
 }
 
+/// Whether a daemon lock file lives in this instance's runtime directory.
+///
+/// Compared against the directory this build's own socket resolves to when
+/// that is known, and against the instance's runtime subdirectory name when
+/// `XDG_RUNTIME_DIR` is unavailable, which is the case inside a test.
+#[cfg(any(feature = "host", feature = "ui"))]
+fn same_instance_runtime(lock_path: &Path) -> bool {
+    let Some(directory) = lock_path.parent() else {
+        return true;
+    };
+    match crate::terminal::ipc::daemon_socket_path() {
+        Ok(socket) => socket.parent() == Some(directory),
+        Err(_) => directory
+            .file_name()
+            .is_none_or(|name| name == crate::instance::RUNTIME_SUBDIRECTORY),
+    }
+}
+
 #[cfg(any(feature = "host", feature = "ui"))]
 pub(crate) fn belongs_to_other_daemon(
     pid: u32,
@@ -292,6 +310,16 @@ pub(crate) fn belongs_to_other_daemon(
                     .is_none_or(|name| name != "cagentsd.lock")
                 {
                     continue;
+                }
+                // A daemon of another instance - a development build beside
+                // the production install, a second install - hosts terminals
+                // whose environment carries the same instance-agnostic
+                // markers. Its processes are doing exactly what they should
+                // and have nothing to do with this recovery, so they are
+                // owned rather than unclassified. Which instance a daemon
+                // serves is the runtime directory its lock lives in.
+                if !same_instance_runtime(&lock_path) {
+                    return Ok(true);
                 }
                 #[derive(serde::Deserialize)]
                 struct Metadata {
@@ -716,7 +744,10 @@ pub(crate) mod handoff {
             Ok(self.path.with_file_name(ARCHIVE))
         }
 
-        #[cfg(any(feature = "host", test))]
+        /// Host-only: the daemon removes a checkpoint it has finished
+        /// resuming from. No UI or CLI path removes one, so the method exists
+        /// only where its caller does and no lane carries it as dead code.
+        #[cfg(feature = "host")]
         pub fn remove(&self) -> Result<(), String> {
             fs_safety::unlink_within(&self.root, OsStr::new(FILE))
                 .map_err(|error| error.to_string())?;

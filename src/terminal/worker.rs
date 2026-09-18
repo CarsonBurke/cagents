@@ -1956,7 +1956,7 @@ fn terminal_environment(command: &mut CommandBuilder) {
     command.env("TERM", "xterm-256color");
     command.env("COLORTERM", "truecolor");
     command.env("TERM_PROGRAM", "cagents");
-    command.env("TERM_PROGRAM_VERSION", env!("CARGO_PKG_VERSION"));
+    command.env("TERM_PROGRAM_VERSION", crate::VERSION);
 }
 
 fn pty_size(size: TerminalSize) -> PtySize {
@@ -3202,7 +3202,7 @@ mod tests {
         assert_eq!(command.get_env("TERM_PROGRAM"), Some(OsStr::new("cagents")));
         assert_eq!(
             command.get_env("TERM_PROGRAM_VERSION"),
-            Some(OsStr::new(env!("CARGO_PKG_VERSION")))
+            Some(OsStr::new(crate::VERSION))
         );
         // The test below proves the scrub removes names; this one proves
         // `command_from_recipe` still calls it. Only markers this host

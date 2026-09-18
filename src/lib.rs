@@ -1,3 +1,10 @@
+/// The version this build reports about itself: the product version plus the
+/// build metadata `build.rs` resolved (`0.1.3+local.3d80e6d`), or the bare
+/// product version for a release build. Use `CARGO_PKG_VERSION` only where a
+/// release is being chosen or compared; use this wherever a build identifies
+/// itself to a person or a log.
+pub const VERSION: &str = env!("CAGENTS_VERSION");
+
 pub mod agent;
 #[cfg(feature = "ui")]
 pub mod app;

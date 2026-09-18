@@ -4,6 +4,7 @@ fn main() -> std::process::ExitCode {
     // every user PTY leaves nothing to diagnose, and `RUST_LOG` is inert.
     cagents::instance::install_panic_hook("cagentsd");
     cagents::instance::install_tracing("cagentsd", "cagentsd=info,cagents=info,warn");
+    tracing::info!(version = cagents::VERSION, "starting cagentsd");
     match cagents::host::run() {
         Ok(()) => std::process::ExitCode::SUCCESS,
         // Returning `Result` from `main` renders this with `Debug`, which
