@@ -168,7 +168,8 @@ fn syntect_theme_name(theme: crate::settings::EditorSyntaxTheme, dark: bool) -> 
     }
 }
 
-type SyntaxLines = [Vec<Vec<SyntaxSpan>>; 2];
+/// One text's highlighted lines, the light palette first and the dark second.
+pub(crate) type SyntaxLines = [Vec<Vec<SyntaxSpan>>; 2];
 
 /// Immutable grammar/theme tables, identical to iced's highlighter. Parsing is
 /// theme-independent: advance one parser and scope stack, then color each scope
@@ -184,6 +185,42 @@ fn highlight_side(
     theme: crate::settings::EditorSyntaxTheme,
     cancellation: &CancellationToken,
 ) -> Result<SyntaxLines, Cancelled> {
+    let settings = highlighter_settings(path, theme, false);
+    highlight_lines(text, &settings.token, theme, cancellation)
+}
+
+/// Highlights a snippet whose language is named by `token` - a Markdown
+/// fence's info string, say - in both of `theme`'s palettes.
+///
+/// This is the highlighting a diff gets, applied to text that has no path:
+/// the same grammars, the same palettes, and the same spans, so code an agent
+/// quotes reads the way the same code reads in the editor beside it. A
+/// snippet is small and highlighted where it is cached, so nothing cancels
+/// it.
+pub(crate) fn highlight_snippet(
+    code: &str,
+    token: &str,
+    theme: crate::settings::EditorSyntaxTheme,
+) -> SyntaxLines {
+    highlight_lines(code, token, theme, &CancellationToken::new())
+        .unwrap_or_else(|Cancelled| unreachable!("a fresh token is never cancelled"))
+}
+
+/// The spans that draw one line of `text` under its highlights alone, with no
+/// change to mark.
+pub(crate) fn syntax_spans<'a>(
+    text: &'a str,
+    syntax: &[SyntaxSpan],
+) -> Vec<cosmic::iced::widget::text::Span<'a>> {
+    line_spans(text, &[], syntax, cosmic::iced::Color::TRANSPARENT)
+}
+
+fn highlight_lines(
+    text: &str,
+    token: &str,
+    theme: crate::settings::EditorSyntaxTheme,
+    cancellation: &CancellationToken,
+) -> Result<SyntaxLines, Cancelled> {
     use two_face::re_exports::syntect::{highlighting, parsing};
     static SYNTAXES: LazyLock<parsing::SyntaxSet> =
         LazyLock::new(two_face::syntax::extra_no_newlines);
@@ -191,9 +228,8 @@ fn highlight_side(
         LazyLock::new(highlighting::ThemeSet::load_defaults);
 
     check_cancelled(cancellation)?;
-    let settings = highlighter_settings(path, theme, false);
     let syntax = SYNTAXES
-        .find_syntax_by_token(&settings.token)
+        .find_syntax_by_token(token)
         .unwrap_or_else(|| SYNTAXES.find_syntax_plain_text());
     let mut parser = parsing::ParseState::new(syntax);
     let mut stack = parsing::ScopeStack::new();

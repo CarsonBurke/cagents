@@ -4067,19 +4067,48 @@ fn linear_issue_key(value: &str) -> bool {
     })
 }
 
-fn branch_destination_component(branch: &str) -> String {
+/// The managed directory a branch's worktree is created in, relative to the
+/// managed root.
+///
+/// A branch is a path already: `carson/main-5717-fix` names a directory
+/// `main-5717-fix` inside `carson`, which is how every other tool that lays
+/// worktrees out by branch spells it and what a reader expects to see in a
+/// file manager. Encoding the slash produced `carson%2Fmain-5717-fix`, a name
+/// nobody typed and nobody could read.
+///
+/// Every other byte a filesystem or a shell could misread is still
+/// percent-encoded, and a component the branch grammar forbids anyway - empty,
+/// `.` or `..` - falls back to the encoded form so a destination can never
+/// leave the managed root, whatever Git accepted.
+fn branch_destination_component(branch: &str) -> PathBuf {
     const HEX: &[u8; 16] = b"0123456789ABCDEF";
-    let mut component = String::with_capacity(branch.len());
-    for byte in branch.bytes() {
-        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_') {
-            component.push(char::from(byte));
-        } else {
-            component.push('%');
-            component.push(char::from(HEX[(byte >> 4) as usize]));
-            component.push(char::from(HEX[(byte & 15) as usize]));
+    fn encode(component: &str, allow_dot: bool) -> String {
+        let mut encoded = String::with_capacity(component.len());
+        for byte in component.bytes() {
+            if byte.is_ascii_alphanumeric()
+                || matches!(byte, b'-' | b'_')
+                || (allow_dot && byte == b'.')
+            {
+                encoded.push(char::from(byte));
+            } else {
+                encoded.push('%');
+                encoded.push(char::from(HEX[(byte >> 4) as usize]));
+                encoded.push(char::from(HEX[(byte & 15) as usize]));
+            }
         }
+        encoded
     }
-    component
+    let components: Vec<&str> = branch.split('/').collect();
+    let nestable = components
+        .iter()
+        .all(|component| !component.is_empty() && !component.starts_with('.'));
+    if !nestable {
+        return PathBuf::from(encode(branch, false));
+    }
+    components
+        .iter()
+        .map(|component| encode(component, true))
+        .collect()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -6446,7 +6475,10 @@ fn validate_destination(root: &Path, destination: &Path) -> Result<(), Validatio
     let parent = destination
         .parent()
         .ok_or(ValidationError::DestinationOutsideRoot)?;
-    let parent = fs::canonicalize(parent).map_err(|_| ValidationError::DestinationOutsideRoot)?;
+    // A slash-separated branch nests its worktree under directories that
+    // `git worktree add` creates on the way; they need not exist yet.
+    let parent =
+        canonical_future_path(parent).map_err(|_| ValidationError::DestinationOutsideRoot)?;
     if parent != root && !parent.starts_with(&root) {
         return Err(ValidationError::DestinationOutsideRoot);
     }
@@ -10029,6 +10061,14 @@ fn operation_timestamp() -> i64 {
         .unwrap_or_default()
 }
 
+/// A managed destination lies strictly inside the managed root. A branch with
+/// slashes nests its directory under intermediate ones, so the destination
+/// need not be the root's direct child, but it can never be the root itself
+/// or leave it.
+fn destination_within_managed_root(destination: &Path, managed_root: &Path) -> bool {
+    destination != managed_root && destination.starts_with(managed_root)
+}
+
 fn journal_identity(common: &Path, request: &CreateWorktreeRequest) -> String {
     use std::os::unix::ffi::OsStrExt;
     // Length-delimited raw path bytes avoid aliases from lossy UTF-8 or separators.
@@ -10113,9 +10153,11 @@ fn worktree_lease_with_grace(path: &Path, create: bool, grace: Duration) -> io::
         if error.kind() != io::ErrorKind::WouldBlock || Instant::now() >= deadline {
             return Err(error);
         }
-        // Only an in-process command's cold settlement path grants this grace.
         // CLOEXEC descriptors remain inherited by unrelated concurrent forks
-        // until exec; allow that interval to finish without weakening evidence.
+        // until exec, and a `posix_spawn` suspends only the spawning thread;
+        // any other thread's `flock` meets the copy in the meantime. Allow
+        // that interval to finish without weakening evidence. The grace is
+        // consumed only while the lease is actually contended.
         thread::sleep(
             Duration::from_millis(2).min(deadline.saturating_duration_since(Instant::now())),
         );
@@ -10597,7 +10639,7 @@ impl<E: ProcessExecutor> RepositoryService<E> {
             .map_err(|e| ValidationError::Io(e.to_string()))?;
         request.destination = canonical_future_path(&request.destination)
             .map_err(|e| ValidationError::Io(e.to_string()))?;
-        if request.destination.parent() != Some(request.managed_root.as_path()) {
+        if !destination_within_managed_root(&request.destination, &request.managed_root) {
             return Err(ValidationError::DestinationOutsideRoot.into());
         }
         let lease_path =
@@ -10661,17 +10703,29 @@ impl<E: ProcessExecutor> RepositoryService<E> {
                 return;
             }
         }
-        let current_common = self
-            .run_checked(
-                &self.git_read(
-                    &journal.request.repository,
-                    ["rev-parse", "--path-format=absolute", "--git-common-dir"],
-                ),
-                &CancellationToken::new(),
-            )
-            .ok()
-            .and_then(|output| parse_path_line(&output.stdout, "common_dir").ok())
-            .and_then(|path| fs::canonicalize(path).ok());
+        // A `rev-parse` that could not run says nothing about the repository:
+        // a spawn refused under load, or a Git that is gone, leaves the
+        // outcome unknown until the next settlement, and is reported as that
+        // rather than as evidence that the repository moved.
+        let current_common = match self.run_checked(
+            &self.git_read(
+                &journal.request.repository,
+                ["rev-parse", "--path-format=absolute", "--git-common-dir"],
+            ),
+            &CancellationToken::new(),
+        ) {
+            Ok(output) => parse_path_line(&output.stdout, "common_dir")
+                .ok()
+                .and_then(|path| fs::canonicalize(path).ok()),
+            Err(failure) => {
+                journal.state = WorktreeOperationState::OutcomeUnknown;
+                journal.detail = format!(
+                    "Could not read the repository's common directory; settlement will be \
+                     retried: {failure}"
+                );
+                return;
+            }
+        };
         if current_common.as_ref() != Some(&journal.common_dir)
             || canonical_future_path(&journal.request.managed_root)
                 .ok()
@@ -10901,8 +10955,10 @@ impl<E: ProcessExecutor> RepositoryService<E> {
                             == journal
                                 .common_dir
                                 .join(format!("cagents-operation-{}.lease", operation.id))
-                        && journal.request.destination.parent()
-                            == Some(journal.request.managed_root.as_path())
+                        && destination_within_managed_root(
+                            &journal.request.destination,
+                            &journal.request.managed_root,
+                        )
                         && journal.common_dir.is_absolute()
                         && journal.request.managed_root.is_absolute()
                         && journal.request.destination.is_absolute()
@@ -10945,7 +11001,14 @@ impl<E: ProcessExecutor> RepositoryService<E> {
                 operation.status,
                 PendingOperationStatus::Pending | PendingOperationStatus::NeedsReconciliation
             ) {
-                self.settle_worktree_journal(&mut journal, Duration::ZERO);
+                // Settlement at launch races every process the daemon is
+                // starting - restored terminals, status polls - and each of
+                // those briefly holds a copy of this lease between fork and
+                // exec. Read without grace, that copy was "a live child" and
+                // an operation that had in fact settled was handed to the
+                // user to reconcile by hand. The grace is the same bound the
+                // in-process path accepts, and costs nothing uncontended.
+                self.settle_worktree_journal(&mut journal, CLEANUP_GRACE);
                 reports.push(finish_worktree_journal(
                     store,
                     &journal,
@@ -11197,9 +11260,12 @@ mod worktree_journal_tests {
             fs::read_to_string(fixture.request.repository.join("tracked.txt")).unwrap(),
             "local dirty content"
         );
+        // A branch named with a slash lives under the directory its prefix
+        // names, so `feature/new` is next to `feature/other` rather than
+        // beside every other branch with the separator escaped.
         assert_eq!(
             fixture.request.destination,
-            fixture.request.repository.join("worktrees/feature%2Fnew")
+            fixture.request.repository.join("worktrees/feature/new")
         );
         assert_eq!(
             fixture.git(&[
@@ -11386,6 +11452,28 @@ mod worktree_journal_tests {
             branch_destination_component("a/b"),
             branch_destination_component("a%2Fb")
         );
+        assert_eq!(
+            branch_destination_component("carson/main-5717-fix"),
+            Path::new("carson").join("main-5717-fix")
+        );
+        assert_eq!(
+            branch_destination_component("release/v1.2"),
+            Path::new("release").join("v1.2")
+        );
+        assert_eq!(
+            branch_destination_component("odd name"),
+            PathBuf::from("odd%20name")
+        );
+        // Git refuses these, and the fallback refuses them again so a
+        // destination can never climb out of the managed root.
+        assert_eq!(
+            branch_destination_component("a//b"),
+            PathBuf::from("a%2F%2Fb")
+        );
+        assert_eq!(
+            branch_destination_component("a/../b"),
+            PathBuf::from("a%2F%2E%2E%2Fb")
+        );
     }
 
     #[test]
@@ -11513,14 +11601,33 @@ mod worktree_journal_tests {
             .service
             .rehydrate_worktree_operations(&fixture.store)
             .unwrap();
-        assert_eq!(reports[0].state, WorktreeOperationState::OutcomeUnknown);
+        assert_eq!(
+            reports[0].state,
+            WorktreeOperationState::OutcomeUnknown,
+            "{}",
+            reports[0].detail
+        );
+        assert!(
+            reports[0]
+                .detail
+                .starts_with("A live/orphaned child or unavailable lease prevents settlement"),
+            "the child's inherited lease is what stops settlement, not {:?}",
+            reports[0].detail
+        );
         child.stdin.take().unwrap().write_all(b"exit\n").unwrap();
         assert!(child.wait().unwrap().success());
         let reports = fixture
             .service
             .rehydrate_worktree_operations(&fixture.store)
             .unwrap();
-        assert_eq!(reports[0].state, WorktreeOperationState::NotCreated);
+        // Every branch that leaves the outcome unknown writes its own detail,
+        // so a failure here names which one fired rather than only the state.
+        assert_eq!(
+            reports[0].state,
+            WorktreeOperationState::NotCreated,
+            "{}",
+            reports[0].detail
+        );
     }
 
     #[test]

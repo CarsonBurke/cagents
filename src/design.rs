@@ -27,6 +27,9 @@ pub const COMPACT_CONTROL_SIZE: f32 = 20.0;
 pub const COMPACT_ICON_SIZE: u16 = 12;
 
 pub const TEXT_BODY: f32 = 13.0;
+/// Prose that is read at length - an agent's answers and the draft being
+/// written to it - one step above the shell's controls and captions.
+pub const TEXT_PROSE: f32 = 14.0;
 pub const TEXT_CAPTION: f32 = 11.0;
 pub const TEXT_HEADING: f32 = 13.0;
 
@@ -121,6 +124,14 @@ pub fn muted_color(theme: &cosmic::Theme) -> cosmic::iced::Color {
 pub fn muted_text(theme: &cosmic::Theme) -> cosmic::iced::widget::text::Style {
     cosmic::iced::widget::text::Style {
         color: Some(muted_color(theme)),
+        ..Default::default()
+    }
+}
+
+/// Text that reports a failure the reader is expected to act on.
+pub fn warning_text(theme: &cosmic::Theme) -> cosmic::iced::widget::text::Style {
+    cosmic::iced::widget::text::Style {
+        color: Some(warning_color(theme)),
         ..Default::default()
     }
 }
@@ -409,6 +420,8 @@ pub fn with_both_rails(padding: cosmic::iced::Padding) -> cosmic::iced::Padding 
 pub const MINIMAP_WIDTH: f32 = 12.0;
 pub const MINIMAP_MARK_INSET: f32 = 3.0;
 pub const MINIMAP_MARK_MIN_HEIGHT: f32 = 2.0;
+/// The tick the minimap draws for one of the reader's messages.
+pub const MINIMAP_TICK_HEIGHT: f32 = 2.0;
 /// The floor under the lens that reports the viewport's own extent, so a
 /// reader scrolling a very long conversation can still see where they are.
 pub const MINIMAP_LENS_MIN_HEIGHT: f32 = 8.0;

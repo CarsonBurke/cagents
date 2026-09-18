@@ -47,7 +47,7 @@ const MAX_WAIT_SECONDS: f64 = 24.0 * 60.0 * 60.0;
 #[derive(Debug, Parser)]
 #[command(
     name = "cagents",
-    version,
+    version = crate::VERSION,
     about = "Control cagents terminals and processes"
 )]
 pub struct Cli {
@@ -462,6 +462,24 @@ impl ControlClient {
         match self.request_strict(ClientRequest::ChatList)? {
             ServerResponse::ChatListed { sessions } => Ok(sessions),
             response => Err(unexpected_response("a native chat list", &response)),
+        }
+    }
+
+    /// Closes a native chat this client did not open.
+    ///
+    /// The daemon honours a close only from an attached client, so this
+    /// attaches first with the session as the inventory reported it. Closing
+    /// interrupts the provider's work and frees the conversation; it is what
+    /// worktree deletion does to the chats still running inside the directory.
+    pub fn close_chat(&mut self, session: crate::chat::Session) -> Result<(), ControlError> {
+        let chat_id = session.id;
+        match self.request_strict(ClientRequest::ChatAttach { session })? {
+            ServerResponse::ChatAttached { .. } => {}
+            response => return Err(unexpected_response("a native chat attachment", &response)),
+        }
+        match self.request_strict(ClientRequest::ChatClose { chat_id })? {
+            ServerResponse::ChatClosed { .. } => Ok(()),
+            response => Err(unexpected_response("a native chat close", &response)),
         }
     }
 
@@ -1423,12 +1441,23 @@ fn execute_daemon(command: DaemonCommand) -> Result<CommandOutput, AppError> {
                 data: json!({
                     "instance": instance::NAME,
                     "running": running,
-                    "socket": socket
+                    "socket": socket,
+                    // The build asking, not necessarily the build serving the
+                    // socket: the CLI cannot ask a daemon which build it is
+                    // without a protocol round trip that an older daemon
+                    // would not answer. It is still the first fact a bug
+                    // report needs, so it is reported as what it is.
+                    "cli_version": crate::VERSION
                 }),
                 human: if running {
-                    format!("{} daemon running ({})", instance::NAME, socket.display())
+                    format!(
+                        "{} daemon running ({}); cli {}",
+                        instance::NAME,
+                        socket.display(),
+                        crate::VERSION
+                    )
                 } else {
-                    format!("{} daemon stopped", instance::NAME)
+                    format!("{} daemon stopped; cli {}", instance::NAME, crate::VERSION)
                 },
             })
         }

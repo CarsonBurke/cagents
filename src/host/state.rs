@@ -1073,6 +1073,41 @@ fn upgrade_error(message: impl Into<String>) -> ProtocolError {
     ProtocolError::new(ProtocolErrorCode::InvalidRequest, message, false)
 }
 
+/// Names a terminal whose running job would be lost by the upgrade: what is
+/// running, where, and which terminal it is, so the user can find it in the
+/// sidebar without opening each one.
+fn describe_upgrade_blocker(source: &TerminalSession) -> String {
+    let launch = &source.launch;
+    let mut command = launch.program.clone();
+    for argument in &launch.arguments {
+        command.push(' ');
+        command.push_str(argument);
+    }
+    format!(
+        "{command} in {} (terminal {})",
+        launch.working_directory.display(),
+        source.id
+    )
+}
+
+fn upgrade_blockers_message(blockers: &[String]) -> String {
+    // "Active work" is narrower than it sounds, and the message says so: the
+    // session's process cannot be resumed after the daemon restarts, only
+    // started again, and the upgrade will not make that choice for the user.
+    let mut message = String::from(if blockers.len() == 1 {
+        "A terminal is running an agent the upgrade could only relaunch, not resume; finish or \
+         close it, then upgrade again:"
+    } else {
+        "Terminals are running agents the upgrade could only relaunch, not resume; finish or \
+         close them, then upgrade again:"
+    });
+    for blocker in blockers {
+        message.push_str("\n  ");
+        message.push_str(blocker);
+    }
+    message
+}
+
 /// Caller holds control_gate throughout reversible snapshots and durable commit.
 pub(super) fn prepare_upgrade(
     host: &SharedHost,
@@ -1231,6 +1266,11 @@ fn prepare_upgrade_with(
     }
     let mut frozen = Vec::with_capacity(terminals.len());
     let mut saved = Vec::with_capacity(terminals.len());
+    // Every terminal that would refuse the upgrade is reported at once, so the
+    // user resolves them in one pass instead of discovering them one retry at
+    // a time. Snapshots taken before a blocker is found stay reversible under
+    // the control gate, exactly as they do for any other refusal below.
+    let mut blockers = Vec::new();
     for (mut source, handle, mut options, previous_sources, execution_environment) in terminals {
         let snapshot = handle.prepare_upgrade().map_err(upgrade_error)?;
         source.resume_hint = if let Some((selected, native)) = paired_codex.get(&source.id) {
@@ -1273,10 +1313,8 @@ fn prepare_upgrade_with(
             .and_then(crate::model::agent_recovery::recipe_from_hint);
         // A shell recipe alone cannot authorize losing its arbitrary running job.
         if snapshot.active && exact.is_none() {
-            return Err(upgrade_error(format!(
-                "Terminal {} has active work without a process-bound exact agent identity; finish or close it before upgrading",
-                source.id
-            )));
+            blockers.push(describe_upgrade_blocker(&source));
+            continue;
         }
         let recipe = crate::upgrade::recovery_recipe(&source).map_err(upgrade_error)?;
         if let Some(execution) = execution_environment {
@@ -1295,6 +1333,9 @@ fn prepare_upgrade_with(
             options,
         });
         frozen.push(snapshot);
+    }
+    if !blockers.is_empty() {
+        return Err(upgrade_error(upgrade_blockers_message(&blockers)));
     }
     let checkpoint = Checkpoint::new(proof, saved, chats);
     let counts = (

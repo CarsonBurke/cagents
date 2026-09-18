@@ -155,6 +155,57 @@ fn submit_control(mode: PromptMode, slot: usize, enter_sends: bool) -> (&'static
 /// overloading a bare key with two unrelated meanings.
 /// `command` is Ctrl everywhere but macOS, where it is Cmd, so a single arm
 /// covers both platforms.
+/// Whether a key press asks to recall a sent message: `Some(true)` for the
+/// older one, `Some(false)` for the newer. Only the bare arrow keys, and only
+/// where the caret's line makes the arrow a walk through history rather than
+/// through the draft.
+fn history_key(
+    press: &text_editor::KeyPress,
+    recall_older: bool,
+    recall_newer: bool,
+) -> Option<bool> {
+    if !matches!(press.status, text_editor::Status::Focused { .. })
+        || press.modifiers.shift()
+        || press.modifiers.control()
+        || press.modifiers.alt()
+        || press.modifiers.command()
+    {
+        return None;
+    }
+    match press.key {
+        keyboard::Key::Named(keyboard::key::Named::ArrowUp) if recall_older => Some(true),
+        keyboard::Key::Named(keyboard::key::Named::ArrowDown) if recall_newer => Some(false),
+        _ => None,
+    }
+}
+
+/// A failure, as an entry of the transcript: what went wrong, set apart the
+/// way a system notice is and read in sequence with what it interrupted.
+fn notice_entry<'a>(message: &'a str) -> Element<'a, Message> {
+    widget::container(
+        widget::row::with_children(vec![
+            widget::icon(crate::ui_controls::symbolic_icon("dialog-warning-symbolic"))
+                .size(design::COMPACT_ICON_SIZE)
+                .into(),
+            design::caption(message)
+                .class(cosmic::theme::Text::Custom(design::warning_text))
+                .width(Length::Fill)
+                .wrapping(iced::widget::text::Wrapping::Word)
+                .into(),
+        ])
+        .spacing(step::GAP_S)
+        .align_y(Alignment::Start),
+    )
+    .class(design::surface(
+        Some(design::sunken),
+        [design::RADIUS_S; 4],
+        false,
+    ))
+    .padding([step::GAP_S as u16, step::GAP_M as u16])
+    .max_width(design::READABLE_MEASURE)
+    .into()
+}
+
 fn submit_chord(
     press: &text_editor::KeyPress,
     primary: Option<PromptMode>,
@@ -340,7 +391,10 @@ impl Scroll {
     }
 }
 
-/// The minimap's marks for `turns`, one per stretch of work.
+/// The minimap's marks for `turns`: one tick where each of the reader's own
+/// messages sits, which is the rhythm a conversation is navigated by. The
+/// work between messages draws nothing; a rail that blocked it in was a
+/// second transcript in miniature, and unreadable as one.
 ///
 /// A group's share of the rail is the number of rows it draws rather than the
 /// height those rows take up: the row count is something the grouping already
@@ -360,27 +414,25 @@ pub(super) fn minimap_marks(turns: &[turn::Turn]) -> Vec<TranscriptMark> {
         return Vec::new();
     }
     let mut at = 0.0;
-    turns
-        .iter()
-        .map(|turn| {
-            let span = rows(turn) as f32 / total as f32;
+    let mut marks = Vec::new();
+    for turn in turns {
+        let span = rows(turn) as f32 / total as f32;
+        if !turn.prompt.is_empty() {
+            // A message whose work failed says so at the tick: what the
+            // reader is scrolling back for is the failure.
             let tone = if matches!(
                 turn.glyph(),
                 Some(chat::ToolStatus::Failed | chat::ToolStatus::Denied)
             ) {
-                // A group that failed says so even where the reader opened
-                // it: what they are scrolling back for is the failure.
                 MarkTone::Failed
-            } else if !turn.prompt.is_empty() {
-                MarkTone::Prompt
             } else {
-                MarkTone::Work
+                MarkTone::Prompt
             };
-            let mark = TranscriptMark { at, span, tone };
-            at += span;
-            mark
-        })
-        .collect()
+            marks.push(TranscriptMark { at, span, tone });
+        }
+        at += span;
+    }
+    marks
 }
 
 /// A question, and the material it is about.
@@ -738,14 +790,21 @@ impl Runtime {
         let snapshot = &self.snapshot;
         // One theme lookup and one settings value per frame, rather than one
         // per rendered message.
-        let markdown_settings = markdown::Settings::with_text_size(
-            design::TEXT_BODY,
-            markdown::Style::from(if cosmic::theme::is_dark() {
-                iced::Theme::Dark
-            } else {
-                iced::Theme::Light
-            }),
-        );
+        // Answers are read at a size above the shell's own captions and
+        // controls, and code inside them at the body size rather than the
+        // three quarters of it iced defaults to, which put a code span at
+        // ten pixels.
+        let markdown_settings = markdown::Settings {
+            code_size: design::TEXT_BODY.into(),
+            ..markdown::Settings::with_text_size(
+                design::TEXT_PROSE,
+                markdown::Style::from(if cosmic::theme::is_dark() {
+                    iced::Theme::Dark
+                } else {
+                    iced::Theme::Light
+                }),
+            )
+        };
         let mut transcript = Vec::new();
         if snapshot.has_earlier {
             transcript.push(paging_view(
@@ -792,6 +851,13 @@ impl Runtime {
         // transcript that scrolls under it. Inside the transcript it went out
         // of reach with the first thing the agent did after publishing it,
         // which is precisely when a reader starts asking what is left.
+        // A failure is part of the conversation's record, so it is the last
+        // entry in the transcript rather than a line pinned above the
+        // composer: it scrolls away with what it was about instead of
+        // staying on screen until the next command happens to clear it.
+        if let Some(error) = self.error.as_ref().or(snapshot.error.as_ref()) {
+            transcript.push(notice_entry(error));
+        }
         content.extend(self.plan_view());
         let transcript = widget::scrollable(
             widget::column::with_children(transcript)
@@ -840,9 +906,6 @@ impl Runtime {
             content.push(body(
                 "Switching or closing this session… Editing and session controls are disabled. You can still read and copy the conversation.",
             ));
-        }
-        if let Some(error) = self.error.as_ref().or(snapshot.error.as_ref()) {
-            content.push(body(error.as_str()));
         }
         if self.disconnected || snapshot.exited {
             let unresumable = self.offers_fresh_conversation();
@@ -1094,10 +1157,18 @@ impl Runtime {
             .width(Length::Fill)
             .into()
         } else {
+            // Up on the draft's first line and Down on its last walk the
+            // sent messages, as a shell does; inside a longer draft the keys
+            // keep moving the caret.
+            let caret_line = self.composer.cursor().position.line;
+            let on_first_line = caret_line == 0;
+            let on_last_line = caret_line + 1 >= self.composer.line_count();
+            let recall_older = on_first_line && !self.history.is_empty();
+            let recall_newer = on_last_line && self.history_cursor.is_some();
             iced::widget::text_editor::TextEditor::new(&self.composer)
                 .id(card_control_id(target.card, "chat-composer"))
                 .placeholder(placeholder)
-                .size(design::TEXT_BODY)
+                .size(design::TEXT_PROSE)
                 .height(Length::Shrink)
                 .max_height(composer_ceiling)
                 // The editor scrolls once the draft passes the ceiling, and
@@ -1115,6 +1186,13 @@ impl Runtime {
                         return Some(text_editor::Binding::Custom(action(Action::Submit(
                             target, mode,
                         ))));
+                    }
+                    if let Some(older) = history_key(&press, recall_older, recall_newer) {
+                        return Some(text_editor::Binding::Custom(action(if older {
+                            Action::HistoryOlder(target)
+                        } else {
+                            Action::HistoryNewer(target)
+                        })));
                     }
                     word_delete(&press).or_else(|| text_editor::Binding::from_key_press(press))
                 })
@@ -1200,39 +1278,57 @@ impl Runtime {
         // sideways rather than wrapping, because a chat pane is often narrow
         // and a status line that grows to three rows takes that space from the
         // transcript.
+        // The line always says what the conversation is doing, idle
+        // included: a reader glancing at a card should never have to infer
+        // its state from the absence of a word. The order is the order of
+        // what a reader most needs to know first - that the card is between
+        // sessions, that something is being sent, that the agent has stopped
+        // or failed, that it is waiting on them, that it is working.
         let mut status: Vec<Element<'_, Message>> = Vec::new();
-        let activity = if transitioning {
-            Some(("agent-working-symbolic", "Switching session"))
+        let failed = self.error.is_some() || snapshot.error.is_some();
+        let (glyph, state): (Option<&'static str>, &str) = if transitioning {
+            (Some("agent-working-symbolic"), "Switching session")
         } else if self.attachment_chooser_pending {
-            Some(("agent-working-symbolic", "Choosing attachments"))
+            (Some("agent-working-symbolic"), "Choosing attachments")
         } else if self.pending.is_some() {
-            Some(("agent-working-symbolic", "Awaiting acknowledgement"))
+            (Some("agent-working-symbolic"), "Sending")
+        } else if self.disconnected {
+            (Some("dialog-warning-symbolic"), "Disconnected")
+        } else if snapshot.exited {
+            (Some("dialog-warning-symbolic"), "Exited")
+        } else if failed {
+            (Some("dialog-warning-symbolic"), "Error")
         } else if snapshot.waiting || !snapshot.requests.is_empty() {
-            Some(("agent-waiting-symbolic", "Waiting for you"))
+            (Some("agent-waiting-symbolic"), "Waiting for you")
         } else if snapshot.busy {
-            Some(("agent-working-symbolic", "Replying"))
+            (
+                Some("agent-working-symbolic"),
+                if snapshot.detail.is_empty() {
+                    "Working"
+                } else {
+                    snapshot.detail.as_str()
+                },
+            )
         } else {
-            // An idle agent needs no announcement. "Ready" was on screen for
-            // the whole time nothing was happening, which is most of the time,
-            // and said nothing the empty composer did not already say.
-            None
+            (None, "Ready")
         };
-        if let Some((glyph, state)) = activity {
+        if let Some(glyph) = glyph {
             status.push(
                 widget::icon(crate::ui_controls::symbolic_icon(glyph))
                     .size(12)
                     .into(),
             );
-            status.push(
-                design::caption(if snapshot.busy && !snapshot.detail.is_empty() {
-                    snapshot.detail.as_str()
+        }
+        status.push(
+            design::caption(state)
+                .class(if failed && !transitioning && self.pending.is_none() {
+                    cosmic::theme::Text::Custom(design::warning_text)
                 } else {
-                    state
+                    cosmic::theme::Text::default()
                 })
                 .wrapping(iced::widget::text::Wrapping::None)
                 .into(),
-            );
-        }
+        );
         if !place.name.is_empty() {
             status.push(
                 design::caption(place.name.clone())
@@ -1734,16 +1830,13 @@ impl Runtime {
             // more accordion in a column of them, and the account of why the
             // agent did what it did was the part the reader never opened.
             return widget::container(
-                widget::container(
-                    markdown::view(
-                        cached.markdown.items(),
-                        markdown::Settings {
-                            text_size: design::TEXT_CAPTION.into(),
-                            ..settings
-                        },
-                    )
-                    .map(|uri| action(Action::OpenUrl(uri.to_string()))),
-                )
+                widget::container(Prose::view(
+                    cached,
+                    markdown::Settings {
+                        text_size: design::TEXT_CAPTION.into(),
+                        ..settings
+                    },
+                ))
                 .class(design::surface(
                     Some(design::sunken),
                     [design::RADIUS_S; 4],
@@ -1762,34 +1855,33 @@ impl Runtime {
             // inventing a second treatment for it.
             return self.step_view(item, cached, settings);
         };
-        let mut rows: Vec<Element<'a, Message>> = vec![
-            markdown::view(cached.markdown.items(), settings)
-                .map(|uri| action(Action::OpenUrl(uri.to_string())))
-                .into(),
-        ];
+        let mut rows: Vec<Element<'a, Message>> = vec![Prose::view(cached, settings)];
         // An answer's footer says when it finished and offers to copy it, and
         // nothing else: a reader of an answer reaches for those two, and the
         // Markdown source of a rendered answer was a developer's control on a
         // reader's surface.
-        let mut controls: Vec<Element<'a, Message>> = Vec::new();
-        if let Some(stamp) = item.at.map(clock_label).filter(|at| !at.is_empty()) {
-            controls.push(
-                design::caption(stamp)
-                    .class(cosmic::theme::Text::Custom(design::muted_text))
-                    .into(),
-            );
-        }
-        controls.push(small_icon(
+        // The controls lead and the time follows, muted like the time: a
+        // reader reaches for copy far more often than they read the stamp,
+        // and an icon in the text color beside a muted stamp was the one
+        // thing on the row that looked like it wanted attention.
+        let mut controls: Vec<Element<'a, Message>> = vec![small_icon(
             "edit-copy-symbolic",
             "Copy this message",
             Action::Copy(target, item.id.clone(), CopyPart::Text),
-        ));
+        )];
         for index in 0..cached.code.codes.len() {
             controls.push(small_icon(
                 "edit-copy-symbolic",
                 code_label(index),
                 Action::Copy(target, item.id.clone(), CopyPart::Code(index)),
             ));
+        }
+        if let Some(stamp) = item.at.map(clock_label).filter(|at| !at.is_empty()) {
+            controls.push(
+                design::caption(stamp)
+                    .class(cosmic::theme::Text::Custom(design::muted_text))
+                    .into(),
+            );
         }
         rows.push(
             widget::row::with_children(controls)
@@ -2510,7 +2602,11 @@ mod tests {
         ];
         let turns = turn::group(&items, &HashSet::new());
         let marks = minimap_marks(&turns);
-        assert_eq!(marks.len(), turns.len());
+        assert_eq!(
+            marks.len(),
+            turns.iter().filter(|turn| !turn.prompt.is_empty()).count(),
+            "one tick per message of the reader's own"
+        );
         assert_eq!(marks[0].at, 0.0, "the first stretch starts the rail");
         let end = marks.last().expect("a mark");
         assert!(

@@ -159,7 +159,9 @@ impl Turn {
                 }
                 None => "1 step".to_owned(),
             },
-            steps => format!("{} steps", steps.len()),
+            steps => {
+                summarize_steps(steps, items).unwrap_or_else(|| format!("{} steps", steps.len()))
+            }
         };
         // Still working outranks how the finished steps went, because a
         // reader deciding whether to wait needs that first.
@@ -410,6 +412,73 @@ pub(super) fn step_verb(content: &ItemContent) -> &'static str {
     }
 }
 
+/// What a group did, told by kind and count the way a reader would tell
+/// someone: "Edited 2 files, ran 3 commands, read a file". What changed comes
+/// first because it is what a reader scrolling back is looking for; a kind
+/// that did not happen is left out. `None` when nothing in the group is a
+/// kind this can name, which is when a bare count is the honest summary.
+fn summarize_steps(steps: &[Placed], items: &[Item]) -> Option<String> {
+    let mut edited = std::collections::BTreeSet::new();
+    let (mut ran, mut read, mut searched, mut listed, mut web, mut called, mut viewed) =
+        (0, 0, 0, 0, 0, 0, 0);
+    for placed in steps {
+        match &items.get(placed.index)?.content {
+            ItemContent::Changes { changes, .. } => {
+                edited.extend(changes.iter().map(|change| change.path.as_str()));
+            }
+            ItemContent::Command { action, .. } => match action {
+                chat::CommandAction::Run => ran += 1,
+                chat::CommandAction::Read => read += 1,
+                chat::CommandAction::Search => searched += 1,
+                chat::CommandAction::List => listed += 1,
+            },
+            ItemContent::WebSearch { .. } => web += 1,
+            ItemContent::Tool { .. } => called += 1,
+            ItemContent::Image { .. } => viewed += 1,
+            ItemContent::Text { .. } => {}
+        }
+    }
+    let counted = |count: usize, one: &str, many: &str| match count {
+        1 => format!("a {one}"),
+        count => format!("{count} {many}"),
+    };
+    let mut parts = Vec::new();
+    if !edited.is_empty() {
+        parts.push(format!("edited {}", counted(edited.len(), "file", "files")));
+    }
+    if ran > 0 {
+        parts.push(format!("ran {}", counted(ran, "command", "commands")));
+    }
+    if read > 0 {
+        parts.push(format!("read {}", counted(read, "file", "files")));
+    }
+    if searched > 0 {
+        parts.push(format!("ran {}", counted(searched, "search", "searches")));
+    }
+    if listed > 0 {
+        parts.push(format!(
+            "listed {}",
+            counted(listed, "directory", "directories")
+        ));
+    }
+    if web > 0 {
+        parts.push(match web {
+            1 => "searched the web".to_owned(),
+            count => format!("searched the web {count} times"),
+        });
+    }
+    if called > 0 {
+        parts.push(format!("called {}", counted(called, "tool", "tools")));
+    }
+    if viewed > 0 {
+        parts.push(format!("viewed {}", counted(viewed, "image", "images")));
+    }
+    let mut summary = parts.join(", ");
+    let first = summary.get(..1)?.to_uppercase();
+    summary.replace_range(..1, &first);
+    Some(summary)
+}
+
 /// A command's first line, which is what a label should show when a provider
 /// offered none. A heredoc or a multi-line pipeline would otherwise push the
 /// whole script into a one-line summary.
@@ -624,7 +693,7 @@ mod tests {
             "a live group reports that it is live; the step that failed says so on its own row"
         );
         assert_eq!(
-            turns[0].summary, "2 steps · working",
+            turns[0].summary, "Ran 2 commands · working",
             "still working outranks how the finished steps went"
         );
     }
@@ -642,7 +711,7 @@ mod tests {
             Some(ToolStatus::Succeeded),
             "a failure a later step recovered from is not how the work ended"
         );
-        assert_eq!(turns[0].summary, "2 steps");
+        assert_eq!(turns[0].summary, "Ran 2 commands");
         let items = vec![
             text("u1", Role::User, Phase::Final, false),
             command("c1", ToolStatus::Succeeded),
@@ -654,7 +723,7 @@ mod tests {
             Some(ToolStatus::Failed),
             "a group that ended on a failure still reports it"
         );
-        assert_eq!(turns[0].summary, "2 steps · failed");
+        assert_eq!(turns[0].summary, "Ran 2 commands · failed");
     }
 
     #[test]

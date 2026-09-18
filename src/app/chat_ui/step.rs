@@ -35,6 +35,11 @@ const PATCH_GUTTER_WIDTH: f32 = 8.0;
 /// rather than per row, so it cannot break between rows.
 const RAIL_INSET: f32 = design::GRID_UNIT * 3.0;
 
+/// Where a group's thread line hangs: under the centre of the header's
+/// disclosure chevron, which sits one control inset from the header's edge.
+const THREAD_RAIL_OFFSET: f32 =
+    GAP_S + design::COMPACT_ICON_SIZE as f32 / 2.0 - design::BORDER_WIDTH / 2.0;
+
 /// The indicator and tone a group's status draws as.
 ///
 /// Status is information, not a control, so it is a plain glyph rather than
@@ -427,6 +432,9 @@ impl Runtime {
             // them, so the sequence reads as continuous. `Border` carries a
             // single width for all four edges, so a left-only edge has to be
             // its own sliver.
+            // The hairline hangs from the header's disclosure chevron, so the
+            // steps read as a thread that opens from it rather than a block
+            // set off to the left of the summary they belong to.
             widget::row::with_children(vec![
                 widget::container(iced::widget::Space::new().height(Length::Fill))
                     .width(design::BORDER_WIDTH)
@@ -444,6 +452,7 @@ impl Runtime {
                     .into(),
             ])
             .spacing(RAIL_INSET)
+            .padding(iced::Padding::ZERO.left(THREAD_RAIL_OFFSET))
             .width(Length::Fill)
             .into(),
         ])
@@ -474,12 +483,15 @@ impl Runtime {
         // The target is a path, a pattern, or a command, so it is set in the
         // same face the reader would see it in a terminal or an editor. That
         // is also what separates it at a glance from the verb beside it.
+        // A long command wraps onto the next line rather than running under
+        // the outcome beside it: a pane is often narrow, and a row whose end
+        // is hidden is a row the reader cannot check.
         line.push(
             widget::text::body(label)
                 .size(design::TEXT_BODY)
                 .font(iced::Font::MONOSPACE)
                 .width(Length::Fill)
-                .wrapping(iced::widget::text::Wrapping::None)
+                .wrapping(iced::widget::text::Wrapping::WordOrGlyph)
                 .into(),
         );
         if let Some(detail) = &cached.detail {
@@ -531,11 +543,7 @@ impl Runtime {
         let mut rows: Vec<Element<'a, Message>> = Vec::new();
         match &item.content {
             ItemContent::Text { .. } => {
-                rows.push(
-                    markdown::view(cached.markdown.items(), settings)
-                        .map(|uri| action(Action::OpenUrl(uri.to_string())))
-                        .into(),
-                );
+                rows.push(Prose::view(cached, settings));
             }
             ItemContent::Command {
                 command,

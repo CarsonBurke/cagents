@@ -185,6 +185,32 @@ impl Cagents {
         }
     }
 
+    /// Closes every channel that `retired` has just left without an open card.
+    ///
+    /// A channel is its conversations; once the last one is closed there is
+    /// nothing to come back to, and an empty channel left in the sidebar is
+    /// one more row the user has to delete by hand. Only channels one of
+    /// these cards belonged to are considered: a channel that has just been
+    /// created is empty too, and is waiting for its first card.
+    pub(super) fn close_emptied_channels(&mut self, retired: &[CardId]) -> Task<Message> {
+        let emptied: Vec<ChannelId> = self
+            .durable
+            .channels
+            .iter()
+            .filter(|channel| channel.cards.iter().any(|card| retired.contains(card)))
+            .filter(|channel| {
+                !channel.cards.iter().any(|&card| {
+                    !retired.contains(&card)
+                        && self
+                            .card_state(card)
+                            .is_some_and(|state| state.existence.is_open())
+                })
+            })
+            .map(|channel| channel.id)
+            .collect();
+        Task::batch(emptied.into_iter().map(|id| self.delete_channel(id)))
+    }
+
     /// Removes a channel along with everything that existed only inside it.
     ///
     /// A channel's conversations are reachable nowhere else, so they are

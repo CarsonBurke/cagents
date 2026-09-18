@@ -42,6 +42,7 @@ fn main() -> std::process::ExitCode {
     // unobservable, because the subscriber was installed after it.
     cagents::instance::install_panic_hook(PRODUCT);
     cagents::instance::install_tracing(PRODUCT, DEFAULT_LOG_FILTER);
+    tracing::info!(version = cagents::VERSION, "starting cagents-ui");
 
     let arguments: Vec<String> = std::env::args().skip(1).collect();
     // The standalone dialogs write their result to stdout and the tray shows
@@ -291,19 +292,42 @@ fn run(options: Options<'_>) -> Result<(), Box<dyn std::error::Error>> {
 /// Minimal standalone shell that tells the user why nothing opened. It runs in
 /// its own detached process, so it must not touch the session store or the
 /// window lease the failed launch was contending for.
+///
+/// It can also try again. Several of the failures that reach it are
+/// transient - a daemon that lost a startup race, a socket directory that was
+/// momentarily unavailable, a foreign process that has since gone - and an
+/// installer that has just replaced the running window with this dialog
+/// leaves the user no cagents window at all once it closes. Retry re-runs the
+/// launcher, which is the whole remedy for a transient failure.
 struct StartupError {
     core: Core,
     message: String,
+    /// Why the last retry could not even start the launcher, shown in place
+    /// of a dialog that silently did nothing.
+    retry_failure: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum StartupErrorMessage {
+    Retry,
+    Close,
 }
 
 impl cosmic::Application for StartupError {
     type Executor = cosmic::executor::Default;
     type Flags = String;
-    type Message = ();
+    type Message = StartupErrorMessage;
     const APP_ID: &'static str = "dev.cagents.Cagents.StartupError";
 
-    fn init(core: Core, message: String) -> (Self, cosmic::app::Task<()>) {
-        (Self { core, message }, cosmic::app::Task::none())
+    fn init(core: Core, message: String) -> (Self, cosmic::app::Task<StartupErrorMessage>) {
+        (
+            Self {
+                core,
+                message,
+                retry_failure: None,
+            },
+            cosmic::app::Task::none(),
+        )
     }
 
     fn core(&self) -> &Core {
@@ -314,34 +338,86 @@ impl cosmic::Application for StartupError {
         &mut self.core
     }
 
-    fn on_close_requested(&self, _: iced::window::Id) -> Option<()> {
-        Some(())
+    fn on_close_requested(&self, _: iced::window::Id) -> Option<StartupErrorMessage> {
+        Some(StartupErrorMessage::Close)
     }
 
-    fn update(&mut self, (): ()) -> cosmic::app::Task<()> {
-        iced::exit().map(cosmic::Action::App)
+    fn update(&mut self, message: StartupErrorMessage) -> cosmic::app::Task<StartupErrorMessage> {
+        match message {
+            StartupErrorMessage::Close => iced::exit().map(cosmic::Action::App),
+            StartupErrorMessage::Retry => match relaunch() {
+                Ok(()) => iced::exit().map(cosmic::Action::App),
+                Err(error) => {
+                    self.retry_failure = Some(error);
+                    cosmic::app::Task::none()
+                }
+            },
+        }
     }
 
-    fn view(&self) -> cosmic::Element<'_, ()> {
-        cosmic::widget::container(
-            cosmic::widget::column::with_children(vec![
-                cosmic::widget::text::title3("cagents could not start").into(),
-                cosmic::widget::text::body(&self.message).into(),
-                cosmic::widget::text::body(format!(
-                    "The full report is in {PRODUCT}-crash.log in the cagents data directory."
-                ))
-                .into(),
+    fn view(&self) -> cosmic::Element<'_, StartupErrorMessage> {
+        let mut rows = vec![
+            cosmic::widget::text::title3("cagents could not start").into(),
+            cosmic::widget::text::body(&self.message).into(),
+            cosmic::widget::text::body(
+                "This may be temporary. Retry starts cagents again; Close leaves no window open.",
+            )
+            .into(),
+            cosmic::widget::text::body(format!(
+                "The report is in {PRODUCT}-crash.log in the cagents data directory."
+            ))
+            .into(),
+        ];
+        if let Some(failure) = &self.retry_failure {
+            rows.push(cosmic::widget::text::body(format!("Retry failed: {failure}")).into());
+        }
+        rows.push(
+            cosmic::widget::row::with_children(vec![
+                cosmic::widget::button::suggested("Retry")
+                    .on_press(StartupErrorMessage::Retry)
+                    .into(),
                 cosmic::widget::button::standard("Close")
-                    .on_press(())
+                    .on_press(StartupErrorMessage::Close)
                     .into(),
             ])
-            .spacing(16),
-        )
-        .padding(24)
-        .width(iced::Length::Fill)
-        .height(iced::Length::Fill)
-        .into()
+            .spacing(8)
+            .into(),
+        );
+        cosmic::widget::container(cosmic::widget::column::with_children(rows).spacing(16))
+            .padding(24)
+            .width(iced::Length::Fill)
+            .height(iced::Length::Fill)
+            .into()
     }
+}
+
+/// Starts the launcher that produced this dialog, detached from it.
+///
+/// The launcher is the `cagents` executable installed beside this one: it is
+/// what the desktop entry runs, it starts the daemon before the window, and
+/// it reuses a window that did manage to open in the meantime instead of
+/// opening a second one. Running `cagents-ui` directly again would skip all
+/// three.
+fn relaunch() -> Result<(), String> {
+    let launcher = std::env::current_exe()
+        .map_err(|error| error.to_string())?
+        .with_file_name("cagents");
+    if !launcher.is_file() {
+        return Err(format!(
+            "the cagents launcher was not found beside this executable at {}",
+            launcher.display()
+        ));
+    }
+    std::process::Command::new(launcher)
+        .arg("ui")
+        .env_remove(cagents::instance::UI_LAUNCH_HANDSHAKE_ENV)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .process_group(0)
+        .spawn()
+        .map(|_| ())
+        .map_err(|error| error.to_string())
 }
 
 fn run_startup_error_dialog(message: &str) -> Result<(), Box<dyn std::error::Error>> {
