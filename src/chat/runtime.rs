@@ -420,18 +420,24 @@ impl Handle {
     pub fn close(&self) -> Result<(), String> {
         self.0.stop.store(true, Ordering::Release);
         self.wake();
-        if let Some(worker) = self
-            .0
-            .worker
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .take()
+        // Serialize explicit closes through the join. A protocol failure is
+        // still useful diagnostic history, but it must not prevent retiring an
+        // actor whose process teardown has subsequently completed.
+        let mut worker = self.0.worker.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(worker) = worker.take()
             && worker.join().is_err()
         {
-            *self.0.failure.lock().unwrap_or_else(|p| p.into_inner()) = Some(
+            let error =
                 "Native chat worker did not shut down cleanly; provider state is unconfirmed"
-                    .into(),
-            );
+                    .to_owned();
+            // Even if the panic happened after the completion publication,
+            // repeated closes must preserve the uncertain teardown outcome.
+            self.0.completed.store(false, Ordering::Release);
+            *self.0.failure.lock().unwrap_or_else(|p| p.into_inner()) = Some(error.clone());
+            return Err(error);
+        }
+        if self.is_completed() {
+            return Ok(());
         }
         match self
             .0
@@ -441,7 +447,9 @@ impl Handle {
             .clone()
         {
             Some(error) => Err(error),
-            None => Ok(()),
+            None => {
+                Err("Native chat teardown did not complete; provider state is unconfirmed".into())
+            }
         }
     }
 }
@@ -1875,7 +1883,13 @@ mod tests {
         let snapshot = until(&handle, |snapshot| snapshot.exited);
         assert!(snapshot.error.is_some());
         assert!(snapshot.items.is_empty());
-        assert!(handle.close().is_err());
+        handle
+            .close()
+            .expect("failed protocol actor can be retired after teardown");
+        assert!(
+            handle.failure().is_some(),
+            "closing retains the failure diagnosis"
+        );
         release.send(()).unwrap();
         server.join().unwrap();
     }
@@ -1900,6 +1914,38 @@ mod tests {
                 .unwrap()
                 .contains("Unsupported provider stdout")
         );
-        assert!(handle.close().is_err());
+        handle
+            .close()
+            .expect("failed provider can be explicitly retired");
+        handle.close().expect("completed close is idempotent");
+        assert!(
+            handle.failure().is_some(),
+            "closing retains the failure diagnosis"
+        );
+    }
+
+    #[test]
+    fn a_panicked_join_cannot_be_retired_even_after_a_completion_publication() {
+        let spec = ProcessSpec {
+            transport: TransportSpec::JsonLines,
+            program: "/usr/bin/printf".into(),
+            arguments: vec!["not-json\\n".into()],
+            working_directory: std::env::temp_dir(),
+            environment: BTreeMap::new(),
+        };
+        let mut initial = Step::default();
+        let store = preflight(&spec, &mut initial).unwrap();
+        let handle = Handle::start(spec, Box::new(Echo), initial, store, None, |_| {}).unwrap();
+        until(&handle, |snapshot| snapshot.exited);
+        handle.close().unwrap();
+        // Model a panic after the worker published completion, such as a
+        // teardown notification failing. Join outcome must take precedence.
+        *handle.0.worker.lock().unwrap() = Some(thread::spawn(|| panic!("fixture join failure")));
+        assert!(handle.close().unwrap_err().contains("unconfirmed"));
+        assert!(!handle.is_completed());
+        assert!(
+            handle.close().is_err(),
+            "a retry cannot erase uncertain teardown"
+        );
     }
 }

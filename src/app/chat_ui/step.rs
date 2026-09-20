@@ -25,9 +25,6 @@ pub(super) const GAP_S: f32 = design::GRID_UNIT * 2.0;
 pub(super) const GAP_M: f32 = design::GRID_UNIT * 3.0;
 pub(super) const GAP_L: f32 = design::GRID_UNIT * 7.0;
 
-/// The gutter column that carries a patch line's marker.
-const PATCH_GUTTER_WIDTH: f32 = 8.0;
-
 /// The rail a turn's steps hang from, and the space between it and them.
 ///
 /// A continuous hairline down the left of the strip is what turns a list of
@@ -131,6 +128,14 @@ pub(super) fn code_surface<'a>(
         .into(),
         None => body.into(),
     };
+    code_frame(body, caption, copy)
+}
+
+fn code_frame<'a>(
+    body: Element<'a, Message>,
+    caption: Option<&'a str>,
+    copy: Option<Action>,
+) -> Element<'a, Message> {
     let Some(caption) = caption else {
         return widget::container(body)
             .class(design::surface(
@@ -178,112 +183,6 @@ pub(super) fn code_surface<'a>(
     .into()
 }
 
-/// One line of a unified patch, marked in its own gutter column.
-///
-/// The provider hands us a patch, not the two file revisions
-/// `crate::diff_view` consumes, and a patch only describes the regions it
-/// touches. Reconstructing both full revisions from it would mean inventing
-/// the untouched remainder, so the patch is rendered as what it is.
-///
-/// The marker the patch already carries is promoted to its own column and
-/// tinted, and the line gets a faint wash behind it. Neither the marker nor
-/// the wash is drawn at full accent strength, because a saturated fill behind
-/// monospace text costs the text the contrast that marking a change is for.
-/// Both parts size themselves to their own text, so a wrapped line keeps its
-/// marker aligned with its first row instead of stretching a sibling to a
-/// height the row has not resolved yet.
-fn patch_line(line: &str) -> Element<'_, Message> {
-    let marker = line.as_bytes().first().copied();
-    let (wash, ink): (
-        Option<fn(&cosmic::Theme) -> iced::Color>,
-        Option<fn(&cosmic::Theme) -> cosmic::iced::widget::text::Style>,
-    ) = match marker {
-        Some(b'+') => (Some(design::diff_added_color), Some(design::added_text)),
-        Some(b'-') => (Some(design::diff_removed_color), Some(design::removed_text)),
-        _ => (None, None),
-    };
-    // The marker is split off so the body keeps the reader's ink while the
-    // gutter carries the color, and so the columns line up down the patch.
-    let (gutter, rest) = match marker {
-        Some(b'+') | Some(b'-') | Some(b' ') => line.split_at(1),
-        _ => ("", line),
-    };
-    let body = widget::selectable_text(rest)
-        .size(design::TEXT_BODY)
-        .font(iced::Font::MONOSPACE)
-        .width(Length::Fill);
-    // A hunk header is structure rather than content, so it recedes to the
-    // weight of the surface's other secondary labels.
-    let body: Element<'_, Message> = if marker == Some(b'@') {
-        body.class(cosmic::theme::Text::Custom(design::muted_text))
-            .into()
-    } else {
-        body.into()
-    };
-    widget::container(
-        widget::row::with_children(vec![
-            widget::text::body(gutter)
-                .size(design::TEXT_BODY)
-                .font(iced::Font::MONOSPACE)
-                .width(PATCH_GUTTER_WIDTH)
-                .class(match ink {
-                    Some(ink) => cosmic::theme::Text::Custom(ink),
-                    None => cosmic::theme::Text::Default,
-                })
-                .into(),
-            body,
-        ])
-        .spacing(GAP_XS),
-    )
-    .class(cosmic::theme::Container::custom(move |theme| {
-        cosmic::widget::container::Style {
-            background: wash.map(|wash| iced::Background::Color(wash(theme))),
-            ..Default::default()
-        }
-    }))
-    .padding([0, GAP_S as u16])
-    .width(Length::Fill)
-    .into()
-}
-
-/// How much of one file's patch is rendered before the rest is withheld.
-///
-/// A single generated-file edit can be tens of thousands of lines. Rendering
-/// all of them costs one widget per line in a transcript that is rebuilt
-/// whenever the turn advances, so a long patch is truncated with an explicit
-/// count rather than silently.
-const MAX_PATCH_LINES: usize = 400;
-
-fn patch_view(diff: &str) -> Element<'_, Message> {
-    let mut lines: Vec<Element<'_, Message>> = Vec::new();
-    let mut total = 0usize;
-    for line in diff.lines() {
-        total += 1;
-        if lines.len() < MAX_PATCH_LINES {
-            lines.push(patch_line(line));
-        }
-    }
-    if total > lines.len() {
-        lines.push(
-            widget::container(design::caption(format!(
-                "{} further lines withheld from the inline patch.",
-                total - lines.len()
-            )))
-            .padding([GAP_XS as u16, GAP_M as u16])
-            .into(),
-        );
-    }
-    widget::container(widget::column::with_children(lines).width(Length::Fill))
-        .class(design::surface(
-            Some(design::sunken),
-            [design::RADIUS_S; 4],
-            true,
-        ))
-        .padding([GAP_XS as u16, 0])
-        .width(Length::Fill)
-        .into()
-}
-
 fn change_verb(kind: &ChangeKind) -> &'static str {
     match kind {
         ChangeKind::Added => "Added",
@@ -309,9 +208,6 @@ fn change_view(change: &FileChange) -> Element<'_, Message> {
     ];
     if let ChangeKind::Renamed { from } = &change.kind {
         rows.push(design::caption(format!("from {from}")).into());
-    }
-    if !change.diff.is_empty() {
-        rows.push(patch_view(&change.diff));
     }
     widget::column::with_children(rows)
         .spacing(GAP_XS)
@@ -346,6 +242,34 @@ fn search_result_view(result: &SearchResult) -> Element<'_, Message> {
 }
 
 impl Runtime {
+    fn tool_code_surface<'a>(
+        &'a self,
+        item: &'a chat::Item,
+        cached: &'a CachedItem,
+        part: CopyPart,
+        caption: &'a str,
+        limit: Option<f32>,
+    ) -> Element<'a, Message> {
+        let block = match part {
+            CopyPart::Input => cached.tool_input.as_ref(),
+            CopyPart::Change(index) => cached.patches.get(index),
+            _ => cached.tool_output.as_ref(),
+        };
+        let Some(block) = block else {
+            return design::caption("No content.").into();
+        };
+        let target = self.target;
+        let id = item.id.clone();
+        let copy = Action::Copy(target, id.clone(), part.clone());
+        code_frame(
+            block.view(self.syntax_theme, limit, move |event| {
+                action(Action::ToolText(target, id.clone(), part.clone(), event))
+            }),
+            Some(caption),
+            Some(copy),
+        )
+    }
+
     /// One group's activity: a summary line and how long the work took,
     /// disclosing the individual steps.
     ///
@@ -403,7 +327,7 @@ impl Runtime {
         let header = widget::button::custom(
             widget::row::with_children(line)
                 .spacing(GAP_S)
-                .align_y(Alignment::Center),
+                .align_y(Alignment::Start),
         )
         .name(name)
         .class(crate::ui_controls::control_style(false, tone))
@@ -473,6 +397,13 @@ impl Runtime {
         let verb = turn::step_verb(&item.content);
         let label = turn::step_label(&item.content);
         let mut line: Vec<Element<'a, Message>> = vec![
+            widget::icon(crate::ui_controls::symbolic_icon(if open {
+                "pan-down-symbolic"
+            } else {
+                "pan-end-symbolic"
+            }))
+            .size(design::COMPACT_ICON_SIZE)
+            .into(),
             widget::icon(crate::ui_controls::symbolic_icon(kind_glyph(&item.content)))
                 .size(14)
                 .into(),
@@ -486,14 +417,20 @@ impl Runtime {
         // A long command wraps onto the next line rather than running under
         // the outcome beside it: a pane is often narrow, and a row whose end
         // is hidden is a row the reader cannot check.
-        line.push(
-            widget::text::body(label)
-                .size(design::TEXT_BODY)
-                .font(iced::Font::MONOSPACE)
-                .width(Length::Fill)
-                .wrapping(iced::widget::text::Wrapping::WordOrGlyph)
-                .into(),
-        );
+        if matches!(item.content, ItemContent::Tool { .. }) {
+            let mut preview = vec![design::body(label).into()];
+            if !cached.preview.text.is_empty() {
+                preview.push(cached.preview.view());
+            }
+            line.push(
+                widget::column::with_children(preview)
+                    .spacing(GAP_XS)
+                    .width(Length::Fill)
+                    .into(),
+            );
+        } else {
+            line.push(cached.preview.view());
+        }
         if let Some(detail) = &cached.detail {
             line.push(design::caption(detail.as_str()).into());
         }
@@ -505,7 +442,7 @@ impl Runtime {
         let header = widget::button::custom(
             widget::row::with_children(line)
                 .spacing(GAP_S)
-                .align_y(Alignment::Center),
+                .align_y(Alignment::Start),
         )
         .name(name)
         .class(crate::ui_controls::control_style(open, None))
@@ -539,32 +476,36 @@ impl Runtime {
         cached: &'a CachedItem,
         settings: markdown::Settings,
     ) -> Element<'a, Message> {
-        let target = self.target;
         let mut rows: Vec<Element<'a, Message>> = Vec::new();
         match &item.content {
             ItemContent::Text { .. } => {
                 rows.push(Prose::view(cached, settings));
             }
             ItemContent::Command {
-                command,
                 working_directory,
                 output,
                 ..
             } => {
-                rows.push(code_surface(
-                    command.as_str(),
-                    (!working_directory.is_empty()).then_some(working_directory.as_str()),
+                rows.push(self.tool_code_surface(
+                    item,
+                    cached,
+                    CopyPart::Input,
+                    if working_directory.is_empty() {
+                        "Command"
+                    } else {
+                        working_directory
+                    },
                     None,
-                    Some(Action::Copy(target, item.id.clone(), CopyPart::Input)),
                 ));
                 if output.is_empty() {
                     rows.push(design::caption("No output.").into());
                 } else {
-                    rows.push(code_surface(
-                        output.as_str(),
-                        Some("Output"),
+                    rows.push(self.tool_code_surface(
+                        item,
+                        cached,
+                        CopyPart::Output,
+                        "Output",
                         Some(Self::OUTPUT_HEIGHT),
-                        Some(Action::Copy(target, item.id.clone(), CopyPart::Output)),
                     ));
                 }
             }
@@ -572,7 +513,18 @@ impl Runtime {
                 if changes.is_empty() {
                     rows.push(design::caption("No file changes were reported.").into());
                 }
-                rows.extend(changes.iter().map(change_view));
+                for (index, change) in changes.iter().enumerate() {
+                    rows.push(change_view(change));
+                    if !change.diff.is_empty() {
+                        rows.push(self.tool_code_surface(
+                            item,
+                            cached,
+                            CopyPart::Change(index),
+                            "Patch",
+                            Some(Self::OUTPUT_HEIGHT),
+                        ));
+                    }
+                }
             }
             ItemContent::WebSearch { query, results } => {
                 rows.push(design::body(query.as_str()).into());
@@ -583,21 +535,23 @@ impl Runtime {
             }
             ItemContent::Tool { input, output, .. } => {
                 if !input.is_empty() {
-                    rows.push(code_surface(
-                        input.as_str(),
-                        Some("Input"),
+                    rows.push(self.tool_code_surface(
+                        item,
+                        cached,
+                        CopyPart::Input,
+                        "Input",
                         Some(Self::OUTPUT_HEIGHT),
-                        Some(Action::Copy(target, item.id.clone(), CopyPart::Input)),
                     ));
                 }
                 if output.is_empty() {
                     rows.push(design::caption("No output.").into());
                 } else {
-                    rows.push(code_surface(
-                        output.as_str(),
-                        Some("Output"),
+                    rows.push(self.tool_code_surface(
+                        item,
+                        cached,
+                        CopyPart::Output,
+                        "Output",
                         Some(Self::OUTPUT_HEIGHT),
-                        Some(Action::Copy(target, item.id.clone(), CopyPart::Output)),
                     ));
                 }
             }

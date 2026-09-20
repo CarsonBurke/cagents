@@ -60,8 +60,20 @@ pub fn reveal_width<'a, Message: 'a>(
 pub fn horizontal_wheel<'a, Message: 'a>(
     content: impl Into<Element<'a, Message>>,
 ) -> Element<'a, Message> {
-    Element::new(HorizontalWheel {
+    Element::new(WheelInput {
         content: content.into(),
+        pass_to_parent: false,
+    })
+}
+
+/// Lets the enclosing native scrollable own wheel gestures over a read-only
+/// editor while preserving the editor's selection and keyboard handling.
+pub fn parent_wheel<'a, Message: 'a>(
+    content: impl Into<Element<'a, Message>>,
+) -> Element<'a, Message> {
+    Element::new(WheelInput {
+        content: content.into(),
+        pass_to_parent: true,
     })
 }
 
@@ -80,7 +92,7 @@ pub fn overflow_fade_x<'a, Message: 'a>(
 /// Projects a wheel gesture onto the horizontal axis.
 ///
 /// Summing the two components cancels a diagonal trackpad gesture exactly - a
-/// gesture reporting `x = -d, y = +d` sums to zero - and [`HorizontalWheel`]
+/// gesture reporting `x = -d, y = +d` sums to zero - and [`WheelInput`]
 /// has already replaced the original event by then, so the motion is discarded
 /// rather than forwarded. A real horizontal delta therefore wins outright, and
 /// only a purely vertical one is remapped.
@@ -433,11 +445,12 @@ impl<Message> Widget<Message, Theme, Renderer> for Layers<'_, Message> {
     }
 }
 
-struct HorizontalWheel<'a, Message> {
+struct WheelInput<'a, Message> {
     content: Element<'a, Message>,
+    pass_to_parent: bool,
 }
 
-impl<Message> Widget<Message, Theme, Renderer> for HorizontalWheel<'_, Message> {
+impl<Message> Widget<Message, Theme, Renderer> for WheelInput<'_, Message> {
     fn children(&self) -> Vec<Tree> {
         vec![Tree::new(&self.content)]
     }
@@ -482,6 +495,10 @@ impl<Message> Widget<Message, Theme, Renderer> for HorizontalWheel<'_, Message> 
         shell: &mut Shell<'_, Message>,
         viewport: &Rectangle,
     ) {
+        if self.pass_to_parent && matches!(event, Event::Mouse(mouse::Event::WheelScrolled { .. }))
+        {
+            return;
+        }
         let remapped;
         let event = match event {
             Event::Mouse(mouse::Event::WheelScrolled { delta })

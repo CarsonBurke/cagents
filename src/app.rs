@@ -5541,52 +5541,59 @@ impl Cagents {
             }
             Some(CardRuntime::Failed(message)) => widget::container(
                 widget::container(
-                    widget::column::with_children(vec![
-                        widget::row::with_children(vec![
-                            widget::icon::from_name("dialog-warning-symbolic")
-                                .size(24)
-                                .into(),
-                            widget::text::title3(labels.unavailable).into(),
-                        ])
-                        .align_y(Alignment::Center)
-                        .spacing(spacing.space_xxs)
-                        .into(),
-                        widget::selectable_text(message)
-                            .wrapping(cosmic::iced::widget::text::Wrapping::Word)
-                            .width(Length::Fill)
-                            .into(),
-                        widget::row::with_children({
-                            let mut controls = vec![
-                                widget::button::suggested(retry_label)
-                                    .id(card_control_id(id, "retry"))
-                                    .name(format!("{retry_label} {}", labels.type_label))
-                                    .on_press(Message::RetryCard(id))
+                    widget::column::with_children(
+                        vec![
+                            widget::row::with_children(vec![
+                                widget::icon::from_name("dialog-warning-symbolic")
+                                    .size(24)
                                     .into(),
-                            ];
-                            // A conversation no retry can reach still has one
-                            // thing left to do with it, and the reader has to
-                            // be the one who asks for it.
-                            if self.chat_offers_fresh_conversation(id) {
+                                widget::text::title3(labels.unavailable).into(),
+                            ])
+                            .align_y(Alignment::Center)
+                            .spacing(spacing.space_xxs)
+                            .into(),
+                            widget::selectable_text(message)
+                                .wrapping(cosmic::iced::widget::text::Wrapping::Word)
+                                .width(Length::Fill)
+                                .into(),
+                            widget::row::with_children({
+                                let mut controls = vec![
+                                    widget::button::suggested(retry_label)
+                                        .id(card_control_id(id, "retry"))
+                                        .name(format!("{retry_label} {}", labels.type_label))
+                                        .on_press(Message::RetryCard(id))
+                                        .into(),
+                                ];
+                                // A conversation no retry can reach still has one
+                                // thing left to do with it, and the reader has to
+                                // be the one who asks for it.
+                                if self.chat_offers_fresh_conversation(id) {
+                                    controls.push(
+                                        widget::button::standard("Start a new conversation here")
+                                            .id(card_control_id(id, "chat.fresh"))
+                                            .name("Start a new conversation in the same directory")
+                                            .on_press(Message::ChatUi(chat_ui::Action::StartFresh(
+                                                id,
+                                            )))
+                                            .into(),
+                                    );
+                                }
                                 controls.push(
-                                    widget::button::standard("Start a new conversation here")
-                                        .id(card_control_id(id, "chat.fresh"))
-                                        .name("Start a new conversation in the same directory")
-                                        .on_press(Message::ChatUi(chat_ui::Action::StartFresh(id)))
+                                    widget::button::standard("Close")
+                                        .id(card_control_id(id, "failed.close"))
+                                        .name(format!("Close {}", labels.type_label))
+                                        .on_press(Message::CloseCard(id))
                                         .into(),
                                 );
-                            }
-                            controls.push(
-                                widget::button::standard("Close")
-                                    .id(card_control_id(id, "failed.close"))
-                                    .name(format!("Close {}", labels.type_label))
-                                    .on_press(Message::CloseCard(id))
-                                    .into(),
-                            );
-                            controls
-                        })
-                        .spacing(spacing.space_xxs)
-                        .into(),
-                    ])
+                                controls
+                            })
+                            .spacing(spacing.space_xxs)
+                            .into(),
+                        ]
+                        .into_iter()
+                        .chain(self.chat_provider_recovery(id))
+                        .collect::<Vec<_>>(),
+                    )
                     .spacing(spacing.space_s),
                 )
                 .class(cosmic::theme::Container::Secondary)
@@ -6689,7 +6696,6 @@ impl Cagents {
             || self.settings_reset_confirm
             || self.project_ui.modal_open()
             || self.channel_ui.modal_open()
-            || self.new_thread_is_open()
             // Mounted by `dialog` from the sidebar's own state, so nothing
             // beneath it can learn about it any other way. Leaving it out is
             // how the one dialog that is on screen *because* it is about to
@@ -7153,9 +7159,7 @@ impl Cagents {
     }
 
     fn nested_modal_focus_target(&self) -> Option<widget::Id> {
-        if self.new_thread_is_open() {
-            Some(widget::Id::new("chat.new-thread.chatgpt"))
-        } else if self.sidebar_state.pending_discard().is_some() {
+        if self.sidebar_state.pending_discard().is_some() {
             Some(sidebar::discard_confirm_id())
         } else if self.project_ui.modal_open() {
             Some(self.project_ui.focus_target())
@@ -9920,9 +9924,6 @@ impl Application for Cagents {
                 // `WorkspaceSurface` captures those chords itself, before any
                 // child sees them, and relies on this message to act on them.
                 if is_escape_press(&event) && !captured {
-                    if self.new_thread_is_open() {
-                        return self.handle_chat_ui(chat_ui::Action::DismissNewThread);
-                    }
                     if self.terminal_close.is_some() {
                         return self.cancel_terminal_close();
                     }
@@ -9970,11 +9971,6 @@ impl Application for Cagents {
                     }
                 }
                 if let Some(backwards) = is_tab_press(&event)
-                    && self.new_thread_is_open()
-                {
-                    return self.cycle_new_thread_focus(backwards);
-                }
-                if let Some(backwards) = is_tab_press(&event)
                     && self.terminal_close.is_some()
                 {
                     return self.cycle_terminal_close_focus(backwards);
@@ -9990,6 +9986,9 @@ impl Application for Cagents {
                 // time this runs, and what it does with one is its own affair.
                 if self.workspace_inputs_blocked() {
                     return Task::none();
+                }
+                if !captured && let Some(task) = self.chat_scroll_key(&event) {
+                    return task;
                 }
                 if is_save_press(&event)
                     && let Some(card) = self.workspace.focused()
@@ -10436,9 +10435,6 @@ impl Application for Cagents {
     }
 
     fn dialog(&self) -> Option<Element<'_, Message>> {
-        if let Some(dialog) = self.new_thread_dialog() {
-            return Some(dialog);
-        }
         if let Some(intent) = &self.terminal_close {
             return self.terminal_close_dialog().map(|surface| {
                 dialog_ui::overlay(

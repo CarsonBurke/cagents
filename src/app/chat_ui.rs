@@ -9,7 +9,9 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
 };
 
+mod scroll;
 mod step;
+mod tool_text;
 mod turn;
 mod view;
 
@@ -78,12 +80,14 @@ pub enum CopyPart {
     Input,
     Output,
     Code(usize),
+    Change(usize),
 }
 
 #[derive(Clone)]
 pub enum Action {
-    NewThreadModelFamily(Provider),
-    DismissNewThread,
+    ToolText(Target, String, CopyPart, text_editor::Action),
+    ChooseProvider(Target, Provider),
+    ChooseFreshProvider(CardId, Provider),
     Switch(CardId),
     Ready(Target, Ready),
     /// The result of closing a conversation that started for a card which
@@ -130,11 +134,8 @@ pub enum Action {
     HandoffFinished(Target, Result<TerminalSession, String>),
     CloseFinished(Target, Result<(), String>),
     /// Where the transcript's viewport has moved to, which is what asks for
-    /// another page of history and what places the minimap's lens.
+    /// another page of history.
     Scrolled(Target, view::Scroll),
-    /// Scrolls the transcript to a fraction of its extent, measured from the
-    /// oldest loaded message.
-    ScrollTranscript(Target, f32),
     /// Opens or closes the model search.
     ModelPicker(Target, bool),
     ReasoningPicker(Target, bool),
@@ -155,9 +156,7 @@ impl Action {
     pub(super) fn allowed_while_modal(&self) -> bool {
         matches!(
             self,
-            Self::NewThreadModelFamily(..)
-                | Self::DismissNewThread
-                | Self::Ready(..)
+            Self::Ready(..)
                 | Self::Wake(..)
                 | Self::UpdatesAcknowledged(..)
                 | Self::CommandFinished(..)
@@ -170,7 +169,8 @@ impl Action {
     fn mutation_target(&self) -> Option<Target> {
         match self {
             Self::Composer(target, action) if action.is_edit() => Some(*target),
-            Self::Reconnect(target)
+            Self::ChooseProvider(target, _)
+            | Self::Reconnect(target)
             | Self::Submit(target, _)
             | Self::AppendProviderDraft(target)
             | Self::Command(target, _)
@@ -185,7 +185,6 @@ impl Action {
             | Self::Slash(target, _)
             | Self::Mention(target, _)
             | Self::Scrolled(target, _)
-            | Self::ScrollTranscript(target, _)
             | Self::ModelPicker(target, _)
             | Self::ModelQuery(target, _) => Some(*target),
             _ => None,
@@ -199,9 +198,6 @@ struct Attempt {
 }
 
 pub(super) struct State {
-    new_thread: bool,
-    new_thread_focus: usize,
-    new_thread_channel: Option<crate::model::ChannelId>,
     sender: async_channel::Sender<(Target, Wake)>,
     receiver: async_channel::Receiver<(Target, Wake)>,
     generation: u64,
@@ -223,6 +219,7 @@ pub(super) struct State {
     /// A card in this set has no chat runtime to hold the offer, because its
     /// start never produced one, so the failed card itself has to carry it.
     fresh_offers: HashSet<CardId>,
+    fresh_threads: HashSet<CardId>,
     /// The new conversation a card is waiting to start once the one it could
     /// not resume has been closed.
     ///
@@ -234,9 +231,6 @@ impl Default for State {
     fn default() -> Self {
         let (sender, receiver) = async_channel::unbounded();
         Self {
-            new_thread: false,
-            new_thread_focus: 0,
-            new_thread_channel: None,
             sender,
             receiver,
             generation: 0,
@@ -247,6 +241,7 @@ impl Default for State {
             drafts: HashMap::new(),
             parked: HashMap::new(),
             fresh_offers: HashSet::new(),
+            fresh_threads: HashSet::new(),
             restarting: HashMap::new(),
         }
     }
@@ -593,7 +588,12 @@ fn copy_text(part: CopyPart, content: &ItemContent) -> Option<String> {
         | (CopyPart::Output, ItemContent::Tool { output, .. }) => joined(&[output]),
         // The code blocks of a Markdown answer are the cache's own, resolved
         // by the caller before it reaches this.
-        (CopyPart::Code(_), _) | (CopyPart::Input | CopyPart::Output, _) => None,
+        (CopyPart::Change(index), ItemContent::Changes { changes, .. }) => {
+            changes.get(index).map(|change| change.diff.clone())
+        }
+        (CopyPart::Code(_) | CopyPart::Change(_), _) | (CopyPart::Input | CopyPart::Output, _) => {
+            None
+        }
     }
 }
 
@@ -603,6 +603,10 @@ fn copy_text(part: CopyPart, content: &ItemContent) -> Option<String> {
 /// recorded as a `ChangeToken`, and the authoritative text stays in the
 /// snapshot the runtime already holds.
 struct CachedItem {
+    preview: tool_text::Preview,
+    tool_input: Option<tool_text::ToolText>,
+    tool_output: Option<tool_text::ToolText>,
+    patches: Vec<tool_text::ToolText>,
     token: ChangeToken,
     markdown: markdown::Content,
     code: CodeScan,
@@ -617,8 +621,67 @@ struct CachedItem {
     image: Option<iced::widget::image::Handle>,
 }
 impl CachedItem {
+    #[cfg(test)]
     fn new(content: &ItemContent, theme: crate::settings::EditorSyntaxTheme) -> Self {
+        Self::updated(content, theme, None, false)
+    }
+
+    fn updated(
+        content: &ItemContent,
+        theme: crate::settings::EditorSyntaxTheme,
+        previous: Option<Self>,
+        expanded: bool,
+    ) -> Self {
+        let (input, output, preview, patches) = previous
+            .map(|cached| {
+                (
+                    cached.tool_input,
+                    cached.tool_output,
+                    Some(cached.preview),
+                    cached.patches,
+                )
+            })
+            .unwrap_or_default();
+        use tool_text::{Language, ToolText};
+        let patches = match content {
+            ItemContent::Changes { changes, .. } if expanded => {
+                let mut previous = patches.into_iter();
+                changes
+                    .iter()
+                    .map(|change| ToolText::update(previous.next(), &change.diff, Language::Diff))
+                    .collect()
+            }
+            _ => Vec::new(),
+        };
+        let (tool_input, tool_output) = match content {
+            _ if !expanded => (None, None),
+            ItemContent::Command {
+                command,
+                output: text,
+                ..
+            } => (
+                Some(ToolText::update(input, command, Language::Shell)),
+                Some(ToolText::update(output, text, Language::structured(text))),
+            ),
+            ItemContent::Tool {
+                input: text,
+                output: result,
+                ..
+            } => (
+                Some(ToolText::update(input, text, Language::structured(text))),
+                Some(ToolText::update(
+                    output,
+                    result,
+                    Language::structured(result),
+                )),
+            ),
+            _ => (None, None),
+        };
         let mut cached = Self {
+            preview: tool_text::Preview::update(preview, content, theme),
+            tool_input,
+            tool_output,
+            patches,
             token: ChangeToken::of(content),
             markdown: markdown::Content::new(),
             code: CodeScan::default(),
@@ -727,6 +790,7 @@ impl CachedItem {
 
     /// Discards the highlighting and does it again in `theme`.
     fn rehighlight(&mut self, theme: crate::settings::EditorSyntaxTheme) {
+        self.preview.rehighlight(theme);
         self.blocks.clear();
         self.highlight(theme);
     }
@@ -924,6 +988,9 @@ pub(super) struct Runtime {
     pending: Option<PendingCommand>,
     next_command: u64,
     disconnected: bool,
+    /// The empty connection was explicitly closed for a model-family change.
+    /// Unlike disconnection, this proves there is no old actor left to close.
+    provider_closed: bool,
     visible: AtomicBool,
     error: Option<String>,
     /// Local send errors anchored to the exchange that produced them.
@@ -939,12 +1006,7 @@ pub(super) struct Runtime {
     /// The draft that was in the composer when the walk began, restored when
     /// the walk goes past the newest message.
     history_stash: String,
-    /// The transcript's minimap marks, derived from `turns` when the snapshot
-    /// changes rather than on the frames that draw them.
-    marks: Vec<crate::ui_controls::TranscriptMark>,
-    /// Where the transcript's viewport sat when it last moved, which places
-    /// the minimap's lens and answers whether the reader has reached the end
-    /// of the loaded history.
+    /// The most recent transcript viewport, used for history pagination.
     scroll: view::Scroll,
     /// The loaded transcript's height when a page of history was last asked
     /// for from that end, and `None` while the reader is not at that end.
@@ -1082,6 +1144,7 @@ impl Runtime {
             pending: None,
             next_command: 0,
             disconnected: false,
+            provider_closed: false,
             visible: AtomicBool::new(visible),
             error: None,
             failures: Vec::new(),
@@ -1090,7 +1153,6 @@ impl Runtime {
             history: Vec::new(),
             history_cursor: None,
             history_stash: String::new(),
-            marks: Vec::new(),
             scroll: view::Scroll::default(),
             earlier_asked: None,
             later_asked: None,
@@ -1139,9 +1201,15 @@ impl Runtime {
                     continue;
                 }
             }
+            let previous = self.cache.remove(&item.id);
             self.cache.insert(
                 item.id.clone(),
-                CachedItem::new(&item.content, self.syntax_theme),
+                CachedItem::updated(
+                    &item.content,
+                    self.syntax_theme,
+                    previous,
+                    self.expanded.contains(&item.id),
+                ),
             );
         }
         self.answers
@@ -1185,10 +1253,6 @@ impl Runtime {
         }
         self.turns = turn::group(&snapshot.items, &self.asked_after);
         reconcile_disclosure(&mut self.opened, &self.turns);
-        // The minimap is drawn on every frame of a streaming turn and changes
-        // only when the grouping does, so it is derived here, beside the
-        // grouping, rather than walked out of the item list per frame.
-        self.marks = view::minimap_marks(&self.turns);
         self.snapshot = snapshot;
     }
     pub(super) fn set_visible(&self, visible: bool) -> Result<(), String> {
@@ -1202,6 +1266,21 @@ impl Runtime {
         if visible {
             self.refresh();
         }
+    }
+
+    fn can_choose_provider(&self) -> bool {
+        self.session.terminal.is_none()
+            && !self.snapshot.busy
+            && !self.snapshot.has_earlier
+            && !self.snapshot.has_later
+            && self.snapshot.requests.is_empty()
+            && self
+                .snapshot
+                .items
+                .iter()
+                .all(|item| item.role == chat::Role::System)
+            && self.pending.is_none()
+            && !self.attachment_chooser_pending
     }
     /// Whether this card should offer to start a new conversation beside the
     /// one it was asked to resume.
@@ -1376,37 +1455,173 @@ fn return_terminal(session: &chat::Session) -> Result<TerminalSession, String> {
     Ok(terminal)
 }
 
+fn fresh_chat_session(
+    provider: Provider,
+    id: TerminalId,
+    working_directory: PathBuf,
+) -> Result<chat::Session, String> {
+    let mut recipe = LaunchRecipe {
+        program: provider.executable().into(),
+        arguments: Vec::new(),
+        working_directory,
+        environment: crate::model::agent_recovery::fresh_native_environment(provider, true),
+    };
+    match provider {
+        // A shared listener lets CLI and native views use the same thread.
+        Provider::Codex => recipe
+            .arguments
+            .extend(["--remote".into(), "unix://".into()]),
+        Provider::Omp => {
+            let root = provider
+                .session_root(&recipe)
+                .ok_or("Cannot locate the configured account for a new conversation")?;
+            recipe.arguments.extend([
+                "--session-dir".into(),
+                root.join("sessions/native").to_string_lossy().into_owned(),
+            ]);
+        }
+        Provider::Claude => {}
+    }
+    Ok(chat::Session {
+        id,
+        launch: chat::Launch {
+            provider,
+            recipe,
+            session_id: None,
+        },
+        proof: None,
+        terminal: None,
+    })
+}
+
 impl Cagents {
+    fn can_choose_failed_chat_provider(&self, card: CardId) -> bool {
+        self.chat_ui.fresh_threads.contains(&card)
+            && !self.chat_start_pending(card)
+            && matches!(self.cards.get(&card), Some(CardRuntime::Failed(_)))
+            && matches!(self.card_state(card).map(|state| &state.kind), Some(CardKind::Chat(session)) if session.launch.session_id.is_none() && session.terminal.is_none() && session.proof.is_none())
+    }
+
+    pub(super) fn chat_provider_recovery(&self, card: CardId) -> Option<Element<'_, Message>> {
+        self.can_choose_failed_chat_provider(card).then(|| {
+            widget::row::with_children(
+                [
+                    (Provider::Codex, "ChatGPT"),
+                    (Provider::Claude, "Claude"),
+                    (Provider::Omp, "Other models"),
+                ]
+                .into_iter()
+                .map(|(provider, label)| {
+                    widget::button::standard(label)
+                        .on_press(action(Action::ChooseFreshProvider(card, provider)))
+                        .into()
+                })
+                .collect::<Vec<_>>(),
+            )
+            .spacing(step::GAP_S)
+            .into()
+        })
+    }
+    fn choose_chat_provider(&mut self, target: Target, provider: Provider) -> Task<Message> {
+        let Some(runtime) = self.chat_runtime_mut(target) else {
+            return Task::none();
+        };
+        if !runtime.can_choose_provider()
+            || (runtime.session.launch.provider == provider && !runtime.provider_closed)
+        {
+            return Task::none();
+        }
+        let session = match fresh_chat_session(
+            provider,
+            runtime.session.id,
+            runtime.session.launch.recipe.working_directory.clone(),
+        ) {
+            Ok(session) => session,
+            Err(error) => {
+                runtime.error = Some(error);
+                return Task::none();
+            }
+        };
+        let handle = runtime.handle.clone();
+        runtime.model_picker = None;
+        if runtime.provider_closed {
+            runtime.session = session.clone();
+            self.commit_chat_session(target.card, session.clone());
+            return self.start_chat(target.card, session, chat::Intent::Start, None, false);
+        }
+        self.chat_ui.closing.insert(target);
+        self.chat_ui.restarting.insert(target.card, session);
+        cosmic::task::future(async move {
+            let result = tokio::task::spawn_blocking(move || handle.close())
+                .await
+                .map_err(|error| error.to_string())
+                .and_then(|result| result);
+            Message::ChatUi(Action::CloseFinished(target, result))
+        })
+    }
+
+    pub(super) fn chat_scroll_key(&self, event: &keyboard::Event) -> Option<Task<Message>> {
+        let keyboard::Event::KeyPressed {
+            key: keyboard::Key::Named(key),
+            modifiers,
+            ..
+        } = event
+        else {
+            return None;
+        };
+        if modifiers.alt() || modifiers.shift() || modifiers.logo() {
+            return None;
+        }
+        let card = self.workspace.focused()?;
+        let Some(CardRuntime::Chat(runtime)) = self.cards.get(&card) else {
+            return None;
+        };
+        use keyboard::key::Named;
+        let id = card_control_id(card, "chat-transcript");
+        let task = match key {
+            Named::PageUp | Named::PageDown if !modifiers.control() => {
+                iced::widget::scrollable::scroll_by(
+                    id,
+                    iced::widget::scrollable::AbsoluteOffset {
+                        x: 0.0,
+                        y: runtime.scroll.page_height()
+                            * if *key == Named::PageUp { 1.0 } else { -1.0 },
+                    },
+                )
+            }
+            Named::Home | Named::End => iced::widget::scrollable::snap_to(
+                id,
+                iced::widget::scrollable::RelativeOffset {
+                    x: None,
+                    y: Some(if *key == Named::Home { 1.0 } else { 0.0 }),
+                },
+            ),
+            _ => return None,
+        };
+        Some(task.map(cosmic::Action::App))
+    }
+
     pub(super) fn new_native_thread(&mut self) -> Task<Message> {
-        self.chat_ui.new_thread = true;
-        self.chat_ui.new_thread_focus = 0;
-        self.chat_ui.new_thread_channel = None;
-        iced::widget::operation::focus(widget::Id::new("chat.new-thread.chatgpt"))
-            .map(cosmic::Action::App)
+        let provider = self
+            .workspace
+            .focused()
+            .and_then(|card| self.card_state(card))
+            .into_iter()
+            .chain(
+                self.durable
+                    .cards
+                    .iter()
+                    .rev()
+                    .filter(|card| card.existence.is_open()),
+            )
+            .find_map(|card| match &card.kind {
+                CardKind::Chat(session) => Some(session.launch.provider),
+                _ => None,
+            })
+            .unwrap_or(Provider::Codex);
+        self.new_native_chat(provider, None)
     }
-    pub(super) fn new_thread_is_open(&self) -> bool {
-        self.chat_ui.new_thread
-    }
-    pub(super) fn new_native_thread_for_channel(
-        &mut self,
-        channel: crate::model::ChannelId,
-    ) -> Task<Message> {
-        let task = self.new_native_thread();
-        self.chat_ui.new_thread_channel = Some(channel);
-        task
-    }
-    pub(super) fn cycle_new_thread_focus(&mut self, backwards: bool) -> Task<Message> {
-        const IDS: [&str; 4] = [
-            "chat.new-thread.chatgpt",
-            "chat.new-thread.claude",
-            "chat.new-thread.other",
-            "chat.new-thread.cancel",
-        ];
-        self.chat_ui.new_thread_focus =
-            (self.chat_ui.new_thread_focus + if backwards { 3 } else { 1 }) % IDS.len();
-        iced::widget::operation::focus(widget::Id::new(IDS[self.chat_ui.new_thread_focus]))
-            .map(cosmic::Action::App)
-    }
+
     pub(super) fn dismiss_chat_picker(&mut self) -> bool {
         let Some(card) = self.workspace.focused() else {
             return false;
@@ -1435,47 +1650,16 @@ impl Cagents {
         let Some(working_directory) = directory.or_else(|| self.terminal_directory()) else {
             return cosmic::task::message(Message::OpenRepository);
         };
-        let mut recipe = LaunchRecipe {
-            program: provider.executable().into(),
-            arguments: Vec::new(),
-            working_directory: working_directory.clone(),
-            environment: crate::model::agent_recovery::fresh_native_environment(provider, true),
-        };
-        if provider == Provider::Codex {
-            // Both views attach to the same server-owned thread. A private
-            // stdio server cannot be joined by the CLI during an active turn.
-            recipe
-                .arguments
-                .extend(["--remote".into(), "unix://".into()]);
-        }
-        if provider == Provider::Omp {
-            let Some(root) = provider.session_root(&recipe) else {
-                self.status = Some(TransientNotice::error(
-                    "Cannot locate the configured OMP account for a new native chat.",
-                ));
-                return Task::none();
+        let session =
+            match fresh_chat_session(provider, TerminalId::new(), working_directory.clone()) {
+                Ok(session) => session,
+                Err(error) => {
+                    self.status = Some(TransientNotice::error(error));
+                    return Task::none();
+                }
             };
-            // An explicit session directory bypasses OMP's auto-resume setting.
-            // Never let a new tab select an established conversation implicitly.
-            recipe.arguments.extend([
-                "--session-dir".into(),
-                root.join("sessions")
-                    .join("native")
-                    .to_string_lossy()
-                    .into_owned(),
-            ]);
-        }
-        let session = chat::Session {
-            id: TerminalId::new(),
-            launch: chat::Launch {
-                provider,
-                recipe,
-                session_id: None,
-            },
-            proof: None,
-            terminal: None,
-        };
         let card_id = CardId::new();
+        self.chat_ui.fresh_threads.insert(card_id);
         let card = CardState {
             id: card_id,
             generation: self.durable.generation,
@@ -1560,6 +1744,7 @@ impl Cagents {
         self.chat_ui.drafts.remove(&card);
         self.chat_ui.parked.remove(&card);
         self.chat_ui.fresh_offers.remove(&card);
+        self.chat_ui.fresh_threads.remove(&card);
     }
     pub(super) fn chat_start_pending(&self, card: CardId) -> bool {
         self.chat_ui.attempts.contains_key(&card)
@@ -1637,6 +1822,10 @@ impl Cagents {
             return Task::none();
         }
         let target = runtime.target;
+        if runtime.provider_closed {
+            self.chat_ui.closing.insert(target);
+            return cosmic::task::message(Message::ChatUi(Action::CloseFinished(target, Ok(()))));
+        }
         let handle = runtime.handle.clone();
         self.chat_ui.closing.insert(target);
         cosmic::task::future(async move {
@@ -1807,33 +1996,44 @@ impl Cagents {
             return Task::none();
         }
         match action {
-            Action::DismissNewThread => {
-                self.chat_ui.new_thread = false;
-                if let Some(channel) = self.chat_ui.new_thread_channel.take()
-                    && self
-                        .durable
-                        .channels
-                        .iter()
-                        .any(|entry| entry.id == channel && entry.cards.is_empty())
+            Action::ToolText(target, id, part, event) => {
+                if let Some(runtime) = self.chat_runtime_mut(target)
+                    && let Some(cached) = runtime.cache.get_mut(&id)
+                    && let Some(block) = match part {
+                        CopyPart::Input => cached.tool_input.as_mut(),
+                        CopyPart::Output => cached.tool_output.as_mut(),
+                        CopyPart::Change(index) => cached.patches.get_mut(index),
+                        _ => None,
+                    }
                 {
-                    return self.delete_channel(channel);
+                    block.perform(event);
                 }
-                return self
-                    .workspace
-                    .focused()
-                    .map(|card| {
-                        iced::widget::operation::focus(workspace_widget::card_focus_id(card))
-                            .map(cosmic::Action::App)
-                    })
-                    .unwrap_or_else(Task::none);
             }
-            Action::NewThreadModelFamily(provider) => {
-                if !self.chat_ui.new_thread {
+            Action::ChooseProvider(target, provider) => {
+                return self.choose_chat_provider(target, provider);
+            }
+            Action::ChooseFreshProvider(card, provider) => {
+                if !self.can_choose_failed_chat_provider(card) {
                     return Task::none();
                 }
-                self.chat_ui.new_thread = false;
-                self.chat_ui.new_thread_channel = None;
-                return self.new_native_chat(provider, None);
+                let Some(CardKind::Chat(previous)) = self.card_state(card).map(|state| &state.kind)
+                else {
+                    return Task::none();
+                };
+                let session = match fresh_chat_session(
+                    provider,
+                    previous.id,
+                    previous.launch.recipe.working_directory.clone(),
+                ) {
+                    Ok(session) => session,
+                    Err(error) => {
+                        self.status = Some(TransientNotice::error(error));
+                        return Task::none();
+                    }
+                };
+                self.commit_chat_session(card, session.clone());
+                self.cards.insert(card, CardRuntime::Loading);
+                return self.start_chat(card, session, chat::Intent::Start, None, false);
             }
             Action::Switch(card) => {
                 if self.chat_start_pending(card) {
@@ -2015,6 +2215,10 @@ impl Cagents {
                         let visible = self.workspace.visibility(target.card)
                             == Some(VisibilityClass::Visible);
                         if let Some(CardRuntime::Chat(runtime)) = self.cards.get_mut(&target.card) {
+                            if runtime.provider_closed {
+                                runtime.model_picker = Some(String::new());
+                            }
+                            runtime.provider_closed = false;
                             runtime.target = target;
                             runtime.handle = handle;
                             runtime.session = session.clone();
@@ -2030,11 +2234,6 @@ impl Cagents {
                                 visible,
                                 self.settings.editor_syntax_theme,
                             );
-                            if attempt.session.launch.session_id.is_none()
-                                && attempt.session.terminal.is_none()
-                            {
-                                runtime.model_picker = Some(String::new());
-                            }
                             // Whatever was typed before this card last left the
                             // chat surface comes back with it.
                             if let Some(draft) = self.chat_ui.drafts.remove(&target.card)
@@ -2064,9 +2263,15 @@ impl Cagents {
                             self.name_channel_from_prompt(target.card, &name);
                         }
                         self.observe_agent_activity_for_card(target.card, Some(activity));
+                        let control = if matches!(self.cards.get(&target.card), Some(CardRuntime::Chat(runtime)) if runtime.model_picker.is_some())
+                        {
+                            "chat-model-search"
+                        } else {
+                            "chat-composer"
+                        };
                         return iced::widget::operation::focus(card_control_id(
                             target.card,
-                            "chat-composer",
+                            control,
                         ))
                         .map(cosmic::Action::App);
                     }
@@ -2117,6 +2322,15 @@ impl Cagents {
                 }
             }
             Action::Wake(target, wake) => {
+                // Ready refreshes the new handle. A final wake from the old,
+                // explicitly closed connection must not restore its identity.
+                if self.chat_start_pending(target.card)
+                    || self
+                        .chat_runtime_mut(target)
+                        .is_some_and(|runtime| runtime.provider_closed)
+                {
+                    return Task::none();
+                }
                 let needs_name = self.channel_needs_name(target.card);
                 if let Some(runtime) = self.chat_ui.parked.get_mut(&target.card)
                     && runtime.target == target
@@ -2365,7 +2579,19 @@ impl Cagents {
             Action::Toggle(target, id) => {
                 if let Some(runtime) = self.chat_runtime_mut(target) {
                     if !runtime.expanded.remove(&id) {
-                        runtime.expanded.insert(id);
+                        runtime.expanded.insert(id.clone());
+                    }
+                    if let Some(item) = runtime.snapshot.items.iter().find(|item| item.id == id) {
+                        let previous = runtime.cache.remove(&id);
+                        runtime.cache.insert(
+                            id.clone(),
+                            CachedItem::updated(
+                                &item.content,
+                                runtime.syntax_theme,
+                                previous,
+                                runtime.expanded.contains(&id),
+                            ),
+                        );
                     }
                 }
             }
@@ -2723,8 +2949,28 @@ impl Cagents {
                     // Only the conversation is being given up here; the card
                     // stays and immediately starts its replacement, so it is
                     // never left showing a conversation that no longer exists.
-                    self.chat_forget(target.card);
-                    self.cards.insert(target.card, CardRuntime::Loading);
+                    let changing_provider = self.chat_runtime_mut(target).is_some_and(|runtime| {
+                        if runtime.session.launch.provider == session.launch.provider {
+                            return false;
+                        }
+                        // Keep the draft, attachments, and composer selection in
+                        // this card while its empty connection changes accounts.
+                        runtime.session = session.clone();
+                        runtime.disconnected = true;
+                        runtime.provider_closed = true;
+                        let snapshot = Arc::make_mut(&mut runtime.snapshot);
+                        snapshot.models.clear();
+                        snapshot.selected_model = None;
+                        snapshot.reasoning = None;
+                        snapshot.session_id = None;
+                        runtime.permission_mode = None;
+                        true
+                    });
+                    if !changing_provider {
+                        self.chat_forget(target.card);
+                        self.cards.insert(target.card, CardRuntime::Loading);
+                    }
+                    self.commit_chat_session(target.card, session.clone());
                     return self.start_chat(target.card, session, chat::Intent::Start, None, false);
                 }
                 self.chat_ui.closed.insert(target.card);
@@ -2760,22 +3006,6 @@ impl Cagents {
                     runtime.later_asked = height;
                     return self.chat_send(target, Command::Refresh, false);
                 }
-            }
-            Action::ScrollTranscript(target, fraction) => {
-                if self.chat_runtime_mut(target).is_none() {
-                    return Task::none();
-                }
-                // The transcript is anchored to its newest message, so a
-                // relative offset is measured from the bottom: asking for the
-                // start of the conversation is asking for the far end of it.
-                return iced::widget::scrollable::snap_to(
-                    card_control_id(target.card, "chat-transcript"),
-                    iced::widget::scrollable::RelativeOffset {
-                        x: None,
-                        y: Some(1.0 - fraction.clamp(0.0, 1.0)),
-                    },
-                )
-                .map(cosmic::Action::App);
             }
             Action::ModelPicker(target, open) => {
                 let Some(runtime) = self.chat_runtime_mut(target) else {
@@ -2920,6 +3150,61 @@ mod tests {
         assert!(
             opened.is_empty(),
             "a group the store no longer produces is forgotten rather than held for the session"
+        );
+    }
+
+    #[test]
+    fn a_failed_new_thread_can_choose_another_provider_in_the_same_card() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let directory = PathBuf::from("/workspace/chat-fixture");
+        // Tasks are intentionally dropped: this exercises the UI lifecycle
+        // without starting a provider or invoking a model.
+        let _ = app.new_native_chat(Provider::Codex, Some(directory.clone()));
+        let card = app.workspace.focused().unwrap();
+        let attempt = app.chat_ui.attempts.get(&card).unwrap();
+        let target = attempt.target;
+        let session_id = attempt.session.id;
+        let _ = app.handle_chat_ui(Action::Ready(
+            target,
+            Ready(Arc::new(Mutex::new(Some(Err(chat::StartFailure::retry(
+                "fixture: executable unavailable",
+            )))))),
+        ));
+        assert!(app.can_choose_failed_chat_provider(card));
+        let _ = app.handle_chat_ui(Action::ChooseFreshProvider(card, Provider::Claude));
+        let attempt = app.chat_ui.attempts.get(&card).unwrap();
+        assert_eq!(attempt.session.id, session_id);
+        assert_eq!(attempt.session.launch.provider, Provider::Claude);
+        assert_eq!(attempt.session.launch.recipe.working_directory, directory);
+        assert_eq!(app.workspace.focused(), Some(card));
+        assert!(!app.can_choose_failed_chat_provider(card));
+    }
+
+    #[test]
+    fn established_failed_conversations_never_offer_provider_replacement() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let _ = app.new_native_chat(
+            Provider::Codex,
+            Some(PathBuf::from("/workspace/chat-fixture")),
+        );
+        let card = app.workspace.focused().unwrap();
+        app.chat_ui.attempts.remove(&card);
+        app.cards
+            .insert(card, CardRuntime::Failed("fixture".into()));
+        let state = Arc::make_mut(&mut app.durable)
+            .cards
+            .iter_mut()
+            .find(|state| state.id == card)
+            .unwrap();
+        let CardKind::Chat(session) = &mut state.kind else {
+            unreachable!()
+        };
+        session.launch.session_id = Some("existing-thread".into());
+        assert!(!app.can_choose_failed_chat_provider(card));
+        let _ = app.handle_chat_ui(Action::ChooseFreshProvider(card, Provider::Claude));
+        assert!(!app.chat_start_pending(card));
+        assert!(
+            matches!(&app.card_state(card).unwrap().kind, CardKind::Chat(session) if session.launch.provider == Provider::Codex)
         );
     }
 

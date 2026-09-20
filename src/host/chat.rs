@@ -2541,7 +2541,13 @@ for line in sys.stdin:
         let handle = host.lock().unwrap_or_else(|p| p.into_inner()).chats[&saved.source.id]
             .handle
             .clone();
-        assert!(handle.close().is_err());
+        handle
+            .close()
+            .expect("failed provider teardown permits explicit retirement");
+        assert!(
+            handle.failure().is_some(),
+            "the rejected session remains diagnosed"
+        );
     }
 
     struct Echo(bool);
