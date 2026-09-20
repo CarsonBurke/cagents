@@ -962,9 +962,8 @@ struct ShapeParams {
 
 /// One row's shaped segments, keyed by the row it was shaped from.
 ///
-/// The daemon reuses the `Arc` of every row a repaint leaves unchanged, so
-/// pointer identity is an exact content key: holding the `Arc` keeps the
-/// address from being recycled under a stale entry.
+/// Pointer identity cheaply recognizes untouched rows. Content equality also
+/// recognizes rows reconstructed by IPC after moving within the viewport.
 #[derive(Default)]
 struct ShapedRow {
     source: Option<Arc<RowSnapshot>>,
@@ -980,6 +979,7 @@ struct ShapedSegment {
 #[derive(Default)]
 struct ShapeCache {
     params: Option<ShapeParams>,
+    offset: u64,
     rows: Vec<ShapedRow>,
     /// Scratch reused while shaping, so a cache miss allocates nothing extra.
     content: String,
@@ -987,6 +987,23 @@ struct ShapeCache {
 }
 
 impl ShapeCache {
+    /// Align buffers with the new viewport before checking their contents.
+    /// Rotation only proposes reuse: equality below validates every candidate,
+    /// including wrapped entries, output changes, and scrollback eviction.
+    fn scroll_to(&mut self, offset: u64) {
+        if !self.rows.is_empty() {
+            let distance = offset.abs_diff(self.offset);
+            if distance < self.rows.len() as u64 {
+                if offset > self.offset {
+                    self.rows.rotate_left(distance as usize);
+                } else {
+                    self.rows.rotate_right(distance as usize);
+                }
+            }
+        }
+        self.offset = offset;
+    }
+
     /// Brings the cache up to date for the visible rows and returns nothing to
     /// draw for rows that shape to no glyphs.
     ///
@@ -1018,12 +1035,16 @@ impl ShapeCache {
         }
         self.rows.resize_with(rows.len(), ShapedRow::default);
 
-        let stale = rows.iter().zip(self.rows.iter()).any(|(row, cached)| {
-            cached
-                .source
-                .as_ref()
-                .is_none_or(|source| !Arc::ptr_eq(source, row))
-        });
+        let mut stale = false;
+        for (row, cached) in rows.iter().zip(self.rows.iter_mut()) {
+            if cached.source.as_ref().is_some_and(|source| source == row) {
+                // Keep the latest allocation so subsequent cursor/pointer
+                // redraws take the Arc identity fast path again.
+                cached.source = Some(Arc::clone(row));
+            } else {
+                stale = true;
+            }
+        }
         if !stale {
             return;
         }
@@ -2001,10 +2022,10 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for TerminalWidget<Message
                     }
                 }
 
-                // Glyphs. One shaped buffer per segment, reused for as long as
-                // the daemon leaves the row alone, so a still terminal reshapes
-                // nothing and a scrolling one reshapes only the rows that moved.
+                // Reuse glyph buffers for overlapping content after scrolling;
+                // only newly exposed or rewritten rows need shaping.
                 let mut shaped = state.shaped.borrow_mut();
+                shaped.scroll_to(self.snapshot.scroll.offset);
                 shaped.refresh(&geometry, self.font_size, rows, column_limit);
                 let default_foreground = color(self.snapshot.foreground);
                 for (row_index, cached) in shaped.rows.iter().enumerate() {
@@ -3660,11 +3681,7 @@ mod tests {
     }
 
     #[test]
-    fn a_shaped_row_survives_exactly_as_long_as_its_snapshot_pointer() {
-        // The cache keys a row's buffers on the `Arc` the daemon handed out and
-        // holds it, so the address cannot be recycled under a stale entry.
-        // Comparing anything weaker - a length, or the cells themselves - would
-        // leave a live terminal drawing glyphs of text it no longer holds.
+    fn shaped_rows_survive_equal_content_but_not_changed_content() {
         let geometry = shape_cache_geometry("");
         let mut cache = ShapeCache::default();
         let mut rows = vec![row("first row"), row("second row")];
@@ -3683,9 +3700,8 @@ mod tests {
             );
         }
 
-        // Equal content in a fresh allocation still reshapes: the daemon reuses
-        // the `Arc` of every row a repaint leaves alone, so a new pointer means
-        // the row was rewritten and pointer identity is the whole key.
+        // IPC reconstructs moved rows in fresh allocations. Equal content
+        // still has exactly the same glyphs and attributes.
         rows[1] = row("second row");
         cache.refresh(&geometry, DEFAULT_FONT_SIZE, &rows, 80);
         let replaced = shaped_buffers(&cache);
@@ -3694,9 +3710,13 @@ mod tests {
             "a row nobody touched must not reshape"
         );
         assert!(
-            !Arc::ptr_eq(&baseline[1], &replaced[1]),
-            "a replaced row must reshape even when its content is equal"
+            Arc::ptr_eq(&baseline[1], &replaced[1]),
+            "equal content must retain its shaped buffer"
         );
+        assert!(Arc::ptr_eq(
+            cache.rows[1].source.as_ref().unwrap(),
+            &rows[1]
+        ));
 
         // And a row whose content actually changed, for the same reason.
         rows[0] = row("FIRST ROW");
@@ -3707,6 +3727,47 @@ mod tests {
             Arc::ptr_eq(&replaced[1], &rewritten[1]),
             "one rewritten row must not cost the others their buffers"
         );
+    }
+
+    #[test]
+    fn scrolling_reuses_overlapping_rows_reconstructed_by_ipc() {
+        let geometry = shape_cache_geometry("");
+        let mut cache = ShapeCache::default();
+        cache.scroll_to(100);
+        cache.refresh(
+            &geometry,
+            DEFAULT_FONT_SIZE,
+            &[row("one"), row("two"), row("three")],
+            80,
+        );
+        let before = shaped_buffers(&cache);
+        cache.scroll_to(101);
+        cache.refresh(
+            &geometry,
+            DEFAULT_FONT_SIZE,
+            &[row("two"), row("three"), row("four")],
+            80,
+        );
+        let down = shaped_buffers(&cache);
+        assert!(Arc::ptr_eq(&before[1], &down[0]));
+        assert!(Arc::ptr_eq(&before[2], &down[1]));
+        assert!(!Arc::ptr_eq(&before[0], &down[2]));
+
+        cache.scroll_to(100);
+        // Concurrent output changed the middle row: scrolling cannot reuse it.
+        cache.refresh(
+            &geometry,
+            DEFAULT_FONT_SIZE,
+            &[row("one"), row("TWO"), row("three")],
+            80,
+        );
+        let up = shaped_buffers(&cache);
+        assert!(!Arc::ptr_eq(&down[0], &up[1]));
+        assert!(Arc::ptr_eq(&down[1], &up[2]));
+
+        cache.scroll_to(u64::MAX);
+        cache.refresh(&geometry, DEFAULT_FONT_SIZE, &[row("new page")], 80);
+        assert_eq!(shaped_buffers(&cache).len(), 1);
     }
 
     #[test]
