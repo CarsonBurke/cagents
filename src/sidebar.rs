@@ -1094,10 +1094,9 @@ impl PanelSection {
         }
     }
 
-    /// `Changes` is the section a source-control surface exists for, so it is
-    /// the one that starts open.
+    /// Show all nonignored working changes immediately, including new files.
     fn expanded_by_default(self) -> bool {
-        matches!(self, Self::Changes)
+        matches!(self, Self::Changes | Self::Untracked)
     }
 }
 
@@ -11318,8 +11317,8 @@ pub(crate) mod tests {
         assert!(!source.can_load_history(), "a short page ends the walk");
     }
     #[test]
-    fn untracked_starts_collapsed_and_history_reloads_when_head_moves() {
-        assert!(!SidebarState::default().section_expanded(PanelSection::Untracked));
+    fn untracked_starts_expanded_and_history_reloads_when_head_moves() {
+        assert!(SidebarState::default().section_expanded(PanelSection::Untracked));
         let mut previous = SourceControlModel::ready(main_key(), &snapshot());
         previous.head_oid = Some(oid_of(1).as_str().into());
         previous.mark_history_requested();

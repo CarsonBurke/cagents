@@ -375,8 +375,9 @@ cagents ui
   rows for their actions; there is no ellipsis menu button. Worktree rows show
   matching pull requests and their reported CI status. Icon tooltips appear
   after one second. Change rows color their status/counts and replace them with
-  action buttons on hover. **Untracked** starts collapsed and is read only when
-  expanded; the Files browser can independently list untracked file names.
+  action buttons on hover. **Untracked** starts expanded, excludes ignored files,
+  and is read only while expanded; the Files browser can independently list
+  nonignored untracked file names.
   Expanded untracked text files show measured additions;
   binary, unsafe, oversized, or budget-limited files retain unknown counts.
   The Changes tab highlights local or committed branch changes; committed files
