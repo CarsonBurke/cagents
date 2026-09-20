@@ -598,7 +598,7 @@ impl HostState {
         terminal_id: TerminalId,
         epoch: u64,
     ) -> Result<(), ProtocolError> {
-        self.handle(client_id, terminal_id)?;
+        self.attached_terminal(client_id, terminal_id)?;
         let observation = self
             .subscriptions
             .output
@@ -644,13 +644,13 @@ impl HostState {
             .get(&terminal_id)
             .ok_or_else(|| not_found(terminal_id))?;
         let mut session = record.session.clone();
-        session.continuity = if record.running && attached {
+        session.continuity = if !record.handle.is_completed() && attached {
             TerminalContinuity::Live {
                 host_session_id: self.proof.host_session_id.clone(),
                 boot_id: self.proof.boot_id.clone(),
                 host_incarnation: self.proof.host_incarnation.clone(),
             }
-        } else if record.running {
+        } else if !record.handle.is_completed() {
             TerminalContinuity::DetachedSameBoot {
                 host_session_id: self.proof.host_session_id.clone(),
                 boot_id: self.proof.boot_id.clone(),
@@ -830,13 +830,31 @@ impl HostState {
     }
 
     /// A retained final grid can gain or lose UI focus after its process exits.
+    /// Presentation and input still belong to a PTY held by descendants, even
+    /// after its original process no longer grants process-control authority.
+    pub(crate) fn surface_handle(
+        &self,
+        client_id: ClientId,
+        terminal_id: TerminalId,
+    ) -> Result<TerminalHandle, ProtocolError> {
+        let record = self.attached_terminal(client_id, terminal_id)?;
+        if record.handle.is_completed() {
+            return Err(ProtocolError::new(
+                ProtocolErrorCode::TerminalUnavailable,
+                "terminal output has completed",
+                false,
+            ));
+        }
+        Ok(record.handle.clone())
+    }
+
     pub(crate) fn focus_handle(
         &self,
         client_id: ClientId,
         terminal_id: TerminalId,
     ) -> Result<Option<TerminalHandle>, ProtocolError> {
         let record = self.attached_terminal(client_id, terminal_id)?;
-        Ok(record.running.then(|| record.handle.clone()))
+        Ok((!record.handle.is_completed()).then(|| record.handle.clone()))
     }
 
     /// Releasing presentation credit is not a process mutation. A shell's exit
@@ -3080,7 +3098,20 @@ for line in sys.stdin:
                 .unwrap();
             let generation = handle.generation();
             assert!(state.redraw_ack_handle(1, id, generation).is_ok());
-            assert!(state.focus_handle(1, id).unwrap().is_none());
+            assert!(state.focus_handle(1, id).unwrap().is_some());
+            assert!(
+                state.surface_handle(1, id).is_ok(),
+                "a descendant's live PTY retains input and scrolling"
+            );
+            assert!(
+                state
+                    .descriptor(1, id)
+                    .unwrap()
+                    .session
+                    .continuity
+                    .live_proof()
+                    .is_some()
+            );
             assert_eq!(
                 state.focus_handle(2, id).err().unwrap().code,
                 ProtocolErrorCode::PermissionDenied

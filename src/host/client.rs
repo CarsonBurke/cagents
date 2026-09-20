@@ -306,7 +306,7 @@ impl AgentActivityJob {
     ) -> Result<(), ProtocolError> {
         let (handle, observer, proof) = {
             let state = host.lock().unwrap_or_else(|error| error.into_inner());
-            let handle = state.handle(client_id, terminal_id)?;
+            let handle = state.surface_handle(client_id, terminal_id)?;
             if state.shutting_down
                 || !state
                     .clients
@@ -362,11 +362,13 @@ impl AgentActivityJob {
                         }
                         handle.observe_agent_process()
                     };
-                    let activity = process.as_ref().and_then(|process| {
-                        (process.provider != crate::agent::Provider::Omp)
-                            .then(|| observer.activity(process))
-                            .flatten()
-                    });
+                    let observation = process
+                        .as_ref()
+                        .and_then(|process| {
+                            (process.provider != crate::agent::Provider::Omp)
+                                .then(|| observer.observe(process))
+                        })
+                        .unwrap_or_default();
                     let cancelled = cancelled.lock().unwrap_or_else(|error| error.into_inner());
                     if *cancelled {
                         return;
@@ -385,7 +387,7 @@ impl AgentActivityJob {
                             delivery.abort("the client connection was replaced");
                             return;
                         }
-                        state.handle(client_id, terminal_id)
+                        state.surface_handle(client_id, terminal_id)
                     };
                     let message = match attached {
                         Ok(_) => {
@@ -395,7 +397,11 @@ impl AgentActivityJob {
                                 if process.provider == crate::agent::Provider::Omp {
                                     handle.agent_activity()
                                 } else {
-                                    handle.apply_agent_activity(process, activity)
+                                    handle.apply_agent_activity(
+                                        process,
+                                        observation.activity,
+                                        observation.title,
+                                    )
                                 }
                             });
                             ServerMessage::Response {
@@ -615,7 +621,7 @@ fn process_request(
             let handle = host
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .handle(client_id, terminal_id)?;
+                .surface_handle(client_id, terminal_id)?;
             handle.input(bytes).map_err(send_error)?;
             Ok((ServerResponse::Accepted, Vec::new(), false))
         }
@@ -634,7 +640,7 @@ fn process_request(
             let handle = host
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .handle(client_id, terminal_id)?;
+                .surface_handle(client_id, terminal_id)?;
             handle.key(input).map_err(send_error)?;
             Ok((ServerResponse::Accepted, Vec::new(), false))
         }
@@ -663,7 +669,7 @@ fn process_request(
             let handle = host
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .handle(client_id, terminal_id)?;
+                .surface_handle(client_id, terminal_id)?;
             handle.mouse(input).map_err(send_error)?;
             Ok((ServerResponse::Accepted, Vec::new(), false))
         }
@@ -687,7 +693,7 @@ fn process_request(
             let handle = host
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .handle(client_id, terminal_id)?;
+                .surface_handle(client_id, terminal_id)?;
             handle.set_theme(theme).map_err(send_error)?;
             Ok((ServerResponse::Accepted, Vec::new(), false))
         }
@@ -708,7 +714,7 @@ fn process_request(
             let handle = host
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .handle(client_id, terminal_id)?;
+                .surface_handle(client_id, terminal_id)?;
             match scroll {
                 TerminalScroll::Lines(delta) => {
                     let delta = isize::try_from(delta).map_err(|_| {
@@ -755,7 +761,7 @@ fn process_request(
             let handle = host
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .handle(client_id, terminal_id)?;
+                .surface_handle(client_id, terminal_id)?;
             handle.resize(size.into()).map_err(send_error)?;
             Ok((ServerResponse::Accepted, Vec::new(), false))
         }

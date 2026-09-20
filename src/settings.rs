@@ -20,6 +20,7 @@ const PRIVATE_FILE_MODE: u32 = 0o600;
 const MAX_TOML_INTEGER: u64 = i64::MAX as u64;
 
 const MAX_TERMINAL_SCROLLBACK_LINES: usize = 1_000_000;
+const MAX_TERMINAL_SCROLL_SIZE: usize = 10;
 const LEGACY_SETTINGS_SCHEMA_VERSION: u32 = 1;
 const PREVIOUS_SETTINGS_SCHEMA_VERSION: u32 = 2;
 const LEGACY_SIDEBAR_WIDTH_MIN: f32 = 180.0;
@@ -286,6 +287,14 @@ const fn default_terminal_scrollback_lines() -> usize {
     10_000
 }
 
+const fn default_terminal_scroll_size() -> usize {
+    2
+}
+
+const fn default_terminal_scroll_speed() -> f32 {
+    1.0
+}
+
 fn default_managed_worktree_directory() -> String {
     "worktrees/".to_owned()
 }
@@ -383,8 +392,12 @@ pub struct AppSettings {
     pub ui_scale: f32,
     #[serde(default = "default_terminal_line_height")]
     pub terminal_line_height: f32,
+    #[serde(default = "default_terminal_scroll_speed")]
+    pub terminal_scroll_speed: f32,
     #[serde(default = "default_terminal_padding")]
     pub terminal_padding: f32,
+    #[serde(default = "default_terminal_scroll_size")]
+    pub terminal_scroll_size: usize,
     #[serde(default)]
     pub terminal_cursor_style: TerminalCursorStyle,
     #[serde(default)]
@@ -446,9 +459,11 @@ impl Default for AppSettings {
             hibernation_delay_ms: 30_000,
             focus_follows_mouse: default_focus_follows_mouse(),
             app_theme: AppTheme::default(),
+            terminal_scroll_speed: default_terminal_scroll_speed(),
             ui_scale: default_ui_scale(),
             terminal_line_height: default_terminal_line_height(),
             terminal_padding: default_terminal_padding(),
+            terminal_scroll_size: default_terminal_scroll_size(),
             terminal_cursor_style: TerminalCursorStyle::default(),
             terminal_theme: crate::terminal::TerminalTheme::default(),
             terminal_font_size: 14.0,
@@ -824,6 +839,16 @@ impl AppSettings {
                 "terminal_padding must be between 0 and 24",
             ));
         }
+        if !(1..=MAX_TERMINAL_SCROLL_SIZE).contains(&self.terminal_scroll_size) {
+            return Err(SettingsError::Invalid(
+                "terminal_scroll_size must be between 1 and 10",
+            ));
+        }
+        if !(0.25..=4.0).contains(&self.terminal_scroll_speed) {
+            return Err(SettingsError::Invalid(
+                "terminal_scroll_speed must be between 0.25 and 4",
+            ));
+        }
         if !(8.0..=40.0).contains(&self.terminal_font_size) {
             return Err(SettingsError::Invalid(
                 "terminal_font_size must be between 8 and 40",
@@ -1141,9 +1166,33 @@ fn load_toml(path: &Path) -> Result<AppSettings, SettingsError> {
         PREVIOUS_SETTINGS_SCHEMA_VERSION => {
             AppSettings::from(toml::from_str::<V2TomlSettings>(document)?).validate()
         }
-        SETTINGS_SCHEMA_VERSION => toml::from_str::<AppSettings>(document)?.validate(),
+        SETTINGS_SCHEMA_VERSION => load_current_toml(document),
         version => Err(SettingsError::UnsupportedSchema(version)),
     }
+}
+
+/// Renames the short-lived scroll-speed key from the first implementation of
+/// the preference. Its value represented lines per wheel notch, so it is the
+/// same setting; the old default of one is promoted to the new default of two.
+fn load_current_toml(document: &str) -> Result<AppSettings, SettingsError> {
+    let mut table = toml::from_str::<toml::Table>(document)?;
+    if !table.contains_key("terminal_scroll_size")
+        && matches!(
+            table.get("terminal_scroll_speed"),
+            Some(toml::Value::Integer(_))
+        )
+        && let Some(value) = table.remove("terminal_scroll_speed")
+    {
+        let value = match value {
+            toml::Value::Integer(1) => toml::Value::Integer(2),
+            value => value,
+        };
+        table.insert("terminal_scroll_size".to_owned(), value);
+    }
+    toml::Value::Table(table)
+        .try_into::<AppSettings>()
+        .map_err(SettingsError::Toml)?
+        .validate()
 }
 
 fn migrate_legacy(path: &Path) -> Result<AppSettings, SettingsError> {
@@ -1388,6 +1437,8 @@ mod tests {
             ui_scale: 1.2,
             terminal_line_height: 1.5,
             terminal_padding: 12.0,
+            terminal_scroll_size: 4,
+            terminal_scroll_speed: 1.75,
             terminal_cursor_style: TerminalCursorStyle::Beam,
             terminal_theme: crate::terminal::TerminalTheme::Light,
             terminal_font_size: 16.5,
@@ -1866,6 +1917,92 @@ next_column = ["Alt+W", "Alt+Right"]
             above_limit.validate(),
             Err(SettingsError::Invalid(_))
         ));
+    }
+
+    #[test]
+    fn terminal_scroll_size_defaults_to_two_and_is_bounded() {
+        assert_eq!(AppSettings::default().terminal_scroll_size, 2);
+        assert!(
+            AppSettings {
+                terminal_scroll_size: MAX_TERMINAL_SCROLL_SIZE,
+                ..AppSettings::default()
+            }
+            .validate()
+            .is_ok()
+        );
+        assert!(
+            AppSettings {
+                terminal_scroll_size: 0,
+                ..AppSettings::default()
+            }
+            .validate()
+            .is_err()
+        );
+        assert!(
+            AppSettings {
+                terminal_scroll_size: MAX_TERMINAL_SCROLL_SIZE + 1,
+                ..AppSettings::default()
+            }
+            .validate()
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn terminal_scroll_speed_defaults_to_one_and_is_bounded() {
+        assert_eq!(AppSettings::default().terminal_scroll_speed, 1.0);
+        for speed in [0.25, 4.0] {
+            assert!(
+                AppSettings {
+                    terminal_scroll_speed: speed,
+                    ..AppSettings::default()
+                }
+                .validate()
+                .is_ok()
+            );
+        }
+        for speed in [0.0, 4.01] {
+            assert!(
+                AppSettings {
+                    terminal_scroll_speed: speed,
+                    ..AppSettings::default()
+                }
+                .validate()
+                .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn old_scroll_speed_setting_migrates_to_scroll_size() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = path_in(&directory);
+        let document = toml::to_string(&AppSettings::default()).unwrap();
+        let old_base = document
+            .replace("terminal_scroll_speed = 1.0\n", "")
+            .replace("terminal_scroll_size = 2\n", "");
+        let old_default = old_base.replace(
+            "terminal_padding",
+            "terminal_scroll_speed = 1\nterminal_padding",
+        );
+        fs::write(&path, old_default).unwrap();
+        assert_eq!(load(&path).unwrap().terminal_scroll_size, 2);
+
+        let old_custom = old_base.replace(
+            "terminal_padding",
+            "terminal_scroll_speed = 4\nterminal_padding",
+        );
+        fs::write(&path, old_custom).unwrap();
+        assert_eq!(load(&path).unwrap().terminal_scroll_size, 4);
+
+        let current =
+            document.replace("terminal_scroll_speed = 1.0", "terminal_scroll_speed = 2.5");
+        fs::write(&path, &current).unwrap();
+        let loaded = load(&path).unwrap();
+        assert_eq!(loaded.terminal_scroll_size, 2);
+        assert_eq!(loaded.terminal_scroll_speed, 2.5);
+        fs::write(&path, current.replace("terminal_scroll_size = 2\n", "")).unwrap();
+        assert_eq!(load(&path).unwrap().terminal_scroll_speed, 2.5);
     }
 
     #[test]

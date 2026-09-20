@@ -82,6 +82,7 @@ enum Command {
     ApplyAgentActivity {
         process: AgentProcess,
         activity: Option<crate::agent::Activity>,
+        title: Option<String>,
         reply: Sender<Option<crate::agent::Activity>>,
         deadline: std::time::Instant,
     },
@@ -401,6 +402,7 @@ impl TerminalHandle {
         &self,
         process: AgentProcess,
         activity: Option<crate::agent::Activity>,
+        title: Option<String>,
     ) -> Option<crate::agent::Activity> {
         let (reply, result) = crossbeam_channel::bounded(1);
         let timeout = std::time::Duration::from_secs(3);
@@ -409,6 +411,7 @@ impl TerminalHandle {
             .try_command(Command::ApplyAgentActivity {
                 process,
                 activity,
+                title,
                 reply,
                 deadline,
             })
@@ -639,6 +642,7 @@ struct Worker {
     agent_process: Option<AgentProcess>,
     display_title: String,
     agent_exited: bool,
+    root_exit: Option<TerminalEvent>,
     terminal: Terminal<'static, 'static>,
     theme: Rc<Cell<TerminalTheme>>,
     key_encoder: KeyEncoder<'static>,
@@ -836,6 +840,7 @@ impl Worker {
             agent_process: None,
             display_title: String::new(),
             agent_exited: false,
+            root_exit: None,
             launch: session.launch,
             terminal,
             theme,
@@ -983,6 +988,20 @@ impl Worker {
                 }
             }
         }
+        if let Some(TerminalEvent::Exited {
+            exit_code,
+            signal,
+            intentional,
+        }) = self.root_exit.take()
+        {
+            // The root can exit while descendants continue using the PTY.
+            // Only teardown after the drained PTY finalizes the surface.
+            self.emit(TerminalEvent::Completed {
+                exit_code,
+                signal,
+                intentional,
+            });
+        }
         drop(self.writer);
         drop(self.master);
         // Terminal, render state, and every Ghostty encoder drop here, on the
@@ -995,6 +1014,7 @@ impl Worker {
             .as_ref()
             .is_some_and(RootIdentity::intentionally_killed);
         if let Some(event) = child_exit_event(exited, result, intentional) {
+            self.root_exit = Some(event.clone());
             self.agent_exited = true;
             self.agent_provider = None;
             self.agent_process = None;
@@ -1096,17 +1116,19 @@ impl Worker {
             Command::ApplyAgentActivity {
                 process,
                 activity,
+                title,
                 reply,
                 deadline,
             } => {
                 let current = self.observe_agent_process();
-                let activity = if std::time::Instant::now() < deadline && current == Some(&process)
-                {
-                    activity
-                } else {
-                    None
-                };
+                let valid = std::time::Instant::now() < deadline && current == Some(&process);
+                let activity = if valid { activity } else { None };
                 self.set_agent_activity(activity);
+                if valid && let Some(title) = title {
+                    self.emit(TerminalEvent::ConversationTitleChanged(
+                        title.chars().take(256).collect(),
+                    ));
+                }
                 let _ = reply.send(
                     *self
                         .published
@@ -1444,6 +1466,11 @@ impl Worker {
                 Effect::PtyWrite(bytes) => self.write_pty(&bytes, "write terminal response"),
                 Effect::Bell => self.emit(TerminalEvent::Bell),
                 Effect::Title(title) => {
+                    let title = if self.agent_provider == Some(crate::agent::Provider::Codex) {
+                        crate::agent::codex_title_without_spinner(&title)
+                    } else {
+                        &title
+                    };
                     let activity = self.agent_provider.and_then(|provider| {
                         provider
                             .activity_from_title(&title)
@@ -1476,6 +1503,15 @@ impl Worker {
                         );
                     }
                     if display_changed || observed != activity {
+                        if let Some(process) = &self.agent_process
+                            && let Some(name) = process
+                                .provider
+                                .conversation_title(&title, &process.launch.working_directory)
+                        {
+                            self.emit(TerminalEvent::ConversationTitleChanged(
+                                name.chars().take(256).collect(),
+                            ));
+                        }
                         let display = canonical_agent_title(&title, observed);
                         if display != self.display_title {
                             self.display_title = display.clone();
@@ -2604,6 +2640,7 @@ mod tests {
             worker.handle_command(Command::ApplyAgentActivity {
                 process,
                 activity: working,
+                title: None,
                 reply,
                 deadline,
             });
@@ -2809,7 +2846,19 @@ mod tests {
                 .collect::<String>(),
             "descendant"
         );
+        assert!(
+            events
+                .try_iter()
+                .all(|event| !matches!(event, TerminalEvent::Completed { .. })),
+            "root exit must not finalize a PTY still owned by descendants"
+        );
         worker.run();
+        assert!(
+            events
+                .try_iter()
+                .any(|event| matches!(event, TerminalEvent::Completed { .. })),
+            "worker teardown publishes the distinct final completion event"
+        );
     }
 
     fn test_published(visible: bool, wakes: Arc<AtomicUsize>) -> PublishedState {

@@ -841,11 +841,35 @@ impl<'a> markdown::Viewer<'a, Message, cosmic::Theme, cosmic::Renderer> for Pros
     }
 }
 
+/// Provider snapshots also cover restored chats and prompts sent through the
+/// paired CLI. Never infer a conversation from another process in the same cwd.
+fn snapshot_channel_name(snapshot: &Snapshot) -> Option<&str> {
+    snapshot
+        .title
+        .as_deref()
+        .filter(|title| !title.trim().is_empty())
+        .or_else(|| {
+            snapshot
+                .items
+                .iter()
+                .find_map(|item| match (&item.role, &item.content) {
+                    (chat::Role::User, ItemContent::Text { text, .. })
+                        if !text.trim().is_empty() =>
+                    {
+                        Some(text.as_str())
+                    }
+                    _ => None,
+                })
+        })
+}
+
 struct PendingCommand {
     id: u64,
     draft_revision: Option<u64>,
     request: Option<String>,
     permission_mode: Option<String>,
+    /// The first user prompt, used to name a new channel once locally queued.
+    first_prompt: Option<String>,
     /// The message this command sends, kept for the composer's history once
     /// the provider has accepted it. A rejected send is not history: the
     /// draft it came from is still in the composer.
@@ -1262,19 +1286,6 @@ pub(super) fn chat_card_title(provider: Provider) -> &'static str {
         Provider::Claude => "Claude chat",
         Provider::Codex => "Codex chat",
     }
-}
-
-/// Whether a card title is still the one the application chose for it.
-///
-/// A channel takes its name from a conversation that has named itself, so
-/// every title the application assigns has to be recognized here or a channel
-/// would be named after the agent rather than the work.
-pub(super) fn placeholder_card_title(title: &str) -> bool {
-    let title = title.trim();
-    matches!(title, "" | "Native chat" | "Agent" | "Terminal")
-        || Provider::ALL
-            .iter()
-            .any(|provider| title == chat_card_title(*provider))
 }
 
 /// The draft with the word being typed replaced by `invocation`.
@@ -1749,6 +1760,10 @@ impl Cagents {
             Command::Refresh => Some(view::Page::Newer),
             _ => None,
         };
+        let first_prompt = match &command {
+            Command::Prompt { text, .. } if !text.trim().is_empty() => Some(text.clone()),
+            _ => None,
+        };
         let sent = match &command {
             Command::Prompt { text, .. } if !text.trim().is_empty() => Some(text.clone()),
             Command::Slash { command } => Some(command.clone()),
@@ -1759,6 +1774,7 @@ impl Cagents {
             draft_revision: clear_draft.then_some(runtime.revision),
             request,
             permission_mode,
+            first_prompt,
             page,
             sent,
         });
@@ -1988,7 +2004,9 @@ impl Cagents {
                         self.chat_ui.fresh_offers.remove(&target.card);
                         let mut session = handle.session();
                         session.proof = handle.proof();
-                        let title = handle.snapshot().title.clone();
+                        let snapshot = handle.snapshot();
+                        let channel_name = snapshot_channel_name(&snapshot).map(str::to_owned);
+                        let title = snapshot.title.clone();
                         let activity = Activity {
                             provider: session.launch.provider,
                             state: handle.take_activity(),
@@ -2041,6 +2059,9 @@ impl Cagents {
                             && self.apply_reported_title(target.card, title)
                         {
                             self.persist();
+                        }
+                        if let Some(name) = channel_name {
+                            self.name_channel_from_prompt(target.card, &name);
                         }
                         self.observe_agent_activity_for_card(target.card, Some(activity));
                         return iced::widget::operation::focus(card_control_id(
@@ -2096,12 +2117,21 @@ impl Cagents {
                 }
             }
             Action::Wake(target, wake) => {
+                let needs_name = self.channel_needs_name(target.card);
                 if let Some(runtime) = self.chat_ui.parked.get_mut(&target.card)
                     && runtime.target == target
                 {
+                    let name = if needs_name && matches!(wake, Wake::Changed) {
+                        snapshot_channel_name(&runtime.handle.snapshot()).map(str::to_owned)
+                    } else {
+                        None
+                    };
                     if let Wake::Disconnected(error) = wake {
                         runtime.disconnected = true;
                         runtime.error = Some(error);
+                    }
+                    if let Some(name) = name {
+                        self.name_channel_from_prompt(target.card, &name);
                     }
                     return Task::none();
                 }
@@ -2116,7 +2146,14 @@ impl Cagents {
                             state: runtime.handle.take_activity(),
                         };
                         let session = runtime.session.clone();
-                        let title = runtime.handle.snapshot().title.clone();
+                        let snapshot = runtime.handle.snapshot();
+                        let channel_name = needs_name
+                            .then(|| snapshot_channel_name(&snapshot).map(str::to_owned))
+                            .flatten();
+                        let title = snapshot.title.clone();
+                        if let Some(name) = channel_name {
+                            self.name_channel_from_prompt(target.card, &name);
+                        }
                         self.observe_agent_activity_for_card(target.card, Some(activity));
                         self.commit_chat_session(target.card, session);
                         if let Some(title) = title
@@ -2292,7 +2329,7 @@ impl Cagents {
                     return Task::none();
                 }
                 let pending = runtime.pending.take().unwrap();
-                match result {
+                let first_prompt = match result {
                     Ok(()) => {
                         if let Some(mode) = pending.permission_mode {
                             runtime.permission_mode = Some(mode);
@@ -2309,6 +2346,7 @@ impl Cagents {
                             runtime.answers.retain(|(id, _), _| id != &request);
                         }
                         runtime.refresh();
+                        pending.first_prompt
                     }
                     Err(error) => {
                         let anchor = runtime.turns.last().map(|turn| turn.key.clone());
@@ -2317,7 +2355,11 @@ impl Cagents {
                         }
                         runtime.failures.push((anchor, error.clone()));
                         runtime.error = Some(error);
+                        None
                     }
+                };
+                if let Some(prompt) = first_prompt {
+                    self.name_channel_from_prompt(target.card, &prompt);
                 }
             }
             Action::Toggle(target, id) => {
@@ -2774,6 +2816,27 @@ impl Cagents {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn resumed_and_cli_paired_snapshots_supply_channel_names() {
+        let mut snapshot = Snapshot::default();
+        assert_eq!(snapshot_channel_name(&snapshot), None);
+        snapshot.items.push(chat::Item {
+            id: "prompt".into(),
+            role: chat::Role::User,
+            content: text("Implement the requested feature"),
+            at: None,
+        });
+        assert_eq!(
+            snapshot_channel_name(&snapshot),
+            Some("Implement the requested feature")
+        );
+        snapshot.title = Some("Provider conversation name".into());
+        assert_eq!(
+            snapshot_channel_name(&snapshot),
+            Some("Provider conversation name")
+        );
+    }
 
     fn text(body: &str) -> ItemContent {
         ItemContent::Text {

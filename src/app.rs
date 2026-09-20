@@ -909,6 +909,9 @@ fn session_health_stream(
 }
 
 fn restored_terminal_failure(session: &TerminalSession) -> Option<String> {
+    if terminal_completed(session) {
+        return None;
+    }
     let TerminalContinuity::RelaunchAvailable {
         last_exit: Some(last_exit),
         ..
@@ -929,6 +932,20 @@ fn restored_terminal_failure(session: &TerminalSession) -> Option<String> {
         "Retry starts a new terminal; no exact agent session is available"
     };
     Some(format!("{outcome}; {recovery}"))
+}
+
+fn terminal_completed(session: &TerminalSession) -> bool {
+    matches!(&session.continuity,
+        TerminalContinuity::RelaunchAvailable { last_exit: Some(exit), .. }
+        | TerminalContinuity::Exited { last_exit: exit }
+        if exit.code == Some(0) && exit.signal.is_none())
+}
+
+fn completed_terminal(state: Option<&CardState>) -> Option<&TerminalSession> {
+    match state.map(|state| &state.kind) {
+        Some(CardKind::Terminal(session)) if terminal_completed(session) => Some(session),
+        _ => None,
+    }
 }
 
 fn restored_runtime_residency(
@@ -1799,6 +1816,7 @@ fn user_workspace_message_blocked_while_modal(message: &Message) -> bool {
         | Message::CloseCard(_)
         | Message::OpenBrowser(_)
         | Message::OpenLink(..)
+        | Message::OpenTerminalOutput(_)
         | Message::NewBrowser
         | Message::RetryCard(_)
         | Message::FocusAdjacent(_)
@@ -2003,6 +2021,8 @@ pub enum SettingsField {
     UiScale,
     TerminalLineHeight,
     TerminalPadding,
+    TerminalScrollSize,
+    TerminalScrollSpeed,
     TerminalCursorStyle,
     TerminalTheme,
     MaxHotCards,
@@ -2077,6 +2097,8 @@ struct SettingsDraft {
     ui_scale: String,
     terminal_line_height: String,
     terminal_padding: String,
+    terminal_scroll_size: String,
+    terminal_scroll_speed: String,
     terminal_cursor_style: String,
     terminal_theme: String,
     max_hot_cards: String,
@@ -2110,6 +2132,8 @@ impl SettingsDraft {
             ui_scale: settings.ui_scale.to_string(),
             terminal_line_height: settings.terminal_line_height.to_string(),
             terminal_padding: settings.terminal_padding.to_string(),
+            terminal_scroll_size: settings.terminal_scroll_size.to_string(),
+            terminal_scroll_speed: settings.terminal_scroll_speed.to_string(),
             terminal_cursor_style: match settings.terminal_cursor_style {
                 TerminalCursorStyle::Application => "application",
                 TerminalCursorStyle::Block => "block",
@@ -2154,8 +2178,10 @@ impl SettingsDraft {
             SettingsField::UiScale => self.ui_scale = value,
             SettingsField::TerminalLineHeight => self.terminal_line_height = value,
             SettingsField::TerminalPadding => self.terminal_padding = value,
-            SettingsField::TerminalCursorStyle => self.terminal_cursor_style = value,
+            SettingsField::TerminalScrollSize => self.terminal_scroll_size = value,
+            SettingsField::TerminalScrollSpeed => self.terminal_scroll_speed = value,
             SettingsField::TerminalTheme => self.terminal_theme = value,
+            SettingsField::TerminalCursorStyle => self.terminal_cursor_style = value,
             SettingsField::MaxHotCards => self.max_hot_cards = value,
             SettingsField::HibernationDelayMs => self.hibernation_delay_ms = value,
             SettingsField::TerminalFontSize => self.terminal_font_size = value,
@@ -2323,6 +2349,14 @@ fn settings_update(
             .parse::<f32>()
             .map(|value| next.terminal_padding = value)
             .map_err(|_| "Terminal padding must be a number.".to_owned()),
+        SettingsField::TerminalScrollSize => value
+            .parse::<usize>()
+            .map(|value| next.terminal_scroll_size = value)
+            .map_err(|_| "Terminal scroll size must be a whole number.".to_owned()),
+        SettingsField::TerminalScrollSpeed => value
+            .parse::<f32>()
+            .map(|value| next.terminal_scroll_speed = value)
+            .map_err(|_| "Terminal scroll speed must be a number.".to_owned()),
         SettingsField::MaxHotCards => value
             .parse::<usize>()
             .map(|value| next.max_hot_cards = value)
@@ -2563,6 +2597,7 @@ pub enum Message {
     },
     OpenBrowser(Url),
     OpenLink(Url, LinkOpenGesture),
+    OpenTerminalOutput(CardId),
     ExternalLinkOpened(Result<(), String>),
     NewBrowser,
     #[cfg(not(feature = "integrated-browser"))]
@@ -2826,6 +2861,7 @@ struct BrowserRuntime {
 enum CardRuntime {
     Loading,
     Failed(String),
+    Completed,
     Terminal(TerminalSurface),
     Chat(Box<chat_ui::Runtime>),
     #[cfg(feature = "integrated-browser")]
@@ -2849,6 +2885,7 @@ struct CardLabels {
 /// card's accessibility node stable across frames.
 struct CardChrome {
     focus_id: widget::Id,
+    title_id: widget::Id,
     container_id: widget::Id,
     close_id: widget::Id,
     resize_id: widget::Id,
@@ -2878,6 +2915,7 @@ impl CardChrome {
     ) -> Self {
         Self {
             focus_id: workspace_widget::card_focus_id(id),
+            title_id: card_control_id(id, "title"),
             container_id: workspace_widget::card_widget_id(id),
             close_id: card_control_id(id, "close"),
             resize_id: card_control_id(id, "resize"),
@@ -3494,7 +3532,10 @@ impl Cagents {
                     if let Some(state) = self.card_state_mut(card.id) {
                         state.residency = terminal_residency;
                     }
-                    if let Some(message) = restored_terminal_failure(&session) {
+                    if terminal_completed(&session) {
+                        self.lifecycle.remove(card.id);
+                        self.cards.insert(card.id, CardRuntime::Completed);
+                    } else if let Some(message) = restored_terminal_failure(&session) {
                         self.cards
                             .insert(card.id, CardRuntime::Failed(message.clone()));
                         self.status
@@ -4404,6 +4445,7 @@ impl Cagents {
             Some(
                 CardRuntime::Loading
                 | CardRuntime::Failed(_)
+                | CardRuntime::Completed
                 | CardRuntime::Repository(_)
                 | CardRuntime::Chat(_)
                 | CardRuntime::PullRequests(_),
@@ -4415,7 +4457,17 @@ impl Cagents {
         self.mark_runtime_failed(card, message);
     }
 
+    fn completed_terminal_has_native_owner(&self, card: CardId) -> bool {
+        completed_terminal(self.card_state(card)).is_some_and(|session| {
+            self.chat_has_parked_runtime(card)
+                || chat_ui::conversion(session).is_ok_and(|chat| chat.owns_codex_listener())
+        })
+    }
+
     fn retry_card(&mut self, card: CardId) -> Task<Message> {
+        if self.completed_terminal_has_native_owner(card) {
+            return self.handle_chat_ui(chat_ui::Action::Switch(card));
+        }
         if matches!(self.cards.get(&card), Some(CardRuntime::Repository(runtime)) if runtime.blocks_navigation())
         {
             return Task::none();
@@ -4929,7 +4981,9 @@ impl Cagents {
         };
         let mut durable_changed = false;
         let mut recovery = None;
-        if let Some(proof) = proof {
+        if let Some(proof) = proof
+            && completed_terminal(self.card_state(card)).is_none()
+        {
             self.uncertain_terminal_proofs.remove(&card);
             let live = TerminalContinuity::Live {
                 host_session_id: proof.host_session_id,
@@ -4956,6 +5010,9 @@ impl Cagents {
                 TerminalEvent::TitleChanged(title) => {
                     durable_changed |= self.apply_reported_title(card, title);
                 }
+                TerminalEvent::ConversationTitleChanged(title) => {
+                    self.name_channel_from_prompt(card, &title);
+                }
                 TerminalEvent::ResumeHintChanged(hint) => {
                     if let Some(state) = self.card_state_mut(card)
                         && let CardKind::Terminal(session) = &mut state.kind
@@ -4966,7 +5023,19 @@ impl Cagents {
                     }
                 }
                 TerminalEvent::Bell => {}
+                // Root exit is not PTY completion: a descendant may still
+                // accept input and produce output. Keep its live surface.
                 TerminalEvent::Exited {
+                    exit_code: 0,
+                    signal: None,
+                    ..
+                } => {}
+                TerminalEvent::Exited {
+                    exit_code,
+                    signal,
+                    intentional,
+                }
+                | TerminalEvent::Completed {
                     exit_code,
                     signal,
                     intentional,
@@ -4974,10 +5043,23 @@ impl Cagents {
                     if let Some(state) = self.card_state_mut(card)
                         && let CardKind::Terminal(session) = &mut state.kind
                     {
-                        transition_terminal_to_relaunchable(session, terminal_exit(exit_code));
+                        let mut last_exit = terminal_exit(exit_code);
+                        // The protocol exposes a signal description rather than
+                        // a portable signal number. Do not misclassify it as a
+                        // successful zero-status completion.
+                        if signal.is_some() && exit_code == 0 {
+                            last_exit.code = None;
+                        }
+                        transition_terminal_to_relaunchable(session, last_exit);
                     }
                     durable_changed = true;
-                    if !intentional {
+                    if exit_code == 0 && signal.is_none() {
+                        self.lifecycle.remove(card);
+                        self.sidebar_state.clear_agent_activity(card);
+                        if let Some(state) = self.card_state_mut(card) {
+                            state.residency = Residency::Hibernated;
+                        }
+                    } else if !intentional {
                         let message = match signal {
                             Some(signal) => format!("terminal exited with {signal}"),
                             None => format!("terminal exited with status {exit_code}"),
@@ -4987,6 +5069,11 @@ impl Cagents {
                     }
                 }
                 TerminalEvent::Error { operation, message } => {
+                    // Commands already in flight can lose the race with a
+                    // successful exit. They cannot turn completion into failure.
+                    if completed_terminal(self.card_state(card)).is_some() {
+                        continue;
+                    }
                     let message = format!("terminal {operation}: {message}");
                     if operation == "connect to cagents daemon"
                         && let Some(proof) = terminal_continuity(self.card_state(card))
@@ -5368,10 +5455,17 @@ impl Cagents {
         let content: Element<'a, Message> = match self.cards.get(&id) {
             Some(CardRuntime::Chat(_)) => self.chat_view(id),
             Some(CardRuntime::Terminal(handle)) => TerminalWidget::new(handle.clone())
+                .read_only(completed_terminal(card).is_some())
+                .id(chrome.map_or_else(
+                    || workspace_widget::card_focus_id(id),
+                    |chrome| chrome.focus_id.clone(),
+                ))
                 .font_size(self.settings.terminal_font_size)
                 .font_family(&self.settings.terminal_font_family)
                 .line_height(self.settings.terminal_line_height)
                 .padding(self.settings.terminal_padding)
+                .scroll_size(self.settings.terminal_scroll_size)
+                .scroll_speed(self.settings.terminal_scroll_speed)
                 .cursor_style(self.settings.terminal_cursor_style)
                 .scale_factor(effective_surface_scale(
                     self.window_scale_factor,
@@ -5440,6 +5534,11 @@ impl Cagents {
             .center(Length::Fill)
             .padding(spacing.space_m)
             .into(),
+            Some(CardRuntime::Completed) => {
+                widget::container(design::body("Process finished successfully."))
+                    .center(Length::Fill)
+                    .into()
+            }
             Some(CardRuntime::Failed(message)) => widget::container(
                 widget::container(
                     widget::column::with_children(vec![
@@ -5518,6 +5617,39 @@ impl Cagents {
         };
 
         let mut rows: Vec<Element<'a, Message>> = Vec::with_capacity(3);
+        if let Some(session) = completed_terminal(card) {
+            let resume = session.agent_resume_recipe().is_some();
+            let native = self.completed_terminal_has_native_owner(id);
+            let mut controls: Vec<Element<'a, Message>> = vec![
+                design::body("Completed").width(Length::Fill).into(),
+                widget::button::standard(if native {
+                    "Open conversation"
+                } else if resume {
+                    "Resume"
+                } else {
+                    "Restart"
+                })
+                .on_press(Message::RetryCard(id))
+                .into(),
+            ];
+            if session.transcript_path.is_some() {
+                controls.push(
+                    widget::button::standard("Open saved output")
+                        .on_press(Message::OpenTerminalOutput(id))
+                        .into(),
+                );
+            }
+            rows.push(
+                widget::container(
+                    widget::row::with_children(controls)
+                        .spacing(8)
+                        .align_y(Alignment::Center),
+                )
+                .padding([4, 8])
+                .width(Length::Fill)
+                .into(),
+            );
+        }
         if let Some(CardRuntime::Repository(runtime)) = self.cards.get(&id)
             && let Some(toolbar) = repository_widget::selected_file_toolbar(id, runtime)
         {
@@ -6492,6 +6624,7 @@ impl Cagents {
                     .map_err(|error| error.to_string()),
                 CardRuntime::Loading
                 | CardRuntime::Failed(_)
+                | CardRuntime::Completed
                 | CardRuntime::Repository(_)
                 | CardRuntime::PullRequests(_) => Ok(()),
             };
@@ -6706,9 +6839,9 @@ impl Cagents {
                 }
             },
             Some(CardRuntime::Chat(_)) => InspectorRuntimeStatus::Ready,
-            Some(CardRuntime::Terminal(_)) | Some(CardRuntime::PullRequests(_)) => {
-                InspectorRuntimeStatus::Ready
-            }
+            Some(CardRuntime::Completed)
+            | Some(CardRuntime::Terminal(_))
+            | Some(CardRuntime::PullRequests(_)) => InspectorRuntimeStatus::Ready,
             Some(CardRuntime::Repository(runtime)) => match runtime.inspector_runtime_status() {
                 RepositoryRuntimeStatus::Loading => InspectorRuntimeStatus::Loading,
                 RepositoryRuntimeStatus::Ready => InspectorRuntimeStatus::Ready,
@@ -7257,7 +7390,10 @@ impl Cagents {
     }
 
     fn synchronize_terminal_theme(&mut self) {
-        for runtime in self.cards.values() {
+        for (card, runtime) in &self.cards {
+            if completed_terminal(self.card_state(*card)).is_some() {
+                continue;
+            }
             if let CardRuntime::Terminal(surface) = runtime {
                 if let Err(error) = surface.set_theme(self.settings.terminal_theme) {
                     self.status = Some(TransientNotice::error(format!(
@@ -7488,12 +7624,14 @@ impl Cagents {
                     | SettingsField::TerminalScrollbackLines
                     | SettingsField::TerminalLineHeight
                     | SettingsField::TerminalPadding
+                    | SettingsField::TerminalScrollSize
+                    | SettingsField::TerminalScrollSpeed
                     | SettingsField::TerminalCursorStyle
-                    | SettingsField::ManagedWorktreeDirectory
                     | SettingsField::ConfirmTerminalClose
                     | SettingsField::ChatEnterSends
                     | SettingsField::FocusFollowsMouse
                     | SettingsField::DefaultColumnFraction
+                    | SettingsField::ManagedWorktreeDirectory
                     | SettingsField::LinkOpenDestination
                     | SettingsField::LinkOpenGesture
                     | SettingsField::ShortcutNewTerminal
@@ -8081,8 +8219,17 @@ impl Application for Cagents {
                         // as a closed visibility channel.
                         self.cards.insert(card, CardRuntime::Terminal(handle));
                         tasks.push(self.drain_terminal(card, 0));
+                        if completed_terminal(self.card_state(card)).is_some() {
+                            self.persist();
+                            tasks.push(self.commit_terminal_handoffs());
+                            tasks.push(self.finish_terminal_start());
+                            return Task::batch(tasks);
+                        }
                         let Some(CardRuntime::Terminal(handle)) = self.cards.get(&card) else {
                             tasks.push(cosmic::task::message(Message::LifecycleSweep));
+                            self.persist();
+                            tasks.push(self.commit_terminal_handoffs());
+                            tasks.push(self.finish_terminal_start());
                             return Task::batch(tasks);
                         };
                         if let Err(error) = handle.set_theme(self.settings.terminal_theme) {
@@ -9256,6 +9403,7 @@ impl Application for Cagents {
                         }
                         CardRuntime::Loading
                         | CardRuntime::Failed(_)
+                        | CardRuntime::Completed
                         | CardRuntime::Repository(_)
                         | CardRuntime::Chat(_)
                         | CardRuntime::PullRequests(_) => {}
@@ -9386,6 +9534,15 @@ impl Application for Cagents {
             }
             Message::OpenLink(url, gesture) => {
                 self.open_link_in(url, self.settings.link_destination(Some(gesture)))
+            }
+            Message::OpenTerminalOutput(card) => {
+                let url = completed_terminal(self.card_state(card))
+                    .and_then(|session| session.transcript_path.as_ref())
+                    .and_then(|path| Url::from_file_path(path).ok());
+                match url {
+                    Some(url) => self.open_link_in(url, LinkOpenDestination::SystemDefault),
+                    None => Task::none(),
+                }
             }
             Message::ExternalLinkOpened(result) => {
                 if let Err(error) = result {
@@ -11619,7 +11776,7 @@ mod tests {
 
     /// A headless `cosmic::Renderer`. With no graphics device it falls back
     /// to tiny-skia, which needs neither a device nor a surface.
-    fn headless_renderer() -> cosmic::Renderer {
+    pub(super) fn headless_renderer() -> cosmic::Renderer {
         use cosmic::iced::advanced::renderer::Headless;
         use cosmic::iced::{Font, Pixels};
 
@@ -13660,6 +13817,84 @@ mod tests {
                 retryable: true,
             } if code == "terminal_exited"
         ));
+    }
+
+    #[test]
+    fn restored_successful_terminal_is_completed_without_automatic_relaunch() {
+        let mut app = context_inspector_test_app(true);
+        let card = app.workspace.focused().unwrap();
+        let CardKind::Terminal(session) = &mut app.card_state_mut(card).unwrap().kind else {
+            panic!("terminal fixture");
+        };
+        transition_terminal_to_relaunchable(session, terminal_exit(0));
+        let identity = session.id;
+        assert!(terminal_completed(session));
+        assert!(restored_terminal_failure(session).is_none());
+        drop(app.initialize_runtimes());
+        assert!(matches!(app.cards.get(&card), Some(CardRuntime::Completed)));
+        assert!(app.status.is_none());
+        assert!(
+            app.lifecycle
+                .reconcile(&HashSet::from([card]), &HashSet::new(), Instant::now())
+                .is_empty()
+        );
+        let session = completed_terminal(app.card_state(card)).unwrap();
+        assert_eq!(session.id, identity);
+        // Relaunch remains an explicit action with a fresh host identity.
+        assert_ne!(fresh_terminal_relaunch(session).id, identity);
+    }
+
+    #[test]
+    fn only_success_without_a_signal_is_normal_completion() {
+        let mut state = terminal_card_state();
+        let CardKind::Terminal(session) = &mut state.kind else {
+            panic!("terminal fixture");
+        };
+        for (code, signal, completed) in [
+            (Some(0), None, true),
+            (Some(1), None, false),
+            (Some(0), Some(15), false),
+            (None, None, false),
+        ] {
+            transition_terminal_to_relaunchable(
+                session,
+                TerminalExit {
+                    code,
+                    signal,
+                    occurred_at_unix_ms: 0,
+                },
+            );
+            assert_eq!(terminal_completed(session), completed);
+            assert_eq!(restored_terminal_failure(session).is_none(), completed);
+        }
+    }
+
+    #[test]
+    fn completed_managed_codex_reopens_its_native_owner_without_a_new_terminal_id() {
+        let mut app = context_inspector_test_app(true);
+        let card = app.workspace.focused().unwrap();
+        let CardKind::Terminal(session) = &mut app.card_state_mut(card).unwrap().kind else {
+            panic!("terminal fixture");
+        };
+        let identity = session.id;
+        session.launch.program = "codex".into();
+        let endpoint = std::env::temp_dir()
+            .join(format!("cagents-codex-{identity}"))
+            .join("control.sock");
+        session.launch.arguments =
+            vec!["--remote".into(), format!("unix://{}", endpoint.display())];
+        transition_terminal_to_relaunchable(session, terminal_exit(0));
+        app.cards.insert(card, CardRuntime::Completed);
+        assert!(app.completed_terminal_has_native_owner(card));
+        // Dropping the task never connects to or launches a real agent.
+        drop(app.retry_card(card));
+        assert!(app.chat_start_pending(card));
+        assert!(matches!(app.cards.get(&card), Some(CardRuntime::Completed)));
+        let CardKind::Terminal(session) = &app.card_state(card).unwrap().kind else {
+            panic!("native attach has not completed yet");
+        };
+        assert_eq!(session.id, identity);
+        assert_eq!(app.terminal_starts_in_flight(), 0);
     }
 
     #[test]

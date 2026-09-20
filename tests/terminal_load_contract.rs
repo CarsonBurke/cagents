@@ -106,6 +106,7 @@ fn wait_for_title(events: &EventReceiver<TerminalEvent>, expected: &str) {
         match events.recv_timeout(remaining) {
             Ok(TerminalEvent::TitleChanged(title)) if title == expected => return,
             Ok(TerminalEvent::TitleChanged(_))
+            | Ok(TerminalEvent::ConversationTitleChanged(_))
             | Ok(TerminalEvent::ResumeHintChanged(_))
             | Ok(TerminalEvent::AgentActivityChanged(_))
             | Ok(TerminalEvent::Bell) => {}
@@ -113,6 +114,9 @@ fn wait_for_title(events: &EventReceiver<TerminalEvent>, expected: &str) {
                 panic!("terminal error during {operation}: {message}")
             }
             Ok(TerminalEvent::Exited {
+                exit_code, signal, ..
+            })
+            | Ok(TerminalEvent::Completed {
                 exit_code, signal, ..
             }) => panic!(
                 "terminal exited before title {expected:?}: code={exit_code}, signal={signal:?}"

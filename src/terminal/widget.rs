@@ -18,7 +18,7 @@ use cosmic::{
             InputMethod, Layout, Shell, Widget,
             clipboard::{self, Clipboard},
             input_method, layout, mouse, renderer, text,
-            widget::{Tree, tree},
+            widget::{Id, Operation, Tree, operation, tree},
         },
         keyboard,
         mouse::{Button as IcedMouseButton, ScrollDelta},
@@ -53,15 +53,12 @@ const UNFOCUSED_CURSOR_ALPHA: f32 = 0.45;
 /// the text it covers any harder to read than the text beside it.
 const SELECTION_ALPHA: f32 = 0.35;
 
-/// Rows the viewport moves for one notch of a discrete wheel.
+/// Rows the viewport moves for one notch of a discrete wheel by default.
 ///
-/// A wheel reports notches rather than distance, so the notch has to be given
-/// a size, and one row per notch makes a pane that every other terminal and
-/// this application's own editor outrun by several rows a notch. Three is the
-/// size xterm, Ghostty and the desktop toolkits settle on. A trackpad is
-/// deliberately exempt: it reports the finger's real distance, which has to
-/// stay 1:1 or the content no longer tracks the hand moving it.
-const ROWS_PER_WHEEL_NOTCH: isize = 3;
+/// A wheel reports notches rather than distance, so the scroll size gives each
+/// notch a predictable number of terminal rows. The scroll-speed multiplier
+/// also scales high-resolution wheel and trackpad input.
+const DEFAULT_ROWS_PER_WHEEL_NOTCH: isize = 2;
 
 /// Text metrics for one terminal grid at one scale factor.
 ///
@@ -785,6 +782,7 @@ fn normalize_paste(text: &str) -> String {
 #[derive(Default)]
 struct WidgetState {
     last_size: Option<TerminalSize>,
+    input_focused: bool,
     focused: bool,
     focus_requested: bool,
     pressed_buttons: u8,
@@ -828,6 +826,20 @@ struct WidgetState {
     shaped: RefCell<ShapeCache>,
 }
 
+impl operation::Focusable for WidgetState {
+    fn is_focused(&self) -> bool {
+        self.input_focused
+    }
+
+    fn focus(&mut self) {
+        self.input_focused = true;
+    }
+
+    fn unfocus(&mut self) {
+        self.input_focused = false;
+    }
+}
+
 impl WidgetState {
     /// Advances the cursor-blink phase to the frame instant `now` and returns
     /// the instant the next phase begins.
@@ -867,21 +879,31 @@ impl WidgetState {
     /// the sub-unit remainder so that a high-resolution trackpad keeps moving
     /// continuously instead of in whole-notch jumps.
     ///
-    /// The remainder accumulates in the unit the device reports, and the notch
-    /// size is applied afterwards to whatever moves the document: the
-    /// scrollback viewport, and the cursor keys an alternate-screen
-    /// application reads instead. A mouse report is the one case left
-    /// unscaled, because there the application counts detents itself and the
-    /// protocol means one report per detent.
+    /// The configured speed scales viewport and alternate-screen movement.
+    /// Mouse-reporting applications remain unscaled because they count
+    /// detents themselves.
     ///
     /// Terminal input is never folded, because a child counts what it
     /// receives, so the two input cases return a count for the caller to send
     /// one by one. A viewport move has no such observer and is returned for
     /// folding.
-    fn wheel_effect(&mut self, travel: WheelTravel, scroll: ScrollSnapshot) -> WheelEffect {
-        let (units, rows_per_unit) = match travel {
-            WheelTravel::Notches(notches) => (notches, ROWS_PER_WHEEL_NOTCH),
-            WheelTravel::Rows(rows) => (rows, 1),
+    fn wheel_effect(
+        &mut self,
+        travel: WheelTravel,
+        scroll: ScrollSnapshot,
+        scroll_size: isize,
+        scroll_speed: f32,
+    ) -> WheelEffect {
+        let speed = if scroll_speed.is_finite() {
+            scroll_speed.max(0.25)
+        } else {
+            1.0
+        };
+        let reporting = scroll.mouse_tracking && !self.modifiers.shift;
+        let units = match travel {
+            WheelTravel::Notches(notches) if !reporting => notches * scroll_size as f32 * speed,
+            WheelTravel::Rows(rows) if !reporting => rows * speed,
+            WheelTravel::Notches(units) | WheelTravel::Rows(units) => units,
         };
         self.wheel_remainder -= units;
         let delta = (self.wheel_remainder.trunc() as isize).clamp(-128, 128);
@@ -889,7 +911,7 @@ impl WidgetState {
         if delta == 0 {
             return WheelEffect::Idle;
         }
-        let rows = delta * rows_per_unit;
+        let rows = delta;
         if self.modifiers.shift {
             return WheelEffect::Viewport(rows);
         }
@@ -1135,12 +1157,16 @@ fn web_link_at(row: &RowSnapshot, column: u16) -> Option<url::Url> {
 /// holds only owned data while drawing, and sends bounded commands back to the
 /// worker without ever borrowing or locking Ghostty state.
 pub struct TerminalWidget<Message> {
+    id: Option<Id>,
+    read_only: bool,
     handle: TerminalSurface,
     snapshot: Arc<RenderSnapshot>,
     font_size: f32,
     font_family: &'static str,
     line_height: f32,
     padding: f32,
+    scroll_size: isize,
+    scroll_speed: f32,
     cursor_style: TerminalCursorStyle,
     scale_factor: f32,
     model_focused: bool,
@@ -1166,12 +1192,16 @@ impl<Message> TerminalWidget<Message> {
         let handle = handle.into();
         let snapshot = handle.snapshot();
         Self {
+            id: None,
+            read_only: false,
             handle,
             snapshot,
             font_size: DEFAULT_FONT_SIZE,
             font_family: "",
             line_height: LINE_HEIGHT_RATIO,
             padding: DEFAULT_PADDING,
+            scroll_size: DEFAULT_ROWS_PER_WHEEL_NOTCH,
+            scroll_speed: 1.0,
             cursor_style: TerminalCursorStyle::default(),
             scale_factor: 1.0,
             model_focused: false,
@@ -1180,6 +1210,18 @@ impl<Message> TerminalWidget<Message> {
             on_open_link: None,
             _message: PhantomData,
         }
+    }
+
+    /// Names the input surface for focus handoffs from tabs and other panes.
+    pub fn id(mut self, id: Id) -> Self {
+        self.id = Some(id);
+        self
+    }
+
+    /// Retain the final grid and selection after a successful process exit.
+    pub fn read_only(mut self, read_only: bool) -> Self {
+        self.read_only = read_only;
+        self
     }
 
     /// Sets the terminal font size.
@@ -1223,6 +1265,26 @@ impl<Message> TerminalWidget<Message> {
             padding.clamp(0.0, 24.0)
         } else {
             DEFAULT_PADDING
+        };
+        self
+    }
+    /// Sets the number of rows moved by one mouse-wheel notch.
+    ///
+    /// The speed multiplier also scales high-resolution wheel/trackpad input.
+    pub fn scroll_size(mut self, scroll_size: usize) -> Self {
+        self.scroll_size = scroll_size
+            .try_into()
+            .unwrap_or(DEFAULT_ROWS_PER_WHEEL_NOTCH)
+            .max(1);
+        self
+    }
+
+    /// Sets the multiplier applied to wheel input.
+    pub fn scroll_speed(mut self, scroll_speed: f32) -> Self {
+        self.scroll_speed = if scroll_speed.is_finite() {
+            scroll_speed.clamp(0.25, 4.0)
+        } else {
+            1.0
         };
         self
     }
@@ -1308,12 +1370,20 @@ impl<Message> TerminalWidget<Message> {
     }
 
     fn apply_scroll(&self, scroll: ViewportScroll, shell: &mut Shell<'_, Message>) {
+        if self.read_only {
+            return;
+        }
         if let Err(error) = scroll.apply(&self.handle) {
             self.publish_error(error, shell);
         }
     }
 
     fn synchronize_focus(&self, state: &mut WidgetState, shell: &mut Shell<'_, Message>) {
+        if self.read_only {
+            state.focused = self.model_focused;
+            state.preedit = None;
+            return;
+        }
         if self.model_focused {
             state.focus_requested = false;
         }
@@ -1346,6 +1416,9 @@ impl<Message> TerminalWidget<Message> {
         geometry: TerminalGeometry,
         shell: &mut Shell<'_, Message>,
     ) {
+        if self.read_only {
+            return;
+        }
         let size = geometry.terminal_size();
         if state.last_size != Some(size) {
             // Reflow moves every cell the selection named, so keeping it would
@@ -1371,6 +1444,9 @@ impl<Message> TerminalWidget<Message> {
         button: Option<MouseButton>,
         shell: &mut Shell<'_, Message>,
     ) {
+        if self.read_only {
+            return;
+        }
         let input = MouseInput {
             action,
             button,
@@ -1419,6 +1495,9 @@ impl<Message> TerminalWidget<Message> {
     /// Sends pasted text to the child, on the same path a committed
     /// composition takes: it has no key of its own to encode either.
     fn paste(&self, text: &str, shell: &mut Shell<'_, Message>) {
+        if self.read_only {
+            return;
+        }
         let normalized = normalize_paste(text);
         if normalized.is_empty() {
             return;
@@ -1441,7 +1520,7 @@ impl<Message> TerminalWidget<Message> {
         state: &'state WidgetState,
         geometry: TerminalGeometry,
     ) -> InputMethod<&'state str> {
-        if !self.model_focused {
+        if self.read_only || !self.model_focused {
             return InputMethod::Disabled;
         }
         let Some(caret) = self
@@ -1481,6 +1560,33 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for TerminalWidget<Message
         tree::State::new(WidgetState::default())
     }
 
+    fn id(&self) -> Option<Id> {
+        self.id.clone()
+    }
+
+    fn set_id(&mut self, id: Id) {
+        self.id = Some(id);
+    }
+
+    fn operate(
+        &mut self,
+        tree: &mut Tree,
+        layout: Layout<'_>,
+        _renderer: &Renderer,
+        operation: &mut dyn Operation,
+    ) {
+        // The workspace owns which terminal receives raw input. Register the
+        // active surface so a handoff clears focus from buttons and text fields
+        // instead of focusing the tab button that would consume Enter.
+        if self.model_focused {
+            operation.focusable(
+                self.id.as_ref(),
+                layout.bounds(),
+                tree.state.downcast_mut::<WidgetState>(),
+            );
+        }
+    }
+
     fn update(
         &mut self,
         tree: &mut Tree,
@@ -1514,8 +1620,8 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for TerminalWidget<Message
         // Only the focused terminal's rail is draggable. An unfocused card may
         // still paint one (see [`TerminalScrollbar::visible`]), but the click
         // that reaches it focuses the terminal instead of grabbing the thumb.
-        let scrollbar =
-            TerminalScrollbar::new(bounds, self.snapshot.scroll).filter(|_| self.model_focused);
+        let scrollbar = TerminalScrollbar::new(bounds, self.snapshot.scroll)
+            .filter(|_| self.model_focused && !self.read_only);
         if scrollbar.is_none() {
             state.scrollbar_drag = None;
         }
@@ -1601,6 +1707,10 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for TerminalWidget<Message
                     shell.capture_event();
                     return;
                 }
+                if self.read_only {
+                    shell.capture_event();
+                    return;
+                }
                 let input = KeyInput {
                     action: if *repeat {
                         KeyAction::Repeat
@@ -1621,6 +1731,10 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for TerminalWidget<Message
                 if self.model_focused =>
             {
                 state.modifiers = map_iced_modifiers(*modifiers);
+                if self.read_only {
+                    shell.capture_event();
+                    return;
+                }
                 // The press was consumed here, so its release must be too: a
                 // child reading key releases may not see one half of a chord.
                 if state.escape_cleared && is_escape(key) {
@@ -1687,7 +1801,8 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for TerminalWidget<Message
                     // them back from a child that is. Without that override a
                     // full-screen application's own output could never be
                     // copied, which is why every terminal binds it.
-                    let ours = state.modifiers.shift
+                    let ours = self.read_only
+                        || state.modifiers.shift
                         || (!self.snapshot.scroll.mouse_tracking
                             && !state.modifiers.control
                             && !state.modifiers.alt
@@ -1827,11 +1942,20 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for TerminalWidget<Message
                 }
             }
             Event::Mouse(mouse::Event::WheelScrolled { delta }) if cursor.is_over(bounds) => {
+                if self.read_only {
+                    shell.capture_event();
+                    return;
+                }
                 let travel = match delta {
                     ScrollDelta::Lines { y, .. } => WheelTravel::Notches(*y),
                     ScrollDelta::Pixels { y, .. } => WheelTravel::Rows(*y / geometry.cell_height),
                 };
-                match state.wheel_effect(travel, self.snapshot.scroll) {
+                match state.wheel_effect(
+                    travel,
+                    self.snapshot.scroll,
+                    self.scroll_size,
+                    self.scroll_speed,
+                ) {
                     WheelEffect::Idle => {}
                     WheelEffect::Viewport(delta) => {
                         self.defer_scroll(state, ViewportScroll::Lines(delta), shell);
@@ -1890,7 +2014,10 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for TerminalWidget<Message
                 if let Some(owed) = state.take_owed_scroll() {
                     self.apply_scroll(owed, shell);
                 }
-                let caret = self.snapshot.cursor.filter(|caret| caret.visible);
+                let caret = self
+                    .snapshot
+                    .cursor
+                    .filter(|caret| caret.visible && !self.read_only);
                 let anchor = caret.map(|caret| (caret.column, caret.row));
                 if self.model_focused && caret.is_some_and(|caret| caret.blinking) {
                     shell.request_redraw_at(state.advance_blink(*now, anchor));
@@ -1906,7 +2033,7 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for TerminalWidget<Message
                 // one, so exactly one card claims the composition target.
                 shell.request_input_method(&self.input_method(state, geometry));
             }
-            Event::InputMethod(event) if self.model_focused => match event {
+            Event::InputMethod(event) if self.model_focused && !self.read_only => match event {
                 input_method::Event::Opened => {
                     state.preedit = Some(input_method::Preedit::new());
                     shell.request_redraw();
@@ -2066,7 +2193,8 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for TerminalWidget<Message
                     // and only the focused terminal blinks: a card in the
                     // background keeps a static mark and asks for no frames.
                     .filter(|cursor| {
-                        cursor.visible
+                        !self.read_only
+                            && cursor.visible
                             && !(self.model_focused && cursor.blinking && state.cursor_dark)
                     })
                     .and_then(|cursor| {
@@ -2134,9 +2262,10 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for TerminalWidget<Message
                     );
                 }
             });
-            if let Some(bar) = TerminalScrollbar::new(bounds, self.snapshot.scroll)
-                .filter(|_| TerminalScrollbar::visible(self.snapshot.scroll, self.model_focused))
-            {
+            if let Some(bar) = TerminalScrollbar::new(bounds, self.snapshot.scroll).filter(|_| {
+                !self.read_only
+                    && TerminalScrollbar::visible(self.snapshot.scroll, self.model_focused)
+            }) {
                 renderer.fill_quad(
                     renderer::Quad {
                         bounds: bar.thumb,
@@ -2642,7 +2771,7 @@ impl ViewportScroll {
 /// a trackpad's real distance.
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum WheelTravel {
-    /// Notches of a discrete wheel, each worth `ROWS_PER_WHEEL_NOTCH` rows.
+    /// Notches of a discrete wheel, each scaled by the configured scroll speed.
     Notches(f32),
     /// A trackpad's distance, already divided down to rows of the grid.
     Rows(f32),
@@ -3964,6 +4093,8 @@ mod tests {
     struct ScrollPump {
         state: WidgetState,
         scroll: ScrollSnapshot,
+        scroll_size: isize,
+        scroll_speed: f32,
         sent: Vec<Sent>,
     }
 
@@ -3972,8 +4103,20 @@ mod tests {
             Self {
                 state: WidgetState::default(),
                 scroll,
+                scroll_size: DEFAULT_ROWS_PER_WHEEL_NOTCH,
+                scroll_speed: 1.0,
                 sent: Vec::new(),
             }
+        }
+
+        fn with_size(mut self, scroll_size: isize) -> Self {
+            self.scroll_size = scroll_size.max(1);
+            self
+        }
+
+        fn with_speed(mut self, scroll_speed: f32) -> Self {
+            self.scroll_speed = scroll_speed;
+            self
         }
 
         fn shifted(mut self) -> Self {
@@ -3990,9 +4133,11 @@ mod tests {
         fn trackpad(&mut self, rows: f32) {
             self.feed(WheelTravel::Rows(rows));
         }
-
         fn feed(&mut self, travel: WheelTravel) {
-            match self.state.wheel_effect(travel, self.scroll) {
+            match self
+                .state
+                .wheel_effect(travel, self.scroll, self.scroll_size, self.scroll_speed)
+            {
                 WheelEffect::Idle => {}
                 WheelEffect::Viewport(delta) => self.owe(ViewportScroll::Lines(delta)),
                 WheelEffect::Report { button, notches } => {
@@ -4050,23 +4195,33 @@ mod tests {
         assert_eq!(
             pump.sent,
             vec![Sent::Scroll(ViewportScroll::Lines(
-                -8 * ROWS_PER_WHEEL_NOTCH
+                -8 * DEFAULT_ROWS_PER_WHEEL_NOTCH
             ))]
         );
 
-        // One detent, three destinations, so the notch size cannot be right
-        // for the scrollback and wrong for the pane the user is actually
-        // looking at. Scrollback and the alternate screen both move a whole
-        // notch of rows - a pager or a full-screen editor would otherwise
-        // crawl a row at a time while the scrollback kept up. A mouse report
-        // stays at one, because there the application counts detents itself
+        // One detent moves two rows by default, so scrollback and an
+        // alternate-screen application both move at the same pace. A mouse
+        // report stays at one because the application counts detents itself
         // and the protocol means exactly one report per detent.
         let mut scrollback = ScrollPump::new(SCROLLBACK);
         scrollback.wheel(1.0);
         scrollback.frame();
         assert_eq!(
             scrollback.sent,
-            vec![Sent::Scroll(ViewportScroll::Lines(-ROWS_PER_WHEEL_NOTCH))]
+            vec![Sent::Scroll(ViewportScroll::Lines(
+                -DEFAULT_ROWS_PER_WHEEL_NOTCH
+            ))]
+        );
+        let mut fast = ScrollPump::new(SCROLLBACK).with_size(4);
+        fast.wheel(1.0);
+        fast.frame();
+        assert_eq!(fast.sent, vec![Sent::Scroll(ViewportScroll::Lines(-4))]);
+        let mut accelerated = ScrollPump::new(SCROLLBACK).with_size(1).with_speed(2.0);
+        accelerated.wheel(1.0);
+        accelerated.frame();
+        assert_eq!(
+            accelerated.sent,
+            vec![Sent::Scroll(ViewportScroll::Lines(-2))]
         );
 
         let mut full_screen = ScrollPump::new(ScrollSnapshot {
@@ -4077,7 +4232,7 @@ mod tests {
         full_screen.frame();
         assert_eq!(
             full_screen.sent,
-            vec![Sent::Key(TerminalKey::ArrowUp); ROWS_PER_WHEEL_NOTCH as usize]
+            vec![Sent::Key(TerminalKey::ArrowUp); DEFAULT_ROWS_PER_WHEEL_NOTCH as usize]
         );
 
         let mut tracked = ScrollPump::new(ScrollSnapshot {
@@ -4118,9 +4273,31 @@ mod tests {
         assert_eq!(
             shifted.sent,
             vec![Sent::Scroll(ViewportScroll::Lines(
-                -4 * ROWS_PER_WHEEL_NOTCH
+                -4 * DEFAULT_ROWS_PER_WHEEL_NOTCH
             ))]
         );
+    }
+
+    #[test]
+    fn scroll_speed_scales_rows_before_rounding_and_never_changes_mouse_reports() {
+        let mut fractional = ScrollPump::new(SCROLLBACK).with_size(4).with_speed(0.25);
+        fractional.wheel(1.0);
+        fractional.frame();
+        assert_eq!(
+            fractional.sent,
+            vec![Sent::Scroll(ViewportScroll::Lines(-1))]
+        );
+        for speed in [0.25, 4.0] {
+            let mut reporting = ScrollPump::new(ScrollSnapshot {
+                mouse_tracking: true,
+                ..SCROLLBACK
+            })
+            .with_speed(speed);
+            reporting.trackpad(1.0);
+            reporting.wheel(1.0);
+            reporting.frame();
+            assert_eq!(reporting.sent, vec![Sent::Report(MouseButton::WheelUp); 2]);
+        }
     }
 
     #[test]
@@ -4160,7 +4337,7 @@ mod tests {
             mixed.sent,
             vec![
                 Sent::Scroll(ViewportScroll::Row(120)),
-                Sent::Scroll(ViewportScroll::Lines(-3 * ROWS_PER_WHEEL_NOTCH)),
+                Sent::Scroll(ViewportScroll::Lines(-3 * DEFAULT_ROWS_PER_WHEEL_NOTCH)),
             ]
         );
     }
