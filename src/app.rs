@@ -5385,10 +5385,8 @@ impl Cagents {
                 Some(CardRuntime::Loading) | None => true,
                 _ => false,
             };
-            let mut rows: Vec<Element<'a, Message>> = vec![
-                widget::divider::horizontal::default().into(),
-                toolbar.into(),
-            ];
+            let mut rows: Vec<Element<'a, Message>> =
+                vec![toolbar.into(), crate::design::horizontal_rule()];
             if browser_loading {
                 rows.push(
                     widget::container(iced::widget::Space::new())
@@ -5438,12 +5436,9 @@ impl Cagents {
             .height(Length::Fixed(BROWSER_TOOLBAR_HEIGHT))
             .padding([0, spacing.space_xxs])
             .class(cosmic::theme::Container::Background);
-            widget::column::with_children(vec![
-                widget::divider::horizontal::default().into(),
-                toolbar.into(),
-            ])
-            .spacing(0)
-            .into()
+            widget::column::with_children(vec![toolbar.into(), crate::design::horizontal_rule()])
+                .spacing(0)
+                .into()
         });
 
         let retry_label = if cfg!(not(feature = "integrated-browser")) && browser_session.is_some()
@@ -5661,6 +5656,7 @@ impl Cagents {
             && let Some(toolbar) = repository_widget::selected_file_toolbar(id, runtime)
         {
             rows.push(toolbar.map(Message::Repository));
+            rows.push(design::horizontal_rule());
         }
         if let Some(toolbar) = browser_toolbar {
             rows.push(toolbar);
@@ -5715,7 +5711,7 @@ impl Cagents {
             )
             .into()
         } else {
-            widget::container(widget::divider::vertical::default())
+            widget::container(crate::design::vertical_rule())
                 .center_x(Length::Fixed(crate::splitter::WIDTH))
                 .height(Length::Fill)
                 .into()

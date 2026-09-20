@@ -1746,12 +1746,12 @@ fn markdown_item(
         .width(Length::Fill)
         .into(),
         Item::Quote(quote) => widget::row::with_children(vec![
-            widget::divider::vertical::default().into(),
+            crate::design::vertical_rule().into(),
             markdown_items(quote, settings, depth + 1),
         ])
         .spacing(settings.spacing.0 / 2.0)
         .into(),
-        Item::Rule => widget::divider::horizontal::default().into(),
+        Item::Rule => crate::design::horizontal_rule().into(),
         Item::Table { columns, rows } => {
             let width = columns.len().min(MARKDOWN_BLOCK_LIMIT);
             let mut table = vec![
@@ -1831,7 +1831,7 @@ pub fn view(model: InspectorModel, width: f32) -> Element<'static, InspectorActi
     let mut sections = Vec::with_capacity(model.sections.len() * 2);
     for (index, section) in model.sections.into_iter().enumerate() {
         if index > 0 {
-            sections.push(widget::divider::horizontal::default().into());
+            sections.push(crate::design::horizontal_rule().into());
         }
         let facts = section
             .facts
@@ -1843,7 +1843,7 @@ pub fn view(model: InspectorModel, width: f32) -> Element<'static, InspectorActi
     // Keep actions in the same scroll surface as details. A rich editor or
     // language server can offer many actions; a fixed footer used to consume
     // all available height and make the document details unreachable.
-    sections.push(widget::divider::horizontal::default().into());
+    sections.push(crate::design::horizontal_rule().into());
     sections.push(SegmentedActions::new(model.actions).view());
     let content = widget::scrollable(
         widget::container(
@@ -1866,7 +1866,7 @@ pub fn view(model: InspectorModel, width: f32) -> Element<'static, InspectorActi
                 .padding(12)
                 .width(Length::Fill)
                 .into(),
-            widget::divider::horizontal::default().into(),
+            crate::design::horizontal_rule().into(),
             content.into(),
         ])
         .spacing(0)

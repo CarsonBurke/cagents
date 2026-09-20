@@ -5824,7 +5824,7 @@ pub fn selected_file_toolbar(
         crate::design::scrollbar().margin(0),
     ))
     .width(Length::FillPortion(4))
-    .height(crate::design::HEADER_HEIGHT);
+    .height(crate::design::HEADER_CONTENT_HEIGHT);
     let mut header = Vec::with_capacity(3);
     if let Some(title) = title {
         header.push(title.into());
@@ -5840,7 +5840,7 @@ pub fn selected_file_toolbar(
             .width(Length::Fill),
     )
     .padding([0.0, crate::design::TOOLBAR_INSET])
-    .height(crate::design::HEADER_HEIGHT)
+    .height(crate::design::HEADER_CONTENT_HEIGHT)
     .width(Length::Fill);
     // The strip is mounted here rather than beside the buffer because it is
     // a subordinate row of this editor's chrome, not a surface of its own:
@@ -8420,7 +8420,8 @@ mod tests {
             let target = crate::design::PRIMARY_CONTROL_SIZE;
             if (bounds.width - target).abs() < 0.1 && (bounds.height - target).abs() < 0.1 {
                 assert!(
-                    (y + bounds.height / 2.0 - crate::design::HEADER_HEIGHT / 2.0).abs() < 0.1,
+                    (y + bounds.height / 2.0 - crate::design::HEADER_CONTENT_HEIGHT / 2.0).abs()
+                        < 0.1,
                     "toolbar target must share the header baseline"
                 );
                 *count += 1;

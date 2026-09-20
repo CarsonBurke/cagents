@@ -7,6 +7,16 @@
 pub const GRID_UNIT: f32 = 4.0;
 
 pub const HEADER_HEIGHT: f32 = 44.0;
+/// Every standard header includes its bottom separator in HEADER_HEIGHT.
+pub const HEADER_CONTENT_HEIGHT: f32 = HEADER_HEIGHT - BORDER_WIDTH;
+
+pub fn horizontal_rule<'a, Message: 'a>() -> cosmic::Element<'a, Message> {
+    crate::separator::horizontal()
+}
+
+pub fn vertical_rule<'a, Message: 'a>() -> cosmic::Element<'a, Message> {
+    crate::separator::vertical()
+}
 pub const ROW_HEIGHT: f32 = 32.0;
 pub const DENSE_ROW_HEIGHT: f32 = 28.0;
 pub const PRIMARY_CONTROL_SIZE: f32 = 30.0;

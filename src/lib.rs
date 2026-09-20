@@ -54,6 +54,8 @@ pub mod repository;
 pub mod repository_widget;
 mod secure_file;
 #[cfg(feature = "ui")]
+mod separator;
+#[cfg(feature = "ui")]
 pub mod session;
 #[cfg(feature = "ui")]
 pub mod settings;

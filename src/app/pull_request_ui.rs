@@ -380,7 +380,7 @@ pub fn view(state: &State) -> Element<'_, Action> {
     ])
     .spacing(4)
     .align_y(Alignment::Center)
-    .height(design::HEADER_HEIGHT);
+    .height(design::HEADER_CONTENT_HEIGHT);
     let mut children: Vec<Element<'_, Action>> = Vec::new();
     if let Some(target) = &state.target {
         children.push(
@@ -604,7 +604,7 @@ pub fn view(state: &State) -> Element<'_, Action> {
                             continue;
                         }
                         shown += 1;
-                        children.push(widget::divider::horizontal::default().into());
+                        children.push(crate::design::horizontal_rule().into());
                         let location = thread.line.map_or_else(
                             || thread.path.clone(),
                             |line| format!("{}:{line}", thread.path),
@@ -683,7 +683,7 @@ pub fn view(state: &State) -> Element<'_, Action> {
             .padding([0, 8])
             .width(Length::Fill)
             .into(),
-        widget::divider::horizontal::default().into(),
+        crate::design::horizontal_rule().into(),
         body.into(),
     ])
     .width(Length::Fill)

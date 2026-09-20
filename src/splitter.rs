@@ -61,7 +61,7 @@ impl<'a, Message: 'a> Splitter<'a, Message> {
     ) -> Self {
         debug_assert!(min.is_finite() && max.is_finite() && min <= max);
         Self {
-            content: widget::container(widget::divider::vertical::default())
+            content: widget::container(cosmic::iced::widget::Space::new())
                 .center_x(Length::Fixed(WIDTH))
                 .height(Length::Fill)
                 .into(),
@@ -181,23 +181,6 @@ fn clamp(width: f32, min: f32, max: f32) -> f32 {
 
 fn chorded(modifiers: keyboard::Modifiers) -> bool {
     modifiers.control() || modifiers.alt() || modifiers.shift() || modifiers.logo()
-}
-
-/// Snap toward the pane interior, in physical screen coordinates. Snapping a
-/// one-unit rule independently of its fractional card clip can move its only
-/// pixel beyond that clip and make the separator disappear while scrolling.
-fn pixel_aligned_rule(bounds: Rectangle, offset: f32, scale: f32, edge: Edge) -> Rectangle {
-    let scale = if scale.is_finite() && scale > 0.0 {
-        scale
-    } else {
-        1.0
-    };
-    let width = (WIDTH * scale).round().max(1.0) / scale;
-    let x = match edge {
-        Edge::Trailing => ((bounds.x + bounds.width - offset) * scale).floor() / scale - width,
-        Edge::Leading => ((bounds.x - offset) * scale).ceil() / scale,
-    } + offset;
-    Rectangle { x, width, ..bounds }
 }
 
 impl<'view, Message: 'view> Widget<Message, Theme, Renderer> for Splitter<'view, Message> {
@@ -383,8 +366,13 @@ impl<'view, Message: 'view> Widget<Message, Theme, Renderer> for Splitter<'view,
             return;
         }
         let scale = style.scale_factor as f32;
-        let bounds =
-            pixel_aligned_rule(layout.bounds(), layout.virtual_offset().x, scale, self.edge);
+        let bounds = crate::separator::physical_bounds(
+            layout.bounds(),
+            layout.virtual_offset(),
+            scale,
+            crate::separator::Axis::Vertical,
+            self.edge == Edge::Trailing,
+        );
         // The exact rule color cosmic dividers paint
         // (`current_container().divider`): the component-level divider and
         // pre-compositing against the window background both rendered a

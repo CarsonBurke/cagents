@@ -3691,7 +3691,7 @@ impl Application for Editor {
         let mut body = Vec::new();
         // The COSMIC header above has no separator of its own: always rule
         // off the content below it, tabs or placeholder alike.
-        body.push(widget::divider::horizontal::default().into());
+        body.push(design::horizontal_rule().into());
         // Keep the tab strip on the same fixed baseline as the app header.
         let strip = vec![
             cagents::tab_strip::horizontal(
@@ -3714,7 +3714,7 @@ impl Application for Editor {
                 design::PRIMARY_CONTROL_SIZE,
                 design::HEADER_HEIGHT,
             ),
-            widget::divider::horizontal::default().into(),
+            design::horizontal_rule().into(),
         ];
         if let Some(tab) = self.current() {
             let mut editor = Vec::new();
@@ -3777,15 +3777,15 @@ impl Application for Editor {
                         ..iced::Padding::ZERO
                     })
                     .center_y(Length::Fill)
-                    .height(design::HEADER_HEIGHT)
+                    .height(design::HEADER_CONTENT_HEIGHT)
                     .width(Length::Fill)
                     .into(),
                 );
-                editor.push(widget::divider::horizontal::default().into());
+                editor.push(design::horizontal_rule().into());
             }
             if self.find_open {
                 editor.push(find_bar(self));
-                editor.push(widget::divider::horizontal::default().into());
+                editor.push(design::horizontal_rule().into());
             }
             editor.push(repository_widget::view(tab.id, &tab.runtime).map(Message::Repository));
             if !tab.completions.is_empty() || !tab.diagnostics.is_empty() || tab.hover.is_some() {
@@ -3840,7 +3840,7 @@ impl Application for Editor {
                         .into(),
                     );
                 }
-                editor.push(widget::divider::horizontal::default().into());
+                editor.push(design::horizontal_rule().into());
                 editor.push(
                     widget::scrollable(
                         widget::column::with_children(results)
@@ -3919,7 +3919,7 @@ impl Application for Editor {
                     .padding(32)
                     .height(Length::Fill)
                     .into(),
-                    widget::divider::horizontal::default().into(),
+                    design::horizontal_rule().into(),
                     self.settings_footer(),
                 ])
                 .height(Length::Fill)
@@ -4307,7 +4307,7 @@ impl Application for Editor {
             .height(Length::Fill);
         let body = widget::row::with_children(vec![
             navigation.into(),
-            widget::divider::vertical::default().into(),
+            design::vertical_rule().into(),
             widget::scrollable(
                 widget::container(widget::column::with_children(controls).spacing(20))
                     .padding([4.0 * design::GRID_UNIT, 5.0 * design::GRID_UNIT])
@@ -4343,7 +4343,7 @@ impl Application for Editor {
             connected_dialog_surface(
                 widget::column::with_children(vec![
                     header.into(),
-                    widget::divider::horizontal::default().into(),
+                    design::horizontal_rule().into(),
                     body.into(),
                 ])
                 .spacing(0)
