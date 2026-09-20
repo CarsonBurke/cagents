@@ -437,21 +437,7 @@ fn settings_category_controls<'a>(
                         1.0,
                         "×",
                     ),
-                    settings_choice(
-                        "Color theme",
-                        "Live parser colors, independent of the interface theme. Programs retain their own truecolor and palette overrides.",
-                        SettingsField::TerminalTheme,
-                        [
-                            ("Dark", "dark", draft.terminal_theme == "dark"),
-                            ("Light", "light", draft.terminal_theme == "light"),
-                            (
-                                "Solarized dark",
-                                "solarized_dark",
-                                draft.terminal_theme == "solarized_dark",
-                            ),
-                        ],
-                        progress,
-                    ),
+                    terminal_theme_choice(&draft.terminal_theme, draft.has_custom_terminal_theme),
                     settings_choice(
                         "Cursor shape",
                         "Bar is the default. Application follows program cursor requests; explicit shapes override requests without forcing a hidden cursor visible.",
@@ -831,4 +817,28 @@ pub(super) fn settings_dialog<'a>(
         .max_height(760.0);
 
     dialog_ui::overlay(surface.into(), Some(Message::CloseInspector), progress)
+}
+
+fn terminal_theme_choice<'a>(selected: &str, has_custom: bool) -> Element<'a, Message> {
+    let mut choices: Vec<(&str, &str)> = crate::terminal::TerminalTheme::PRESETS
+        .iter()
+        .map(|(_, label, id)| (*label, *id))
+        .collect();
+    if has_custom || selected == "custom" {
+        choices.push(("Custom", "custom"));
+    }
+    let index = choices.iter().position(|(_, id)| *id == selected);
+    let labels: Vec<String> = choices
+        .iter()
+        .map(|(label, _)| (*label).to_owned())
+        .collect();
+    setting_field(
+        "Color theme",
+        "Live terminal colors. Add a custom_terminal_theme table to settings.toml to create your own; application color overrides remain intact.",
+        widget::dropdown(labels, index, move |index| Message::SettingsChanged {
+            field: SettingsField::TerminalTheme,
+            value: choices[index].1.to_owned(),
+        })
+        .into(),
+    )
 }

@@ -1739,6 +1739,7 @@ fn execute_terminal(command: TerminalCommand) -> Result<CommandOutput, AppError>
                 }
             };
             let session = TerminalSession {
+                recovery_origin: None,
                 id: TerminalId::new(),
                 launch: recipe.clone(),
                 transcript_path: None,
@@ -3208,6 +3209,7 @@ mod tests {
             environment: BTreeMap::new(),
         };
         let session = TerminalSession {
+            recovery_origin: None,
             id: TerminalId::new(),
             launch: recipe.clone(),
             transcript_path: None,

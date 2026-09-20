@@ -980,6 +980,7 @@ mod tests {
             environment: BTreeMap::new(),
         };
         let terminal = TerminalSession {
+            recovery_origin: None,
             id: TerminalId::new(),
             launch: recipe.clone(),
             continuity: TerminalContinuity::RelaunchAvailable {
@@ -1245,6 +1246,7 @@ mod tests {
         // terminal, and a refused start is a card that does not come back.
         let mut converted = omp_card(Some(CONVERSATION), Some(stale));
         converted.terminal = Some(crate::model::TerminalSession {
+            recovery_origin: None,
             id: converted.id,
             launch: converted.launch.recipe.clone(),
             continuity: crate::model::TerminalContinuity::RelaunchAvailable {

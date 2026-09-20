@@ -1617,6 +1617,7 @@ mod tests {
                 exposure: Exposure::Visible,
                 residency: Residency::Hot,
                 kind: CardKind::Terminal(TerminalSession {
+                    recovery_origin: None,
                     id: TerminalId::new(),
                     launch: launch.clone(),
                     transcript_path: None,
@@ -1898,6 +1899,7 @@ mod tests {
             environment: BTreeMap::new(),
         };
         let terminal = |id| TerminalSession {
+            recovery_origin: None,
             id,
             launch: launch.clone(),
             transcript_path: None,
@@ -2103,6 +2105,7 @@ mod tests {
         let new_id = TerminalId::new();
         let recipe = session.launch.clone();
         let replacement = TerminalSession {
+            recovery_origin: None,
             id: new_id,
             launch: recipe.clone(),
             transcript_path: Some(PathBuf::from("/tmp/relaunched.log")),

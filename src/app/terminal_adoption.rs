@@ -268,6 +268,7 @@ mod tests {
 
     fn hosted(directory: &str) -> TerminalSession {
         TerminalSession {
+            recovery_origin: None,
             id: TerminalId::new(),
             launch: LaunchRecipe {
                 program: "/bin/sh".into(),

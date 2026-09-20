@@ -1550,6 +1550,7 @@ fn restore_upgrade_from(
     }
     for chat in &checkpoint.chats {
         let terminal = TerminalSession {
+            recovery_origin: None,
             id: chat.source.id,
             launch: chat
                 .launch
@@ -2174,6 +2175,7 @@ mod tests {
             )]),
         };
         let source = TerminalSession {
+            recovery_origin: None,
             id: TerminalId::new(),
             launch: recipe.clone(),
             transcript_path: None,
@@ -2383,6 +2385,7 @@ for line in sys.stdin:
         assert!(super::super::chat::resolve_upgrade(&replacement, &changed).is_err());
         changed = source.clone();
         changed.terminal = Some(TerminalSession {
+            recovery_origin: None,
             id: source.id,
             launch: source.launch.recipe.clone(),
             transcript_path: None,
@@ -2583,6 +2586,7 @@ for line in sys.stdin:
             terminal: None,
         };
         let replacement = TerminalSession {
+            recovery_origin: None,
             id: TerminalId::new(),
             launch: recipe.clone(),
             transcript_path: None,
@@ -2640,6 +2644,7 @@ for line in sys.stdin:
         let old = test_host().proof().clone();
         let recipe = crate::model::LaunchRecipe::shell(directory.path().to_owned()).unwrap();
         let source = TerminalSession {
+            recovery_origin: None,
             id: TerminalId::new(),
             launch: recipe.clone(),
             transcript_path: Some(directory.path().join("shell.log")),
@@ -2737,6 +2742,7 @@ for line in sys.stdin:
             environment: BTreeMap::new(),
         };
         let session = TerminalSession {
+            recovery_origin: None,
             id: TerminalId::new(),
             launch: recipe.clone(),
             transcript_path: None,
@@ -2830,6 +2836,7 @@ for line in sys.stdin:
             environment: BTreeMap::new(),
         };
         let session = TerminalSession {
+            recovery_origin: None,
             id: TerminalId::new(),
             launch: recipe.clone(),
             transcript_path: None,
@@ -2946,6 +2953,7 @@ for line in sys.stdin:
         let directory = tempfile::tempdir().unwrap();
         let recipe = crate::model::LaunchRecipe::shell(directory.path().to_owned()).unwrap();
         let session = TerminalSession {
+            recovery_origin: None,
             id: TerminalId::new(),
             launch: recipe.clone(),
             transcript_path: None,
@@ -3062,6 +3070,7 @@ for line in sys.stdin:
             environment: BTreeMap::new(),
         };
         let session = TerminalSession {
+            recovery_origin: None,
             id: TerminalId::new(),
             launch: recipe.clone(),
             transcript_path: None,
@@ -3177,6 +3186,7 @@ for line in sys.stdin:
         let mut handles = Vec::new();
         for count in 1..=3 {
             let session = TerminalSession {
+                recovery_origin: None,
                 id: TerminalId::new(),
                 launch: recipe.clone(),
                 transcript_path: None,
@@ -3199,6 +3209,7 @@ for line in sys.stdin:
             );
         }
         let pending = TerminalSession {
+            recovery_origin: None,
             id: TerminalId::new(),
             launch: recipe.clone(),
             transcript_path: None,

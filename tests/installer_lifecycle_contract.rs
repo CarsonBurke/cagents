@@ -117,7 +117,7 @@ CLI=old
 case "$*" in
   '--json daemon status')
     [ "$#" -eq 3 ] || exit 98
-    if [ "$CLI" = new ] && [ "$FIXTURE_RESTART" = start-unknown ]; then exit 9; fi
+    if [ "$CLI" = new ] && { [ "$FIXTURE_RESTART" = start-unknown ] || [ "$FIXTURE_RESTART" = empty-start-unknown ]; }; then exit 9; fi
     if [ "$CLI" = new ] && [ "$FIXTURE_COMPATIBLE" = false ] &&
        [ "$(cat "$FIXTURE_RUNNING" 2>/dev/null)" = old ]; then exit 9; fi
     if [ -e "$FIXTURE_RUNNING" ]; then running=true; else running=false; fi
@@ -166,7 +166,7 @@ case "$*" in
   'daemon start')
     [ "$#" -eq 2 ] || exit 98
     printf '%s:start\n' "$CLI" >> "$FIXTURE_ACTIONS"
-    if [ "$CLI" = new ] && [ "$FIXTURE_RESTART" = start-failure ]; then exit 4; fi
+    if [ "$CLI" = new ] && { [ "$FIXTURE_RESTART" = start-failure ] || [ "$FIXTURE_RESTART" = empty-start-failure ]; }; then exit 4; fi
     if [ -e "$FIXTURE_CHECKPOINT" ]; then
       [ ! -e "$FIXTURE_RUNNING" ] && [ ! -e "$FIXTURE_PENDING" ] || exit 98
       expected=versions/old
@@ -175,7 +175,7 @@ case "$*" in
       cp "$FIXTURE_CHECKPOINT" "$FIXTURE_RESTORED"
     fi
     if [ ! -e "$FIXTURE_RUNNING" ]; then printf '%s\n' "$CLI" > "$FIXTURE_RUNNING"; fi
-    if [ "$CLI" = new ] && [ "$FIXTURE_RESTART" = start-unknown ]; then exit 4; fi
+    if [ "$CLI" = new ] && { [ "$FIXTURE_RESTART" = start-unknown ] || [ "$FIXTURE_RESTART" = empty-start-unknown ]; }; then exit 4; fi
     if [ "$CLI" = new ] && [ "$FIXTURE_RESTART" = start-signal ]; then
       kill -TERM "$PPID"
       exit 4
@@ -328,6 +328,12 @@ esac
     if restart.is_some() {
         command.arg("--restart-daemon");
     }
+    if matches!(
+        restart,
+        Some("empty" | "empty-start-failure" | "empty-start-unknown")
+    ) {
+        command.arg("--require-empty-daemon");
+    }
     if matches!(restart, Some("relaunch" | "relaunch-unsupported")) {
         command.arg("--relaunch-agents");
     }
@@ -374,6 +380,7 @@ esac
     let success = !matches!(download, Some("gh-failure" | "auth-failure"))
         && match restart {
             Some("success" | "relaunch") => publish_failure.is_none(),
+            Some("empty") => terminals == 0 && publish_failure.is_none(),
             Some(_) => false,
             None => (compatible || terminals == 0) && publish_failure.is_none(),
         };
@@ -383,7 +390,11 @@ esac
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
-    let retained_candidate = success || matches!(restart, Some("start-unknown" | "start-signal"));
+    let retained_candidate = success
+        || matches!(
+            restart,
+            Some("start-unknown" | "start-signal" | "empty-start-unknown")
+        );
     assert_eq!(
         fs::read_link(prefix.join("current")).unwrap(),
         Path::new(if retained_candidate {
@@ -394,7 +405,26 @@ esac
     );
     let actions = fs::read_to_string(actions).unwrap_or_default();
     assert!(!actions.contains("UNSAFE"), "{actions}");
-    if let Some(restart) = restart {
+    if restart == Some("empty-start-unknown") {
+        assert_eq!(actions, "require-empty\nnew:start\n");
+        assert!(!checkpoint.exists());
+        assert!(!restored.exists());
+    } else if restart == Some("empty-start-failure") {
+        assert_eq!(actions, "require-empty\nnew:start\nold:start\n");
+        assert!(!checkpoint.exists());
+        assert!(!restored.exists());
+    } else if restart == Some("empty") {
+        assert_eq!(
+            actions,
+            if terminals == 0 {
+                "require-empty\nnew:start\n"
+            } else {
+                "require-empty\n"
+            }
+        );
+        assert!(!checkpoint.exists());
+        assert!(!restored.exists());
+    } else if let Some(restart) = restart {
         assert!(!actions.contains("require-empty"), "{actions}");
         let expected = match (restart, publish_failure) {
             ("legacy" | "relaunch-unsupported", _) => "old:help\n",
@@ -473,6 +503,15 @@ esac
             Some(_) => panic!("unknown fixture download mode"),
         }
     );
+}
+
+#[test]
+fn an_unconfirmed_update_cannot_interrupt_sessions_created_after_preflight() {
+    for count in [0, 1, 7] {
+        upgrade_fixture(true, count, None, Some("empty"));
+    }
+    upgrade_fixture(true, 0, None, Some("empty-start-failure"));
+    upgrade_fixture(true, 0, None, Some("empty-start-unknown"));
 }
 
 #[test]

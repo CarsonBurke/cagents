@@ -1436,6 +1436,7 @@ fn return_terminal(session: &chat::Session) -> Result<TerminalSession, String> {
         .ok_or_else(|| "Cannot form a safe exact-session terminal resume command.".to_owned())?;
     let id = TerminalId::new();
     let mut terminal = session.terminal.clone().unwrap_or_else(|| TerminalSession {
+        recovery_origin: None,
         id,
         launch: recipe.clone(),
         continuity: TerminalContinuity::RelaunchAvailable {

@@ -30,7 +30,7 @@ use crate::{
     },
 };
 
-pub const CURRENT_SCHEMA_VERSION: u32 = 4;
+pub const CURRENT_SCHEMA_VERSION: u32 = 5;
 pub const DEFAULT_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 pub const MAX_BUSY_TIMEOUT: Duration = Duration::from_secs(10);
 const PRIVATE_FILE_MODE: u32 = 0o600;
@@ -1618,6 +1618,10 @@ fn migrate(connection: &mut Connection) -> Result<()> {
         if current < 4 {
             migrate_to_v4(&transaction)?;
         }
+        if current < 5 {
+            transaction
+                .execute_batch("ALTER TABLE terminal_recipes ADD COLUMN recovery_origin TEXT;")?;
+        }
         let violation = transaction
             .prepare("PRAGMA foreign_key_check")?
             .query([])?
@@ -1949,15 +1953,16 @@ const INVALIDATE_CARD_HASH_BY_TERMINAL: &str = "UPDATE cards SET content_hash = 
 
 const UPSERT_TERMINAL_RECIPE: &str = "INSERT INTO terminal_recipes (
         terminal_id, card_id, generation, recipe_json, continuity_json, resume_hint,
-        updated_at_unix_ms
-     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+        updated_at_unix_ms, recovery_origin
+     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
      ON CONFLICT(terminal_id) DO UPDATE SET
         card_id = excluded.card_id,
         generation = excluded.generation,
         recipe_json = excluded.recipe_json,
         continuity_json = excluded.continuity_json,
         resume_hint = excluded.resume_hint,
-        updated_at_unix_ms = excluded.updated_at_unix_ms";
+        updated_at_unix_ms = excluded.updated_at_unix_ms,
+        recovery_origin = excluded.recovery_origin";
 
 const UPSERT_TRANSCRIPT_PATH: &str = "INSERT INTO transcript_metadata (
         terminal_id, generation, path_json, byte_len, durable_offset, updated_at_unix_ms
@@ -2366,6 +2371,7 @@ struct CardWrite<'card> {
 enum CardPayloadWrite<'card> {
     Terminal {
         terminal_id: String,
+        recovery_origin: Option<String>,
         recipe_json: String,
         continuity_json: String,
         resume_hint: Option<&'card str>,
@@ -2404,6 +2410,7 @@ impl<'card> CardWrite<'card> {
         let payload = match &card.kind {
             CardKind::Terminal(terminal) => CardPayloadWrite::Terminal {
                 terminal_id: terminal.id.to_string(),
+                recovery_origin: terminal.recovery_origin.map(|id| id.to_string()),
                 recipe_json: to_json(&terminal.launch)?,
                 continuity_json: to_json(&terminal.continuity)?,
                 resume_hint: terminal.resume_hint.as_deref(),
@@ -2448,6 +2455,7 @@ impl<'card> CardWrite<'card> {
         match &payload {
             CardPayloadWrite::Terminal {
                 terminal_id,
+                recovery_origin,
                 recipe_json,
                 continuity_json,
                 resume_hint,
@@ -2456,6 +2464,7 @@ impl<'card> CardWrite<'card> {
                 hasher
                     .text("terminal")
                     .text(terminal_id)
+                    .optional_text(recovery_origin.as_deref())
                     .text(recipe_json)
                     .text(continuity_json)
                     .optional_text(*resume_hint)
@@ -2566,6 +2575,7 @@ fn save_card_payload(
     match &write.payload {
         CardPayloadWrite::Terminal {
             terminal_id,
+            recovery_origin,
             recipe_json,
             continuity_json,
             resume_hint,
@@ -2587,6 +2597,7 @@ fn save_card_payload(
                     continuity_json,
                     resume_hint,
                     timestamp,
+                    recovery_origin,
                 ])?;
             if let Some(path_json) = transcript_path_json {
                 transaction
@@ -2719,8 +2730,8 @@ fn replace_terminal_identity_transaction(
     transaction.execute(
         "INSERT INTO terminal_recipes (
             terminal_id, card_id, generation, recipe_json, continuity_json, resume_hint,
-            updated_at_unix_ms
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            updated_at_unix_ms, recovery_origin
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
         params![
             replacement.id.to_string(),
             card_id.to_string(),
@@ -2729,6 +2740,7 @@ fn replace_terminal_identity_transaction(
             continuity_json,
             replacement.resume_hint,
             timestamp,
+            replacement.recovery_origin.map(|id| id.to_string()),
         ],
     )?;
     if let Some(path) = &replacement.transcript_path {
@@ -3127,7 +3139,7 @@ fn load_terminal(
     // `QueryReturnedNoRows` that used to abort the whole workspace restore.
     let recipe = connection
         .query_row(
-            "SELECT terminal_id, recipe_json, continuity_json, resume_hint
+            "SELECT terminal_id, recipe_json, continuity_json, resume_hint, recovery_origin
              FROM terminal_recipes WHERE card_id = ?1",
             [card_id.to_string()],
             |row| {
@@ -3136,11 +3148,13 @@ fn load_terminal(
                     row.get::<_, String>(1)?,
                     row.get::<_, String>(2)?,
                     row.get::<_, Option<String>>(3)?,
+                    row.get::<_, Option<String>>(4)?,
                 ))
             },
         )
         .optional()?;
-    let Some((terminal_id, recipe_json, continuity_json, resume_hint)) = recipe else {
+    let Some((terminal_id, recipe_json, continuity_json, resume_hint, recovery_origin)) = recipe
+    else {
         return Err(StoreError::InvalidState(format!(
             "terminal card {card_id} has no stored launch recipe"
         )));
@@ -3160,6 +3174,9 @@ fn load_terminal(
         .transpose()?;
 
     Ok(TerminalSession {
+        recovery_origin: recovery_origin
+            .map(|id| parse_id("terminal recovery origin", &id))
+            .transpose()?,
         id: terminal_id,
         launch,
         transcript_path,
@@ -3488,6 +3505,7 @@ mod tests {
                 exposure: Exposure::Visible,
                 residency: Residency::Hot,
                 kind: CardKind::Terminal(TerminalSession {
+                    recovery_origin: None,
                     id: TerminalId::new(),
                     launch: launch.clone(),
                     transcript_path: Some(PathBuf::from("/tmp/transcript")),
@@ -3754,6 +3772,11 @@ mod tests {
         migrate_to_v1(&transaction).unwrap();
         migrate_to_v2(&transaction).unwrap();
         migrate_to_v3(&transaction).unwrap();
+        // Use the current writer to populate the fixture, then restore the
+        // historical schema before exercising the real migration chain.
+        transaction
+            .execute_batch("ALTER TABLE terminal_recipes ADD COLUMN recovery_origin TEXT;")
+            .unwrap();
         let (mut workspace, chat) = agent_workspace(crate::agent::Provider::Omp);
         let mut browser = workspace.cards[0].clone();
         browser.id = CardId::new();
@@ -3778,6 +3801,9 @@ mod tests {
         )
         .unwrap();
         transaction.pragma_update(None, "user_version", 3).unwrap();
+        transaction
+            .execute_batch("ALTER TABLE terminal_recipes DROP COLUMN recovery_origin;")
+            .unwrap();
         transaction.commit().unwrap();
         drop(connection);
         let store = StateStore::open(&path, boot("chat-boot")).unwrap();
@@ -4294,6 +4320,7 @@ mod tests {
         let replacement_id = TerminalId::new();
         let launch = recipe();
         let replacement = TerminalSession {
+            recovery_origin: Some(original_id),
             id: replacement_id,
             launch: launch.clone(),
             transcript_path: Some(PathBuf::from("/tmp/relaunched-transcript")),
@@ -4357,6 +4384,7 @@ mod tests {
 
         let launch = recipe();
         let replacement = TerminalSession {
+            recovery_origin: None,
             id: TerminalId::new(),
             launch: launch.clone(),
             transcript_path: None,

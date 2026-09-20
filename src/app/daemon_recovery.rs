@@ -174,6 +174,7 @@ fn reconcile_at(
     let recipe = recovery_recipe(&session, explicit_retry)?;
     let mut replacement = super::fresh_terminal_relaunch(&session);
     replacement.id = replacement_id;
+    replacement.recovery_origin = Some(session.recovery_origin.unwrap_or(session.id));
     replacement.launch = recipe.clone();
     replacement.continuity = crate::model::TerminalContinuity::RelaunchAvailable {
         recipe,
@@ -242,6 +243,7 @@ mod tests {
 
     fn session(path: &Path, proof: &HostSessionProof) -> TerminalSession {
         TerminalSession {
+            recovery_origin: None,
             id: TerminalId::new(),
             launch: LaunchRecipe::shell(path.to_owned()).unwrap(),
             transcript_path: None,
@@ -342,6 +344,7 @@ mod tests {
         let recovered = reconcile_at(original.clone(), false, &socket, directory.path()).unwrap();
         server.join().unwrap();
         assert_ne!(recovered.session.id, original.id);
+        assert_eq!(recovered.session.recovery_origin, Some(original.id));
         assert_eq!(recovered.session.launch, original.launch);
         assert_eq!(recovered.expected_host, Some(replacement_proof));
         assert!(matches!(
@@ -559,6 +562,7 @@ mod tests {
             command
                 .arg("30")
                 .current_dir(directory.path())
+                .env("CAGENTS_RECOVERY_ORIGIN", original.id.to_string())
                 .env("TERM_PROGRAM", "cagents");
             if let Some(marker) = marker {
                 command.env("CAGENTS_TERMINAL_ID", marker);
@@ -589,6 +593,7 @@ mod tests {
         fs::write(pid_directory.join("stat"), b"unreadable process identity").unwrap();
         let launch = LaunchRecipe::shell(directory.path().to_owned()).unwrap();
         let session = TerminalSession {
+            recovery_origin: None,
             id: crate::model::TerminalId::new(),
             launch: launch.clone(),
             transcript_path: None,
@@ -606,6 +611,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let launch = LaunchRecipe::shell(directory.path().join("old-directory")).unwrap();
         let session = TerminalSession {
+            recovery_origin: None,
             id: crate::model::TerminalId::new(),
             launch: launch.clone(),
             transcript_path: None,

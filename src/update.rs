@@ -337,7 +337,13 @@ fn applicable_release(release: GitHubRelease) -> Result<Release, UpdateError> {
 
 /// Explicit user authorization: this starts a detached worker, not an in-process
 /// task. Its inherited lock closes the double-click / concurrent-window race.
-pub fn apply(release: &Release) -> Result<UpdateJob, UpdateError> {
+#[derive(Serialize, Deserialize)]
+struct UpdateRequest {
+    release: Release,
+    allow_interruptions: bool,
+}
+
+pub fn apply(release: &Release, allow_interruptions: bool) -> Result<UpdateJob, UpdateError> {
     let installation = Installation::detect()?;
     if stable_version(&release.version)? <= stable_version(&installation.version)? {
         return Err(invalid(
@@ -357,7 +363,13 @@ pub fn apply(release: &Release) -> Result<UpdateJob, UpdateError> {
     let log = private_create(&job.log_path)?;
     write_job(&state, &job)?;
     let request = private_create(&state.join(format!("{id}.request")))?;
-    serde_json::to_writer(&request, release)?;
+    serde_json::to_writer(
+        &request,
+        &UpdateRequest {
+            release: release.clone(),
+            allow_interruptions,
+        },
+    )?;
     request.sync_all()?;
     let mut command = Command::new(installation.prefix.join("current/bin/cagents"));
     command
@@ -578,10 +590,11 @@ fn perform_update(
     state: &Path,
     job: &mut UpdateJob,
 ) -> Result<(), UpdateError> {
-    let selected: Release = serde_json::from_slice(&read_private(
+    let request: UpdateRequest = serde_json::from_slice(&read_private(
         &state.join(format!("{}.request", job.id)),
         SMALL_ASSET_LIMIT,
     )?)?;
+    let selected = request.release;
     let cancellation = CancellationToken::new();
     let endpoint = format!("repos/{REPOSITORY}/releases/{}", selected.id);
     let release = applicable_release(serde_json::from_slice(&metadata(
@@ -631,7 +644,14 @@ fn perform_update(
             UpdatePhase::Installing,
             "Checkpointing sessions and switching the installation",
         )?;
-        run_installer(installation, &release, &installer, &archive, &checksums)
+        run_installer(
+            installation,
+            &release,
+            &installer,
+            &archive,
+            &checksums,
+            request.allow_interruptions,
+        )
     })();
     let reopen_result = guard
         .relaunch_windows(
@@ -649,6 +669,7 @@ fn run_installer(
     installer: &File,
     archive: &File,
     checksums: &File,
+    allow_interruptions: bool,
 ) -> Result<(), UpdateError> {
     let files = [
         installer.as_raw_fd(),
@@ -667,6 +688,9 @@ fn run_installer(
         .env_remove("ENV")
         .env_remove("BASH_ENV")
         .stdin(Stdio::null());
+    if !allow_interruptions {
+        command.arg("--require-empty-daemon");
+    }
     // SAFETY: descriptor flags only; sealed anonymous files cannot be replaced
     // between checksum verification and the installer's own second verification.
     unsafe {

@@ -854,6 +854,10 @@ pub mod agent_recovery;
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TerminalSession {
     pub id: TerminalId,
+    /// Stable provenance across replacement daemon incarnations. Unlike the
+    /// current terminal ID, this remains unchanged through repeated recovery.
+    #[serde(default)]
+    pub recovery_origin: Option<TerminalId>,
     pub launch: LaunchRecipe,
     pub transcript_path: Option<PathBuf>,
     pub resume_hint: Option<String>,

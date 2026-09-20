@@ -12,6 +12,8 @@ pub(super) struct State {
     /// The installed UI executable this window has been left behind by.
     superseded: Option<PathBuf>,
     restarting: bool,
+    inspecting_impact: bool,
+    pub(super) confirmation: Option<u64>,
 }
 
 #[derive(Clone, Debug)]
@@ -19,6 +21,10 @@ pub enum Action {
     Check,
     Checked(Result<UpdateState, String>),
     Apply,
+    ImpactChecked(Result<u64, String>),
+    ConfirmApply,
+    CancelApply,
+    StartApply(bool),
     Applied(Result<UpdateJob, String>),
     Poll,
     Polled(Option<String>, Result<Option<UpdateJob>, String>),
@@ -31,6 +37,7 @@ pub enum Action {
 impl State {
     fn updating(&self) -> bool {
         self.applying
+            || self.inspecting_impact
             || self.job.as_ref().is_some_and(|job| {
                 !matches!(job.phase, UpdatePhase::Complete | UpdatePhase::Failed)
             })
@@ -215,6 +222,68 @@ impl Cagents {
                 Task::none()
             }
             Action::Apply => {
+                if self.update_ui.updating() || self.window_update_blocker().is_some() {
+                    return Task::none();
+                }
+                self.update_ui.inspecting_impact = true;
+                cosmic::task::future(async {
+                    let result = tokio::task::spawn_blocking(|| {
+                        let socket = crate::terminal::ipc::daemon_socket_path()
+                            .map_err(|error| error.to_string())?;
+                        let mut client = match crate::control::ControlClient::connect(&socket) {
+                            Ok(client) => client,
+                            Err(crate::control::ControlError::Connect(error))
+                                if matches!(
+                                    error.kind(),
+                                    std::io::ErrorKind::NotFound
+                                        | std::io::ErrorKind::ConnectionRefused
+                                ) =>
+                            {
+                                return Ok(0);
+                            }
+                            Err(error) => return Err(error.to_string()),
+                        };
+                        client
+                            .shutdown_preflight()
+                            .map(|preflight| preflight.capability.live_terminals)
+                            .map_err(|error| error.to_string())
+                    })
+                    .await
+                    .map_err(|error| error.to_string())
+                    .and_then(|result| result);
+                    Message::UpdateUi(Action::ImpactChecked(result))
+                })
+            }
+            Action::ImpactChecked(result) => {
+                self.update_ui.inspecting_impact = false;
+                if self.window_update_blocker().is_some() {
+                    return Task::none();
+                }
+                match result {
+                    Ok(0) => self.update_update_ui(Action::StartApply(false)),
+                    Ok(count) => {
+                        self.update_ui.confirmation = Some(count);
+                        iced::widget::operation::focus(widget::Id::new("update.cancel"))
+                            .map(cosmic::Action::App)
+                    }
+                    Err(error) => {
+                        self.update_ui.error = Some(error);
+                        Task::none()
+                    }
+                }
+            }
+            Action::ConfirmApply => {
+                if self.update_ui.confirmation.take().is_none() {
+                    return Task::none();
+                }
+                self.update_update_ui(Action::StartApply(true))
+            }
+            Action::CancelApply => {
+                self.update_ui.confirmation = None;
+                iced::widget::operation::focus(widget::Id::new("application-update"))
+                    .map(cosmic::Action::App)
+            }
+            Action::StartApply(allow_interruptions) => {
                 if self.update_ui.updating() {
                     return Task::none();
                 }
@@ -233,7 +302,8 @@ impl Cagents {
                 self.update_ui.error = None;
                 cosmic::task::future(async move {
                     let result = tokio::task::spawn_blocking(move || {
-                        crate::update::apply(&release).map_err(|error| error.to_string())
+                        crate::update::apply(&release, allow_interruptions)
+                            .map_err(|error| error.to_string())
                     })
                     .await
                     .map_err(|error| error.to_string())
@@ -309,7 +379,7 @@ impl Cagents {
                 if self.update_ui.superseded.is_none() {
                     return Task::none();
                 }
-                self.update_update_ui(Action::Restart)
+                Task::none()
             }
             Action::Restart => {
                 let Some(installed) = self.update_ui.superseded.clone() else {
@@ -364,6 +434,23 @@ impl Cagents {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn live_session_confirmation_is_modal_and_cancel_never_starts_an_update() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        app.update_ui.inspecting_impact = true;
+        drop(app.update_update_ui(Action::ImpactChecked(Ok(2))));
+        assert_eq!(app.update_ui.confirmation, Some(2));
+        assert!(app.modal_is_open());
+        assert!(!app.update_ui.applying);
+        drop(app.update_update_ui(Action::CancelApply));
+        assert!(app.update_ui.confirmation.is_none());
+        assert!(!app.modal_is_open());
+        assert!(!app.update_ui.applying);
+        // An empty daemon needs no interruption dialog.
+        drop(app.update_update_ui(Action::ImpactChecked(Ok(0))));
+        assert!(app.update_ui.confirmation.is_none());
+    }
 
     /// The restart saves and closes every window, so it must lose to anything
     /// that would refuse to be saved, and it must run exactly once.
