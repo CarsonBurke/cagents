@@ -680,7 +680,31 @@ impl HostState {
         })
     }
 
+    #[cfg(test)]
     pub(crate) fn reserve_spawn(&mut self, terminal_id: TerminalId) -> Result<(), ProtocolError> {
+        self.reserve_spawn_for_view(terminal_id, false)
+    }
+
+    pub(super) fn retire_terminal(&mut self, terminal_id: TerminalId) -> Option<TerminalRecord> {
+        let record = self.terminals.remove(&terminal_id)?;
+        let clients: Vec<_> = self
+            .subscriptions
+            .by_terminal
+            .get(&terminal_id)
+            .map(|clients| clients.keys().copied().collect())
+            .unwrap_or_default();
+        for client in clients {
+            self.subscriptions.detach(client, terminal_id);
+        }
+        self.inventory_generation += 1;
+        Some(record)
+    }
+
+    fn reserve_spawn_for_view(
+        &mut self,
+        terminal_id: TerminalId,
+        paired: bool,
+    ) -> Result<(), ProtocolError> {
         if self.shutting_down {
             return Err(ProtocolError::new(
                 ProtocolErrorCode::TerminalUnavailable,
@@ -689,10 +713,12 @@ impl HostState {
             ));
         }
         if self.chat_spawning.contains_key(&terminal_id)
-            || self
-                .chats
-                .get(&terminal_id)
-                .is_some_and(|record| record.handle.owns_work())
+            || self.chats.get(&terminal_id).is_some_and(|record| {
+                record.handle.owns_work()
+                    && !(paired
+                        && record.returning_terminal
+                        && record.session.launch.provider == crate::agent::Provider::Codex)
+            })
         {
             return Err(ProtocolError::new(
                 ProtocolErrorCode::TerminalAlreadyExists,
@@ -1252,9 +1278,20 @@ fn prepare_upgrade_with_policy(
                 paired_codex.insert(
                     source.id,
                     (
-                        record.source_process.clone().ok_or_else(|| {
-                            upgrade_error("The paired Codex chat has no confirmed source process")
-                        })?,
+                        record
+                            .source_process
+                            .clone()
+                            .or_else(|| {
+                                state
+                                    .terminals
+                                    .get(&source.id)
+                                    .and_then(|terminal| terminal.handle.observe_agent_process())
+                            })
+                            .ok_or_else(|| {
+                                upgrade_error(
+                                    "The paired Codex chat has no confirmed source process",
+                                )
+                            })?,
                         record.handle.clone(),
                     ),
                 );
@@ -1520,6 +1557,13 @@ fn restore_upgrade_from(
     checkpoint.phase = Phase::Restoring;
     store.save(&checkpoint)?;
     let restored = (|| {
+        // A managed CLI connects to its thread's server. Recreate that exact
+        // actor first; starting the TUI first races a socket that does not exist.
+        for chat in &checkpoint.chats {
+            if super::chat::owns_codex_listener(&chat.source) {
+                super::chat::restore_upgrade(host, chat)?;
+            }
+        }
         for terminal in &checkpoint.terminals {
             if crate::daemon::termination_requested() {
                 return Err(RESTORE_TERMINATED.to_owned());
@@ -1530,9 +1574,24 @@ fn restore_upgrade_from(
                 recipe: session.launch.clone(),
                 last_exit: None,
             };
-            spawn_terminal(host, 0, session, terminal.options.clone())
-                .map_err(|error| error.message)?;
+            let paired = {
+                let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
+                state.chats.get_mut(&session.id).is_some_and(|record| {
+                    if !super::chat::owns_codex_listener(&record.session) {
+                        return false;
+                    }
+                    record.returning_terminal = true;
+                    true
+                })
+            };
+            let descriptor =
+                spawn_terminal_view(host, 0, session, terminal.options.clone(), None, paired)
+                    .map_err(|error| error.message)?;
             let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
+            if paired && let Some(chat) = state.chats.get_mut(&terminal.source.id) {
+                chat.returning_terminal = false;
+                chat.session.terminal = Some(descriptor.session);
+            }
             let sources = &mut state
                 .terminals
                 .get_mut(&terminal.source.id)
@@ -1551,6 +1610,9 @@ fn restore_upgrade_from(
                 .map_err(|error| error.message)?;
         }
         for chat in &checkpoint.chats {
+            if super::chat::owns_codex_listener(&chat.source) {
+                continue;
+            }
             if crate::daemon::termination_requested() {
                 return Err(RESTORE_TERMINATED.to_owned());
             }
@@ -1633,6 +1695,24 @@ pub(super) fn spawn_terminal_with_environment(
     options: TerminalSpawnOptions,
     execution_environment: Option<crate::terminal_ipc::ChatExecutionEnvironment>,
 ) -> Result<TerminalDescriptor, ProtocolError> {
+    spawn_terminal_view(
+        shared,
+        client_id,
+        session,
+        options,
+        execution_environment,
+        false,
+    )
+}
+
+pub(super) fn spawn_terminal_view(
+    shared: &SharedHost,
+    client_id: ClientId,
+    session: TerminalSession,
+    options: TerminalSpawnOptions,
+    execution_environment: Option<crate::terminal_ipc::ChatExecutionEnvironment>,
+    paired: bool,
+) -> Result<TerminalDescriptor, ProtocolError> {
     validate_launch(&session)?;
     validate_spawn_options(&options)?;
     let terminal_id = session.id;
@@ -1642,7 +1722,7 @@ pub(super) fn spawn_terminal_with_environment(
         let mut state = shared
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        state.reserve_spawn(terminal_id)?;
+        state.reserve_spawn_for_view(terminal_id, paired)?;
     }
 
     let weak = Arc::downgrade(shared);
@@ -1722,7 +1802,7 @@ pub(super) fn spawn_terminal_with_environment(
         .name(format!("cagentsd-events-{terminal_id}"))
         .spawn(move || {
             while let Ok(event) = event_rx.recv() {
-                record_event(&event_host, terminal_id, event);
+                record_event_from(&event_host, terminal_id, event, Some(&completion_handle));
             }
             // The final grid is captured after the exit event and may race a
             // reveal queued just as the worker stops accepting commands.
@@ -1949,7 +2029,16 @@ fn broadcast_redraw(host: &Weak<Mutex<HostState>>, terminal_id: TerminalId, gene
     }
 }
 
+#[cfg(test)]
 fn record_event(host: &Weak<Mutex<HostState>>, terminal_id: TerminalId, event: TerminalEvent) {
+    record_event_from(host, terminal_id, event, None);
+}
+fn record_event_from(
+    host: &Weak<Mutex<HostState>>,
+    terminal_id: TerminalId,
+    event: TerminalEvent,
+    worker: Option<&TerminalHandle>,
+) {
     let Some(host) = host.upgrade() else {
         return;
     };
@@ -1961,6 +2050,9 @@ fn record_event(host: &Weak<Mutex<HostState>>, terminal_id: TerminalId, event: T
         let Some(record) = state.terminals.get_mut(&terminal_id) else {
             return;
         };
+        if worker.is_some_and(|worker| !record.handle.same_worker(worker)) {
+            return;
+        }
         if let WireTerminalEvent::ResumeHintChanged { hint } = &wire_event {
             record.session.resume_hint = hint.clone();
         }

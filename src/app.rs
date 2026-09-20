@@ -6,6 +6,7 @@ mod chrome_ui;
 mod daemon_recovery;
 mod daemon_stop;
 pub(crate) mod dialog_ui;
+mod history_ui;
 #[cfg(feature = "latency-harness")]
 mod latency_ui;
 mod project_ui;
@@ -70,11 +71,10 @@ use crate::{
         TerminalExit, TerminalId, TerminalSession, WorkspaceState, WorktreeState,
     },
     repository::{
-        CancellationToken, ChangeArea, CommitOutcome, CommitRequest, CommitSummary,
-        CreateWorktreeRequest, DiffBasis, HistoryRequest, HistoryRevision, MutationOutcome,
-        PushOutcome, PushRequest, RepoPath, RepositoryId, RepositoryInfo, RepositoryService,
-        RepositorySnapshot, StageRequest, StatusSnapshot, UnstageRequest, WorktreeCreationOutcome,
-        WorktreeRecord,
+        CancellationToken, CommitOutcome, CommitRequest, CommitSummary, CreateWorktreeRequest,
+        DiffBasis, HistoryRequest, HistoryRevision, MutationOutcome, PushOutcome, PushRequest,
+        RepoPath, RepositoryId, RepositoryInfo, RepositoryService, RepositorySnapshot,
+        StageRequest, StatusSnapshot, UnstageRequest, WorktreeCreationOutcome, WorktreeRecord,
     },
     repository_widget::{
         self, LspIntent, RepositoryAction, RepositoryRuntime, RepositoryRuntimeStatus,
@@ -1798,6 +1798,7 @@ fn user_workspace_message_blocked_while_modal(message: &Message) -> bool {
         | Message::CyclePaneWidth
         | Message::CloseCard(_)
         | Message::OpenBrowser(_)
+        | Message::OpenLink(..)
         | Message::NewBrowser
         | Message::RetryCard(_)
         | Message::FocusAdjacent(_)
@@ -1899,6 +1900,11 @@ fn workspace_navigation_blocked_during_save(message: &Message) -> bool {
         Message::NewTerminal
             | Message::NewBrowser
             | Message::OpenBrowser(_)
+            | Message::OpenLink(..)
+            | Message::ChatUi(chat_ui::Action::OpenUrl(_))
+            | Message::PullRequestUi(
+                pull_request_ui::Action::OpenUrl(_) | pull_request_ui::Action::OpenMarkdownLink(_)
+            )
             | Message::ChromeUi(chrome_ui::Action::Launch(_))
             | Message::FocusCard(_)
             | Message::FocusAdjacent(_)
@@ -1934,6 +1940,7 @@ fn context_inspector_action_navigates(action: &InspectorAction) -> bool {
             | InspectorAction::Retry(_)
             | InspectorAction::ReloadBrowser(_)
             | InspectorAction::OpenBrowser(_)
+            | InspectorAction::OpenLspHoverLink(_)
             | InspectorAction::CreatePullRequest { .. }
             | InspectorAction::FocusProjectSearch
     )
@@ -2428,8 +2435,10 @@ pub enum Message {
     },
     /// One page of the bound worktree's history.
     SourceControlHistory {
+        generation: u64,
         key: ActiveWorktreeKey,
         page: u32,
+        head: crate::repository::Oid,
         result: Result<Vec<CommitSummary>, String>,
     },
     /// A finished stage, unstage, discard, commit, or push.
@@ -2553,6 +2562,7 @@ pub enum Message {
         token: Option<String>,
     },
     OpenBrowser(Url),
+    OpenLink(Url, LinkOpenGesture),
     ExternalLinkOpened(Result<(), String>),
     NewBrowser,
     #[cfg(not(feature = "integrated-browser"))]
@@ -2664,6 +2674,7 @@ pub enum Message {
     ChromeUi(chrome_ui::Action),
     ChannelUi(channel_ui::Action),
     BranchUi(branch_ui::Action),
+    CommitUi(history_ui::Action),
     RefreshUi(refresh_ui::Action),
     /// The shell's light or dark mode changed, so a rendered document page no
     /// longer matches the surface it sits on.
@@ -2703,9 +2714,6 @@ struct PendingPanelOpen {
     card: CardId,
     /// Worktree-relative, exactly as the card's own file list names paths.
     path: PathBuf,
-    /// `None` opens the editor; `Some` opens the diff on that side. The card
-    /// has no third basis, so a conflict is shown against the working tree.
-    diff_staged: Option<bool>,
 }
 
 struct DirtyRepositoryClose {
@@ -3086,6 +3094,7 @@ pub struct Cagents {
     chat_ui: chat_ui::State,
     update_ui: update_ui::State,
     branch_ui: branch_ui::State,
+    history_ui: history_ui::State,
     refresh_ui: refresh_ui::State,
     chrome_ui: chrome_ui::State,
     pull_request_inspector: pull_request_ui::State,
@@ -3900,8 +3909,12 @@ impl Cagents {
         Task::batch([self.apply_viewport(update, true, false), load])
     }
     fn open_link(&mut self, url: Url) -> Task<Message> {
+        self.open_link_in(url, self.settings.link_open_destination)
+    }
+
+    fn open_link_in(&mut self, url: Url, destination: LinkOpenDestination) -> Task<Message> {
         self.show_workspace_for_action();
-        match self.settings.link_open_destination {
+        match destination {
             LinkOpenDestination::IntegratedBrowser => self.add_browser(url),
             LinkOpenDestination::SystemDefault => cosmic::task::future(async move {
                 Message::ExternalLinkOpened(open_system_url(url).await)
@@ -3909,20 +3922,16 @@ impl Cagents {
         }
     }
 
-    fn configured_link_gesture_is_pressed(&self) -> bool {
-        self.keyboard_modifiers.control()
-            && match self.settings.link_open_gesture {
-                LinkOpenGesture::ControlClick => !self.keyboard_modifiers.shift(),
-                LinkOpenGesture::ControlShiftClick => self.keyboard_modifiers.shift(),
-            }
-    }
-
     fn open_clicked_link(&mut self, url: Url) -> Task<Message> {
-        if self.configured_link_gesture_is_pressed() {
-            self.open_link(url)
-        } else {
-            self.add_browser(url)
-        }
+        let gesture =
+            self.keyboard_modifiers
+                .control()
+                .then_some(if self.keyboard_modifiers.shift() {
+                    LinkOpenGesture::ControlShiftClick
+                } else {
+                    LinkOpenGesture::ControlClick
+                });
+        self.open_link_in(url, self.settings.link_destination(gesture))
     }
 
     #[cfg(feature = "integrated-browser")]
@@ -5370,7 +5379,7 @@ impl Cagents {
                 ))
                 .model_focused(card_focused)
                 .on_focus(Message::FocusCard(id))
-                .on_open_link(Message::OpenBrowser)
+                .on_open_link(Message::OpenLink)
                 .on_command_error(move |error| Message::TerminalError {
                     card: id,
                     message: error.to_string(),
@@ -5516,9 +5525,6 @@ impl Cagents {
         }
         if let Some(toolbar) = browser_toolbar {
             rows.push(toolbar);
-        }
-        if focused && let Some(binding) = self.chat_binding_view(id) {
-            rows.push(binding);
         }
         rows.push(content);
         let surface: Element<'a, Message> = widget::container(
@@ -5715,6 +5721,8 @@ impl Cagents {
         }
         self.cancel_source_read();
         self.cancel_branch_changes();
+        self.history_ui.cancel();
+        self.history_ui.next_page_request();
         let Some(key) = self.sidebar_state.active_worktree().cloned() else {
             self.sidebar_model.source_control = None;
             return Task::none();
@@ -5737,7 +5745,16 @@ impl Cagents {
             return Task::none();
         }
         source.mark_history_requested();
-        Self::source_control_history_task(source.key.clone(), 0)
+        let generation = self.history_ui.next_page_request();
+        Self::source_control_history_task(
+            generation,
+            source.key.clone(),
+            source
+                .head_oid
+                .as_deref()
+                .and_then(|oid| crate::repository::Oid::parse_object(oid).ok()),
+            0,
+        )
     }
 
     /// The open repository card showing this worktree, if one is open.
@@ -5765,12 +5782,7 @@ impl Cagents {
     /// is parked in [`Self::pending_panel_open`] and performed when that card's
     /// file list lands, because the card resolves a path against the list it
     /// holds and the sidebar's rows come from a snapshot the list may predate.
-    fn route_panel_open(
-        &mut self,
-        key: &ActiveWorktreeKey,
-        path: &RepoPath,
-        diff_staged: Option<bool>,
-    ) -> Task<Message> {
+    fn route_panel_open(&mut self, key: &ActiveWorktreeKey, path: &RepoPath) -> Task<Message> {
         if self.sidebar_state.active_worktree() != Some(key) {
             return Task::none();
         }
@@ -5785,11 +5797,7 @@ impl Cagents {
         let path = path.as_path().to_path_buf();
         let task = match self.repository_card_for(&key.canonical_path) {
             Some(card) => {
-                self.pending_panel_open = Some(PendingPanelOpen {
-                    card,
-                    path,
-                    diff_staged,
-                });
+                self.pending_panel_open = Some(PendingPanelOpen { card, path });
                 let focus = self
                     .workspace
                     .focus(card)
@@ -5812,11 +5820,7 @@ impl Cagents {
                     key.canonical_path.clone(),
                 );
                 if let Some(card) = self.repository_card_for(&key.canonical_path) {
-                    self.pending_panel_open = Some(PendingPanelOpen {
-                        card,
-                        path,
-                        diff_staged,
-                    });
+                    self.pending_panel_open = Some(PendingPanelOpen { card, path });
                 }
                 task
             }
@@ -5824,11 +5828,6 @@ impl Cagents {
         overlay.chain(task)
     }
 
-    /// Performs a parked navigation now that `card` has listed its files.
-    ///
-    /// The three actions are chained rather than batched: the card decides
-    /// whether it may show a diff from the selection the open just made, so
-    /// they must arrive in this order.
     /// Hands the card's buffer lifecycle to the language-server manager.
     ///
     /// The widget records what happened to the buffer; nothing in it can talk
@@ -6170,7 +6169,7 @@ impl Cagents {
                 Task::none()
             }
             InspectorAction::OpenLspHoverLink(uri) => match Url::parse(&uri) {
-                Ok(url) => self.open_link(url),
+                Ok(url) => self.open_clicked_link(url),
                 Err(_) => {
                     self.status = Some(TransientNotice::error(
                         "could not open hover link: invalid absolute URL",
@@ -6326,29 +6325,10 @@ impl Cagents {
             .pending_panel_open
             .take()
             .expect("the pending open was just matched");
-        let mut task = cosmic::task::message(Message::Repository(RepositoryAction::OpenFile {
+        cosmic::task::message(Message::Repository(RepositoryAction::OpenFile {
             card,
             path: open.path,
-        }));
-        if let Some(staged) = open.diff_staged {
-            // A staged row is what the index holds against HEAD; an unstaged
-            // one is what the worktree holds against the index. The panel
-            // reports which list the row came from, and these are the two
-            // bases those lists are computed from.
-            let basis = if staged {
-                DiffBasis::HeadToIndex
-            } else {
-                DiffBasis::IndexToWorktree
-            };
-            task = task
-                .chain(cosmic::task::message(Message::Repository(
-                    RepositoryAction::ApplySourceSurface { card, diff: true },
-                )))
-                .chain(cosmic::task::message(Message::Repository(
-                    RepositoryAction::ApplyDiffBasis { card, basis },
-                )));
-        }
-        task
+        }))
     }
 
     /// True when this result still describes the worktree the panel is bound
@@ -6379,10 +6359,15 @@ impl Cagents {
         let cancellation = CancellationToken::default();
         self.refresh_ui.source_cancel = Some(cancellation.clone());
         let worktree = key.canonical_path.clone();
+        let untracked_changes = self.sidebar_state.section_expanded(PanelSection::Untracked);
+        let options = crate::repository::SnapshotOptions {
+            untracked_changes,
+            untracked_files: untracked_changes || self.context_tab == ContextTab::Files,
+        };
         cosmic::task::future(async move {
             let result = tokio::task::spawn_blocking(move || {
                 RepositoryService::system("git")
-                    .snapshot(&worktree, &cancellation)
+                    .snapshot_with_options(&worktree, options, &cancellation)
                     .map_err(|error| error.to_string())
             })
             .await
@@ -6397,10 +6382,18 @@ impl Cagents {
         })
     }
 
-    fn source_control_history_task(key: ActiveWorktreeKey, page: u32) -> Task<Message> {
+    fn source_control_history_task(
+        generation: u64,
+        key: ActiveWorktreeKey,
+        head: Option<crate::repository::Oid>,
+        page: u32,
+    ) -> Task<Message> {
+        let Some(head) = head else {
+            return Task::none();
+        };
         let request = HistoryRequest {
             worktree: key.canonical_path.clone(),
-            revision: HistoryRevision::Head,
+            revision: HistoryRevision::Object { oid: head.clone() },
             page,
             path: None,
         };
@@ -6413,7 +6406,13 @@ impl Cagents {
             .await
             .map_err(|error| format!("history reader join failed: {error}"))
             .and_then(|result| result);
-            Message::SourceControlHistory { key, page, result }
+            Message::SourceControlHistory {
+                generation,
+                key,
+                page,
+                head,
+                result,
+            }
         })
     }
 
@@ -6557,6 +6556,7 @@ impl Cagents {
             || self.settings_reset_confirm
             || self.project_ui.modal_open()
             || self.channel_ui.modal_open()
+            || self.new_thread_is_open()
             // Mounted by `dialog` from the sidebar's own state, so nothing
             // beneath it can learn about it any other way. Leaving it out is
             // how the one dialog that is on screen *because* it is about to
@@ -6769,9 +6769,7 @@ impl Cagents {
                                 cosmic::task::message(Message::RetryCard(card))
                             }
                         }
-                        InspectorAction::OpenBrowser(url) => {
-                            cosmic::task::message(Message::OpenBrowser(url))
-                        }
+                        InspectorAction::OpenBrowser(url) => self.open_clicked_link(url),
                         InspectorAction::RefreshRepository(card) => cosmic::task::message(
                             Message::Repository(RepositoryAction::RefreshFiles { card }),
                         ),
@@ -7022,7 +7020,9 @@ impl Cagents {
     }
 
     fn nested_modal_focus_target(&self) -> Option<widget::Id> {
-        if self.sidebar_state.pending_discard().is_some() {
+        if self.new_thread_is_open() {
+            Some(widget::Id::new("chat.new-thread.chatgpt"))
+        } else if self.sidebar_state.pending_discard().is_some() {
             Some(sidebar::discard_confirm_id())
         } else if self.project_ui.modal_open() {
             Some(self.project_ui.focus_target())
@@ -7765,6 +7765,7 @@ impl Application for Cagents {
             chat_ui: chat_ui::State::default(),
             update_ui: update_ui::State::default(),
             branch_ui: branch_ui::State::default(),
+            history_ui: history_ui::State::default(),
             refresh_ui: refresh_ui::State::default(),
             chrome_ui: chrome_ui::State::default(),
             pull_request_inspector: pull_request_ui::State::default(),
@@ -8408,7 +8409,7 @@ impl Application for Cagents {
             }
             Message::Repository(RepositoryAction::MarkdownLink { uri, .. }) => {
                 match Url::parse(&uri) {
-                    Ok(url) => self.open_link(url),
+                    Ok(url) => self.open_clicked_link(url),
                     Err(_) => {
                         self.status = Some(TransientNotice::error(
                             "could not open Markdown link: invalid absolute URL",
@@ -8670,6 +8671,24 @@ impl Application for Cagents {
                     // Expanding `History` is the only thing that asks for the
                     // first page; the tail of `update` sees the new toggle and
                     // issues the walk.
+                    SidebarAction::ToggleSection { key, section: PanelSection::Untracked } => self.reload_source_control(&key),
+                    SidebarAction::OpenCommit { key, oid } => self.open_history_commit(key, oid),
+                    SidebarAction::CloseCommit { key } => {
+                        if self.source_control_is_bound(&key) {
+                            self.history_ui.cancel();
+                            if let Some(source) = self.sidebar_model.source_control.as_mut() { source.commit_changes = None; }
+                        }
+                        Task::none()
+                    }
+                    SidebarAction::ShowMoreCommitFiles { key, oid } => {
+                        if self.source_control_is_bound(&key)
+                            && let Some(changes) = self.sidebar_model.source_control.as_mut().and_then(|source| source.commit_changes.as_mut())
+                            && changes.commit.oid == oid {
+                            changes.visible_files = changes.visible_files.saturating_add(200);
+                        }
+                        Task::none()
+                    }
+                    SidebarAction::OpenCommitFile { key, oid, path } => self.open_commit_file(key, oid, path),
                     SidebarAction::ToggleSection { .. }
                     | SidebarAction::ToggleSourceControlPanel { .. }
                     | SidebarAction::FilesQueryChanged { .. }
@@ -8693,7 +8712,7 @@ impl Application for Cagents {
                     }
                     SidebarAction::RefreshWorktree { key } => self.reload_source_control(&key),
                     SidebarAction::OpenFile { key, path } => {
-                        self.route_panel_open(&key, &path, None)
+                        self.route_panel_open(&key, &path)
                     }
                     SidebarAction::OpenFileInEditor { key, path, editor_id } => {
                         if !self.source_control_is_bound(&key) {
@@ -8705,8 +8724,7 @@ impl Application for Cagents {
                         // The card has two diff bases. A conflict has no staged
                         // side to show, so it is opened against the working
                         // tree like any other unstaged change.
-                        let staged = area == ChangeArea::Staged;
-                        self.route_panel_open(&key, &path, Some(staged))
+                        self.open_working_change(key, path, area)
                     }
                     SidebarAction::Stage { key, selection } => {
                         if !self.begin_mutation(&key, MutationKind::Stage) {
@@ -8789,9 +8807,10 @@ impl Application for Cagents {
                             return Task::none();
                         }
                         if let Some(source) = self.sidebar_model.source_control.as_mut() {
+                            if source.history_loading || source.next_history_page != page { return Task::none(); }
                             source.mark_history_requested();
                         }
-                        Self::source_control_history_task(key, page)
+                        Self::source_control_history_task(self.history_ui.next_page_request(), key, self.sidebar_model.source_control.as_ref().and_then(|source| source.head_oid.as_deref()).and_then(|oid| crate::repository::Oid::parse_object(oid).ok()), page)
                     }
                     SidebarAction::ToggleControls => {
                         if self.sidebar_state.controls_expanded() {
@@ -9131,7 +9150,8 @@ impl Application for Cagents {
             Message::CloseCard(id)
                 if self
                     .card_state(id)
-                    .is_some_and(|state| matches!(state.kind, CardKind::Chat(_))) =>
+                    .is_some_and(|state| matches!(state.kind, CardKind::Chat(_)))
+                    || self.chat_has_parked_runtime(id) =>
             {
                 self.begin_chat_close(id)
             }
@@ -9196,9 +9216,10 @@ impl Application for Cagents {
             }
             Message::CancelRepositoryClose => self.cancel_dirty_close(),
             Message::CommitClose(id) => {
-                if self
+                if (self
                     .card_state(id)
                     .is_some_and(|state| matches!(state.kind, CardKind::Chat(_)))
+                    || self.chat_has_parked_runtime(id))
                     && !self.chat_close_approved(id)
                 {
                     return self.begin_chat_close(id);
@@ -9362,6 +9383,9 @@ impl Application for Cagents {
             Message::OpenBrowser(url) => {
                 self.show_workspace_for_action();
                 self.add_browser(url)
+            }
+            Message::OpenLink(url, gesture) => {
+                self.open_link_in(url, self.settings.link_destination(Some(gesture)))
             }
             Message::ExternalLinkOpened(result) => {
                 if let Err(error) = result {
@@ -9739,6 +9763,9 @@ impl Application for Cagents {
                 // `WorkspaceSurface` captures those chords itself, before any
                 // child sees them, and relies on this message to act on them.
                 if is_escape_press(&event) && !captured {
+                    if self.new_thread_is_open() {
+                        return self.handle_chat_ui(chat_ui::Action::DismissNewThread);
+                    }
                     if self.terminal_close.is_some() {
                         return self.cancel_terminal_close();
                     }
@@ -9784,6 +9811,11 @@ impl Application for Cagents {
                             InspectorAction::Close,
                         ));
                     }
+                }
+                if let Some(backwards) = is_tab_press(&event)
+                    && self.new_thread_is_open()
+                {
+                    return self.cycle_new_thread_focus(backwards);
                 }
                 if let Some(backwards) = is_tab_press(&event)
                     && self.terminal_close.is_some()
@@ -9899,8 +9931,13 @@ impl Application for Cagents {
                 self.set_context_inspector_open(!self.context_inspector_open)
             }
             Message::SelectContextTab(tab) => {
+                let changed = self.context_tab != tab;
                 self.context_tab = tab;
-                Task::none()
+                if changed && let Some(key) = self.sidebar_state.active_worktree().cloned() {
+                    self.reload_source_control(&key)
+                } else {
+                    Task::none()
+                }
             }
             Message::ContextInspector(_) if self.modal_is_open() => Task::none(),
             Message::ContextInspector(action) => self.handle_context_inspector_action(action),
@@ -9921,6 +9958,7 @@ impl Application for Cagents {
             }
             Message::ProjectUi(action) => self.handle_project_action(action),
             Message::PullRequestUi(action) => self.handle_pull_request_ui(action),
+            Message::CommitUi(action) => self.update_commit_ui(action),
             Message::ChromeUi(action) => self.update_chrome(action),
             Message::ChannelUi(action) => self.handle_channel_ui(action),
             Message::BranchUi(action) => self.update_branch_ui(action),
@@ -10024,8 +10062,15 @@ impl Application for Cagents {
                     }
                 }
             }
-            Message::SourceControlHistory { key, page, result } => {
-                if !self.source_control_is_bound(&key) {
+            Message::SourceControlHistory {
+                generation,
+                key,
+                page,
+                head,
+                result,
+            } => {
+                if !self.source_control_is_bound(&key) || !self.history_ui.accepts_page(generation)
+                {
                     return Task::none();
                 }
                 match result {
@@ -10034,14 +10079,21 @@ impl Application for Cagents {
                             // A page that arrives out of order would append the
                             // same commits twice, so only the page the walk is
                             // waiting for is taken.
-                            if source.next_history_page == page {
+                            if source.head_oid.as_deref() == Some(head.as_str())
+                                && source.next_history_page == page
+                            {
                                 source.append_history(&commits);
                             }
                         }
                     }
                     Err(error) => {
                         if let Some(source) = self.sidebar_model.source_control.as_mut() {
-                            source.set_error(Some(format!("Could not read history: {error}")));
+                            if source.head_oid.as_deref() == Some(head.as_str())
+                                && source.next_history_page == page
+                                && source.history_loading
+                            {
+                                source.history_failed(format!("Could not read history: {error}"));
+                            }
                         }
                     }
                 }
@@ -10227,6 +10279,9 @@ impl Application for Cagents {
     }
 
     fn dialog(&self) -> Option<Element<'_, Message>> {
+        if let Some(dialog) = self.new_thread_dialog() {
+            return Some(dialog);
+        }
         if let Some(intent) = &self.terminal_close {
             return self.terminal_close_dialog().map(|surface| {
                 dialog_ui::overlay(
@@ -10938,7 +10993,11 @@ fn load_repository(
         .filter(|worktree| worktree_ui::worktree_directory_available(&worktree.path))
         .map(|worktree| {
             let status = (!worktree.bare)
-                .then(|| service.status(&worktree.path, &cancellation).ok())
+                .then(|| {
+                    service
+                        .status_with_untracked(&worktree.path, false, &cancellation)
+                        .ok()
+                })
                 .flatten();
             (worktree, status)
         })
@@ -12668,6 +12727,20 @@ mod tests {
         let messages = [
             Message::NewTerminal,
             Message::NewBrowser,
+            Message::OpenLink(
+                Url::parse("https://example.com").unwrap(),
+                crate::settings::LinkOpenGesture::ControlShiftClick,
+            ),
+            Message::ChatUi(chat_ui::Action::OpenUrl("https://example.com".into())),
+            Message::PullRequestUi(pull_request_ui::Action::OpenUrl(
+                Url::parse("https://example.com").unwrap(),
+            )),
+            Message::PullRequestUi(pull_request_ui::Action::OpenMarkdownLink(
+                "https://example.com".into(),
+            )),
+            Message::ContextInspector(InspectorAction::OpenLspHoverLink(
+                "https://example.com".into(),
+            )),
             Message::FocusCard(CardId::new()),
             Message::FocusAdjacent(crate::workspace::FocusDirection::Right),
             Message::ToggleContextInspector,
@@ -13098,16 +13171,13 @@ mod tests {
             Some(VisibilityClass::Offscreen)
         );
         assert!(app.sidebar_state.has_card_update(target));
-        assert!(app.chat_binding_view(target).is_none());
 
         let _ = app.update(Message::ChatUi(chat_ui::Action::Switch(target)));
 
         assert_eq!(app.workspace.focused(), Some(target));
         assert_eq!(app.durable.focused, Some(target));
         assert!(app.workspace.camera().target() > app.workspace.camera().offset());
-        // The card is revealed while its conversation is resolved, and the
-        // chooser only appears where there is something to choose.
-        assert!(app.chat_binding_view(target).is_none());
+        // The card is revealed while its managed conversation is resolved.
         assert!(!app.sidebar_state.has_card_update(target));
         assert!(app.sidebar_state.has_card_update(unrelated));
         let update = app.workspace.tick(Duration::from_secs(1));
@@ -13117,14 +13187,12 @@ mod tests {
             Some(VisibilityClass::Visible)
         );
 
-        // Confirming before the account has named a conversation must adopt
-        // nothing and must not replace the source terminal.
-        let _ = app.update(Message::ChatUi(chat_ui::Action::BindingConfirm(target)));
+        // The source is preserved until the daemon confirms its exact identity.
         assert_eq!(
             app.card_state(target).unwrap().kind,
             CardKind::Terminal(source)
         );
-        assert!(!app.chat_start_pending(target));
+        assert!(app.chat_start_pending(target));
     }
 
     #[test]
@@ -14649,6 +14717,7 @@ mod tests {
             chrome_ui: chrome_ui::State::default(),
             pull_request_inspector: pull_request_ui::State::default(),
             branch_ui: branch_ui::State::default(),
+            history_ui: history_ui::State::default(),
             refresh_ui: refresh_ui::State::default(),
             active_workspace: None,
             worktree_focus: HashMap::new(),

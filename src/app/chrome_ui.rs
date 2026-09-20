@@ -1,5 +1,5 @@
 use super::*;
-use crate::{agent::Provider, interaction::tooltip};
+use crate::interaction::tooltip;
 
 #[derive(Debug, Default)]
 pub(super) struct State {
@@ -33,59 +33,23 @@ enum Popup {
 #[derive(Debug, Clone, Copy)]
 pub enum NewTab {
     Terminal,
-    /// A conversation hosted inside the application, driven by this provider.
-    NativeChat(Provider),
-    /// The provider's own terminal program, in a hosted terminal.
-    Agent(Provider),
+    Thread,
     Browser,
 }
 
-// A native chat and a terminal agent are different surfaces onto the same
-// three providers, so the menu names the provider in the label and the
-// surface in the icon. Native chats come first because they are the surface
-// the application is for; a terminal agent is the escape hatch.
-const NEW_TAB_CHOICES: [(&str, &str, NewTab, &str); 8] = [
+// Threads choose their model in the composer; backend details are automatic.
+const NEW_TAB_CHOICES: [(&str, &str, NewTab, &str); 3] = [
+    (
+        "New thread",
+        "Choose a model and start a conversation",
+        NewTab::Thread,
+        "chrome.new-tab.thread",
+    ),
     (
         "Terminal",
         "Shell in the current worktree",
         NewTab::Terminal,
         "chrome.new-tab.terminal",
-    ),
-    (
-        "Codex chat",
-        "OpenAI agent inside cagents",
-        NewTab::NativeChat(Provider::Codex),
-        "chrome.new-tab.native-codex",
-    ),
-    (
-        "Claude chat",
-        "Anthropic agent inside cagents",
-        NewTab::NativeChat(Provider::Claude),
-        "chrome.new-tab.native-claude",
-    ),
-    (
-        "OMP chat",
-        "Oh My Pi agent inside cagents",
-        NewTab::NativeChat(Provider::Omp),
-        "chrome.new-tab.native-omp",
-    ),
-    (
-        "Codex terminal",
-        "OpenAI agent in a terminal",
-        NewTab::Agent(Provider::Codex),
-        "chrome.new-tab.codex",
-    ),
-    (
-        "Claude Code terminal",
-        "Anthropic agent in a terminal",
-        NewTab::Agent(Provider::Claude),
-        "chrome.new-tab.claude",
-    ),
-    (
-        "OMP terminal",
-        "Oh My Pi agent in a terminal",
-        NewTab::Agent(Provider::Omp),
-        "chrome.new-tab.omp",
     ),
     (
         "Browser",
@@ -262,20 +226,8 @@ impl Cagents {
                 self.chrome_ui.close();
                 match kind {
                     NewTab::Terminal => cosmic::task::message(Message::NewTerminal),
-                    NewTab::NativeChat(provider) => self.new_native_chat(provider, None),
+                    NewTab::Thread => self.new_native_thread(),
                     NewTab::Browser => cosmic::task::message(Message::NewBrowser),
-                    NewTab::Agent(provider) => {
-                        self.show_workspace_for_action();
-                        let Some(working_directory) = self.terminal_directory() else {
-                            return cosmic::task::message(Message::OpenRepository);
-                        };
-                        self.add_terminal_recipe(LaunchRecipe {
-                            program: provider.executable().to_owned(),
-                            arguments: Vec::new(),
-                            working_directory,
-                            environment: Default::default(),
-                        })
-                    }
                 }
             }
             Action::TabsScrolled(offset) => {
@@ -301,8 +253,7 @@ impl Cagents {
                         NewTab::Terminal => {
                             crate::ui_controls::symbolic_icon("utilities-terminal-symbolic")
                         }
-                        NewTab::NativeChat(_) => chat_icon(),
-                        NewTab::Agent(provider) => crate::ui_controls::provider_icon(provider),
+                        NewTab::Thread => chat_icon(),
                         NewTab::Browser => browser_icon(),
                     };
                     crate::ui_controls::popover_item(

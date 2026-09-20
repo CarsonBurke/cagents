@@ -184,6 +184,22 @@ pub struct Session {
     #[serde(default)]
     pub terminal: Option<crate::model::TerminalSession>,
 }
+impl Session {
+    /// An endpoint allocated for this exact cagents thread, retained in both views.
+    pub fn owns_codex_listener(&self) -> bool {
+        let socket = std::env::temp_dir()
+            .join(format!("cagents-codex-{}", self.id))
+            .join("control.sock");
+        let remote = format!("unix://{}", socket.display());
+        self.launch.provider == Provider::Codex
+            && self
+                .launch
+                .recipe
+                .arguments
+                .windows(2)
+                .any(|pair| pair[0] == "--remote" && pair[1] == remote)
+    }
+}
 
 /// Read-only provider metadata plus an expiring, single-use daemon capability.
 /// The token binds explicit user confirmation to the observed source process.

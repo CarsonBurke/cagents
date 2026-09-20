@@ -339,7 +339,12 @@ pub enum RepositoryAction {
         card: CardId,
         path: PathBuf,
     },
-    OpenBranchFile {
+    OpenWorkingDiff {
+        card: CardId,
+        file: RepositoryFile,
+        basis: DiffBasis,
+    },
+    OpenCommittedFile {
         card: CardId,
         path: RepoPath,
         old_path: Option<RepoPath>,
@@ -525,7 +530,8 @@ impl RepositoryAction {
             | Self::DirectorySearchLoaded { card, .. }
             | Self::NewTerminal { card }
             | Self::OpenFile { card, .. }
-            | Self::OpenBranchFile { card, .. }
+            | Self::OpenWorkingDiff { card, .. }
+            | Self::OpenCommittedFile { card, .. }
             | Self::SelectBranchBase { card, .. }
             | Self::EditorAction { card, .. }
             | Self::Clipboard { card, .. }
@@ -1493,7 +1499,7 @@ pub struct RepositoryRuntime {
     source_surface: SourceSurface,
     markdown_mode: MarkdownMode,
     diff_mode: DiffMode,
-    branch_selection: Option<(DiffBasis, Option<PathBuf>)>,
+    committed_selection: Option<(DiffBasis, Option<PathBuf>)>,
     diff_basis: DiffBasis,
     /// The committed comparison being resolved, or the reason one could not
     /// be, while that is the whole story of the diff surface.
@@ -1629,7 +1635,7 @@ impl RepositoryRuntime {
             next_diff_request: 0,
             source_surface: SourceSurface::Editor,
             markdown_mode: MarkdownMode::Edit,
-            branch_selection: None,
+            committed_selection: None,
             diff_mode: DiffMode::Inline,
             diff_basis: DiffBasis::IndexToWorktree,
             basis_resolution: None,
@@ -4109,7 +4115,7 @@ impl RepositoryRuntime {
                 self.retain_viewports();
                 self.push_lsp_close();
                 self.selected = None;
-                self.branch_selection = None;
+                self.committed_selection = None;
                 self.document = DocumentState::None;
                 self.diffs.clear();
                 self.basis_resolution = None;
@@ -4184,12 +4190,26 @@ impl RepositoryRuntime {
                 self.diff_change = self.diff_change.min(self.change_count().saturating_sub(1));
                 self.restore_visible_scroll()
             }
-            RepositoryAction::OpenBranchFile {
+            RepositoryAction::OpenWorkingDiff { card, file, basis } => {
+                if self.blocks_navigation()
+                    || file.directory
+                    || self.directory_only
+                    || !matches!(basis, DiffBasis::HeadToIndex | DiffBasis::IndexToWorktree)
+                    || RepoPath::parse(&file.path).is_err()
+                {
+                    return Task::none();
+                }
+                let task = self.open_file_entry(card, file);
+                self.source_surface = SourceSurface::Diff;
+                self.diff_basis = basis;
+                Task::batch([task, self.ensure_current_diff(card)])
+            }
+            RepositoryAction::OpenCommittedFile {
                 card,
                 path,
                 old_path,
                 basis,
-            } => self.open_branch_file(card, path, old_path, basis),
+            } => self.open_committed_file(card, path, old_path, basis),
             RepositoryAction::SelectBranchBase { card, base_ref } => {
                 let offered = matches!(&self.basis_resolution,
                     Some(BasisResolution::NeedsBase(candidates)) if candidates.contains(&base_ref));
@@ -4482,7 +4502,7 @@ impl RepositoryRuntime {
     }
 
     fn comparison_old_path(&self) -> Option<PathBuf> {
-        if let Some((basis, old_path)) = &self.branch_selection
+        if let Some((basis, old_path)) = &self.committed_selection
             && *basis == self.diff_basis
         {
             return old_path.clone();
@@ -4490,7 +4510,7 @@ impl RepositoryRuntime {
         self.selected.as_ref()?.previous_path(&self.diff_basis)
     }
 
-    fn open_branch_file(
+    fn open_committed_file(
         &mut self,
         card: CardId,
         path: RepoPath,
@@ -4499,7 +4519,10 @@ impl RepositoryRuntime {
     ) -> Task<RepositoryAction> {
         if self.blocks_navigation()
             || self.directory_only
-            || !matches!(basis, DiffBasis::MergeBaseToHead { .. })
+            || !matches!(
+                basis,
+                DiffBasis::MergeBaseToHead { .. } | DiffBasis::CommitToParent { .. }
+            )
         {
             return Task::none();
         }
@@ -4523,7 +4546,7 @@ impl RepositoryRuntime {
         self.basis_resolution = None;
         self.source_surface = SourceSurface::Diff;
         self.diff_basis = basis.clone();
-        self.branch_selection = Some((basis.clone(), old_path.clone()));
+        self.committed_selection = Some((basis.clone(), old_path.clone()));
         self.apply_diff_viewport(self.viewports.diff[self.diff_mode_index()].unwrap_or_default());
         let identity = self.next_identity(card, path);
         self.request_diff(identity, basis, old_path)
@@ -4545,6 +4568,11 @@ impl RepositoryRuntime {
             }
             None => return Task::none(),
         };
+        self.open_file_entry(card, file)
+    }
+
+    fn open_file_entry(&mut self, card: CardId, file: RepositoryFile) -> Task<RepositoryAction> {
+        let path = file.path.clone();
         let reopening = self.selected.as_ref().is_some_and(|file| file.path == path);
         // Take the destination before retaining the departing file, which may
         // evict the oldest anchor when the cache is full.
@@ -4563,7 +4591,7 @@ impl RepositoryRuntime {
         // name. Emitted before the replacement, while the old buffer still
         // exists to be closed.
         self.push_lsp_close();
-        self.branch_selection = None;
+        self.committed_selection = None;
         self.selected = Some(file.clone());
         self.document = DocumentState::Loading;
         self.diffs.clear();
@@ -4969,7 +4997,14 @@ fn resolve_basis(worktree: &Path, choice: CommittedChoice) -> Result<ResolvedBas
                 return Ok(ResolvedBasis::NoCommit);
             }
             let snapshot = service
-                .snapshot(worktree, &cancellation)
+                .snapshot_with_options(
+                    worktree,
+                    crate::repository::SnapshotOptions {
+                        untracked_changes: false,
+                        untracked_files: false,
+                    },
+                    &cancellation,
+                )
                 .map_err(|error| error.to_string())?;
             Ok(match snapshot.default_branch_base() {
                 Some(base_ref) => return resolved_branch_basis(worktree, base_ref.clone()),
@@ -6967,24 +7002,54 @@ fn color_over(foreground: iced::Color, background: iced::Color) -> iced::Color {
 fn readable_diff_color(foreground: iced::Color, background: iced::Color) -> iced::Color {
     let foreground = color_over(foreground, background);
     if foreground.relative_contrast(background) >= 4.5 {
-        foreground
-    } else if iced::Color::BLACK.relative_contrast(background)
+        return foreground;
+    }
+    let target = if iced::Color::BLACK.relative_contrast(background)
         >= iced::Color::WHITE.relative_contrast(background)
     {
         iced::Color::BLACK
     } else {
         iced::Color::WHITE
+    };
+    // Correct only as much luminance as necessary. Replacing a syntax color
+    // outright with black/white erased the distinction between token kinds.
+    let mix = |amount: f32| {
+        iced::Color::from_rgb(
+            foreground.r + (target.r - foreground.r) * amount,
+            foreground.g + (target.g - foreground.g) * amount,
+            foreground.b + (target.b - foreground.b) * amount,
+        )
+    };
+    let (mut low, mut high) = (0.0, 1.0);
+    for _ in 0..12 {
+        let mid = (low + high) * 0.5;
+        if mix(mid).relative_contrast(background) >= 4.5 {
+            high = mid;
+        } else {
+            low = mid;
+        }
     }
+    mix(high)
+}
+
+/// Mix diff tints in display color space, then draw an opaque background.
+/// Linear-light mixing made small alpha values much brighter than expected.
+fn diff_tint(tint: iced::Color, background: iced::Color) -> iced::Color {
+    iced::Color::from_rgb(
+        background.r + (tint.r - background.r) * tint.a,
+        background.g + (tint.g - background.g) * tint.a,
+        background.b + (tint.b - background.b) * tint.a,
+    )
 }
 
 fn diff_row_background(theme: &cosmic::Theme, kind: DiffRowKind) -> iced::Color {
-    color_over(
+    diff_tint(
         diff_color(
             kind,
             if theme.theme_type.is_dark() {
-                0.055
+                0.10
             } else {
-                0.035
+                0.075
             },
         ),
         theme.cosmic().bg_color().into(),
@@ -7002,11 +7067,18 @@ fn diff_text<'a>(
 ) -> Element<'a, RepositoryAction> {
     let theme = cosmic::theme::active();
     let row_background = diff_row_background(&theme, kind);
+    // A wholly added/deleted line already has a line tint. Word emphasis is
+    // useful only when it distinguishes an edit within otherwise shared text.
+    let changed = if changed == [0..text.len()] {
+        &[]
+    } else {
+        changed
+    };
     let mut spans = crate::diff_view::line_spans(
         text,
         changed,
         syntax,
-        diff_color(kind, if cosmic::theme::is_dark() { 0.18 } else { 0.12 }),
+        diff_color(kind, if cosmic::theme::is_dark() { 0.24 } else { 0.18 }),
     );
     for span in &mut spans {
         let background = match span
@@ -7015,7 +7087,7 @@ fn diff_text<'a>(
             .map(|highlight| &mut highlight.background)
         {
             Some(iced::Background::Color(color)) => {
-                *color = color_over(*color, row_background);
+                *color = diff_tint(*color, row_background);
                 *color
             }
             _ => row_background,
@@ -7631,7 +7703,46 @@ mod tests {
             head: fixture_oid(1),
             merge_base: fixture_oid(2),
         };
-        drop(runtime.update(RepositoryAction::OpenBranchFile {
+        drop(runtime.update(RepositoryAction::OpenCommittedFile {
+            card,
+            path: RepoPath::parse("deleted-or-renamed.txt").unwrap(),
+            old_path: Some(RepoPath::parse("old-name.txt").unwrap()),
+            basis: basis.clone(),
+        }));
+        assert!(!runtime.accepts_selected(&identity));
+        assert!(matches!(runtime.document, DocumentState::None));
+        assert!(!runtime.can_save());
+        assert!(runtime.file(Path::new("deleted-or-renamed.txt")).is_none());
+        assert_eq!(
+            runtime.comparison_old_path(),
+            Some(PathBuf::from("old-name.txt"))
+        );
+        assert_eq!(runtime.diff_basis, basis);
+        assert_eq!(runtime.source_surface, SourceSurface::Diff);
+        runtime.set_diff_state(
+            basis.clone(),
+            DiffState::Ready(RenderedDiff::Error("retry".into())),
+        );
+        drop(runtime.update(RepositoryAction::RetryDiff { card }));
+        assert!(matches!(
+            runtime.diff_state(&basis),
+            Some(DiffState::Loading { .. })
+        ));
+        assert_eq!(
+            runtime.comparison_old_path(),
+            Some(PathBuf::from("old-name.txt"))
+        );
+    }
+
+    #[test]
+    fn commit_only_paths_open_read_only_and_keep_rename_identity_for_retry() {
+        let card = CardId::new();
+        let (mut runtime, identity) = working_diff_runtime(card, "old\n", "working\n");
+        let basis = DiffBasis::CommitToParent {
+            oid: fixture_oid(1),
+            parent: Some(fixture_oid(2)),
+        };
+        drop(runtime.update(RepositoryAction::OpenCommittedFile {
             card,
             path: RepoPath::parse("deleted-or-renamed.txt").unwrap(),
             old_path: Some(RepoPath::parse("old-name.txt").unwrap()),
@@ -7669,7 +7780,7 @@ mod tests {
         // The buffer is dirtied through the Edit surface, which is the only
         // surface that mounts it.
         runtime.source_surface = SourceSurface::Editor;
-        let open = RepositoryAction::OpenBranchFile {
+        let open = RepositoryAction::OpenCommittedFile {
             card,
             path: RepoPath::parse("deleted.txt").unwrap(),
             old_path: None,
@@ -12548,5 +12659,51 @@ mod tests {
             None,
             "a query the user cleared leaves nothing highlighted behind it"
         );
+    }
+    #[test]
+    fn sidebar_working_diff_opens_exact_status_without_a_file_list_refresh() {
+        let card = CardId::new();
+        let (mut runtime, _) = working_diff_runtime(card, "old\n", "working\n");
+        let generation = runtime.file_list_generation;
+        let file = RepositoryFile {
+            path: "new-name.txt".into(),
+            staged: true,
+            staged_old_path: Some("old-name.txt".into()),
+            ..Default::default()
+        };
+        drop(runtime.update(RepositoryAction::OpenWorkingDiff {
+            card,
+            file,
+            basis: DiffBasis::HeadToIndex,
+        }));
+        assert_eq!(runtime.file_list_generation, generation);
+        assert_eq!(
+            runtime.selected.as_ref().unwrap().path,
+            Path::new("new-name.txt")
+        );
+        assert_eq!(
+            runtime.comparison_old_path(),
+            Some(PathBuf::from("old-name.txt"))
+        );
+        assert_eq!(runtime.source_surface, SourceSurface::Diff);
+        assert!(matches!(
+            runtime.diff_state(&DiffBasis::HeadToIndex),
+            Some(DiffState::Loading { .. })
+        ));
+    }
+
+    #[test]
+    fn contrast_correction_retains_syntax_hue_instead_of_replacing_it() {
+        for background in [
+            iced::Color::from_rgb8(42, 29, 31),
+            iced::Color::from_rgb8(251, 231, 233),
+        ] {
+            let syntax = iced::Color::from_rgb8(110, 75, 170);
+            let adjusted = readable_diff_color(syntax, background);
+            assert!(adjusted.relative_contrast(background) >= 4.5);
+            assert_ne!(adjusted, iced::Color::WHITE);
+            assert_ne!(adjusted, iced::Color::BLACK);
+            assert!(adjusted.b > adjusted.r && adjusted.r > adjusted.g);
+        }
     }
 }

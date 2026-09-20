@@ -353,8 +353,8 @@ cagents ui
   In cagents, editor tabs use the ceditor mark; recognized agent terminals and
   native chats use their OMP, Claude, or Codex provider mark.
   Each tab strip contains only its selected worktree or channel. The **New tab**
-  menu offers a terminal, native chat, OMP, Claude Code, Codex, or browser tab,
-  with provider icons and keyboard navigation; there is no Workspaces dropdown.
+  menu offers **New thread**, **Terminal**, and **Browser**, with keyboard
+  navigation. New thread opens the model selector; no harness menu is required.
   Drag a project header to reorder projects; the order survives restarts.
   Project headers stay visible above their worktrees while scrolling. The
   primary worktree stays first; the sort control selects newest, oldest, or
@@ -375,11 +375,17 @@ cagents ui
   rows for their actions; there is no ellipsis menu button. Worktree rows show
   matching pull requests and their reported CI status. Icon tooltips appear
   after one second. Change rows color their status/counts and replace them with
-  action buttons on hover. Untracked text files show measured additions;
+  action buttons on hover. **Untracked** starts collapsed and is read only when
+  expanded; the Files browser can independently list untracked file names.
+  Expanded untracked text files show measured additions;
   binary, unsafe, oversized, or budget-limited files retain unknown counts.
   The Changes tab highlights local or committed branch changes; committed files
   appear below staged and unstaged files, compared against the known default
-  branch's merge base. Visible repository views refresh automatically while
+  branch's merge base. Switch from **Changes** to **History** to browse commits,
+  open a commit's changed files, and inspect their diffs against its first parent
+  (or the empty tree for an initial commit). The Pull request inspector groups
+  description, checks, and discussion in collapsible sections.
+  Visible repository views refresh automatically while
   the application is focused. File filters open from their search icons.
 - Switching worktrees remembers each strip's horizontal scroll position and
   focused column. Hidden terminal presentation is released while hosted PTYs
@@ -495,10 +501,9 @@ fresh OMP source can switch before publishing a saved conversation: cagents
 waits for the replacement's resumable identity before stopping the source.
 Missing or ambiguous established identities leave the terminal intact; resume
 the exact conversation in the provider CLI and retry.
-For Codex's shared server, copy the full conversation UUID from the intended
-CLI's `/status`, preview its title and directory read-only, then explicitly
-confirm attachment. The source terminal remains running; cagents does not choose
-the most recent conversation or infer its identity from the working directory.
+Managed Codex threads retain their exact identity automatically across native
+and CLI views. There is no conversation chooser or UUID-copy step. An unrelated
+unmanaged terminal without a proven identity stays intact.
 Native handoff preserves the source process's explicit provider account,
 environment, and trust-store paths. If credentials or provider settings cannot
 be transferred safely, the switch refuses before stopping the live terminal;
@@ -510,7 +515,7 @@ That context remains in daemon memory when returning to a terminal and switching
 back. A full daemon upgrade refuses before shutdown if its supported recovery
 path cannot reproduce the same execution environment; it does not serialize
 credentials into the upgrade checkpoint or silently choose another account.
-A successful return retains only a lightweight replay receipt. The GUI releases
+A completed stop-and-resume handoff retains a lightweight replay receipt. The GUI releases
 it after its terminal replacement is durably saved, including retries after
 restart or early terminal exit; unresolved handoffs block a full upgrade.
 
@@ -521,15 +526,12 @@ restart or early terminal exit; unresolved handoffs block a full upgrade.
   be silently lost.
   This is not a simultaneous live view; available history depends on the
   provider. The original launch recipe and terminal descriptor are retained.
-- **Codex:** join the exact existing conversation directly over the shared
-  daemon's local Unix socket, leaving the original CLI alive. Launches using
-  `--remote unix://PATH`, `--remote=unix://PATH`, and existing `--sock` proxy
-  recipes are supported; bare `unix://` uses the existing default socket under
-  `CODEX_HOME`. Remote `ws://` and `wss://` endpoints are not supported.
-  If that session cannot be joined safely, cagents keeps the terminal and
-  reports an error; it does not launch a proxy process, start a replacement
-  daemon, or fall back to a separate conversation. Returning to the terminal
-  detaches the native view while active work continues.
+- **Codex:** new threads use a cagents-owned local server. Native and CLI views
+  attach to the same thread, including during active responses. Switching keeps
+  the draft, attachments, and pending native commands intact. Existing exact
+  sessions on a shared Unix socket can also be attached; remote WebSocket
+  endpoints are not supported. cagents never selects a thread by directory
+  or recency.
 
 The native view presents streamed messages, tool activity, and explicit provider
 approval/input requests. Controls appear according to provider capabilities:
@@ -797,8 +799,8 @@ cycle_pane_width = ["Alt+R"]
 | `sidebar_width` | float | `260.0` | finite values from `220.0` through `420.0`, inclusive |
 | `inspector_width` | float | `380.0` | finite values from `320.0` through `480.0`, inclusive |
 | `default_column_fraction` | float | `0.5` | finite values from `0.25` through `1.0`, inclusive |
-| `link_open_destination` | string | `"integrated_browser"` | `"integrated_browser"` or `"system_default"` |
-| `link_open_gesture` | string | `"control_click"` | `"control_click"` or `"control_shift_click"` |
+| `link_open_destination` | string | `"integrated_browser"` | Default for ordinary application links: `"integrated_browser"` or `"system_default"` |
+| `link_open_gesture` | string | `"control_click"` | Gesture that explicitly opens the system browser: `"control_click"` or `"control_shift_click"`; the other gesture opens in-app |
 | `managed_worktree_directory` | string | `"worktrees/"` | nonempty path without control characters; absolute or relative to the repository root |
 | `editor_auto_save` | boolean | `true` | `true` or `false`; automatically save edited files after a pause, stopping on conflicts or save errors |
 | `editor_wrap_lines` | boolean | `false` | wrap long native-editor lines instead of keeping a horizontally navigable line |

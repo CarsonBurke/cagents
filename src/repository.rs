@@ -1584,8 +1584,28 @@ pub struct BranchComparison {
     pub entries: Vec<DiffEntry>,
 }
 
+/// Independent source-control and file-browser demand. Neither collapsed changes
+/// nor background branch/HEAD checks need an untracked scan.
+#[derive(Debug, Clone, Copy)]
+pub struct SnapshotOptions {
+    pub untracked_changes: bool,
+    pub untracked_files: bool,
+}
+
+impl Default for SnapshotOptions {
+    fn default() -> Self {
+        Self {
+            untracked_changes: true,
+            untracked_files: true,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct StatusSnapshot {
+    /// This read deliberately skipped untracked files; zero is not authoritative.
+    #[serde(default)]
+    pub untracked_omitted: bool,
     pub head: HeadState,
     pub tracking: TrackingState,
     pub dirty: DirtyState,
@@ -2732,6 +2752,7 @@ pub fn parse_status(output: &[u8]) -> Result<StatusSnapshot, GitParseError> {
         (upstream, _) => TrackingState::Unknown { upstream },
     };
     Ok(StatusSnapshot {
+        untracked_omitted: false,
         head,
         tracking,
         dirty,
@@ -4239,6 +4260,10 @@ impl<E: ProcessExecutor> RepositoryService<E> {
     }
 
     pub fn status_command(&self, worktree: &Path) -> CommandSpec {
+        self.status_command_with_untracked(worktree, true)
+    }
+
+    pub fn status_command_with_untracked(&self, worktree: &Path, untracked: bool) -> CommandSpec {
         self.git_read(
             worktree,
             [
@@ -4248,7 +4273,11 @@ impl<E: ProcessExecutor> RepositoryService<E> {
                 "--ahead-behind",
                 // Every untracked file individually, not just the directory
                 // that contains them: staging and discarding act on files.
-                "--untracked-files=all",
+                if untracked {
+                    "--untracked-files=all"
+                } else {
+                    "--untracked-files=no"
+                },
                 "-z",
             ],
         )
@@ -4445,11 +4474,23 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         worktree: &Path,
         cancellation: &CancellationToken,
     ) -> Result<StatusSnapshot, RepositoryError> {
-        let command = self.status_command(worktree);
+        self.status_with_untracked(worktree, true, cancellation)
+    }
+
+    pub fn status_with_untracked(
+        &self,
+        worktree: &Path,
+        untracked: bool,
+        cancellation: &CancellationToken,
+    ) -> Result<StatusSnapshot, RepositoryError> {
+        let command = self.status_command_with_untracked(worktree, untracked);
         let output = self.run_checked(&command, cancellation)?;
         let parsed = parse_status(&output.stdout);
         match parsed {
-            Ok(status) => Ok(status),
+            Ok(mut status) => {
+                status.untracked_omitted = !untracked;
+                Ok(status)
+            }
             Err(error) => Err(RepositoryError::InvalidGitOutput {
                 error,
                 process: output,
@@ -4463,7 +4504,19 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         worktree: &Path,
         cancellation: &CancellationToken,
     ) -> Result<RepositorySnapshot, RepositoryError> {
-        let mut status = self.status(worktree, cancellation)?;
+        self.snapshot_with_options(worktree, SnapshotOptions::default(), cancellation)
+    }
+
+    /// Collapsed source-control groups do not enumerate or read untracked files.
+    /// File browsing can still request the complete working-file list separately.
+    pub fn snapshot_with_options(
+        &self,
+        worktree: &Path,
+        options: SnapshotOptions,
+        cancellation: &CancellationToken,
+    ) -> Result<RepositorySnapshot, RepositoryError> {
+        let mut status =
+            self.status_with_untracked(worktree, options.untracked_changes, cancellation)?;
         for (staged, area) in [(true, ChangeArea::Staged), (false, ChangeArea::Unstaged)] {
             let output = self.run_checked(&self.numstat_command(worktree, staged), cancellation)?;
             let parsed = parse_numstat(&output.stdout);
@@ -4472,7 +4525,12 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         }
         measure_untracked(worktree, &mut status.entries, cancellation);
 
-        let output = self.run_checked(&self.working_files_command(worktree), cancellation)?;
+        let files_command = if options.untracked_files {
+            self.working_files_command(worktree)
+        } else {
+            self.git_read(worktree, ["ls-files", "-tc", "--exclude-standard", "-z"])
+        };
+        let output = self.run_checked(&files_command, cancellation)?;
         let parsed = parse_working_files(&output.stdout);
         let files = invalid_output(parsed, output)?;
 
@@ -7007,6 +7065,111 @@ mod tests {
 
         fn service() -> RepositoryService<IsolatedExecutor> {
             RepositoryService::new("git", Arc::new(IsolatedExecutor))
+        }
+
+        #[test]
+        fn collapsed_untracked_snapshot_skips_untracked_status_and_file_listing() {
+            let directory = tempfile::tempdir().unwrap();
+            let root = directory.path();
+            git(root, &["init", "-b", "main"]);
+            fs::write(root.join("tracked.txt"), "tracked\n").unwrap();
+            git(root, &["add", "tracked.txt"]);
+            fs::write(root.join("untracked.txt"), "one\ntwo\n").unwrap();
+            let cancel = CancellationToken::new();
+            let collapsed = service()
+                .snapshot_with_options(
+                    root,
+                    SnapshotOptions {
+                        untracked_changes: false,
+                        untracked_files: false,
+                    },
+                    &cancel,
+                )
+                .unwrap();
+            assert_eq!(collapsed.status.dirty.untracked, 0);
+            assert_eq!(collapsed.files.paths, vec![path("tracked.txt")]);
+            assert!(
+                collapsed
+                    .status
+                    .entries
+                    .iter()
+                    .all(|entry| entry.area != ChangeArea::Untracked)
+            );
+            let expanded = service()
+                .snapshot_with_options(root, SnapshotOptions::default(), &cancel)
+                .unwrap();
+            assert_eq!(expanded.status.dirty.untracked, 1);
+            assert!(expanded.files.paths.contains(&path("untracked.txt")));
+            assert_eq!(
+                expanded
+                    .status
+                    .area(ChangeArea::Untracked)
+                    .next()
+                    .unwrap()
+                    .added_lines,
+                Some(2)
+            );
+            let command = service().status_command_with_untracked(root, false);
+            assert!(
+                command
+                    .arguments
+                    .contains(&OsString::from("--untracked-files=no"))
+            );
+        }
+
+        #[test]
+        fn commit_navigation_reads_root_renames_and_deletions_from_immutable_objects() {
+            let directory = tempfile::tempdir().unwrap();
+            let root = directory.path();
+            git(root, &["init", "-b", "main"]);
+            fs::write(root.join("old.txt"), "original\n").unwrap();
+            git(root, &["add", "-A"]);
+            git(root, &["commit", "-m", "initial"]);
+            let cancel = CancellationToken::new();
+            let first = service().resolve_head(root, &cancel).unwrap().unwrap();
+            let entries = service()
+                .commit_diff_entries(root, &first, None, &cancel)
+                .unwrap();
+            assert_eq!(entries[0].kind, ChangeKind::Added);
+            git(root, &["mv", "old.txt", "new.txt"]);
+            git(root, &["commit", "-m", "rename"]);
+            let renamed = service().resolve_head(root, &cancel).unwrap().unwrap();
+            git(root, &["rm", "new.txt"]);
+            git(root, &["commit", "-m", "delete"]);
+            let deleted = service().resolve_head(root, &cancel).unwrap().unwrap();
+            let entries = service()
+                .commit_diff_entries(root, &renamed, Some(&first), &cancel)
+                .unwrap();
+            assert_eq!(entries[0].kind, ChangeKind::Renamed);
+            assert_eq!(entries[0].old_path, Some(path("old.txt")));
+            let entries = service()
+                .commit_diff_entries(root, &deleted, Some(&renamed), &cancel)
+                .unwrap();
+            assert_eq!(entries[0].kind, ChangeKind::Deleted);
+            assert!(!root.join("new.txt").exists());
+            // A historical rename remains readable after both names disappeared.
+            let diff = service()
+                .diff(
+                    &DiffRequest {
+                        worktree: root.into(),
+                        path: path("new.txt"),
+                        old_path: Some(path("old.txt")),
+                        basis: DiffBasis::CommitToParent {
+                            oid: renamed,
+                            parent: Some(first),
+                        },
+                    },
+                    &cancel,
+                )
+                .unwrap();
+            assert!(matches!(
+                diff,
+                DiffContent::Comparison {
+                    old: DiffSide::Text { .. },
+                    new: DiffSide::Text { .. },
+                    ..
+                }
+            ));
         }
 
         fn git(directory: &Path, arguments: &[&str]) {

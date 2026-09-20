@@ -49,6 +49,22 @@ pub(crate) enum Update {
 
 #[derive(Clone)]
 pub struct Handle(Arc<Inner>);
+
+struct OwnedSocket(std::path::PathBuf);
+impl Drop for OwnedSocket {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+        if let Some(directory) = self.0.parent() {
+            let _ = std::fs::remove_dir(directory);
+        }
+    }
+}
+
+impl Handle {
+    pub(crate) fn same_actor(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
 struct Inner {
     commands: crossbeam_channel::Sender<CommandRequest>,
     wake: Mutex<UnixStream>,
@@ -74,17 +90,41 @@ impl Handle {
         session_id: Option<String>,
         notify: impl Fn(Update) + Send + Sync + 'static,
     ) -> Result<Self, String> {
+        let mut owned_socket = None;
+        if let TransportSpec::OwnedUnixWebSocket { socket } = &spec.transport {
+            use std::os::unix::fs::DirBuilderExt;
+            let directory = socket
+                .parent()
+                .ok_or("Provider socket needs a parent directory")?;
+            let created = std::fs::DirBuilder::new().mode(0o700).create(directory);
+            if let Err(error) = created {
+                use std::os::unix::fs::MetadataExt;
+                let safe_existing = error.kind() == std::io::ErrorKind::AlreadyExists
+                    && std::fs::symlink_metadata(directory).is_ok_and(|metadata| {
+                        metadata.is_dir()
+                            && metadata.uid() == unsafe { libc::geteuid() }
+                            && metadata.mode() & 0o777 == 0o700
+                    });
+                if !safe_existing {
+                    return Err(format!(
+                        "Cannot create private provider socket directory: {error}"
+                    ));
+                }
+            }
+            owned_socket = Some(OwnedSocket(socket.clone()));
+        }
         let child = match &spec.transport {
-            TransportSpec::JsonLines => {
+            TransportSpec::JsonLines | TransportSpec::OwnedUnixWebSocket { .. } => {
+                let pipes = matches!(spec.transport, TransportSpec::JsonLines);
                 let mut process = Process::new(&spec.program);
                 process
                     .args(&spec.arguments)
                     .current_dir(&spec.working_directory)
                     .env_clear()
                     .envs(&spec.environment)
-                    .stdin(Stdio::piped())
-                    .stdout(Stdio::piped())
-                    .stderr(Stdio::piped())
+                    .stdin(if pipes { Stdio::piped() } else { Stdio::null() })
+                    .stdout(if pipes { Stdio::piped() } else { Stdio::null() })
+                    .stderr(if pipes { Stdio::piped() } else { Stdio::null() })
                     .process_group(0);
                 Some(ChildGuard(
                     process
@@ -133,6 +173,7 @@ impl Handle {
         let worker = thread::Builder::new()
             .name("cagents-chat".into())
             .spawn(move || {
+                let _owned_socket = owned_socket;
                 let mut actor = Actor {
                     child,
                     adapter,
@@ -168,6 +209,38 @@ impl Handle {
                         device,
                         inode,
                     } => actor.run_websocket(initial, &socket, device, inode),
+                    TransportSpec::OwnedUnixWebSocket { socket } => {
+                        use std::os::unix::fs::{FileTypeExt, MetadataExt};
+                        let started = Instant::now();
+                        let metadata = loop {
+                            if let Ok(metadata) = std::fs::metadata(&socket)
+                                && metadata.file_type().is_socket()
+                            {
+                                break Ok(metadata);
+                            }
+                            if actor.stop.load(Ordering::Acquire) {
+                                break Err("Provider startup cancelled".to_owned());
+                            }
+                            if actor
+                                .child
+                                .as_mut()
+                                .is_some_and(|child| child.0.try_wait().ok().flatten().is_some())
+                            {
+                                break Err("Codex server exited before opening its local socket"
+                                    .to_owned());
+                            }
+                            if started.elapsed() >= Duration::from_secs(15) {
+                                break Err(
+                                    "Codex server did not open its local socket within 15 seconds"
+                                        .to_owned(),
+                                );
+                            }
+                            thread::sleep(Duration::from_millis(20));
+                        };
+                        metadata.and_then(|metadata| {
+                            actor.run_websocket(initial, &socket, metadata.dev(), metadata.ino())
+                        })
+                    }
                 }))
                 .unwrap_or_else(|_| {
                     Err("Native chat worker panicked; exact provider state is unconfirmed".into())
@@ -391,7 +464,10 @@ pub(crate) fn preflight(spec: &ProcessSpec, initial: &mut Step) -> Result<Store,
             "Provider launch contains invalid executable, argument, or environment data".into(),
         );
     }
-    if matches!(spec.transport, TransportSpec::JsonLines) {
+    if matches!(
+        spec.transport,
+        TransportSpec::JsonLines | TransportSpec::OwnedUnixWebSocket { .. }
+    ) {
         let paths = if spec.program.contains('/') {
             vec![spec.working_directory.join(&spec.program)]
         } else {
@@ -1481,6 +1557,34 @@ mod tests {
             environment
         );
         handle.close().unwrap();
+    }
+    #[test]
+    fn owned_listener_startup_failure_is_reported_and_releases_its_private_directory() {
+        let directory = tempfile::tempdir().unwrap();
+        let socket = directory.path().join("server").join("control.sock");
+        let spec = ProcessSpec {
+            transport: TransportSpec::OwnedUnixWebSocket {
+                socket: socket.clone(),
+            },
+            program: "/bin/false".into(),
+            arguments: Vec::new(),
+            working_directory: directory.path().into(),
+            environment: BTreeMap::new(),
+        };
+        let mut initial = Step::default();
+        let store = preflight(&spec, &mut initial).unwrap();
+        let handle = Handle::start(spec, Box::new(Echo), initial, store, None, |_| {}).unwrap();
+        let snapshot = until(&handle, |snapshot| snapshot.exited);
+        assert!(
+            snapshot
+                .error
+                .as_deref()
+                .unwrap()
+                .contains("before opening its local socket")
+        );
+        let _ = handle.close();
+        drop(handle);
+        assert!(!socket.parent().unwrap().exists());
     }
     #[test]
     fn real_json_lines_pipe_keeps_hidden_state_without_presentation() {
