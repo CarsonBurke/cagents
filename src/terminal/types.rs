@@ -79,6 +79,14 @@ pub enum TerminalEvent {
         message: String,
     },
     AgentActivityChanged(Option<crate::agent::Activity>),
+    /// The PTY has drained and the final grid is published. Unlike `Exited`,
+    /// this confirms that descendants no longer own the terminal.
+    Completed {
+        exit_code: u32,
+        signal: Option<String>,
+        intentional: bool,
+    },
+    ConversationTitleChanged(String),
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]

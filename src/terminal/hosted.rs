@@ -2063,6 +2063,7 @@ fn accept_server_event(
                 event,
                 TerminalEvent::ResumeHintChanged(_)
                     | TerminalEvent::Exited { .. }
+                    | TerminalEvent::Completed { .. }
                     | TerminalEvent::Error { .. }
             ) {
                 published.agent_revision.fetch_add(1, Ordering::AcqRel);

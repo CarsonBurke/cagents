@@ -65,9 +65,9 @@ use crate::{
 /// such a peer cannot issue. A peer therefore never has to decode a variant
 /// index it does not know, which is the only thing the version could warn it
 /// about.
-/// Version 13 adds explicit agent-relaunch acceptance to upgrade preparation
-/// and per-terminal relaunch provenance to inventory descriptors.
-pub const PROTOCOL_VERSION: u16 = 13;
+/// Version 14 distinguishes root process exit from final PTY completion and
+/// publishes semantic conversation titles independently of terminal titles.
+pub const PROTOCOL_VERSION: u16 = 14;
 /// Postcard encodes an 80x24 grid in roughly 20 KiB and a typical single-row
 /// delta in a few hundred bytes, but a full repaint of a very large grid after
 /// a resize still has to fit, so keep generous headroom.
@@ -1167,12 +1167,32 @@ pub enum WireTerminalEvent {
     AgentActivityChanged {
         activity: Option<crate::agent::Activity>,
     },
+    Completed {
+        exit_code: u32,
+        signal: Option<String>,
+        intentional: bool,
+    },
+    ConversationTitleChanged {
+        title: String,
+    },
 }
 
 impl From<TerminalEvent> for WireTerminalEvent {
     fn from(value: TerminalEvent) -> Self {
         match value {
             TerminalEvent::TitleChanged(title) => Self::TitleChanged { title },
+            TerminalEvent::ConversationTitleChanged(title) => {
+                Self::ConversationTitleChanged { title }
+            }
+            TerminalEvent::Completed {
+                exit_code,
+                signal,
+                intentional,
+            } => Self::Completed {
+                exit_code,
+                signal,
+                intentional,
+            },
             TerminalEvent::ResumeHintChanged(hint) => Self::ResumeHintChanged { hint },
             TerminalEvent::AgentActivityChanged(activity) => {
                 Self::AgentActivityChanged { activity }
@@ -1199,6 +1219,18 @@ impl From<WireTerminalEvent> for TerminalEvent {
     fn from(value: WireTerminalEvent) -> Self {
         match value {
             WireTerminalEvent::TitleChanged { title } => Self::TitleChanged(title),
+            WireTerminalEvent::ConversationTitleChanged { title } => {
+                Self::ConversationTitleChanged(title)
+            }
+            WireTerminalEvent::Completed {
+                exit_code,
+                signal,
+                intentional,
+            } => Self::Completed {
+                exit_code,
+                signal,
+                intentional,
+            },
             WireTerminalEvent::ResumeHintChanged { hint } => Self::ResumeHintChanged(hint),
             WireTerminalEvent::AgentActivityChanged { activity } => {
                 Self::AgentActivityChanged(activity)

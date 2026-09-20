@@ -223,6 +223,54 @@ impl Provider {
         (self.adapter().activity_from_title)(title)
     }
 
+    /// Presentation metadata from this provider's own PTY, never a session ID
+    /// or permission to attach to a conversation.
+    pub fn conversation_title<'a>(self, title: &'a str, cwd: &std::path::Path) -> Option<&'a str> {
+        let label = match self {
+            Self::Omp => {
+                self.activity_from_title(title)?;
+                let rest = title.strip_prefix("π ")?;
+                rest[rest.chars().next()?.len_utf8()..].trim()
+            }
+            Self::Codex => codex_title_without_spinner(title).trim(),
+            // Claude exposes names through its PID-scoped inventory. Arbitrary
+            // OSC titles are not an alternative to that authoritative source.
+            Self::Claude => return None,
+        };
+        let directory = cwd.file_name().and_then(|name| name.to_str());
+        // Codex's default title ends in the project name, separated from the
+        // thread name by " | ". Only remove a suffix matching this PTY's cwd.
+        let label = if self == Self::Codex {
+            label
+                .rsplit_once(" | ")
+                .filter(|(_, project)| {
+                    Some(*project) == directory || Some(*project) == cwd.to_str()
+                })
+                .map_or(label, |(name, _)| name)
+        } else {
+            label
+        };
+        if label.is_empty()
+            || Some(label) == cwd.to_str()
+            || Some(label) == directory
+            || [
+                "codex",
+                "omp",
+                "Ready",
+                "Working",
+                "Idle",
+                "Action Required",
+            ]
+            .iter()
+            .any(|default| label.eq_ignore_ascii_case(default))
+            || label.starts_with("[ ! ] Action Required")
+            || label.starts_with("[ . ] Action Required")
+        {
+            return None;
+        }
+        Some(label)
+    }
+
     #[cfg(feature = "host")]
     pub(crate) fn create_chat(
         self,
@@ -238,9 +286,56 @@ impl Provider {
     }
 }
 
+/// Codex's configured leading activity item is rendered by the shared app
+/// spinner instead. This is presentation only; it never infers agent activity.
+pub(crate) fn codex_title_without_spinner(title: &str) -> &str {
+    let Some(first) = title.chars().next() else {
+        return title;
+    };
+    if "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏".contains(first) {
+        let rest = &title[first.len_utf8()..];
+        if rest.is_empty() {
+            rest
+        } else {
+            rest.strip_prefix(' ').unwrap_or(title)
+        }
+    } else {
+        title
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn conversation_titles_omit_activity_and_ignore_launch_placeholders() {
+        let cwd = std::path::Path::new("/repo/project");
+        assert_eq!(
+            Provider::Omp.conversation_title("π ◕ Fix parser", cwd),
+            Some("Fix parser")
+        );
+        assert_eq!(Provider::Omp.conversation_title("π > project", cwd), None);
+        assert_eq!(
+            Provider::Omp.conversation_title("π > /repo/project", cwd),
+            None
+        );
+        assert_eq!(
+            Provider::Omp.conversation_title("arbitrary shell title", cwd),
+            None
+        );
+        assert_eq!(
+            Provider::Codex.conversation_title("⠋ Fix parser", cwd),
+            Some("Fix parser")
+        );
+        assert_eq!(
+            Provider::Codex.conversation_title("⠋ Fix parser | project", cwd),
+            Some("Fix parser")
+        );
+        assert_eq!(Provider::Codex.conversation_title("⠋ project", cwd), None);
+        assert_eq!(Provider::Codex.conversation_title("codex", cwd), None);
+        assert_eq!(Provider::Claude.conversation_title("Fix parser", cwd), None);
+    }
 
     fn launch(program: &str, arguments: &[&str]) -> LaunchRecipe {
         LaunchRecipe {

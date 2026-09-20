@@ -115,8 +115,7 @@ fn channel_terminal_needs_close(
 pub enum Action {
     Create(ProjectId),
     Open(ChannelId),
-    /// Asks to delete a channel. Nothing is removed until the confirmation is
-    /// answered, because a channel's conversations exist nowhere else.
+    /// Deletes an empty channel immediately; live sessions require confirmation.
     Delete(ChannelId),
     ConfirmDelete,
     Dismiss,
@@ -247,7 +246,7 @@ impl Cagents {
                     .push(ProjectChannel {
                         id,
                         project_id,
-                        // Empty means awaiting the conversation's first meaningful title.
+                        // Empty means awaiting the channel's first accepted prompt.
                         // Nonempty names, including user edits, are never replaced here.
                         title: String::new(),
                         ordinal,
@@ -287,10 +286,13 @@ impl Cagents {
                         self.durable.cards.iter().any(|state| {
                             state.id == **card
                                 && state.existence.is_open()
-                                && matches!(&state.kind, CardKind::Chat(_))
+                                && matches!(&state.kind, CardKind::Chat(_) | CardKind::Terminal(_))
                         })
                     })
                     .count();
+                if chats == 0 {
+                    return self.delete_channel(id);
+                }
                 self.channel_ui.dialog = Some(Deletion {
                     channel: id,
                     title,
@@ -526,43 +528,38 @@ impl Cagents {
             480.0,
         ))
     }
+    pub(super) fn channel_needs_name(&self, card: CardId) -> bool {
+        self.durable
+            .channels
+            .iter()
+            .any(|channel| channel.title.is_empty() && channel.cards.contains(&card))
+    }
 
-    /// Refresh cached rows after state changes, never during rendering. A channel's
-    /// conversation supplies its initial name, but cannot overwrite a saved name.
+    /// Names a new channel from its first submitted prompt or conversation name.
+    ///
+    /// A title that already exists is authoritative: it may have been entered
+    /// by the user, supplied by another window, or restored from persistence.
+    pub(super) fn name_channel_from_prompt(&mut self, card: CardId, prompt: &str) {
+        let Some(index) = self
+            .durable
+            .channels
+            .iter()
+            .position(|channel| channel.title.is_empty() && channel.cards.contains(&card))
+        else {
+            return;
+        };
+        let Some(title) = channel_title_from_prompt(prompt) else {
+            return;
+        };
+        let id = self.durable.channels[index].id;
+        Arc::make_mut(&mut self.durable).channels[index].title = title.clone();
+        self.publish_model_edit(ModelEdit::RetitleChannel { id, title });
+        self.refresh_sidebar_channels();
+        self.persist();
+    }
+
+    /// Refresh cached rows after state changes, never during rendering.
     pub(super) fn refresh_sidebar_channels(&mut self) {
-        let mut renamed = Vec::new();
-        for index in 0..self.durable.channels.len() {
-            let channel = &self.durable.channels[index];
-            if !channel.title.is_empty() {
-                continue;
-            }
-            let title = channel.cards.iter().find_map(|id| {
-                let card = self.card_state(*id)?;
-                if !card.existence.is_open()
-                    || !matches!(&card.kind, CardKind::Chat(_))
-                    || super::chat_ui::placeholder_card_title(&card.title)
-                {
-                    return None;
-                }
-                normalize_card_name(&card.title)
-            });
-            if let Some(title) = title {
-                let durable = Arc::make_mut(&mut self.durable);
-                durable.channels[index].title = title.clone();
-                renamed.push((durable.channels[index].id, title));
-            }
-        }
-        if !renamed.is_empty() {
-            // The window that derives a title is the shared title's writer for
-            // that moment, and a window that receives one adopts it even where
-            // its own derivation would differ. The guard above is what stops a
-            // later derivation from fighting a title that already exists.
-            for (id, title) in renamed {
-                self.publish_model_edit(ModelEdit::RetitleChannel { id, title });
-            }
-            self.persist();
-        }
-
         let durable = &self.durable;
         let state = &self.sidebar_state;
         for project in &mut self.sidebar_model.projects {
@@ -589,7 +586,11 @@ impl Cagents {
                     else {
                         continue;
                     };
-                    if matches!(&card.kind, CardKind::Chat(_)) {
+                    if matches!(&card.kind, CardKind::Chat(_))
+                        || matches!(&card.kind, CardKind::Terminal(session)
+                            if crate::agent::Provider::recognize_launch(&session.launch).is_some())
+                        || state.card_activity(*id).is_some()
+                    {
                         chats += 1;
                     }
                     unread |= state.has_card_update(*id);
@@ -635,7 +636,14 @@ impl Cagents {
     }
 }
 
-/// A channel still waiting for its conversation's name has to be nameable
+const MAX_CHANNEL_TITLE_CHARS: usize = 80;
+
+fn channel_title_from_prompt(prompt: &str) -> Option<String> {
+    let title = normalize_card_name(prompt)?;
+    Some(title.chars().take(MAX_CHANNEL_TITLE_CHARS).collect())
+}
+
+/// A channel still waiting for its first accepted prompt has to be nameable
 /// anyway: a row has to label it, and a dialog about to destroy it has to say
 /// which one it means.
 fn channel_display_title(channel: &ProjectChannel) -> &str {
@@ -751,15 +759,13 @@ mod tests {
     }
 
     #[test]
-    fn channel_waits_for_a_conversation_name_and_preserves_saved_names() {
+    fn channel_uses_first_prompt_and_preserves_saved_names() {
         let mut app = super::super::tests::context_inspector_test_app(true);
         let card = app.workspace.focused().unwrap();
         let project = ProjectId::new();
         let id = ChannelId::new();
         let durable = Arc::make_mut(&mut app.durable);
         durable.cards[0].title = "Native chat".into();
-        // Channel naming reads the conversation card: the fixture's default
-        // terminal card never qualifies.
         durable.cards[0].kind = crate::model::CardKind::Chat(chat_session());
         durable.channels.push(ProjectChannel {
             id,
@@ -788,18 +794,21 @@ mod tests {
         app.refresh_sidebar_channels();
         assert_eq!(
             app.sidebar_model.projects[0].channels[0].title,
-            "Explain the parser"
+            "New channel"
         );
 
+        let prompt = format!("Explain the parser {}", "with detailed context ".repeat(12));
+        let expected = channel_title_from_prompt(&prompt).expect("prompt has a title");
+        app.name_channel_from_prompt(card, &prompt);
+        assert_eq!(app.durable.channels[0].title, expected);
+        assert_eq!(app.sidebar_model.projects[0].channels[0].title, expected);
+
         let durable = Arc::make_mut(&mut app.durable);
-        durable.channels[0].title = "My investigation".into();
         durable.cards[0].title = "A later conversation title".into();
+        app.name_channel_from_prompt(card, "A later prompt must not replace it");
         app.refresh_sidebar_channels();
-        assert_eq!(
-            app.sidebar_model.projects[0].channels[0].title,
-            "My investigation"
-        );
-        assert_eq!(app.durable.channels[0].title, "My investigation");
+        assert_eq!(app.sidebar_model.projects[0].channels[0].title, expected);
+        assert_eq!(app.durable.channels[0].title, expected);
     }
 
     fn chat_session() -> crate::chat::Session {
@@ -877,6 +886,60 @@ mod tests {
         app.refresh_sidebar_channels();
         assert_eq!(app.sidebar_model.projects[0].channels[0].chats, 1);
         assert_eq!(app.sidebar_model.projects[0].channels[0].id, id);
+    }
+
+    #[test]
+    fn empty_channels_delete_without_confirmation_even_with_closed_cards() {
+        for closed_card in [false, true] {
+            let mut app = super::super::tests::context_inspector_test_app(true);
+            let id = ChannelId::new();
+            let durable = Arc::make_mut(&mut app.durable);
+            let cards = if closed_card {
+                let mut card = durable.cards[0].clone();
+                card.id = CardId::new();
+                card.kind = CardKind::Chat(chat_session());
+                card.existence = super::super::project_ui::removed_existence("closed fixture");
+                let ids = vec![card.id];
+                durable.cards.push(card);
+                ids
+            } else {
+                Vec::new()
+            };
+            durable.channels.push(ProjectChannel {
+                id,
+                project_id: ProjectId::new(),
+                title: "Empty".into(),
+                ordinal: 0,
+                shared: false,
+                cards,
+                focused: None,
+            });
+            let _ = app.handle_channel_ui(Action::Delete(id));
+            assert!(!app.durable.channels.iter().any(|channel| channel.id == id));
+            assert!(!app.channel_ui.modal_open());
+        }
+    }
+
+    #[test]
+    fn a_channel_with_a_cli_terminal_still_requires_confirmation() {
+        let mut app = super::super::tests::context_inspector_test_app(true);
+        let id = ChannelId::new();
+        let card = app.durable.cards[0].id;
+        assert!(matches!(app.durable.cards[0].kind, CardKind::Terminal(_)));
+        Arc::make_mut(&mut app.durable)
+            .channels
+            .push(ProjectChannel {
+                id,
+                project_id: ProjectId::new(),
+                title: "CLI".into(),
+                ordinal: 0,
+                shared: false,
+                cards: vec![card],
+                focused: Some(card),
+            });
+        let _ = app.handle_channel_ui(Action::Delete(id));
+        assert_eq!(app.channel_ui.dialog.as_ref().unwrap().chats, 1);
+        assert!(app.durable.channels.iter().any(|channel| channel.id == id));
     }
 
     /// A channel's conversations are reachable nowhere else, so deleting one

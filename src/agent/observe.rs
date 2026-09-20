@@ -78,6 +78,12 @@ pub(crate) struct Observer {
     accounts: Mutex<BTreeMap<Key, Arc<Mutex<Entry>>>>,
 }
 
+#[derive(Default)]
+pub(crate) struct Observation {
+    pub activity: Option<Activity>,
+    pub title: Option<String>,
+}
+
 impl Observer {
     pub fn new() -> Self {
         Self {
@@ -85,10 +91,14 @@ impl Observer {
         }
     }
 
-    pub fn activity(
+    pub fn observe(&self, process: &crate::model::agent_recovery::AgentProcess) -> Observation {
+        self.try_observe(process).unwrap_or_default()
+    }
+
+    fn try_observe(
         &self,
         process: &crate::model::agent_recovery::AgentProcess,
-    ) -> Option<Activity> {
+    ) -> Option<Observation> {
         let provider = process.provider;
         let recipe = &process.launch;
         if provider == Provider::Omp || !recipe.working_directory.is_absolute() {
@@ -135,7 +145,16 @@ impl Observer {
                 .get(&recipe.working_directory)
                 .unwrap_or(&ActivityState::Idle),
         };
-        (state != ActivityState::Unknown).then_some(Activity { provider, state })
+        let title = match entry.census.as_ref()? {
+            Inventory::Claude(census) => {
+                claude::title(census, process.pid, &recipe.working_directory)
+            }
+            Inventory::Codex(_) => None,
+        };
+        Some(Observation {
+            activity: (state != ActivityState::Unknown).then_some(Activity { provider, state }),
+            title,
+        })
     }
 }
 

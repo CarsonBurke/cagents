@@ -759,6 +759,8 @@ terminal_font_size = 13.0
 terminal_font_family = ""
 terminal_line_height = 1.286
 terminal_padding = 8.0
+terminal_scroll_size = 2
+terminal_scroll_speed = 1.0
 terminal_cursor_style = "beam"
 terminal_theme = "dark"
 sidebar_width = 260.0
@@ -794,6 +796,8 @@ cycle_pane_width = ["Alt+R"]
 | `terminal_font_family` | string | `""` | empty for the system monospace font, or a non-whitespace family name up to 128 bytes. The family must be fixed-pitch; one whose glyph widths differ falls back to the system monospace font, because the grid is a single pitch |
 | `terminal_line_height` | float | `1.286` | finite values from `1.0` through `2.0`, inclusive; relative to font size |
 | `terminal_padding` | float | `8.0` | finite values from `0.0` through `24.0`, inclusive; logical pixels |
+| `terminal_scroll_size` | integer | `2` | `1` through `10` lines moved per mouse-wheel notch; trackpad scrolling remains proportional |
+| `terminal_scroll_speed` | float | `1.0` | `0.25` through `4.0` multiplier for wheel and trackpad scrolling; mouse-reporting applications remain unchanged |
 | `terminal_cursor_style` | string | `"beam"` | `"application"` respects the terminal program; `"block"`, `"beam"`, or `"underline"` overrides it |
 | `terminal_theme` | string | `"dark"` | `"dark"`, `"light"`, or `"solarized_dark"`; independent of `app_theme` |
 | `terminal_scrollback_lines` | non-negative integer | `10000` | `0` through `1000000` lines for newly started terminals |

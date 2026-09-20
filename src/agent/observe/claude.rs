@@ -142,11 +142,16 @@ fn session_for_process(rows: &[Value], pid: i32) -> ProbeResult<Option<String>> 
     Ok(identity)
 }
 
-pub(super) type ProcessCensus = BTreeMap<i32, (PathBuf, ActivityState)>;
+pub(super) type ProcessCensus = BTreeMap<i32, (PathBuf, ActivityState, Option<String>)>;
 
 pub(super) fn activity(census: &ProcessCensus, pid: i32, cwd: &Path) -> Option<ActivityState> {
-    let (observed_cwd, state) = census.get(&pid)?;
+    let (observed_cwd, state, _) = census.get(&pid)?;
     (observed_cwd == cwd).then_some(*state)
+}
+
+pub(super) fn title(census: &ProcessCensus, pid: i32, cwd: &Path) -> Option<String> {
+    let (observed_cwd, _, title) = census.get(&pid)?;
+    (observed_cwd == cwd).then(|| title.clone()).flatten()
 }
 
 pub(super) fn census(recipe: &LaunchRecipe) -> ProbeResult<ProcessCensus> {
@@ -189,12 +194,17 @@ fn census_rows(rows: &[Value]) -> ProbeResult<ProcessCensus> {
             Some("idle") => ActivityState::Idle,
             _ => return Err(()),
         };
+        let title = row["name"]
+            .as_str()
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+            .map(str::to_owned);
         match census.entry(pid) {
             std::collections::btree_map::Entry::Vacant(entry) => {
-                entry.insert((cwd, state));
+                entry.insert((cwd, state, title));
             }
             std::collections::btree_map::Entry::Occupied(entry) => {
-                if entry.get() != &(cwd, state) {
+                if entry.get() != &(cwd, state, title) {
                     return Err(());
                 }
             }
@@ -206,6 +216,29 @@ fn census_rows(rows: &[Value]) -> ProbeResult<ProcessCensus> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn conversation_names_are_scoped_to_the_exact_interactive_process() {
+        let census = parse(
+            br#"[
+            {"cwd":"/same","kind":"interactive","pid":42,"status":"idle","name":"First task"},
+            {"cwd":"/same","kind":"interactive","pid":43,"status":"busy","name":"Second task"},
+            {"cwd":"/same","kind":"interactive","pid":44,"status":"idle"}
+        ]"#,
+        )
+        .unwrap();
+        assert_eq!(
+            title(&census, 42, Path::new("/same")).as_deref(),
+            Some("First task")
+        );
+        assert_eq!(
+            title(&census, 43, Path::new("/same")).as_deref(),
+            Some("Second task")
+        );
+        assert_eq!(title(&census, 44, Path::new("/same")), None);
+        assert_eq!(title(&census, 42, Path::new("/elsewhere")), None);
+        assert_eq!(title(&census, 45, Path::new("/same")), None);
+    }
 
     #[test]
     fn interactive_activity_is_scoped_to_pid_not_background_jobs_or_shared_cwd() {

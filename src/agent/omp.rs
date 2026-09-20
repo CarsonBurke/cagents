@@ -142,7 +142,8 @@ fn activity_from_title(title: &str) -> Option<ActivityState> {
     let state = match suffix.next()? {
         '>' => ActivityState::Idle,
         '!' => ActivityState::Waiting,
-        '⠋' | '⠙' | '⠹' | '⠸' | '⠼' | '⠴' | '⠦' | '⠧' | '⠇' | '⠏' => {
+        '⠋' | '⠙' | '⠹' | '⠸' | '⠼' | '⠴' | '⠦' | '⠧' | '⠇' | '⠏' | '○' | '◔' | '◑' | '◕' | '●'
+        | '⠁' | '⠂' | '⠄' | '⠠' | '⠐' | '⠈' | '-' | '\\' | '|' | '/' => {
             ActivityState::Working
         }
         _ => return None,
@@ -212,7 +213,8 @@ mod tests {
             Provider::Omp.activity_from_title("π !"),
             Some(ActivityState::Waiting)
         );
-        for frame in ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'] {
+        for frame in "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏○◔◑◕●⠁⠂⠄⠠⠐⠈-\\|/".chars()
+        {
             assert_eq!(
                 Provider::Omp.activity_from_title(&format!("π {frame} waiting >")),
                 Some(ActivityState::Working)
@@ -223,7 +225,7 @@ mod tests {
             "π: ⠋ task",
             "custom π ⠋ task",
             "π >task",
-            "π ⠁ task",
+            "π ◕task",
             "π  ⠋ task",
             "working",
         ] {
