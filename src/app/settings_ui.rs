@@ -485,15 +485,15 @@ fn settings_category_controls<'a>(
         ],
         SettingsCategory::Links => vec![settings_group(
             "Link handling",
-            "Choose where modified clicks on known links open. Regular clicks stay inside the workspace.",
+            "Choose the default browser for links. Modified clicks explicitly choose either browser.",
             vec![
                 settings_choice(
-                    "Open modified links in",
-                    "Applies to pull request links and other links whose destination is known to cagents.",
+                    "Open links in",
+                    "Regular clicks use this destination. Ctrl+click and Ctrl+Shift+click override it.",
                     SettingsField::LinkOpenDestination,
                     [
                         (
-                            "Integrated browser",
+                            "In-app browser",
                             LinkOpenDestination::IntegratedBrowser.as_str(),
                             draft.link_open_destination == LinkOpenDestination::IntegratedBrowser,
                         ),
@@ -506,8 +506,8 @@ fn settings_category_controls<'a>(
                     progress,
                 ),
                 settings_choice(
-                    "Modified-click gesture",
-                    "This gesture opens the link in the destination above.",
+                    "System browser gesture",
+                    "The other gesture opens the in-app browser. Both work regardless of the default above.",
                     SettingsField::LinkOpenGesture,
                     [
                         (

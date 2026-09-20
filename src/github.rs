@@ -1186,6 +1186,16 @@ impl<E: ProcessExecutor> GitHubService<E> {
             Some(1) if !output.stdout.is_empty() => {
                 attach_process(parse_json(&output.stdout), &output)
             }
+            Some(1)
+                if std::str::from_utf8(&output.stderr).is_ok_and(|stderr| {
+                    let message = stderr.trim();
+                    message.starts_with("no checks reported on the '")
+                        && message.ends_with("' branch")
+                        && !message.contains('\n')
+                }) =>
+            {
+                Ok(Vec::new())
+            }
             Some(4) => Err(GitHubError::AuthenticationRequired {
                 host: key.repository.host.clone(),
                 failure: Box::new(output.require_success(&self.gh).unwrap_err()),
@@ -1872,6 +1882,32 @@ mod tests {
             service.create(&request, &CancellationToken::new()).unwrap(),
             PullRequestCreationOutcome::OutcomeUnknown { .. }
         ));
+    }
+
+    #[test]
+    fn a_pr_without_checks_is_empty_but_other_stderr_is_an_error() {
+        let output = |stderr: &[u8]| {
+            Ok(ProcessOutput {
+                exit_code: Some(1),
+                signal: None,
+                success: false,
+                stdout: Vec::new(),
+                stderr: stderr.to_vec(),
+            })
+        };
+        let fake = Arc::new(FakeExecutor::with_outputs(vec![
+            output(b"no checks reported on the 'feature' branch\n"),
+            output(b"error connecting to api.github.com\n"),
+        ]));
+        let service = GitHubService::new("gh", fake);
+        let key = PullRequestKey::new(repository(), 7).unwrap();
+        assert!(
+            service
+                .checks(&key, &CancellationToken::new())
+                .unwrap()
+                .is_empty()
+        );
+        assert!(service.checks(&key, &CancellationToken::new()).is_err());
     }
 
     #[test]

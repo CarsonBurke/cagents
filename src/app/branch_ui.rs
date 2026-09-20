@@ -261,6 +261,87 @@ impl Cagents {
         if !current {
             return Task::none();
         }
+        self.open_committed_file(
+            key,
+            path,
+            old_path,
+            DiffBasis::MergeBaseToHead {
+                base_ref,
+                head,
+                merge_base,
+            },
+        )
+    }
+
+    pub(super) fn open_committed_file(
+        &mut self,
+        key: ActiveWorktreeKey,
+        path: RepoPath,
+        old_path: Option<RepoPath>,
+        basis: DiffBasis,
+    ) -> Task<Message> {
+        self.open_diff_card(key, move |card| RepositoryAction::OpenCommittedFile {
+            card,
+            path,
+            old_path,
+            basis,
+        })
+    }
+
+    pub(super) fn open_working_change(
+        &mut self,
+        key: ActiveWorktreeKey,
+        path: RepoPath,
+        area: crate::repository::ChangeArea,
+    ) -> Task<Message> {
+        use crate::repository::ChangeArea;
+        if self.modal_is_open() || !self.source_control_is_bound(&key) {
+            return Task::none();
+        }
+        let Some(source) = self.sidebar_model.source_control.as_ref() else {
+            return Task::none();
+        };
+        let find = |area| {
+            source
+                .group(area)
+                .and_then(|group| group.rows().iter().find(|row| row.entry.path == path))
+        };
+        if find(area).is_none() {
+            return Task::none();
+        }
+        let staged = find(ChangeArea::Staged);
+        let unstaged = find(ChangeArea::Unstaged)
+            .or_else(|| find(ChangeArea::Untracked))
+            .or_else(|| find(ChangeArea::Conflict));
+        let file = crate::repository_widget::RepositoryFile {
+            path: path.as_path().to_owned(),
+            staged: staged.is_some(),
+            unstaged: unstaged.is_some(),
+            staged_old_path: staged
+                .and_then(|row| row.entry.old_path.as_ref())
+                .map(|path| path.as_path().to_owned()),
+            unstaged_old_path: unstaged
+                .and_then(|row| row.entry.old_path.as_ref())
+                .map(|path| path.as_path().to_owned()),
+            ..Default::default()
+        };
+        let basis = if area == ChangeArea::Staged {
+            DiffBasis::HeadToIndex
+        } else {
+            DiffBasis::IndexToWorktree
+        };
+        self.open_diff_card(key, move |card| RepositoryAction::OpenWorkingDiff {
+            card,
+            file,
+            basis,
+        })
+    }
+
+    fn open_diff_card(
+        &mut self,
+        key: ActiveWorktreeKey,
+        open: impl FnOnce(CardId) -> RepositoryAction,
+    ) -> Task<Message> {
         self.show_workspace_for_action();
         let overlay = if self.context_inspector_is_overlay() {
             self.set_context_inspector_open(false)
@@ -285,16 +366,7 @@ impl Cagents {
         let Some(card) = self.repository_card_for(&key.canonical_path) else {
             return overlay.chain(prepare);
         };
-        let open = cosmic::task::message(Message::Repository(RepositoryAction::OpenBranchFile {
-            card,
-            path,
-            old_path,
-            basis: DiffBasis::MergeBaseToHead {
-                base_ref,
-                head,
-                merge_base,
-            },
-        }));
+        let open = cosmic::task::message(Message::Repository(open(card)));
         Task::batch([overlay, prepare, open])
     }
 }

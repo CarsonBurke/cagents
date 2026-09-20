@@ -66,7 +66,6 @@ const COMPLETION_CEILING: f32 = 180.0;
 ///
 /// The panel sits over the card, so it is bounded and scrolls: an account with
 /// twenty open conversations must not cover the whole surface.
-const BINDING_CEILING: f32 = 360.0;
 
 /// How tall the pending questions are allowed to grow.
 ///
@@ -585,160 +584,43 @@ fn model_hits<'a>(models: &'a [chat::Model], query: &str) -> Vec<&'a chat::Model
 }
 
 impl Cagents {
-    /// Choosing which of a Codex account's open conversations a terminal is
-    /// looking at.
-    ///
-    /// This used to be a bare text field demanding a 36-character UUID copied
-    /// out of another program's `/status` output. The account's own server
-    /// knows what it is holding open, so the reader picks from that list, and
-    /// the common case - one conversation rooted in this terminal's directory
-    /// - resolves without the panel appearing at all.
-    pub(in crate::app) fn chat_binding_view(&self, card: CardId) -> Option<Element<'_, Message>> {
-        let binding = self.chat_ui.bindings.get(&card)?;
-        // A panel that appears for a moment and then answers its own question
-        // is worse than no panel: the reader reads a heading, loses the
-        // terminal they were looking at, and gets the conversation they asked
-        // for anyway. While the resolution is still unambiguous the card is
-        // left exactly as it was.
-        if binding.auto {
+    pub(in crate::app) fn new_thread_dialog(&self) -> Option<Element<'_, Message>> {
+        if !self.new_thread_is_open() {
             return None;
         }
-        let valid =
-            binding.input.trim().len() == 36 && uuid::Uuid::parse_str(binding.input.trim()).is_ok();
-        let here = binding
-            .session
-            .terminal
-            .as_ref()
-            .map(|terminal| terminal.launch.working_directory.clone());
-        let mut rows: Vec<Element<'_, Message>> =
-            vec![design::heading("Which conversation is this terminal viewing?").into()];
-        // One sentence about the state of the list, not two: an error and an
-        // "it is empty" line together told the reader two different stories
-        // about the same failure.
-        if binding.scanning {
-            rows.push(body("Reading this account's open conversations…"));
-        } else if let Some(error) = &binding.error {
-            rows.push(body(error.as_str()));
-        } else if binding.candidates.is_empty() {
-            rows.push(body(
-                "This account's shared Codex server is holding no conversation open. Start one in the terminal, or paste its identifier below.",
-            ));
-        } else {
-            rows.push(body(
-                "Reading a conversation is read-only; nothing is resumed or sent until you confirm.",
-            ));
-        }
-        // The terminal's own directory comes first, because a conversation
-        // rooted anywhere else is almost never the one being looked at.
-        let mut listed = binding.candidates.iter().collect::<Vec<_>>();
-        listed.sort_by_key(|candidate| here.as_ref() != Some(&candidate.working_directory));
-        for candidate in listed {
-            let chosen = binding.input.trim() == candidate.session_id;
-            let directory = candidate
-                .working_directory
-                .file_name()
-                .map(|name| name.to_string_lossy().into_owned())
-                .unwrap_or_else(|| candidate.working_directory.display().to_string());
+        let choices = [
+            (Provider::Codex, "ChatGPT", "chat.new-thread.chatgpt"),
+            (Provider::Claude, "Claude", "chat.new-thread.claude"),
+            (Provider::Omp, "Other models", "chat.new-thread.other"),
+        ];
+        let mut rows: Vec<Element<'_, Message>> = vec![
+            widget::text::title3("New thread").into(),
+            body("Choose a model family, then select a model from your account."),
+        ];
+        for (provider, label, id) in choices {
             rows.push(
-                widget::button::custom(
-                    widget::column::with_children(vec![
-                        design::body(candidate.title.as_str())
-                            .wrapping(iced::widget::text::Wrapping::None)
-                            .into(),
-                        design::caption(directory)
-                            .class(cosmic::theme::Text::Custom(design::muted_text))
-                            .into(),
-                    ])
-                    .width(Length::Fill),
-                )
-                .class(if chosen {
-                    cosmic::theme::Button::Suggested
-                } else {
-                    cosmic::theme::Button::MenuItem
-                })
-                .padding(iced::Padding::from([step::GAP_XS, step::GAP_S]))
-                .width(Length::Fill)
-                .on_press_maybe((!binding.loading).then_some(action(Action::BindingChoose(
-                    card,
-                    candidate.session_id.clone(),
-                ))))
-                .into(),
+                widget::button::standard(label)
+                    .id(widget::Id::new(id))
+                    .width(Length::Fill)
+                    .on_press(action(Action::NewThreadModelFamily(provider)))
+                    .into(),
             );
         }
-        if let Some(preview) = &binding.preview {
-            rows.push(body(format!(
-                "{}\n{}\n{}",
-                preview.title,
-                preview.session_id,
-                preview.working_directory.display()
-            )));
-            rows.push(body(
-                "Confirming attaches to this conversation's existing shared backend with its current permissions. The source terminal stays running; no duplicate agent is launched.",
-            ));
-        }
-        // Manual entry stays as the last resort, for a conversation the server
-        // is not holding open and can therefore not list.
         rows.push(
-            design::caption("Not listed? Paste its identifier.")
-                .class(cosmic::theme::Text::Custom(design::muted_text))
+            widget::button::text("Cancel")
+                .id(widget::Id::new("chat.new-thread.cancel"))
+                .on_press(action(Action::DismissNewThread))
                 .into(),
         );
-        rows.push(
-            iced::widget::text_input("Conversation identifier", &binding.input)
-                .on_input(move |input| action(Action::BindingInput(card, input)))
-                .on_submit_maybe(
-                    (valid && !binding.loading).then_some(action(Action::BindingPreview(card))),
-                )
-                .into(),
-        );
-        rows.push(
-            widget::row::with_children(vec![
-                widget::button::suggested("Confirm")
-                    .on_press_maybe(
-                        (binding.preview.is_some() && !binding.loading)
-                            .then_some(action(Action::BindingConfirm(card))),
-                    )
-                    .into(),
-                widget::button::text(if binding.loading {
-                    "Reading…"
-                } else {
-                    "Read conversation"
-                })
-                .on_press_maybe(
-                    (valid && !binding.loading).then_some(action(Action::BindingPreview(card))),
-                )
-                .into(),
-                // Attaching needs the account's shared server. Where there is
-                // none, this is the only thing that can still be done here,
-                // and it was previously left for the reader to work out.
-                widget::button::text("New conversation here")
-                    .on_press_maybe((!binding.loading).then_some(action(Action::BindingNew(card))))
-                    .into(),
-                widget::button::text("Cancel")
-                    .on_press(action(Action::BindingCancel(card)))
-                    .into(),
-            ])
-            .spacing(step::GAP_S)
-            .into(),
-        );
-        Some(
-            widget::container(
-                widget::scrollable(
-                    widget::column::with_children(rows)
-                        .spacing(step::GAP_S)
-                        .padding(step::GAP_M),
-                )
-                .direction(iced::widget::scrollable::Direction::Vertical(
-                    design::scrollbar(),
-                ))
-                .height(Length::Shrink),
-            )
-            .max_height(BINDING_CEILING)
-            .width(Length::Fill)
-            .into(),
-        )
+        Some(dialog_ui::overlay(
+            dialog_ui::surface(
+                widget::column::with_children(rows).spacing(step::GAP_M),
+                420.0,
+            ),
+            Some(action(Action::DismissNewThread)),
+            1.0,
+        ))
     }
-
     /// Where a conversation is working, as the status line reports it.
     ///
     /// A chat pane names no location of its own, so a reader with several
@@ -2330,9 +2212,8 @@ fn model_list<'a>(
             .on_submit_maybe(
                 top.map(move |id| move |_: String| action(Action::Model(target, id.clone()))),
             )
-            // Escape and Tab both leave the field, and a search popup that
-            // outlives the search is a menu the reader has to dismiss twice.
-            .on_unfocus(action(Action::ModelPicker(target, false)))
+            // The popover owns dismissal. Unfocusing on mouse-down inside a
+            // model row must not remove that row before its mouse-up selects it.
             .into(),
         widget::container(
             widget::scrollable(
@@ -2743,6 +2624,78 @@ mod tests {
             label: label.into(),
             reasoning: Vec::new(),
         }
+    }
+
+    #[test]
+    fn clicking_a_model_keeps_the_popup_alive_until_selection() {
+        use cosmic::iced::advanced::{
+            Layout, Shell, clipboard, layout, mouse, renderer::Headless, widget::Tree,
+        };
+        use cosmic::iced::{Event, Point, Rectangle, Size};
+        let renderer = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(<cosmic::Renderer as Headless>::new(
+                iced::Font::DEFAULT,
+                iced::Pixels(13.),
+                Some("tiny-skia"),
+            ))
+            .unwrap();
+        let target = Target {
+            card: CardId::new(),
+            generation: 1,
+        };
+        let models = vec![model("gpt-selected", "ChatGPT selected")];
+        let mut element = model_list(target, &models, None, "");
+        let mut tree = Tree::new(element.as_widget());
+        let viewport = Rectangle::new(Point::ORIGIN, Size::new(300., 400.));
+        let node = element.as_widget_mut().layout(
+            &mut tree,
+            &renderer,
+            &layout::Limits::new(Size::ZERO, viewport.size()),
+        );
+        let field = Layout::new(&node)
+            .children()
+            .next()
+            .unwrap()
+            .bounds()
+            .center();
+        let row = Layout::new(&node)
+            .children()
+            .nth(1)
+            .unwrap()
+            .bounds()
+            .center();
+        let mut update = |pressed: bool, point: Point| {
+            let mut messages = Vec::new();
+            let event = Event::Mouse(if pressed {
+                mouse::Event::ButtonPressed(mouse::Button::Left)
+            } else {
+                mouse::Event::ButtonReleased(mouse::Button::Left)
+            });
+            element.as_widget_mut().update(
+                &mut tree,
+                &event,
+                Layout::new(&node),
+                mouse::Cursor::Available(point),
+                &renderer,
+                &mut clipboard::Null,
+                &mut Shell::new(&mut messages),
+                &viewport,
+            );
+            messages
+        };
+        let _ = update(true, field);
+        let _ = update(false, field);
+        let pressed = update(true, row);
+        assert!(
+            !pressed
+                .iter()
+                .any(|message| matches!(message, Message::ChatUi(Action::ModelPicker(_, false))))
+        );
+        let released = update(false, row);
+        assert!(released.iter().any(|message| matches!(message, Message::ChatUi(Action::Model(selected, model)) if *selected == target && model == "gpt-selected")));
     }
 
     /// A reader recalls a model by any part of its identifier, including the

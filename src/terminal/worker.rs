@@ -437,6 +437,9 @@ impl TerminalHandle {
     pub fn is_completed(&self) -> bool {
         self.inner.published.completed.load(Ordering::Acquire)
     }
+    pub(crate) fn same_worker(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.inner, &other.inner)
+    }
 
     pub fn generation(&self) -> u64 {
         self.inner

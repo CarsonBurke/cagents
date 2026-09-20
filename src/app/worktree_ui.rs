@@ -1086,7 +1086,7 @@ mod tests {
             let _ = app.restore_worktree_scope();
             let key = app.sidebar_state.active_worktree().unwrap().clone();
             let was_overlay = app.context_inspector_is_overlay();
-            let _ = app.route_panel_open(&key, &RepoPath::parse("src/main.rs").unwrap(), None);
+            let _ = app.route_panel_open(&key, &RepoPath::parse("src/main.rs").unwrap());
             assert_eq!(app.workspace.focused(), Some(editor.id));
             assert_eq!(app.context_tab, ContextTab::Changes);
             assert_eq!(app.context_inspector_open, !was_overlay);
@@ -1101,8 +1101,7 @@ mod tests {
 
             let _ = app.select_worktree("/b".into(), false);
             app.pending_panel_open = None;
-            let _ =
-                app.route_panel_open(&key, &RepoPath::parse("src/main.rs").unwrap(), Some(false));
+            let _ = app.route_panel_open(&key, &RepoPath::parse("src/main.rs").unwrap());
             assert!(app.pending_panel_open.is_none());
             assert!(app.workspace.cards().is_empty());
         }

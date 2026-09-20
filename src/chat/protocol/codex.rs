@@ -73,6 +73,20 @@ pub fn align_resume_identity(arguments: &mut Vec<String>, id: &str) -> Result<()
 }
 
 pub fn create(launch: &Launch) -> Result<(ProcessSpec, Box<dyn Adapter>), String> {
+    create_inner(launch, None)
+}
+
+pub(crate) fn create_with_listener(
+    launch: &Launch,
+    socket: PathBuf,
+) -> Result<(ProcessSpec, Box<dyn Adapter>), String> {
+    create_inner(launch, Some(socket))
+}
+
+fn create_inner(
+    launch: &Launch,
+    owned_socket: Option<PathBuf>,
+) -> Result<(ProcessSpec, Box<dyn Adapter>), String> {
     if launch
         .session_id
         .as_ref()
@@ -83,6 +97,7 @@ pub fn create(launch: &Launch) -> Result<(ProcessSpec, Box<dyn Adapter>), String
     let mut spec = ProcessSpec::from(&launch.recipe);
     let mut start = json!({"cwd": spec.working_directory, "experimentalRawEvents": false});
     let mut explicit_socket = None;
+    let mut shared = false;
     let mut args = launch.recipe.arguments.iter();
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -93,10 +108,12 @@ pub fn create(launch: &Launch) -> Result<(ProcessSpec, Box<dyn Adapter>), String
                 ))
             }
             "--remote" => {
+                shared = true;
                 explicit_socket =
                     remote_socket(args.next().ok_or("Missing Codex --remote address")?)?;
             }
             _ if arg.starts_with("--remote=") => {
+                shared = true;
                 explicit_socket = remote_socket(&arg["--remote=".len()..])?;
             }
             "resume" => {
@@ -179,7 +196,14 @@ pub fn create(launch: &Launch) -> Result<(ProcessSpec, Box<dyn Adapter>), String
     // with. An explicitly named socket is still honoured for a fresh thread,
     // because naming one is a request to use that server.
     let mut alias = None;
-    if launch.session_id.is_some() || explicit_socket.is_some() {
+    if let Some(socket) = owned_socket {
+        spec.arguments = vec![
+            "app-server".into(),
+            "--listen".into(),
+            format!("unix://{}", socket.display()),
+        ];
+        spec.transport = TransportSpec::OwnedUnixWebSocket { socket };
+    } else if shared || launch.session_id.is_some() || explicit_socket.is_some() {
         let socket = explicit_socket
             .unwrap_or_else(|| home.join("app-server-control/app-server-control.sock"));
         let socket = if socket.is_absolute() {
@@ -1888,6 +1912,48 @@ fn elicitation_answers(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_explicit_default_remote_starts_new_threads_on_the_shared_server() {
+        let home = tempfile::tempdir().unwrap();
+        let directory = home.path().join("app-server-control");
+        std::fs::create_dir(&directory).unwrap();
+        let socket = directory.join("app-server-control.sock");
+        let _listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        let launch = Launch {
+            provider: crate::agent::Provider::Codex,
+            session_id: None,
+            recipe: crate::model::LaunchRecipe {
+                program: "codex".into(),
+                arguments: vec!["--remote".into(), "unix://".into()],
+                working_directory: home.path().into(),
+                environment: BTreeMap::from([(
+                    "CODEX_HOME".into(),
+                    home.path().to_string_lossy().into_owned(),
+                )]),
+            },
+        };
+        let (spec, mut adapter) = create(&launch).unwrap();
+        assert!(matches!(
+            spec.transport,
+            TransportSpec::UnixWebSocket { .. }
+        ));
+        assert!(spec.arguments.is_empty());
+        let initialize = adapter.initialize().unwrap();
+        let result = adapter.receive(json!({"id":initialize.writes[0]["id"],"result":{"userAgent":"codex","codexHome":home.path()}})).unwrap();
+        assert!(
+            result
+                .writes
+                .iter()
+                .any(|frame| frame["method"] == "thread/start")
+        );
+        drop(_listener);
+        std::fs::remove_file(socket).unwrap();
+        assert!(
+            create(&launch).is_err(),
+            "an unavailable selected server must not create a private thread"
+        );
+    }
 
     #[test]
     fn align_resume_identity_rewrites_resume_thread() {

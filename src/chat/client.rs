@@ -423,6 +423,16 @@ impl ClientHandle {
         if !proof.is_complete() {
             return Err("Daemon returned an incomplete native chat ownership proof".into());
         }
+        let mut session = session;
+        if intent == Intent::Start
+            && source.is_none()
+            && session.terminal.is_some()
+            && session.owns_codex_listener()
+        {
+            // A stopped CLI has no live PTY proof. The daemon must match the
+            // retained actor and exact descriptor under this authenticated epoch.
+            session.proof = Some(proof.clone());
+        }
         let id = session.id;
         let mut attach_request = 2;
         let request = if let Some(token) = selection {
@@ -599,6 +609,16 @@ impl ClientHandle {
                         _ => unreachable!(),
                     };
                     if chat_id!=id { break "Daemon closed a different chat".into(); }
+                    if terminal.is_some() && !final_snapshot.exited {
+                        // A shared-server CLI is another view, not a closed
+                        // native actor. Keep this connection and pending work.
+                        *snapshot.lock().unwrap_or_else(|p|p.into_inner())=Arc::new(final_snapshot);
+                        if let Some(reply) = envelope.request_id.and_then(|id| pending.lock().unwrap_or_else(|p|p.into_inner()).remove(&id)) {
+                            let _ = reply.try_send(Ok(terminal));
+                        }
+                        wake(Wake::Changed);
+                        continue;
+                    }
                     *snapshot.lock().unwrap_or_else(|p|p.into_inner())=Arc::new(final_snapshot);
                     {
                         let mut activity = activity.lock().unwrap_or_else(|p| p.into_inner());

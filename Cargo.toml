@@ -58,6 +58,7 @@ ui = [
     "dep:toml",
     "dep:tracing-subscriber",
     "dep:two-face",
+    "dep:unicode-linebreak",
 ]
 integrated-browser = [
     "full",
@@ -92,6 +93,7 @@ bench = false
 required-features = ["host"]
 
 [dependencies]
+unicode-linebreak = { version = "0.1", optional = true }
 arc-swap = "1.7"
 async-channel = { version = "2.5", optional = true }
 ashpd = { version = "0.12.3", default-features = false, features = ["tokio", "wayland"], optional = true }

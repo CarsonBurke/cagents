@@ -559,6 +559,7 @@ pub struct SidebarWorktree {
     pub detached: bool,
     pub locked: bool,
     pub dirty: Option<DirtyState>,
+    pub untracked_omitted: bool,
     pub ahead: Option<u64>,
     pub behind: Option<u64>,
     pub created_at_unix_ms: Option<i64>,
@@ -580,7 +581,7 @@ impl SidebarWorktree {
     ) -> Self {
         let label = worktree_display_name(&path, branch.as_deref(), detached);
         let path_label = path.display().to_string();
-        let status = status_summary(detached, locked, dirty.as_ref(), ahead, behind);
+        let status = status_summary(detached, locked, dirty.as_ref(), false, ahead, behind);
         let chrome = WorktreeChrome {
             folded_label: fold(&label),
             folded_branch: branch.as_deref().map(fold),
@@ -611,6 +612,7 @@ impl SidebarWorktree {
             detached,
             locked,
             dirty,
+            untracked_omitted: false,
             ahead,
             behind,
             created_at_unix_ms: None,
@@ -647,6 +649,8 @@ impl SidebarWorktree {
             ahead,
             behind,
         );
+        row.untracked_omitted = status.is_some_and(|status| status.untracked_omitted);
+        row.refresh_status_chrome();
         row.created_at_unix_ms = record.created_at_unix_ms;
         row
     }
@@ -657,13 +661,15 @@ impl SidebarWorktree {
             TrackingState::Compared { ahead, behind, .. } => (Some(*ahead), Some(*behind)),
             _ => (None, None),
         };
-        if self.dirty.as_ref() == Some(&status.dirty)
+        if self.untracked_omitted == status.untracked_omitted
+            && self.dirty.as_ref() == Some(&status.dirty)
             && self.ahead == ahead
             && self.behind == behind
         {
             return;
         }
         self.dirty = Some(status.dirty.clone());
+        self.untracked_omitted = status.untracked_omitted;
         self.ahead = ahead;
         self.behind = behind;
         self.refresh_status_chrome();
@@ -710,15 +716,27 @@ impl SidebarWorktree {
             self.chrome.folded_label = fold(&label);
             self.chrome.label = label.into();
         }
-        self.chrome.dirty_badge = self
-            .dirty
-            .as_ref()
-            .filter(|dirty| dirty.is_dirty())
-            .map(|dirty| format!("{} changes", dirty_count(dirty)).into_boxed_str());
+        self.chrome.dirty_badge =
+            self.dirty
+                .as_ref()
+                .filter(|dirty| dirty.is_dirty())
+                .map(|dirty| {
+                    format!(
+                        "{} {}changes",
+                        dirty_count(dirty),
+                        if self.untracked_omitted {
+                            "tracked "
+                        } else {
+                            ""
+                        }
+                    )
+                    .into_boxed_str()
+                });
         let mut status = status_summary(
             self.detached,
             self.locked,
             self.dirty.as_ref(),
+            self.untracked_omitted,
             self.ahead,
             self.behind,
         );
@@ -1061,16 +1079,18 @@ pub enum PanelSection {
     Files,
     Changes,
     History,
+    Untracked,
 }
 
 impl PanelSection {
-    pub const ALL: [Self; 3] = [Self::Files, Self::Changes, Self::History];
+    pub const ALL: [Self; 4] = [Self::Files, Self::Changes, Self::History, Self::Untracked];
 
     fn title(self) -> &'static str {
         match self {
             Self::Files => "Files",
             Self::Changes => "Changes",
             Self::History => "History",
+            Self::Untracked => "Untracked",
         }
     }
 
@@ -1412,6 +1432,7 @@ struct ChangeGroupChrome {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CommitRow {
     pub oid: Oid,
+    pub parent: Option<Oid>,
     chrome: CommitRowChrome,
 }
 
@@ -1439,6 +1460,7 @@ impl CommitRow {
         };
         Self {
             oid: commit.oid.clone(),
+            parent: commit.parents.first().cloned(),
             chrome,
         }
     }
@@ -1449,6 +1471,13 @@ struct CommitRowChrome {
     subject: Box<str>,
     metadata: Box<str>,
     accessible_name: Box<str>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommitChanges {
+    pub commit: CommitRow,
+    pub visible_files: usize,
+    pub result: Option<Result<Vec<crate::repository::DiffEntry>, String>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1589,6 +1618,7 @@ pub struct SourceControlModel {
     groups: Vec<ChangeGroup>,
     pub branch_changes: BranchChanges,
     pub history: Vec<CommitRow>,
+    pub commit_changes: Option<CommitChanges>,
     /// False until a page has landed. Without it an empty `history` is
     /// indistinguishable from a branch that has no commits.
     pub history_loaded: bool,
@@ -1596,6 +1626,8 @@ pub struct SourceControlModel {
     /// the panel stays bound to this worktree. Separate from `history_loaded`,
     /// which a moved `HEAD` clears; see [`Self::history_requested`].
     history_requested: bool,
+    pub history_loading: bool,
+    pub history_error: Option<String>,
     /// False while another [`HISTORY_PAGE_SIZE`] page may exist.
     pub history_complete: bool,
     /// The next zero-based page `History` should request.
@@ -1726,8 +1758,11 @@ impl SourceControlModel {
             groups: Vec::new(),
             branch_changes: BranchChanges::Unavailable("No branch comparison available."),
             history: Vec::new(),
+            commit_changes: None,
             history_loaded: false,
             history_requested: false,
+            history_loading: false,
+            history_error: None,
             history_complete: false,
             next_history_page: 0,
             reloading: false,
@@ -1802,8 +1837,11 @@ impl SourceControlModel {
             groups,
             branch_changes: BranchChanges::Unavailable("No branch comparison available."),
             history: Vec::new(),
+            commit_changes: None,
             history_loaded: false,
             history_requested: false,
+            history_loading: false,
+            history_error: None,
             history_complete: false,
             next_history_page: 0,
             reloading: false,
@@ -1823,6 +1861,7 @@ impl SourceControlModel {
         for commit in page {
             self.history.push(CommitRow::new(commit));
         }
+        self.history_loading = false;
         self.history_loaded = true;
         self.history_requested = true;
         self.history_complete = page.len() < HISTORY_PAGE_SIZE as usize;
@@ -1861,12 +1900,19 @@ impl SourceControlModel {
     /// True while a further page can exist. An unborn `HEAD` has no walk to
     /// page through, so it is offered no pager.
     fn can_load_history(&self) -> bool {
-        !self.history_complete && !self.unborn
+        !self.history_loading && !self.history_complete && !self.unborn
     }
 
     /// Records that the first page has been asked for, so expanding, closing,
     /// and reopening `History` cannot queue a second walk.
+    pub fn history_failed(&mut self, error: String) {
+        self.history_loading = false;
+        self.history_error = Some(error);
+    }
+
     pub fn mark_history_requested(&mut self) {
+        self.history_error = None;
+        self.history_loading = true;
         self.history_requested = true;
     }
 
@@ -1921,13 +1967,16 @@ impl SourceControlModel {
         }
         next.mutation = self.mutation;
         next.error = self.error.clone();
-        next.history_requested |= self.history_requested;
+        next.commit_changes = self.commit_changes.clone();
         // The loading placeholder between two snapshots has not read `HEAD`
         // yet, and that gap must not look like a `HEAD` that moved.
         if next.head_oid.is_none() && !next.unborn {
             next.head_oid = self.head_oid.clone();
         }
         if next.head_oid == self.head_oid && next.history.is_empty() {
+            next.history_requested = self.history_requested;
+            next.history_loading = self.history_loading;
+            next.history_error = self.history_error.clone();
             next.history = self.history.clone();
             next.history_loaded = self.history_loaded;
             next.history_complete = self.history_complete;
@@ -2048,7 +2097,7 @@ struct SourceControlChrome {
     publish_cancel_id: Id,
     publish_branch_id: Id,
     more_history_id: Id,
-    section_ids: [Id; 3],
+    section_ids: [Id; 4],
 }
 
 impl SourceControlChrome {
@@ -2535,6 +2584,7 @@ impl SidebarState {
         self.files_filter_open = false;
         self.commit_message.clear();
         self.expanded_directories.clear();
+        self.toggled_sections.remove(&PanelSection::Untracked);
         self.publish = None;
         self.discard = None;
         self.panel_selection = None;
@@ -2666,6 +2716,10 @@ impl SidebarState {
             | SidebarAction::Stage { .. }
             | SidebarAction::Unstage { .. }
             | SidebarAction::Commit { .. }
+            | SidebarAction::OpenCommit { .. }
+            | SidebarAction::CloseCommit { .. }
+            | SidebarAction::OpenCommitFile { .. }
+            | SidebarAction::ShowMoreCommitFiles { .. }
             | SidebarAction::LoadMoreHistory { .. }
             | SidebarAction::Resize { .. }
             | SidebarAction::ResizeFinished => {}
@@ -2754,6 +2808,23 @@ pub enum SidebarAction {
         worktree: Option<PathBuf>,
     },
     OpenSettings,
+
+    OpenCommit {
+        key: ActiveWorktreeKey,
+        oid: Oid,
+    },
+    CloseCommit {
+        key: ActiveWorktreeKey,
+    },
+    ShowMoreCommitFiles {
+        key: ActiveWorktreeKey,
+        oid: Oid,
+    },
+    OpenCommitFile {
+        key: ActiveWorktreeKey,
+        oid: Oid,
+        path: RepoPath,
+    },
 
     // Source-control panel.
     ToggleSection {
@@ -5038,18 +5109,32 @@ fn source_control_panel<'a>(
         );
     }
 
-    let mut sections = widget::column::with_capacity(3).spacing(spacing.space_xxxs);
-    sections = sections.push(changes_section(state, source, modal_open));
-    sections = sections.push(branch_changes_section(state, source, modal_open));
-    sections = sections.push(panel_section(
-        key,
-        PanelSection::History,
-        chrome.section_id(PanelSection::History).clone(),
-        source.history_count().map(RowCount::exact),
-        state.section_expanded(PanelSection::History),
-        modal_open,
-        || history_section(source, modal_open),
-    ));
+    let history = state.section_expanded(PanelSection::History);
+    let mut sections = widget::column::with_capacity(4).spacing(spacing.space_xxxs);
+    let switch =
+        widget::row::with_children([("Changes", false), ("History", true)].into_iter().map(
+            |(label, selected)| {
+                button::custom(design::body(label))
+                    .class(crate::ui_controls::control_style(history == selected, None))
+                    .height(design::DENSE_ROW_HEIGHT)
+                    .width(Length::Fill)
+                    .on_press_maybe(gated(
+                        SidebarAction::ToggleSection {
+                            key: key.clone(),
+                            section: PanelSection::History,
+                        },
+                        modal_open || history == selected,
+                    ))
+                    .into()
+            },
+        ));
+    sections = sections.push(switch);
+    if history {
+        sections = sections.push(history_section(source, modal_open));
+    } else {
+        sections = sections.push(changes_section(state, source, modal_open));
+        sections = sections.push(branch_changes_section(state, source, modal_open));
+    }
 
     worktree_panel_chrome(
         header.into(),
@@ -5176,6 +5261,7 @@ fn panel_section<'a>(
     count: Option<RowCount>,
     expanded: bool,
     modal_open: bool,
+    actions: Option<Element<'a, SidebarAction>>,
     body: impl FnOnce() -> Element<'a, SidebarAction>,
 ) -> Element<'a, SidebarAction> {
     let spacing = cosmic::theme::spacing();
@@ -5205,6 +5291,11 @@ fn panel_section<'a>(
     .width(Length::Fill)
     .on_press_maybe(parts.toggle);
     let header = crate::interaction::tooltip(crate::interaction::hover(row), parts.action_name);
+    let header: Element<'a, SidebarAction> = if let Some(actions) = actions {
+        RowInteraction::actions(header.into(), actions, 0.0).into()
+    } else {
+        header.into()
+    };
     let mut column = widget::column::with_capacity(2).spacing(0).push(header);
     if expanded {
         column = column.push(widget::container(body()).padding([0, 0, spacing.space_xxs, 0]));
@@ -5488,13 +5579,59 @@ fn changes_section<'a>(
     let mut column =
         widget::column::with_capacity(source.groups().len() + 2).spacing(spacing.space_xxxs);
     if source.groups().iter().all(ChangeGroup::is_empty) {
-        column = column.push(design::caption("No uncommitted changes."));
+        column = column.push(design::caption("No tracked changes."));
     }
     for group in source.groups() {
-        if group.is_empty() {
-            continue;
+        if group.area == ChangeArea::Untracked {
+            let expanded = state.section_expanded(PanelSection::Untracked);
+            let actions = expanded.then(|| {
+                let (tree, _) = visible_file_rows(
+                    &group.tree,
+                    &state.expanded_directories,
+                    "",
+                    state.change_list_mode == FileListMode::Flat,
+                    true,
+                );
+                let visible: Vec<_> = tree
+                    .iter()
+                    .filter(|row| !row.directory)
+                    .filter_map(|file| group.visible_path(&file.path))
+                    .collect();
+                widget::container(widget::row::with_children(
+                    group_commands(source, group, &visible, modal_open)
+                        .into_iter()
+                        .map(IconCommand::into_element),
+                ))
+                .align_right(Length::Fill)
+                .height(PANEL_ROW_HEIGHT)
+                .into()
+            });
+            column = column.push(panel_section(
+                &source.key,
+                PanelSection::Untracked,
+                source.chrome.section_id(PanelSection::Untracked).clone(),
+                state
+                    .section_expanded(PanelSection::Untracked)
+                    .then(|| RowCount::exact(group.rows().len())),
+                state.section_expanded(PanelSection::Untracked),
+                modal_open,
+                actions,
+                || {
+                    if group.is_empty() {
+                        design::caption(if source.reloading {
+                            "Loading untracked files…"
+                        } else {
+                            "No untracked files."
+                        })
+                        .into()
+                    } else {
+                        change_group_view(state, source, group, modal_open)
+                    }
+                },
+            ));
+        } else if !group.is_empty() {
+            column = column.push(change_group_view(state, source, group, modal_open));
         }
-        column = column.push(change_group_view(state, source, group, modal_open));
     }
     column = column.push(widget::divider::horizontal::default());
     column = column.push(changes_footer(state, source, modal_open));
@@ -5650,9 +5787,10 @@ fn change_group_view<'a>(
     ))
     .align_right(Length::Fill)
     .height(PANEL_ROW_HEIGHT);
-    let mut column = widget::column::with_capacity(tree.len() + 2)
-        .spacing(0)
-        .push(RowInteraction::actions(header.into(), actions.into(), 0.0));
+    let mut column = widget::column::with_capacity(tree.len() + 2).spacing(0);
+    if group.area != ChangeArea::Untracked {
+        column = column.push(RowInteraction::actions(header.into(), actions.into(), 0.0));
+    }
     for file in tree {
         if file.directory {
             // An inert hierarchy label, like branch review above.
@@ -6225,29 +6363,150 @@ fn publish_picker<'a>(
 ///
 /// The list is a walk from `HEAD` — the application loads it with
 /// [`crate::repository::HistoryRevision::Head`] — so it is the branch's
-/// history. The rows are text: this application has no surface that renders a
-/// commit's diff, so a row that took a press would have nowhere to send it.
+/// history. Selecting a row drills into its immutable changed-file list.
+fn commit_changes_section<'a>(
+    source: &'a SourceControlModel,
+    changes: &'a CommitChanges,
+    modal_open: bool,
+) -> Element<'a, SidebarAction> {
+    let key = &source.key;
+    let commit = &changes.commit;
+    let mut column = widget::column::with_capacity(5)
+        .spacing(4)
+        .push(
+            button::custom(
+                widget::row::with_children(vec![
+                    icon::from_name("go-previous-symbolic")
+                        .size(ROW_ICON_SIZE)
+                        .into(),
+                    design::body("History").into(),
+                ])
+                .spacing(4)
+                .align_y(Alignment::Center),
+            )
+            .class(sidebar_button_style(false))
+            .on_press_maybe(gated(
+                SidebarAction::CloseCommit { key: key.clone() },
+                modal_open,
+            )),
+        )
+        .push(design::heading(&*commit.chrome.subject).width(Length::Fill))
+        .push(design::caption(&*commit.chrome.metadata).width(Length::Fill))
+        .push(design::caption(if commit.parent.is_some() {
+            "Changes against first parent"
+        } else {
+            "Initial commit"
+        }));
+    match &changes.result {
+        None => column = column.push(design::caption("Loading changed files…")),
+        Some(Err(error)) => {
+            column = column
+                .push(design::caption(error).width(Length::Fill))
+                .push(
+                    button::custom(design::body("Try again"))
+                        .class(sidebar_button_style(false))
+                        .on_press_maybe(gated(
+                            SidebarAction::OpenCommit {
+                                key: key.clone(),
+                                oid: commit.oid.clone(),
+                            },
+                            modal_open,
+                        )),
+                );
+        }
+        Some(Ok(entries)) => {
+            column = column.push(design::caption(format!("{} changed files", entries.len())));
+            for entry in entries.iter().take(changes.visible_files) {
+                let label = entry.old_path.as_ref().map_or_else(
+                    || entry.path.display().into_owned(),
+                    |old| format!("{} → {}", old.display(), entry.path.display()),
+                );
+                let tone = match entry.kind {
+                    ChangeKind::Added => BadgeTone::Success,
+                    ChangeKind::Deleted => BadgeTone::Danger,
+                    _ => BadgeTone::Warning,
+                };
+                column = column.push(panel_row(
+                    label.clone(),
+                    0,
+                    widget::row::with_children(vec![
+                        crate::file_icon::icon(entry.path.as_path()).into(),
+                        design::body(label)
+                            .width(Length::Fill)
+                            .wrapping(cosmic::iced::widget::text::Wrapping::None)
+                            .ellipsize(cosmic::iced::widget::text::Ellipsize::Start(
+                                EllipsizeHeightLimit::Lines(1),
+                            ))
+                            .into(),
+                        semantic_caption(change_kind_label(entry.kind), tone),
+                        design::caption(crate::repository::line_change_counts(
+                            entry.added_lines,
+                            entry.removed_lines,
+                        ))
+                        .into(),
+                    ])
+                    .spacing(4)
+                    .align_y(Alignment::Center),
+                    Some(SidebarAction::OpenCommitFile {
+                        key: key.clone(),
+                        oid: commit.oid.clone(),
+                        path: entry.path.clone(),
+                    }),
+                    false,
+                    modal_open,
+                ));
+            }
+            if entries.len() > changes.visible_files {
+                column = column.push(
+                    button::custom(design::caption(format!(
+                        "Show more files ({} remaining)",
+                        entries.len() - changes.visible_files
+                    )))
+                    .class(sidebar_button_style(false))
+                    .on_press_maybe(gated(
+                        SidebarAction::ShowMoreCommitFiles {
+                            key: key.clone(),
+                            oid: commit.oid.clone(),
+                        },
+                        modal_open,
+                    )),
+                );
+            }
+        }
+    }
+    column.into()
+}
+
 fn history_section<'a>(
     source: &'a SourceControlModel,
     modal_open: bool,
 ) -> Element<'a, SidebarAction> {
     let spacing = cosmic::theme::spacing();
     let key = &source.key;
+    if let Some(changes) = &source.commit_changes {
+        return commit_changes_section(source, changes, modal_open);
+    }
     // The notice, the row list, and the pager. The notice and the pager are
     // slots because both come and go — the notice the moment the first page
     // lands, the pager when the walk runs out — and the pager is a named
     // button.
     let mut column = widget::column::with_capacity(3).spacing(spacing.space_xxxs);
-    column = column.push(slot(history_notice(source).map(|notice| {
-        design::caption(notice)
-            .wrapping(cosmic::iced::widget::text::Wrapping::Word)
-            .into()
-    })));
+    column = column.push(slot(
+        source
+            .history_error
+            .as_deref()
+            .or_else(|| history_notice(source))
+            .map(|notice| {
+                design::caption(notice)
+                    .wrapping(cosmic::iced::widget::text::Wrapping::Word)
+                    .into()
+            }),
+    ));
     let mut rows = widget::column::with_capacity(source.history.len()).spacing(0);
     for row in &source.history {
         let chrome = &row.chrome;
         rows = rows.push(
-            widget::container(
+            button::custom(
                 widget::row::with_children(vec![
                     widget::container(icon::from_name("vcs-commit-symbolic").size(ROW_ICON_SIZE))
                         .center_x(Length::Fixed(ROW_ICON_WIDTH))
@@ -6276,6 +6535,14 @@ fn history_section<'a>(
                 .align_y(Alignment::Center),
             )
             .padding([spacing.space_xxxs, spacing.space_xxxs])
+            .class(sidebar_button_style(false))
+            .on_press_maybe(gated(
+                SidebarAction::OpenCommit {
+                    key: key.clone(),
+                    oid: row.oid.clone(),
+                },
+                modal_open,
+            ))
             .width(Length::Fill),
         );
     }
@@ -6312,6 +6579,9 @@ fn history_section<'a>(
 /// how this section came to contradict the commits the repository card beside
 /// it was listing at the same moment.
 fn history_notice(source: &SourceControlModel) -> Option<&'static str> {
+    if source.history_loading {
+        return Some("Loading commits…");
+    }
     if source.unborn {
         return Some("No commits yet.");
     }
@@ -6630,12 +6900,18 @@ fn status_summary(
     detached: bool,
     locked: bool,
     dirty: Option<&DirtyState>,
+    untracked_omitted: bool,
     ahead: Option<u64>,
     behind: Option<u64>,
 ) -> String {
     let mut parts = Vec::with_capacity(4);
     match dirty {
-        Some(dirty) if dirty.is_dirty() => parts.push(format!("{} changes", dirty_count(dirty))),
+        Some(dirty) if dirty.is_dirty() => parts.push(format!(
+            "{} {}changes",
+            dirty_count(dirty),
+            if untracked_omitted { "tracked " } else { "" }
+        )),
+        Some(_) if untracked_omitted => parts.push("no tracked changes".to_owned()),
         Some(_) => parts.push("clean".to_owned()),
         None => parts.push("status unavailable".to_owned()),
     }
@@ -7814,6 +8090,7 @@ pub(crate) mod tests {
                 prunable_reason: None,
             },
             Some(&StatusSnapshot {
+                untracked_omitted: false,
                 head: crate::repository::HeadState::Unknown,
                 tracking: TrackingState::NoUpstream,
                 dirty: DirtyState {
@@ -10244,6 +10521,7 @@ pub(crate) mod tests {
     fn snapshot() -> RepositorySnapshot {
         RepositorySnapshot {
             status: StatusSnapshot {
+                untracked_omitted: false,
                 head: HeadState::Branch {
                     name: "main".into(),
                     oid: oid_of(0x11).to_string(),
@@ -10318,6 +10596,28 @@ pub(crate) mod tests {
 
     fn source_control() -> SourceControlModel {
         SourceControlModel::ready(main_key(), &snapshot())
+    }
+
+    #[test]
+    fn partial_status_does_not_claim_untracked_files_are_clean() {
+        let mut worktree =
+            SidebarWorktree::from_durable(WorktreeId::new(), "/repo".into(), Some("main".into()));
+        let mut status = StatusSnapshot {
+            untracked_omitted: true,
+            ..StatusSnapshot::default()
+        };
+        worktree.apply_status(&status);
+        assert!(worktree.chrome.tooltip.contains("no tracked changes"));
+        assert!(!worktree.chrome.tooltip.contains("clean"));
+        status.dirty.unstaged = 1;
+        worktree.apply_status(&status);
+        assert_eq!(
+            worktree.chrome.dirty_badge.as_deref(),
+            Some("1 tracked changes")
+        );
+        status.untracked_omitted = false;
+        worktree.apply_status(&status);
+        assert_eq!(worktree.chrome.dirty_badge.as_deref(), Some("1 changes"));
     }
 
     #[test]
@@ -10946,9 +11246,10 @@ pub(crate) mod tests {
         for project in &mut model.projects {
             project.github_ready = true;
         }
-        let state = panel_state(&model);
+        let mut state = panel_state(&model);
+        state.toggled_sections.remove(&PanelSection::History);
 
-        // Every section open, so every command the panel has is in the frame.
+        // The Changes view contains index mutations; History is a separate view.
         let live = frame_enter_presses(&renderer, git_panel(&model, &state, 380.0, false));
         assert!(
             live.iter()
@@ -10964,6 +11265,8 @@ pub(crate) mod tests {
              is up - so a control that still published one would report itself enabled, take the \
              press, and do nothing. It published {gated:?}"
         );
+        state.toggled_sections.insert(PanelSection::History);
+        assert!(frame_enter_presses(&renderer, git_panel(&model, &state, 380.0, true)).is_empty());
     }
 
     #[test]
@@ -11013,5 +11316,28 @@ pub(crate) mod tests {
             "an empty page is an answer; \"nobody asked\" is not"
         );
         assert!(!source.can_load_history(), "a short page ends the walk");
+    }
+    #[test]
+    fn untracked_starts_collapsed_and_history_reloads_when_head_moves() {
+        assert!(!SidebarState::default().section_expanded(PanelSection::Untracked));
+        let mut previous = SourceControlModel::ready(main_key(), &snapshot());
+        previous.head_oid = Some(oid_of(1).as_str().into());
+        previous.mark_history_requested();
+        let mut same = SourceControlModel::ready(main_key(), &snapshot());
+        same.head_oid = previous.head_oid.clone();
+        previous.carry_mutation_into(&mut same);
+        assert!(same.history_loading);
+        let mut moved = SourceControlModel::ready(main_key(), &snapshot());
+        moved.head_oid = Some(oid_of(2).as_str().into());
+        previous.carry_mutation_into(&mut moved);
+        assert!(!moved.history_requested());
+        assert!(moved.wants_history());
+        previous.history_failed("Failed".into());
+        assert!(!previous.history_loading);
+        assert!(
+            previous.history_requested(),
+            "failure requires explicit retry, not an automatic loop"
+        );
+        assert!(previous.can_load_history());
     }
 }

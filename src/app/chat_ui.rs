@@ -82,17 +82,9 @@ pub enum CopyPart {
 
 #[derive(Clone)]
 pub enum Action {
+    NewThreadModelFamily(Provider),
+    DismissNewThread,
     Switch(CardId),
-    BindingInput(CardId, String),
-    BindingScanned(Target, Result<Vec<chat::BindingCandidate>, String>),
-    BindingChoose(CardId, String),
-    BindingPreview(CardId),
-    BindingPreviewed(Target, Result<chat::BindingPreview, String>),
-    BindingConfirm(CardId),
-    /// Leaves the terminal alone and opens a new conversation in its
-    /// directory, which is the only thing left when nothing attachable exists.
-    BindingNew(CardId),
-    BindingCancel(CardId),
     Ready(Target, Ready),
     /// The result of closing a conversation that started for a card which
     /// could no longer hold it, so a stranded writer is not left behind.
@@ -137,7 +129,6 @@ pub enum Action {
     Mention(Target, String),
     HandoffFinished(Target, Result<TerminalSession, String>),
     CloseFinished(Target, Result<(), String>),
-    UrlFinished(Result<(), String>),
     /// Where the transcript's viewport has moved to, which is what asks for
     /// another page of history and what places the minimap's lens.
     Scrolled(Target, view::Scroll),
@@ -164,16 +155,15 @@ impl Action {
     pub(super) fn allowed_while_modal(&self) -> bool {
         matches!(
             self,
-            Self::Ready(..)
+            Self::NewThreadModelFamily(..)
+                | Self::DismissNewThread
+                | Self::Ready(..)
                 | Self::Wake(..)
                 | Self::UpdatesAcknowledged(..)
                 | Self::CommandFinished(..)
                 | Self::Attached(..)
                 | Self::HandoffFinished(..)
                 | Self::CloseFinished(..)
-                | Self::UrlFinished(..)
-                | Self::BindingPreviewed(..)
-                | Self::BindingScanned(..)
         )
     }
 
@@ -185,7 +175,6 @@ impl Action {
             | Self::AppendProviderDraft(target)
             | Self::Command(target, _)
             | Self::Attach(target)
-            | Self::Attached(target, _)
             | Self::RemoveAttachment(target, _)
             | Self::Model(target, _)
             | Self::Reasoning(target, _, _)
@@ -209,38 +198,14 @@ struct Attempt {
     session: chat::Session,
 }
 
-struct Binding {
-    target: Target,
-    session: chat::Session,
-    source: HostSessionProof,
-    input: String,
-    /// What the account's shared server is holding open, as the daemon last
-    /// reported it. Listing is what turns this from a UUID prompt into a
-    /// choice a reader can make.
-    candidates: Vec<chat::BindingCandidate>,
-    scanning: bool,
-    /// The generation the listing was requested with. Typing in the identifier
-    /// field moves `target`, so this is what tells a listing for this panel
-    /// apart from one left over from a panel that was cancelled and reopened.
-    scan: u64,
-    preview: Option<chat::BindingPreview>,
-    loading: bool,
-    /// True while the panel is still trying to resolve the terminal's
-    /// conversation without asking. Switching a terminal whose own launch
-    /// named a conversation, or whose account holds exactly one open in this
-    /// worktree, is not a choice - it is the answer - so the panel stays off
-    /// screen and the conversation is adopted. It clears the moment the
-    /// resolution is not unambiguous, which is when there is something to ask.
-    auto: bool,
-    error: Option<String>,
-}
-
 pub(super) struct State {
+    new_thread: bool,
+    new_thread_focus: usize,
+    new_thread_channel: Option<crate::model::ChannelId>,
     sender: async_channel::Sender<(Target, Wake)>,
     receiver: async_channel::Receiver<(Target, Wake)>,
     generation: u64,
     attempts: HashMap<CardId, Attempt>,
-    bindings: HashMap<CardId, Binding>,
     handoffs: HashSet<Target>,
     closing: HashSet<Target>,
     closed: HashSet<CardId>,
@@ -252,6 +217,7 @@ pub(super) struct State {
     /// refused. Holding the draft here makes the round trip lossless, so the
     /// refusal is only needed where the process itself is about to restart.
     drafts: HashMap<CardId, String>,
+    parked: HashMap<CardId, Box<Runtime>>,
     /// The cards whose saved conversation cannot be resumed by trying again.
     ///
     /// A card in this set has no chat runtime to hold the offer, because its
@@ -268,15 +234,18 @@ impl Default for State {
     fn default() -> Self {
         let (sender, receiver) = async_channel::unbounded();
         Self {
+            new_thread: false,
+            new_thread_focus: 0,
+            new_thread_channel: None,
             sender,
             receiver,
             generation: 0,
             attempts: HashMap::new(),
             handoffs: HashSet::new(),
-            bindings: HashMap::new(),
             closing: HashSet::new(),
             closed: HashSet::new(),
             drafts: HashMap::new(),
+            parked: HashMap::new(),
             fresh_offers: HashSet::new(),
             restarting: HashMap::new(),
         }
@@ -285,10 +254,7 @@ impl Default for State {
 
 impl State {
     pub(super) fn transition_pending(&self) -> bool {
-        !self.attempts.is_empty()
-            || !self.handoffs.is_empty()
-            || !self.closing.is_empty()
-            || !self.bindings.is_empty()
+        !self.attempts.is_empty() || !self.handoffs.is_empty() || !self.closing.is_empty()
     }
 }
 
@@ -1400,6 +1366,36 @@ fn return_terminal(session: &chat::Session) -> Result<TerminalSession, String> {
 }
 
 impl Cagents {
+    pub(super) fn new_native_thread(&mut self) -> Task<Message> {
+        self.chat_ui.new_thread = true;
+        self.chat_ui.new_thread_focus = 0;
+        self.chat_ui.new_thread_channel = None;
+        iced::widget::operation::focus(widget::Id::new("chat.new-thread.chatgpt"))
+            .map(cosmic::Action::App)
+    }
+    pub(super) fn new_thread_is_open(&self) -> bool {
+        self.chat_ui.new_thread
+    }
+    pub(super) fn new_native_thread_for_channel(
+        &mut self,
+        channel: crate::model::ChannelId,
+    ) -> Task<Message> {
+        let task = self.new_native_thread();
+        self.chat_ui.new_thread_channel = Some(channel);
+        task
+    }
+    pub(super) fn cycle_new_thread_focus(&mut self, backwards: bool) -> Task<Message> {
+        const IDS: [&str; 4] = [
+            "chat.new-thread.chatgpt",
+            "chat.new-thread.claude",
+            "chat.new-thread.other",
+            "chat.new-thread.cancel",
+        ];
+        self.chat_ui.new_thread_focus =
+            (self.chat_ui.new_thread_focus + if backwards { 3 } else { 1 }) % IDS.len();
+        iced::widget::operation::focus(widget::Id::new(IDS[self.chat_ui.new_thread_focus]))
+            .map(cosmic::Action::App)
+    }
     pub(super) fn dismiss_chat_picker(&mut self) -> bool {
         let Some(card) = self.workspace.focused() else {
             return false;
@@ -1411,25 +1407,6 @@ impl Cagents {
         runtime.reasoning_picker = false;
         open
     }
-    /// The provider a new channel's conversation should use.
-    ///
-    /// The menu names the provider explicitly, but a channel is created from
-    /// the sidebar with no such choice, so it follows the most recent
-    /// conversation in the workspace. That is state the workspace already
-    /// persists, so the answer survives a restart without a second setting
-    /// for the same decision.
-    pub(super) fn preferred_chat_provider(&self) -> Provider {
-        self.durable
-            .cards
-            .iter()
-            .rev()
-            .find_map(|card| match &card.kind {
-                CardKind::Chat(session) => Some(session.launch.provider),
-                _ => None,
-            })
-            .unwrap_or(Provider::Codex)
-    }
-
     /// Opens a new native conversation in a new card.
     ///
     /// `directory` is the conversation's root. A caller that already knows it,
@@ -1453,6 +1430,13 @@ impl Cagents {
             working_directory: working_directory.clone(),
             environment: crate::model::agent_recovery::fresh_native_environment(provider, true),
         };
+        if provider == Provider::Codex {
+            // Both views attach to the same server-owned thread. A private
+            // stdio server cannot be joined by the CLI during an active turn.
+            recipe
+                .arguments
+                .extend(["--remote".into(), "unix://".into()]);
+        }
         if provider == Provider::Omp {
             let Some(root) = provider.session_root(&recipe) else {
                 self.status = Some(TransientNotice::error(
@@ -1549,7 +1533,6 @@ impl Cagents {
             }
         }
         self.chat_ui.attempts.remove(&card);
-        self.chat_ui.bindings.remove(&card);
         self.chat_ui.handoffs.retain(|target| target.card != card);
         self.chat_ui.closing.retain(|target| target.card != card);
         self.chat_ui.restarting.remove(&card);
@@ -1564,6 +1547,7 @@ impl Cagents {
     pub(super) fn chat_discard(&mut self, card: CardId) {
         self.chat_forget(card);
         self.chat_ui.drafts.remove(&card);
+        self.chat_ui.parked.remove(&card);
         self.chat_ui.fresh_offers.remove(&card);
     }
     pub(super) fn chat_start_pending(&self, card: CardId) -> bool {
@@ -1616,11 +1600,23 @@ impl Cagents {
     pub(super) fn chat_close_approved(&self, card: CardId) -> bool {
         self.chat_ui.closed.contains(&card)
     }
+    pub(super) fn chat_has_parked_runtime(&self, card: CardId) -> bool {
+        self.chat_ui.parked.contains_key(&card)
+    }
+    pub(super) fn parked_chat_restart_blocker(&self) -> Option<&'static str> {
+        self.chat_ui
+            .parked
+            .values()
+            .find_map(|runtime| runtime.restart_blocker())
+    }
     pub(super) fn begin_chat_close(&mut self, card: CardId) -> Task<Message> {
         if self.chat_start_pending(card) {
             return Task::none();
         }
-        let Some(CardRuntime::Chat(runtime)) = self.cards.get(&card) else {
+        let Some(runtime) = (match self.cards.get(&card) {
+            Some(CardRuntime::Chat(runtime)) => Some(runtime),
+            _ => self.chat_ui.parked.get(&card),
+        }) else {
             return Task::none();
         };
         if runtime.attachment_chooser_pending {
@@ -1649,13 +1645,7 @@ impl Cagents {
         terminate_source: bool,
     ) -> Task<Message> {
         self.chat_ui.generation = self.chat_ui.generation.wrapping_add(1).max(1);
-        let selection = self
-            .chat_ui
-            .bindings
-            .remove(&card)
-            .and_then(|binding| binding.preview)
-            .filter(|preview| session.launch.session_id.as_ref() == Some(&preview.session_id))
-            .map(|preview| preview.token);
+        let selection = None;
         let target = Target {
             card,
             generation: self.chat_ui.generation,
@@ -1715,7 +1705,12 @@ impl Cagents {
     fn chat_runtime_mut(&mut self, target: Target) -> Option<&mut Runtime> {
         match self.cards.get_mut(&target.card) {
             Some(CardRuntime::Chat(runtime)) if runtime.target == target => Some(runtime),
-            _ => None,
+            _ => self
+                .chat_ui
+                .parked
+                .get_mut(&target.card)
+                .filter(|runtime| runtime.target == target)
+                .map(Box::as_mut),
         }
     }
     fn chat_send(&mut self, target: Target, command: Command, clear_draft: bool) -> Task<Message> {
@@ -1778,212 +1773,66 @@ impl Cagents {
         })
     }
     pub(super) fn handle_chat_ui(&mut self, action: Action) -> Task<Message> {
+        let focus = if let Action::Switch(card) = &action {
+            self.workspace
+                .focus(*card)
+                .ok()
+                .map(|update| self.apply_viewport(update, true, false))
+        } else {
+            None
+        };
+        let action = self.handle_chat_action(action);
+        Task::batch(focus.into_iter().chain(std::iter::once(action)))
+    }
+    fn handle_chat_action(&mut self, action: Action) -> Task<Message> {
         if let Some(target) = action.mutation_target()
             && (self.chat_start_pending(target.card) || self.chat_ui.closed.contains(&target.card))
         {
             return Task::none();
         }
         match action {
-            Action::BindingInput(card, input) => {
-                if let Some(binding) = self.chat_ui.bindings.get_mut(&card) {
-                    binding.input = input;
-                    // A reader typing here has taken the question over.
-                    binding.auto = false;
-                    binding.preview = None;
-                    binding.error = None;
-                    binding.loading = false;
-                    self.chat_ui.generation = self.chat_ui.generation.wrapping_add(1).max(1);
-                    binding.target.generation = self.chat_ui.generation;
+            Action::DismissNewThread => {
+                self.chat_ui.new_thread = false;
+                if let Some(channel) = self.chat_ui.new_thread_channel.take()
+                    && self
+                        .durable
+                        .channels
+                        .iter()
+                        .any(|entry| entry.id == channel && entry.cards.is_empty())
+                {
+                    return self.delete_channel(channel);
                 }
+                return self
+                    .workspace
+                    .focused()
+                    .map(|card| {
+                        iced::widget::operation::focus(workspace_widget::card_focus_id(card))
+                            .map(cosmic::Action::App)
+                    })
+                    .unwrap_or_else(Task::none);
             }
-            Action::BindingScanned(target, result) => {
-                let Some(binding) = self.chat_ui.bindings.get_mut(&target.card) else {
-                    return Task::none();
-                };
-                // A listing adopts nothing by itself, so it is accepted even
-                // when the reader typed in the identifier field while it was
-                // in flight. Matching the whole target there left the panel
-                // reading "Reading this account's open conversations…" for as
-                // long as the card lived. A listing for a panel that was
-                // cancelled and reopened is a different request, though, and
-                // describes what the account held open before.
-                if binding.scan != target.generation {
+            Action::NewThreadModelFamily(provider) => {
+                if !self.chat_ui.new_thread {
                     return Task::none();
                 }
-                let current = binding.target == target;
-                binding.scanning = false;
-                let candidates = match result {
-                    Ok(candidates) => candidates,
-                    Err(error) => {
-                        // Nothing can be resolved from a listing that failed,
-                        // so the panel has to appear and say so.
-                        binding.auto = false;
-                        binding.error = Some(error);
-                        return Task::none();
-                    }
-                };
-                let typed = !binding.input.trim().is_empty();
-                binding.candidates = candidates;
-                // A terminal is usually looking at a conversation rooted in
-                // its own directory, so where exactly one of the account's
-                // open conversations is, that one is the conversation being
-                // switched to and is adopted without asking. Where there are
-                // two, a directory no longer identifies a thread, and the
-                // reader is the only one who can say which.
-                let directory = binding
-                    .session
-                    .terminal
-                    .as_ref()
-                    .map(|terminal| terminal.launch.working_directory.clone());
-                let mut here = binding.candidates.iter().filter(|candidate| {
-                    directory
-                        .as_ref()
-                        .is_some_and(|directory| &candidate.working_directory == directory)
-                });
-                let resolved = match (here.next(), here.next()) {
-                    (Some(only), None) => Some(only.session_id.clone()),
-                    _ => None,
-                };
-                // An identifier the terminal's own launch named, or one the
-                // reader typed, is theirs and is never overwritten.
-                if let Some(id) = resolved.filter(|_| current && !typed) {
-                    binding.input = id;
-                    return self.handle_chat_ui(Action::BindingPreview(target.card));
-                }
-                // Whatever is left is a question: the account holds several
-                // conversations here, or none, or the reader is already typing
-                // one in. The panel appears for that.
-                if !typed {
-                    binding.auto = false;
-                }
-            }
-            Action::BindingChoose(card, id) => {
-                let Some(binding) = self.chat_ui.bindings.get_mut(&card) else {
-                    return Task::none();
-                };
-                binding.input = id;
-                // A reader picking from the list is answering the question the
-                // panel asked, and the panel stays up to say what confirming
-                // that choice does.
-                binding.auto = false;
-                binding.preview = None;
-                binding.error = None;
-                binding.loading = false;
-                self.chat_ui.generation = self.chat_ui.generation.wrapping_add(1).max(1);
-                if let Some(binding) = self.chat_ui.bindings.get_mut(&card) {
-                    binding.target.generation = self.chat_ui.generation;
-                }
-                return self.handle_chat_ui(Action::BindingPreview(card));
-            }
-            Action::BindingPreview(card) => {
-                let Some(binding) = self.chat_ui.bindings.get_mut(&card) else {
-                    return Task::none();
-                };
-                if binding.loading {
-                    return Task::none();
-                }
-                let id = binding.input.trim();
-                if id.len() != 36 || uuid::Uuid::parse_str(id).is_err() {
-                    // A conversation that cannot even be named is not one this
-                    // can adopt quietly.
-                    binding.auto = false;
-                    binding.error = Some("Enter the full conversation UUID shown by /status in the intended Codex CLI.".into());
-                    return Task::none();
-                }
-                binding.session.launch.session_id = Some(id.to_owned());
-                binding.preview = None;
-                binding.error = None;
-                binding.loading = true;
-                let target = binding.target;
-                let session = binding.session.clone();
-                let source = binding.source.clone();
-                return cosmic::task::future(async move {
-                    let result =
-                        tokio::task::spawn_blocking(move || ClientHandle::preview(session, source))
-                            .await
-                            .map_err(|error| error.to_string())
-                            .and_then(|result| result);
-                    Message::ChatUi(Action::BindingPreviewed(target, result))
-                });
-            }
-            Action::BindingPreviewed(target, result) => {
-                let Some(binding) = self
-                    .chat_ui
-                    .bindings
-                    .get_mut(&target.card)
-                    .filter(|binding| binding.target == target)
-                else {
-                    return Task::none();
-                };
-                binding.loading = false;
-                let auto = binding.auto;
-                match result {
-                    Ok(preview)
-                        if binding.session.launch.session_id.as_ref()
-                            == Some(&preview.session_id) =>
-                    {
-                        binding.preview = Some(preview);
-                        // The conversation the terminal is looking at has been
-                        // named and read back by its own account's server.
-                        // Asking a reader to confirm what they already asked
-                        // for is a dialog for the sake of one.
-                        if auto {
-                            return self.handle_chat_ui(Action::BindingConfirm(target.card));
-                        }
-                    }
-                    Ok(_) => {
-                        binding.auto = false;
-                        binding.error = Some(
-                            "The preview returned a different identity; no conversation was \
-                             activated."
-                                .into(),
-                        );
-                    }
-                    Err(error) => {
-                        binding.auto = false;
-                        binding.error = Some(error);
-                    }
-                }
-            }
-            Action::BindingConfirm(card) => {
-                let Some(binding) = self
-                    .chat_ui
-                    .bindings
-                    .get(&card)
-                    .filter(|binding| binding.preview.is_some() && !binding.loading)
-                else {
-                    return Task::none();
-                };
-                if !self.card_state(card).is_some_and(|state| matches!(&state.kind, CardKind::Terminal(terminal) if terminal.id == binding.session.id && terminal.continuity.live_proof().as_ref() == Some(&binding.source))) {
-                    self.chat_ui.bindings.remove(&card);
-                    self.status = Some(TransientNotice::error("The source terminal changed; choose its conversation again."));
-                    return Task::none();
-                }
-                let session = binding.session.clone();
-                let source = binding.source.clone();
-                return self.start_chat(card, session, chat::Intent::Start, Some(source), false);
-            }
-            Action::BindingNew(card) => {
-                let Some(binding) = self.chat_ui.bindings.remove(&card) else {
-                    return Task::none();
-                };
-                // The source terminal keeps running and keeps its own
-                // conversation; this opens a second card beside it rather than
-                // taking anything over.
-                return self.new_native_chat(
-                    binding.session.launch.provider,
-                    binding
-                        .session
-                        .terminal
-                        .as_ref()
-                        .map(|terminal| terminal.launch.working_directory.clone()),
-                );
-            }
-            Action::BindingCancel(card) => {
-                self.chat_ui.bindings.remove(&card);
+                self.chat_ui.new_thread = false;
+                self.chat_ui.new_thread_channel = None;
+                return self.new_native_chat(provider, None);
             }
             Action::Switch(card) => {
                 if self.chat_start_pending(card) {
+                    return Task::none();
+                }
+                if let Some(mut runtime) = self.chat_ui.parked.remove(&card) {
+                    runtime.show(true);
+                    runtime.refresh();
+                    let session = runtime.session.clone();
+                    if let Some(CardRuntime::Terminal(terminal)) =
+                        self.cards.insert(card, CardRuntime::Chat(runtime))
+                    {
+                        self.begin_terminal_teardown(terminal);
+                    }
+                    self.commit_chat_session(card, session);
                     return Task::none();
                 }
                 match self.card_state(card).map(|state| &state.kind) {
@@ -1996,7 +1845,7 @@ impl Cagents {
                                 return Task::none();
                             }
                         };
-                        if source.is_none() {
+                        if source.is_none() && !session.owns_codex_listener() {
                             // Nothing is running, so there is nothing to take
                             // over and no handoff to authorize: the same
                             // configuration opens a new conversation natively.
@@ -2046,69 +1895,8 @@ impl Cagents {
                                 false,
                             );
                         }
-                        if session.launch.provider == Provider::Codex {
-                            self.chat_ui.generation =
-                                self.chat_ui.generation.wrapping_add(1).max(1);
-                            let target = Target {
-                                card,
-                                generation: self.chat_ui.generation,
-                            };
-                            let input = session.launch.session_id.clone().unwrap_or_default();
-                            let named = !input.is_empty();
-                            let source = source.expect("checked source");
-                            self.chat_ui.bindings.insert(
-                                card,
-                                Binding {
-                                    target,
-                                    session: session.clone(),
-                                    source: source.clone(),
-                                    input,
-                                    candidates: Vec::new(),
-                                    scanning: true,
-                                    scan: target.generation,
-                                    preview: None,
-                                    loading: false,
-                                    auto: true,
-                                    error: None,
-                                },
-                            );
-                            // The account's shared server knows which
-                            // conversations it is holding open, so a reader
-                            // who has to choose chooses from those rather than
-                            // copying an identifier out of another program.
-                            // The listing is read even when the terminal's own
-                            // launch named a conversation, because it is what
-                            // the panel falls back to if that name no longer
-                            // resolves.
-                            let scan = cosmic::task::future(async move {
-                                let result = tokio::task::spawn_blocking(move || {
-                                    ClientHandle::candidates(session, source)
-                                })
-                                .await
-                                .map_err(|error| error.to_string())
-                                .and_then(|result| result);
-                                Message::ChatUi(Action::BindingScanned(target, result))
-                            });
-                            // A terminal whose launch recorded its conversation
-                            // has already answered the question this panel
-                            // exists to ask, so that identity is read back at
-                            // once rather than after a listing the reader does
-                            // not need.
-                            let named = named
-                                .then(|| self.handle_chat_ui(Action::BindingPreview(card)))
-                                .unwrap_or_else(Task::none);
-                            return match self.workspace.focus(card) {
-                                Ok(update) => Task::batch([
-                                    self.apply_viewport(update, true, false),
-                                    scan,
-                                    named,
-                                ]),
-                                Err(error) => {
-                                    self.status = Some(TransientNotice::error(error.to_string()));
-                                    Task::none()
-                                }
-                            };
-                        }
+                        // The daemon reattaches its exact managed thread automatically.
+                        // Unmanaged terminals are never matched by directory or recency.
                         let terminate = session.launch.provider != Provider::Codex;
                         return self.start_chat(
                             card,
@@ -2122,7 +1910,9 @@ impl Cagents {
                         let Some(CardRuntime::Chat(runtime)) = self.cards.get(&card) else {
                             return Task::none();
                         };
-                        if let Some(reason) = runtime.transition_blocker() {
+                        if runtime.session.launch.provider != Provider::Codex
+                            && let Some(reason) = runtime.transition_blocker()
+                        {
                             self.status = Some(TransientNotice::error(reason));
                             return Task::none();
                         }
@@ -2137,21 +1927,14 @@ impl Cagents {
                         };
                         let target = runtime.target;
                         let handle = runtime.handle.clone();
-                        let detach = session.launch.provider == Provider::Codex
-                            && session
-                                .terminal
-                                .as_ref()
-                                .is_some_and(|source| source.id == terminal.id);
+                        let _ = terminal;
                         self.chat_ui.handoffs.insert(target);
                         return cosmic::task::future(async move {
-                            let result = if detach {
-                                Ok(terminal)
-                            } else {
+                            let result =
                                 tokio::task::spawn_blocking(move || handle.return_terminal())
                                     .await
                                     .map_err(|error| error.to_string())
-                                    .and_then(|result| result)
-                            };
+                                    .and_then(|result| result);
                             Message::ChatUi(Action::HandoffFinished(target, result))
                         });
                     }
@@ -2229,6 +2012,11 @@ impl Cagents {
                                 visible,
                                 self.settings.editor_syntax_theme,
                             );
+                            if attempt.session.launch.session_id.is_none()
+                                && attempt.session.terminal.is_none()
+                            {
+                                runtime.model_picker = Some(String::new());
+                            }
                             // Whatever was typed before this card last left the
                             // chat surface comes back with it.
                             if let Some(draft) = self.chat_ui.drafts.remove(&target.card)
@@ -2308,6 +2096,15 @@ impl Cagents {
                 }
             }
             Action::Wake(target, wake) => {
+                if let Some(runtime) = self.chat_ui.parked.get_mut(&target.card)
+                    && runtime.target == target
+                {
+                    if let Wake::Disconnected(error) = wake {
+                        runtime.disconnected = true;
+                        runtime.error = Some(error);
+                    }
+                    return Task::none();
+                }
                 let Some(runtime) = self.chat_runtime_mut(target) else {
                     return Task::none();
                 };
@@ -2566,24 +2363,16 @@ impl Cagents {
                     return iced::clipboard::write(text).map(cosmic::Action::App);
                 }
             }
-            Action::OpenUrl(raw) => {
-                return cosmic::task::future(async move {
-                    let result = match Url::parse(&raw) {
-                        Ok(url) if matches!(url.scheme(), "https" | "http") => {
-                            open_system_url(url).await
-                        }
-                        _ => Err(
-                            "Only explicit HTTP and HTTPS links can be opened from chat.".into(),
-                        ),
-                    };
-                    Message::ChatUi(Action::UrlFinished(result))
-                });
-            }
-            Action::UrlFinished(result) => {
-                if let Err(error) = result {
-                    self.status = Some(TransientNotice::error(error));
+            Action::OpenUrl(raw) => match Url::parse(&raw) {
+                Ok(url) if matches!(url.scheme(), "https" | "http") => {
+                    return self.open_clicked_link(url);
                 }
-            }
+                _ => {
+                    self.status = Some(TransientNotice::error(
+                        "Only explicit HTTP and HTTPS links can be opened from chat.",
+                    ))
+                }
+            },
             Action::Attach(target) => {
                 let Some(runtime) = self.chat_runtime_mut(target) else {
                     return Task::none();
@@ -2850,13 +2639,26 @@ impl Cagents {
                 let Some(runtime) = self.chat_runtime_mut(target) else {
                     return Task::none();
                 };
-                if let Some(reason) = runtime.transition_blocker() {
+                if runtime.session.launch.provider != Provider::Codex
+                    && let Some(reason) = runtime.transition_blocker()
+                {
                     self.status = Some(TransientNotice::error(reason));
                     return Task::none();
                 }
                 runtime.session.launch.session_id = runtime.handle.snapshot().session_id.clone();
+                let preserve = runtime.session.launch.provider == Provider::Codex
+                    && !runtime.handle.snapshot().exited;
+                if preserve {
+                    runtime.session.terminal = Some(terminal.clone());
+                }
                 let session = runtime.session.clone();
                 self.commit_chat_session(target.card, session);
+                if preserve
+                    && let Some(CardRuntime::Chat(mut runtime)) = self.cards.remove(&target.card)
+                {
+                    runtime.show(false);
+                    self.chat_ui.parked.insert(target.card, runtime);
+                }
                 // Enqueue the returned live proof checkpoint. The host retains
                 // the transition receipt independently of this UI attachment.
                 let task = self.finish_chat_terminal_handoff(target.card, terminal);
@@ -3058,96 +2860,27 @@ mod tests {
         );
     }
 
-    /// A conversation that is not in doubt must not be answered with a
-    /// question. Switching a Codex terminal whose account holds exactly one
-    /// conversation in that terminal's own worktree adopts it: no chooser, no
-    /// confirmation. Two conversations rooted in the same directory is a real
-    /// question - a directory does not identify a thread - so the chooser
-    /// appears for that one and adopts nothing by itself.
     #[test]
-    fn an_unambiguous_codex_conversation_is_adopted_without_being_asked_about() {
-        use crate::model::{BootId, HostIncarnation, HostSessionId};
-
-        let directory = std::path::PathBuf::from("/tmp");
-        let conversation = |index: u128| uuid::Uuid::from_u128(index).to_string();
-        let candidate = |session_id: String| chat::BindingCandidate {
-            session_id,
-            title: "Conversation".into(),
-            working_directory: directory.clone(),
+    fn switching_a_terminal_never_opens_a_conversation_chooser() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let mut card = crate::app::tests::terminal_card_state();
+        let id = card.id;
+        let CardKind::Terminal(terminal) = &mut card.kind else {
+            unreachable!()
         };
-        // Everything up to the account's answer is the same in both cases, so
-        // the difference the test is about is the listing itself.
-        let scanned = |candidates: Vec<chat::BindingCandidate>| {
-            let mut app = crate::app::tests::context_inspector_test_app(false);
-            let mut card = crate::app::tests::terminal_card_state();
-            let id = card.id;
-            let CardKind::Terminal(terminal) = &mut card.kind else {
-                unreachable!("the fixture is a terminal card");
-            };
-            terminal.launch.program = "codex".into();
-            terminal.continuity = TerminalContinuity::Live {
-                host_session_id: HostSessionId::new("codex-host"),
-                boot_id: BootId::new("boot"),
-                host_incarnation: HostIncarnation::new("incarnation"),
-            };
-            app.durable = Arc::new(WorkspaceState {
-                focused: Some(id),
-                cards: vec![card],
-                ..WorkspaceState::default()
-            });
-            app.workspace = Cagents::rebuild_workspace(&app.durable);
-            app.workspace.resize_viewport(600.0);
-            let _ = app.update(Message::ChatUi(Action::Switch(id)));
-            let target = app
-                .chat_ui
-                .bindings
-                .get(&id)
-                .expect("switching a live Codex terminal opens a binding")
-                .target;
-            assert!(
-                app.chat_binding_view(id).is_none(),
-                "the chooser stays off screen while the conversation is still being looked up"
-            );
-            let _ = app.update(Message::ChatUi(Action::BindingScanned(
-                target,
-                Ok(candidates),
-            )));
-            (app, id, target)
+        terminal.launch.program = "codex".into();
+        terminal.continuity = TerminalContinuity::Live {
+            host_session_id: crate::model::HostSessionId::new("host"),
+            boot_id: crate::model::BootId::new("boot"),
+            host_incarnation: crate::model::HostIncarnation::new("incarnation"),
         };
-
-        let only = conversation(1);
-        let (mut app, card, target) = scanned(vec![candidate(only.clone())]);
-        assert!(
-            app.chat_binding_view(card).is_none(),
-            "one conversation in this worktree is the answer, not a choice"
-        );
-        let _ = app.update(Message::ChatUi(Action::BindingPreviewed(
-            target,
-            Ok(chat::BindingPreview {
-                token: "capability".into(),
-                session_id: only.clone(),
-                title: "Conversation".into(),
-                working_directory: directory.clone(),
-            }),
-        )));
-        assert!(
-            app.chat_start_pending(card),
-            "the resolved conversation is adopted without a confirmation step"
-        );
-        assert!(
-            app.chat_binding_view(card).is_none(),
-            "an adopted conversation leaves no panel behind"
-        );
-
-        let (app, card, _) = scanned(vec![candidate(only), candidate(conversation(2))]);
-        assert!(
-            app.chat_binding_view(card).is_some(),
-            "two conversations in the same worktree is a question only the reader can answer"
-        );
-        assert!(
-            !app.chat_start_pending(card),
-            "an ambiguous listing adopts nothing by itself"
-        );
+        app.durable = Arc::new(WorkspaceState {
+            focused: Some(id),
+            cards: vec![card],
+            ..WorkspaceState::default()
+        });
+        app.workspace = Cagents::rebuild_workspace(&app.durable);
+        let _ = app.update(Message::ChatUi(Action::Switch(id)));
     }
 
     /// Picking a skill replaces the word being typed and nothing else, for any

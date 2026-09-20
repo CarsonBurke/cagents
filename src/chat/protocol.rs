@@ -10,6 +10,10 @@ pub mod omp;
 #[derive(Debug, Clone)]
 pub enum TransportSpec {
     JsonLines,
+    /// A supervised provider server that both native and CLI views can join.
+    OwnedUnixWebSocket {
+        socket: PathBuf,
+    },
     /// Join only the exact socket checked by the provider adapter.
     UnixWebSocket {
         socket: PathBuf,

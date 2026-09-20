@@ -1,6 +1,7 @@
 use super::*;
 use crate::github::{PullRequest, PullRequestComment, PullRequestInspection};
 use crate::repository::HeadState;
+use cosmic::widget::markdown;
 
 type ActionTask = iced::Task<Action>;
 
@@ -11,6 +12,13 @@ pub struct Target {
     pub branch: String,
     pub head_oid: Option<String>,
     pub repository: GitHubRepoKey,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum Section {
+    Description,
+    Checks,
+    Discussion,
 }
 
 #[derive(Debug, Clone)]
@@ -24,16 +32,14 @@ pub enum Action {
     ),
     Filter(String),
     ToggleResolved,
+    ToggleSection(Section),
     OpenUrl(Url),
-    UrlFinished(u64, Result<(), String>),
+    OpenMarkdownLink(String),
 }
 
 impl Action {
     pub(super) fn allowed_while_modal(&self) -> bool {
-        matches!(
-            self,
-            Self::Resolved(..) | Self::Loaded(..) | Self::UrlFinished(..)
-        )
+        matches!(self, Self::Resolved(..) | Self::Loaded(..))
     }
 }
 
@@ -52,6 +58,10 @@ pub struct State {
     link_error: Option<String>,
     filter: String,
     hide_resolved: bool,
+    description_open: bool,
+    description: Vec<markdown::Item>,
+    checks_collapsed: bool,
+    discussion_collapsed: bool,
 }
 
 impl State {
@@ -77,6 +87,7 @@ impl State {
         self.loaded = false;
         self.loading = false;
         self.filter.clear();
+        self.description.clear();
         self.refresh()
     }
 
@@ -150,6 +161,13 @@ impl State {
                         return ActionTask::none();
                     }
                 };
+                self.description = markdown::parse(
+                    pull_request
+                        .body
+                        .as_deref()
+                        .unwrap_or("No description provided."),
+                )
+                .collect();
                 self.pull_request = Some(Arc::clone(&pull_request));
                 self.preview = None;
                 let cancellation = self.cancellation.clone();
@@ -184,6 +202,14 @@ impl State {
                 self.loaded = true;
                 match result {
                     Ok(inspection) => {
+                        self.description = markdown::parse(
+                            inspection
+                                .as_ref()
+                                .and_then(|inspection| inspection.pull_request.body.as_deref())
+                                .filter(|body| !body.is_empty())
+                                .unwrap_or("No description provided."),
+                        )
+                        .collect();
                         self.pull_request = inspection
                             .as_ref()
                             .map(|inspection| Arc::new(inspection.pull_request.clone()));
@@ -192,32 +218,15 @@ impl State {
                     Err(error) => self.error = Some(error),
                 }
             }
+            Action::ToggleSection(section) => match section {
+                Section::Description => self.description_open = !self.description_open,
+                Section::Checks => self.checks_collapsed = !self.checks_collapsed,
+                Section::Discussion => self.discussion_collapsed = !self.discussion_collapsed,
+            },
             Action::Filter(filter) => self.filter = filter,
             Action::ToggleResolved => self.hide_resolved = !self.hide_resolved,
-            Action::OpenUrl(url) => {
-                let generation = self.generation;
-                return ActionTask::perform(
-                    async move {
-                        let result = if matches!(url.scheme(), "https" | "http")
-                            && url.username().is_empty()
-                            && url.password().is_none()
-                        {
-                            open_system_url(url).await
-                        } else {
-                            Err(
-                                "Only HTTP and HTTPS links without credentials can be opened."
-                                    .into(),
-                            )
-                        };
-                        Action::UrlFinished(generation, result)
-                    },
-                    |action| action,
-                );
-            }
-            Action::UrlFinished(generation, result) if generation == self.generation => {
-                self.link_error = result.err();
-            }
-            Action::UrlFinished(..) => {}
+            // Link routing belongs to the application, which owns browser preferences.
+            Action::OpenUrl(_) | Action::OpenMarkdownLink(_) => {}
         }
         ActionTask::none()
     }
@@ -235,7 +244,7 @@ impl Drop for State {
 
 fn verify_local_head(target: &Target, cancellation: &CancellationToken) -> Result<(), String> {
     let status = RepositoryService::system("git")
-        .status(&target.worktree, cancellation)
+        .status_with_untracked(&target.worktree, false, cancellation)
         .map_err(|error| error.to_string())?;
     let matches = match status.head {
         HeadState::Branch { name, oid } => {
@@ -254,7 +263,9 @@ fn verify_local_head(target: &Target, cancellation: &CancellationToken) -> Resul
 }
 
 fn link<'a>(label: &'a str, url: &Url) -> Element<'a, Action> {
-    widget::button::text(label)
+    widget::button::custom(design::caption(label))
+        .class(crate::ui_controls::control_style(false, None))
+        .padding([4, 8])
         .on_press(Action::OpenUrl(url.clone()))
         .into()
 }
@@ -264,20 +275,78 @@ fn comment<'a>(comment: &'a PullRequestComment, reply: bool) -> Element<'a, Acti
         .author
         .as_ref()
         .map_or("Deleted account", |author| author.login.as_str());
-    widget::column::with_children(vec![
-        design::caption(format!(
-            "{}{} · {}",
-            if reply { "Reply · " } else { "" },
-            author,
-            comment.created_at
-        ))
-        .into(),
-        widget::text::body(&comment.body).width(Length::Fill).into(),
-        link("Open comment", &comment.url),
-    ])
-    .spacing(4)
+    widget::container(
+        widget::column::with_children(vec![
+            widget::row::with_children(vec![
+                design::heading(author).width(Length::Fill).into(),
+                design::caption(comment.created_at.get(..10).unwrap_or(&comment.created_at)).into(),
+                crate::ui_controls::compact_icon_control(
+                    crate::ui_controls::symbolic_icon("external-link-symbolic"),
+                    "Open comment on GitHub",
+                    Some(Action::OpenUrl(comment.url.clone())),
+                )
+                .into(),
+            ])
+            .align_y(Alignment::Center)
+            .spacing(4)
+            .into(),
+            design::body(&comment.body).width(Length::Fill).into(),
+        ])
+        .spacing(4)
+        .width(Length::Fill),
+    )
+    .padding(cosmic::iced::Padding {
+        top: 4.,
+        right: 0.,
+        bottom: 8.,
+        left: if reply { 12. } else { 0. },
+    })
     .width(Length::Fill)
     .into()
+}
+
+fn section_header(
+    label: impl Into<String>,
+    section: Section,
+    open: bool,
+) -> Element<'static, Action> {
+    widget::button::custom(
+        widget::row::with_children(vec![
+            widget::icon::from_name(if open {
+                "go-down-symbolic"
+            } else {
+                "go-next-symbolic"
+            })
+            .size(design::ROW_ICON_SIZE)
+            .into(),
+            design::heading(label.into()).width(Length::Fill).into(),
+        ])
+        .spacing(4)
+        .align_y(Alignment::Center),
+    )
+    .class(crate::ui_controls::control_style(false, None))
+    .height(design::DENSE_ROW_HEIGHT)
+    .padding([0, 4])
+    .width(Length::Fill)
+    .on_press(Action::ToggleSection(section))
+    .into()
+}
+
+fn readable_state(value: &str) -> String {
+    value
+        .split('_')
+        .filter(|word| !word.is_empty())
+        .map(|word| {
+            let mut chars = word.chars();
+            chars
+                .next()
+                .map(|first| {
+                    first.to_uppercase().collect::<String>() + &chars.as_str().to_lowercase()
+                })
+                .unwrap_or_default()
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 fn comment_matches(comment: &PullRequestComment, filter: &str) -> bool {
@@ -290,21 +359,29 @@ fn comment_matches(comment: &PullRequestComment, filter: &str) -> bool {
 }
 
 pub fn view(state: &State) -> Element<'_, Action> {
-    let mut children: Vec<Element<'_, Action>> = vec![
-        widget::row::with_children(vec![
-            widget::text::title4("Pull request")
-                .width(Length::Fill)
-                .into(),
-            widget::button::text("Refresh")
-                .on_press_maybe(
-                    (state.target.is_some() && !state.loading).then_some(Action::Refresh),
-                )
-                .into(),
-        ])
-        .spacing(8)
-        .align_y(Alignment::Center)
+    let header = widget::row::with_children(vec![
+        widget::icon::from_name("pull-request-symbolic")
+            .size(design::ROW_ICON_SIZE)
+            .into(),
+        design::heading(state.pull_request.as_ref().map_or_else(
+            || "Pull request".to_owned(),
+            |pr| format!("Pull request #{}", pr.number),
+        ))
+        .width(Length::Fill)
         .into(),
-    ];
+        crate::ui_controls::icon_control(
+            crate::ui_controls::symbolic_icon("view-refresh-symbolic"),
+            "Refresh pull request",
+            false,
+            state.target.is_some() && !state.loading,
+            Some(Action::Refresh),
+        )
+        .into(),
+    ])
+    .spacing(4)
+    .align_y(Alignment::Center)
+    .height(design::HEADER_HEIGHT);
+    let mut children: Vec<Element<'_, Action>> = Vec::new();
     if let Some(target) = &state.target {
         children.push(
             crate::design::caption(format!(
@@ -316,7 +393,7 @@ pub fn view(state: &State) -> Element<'_, Action> {
         );
     } else {
         children.push(
-            widget::text::body(
+            design::body(
                 state
                     .unavailable
                     .as_deref()
@@ -332,26 +409,26 @@ pub fn view(state: &State) -> Element<'_, Action> {
         children.push(crate::design::caption("Loading pull request…").into());
     }
     if let Some(error) = &state.error {
-        children.push(widget::text::body(format!("Unable to load pull request: {error}")).into());
+        children.push(design::body(format!("Unable to load pull request: {error}")).into());
     }
     if let Some(error) = &state.link_error {
-        children.push(widget::text::body(format!("Unable to open link: {error}")).into());
+        children.push(design::body(format!("Unable to open link: {error}")).into());
     }
     if state.pull_request.is_none()
         && let Some(pr) = &state.preview
     {
-        children.push(widget::text::title4(&pr.title).into());
+        children.push(design::heading(&pr.title).into());
         children.push(link("Open pull request on GitHub", &pr.url));
     }
     if state.loaded && !state.loading && state.error.is_none() && state.inspection.is_none() {
-        children.push(widget::text::body("No pull request matches this worktree branch.").into());
+        children.push(design::body("No pull request matches this worktree branch.").into());
     }
     if let Some(pr) = state.pull_request.as_deref() {
-        children.push(widget::text::title4(format!("#{} {}", pr.number, pr.title)).into());
+        children.push(design::heading(&pr.title).width(Length::Fill).into());
         children.push(
             crate::design::caption(format!(
                 "{}{} · {} → {}",
-                pr.state.0,
+                readable_state(&pr.state.0),
                 if pr.is_draft { " · Draft" } else { "" },
                 pr.head_ref_name,
                 pr.base_ref_name
@@ -365,174 +442,279 @@ pub fn view(state: &State) -> Element<'_, Action> {
             .and_then(|target| target.head_oid.as_deref())
             != Some(pr.head_ref_oid.as_str())
         {
-            children.push(widget::text::body("Local HEAD differs from the pull request head. Checks below apply to the remote pull request commit.").into());
+            children.push(design::body("Local HEAD differs from the pull request head. Checks below apply to the remote pull request commit.").into());
         }
         children.push(
             crate::design::caption(format!(
                 "Review decision: {}",
-                pr.review_decision
-                    .as_ref()
-                    .map(|decision| decision.0.as_str())
-                    .filter(|value| !value.is_empty())
-                    .unwrap_or("No decision reported")
+                readable_state(
+                    pr.review_decision
+                        .as_ref()
+                        .map(|decision| decision.0.as_str())
+                        .filter(|value| !value.is_empty())
+                        .unwrap_or("No decision reported")
+                )
             ))
             .into(),
         );
-        children.push(
-            widget::text::body(
-                pr.body
-                    .as_deref()
-                    .filter(|body| !body.is_empty())
-                    .unwrap_or("No description provided."),
-            )
-            .width(Length::Fill)
-            .into(),
-        );
+        children.push(section_header(
+            "Description",
+            Section::Description,
+            state.description_open,
+        ));
+        if state.description_open {
+            let theme = cosmic::theme::active();
+            let settings = markdown::Settings {
+                h1_size: design::TEXT_HEADING.into(),
+                h2_size: design::TEXT_HEADING.into(),
+                h3_size: design::TEXT_HEADING.into(),
+                h4_size: design::TEXT_HEADING.into(),
+                spacing: 8.into(),
+                code_size: design::TEXT_CAPTION.into(),
+                ..markdown::Settings::with_text_size(
+                    design::TEXT_BODY,
+                    if theme.theme_type.is_dark() {
+                        iced::Theme::Dark
+                    } else {
+                        iced::Theme::Light
+                    },
+                )
+            };
+            children.push(
+                markdown::view(&state.description, settings)
+                    .map(|uri| Action::OpenMarkdownLink(uri.to_string())),
+            );
+        }
     }
     if let Some(inspection) = &state.inspection {
-        children.push(widget::text::title4("Checks").into());
-        match &inspection.checks {
-            Ok(checks) if checks.is_empty() => {
-                children.push(widget::text::body("No checks reported.").into())
-            }
-            Ok(checks) => {
-                for check in checks {
-                    let mut check_rows = vec![
-                        widget::text::body(format!("{} · {}", check.name, check.state.0)).into(),
-                        design::caption(format!(
-                            "{}{}{}",
-                            check.bucket.0,
-                            if check.workflow.is_empty() {
-                                ""
-                            } else {
-                                " · "
-                            },
-                            check.workflow
-                        ))
-                        .into(),
-                    ];
-                    if !check.description.is_empty() {
-                        check_rows.push(
-                            widget::text::body(&check.description)
-                                .width(Length::Fill)
-                                .into(),
+        let checks_label = inspection.checks.as_ref().map_or_else(
+            |_| "Checks".to_owned(),
+            |checks| format!("Checks ({})", checks.len()),
+        );
+        children.push(section_header(
+            checks_label,
+            Section::Checks,
+            !state.checks_collapsed,
+        ));
+        if !state.checks_collapsed {
+            match &inspection.checks {
+                Ok(checks) if checks.is_empty() => {
+                    children.push(design::body("No checks reported.").into())
+                }
+                Ok(checks) => {
+                    for check in checks {
+                        let (symbol, tone): (_, fn(&cosmic::Theme) -> cosmic::iced::Color) =
+                            match check.bucket.0.as_str() {
+                                "pass" => ("emblem-ok-symbolic", design::success_color),
+                                "fail" => ("dialog-error-symbolic", design::destructive_color),
+                                "pending" => ("content-loading-symbolic", design::warning_color),
+                                _ => ("dialog-information-symbolic", design::muted_color),
+                            };
+                        let mut content = widget::column::with_children(vec![
+                            design::body(&check.name).width(Length::Fill).into(),
+                            design::caption(format!(
+                                "{}{}{}",
+                                readable_state(&check.state.0),
+                                if check.workflow.is_empty() {
+                                    ""
+                                } else {
+                                    " · "
+                                },
+                                check.workflow
+                            ))
+                            .width(Length::Fill)
+                            .into(),
+                        ])
+                        .spacing(0)
+                        .width(Length::Fill);
+                        if !check.description.is_empty() {
+                            content = content
+                                .push(design::caption(&check.description).width(Length::Fill));
+                        }
+                        children.push(
+                            widget::button::custom(
+                                widget::row::with_children(vec![
+                                    widget::icon::from_name(symbol)
+                                        .size(design::ROW_ICON_SIZE)
+                                        .into(),
+                                    content.into(),
+                                    widget::icon::from_name("external-link-symbolic")
+                                        .size(design::COMPACT_ICON_SIZE)
+                                        .into(),
+                                ])
+                                .spacing(8)
+                                .align_y(Alignment::Center),
+                            )
+                            .class(crate::ui_controls::control_style(
+                                false,
+                                Some(design::Tone::Themed(tone)),
+                            ))
+                            .padding([4, 8])
+                            .width(Length::Fill)
+                            .on_press(Action::OpenUrl(check.link.clone()))
+                            .into(),
                         );
                     }
-                    check_rows.push(link("Open check details / output", &check.link));
-                    children.push(widget::column::with_children(check_rows).spacing(4).into());
                 }
-            }
-            Err(error) => {
-                children.push(widget::text::body(format!("Checks unavailable: {error}")).into())
+                Err(error) => {
+                    children.push(design::body(format!("Checks unavailable: {error}")).into())
+                }
             }
         }
-        children.push(widget::text::title4("Discussion").into());
-        match &inspection.conversation {
-            Err(error) => {
-                children.push(widget::text::body(format!("Discussion unavailable: {error}")).into())
-            }
-            Ok(conversation) => {
-                children.push(
-                    widget::text_input("Filter by author, text, or file", &state.filter)
-                        .on_input(Action::Filter)
-                        .into(),
-                );
-                children.push(
-                    widget::button::text(if state.hide_resolved {
-                        "Show resolved threads"
-                    } else {
-                        "Hide resolved threads"
-                    })
-                    .on_press(Action::ToggleResolved)
-                    .into(),
-                );
-                let filter = state.filter.to_lowercase();
-                let mut shown = 0;
-                for thread in &conversation.threads {
-                    if state.hide_resolved && thread.resolved {
-                        continue;
-                    }
-                    if !filter.is_empty()
-                        && !thread.path.to_lowercase().contains(&filter)
-                        && !thread
-                            .comments
-                            .iter()
-                            .any(|comment| comment_matches(comment, &filter))
-                    {
-                        continue;
-                    }
-                    shown += 1;
-                    let location = thread.line.map_or_else(
-                        || thread.path.clone(),
-                        |line| format!("{}:{line}", thread.path),
+        children.push(section_header(
+            "Discussion",
+            Section::Discussion,
+            !state.discussion_collapsed,
+        ));
+        if !state.discussion_collapsed {
+            match &inspection.conversation {
+                Err(error) => {
+                    children.push(design::body(format!("Discussion unavailable: {error}")).into())
+                }
+                Ok(conversation) => {
+                    children.push(
+                        widget::text_input("Filter by author, text, or file", &state.filter)
+                            .on_input(Action::Filter)
+                            .into(),
                     );
                     children.push(
-                        widget::text::body(format!(
-                            "{location} · {}{}",
-                            if thread.resolved {
-                                "Resolved"
-                            } else {
-                                "Unresolved"
-                            },
-                            if thread.outdated { " · Outdated" } else { "" }
-                        ))
-                        .into(),
-                    );
-                    // Preserve the whole matching thread so replies retain context.
-                    for (index, item) in thread.comments.iter().enumerate() {
-                        children.push(comment(item, index != 0));
-                    }
-                    if thread.truncated {
-                        children.push(crate::design::caption("Showing the first 100 comments in this thread. Open its comment link for the full discussion.").into());
-                    }
-                }
-                children.push(widget::text::title4("Reviews").into());
-                for review in &conversation.reviews {
-                    if comment_matches(&review.comment, &filter) {
-                        shown += 1;
-                        children.push(crate::design::caption(&review.state.0).into());
-                        children.push(comment(&review.comment, false));
-                    }
-                }
-                children.push(widget::text::title4("Issue comments").into());
-                for item in &conversation.comments {
-                    if comment_matches(item, &filter) {
-                        shown += 1;
-                        children.push(comment(item, false));
-                    }
-                }
-                if shown == 0 {
-                    children.push(
-                        widget::text::body(if filter.is_empty() && !state.hide_resolved {
-                            "No discussion comments reported."
+                        widget::button::custom(design::caption(if state.hide_resolved {
+                            "Show resolved threads"
                         } else {
-                            "No comments match these filters."
-                        })
+                            "Hide resolved threads"
+                        }))
+                        .class(crate::ui_controls::control_style(state.hide_resolved, None))
+                        .height(design::DENSE_ROW_HEIGHT)
+                        .on_press(Action::ToggleResolved)
                         .into(),
                     );
-                }
-                if conversation.truncated {
-                    children.push(crate::design::caption("Showing up to 200 review threads, 200 reviews, and 200 issue comments. Open the pull request for the full discussion.").into());
+                    let filter = state.filter.to_lowercase();
+                    let mut shown = 0;
+                    for thread in &conversation.threads {
+                        if state.hide_resolved && thread.resolved {
+                            continue;
+                        }
+                        if !filter.is_empty()
+                            && !thread.path.to_lowercase().contains(&filter)
+                            && !thread
+                                .comments
+                                .iter()
+                                .any(|comment| comment_matches(comment, &filter))
+                        {
+                            continue;
+                        }
+                        shown += 1;
+                        children.push(widget::divider::horizontal::default().into());
+                        let location = thread.line.map_or_else(
+                            || thread.path.clone(),
+                            |line| format!("{}:{line}", thread.path),
+                        );
+                        children.push(
+                            design::body(format!(
+                                "{location} · {}{}",
+                                if thread.resolved {
+                                    "Resolved"
+                                } else {
+                                    "Unresolved"
+                                },
+                                if thread.outdated { " · Outdated" } else { "" }
+                            ))
+                            .into(),
+                        );
+                        // Preserve the whole matching thread so replies retain context.
+                        for (index, item) in thread.comments.iter().enumerate() {
+                            children.push(comment(item, index != 0));
+                        }
+                        if thread.truncated {
+                            children.push(crate::design::caption("Showing the first 100 comments in this thread. Open its comment link for the full discussion.").into());
+                        }
+                    }
+                    if !conversation.reviews.is_empty() {
+                        children.push(design::heading("Reviews").into());
+                    }
+                    for review in &conversation.reviews {
+                        if comment_matches(&review.comment, &filter) {
+                            shown += 1;
+                            children.push(crate::design::caption(&review.state.0).into());
+                            children.push(comment(&review.comment, false));
+                        }
+                    }
+                    if !conversation.comments.is_empty() {
+                        children.push(design::heading("Comments").into());
+                    }
+                    for item in &conversation.comments {
+                        if comment_matches(item, &filter) {
+                            shown += 1;
+                            children.push(comment(item, false));
+                        }
+                    }
+                    if shown == 0 {
+                        children.push(
+                            design::body(if filter.is_empty() && !state.hide_resolved {
+                                "No discussion comments reported."
+                            } else {
+                                "No comments match these filters."
+                            })
+                            .into(),
+                        );
+                    }
+                    if conversation.truncated {
+                        children.push(crate::design::caption("Showing up to 200 review threads, 200 reviews, and 200 issue comments. Open the pull request for the full discussion.").into());
+                    }
                 }
             }
         }
     }
-    widget::scrollable(
+    let body = widget::scrollable(
         widget::column::with_children(children)
-            .spacing(12)
-            .padding(12)
+            .spacing(8)
+            .padding(design::with_vertical_rail(cosmic::iced::Padding::from([
+                4, 8,
+            ])))
             .width(Length::Fill),
     )
     .direction(cosmic::iced::widget::scrollable::Direction::Vertical(
         crate::design::scrollbar(),
     ))
     .height(Length::Fill)
+    .width(Length::Fill);
+    widget::column::with_children(vec![
+        widget::container(header)
+            .padding([0, 8])
+            .width(Length::Fill)
+            .into(),
+        widget::divider::horizontal::default().into(),
+        body.into(),
+    ])
     .width(Length::Fill)
+    .height(Length::Fill)
     .into()
 }
 
 impl Cagents {
     pub(super) fn handle_pull_request_ui(&mut self, action: Action) -> Task<Message> {
+        let url = match &action {
+            Action::OpenUrl(url) => Some(Ok(url.clone())),
+            Action::OpenMarkdownLink(uri) => Some(Url::parse(uri)),
+            _ => None,
+        };
+        if let Some(url) = url {
+            return match url {
+                Ok(url)
+                    if matches!(url.scheme(), "https" | "http")
+                        && url.username().is_empty()
+                        && url.password().is_none() =>
+                {
+                    self.pull_request_inspector.link_error = None;
+                    self.open_clicked_link(url)
+                }
+                _ => {
+                    self.pull_request_inspector.link_error =
+                        Some("Only HTTP and HTTPS links without credentials can be opened.".into());
+                    Task::none()
+                }
+            };
+        }
         let accepted = match &action {
             Action::Resolved(target, generation, Ok(_))
             | Action::Loaded(target, generation, Ok(_)) => {

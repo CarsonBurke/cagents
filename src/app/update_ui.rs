@@ -51,6 +51,9 @@ impl Cagents {
         {
             return Some("Finish pending operations and dialogs before updating.");
         }
+        if let Some(reason) = self.parked_chat_restart_blocker() {
+            return Some(reason);
+        }
         for runtime in self.cards.values() {
             match runtime {
                 CardRuntime::Repository(repository) if repository.blocks_navigation() => {

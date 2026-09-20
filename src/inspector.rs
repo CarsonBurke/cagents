@@ -619,8 +619,8 @@ pub fn model_for_card(
                 .primary(),
             );
             actions.push(Action::new(
-                "Open copy",
-                "list-add-symbolic",
+                "Open URL",
+                "internet-web-browser-symbolic",
                 InspectorAction::OpenBrowser(session.current_url.clone()),
             ));
         }

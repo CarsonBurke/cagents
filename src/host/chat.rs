@@ -447,7 +447,7 @@ fn resolve_source(
     }).or_else(|| {
         (provider == Provider::Codex && selection_authorized).then(|| selected.map(str::to_owned)).flatten()
     }).ok_or_else(|| unavailable(match provider {
-        Provider::Codex => "Choose the exact Codex thread ID shown by /status in the source CLI, then attach the selected conversation. No recent thread is selected automatically.",
+        Provider::Codex => "This terminal is not associated with a managed thread. Open New thread to use native and CLI views of one conversation.",
         Provider::Claude => "Claude has not published an exact live conversation yet. Retry once its live session is available; the terminal has not been stopped.",
         Provider::Omp => "OMP has not published an exact live conversation or fresh-session boundary for this terminal. The terminal has not been stopped; no recent history will be selected.",
     }))?;
@@ -557,6 +557,47 @@ fn start(
     selection: Option<PendingBinding>,
     execution_environment: crate::terminal_ipc::ChatExecutionEnvironment,
 ) -> Result<ServerResponse, ProtocolError> {
+    // A managed CLI is a second view of the thread that this daemon owns.
+    // Reattach that proven pair before trying to infer anything from argv or
+    // the account-wide list of conversations.
+    if source.is_some() || session.owns_codex_listener() {
+        let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(proof) = source.as_ref() {
+            validate_proof(Some(proof), state.proof())?;
+        }
+        let paired = state.chats.get(&session.id).is_some_and(|record| {
+            record.handle.owns_work()
+                && session.launch.provider == Provider::Codex
+                && record.session.launch.provider == Provider::Codex
+                && record.handle.session_id() == session.launch.session_id
+                && record.session.terminal.as_ref().is_some_and(|terminal| {
+                    session.terminal.as_ref().is_some_and(|source| {
+                        terminal.id == source.id && terminal.launch == source.launch
+                    }) && state
+                        .terminals
+                        .get(&terminal.id)
+                        .is_some_and(|live| live.session.launch == terminal.launch)
+                })
+        });
+        if paired {
+            if source.is_none() {
+                validate_proof(session.proof.as_ref(), state.proof())?;
+            }
+            let record = state
+                .chats
+                .get_mut(&session.id)
+                .expect("checked managed pair");
+            record.subscribers.entry(client).or_insert(false);
+            record
+                .observations
+                .entry(client)
+                .or_insert_with(|| Observation {
+                    after_generation: record.handle.observe_next_update(),
+                    ..Observation::default()
+                });
+            return Ok(session_snapshot(record));
+        }
+    }
     if !execution_environment.0.is_empty() && (source.is_some() || session.terminal.is_some()) {
         return Err(error(
             "A terminal handoff must use the proven source environment, not a client override",
@@ -670,7 +711,59 @@ fn start(
         }
     }
     // All adapter validation happens before a source terminal can be changed.
-    let (mut spec, mut adapter) = chat::protocol::create(&session.launch).map_err(error)?;
+    let owned_socket = std::env::temp_dir()
+        .join(format!("cagents-codex-{}", session.id))
+        .join("control.sock");
+    let owned_remote = format!("unix://{}", owned_socket.display());
+    let owned = source.is_none()
+        && session.launch.provider == Provider::Codex
+        && session.launch.recipe.arguments.windows(2).any(|pair| {
+            pair[0] == "--remote"
+                && (pair[1] == owned_remote
+                    || (pair[1] == "unix://" && session.launch.session_id.is_none()))
+        });
+    if owned {
+        if let Some(index) = session
+            .launch
+            .recipe
+            .arguments
+            .iter()
+            .position(|argument| argument == "--remote")
+        {
+            session.launch.recipe.arguments[index + 1] = owned_remote.clone();
+        }
+        // An unclean daemon exit can leave the owned socket inode behind.
+        // Only remove a refused socket inside our private, user-owned directory;
+        // a live listener is reused and an arbitrary endpoint is never touched.
+        if owned_socket.exists() {
+            use std::os::unix::fs::{FileTypeExt, MetadataExt};
+            let private = owned_socket.parent().is_some_and(|directory| {
+                std::fs::symlink_metadata(directory).is_ok_and(|metadata| {
+                    metadata.is_dir()
+                        && metadata.uid() == unsafe { libc::geteuid() }
+                        && metadata.mode() & 0o777 == 0o700
+                })
+            });
+            let socket = std::fs::symlink_metadata(&owned_socket).is_ok_and(|metadata| {
+                metadata.file_type().is_socket() && metadata.uid() == unsafe { libc::geteuid() }
+            });
+            if private
+                && socket
+                && let Err(failure) = std::os::unix::net::UnixStream::connect(&owned_socket)
+                && failure.kind() == std::io::ErrorKind::ConnectionRefused
+            {
+                std::fs::remove_file(&owned_socket).map_err(|failure| {
+                    unavailable(format!("Cannot retire stopped provider socket: {failure}"))
+                })?;
+            }
+        }
+    }
+    let (mut spec, mut adapter) = if owned && !owned_socket.exists() {
+        chat::protocol::codex::create_with_listener(&session.launch, owned_socket)
+    } else {
+        chat::protocol::create(&session.launch)
+    }
+    .map_err(error)?;
     if source.is_none() {
         // A conversation with no proven source has no proven environment to
         // preserve, so it starts from the daemon's own native configuration
@@ -960,6 +1053,113 @@ fn start(
     result
 }
 
+/// Attach a CLI view without stopping the server-owned thread or its native
+/// connection. Both descriptors retain the same daemon-owned session ID.
+fn codex_terminal_view(
+    host: &SharedHost,
+    client: ClientId,
+    chat_id: TerminalId,
+    handle: &Handle,
+    session: Session,
+    recipe: crate::model::LaunchRecipe,
+) -> Result<ServerResponse, ProtocolError> {
+    {
+        let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
+        let record = attached(&state, client, chat_id)?;
+        if !record.handle.same_actor(handle) {
+            return Err(unavailable(
+                "The thread changed while opening its CLI view.",
+            ));
+        }
+        if let Some(terminal) = &record.session.terminal
+            && let Some(live) = state.terminals.get(&terminal.id)
+            && !live.handle.is_completed()
+        {
+            return Ok(ServerResponse::ChatTerminal {
+                chat_id,
+                session: state.descriptor(client, terminal.id)?.session,
+                snapshot: handle.snapshot(None).expect("unconditional snapshot"),
+            });
+        }
+        if record.returning_terminal {
+            return Err(unavailable("The CLI view is already opening."));
+        }
+        if state
+            .terminals
+            .get(&chat_id)
+            .is_some_and(|terminal| terminal.handle.is_completed())
+        {
+            state.retire_terminal(chat_id);
+        } else if state.terminals.contains_key(&chat_id) {
+            return Err(unavailable(
+                "This thread already has an unrelated active terminal view.",
+            ));
+        }
+        state
+            .chats
+            .get_mut(&chat_id)
+            .expect("attached actor")
+            .returning_terminal = true;
+    }
+    let terminal = crate::model::TerminalSession {
+        id: chat_id,
+        launch: recipe.clone(),
+        continuity: crate::model::TerminalContinuity::RelaunchAvailable {
+            recipe,
+            last_exit: None,
+        },
+        resume_hint: None,
+        transcript_path: None,
+    };
+    let result = super::state::spawn_terminal_view(
+        host,
+        client,
+        terminal,
+        crate::terminal_ipc::TerminalSpawnOptions {
+            initially_visible: false,
+            ..Default::default()
+        },
+        Some(handle.execution_environment()),
+        true,
+    );
+    let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
+    let current = state
+        .chats
+        .get(&chat_id)
+        .is_some_and(|record| record.handle.same_actor(handle));
+    if !current {
+        let orphan = result
+            .as_ref()
+            .ok()
+            .and_then(|descriptor| state.terminals.remove(&descriptor.session.id));
+        drop(state);
+        if let Some(orphan) = orphan {
+            let _ = orphan.handle.shutdown();
+        }
+        return Err(unavailable("The thread closed while opening its CLI view."));
+    }
+    state
+        .chats
+        .get_mut(&chat_id)
+        .expect("checked actor")
+        .returning_terminal = false;
+    let descriptor = result?;
+    let process = state
+        .terminals
+        .get(&chat_id)
+        .and_then(|terminal| terminal.handle.observe_agent_process());
+    let record = state.chats.get_mut(&chat_id).expect("checked actor");
+    record.session.terminal = Some(descriptor.session.clone());
+    record.session.launch.session_id = session.launch.session_id;
+    record.source_process = process;
+    state.inventory_generation += 1;
+    Ok(ServerResponse::ChatTerminal {
+        chat_id,
+        session: descriptor.session,
+        snapshot: handle.snapshot(None).expect("unconditional snapshot"),
+    })
+}
+
 pub(super) fn process(
     host: &SharedHost,
     client: ClientId,
@@ -1190,6 +1390,17 @@ pub(super) fn process(
             let recipe = session.launch.terminal_recipe().ok_or_else(|| unavailable(
                 "Wait for the provider's confirmed exact conversation before returning to terminal",
             ))?;
+            if session.launch.provider == Provider::Codex
+                && (session.terminal.is_some()
+                    || session
+                        .launch
+                        .recipe
+                        .arguments
+                        .iter()
+                        .any(|arg| arg == "--remote" || arg.starts_with("--remote=")))
+            {
+                return codex_terminal_view(host, client, chat_id, &handle, session, recipe);
+            }
             if session.launch.provider == Provider::Codex && session.terminal.is_some() {
                 return Err(error(
                     "A shared Codex source must be reattached, not replaced",
@@ -1325,11 +1536,32 @@ pub(super) fn process(
             };
             handle.close().map_err(unavailable)?;
             let snapshot = handle.snapshot(None).expect("unconditional final snapshot");
-            let record = {
+            let (record, terminal) = {
                 let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
+                if !state
+                    .chats
+                    .get(&chat_id)
+                    .is_some_and(|record| record.handle.same_actor(&handle))
+                {
+                    return Err(unavailable(
+                        "The thread changed while its previous actor was closing.",
+                    ));
+                }
+                let paired = state
+                    .chats
+                    .get(&chat_id)
+                    .filter(|record| record.handle.same_actor(&handle))
+                    .and_then(|record| record.session.terminal.as_ref())
+                    .filter(|terminal| terminal.id == chat_id)
+                    .map(|terminal| terminal.id);
                 state.inventory_generation += 1;
-                state.chats.remove(&chat_id)
+                let record = state.chats.remove(&chat_id);
+                let terminal = paired.and_then(|id| state.retire_terminal(id));
+                (record, terminal)
             };
+            if let Some(terminal) = terminal {
+                let _ = terminal.handle.shutdown();
+            }
             drop(record);
             Ok(ServerResponse::ChatClosed { chat_id, snapshot })
         }
@@ -1598,6 +1830,46 @@ pub(super) fn restore_upgrade(
         launch: saved.launch.clone(),
     });
     state.upgrade_chats.insert(saved.source.id, sources);
+    Ok(())
+}
+
+pub(super) fn owns_codex_listener(session: &Session) -> bool {
+    session.owns_codex_listener()
+}
+
+/// A terminal card restored after a GUI restart has no parked UI runtime, but
+/// the daemon still owns its exact native actor. Explicit card close retires both.
+pub(super) fn close_for_terminal(
+    host: &SharedHost,
+    terminal_id: TerminalId,
+) -> Result<(), ProtocolError> {
+    let handle = {
+        let state = host.lock().unwrap_or_else(|p| p.into_inner());
+        state
+            .chats
+            .get(&terminal_id)
+            .filter(|record| {
+                record.session.launch.provider == Provider::Codex
+                    && record
+                        .session
+                        .terminal
+                        .as_ref()
+                        .is_some_and(|terminal| terminal.id == terminal_id)
+            })
+            .map(|record| record.handle.clone())
+    };
+    if let Some(handle) = handle {
+        handle.close().map_err(unavailable)?;
+        let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
+        if state
+            .chats
+            .get(&terminal_id)
+            .is_some_and(|record| record.handle.same_actor(&handle))
+        {
+            state.chats.remove(&terminal_id);
+            state.inventory_generation += 1;
+        }
+    }
     Ok(())
 }
 
@@ -2273,6 +2545,169 @@ for line in sys.stdin:
     }
 
     struct Echo(bool);
+    struct ActiveFixture;
+    impl Adapter for ActiveFixture {
+        fn initialize(&mut self) -> Result<Step, String> {
+            Ok(Step::default())
+        }
+        fn command(&mut self, command: Command) -> Result<Step, String> {
+            Ok(Step {
+                writes: Vec::new(),
+                events: if matches!(command, Command::Interrupt) {
+                    vec![Event::Status {
+                        busy: false,
+                        detail: String::new(),
+                    }]
+                } else {
+                    Vec::new()
+                },
+            })
+        }
+        fn receive(&mut self, _: Value) -> Result<Step, String> {
+            Ok(Step::default())
+        }
+    }
+    #[test]
+    fn managed_cli_keeps_the_active_actor_and_close_retires_both_views() {
+        let (_directory, host, _) = upgrade_fixture();
+        let chat_id = TerminalId::new();
+        let recipe = LaunchRecipe {
+            program: "/bin/cat".into(),
+            arguments: Vec::new(),
+            working_directory: std::env::temp_dir(),
+            environment: BTreeMap::new(),
+        };
+        let spec = ProcessSpec::from(&recipe);
+        let mut initial = Step {
+            writes: Vec::new(),
+            events: vec![Event::Status {
+                busy: true,
+                detail: "working".into(),
+            }],
+        };
+        let store = chat::runtime::preflight(&spec, &mut initial).unwrap();
+        let identity = "12345678-1234-4234-8234-123456789abc";
+        let handle = Handle::start(
+            spec,
+            Box::new(ActiveFixture),
+            initial,
+            store,
+            Some(identity.into()),
+            |_| {},
+        )
+        .unwrap();
+        let mut session = Session {
+            id: chat_id,
+            proof: None,
+            terminal: None,
+            launch: chat::Launch {
+                provider: Provider::Codex,
+                recipe: recipe.clone(),
+                session_id: Some(identity.into()),
+            },
+        };
+        session.launch.recipe.arguments = vec![
+            "--remote".into(),
+            format!(
+                "unix://{}/cagents-codex-{chat_id}/control.sock",
+                std::env::temp_dir().display()
+            ),
+        ];
+        {
+            let mut state = host.lock().unwrap();
+            state.register_client(1);
+            state.chats.insert(
+                chat_id,
+                Record {
+                    session: session.clone(),
+                    handle: handle.clone(),
+                    source_process: None,
+                    subscribers: BTreeMap::from([(1, false)]),
+                    observations: BTreeMap::new(),
+                    completion_observed: false,
+                    returning_terminal: false,
+                },
+            );
+        }
+        let first =
+            codex_terminal_view(&host, 1, chat_id, &handle, session.clone(), recipe.clone())
+                .unwrap();
+        let ServerResponse::ChatTerminal {
+            session: terminal,
+            snapshot,
+            ..
+        } = first
+        else {
+            panic!("CLI view missing")
+        };
+        assert!(!snapshot.exited);
+        assert!(!handle.is_completed());
+        let worker = host.lock().unwrap().terminals[&terminal.id].handle.clone();
+        let second =
+            codex_terminal_view(&host, 1, chat_id, &handle, session.clone(), recipe.clone())
+                .unwrap();
+        assert!(
+            matches!(second, ServerResponse::ChatTerminal { snapshot, .. } if !snapshot.exited)
+        );
+        assert!(
+            host.lock().unwrap().terminals[&terminal.id]
+                .handle
+                .same_worker(&worker)
+        );
+        worker.shutdown().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !matches!(
+            host.lock()
+                .unwrap()
+                .descriptor(1, terminal.id)
+                .unwrap()
+                .session
+                .continuity,
+            crate::model::TerminalContinuity::RelaunchAvailable { .. }
+        ) {
+            assert!(Instant::now() < deadline, "terminal exit was not published");
+            thread::sleep(Duration::from_millis(10));
+        }
+        let mut retained = {
+            let mut state = host.lock().unwrap();
+            state.register_client(2);
+            let mut retained = state.chats[&chat_id].session.clone();
+            retained.proof = Some(state.proof().clone());
+            retained
+        };
+        let valid_proof = retained.proof.take();
+        assert!(
+            start(
+                &host,
+                2,
+                retained.clone(),
+                None,
+                false,
+                None,
+                Default::default()
+            )
+            .is_err()
+        );
+        retained.proof = valid_proof;
+        assert!(matches!(
+            start(&host, 2, retained, None, false, None, Default::default()).unwrap(),
+            ServerResponse::ChatAttached { .. }
+        ));
+        assert!(
+            host.lock().unwrap().chats[&chat_id]
+                .handle
+                .same_actor(&handle)
+        );
+        codex_terminal_view(&host, 2, chat_id, &handle, session, recipe).unwrap();
+        let replacement = host.lock().unwrap().terminals[&terminal.id].handle.clone();
+        assert!(!replacement.same_worker(&worker));
+        process(&host, 2, ClientRequest::ChatClose { chat_id }).unwrap();
+        assert!(handle.is_completed());
+        assert!(worker.is_completed());
+        assert!(replacement.is_completed());
+        assert!(!host.lock().unwrap().terminals.contains_key(&terminal.id));
+        assert!(!host.lock().unwrap().chats.contains_key(&chat_id));
+    }
     impl Adapter for Echo {
         fn initialize(&mut self) -> Result<Step, String> {
             Ok(Step::default())

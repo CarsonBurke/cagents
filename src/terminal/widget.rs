@@ -1063,7 +1063,7 @@ impl ShapeCache {
 }
 
 type ErrorMapper<Message> = dyn Fn(TerminalSendError) -> Message + Send + Sync + 'static;
-type LinkMapper<Message> = dyn Fn(url::Url) -> Message + 'static;
+type LinkMapper<Message> = dyn Fn(url::Url, crate::settings::LinkOpenGesture) -> Message + 'static;
 
 /// Resolve a printed web address at a cell without confusing byte offsets with
 /// terminal columns. Restrict activation to web URLs; terminal output is untrusted.
@@ -1235,7 +1235,10 @@ impl<Message> TerminalWidget<Message> {
     }
 
     /// Ctrl-click opens a printed web address, including in mouse-reporting TUIs.
-    pub fn on_open_link(mut self, mapper: impl Fn(url::Url) -> Message + 'static) -> Self {
+    pub fn on_open_link(
+        mut self,
+        mapper: impl Fn(url::Url, crate::settings::LinkOpenGesture) -> Message + 'static,
+    ) -> Self {
         self.on_open_link = Some(Box::new(mapper));
         self
     }
@@ -1647,7 +1650,14 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for TerminalWidget<Message
                         && let Some(row) = self.snapshot.lines.get(usize::from(cell.1))
                         && let Some(url) = web_link_at(row, cell.0)
                     {
-                        shell.publish(open(url));
+                        shell.publish(open(
+                            url,
+                            if state.modifiers.shift {
+                                crate::settings::LinkOpenGesture::ControlShiftClick
+                            } else {
+                                crate::settings::LinkOpenGesture::ControlClick
+                            },
+                        ));
                         shell.capture_event();
                         return;
                     }

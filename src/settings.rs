@@ -783,6 +783,16 @@ fn normalize_legacy_sidebar_width(width: f32) -> f32 {
 }
 
 impl AppSettings {
+    /// A modified click explicitly selects a browser; ordinary links use the preference.
+    pub fn link_destination(&self, gesture: Option<LinkOpenGesture>) -> LinkOpenDestination {
+        match gesture {
+            None => self.link_open_destination,
+            Some(gesture) if gesture == self.link_open_gesture => {
+                LinkOpenDestination::SystemDefault
+            }
+            Some(_) => LinkOpenDestination::IntegratedBrowser,
+        }
+    }
     pub fn validate(self) -> Result<Self, SettingsError> {
         if self.schema_version != SETTINGS_SCHEMA_VERSION {
             return Err(SettingsError::UnsupportedSchema(self.schema_version));
@@ -1290,6 +1300,40 @@ mod tests {
 
     fn path_in(directory: &tempfile::TempDir) -> PathBuf {
         directory.path().join("settings.toml")
+    }
+
+    #[test]
+    fn browser_preference_and_both_gestures_are_independent_and_persist() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = path_in(&directory);
+        for destination in [
+            LinkOpenDestination::SystemDefault,
+            LinkOpenDestination::IntegratedBrowser,
+        ] {
+            for system_gesture in [
+                LinkOpenGesture::ControlClick,
+                LinkOpenGesture::ControlShiftClick,
+            ] {
+                let mut settings = AppSettings::default();
+                settings.link_open_destination = destination;
+                settings.link_open_gesture = system_gesture;
+                save(&path, &settings).unwrap();
+                let settings = load(&path).unwrap();
+                assert_eq!(settings.link_destination(None), destination);
+                assert_eq!(
+                    settings.link_destination(Some(system_gesture)),
+                    LinkOpenDestination::SystemDefault
+                );
+                let other = match system_gesture {
+                    LinkOpenGesture::ControlClick => LinkOpenGesture::ControlShiftClick,
+                    LinkOpenGesture::ControlShiftClick => LinkOpenGesture::ControlClick,
+                };
+                assert_eq!(
+                    settings.link_destination(Some(other)),
+                    LinkOpenDestination::IntegratedBrowser
+                );
+            }
+        }
     }
 
     #[test]

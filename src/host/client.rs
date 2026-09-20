@@ -839,6 +839,9 @@ fn process_request(
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .handle(client_id, terminal_id)?;
             let outcome = handle.close_checked(allow_active);
+            if outcome == crate::terminal_ipc::TerminalCloseResult::Closed {
+                super::chat::close_for_terminal(host, terminal_id)?;
+            }
             Ok((
                 ServerResponse::TerminalCloseChecked {
                     terminal_id,
