@@ -229,7 +229,19 @@ impl Cagents {
                     _ => None,
                 };
                 self.workspace_model.fold(sequence, &edit);
-                let retired = deleted.map_or_else(Task::none, |id| self.delete_channel(id));
+                let retired = deleted.map_or_else(Task::none, |id| {
+                    // The registry has authoritatively removed this identity,
+                    // even if its creation acknowledgment never reached us.
+                    // A failed session close must not make it publishable again.
+                    if let Some(channel) = Arc::make_mut(&mut self.durable)
+                        .channels
+                        .iter_mut()
+                        .find(|channel| channel.id == id)
+                    {
+                        channel.shared = true;
+                    }
+                    self.delete_channel(id)
+                });
                 Task::batch([retired, self.reconcile_workspace_model()])
             }
             ModelUpdate::Ranked { channel, ordinal } => {
@@ -327,6 +339,9 @@ impl Cagents {
             }
         }
         for shared in &model.channels {
+            if self.channel_ui.is_deleting(shared.id) {
+                continue;
+            }
             match self
                 .durable
                 .channels
@@ -354,6 +369,9 @@ impl Cagents {
             .map(|local| (local.id, local.shared))
             .collect::<Vec<_>>();
         for (id, shared) in retired {
+            if self.channel_ui.is_deleting(id) {
+                continue;
+            }
             if shared {
                 // The window's own deletion path, so a channel that disappeared
                 // elsewhere retires its cards exactly as a local delete retires
@@ -861,11 +879,15 @@ mod tests {
         channel.focused = Some(conversation);
         Arc::make_mut(&mut app.durable).channels.push(channel);
         app.workspace_model = registry(vec![shared(id, &repository, "doomed", 4)]);
+        let published = intercept_publishes(&mut app);
 
         let _ = app.apply_workspace_model_update(ModelUpdate::Edited {
             sequence: 5,
             edit: ModelEdit::DeleteChannel { id },
         });
+        assert!(app.channel_ui.is_deleting(id));
+        assert!(!drain(&published).iter().any(|edit| matches!(edit, ModelEdit::CreateChannel { id: revived, .. } if *revived == id)), "an in-flight deletion must not resurrect an unacknowledged channel");
+        let _ = app.handle_channel_ui(super::super::channel_ui::Action::SessionsClosed(id, Ok(())));
 
         assert!(
             !app.durable.channels.iter().any(|channel| channel.id == id),
@@ -961,6 +983,8 @@ mod tests {
             identity,
             ..registry(Vec::new())
         }));
+
+        let _ = app.handle_channel_ui(super::super::channel_ui::Action::SessionsClosed(id, Ok(())));
 
         assert!(
             !app.durable.channels.iter().any(|channel| channel.id == id),

@@ -146,6 +146,7 @@ pub enum Action {
     ScrollTranscript(Target, f32),
     /// Opens or closes the model search.
     ModelPicker(Target, bool),
+    ReasoningPicker(Target, bool),
     ModelQuery(Target, String),
 }
 
@@ -935,6 +936,9 @@ pub(super) struct Runtime {
     disconnected: bool,
     visible: AtomicBool,
     error: Option<String>,
+    /// Local send errors anchored to the exchange that produced them.
+    failures: Vec<(Option<String>, String)>,
+    reasoning_picker: bool,
     permission_mode: Option<String>,
     /// Messages the provider accepted, oldest first, for Up and Down in the
     /// composer to walk through the way a shell does.
@@ -1090,6 +1094,8 @@ impl Runtime {
             disconnected: false,
             visible: AtomicBool::new(visible),
             error: None,
+            failures: Vec::new(),
+            reasoning_picker: false,
             permission_mode: None,
             history: Vec::new(),
             history_cursor: None,
@@ -1394,6 +1400,17 @@ fn return_terminal(session: &chat::Session) -> Result<TerminalSession, String> {
 }
 
 impl Cagents {
+    pub(super) fn dismiss_chat_picker(&mut self) -> bool {
+        let Some(card) = self.workspace.focused() else {
+            return false;
+        };
+        let Some(CardRuntime::Chat(runtime)) = self.cards.get_mut(&card) else {
+            return false;
+        };
+        let open = runtime.model_picker.take().is_some() || runtime.reasoning_picker;
+        runtime.reasoning_picker = false;
+        open
+    }
     /// The provider a new channel's conversation should use.
     ///
     /// The menu names the provider explicitly, but a channel is created from
@@ -2496,7 +2513,14 @@ impl Cagents {
                         }
                         runtime.refresh();
                     }
-                    Err(error) => runtime.error = Some(error),
+                    Err(error) => {
+                        let anchor = runtime.turns.last().map(|turn| turn.key.clone());
+                        if runtime.failures.len() == 32 {
+                            runtime.failures.remove(0);
+                        }
+                        runtime.failures.push((anchor, error.clone()));
+                        runtime.error = Some(error);
+                    }
                 }
             }
             Action::Toggle(target, id) => {
@@ -2646,6 +2670,7 @@ impl Cagents {
                 let Some(runtime) = self.chat_runtime_mut(target) else {
                     return Task::none();
                 };
+                runtime.reasoning_picker = false;
                 let Some(model) = runtime.snapshot.models.iter().find(|model| {
                     model.id == model_id
                         && Some(&model.id) == runtime.snapshot.selected_model.as_ref()
@@ -2915,6 +2940,7 @@ impl Cagents {
                 // A reopened search starts empty: the query a reader typed
                 // last time is not the model they are looking for now.
                 runtime.model_picker = open.then(String::new);
+                runtime.reasoning_picker = false;
                 if open {
                     // The field takes focus with the popup, so opening the
                     // picker and naming a model are one gesture.
@@ -2930,6 +2956,12 @@ impl Cagents {
                     && let Some(current) = runtime.model_picker.as_mut()
                 {
                     *current = query;
+                }
+            }
+            Action::ReasoningPicker(target, open) => {
+                if let Some(runtime) = self.chat_runtime_mut(target) {
+                    runtime.reasoning_picker = open;
+                    runtime.model_picker = None;
                 }
             }
         }

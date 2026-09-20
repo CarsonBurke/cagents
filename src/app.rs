@@ -5370,6 +5370,7 @@ impl Cagents {
                 ))
                 .model_focused(card_focused)
                 .on_focus(Message::FocusCard(id))
+                .on_open_link(Message::OpenBrowser)
                 .on_command_error(move |error| Message::TerminalError {
                     card: id,
                     message: error.to_string(),
@@ -9760,6 +9761,9 @@ impl Application for Cagents {
                     // Ahead of the inspector and the sidebar because the find
                     // bar is the innermost thing the user is looking at, and
                     // behind the confirmations above because those are modal.
+                    if self.dismiss_chat_picker() {
+                        return Task::none();
+                    }
                     if let Some(card) = self.focused_repository_card_with_find() {
                         return cosmic::task::message(Message::Repository(
                             RepositoryAction::CloseFind { card },
@@ -10082,6 +10086,15 @@ impl Application for Cagents {
         // survive the next assignment instead of silently replacing each other,
         // and it is the one place that can bound the history.
         if let Some(notice) = self.status.take() {
+            match notice.severity {
+                NoticeSeverity::Error => {
+                    tracing::error!(message = %notice.message, "application notice")
+                }
+                NoticeSeverity::Warning => {
+                    tracing::warn!(message = %notice.message, "application notice")
+                }
+                NoticeSeverity::Success => {}
+            }
             self.notices.record(notice);
         }
         if self.latency_focus != self.workspace.focused() {
