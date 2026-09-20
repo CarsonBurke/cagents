@@ -1,5 +1,4 @@
 use super::*;
-use crate::ui_controls::{MarkTone, TranscriptMark};
 
 fn body<'a>(text: impl Into<Cow<'a, str>> + 'a) -> Element<'a, Message> {
     widget::selectable_text(text)
@@ -370,68 +369,9 @@ impl Scroll {
         self.content
     }
 
-    /// The share of the loaded conversation the viewport shows.
-    fn window(self) -> f32 {
-        if self.content > 0.0 {
-            (self.window / self.content).clamp(0.0, 1.0)
-        } else {
-            1.0
-        }
+    pub(super) fn page_height(self) -> f32 {
+        (self.window * 0.9).max(1.0)
     }
-
-    /// How far through the scrollable extent the viewport sits, from the top.
-    fn position(self) -> f32 {
-        let travel = self.travel();
-        if travel > 0.0 {
-            (self.from_top / travel).clamp(0.0, 1.0)
-        } else {
-            0.0
-        }
-    }
-}
-
-/// The minimap's marks for `turns`: one tick where each of the reader's own
-/// messages sits, which is the rhythm a conversation is navigated by. The
-/// work between messages draws nothing; a rail that blocked it in was a
-/// second transcript in miniature, and unreadable as one.
-///
-/// A group's share of the rail is the number of rows it draws rather than the
-/// height those rows take up: the row count is something the grouping already
-/// knows, while the heights are known only to a layout pass, and laying the
-/// transcript out a second time to place an overview of it would cost more
-/// than the overview is worth. This is derived once per snapshot, beside the
-/// grouping it comes from, so every frame of a streaming turn draws the rail
-/// without recomputing it.
-pub(super) fn minimap_marks(turns: &[turn::Turn]) -> Vec<TranscriptMark> {
-    // Every group draws at least one row, and a group whose rows are all
-    // still arriving would otherwise take no share of a rail it is part of.
-    let rows = |turn: &turn::Turn| {
-        (turn.prompt.len() + usize::from(!turn.steps.is_empty()) + turn.prose.len()).max(1)
-    };
-    let total: usize = turns.iter().map(rows).sum();
-    if total == 0 {
-        return Vec::new();
-    }
-    let mut at = 0.0;
-    let mut marks = Vec::new();
-    for turn in turns {
-        let span = rows(turn) as f32 / total as f32;
-        if !turn.prompt.is_empty() {
-            // A message whose work failed says so at the tick: what the
-            // reader is scrolling back for is the failure.
-            let tone = if matches!(
-                turn.glyph(),
-                Some(chat::ToolStatus::Failed | chat::ToolStatus::Denied)
-            ) {
-                MarkTone::Failed
-            } else {
-                MarkTone::Prompt
-            };
-            marks.push(TranscriptMark { at, span, tone });
-        }
-        at += span;
-    }
-    marks
 }
 
 /// A question, and the material it is about.
@@ -584,43 +524,6 @@ fn model_hits<'a>(models: &'a [chat::Model], query: &str) -> Vec<&'a chat::Model
 }
 
 impl Cagents {
-    pub(in crate::app) fn new_thread_dialog(&self) -> Option<Element<'_, Message>> {
-        if !self.new_thread_is_open() {
-            return None;
-        }
-        let choices = [
-            (Provider::Codex, "ChatGPT", "chat.new-thread.chatgpt"),
-            (Provider::Claude, "Claude", "chat.new-thread.claude"),
-            (Provider::Omp, "Other models", "chat.new-thread.other"),
-        ];
-        let mut rows: Vec<Element<'_, Message>> = vec![
-            widget::text::title3("New thread").into(),
-            body("Choose a model family, then select a model from your account."),
-        ];
-        for (provider, label, id) in choices {
-            rows.push(
-                widget::button::standard(label)
-                    .id(widget::Id::new(id))
-                    .width(Length::Fill)
-                    .on_press(action(Action::NewThreadModelFamily(provider)))
-                    .into(),
-            );
-        }
-        rows.push(
-            widget::button::text("Cancel")
-                .id(widget::Id::new("chat.new-thread.cancel"))
-                .on_press(action(Action::DismissNewThread))
-                .into(),
-        );
-        Some(dialog_ui::overlay(
-            dialog_ui::surface(
-                widget::column::with_children(rows).spacing(step::GAP_M),
-                420.0,
-            ),
-            Some(action(Action::DismissNewThread)),
-            1.0,
-        ))
-    }
     /// Where a conversation is working, as the status line reports it.
     ///
     /// A chat pane names no location of its own, so a reader with several
@@ -760,14 +663,11 @@ impl Runtime {
                 // That is the separation a divider between messages was
                 // doing badly.
                 .spacing(step::GAP_L)
+                .padding(design::with_vertical_rail(iced::Padding::ZERO))
                 .width(Length::Fill),
         )
         .direction(iced::widget::scrollable::Direction::Vertical(
-            // The minimap beside this scrollable is its scroll control, so
-            // the native rail is not drawn as well: two thumbs down one edge,
-            // one of them carrying the shape of the conversation and the
-            // other carrying nothing, is the chrome this replaces.
-            iced::widget::scrollable::Scrollbar::hidden(),
+            design::scrollbar(),
         ))
         .id(card_control_id(target.card, "chat-transcript"))
         .anchor_bottom()
@@ -778,24 +678,10 @@ impl Runtime {
         .on_scroll(move |viewport| action(Action::Scrolled(target, Scroll::of(&viewport))))
         .height(Length::Fill)
         .width(Length::Fill);
-        let mut pane: Vec<Element<'_, Message>> = vec![transcript.into()];
-        // An empty conversation has no shape to overview, and a rail drawn
-        // down the edge of one would be a control with nothing to control.
-        if !self.marks.is_empty() {
-            pane.push(crate::ui_controls::transcript_minimap(
-                &self.marks,
-                self.scroll.position(),
-                self.scroll.window(),
-                move |fraction| action(Action::ScrollTranscript(target, fraction)),
-            ));
-        }
-        content.push(
-            widget::row::with_children(pane)
-                .spacing(step::GAP_XS)
-                .height(Length::Fill)
-                .width(Length::Fill)
-                .into(),
-        );
+        content.push(scroll::transcript(
+            transcript,
+            snapshot.items.first().map(|item| item.id.as_str()),
+        ));
         if transitioning {
             content.push(body(
                 "Switching or closing this session… Editing and session controls are disabled. You can still read and copy the conversation.",
@@ -1076,6 +962,19 @@ impl Runtime {
                 )))
                 .on_action(move |event| action(Action::Composer(target, event)))
                 .key_binding(move |press| {
+                    if !press.modifiers.shift()
+                        && !press.modifiers.control()
+                        && !press.modifiers.alt()
+                        && !press.modifiers.logo()
+                        && matches!(
+                            press.key,
+                            keyboard::Key::Named(
+                                keyboard::key::Named::PageUp | keyboard::key::Named::PageDown
+                            )
+                        )
+                    {
+                        return None;
+                    }
                     if let Some(mode) = submit_chord(&press, submit.0, submit.1, enter_sends) {
                         return Some(text_editor::Binding::Custom(action(Action::Submit(
                             target, mode,
@@ -1438,7 +1337,9 @@ impl Runtime {
         let target = self.target;
         let snapshot = &self.snapshot;
         let mut controls: Vec<Element<'_, Message>> = Vec::new();
-        if snapshot.capabilities.model_selection && !snapshot.models.is_empty() {
+        if (snapshot.capabilities.model_selection && !snapshot.models.is_empty())
+            || self.can_choose_provider()
+        {
             let current = snapshot
                 .models
                 .iter()
@@ -1555,9 +1456,16 @@ impl Runtime {
         let open = self.model_picker.is_some();
         let anchor = widget::button::custom(
             widget::row::with_children(vec![
-                design::caption(current.map_or("Model", |model| model.label.as_str()))
-                    .wrapping(iced::widget::text::Wrapping::None)
-                    .into(),
+                design::caption(current.map_or(
+                    match self.session.launch.provider {
+                        Provider::Codex => "ChatGPT · Model",
+                        Provider::Claude => "Claude · Model",
+                        Provider::Omp => "Other models",
+                    },
+                    |model| model.label.as_str(),
+                ))
+                .wrapping(iced::widget::text::Wrapping::None)
+                .into(),
                 widget::icon(crate::ui_controls::symbolic_icon("pan-down-symbolic"))
                     .size(design::COMPACT_ICON_SIZE)
                     .into(),
@@ -1584,12 +1492,40 @@ impl Runtime {
     /// transcript's height or scroll position.
     fn model_search(&self) -> Option<Element<'_, Message>> {
         let query = self.model_picker.as_deref()?;
-        Some(model_list(
+        let models = model_list(
             self.target,
             &self.snapshot.models,
             self.snapshot.selected_model.as_deref(),
             query,
-        ))
+        );
+        if !self.can_choose_provider() {
+            return Some(models);
+        }
+        let families = widget::row::with_children(
+            [
+                (Provider::Codex, "ChatGPT"),
+                (Provider::Claude, "Claude"),
+                (Provider::Omp, "Other models"),
+            ]
+            .into_iter()
+            .map(|(provider, label)| {
+                widget::button::custom(design::body(label))
+                    .class(crate::ui_controls::control_style(
+                        provider == self.session.launch.provider,
+                        None,
+                    ))
+                    .padding(CONTROL_PADDING)
+                    .on_press(action(Action::ChooseProvider(self.target, provider)))
+                    .into()
+            })
+            .collect::<Vec<_>>(),
+        )
+        .spacing(step::GAP_XS);
+        Some(
+            widget::column::with_children(vec![families.into(), models])
+                .spacing(step::GAP_S)
+                .into(),
+        )
     }
 
     /// One exchange: what was asked, what was done, and what came back.
@@ -1672,7 +1608,7 @@ impl Runtime {
             .into()
         } else {
             widget::selectable_text(text)
-                .size(design::TEXT_BODY)
+                .size(design::TEXT_PROSE)
                 .width(Length::Shrink)
                 .into()
         };
@@ -1698,9 +1634,8 @@ impl Runtime {
 
     /// An assistant answer, its reasoning, its narration, or a system notice.
     ///
-    /// Commentary recedes: it outnumbers answers several times over, and
-    /// giving both the same weight is why a reader could not find the answer
-    /// in the surface this replaces.
+    /// Every prose phase shares the message body size and Markdown renderer,
+    /// including partial streaming paragraphs.
     fn prose_view<'a>(
         &'a self,
         item: &'a chat::Item,
@@ -1710,43 +1645,22 @@ impl Runtime {
     ) -> Element<'a, Message> {
         let target = self.target;
         if slot == turn::Slot::Commentary {
-            // Narration is a passing remark, so it gets one line at caption
-            // weight, indented to sit under the activity it describes. Given
-            // a paragraph of its own it drowned out the answer.
-            return widget::container(
-                design::caption(turn::first_line(match &item.content {
-                    ItemContent::Text { text, .. } => text.as_str(),
-                    content => turn::step_label(content),
-                }))
+            return widget::container(Prose::view(cached, settings))
+                .max_width(design::READABLE_MEASURE)
                 .width(Length::Fill)
-                .wrapping(iced::widget::text::Wrapping::None),
-            )
-            .padding(iced::Padding::ZERO.left(step::GAP_M))
-            .width(Length::Fill)
-            .into();
+                .into();
         }
         if slot == turn::Slot::Thinking {
-            // Reasoning is prose, so it is read rather than operated: it is
-            // rendered here, quoted onto the sunken surface at caption scale
-            // that the rest of the shell uses for text taken from elsewhere.
-            // Filed behind a disclosure row captioned "Thinking" it was one
-            // more accordion in a column of them, and the account of why the
-            // agent did what it did was the part the reader never opened.
+            // Reasoning keeps a subtle surface without shrinking the prose.
             return widget::container(
-                widget::container(Prose::view(
-                    cached,
-                    markdown::Settings {
-                        text_size: design::TEXT_CAPTION.into(),
-                        ..settings
-                    },
-                ))
-                .class(design::surface(
-                    Some(design::sunken),
-                    [design::RADIUS_S; 4],
-                    false,
-                ))
-                .padding([step::GAP_S as u16, step::GAP_M as u16])
-                .max_width(design::READABLE_MEASURE),
+                widget::container(Prose::view(cached, settings))
+                    .class(design::surface(
+                        Some(design::sunken),
+                        [design::RADIUS_S; 4],
+                        false,
+                    ))
+                    .padding([step::GAP_S as u16, step::GAP_M as u16])
+                    .max_width(design::READABLE_MEASURE),
             )
             .padding(iced::Padding::ZERO.left(step::GAP_M))
             .width(Length::Fill)
@@ -2441,88 +2355,6 @@ mod tests {
         // arrive without one.
         let short = scroll(0.0, 200.0, 400.0);
         assert!(short.at_top() && short.at_bottom());
-    }
-
-    /// The minimap's lens is the reader's own position, so it has to follow
-    /// the viewport from one end of the conversation to the other and report
-    /// how much of it is on screen.
-    #[test]
-    fn the_minimap_lens_follows_the_viewport() {
-        let top = scroll(0.0, 1_600.0, 400.0);
-        assert_eq!(top.position(), 0.0);
-        assert_eq!(top.window(), 0.25);
-        assert_eq!(scroll(1_200.0, 1_600.0, 400.0).position(), 1.0);
-        assert_eq!(scroll(600.0, 1_600.0, 400.0).position(), 0.5);
-        // Nothing loaded yet: the whole of nothing is on screen, and the
-        // lens must not be placed by a division by zero.
-        let empty = scroll(0.0, 0.0, 400.0);
-        assert_eq!(empty.window(), 1.0);
-        assert_eq!(empty.position(), 0.0);
-    }
-
-    fn asked(id: &str) -> chat::Item {
-        chat::Item {
-            id: id.into(),
-            role: chat::Role::User,
-            content: ItemContent::Text {
-                text: "please".into(),
-                thinking: false,
-                phase: chat::Phase::Final,
-            },
-            at: None,
-        }
-    }
-
-    fn ran(id: &str, status: chat::ToolStatus) -> chat::Item {
-        chat::Item {
-            id: id.into(),
-            role: chat::Role::Assistant,
-            content: ItemContent::Command {
-                label: String::new(),
-                command: "cargo check".into(),
-                working_directory: "/tmp".into(),
-                action: chat::CommandAction::Run,
-                status,
-                exit_code: None,
-                duration_ms: None,
-                output: String::new(),
-            },
-            at: None,
-        }
-    }
-
-    /// The minimap is the only overview of a long conversation, so it has to
-    /// cover the whole of it, mark every stretch of work once, and single out
-    /// the two a reader scrolls back for.
-    #[test]
-    fn the_minimap_marks_every_stretch_of_work_once() {
-        let items = vec![
-            asked("u1"),
-            ran("c1", chat::ToolStatus::Succeeded),
-            asked("u2"),
-            ran("c2", chat::ToolStatus::Failed),
-        ];
-        let turns = turn::group(&items, &HashSet::new());
-        let marks = minimap_marks(&turns);
-        assert_eq!(
-            marks.len(),
-            turns.iter().filter(|turn| !turn.prompt.is_empty()).count(),
-            "one tick per message of the reader's own"
-        );
-        assert_eq!(marks[0].at, 0.0, "the first stretch starts the rail");
-        let end = marks.last().expect("a mark");
-        assert!(
-            (end.at + end.span - 1.0).abs() < 1e-5,
-            "the marks stop at {} rather than covering the conversation",
-            end.at + end.span
-        );
-        assert_eq!(marks[0].tone, MarkTone::Prompt);
-        assert_eq!(
-            marks[1].tone,
-            MarkTone::Failed,
-            "a stretch that failed has to say so, whoever prompted it"
-        );
-        assert_eq!(minimap_marks(&[]), Vec::new());
     }
 
     /// A question's own prose and the command or payload it is about read as

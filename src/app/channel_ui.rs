@@ -261,7 +261,7 @@ impl Cagents {
                 self.sidebar_state.reveal_project(project_id);
                 self.show_workspace_for_action();
                 let scope = self.select_channel(id);
-                let chat = self.new_native_thread_for_channel(id);
+                let chat = self.new_native_thread();
                 self.persist();
                 Task::batch([scope, chat])
             }
@@ -725,17 +725,11 @@ mod tests {
 
         let _ = app.handle_channel_ui(Action::Create(project));
         let first = app.durable.active_channel.expect("the first channel opens");
-        let _ = app.handle_chat_ui(chat_ui::Action::NewThreadModelFamily(
-            crate::agent::Provider::Codex,
-        ));
         let _ = app.handle_channel_ui(Action::Create(project));
         let second = app
             .durable
             .active_channel
             .expect("the second channel opens");
-        let _ = app.handle_chat_ui(chat_ui::Action::NewThreadModelFamily(
-            crate::agent::Provider::Codex,
-        ));
         assert_ne!(first, second);
 
         app.refresh_sidebar_channels();
@@ -746,16 +740,19 @@ mod tests {
         assert_eq!(rows[0].id, second, "the newest channel is the top row");
         assert_eq!(rows[1].id, first);
         let _ = app.handle_channel_ui(Action::Create(project));
-        let cancelled = app.durable.active_channel.unwrap();
-        assert_ne!(cancelled, second);
-        let _ = app.handle_chat_ui(chat_ui::Action::DismissNewThread);
+        let third = app.durable.active_channel.unwrap();
+        assert_ne!(third, second);
+        assert_eq!(app.durable.channels.len(), 3);
         assert!(
-            !app.durable
+            app.durable
                 .channels
                 .iter()
-                .any(|channel| channel.id == cancelled)
+                .all(|channel| channel.cards.len() == 1)
         );
-        assert_eq!(app.durable.channels.len(), 2);
+        assert!(
+            !app.modal_is_open(),
+            "creating a channel opens its composer directly"
+        );
     }
 
     #[test]
