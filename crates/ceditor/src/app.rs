@@ -19,7 +19,7 @@ use cagents::{
         WorktreePanel,
     },
     splitter::{self, Splitter},
-    ui_controls::{icon_control, popover, segmented_controls, symbolic_icon},
+    ui_controls::{icon_control, popover, symbolic_icon, toolbar_actions},
     workspace_widget,
 };
 use cosmic::app::ApplicationExt;
@@ -3722,10 +3722,12 @@ impl Application for Editor {
             let mut toolbar_controls = Vec::new();
             if let Some(toolbar) = repository_widget::selected_file_toolbar(tab.id, &tab.runtime) {
                 toolbar_controls.push(toolbar.map(Message::Repository));
+            } else {
+                toolbar_controls.push(iced::widget::Space::new().width(Length::Fill).into());
             }
             if tab.runtime.lsp_document().is_some() {
                 toolbar_controls.push(
-                    segmented_controls(vec![
+                    toolbar_actions(vec![
                         icon_control(
                             symbolic_icon("insert-text-symbolic"),
                             "Complete (Ctrl+Space)",
@@ -3746,7 +3748,6 @@ impl Application for Editor {
                     .into(),
                 );
             }
-            toolbar_controls.push(iced::widget::Space::new().width(Length::Fill).into());
             toolbar_controls.push(
                 icon_control(
                     symbolic_icon("system-search-symbolic"),

@@ -352,6 +352,19 @@ pub fn popover_item<'a, Message: Clone + 'a>(
     .on_press(on_press)
 }
 
+/// Independent toolbar commands, grouped by spacing without a selector surface.
+pub fn toolbar_actions<'a, Message: 'a>(
+    controls: Vec<Element<'a, Message>>,
+) -> Element<'a, Message> {
+    widget::container(
+        widget::row::with_children(controls)
+            .spacing(0)
+            .align_y(iced::Alignment::Center),
+    )
+    .padding(2)
+    .into()
+}
+
 /// A connected mode selector using the same compact targets as toolbar actions.
 /// Pass `icon_control(...).into()` children; each retains its own focus and tooltip.
 pub fn segmented_controls<'a, Message: 'a>(
@@ -369,9 +382,8 @@ pub fn segmented_controls<'a, Message: 'a>(
                 theme.current_container().component.base.into(),
             )),
             border: iced::Border {
-                color: theme.current_container().component.divider.into(),
-                width: crate::design::BORDER_WIDTH,
-                radius: theme.cosmic().corner_radii.radius_m.into(),
+                radius: crate::design::RADIUS_S.into(),
+                ..Default::default()
             },
             ..Default::default()
         }
