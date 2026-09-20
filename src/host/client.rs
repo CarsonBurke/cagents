@@ -463,8 +463,19 @@ fn process_request(
     let _shared = (!exclusive).then(|| gate.read().unwrap_or_else(|p| p.into_inner()));
     ensure_control_open(host)?;
     match request {
-        ClientRequest::PrepareUpgrade { capability } => {
-            let (terminals, chats) = super::state::prepare_upgrade(host, capability)?;
+        ClientRequest::BuildInfo => Ok((
+            ServerResponse::BuildInfo {
+                version: crate::VERSION.into(),
+            },
+            Vec::new(),
+            false,
+        )),
+        ClientRequest::PrepareUpgrade {
+            capability,
+            relaunch_agents,
+        } => {
+            let (terminals, chats) =
+                super::state::prepare_upgrade(host, capability, relaunch_agents)?;
             Ok((
                 ServerResponse::UpgradePrepared { terminals, chats },
                 Vec::new(),
@@ -1156,7 +1167,10 @@ mod tests {
                 .send(process_request(
                     &upgrade_host,
                     2,
-                    ClientRequest::PrepareUpgrade { capability },
+                    ClientRequest::PrepareUpgrade {
+                        capability,
+                        relaunch_agents: false,
+                    },
                 ))
                 .unwrap();
         });

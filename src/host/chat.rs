@@ -1980,7 +1980,7 @@ for line in sys.stdin:
             .shutdown_preflight(Instant::now())
             .unwrap()
             .capability;
-        let failure = super::super::state::prepare_upgrade(&host, capability).unwrap_err();
+        let failure = super::super::state::prepare_upgrade(&host, capability, false).unwrap_err();
         assert!(failure.message.contains("execution environment"));
         assert!(!handle.is_completed());
         assert!(!host.lock().unwrap_or_else(|p| p.into_inner()).shutting_down);
@@ -2022,7 +2022,7 @@ for line in sys.stdin:
             .shutdown_preflight(Instant::now())
             .unwrap()
             .capability;
-        let failure = super::super::state::prepare_upgrade(&host, capability).unwrap_err();
+        let failure = super::super::state::prepare_upgrade(&host, capability, false).unwrap_err();
         assert!(failure.message.contains("replacement is still pending"));
         std::fs::rename(
             directory.path().join("held-omp"),
@@ -2174,7 +2174,7 @@ for line in sys.stdin:
             .shutdown_preflight(Instant::now())
             .unwrap()
             .capability;
-        let failure = super::super::state::prepare_upgrade(&host, capability).unwrap_err();
+        let failure = super::super::state::prepare_upgrade(&host, capability, false).unwrap_err();
         assert!(failure.message.contains("not durably acknowledged"));
         process(
             &host,
@@ -2228,7 +2228,7 @@ for line in sys.stdin:
             .shutdown_preflight(Instant::now())
             .unwrap()
             .capability;
-        let failure = super::super::state::prepare_upgrade(&host, capability).unwrap_err();
+        let failure = super::super::state::prepare_upgrade(&host, capability, false).unwrap_err();
         assert!(failure.message.contains("execution environment"));
         assert!(!terminal_handle.is_completed());
         assert!(!host.lock().unwrap_or_else(|p| p.into_inner()).shutting_down);

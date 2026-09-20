@@ -209,12 +209,95 @@ impl<Message: Clone + 'static> Widget<Message, Theme, Renderer> for MenuSurface<
         // runtime drives overlays in, so the native menu needs no translation:
         // it derives one offset for its layout and the opposite one for its
         // hit tests, and the two only agree at none at all.
-        self.native.overlay(
-            &mut tree.children[0],
-            layout,
-            renderer,
-            viewport,
-            Vector::ZERO,
-        )
+        self.native
+            .overlay(
+                &mut tree.children[0],
+                layout,
+                renderer,
+                viewport,
+                Vector::ZERO,
+            )
+            .map(|inner| overlay::Element::new(Box::new(PointerAwareMenu { inner })))
+    }
+}
+
+/// COSMIC dispatches presses only to its last hovered item. Wayland can update
+/// the cursor on surface entry without a CursorMoved event, so derive that
+/// item from the actual press position instead of requiring prior motion.
+struct PointerAwareMenu<'a, Message> {
+    inner: overlay::Element<'a, Message, Theme, Renderer>,
+}
+impl<Message> overlay::Overlay<Message, Theme, Renderer> for PointerAwareMenu<'_, Message> {
+    fn layout(&mut self, renderer: &Renderer, bounds: Size) -> layout::Node {
+        self.inner.as_overlay_mut().layout(renderer, bounds)
+    }
+    fn update(
+        &mut self,
+        event: &Event,
+        layout: Layout<'_>,
+        cursor: mouse::Cursor,
+        renderer: &Renderer,
+        clipboard: &mut dyn Clipboard,
+        shell: &mut Shell<'_, Message>,
+    ) {
+        let press = match event {
+            Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)) => cursor.position(),
+            _ => None,
+        };
+        let mut messages = Vec::new();
+        let mut motion = Shell::new(&mut messages);
+        if let Some(position) = press {
+            self.inner.as_overlay_mut().update(
+                &Event::Mouse(mouse::Event::CursorMoved { position }),
+                layout,
+                mouse::Cursor::Available(position),
+                renderer,
+                clipboard,
+                &mut motion,
+            );
+        }
+        // Merge afterwards: motion's capture must not make the item's button
+        // skip the real press. Preserve any submenu layout/redraw requests.
+        self.inner
+            .as_overlay_mut()
+            .update(event, layout, cursor, renderer, clipboard, shell);
+        shell.merge(motion, std::convert::identity);
+    }
+    fn draw(
+        &self,
+        renderer: &mut Renderer,
+        theme: &Theme,
+        style: &renderer::Style,
+        layout: Layout<'_>,
+        cursor: mouse::Cursor,
+    ) {
+        self.inner
+            .as_overlay()
+            .draw(renderer, theme, style, layout, cursor);
+    }
+    fn operate(&mut self, layout: Layout<'_>, renderer: &Renderer, operation: &mut dyn Operation) {
+        self.inner
+            .as_overlay_mut()
+            .operate(layout, renderer, operation);
+    }
+    fn mouse_interaction(
+        &self,
+        layout: Layout<'_>,
+        cursor: mouse::Cursor,
+        renderer: &Renderer,
+    ) -> mouse::Interaction {
+        self.inner
+            .as_overlay()
+            .mouse_interaction(layout, cursor, renderer)
+    }
+    fn overlay<'a>(
+        &'a mut self,
+        layout: Layout<'a>,
+        renderer: &Renderer,
+    ) -> Option<overlay::Element<'a, Message, Theme, Renderer>> {
+        self.inner.as_overlay_mut().overlay(layout, renderer)
+    }
+    fn index(&self) -> f32 {
+        self.inner.as_overlay().index()
     }
 }

@@ -68,6 +68,59 @@ impl ActiveWorktreeOperation {
     }
 }
 
+#[cfg(test)]
+mod input_tests {
+    use super::*;
+
+    #[test]
+    fn resolving_input_has_a_cancellable_row_and_does_not_close_a_new_dialog() {
+        let mut app = super::super::tests::context_inspector_test_app(false);
+        let directory = tempfile::tempdir().unwrap();
+        let (session, _) = SessionRuntime::open(
+            directory.path().join("state.sqlite3"),
+            crate::model::BootId::new("test"),
+        )
+        .unwrap();
+        app.session = Some(session);
+        let project = ProjectId::new();
+        let dialog = || WorktreeDialog {
+            project_id: project,
+            repository: directory.path().into(),
+            branch: "feature/one".into(),
+            base: "main".into(),
+            destination: String::new(),
+            advanced: false,
+            resolving: None,
+            error: None,
+        };
+        app.worktree_dialog = Some(dialog());
+        let id = OperationId::new();
+        let _task = app.start_worktree_input(
+            project,
+            crate::repository::WorktreeInput {
+                repository: directory.path().into(),
+                input: "feature/one".into(),
+                base: "main".into(),
+                managed_directory: "worktrees".into(),
+                destination: String::new(),
+                operation_id: id,
+            },
+        );
+        assert!(app.worktree_dialog.is_none());
+        assert!(app.worktree_operations[&id].row(&[]).is_some());
+        assert!(!app.worktree_operations[&id].finished);
+        app.worktree_dialog = Some(dialog());
+        let _ = app.cancel_worktree_operation(id);
+        let _ = app.finish_worktree_input(project, id, Err("cancelled".into()));
+        assert!(app.worktree_dialog.is_some());
+        assert!(app.worktree_operations[&id].finished);
+        assert_eq!(
+            app.worktree_operations[&id].state,
+            Some(WorktreeOperationState::NotCreated)
+        );
+    }
+}
+
 /// The sidebar name of the worktree a request creates: what its row will read
 /// once the checkout lists it, so the pending row turns into it in place.
 fn worktree_operation_label(request: Option<&CreateWorktreeRequest>) -> String {
@@ -134,6 +187,12 @@ impl Cagents {
         project_id: ProjectId,
         input: crate::repository::WorktreeInput,
     ) -> Task<Message> {
+        if self.session.is_none() {
+            self.status = Some(TransientNotice::error(
+                "Worktree creation requires an available durable journal.",
+            ));
+            return Task::none();
+        }
         let Some(dialog) = &mut self.worktree_dialog else {
             return Task::none();
         };
@@ -143,10 +202,33 @@ impl Cagents {
         let operation_id = input.operation_id;
         dialog.resolving = Some(operation_id);
         dialog.error = None;
+        let token = CancellationToken::new();
+        self.worktree_operations.insert(
+            operation_id,
+            ActiveWorktreeOperation {
+                project: project_id,
+                generation: 1,
+                request: None,
+                token: Some(token.clone()),
+                receiver: None,
+                stage: Some(WorktreeProgressStage::ResolvingBase),
+                started: Instant::now(),
+                completed_elapsed: None,
+                restored: false,
+                termination_requested: false,
+                finished: false,
+                detail: "Resolving branch".into(),
+                created_worktree: None,
+                label: input.input.clone(),
+                state: None,
+            },
+        );
+        self.worktree_dialog = None;
+        self.sync_worktree_operation_rows();
         cosmic::task::future(async move {
             let result = tokio::task::spawn_blocking(move || {
                 RepositoryService::system("git")
-                    .resolve_worktree_request(&input, &CancellationToken::new())
+                    .resolve_worktree_request(&input, &token)
                     .map_err(|error| error.to_string())
             })
             .await
@@ -166,23 +248,33 @@ impl Cagents {
         operation_id: OperationId,
         result: Result<CreateWorktreeRequest, String>,
     ) -> Task<Message> {
-        let Some(dialog) = &mut self.worktree_dialog else {
+        let Some(operation) = self.worktree_operations.get_mut(&operation_id) else {
             return Task::none();
         };
-        if dialog.project_id != project_id || dialog.resolving != Some(operation_id) {
+        if operation.project != project_id || operation.request.is_some() || operation.finished {
             return Task::none();
         }
-        dialog.resolving = None;
+        if operation.termination_requested {
+            operation.finished = true;
+            operation.state = Some(WorktreeOperationState::NotCreated);
+            operation.detail = "Cancelled".into();
+            operation.token = None;
+            self.sync_worktree_operation_rows();
+            return Task::none();
+        }
         match result {
             Ok(request) => {
-                self.worktree_dialog = None;
                 let submit = self.start_worktree_operation(project_id, request);
                 Task::batch([submit, self.focus_context_overlay_if_exposed()])
             }
             Err(error) => {
-                dialog.error = Some(error.clone());
+                operation.finished = true;
+                operation.state = Some(WorktreeOperationState::NotCreated);
+                operation.detail = error.clone();
+                operation.token = None;
+                self.sync_worktree_operation_rows();
                 self.status = Some(TransientNotice::error(error));
-                iced::widget::operation::focus(worktree_dialog_focus_id()).map(cosmic::Action::App)
+                Task::none()
             }
         }
     }

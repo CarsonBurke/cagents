@@ -711,7 +711,7 @@ struct UiActivationSource(async_channel::Receiver<instance::UiActivation>);
 
 /// Hosted terminals observed on the daemon, from the inventory observer thread.
 #[derive(Clone)]
-struct HostedTerminalSource(async_channel::Receiver<Vec<TerminalSession>>);
+struct HostedTerminalSource(async_channel::Receiver<Vec<crate::terminal::ipc::TerminalDescriptor>>);
 
 impl PartialEq for HostedTerminalSource {
     fn eq(&self, _other: &Self) -> bool {
@@ -847,7 +847,13 @@ fn terminal_wake_stream(
 
 fn hosted_terminal_stream(
     source: &HostedTerminalSource,
-) -> Pin<Box<dyn cosmic::iced::futures::Stream<Item = Vec<TerminalSession>> + Send + 'static>> {
+) -> Pin<
+    Box<
+        dyn cosmic::iced::futures::Stream<Item = Vec<crate::terminal::ipc::TerminalDescriptor>>
+            + Send
+            + 'static,
+    >,
+> {
     Box::pin(cosmic::iced::futures::stream::unfold(
         source.0.clone(),
         |receiver| async move {
@@ -2452,7 +2458,7 @@ pub enum Message {
     },
     /// Hosted terminals the daemon reports, either as its full inventory on
     /// connect or as one terminal another client just created.
-    HostedTerminalsObserved(Vec<TerminalSession>),
+    HostedTerminalsObserved(Vec<crate::terminal::ipc::TerminalDescriptor>),
     TerminalWake {
         card: CardId,
         generation: u64,
@@ -3017,7 +3023,7 @@ pub struct Cagents {
     lifecycle_sweep_generation: u64,
     terminal_wake_tx: async_channel::Sender<TerminalWakeup>,
     terminal_wake_rx: async_channel::Receiver<TerminalWakeup>,
-    hosted_terminals_rx: async_channel::Receiver<Vec<TerminalSession>>,
+    hosted_terminals_rx: async_channel::Receiver<Vec<crate::terminal::ipc::TerminalDescriptor>>,
     /// Terminal starts this window has dispatched and not yet accounted for.
     ///
     /// Adoption must not claim a terminal a start is about to claim, and a
@@ -3028,6 +3034,7 @@ pub struct Cagents {
     terminal_starts: std::sync::atomic::AtomicUsize,
     /// Observations held back while a start was outstanding.
     pending_adoptions: Vec<TerminalSession>,
+    relaunched_terminals: HashSet<TerminalId>,
     /// The shared sidebar model as this window last saw it.
     workspace_model: crate::workspace_model::WorkspaceModel,
     /// Repositories this window has already been asked to open on the shared
@@ -4253,7 +4260,15 @@ impl Cagents {
     fn sync_chrome(&mut self) -> Task<Message> {
         for card in &self.durable.cards {
             let type_label = card_kind_labels(Some(&card.kind)).type_label;
-            let caption = card_kind_caption(&card.kind);
+            let caption = match &card.kind {
+                CardKind::Terminal(session) if self.relaunched_terminals.contains(&session.id) => {
+                    Cow::Owned(format!(
+                        "Relaunched after upgrade · {}",
+                        card_kind_caption(&card.kind)
+                    ))
+                }
+                _ => card_kind_caption(&card.kind),
+            };
             if self
                 .card_chrome
                 .get(&card.id)
@@ -5355,6 +5370,7 @@ impl Cagents {
                 ))
                 .model_focused(card_focused)
                 .on_focus(Message::FocusCard(id))
+                .on_open_link(Message::OpenBrowser)
                 .on_command_error(move |error| Message::TerminalError {
                     card: id,
                     message: error.to_string(),
@@ -7711,6 +7727,7 @@ impl Application for Cagents {
             hosted_terminals_rx,
             terminal_starts: std::sync::atomic::AtomicUsize::new(0),
             pending_adoptions: Vec::new(),
+            relaunched_terminals: HashSet::new(),
             workspace_model: crate::workspace_model::WorkspaceModel::default(),
             workspace_model_opens: HashSet::new(),
             workspace_model_rx,
@@ -8001,7 +8018,9 @@ impl Application for Cagents {
                     }
                 }
             }
-            Message::HostedTerminalsObserved(terminals) => self.observe_hosted_terminals(terminals),
+            Message::HostedTerminalsObserved(terminals) => {
+                self.observe_hosted_descriptors(terminals)
+            }
             Message::WorkspaceModelObserved(update) => self.apply_workspace_model_update(update),
             Message::TerminalStarted {
                 card,
@@ -9742,6 +9761,9 @@ impl Application for Cagents {
                     // Ahead of the inspector and the sidebar because the find
                     // bar is the innermost thing the user is looking at, and
                     // behind the confirmations above because those are modal.
+                    if self.dismiss_chat_picker() {
+                        return Task::none();
+                    }
                     if let Some(card) = self.focused_repository_card_with_find() {
                         return cosmic::task::message(Message::Repository(
                             RepositoryAction::CloseFind { card },
@@ -10064,6 +10086,15 @@ impl Application for Cagents {
         // survive the next assignment instead of silently replacing each other,
         // and it is the one place that can bound the history.
         if let Some(notice) = self.status.take() {
+            match notice.severity {
+                NoticeSeverity::Error => {
+                    tracing::error!(message = %notice.message, "application notice")
+                }
+                NoticeSeverity::Warning => {
+                    tracing::warn!(message = %notice.message, "application notice")
+                }
+                NoticeSeverity::Success => {}
+            }
             self.notices.record(notice);
         }
         if self.latency_focus != self.workspace.focused() {
@@ -14570,6 +14601,7 @@ mod tests {
             hosted_terminals_rx: async_channel::unbounded().1,
             terminal_starts: std::sync::atomic::AtomicUsize::new(0),
             pending_adoptions: Vec::new(),
+            relaunched_terminals: HashSet::new(),
             workspace_model: crate::workspace_model::WorkspaceModel::default(),
             workspace_model_opens: HashSet::new(),
             workspace_model_rx: async_channel::unbounded().1,

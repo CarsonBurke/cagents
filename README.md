@@ -582,6 +582,18 @@ means checkpoint persisted and shutdown requested, so callers must still wait fo
 `daemon status` to report stopped. Prefer the installer's `--restart-daemon` flow
 when replacing an installed release.
 
+If identified agents have no exact resume identity, the default remains to refuse
+the upgrade and list every blocker. `daemon prepare-upgrade --yes --relaunch-agents`
+explicitly accepts fresh conversations for those agents. The checkpoint records
+this choice and their cards say **Relaunched after upgrade**. Unrelated shell jobs
+still block the upgrade. The installer accepts `--restart-daemon --relaunch-agents`
+only when the installed CLI supports recording this acceptance.
+
+`daemon status` reports both `cli_version` and `daemon_version`; the latter is
+read from the running daemon and is null when no daemon can report its build.
+Ctrl-click a printed HTTP or HTTPS address in a terminal to open it using the
+configured browser behavior.
+
 If pull-request creation fails, cagents restores the submitted title, description,
 branches, and draft setting. If the remote outcome is uncertain, the form remains
 editable but another creation attempt is blocked until you check GitHub and confirm

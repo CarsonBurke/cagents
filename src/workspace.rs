@@ -608,6 +608,8 @@ struct PendingClose {
 /// the target widths, so saving or switching worktrees cannot persist a frame.
 #[derive(Debug, Clone)]
 struct LayoutTransition {
+    from_total_width: f32,
+    from_positions: Option<Vec<f32>>,
     from_widths: Vec<f32>,
     geometry: StripGeometry,
     elapsed: Duration,
@@ -948,7 +950,9 @@ impl Workspace {
             });
         }
 
+        let previous = self.presentation_geometry().clone();
         let index = self.index_of(id).ok_or(WorkspaceError::UnknownCard(id))?;
+        let previous_camera = self.camera;
         self.cards.remove(index);
         self.rebuild_card_indices();
         self.pending_close = None;
@@ -979,6 +983,38 @@ impl Workspace {
             self.pending_widget_focus = None;
         }
         self.rebuild_geometry();
+        if !self.cards.is_empty() && self.viewport_width > 0.0 {
+            let mut transition = LayoutTransition {
+                from_total_width: previous.total_width(),
+                from_widths: self
+                    .geometry
+                    .cards()
+                    .iter()
+                    .map(|card| {
+                        previous
+                            .card(card.id)
+                            .map_or(card.width(), CardGeometry::width)
+                    })
+                    .collect(),
+                from_positions: Some(
+                    self.geometry
+                        .cards()
+                        .iter()
+                        .map(|card| previous.card(card.id).map_or(card.start, |old| old.start))
+                        .collect(),
+                ),
+                geometry: self.geometry.clone(),
+                elapsed: Duration::ZERO,
+            };
+            Self::interpolate_layout(
+                &mut transition,
+                &self.geometry,
+                self.viewport_width,
+                self.config,
+            );
+            self.layout_transition = Some(transition);
+            self.camera = previous_camera;
+        }
         self.reveal_focused();
         Ok(self.refresh_visibility(false))
     }
@@ -1198,6 +1234,8 @@ impl Workspace {
             return;
         }
         let mut transition = LayoutTransition {
+            from_total_width: previous.total_width(),
+            from_positions: None,
             from_widths,
             geometry: self.geometry.clone(),
             elapsed: Duration::ZERO,
@@ -1222,14 +1260,18 @@ impl Workspace {
             (transition.elapsed.as_secs_f32() / LAYOUT_DURATION.as_secs_f32()).clamp(0.0, 1.0);
         let eased = 1.0 - (1.0 - progress).powi(3);
         let mut cursor = config.leading_padding;
-        for (((card, end), target), from) in transition
+        for (index, (((card, end), target), from)) in transition
             .geometry
             .cards
             .iter_mut()
             .zip(&mut transition.geometry.prefix_ends)
             .zip(target.cards())
             .zip(&transition.from_widths)
+            .enumerate()
         {
+            if let Some(positions) = &transition.from_positions {
+                cursor = positions[index] + (target.start - positions[index]) * eased;
+            }
             card.start = cursor;
             card.end = cursor + from + (target.width() - from) * eased;
             *end = card.end;
@@ -1238,7 +1280,12 @@ impl Workspace {
         let trailing = cursor - config.gap + config.trailing_padding;
         // Keep the destination reachable during a reveal. Shrinking content
         // still retains its current extent until the final frame.
-        transition.geometry.total_width = trailing.max(viewport_width).max(target.total_width());
+        let extent = transition.from_total_width
+            + (target.total_width() - transition.from_total_width) * eased;
+        transition.geometry.total_width = trailing
+            .max(viewport_width)
+            .max(target.total_width())
+            .max(extent);
     }
 
     fn reveal_focused(&mut self) {
@@ -1465,6 +1512,40 @@ mod tests {
             ViewportUpdate::unchanged()
         );
         assert_eq!(workspace.projection(800.0), settled);
+    }
+
+    #[test]
+    fn closing_a_pane_collapses_its_gap_without_teleporting_its_neighbors() {
+        let mut workspace = workspace_with_widths(&[CardWidth::Fraction(0.4); 3], 800.0);
+        let removed = workspace.cards[1].id;
+        let survivor = workspace.cards[2].id;
+        let before = workspace
+            .presentation_geometry()
+            .card(survivor)
+            .unwrap()
+            .start;
+        workspace.request_close(removed).unwrap();
+        workspace.commit_close(removed).unwrap();
+        let target = workspace.geometry().card(survivor).unwrap().start;
+        assert!(target < before);
+        assert_eq!(
+            workspace
+                .presentation_geometry()
+                .card(survivor)
+                .unwrap()
+                .start,
+            before
+        );
+        workspace.tick(Duration::from_millis(50));
+        let moving = workspace
+            .presentation_geometry()
+            .card(survivor)
+            .unwrap()
+            .start;
+        assert!(moving > target && moving < before);
+        assert!(workspace.projection(800.0).mounted_are_disjoint());
+        workspace.tick(LAYOUT_DURATION);
+        assert_eq!(workspace.presentation_geometry(), workspace.geometry());
     }
 
     #[test]

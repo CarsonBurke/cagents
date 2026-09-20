@@ -4,7 +4,114 @@ use crate::model::{ChannelId, ProjectChannel};
 use crate::sidebar::SidebarChannel;
 use crate::workspace_model::ModelEdit;
 
-#[derive(Debug, Clone, Copy)]
+fn close_channel_sessions(sessions: Vec<CardKind>) -> Result<(), String> {
+    if !sessions
+        .iter()
+        .any(|kind| matches!(kind, CardKind::Terminal(_) | CardKind::Chat(_)))
+    {
+        return Ok(());
+    }
+    let socket = crate::terminal::ipc::daemon_socket_path().map_err(|error| error.to_string())?;
+    let mut client = match crate::control::ControlClient::connect(&socket) {
+        Ok(client) => client,
+        Err(crate::control::ControlError::Connect(error))
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
+            ) =>
+        {
+            return Ok(());
+        }
+        Err(error) => return Err(format!("Cannot close the channel's sessions: {error}")),
+    };
+    // Query live identities: a saved descriptor can predate an upgrade or handoff.
+    let terminals = client.list().map_err(|error| error.to_string())?;
+    let chats = client.list_chats().map_err(|error| error.to_string())?;
+    let terminal_ids = channel_terminal_ids(&sessions, &chats);
+    for kind in &sessions {
+        if let CardKind::Chat(session) = kind
+            && let Some(live) = chats.iter().find(|live| live.id == session.id)
+        {
+            if let Err(error) = client.close_chat(live.clone()) {
+                // Another window or a natural exit can win this race.
+                // Only a fresh inventory may turn a close error into success.
+                if client
+                    .list_chats()
+                    .map_err(|error| error.to_string())?
+                    .iter()
+                    .any(|chat| chat.id == live.id)
+                {
+                    return Err(error.to_string());
+                }
+            }
+        }
+    }
+    for terminal in terminals {
+        if !channel_terminal_needs_close(&terminal.session, &terminal_ids) {
+            continue;
+        }
+        let result = client
+            .close_terminal_checked(terminal.session.id, true)
+            .map_err(|error| error.to_string())
+            .and_then(|outcome| match outcome {
+                crate::terminal::ipc::TerminalCloseResult::Closed => Ok(()),
+                other => Err(format!("Channel terminal could not be closed: {other:?}")),
+            });
+        if let Err(error) = result {
+            let still_running = client
+                .list()
+                .map_err(|error| error.to_string())?
+                .iter()
+                .any(|live| {
+                    live.session.id == terminal.session.id
+                        && channel_terminal_needs_close(&live.session, &terminal_ids)
+                });
+            if still_running {
+                return Err(error);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn channel_terminal_ids(
+    sessions: &[CardKind],
+    chats: &[crate::chat::Session],
+) -> HashSet<crate::model::TerminalId> {
+    sessions
+        .iter()
+        .filter_map(|kind| match kind {
+            CardKind::Terminal(session) => Some(session.id),
+            // Codex retains its source PTY when converted to a native chat.
+            // Close it after the actor, even if the actor has already exited.
+            CardKind::Chat(session) => chats
+                .iter()
+                .find(|live| live.id == session.id)
+                .unwrap_or(session)
+                .terminal
+                .as_ref()
+                .map(|terminal| terminal.id),
+            _ => None,
+        })
+        .collect()
+}
+
+fn channel_terminal_needs_close(
+    session: &crate::model::TerminalSession,
+    ids: &HashSet<crate::model::TerminalId>,
+) -> bool {
+    ids.contains(&session.id)
+        && !matches!(
+            session.continuity,
+            crate::model::TerminalContinuity::Exited { .. }
+                | crate::model::TerminalContinuity::RelaunchAvailable {
+                    last_exit: Some(_),
+                    ..
+                }
+        )
+}
+
+#[derive(Debug, Clone)]
 pub enum Action {
     Create(ProjectId),
     Open(ChannelId),
@@ -13,6 +120,8 @@ pub enum Action {
     Delete(ChannelId),
     ConfirmDelete,
     Dismiss,
+    SessionsClosed(ChannelId, Result<(), String>),
+    RetryDelete(ChannelId),
 }
 
 impl Action {
@@ -21,8 +130,11 @@ impl Action {
     /// Everything else a channel can be asked to do is a navigation command
     /// and stands down behind any modal; refusing the dialog's own answers
     /// would strand it with no way out.
-    pub fn answers_own_dialog(self) -> bool {
-        matches!(self, Self::ConfirmDelete | Self::Dismiss)
+    pub fn answers_own_dialog(&self) -> bool {
+        matches!(
+            self,
+            Self::ConfirmDelete | Self::Dismiss | Self::SessionsClosed(..) | Self::RetryDelete(_)
+        )
     }
 }
 
@@ -30,6 +142,7 @@ impl Action {
 #[derive(Debug, Default)]
 pub struct State {
     dialog: Option<Deletion>,
+    deleting: HashSet<ChannelId>,
 }
 
 #[derive(Debug, Clone)]
@@ -42,7 +155,11 @@ struct Deletion {
 
 impl State {
     pub fn modal_open(&self) -> bool {
-        self.dialog.is_some()
+        self.dialog.is_some() || !self.deleting.is_empty()
+    }
+
+    pub(super) fn is_deleting(&self, id: ChannelId) -> bool {
+        self.deleting.contains(&id)
     }
 
     pub(super) fn focus_target() -> widget::Id {
@@ -86,6 +203,20 @@ impl Cagents {
     }
 
     pub(super) fn handle_channel_ui(&mut self, action: Action) -> Task<Message> {
+        if let Action::RetryDelete(id) = action {
+            self.channel_ui.deleting.remove(&id);
+            return self.delete_channel(id);
+        }
+        if let Action::SessionsClosed(id, result) = action {
+            self.channel_ui.deleting.remove(&id);
+            return match result {
+                Ok(()) => self.finish_delete_channel(id),
+                Err(error) => {
+                    self.status = Some(TransientNotice::error(error));
+                    Task::none()
+                }
+            };
+        }
         if self.update_prepared
             || self.focused_repository_is_saving()
             || self.project_ui.deleting()
@@ -94,6 +225,7 @@ impl Cagents {
             return Task::none();
         }
         match action {
+            Action::SessionsClosed(..) | Action::RetryDelete(_) => unreachable!(),
             Action::Create(project_id) => {
                 if !self
                     .sidebar_model
@@ -218,6 +350,51 @@ impl Cagents {
     /// show - the same treatment worktree deletion gives the cards of the
     /// directory it removes.
     pub(super) fn delete_channel(&mut self, id: ChannelId) -> Task<Message> {
+        let Some(channel) = self
+            .durable
+            .channels
+            .iter()
+            .find(|channel| channel.id == id)
+        else {
+            return Task::none();
+        };
+        if !self.channel_ui.deleting.insert(id) {
+            return Task::none();
+        }
+        if channel
+            .cards
+            .iter()
+            .any(|card| self.pending_terminal_spawn(*card) || self.chat_start_pending(*card))
+        {
+            return cosmic::task::future(async move {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                Message::ChannelUi(Action::RetryDelete(id))
+            });
+        }
+        let sessions: Vec<_> = self
+            .durable
+            .cards
+            .iter()
+            .filter(|card| channel.cards.contains(&card.id) && card.existence.is_open())
+            .map(|card| card.kind.clone())
+            .collect();
+        if !sessions
+            .iter()
+            .any(|kind| matches!(kind, CardKind::Terminal(_) | CardKind::Chat(_)))
+        {
+            self.channel_ui.deleting.remove(&id);
+            return self.finish_delete_channel(id);
+        }
+        cosmic::task::future(async move {
+            let result = tokio::task::spawn_blocking(move || close_channel_sessions(sessions))
+                .await
+                .map_err(|error| error.to_string())
+                .and_then(|result| result);
+            Message::ChannelUi(Action::SessionsClosed(id, result))
+        })
+    }
+
+    fn finish_delete_channel(&mut self, id: ChannelId) -> Task<Message> {
         let Some(index) = self
             .durable
             .channels
@@ -258,6 +435,9 @@ impl Cagents {
         self.publish_model_edit(ModelEdit::DeleteChannel { id });
         for card in channel.cards {
             self.retire_lsp_card(card);
+            self.sidebar_state.clear_agent_activity(card);
+            self.sidebar_state.acknowledge_agent_update(card);
+            self.chat_discard(card);
             self.cards.remove(&card);
             self.lifecycle.remove(card);
             if let Some(state) = self.card_state_mut(card) {
@@ -304,6 +484,16 @@ impl Cagents {
     }
 
     pub(super) fn channel_dialog_view(&self) -> Option<Element<'_, Message>> {
+        if !self.channel_ui.deleting.is_empty() {
+            return Some(super::dialog_ui::surface(
+                widget::column::with_children(vec![
+                    widget::text::title3("Closing channel…").into(),
+                    super::notice_body("Closing its sessions before removing the channel."),
+                ])
+                .spacing(3.0 * design::GRID_UNIT),
+                480.0,
+            ));
+        }
         let dialog = self.channel_ui.dialog.as_ref()?;
         let rows: Vec<Element<'_, Message>> = vec![
             widget::text::title3("Delete channel?").into(),
@@ -459,6 +649,52 @@ fn channel_display_title(channel: &ProjectChannel) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn deleting_a_channel_closes_paired_sources_once_and_skips_exited_terminals() {
+        use crate::model::{TerminalContinuity, TerminalExit};
+        let app = super::super::tests::context_inspector_test_app(true);
+        let CardKind::Terminal(source) = &app.durable.cards[0].kind else {
+            panic!("fixture must have a terminal");
+        };
+        let mut chat = chat_session();
+        chat.launch.provider = crate::agent::Provider::Codex;
+        chat.terminal = Some(source.clone());
+        let cards = vec![
+            CardKind::Chat(chat.clone()),
+            CardKind::Terminal(source.clone()),
+        ];
+        let ids = channel_terminal_ids(&cards, &[chat.clone()]);
+        assert_eq!(ids, HashSet::from([source.id]));
+        assert!(channel_terminal_needs_close(source, &ids));
+        // The retained pairing is still needed after the chat actor disappears.
+        assert_eq!(channel_terminal_ids(&cards[..1], &[]), ids);
+        // The current descriptor, not a stale saved pairing, owns the source.
+        let mut live = chat;
+        let paired = live.terminal.as_mut().unwrap();
+        paired.id = crate::model::TerminalId::new();
+        let current = paired.id;
+        assert_eq!(
+            channel_terminal_ids(&cards[..1], &[live]),
+            HashSet::from([current])
+        );
+        let exit = TerminalExit {
+            code: Some(0),
+            signal: None,
+            occurred_at_unix_ms: 0,
+        };
+        let mut ended = source.clone();
+        ended.continuity = TerminalContinuity::Exited {
+            last_exit: exit.clone(),
+        };
+        assert!(!channel_terminal_needs_close(&ended, &ids));
+        ended.continuity = TerminalContinuity::RelaunchAvailable {
+            recipe: ended.launch.clone(),
+            last_exit: Some(exit),
+        };
+        assert!(!channel_terminal_needs_close(&ended, &ids));
+        assert!(!channel_terminal_needs_close(source, &HashSet::new()));
+    }
 
     /// A channel is created to be used now, so the newest belongs at the top of
     /// its project rather than at the bottom of a list that only grows.
@@ -687,6 +923,8 @@ mod tests {
         assert!(app.durable.channels.iter().any(|row| row.id == doomed));
 
         let _ = app.handle_channel_ui(Action::ConfirmDelete);
+        assert!(app.channel_ui.is_deleting(doomed));
+        let _ = app.handle_channel_ui(Action::SessionsClosed(doomed, Ok(())));
         assert!(
             !app.durable.channels.iter().any(|row| row.id == doomed),
             "the confirmed deletion removes the channel"

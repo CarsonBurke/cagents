@@ -72,6 +72,7 @@ pub enum Action {
     },
     EditorsLoaded(Result<Vec<crate::external_editor::Editor>, String>),
     ConfirmDelete,
+    AwaitSessions(Target),
     Deleted {
         target: Target,
         result: Result<Option<String>, String>,
@@ -187,6 +188,19 @@ impl Cagents {
 
     pub(super) fn handle_project_action(&mut self, action: Action) -> Task<Message> {
         match action {
+            Action::AwaitSessions(target) => {
+                let Some(dialog) = &mut self.project_ui.dialog else {
+                    return Task::none();
+                };
+                if dialog.target.worktree != target.worktree
+                    || dialog.target.path != target.path
+                    || !dialog.pending
+                {
+                    return Task::none();
+                }
+                dialog.pending = false;
+                return self.handle_project_action(Action::ConfirmDelete);
+            }
             Action::EditorsLoaded(result) => match result {
                 Ok(editors) => {
                     let choices: Vec<_> =
@@ -322,6 +336,17 @@ impl Cagents {
                 dialog.pending = true;
                 dialog.blocker = None;
                 dialog.failure = None;
+                if self.durable.cards.iter().any(|card| {
+                    card.existence.is_open()
+                        && card_belongs_to(card, &target.path)
+                        && (self.pending_terminal_spawn(card.id)
+                            || self.chat_start_pending(card.id))
+                }) {
+                    return cosmic::task::future(async move {
+                        tokio::time::sleep(Duration::from_millis(50)).await;
+                        Message::ProjectUi(Action::AwaitSessions(target))
+                    });
+                }
                 return cosmic::task::future(async move {
                     let request = target.clone();
                     let result =
@@ -453,17 +478,6 @@ impl Cagents {
         {
             return Some(
                 "Commit, stash, or discard the worktree changes before deleting it.".into(),
-            );
-        }
-        // A terminal that has no daemon identity yet cannot be closed by
-        // anyone; it gets one within moments of starting.
-        if self.durable.cards.iter().any(|card| {
-            card.existence.is_open()
-                && card_belongs_to(card, &target.path)
-                && self.pending_terminal_spawn(card.id)
-        }) {
-            return Some(
-                "A terminal in this worktree is still starting. Try again in a moment.".into(),
             );
         }
         if self.cards.values().any(|runtime| {

@@ -827,8 +827,18 @@ impl Runtime {
                 .into(),
             );
         }
+        for (_, error) in self.failures.iter().filter(|(anchor, _)| anchor.is_none()) {
+            transcript.push(notice_entry(error));
+        }
         for turn in &self.turns {
             transcript.push(self.turn_view(turn, markdown_settings));
+            for (_, error) in self
+                .failures
+                .iter()
+                .filter(|(anchor, _)| anchor.as_ref() == Some(&turn.key))
+            {
+                transcript.push(notice_entry(error));
+            }
         }
         if snapshot.has_later {
             transcript.push(paging_view(Page::Newer, self.paging() == Some(Page::Newer)));
@@ -855,7 +865,9 @@ impl Runtime {
         // entry in the transcript rather than a line pinned above the
         // composer: it scrolls away with what it was about instead of
         // staying on screen until the next command happens to clear it.
-        if let Some(error) = self.error.as_ref().or(snapshot.error.as_ref()) {
+        if let Some(error) = self.error.as_ref().or(snapshot.error.as_ref())
+            && !self.failures.iter().any(|(_, recorded)| recorded == error)
+        {
             transcript.push(notice_entry(error));
         }
         content.extend(self.plan_view());
@@ -1271,7 +1283,6 @@ impl Runtime {
             .width(Length::Fill)
             .into(),
         );
-        content.extend(self.model_search());
         let usage = &snapshot.usage;
         // The status line has two halves. What the agent is doing, where it is
         // doing it and the settings a reader changes mid-conversation scroll
@@ -1577,20 +1588,45 @@ impl Runtime {
                     .into(),
                 );
             } else {
-                let reasoning = model.reasoning.clone();
-                let model_id = model.id.clone();
-                controls.push(
-                    widget::dropdown(model.reasoning.clone(), selected, move |index| {
-                        action(Action::Reasoning(
-                            target,
-                            model_id.clone(),
-                            reasoning[index].clone(),
-                        ))
-                    })
-                    .text_size(design::TEXT_CAPTION)
-                    .padding(CONTROL_PADDING)
-                    .into(),
-                );
+                let open = self.reasoning_picker;
+                let anchor = widget::button::custom(design::caption(
+                    selected.map_or("Reasoning", |index| model.reasoning[index].as_str()),
+                ))
+                .name("Choose reasoning effort")
+                .class(crate::ui_controls::control_style(open, None))
+                .padding(CONTROL_PADDING)
+                .on_press(action(Action::ReasoningPicker(target, !open)));
+                let choices = open.then(|| {
+                    widget::column::with_children(
+                        model
+                            .reasoning
+                            .iter()
+                            .enumerate()
+                            .map(|(index, reasoning)| {
+                                widget::button::custom(design::body(reasoning.as_str()))
+                                    .class(crate::ui_controls::control_style(
+                                        Some(index) == selected,
+                                        None,
+                                    ))
+                                    .width(Length::Fill)
+                                    .on_press(action(Action::Reasoning(
+                                        target,
+                                        model.id.clone(),
+                                        reasoning.clone(),
+                                    )))
+                                    .into()
+                            })
+                            .collect::<Vec<_>>(),
+                    )
+                    .width(160)
+                    .into()
+                });
+                controls.push(crate::ui_controls::popover(
+                    anchor,
+                    choices,
+                    widget::popover::Position::Top,
+                    action(Action::ReasoningPicker(target, false)),
+                ));
             }
         }
         if !snapshot.capabilities.permission_modes.is_empty() {
@@ -1635,7 +1671,7 @@ impl Runtime {
     fn model_picker<'a>(&'a self, current: Option<&'a chat::Model>) -> Element<'a, Message> {
         let target = self.target;
         let open = self.model_picker.is_some();
-        widget::button::custom(
+        let anchor = widget::button::custom(
             widget::row::with_children(vec![
                 design::caption(current.map_or("Model", |model| model.label.as_str()))
                     .wrapping(iced::widget::text::Wrapping::None)
@@ -1650,43 +1686,28 @@ impl Runtime {
         .name("Choose a model")
         .class(crate::ui_controls::control_style(open, None))
         .padding(CONTROL_PADDING)
-        .on_press(action(Action::ModelPicker(target, !open)))
-        .into()
+        .on_press(action(Action::ModelPicker(target, !open)));
+        crate::ui_controls::popover(
+            anchor,
+            self.model_search(),
+            widget::popover::Position::Top,
+            action(Action::ModelPicker(target, false)),
+        )
     }
 
     /// The search field and list, pinned above the status line the picker
     /// sits on, or nothing while the picker is closed.
     ///
-    /// This is a panel in the pane's own column rather than a popup floating
-    /// over it, because an overlay raised from inside a card never reaches
-    /// the screen in this shell - the reasoning dropdown beside it has the
-    /// same problem - and a search a reader cannot see is not a search. Above
-    /// the status line it still reads as belonging to the control that opened
-    /// it, and the transcript it displaces is restored the moment it closes.
+    /// The shared popover anchors this above its control without changing the
+    /// transcript's height or scroll position.
     fn model_search(&self) -> Option<Element<'_, Message>> {
         let query = self.model_picker.as_deref()?;
-        Some(
-            widget::container(
-                widget::container(model_list(
-                    self.target,
-                    &self.snapshot.models,
-                    self.snapshot.selected_model.as_deref(),
-                    query,
-                ))
-                .class(design::surface(
-                    Some(design::raised),
-                    [design::RADIUS_M; 4],
-                    true,
-                ))
-                .padding(step::GAP_S),
-            )
-            // The panel keeps the picker's own corner of the pane instead of
-            // stretching across it, so the eye travels from the control to
-            // the list rather than across a full-width band.
-            .align_x(Alignment::End)
-            .width(Length::Fill)
-            .into(),
-        )
+        Some(model_list(
+            self.target,
+            &self.snapshot.models,
+            self.snapshot.selected_model.as_deref(),
+            query,
+        ))
     }
 
     /// One exchange: what was asked, what was done, and what came back.

@@ -123,9 +123,19 @@ impl CloseSafetyShell {
     }
 
     fn assert_unconfirmed_close(&self) {
-        self.wait_for("unconfirmed shell close", || {
-            self.terminal.close_checked(false) == TerminalCloseResult::Closed
-        });
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let outcome = self.terminal.close_checked(false);
+            if outcome == TerminalCloseResult::Closed {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "Timed out waiting for unconfirmed shell close: {outcome:?}; screen:\n{}",
+                self.screen()
+            );
+            let _ = self.wakes.recv_timeout(Duration::from_millis(10));
+        }
     }
 
     fn assert_child_requires_confirmation(&self, command: &[u8], marker: &str) {

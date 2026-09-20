@@ -1574,6 +1574,37 @@ mod tests {
         }
 
         #[test]
+        fn a_single_item_context_menu_activates_its_visible_item() {
+            for move_before_press in [false, true] {
+                let mut frames = Frames::new();
+                // The full-width row makes COSMIC place this popup leftwards:
+                // its measured bounds are x=180..420, y=16..52.
+                let point = Point::new(220.0, 32.0);
+                let _ = frames.frame(row(1), &[], ANCHOR);
+                let _ = frames.frame(row(1), &right_click(), ANCHOR);
+                let _ = frames.frame(row(1), &[redraw()], ANCHOR);
+                if move_before_press {
+                    let _ = frames.frame(row(1), &[moved(point)], point);
+                }
+                let _ = frames.frame(
+                    row(1),
+                    &[Event::Mouse(mouse::Event::ButtonPressed(
+                        mouse::Button::Left,
+                    ))],
+                    point,
+                );
+                let _ = frames.frame(
+                    row(1),
+                    &[Event::Mouse(mouse::Event::ButtonReleased(
+                        mouse::Button::Left,
+                    ))],
+                    point,
+                );
+                assert_eq!(frames.messages, vec![Act::Item(0)]);
+            }
+        }
+
+        #[test]
         fn an_open_menu_outlives_frames_that_leave_its_items_alone() {
             // The dismissal below must cost something, or it would be no fix at
             // all: a menu that closes on the next frame regardless is useless.

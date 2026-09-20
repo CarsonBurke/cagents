@@ -53,6 +53,7 @@ pub(crate) struct TerminalRecord {
     pub(super) execution_environment: Option<crate::terminal_ipc::ChatExecutionEnvironment>,
     options: TerminalSpawnOptions,
     upgrade_sources: Vec<TerminalSession>,
+    upgrade_relaunches: Vec<crate::terminal_ipc::UpgradeRelaunch>,
     running: bool,
     completion_observed: bool,
     last_exit: Option<TerminalExit>,
@@ -675,6 +676,7 @@ impl HostState {
             attached,
             transcript: transcript_metadata(record.session.transcript_path.as_deref()),
             upgrade_sources: record.upgrade_sources.clone(),
+            upgrade_relaunches: record.upgrade_relaunches.clone(),
         })
     }
 
@@ -749,6 +751,7 @@ impl HostState {
                 options: TerminalSpawnOptions::default(),
                 execution_environment: None,
                 upgrade_sources: Vec::new(),
+                upgrade_relaunches: Vec::new(),
                 running: true,
                 completion_observed: false,
                 last_exit: None,
@@ -1094,13 +1097,9 @@ fn upgrade_blockers_message(blockers: &[String]) -> String {
     // "Active work" is narrower than it sounds, and the message says so: the
     // session's process cannot be resumed after the daemon restarts, only
     // started again, and the upgrade will not make that choice for the user.
-    let mut message = String::from(if blockers.len() == 1 {
-        "A terminal is running an agent the upgrade could only relaunch, not resume; finish or \
-         close it, then upgrade again:"
-    } else {
-        "Terminals are running agents the upgrade could only relaunch, not resume; finish or \
-         close them, then upgrade again:"
-    });
+    let mut message = String::from(
+        "These active terminals cannot be resumed automatically. Finish or close their jobs before upgrading. For identified agents, --relaunch-agents accepts starting fresh conversations; unrelated shell jobs still block the upgrade:",
+    );
     for blocker in blockers {
         message.push_str("\n  ");
         message.push_str(blocker);
@@ -1112,8 +1111,14 @@ fn upgrade_blockers_message(blockers: &[String]) -> String {
 pub(super) fn prepare_upgrade(
     host: &SharedHost,
     capability: ShutdownCapability,
+    relaunch_agents: bool,
 ) -> Result<(u64, u64), ProtocolError> {
-    prepare_upgrade_with(host, capability, crate::upgrade::handoff::Store::discover)
+    prepare_upgrade_with_policy(
+        host,
+        capability,
+        relaunch_agents,
+        crate::upgrade::handoff::Store::discover,
+    )
 }
 
 fn validate_terminal_upgrade_environment(
@@ -1133,9 +1138,19 @@ fn validate_terminal_upgrade_environment(
     Ok(())
 }
 
+#[cfg(test)]
 fn prepare_upgrade_with(
     host: &SharedHost,
     capability: ShutdownCapability,
+    discover: impl FnOnce() -> Result<crate::upgrade::handoff::Store, String>,
+) -> Result<(u64, u64), ProtocolError> {
+    prepare_upgrade_with_policy(host, capability, false, discover)
+}
+
+fn prepare_upgrade_with_policy(
+    host: &SharedHost,
+    capability: ShutdownCapability,
+    relaunch_agents: bool,
     discover: impl FnOnce() -> Result<crate::upgrade::handoff::Store, String>,
 ) -> Result<(u64, u64), ProtocolError> {
     use crate::upgrade::handoff::{Chat, Checkpoint, Phase, Terminal};
@@ -1187,6 +1202,7 @@ fn prepare_upgrade_with(
                     record.handle.clone(),
                     record.options.clone(),
                     record.upgrade_sources.clone(),
+                    record.upgrade_relaunches.clone(),
                     record.execution_environment.clone(),
                 ))
             })
@@ -1271,7 +1287,15 @@ fn prepare_upgrade_with(
     // a time. Snapshots taken before a blocker is found stay reversible under
     // the control gate, exactly as they do for any other refusal below.
     let mut blockers = Vec::new();
-    for (mut source, handle, mut options, previous_sources, execution_environment) in terminals {
+    for (
+        mut source,
+        handle,
+        mut options,
+        previous_sources,
+        mut relaunches,
+        execution_environment,
+    ) in terminals
+    {
         let snapshot = handle.prepare_upgrade().map_err(upgrade_error)?;
         source.resume_hint = if let Some((selected, native)) = paired_codex.get(&source.id) {
             // The worker's argv hint can be fresh or name an older TUI thread.
@@ -1313,10 +1337,24 @@ fn prepare_upgrade_with(
             .and_then(crate::model::agent_recovery::recipe_from_hint);
         // A shell recipe alone cannot authorize losing its arbitrary running job.
         if snapshot.active && exact.is_none() {
-            blockers.push(describe_upgrade_blocker(&source));
-            continue;
+            let accepted = relaunch_agents
+                .then(|| handle.observe_agent_process())
+                .flatten()
+                .filter(|agent| snapshot.only_agent_tree(agent.pid))
+                .and_then(|agent| crate::model::agent_recovery::fresh_recipe(&agent.recovery));
+            match accepted {
+                Some(recipe) => relaunches.push(crate::terminal_ipc::UpgradeRelaunch {
+                    source: source.clone(),
+                    recipe,
+                }),
+                None => {
+                    blockers.push(describe_upgrade_blocker(&source));
+                    continue;
+                }
+            }
         }
-        let recipe = crate::upgrade::recovery_recipe(&source).map_err(upgrade_error)?;
+        let recipe =
+            crate::upgrade::checkpoint_recipe(&source, &relaunches).map_err(upgrade_error)?;
         if let Some(execution) = execution_environment {
             validate_terminal_upgrade_environment(&recipe, &execution)?;
         }
@@ -1329,6 +1367,7 @@ fn prepare_upgrade_with(
         saved.push(Terminal {
             source,
             previous_sources,
+            relaunches,
             recipe,
             options,
         });
@@ -1501,6 +1540,12 @@ fn restore_upgrade_from(
                 .upgrade_sources;
             sources.clone_from(&terminal.previous_sources);
             sources.push(terminal.source.clone());
+            state
+                .terminals
+                .get_mut(&terminal.source.id)
+                .expect("restored terminal")
+                .upgrade_relaunches
+                .clone_from(&terminal.relaunches);
             state
                 .detach(0, terminal.source.id)
                 .map_err(|error| error.message)?;
@@ -2002,6 +2047,94 @@ mod tests {
     }
 
     #[test]
+    fn upgrade_agent_relaunch_requires_opt_in_and_survives_repeated_restore() {
+        use crate::upgrade::handoff::Store;
+        let directory = tempfile::tempdir().unwrap();
+        // A real foreground process, recognized by its provider argv. Its
+        // executable is deliberately different from the recovery command.
+        let executable = directory.path().join("claude");
+        std::os::unix::fs::symlink("/bin/cat", &executable).unwrap();
+        let recipe = crate::model::LaunchRecipe {
+            program: executable.to_string_lossy().into_owned(),
+            arguments: Vec::new(),
+            working_directory: directory.path().into(),
+            environment: BTreeMap::from([(
+                "HOME".into(),
+                directory.path().to_string_lossy().into_owned(),
+            )]),
+        };
+        let source = TerminalSession {
+            id: TerminalId::new(),
+            launch: recipe.clone(),
+            transcript_path: None,
+            resume_hint: None,
+            continuity: TerminalContinuity::RelaunchAvailable {
+                recipe,
+                last_exit: None,
+            },
+        };
+        let mut host = Arc::new(Mutex::new(test_host()));
+        spawn_terminal(&host, 0, source.clone(), TerminalSpawnOptions::default()).unwrap();
+        let empty_proc = directory.path().join("proc");
+        fs::create_dir(&empty_proc).unwrap();
+        for incarnation in ["second", "third"] {
+            let handle = host.lock().unwrap().terminals[&source.id].handle.clone();
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while handle.observe_agent_process().is_none() {
+                assert!(Instant::now() < deadline, "agent never became foreground");
+                thread::sleep(Duration::from_millis(10));
+            }
+            let capability = host
+                .lock()
+                .unwrap()
+                .shutdown_preflight(Instant::now())
+                .unwrap()
+                .capability;
+            assert!(
+                prepare_upgrade_with_policy(&host, capability, false, || Store::open(
+                    directory.path()
+                ))
+                .is_err()
+            );
+            assert!(!handle.is_completed(), "refusal must preserve the agent");
+            let capability = host
+                .lock()
+                .unwrap()
+                .shutdown_preflight(Instant::now())
+                .unwrap()
+                .capability;
+            assert_eq!(
+                prepare_upgrade_with_policy(&host, capability, true, || Store::open(
+                    directory.path()
+                ))
+                .unwrap(),
+                (1, 0)
+            );
+            finish_upgrade(&host).unwrap();
+            let saved = Store::open(directory.path())
+                .unwrap()
+                .load()
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                saved.terminals[0].recipe.program,
+                executable.to_string_lossy()
+            );
+            assert!(!saved.terminals[0].relaunches.is_empty());
+            host = Arc::new(Mutex::new(test_host_with_incarnation(incarnation)));
+            restore_upgrade_from(&host, Store::open(directory.path()).unwrap(), &empty_proc)
+                .unwrap();
+            let descriptor = host.lock().unwrap().descriptor(0, source.id).unwrap();
+            assert!(!descriptor.upgrade_relaunches.is_empty());
+        }
+        let handle = host.lock().unwrap().terminals[&source.id].handle.clone();
+        assert_eq!(
+            handle.close_checked(true),
+            crate::terminal_ipc::TerminalCloseResult::Closed
+        );
+    }
+
+    #[test]
     fn native_upgrade_retains_hidden_lineage_and_restarts_final_claude_conversation_once() {
         use crate::{
             agent::Provider,
@@ -2412,6 +2545,7 @@ for line in sys.stdin:
             vec![Terminal {
                 source: source.clone(),
                 previous_sources: Vec::new(),
+                relaunches: Vec::new(),
                 recipe,
                 options: TerminalSpawnOptions::default(),
             }],

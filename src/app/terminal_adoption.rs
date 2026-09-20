@@ -15,7 +15,9 @@ const RECONNECT_DELAY: Duration = Duration::from_secs(2);
 /// connect, and one session per creation edge afterwards. The receiver decides
 /// what to do with them, so a reconnection after a missed edge is a resynchronise
 /// rather than a special case.
-pub(super) fn observe_hosted_inventory(sender: async_channel::Sender<Vec<TerminalSession>>) {
+pub(super) fn observe_hosted_inventory(
+    sender: async_channel::Sender<Vec<crate::terminal::ipc::TerminalDescriptor>>,
+) {
     let observer = std::thread::Builder::new()
         .name("cagents-terminal-inventory".into())
         .spawn(move || {
@@ -35,7 +37,9 @@ pub(super) fn observe_hosted_inventory(sender: async_channel::Sender<Vec<Termina
     }
 }
 
-fn observe_inventory(sender: &async_channel::Sender<Vec<TerminalSession>>) -> Result<(), String> {
+fn observe_inventory(
+    sender: &async_channel::Sender<Vec<crate::terminal::ipc::TerminalDescriptor>>,
+) -> Result<(), String> {
     // Never start a daemon merely to watch it: with no daemon there is nothing
     // to adopt, and the window starts one itself as soon as it hosts a terminal.
     let socket = crate::terminal::ipc::daemon_socket_path().map_err(|error| error.to_string())?;
@@ -47,19 +51,14 @@ fn observe_inventory(sender: &async_channel::Sender<Vec<TerminalSession>>) -> Re
     // a buffered edge; listing first would lose it.
     let listed = client.list().map_err(|error| error.to_string())?;
     sender
-        .send_blocking(
-            listed
-                .into_iter()
-                .map(|terminal| terminal.session)
-                .collect(),
-        )
+        .send_blocking(listed)
         .map_err(|error| error.to_string())?;
     loop {
         let created = client
             .next_created_terminal()
             .map_err(|error| error.to_string())?;
         sender
-            .send_blocking(vec![created.session])
+            .send_blocking(vec![created])
             .map_err(|error| error.to_string())?;
     }
 }
@@ -85,6 +84,24 @@ fn card_claims_terminal(card: &CardState, terminal: TerminalId) -> bool {
 }
 
 impl Cagents {
+    pub(super) fn observe_hosted_descriptors(
+        &mut self,
+        terminals: Vec<crate::terminal::ipc::TerminalDescriptor>,
+    ) -> Task<Message> {
+        for terminal in &terminals {
+            if !terminal.upgrade_relaunches.is_empty() {
+                self.relaunched_terminals.insert(terminal.session.id);
+            } else {
+                self.relaunched_terminals.remove(&terminal.session.id);
+            }
+        }
+        self.observe_hosted_terminals(
+            terminals
+                .into_iter()
+                .map(|terminal| terminal.session)
+                .collect(),
+        )
+    }
     /// Adopts every observed hosted terminal this window has no card for.
     ///
     /// The daemon owns the terminal inventory, so a terminal spawned by the CLI

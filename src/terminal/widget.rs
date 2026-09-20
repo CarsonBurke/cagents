@@ -1063,6 +1063,50 @@ impl ShapeCache {
 }
 
 type ErrorMapper<Message> = dyn Fn(TerminalSendError) -> Message + Send + Sync + 'static;
+type LinkMapper<Message> = dyn Fn(url::Url) -> Message + 'static;
+
+/// Resolve a printed web address at a cell without confusing byte offsets with
+/// terminal columns. Restrict activation to web URLs; terminal output is untrusted.
+fn web_link_at(row: &RowSnapshot, column: u16) -> Option<url::Url> {
+    let column = usize::from(column);
+    let cell = row.cells.get(column)?;
+    let boundary = |cell: &CellSnapshot| {
+        cell.style.invisible
+            || cell.text.is_empty()
+            || cell
+                .text
+                .as_str()
+                .chars()
+                .any(|ch| ch.is_whitespace() || matches!(ch, '<' | '>' | '"' | '\'' | '`'))
+    };
+    if boundary(cell) {
+        return None;
+    }
+    let start = row.cells[..column]
+        .iter()
+        .rposition(boundary)
+        .map_or(0, |i| i + 1);
+    let end = row.cells[column..]
+        .iter()
+        .position(boundary)
+        .map_or(row.cells.len(), |i| column + i);
+    let text: String = row.cells[start..end]
+        .iter()
+        .map(|cell| cell.text.as_str())
+        .collect();
+    let text = text
+        .trim_start_matches(['(', '[', '{'])
+        .trim_end_matches(['.', ',', ';', '!', '?']);
+    // A balanced parenthesis is legal in a URL; trim only surrounding prose.
+    let mut text = text;
+    for (open, close) in [('(', ')'), ('[', ']'), ('{', '}')] {
+        while text.ends_with(close) && text.matches(close).count() > text.matches(open).count() {
+            text = &text[..text.len() - 1];
+        }
+    }
+    let url = url::Url::parse(text).ok()?;
+    (matches!(url.scheme(), "http" | "https") && url.host_str().is_some()).then_some(url)
+}
 
 /// A lock-free iced view over a single immutable terminal snapshot.
 ///
@@ -1081,6 +1125,7 @@ pub struct TerminalWidget<Message> {
     model_focused: bool,
     on_focus: Option<Message>,
     on_command_error: Option<Arc<ErrorMapper<Message>>>,
+    on_open_link: Option<Box<LinkMapper<Message>>>,
     _message: PhantomData<fn() -> Message>,
 }
 
@@ -1111,6 +1156,7 @@ impl<Message> TerminalWidget<Message> {
             model_focused: false,
             on_focus: None,
             on_command_error: None,
+            on_open_link: None,
             _message: PhantomData,
         }
     }
@@ -1185,6 +1231,12 @@ impl<Message> TerminalWidget<Message> {
 
     pub fn on_focus(mut self, message: Message) -> Self {
         self.on_focus = Some(message);
+        self
+    }
+
+    /// Ctrl-click opens a printed web address, including in mouse-reporting TUIs.
+    pub fn on_open_link(mut self, mapper: impl Fn(url::Url) -> Message + 'static) -> Self {
+        self.on_open_link = Some(Box::new(mapper));
         self
     }
 
@@ -1589,6 +1641,16 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for TerminalWidget<Message
                     state.last_cursor = Some(position);
                     let cell = geometry.cell_at(position);
                     state.last_motion_cell = Some(cell);
+                    if *button == IcedMouseButton::Left
+                        && state.modifiers.control
+                        && let Some(open) = &self.on_open_link
+                        && let Some(row) = self.snapshot.lines.get(usize::from(cell.1))
+                        && let Some(url) = web_link_at(row, cell.0)
+                    {
+                        shell.publish(open(url));
+                        shell.capture_event();
+                        return;
+                    }
                     // Selecting and pasting belong to this widget whenever the
                     // child is not reading the mouse itself, and shift takes
                     // them back from a child that is. Without that override a
@@ -2079,7 +2141,7 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for TerminalWidget<Message
 
     fn mouse_interaction(
         &self,
-        _tree: &Tree,
+        tree: &Tree,
         layout: Layout<'_>,
         cursor: mouse::Cursor,
         _viewport: &Rectangle,
@@ -2099,7 +2161,19 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for TerminalWidget<Message
             self.line_height,
             self.padding,
         );
-        if geometry.cursor_position(cursor).is_some() {
+        if let Some(position) = geometry.cursor_position(cursor) {
+            let cell = geometry.cell_at(position);
+            if tree.state.downcast_ref::<WidgetState>().modifiers.control
+                && self.on_open_link.is_some()
+                && self
+                    .snapshot
+                    .lines
+                    .get(usize::from(cell.1))
+                    .and_then(|row| web_link_at(row, cell.0))
+                    .is_some()
+            {
+                return mouse::Interaction::Pointer;
+            }
             mouse::Interaction::Text
         } else {
             mouse::Interaction::None
@@ -3524,6 +3598,24 @@ mod tests {
                 .map(|segment| (segment.start, segment.len))
                 .collect::<Vec<_>>(),
             vec![(0, 2), (3, 1)]
+        );
+    }
+
+    #[test]
+    fn printed_links_use_cell_columns_and_preserve_balanced_url_punctuation() {
+        let line = row("é (https://example.org/a_(b)). next");
+        assert_eq!(
+            web_link_at(&line, 8).unwrap().as_str(),
+            "https://example.org/a_(b)"
+        );
+        assert!(web_link_at(&line, 1).is_none());
+        assert!(web_link_at(&row("javascript:alert(1)"), 5).is_none());
+        assert!(web_link_at(&row("file:///etc/passwd"), 5).is_none());
+        assert_eq!(
+            web_link_at(&row("https://example.org/a?b=1&c=2"), 10)
+                .unwrap()
+                .query(),
+            Some("b=1&c=2")
         );
     }
 

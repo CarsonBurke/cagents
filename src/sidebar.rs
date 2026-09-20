@@ -3248,7 +3248,7 @@ fn body<'a>(
         SidebarDataState::Loading if !model.projects.is_empty() => {
             project_list(model, state, compact, modal_open)
         }
-        SidebarDataState::Loading => loading(compact),
+        SidebarDataState::Loading => loading(),
         SidebarDataState::Error(message) => error(message, compact, modal_open),
         SidebarDataState::Ready => project_list(model, state, compact, modal_open),
     }
@@ -3328,20 +3328,12 @@ fn project_scroll(
     )
 }
 
-fn loading(compact: bool) -> Element<'static, SidebarAction> {
+fn loading() -> Element<'static, SidebarAction> {
     let spacing = cosmic::theme::spacing();
-    let content = widget::column::with_children(vec![
-        crate::ui_controls::activity_spinner_tone(
-            f32::from(STATUS_ICON_SIZE),
-            design::warning_color,
-        ),
-        design::caption(if compact {
-            "Loading"
-        } else {
-            "Loading projects…"
-        })
-        .into(),
-    ])
+    let content = widget::column::with_children(vec![crate::ui_controls::activity_spinner_tone(
+        f32::from(STATUS_ICON_SIZE),
+        design::accent_color,
+    )])
     .align_x(Alignment::Center)
     .spacing(spacing.space_xxs);
     widget::container(content)
