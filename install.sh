@@ -14,6 +14,7 @@ Options:
   --version VERSION  Install a release version (default: latest v* release)
   --prefix PATH      Installation root (default: $XDG_DATA_HOME/cagents-install)
   --restart-daemon   Checkpoint supported sessions and replace the running daemon
+  --require-empty-daemon  With --restart-daemon, refuse to interrupt live sessions
   --relaunch-agents  With --restart-daemon, accept fresh launches for non-resumable agents
   --uninstall        Remove program files while preserving user data
   --purge            Uninstall and also remove cagents user data
@@ -36,6 +37,7 @@ PREFIX=
 UNINSTALL=0
 PURGE=0
 RESTART_DAEMON=0
+REQUIRE_EMPTY_DAEMON=0
 RELAUNCH_AGENTS=0
 
 while [ "$#" -gt 0 ]; do
@@ -56,6 +58,10 @@ while [ "$#" -gt 0 ]; do
             ;;
         --relaunch-agents)
             RELAUNCH_AGENTS=1
+            shift
+            ;;
+        --require-empty-daemon)
+            REQUIRE_EMPTY_DAEMON=1
             shift
             ;;
         --uninstall)
@@ -79,6 +85,8 @@ done
 
 [ "$RELAUNCH_AGENTS" -eq 0 ] || [ "$RESTART_DAEMON" -eq 1 ] \
     || fail '--relaunch-agents requires --restart-daemon'
+[ "$REQUIRE_EMPTY_DAEMON" -eq 0 ] || [ "$RESTART_DAEMON" -eq 1 ] \
+    || fail '--require-empty-daemon requires --restart-daemon'
 
 [ "$RESTART_DAEMON" -eq 0 ] || [ "$UNINSTALL" -eq 0 ] \
     || fail '--restart-daemon cannot be combined with --uninstall or --purge'
@@ -386,7 +394,7 @@ cleanup() {
     fi
 
     if [ "$TRANSACTION_COMMITTED" -eq 0 ] \
-        && [ "$DAEMON_CHECKPOINTED" -eq 1 ] \
+        && [ "$RESTART_DAEMON" -eq 1 ] \
         && [ "$DAEMON_START_ATTEMPTED" -eq 1 ]; then
         read_daemon_status "$NEW_VERSION_DIR/bin/cagents"
         if [ "$DAEMON_STATUS" != stopped ]; then
@@ -729,7 +737,12 @@ if [ "$HAD_CURRENT" -eq 1 ]; then
         case $DAEMON_STATUS in
             running)
                 OLD_DAEMON_WAS_RUNNING=1
-                prepare_daemon_upgrade "$PREFIX/current/bin/cagents"
+                if [ "$REQUIRE_EMPTY_DAEMON" -eq 1 ]; then
+                    stop_daemon_and_wait "$PREFIX/current/bin/cagents"
+                    DAEMON_STOPPED_FOR_SWITCH=1
+                else
+                    prepare_daemon_upgrade "$PREFIX/current/bin/cagents"
+                fi
                 ;;
             stopped) ;;
             *) fail 'cannot verify the installed daemon status; installation was not changed' ;;
@@ -766,14 +779,14 @@ ensure_link "$ICON_TARGET" "$ICON_LINK" icon
 ensure_link "$RASTER_ICON_TARGET" "$RASTER_ICON_LINK" raster_icon
 ensure_link "$METAINFO_TARGET" "$METAINFO_LINK" metainfo
 ensure_link "$AUTOSTART_TARGET" "$AUTOSTART_LINK" autostart
-# A checkpointed update commits only after the replacement starts. Ordinary
+# A requested daemon update commits only after the replacement starts. Ordinary
 # installs retain their existing login-autostart behavior on startup failure.
-[ "$DAEMON_CHECKPOINTED" -eq 1 ] || TRANSACTION_COMMITTED=1
+[ "$RESTART_DAEMON" -eq 1 ] || TRANSACTION_COMMITTED=1
 DAEMON_START_ATTEMPTED=1
 if "$PREFIX/current/bin/cagents" daemon start >/dev/null; then
     DAEMON_STARTED=1
 else
-    if [ "$DAEMON_CHECKPOINTED" -eq 1 ]; then
+    if [ "$RESTART_DAEMON" -eq 1 ]; then
         fail 'replacement daemon startup failed; checking rollback safety while preserving durable recovery state'
     fi
     printf '%s: installed cagents, but its production daemon could not start now; login autostart remains enabled\n' \

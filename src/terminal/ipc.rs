@@ -67,7 +67,8 @@ use crate::{
 /// about.
 /// Version 14 distinguishes root process exit from final PTY completion and
 /// publishes semantic conversation titles independently of terminal titles.
-pub const PROTOCOL_VERSION: u16 = 14;
+/// Version 15 adds terminal palettes and durable recovery-origin identity.
+pub const PROTOCOL_VERSION: u16 = 15;
 /// Postcard encodes an 80x24 grid in roughly 20 KiB and a typical single-row
 /// delta in a few hundred bytes, but a full repaint of a very large grid after
 /// a resize still has to fit, so keep generous headroom.
@@ -692,6 +693,7 @@ impl TerminalDescriptor {
     ) -> Self {
         Self {
             session: TerminalSession {
+                recovery_origin: None,
                 id: terminal_id,
                 launch: recipe.clone(),
                 transcript_path,
@@ -1521,6 +1523,32 @@ mod tests {
     use crate::model::{BootId, HostIncarnation, HostSessionId};
 
     use super::*;
+
+    #[test]
+    fn terminal_recovery_origin_round_trips_in_framed_inventory() {
+        for origin in [None, Some(TerminalId::new())] {
+            let mut terminal = TerminalDescriptor::relaunchable(
+                TerminalId::new(),
+                LaunchRecipe::shell(PathBuf::from("/tmp")).unwrap(),
+                None,
+            );
+            terminal.session.recovery_origin = origin;
+            let message = ServerEnvelope {
+                version: PROTOCOL_VERSION,
+                request_id: Some(1),
+                proof: proof("session", "boot", "incarnation"),
+                message: ServerMessage::Response {
+                    response: ServerResponse::Listed {
+                        terminals: vec![terminal],
+                    },
+                },
+            };
+            let mut bytes = Vec::new();
+            write_frame(&mut bytes, &message).unwrap();
+            let decoded: ServerEnvelope = read_frame(&mut Cursor::new(bytes)).unwrap().unwrap();
+            assert_eq!(decoded, message);
+        }
+    }
 
     #[test]
     fn intentional_exit_provenance_survives_a_framed_daemon_event() {

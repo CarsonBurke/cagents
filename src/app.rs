@@ -1274,6 +1274,7 @@ fn fresh_terminal_relaunch(session: &TerminalSession) -> TerminalSession {
     let recipe = resume_recipe.unwrap_or(recipe);
     let id = TerminalId::new();
     TerminalSession {
+        recovery_origin: Some(session.recovery_origin.unwrap_or(session.id)),
         id,
         launch: recipe.clone(),
         transcript_path: terminal_transcript_path(id),
@@ -2101,6 +2102,7 @@ struct SettingsDraft {
     terminal_scroll_speed: String,
     terminal_cursor_style: String,
     terminal_theme: String,
+    has_custom_terminal_theme: bool,
     max_hot_cards: String,
     hibernation_delay_ms: String,
     terminal_font_size: String,
@@ -2141,12 +2143,8 @@ impl SettingsDraft {
                 TerminalCursorStyle::Underline => "underline",
             }
             .into(),
-            terminal_theme: match settings.terminal_theme {
-                crate::terminal::TerminalTheme::Dark => "dark",
-                crate::terminal::TerminalTheme::Light => "light",
-                crate::terminal::TerminalTheme::SolarizedDark => "solarized_dark",
-            }
-            .into(),
+            terminal_theme: settings.terminal_theme.id().into(),
+            has_custom_terminal_theme: settings.custom_terminal_theme.is_some(),
             max_hot_cards: settings.max_hot_cards.to_string(),
             hibernation_delay_ms: settings.hibernation_delay_ms.to_string(),
             terminal_font_size: settings.terminal_font_size.to_string(),
@@ -2322,21 +2320,26 @@ fn settings_update(
             }
             _ => Err("Choose an application, block, beam, or underline cursor.".into()),
         },
-        SettingsField::TerminalTheme => match value {
-            "dark" => {
-                next.terminal_theme = crate::terminal::TerminalTheme::Dark;
-                Ok(())
+        SettingsField::TerminalTheme => {
+            let theme = if value == "custom" {
+                next.custom_terminal_theme
+                    .map(crate::terminal::TerminalTheme::Custom)
+            } else {
+                crate::terminal::TerminalTheme::PRESETS
+                    .iter()
+                    .find(|(_, _, id)| *id == value)
+                    .map(|(theme, _, _)| *theme)
+            };
+            match theme {
+                Some(theme) => {
+                    next.terminal_theme = theme;
+                    Ok(())
+                }
+                None => Err(
+                    "Choose a preset or configure custom_terminal_theme in settings.toml.".into(),
+                ),
             }
-            "light" => {
-                next.terminal_theme = crate::terminal::TerminalTheme::Light;
-                Ok(())
-            }
-            "solarized_dark" => {
-                next.terminal_theme = crate::terminal::TerminalTheme::SolarizedDark;
-                Ok(())
-            }
-            _ => Err("Choose Dark, Light, or Solarized Dark.".into()),
-        },
+        }
         SettingsField::UiScale => value
             .parse::<f32>()
             .map(|value| next.ui_scale = value)
@@ -3702,6 +3705,7 @@ impl Cagents {
         let terminal_id = TerminalId::new();
         let transcript_path = terminal_transcript_path(terminal_id);
         let session = TerminalSession {
+            recovery_origin: None,
             id: terminal_id,
             launch: launch.clone(),
             transcript_path,
@@ -6684,7 +6688,8 @@ impl Cagents {
     /// therefore act on a keystroke, because the user is aiming it at the
     /// dialog - and a terminal acts by writing to a shell.
     fn modal_is_open(&self) -> bool {
-        self.inspector.is_some()
+        self.update_ui.confirmation.is_some()
+            || self.inspector.is_some()
             || self.worktree_dialog.is_some()
             || self.pull_request_dialog.is_some()
             || self.dirty_repository_close.is_some()
@@ -9920,6 +9925,9 @@ impl Application for Cagents {
                 // `WorkspaceSurface` captures those chords itself, before any
                 // child sees them, and relies on this message to act on them.
                 if is_escape_press(&event) && !captured {
+                    if self.update_ui.confirmation.is_some() {
+                        return self.update_update_ui(update_ui::Action::CancelApply);
+                    }
                     if self.terminal_close.is_some() {
                         return self.cancel_terminal_close();
                     }
@@ -10431,6 +10439,21 @@ impl Application for Cagents {
     }
 
     fn dialog(&self) -> Option<Element<'_, Message>> {
+        if let Some(count) = self.update_ui.confirmation {
+            return Some(dialog_ui::overlay(dialog_ui::surface(
+                widget::column::with_children(vec![
+                    widget::text::title3("Update and reopen cagents?").into(),
+                    notice_body(format!("The terminal service will restart, interrupting {count} live sessions. Agent conversations resume where supported; shells reopen in their working directories. Running shell jobs will stop. Your windows and tabs will reopen automatically.")),
+                    widget::row::with_children(vec![
+                        iced::widget::Space::new().width(Length::Fill).into(),
+                        widget::button::standard("Cancel").id(widget::Id::new("update.cancel"))
+                            .on_press(Message::UpdateUi(update_ui::Action::CancelApply)).into(),
+                        widget::button::suggested("Update and reopen")
+                            .on_press(Message::UpdateUi(update_ui::Action::ConfirmApply)).into(),
+                    ]).spacing(8).into(),
+                ]).spacing(16), 520.0,
+            ), Some(Message::UpdateUi(update_ui::Action::CancelApply)), 1.0));
+        }
         if let Some(intent) = &self.terminal_close {
             return self.terminal_close_dialog().map(|surface| {
                 dialog_ui::overlay(
@@ -13588,6 +13611,7 @@ mod tests {
 
         let launch = launch_recipe("/tmp");
         let mut session = TerminalSession {
+            recovery_origin: None,
             id: TerminalId::new(),
             launch: launch.clone(),
             transcript_path: None,
@@ -13734,6 +13758,7 @@ mod tests {
 
         let launch = launch_recipe("/worktree");
         let mut session = TerminalSession {
+            recovery_origin: None,
             id: TerminalId::new(),
             launch: launch.clone(),
             transcript_path: None,
@@ -13781,6 +13806,7 @@ mod tests {
     fn restored_child_exit_stays_retryable_without_starting_the_stale_identity() {
         let launch = launch_recipe("/worktree");
         let session = TerminalSession {
+            recovery_origin: None,
             id: TerminalId::new(),
             launch: launch.clone(),
             transcript_path: None,
@@ -14061,6 +14087,7 @@ mod tests {
                 epoch: INITIAL_HYDRATION_EPOCH,
             },
             kind: CardKind::Terminal(TerminalSession {
+                recovery_origin: None,
                 id: TerminalId::new(),
                 launch: launch.clone(),
                 transcript_path: None,

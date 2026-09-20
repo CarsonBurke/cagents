@@ -196,6 +196,7 @@ impl Cagents {
                 generation: 0,
                 title: format!("Fixture card {}", index + 1),
                 kind: CardKind::Terminal(TerminalSession {
+                    recovery_origin: None,
                     id: TerminalId::new(),
                     launch: launch.clone(),
                     transcript_path: None,

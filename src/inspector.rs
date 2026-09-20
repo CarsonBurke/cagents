@@ -1910,6 +1910,7 @@ mod tests {
             exposure: Exposure::Visible,
             residency: Residency::Hot,
             kind: CardKind::Terminal(TerminalSession {
+                recovery_origin: None,
                 id: TerminalId::new(),
                 launch: launch.clone(),
                 transcript_path: Some(PathBuf::from("/state/transcript")),

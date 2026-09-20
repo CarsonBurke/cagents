@@ -37,11 +37,12 @@ use crate::{
 };
 
 use super::{
+    TerminalTheme,
     snapshot::{RenderSnapshot, VisualResources},
     types::{
         KeyAction, KeyInput, KeyModifiers, MouseAction, MouseButton, MouseInput, TerminalConfig,
         TerminalEvent, TerminalKey, TerminalSendError, TerminalSize, TerminalStartError,
-        TerminalTheme, TerminalWake,
+        TerminalWake,
     },
 };
 
@@ -758,6 +759,10 @@ impl Worker {
             None => command_from_recipe(&session.launch),
         };
         command.env("CAGENTS_TERMINAL_ID", session.id.to_string());
+        command.env(
+            "CAGENTS_RECOVERY_ORIGIN",
+            session.recovery_origin.unwrap_or(session.id).to_string(),
+        );
         let executable = interactive_shell_launch(&session.launch)
             .then(|| RootIdentity::launch_executable(&command))
             .flatten();
@@ -1693,7 +1698,7 @@ fn agent_title_label(title: &str, activity: Option<crate::agent::Activity>) -> O
 }
 
 fn theme_scheme(theme: TerminalTheme) -> ColorScheme {
-    if theme == TerminalTheme::Light {
+    if theme.palette().light {
         ColorScheme::Light
     } else {
         ColorScheme::Dark
@@ -1727,46 +1732,20 @@ fn apply_theme(
     terminal: &mut Terminal<'_, '_>,
     theme: TerminalTheme,
 ) -> Result<(), libghostty_vt::Error> {
-    let (foreground, background, ansi) = match theme {
-        TerminalTheme::Dark => (
-            0xd8d8d8,
-            0x101010,
-            [
-                0x3b4252, 0xbf616a, 0xa3be8c, 0xebcb8b, 0x81a1c1, 0xb48ead, 0x88c0d0, 0xe5e9f0,
-                0x4c566a, 0xd08770, 0xb1d196, 0xf0d399, 0x8fbcdb, 0xc5a0c0, 0x93ccdc, 0xeceff4,
-            ],
-        ),
-        TerminalTheme::Light => (
-            0x24292f,
-            0xffffff,
-            [
-                0x24292f, 0xcf222e, 0x116329, 0x7d4e00, 0x0969da, 0x8250df, 0x1b7c83, 0x6e7781,
-                0x57606a, 0xa40e26, 0x1a7f37, 0x9a6700, 0x0550ae, 0x6639ba, 0x0a6269, 0x8c959f,
-            ],
-        ),
-        TerminalTheme::SolarizedDark => (
-            0x839496,
-            0x002b36,
-            [
-                0x073642, 0xdc322f, 0x859900, 0xb58900, 0x268bd2, 0xd33682, 0x2aa198, 0xeee8d5,
-                0x002b36, 0xcb4b16, 0x586e75, 0x657b83, 0x839496, 0x6c71c4, 0x93a1a1, 0xfdf6e3,
-            ],
-        ),
-    };
-    let rgb = |value: u32| RgbColor {
-        r: (value >> 16) as u8,
-        g: (value >> 8) as u8,
-        b: value as u8,
+    let palette = theme.palette();
+    let rgb = |color: super::ThemeColor| {
+        let (r, g, b) = color.rgb();
+        RgbColor { r, g, b }
     };
     terminal
-        .set_default_fg_color(Some(rgb(foreground)))?
-        .set_default_bg_color(Some(rgb(background)))?
-        .set_default_cursor_color(Some(rgb(foreground)))?;
-    let mut palette = terminal.default_color_palette()?;
-    for (index, value) in ansi.into_iter().enumerate() {
-        palette.set(PaletteIndex(index as u8), rgb(value));
+        .set_default_fg_color(Some(rgb(palette.foreground)))?
+        .set_default_bg_color(Some(rgb(palette.background)))?
+        .set_default_cursor_color(Some(rgb(palette.cursor)))?;
+    let mut colors = terminal.default_color_palette()?;
+    for (index, value) in palette.ansi.into_iter().enumerate() {
+        colors.set(PaletteIndex(index as u8), rgb(value));
     }
-    terminal.set_default_color_palette(Some(palette))?;
+    terminal.set_default_color_palette(Some(colors))?;
     Ok(())
 }
 
@@ -1923,6 +1902,7 @@ const INHERITED_TERMINAL_MARKERS: &[&str] = &[
 /// not have them.
 fn scrub_inherited_markers(command: &mut CommandBuilder) {
     command.env_remove("CAGENTS_TERMINAL_ID");
+    command.env_remove("CAGENTS_RECOVERY_ORIGIN");
     for name in INHERITED_TERMINAL_MARKERS {
         command.env_remove(name);
     }
@@ -2504,6 +2484,7 @@ mod tests {
         config: TerminalConfig,
     ) -> (Worker, Receiver<TerminalEvent>) {
         let session = TerminalSession {
+            recovery_origin: None,
             id: crate::model::TerminalId::new(),
             launch: recipe.clone(),
             transcript_path: None,

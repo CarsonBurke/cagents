@@ -1303,6 +1303,7 @@ mod tests {
         };
         let terminal_id = TerminalId::new();
         let session = crate::model::TerminalSession {
+            recovery_origin: None,
             id: terminal_id,
             launch: launch.clone(),
             transcript_path: None,
@@ -1580,6 +1581,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let recipe = crate::model::LaunchRecipe::shell(directory.path().to_owned()).unwrap();
         let session = crate::model::TerminalSession {
+            recovery_origin: None,
             id: crate::model::TerminalId::new(),
             launch: recipe.clone(),
             transcript_path: None,

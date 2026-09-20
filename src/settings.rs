@@ -402,6 +402,8 @@ pub struct AppSettings {
     pub terminal_cursor_style: TerminalCursorStyle,
     #[serde(default)]
     pub terminal_theme: crate::terminal::TerminalTheme,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub custom_terminal_theme: Option<crate::terminal::TerminalPalette>,
     pub terminal_font_size: f32,
     /// The terminal font family, or empty for the system monospace default.
     #[serde(default)]
@@ -466,6 +468,7 @@ impl Default for AppSettings {
             terminal_scroll_size: default_terminal_scroll_size(),
             terminal_cursor_style: TerminalCursorStyle::default(),
             terminal_theme: crate::terminal::TerminalTheme::default(),
+            custom_terminal_theme: None,
             terminal_font_size: 14.0,
             terminal_font_family: String::new(),
             sidebar_width: design::NAVIGATION_DEFAULT_WIDTH,
@@ -808,7 +811,13 @@ impl AppSettings {
             Some(_) => LinkOpenDestination::IntegratedBrowser,
         }
     }
-    pub fn validate(self) -> Result<Self, SettingsError> {
+    pub fn validate(mut self) -> Result<Self, SettingsError> {
+        if let crate::terminal::TerminalTheme::Custom(palette) = self.terminal_theme {
+            // Keep custom colors when selecting another preset, and refresh
+            // the active palette after the configuration file is edited.
+            let palette = *self.custom_terminal_theme.get_or_insert(palette);
+            self.terminal_theme = crate::terminal::TerminalTheme::Custom(palette);
+        }
         if self.schema_version != SETTINGS_SCHEMA_VERSION {
             return Err(SettingsError::UnsupportedSchema(self.schema_version));
         }
@@ -1383,6 +1392,38 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn custom_terminal_palette_survives_preset_switches_and_file_edits() {
+        use crate::terminal::{TerminalTheme, ThemeColor};
+        let directory = tempfile::tempdir().unwrap();
+        let path = path_in(&directory);
+        let palette = TerminalTheme::Dracula.palette();
+        let mut settings = AppSettings {
+            terminal_theme: TerminalTheme::Custom(palette),
+            ..AppSettings::default()
+        }
+        .validate()
+        .unwrap();
+        save(&path, &settings).unwrap();
+        settings = load(&path).unwrap();
+        assert_eq!(settings.custom_terminal_theme, Some(palette));
+        settings.terminal_theme = TerminalTheme::Nord;
+        save(&path, &settings).unwrap();
+        settings = load(&path).unwrap();
+        assert_eq!(settings.custom_terminal_theme, Some(palette));
+        settings.terminal_theme = TerminalTheme::Custom(settings.custom_terminal_theme.unwrap());
+        save(&path, &settings).unwrap();
+        let mut document: toml::Value =
+            toml::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        document["custom_terminal_theme"]["background"] = toml::Value::String("#112233".into());
+        fs::write(&path, toml::to_string(&document).unwrap()).unwrap();
+        let reloaded = load(&path).unwrap();
+        let mut edited = palette;
+        edited.background = ThemeColor(0x112233);
+        assert_eq!(reloaded.terminal_theme, TerminalTheme::Custom(edited));
+        assert_eq!(reloaded.custom_terminal_theme, Some(edited));
     }
 
     #[test]

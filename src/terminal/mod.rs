@@ -3,7 +3,9 @@ pub mod ipc;
 mod snapshot;
 #[cfg(feature = "ui")]
 mod surface;
+mod theme;
 mod types;
+pub use theme::{TerminalPalette, TerminalTheme, ThemeColor};
 #[cfg(feature = "ui")]
 mod widget;
 #[cfg(feature = "host")]
@@ -19,8 +21,7 @@ pub use snapshot::{
 pub use surface::TerminalSurface;
 pub use types::{
     KeyAction, KeyInput, KeyModifiers, MouseAction, MouseButton, MouseInput, TerminalConfig,
-    TerminalEvent, TerminalKey, TerminalSendError, TerminalSize, TerminalStartError, TerminalTheme,
-    TerminalWake,
+    TerminalEvent, TerminalKey, TerminalSendError, TerminalSize, TerminalStartError, TerminalWake,
 };
 #[cfg(feature = "ui")]
 pub use widget::{CellMetrics, TerminalWidget};

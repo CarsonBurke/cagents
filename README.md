@@ -799,7 +799,7 @@ cycle_pane_width = ["Alt+R"]
 | `terminal_scroll_size` | integer | `2` | `1` through `10` lines moved per mouse-wheel notch; trackpad scrolling remains proportional |
 | `terminal_scroll_speed` | float | `1.0` | `0.25` through `4.0` multiplier for wheel and trackpad scrolling; mouse-reporting applications remain unchanged |
 | `terminal_cursor_style` | string | `"beam"` | `"application"` respects the terminal program; `"block"`, `"beam"`, or `"underline"` overrides it |
-| `terminal_theme` | string | `"dark"` | `"dark"`, `"light"`, or `"solarized_dark"`; independent of `app_theme` |
+| `terminal_theme` | string or custom palette | `"dark"` | Preset selected in Settings → Terminal; independent of `app_theme`. Examples: `"catppuccin_mocha"`, `"dracula"`, `"nord"`, `"tokyo_night"`, `"github_light"`. |
 | `terminal_scrollback_lines` | non-negative integer | `10000` | `0` through `1000000` lines for newly started terminals |
 | `sidebar_width` | float | `260.0` | finite values from `220.0` through `420.0`, inclusive |
 | `inspector_width` | float | `380.0` | finite values from `320.0` through `480.0`, inclusive |
@@ -810,6 +810,27 @@ cycle_pane_width = ["Alt+R"]
 | `editor_auto_save` | boolean | `true` | `true` or `false`; automatically save edited files after a pause, stopping on conflicts or save errors |
 | `editor_wrap_lines` | boolean | `false` | wrap long native-editor lines instead of keeping a horizontally navigable line |
 | `keyboard_shortcuts.*` | array of strings | shown above | one or more chords, each containing Ctrl, Alt, or Super and one A-Z, 0-9, Left, or Right key; Shift is optional. Every chord in the table must be distinct, and a bound chord is reserved rather than forwarded to the process inside a card. `cycle_pane_width`, `new_channel`, and `clone_pane` may be empty to leave them unbound |
+
+Terminal colors include 25 dark and light presets. To create your own, append
+this table to `settings.toml`, restart the app, and select **Custom** in the
+terminal theme dropdown. This table is retained when you switch to a preset.
+Colors must use `#RRGGBB`; `ansi` contains exactly 16 colors (normal 0–7,
+bright 8–15). `light` tells terminal applications which appearance is active.
+Programs' truecolor and OSC palette overrides remain authoritative.
+
+```toml
+[custom_terminal_theme]
+foreground = "#d8d8d8"
+background = "#101010"
+cursor = "#ffffff"
+light = false
+ansi = [
+  "#3b4252", "#bf616a", "#a3be8c", "#ebcb8b",
+  "#81a1c1", "#b48ead", "#88c0d0", "#e5e9f0",
+  "#4c566a", "#d08770", "#b1d196", "#f0d399",
+  "#8fbcdb", "#c5a0c0", "#93ccdc", "#eceff4",
+]
+```
 
 Version 1 and 2 TOML files are upgraded while loading. Sidebar widths accepted
 by version 1 are clamped to the current visible range; other values are
@@ -948,7 +969,12 @@ a hosted build.
 Full self-managed installations check authenticated GitHub releases at startup
 and every six hours. When a newer stable version is available, an update icon
 appears in the top-right application controls; its tooltip names the version.
-Clicking it starts an explicit update, not an automatic background installation.
+Clicking it checks the impact. If the daemon has live sessions, one confirmation
+explains that agent conversations resume where supported, shells reopen in their
+working directories, and running shell jobs stop. Without this confirmation, the
+installer can only replace an empty daemon—even if a session starts during the
+download. An installed UI-only replacement offers a reopen button and keeps the
+daemon and terminals running.
 Source, browserless, and OS-package installations retain their original update
 method instead of being replaced by the application.
 

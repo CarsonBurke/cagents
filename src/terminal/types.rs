@@ -9,15 +9,7 @@ const DEFAULT_TRANSCRIPT_CAPACITY: usize = 64;
 /// so an unbounded log turns one animated pane into endless disk writes.
 const DEFAULT_TRANSCRIPT_MAX_BYTES: u64 = 1 << 20;
 
-/// Parser-owned default colors; application OSC overrides remain authoritative.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum TerminalTheme {
-    #[default]
-    Dark,
-    Light,
-    SolarizedDark,
-}
+use super::theme::TerminalTheme;
 
 #[derive(Clone, Debug)]
 pub struct TerminalConfig {

@@ -798,6 +798,7 @@ mod tests {
             environment: Default::default(),
         };
         card.kind = CardKind::Terminal(TerminalSession {
+            recovery_origin: None,
             id: TerminalId::new(),
             launch: launch.clone(),
             transcript_path: None,

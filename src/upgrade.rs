@@ -1,6 +1,8 @@
 //! Shared exact-session recovery authority and durable daemon upgrade handoff.
+#[cfg(any(feature = "host", test))]
+use crate::model::HostSessionProof;
 #[cfg(any(feature = "host", feature = "ui", test))]
-use crate::model::{HostSessionProof, LaunchRecipe, TerminalSession};
+use crate::model::{LaunchRecipe, TerminalSession};
 #[cfg(any(feature = "host", feature = "ui", test))]
 use std::{fs, io};
 use std::{os::unix::fs::MetadataExt, path::Path};
@@ -101,6 +103,10 @@ pub(crate) fn ensure_no_surviving_process(
     let exact_resume = session.agent_resume_recipe();
     let exact_identity = exact_resume.as_ref().and_then(exact_conversation);
     let terminal_marker = format!("CAGENTS_TERMINAL_ID={}", session.id);
+    let origin_marker = format!(
+        "CAGENTS_RECOVERY_ORIGIN={}",
+        session.recovery_origin.unwrap_or(session.id)
+    );
     for &pid in processes.keys() {
         if pid == std::process::id() || belongs_to_owner(pid, owner, &processes) {
             continue;
@@ -163,22 +169,17 @@ pub(crate) fn ensure_no_surviving_process(
                 return Err(format!("cannot inspect process environment ({pid})"));
             }
         }
-        let mut cagents = false;
         for entry in environment.split(|byte| *byte == 0) {
-            if entry == terminal_marker.as_bytes() {
+            if entry == terminal_marker.as_bytes() || entry == origin_marker.as_bytes() {
                 return Err(format!(
                     "terminal {} still has a live process ({pid}); preserving it",
                     session.id
                 ));
             }
-            cagents |=
-                entry.starts_with(b"CAGENTS_TERMINAL_ID=") || entry == b"TERM_PROGRAM=cagents";
         }
-        if cagents && !belongs_to_other_daemon(pid, session, &processes, proc_root)? {
-            return Err(format!(
-                "an unclassified cagents process ({pid}) survives outside the replacement daemon; preserving it instead of launching a duplicate"
-            ));
-        }
+        // Terminal branding and another terminal's marker can be inherited by
+        // detached browsers and services. Neither proves ownership of this
+        // session. Recovery lineage and exact agent identities do.
     }
     Ok(())
 }
@@ -285,94 +286,6 @@ pub(crate) fn belongs_to_owner(
         current = parent;
     }
     false
-}
-
-/// Whether a daemon lock file lives in this instance's runtime directory.
-///
-/// Compared against the directory this build's own socket resolves to when
-/// that is known, and against the instance's runtime subdirectory name when
-/// `XDG_RUNTIME_DIR` is unavailable, which is the case inside a test.
-#[cfg(any(feature = "host", feature = "ui"))]
-fn same_instance_runtime(lock_path: &Path) -> bool {
-    let Some(directory) = lock_path.parent() else {
-        return true;
-    };
-    match crate::terminal::ipc::daemon_socket_path() {
-        Ok(socket) => socket.parent() == Some(directory),
-        Err(_) => directory
-            .file_name()
-            .is_none_or(|name| name == crate::instance::RUNTIME_SUBDIRECTORY),
-    }
-}
-
-#[cfg(any(feature = "host", feature = "ui"))]
-pub(crate) fn belongs_to_other_daemon(
-    pid: u32,
-    session: &TerminalSession,
-    processes: &std::collections::HashMap<u32, u32>,
-    proc_root: &Path,
-) -> Result<bool, String> {
-    let mut current = pid;
-    for _ in 0..processes.len() {
-        let path = proc_root.join(current.to_string());
-        if fs::read_link(path.join("exe"))
-            .ok()
-            .is_some_and(|exe| exe.file_name().is_some_and(|name| name == "cagentsd"))
-        {
-            for entry in fs::read_dir(path.join("fd")).map_err(process_error)? {
-                let entry = entry.map_err(process_error)?;
-                let Ok(lock_path) = fs::read_link(entry.path()) else {
-                    continue;
-                };
-                if lock_path
-                    .file_name()
-                    .is_none_or(|name| name != "cagentsd.lock")
-                {
-                    continue;
-                }
-                // A daemon of another instance - a development build beside
-                // the production install, a second install - hosts terminals
-                // whose environment carries the same instance-agnostic
-                // markers. Its processes are doing exactly what they should
-                // and have nothing to do with this recovery, so they are
-                // owned rather than unclassified. Which instance a daemon
-                // serves is the runtime directory its lock lives in.
-                if !same_instance_runtime(&lock_path) {
-                    return Ok(true);
-                }
-                #[derive(serde::Deserialize)]
-                struct Metadata {
-                    proof: HostSessionProof,
-                }
-                let metadata: Metadata =
-                    serde_json::from_reader(fs::File::open(&lock_path).map_err(process_error)?)
-                        .map_err(|error| {
-                            format!("cannot inspect surviving daemon proof: {error}")
-                        })?;
-                if session.continuity.live_proof().as_ref() == Some(&metadata.proof) {
-                    return Err(
-                        "the original daemon still has live processes; preserving its terminals"
-                            .into(),
-                    );
-                }
-                let socket = lock_path.with_file_name(crate::terminal::ipc::SOCKET_FILE_NAME);
-                return crate::daemon::replacement_owner(&socket, &metadata.proof)
-                    .map(|owner| owner == current)
-                    .map_err(|error| format!("cannot authenticate surviving daemon: {error}"));
-            }
-            return Err(
-                "a surviving daemon has unknown ownership; automatic recovery is unsafe".into(),
-            );
-        }
-        let Some(parent) = processes.get(&current).copied() else {
-            break;
-        };
-        if parent == current {
-            break;
-        }
-        current = parent;
-    }
-    Ok(false)
 }
 
 #[cfg(any(feature = "host", feature = "ui"))]
@@ -873,6 +786,7 @@ mod tests {
         };
         let recipe = LaunchRecipe::shell(directory.to_owned()).unwrap();
         let source = TerminalSession {
+            recovery_origin: None,
             id: TerminalId::new(),
             launch: recipe.clone(),
             transcript_path: Some(directory.join("terminal.log")),
@@ -995,6 +909,51 @@ mod tests {
 
         fs::write(process.join("environ"), b"PATH=/bin\0").unwrap();
         assert!(ensure_no_surviving_process(&source, u32::MAX, directory.path()).is_ok());
+    }
+
+    #[cfg(any(feature = "host", feature = "ui"))]
+    #[test]
+    fn recovery_ignores_unrelated_terminals_even_after_their_daemon_disappears() {
+        use std::os::unix::fs::symlink;
+        let directory = tempfile::tempdir().unwrap();
+        let source = checkpoint(directory.path()).terminals.remove(0).source;
+        let shell = directory.path().join("42");
+        let daemon = directory.path().join("43");
+        fs::create_dir(&shell).unwrap();
+        fs::create_dir_all(daemon.join("fd")).unwrap();
+        fs::write(shell.join("stat"), "42 (fish) S 43").unwrap();
+        fs::write(shell.join("cmdline"), b"fish\0").unwrap();
+        fs::write(
+            shell.join("environ"),
+            b"TERM_PROGRAM=cagents\0CAGENTS_TERMINAL_ID=other-terminal\0",
+        )
+        .unwrap();
+        fs::write(daemon.join("stat"), "43 (cagentsd) S 1").unwrap();
+        fs::write(daemon.join("cmdline"), b"cagentsd\0").unwrap();
+        fs::write(daemon.join("environ"), b"PATH=/bin\0").unwrap();
+        symlink(
+            directory.path().join("other-instance/cagentsd.lock"),
+            daemon.join("fd/7"),
+        )
+        .unwrap();
+        for name in ["cagentsd", "cagentsd (deleted)"] {
+            symlink(Path::new("/build/bin").join(name), daemon.join("exe")).unwrap();
+            assert!(ensure_no_surviving_process(&source, u32::MAX, directory.path()).is_ok());
+            fs::remove_file(daemon.join("exe")).unwrap();
+        }
+        symlink("/build/bin/cagentsd-helper (deleted)", daemon.join("exe")).unwrap();
+        assert!(ensure_no_surviving_process(&source, u32::MAX, directory.path()).is_ok());
+        fs::write(shell.join("environ"), b"TERM_PROGRAM=cagents\0").unwrap();
+        assert!(ensure_no_surviving_process(&source, u32::MAX, directory.path()).is_ok());
+        // Exact terminal evidence still blocks duplication.
+        fs::remove_file(daemon.join("exe")).unwrap();
+        symlink("/build/bin/cagentsd (deleted)", daemon.join("exe")).unwrap();
+        fs::write(
+            shell.join("environ"),
+            format!("CAGENTS_TERMINAL_ID={}\0", source.id),
+        )
+        .unwrap();
+        assert!(ensure_no_surviving_process(&source, u32::MAX, directory.path()).is_err());
     }
 
     #[test]

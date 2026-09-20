@@ -1102,6 +1102,7 @@ fn codex_terminal_view(
             .returning_terminal = true;
     }
     let terminal = crate::model::TerminalSession {
+        recovery_origin: None,
         id: chat_id,
         launch: recipe.clone(),
         continuity: crate::model::TerminalContinuity::RelaunchAvailable {
@@ -1414,6 +1415,7 @@ pub(super) fn process(
             }
             let terminal_id = crate::model::TerminalId::new();
             let terminal = crate::model::TerminalSession {
+                recovery_origin: None,
                 id: terminal_id,
                 launch: recipe.clone(),
                 continuity: crate::model::TerminalContinuity::RelaunchAvailable {
@@ -2099,6 +2101,7 @@ for line in sys.stdin:
         let recipe = saved.launch.terminal_recipe().unwrap();
         let terminal_id = TerminalId::new();
         let terminal = crate::model::TerminalSession {
+            recovery_origin: None,
             id: terminal_id,
             launch: recipe.clone(),
             continuity: crate::model::TerminalContinuity::RelaunchAvailable {
