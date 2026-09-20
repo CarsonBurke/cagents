@@ -5602,7 +5602,7 @@ impl widget::menu::Action for ExternalEditorCommand<'_> {
 fn toolbar_group<'a>(
     controls: Vec<Element<'a, RepositoryAction>>,
 ) -> Element<'a, RepositoryAction> {
-    crate::ui_controls::segmented_controls(controls)
+    crate::ui_controls::toolbar_actions(controls)
 }
 
 /// Dedicated content toolbar, mounted separately from tabs and the scroll viewport.
@@ -5686,18 +5686,19 @@ pub fn selected_file_toolbar(
     } else {
         edit
     };
-    let mut controls: Vec<Element<'_, RepositoryAction>> = vec![toolbar_group(vec![
-        preview.into(),
-        edit.into(),
-        icon_control(
-            comparison_icon(),
-            "View diff",
-            runtime.source_surface == SourceSurface::Diff && runtime.can_show_diff(),
-            runtime.can_show_diff(),
-            Some(RepositoryAction::ApplySourceSurface { card, diff: true }),
-        )
-        .into(),
-    ])];
+    let mut controls: Vec<Element<'_, RepositoryAction>> =
+        vec![crate::ui_controls::segmented_controls(vec![
+            preview.into(),
+            edit.into(),
+            icon_control(
+                comparison_icon(),
+                "View diff",
+                runtime.source_surface == SourceSurface::Diff && runtime.can_show_diff(),
+                runtime.can_show_diff(),
+                Some(RepositoryAction::ApplySourceSurface { card, diff: true }),
+            )
+            .into(),
+        ])];
     // File actions stay mounted whether or not they can run: an inactive
     // icon renders muted but keeps its tooltip, so the toolbar never jumps
     // around as edits, saves, and staging change what is available.
@@ -5814,14 +5815,13 @@ pub fn selected_file_toolbar(
         widget::row::with_children(controls)
             .spacing(crate::design::TOOLBAR_GROUP_SPACING)
             .align_y(Alignment::Center)
-            .height(Length::Fill)
-            // Reserve the rail instead of embedding the scrollbar: an embedded
-            // one is drawn even when every action fits, putting a permanent
-            // track under a toolbar that usually has nothing to scroll.
-            .padding(crate::design::with_horizontal_rail(iced::Padding::ZERO)),
+            .height(Length::Fill),
     )
     .direction(iced::widget::scrollable::Direction::Horizontal(
-        crate::design::scrollbar(),
+        // The compact rail fits below the centered controls in their existing
+        // inset. Reserving the full content gutter only on this lane shifted
+        // its controls above the filename and the shell's trailing actions.
+        crate::design::scrollbar().margin(0),
     ))
     .width(Length::FillPortion(4))
     .height(crate::design::HEADER_HEIGHT);
@@ -6400,7 +6400,7 @@ fn diff_basis_controls(card: CardId, runtime: &RepositoryRuntime) -> Element<'_,
     };
     let unstaged = runtime.can_select_diff_basis(&DiffBasis::IndexToWorktree);
     let staged = runtime.can_select_diff_basis(&DiffBasis::HeadToIndex);
-    toolbar_group(vec![
+    crate::ui_controls::segmented_controls(vec![
         icon_control(
             crate::ui_controls::symbolic_icon("document-edit-symbolic"),
             "Unstaged changes",
@@ -6460,7 +6460,7 @@ fn diff_review_controls(
     };
     let change_count = model.map_or(0, |model| model.change_starts(runtime.diff_mode).len());
     let mut controls = vec![
-        toolbar_group(vec![
+        crate::ui_controls::segmented_controls(vec![
             icon_control(
                 crate::ui_controls::symbolic_icon("view-list-symbolic"),
                 "Inline diff",
@@ -6478,9 +6478,7 @@ fn diff_review_controls(
             )
             .into(),
         ]),
-        // Change navigation is one cluster, segmented like the layout and
-        // basis groups beside it, so the header reads as groups at one rhythm
-        // rather than as loose buttons next to boxed ones.
+        // Navigation commands are a plain cluster, distinct from mode choices.
         toolbar_group(vec![
             icon_control(
                 crate::ui_controls::symbolic_icon("go-up-symbolic"),
@@ -8413,8 +8411,37 @@ mod tests {
             "the lowest diff row leaves {bottom} below it, not {rail}"
         );
 
-        // Horizontal only: the content toolbar's action lane. There is no
-        // vertical thumb, so a right rail there would only be dead space.
+        // All toolbar targets share the full header's center, including when
+        // the action lane overflows. A bottom-only rail used to lift these
+        // targets above the filename and the shell's trailing Find button.
+        fn check_targets(node: &layout::Node, parent_y: f32, count: &mut usize) {
+            let bounds = node.bounds();
+            let y = parent_y + bounds.y;
+            let target = crate::design::PRIMARY_CONTROL_SIZE;
+            if (bounds.width - target).abs() < 0.1 && (bounds.height - target).abs() < 0.1 {
+                assert!(
+                    (y + bounds.height / 2.0 - crate::design::HEADER_HEIGHT / 2.0).abs() < 0.1,
+                    "toolbar target must share the header baseline"
+                );
+                *count += 1;
+            }
+            for child in node.children() {
+                check_targets(child, y, count);
+            }
+        }
+        for width in [240.0, 1200.0] {
+            let toolbar = laid_out(
+                selected_file_toolbar(card, &runtime).unwrap(),
+                &renderer,
+                iced::Size::new(width, crate::design::HEADER_HEIGHT),
+            );
+            let mut targets = 0;
+            check_targets(&toolbar, 0.0, &mut targets);
+            assert!(targets > 0);
+        }
+
+        // Horizontal only: the compact toolbar thumb fits into the controls'
+        // existing symmetric inset, with no right or bottom-only padding.
         let toolbar = laid_out(
             selected_file_toolbar(card, &runtime).expect("a selected file has a toolbar"),
             &renderer,
@@ -8431,8 +8458,8 @@ mod tests {
         );
         let bottom = content.size().height - (controls.y + controls.height);
         assert!(
-            bottom >= rail - 0.5,
-            "the lowest control leaves {bottom} below it, inside the {rail} rail"
+            bottom >= crate::design::SCROLLBAR_THUMB_WIDTH,
+            "the lowest control leaves {bottom} below it, clear of the compact thumb"
         );
 
         // Vertical only: the Markdown preview, whose inset comes from the
