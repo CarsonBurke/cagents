@@ -729,7 +729,7 @@ pub(super) fn settings_dialog<'a>(
     let body: Element<'a, Message> = if narrow {
         widget::column::with_children(vec![
             navigation,
-            widget::divider::horizontal::default().into(),
+            crate::design::horizontal_rule().into(),
             content,
         ])
         .width(Length::Fill)
@@ -738,7 +738,7 @@ pub(super) fn settings_dialog<'a>(
     } else {
         widget::row::with_children(vec![
             navigation,
-            widget::divider::vertical::default().into(),
+            crate::design::vertical_rule().into(),
             content,
         ])
         .width(Length::Fill)
@@ -813,9 +813,9 @@ pub(super) fn settings_dialog<'a>(
     let surface = dialog_ui::connected_surface(
         widget::column::with_children(vec![
             header.into(),
-            widget::divider::horizontal::default().into(),
+            crate::design::horizontal_rule().into(),
             body,
-            widget::divider::horizontal::default().into(),
+            crate::design::horizontal_rule().into(),
             widget::container(footer)
                 .padding([3.0 * design::GRID_UNIT, gutter])
                 .width(Length::Fill)

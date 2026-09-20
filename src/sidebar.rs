@@ -48,7 +48,7 @@ pub const EXPANDED_WIDTH_MAX: f32 = design::NAVIGATION_MAX_WIDTH;
 /// `settings::AppSettings::default`, so a corrupt file looks like a fresh one.
 const DEFAULT_EXPANDED_WIDTH: f32 = design::NAVIGATION_DEFAULT_WIDTH;
 const COMPACT_WIDTH: f32 = design::NAVIGATION_RAIL_WIDTH;
-const HEADER_HEIGHT: f32 = design::HEADER_HEIGHT - design::BORDER_WIDTH;
+const HEADER_HEIGHT: f32 = design::HEADER_CONTENT_HEIGHT;
 const PROJECT_HEADER_HEIGHT: f32 = design::ROW_HEIGHT;
 const WORKTREE_ROW_HEIGHT: f32 = design::ROW_HEIGHT;
 const ICON_CONTROL_SIZE: f32 = design::PRIMARY_CONTROL_SIZE;
@@ -3023,7 +3023,7 @@ pub fn view<'a>(
             widget::container(header(model, state, compact, header_loading, modal_open))
                 .padding([0, spacing.space_xxxs]),
         )
-        .push(widget::divider::horizontal::default());
+        .push(crate::design::horizontal_rule());
 
     if !compact && state.controls_expanded && search_is_reachable(model, mode) {
         content = content.push(
@@ -3039,7 +3039,7 @@ pub fn view<'a>(
             .height(Length::Fill),
     );
     content = content
-        .push(widget::divider::horizontal::default())
+        .push(crate::design::horizontal_rule())
         .push(footer(compact, modal_open))
         .spacing(0)
         .width(Length::Fill)
@@ -3055,7 +3055,7 @@ pub fn view<'a>(
         // rail does not render.
         widget::container(if compact {
             Element::from(
-                widget::container(widget::divider::vertical::default())
+                widget::container(crate::design::vertical_rule())
                     .width(crate::splitter::WIDTH)
                     .height(Length::Fill),
             )
@@ -4917,7 +4917,7 @@ fn worktree_panel<'a>(
                 .width(Length::Fill)
                 .height(Length::Fill)
                 .into(),
-            widget::divider::horizontal::default().into(),
+            crate::design::horizontal_rule().into(),
             footer(false, modal_open),
         ])
         .width(Length::Fill)
@@ -5042,7 +5042,7 @@ fn source_control_panel<'a>(
     let header = header
         .align_y(Alignment::Center)
         .spacing(spacing.space_xxxs)
-        .height(design::HEADER_HEIGHT)
+        .height(design::HEADER_CONTENT_HEIGHT)
         .width(Length::Fill);
 
     // Both notices are permanent slots. The failure arm below this ends in a
@@ -5176,7 +5176,7 @@ fn worktree_panel_chrome<'a>(
             .padding([0, spacing.space_xxs])
             .width(Length::Fill),
     );
-    chrome = chrome.push(widget::divider::horizontal::default());
+    chrome = chrome.push(crate::design::horizontal_rule());
     chrome = chrome.push(
         widget::container(notices)
             .padding([0, spacing.space_xxs])
@@ -5632,7 +5632,7 @@ fn changes_section<'a>(
             column = column.push(change_group_view(state, source, group, modal_open));
         }
     }
-    column = column.push(widget::divider::horizontal::default());
+    column = column.push(crate::design::horizontal_rule());
     column = column.push(changes_footer(state, source, modal_open));
     column.into()
 }
@@ -11236,6 +11236,56 @@ pub(crate) mod tests {
 
         state.apply(&SidebarAction::CancelDiscard);
         assert!(state.pending_discard().is_none());
+    }
+
+    #[test]
+    fn project_worktree_and_tab_headers_share_the_same_separator_baseline() {
+        use cosmic::iced::Point;
+        let renderer = headless_renderer();
+        let model = panel_model();
+        let state = panel_state(&model);
+        let width = 380.0;
+        let tabs = widget::column::with_children(vec![
+            crate::tab_strip::horizontal(
+                widget::Id::new("header.geometry.tabs"),
+                vec![],
+                design::PRIMARY_CONTROL_SIZE,
+                design::HEADER_HEIGHT,
+            ),
+            design::horizontal_rule(),
+        ])
+        .into();
+        let surfaces = [
+            view(&model, &state, SidebarMode::Expanded, width, false),
+            file_panel(&model, &state, width, false),
+            git_panel(&model, &state, width, false),
+            tabs,
+        ];
+        fn first_rule(node: &layout::Node, parent: Point, width: f32) -> Option<f32> {
+            let bounds = node.bounds();
+            let origin = Point::new(parent.x + bounds.x, parent.y + bounds.y);
+            let own = (node.children().is_empty()
+                && (bounds.width - width).abs() < 0.1
+                && (bounds.height - design::BORDER_WIDTH).abs() < 0.1)
+                .then_some(origin.y);
+            node.children()
+                .iter()
+                .filter_map(|child| first_rule(child, origin, width))
+                .chain(own)
+                .min_by(f32::total_cmp)
+        }
+        for mut surface in surfaces {
+            let mut tree = Tree::new(&surface);
+            let node = surface.as_widget_mut().layout(
+                &mut tree,
+                &renderer,
+                &layout::Limits::new(Size::ZERO, Size::new(width, 300.0)),
+            );
+            assert_eq!(
+                first_rule(&node, Point::ORIGIN, width),
+                Some(design::HEADER_CONTENT_HEIGHT)
+            );
+        }
     }
 
     #[test]

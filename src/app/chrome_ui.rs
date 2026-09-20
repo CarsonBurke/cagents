@@ -337,7 +337,7 @@ impl Cagents {
                 widget::container(design::heading("New tab"))
                     .padding([6, 8])
                     .into(),
-                widget::divider::horizontal::default().into(),
+                crate::design::horizontal_rule().into(),
                 widget::column::with_children(items).spacing(2).into(),
             ])
             .spacing(6)
@@ -538,7 +538,7 @@ impl Cagents {
             }
         }
         widget::container(header)
-            .center_y(design::HEADER_HEIGHT - design::BORDER_WIDTH)
+            .center_y(design::HEADER_CONTENT_HEIGHT)
             .width(Length::Fill)
             .class(cosmic::theme::Container::Background)
             .into()
@@ -686,7 +686,7 @@ impl Cagents {
         );
         widget::column::with_children(vec![
             header,
-            widget::divider::horizontal::default().into(),
+            crate::design::horizontal_rule().into(),
             content,
         ])
         .spacing(0)
@@ -1045,7 +1045,7 @@ impl Cagents {
         let heading = self.native_header(iced::widget::Space::new().into(), Some(end), true);
         let tabs = widget::container(tabs)
             .padding([0, 8])
-            .center_y(design::HEADER_HEIGHT - design::BORDER_WIDTH)
+            .center_y(design::HEADER_CONTENT_HEIGHT)
             .width(Length::Fill);
         let body = match self.context_tab {
             ContextTab::Files => sidebar::file_panel(
@@ -1095,9 +1095,9 @@ impl Cagents {
         widget::container(
             widget::column::with_children(vec![
                 heading.into(),
-                widget::divider::horizontal::default().into(),
+                crate::design::horizontal_rule().into(),
                 tabs.into(),
-                widget::divider::horizontal::default().into(),
+                crate::design::horizontal_rule().into(),
                 body,
             ])
             .spacing(0)
