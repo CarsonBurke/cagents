@@ -14,6 +14,7 @@ Options:
   --version VERSION  Install a release version (default: latest v* release)
   --prefix PATH      Installation root (default: $XDG_DATA_HOME/cagents-install)
   --restart-daemon   Checkpoint supported sessions and replace the running daemon
+  --relaunch-agents  With --restart-daemon, accept fresh launches for non-resumable agents
   --uninstall        Remove program files while preserving user data
   --purge            Uninstall and also remove cagents user data
   --help             Show this help
@@ -35,6 +36,7 @@ PREFIX=
 UNINSTALL=0
 PURGE=0
 RESTART_DAEMON=0
+RELAUNCH_AGENTS=0
 
 while [ "$#" -gt 0 ]; do
     case $1 in
@@ -50,6 +52,10 @@ while [ "$#" -gt 0 ]; do
             ;;
         --restart-daemon)
             RESTART_DAEMON=1
+            shift
+            ;;
+        --relaunch-agents)
+            RELAUNCH_AGENTS=1
             shift
             ;;
         --uninstall)
@@ -70,6 +76,9 @@ while [ "$#" -gt 0 ]; do
             ;;
     esac
 done
+
+[ "$RELAUNCH_AGENTS" -eq 0 ] || [ "$RESTART_DAEMON" -eq 1 ] \
+    || fail '--relaunch-agents requires --restart-daemon'
 
 [ "$RESTART_DAEMON" -eq 0 ] || [ "$UNINSTALL" -eq 0 ] \
     || fail '--restart-daemon cannot be combined with --uninstall or --purge'
@@ -189,7 +198,15 @@ prepare_daemon_upgrade() {
         '; then
         fail 'the installed CLI cannot checkpoint upgrades; for the one-time legacy bootstrap, finish sessions or explicitly terminate disposable sessions with the installed CLI, then retry after its daemon exits; installation was not changed'
     fi
-    "$daemon_cli" --json daemon prepare-upgrade --yes >/dev/null \
+    set -- --yes
+    if [ "$RELAUNCH_AGENTS" -eq 1 ]; then
+        relaunch_help=$("$daemon_cli" daemon prepare-upgrade --help 2>/dev/null) \
+            || fail 'cannot inspect installed upgrade support; installation was not changed'
+        printf '%s\n' "$relaunch_help" | awk '$1 == "--relaunch-agents" { supported = 1 } END { exit !supported }' \
+            || fail 'the installed CLI cannot record agent relaunch acceptance; finish blocking sessions before upgrading; installation was not changed'
+        set -- "$@" --relaunch-agents
+    fi
+    "$daemon_cli" --json daemon prepare-upgrade "$@" >/dev/null \
         || fail 'daemon checkpoint preparation failed; installation was not changed'
     wait_for_daemon_shutdown "$daemon_cli"
     DAEMON_STOPPED_FOR_SWITCH=1

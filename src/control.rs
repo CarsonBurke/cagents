@@ -133,6 +133,9 @@ pub enum DaemonCommand {
         /// Authorize interruption and resumption of all supported hosted sessions.
         #[arg(long)]
         yes: bool,
+        /// Accept starting fresh conversations for identified agents without an exact resume ID.
+        #[arg(long)]
+        relaunch_agents: bool,
     },
     /// Archive an interrupted upgrade checkpoint without resuming its processes.
     AbandonUpgrade {
@@ -608,10 +611,21 @@ impl ControlClient {
     pub fn prepare_upgrade(
         &mut self,
         capability: ShutdownCapability,
+        relaunch_agents: bool,
     ) -> Result<(u64, u64), ControlError> {
-        match self.request_strict(ClientRequest::PrepareUpgrade { capability })? {
+        match self.request_strict(ClientRequest::PrepareUpgrade {
+            capability,
+            relaunch_agents,
+        })? {
             ServerResponse::UpgradePrepared { terminals, chats } => Ok((terminals, chats)),
             response => Err(unexpected_response("an upgrade checkpoint", &response)),
+        }
+    }
+
+    pub fn daemon_version(&mut self) -> Result<String, ControlError> {
+        match self.request_strict(ClientRequest::BuildInfo)? {
+            ServerResponse::BuildInfo { version } => Ok(version),
+            response => Err(unexpected_response("daemon build information", &response)),
         }
     }
 
@@ -1096,6 +1110,7 @@ fn message_name(message: &ServerMessage) -> &'static str {
 
 fn response_name(response: &ServerResponse) -> &'static str {
     match response {
+        ServerResponse::BuildInfo { .. } => "build_info",
         ServerResponse::Connected { .. } => "connected",
         ServerResponse::Listed { .. } => "listed",
         ServerResponse::Spawned { .. } => "spawned",
@@ -1423,8 +1438,12 @@ fn execute_daemon(command: DaemonCommand) -> Result<CommandOutput, AppError> {
             let paths = crate::daemon::RuntimePaths::discover()
                 .map_err(|error| AppError::new("socket_path", error))?;
             let socket = &paths.socket;
+            let mut daemon_version = None;
             let running = match ControlClient::connect(socket) {
-                Ok(_) => true,
+                Ok(mut client) => {
+                    daemon_version = Some(client.daemon_version().map_err(protocol_error)?);
+                    true
+                }
                 Err(ControlError::Connect(error))
                     if matches!(
                         error.kind(),
@@ -1442,17 +1461,14 @@ fn execute_daemon(command: DaemonCommand) -> Result<CommandOutput, AppError> {
                     "instance": instance::NAME,
                     "running": running,
                     "socket": socket,
-                    // The build asking, not necessarily the build serving the
-                    // socket: the CLI cannot ask a daemon which build it is
-                    // without a protocol round trip that an older daemon
-                    // would not answer. It is still the first fact a bug
-                    // report needs, so it is reported as what it is.
+                    "daemon_version": daemon_version,
                     "cli_version": crate::VERSION
                 }),
                 human: if running {
                     format!(
-                        "{} daemon running ({}); cli {}",
+                        "{} daemon {} running ({}); cli {}",
                         instance::NAME,
+                        daemon_version.as_deref().unwrap_or("starting"),
                         socket.display(),
                         crate::VERSION
                     )
@@ -1542,7 +1558,10 @@ fn execute_daemon(command: DaemonCommand) -> Result<CommandOutput, AppError> {
                 human: capability,
             })
         }
-        DaemonCommand::PrepareUpgrade { yes } => {
+        DaemonCommand::PrepareUpgrade {
+            yes,
+            relaunch_agents,
+        } => {
             if !yes {
                 return Err(AppError::new(
                     "confirmation_required",
@@ -1554,7 +1573,7 @@ fn execute_daemon(command: DaemonCommand) -> Result<CommandOutput, AppError> {
             let mut client = ControlClient::connect(&socket).map_err(protocol_error)?;
             let preflight = client.shutdown_preflight().map_err(protocol_error)?;
             let (terminals, chats) = client
-                .prepare_upgrade(preflight.capability)
+                .prepare_upgrade(preflight.capability, relaunch_agents)
                 .map_err(protocol_error)?;
             Ok(CommandOutput {
                 command: "daemon.prepare_upgrade",

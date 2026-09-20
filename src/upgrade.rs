@@ -19,6 +19,25 @@ pub(crate) fn recovery_recipe(session: &TerminalSession) -> Result<LaunchRecipe,
     Err("This command has no exact agent identity and cannot safely be replayed; finish or close it before upgrading".into())
 }
 
+#[cfg(any(feature = "host", test))]
+pub(crate) fn checkpoint_recipe(
+    session: &TerminalSession,
+    relaunches: &[crate::terminal_ipc::UpgradeRelaunch],
+) -> Result<LaunchRecipe, String> {
+    if let Some(accepted) = relaunches
+        .iter()
+        .find(|accepted| accepted.source == *session)
+    {
+        if crate::model::agent_recovery::fresh_recipe(&accepted.recipe).as_ref()
+            != Some(&accepted.recipe)
+        {
+            return Err("Accepted relaunch must be a fresh interactive agent recipe".into());
+        }
+        return Ok(accepted.recipe.clone());
+    }
+    recovery_recipe(session)
+}
+
 /// Recipes passed here have already been normalized by agent_resume_recipe.
 /// Only the provider's resume selector identifies the writer, never UUID-shaped
 /// values of unrelated model, profile, or configuration flags.
@@ -397,6 +416,8 @@ pub(crate) mod handoff {
         /// Oldest first; each source's safe restart is the next issued launch.
         #[serde(default)]
         pub previous_sources: Vec<TerminalSession>,
+        #[serde(default)]
+        pub relaunches: Vec<crate::terminal_ipc::UpgradeRelaunch>,
         pub recipe: LaunchRecipe,
         pub options: TerminalSpawnOptions,
     }
@@ -471,7 +492,7 @@ pub(crate) mod handoff {
             for terminal in &self.terminals {
                 if !ids.insert(terminal.source.id)
                     || terminal.source.continuity.live_proof().as_ref() != Some(&self.proof)
-                    || recovery_recipe(&terminal.source)? != terminal.recipe
+                    || checkpoint_recipe(&terminal.source, &terminal.relaunches)? != terminal.recipe
                 {
                     return Err("Upgrade terminal source or safe recipe is inconsistent".into());
                 }
@@ -484,11 +505,26 @@ pub(crate) mod handoff {
                         .chain(std::iter::once(&terminal.source)),
                 ) {
                     source_proof(source.continuity.live_proof(), &mut proofs)?;
-                    if source.id != terminal.source.id || recovery_recipe(source)? != next.launch {
+                    if source.id != terminal.source.id
+                        || checkpoint_recipe(source, &terminal.relaunches)? != next.launch
+                    {
                         return Err("Upgrade terminal lineage is inconsistent".into());
                     }
                 }
                 source_proof(terminal.source.continuity.live_proof(), &mut proofs)?;
+                for (index, accepted) in terminal.relaunches.iter().enumerate() {
+                    if (accepted.source != terminal.source
+                        && !terminal.previous_sources.contains(&accepted.source))
+                        || terminal.relaunches[..index]
+                            .iter()
+                            .any(|old| old.source == accepted.source)
+                    {
+                        return Err(
+                            "Relaunch acceptance does not identify a unique checkpoint source"
+                                .into(),
+                        );
+                    }
+                }
                 if let Some((provider, id)) = exact_conversation(&terminal.recipe)
                     && !conversations.insert((provider.executable(), id))
                 {
@@ -852,6 +888,7 @@ mod tests {
             vec![Terminal {
                 source,
                 previous_sources: Vec::new(),
+                relaunches: Vec::new(),
                 recipe,
                 options: crate::terminal_ipc::TerminalSpawnOptions::default(),
             }],
@@ -880,6 +917,35 @@ mod tests {
         );
         source.launch.arguments = vec!["--continue".into()];
         assert!(recovery_recipe(source).is_err());
+    }
+
+    #[test]
+    fn relaunch_acceptance_is_explicit_source_bound_and_never_replays_a_prompt() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut checkpoint = checkpoint(directory.path());
+        let terminal = &mut checkpoint.terminals[0];
+        terminal.source.launch.program = "claude".into();
+        terminal.source.launch.arguments = Vec::new();
+        terminal.recipe = terminal.source.launch.clone();
+        assert!(checkpoint.validate().is_err());
+        let terminal = &mut checkpoint.terminals[0];
+        terminal
+            .relaunches
+            .push(crate::terminal_ipc::UpgradeRelaunch {
+                source: terminal.source.clone(),
+                recipe: terminal.recipe.clone(),
+            });
+        checkpoint.validate().unwrap();
+        let mut forged = checkpoint.clone();
+        forged.terminals[0].relaunches[0].source.id = TerminalId::new();
+        assert!(forged.validate().is_err());
+        let mut prompt = checkpoint.clone();
+        prompt.terminals[0].relaunches[0].recipe.arguments = vec!["run this again".into()];
+        assert!(prompt.validate().is_err());
+        let mut duplicate = checkpoint.clone();
+        let accepted = duplicate.terminals[0].relaunches[0].clone();
+        duplicate.terminals[0].relaunches.push(accepted);
+        assert!(duplicate.validate().is_err());
     }
 
     #[cfg(any(feature = "host", feature = "ui"))]

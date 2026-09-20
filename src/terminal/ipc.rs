@@ -65,7 +65,9 @@ use crate::{
 /// such a peer cannot issue. A peer therefore never has to decode a variant
 /// index it does not know, which is the only thing the version could warn it
 /// about.
-pub const PROTOCOL_VERSION: u16 = 12;
+/// Version 13 adds explicit agent-relaunch acceptance to upgrade preparation
+/// and per-terminal relaunch provenance to inventory descriptors.
+pub const PROTOCOL_VERSION: u16 = 13;
 /// Postcard encodes an 80x24 grid in roughly 20 KiB and a typical single-row
 /// delta in a few hundred bytes, but a full repaint of a very large grid after
 /// a resize still has to fit, so keep generous headroom.
@@ -242,6 +244,7 @@ pub enum ClientRequest {
     },
     PrepareUpgrade {
         capability: ShutdownCapability,
+        relaunch_agents: bool,
     },
     ResolveUpgradeChat {
         source: crate::chat::Session,
@@ -289,6 +292,7 @@ pub enum ClientRequest {
     EditWorkspaceModel {
         edit: crate::workspace_model::ModelEdit,
     },
+    BuildInfo,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -552,6 +556,9 @@ pub enum ServerResponse {
     WorkspaceModel {
         model: crate::workspace_model::WorkspaceModel,
     },
+    BuildInfo {
+        version: String,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -666,6 +673,15 @@ pub struct TerminalDescriptor {
     /// Authenticated former daemon identities retained by durable upgrade restore.
     #[serde(default)]
     pub upgrade_sources: Vec<TerminalSession>,
+    #[serde(default)]
+    pub upgrade_relaunches: Vec<UpgradeRelaunch>,
+}
+
+/// Explicitly accepted fresh launches, bound to the exact former daemon source.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct UpgradeRelaunch {
+    pub source: TerminalSession,
+    pub recipe: LaunchRecipe,
 }
 
 impl TerminalDescriptor {
@@ -693,6 +709,7 @@ impl TerminalDescriptor {
             activity: None,
             agent_activity: None,
             upgrade_sources: Vec::new(),
+            upgrade_relaunches: Vec::new(),
         }
     }
 }

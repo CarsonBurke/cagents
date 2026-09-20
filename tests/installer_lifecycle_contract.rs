@@ -139,8 +139,16 @@ case "$*" in
     fi
     printf 'Commands:\n  prepare-upgrade  Checkpoint supported sessions\n'
     ;;
-  '--json daemon prepare-upgrade --yes')
-    [ "$#" -eq 4 ] || exit 98
+  'daemon prepare-upgrade --help')
+    [ "$FIXTURE_RESTART" != relaunch-unsupported ] || exit 0
+    printf 'Options:\n  --relaunch-agents  Accept fresh launches\n'
+    ;;
+  '--json daemon prepare-upgrade --yes'|'--json daemon prepare-upgrade --yes --relaunch-agents')
+    if [ "$FIXTURE_RESTART" = relaunch ]; then
+      [ "$#" -eq 5 ] && [ "$5" = --relaunch-agents ] || exit 98
+    else
+      [ "$#" -eq 4 ] || exit 98
+    fi
     printf '%s:prepare\n' "$CLI" >> "$FIXTURE_ACTIONS"
     [ "$CLI" = old ] || exit 98
     [ "$FIXTURE_RESTART" != prepare-failure ] || exit 3
@@ -320,6 +328,9 @@ esac
     if restart.is_some() {
         command.arg("--restart-daemon");
     }
+    if matches!(restart, Some("relaunch" | "relaunch-unsupported")) {
+        command.arg("--relaunch-agents");
+    }
     if download.is_some() {
         command
             .env_remove("CAGENTS_ARCHIVE")
@@ -362,7 +373,7 @@ esac
         .unwrap();
     let success = !matches!(download, Some("gh-failure" | "auth-failure"))
         && match restart {
-            Some("success") => publish_failure.is_none(),
+            Some("success" | "relaunch") => publish_failure.is_none(),
             Some(_) => false,
             None => (compatible || terminals == 0) && publish_failure.is_none(),
         };
@@ -386,12 +397,14 @@ esac
     if let Some(restart) = restart {
         assert!(!actions.contains("require-empty"), "{actions}");
         let expected = match (restart, publish_failure) {
-            ("legacy", _) => "old:help\n",
+            ("legacy" | "relaunch-unsupported", _) => "old:help\n",
             ("prepare-failure", _) => "old:help\nold:prepare\n",
             ("start-failure", _) => {
                 "old:help\nold:prepare\nold:draining\nold:stopped\nnew:start\nnew:stopped\nold:start\n"
             }
-            ("success", None) => "old:help\nold:prepare\nold:draining\nold:stopped\nnew:start\n",
+            ("success" | "relaunch", None) => {
+                "old:help\nold:prepare\nold:draining\nold:stopped\nnew:start\n"
+            }
             ("success", Some(_)) => "old:help\nold:prepare\nold:draining\nold:stopped\nold:start\n",
             ("start-unknown" | "start-signal", _) => {
                 "old:help\nold:prepare\nold:draining\nold:stopped\nnew:start\n"
@@ -399,7 +412,10 @@ esac
             _ => panic!("unknown fixture restart mode"),
         };
         assert_eq!(actions, expected);
-        let prepared = !matches!(restart, "legacy" | "prepare-failure");
+        let prepared = !matches!(
+            restart,
+            "legacy" | "prepare-failure" | "relaunch-unsupported"
+        );
         assert_eq!(checkpoint.exists(), prepared);
         assert_eq!(restored.exists(), prepared);
         if prepared {
@@ -505,6 +521,12 @@ fn legacy_restart_refuses_without_checkpoint_or_shutdown() {
 }
 
 #[test]
+fn installer_passes_relaunch_acceptance_only_to_a_supporting_installed_cli() {
+    upgrade_fixture(false, 7, None, Some("relaunch"));
+    upgrade_fixture(false, 7, None, Some("relaunch-unsupported"));
+}
+
+#[test]
 fn checkpointed_publication_failure_restarts_previous_version_from_handoff() {
     upgrade_fixture(false, 7, Some("error"), Some("success"));
 }
@@ -537,6 +559,7 @@ fn restart_option_rejects_uninstall_and_extra_values_without_creating_installati
         vec!["--purge", "--restart-daemon"],
         vec!["--restart-daemon=yes"],
         vec!["--restart-daemon", "yes"],
+        vec!["--relaunch-agents"],
     ] {
         let output = Command::new("sh")
             .arg(Path::new(env!("CARGO_MANIFEST_DIR")).join("install.sh"))
