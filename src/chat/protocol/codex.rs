@@ -17,6 +17,28 @@ const MAX_PENDING: usize = 128;
 const MAX_MODELS: usize = 512;
 const MAX_ACTIVE_ITEMS: usize = 128;
 const MAX_ITEM_BYTES: usize = 512 * 1024;
+const OUTPUT_TRUNCATED: &str = "\n[Output truncated for display]";
+
+fn append_display_output(output: &mut String, delta: &str, limit: usize) -> bool {
+    if (output.ends_with(OUTPUT_TRUNCATED) && output.len().saturating_add(3) >= limit)
+        || delta.is_empty()
+    {
+        return false;
+    }
+    if output.len().saturating_add(delta.len()) <= limit {
+        output.push_str(delta);
+        return true;
+    }
+    let budget = limit.saturating_sub(OUTPUT_TRUNCATED.len());
+    let end = output.floor_char_boundary(budget.min(output.len()));
+    output.truncate(end);
+    let end = delta.floor_char_boundary(budget.saturating_sub(output.len()).min(delta.len()));
+    output.push_str(&delta[..end]);
+    if limit >= OUTPUT_TRUNCATED.len() {
+        output.push_str(OUTPUT_TRUNCATED);
+    }
+    true
+}
 /// How many skills one conversation will carry into the composer's completion
 /// list. A directory tree with a pathological number of skill files must not
 /// grow the snapshot without bound.
@@ -1141,6 +1163,7 @@ impl Adapter for Codex {
                 // streamed, and losing the tail of its output is better than
                 // ending the session over a delta nothing can render.
                 if let Some(item) = self.active_items.get_mut(&id) {
+                    let bytes = item.content.byte_len();
                     // A fileChange's content is its patch rather than a stream, so the
                     // deprecated textual delta that used to accompany one has nowhere to land.
                     if let ItemContent::Tool { output, .. } | ItemContent::Command { output, .. } =
@@ -1153,11 +1176,11 @@ impl Adapter for Codex {
                         } else {
                             string(params, "delta")?
                         };
-                        if output.len().saturating_add(delta.len()) > MAX_ITEM_BYTES {
-                            return Err("Codex live tool output exceeds native client bound".into());
+                        let limit =
+                            MAX_ITEM_BYTES.saturating_sub(bytes.saturating_sub(output.len()));
+                        if append_display_output(output, delta, limit) {
+                            step.events.push(Event::Item(item.clone()));
                         }
-                        output.push_str(delta);
-                        step.events.push(Event::Item(item.clone()));
                     }
                 }
             }
@@ -1525,7 +1548,7 @@ fn parse_item(value: &Value, done: bool, turn: &str) -> Result<Vec<Item>, String
             at: None,
         }]
     };
-    let items = match kind {
+    let mut items = match kind {
         "agentMessage" | "plan" => vec![Item {
             id: id.into(),
             role: Role::Assistant,
@@ -1707,7 +1730,18 @@ fn parse_item(value: &Value, done: bool, turn: &str) -> Result<Vec<Item>, String
         // renderable rather than ending the session over it.
         other => tool(other.into(), String::new(), value.to_string()),
     };
-    for item in &items {
+    for item in &mut items {
+        let bytes = item.content.byte_len();
+        if bytes > MAX_ITEM_BYTES {
+            if let ItemContent::Tool { output, .. } | ItemContent::Command { output, .. } =
+                &mut item.content
+            {
+                let limit = MAX_ITEM_BYTES.saturating_sub(bytes.saturating_sub(output.len()));
+                // Completed items replace streamed items, so apply the same bound.
+                let full = std::mem::take(output);
+                append_display_output(output, &full, limit);
+            }
+        }
         if item.content.byte_len() > MAX_ITEM_BYTES {
             return Err("Codex item exceeds native client size bound".into());
         }
@@ -2106,6 +2140,40 @@ mod tests {
         assert_ne!(one[0].id, two[0].id);
         let live = adapter.receive(json!({"method":"item/agentMessage/delta","params":{"threadId":"thread-exact","turnId":"turn-a","itemId":"0","delta":"answer"}})).unwrap();
         assert!(matches!(&live.events[0],Event::TextDelta { id,.. } if id == &one[0].id));
+    }
+
+    #[test]
+    fn oversized_tool_output_keeps_stream_and_completion_alive() {
+        let mut adapter = adapter();
+        adapter.busy = true;
+        let mut item = json!({"id":"large","type":"commandExecution","command":"cat data","cwd":"/tmp","status":"inProgress","aggregatedOutput":""});
+        adapter.receive(json!({"method":"item/started","params":{"threadId":"thread-exact","turnId":"turn","item":item}})).unwrap();
+        let delta = "🦀".repeat(MAX_ITEM_BYTES);
+        let streamed = adapter.receive(json!({"method":"item/commandExecution/outputDelta","params":{"threadId":"thread-exact","turnId":"turn","itemId":"large","delta":delta}})).unwrap();
+        let Event::Item(streamed) = &streamed.events[0] else {
+            panic!("missing streamed item")
+        };
+        assert!(streamed.content.byte_len() <= MAX_ITEM_BYTES);
+        assert!(
+            matches!(&streamed.content, ItemContent::Command { output, .. } if output.ends_with(OUTPUT_TRUNCATED))
+        );
+        item["status"] = json!("completed");
+        item["aggregatedOutput"] = json!(delta);
+        let completed = adapter.receive(json!({"method":"item/completed","params":{"threadId":"thread-exact","turnId":"turn","item":item}})).unwrap();
+        let Event::Item(completed) = &completed.events[0] else {
+            panic!("missing completed item")
+        };
+        assert!(completed.content.byte_len() <= MAX_ITEM_BYTES);
+        assert!(matches!(
+            &completed.content,
+            ItemContent::Command {
+                status: ToolStatus::Succeeded,
+                ..
+            }
+        ));
+        assert!(adapter.active_items.is_empty());
+        adapter.receive(json!({"method":"turn/completed","params":{"threadId":"thread-exact","turn":{"id":"turn","status":"completed","items":[]}}})).unwrap();
+        assert!(!adapter.busy);
     }
 
     #[test]
