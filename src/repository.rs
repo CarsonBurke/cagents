@@ -7073,8 +7073,14 @@ mod tests {
             let root = directory.path();
             git(root, &["init", "-b", "main"]);
             fs::write(root.join("tracked.txt"), "tracked\n").unwrap();
-            git(root, &["add", "tracked.txt"]);
+            fs::write(root.join(".gitignore"), "ignored.txt\nignored-dir/\n").unwrap();
+            git(root, &["add", "tracked.txt", ".gitignore"]);
             fs::write(root.join("untracked.txt"), "one\ntwo\n").unwrap();
+            fs::write(root.join("ignored.txt"), "ignored\n").unwrap();
+            fs::create_dir(root.join("ignored-dir")).unwrap();
+            fs::write(root.join("ignored-dir/nested.txt"), "ignored\n").unwrap();
+            fs::write(root.join(".git/info/exclude"), "private.txt\n").unwrap();
+            fs::write(root.join("private.txt"), "ignored\n").unwrap();
             let cancel = CancellationToken::new();
             let collapsed = service()
                 .snapshot_with_options(
@@ -7087,7 +7093,10 @@ mod tests {
                 )
                 .unwrap();
             assert_eq!(collapsed.status.dirty.untracked, 0);
-            assert_eq!(collapsed.files.paths, vec![path("tracked.txt")]);
+            assert_eq!(
+                collapsed.files.paths,
+                vec![path(".gitignore"), path("tracked.txt")]
+            );
             assert!(
                 collapsed
                     .status
@@ -7099,7 +7108,14 @@ mod tests {
                 .snapshot_with_options(root, SnapshotOptions::default(), &cancel)
                 .unwrap();
             assert_eq!(expanded.status.dirty.untracked, 1);
-            assert!(expanded.files.paths.contains(&path("untracked.txt")));
+            assert_eq!(
+                expanded.files.paths,
+                vec![
+                    path(".gitignore"),
+                    path("tracked.txt"),
+                    path("untracked.txt")
+                ]
+            );
             assert_eq!(
                 expanded
                     .status
