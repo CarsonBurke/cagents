@@ -32,8 +32,8 @@ use crate::{
         highlighter_settings, load_repository_diff,
     },
     editor::{
-        FileContent, FileIoError, OversizeKind, ReadOnlyReason, SaveDurability, SaveOutcome,
-        load_file, save_file, validate_repo_path,
+        FileContent, FileIoError, LinkRefusal, LoadedFile, OversizeKind, ReadOnlyReason,
+        SaveDurability, SaveOutcome, load_file, save_file, validate_repo_path,
     },
     lsp::{
         LspCompletionEdit, LspCompletionItem, LspDocumentId, LspPosition, LspRange, LspTextEdit,
@@ -377,7 +377,7 @@ pub enum RepositoryAction {
     },
     FileLoaded {
         identity: AsyncIdentity,
-        result: Result<FileContent, FileIoError>,
+        result: Result<LoadedFile, FileIoError>,
     },
     /// Turn to a page of the open document, or re-render the current one after
     /// the reader changes how its colors are adapted or how large it is drawn.
@@ -610,7 +610,14 @@ enum MarkdownMode {
 }
 
 struct EditorDocument {
+    /// The selected path: the name the reader opened and the file list rows.
     path: PathBuf,
+    /// The file the bytes were read from and are saved to. Differs from
+    /// [`EditorDocument::path`] when that is a symbolic link, and everything
+    /// that is about the bytes rather than the row — saving, the language
+    /// server's document, the syntax the buffer is highlighted with — goes by
+    /// this one. See [`LoadedFile::source`].
+    source: PathBuf,
     content: text_editor::Content<cosmic::Renderer>,
     saved_text: String,
     disk_hash: blake3::Hash,
@@ -650,7 +657,13 @@ struct SaveTicket {
 }
 
 impl EditorDocument {
-    fn new(path: PathBuf, text: String, disk_hash: blake3::Hash, markdown: bool) -> Self {
+    fn new(
+        path: PathBuf,
+        source: PathBuf,
+        text: String,
+        disk_hash: blake3::Hash,
+        markdown: bool,
+    ) -> Self {
         let markdown_items = if markdown {
             markdown::parse(&text).collect()
         } else {
@@ -658,6 +671,7 @@ impl EditorDocument {
         };
         Self {
             path,
+            source,
             content: text_editor::Content::with_text(&text),
             saved_text: text,
             disk_hash,
@@ -672,6 +686,13 @@ impl EditorDocument {
             error: None,
             durability_warning: None,
         }
+    }
+
+    /// A document that is its own file, which is every fixture that is not
+    /// about links.
+    #[cfg(test)]
+    fn unlinked(path: PathBuf, text: String, disk_hash: blake3::Hash, markdown: bool) -> Self {
+        Self::new(path.clone(), path, text, disk_hash, markdown)
     }
 
     /// Applies one editor action and brings the derived state with it.
@@ -1206,6 +1227,10 @@ enum DocumentState {
     Loading,
     Editable(EditorDocument),
     Image {
+        /// The worktree-relative file the pixels came from, which is not the
+        /// selected row when that row is a symbolic link. See
+        /// [`LoadedFile::source`].
+        source: PathBuf,
         handle: iced::widget::image::Handle,
         width: u32,
         height: u32,
@@ -1215,6 +1240,9 @@ enum DocumentState {
     /// child process that re-reads the file, which is what keeps a damaged or
     /// hostile document from taking the window down with it.
     Pdf {
+        /// The same file as `path`, worktree-relative, kept so the chrome can
+        /// say which file a row that is a symbolic link resolved to.
+        source: PathBuf,
         path: PathBuf,
         pages: usize,
         page: usize,
@@ -1981,7 +2009,8 @@ impl RepositoryRuntime {
             path: path.clone(),
             generation: 1,
         };
-        let mut document = EditorDocument::new(path, "A\n".into(), blake3::hash(b"A\n"), false);
+        let mut document =
+            EditorDocument::unlinked(path, "A\n".into(), blake3::hash(b"A\n"), false);
         document.content = text_editor::Content::with_text("A\n");
         document.dirty = false;
         document.revision = 2;
@@ -2154,10 +2183,13 @@ impl RepositoryRuntime {
         let (mut runtime, identity) = Self::selection_fixture(card, name);
         drop(runtime.update(RepositoryAction::FileLoaded {
             identity: identity.clone(),
-            result: Ok(FileContent::Editable {
-                text: text.into(),
-                content_hash: blake3::hash(text.as_bytes()),
-                markdown: false,
+            result: Ok(LoadedFile {
+                source: identity.path.clone(),
+                content: FileContent::Editable {
+                    text: text.into(),
+                    content_hash: blake3::hash(text.as_bytes()),
+                    markdown: false,
+                },
             }),
         }));
         (runtime, identity)
@@ -2706,7 +2738,7 @@ impl RepositoryRuntime {
             return;
         };
         self.lsp_intents.push(LspIntent::Open {
-            absolute_path: worktree.join(&document.path),
+            absolute_path: worktree.join(&document.source),
             worktree: worktree.to_path_buf(),
             version: document.lsp_version,
             text: document.content.text(),
@@ -2738,6 +2770,33 @@ impl RepositoryRuntime {
 
     pub fn selected_path(&self) -> Option<&Path> {
         self.selected.as_ref().map(|file| file.path.as_path())
+    }
+
+    /// The file the open buffer really is, when the selected path is a
+    /// symbolic link to it; `None` for a buffer that is its own file.
+    ///
+    /// The chrome shows this so a reader editing `AGENTS.md` can see that the
+    /// keystrokes land in `CLAUDE.md`, which is also where a save will be
+    /// reported by the file list.
+    #[must_use]
+    pub fn linked_source(&self) -> Option<&Path> {
+        let source = match &self.document {
+            DocumentState::Editable(document) => &document.source,
+            DocumentState::Image { source, .. }
+            | DocumentState::Pdf { source, .. }
+            | DocumentState::ReadOnly { path: source, .. } => source,
+            DocumentState::None | DocumentState::Loading | DocumentState::Failed { .. } => {
+                return None;
+            }
+        };
+        let selected = self.selected.as_ref()?;
+        (*source != selected.path).then_some(source.as_path())
+    }
+
+    /// Whether the open buffer's bytes live in a file other than the selected
+    /// row, so that a save changes a row the list has to be asked about.
+    fn saves_elsewhere(&self) -> bool {
+        matches!(&self.document, DocumentState::Editable(document) if document.source != document.path)
     }
 
     pub fn preview_fragment(&mut self, card: CardId, fragment: &str) -> Task<RepositoryAction> {
@@ -3056,6 +3115,9 @@ impl RepositoryRuntime {
             return Task::none();
         };
         let identity = self.current_identity(card, document.path.clone());
+        // Highlighting follows the bytes, which is the source; the identity
+        // stays the row, which is what the result is matched against.
+        let source = document.source.clone();
         // Only the debounce boundary serializes the native buffer. No Git is
         // invoked, no second editable Content is created, and queued edits do
         // not retain copies of superseded text.
@@ -3075,10 +3137,9 @@ impl RepositoryRuntime {
             cancellation: cancellation.clone(),
         });
         cosmic::task::future(async move {
-            let path = identity.path.clone();
             let baseline = Arc::clone(&before);
             let result = tokio::task::spawn_blocking(move || {
-                build_document_diff(baseline, &after, &path, syntax_theme, &cancellation)
+                build_document_diff(baseline, &after, &source, syntax_theme, &cancellation)
             })
             .await
             .map_err(|error| format!("Diff worker failed: {error}"));
@@ -3525,13 +3586,14 @@ impl RepositoryRuntime {
         overwrite: bool,
         reveal_editor: bool,
     ) -> Task<RepositoryAction> {
-        let (path, text, disk_hash, revision) = match &self.document {
+        let (path, destination, text, disk_hash, revision) = match &self.document {
             DocumentState::Editable(document)
                 if (document.dirty || document.durability_warning.is_some())
                     && document.active_save.is_none() =>
             {
                 (
                     document.path.clone(),
+                    document.source.clone(),
                     document.content.text(),
                     document.disk_hash,
                     document.revision,
@@ -3539,6 +3601,8 @@ impl RepositoryRuntime {
             }
             _ => return Task::none(),
         };
+        // The ticket is about the selected row, which is what a result is
+        // matched against; the bytes go where they were read from.
         let identity = self.current_identity(card, path);
         self.next_save_ticket = self.next_save_ticket.wrapping_add(1).max(1);
         let ticket = SaveTicket {
@@ -3558,11 +3622,10 @@ impl RepositoryRuntime {
             self.markdown_mode = MarkdownMode::Edit;
         }
         let worktree = identity.worktree.clone();
-        let relative_path = identity.path.clone();
         let saved_text = text.clone();
         cosmic::task::future(async move {
             let result = tokio::task::spawn_blocking(move || {
-                save_file(&worktree, &relative_path, &text, disk_hash, overwrite)
+                save_file(&worktree, &destination, &text, disk_hash, overwrite)
             })
             .await
             .map_err(|error| FileIoError::Io(format!("save worker failed: {error}")))
@@ -3678,21 +3741,31 @@ impl RepositoryRuntime {
                     return Task::none();
                 }
                 self.document = match result {
-                    Ok(FileContent::Editable {
-                        text,
-                        content_hash,
-                        markdown,
+                    Ok(LoadedFile {
+                        source,
+                        content:
+                            FileContent::Editable {
+                                text,
+                                content_hash,
+                                markdown,
+                            },
                     }) => DocumentState::Editable(EditorDocument::new(
                         identity.path,
+                        source,
                         text,
                         content_hash,
                         markdown,
                     )),
-                    Ok(FileContent::Image {
-                        width,
-                        height,
-                        rgba,
+                    Ok(LoadedFile {
+                        source,
+                        content:
+                            FileContent::Image {
+                                width,
+                                height,
+                                rgba,
+                            },
                     }) => DocumentState::Image {
+                        source,
                         handle: iced::widget::image::Handle::from_rgba(
                             width,
                             height,
@@ -3701,7 +3774,10 @@ impl RepositoryRuntime {
                         width,
                         height,
                     },
-                    Ok(FileContent::Pdf { pages, page }) => DocumentState::Pdf {
+                    Ok(LoadedFile {
+                        source,
+                        content: FileContent::Pdf { pages, page },
+                    }) => DocumentState::Pdf {
                         handle: iced::widget::image::Handle::from_rgba(
                             page.width,
                             page.height,
@@ -3720,7 +3796,8 @@ impl RepositoryRuntime {
                         tone: self.document_tone,
                         // The same absolute path the load resolved, because
                         // every later page is read from the file again.
-                        path: identity.worktree.join(&identity.path),
+                        path: identity.worktree.join(&source),
+                        source,
                         pages,
                         rendering: None,
                         message: None,
@@ -3728,8 +3805,14 @@ impl RepositoryRuntime {
                         // the reader says otherwise.
                         chosen_tone: None,
                     },
-                    Ok(FileContent::ReadOnly(reason)) => DocumentState::ReadOnly {
-                        path: identity.path,
+                    // The notice is about the file that was classified: for
+                    // a refused link the link that failed, which in a chain
+                    // is not the row, and otherwise the file the row led to.
+                    Ok(LoadedFile {
+                        source,
+                        content: FileContent::ReadOnly(reason),
+                    }) => DocumentState::ReadOnly {
+                        path: source,
                         reason,
                     },
                     Err(error) => DocumentState::Failed {
@@ -3852,6 +3935,7 @@ impl RepositoryRuntime {
                 // lives beside it rather than in it.
                 let intended = self.document_tone;
                 let DocumentState::Pdf {
+                    source: _,
                     path,
                     pages,
                     page,
@@ -4093,10 +4177,13 @@ impl RepositoryRuntime {
                     // conflict, and not on a failure — in none of those does
                     // the file on disk match this buffer.
                     self.push_lsp_save();
-                    if self.mutation_refresh_pending {
+                    if self.mutation_refresh_pending || self.saves_elsewhere() {
                         // Status may have been read before this save reached
                         // disk. Supersede that read rather than let it erase the
-                        // newly saved worktree change.
+                        // newly saved worktree change. A save through a
+                        // symbolic link changed a different row from the
+                        // selected one, and only Git knows which state that
+                        // row is in now.
                         return self.refresh_after_mutation(identity.card);
                     }
                     let Some(selected) = self.selected.as_mut() else {
@@ -5639,27 +5726,62 @@ pub fn selected_file_toolbar(
     let editing = runtime.source_surface == SourceSurface::Editor
         && runtime.markdown_mode == MarkdownMode::Edit;
     let editable = matches!(runtime.document, DocumentState::Editable(_));
-    let title = (!runtime.standalone).then(|| {
-        let name = selected
-            .path
-            .file_name()
-            .unwrap_or(selected.path.as_os_str())
-            .to_string_lossy();
-        widget::container(crate::interaction::tooltip(
-            widget::row::with_children(vec![
-                crate::file_icon::icon(&selected.path).into(),
-                widget::text::body(name)
-                    .wrapping(iced::widget::text::Wrapping::None)
-                    .ellipsize(iced::widget::text::Ellipsize::End(
-                        iced::advanced::text::EllipsizeHeightLimit::Lines(1),
-                    ))
-                    .width(Length::Fill)
+    // A buffer reached through a symbolic link says so in the chrome, even in
+    // a standalone window whose tab already names the file: the row the
+    // reader clicked is not the file their keystrokes land in, and the file
+    // list will report the save against the other name.
+    let linked = runtime.linked_source();
+    let title = (!runtime.standalone || linked.is_some()).then(|| {
+        let file_name = |path: &Path| {
+            path.file_name()
+                .unwrap_or(path.as_os_str())
+                .to_string_lossy()
+                .into_owned()
+        };
+        let one_line = |text: widget::text::Text<'static, cosmic::Theme, cosmic::Renderer>| {
+            text.wrapping(iced::widget::text::Wrapping::None).ellipsize(
+                iced::widget::text::Ellipsize::End(
+                    iced::advanced::text::EllipsizeHeightLimit::Lines(1),
+                ),
+            )
+        };
+        let mut label: Vec<Element<'_, RepositoryAction>> = Vec::new();
+        if !runtime.standalone {
+            label.push(crate::file_icon::icon(&selected.path).into());
+            // The name gives way to the caption only when there is one; on
+            // its own it fills the slot as it always has.
+            label.push(
+                one_line(widget::text::body(file_name(&selected.path)))
+                    .width(if linked.is_some() {
+                        Length::Shrink
+                    } else {
+                        Length::Fill
+                    })
                     .into(),
-            ])
-            .spacing(8)
-            .align_y(Alignment::Center)
-            .width(Length::Fill),
-            selected.path.to_string_lossy(),
+            );
+        }
+        let tooltip = match linked {
+            Some(source) => {
+                let caption = if runtime.standalone {
+                    format!(
+                        "{} \u{2192} {}",
+                        file_name(&selected.path),
+                        file_name(source)
+                    )
+                } else {
+                    format!("\u{2192} {}", file_name(source))
+                };
+                label.push(one_line(crate::design::caption(caption)).into());
+                format!("{} \u{2192} {}", selected.path.display(), source.display())
+            }
+            None => selected.path.to_string_lossy().into_owned(),
+        };
+        widget::container(crate::interaction::tooltip(
+            widget::row::with_children(label)
+                .spacing(8)
+                .align_y(Alignment::Center)
+                .width(Length::Fill),
+            tooltip,
         ))
         .width(Length::FillPortion(1))
         .max_width(220)
@@ -5981,6 +6103,7 @@ fn editor_surface(card: CardId, runtime: &RepositoryRuntime) -> Element<'_, Repo
             handle,
             width,
             height,
+            source: _,
         } => crate::interaction::tooltip(
             widget::container(
                 iced::widget::image(handle.clone())
@@ -5995,6 +6118,7 @@ fn editor_surface(card: CardId, runtime: &RepositoryRuntime) -> Element<'_, Repo
         )
         .into(),
         DocumentState::Pdf {
+            source: _,
             path: _,
             pages,
             page,
@@ -6384,7 +6508,7 @@ fn editable_document_view<'a>(
             .id(editor_focus_id(card))
             .highlight_with::<highlighter::Highlighter>(
                 highlighter_settings(
-                    &document.path,
+                    &document.source,
                     runtime.syntax_theme,
                     cosmic::theme::is_dark(),
                 ),
@@ -7370,12 +7494,21 @@ impl Widget<RepositoryAction, cosmic::Theme, cosmic::Renderer> for DiffHorizonta
     }
 }
 
-fn read_only_state(path: &Path, reason: &ReadOnlyReason) -> Element<'static, RepositoryAction> {
-    let detail = match reason {
-        ReadOnlyReason::Symlink { target } => format!(
-            "{} is a symbolic link to {}.",
+/// The sentence under the read-only title, about the file that was classified.
+fn read_only_detail(path: &Path, reason: &ReadOnlyReason) -> String {
+    match reason {
+        // A link is followed when it can be, so the sentence has to say why
+        // this one was not: the reader's next move differs for each.
+        ReadOnlyReason::Symlink { target, refusal } => format!(
+            "{} is a symbolic link to {}, {}",
             path.display(),
-            target.display()
+            target.display(),
+            match refusal {
+                LinkRefusal::LeavesWorktree =>
+                    "which is outside the worktree or reached through another link.",
+                LinkRefusal::Dangling => "which does not exist.",
+                LinkRefusal::TooManyLinks => "which leads through too many links to follow.",
+            }
         ),
         ReadOnlyReason::Binary => format!("{} contains binary data.", path.display()),
         ReadOnlyReason::InvalidUtf8 => format!("{} is not valid UTF-8.", path.display()),
@@ -7394,7 +7527,11 @@ fn read_only_state(path: &Path, reason: &ReadOnlyReason) -> Element<'static, Rep
             }
         ),
         ReadOnlyReason::NotRegularFile => format!("{} is not a regular file.", path.display()),
-    };
+    }
+}
+
+fn read_only_state(path: &Path, reason: &ReadOnlyReason) -> Element<'static, RepositoryAction> {
+    let detail = read_only_detail(path, reason);
     information_state(
         match reason {
             ReadOnlyReason::Image(_) => "Image preview unavailable",
@@ -8068,10 +8205,13 @@ mod tests {
             path: "notes.md".into(),
         }));
         let loaded = || {
-            Ok(FileContent::Editable {
-                text: text.clone(),
-                content_hash: blake3::hash(text.as_bytes()),
-                markdown: true,
+            Ok(LoadedFile {
+                source: "notes.md".into(),
+                content: FileContent::Editable {
+                    text: text.clone(),
+                    content_hash: blake3::hash(text.as_bytes()),
+                    markdown: true,
+                },
             })
         };
         drop(runtime.update(RepositoryAction::FileLoaded {
@@ -8165,7 +8305,7 @@ mod tests {
     fn preview_actions_require_a_preview_renderer_and_preserve_the_current_surface() {
         let card = CardId::new();
         let (mut runtime, _) = diff_runtime(card);
-        runtime.document = DocumentState::Editable(EditorDocument::new(
+        runtime.document = DocumentState::Editable(EditorDocument::unlinked(
             PathBuf::from("plain.rs"),
             "fn main() {}\n".into(),
             blake3::hash(b"fn main() {}\n"),
@@ -8184,7 +8324,7 @@ mod tests {
         }));
         assert_eq!(runtime.source_surface, SourceSurface::Editor);
 
-        runtime.document = DocumentState::Editable(EditorDocument::new(
+        runtime.document = DocumentState::Editable(EditorDocument::unlinked(
             PathBuf::from("README.md"),
             "# Heading\n".into(),
             blake3::hash(b"# Heading\n"),
@@ -8569,10 +8709,13 @@ mod tests {
         let text = "# Notes\n\nA paragraph long enough to wrap inside the preview.\n".repeat(24);
         drop(preview.update(RepositoryAction::FileLoaded {
             identity,
-            result: Ok(crate::editor::FileContent::Editable {
-                content_hash: blake3::hash(text.as_bytes()),
-                text,
-                markdown: true,
+            result: Ok(LoadedFile {
+                source: "notes.md".into(),
+                content: crate::editor::FileContent::Editable {
+                    content_hash: blake3::hash(text.as_bytes()),
+                    text,
+                    markdown: true,
+                },
             }),
         }));
         drop(preview.update(RepositoryAction::ApplyMarkdownMode {
@@ -8934,7 +9077,7 @@ mod tests {
 
     #[test]
     fn editor_dirty_state_and_markdown_preview_follow_edits() {
-        let mut document = EditorDocument::new(
+        let mut document = EditorDocument::unlinked(
             PathBuf::from("README.md"),
             "# Title\n".into(),
             blake3::hash(b"# Title\n"),
@@ -8973,7 +9116,7 @@ mod tests {
             status: Some(" M".into()),
             directory: false,
         });
-        let mut document = EditorDocument::new(
+        let mut document = EditorDocument::unlinked(
             path.clone(),
             "before\n".into(),
             blake3::hash(b"before\n"),
@@ -9128,10 +9271,13 @@ mod tests {
         let identity = reloaded.current_identity(card, PathBuf::from("notes.txt"));
         let _ = reloaded.update(RepositoryAction::FileLoaded {
             identity,
-            result: Ok(FileContent::Editable {
-                text: "B\n".into(),
-                content_hash: blake3::hash(b"B\n"),
-                markdown: false,
+            result: Ok(LoadedFile {
+                source: "notes.txt".into(),
+                content: FileContent::Editable {
+                    text: "B\n".into(),
+                    content_hash: blake3::hash(b"B\n"),
+                    markdown: false,
+                },
             }),
         });
         assert!(!reloaded.blocks_navigation());
@@ -9177,7 +9323,7 @@ mod tests {
             status: Some(" M".into()),
             directory: false,
         });
-        let mut document = EditorDocument::new(
+        let mut document = EditorDocument::unlinked(
             path.clone(),
             "disk\n".into(),
             blake3::hash(b"disk\n"),
@@ -9229,7 +9375,7 @@ mod tests {
 
     #[test]
     fn save_in_flight_blocks_navigation_even_when_text_temporarily_matches_old_disk() {
-        let mut document = EditorDocument::new(
+        let mut document = EditorDocument::unlinked(
             PathBuf::from("notes.txt"),
             "disk\n".into(),
             blake3::hash(b"disk\n"),
@@ -9285,7 +9431,7 @@ mod tests {
             path: path.clone(),
             generation: 4,
         };
-        let mut document = EditorDocument::new(
+        let mut document = EditorDocument::unlinked(
             path.clone(),
             "disk\n".into(),
             blake3::hash(b"disk\n"),
@@ -9355,10 +9501,13 @@ mod tests {
         });
         let _ = runtime.update(RepositoryAction::FileLoaded {
             identity: identity.clone(),
-            result: Ok(FileContent::Editable {
-                text: "loaded\n".into(),
-                content_hash: blake3::hash(b"loaded\n"),
-                markdown: false,
+            result: Ok(LoadedFile {
+                source: identity.path.clone(),
+                content: FileContent::Editable {
+                    text: "loaded\n".into(),
+                    content_hash: blake3::hash(b"loaded\n"),
+                    markdown: false,
+                },
             }),
         });
         let _ = runtime.update(RepositoryAction::DiffLoaded {
@@ -9493,10 +9642,13 @@ mod tests {
                 path: path.clone(),
                 generation: 4,
             },
-            result: Ok(FileContent::Editable {
-                text: "loaded\n".into(),
-                content_hash: blake3::hash(b"loaded\n"),
-                markdown: true,
+            result: Ok(LoadedFile {
+                source: path.clone(),
+                content: FileContent::Editable {
+                    text: "loaded\n".into(),
+                    content_hash: blake3::hash(b"loaded\n"),
+                    markdown: true,
+                },
             }),
         });
         let _ = runtime.update(RepositoryAction::FilesLoaded {
@@ -9557,7 +9709,7 @@ mod tests {
             generation: 7,
         };
         let mut document =
-            EditorDocument::new(path, "before\n".into(), blake3::hash(b"before\n"), false);
+            EditorDocument::unlinked(path, "before\n".into(), blake3::hash(b"before\n"), false);
         document.content = text_editor::Content::with_text("after\n");
         document.dirty = true;
         document.revision = 1;
@@ -9613,7 +9765,7 @@ mod tests {
             directory: false,
         });
         let mut document =
-            EditorDocument::new(path, "disk\n".into(), blake3::hash(b"disk\n"), true);
+            EditorDocument::unlinked(path, "disk\n".into(), blake3::hash(b"disk\n"), true);
         document.content = text_editor::Content::with_text("changed\n");
         document.dirty = true;
         document.revision = 1;
@@ -9744,7 +9896,7 @@ mod tests {
         };
         runtime.files = FileListState::Ready(vec![file.clone()]);
         runtime.selected = Some(file);
-        let mut document = EditorDocument::new(
+        let mut document = EditorDocument::unlinked(
             PathBuf::from("notes.md"),
             "before\n".into(),
             blake3::hash(b"before\n"),
@@ -9863,7 +10015,7 @@ mod tests {
                 status: (!tracked).then(|| "??".into()),
                 directory: false,
             });
-            let mut document = EditorDocument::new(
+            let mut document = EditorDocument::unlinked(
                 path.clone(),
                 "before\n".into(),
                 blake3::hash(b"before\n"),
@@ -10031,10 +10183,13 @@ mod tests {
         };
         let _ = runtime.update(RepositoryAction::FileLoaded {
             identity: stale,
-            result: Ok(FileContent::Editable {
-                text: "stale".into(),
-                content_hash: blake3::hash(b"stale"),
-                markdown: false,
+            result: Ok(LoadedFile {
+                source: "older.rs".into(),
+                content: FileContent::Editable {
+                    text: "stale".into(),
+                    content_hash: blake3::hash(b"stale"),
+                    markdown: false,
+                },
             }),
         });
         assert!(
@@ -10255,11 +10410,165 @@ mod tests {
         );
     }
 
+    /// A row that is a symbolic link opens the file behind it: the buffer is
+    /// that file's bytes, the language server is told about that file, the
+    /// chrome names it, and a save goes there rather than over the link.
+    #[test]
+    fn a_link_opens_edits_and_saves_its_target() {
+        let card = CardId::new();
+        let (mut runtime, identity) = RepositoryRuntime::selection_fixture(card, "AGENTS.md");
+        drop(runtime.update(RepositoryAction::FileLoaded {
+            identity,
+            result: Ok(LoadedFile {
+                source: "CLAUDE.md".into(),
+                content: FileContent::Editable {
+                    text: "# Guidance\n".into(),
+                    content_hash: blake3::hash(b"# Guidance\n"),
+                    markdown: true,
+                },
+            }),
+        }));
+        assert_eq!(runtime.selected_path(), Some(Path::new("AGENTS.md")));
+        assert_eq!(runtime.linked_source(), Some(Path::new("CLAUDE.md")));
+        assert!(matches!(
+            runtime.take_lsp_intents().as_slice(),
+            [LspIntent::Open { absolute_path, .. }] if absolute_path == Path::new("/repo/CLAUDE.md")
+        ));
+
+        drop(runtime.update(RepositoryAction::EditorAction {
+            card,
+            action: text_editor::Action::Edit(text_editor::Edit::Insert('x')),
+        }));
+        drop(runtime.request_save(card, false));
+        let DocumentState::Editable(document) = &runtime.document else {
+            panic!("the buffer stays editable while it saves");
+        };
+        let ticket = document
+            .active_save
+            .as_ref()
+            .expect("a dirty buffer starts a save");
+        assert_eq!(
+            ticket.identity.path,
+            Path::new("AGENTS.md"),
+            "the save is matched back to the row that was opened"
+        );
+        assert_eq!(
+            document.source,
+            Path::new("CLAUDE.md"),
+            "and its bytes go to the file the link resolves to"
+        );
+
+        let (mut plain, _) = RepositoryRuntime::open_fixture(card, "notes.txt", "plain\n");
+        assert_eq!(plain.linked_source(), None);
+        drop(plain.take_lsp_intents());
+    }
+
+    /// A save through a link changes a row other than the selected one, so
+    /// the list is asked again rather than the selected row marked modified.
+    #[test]
+    fn a_save_through_a_link_refreshes_the_list_instead_of_marking_the_link() {
+        let card = CardId::new();
+        let (mut runtime, identity) = RepositoryRuntime::selection_fixture(card, "AGENTS.md");
+        drop(runtime.update(RepositoryAction::FileLoaded {
+            identity: identity.clone(),
+            result: Ok(LoadedFile {
+                source: "CLAUDE.md".into(),
+                content: FileContent::Editable {
+                    text: "# Guidance\n".into(),
+                    content_hash: blake3::hash(b"# Guidance\n"),
+                    markdown: true,
+                },
+            }),
+        }));
+        drop(runtime.take_lsp_intents());
+        if let Some(selected) = runtime.selected.as_mut() {
+            selected.unstaged = false;
+            selected.status = None;
+        }
+        drop(runtime.update(RepositoryAction::EditorAction {
+            card,
+            action: text_editor::Action::Edit(text_editor::Edit::Insert('x')),
+        }));
+        drop(runtime.request_save(card, false));
+        let ticket = match &runtime.document {
+            DocumentState::Editable(document) => document.active_save.clone().unwrap(),
+            _ => panic!("the buffer stays editable while it saves"),
+        };
+        drop(runtime.update(RepositoryAction::SaveFinished {
+            identity,
+            ticket: ticket.id,
+            revision: ticket.revision,
+            saved_text: ticket.snapshot.clone(),
+            result: Ok(SaveOutcome::Saved {
+                content_hash: blake3::hash(ticket.snapshot.as_bytes()),
+                durability: SaveDurability::Durable,
+            }),
+        }));
+        let selected = runtime.selected.as_ref().unwrap();
+        assert!(
+            !selected.unstaged && selected.status.is_none(),
+            "the link itself did not change: {selected:?}"
+        );
+        assert!(
+            runtime.mutation_refresh_pending,
+            "the row that did change is learned from Git"
+        );
+    }
+
+    /// The notice names the link that actually failed, which in a chain is
+    /// not the row, and the link's own target rather than the row's.
+    #[test]
+    fn a_refused_link_is_described_by_the_link_that_failed() {
+        let card = CardId::new();
+        let (mut runtime, identity) = RepositoryRuntime::selection_fixture(card, "to-dangling");
+        drop(runtime.update(RepositoryAction::FileLoaded {
+            identity,
+            result: Ok(LoadedFile {
+                source: "dangling".into(),
+                content: FileContent::ReadOnly(ReadOnlyReason::Symlink {
+                    target: "missing".into(),
+                    refusal: LinkRefusal::Dangling,
+                }),
+            }),
+        }));
+        let DocumentState::ReadOnly { path, reason } = &runtime.document else {
+            panic!("a refused link is read-only");
+        };
+        assert_eq!(
+            read_only_detail(path, reason),
+            "dangling is a symbolic link to missing, which does not exist."
+        );
+        assert_eq!(runtime.linked_source(), Some(Path::new("dangling")));
+        assert_eq!(
+            read_only_detail(
+                Path::new("escape"),
+                &ReadOnlyReason::Symlink {
+                    target: "/etc/passwd".into(),
+                    refusal: LinkRefusal::LeavesWorktree,
+                }
+            ),
+            "escape is a symbolic link to /etc/passwd, which is outside the worktree or reached through another link."
+        );
+        assert_eq!(
+            read_only_detail(
+                Path::new("loop-a"),
+                &ReadOnlyReason::Symlink {
+                    target: "loop-b".into(),
+                    refusal: LinkRefusal::TooManyLinks,
+                }
+            ),
+            "loop-a is a symbolic link to loop-b, which leads through too many links to follow."
+        );
+    }
+
     #[test]
     fn a_read_only_or_unreadable_file_is_never_opened_at_the_boundary() {
         let card = CardId::new();
         for result in [
-            Ok(FileContent::ReadOnly(ReadOnlyReason::Binary)),
+            Ok(LoadedFile {
+                source: "notes.txt".into(),
+                content: FileContent::ReadOnly(ReadOnlyReason::Binary),
+            }),
             Err(FileIoError::Io("injected read failure".into())),
         ] {
             let (mut runtime, identity) = RepositoryRuntime::lsp_selection_fixture(card);
@@ -10279,10 +10588,13 @@ mod tests {
         runtime.set_auto_save(true);
         drop(runtime.update(RepositoryAction::FileLoaded {
             identity,
-            result: Ok(FileContent::Image {
-                width: 1,
-                height: 1,
-                rgba: vec![255, 0, 0, 255].into(),
+            result: Ok(LoadedFile {
+                source: "notes.txt".into(),
+                content: FileContent::Image {
+                    width: 1,
+                    height: 1,
+                    rgba: vec![255, 0, 0, 255].into(),
+                },
             }),
         }));
         drop(runtime.update(RepositoryAction::EditorAction {
@@ -10310,9 +10622,12 @@ mod tests {
         runtime.document_tone = pdf_tone(&cosmic::theme::active());
         drop(runtime.update(RepositoryAction::FileLoaded {
             identity,
-            result: Ok(FileContent::Pdf {
-                pages,
-                page: rendered_document_page(0, pages).page,
+            result: Ok(LoadedFile {
+                source: "book.pdf".into(),
+                content: FileContent::Pdf {
+                    pages,
+                    page: rendered_document_page(0, pages).page,
+                },
             }),
         }));
         runtime
@@ -10666,9 +10981,12 @@ mod tests {
         runtime.document_tone = other_document_tone(shell);
         drop(runtime.update(RepositoryAction::FileLoaded {
             identity,
-            result: Ok(FileContent::Pdf {
-                pages: 4,
-                page: rendered_document_page(0, 4).page,
+            result: Ok(LoadedFile {
+                source: "book.pdf".into(),
+                content: FileContent::Pdf {
+                    pages: 4,
+                    page: rendered_document_page(0, 4).page,
+                },
             }),
         }));
         let (page, tone, requested, _) = document_view_state(&runtime);
@@ -10878,10 +11196,13 @@ mod tests {
         };
         drop(runtime.update(RepositoryAction::FileLoaded {
             identity,
-            result: Ok(FileContent::Editable {
-                text: "fn main() {}\n".into(),
-                content_hash: blake3::hash(b"fn main() {}\n"),
-                markdown: false,
+            result: Ok(LoadedFile {
+                source: "notes.txt".into(),
+                content: FileContent::Editable {
+                    text: "fn main() {}\n".into(),
+                    content_hash: blake3::hash(b"fn main() {}\n"),
+                    markdown: false,
+                },
             }),
         }));
         assert_eq!(
@@ -12127,10 +12448,13 @@ mod tests {
                 path: "picture.png".into(),
                 generation: runtime.generation,
             },
-            result: Ok(FileContent::Image {
-                width: 1,
-                height: 1,
-                rgba: vec![200, 20, 40, 255].into(),
+            result: Ok(LoadedFile {
+                source: "picture.png".into(),
+                content: FileContent::Image {
+                    width: 1,
+                    height: 1,
+                    rgba: vec![200, 20, 40, 255].into(),
+                },
             }),
         });
         let mut element = view(card, &runtime);
@@ -12612,7 +12936,7 @@ mod tests {
     #[test]
     fn discarding_edits_keeps_the_viewport_where_the_user_left_it() {
         let text = "line\n".repeat(400);
-        let mut document = EditorDocument::new(
+        let mut document = EditorDocument::unlinked(
             PathBuf::from("notes.txt"),
             text.clone(),
             blake3::hash(text.as_bytes()),
@@ -12641,7 +12965,7 @@ mod tests {
     #[test]
     fn an_edit_that_restores_the_saved_text_is_not_a_modification() {
         let text = "hello\nworld\n";
-        let mut document = EditorDocument::new(
+        let mut document = EditorDocument::unlinked(
             PathBuf::from("notes.txt"),
             text.into(),
             blake3::hash(text.as_bytes()),
