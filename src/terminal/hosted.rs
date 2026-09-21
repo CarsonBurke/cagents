@@ -48,6 +48,7 @@ struct WorkerStop {
     worker: OnceLock<thread::Thread>,
     notification_tx: Sender<()>,
     notification_rx: Receiver<()>,
+    connection: Mutex<Option<UnixStream>>,
 }
 
 impl Default for WorkerStop {
@@ -58,6 +59,7 @@ impl Default for WorkerStop {
             worker: OnceLock::new(),
             notification_tx,
             notification_rx,
+            connection: Mutex::new(None),
         }
     }
 }
@@ -69,6 +71,11 @@ impl WorkerStop {
 
     fn request(&self) {
         self.requested.store(true, Ordering::Release);
+        if let Ok(connection) = self.connection.lock()
+            && let Some(connection) = connection.as_ref()
+        {
+            let _ = connection.shutdown(std::net::Shutdown::Both);
+        }
         let _ = self.notification_tx.try_send(());
         if let Some(worker) = self.worker.get() {
             worker.unpark();
@@ -77,6 +84,21 @@ impl WorkerStop {
 
     fn is_requested(&self) -> bool {
         self.requested.load(Ordering::Acquire)
+    }
+
+    fn register_connection(
+        &self,
+        stream: &UnixStream,
+    ) -> std::io::Result<ConnectionRegistration<'_>> {
+        let mut connection = self
+            .connection
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        *connection = Some(stream.try_clone()?);
+        if self.is_requested() {
+            stream.shutdown(std::net::Shutdown::Both)?;
+        }
+        Ok(ConnectionRegistration(self))
     }
 
     fn notification(&self) -> &Receiver<()> {
@@ -88,6 +110,17 @@ impl WorkerStop {
             thread::park_timeout(timeout);
         }
         self.is_requested()
+    }
+}
+
+struct ConnectionRegistration<'a>(&'a WorkerStop);
+impl Drop for ConnectionRegistration<'_> {
+    fn drop(&mut self) {
+        self.0
+            .connection
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .take();
     }
 }
 
@@ -636,18 +669,8 @@ struct HostedHandleInner {
 
 impl Drop for HostedHandleInner {
     fn drop(&mut self) {
-        let on_worker_thread = self
-            .worker
-            .get_mut()
-            .ok()
-            .and_then(|worker| worker.as_ref())
-            .is_some_and(|worker| worker.thread().id() == thread::current().id());
         self.stop.request();
-        if on_worker_thread {
-            let _ = self.commands.try_send(ClientCommand::Stop);
-        } else {
-            let _ = self.commands.send(ClientCommand::Stop);
-        }
+        let _ = self.commands.try_send(ClientCommand::Stop);
         if let Ok(worker) = self.worker.get_mut()
             && let Some(worker) = worker.take()
             && worker.thread().id() != thread::current().id()
@@ -1391,6 +1414,10 @@ fn serve_connection(
     }
     let mut stream = match UnixStream::connect(socket) {
         Ok(stream) => stream,
+        Err(_) => return ConnectionEnd::Retry,
+    };
+    let _connection = match stop.register_connection(&stream) {
+        Ok(registration) => registration,
         Err(_) => return ConnectionEnd::Retry,
     };
     if stream
@@ -2150,6 +2177,31 @@ mod tests {
     };
 
     use super::*;
+    #[test]
+    fn stopping_an_attachment_interrupts_blocked_socket_io() {
+        let stop = Arc::new(WorkerStop::default());
+        let (mut client, _server) = UnixStream::pair().unwrap();
+        let registration = stop.register_connection(&client).unwrap();
+        let (started_tx, started_rx) = crossbeam_channel::bounded(1);
+        let (finished_tx, finished_rx) = crossbeam_channel::bounded(1);
+        let worker = thread::spawn(move || {
+            use std::io::Write;
+            started_tx.send(()).unwrap();
+            let result = client.write_all(&vec![0; 4 * 1024 * 1024]);
+            finished_tx.send(result.is_err()).unwrap();
+        });
+        started_rx.recv().unwrap();
+        stop.request();
+        assert!(finished_rx.recv_timeout(Duration::from_secs(1)).unwrap());
+        worker.join().unwrap();
+        drop(registration);
+        assert!(stop.connection.lock().unwrap().is_none());
+        let (client, _server) = UnixStream::pair().unwrap();
+        let _registration = stop.register_connection(&client).unwrap();
+        assert!(client.take_error().unwrap().is_none());
+        use std::io::Read;
+        assert_eq!((&client).read(&mut [0]).unwrap(), 0);
+    }
     #[test]
     fn startup_waits_for_six_second_restoration_before_accepting_listener() {
         let directory = tempfile::tempdir().unwrap();
