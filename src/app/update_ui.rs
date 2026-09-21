@@ -435,6 +435,73 @@ impl Cagents {
 mod tests {
     use super::*;
 
+    fn custom_widget_ids(element: &mut Element<'_, Message>) -> Vec<String> {
+        use cosmic::iced::advanced::widget::Tree;
+        use iced_accessibility::id::Internal;
+
+        fn walk(tree: &Tree, out: &mut Vec<String>) {
+            if let Some(widget::Id(Internal::Custom(_, name))) = &tree.id {
+                out.push(name.to_string());
+            }
+            for child in &tree.children {
+                walk(child, out);
+            }
+        }
+
+        let mut ids = Vec::new();
+        walk(&Tree::new(element.as_widget_mut()), &mut ids);
+        ids
+    }
+
+    fn position(ids: &[String], name: &str) -> Option<usize> {
+        ids.iter().position(|id| id == name)
+    }
+
+    #[test]
+    fn the_update_icon_sits_immediately_right_of_the_alerts() {
+        let mut app = crate::app::tests::context_inspector_test_app(true);
+        app.update_ui.superseded = Some(PathBuf::from("/nonexistent/current/bin/cagents-ui"));
+        app.notices
+            .record(TransientNotice::warning("A saved notice"));
+        app.context_inspector_open = true;
+        app.context_inspector_transition = None;
+        app.window_width = 1600.0;
+
+        let open = custom_widget_ids(&mut app.view());
+        assert_eq!(
+            open.iter()
+                .filter(|id| id.as_str() == "application-update")
+                .count(),
+            1,
+            "the open inspector and the workspace header must not both mount the update icon: {open:?}"
+        );
+        let alerts = position(&open, "chrome.notices").expect("alerts are shown");
+        let update = position(&open, "application-update").expect("update is shown");
+        let toggle = position(&open, "command.toggle-context-inspector").expect("sidebar toggle");
+        assert!(
+            alerts < update && update < toggle,
+            "update belongs on the right of the alerts and left of the sidebar toggle: {open:?}"
+        );
+
+        app.context_inspector_open = false;
+        let closed = custom_widget_ids(&mut app.view());
+        assert_eq!(
+            closed
+                .iter()
+                .filter(|id| id.as_str() == "application-update")
+                .count(),
+            1,
+            "closing the inspector leaves exactly one update icon: {closed:?}"
+        );
+        let alerts =
+            position(&closed, "chrome.notices").expect("alerts stay on the workspace header");
+        let update = position(&closed, "application-update").expect("update follows the alerts");
+        assert!(
+            alerts < update,
+            "with the inspector closed the update icon is still to the right of the alerts: {closed:?}"
+        );
+    }
+
     #[test]
     fn live_session_confirmation_is_modal_and_cancel_never_starts_an_update() {
         let mut app = crate::app::tests::context_inspector_test_app(false);
