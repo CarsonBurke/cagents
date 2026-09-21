@@ -913,6 +913,7 @@ mod tests {
             workspace_widget::view(
                 &workspace,
                 &shortcuts,
+                false,
                 true,
                 300.0,
                 id,

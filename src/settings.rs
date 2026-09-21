@@ -179,6 +179,26 @@ impl LinkOpenDestination {
     }
 }
 
+/// What choosing a pull request in the sidebar does.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PullRequestOpenTarget {
+    /// Opens the review pane: the changed files, their diffs, and viewed marks.
+    #[default]
+    Review,
+    /// Opens the pull request's page through the link preference.
+    Link,
+}
+
+impl PullRequestOpenTarget {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Review => "review",
+            Self::Link => "link",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum LinkOpenGesture {
@@ -217,6 +237,10 @@ pub struct KeyboardShortcuts {
     pub cycle_pane_width: Vec<String>,
     pub previous_workspace: Vec<String>,
     pub next_workspace: Vec<String>,
+    /// Flips the viewed mark on the file a review pane shows.
+    pub review_toggle_viewed: Vec<String>,
+    pub review_next_file: Vec<String>,
+    pub review_previous_file: Vec<String>,
 }
 
 impl Default for KeyboardShortcuts {
@@ -232,6 +256,9 @@ impl Default for KeyboardShortcuts {
             cycle_pane_width: vec!["Alt+R".to_owned()],
             previous_workspace: vec!["Alt+Shift+Tab".to_owned()],
             next_workspace: vec!["Alt+Tab".to_owned()],
+            review_toggle_viewed: vec!["Alt+V".to_owned()],
+            review_next_file: vec!["Alt+Down".to_owned()],
+            review_previous_file: vec!["Alt+Up".to_owned()],
         }
     }
 }
@@ -241,7 +268,7 @@ pub const CHORD_SEPARATOR: &str = ", ";
 
 impl KeyboardShortcuts {
     /// Every action's chord list, in the order the dialog presents them.
-    fn actions(&self) -> [&Vec<String>; 10] {
+    fn actions(&self) -> [&Vec<String>; 13] {
         [
             &self.new_terminal,
             &self.new_channel,
@@ -253,13 +280,16 @@ impl KeyboardShortcuts {
             &self.cycle_pane_width,
             &self.previous_workspace,
             &self.next_workspace,
+            &self.review_toggle_viewed,
+            &self.review_next_file,
+            &self.review_previous_file,
         ]
     }
 
     fn validate(&self) -> Result<(), SettingsError> {
         let mut parsed = Vec::new();
         for (index, chords) in self.actions().into_iter().enumerate() {
-            if chords.is_empty() && !matches!(index, 1 | 2 | 7 | 8 | 9) {
+            if chords.is_empty() && !matches!(index, 1 | 2 | 7..=12) {
                 // Newly introduced actions may remain unbound so migration
                 // never steals a user's existing custom chord.
                 return Err(SettingsError::InvalidShortcut(
@@ -340,6 +370,8 @@ pub enum ShortcutKey {
     Character(char),
     ArrowLeft,
     ArrowRight,
+    ArrowUp,
+    ArrowDown,
     Tab,
 }
 
@@ -374,6 +406,10 @@ pub fn parse_shortcut(raw: &str) -> Result<ShortcutBinding, &'static str> {
                 Some(ShortcutKey::ArrowLeft)
             } else if token.eq_ignore_ascii_case("right") {
                 Some(ShortcutKey::ArrowRight)
+            } else if token.eq_ignore_ascii_case("up") {
+                Some(ShortcutKey::ArrowUp)
+            } else if token.eq_ignore_ascii_case("down") {
+                Some(ShortcutKey::ArrowDown)
             } else if token.eq_ignore_ascii_case("tab") {
                 Some(ShortcutKey::Tab)
             } else {
@@ -383,7 +419,9 @@ pub fn parse_shortcut(raw: &str) -> Result<ShortcutBinding, &'static str> {
                         Some(ShortcutKey::Character(character.to_ascii_lowercase()))
                     }
                     _ => {
-                        return Err("keyboard shortcut key must be A-Z, 0-9, Left, Right, or Tab");
+                        return Err(
+                            "keyboard shortcut key must be A-Z, 0-9, Left, Right, Up, Down, or Tab",
+                        );
                     }
                 }
             };
@@ -535,6 +573,8 @@ pub struct AppSettings {
     pub link_open_destination: LinkOpenDestination,
     #[serde(default)]
     pub link_open_gesture: LinkOpenGesture,
+    #[serde(default)]
+    pub pull_request_open_target: PullRequestOpenTarget,
     /// Absolute, or resolved relative to the repository root.
     #[serde(default = "default_managed_worktree_directory")]
     pub managed_worktree_directory: String,
@@ -595,6 +635,7 @@ impl Default for AppSettings {
             terminal_scrollback_lines: 10_000,
             link_open_destination: LinkOpenDestination::default(),
             link_open_gesture: LinkOpenGesture::default(),
+            pull_request_open_target: PullRequestOpenTarget::default(),
             managed_worktree_directory: default_managed_worktree_directory(),
             worktree_sort: WorktreeSort::default(),
             editor_auto_save: default_editor_auto_save(),
@@ -805,6 +846,9 @@ where
     preserve_existing_shortcut(&mut shortcuts, "clone_pane", "Alt+E");
     preserve_existing_shortcut(&mut shortcuts, "previous_workspace", "Alt+Shift+Tab");
     preserve_existing_shortcut(&mut shortcuts, "next_workspace", "Alt+Tab");
+    preserve_existing_shortcut(&mut shortcuts, "review_toggle_viewed", "Alt+V");
+    preserve_existing_shortcut(&mut shortcuts, "review_next_file", "Alt+Down");
+    preserve_existing_shortcut(&mut shortcuts, "review_previous_file", "Alt+Up");
     toml::Value::Table(shortcuts)
         .try_into()
         .map_err(serde::de::Error::custom)
@@ -826,6 +870,9 @@ where
     preserve_existing_shortcut(&mut shortcuts, "clone_pane", "Alt+E");
     preserve_existing_shortcut(&mut shortcuts, "previous_workspace", "Alt+Shift+Tab");
     preserve_existing_shortcut(&mut shortcuts, "next_workspace", "Alt+Tab");
+    preserve_existing_shortcut(&mut shortcuts, "review_toggle_viewed", "Alt+V");
+    preserve_existing_shortcut(&mut shortcuts, "review_next_file", "Alt+Down");
+    preserve_existing_shortcut(&mut shortcuts, "review_previous_file", "Alt+Up");
     toml::Value::Table(shortcuts)
         .try_into()
         .map_err(serde::de::Error::custom)

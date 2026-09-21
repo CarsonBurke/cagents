@@ -1108,6 +1108,13 @@ pub trait GitHubReviewApi: Send + Sync {
         viewed: bool,
         cancellation: &CancellationToken,
     ) -> Result<ReviewMutationOutcome<()>, GitHubError>;
+
+    /// The pull requests a review surface offers to open.
+    fn list_pull_requests(
+        &self,
+        request: &ListPullRequestsRequest,
+        cancellation: &CancellationToken,
+    ) -> Result<Vec<PullRequest>, GitHubError>;
 }
 
 #[derive(Debug, Error)]
@@ -1209,7 +1216,7 @@ impl GitHubAvailability {
 
 /// A syntactically valid GitHub-shaped remote identity. Forge support for
 /// non-public hosts must additionally be established by gh's configured hosts.
-fn remote_repository_key(remote: &str) -> Option<GitHubRepoKey> {
+pub fn remote_repository_key(remote: &str) -> Option<GitHubRepoKey> {
     let parsed = if remote.contains("://") {
         Url::parse(remote).ok()?
     } else {
@@ -1228,6 +1235,31 @@ fn remote_repository_key(remote: &str) -> Option<GitHubRepoKey> {
         return None;
     }
     GitHubRepoKey::new(parsed.host_str()?, parsed.port(), owner, repository).ok()
+}
+
+/// The remote whose fetch URL names `key`, preferring `origin` when several
+/// do. Pull request refs are fetched from it, so the choice must be the
+/// repository GitHub's own numbers belong to rather than a fork of it.
+pub fn remote_for_repository(
+    remotes: &[crate::repository::RemoteRecord],
+    key: &GitHubRepoKey,
+) -> Option<String> {
+    let mut matching = remotes.iter().filter(|remote| {
+        remote
+            .fetch_url
+            .as_deref()
+            .and_then(remote_repository_key)
+            .is_some_and(|candidate| candidate == *key)
+    });
+    let first = matching.next()?;
+    Some(
+        std::iter::once(first)
+            .chain(matching)
+            .find(|remote| remote.name == "origin")
+            .unwrap_or(first)
+            .name
+            .clone(),
+    )
 }
 
 impl<E: ProcessExecutor> GitHubService<E> {
@@ -2393,6 +2425,14 @@ impl<E: ProcessExecutor + Send + Sync> GitHubReviewApi for GitHubService<E> {
         )?;
         Ok(outcome.map(drop))
     }
+
+    fn list_pull_requests(
+        &self,
+        request: &ListPullRequestsRequest,
+        cancellation: &CancellationToken,
+    ) -> Result<Vec<PullRequest>, GitHubError> {
+        self.list(request, cancellation)
+    }
 }
 
 pub fn parse_auth_status(output: &[u8], host: &str) -> Result<GhAuthStatus, GitHubError> {
@@ -2648,6 +2688,50 @@ mod tests {
                 outputs: Mutex::new(outputs.into_iter().rev().collect()),
             }
         }
+    }
+
+    fn remote(name: &str, fetch_url: &str) -> crate::repository::RemoteRecord {
+        crate::repository::RemoteRecord {
+            name: name.into(),
+            fetch_url: Some(fetch_url.into()),
+            push_url: None,
+        }
+    }
+
+    #[test]
+    fn remote_for_repository_prefers_origin_among_matching_remotes() {
+        let key = GitHubRepoKey::new("github.com", None, "acme", "widgets").unwrap();
+        let remotes = [
+            remote("upstream", "git@github.com:acme/widgets.git"),
+            remote("fork", "https://github.com/someone/widgets.git"),
+            remote("origin", "https://github.com/acme/widgets"),
+        ];
+        assert_eq!(
+            remote_for_repository(&remotes, &key).as_deref(),
+            Some("origin")
+        );
+        assert_eq!(
+            remote_for_repository(&remotes[..2], &key).as_deref(),
+            Some("upstream"),
+            "without origin the first matching remote is used",
+        );
+        assert_eq!(
+            remote_for_repository(&remotes[1..2], &key),
+            None,
+            "a remote of another repository never matches",
+        );
+        assert_eq!(
+            remote_for_repository(
+                &[crate::repository::RemoteRecord {
+                    name: "origin".into(),
+                    fetch_url: None,
+                    push_url: None,
+                }],
+                &key,
+            ),
+            None,
+            "a remote without a fetch URL cannot be fetched from",
+        );
     }
 
     impl ProcessExecutor for FakeExecutor {

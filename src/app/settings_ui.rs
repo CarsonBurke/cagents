@@ -469,11 +469,29 @@ fn settings_category_controls<'a>(
                     ],
                     progress,
                 ),
+                settings_choice(
+                    "Open pull requests in",
+                    "Where a pull request row in Projects opens. The review pane fetches the changes and tracks which files you have viewed.",
+                    SettingsField::PullRequestOpenTarget,
+                    [
+                        (
+                            "Review pane",
+                            PullRequestOpenTarget::Review.as_str(),
+                            draft.pull_request_open_target == PullRequestOpenTarget::Review,
+                        ),
+                        (
+                            "Browser link",
+                            PullRequestOpenTarget::Link.as_str(),
+                            draft.pull_request_open_target == PullRequestOpenTarget::Link,
+                        ),
+                    ],
+                    progress,
+                ),
             ],
         )],
         SettingsCategory::Keyboard => vec![settings_group(
             "Keyboard shortcuts",
-            "Each row takes one or more chords separated by commas and saves after you pause typing. Use Ctrl, Alt, or Super, optionally with Shift, plus A-Z, 0-9, Left, or Right. Every chord must be unique.",
+            "Each row takes one or more chords separated by commas and saves after you pause typing. Use Ctrl, Alt, or Super, optionally with Shift, plus A-Z, 0-9, Left, Right, Up, or Down. Every chord must be unique.",
             vec![
                 setting_input(
                     "New terminal",
@@ -543,6 +561,27 @@ fn settings_category_controls<'a>(
                     "Opens the worktree or channel after this one in the sidebar; may repeat while held.",
                     &draft.keyboard_shortcuts.next_workspace,
                     SettingsField::ShortcutNextWorkspace,
+                    progress,
+                ),
+                setting_input(
+                    "Mark reviewed file viewed",
+                    "Toggles the reviewed file's viewed mark in the focused pull request pane and moves to the next file.",
+                    &draft.keyboard_shortcuts.review_toggle_viewed,
+                    SettingsField::ShortcutReviewToggleViewed,
+                    progress,
+                ),
+                setting_input(
+                    "Next reviewed file",
+                    "Opens the next changed file in the focused pull request pane; may repeat while held.",
+                    &draft.keyboard_shortcuts.review_next_file,
+                    SettingsField::ShortcutReviewNextFile,
+                    progress,
+                ),
+                setting_input(
+                    "Previous reviewed file",
+                    "Opens the previous changed file in the focused pull request pane; may repeat while held.",
+                    &draft.keyboard_shortcuts.review_previous_file,
+                    SettingsField::ShortcutReviewPreviousFile,
                     progress,
                 ),
             ],

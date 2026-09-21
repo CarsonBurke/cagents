@@ -51,6 +51,8 @@ pub mod performance;
 #[cfg(feature = "ui")]
 pub mod persistence;
 #[cfg(feature = "ui")]
+pub mod pull_request_review;
+#[cfg(feature = "ui")]
 pub mod repository;
 #[cfg(feature = "ui")]
 pub mod repository_widget;

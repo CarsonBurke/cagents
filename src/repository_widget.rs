@@ -2768,6 +2768,13 @@ impl RepositoryRuntime {
         self.directory_only
     }
 
+    /// Whether the runtime compares a fetched pull request range. The
+    /// working tree plays no part in that comparison, so staging and the
+    /// basis switch are left out of the toolbar.
+    pub fn reviews_pull_request(&self) -> bool {
+        matches!(self.diff_basis, DiffBasis::PullRequest { .. })
+    }
+
     pub fn selected_path(&self) -> Option<&Path> {
         self.selected.as_ref().map(|file| file.path.as_path())
     }
@@ -5881,20 +5888,25 @@ pub fn selected_file_toolbar(
             .into(),
         );
     }
-    for (stage, has_changes, icon, label) in [
-        (
-            true,
-            selected.unstaged,
-            "list-add-symbolic",
-            "Stage file changes",
-        ),
-        (
-            false,
-            selected.staged,
-            "list-remove-symbolic",
-            "Unstage file changes",
-        ),
-    ] {
+    let staging: &[(bool, bool, &str, &str)] = if runtime.reviews_pull_request() {
+        &[]
+    } else {
+        &[
+            (
+                true,
+                selected.unstaged,
+                "list-add-symbolic",
+                "Stage file changes",
+            ),
+            (
+                false,
+                selected.staged,
+                "list-remove-symbolic",
+                "Unstage file changes",
+            ),
+        ]
+    };
+    for &(stage, has_changes, icon, label) in staging {
         document_actions.push(
             icon_control(
                 crate::ui_controls::symbolic_icon(icon),
@@ -5906,10 +5918,12 @@ pub fn selected_file_toolbar(
             .into(),
         );
     }
-    controls.push(toolbar_group(document_actions));
+    if !document_actions.is_empty() {
+        controls.push(toolbar_group(document_actions));
+    }
     // Diff navigation follows the file it compares: view modes, file
     // actions, then diff scope.
-    if !runtime.directory_only {
+    if !runtime.directory_only && !runtime.reviews_pull_request() {
         controls.push(diff_basis_controls(card, runtime));
     }
     if runtime.source_surface == SourceSurface::Diff {

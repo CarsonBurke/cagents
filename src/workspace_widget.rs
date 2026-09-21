@@ -44,6 +44,21 @@ pub enum GlobalShortcut {
     /// Moves between the top-level workspaces: every project's worktrees and
     /// channels, in the order the sidebar lists them.
     CycleWorkspace(FocusDirection),
+    /// Flips the viewed mark on the file the focused review pane shows.
+    ReviewToggleViewed,
+    ReviewNextFile,
+    ReviewPreviousFile,
+}
+
+/// Where a shortcut applies, which decides when its chord is withheld from
+/// the process inside a card.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShortcutScope {
+    /// Anywhere in the workspace.
+    Workspace,
+    /// Only while a pull request pane has focus; a terminal or editor with
+    /// focus receives the chord as ordinary input.
+    Review,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -51,6 +66,7 @@ pub struct ShortcutDescriptor {
     pub action: GlobalShortcut,
     pub label: &'static str,
     pub repeatable: bool,
+    pub scope: ShortcutScope,
 }
 
 pub const GLOBAL_SHORTCUT_DESCRIPTORS: &[ShortcutDescriptor] = &[
@@ -58,51 +74,79 @@ pub const GLOBAL_SHORTCUT_DESCRIPTORS: &[ShortcutDescriptor] = &[
         action: GlobalShortcut::NewTerminal,
         label: "New terminal",
         repeatable: false,
+        scope: ShortcutScope::Workspace,
     },
     ShortcutDescriptor {
         action: GlobalShortcut::NewChannel,
         label: "New channel",
         repeatable: false,
+        scope: ShortcutScope::Workspace,
     },
     ShortcutDescriptor {
         action: GlobalShortcut::ClonePane,
         label: "Clone focused pane",
         repeatable: false,
+        scope: ShortcutScope::Workspace,
     },
     ShortcutDescriptor {
         action: GlobalShortcut::CloseFocusedCard,
         label: "Close focused column",
         repeatable: false,
+        scope: ShortcutScope::Workspace,
     },
     ShortcutDescriptor {
         action: GlobalShortcut::FocusProjectSearch,
         label: "Search projects",
         repeatable: false,
+        scope: ShortcutScope::Workspace,
     },
     ShortcutDescriptor {
         action: GlobalShortcut::FocusAdjacent(FocusDirection::Left),
         label: "Previous column",
         repeatable: true,
+        scope: ShortcutScope::Workspace,
     },
     ShortcutDescriptor {
         action: GlobalShortcut::FocusAdjacent(FocusDirection::Right),
         label: "Next column",
         repeatable: true,
+        scope: ShortcutScope::Workspace,
     },
     ShortcutDescriptor {
         action: GlobalShortcut::CyclePaneWidth,
         label: "Cycle pane width",
         repeatable: true,
+        scope: ShortcutScope::Workspace,
     },
     ShortcutDescriptor {
         action: GlobalShortcut::CycleWorkspace(FocusDirection::Left),
         label: "Previous workspace",
         repeatable: true,
+        scope: ShortcutScope::Workspace,
     },
     ShortcutDescriptor {
         action: GlobalShortcut::CycleWorkspace(FocusDirection::Right),
         label: "Next workspace",
         repeatable: true,
+        scope: ShortcutScope::Workspace,
+    },
+    ShortcutDescriptor {
+        action: GlobalShortcut::ReviewToggleViewed,
+        label: "Mark reviewed file viewed",
+        repeatable: false,
+        scope: ShortcutScope::Review,
+    },
+    ShortcutDescriptor {
+        action: GlobalShortcut::ReviewNextFile,
+        label: "Next reviewed file",
+        repeatable: true,
+        scope: ShortcutScope::Review,
+    },
+    ShortcutDescriptor {
+        action: GlobalShortcut::ReviewPreviousFile,
+        label: "Previous reviewed file",
+        repeatable: true,
+        scope: ShortcutScope::Review,
     },
 ];
 
@@ -126,6 +170,9 @@ pub fn shortcut_keys(action: GlobalShortcut, shortcuts: &KeyboardShortcuts) -> &
         GlobalShortcut::CyclePaneWidth => &shortcuts.cycle_pane_width,
         GlobalShortcut::CycleWorkspace(FocusDirection::Left) => &shortcuts.previous_workspace,
         GlobalShortcut::CycleWorkspace(FocusDirection::Right) => &shortcuts.next_workspace,
+        GlobalShortcut::ReviewToggleViewed => &shortcuts.review_toggle_viewed,
+        GlobalShortcut::ReviewNextFile => &shortcuts.review_next_file,
+        GlobalShortcut::ReviewPreviousFile => &shortcuts.review_previous_file,
     }
 }
 
@@ -271,14 +318,20 @@ pub fn global_shortcut(
     (!*repeat || descriptor.repeatable).then_some(descriptor.action)
 }
 
+/// Whether a chord is withheld from the process inside a card. Review chords
+/// are reserved only while a pull request pane has focus (`review_focused`),
+/// so a terminal never loses an arrow chord to a pane that is not there.
 pub(crate) fn is_global_shortcut_chord(
     key: &keyboard::Key,
     physical_key: keyboard::key::Physical,
     modifiers: keyboard::Modifiers,
     shortcuts: &KeyboardShortcuts,
+    review_focused: bool,
 ) -> bool {
     crate::tab_history::is_chord(key, modifiers)
-        || global_shortcut_descriptor(key, physical_key, modifiers, shortcuts).is_some()
+        || global_shortcut_descriptor(key, physical_key, modifiers, shortcuts).is_some_and(
+            |descriptor| review_focused || descriptor.scope == ShortcutScope::Workspace,
+        )
 }
 
 fn global_shortcut_descriptor(
@@ -321,6 +374,14 @@ fn shortcut_matches(
             ShortcutKey::ArrowRight => matches!(
                 key.as_ref(),
                 keyboard::Key::Named(keyboard::key::Named::ArrowRight)
+            ),
+            ShortcutKey::ArrowUp => matches!(
+                key.as_ref(),
+                keyboard::Key::Named(keyboard::key::Named::ArrowUp)
+            ),
+            ShortcutKey::ArrowDown => matches!(
+                key.as_ref(),
+                keyboard::Key::Named(keyboard::key::Named::ArrowDown)
             ),
             ShortcutKey::Tab => matches!(
                 key.as_ref(),
@@ -408,6 +469,7 @@ pub struct Events<ViewportMessage> {
 pub fn view<'a, Message, BuildCard, ContainerId, ViewportMessage>(
     workspace: &'a Workspace,
     shortcuts: &'a KeyboardShortcuts,
+    review_focused: bool,
     focus_follows_mouse: bool,
     viewport_width: f32,
     scroll_id: widget::Id,
@@ -478,6 +540,7 @@ where
     WorkspaceSurface::new(
         cosmic::widget::id_container(scrollable, scroll_id),
         shortcuts,
+        review_focused,
         viewport_width,
         move |width: f32| on_viewport(WorkspaceViewportEvent::Resized(width)),
     )
@@ -1121,6 +1184,9 @@ impl<'a, Message: 'a> From<VirtualStrip<'a, Message>> for Element<'a, Message> {
 struct WorkspaceSurface<'a, Message> {
     content: Element<'a, Message>,
     shortcuts: &'a KeyboardShortcuts,
+    /// Whether the focused card is a pull request pane; see
+    /// [`is_global_shortcut_chord`].
+    review_focused: bool,
     /// The strip viewport width the owner already holds, which is what the
     /// enclosing `view` laid this surface's content out against.
     ///
@@ -1135,12 +1201,14 @@ impl<'a, Message> WorkspaceSurface<'a, Message> {
     fn new(
         content: impl Into<Element<'a, Message>>,
         shortcuts: &'a KeyboardShortcuts,
+        review_focused: bool,
         reported_width: f32,
         on_resize: impl Fn(f32) -> Message + 'a,
     ) -> Self {
         Self {
             content: content.into(),
             shortcuts,
+            review_focused,
             reported_width,
             on_resize: Box::new(on_resize),
         }
@@ -1227,7 +1295,14 @@ impl<Message> Widget<Message, Theme, Renderer> for WorkspaceSurface<'_, Message>
                     modifiers,
                     ..
                 },
-            ) if is_global_shortcut_chord(key, *physical_key, *modifiers, self.shortcuts) => {
+            ) if is_global_shortcut_chord(
+                key,
+                *physical_key,
+                *modifiers,
+                self.shortcuts,
+                self.review_focused,
+            ) =>
+            {
                 shell.capture_event();
                 return;
             }
@@ -1767,6 +1842,7 @@ mod tests {
                 keyboard::key::Physical::Code(code),
                 keyboard::Modifiers::ALT,
                 &shortcuts,
+                false,
             ));
         }
         assert_eq!(
@@ -1850,6 +1926,7 @@ mod tests {
                     keyboard::key::Physical::Code(code),
                     keyboard::Modifiers::ALT,
                     &shortcuts,
+                    false,
                 ));
             }
         }
@@ -1910,12 +1987,14 @@ mod tests {
                 keyboard::key::Physical::Code(code),
                 modifiers,
                 &shortcuts,
+                false,
             ));
             assert!(!is_global_shortcut_chord(
                 &keyboard::Key::Character(default_character.into()),
                 keyboard::key::Physical::Code(default_code),
                 keyboard::Modifiers::ALT,
                 &shortcuts,
+                false,
             ));
         }
 
@@ -1927,6 +2006,7 @@ mod tests {
                 keyboard::key::Physical::Code(code),
                 keyboard::Modifiers::CTRL | keyboard::Modifiers::SHIFT,
                 &shortcuts,
+                false,
             ));
         }
     }
@@ -1974,6 +2054,7 @@ mod tests {
         let mut element = view(
             &workspace,
             &shortcuts,
+            false,
             true,
             400.0,
             widget::Id::unique(),
@@ -2076,6 +2157,7 @@ mod tests {
                 view(
                     workspace,
                     &shortcuts,
+                    false,
                     false,
                     workspace.viewport_width(),
                     scroll_id.clone(),
@@ -2289,7 +2371,7 @@ mod tests {
         };
         let shortcuts = KeyboardShortcuts::default();
         let surface: Element<'_, ()> =
-            Element::new(WorkspaceSurface::new(strip, &shortcuts, 0.0, |_| ()));
+            Element::new(WorkspaceSurface::new(strip, &shortcuts, false, 0.0, |_| ()));
         let tree = Tree::new(&surface);
         let card_node = || {
             layout::Node::with_children(
@@ -2349,6 +2431,7 @@ mod tests {
         let mut composed: Element<'_, ()> = view(
             &workspace,
             &shortcuts,
+            false,
             true,
             VIEWPORT_WIDTH,
             widget::Id::unique(),
@@ -2414,6 +2497,7 @@ mod tests {
                 Physical::Code(code),
                 modifiers,
                 &shortcuts,
+                false,
             )
         };
         assert!(reserved("t".into(), Code::KeyT, keyboard::Modifiers::CTRL));
@@ -2432,6 +2516,62 @@ mod tests {
             Code::KeyT,
             keyboard::Modifiers::CTRL | keyboard::Modifiers::SHIFT,
         ));
+    }
+
+    /// The review chords are arrow chords a terminal program may well use,
+    /// so they are withheld from a card's process only while a pull request
+    /// pane, which is the only thing that acts on them, has focus.
+    #[test]
+    fn review_chords_are_reserved_only_while_a_review_pane_has_focus() {
+        use keyboard::key::{Code, Physical};
+
+        let shortcuts = KeyboardShortcuts::default();
+        let reserved = |named, code, review_focused| {
+            is_global_shortcut_chord(
+                &keyboard::Key::Named(named),
+                Physical::Code(code),
+                keyboard::Modifiers::ALT,
+                &shortcuts,
+                review_focused,
+            )
+        };
+        for (named, code) in [
+            (keyboard::key::Named::ArrowUp, Code::ArrowUp),
+            (keyboard::key::Named::ArrowDown, Code::ArrowDown),
+        ] {
+            assert!(
+                !reserved(named, code, false),
+                "{named:?} reached a terminal"
+            );
+            assert!(
+                reserved(named, code, true),
+                "{named:?} bypassed the review pane"
+            );
+        }
+        // Workspace chords stay reserved either way.
+        assert!(reserved(
+            keyboard::key::Named::ArrowLeft,
+            Code::ArrowLeft,
+            false
+        ));
+        assert!(reserved(
+            keyboard::key::Named::ArrowLeft,
+            Code::ArrowLeft,
+            true
+        ));
+        assert_eq!(
+            global_shortcut(
+                &named_key_press(
+                    keyboard::key::Named::ArrowDown,
+                    Code::ArrowDown,
+                    keyboard::Modifiers::ALT,
+                    true,
+                ),
+                &shortcuts,
+            ),
+            Some(GlobalShortcut::ReviewNextFile),
+            "stepping files repeats while held"
+        );
     }
 
     #[test]
@@ -2649,6 +2789,7 @@ mod tests {
         let mut element: Element<'_, ()> = view(
             &workspace,
             &shortcuts,
+            false,
             false,
             VIEWPORT,
             scroll_id.clone(),
