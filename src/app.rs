@@ -2088,6 +2088,8 @@ pub enum SettingsField {
     ShortcutPreviousColumn,
     ShortcutNextColumn,
     ShortcutCyclePaneWidth,
+    ShortcutPreviousWorkspace,
+    ShortcutNextWorkspace,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2113,6 +2115,8 @@ struct ShortcutDraft {
     previous_column: String,
     next_column: String,
     cycle_pane_width: String,
+    previous_workspace: String,
+    next_workspace: String,
 }
 
 impl ShortcutDraft {
@@ -2126,6 +2130,8 @@ impl ShortcutDraft {
             previous_column: settings::format_chords(&shortcuts.previous_column),
             next_column: settings::format_chords(&shortcuts.next_column),
             cycle_pane_width: settings::format_chords(&shortcuts.cycle_pane_width),
+            previous_workspace: settings::format_chords(&shortcuts.previous_workspace),
+            next_workspace: settings::format_chords(&shortcuts.next_workspace),
         }
     }
 }
@@ -2261,6 +2267,12 @@ impl SettingsDraft {
             SettingsField::ShortcutNextColumn => self.keyboard_shortcuts.next_column = value,
             SettingsField::ShortcutCyclePaneWidth => {
                 self.keyboard_shortcuts.cycle_pane_width = value;
+            }
+            SettingsField::ShortcutPreviousWorkspace => {
+                self.keyboard_shortcuts.previous_workspace = value;
+            }
+            SettingsField::ShortcutNextWorkspace => {
+                self.keyboard_shortcuts.next_workspace = value;
             }
         }
     }
@@ -2461,6 +2473,14 @@ fn settings_update(
         }
         SettingsField::ShortcutCyclePaneWidth => {
             next.keyboard_shortcuts.cycle_pane_width = settings::parse_chords(value);
+            Ok(())
+        }
+        SettingsField::ShortcutPreviousWorkspace => {
+            next.keyboard_shortcuts.previous_workspace = settings::parse_chords(value);
+            Ok(())
+        }
+        SettingsField::ShortcutNextWorkspace => {
+            next.keyboard_shortcuts.next_workspace = settings::parse_chords(value);
             Ok(())
         }
     };
@@ -5858,6 +5878,44 @@ impl Cagents {
         }
     }
 
+    /// Moves to the workspace before or after this one: a worktree or a
+    /// channel, in sidebar order, wrapping at both ends.
+    ///
+    /// Nothing open means the cycle starts at the end the reader is heading
+    /// for, so the first press already lands somewhere rather than priming an
+    /// invisible cursor.
+    fn cycle_workspace(&self, direction: crate::workspace::FocusDirection) -> Task<Message> {
+        match self.next_workspace(direction) {
+            Some(action) => cosmic::task::message(Message::Sidebar(action)),
+            None => Task::none(),
+        }
+    }
+
+    fn next_workspace(&self, direction: crate::workspace::FocusDirection) -> Option<SidebarAction> {
+        let mut destinations = sidebar::workspace_cycle(&self.sidebar_model, &self.sidebar_state);
+        let last = destinations.len().checked_sub(1)?;
+        let channel = self.durable.active_channel;
+        let worktree = self.active_workspace.clone();
+        let current = destinations.iter().position(|action| match action {
+            SidebarAction::OpenChannel { channel_id } => channel == Some(*channel_id),
+            SidebarAction::OpenWorktree { path, .. } => {
+                channel.is_none() && worktree.as_deref() == Some(path.as_path())
+            }
+            _ => false,
+        });
+        let index = match (current, direction) {
+            (Some(current), crate::workspace::FocusDirection::Right) => {
+                (current + 1) % destinations.len()
+            }
+            (Some(current), crate::workspace::FocusDirection::Left) => {
+                (current + last) % destinations.len()
+            }
+            (None, crate::workspace::FocusDirection::Right) => 0,
+            (None, crate::workspace::FocusDirection::Left) => last,
+        };
+        Some(destinations.swap_remove(index))
+    }
+
     /// The focused card, reduced to what binding the source-control panel
     /// needs. A card that names no worktree directory - a browser, a
     /// pull-request list - is [`SidebarFocus::None`], which leaves the panel
@@ -7612,6 +7670,8 @@ impl Cagents {
                         | SettingsField::ShortcutPreviousColumn
                         | SettingsField::ShortcutNextColumn
                         | SettingsField::ShortcutCyclePaneWidth
+                        | SettingsField::ShortcutPreviousWorkspace
+                        | SettingsField::ShortcutNextWorkspace
                 ) {
                     self.card_chrome.clear();
                 }
@@ -7683,7 +7743,9 @@ impl Cagents {
                     | SettingsField::ShortcutSearchProjects
                     | SettingsField::ShortcutPreviousColumn
                     | SettingsField::ShortcutNextColumn
-                    | SettingsField::ShortcutCyclePaneWidth => Task::none(),
+                    | SettingsField::ShortcutCyclePaneWidth
+                    | SettingsField::ShortcutPreviousWorkspace
+                    | SettingsField::ShortcutNextWorkspace => Task::none(),
                 };
                 Task::batch([save, effect])
             }
@@ -10115,6 +10177,9 @@ impl Application for Cagents {
                     }
                     Some(workspace_widget::GlobalShortcut::CyclePaneWidth) => {
                         cosmic::task::message(Message::CyclePaneWidth)
+                    }
+                    Some(workspace_widget::GlobalShortcut::CycleWorkspace(direction)) => {
+                        self.cycle_workspace(direction)
                     }
                     None => Task::none(),
                 }
@@ -13947,6 +14012,75 @@ mod tests {
         assert_eq!(session.id, identity);
         // Relaunch remains an explicit action with a fresh host identity.
         assert_ne!(fresh_terminal_relaunch(session).id, identity);
+    }
+
+    /// Alt+Tab moves between the top-level workspaces, wrapping at both ends,
+    /// and starts at the end the reader is heading for when nothing is open.
+    #[test]
+    fn cycling_workspaces_wraps_through_every_worktree_and_channel() {
+        use crate::model::{ChannelId, ProjectChannel, WorktreeId};
+        use crate::sidebar::{SidebarProject, SidebarWorktree};
+        use crate::workspace::FocusDirection;
+
+        let mut app = context_inspector_test_app(false);
+        let project = ProjectId::new();
+        let channel = ChannelId::new();
+        let durable = Arc::make_mut(&mut app.durable);
+        durable.channels.push(ProjectChannel {
+            id: channel,
+            project_id: project,
+            title: "Migration".into(),
+            ordinal: 0,
+            shared: false,
+            cards: Vec::new(),
+            focused: None,
+        });
+        app.sidebar_model.projects.push(SidebarProject::new(
+            project,
+            RepositoryId::new(),
+            "project".into(),
+            "/repo".into(),
+            vec![
+                SidebarWorktree::from_durable(
+                    WorktreeId::new(),
+                    "/repo".into(),
+                    Some("main".into()),
+                ),
+                SidebarWorktree::from_durable(
+                    WorktreeId::new(),
+                    "/repo/feature".into(),
+                    Some("feature".into()),
+                ),
+            ],
+            Vec::new(),
+        ));
+        app.refresh_sidebar_channels();
+
+        let names = |app: &Cagents, direction| match app.next_workspace(direction) {
+            Some(SidebarAction::OpenWorktree { path, .. }) => path.display().to_string(),
+            Some(SidebarAction::OpenChannel { channel_id }) => format!("channel {channel_id:?}"),
+            other => panic!("unexpected destination: {other:?}"),
+        };
+
+        // Nothing open yet: each direction enters from its own end.
+        assert_eq!(names(&app, FocusDirection::Right), "/repo");
+        assert_eq!(
+            names(&app, FocusDirection::Left),
+            format!("channel {channel:?}")
+        );
+
+        app.active_workspace = Some("/repo".into());
+        assert_eq!(names(&app, FocusDirection::Right), "/repo/feature");
+        // The first worktree wraps backwards onto the last channel.
+        assert_eq!(
+            names(&app, FocusDirection::Left),
+            format!("channel {channel:?}")
+        );
+
+        // A channel is the active workspace even while a worktree path stands.
+        Arc::make_mut(&mut app.durable).active_channel = Some(channel);
+        assert_eq!(names(&app, FocusDirection::Right), "/repo");
+        assert_eq!(names(&app, FocusDirection::Left), "/repo/feature");
     }
 
     /// A killed session used to take its pane with it: `fail_runtime` replaced
