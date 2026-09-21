@@ -105,6 +105,10 @@ pub fn symbolic_icon(name: &str) -> widget::icon::Handle {
     static INSERT_TEXT: LazyLock<widget::icon::Handle> = LazyLock::new(|| {
         widget::icon::from_svg_bytes(br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16"><path d="M3.5 3.25h9M8 3.25v9.5" fill="none" stroke="black" stroke-width="1.4" stroke-linecap="round"/></svg>"#.as_slice()).symbolic(true)
     });
+    // A clock face with its hand swept back: the log walk, not a document.
+    static HISTORY: LazyLock<widget::icon::Handle> = LazyLock::new(|| {
+        widget::icon::from_svg_bytes(br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16"><g fill="none" stroke="black" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><path d="M2.5 8a5.5 5.5 0 1 0 1.6-3.9M2 2.5v3h3M8 5v3.2l2.2 1.3"/></g></svg>"#.as_slice()).symbolic(true)
+    });
     static INFO: LazyLock<widget::icon::Handle> = LazyLock::new(|| {
         widget::icon::from_svg_bytes(br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16"><g fill="none" stroke="black" stroke-width="1.4" stroke-linecap="round"><circle cx="8" cy="8" r="5.5"/><path d="M8 7.2v4.1M8 5.2h0"/></g></svg>"#.as_slice()).symbolic(true)
     });
@@ -158,6 +162,7 @@ pub fn symbolic_icon(name: &str) -> widget::icon::Handle {
         "document-save-as-symbolic" => SAVE.clone(),
         "emblem-system-symbolic" | "preferences-system-symbolic" => SETTINGS.clone(),
         "insert-text-symbolic" => INSERT_TEXT.clone(),
+        "document-open-recent-symbolic" => HISTORY.clone(),
         "dialog-information-symbolic" => INFO.clone(),
         "window-close-symbolic" => CLOSE.clone(),
         _ => widget::icon::from_name(name).handle(),
