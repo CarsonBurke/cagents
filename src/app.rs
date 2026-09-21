@@ -5862,10 +5862,10 @@ impl Cagents {
     }
 
     /// Asks for the first page of history once, and only once the `History`
-    /// section is showing: a page is a `git log` walk, and a section nobody
-    /// opened is not worth one.
+    /// tab is showing: a page is a `git log` walk, and a view nobody opened is
+    /// not worth one.
     fn load_pending_history(&mut self) -> Task<Message> {
-        if !self.sidebar_state.section_expanded(PanelSection::History) {
+        if self.sidebar_state.changes_tab() != sidebar::ChangesTab::History {
             return Task::none();
         }
         let Some(source) = self.sidebar_model.source_control.as_mut() else {
@@ -8810,9 +8810,9 @@ impl Application for Cagents {
                     SidebarAction::OpenBranchFile { key, path, old_path, base_ref, head, merge_base } => {
                         self.open_branch_file(key, path, old_path, base_ref, head, merge_base)
                     }
-                    // Expanding `History` is the only thing that asks for the
-                    // first page; the tail of `update` sees the new toggle and
-                    // issues the walk.
+                    // Disclosing `Untracked` is what decides whether the
+                    // snapshot walks for untracked paths at all, so the read
+                    // is reissued with the group's new state.
                     SidebarAction::ToggleSection { key, section: PanelSection::Untracked } => self.reload_source_control(&key),
                     SidebarAction::OpenCommit { key, oid } => self.open_history_commit(key, oid),
                     SidebarAction::CloseCommit { key } => {
@@ -8832,6 +8832,7 @@ impl Application for Cagents {
                     }
                     SidebarAction::OpenCommitFile { key, oid, path } => self.open_commit_file(key, oid, path),
                     SidebarAction::ToggleSection { .. }
+                    | SidebarAction::SetChangesTab { .. }
                     | SidebarAction::ToggleSourceControlPanel { .. }
                     | SidebarAction::FilesQueryChanged { .. }
                     | SidebarAction::SetChangeListMode { .. }

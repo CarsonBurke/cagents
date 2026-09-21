@@ -1073,30 +1073,88 @@ impl SidebarFocus {
     }
 }
 
-/// Section identities retained in presentation state; Files has its own panel.
+/// The collapsible sections of the Changes tab: one per working-tree change
+/// area, so every group discloses the same way rather than `Untracked` alone.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum PanelSection {
-    Files,
-    Changes,
-    History,
+    Conflicts,
+    Staged,
+    Unstaged,
     Untracked,
 }
 
 impl PanelSection {
-    pub const ALL: [Self; 4] = [Self::Files, Self::Changes, Self::History, Self::Untracked];
+    pub const ALL: [Self; 4] = [
+        Self::Conflicts,
+        Self::Staged,
+        Self::Unstaged,
+        Self::Untracked,
+    ];
 
     fn title(self) -> &'static str {
         match self {
-            Self::Files => "Files",
-            Self::Changes => "Changes",
-            Self::History => "History",
+            Self::Conflicts => "Conflicts",
+            Self::Staged => "Staged",
+            Self::Unstaged => "Unstaged",
             Self::Untracked => "Untracked",
+        }
+    }
+
+    fn for_area(area: ChangeArea) -> Self {
+        match area {
+            ChangeArea::Conflict => Self::Conflicts,
+            ChangeArea::Staged => Self::Staged,
+            ChangeArea::Unstaged => Self::Unstaged,
+            ChangeArea::Untracked => Self::Untracked,
         }
     }
 
     /// Show all nonignored working changes immediately, including new files.
     fn expanded_by_default(self) -> bool {
-        matches!(self, Self::Changes | Self::Untracked)
+        true
+    }
+}
+
+/// Which view of the worktree's Git state the Changes tab is showing.
+///
+/// Three peers, not a boolean: working-tree changes, this branch's commits,
+/// and the diff against the branch's base are separate questions, and the
+/// panel used to answer the third by stacking it under the first.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum ChangesTab {
+    #[default]
+    Changes,
+    History,
+    Branch,
+}
+
+impl ChangesTab {
+    pub const ALL: [Self; 3] = [Self::Changes, Self::History, Self::Branch];
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Changes => "Changes",
+            Self::History => "History",
+            Self::Branch => "Branch",
+        }
+    }
+
+    /// The accessible name and tooltip, which say what the short tab label
+    /// cannot fit.
+    fn description(self) -> &'static str {
+        match self {
+            Self::Changes => "Working tree changes",
+            Self::History => "Commit history",
+            Self::Branch => "Changes since this branch left its base",
+        }
+    }
+
+    fn icon(self) -> widget::icon::Handle {
+        match self {
+            Self::Changes => crate::ui_controls::symbolic_icon("document-edit-symbolic"),
+            Self::History => crate::ui_controls::symbolic_icon("document-open-recent-symbolic"),
+            Self::Branch => worktree_icon(),
+        }
     }
 }
 
@@ -1367,7 +1425,6 @@ impl ChangeGroup {
         };
         let key = format!("{worktree_id}.{area:?}");
         let chrome = ChangeGroupChrome {
-            title: format!("{title} ({})", rows.len()).into_boxed_str(),
             stage_all_id: stable_id(format!("panel.group.stage.{key}")),
             unstage_all_id: stable_id(format!("panel.group.unstage.{key}")),
             discard_all_id: stable_id(format!("panel.group.discard.{key}")),
@@ -1418,7 +1475,6 @@ impl ChangeGroup {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ChangeGroupChrome {
-    title: Box<str>,
     stage_all_id: Id,
     unstage_all_id: Id,
     discard_all_id: Id,
@@ -2097,6 +2153,7 @@ struct SourceControlChrome {
     publish_branch_id: Id,
     more_history_id: Id,
     section_ids: [Id; 4],
+    changes_tab_ids: [Id; 3],
 }
 
 impl SourceControlChrome {
@@ -2135,11 +2192,17 @@ impl SourceControlChrome {
             more_history_id: entity_id("panel.history.more", worktree_id),
             section_ids: PanelSection::ALL
                 .map(|section| entity_id("panel.section", format!("{worktree_id}.{section:?}"))),
+            changes_tab_ids: ChangesTab::ALL
+                .map(|tab| entity_id("panel.tab", format!("{worktree_id}.{tab:?}"))),
         }
     }
 
     fn section_id(&self, section: PanelSection) -> &Id {
         &self.section_ids[section as usize]
+    }
+
+    fn changes_tab_id(&self, tab: ChangesTab) -> &Id {
+        &self.changes_tab_ids[tab as usize]
     }
 }
 
@@ -2339,6 +2402,9 @@ pub struct SidebarState {
     files_query: String,
     files_filter_open: bool,
     change_list_mode: FileListMode,
+    /// Which view of the Git panel is showing. Local to the surface, like
+    /// every other draft here, so a worktree switch resets it.
+    changes_tab: ChangesTab,
     worktree_sort: crate::settings::WorktreeSort,
     agent_updates: BTreeMap<CardId, Option<(ProjectId, WorktreeId)>>,
     agent_activity: BTreeMap<CardId, PaneActivity>,
@@ -2583,18 +2649,30 @@ impl SidebarState {
         self.files_filter_open = false;
         self.commit_message.clear();
         self.expanded_directories.clear();
-        self.toggled_sections.remove(&PanelSection::Untracked);
+        // Every section is one worktree's change area now, not a view of the
+        // panel, so none of their disclosures carry to the next worktree.
+        self.toggled_sections.clear();
+        self.changes_tab = ChangesTab::default();
         self.publish = None;
         self.discard = None;
         self.panel_selection = None;
         true
     }
 
-    /// Whether one panel section is showing.
+    /// Which Git view the panel is showing.
     ///
-    /// Public because expanding a section is the only request the `History`
-    /// section has: the application asks for the first page when this becomes
-    /// true, and nothing else in the panel asks for one.
+    /// Public because opening `History` is the only request that view makes:
+    /// the application asks for the first page when this becomes
+    /// [`ChangesTab::History`], and nothing else in the panel asks for one.
+    pub fn changes_tab(&self) -> ChangesTab {
+        self.changes_tab
+    }
+
+    /// Whether one change group is disclosed.
+    ///
+    /// Public because `Untracked` gates what the snapshot reads: a collapsed
+    /// group is not worth the untracked walk, so the application reloads when
+    /// this changes.
     pub fn section_expanded(&self, section: PanelSection) -> bool {
         self.toggled_sections.contains(&section) != section.expanded_by_default()
     }
@@ -2645,6 +2723,7 @@ impl SidebarState {
                 }
             }
             SidebarAction::SetChangeListMode { mode, .. } => self.change_list_mode = *mode,
+            SidebarAction::SetChangesTab { tab, .. } => self.changes_tab = *tab,
             SidebarAction::SetWorktreePanel { .. } => {}
             SidebarAction::ToggleDirectory { path, .. } => {
                 if !self.expanded_directories.remove(path) {
@@ -2849,6 +2928,10 @@ pub enum SidebarAction {
     SetChangeListMode {
         key: ActiveWorktreeKey,
         mode: FileListMode,
+    },
+    SetChangesTab {
+        key: ActiveWorktreeKey,
+        tab: ChangesTab,
     },
     SetWorktreePanel {
         panel: WorktreePanel,
@@ -5108,51 +5191,99 @@ fn source_control_panel<'a>(
         );
     }
 
-    let history = state.section_expanded(PanelSection::History);
-    let mut sections = widget::column::with_capacity(4).spacing(spacing.space_xxxs);
-    let switch =
-        widget::row::with_children([("Changes", false), ("History", true)].into_iter().map(
-            |(label, selected)| {
-                button::custom(design::body(label))
-                    .class(crate::ui_controls::control_style(history == selected, None))
-                    .height(design::DENSE_ROW_HEIGHT)
-                    .width(Length::Fill)
-                    .on_press_maybe(gated(
-                        SidebarAction::ToggleSection {
-                            key: key.clone(),
-                            section: PanelSection::History,
-                        },
-                        modal_open || history == selected,
-                    ))
-                    .into()
-            },
-        ));
-    sections = sections.push(switch);
-    if history {
-        sections = sections.push(history_section(source, modal_open));
-    } else {
-        sections = sections.push(changes_section(state, source, modal_open));
-        sections = sections.push(branch_changes_section(state, source, modal_open));
-    }
+    let tab = state.changes_tab;
+    let body = match tab {
+        ChangesTab::Changes => changes_section(state, source, modal_open),
+        ChangesTab::History => history_section(source, modal_open),
+        ChangesTab::Branch => branch_changes_section(state, source, modal_open),
+    };
+    // Committing is the panel's terminal action, so it sits at the panel's
+    // bottom edge rather than after however many change rows the scroll
+    // region happens to hold. It belongs to the working tree, so only the
+    // working-tree view carries it.
+    let footer = matches!(tab, ChangesTab::Changes).then(|| {
+        widget::container(changes_footer(state, source, modal_open))
+            .padding(Padding::from([spacing.space_xxs, spacing.space_xxs]))
+            .width(Length::Fill)
+            .into()
+    });
 
-    worktree_panel_chrome(
+    worktree_panel_chrome_with_footer(
         header.into(),
         notices.into(),
         Some(
-            widget::scrollable(
-                widget::container(sections)
-                    .padding(design::with_vertical_rail(Padding::from([
-                        spacing.space_xxxs,
-                        spacing.space_xxs,
-                    ])))
-                    .width(Length::Fill),
-            )
-            .direction(sidebar_scroll_direction())
-            .class(cosmic::style::iced::Scrollable::Minimal)
+            widget::column::with_children(vec![
+                widget::container(changes_tab_controls(key, tab, chrome, modal_open))
+                    .padding(Padding::from([spacing.space_xxxs, spacing.space_xxs]))
+                    .width(Length::Fill)
+                    .into(),
+                widget::scrollable(
+                    widget::container(body)
+                        .padding(design::with_vertical_rail(Padding::from([
+                            0,
+                            spacing.space_xxs,
+                        ])))
+                        .width(Length::Fill),
+                )
+                .direction(sidebar_scroll_direction())
+                .class(cosmic::style::iced::Scrollable::Minimal)
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .into(),
+            ])
             .width(Length::Fill)
             .height(Length::Fill)
             .into(),
         ),
+        footer,
+    )
+}
+
+/// The Changes/History/Branch switch.
+///
+/// One segmented control of three peers, each an icon over its own label, so
+/// the current view is read from the filled segment rather than from which of
+/// two words happens to look pressed. Each segment keeps a stable id so focus
+/// and the accessibility tree survive a switch.
+fn changes_tab_controls<'a>(
+    key: &ActiveWorktreeKey,
+    selected: ChangesTab,
+    chrome: &SourceControlChrome,
+    modal_open: bool,
+) -> Element<'a, SidebarAction> {
+    let spacing = cosmic::theme::spacing();
+    crate::ui_controls::segmented_controls(
+        ChangesTab::ALL
+            .into_iter()
+            .map(|tab| {
+                let active = tab == selected;
+                let control = button::custom(
+                    widget::row::with_children(vec![
+                        widget::icon(tab.icon()).size(ROW_ICON_SIZE).into(),
+                        design::body(tab.label())
+                            .wrapping(cosmic::iced::widget::text::Wrapping::None)
+                            .into(),
+                    ])
+                    .spacing(spacing.space_xxxs)
+                    .align_y(Alignment::Center),
+                )
+                .class(crate::ui_controls::control_style(active, None))
+                .id(chrome.changes_tab_id(tab).clone())
+                .name(tab.description())
+                .selected(active)
+                .padding([0, spacing.space_xxs])
+                .height(design::DENSE_ROW_HEIGHT)
+                .width(Length::Fill)
+                .on_press_maybe(gated(
+                    SidebarAction::SetChangesTab {
+                        key: key.clone(),
+                        tab,
+                    },
+                    modal_open || active,
+                ));
+                crate::interaction::tooltip(crate::interaction::hover(control), tab.description())
+            })
+            .collect(),
     )
 }
 
@@ -5166,6 +5297,17 @@ fn worktree_panel_chrome<'a>(
     header: Element<'a, SidebarAction>,
     notices: Element<'a, SidebarAction>,
     body: Option<Element<'a, SidebarAction>>,
+) -> Element<'a, SidebarAction> {
+    worktree_panel_chrome_with_footer(header, notices, body, None)
+}
+
+/// The same chrome with a region pinned below the scrolling body, for the
+/// commit box: a terminal action the user must not have to scroll to reach.
+fn worktree_panel_chrome_with_footer<'a>(
+    header: Element<'a, SidebarAction>,
+    notices: Element<'a, SidebarAction>,
+    body: Option<Element<'a, SidebarAction>>,
+    footer: Option<Element<'a, SidebarAction>>,
 ) -> Element<'a, SidebarAction> {
     let spacing = cosmic::theme::spacing();
     // The divider is the header's bottom edge; spacing would move it below
@@ -5183,10 +5325,16 @@ fn worktree_panel_chrome<'a>(
             .width(Length::Fill),
     );
     match body {
-        Some(body) => widget::column::with_children(vec![chrome.into(), body])
-            .width(Length::Fill)
-            .height(Length::Fill)
-            .into(),
+        Some(body) => {
+            let mut column = widget::column::with_capacity(4)
+                .spacing(0)
+                .push(chrome)
+                .push(body);
+            if let Some(footer) = footer {
+                column = column.push(crate::design::horizontal_rule()).push(footer);
+            }
+            column.width(Length::Fill).height(Length::Fill).into()
+        }
         None => chrome.width(Length::Fill).into(),
     }
 }
@@ -5576,64 +5724,80 @@ fn changes_section<'a>(
 ) -> Element<'a, SidebarAction> {
     let spacing = cosmic::theme::spacing();
     let mut column =
-        widget::column::with_capacity(source.groups().len() + 2).spacing(spacing.space_xxxs);
+        widget::column::with_capacity(source.groups().len() + 1).spacing(spacing.space_xxxs);
     if source.groups().iter().all(ChangeGroup::is_empty) {
         column = column.push(design::caption("No tracked changes."));
     }
     for group in source.groups() {
-        if group.area == ChangeArea::Untracked {
-            let expanded = state.section_expanded(PanelSection::Untracked);
-            let actions = expanded.then(|| {
-                let (tree, _) = visible_file_rows(
-                    &group.tree,
-                    &state.expanded_directories,
-                    "",
-                    state.change_list_mode == FileListMode::Flat,
-                    true,
-                );
-                let visible: Vec<_> = tree
-                    .iter()
-                    .filter(|row| !row.directory)
-                    .filter_map(|file| group.visible_path(&file.path))
-                    .collect();
-                widget::container(widget::row::with_children(
-                    group_commands(source, group, &visible, modal_open)
-                        .into_iter()
-                        .map(IconCommand::into_element),
-                ))
-                .align_right(Length::Fill)
-                .height(PANEL_ROW_HEIGHT)
-                .into()
-            });
-            column = column.push(panel_section(
-                &source.key,
-                PanelSection::Untracked,
-                source.chrome.section_id(PanelSection::Untracked).clone(),
-                state
-                    .section_expanded(PanelSection::Untracked)
-                    .then(|| RowCount::exact(group.rows().len())),
-                state.section_expanded(PanelSection::Untracked),
-                modal_open,
-                actions,
-                || {
-                    if group.is_empty() {
-                        design::caption(if source.reloading {
-                            "Loading untracked files…"
-                        } else {
-                            "No untracked files."
-                        })
-                        .into()
-                    } else {
-                        change_group_view(state, source, group, modal_open)
-                    }
-                },
-            ));
-        } else if !group.is_empty() {
-            column = column.push(change_group_view(state, source, group, modal_open));
+        // `Untracked` is always offered even when empty: it is the one group
+        // whose emptiness may only mean the snapshot did not walk for it.
+        if group.is_empty() && group.area != ChangeArea::Untracked {
+            continue;
         }
+        let section = PanelSection::for_area(group.area);
+        let expanded = state.section_expanded(section);
+        let actions = expanded.then(|| {
+            let (tree, _) = visible_file_rows(
+                &group.tree,
+                &state.expanded_directories,
+                "",
+                state.change_list_mode == FileListMode::Flat,
+                true,
+            );
+            let visible: Vec<_> = tree
+                .iter()
+                .filter(|row| !row.directory)
+                .filter_map(|file| group.visible_path(&file.path))
+                .collect();
+            widget::container(widget::row::with_children(
+                group_commands(source, group, &visible, modal_open)
+                    .into_iter()
+                    .map(IconCommand::into_element),
+            ))
+            .align_right(Length::Fill)
+            .height(PANEL_ROW_HEIGHT)
+            .into()
+        });
+        column = column.push(panel_section(
+            &source.key,
+            section,
+            source.chrome.section_id(section).clone(),
+            // A count matters most while the rows are not drawn: a bare
+            // "Unstaged" does not say it is folding forty files away.
+            Some(RowCount::exact(group.rows().len())),
+            expanded,
+            modal_open,
+            actions,
+            || {
+                if group.is_empty() {
+                    let noun = match group.area {
+                        ChangeArea::Conflict => "conflicted files",
+                        ChangeArea::Staged => "staged changes",
+                        ChangeArea::Unstaged => "unstaged changes",
+                        ChangeArea::Untracked => "untracked files",
+                    };
+                    design::caption(if source.reloading {
+                        format!("Loading {noun}…")
+                    } else {
+                        format!("No {noun}.")
+                    })
+                    .into()
+                } else {
+                    change_group_view(state, source, group, modal_open)
+                }
+            },
+        ));
     }
-    column = column.push(crate::design::horizontal_rule());
-    column = column.push(changes_footer(state, source, modal_open));
+    // The publish form is several rows tall and grows a wrapping refusal, so
+    // it stays in the scroll region: pinned beside the commit box it could
+    // push its own Cancel and Publish past the bottom of a short panel.
+    if let Some(publish) = state
+        .publish_draft()
+        .filter(|draft| draft.key == source.key)
+    {
+        column = column.push(crate::design::horizontal_rule());
+        column = column.push(publish_picker(source, publish, modal_open));
+    }
     column.into()
 }
 
@@ -5771,25 +5935,9 @@ fn change_group_view<'a>(
     // Uncommitted-change review always expands, like branch review above.
     let (tree, tree_hidden) =
         visible_file_rows(&group.tree, &state.expanded_directories, "", flat, true);
-    let visible: Vec<&ChangeRow> = tree
-        .iter()
-        .filter(|row| !row.directory)
-        .filter_map(|file| group.visible_path(&file.path))
-        .collect();
-    let header = widget::container(design::heading(&*group.chrome.title))
-        .width(Length::Fill)
-        .height(PANEL_ROW_HEIGHT)
-        .center_y(PANEL_ROW_HEIGHT);
-    let commands = group_commands(source, group, &visible, modal_open);
-    let actions = widget::container(widget::row::with_children(
-        commands.into_iter().map(IconCommand::into_element),
-    ))
-    .align_right(Length::Fill)
-    .height(PANEL_ROW_HEIGHT);
-    let mut column = widget::column::with_capacity(tree.len() + 2).spacing(0);
-    if group.area != ChangeArea::Untracked {
-        column = column.push(RowInteraction::actions(header.into(), actions.into(), 0.0));
-    }
+    // The disclosure header above this view already carries the group's name,
+    // its count, and its commands; the body is only the rows.
+    let mut column = widget::column::with_capacity(tree.len() + 1).spacing(0);
     for file in tree {
         if file.directory {
             // An inert hierarchy label, like branch review above.
@@ -6265,9 +6413,6 @@ fn changes_footer<'a>(
         }
     }
     column = column.push(buttons);
-    if let Some(publish) = state.publish_draft().filter(|draft| &draft.key == key) {
-        column = column.push(publish_picker(source, publish, modal_open));
-    }
     column.into()
 }
 
@@ -11289,6 +11434,106 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn the_git_tab_strip_offers_every_view_it_is_not_already_showing() {
+        let renderer = headless_renderer();
+        let model = panel_model();
+        let mut state = panel_state(&model);
+        for tab in ChangesTab::ALL {
+            state.changes_tab = tab;
+            let published = frame_enter_presses(&renderer, git_panel(&model, &state, 380.0, false));
+            let offered: Vec<ChangesTab> = published
+                .iter()
+                .filter_map(|action| match action {
+                    SidebarAction::SetChangesTab { tab, .. } => Some(*tab),
+                    _ => None,
+                })
+                .collect();
+            let expected: Vec<ChangesTab> = ChangesTab::ALL
+                .into_iter()
+                .filter(|it| *it != tab)
+                .collect();
+            assert_eq!(
+                offered, expected,
+                "the strip must offer the other two views and refuse the one already showing; \
+                 from {tab:?} it published {offered:?}"
+            );
+        }
+    }
+
+    /// Committing belongs to the working tree, and the working tree is one of
+    /// three views. Leaving the commit box under History or branch review
+    /// would offer a mutation of state that view is not showing.
+    #[test]
+    fn committing_is_offered_only_by_the_working_tree_view() {
+        let renderer = headless_renderer();
+        let model = panel_model();
+        let mut state = panel_state(&model);
+        state.commit_message.push_str("a message");
+        for tab in ChangesTab::ALL {
+            state.changes_tab = tab;
+            let commits = frame_enter_presses(&renderer, git_panel(&model, &state, 380.0, false))
+                .iter()
+                .any(|action| matches!(action, SidebarAction::Commit { .. }));
+            assert_eq!(
+                commits,
+                tab == ChangesTab::Changes,
+                "{tab:?} offered Commit: {commits}"
+            );
+        }
+    }
+
+    /// Every change group discloses the same way. `Unstaged` used to be the
+    /// one group with no way to fold a long list away.
+    #[test]
+    fn every_change_group_folds_away_its_rows() {
+        let renderer = headless_renderer();
+        let model = panel_model();
+        let mut state = panel_state(&model);
+        state.changes_tab = ChangesTab::Changes;
+        for section in PanelSection::ALL {
+            assert!(
+                state.section_expanded(section),
+                "the fixture opens every group; {section:?} was closed"
+            );
+        }
+        let unstaged_row = |action: &SidebarAction| {
+            matches!(
+                action,
+                SidebarAction::OpenChange {
+                    area: ChangeArea::Unstaged,
+                    ..
+                }
+            )
+        };
+        let open = frame_enter_presses(&renderer, git_panel(&model, &state, 380.0, false));
+        assert!(
+            open.iter().any(unstaged_row),
+            "the fixture must draw unstaged rows for this test to mean anything; it published \
+             {open:?}"
+        );
+        state.apply(&SidebarAction::ToggleSection {
+            key: main_key(),
+            section: PanelSection::Unstaged,
+        });
+        assert!(!state.section_expanded(PanelSection::Unstaged));
+        let folded = frame_enter_presses(&renderer, git_panel(&model, &state, 380.0, false));
+        assert!(
+            !folded.iter().any(unstaged_row),
+            "a folded group must draw none of its rows; it published {folded:?}"
+        );
+        assert!(
+            folded.iter().any(|action| matches!(
+                action,
+                SidebarAction::ToggleSection {
+                    section: PanelSection::Unstaged,
+                    ..
+                }
+            )),
+            "the folded group must keep the control that reopens it; it published {folded:?}"
+        );
+    }
+
+    #[test]
     fn no_panel_command_is_pressable_while_a_dialog_is_open() {
         let renderer = headless_renderer();
         let mut model = panel_model();
@@ -11296,9 +11541,10 @@ pub(crate) mod tests {
             project.github_ready = true;
         }
         let mut state = panel_state(&model);
-        state.toggled_sections.remove(&PanelSection::History);
+        state.changes_tab = ChangesTab::Changes;
 
-        // The Changes view contains index mutations; History is a separate view.
+        // The Changes view contains index mutations; History and Branch are
+        // separate views with their own commands, and each must stand down.
         let live = frame_enter_presses(&renderer, git_panel(&model, &state, 380.0, false));
         assert!(
             live.iter()
@@ -11314,8 +11560,14 @@ pub(crate) mod tests {
              is up - so a control that still published one would report itself enabled, take the \
              press, and do nothing. It published {gated:?}"
         );
-        state.toggled_sections.insert(PanelSection::History);
-        assert!(frame_enter_presses(&renderer, git_panel(&model, &state, 380.0, true)).is_empty());
+        for tab in ChangesTab::ALL {
+            state.changes_tab = tab;
+            let gated = frame_enter_presses(&renderer, git_panel(&model, &state, 380.0, true));
+            assert!(
+                gated.is_empty(),
+                "{tab:?} published {gated:?} behind a modal"
+            );
+        }
     }
 
     #[test]
