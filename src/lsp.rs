@@ -1736,6 +1736,7 @@ struct SessionContext {
     /// is still winding down cannot publish into the documents its
     /// replacement now owns.
     retired: Arc<AtomicBool>,
+    retirement: Arc<tokio::sync::Notify>,
     /// Process group of the running server, published so an exit path that
     /// stops waiting for this task can still end the tree it owns. Zero if
     /// this session never had a process of its own, and zeroed by whichever
@@ -2004,6 +2005,9 @@ async fn run_session(
     context: SessionContext,
     mut commands: mpsc::UnboundedReceiver<SessionCommand>,
 ) {
+    if context.retired.load(Ordering::Acquire) {
+        return;
+    }
     let transport = match (context.transport)(&context.launch) {
         Ok(transport) => transport,
         Err(reason) => {
@@ -2055,7 +2059,19 @@ async fn run_session(
     };
     let initialize = server.request::<request::Initialize>(params);
     next_wire_id += 1;
-    let negotiated = match tokio::time::timeout(INITIALIZE_TIMEOUT, initialize).await {
+    let initialized = tokio::select! {
+        biased;
+        _ = async {
+            if !context.retired.load(Ordering::Acquire) {
+                context.retirement.notified().await;
+            }
+        } => {
+            teardown(protocol, child, stderr_drain, &context.process_group).await;
+            return;
+        }
+        result = tokio::time::timeout(INITIALIZE_TIMEOUT, initialize) => result,
+    };
+    let negotiated = match initialized {
         Ok(Ok(result)) => result,
         outcome => {
             let reason = match outcome {
@@ -3104,6 +3120,7 @@ struct SessionHandle {
     /// Shared with the session's router: set before the handle is dropped so
     /// a retiring server cannot publish into its replacement's documents.
     retired: Arc<AtomicBool>,
+    retirement: Arc<tokio::sync::Notify>,
     /// Shared with the session task; see [`SessionContext::process_group`].
     process_group: Arc<AtomicU32>,
     /// The session task, so teardown can be awaited to completion.
@@ -3122,6 +3139,7 @@ impl SessionHandle {
     /// its process; [`LspManager::wait_for_shutdown`] awaits that.
     fn retire(&self) -> Option<RetiringSession> {
         self.retired.store(true, Ordering::Release);
+        self.retirement.notify_one();
         let _ = self.commands.send(SessionCommand::Shutdown);
         self.task
             .lock()
@@ -3752,6 +3770,7 @@ impl LspManager {
             commands: tx,
             status: Arc::new(Mutex::new(LspStatus::Starting)),
             retired: Arc::new(AtomicBool::new(false)),
+            retirement: Arc::new(tokio::sync::Notify::new()),
             process_group: Arc::new(AtomicU32::new(0)),
             task: Arc::new(Mutex::new(None)),
         };
@@ -3766,6 +3785,7 @@ impl LspManager {
             events: self.events.clone(),
             status: Arc::clone(&handle.status),
             retired: Arc::clone(&handle.retired),
+            retirement: Arc::clone(&handle.retirement),
             process_group: Arc::clone(&handle.process_group),
             stderr: Arc::new(StderrTail::default()),
         };
@@ -4654,6 +4674,42 @@ mod tests {
             await_ready(&events, doc).await;
             assert_eq!(manager.status(doc), LspStatus::Ready);
             manager.shutdown();
+        });
+    }
+
+    #[test]
+    fn shutdown_interrupts_an_unanswered_initialize() {
+        block_on(async {
+            let (_guard, worktree, file) = workspace();
+            let mut manager = rust_manager();
+            let slot = Arc::new(Mutex::new(None));
+            let sink = Arc::clone(&slot);
+            manager.set_transport(Arc::new(move |_| {
+                let (transport, handle) = fake_transport(|_| Vec::new());
+                *sink.lock().unwrap() = Some(handle);
+                Ok(transport)
+            }));
+            manager.open(
+                LspDocumentId(1),
+                &file,
+                &worktree,
+                rust_language(),
+                1,
+                "fn main() {}\n",
+            );
+            let handle = handle_of(&slot).await;
+            handle.wait_for("initialize").await;
+            tokio::time::timeout(Duration::from_secs(1), manager.begin_shutdown())
+                .await
+                .expect(
+                    "initializing servers must not hold the application open for the reap deadline",
+                );
+            assert!(
+                !handle
+                    .methods()
+                    .iter()
+                    .any(|method| method == "initialized")
+            );
         });
     }
 

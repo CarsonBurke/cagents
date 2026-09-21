@@ -189,3 +189,6 @@ debug = 0
 
 [profile.test.package."libghostty-vt-sys"]
 debug = "line-tables-only"
+
+[patch."https://github.com/pop-os/winit.git"]
+winit-wayland = { path = "vendor/winit-wayland" }
