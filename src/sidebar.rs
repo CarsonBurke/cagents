@@ -7179,7 +7179,7 @@ fn fold(value: &str) -> Box<str> {
     value.to_ascii_lowercase().into_boxed_str()
 }
 
-fn is_check_failure(value: &str) -> bool {
+pub(crate) fn is_check_failure(value: &str) -> bool {
     matches!(
         value,
         "fail"
@@ -7194,14 +7194,14 @@ fn is_check_failure(value: &str) -> bool {
     )
 }
 
-fn is_check_pending(value: &str) -> bool {
+pub(crate) fn is_check_pending(value: &str) -> bool {
     matches!(
         value,
         "pending" | "queued" | "in_progress" | "waiting" | "expected"
     )
 }
 
-fn is_check_success(value: &str) -> bool {
+pub(crate) fn is_check_success(value: &str) -> bool {
     matches!(
         value,
         "pass" | "success" | "successful" | "skipping" | "skipped" | "neutral"

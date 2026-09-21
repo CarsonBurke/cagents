@@ -517,6 +517,46 @@ pub const TOOLBAR_GROUP_SPACING: f32 = TOOLBAR_INSET;
 /// hold, so the control after it does not move as the count changes.
 pub const STEPPER_LABEL_WIDTH: f32 = GRID_UNIT * 12.0;
 
+/// A small status pill.
+///
+/// A condition with a name -- open, merged, failing, resolved -- is not another
+/// sentence at the same weight as the column around it. Giving it a shape and a
+/// tone lets the eye find the state before it reads any of the words, which is
+/// the whole reason the state is on the row.
+pub fn badge<'a, Message: 'a>(
+    label: impl Into<std::borrow::Cow<'a, str>> + 'a,
+    tone: Tone,
+) -> cosmic::Element<'a, Message> {
+    cosmic::widget::container(
+        caption(label)
+            .wrapping(cosmic::iced::widget::text::Wrapping::None)
+            .class(cosmic::theme::Text::Default),
+    )
+    .padding(cosmic::iced::Padding {
+        top: 1.0,
+        right: GRID_UNIT + 2.0,
+        bottom: 1.0,
+        left: GRID_UNIT + 2.0,
+    })
+    .class(cosmic::theme::Container::custom(move |theme| {
+        let color = tone.resolve(theme);
+        let mut wash = color;
+        // Strong enough to read as a filled pill, weak enough that the label
+        // on top keeps its contrast at either theme polarity.
+        wash.a *= 0.18;
+        cosmic::widget::container::Style {
+            background: Some(cosmic::iced::Background::Color(wash)),
+            text_color: Some(color),
+            border: cosmic::iced::Border {
+                radius: RADIUS_XS.into(),
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+    }))
+    .into()
+}
+
 /// A `+12 −4` change count, with each side carrying its own semantic tone.
 ///
 /// [`crate::repository::line_change_counts`] joins the two sides with a single
