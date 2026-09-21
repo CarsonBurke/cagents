@@ -1723,6 +1723,9 @@ impl Editor {
         area: cagents::repository::ChangeArea,
     ) -> Task<Message> {
         use cagents::repository::ChangeArea;
+        // An open that was already in flight belongs to the previous
+        // selection. The same fence `request_file` raises.
+        self.selection_epoch = self.selection_epoch.wrapping_add(1);
         if self
             .tab(id)
             .is_some_and(|tab| tab.runtime.blocks_navigation())
@@ -1768,6 +1771,17 @@ impl Editor {
         } else {
             DiffBasis::IndexToWorktree
         };
+        let file_name = path
+            .as_path()
+            .file_name()
+            .unwrap_or(path.as_path().as_os_str())
+            .to_string_lossy()
+            .into_owned();
+        tab.title = file_name;
+        // The row may not exist on disk. Record it anyway, so the session and
+        // the language-server document follow this change rather than the
+        // file that was open before the click.
+        tab.owned_file = Some(tab.runtime.descriptor.worktree.join(path.as_path()));
         tab.pending_file = None;
         tab.pending_fragment = None;
         repository_task(tab.runtime.update(RepositoryAction::OpenWorkingDiff {
@@ -1861,15 +1875,13 @@ impl Editor {
         for intent in intents {
             match intent {
                 LspIntent::Open {
-                    absolute_path: _,
+                    absolute_path,
                     worktree,
                     version,
                     text,
                 } => {
-                    let Some(absolute_path) = self.tab(id).and_then(|tab| tab.owned_file.clone())
-                    else {
-                        continue;
-                    };
+                    // The intent names the file the bytes belong to. A link's
+                    // buffer is the target, which is not the row that was clicked.
                     self.close_document(id);
                     if !self.language_server_assistance {
                         continue;
@@ -6476,6 +6488,52 @@ mod tests {
         assert_eq!(
             app.notice.as_deref(),
             Some("Save or discard the current file before opening another file.")
+        );
+    }
+
+    #[test]
+    fn opening_a_change_tracks_that_file_instead_of_the_one_already_open() {
+        use cagents::repository::{ChangeArea, ChangeKind};
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        std::fs::write(root.join("notes.txt"), "alpha\n").unwrap();
+        let mut app = editor();
+        let id = open_git(
+            &mut app,
+            root,
+            Some("notes.txt"),
+            vec![changed_path(
+                "gone.txt",
+                None,
+                ChangeArea::Unstaged,
+                ChangeKind::Deleted,
+            )],
+        );
+        file_loaded(&mut app, id, root, "notes.txt");
+        assert_eq!(app.tab(id).unwrap().title, "notes.txt");
+        let epoch = app.selection_epoch;
+        open_change(&mut app, id, "gone.txt", ChangeArea::Unstaged);
+        let tab = app.tab(id).unwrap();
+        assert!(app.selection_epoch != epoch);
+        assert_eq!(tab.title, "gone.txt");
+        assert_eq!(
+            tab.owned_file.as_deref(),
+            Some(root.join("gone.txt").as_path())
+        );
+        assert_eq!(
+            app.session().paths,
+            vec![root.join("gone.txt")],
+            "a restart would otherwise reopen the file that was open before the click"
+        );
+        drop(app.request_file(id, "notes.txt".into()));
+        assert_eq!(
+            app.tab(id)
+                .unwrap()
+                .pending_file
+                .as_ref()
+                .map(|pending| pending.path.as_path()),
+            Some(Path::new("notes.txt")),
+            "the previous file is no longer considered the one this tab has open"
         );
     }
 }
