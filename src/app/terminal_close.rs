@@ -112,6 +112,17 @@ impl Cagents {
         let Some(intent) = self.terminal_close.take() else {
             return Task::none();
         };
+        // Dismissing a report ends the attempt it reported on. The fence
+        // exists so one intent cannot submit two concurrent requests and so
+        // no automatic path retries a request whose fate is unknown; it is
+        // not a permanent refusal to ever close this terminal again. A
+        // terminal id is a fresh UUID and the request carries the owner's
+        // session proof, so a later explicit close cannot reach a different
+        // terminal, and an owner that no longer knows this one answers
+        // `Stale` rather than killing something else.
+        if intent.detail.is_some() {
+            self.terminal_close_attempts.remove(&intent.terminal);
+        }
         self.core.set_keyboard_nav(intent.restore_keyboard_nav);
         let card = resolve_restore_card(intent.restore_card, Some(intent.card), |card| {
             self.workspace.order().any(|id| id == card)
@@ -239,6 +250,12 @@ impl Cagents {
                 close_focus(1)
             }
             outcome => {
+                // `Stale` and a mismatched identity both mean the request was
+                // never applied to the card's terminal, so nothing is left
+                // outstanding for the fence to hold.
+                if !matches!(outcome, CloseOutcome::Unreachable(_)) {
+                    self.terminal_close_attempts.remove(&terminal);
+                }
                 let intent = self.terminal_close.as_mut().unwrap();
                 intent.pending = false;
                 intent.focus = 0;
@@ -308,8 +325,19 @@ impl Cagents {
                 .into(),
             );
         }
-        rows.push(
-            widget::row::with_children(vec![
+        // A detail is an outcome the dialog is reporting, not a question it is
+        // asking: it offers one way out rather than a refusal beside a
+        // destructive button that can never be pressed. The dismissal keeps
+        // the cancel id so focus traversal stays one rule for both shapes.
+        let buttons = if intent.detail.is_some() {
+            vec![
+                widget::button::suggested("Dismiss")
+                    .id(widget::Id::new("dialog.terminal-close.cancel"))
+                    .on_press_maybe((!intent.pending).then_some(Message::CancelTerminalClose))
+                    .into(),
+            ]
+        } else {
+            vec![
                 widget::button::standard("Cancel")
                     .id(widget::Id::new("dialog.terminal-close.cancel"))
                     .on_press_maybe((!intent.pending).then_some(Message::CancelTerminalClose))
@@ -317,14 +345,12 @@ impl Cagents {
                 widget::button::destructive("Close")
                     .id(widget::Id::new("dialog.terminal-close.confirm"))
                     .on_press_maybe(
-                        (!intent.pending && intent.active && intent.detail.is_none())
-                            .then_some(Message::ConfirmTerminalClose),
+                        (!intent.pending && intent.active).then_some(Message::ConfirmTerminalClose),
                     )
                     .into(),
-            ])
-            .spacing(8)
-            .into(),
-        );
+            ]
+        };
+        rows.push(widget::row::with_children(buttons).spacing(8).into());
         Some(super::dialog_ui::surface(
             widget::column::with_children(rows).spacing(12),
             560.0,
