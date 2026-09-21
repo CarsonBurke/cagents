@@ -41,6 +41,9 @@ pub enum GlobalShortcut {
     FocusProjectSearch,
     FocusAdjacent(FocusDirection),
     CyclePaneWidth,
+    /// Moves between the top-level workspaces: every project's worktrees and
+    /// channels, in the order the sidebar lists them.
+    CycleWorkspace(FocusDirection),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -91,6 +94,16 @@ pub const GLOBAL_SHORTCUT_DESCRIPTORS: &[ShortcutDescriptor] = &[
         label: "Cycle pane width",
         repeatable: true,
     },
+    ShortcutDescriptor {
+        action: GlobalShortcut::CycleWorkspace(FocusDirection::Left),
+        label: "Previous workspace",
+        repeatable: true,
+    },
+    ShortcutDescriptor {
+        action: GlobalShortcut::CycleWorkspace(FocusDirection::Right),
+        label: "Next workspace",
+        repeatable: true,
+    },
 ];
 
 pub fn shortcut_descriptor(action: GlobalShortcut) -> &'static ShortcutDescriptor {
@@ -111,6 +124,8 @@ pub fn shortcut_keys(action: GlobalShortcut, shortcuts: &KeyboardShortcuts) -> &
         GlobalShortcut::FocusAdjacent(FocusDirection::Left) => &shortcuts.previous_column,
         GlobalShortcut::FocusAdjacent(FocusDirection::Right) => &shortcuts.next_column,
         GlobalShortcut::CyclePaneWidth => &shortcuts.cycle_pane_width,
+        GlobalShortcut::CycleWorkspace(FocusDirection::Left) => &shortcuts.previous_workspace,
+        GlobalShortcut::CycleWorkspace(FocusDirection::Right) => &shortcuts.next_workspace,
     }
 }
 
@@ -306,6 +321,10 @@ fn shortcut_matches(
             ShortcutKey::ArrowRight => matches!(
                 key.as_ref(),
                 keyboard::Key::Named(keyboard::key::Named::ArrowRight)
+            ),
+            ShortcutKey::Tab => matches!(
+                key.as_ref(),
+                keyboard::Key::Named(keyboard::key::Named::Tab)
             ),
         }
 }

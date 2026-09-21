@@ -7173,6 +7173,40 @@ pub(crate) fn channels_in_display_order<'a>(
     rows
 }
 
+/// Every top-level destination the sidebar lists -- each project's worktrees
+/// and then its channels -- in the order the reader sees them.
+///
+/// Cycling has to agree with the rows on screen, so it reuses the same
+/// ordering those rows are built from rather than the model's storage order.
+/// The active filter is deliberately not applied: a transient search must not
+/// silently shrink what a keyboard shortcut can reach.
+pub fn workspace_cycle(model: &SidebarModel, state: &SidebarState) -> Vec<SidebarAction> {
+    let mut destinations = Vec::new();
+    for project in &model.projects {
+        destinations.extend(
+            worktrees_in_display_order(
+                &project.repository,
+                state.worktree_sort,
+                &project.worktrees,
+            )
+            .into_iter()
+            .map(|worktree| SidebarAction::OpenWorktree {
+                project_id: project.id,
+                worktree_id: worktree.id,
+                path: worktree.path.clone(),
+            }),
+        );
+        destinations.extend(
+            channels_in_display_order(&project.channels)
+                .into_iter()
+                .map(|channel| SidebarAction::OpenChannel {
+                    channel_id: channel.id,
+                }),
+        );
+    }
+    destinations
+}
+
 /// Case-folds a filter key. Entities store the result so the free-text filter
 /// never folds a candidate while rendering.
 fn fold(value: &str) -> Box<str> {
@@ -8135,6 +8169,55 @@ pub(crate) mod tests {
                 CheckStatus::Failing,
             )],
         )
+    }
+
+    /// Cycling with Alt+Tab has to visit rows in the order the reader sees
+    /// them, worktrees before channels, and it must not be narrowed by a
+    /// transient filter.
+    #[test]
+    fn the_workspace_cycle_follows_the_order_the_sidebar_lists() {
+        let mut entry = project();
+        let mut root = worktree(10, "main", false);
+        root.path = entry.repository.clone();
+        let mut older = worktree(11, "z-old", false);
+        older.created_at_unix_ms = Some(100);
+        let mut newer = worktree(12, "a-new", false);
+        newer.created_at_unix_ms = Some(200);
+        entry.worktrees = vec![older, root, newer];
+        let first = ChannelId::new();
+        let second = ChannelId::new();
+        entry.channels = vec![
+            SidebarChannel::new(first, "First".into(), false, None, false, 1, 1),
+            SidebarChannel::new(second, "Second".into(), false, None, false, 1, 2),
+        ];
+        let model = SidebarModel::ready(SidebarMode::Expanded, vec![entry]);
+        let mut state = SidebarState::default();
+        state.filter = SidebarFilter::Attention;
+
+        let cycle = workspace_cycle(&model, &state);
+        let id = |id| WorktreeId::from_uuid(Uuid::from_u128(id));
+        let worktrees = cycle
+            .iter()
+            .filter_map(|action| match action {
+                SidebarAction::OpenWorktree { worktree_id, .. } => Some(*worktree_id),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        // The primary worktree pins to the top, then newest first.
+        assert_eq!(worktrees, vec![id(10), id(12), id(11)]);
+        let channels = cycle
+            .iter()
+            .filter_map(|action| match action {
+                SidebarAction::OpenChannel { channel_id } => Some(*channel_id),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(channels, vec![second, first]);
+        // Channels follow every worktree of their project.
+        assert!(matches!(
+            cycle.last(),
+            Some(SidebarAction::OpenChannel { .. })
+        ));
     }
 
     #[test]
