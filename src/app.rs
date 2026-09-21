@@ -908,30 +908,13 @@ fn session_health_stream(
     ))
 }
 
-fn restored_terminal_failure(session: &TerminalSession) -> Option<String> {
-    if terminal_completed(session) {
-        return None;
+/// What a relaunch of this terminal would do, as its card offers it.
+fn terminal_relaunch_advice(session: &TerminalSession) -> &'static str {
+    if session.agent_resume_recipe().is_some() {
+        "Restart resumes the saved agent session in a new terminal."
+    } else {
+        "Restart starts a new terminal; no exact agent session is available."
     }
-    let TerminalContinuity::RelaunchAvailable {
-        last_exit: Some(last_exit),
-        ..
-    } = &session.continuity
-    else {
-        return None;
-    };
-    let outcome = if let Some(signal) = last_exit.signal {
-        format!("terminal was terminated by signal {signal}")
-    } else if let Some(code) = last_exit.code {
-        format!("terminal exited with status {code}")
-    } else {
-        "terminal exited".into()
-    };
-    let recovery = if session.agent_resume_recipe().is_some() {
-        "Retry resumes the saved agent session in a new terminal"
-    } else {
-        "Retry starts a new terminal; no exact agent session is available"
-    };
-    Some(format!("{outcome}; {recovery}"))
 }
 
 fn terminal_completed(session: &TerminalSession) -> bool {
@@ -941,10 +924,65 @@ fn terminal_completed(session: &TerminalSession) -> bool {
         if exit.code == Some(0) && exit.signal.is_none())
 }
 
-fn completed_terminal(state: Option<&CardState>) -> Option<&TerminalSession> {
-    match state.map(|state| &state.kind) {
-        Some(CardKind::Terminal(session)) if terminal_completed(session) => Some(session),
+/// The terminal a card shows, once the card is not in the middle of starting
+/// one.
+///
+/// A relaunch carries the previous exit forward as metadata, so between
+/// pressing Restart and the daemon answering the session still reads as ended.
+/// Hydration is what tells the two apart.
+fn settled_terminal(state: Option<&CardState>) -> Option<&TerminalSession> {
+    let state = state?;
+    if matches!(state.residency, Residency::Hydrating { .. }) {
+        return None;
+    }
+    match &state.kind {
+        CardKind::Terminal(session) => Some(session),
         _ => None,
+    }
+}
+
+fn completed_terminal(state: Option<&CardState>) -> Option<&TerminalSession> {
+    settled_terminal(state).filter(|session| terminal_completed(session))
+}
+
+/// Whether a terminal's process has ended, cleanly or not.
+///
+/// An unclean exit is still an end, not a runtime failure: the surface holds
+/// the only account of what the process did, and that account is wanted most
+/// precisely when the process died badly.
+fn terminal_ended(session: &TerminalSession) -> bool {
+    matches!(
+        &session.continuity,
+        TerminalContinuity::RelaunchAvailable {
+            last_exit: Some(_),
+            ..
+        } | TerminalContinuity::Exited { .. }
+    )
+}
+
+fn ended_terminal(state: Option<&CardState>) -> Option<&TerminalSession> {
+    settled_terminal(state).filter(|session| terminal_ended(session))
+}
+
+/// How an ended terminal finished, as the card's status line states it.
+fn terminal_end_summary(session: &TerminalSession) -> String {
+    if terminal_completed(session) {
+        return "Completed".into();
+    }
+    let (TerminalContinuity::RelaunchAvailable {
+        last_exit: Some(last_exit),
+        ..
+    }
+    | TerminalContinuity::Exited { last_exit }) = &session.continuity
+    else {
+        return "Ended".into();
+    };
+    match (last_exit.code, last_exit.signal.as_deref()) {
+        // The host reports the signal the way a shell names it -- "Killed",
+        // "Terminated", "Hangup" -- which is already the whole sentence.
+        (_, Some(signal)) => signal.to_owned(),
+        (Some(code), None) => format!("Exited with status {code}"),
+        (None, None) => "Ended".into(),
     }
 }
 
@@ -954,16 +992,7 @@ fn restored_runtime_residency(
     durable_residency: &Residency,
 ) -> Residency {
     match kind {
-        CardKind::Terminal(session) => restored_terminal_failure(session).map_or_else(
-            || Residency::Hibernated,
-            |message| Residency::Failed {
-                typed_error: RuntimeError {
-                    code: "terminal_exited".into(),
-                    message,
-                },
-                retryable: true,
-            },
-        ),
+        CardKind::Terminal(_) => Residency::Hibernated,
         CardKind::Browser(_) => Residency::Hibernated,
         CardKind::Chat(_) => Residency::Hibernated,
         CardKind::Repository(_) | CardKind::PullRequests(_) => durable_residency.clone(),
@@ -1233,10 +1262,15 @@ fn terminal_transcript_path(id: TerminalId) -> Option<PathBuf> {
     })
 }
 
-fn terminal_exit(exit_code: u32) -> TerminalExit {
+fn terminal_exit(exit_code: u32, signal: Option<&str>) -> TerminalExit {
     TerminalExit {
-        code: i32::try_from(exit_code).ok(),
-        signal: None,
+        // A signalled end has no meaningful status of its own: the shell's
+        // 128+n convention would otherwise read as a plain exit code.
+        code: signal
+            .is_none()
+            .then(|| i32::try_from(exit_code).ok())
+            .flatten(),
+        signal: signal.map(str::to_owned),
         occurred_at_unix_ms: unix_millis(),
     }
 }
@@ -3526,14 +3560,12 @@ impl Cagents {
                     if let Some(state) = self.card_state_mut(card.id) {
                         state.residency = terminal_residency;
                     }
-                    if terminal_completed(&session) {
+                    if terminal_ended(&session) {
+                        // An ended terminal is restored the way it was left,
+                        // however it ended. Its card states the outcome and
+                        // offers a relaunch; it is not a runtime failure.
                         self.lifecycle.remove(card.id);
                         self.cards.insert(card.id, CardRuntime::Completed);
-                    } else if let Some(message) = restored_terminal_failure(&session) {
-                        self.cards
-                            .insert(card.id, CardRuntime::Failed(message.clone()));
-                        self.status
-                            .get_or_insert_with(|| TransientNotice::error(message));
                     } else {
                         // Restored terminals remain detached until lifecycle
                         // reconciliation admits them under the terminal startup
@@ -4452,7 +4484,40 @@ impl Cagents {
         self.mark_runtime_failed(card, message);
     }
 
+    /// Retires a terminal whose process ended, keeping its surface.
+    ///
+    /// Every end is retired the same way, clean or not. A process that died is
+    /// not a runtime that failed: replacing the card with a failure surface
+    /// would throw away the scrollback that says why it died, which is exactly
+    /// what the reader wants after an unclean exit.
+    fn retire_ended_terminal(
+        &mut self,
+        card: CardId,
+        exit_code: u32,
+        signal: Option<&str>,
+        intentional: bool,
+    ) {
+        if let Some(state) = self.card_state_mut(card)
+            && let CardKind::Terminal(session) = &mut state.kind
+        {
+            transition_terminal_to_relaunchable(session, terminal_exit(exit_code, signal));
+        }
+        self.lifecycle.remove(card);
+        self.sidebar_state.clear_agent_activity(card);
+        if let Some(state) = self.card_state_mut(card) {
+            state.residency = Residency::Hibernated;
+        }
+        if !intentional && (exit_code != 0 || signal.is_some()) {
+            self.status = Some(TransientNotice::error(match signal {
+                Some(signal) => format!("terminal exited with {signal}"),
+                None => format!("terminal exited with status {exit_code}"),
+            }));
+        }
+    }
+
     fn completed_terminal_has_native_owner(&self, card: CardId) -> bool {
+        // Only a clean finish hands the card to a native conversation. A
+        // crashed agent has nothing to open; its card offers a restart.
         completed_terminal(self.card_state(card)).is_some_and(|session| {
             self.chat_has_parked_runtime(card)
                 || chat_ui::conversion(session).is_ok_and(|chat| chat.owns_codex_listener())
@@ -4977,7 +5042,7 @@ impl Cagents {
         let mut durable_changed = false;
         let mut recovery = None;
         if let Some(proof) = proof
-            && completed_terminal(self.card_state(card)).is_none()
+            && ended_terminal(self.card_state(card)).is_none()
         {
             self.uncertain_terminal_proofs.remove(&card);
             let live = TerminalContinuity::Live {
@@ -5035,38 +5100,13 @@ impl Cagents {
                     signal,
                     intentional,
                 } => {
-                    if let Some(state) = self.card_state_mut(card)
-                        && let CardKind::Terminal(session) = &mut state.kind
-                    {
-                        let mut last_exit = terminal_exit(exit_code);
-                        // The protocol exposes a signal description rather than
-                        // a portable signal number. Do not misclassify it as a
-                        // successful zero-status completion.
-                        if signal.is_some() && exit_code == 0 {
-                            last_exit.code = None;
-                        }
-                        transition_terminal_to_relaunchable(session, last_exit);
-                    }
+                    self.retire_ended_terminal(card, exit_code, signal.as_deref(), intentional);
                     durable_changed = true;
-                    if exit_code == 0 && signal.is_none() {
-                        self.lifecycle.remove(card);
-                        self.sidebar_state.clear_agent_activity(card);
-                        if let Some(state) = self.card_state_mut(card) {
-                            state.residency = Residency::Hibernated;
-                        }
-                    } else if !intentional {
-                        let message = match signal {
-                            Some(signal) => format!("terminal exited with {signal}"),
-                            None => format!("terminal exited with status {exit_code}"),
-                        };
-                        self.fail_runtime(card, message.clone());
-                        self.status = Some(TransientNotice::error(message));
-                    }
                 }
                 TerminalEvent::Error { operation, message } => {
-                    // Commands already in flight can lose the race with a
-                    // successful exit. They cannot turn completion into failure.
-                    if completed_terminal(self.card_state(card)).is_some() {
+                    // Commands already in flight can lose the race with the
+                    // process ending. They cannot turn an end into a failure.
+                    if ended_terminal(self.card_state(card)).is_some() {
                         continue;
                     }
                     let message = format!("terminal {operation}: {message}");
@@ -5445,7 +5485,7 @@ impl Cagents {
         let content: Element<'a, Message> = match self.cards.get(&id) {
             Some(CardRuntime::Chat(_)) => self.chat_view(id),
             Some(CardRuntime::Terminal(handle)) => TerminalWidget::new(handle.clone())
-                .read_only(completed_terminal(card).is_some())
+                .read_only(ended_terminal(card).is_some())
                 .id(chrome.map_or_else(
                     || workspace_widget::card_focus_id(id),
                     |chrome| chrome.focus_id.clone(),
@@ -5525,9 +5565,18 @@ impl Cagents {
             .padding(spacing.space_m)
             .into(),
             Some(CardRuntime::Completed) => {
-                widget::container(design::body("Process finished successfully."))
-                    .center(Length::Fill)
-                    .into()
+                widget::container(design::body(ended_terminal(card).map_or_else(
+                    || "Process finished successfully.".to_string(),
+                    |session| {
+                        format!(
+                            "{}. {}",
+                            terminal_end_summary(session),
+                            terminal_relaunch_advice(session)
+                        )
+                    },
+                )))
+                .center(Length::Fill)
+                .into()
             }
             Some(CardRuntime::Failed(message)) => widget::container(
                 widget::container(
@@ -5614,11 +5663,13 @@ impl Cagents {
         };
 
         let mut rows: Vec<Element<'a, Message>> = Vec::with_capacity(3);
-        if let Some(session) = completed_terminal(card) {
+        if let Some(session) = ended_terminal(card) {
             let resume = session.agent_resume_recipe().is_some();
             let native = self.completed_terminal_has_native_owner(id);
             let mut controls: Vec<Element<'a, Message>> = vec![
-                design::body("Completed").width(Length::Fill).into(),
+                design::body(terminal_end_summary(session))
+                    .width(Length::Fill)
+                    .into(),
                 widget::button::standard(if native {
                     "Open conversation"
                 } else if resume {
@@ -7387,7 +7438,7 @@ impl Cagents {
 
     fn synchronize_terminal_theme(&mut self) {
         for (card, runtime) in &self.cards {
-            if completed_terminal(self.card_state(*card)).is_some() {
+            if ended_terminal(self.card_state(*card)).is_some() {
                 continue;
             }
             if let CardRuntime::Terminal(surface) = runtime {
@@ -8214,7 +8265,15 @@ impl Application for Cagents {
                         // as a closed visibility channel.
                         self.cards.insert(card, CardRuntime::Terminal(handle));
                         tasks.push(self.drain_terminal(card, 0));
-                        if completed_terminal(self.card_state(card)).is_some() {
+                        if ended_terminal(self.card_state(card)).is_some() {
+                            // The daemon can report a session that already
+                            // ended without a queued event to drain, and a card
+                            // registered as hydrating has nothing else left to
+                            // resolve it.
+                            self.lifecycle.remove(card);
+                            if let Some(state) = self.card_state_mut(card) {
+                                state.residency = Residency::Hibernated;
+                            }
                             self.persist();
                             tasks.push(self.commit_terminal_handoffs());
                             tasks.push(self.finish_terminal_start());
@@ -9535,7 +9594,7 @@ impl Application for Cagents {
                 self.open_link_in(url, self.settings.link_destination(Some(gesture)))
             }
             Message::OpenTerminalOutput(card) => {
-                let url = completed_terminal(self.card_state(card))
+                let url = ended_terminal(self.card_state(card))
                     .and_then(|session| session.transcript_path.as_ref())
                     .and_then(|path| Url::from_file_path(path).ok());
                 match url {
@@ -13668,7 +13727,6 @@ mod tests {
             terminal_start_mode(&session),
             Ok(TerminalStartMode::Spawn(_))
         ));
-        assert!(restored_terminal_failure(&session).is_none());
         assert_eq!(
             restored_runtime_residency(
                 &CardKind::Terminal(session),
@@ -13835,6 +13893,9 @@ mod tests {
         ));
     }
 
+    /// However it ended, a restored terminal is presented the same way it was
+    /// left: an ended card that states its outcome and offers a relaunch, not
+    /// a failed runtime.
     #[test]
     fn restored_child_exit_stays_retryable_without_starting_the_stale_identity() {
         let launch = launch_recipe("/worktree");
@@ -13854,20 +13915,14 @@ mod tests {
             },
         };
 
-        assert!(matches!(
+        assert_eq!(
             restored_runtime_residency(
                 &CardKind::Terminal(session),
                 Exposure::Visible,
                 &Residency::Hot,
             ),
-            Residency::Failed {
-                typed_error: RuntimeError {
-                    code,
-                    ..
-                },
-                retryable: true,
-            } if code == "terminal_exited"
-        ));
+            Residency::Hibernated
+        );
     }
 
     #[test]
@@ -13877,10 +13932,9 @@ mod tests {
         let CardKind::Terminal(session) = &mut app.card_state_mut(card).unwrap().kind else {
             panic!("terminal fixture");
         };
-        transition_terminal_to_relaunchable(session, terminal_exit(0));
+        transition_terminal_to_relaunchable(session, terminal_exit(0, None));
         let identity = session.id;
         assert!(terminal_completed(session));
-        assert!(restored_terminal_failure(session).is_none());
         drop(app.initialize_runtimes());
         assert!(matches!(app.cards.get(&card), Some(CardRuntime::Completed)));
         assert!(app.status.is_none());
@@ -13889,10 +13943,54 @@ mod tests {
                 .reconcile(&HashSet::from([card]), &HashSet::new(), Instant::now())
                 .is_empty()
         );
-        let session = completed_terminal(app.card_state(card)).unwrap();
+        let session = ended_terminal(app.card_state(card)).unwrap();
         assert_eq!(session.id, identity);
         // Relaunch remains an explicit action with a fresh host identity.
         assert_ne!(fresh_terminal_relaunch(session).id, identity);
+    }
+
+    /// A killed session used to take its pane with it: `fail_runtime` replaced
+    /// the terminal runtime with a failure surface, so the scrollback that said
+    /// why the process died was discarded along with it.
+    #[test]
+    fn an_unclean_exit_keeps_the_terminal_surface_it_explains() {
+        let mut app = context_inspector_test_app(true);
+        let card = app.workspace.focused().unwrap();
+        app.lifecycle
+            .register(card, Exposure::Visible, Residency::Hot, Instant::now());
+        // A sentinel stands in for the live surface: the retirement must leave
+        // whatever runtime the card holds exactly where it is.
+        app.cards.insert(card, CardRuntime::Loading);
+
+        app.retire_ended_terminal(card, 0, Some("SIGKILL"), false);
+
+        assert!(matches!(app.cards.get(&card), Some(CardRuntime::Loading)));
+        assert!(app.lifecycle.state(card).is_none());
+        assert_eq!(
+            app.card_state(card).map(|state| &state.residency),
+            Some(&Residency::Hibernated)
+        );
+        assert!(app.status.is_some());
+        let session = ended_terminal(app.card_state(card)).expect("the terminal has ended");
+        // A signalled exit is not a clean zero status, and it says so.
+        assert!(!terminal_completed(session));
+        assert_eq!(terminal_end_summary(session), "SIGKILL");
+
+        app.retire_ended_terminal(card, 0, None, false);
+        let session = ended_terminal(app.card_state(card)).expect("the terminal has ended");
+        assert!(terminal_completed(session));
+        assert_eq!(terminal_end_summary(session), "Completed");
+
+        app.retire_ended_terminal(card, 3, None, false);
+        let session = ended_terminal(app.card_state(card)).expect("the terminal has ended");
+        assert_eq!(terminal_end_summary(session), "Exited with status 3");
+
+        // A relaunch carries the exit forward as metadata. While the card is
+        // hydrating that is a starting terminal, not an ended one, and it must
+        // not be read back as read-only scrollback with a Restart button.
+        app.card_state_mut(card).unwrap().residency = Residency::Hydrating { epoch: 1 };
+        assert!(ended_terminal(app.card_state(card)).is_none());
+        assert!(completed_terminal(app.card_state(card)).is_none());
     }
 
     #[test]
@@ -13901,22 +13999,22 @@ mod tests {
         let CardKind::Terminal(session) = &mut state.kind else {
             panic!("terminal fixture");
         };
-        for (code, signal, completed) in [
-            (Some(0), None, true),
-            (Some(1), None, false),
-            (Some(0), Some(15), false),
-            (None, None, false),
+        for (code, signal, completed, summary) in [
+            (Some(0), None, true, "Completed"),
+            (Some(1), None, false, "Exited with status 1"),
+            (None, Some("Terminated"), false, "Terminated"),
+            (None, None, false, "Ended"),
         ] {
             transition_terminal_to_relaunchable(
                 session,
                 TerminalExit {
                     code,
-                    signal,
+                    signal: signal.map(str::to_owned),
                     occurred_at_unix_ms: 0,
                 },
             );
             assert_eq!(terminal_completed(session), completed);
-            assert_eq!(restored_terminal_failure(session).is_none(), completed);
+            assert_eq!(terminal_end_summary(session), summary);
         }
     }
 
@@ -13934,7 +14032,9 @@ mod tests {
             .join("control.sock");
         session.launch.arguments =
             vec!["--remote".into(), format!("unix://{}", endpoint.display())];
-        transition_terminal_to_relaunchable(session, terminal_exit(0));
+        transition_terminal_to_relaunchable(session, terminal_exit(0, None));
+        // The fixture starts a card mid-hydration; this one has finished.
+        app.card_state_mut(card).unwrap().residency = Residency::Hibernated;
         app.cards.insert(card, CardRuntime::Completed);
         assert!(app.completed_terminal_has_native_owner(card));
         // Dropping the task never connects to or launches a real agent.

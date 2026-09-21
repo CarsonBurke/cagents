@@ -341,7 +341,10 @@ fn fs_metadata_is_executable(path: &Path) -> bool {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TerminalExit {
     pub code: Option<i32>,
-    pub signal: Option<i32>,
+    /// The signal that ended the process, as the host describes it. The PTY
+    /// layer reports a name rather than a portable number, and the name is
+    /// what the card has to show.
+    pub signal: Option<String>,
     pub occurred_at_unix_ms: i64,
 }
 
