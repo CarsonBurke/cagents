@@ -53,10 +53,22 @@ pub(crate) const MAX_PDF_PAGES: usize = 4096;
 /// render may be handed rather than how much memory the window holds.
 pub(crate) const MAX_DOCUMENT_BYTES: u64 = 192 * 1024 * 1024;
 
+/// The most symbolic links a load follows before giving up on the chain.
+///
+/// The kernel's own limit (`SYMLOOP_MAX`, 40 on Linux) is the number above
+/// which a path is a loop rather than a chain, and matching it means a link
+/// the shell can open is a link the editor can open. Each step here is one
+/// `readlinkat` and one lexical join, so the bound is about loops, not cost.
+const MAX_FOLLOWED_LINKS: usize = 40;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ReadOnlyReason {
+    /// A symbolic link the editor would not follow. `target` is the target as
+    /// the refused link spells it, which for a chain is the last link's rather
+    /// than the first's: that is the one the reader has to repair.
     Symlink {
         target: PathBuf,
+        refusal: LinkRefusal,
     },
     Binary,
     InvalidUtf8,
@@ -73,6 +85,24 @@ pub enum ReadOnlyReason {
     NotRegularFile,
 }
 
+/// Why a symbolic link was presented instead of followed.
+///
+/// A link is followed only while everything it names stays inside the
+/// worktree, because the worktree is the boundary every read and write here
+/// is held to: a link is exactly how a repository would otherwise turn an
+/// ordinary open into a read of `/etc/passwd` or a save over `~/.ssh/config`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LinkRefusal {
+    /// The target lies outside the worktree, or reaches its file through a
+    /// directory that is itself a link, which resolution never traverses.
+    LeavesWorktree,
+    /// Nothing exists at the target.
+    Dangling,
+    /// The chain of links is longer than [`MAX_FOLLOWED_LINKS`], which in
+    /// practice means it loops.
+    TooManyLinks,
+}
+
 /// Which of the two size limits a file was held to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OversizeKind {
@@ -81,6 +111,21 @@ pub enum OversizeKind {
     /// The file is a paged document, which never becomes editable and is held
     /// to the document limit instead.
     Document,
+}
+
+/// One file as the view will present it, with the path its bytes came from.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LoadedFile {
+    /// The worktree-relative file the bytes were read from.
+    ///
+    /// The requested path, unless that path is a symbolic link: then the file
+    /// the link resolves to, which is where an edit has to be saved. Saving to
+    /// the link's own name would not update the target but replace the link
+    /// with an ordinary file, which is a change the reader never asked for.
+    /// A link that could not be followed reports the link itself, so the
+    /// source always names something the worktree contains.
+    pub source: PathBuf,
+    pub content: FileContent,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -198,6 +243,13 @@ fn starts_with_pdf_header(file: &File) -> io::Result<bool> {
 
 /// Loads one file, already classified and decoded for the view.
 ///
+/// A symbolic link is followed as long as it stays inside the worktree, and
+/// the result names the file it led to; see [`LoadedFile::source`] for why the
+/// caller has to know. A link that leaves the worktree, dangles or loops is
+/// presented read-only with the reason, because the alternative — an editor
+/// that silently reads and writes outside the tree — is the one thing the
+/// resolution in [`fs_safety`] exists to rule out.
+///
 /// `tone` only reaches the document path. A page is rasterized before the
 /// view sees it, so the caller has to say which surface it is destined for;
 /// the alternative is rendering every page twice whenever the shell is dark.
@@ -205,17 +257,136 @@ pub fn load_file(
     worktree: &Path,
     relative_path: &Path,
     tone: PdfTone,
-) -> Result<FileContent, FileIoError> {
+) -> Result<LoadedFile, FileIoError> {
     validate_repo_path(relative_path)?;
     let root = worktree_root(worktree)?;
+    let mut source = relative_path.to_path_buf();
+    // The link `source` was reached through, with the target it holds, so a
+    // target that turns out to name nothing usable is reported against the
+    // link the reader can repair rather than against a path they never typed.
+    let mut reached_through: Option<(PathBuf, PathBuf)> = None;
+    let mut followed = 0;
     // A symlink is the one classification that has to be made from the name
-    // without opening it, because opening it is exactly what must not happen.
-    let metadata = fs_safety::metadata_beneath(&root, relative_path).map_err(resolve_error)?;
-    if metadata.file_type().is_symlink() {
-        return fs_safety::read_link_beneath(&root, relative_path)
-            .map(|target| FileContent::ReadOnly(ReadOnlyReason::Symlink { target }))
-            .map_err(resolve_error);
+    // without opening it, because opening it is exactly what must not happen:
+    // the kernel would follow it wherever it points, and only a lexical
+    // reading of the target can say whether that is still inside the tree.
+    let metadata = loop {
+        let metadata = match fs_safety::metadata_beneath(&root, &source) {
+            Ok(metadata) => metadata,
+            Err(error) => {
+                // The requested path itself failing to resolve is a failure;
+                // a link's target failing to resolve is a fact about the link.
+                let Some((link, target)) = reached_through else {
+                    return Err(resolve_error(error));
+                };
+                let refusal = if error.is_not_found() {
+                    LinkRefusal::Dangling
+                } else if matches!(error, ResolveError::Escaped { .. }) {
+                    LinkRefusal::LeavesWorktree
+                } else {
+                    return Err(resolve_error(error));
+                };
+                return Ok(refused_link(link, target, refusal));
+            }
+        };
+        if !metadata.file_type().is_symlink() {
+            break metadata;
+        }
+        let target = match fs_safety::read_link_beneath(&root, &source) {
+            Ok(target) => target,
+            // The link a previous hop led to was removed between being
+            // classified and being read: a fact about that hop, reported
+            // as the dangling link it now is.
+            Err(error) if error.is_not_found() && reached_through.is_some() => {
+                let (link, target) = reached_through.expect("checked above");
+                return Ok(refused_link(link, target, LinkRefusal::Dangling));
+            }
+            Err(error) => return Err(resolve_error(error)),
+        };
+        if followed == MAX_FOLLOWED_LINKS {
+            return Ok(refused_link(source, target, LinkRefusal::TooManyLinks));
+        }
+        let Some(resolved) = link_target_beneath(&root, &source, &target) else {
+            return Ok(refused_link(source, target, LinkRefusal::LeavesWorktree));
+        };
+        let Some(resolved) = resolved else {
+            // The link names the worktree itself, which is a directory.
+            return Ok(LoadedFile {
+                source,
+                content: FileContent::ReadOnly(ReadOnlyReason::NotRegularFile),
+            });
+        };
+        followed += 1;
+        reached_through = Some((source, target));
+        source = resolved;
+    };
+    let content = load_regular_file(&root, worktree, &source, metadata, tone)?;
+    Ok(LoadedFile { source, content })
+}
+
+/// The link at `link`, holding `target`, presented rather than followed.
+fn refused_link(link: PathBuf, target: PathBuf, refusal: LinkRefusal) -> LoadedFile {
+    LoadedFile {
+        source: link,
+        content: FileContent::ReadOnly(ReadOnlyReason::Symlink { target, refusal }),
     }
+}
+
+/// Where the link at `link` points, as a worktree-relative path, or `None`
+/// when the target cannot be inside the worktree.
+///
+/// The resolution is lexical: an absolute target has to start with the root,
+/// a relative one is taken from the link's own directory, and `..` climbs out
+/// of that but never above the root. What the resolved path then turns out to
+/// contain — a further link, a directory that is a link, nothing at all — is
+/// for the beneath-root open that follows to decide. `Some(None)` is the root
+/// itself, which is a path this module's resolution has no name for.
+fn link_target_beneath(root: &Root, link: &Path, target: &Path) -> Option<Option<PathBuf>> {
+    let mut resolved: Vec<&std::ffi::OsStr> = Vec::new();
+    let base = if target.is_absolute() {
+        // The root was canonicalized when it was opened, so a target spelled
+        // through a symlinked ancestor of the worktree is refused rather than
+        // guessed at: deciding that it lands inside would take following
+        // links outside the tree, which is the one thing never done here.
+        target.strip_prefix(root.path()).ok()?
+    } else {
+        // `validate_repo_path` admitted only normal components, so the link's
+        // directory is exactly its leading components.
+        resolved.extend(
+            link.parent()
+                .into_iter()
+                .flat_map(Path::components)
+                .map(|component| component.as_os_str()),
+        );
+        target
+    };
+    for component in base.components() {
+        match component {
+            Component::Normal(name) => resolved.push(name),
+            Component::CurDir => {}
+            // Climbing past the root is leaving the worktree, however the
+            // path is spelled afterwards.
+            Component::ParentDir => {
+                resolved.pop()?;
+            }
+            Component::RootDir | Component::Prefix(_) => return None,
+        }
+    }
+    if resolved.is_empty() {
+        return Some(None);
+    }
+    Some(Some(resolved.into_iter().collect()))
+}
+
+/// Reads and classifies the regular file at `relative_path`, whose name was
+/// just found to describe something other than a link.
+fn load_regular_file(
+    root: &Root,
+    worktree: &Path,
+    relative_path: &Path,
+    metadata: fs::Metadata,
+    tone: PdfTone,
+) -> Result<FileContent, FileIoError> {
     if !metadata.is_file() {
         return Ok(FileContent::ReadOnly(ReadOnlyReason::NotRegularFile));
     }
@@ -225,7 +396,7 @@ pub fn load_file(
     // or a hostile local process can put a different object behind it before
     // the read. The kind and the size are therefore taken again from the file
     // whose bytes are actually about to be read.
-    let file = fs_safety::open_beneath(&root, relative_path).map_err(resolve_error)?;
+    let file = fs_safety::open_beneath(root, relative_path).map_err(resolve_error)?;
     let metadata = fs_safety::metadata_of(&file).map_err(io_error)?;
     if !metadata.is_file() {
         return Ok(FileContent::ReadOnly(ReadOnlyReason::NotRegularFile));
@@ -954,7 +1125,7 @@ mod tests {
             width,
             height,
             rgba,
-        } = load_file(root.path(), Path::new("opaque.dat"), PdfTone::Original).unwrap()
+        } = content(root.path(), "opaque.dat")
         else {
             panic!("image magic must win over the filename extension");
         };
@@ -971,18 +1142,18 @@ mod tests {
             .save_with_format(&path, image::ImageFormat::Png)
             .unwrap();
         assert!(matches!(
-            load_file(root.path(), Path::new("wide.png"), PdfTone::Original).unwrap(),
+            content(root.path(), "wide.png"),
             FileContent::ReadOnly(ReadOnlyReason::Image(_))
         ));
         let file = File::create(root.path().join("huge.png")).unwrap();
         file.set_len(MAX_EDITABLE_FILE_BYTES + 1).unwrap();
         assert!(matches!(
-            load_file(root.path(), Path::new("huge.png"), PdfTone::Original).unwrap(),
+            content(root.path(), "huge.png"),
             FileContent::ReadOnly(ReadOnlyReason::Oversize { .. })
         ));
         fs::write(root.path().join("broken.png"), b"not a valid image").unwrap();
         assert!(matches!(
-            load_file(root.path(), Path::new("broken.png"), PdfTone::Original).unwrap(),
+            content(root.path(), "broken.png"),
             FileContent::ReadOnly(ReadOnlyReason::Image(_))
         ));
     }
@@ -1032,7 +1203,7 @@ mod tests {
         fs::write(root.path().join("report"), document_header(0)).unwrap();
         assert!(
             matches!(
-                load_file(root.path(), Path::new("report"), PdfTone::Original).unwrap(),
+                content(root.path(), "report"),
                 FileContent::ReadOnly(ReadOnlyReason::Document(_))
             ),
             "a document whose page cannot be produced is read-only for a document reason"
@@ -1041,7 +1212,7 @@ mod tests {
         // be named like a document stays editable.
         fs::write(root.path().join("notes.pdf"), "not a document at all\n").unwrap();
         assert!(matches!(
-            load_file(root.path(), Path::new("notes.pdf"), PdfTone::Original).unwrap(),
+            content(root.path(), "notes.pdf"),
             FileContent::Editable { .. }
         ));
     }
@@ -1061,7 +1232,7 @@ mod tests {
         .unwrap();
         assert!(
             matches!(
-                load_file(root.path(), Path::new("big.pdf"), PdfTone::Original).unwrap(),
+                content(root.path(), "big.pdf"),
                 FileContent::ReadOnly(ReadOnlyReason::Document(_))
             ),
             "a document must be held to the document limit, not the text limit"
@@ -1070,7 +1241,7 @@ mod tests {
         (&huge).write_all(b"%PDF-1.7\n").unwrap();
         huge.set_len(MAX_DOCUMENT_BYTES + 1).unwrap();
         assert!(matches!(
-            load_file(root.path(), Path::new("huge.pdf"), PdfTone::Original).unwrap(),
+            content(root.path(), "huge.pdf"),
             FileContent::ReadOnly(ReadOnlyReason::Oversize {
                 limit: MAX_DOCUMENT_BYTES,
                 kind: OversizeKind::Document,
@@ -1085,7 +1256,7 @@ mod tests {
         )
         .unwrap();
         assert!(matches!(
-            load_file(root.path(), Path::new("big.txt"), PdfTone::Original).unwrap(),
+            content(root.path(), "big.txt"),
             FileContent::ReadOnly(ReadOnlyReason::Oversize {
                 limit: MAX_EDITABLE_FILE_BYTES,
                 kind: OversizeKind::Editable,
@@ -1119,17 +1290,207 @@ mod tests {
 
         assert_eq!(
             load_file(root.path(), Path::new("binary.bin"), PdfTone::Original).unwrap(),
-            FileContent::ReadOnly(ReadOnlyReason::Binary)
+            loaded("binary.bin", FileContent::ReadOnly(ReadOnlyReason::Binary))
         );
         assert_eq!(
             load_file(root.path(), Path::new("invalid.txt"), PdfTone::Original).unwrap(),
-            FileContent::ReadOnly(ReadOnlyReason::InvalidUtf8)
+            loaded(
+                "invalid.txt",
+                FileContent::ReadOnly(ReadOnlyReason::InvalidUtf8)
+            )
         );
+        // A link is classified by what it leads to, and the source names that.
         assert_eq!(
             load_file(root.path(), Path::new("link.txt"), PdfTone::Original).unwrap(),
+            loaded("binary.bin", FileContent::ReadOnly(ReadOnlyReason::Binary))
+        );
+    }
+
+    /// What the file at `path` presents as, for the tests that are about the
+    /// bytes rather than where they came from.
+    fn content(root: &Path, path: &str) -> FileContent {
+        load_file(root, Path::new(path), PdfTone::Original)
+            .unwrap()
+            .content
+    }
+
+    fn loaded(source: &str, content: FileContent) -> LoadedFile {
+        LoadedFile {
+            source: PathBuf::from(source),
+            content,
+        }
+    }
+
+    fn editable(text: &str, markdown: bool) -> FileContent {
+        FileContent::Editable {
+            text: text.to_owned(),
+            content_hash: blake3::hash(text.as_bytes()),
+            markdown,
+        }
+    }
+
+    fn refused(link: &str, target: &str, refusal: LinkRefusal) -> LoadedFile {
+        loaded(
+            link,
             FileContent::ReadOnly(ReadOnlyReason::Symlink {
-                target: PathBuf::from("binary.bin")
-            })
+                target: PathBuf::from(target),
+                refusal,
+            }),
+        )
+    }
+
+    #[test]
+    fn a_link_inside_the_worktree_opens_its_target() {
+        let root = tempdir().unwrap();
+        fs::create_dir_all(root.path().join("docs/guide")).unwrap();
+        fs::write(root.path().join("CLAUDE.md"), "# Guidance\n").unwrap();
+        fs::write(root.path().join("docs/notes.txt"), "plain\n").unwrap();
+        symlink("CLAUDE.md", root.path().join("AGENTS.md")).unwrap();
+        symlink("../../CLAUDE.md", root.path().join("docs/guide/AGENTS.md")).unwrap();
+        symlink("./notes.txt", root.path().join("docs/README")).unwrap();
+        symlink(
+            root.path().join("docs/notes.txt"),
+            root.path().join("absolute"),
+        )
+        .unwrap();
+        symlink("AGENTS.md", root.path().join("chain")).unwrap();
+        symlink("docs/guide/../notes.txt", root.path().join("round-trip")).unwrap();
+        image::RgbaImage::from_pixel(1, 1, image::Rgba([1, 2, 3, 4]))
+            .save_with_format(root.path().join("docs/pixel.png"), image::ImageFormat::Png)
+            .unwrap();
+        symlink("docs/pixel.png", root.path().join("picture")).unwrap();
+
+        let load = |path: &str| load_file(root.path(), Path::new(path), PdfTone::Original).unwrap();
+        let guidance = loaded("CLAUDE.md", editable("# Guidance\n", true));
+        assert_eq!(load("AGENTS.md"), guidance);
+        // `..` inside the tree is unwound rather than refused.
+        assert_eq!(
+            load("round-trip"),
+            loaded("docs/notes.txt", editable("plain\n", false))
+        );
+        assert!(
+            matches!(
+                load("picture"),
+                LoadedFile { source, content: FileContent::Image { width: 1, height: 1, .. } }
+                    if source == Path::new("docs/pixel.png")
+            ),
+            "a link to an image is the image, from the image's own path"
+        );
+        // `..` climbs out of the link's own directory, not out of the root.
+        assert_eq!(load("docs/guide/AGENTS.md"), guidance);
+        // Whether the buffer is Markdown is a fact about the bytes, so it is
+        // decided by the target's name rather than the link's.
+        assert_eq!(
+            load("docs/README"),
+            loaded("docs/notes.txt", editable("plain\n", false))
+        );
+        // An absolute target is fine as long as it starts at the root.
+        assert_eq!(
+            load("absolute"),
+            loaded("docs/notes.txt", editable("plain\n", false))
+        );
+        assert_eq!(load("chain"), guidance);
+
+        // Saving to the source the load named edits the target and leaves
+        // the link a link; saving to the link's own name is refused, which
+        // is why the runtime never does it.
+        let loaded = load("AGENTS.md");
+        let FileContent::Editable { content_hash, .. } = loaded.content else {
+            unreachable!("asserted editable above");
+        };
+        assert!(matches!(
+            save_file(
+                root.path(),
+                &loaded.source,
+                "# Edited\n",
+                content_hash,
+                false
+            )
+            .unwrap(),
+            SaveOutcome::Saved { .. }
+        ));
+        assert_eq!(
+            fs::read_to_string(root.path().join("CLAUDE.md")).unwrap(),
+            "# Edited\n"
+        );
+        assert_eq!(
+            fs::read_link(root.path().join("AGENTS.md")).unwrap(),
+            Path::new("CLAUDE.md")
+        );
+        assert!(save_file(root.path(), Path::new("AGENTS.md"), "x", content_hash, true).is_err());
+        assert_eq!(
+            fs::read_link(root.path().join("AGENTS.md")).unwrap(),
+            Path::new("CLAUDE.md")
+        );
+    }
+
+    #[test]
+    fn a_link_that_cannot_be_followed_is_presented_with_the_reason() {
+        let root = tempdir().unwrap();
+        let outside = tempdir().unwrap();
+        fs::write(outside.path().join("secret"), "outside\n").unwrap();
+        fs::create_dir(root.path().join("real")).unwrap();
+        fs::write(root.path().join("real/file"), "inside\n").unwrap();
+        symlink("../secret", root.path().join("climbs")).unwrap();
+        symlink("real/../../secret", root.path().join("climbs-late")).unwrap();
+        symlink(outside.path().join("secret"), root.path().join("absolute")).unwrap();
+        symlink("real", root.path().join("linked-dir")).unwrap();
+        symlink("linked-dir/file", root.path().join("through")).unwrap();
+        symlink("missing", root.path().join("dangling")).unwrap();
+        symlink("dangling", root.path().join("to-dangling")).unwrap();
+        symlink("loop-b", root.path().join("loop-a")).unwrap();
+        symlink("loop-a", root.path().join("loop-b")).unwrap();
+        symlink(".", root.path().join("self-dir")).unwrap();
+        symlink("real", root.path().join("directory")).unwrap();
+
+        let load = |path: &str| load_file(root.path(), Path::new(path), PdfTone::Original).unwrap();
+        for link in ["climbs", "climbs-late", "absolute"] {
+            let target = fs::read_link(root.path().join(link)).unwrap();
+            assert_eq!(
+                load(link),
+                refused(link, &target.to_string_lossy(), LinkRefusal::LeavesWorktree),
+                "{link}"
+            );
+        }
+        // A link through a linked directory is refused, not followed, because
+        // resolution beneath the root never traverses one: the directory's
+        // target was never checked.
+        assert_eq!(
+            load("through"),
+            refused("through", "linked-dir/file", LinkRefusal::LeavesWorktree)
+        );
+        assert_eq!(
+            load("dangling"),
+            refused("dangling", "missing", LinkRefusal::Dangling)
+        );
+        // A chain is reported against the link that actually fails.
+        assert_eq!(
+            load("to-dangling"),
+            refused("dangling", "missing", LinkRefusal::Dangling)
+        );
+        // The bound is even, so the loop is reported from where it started.
+        assert_eq!(
+            load("loop-a"),
+            refused("loop-a", "loop-b", LinkRefusal::TooManyLinks)
+        );
+        assert_eq!(
+            load("self-dir"),
+            loaded(
+                "self-dir",
+                FileContent::ReadOnly(ReadOnlyReason::NotRegularFile)
+            )
+        );
+        assert_eq!(
+            load("directory"),
+            loaded(
+                "real",
+                FileContent::ReadOnly(ReadOnlyReason::NotRegularFile)
+            )
+        );
+        // Nothing outside the root was read on the way.
+        assert_eq!(
+            fs::read(outside.path().join("secret")).unwrap(),
+            b"outside\n"
         );
     }
 
