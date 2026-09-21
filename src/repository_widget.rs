@@ -2724,6 +2724,36 @@ impl RepositoryRuntime {
         self.selected.as_ref().map(|file| file.path.as_path())
     }
 
+    pub fn preview_fragment(&mut self, card: CardId, fragment: &str) -> Task<RepositoryAction> {
+        let DocumentState::Editable(document) = &mut self.document else {
+            return Task::none();
+        };
+        if !document.markdown {
+            return Task::none();
+        }
+        document.sync_markdown();
+        self.source_surface = SourceSurface::Editor;
+        self.markdown_mode = MarkdownMode::Preview;
+        if fragment.is_empty() {
+            return iced::widget::scrollable::scroll_to(
+                self.preview_scroll_id.clone(),
+                iced::widget::scrollable::AbsoluteOffset {
+                    x: None,
+                    y: Some(0.0),
+                },
+            );
+        }
+        crate::document_link::heading_index(&document.markdown_items, fragment).map_or_else(
+            Task::none,
+            |index| {
+                crate::document_link::scroll_to_heading(
+                    self.preview_scroll_id.clone(),
+                    crate::document_link::heading_id(card, index),
+                )
+            },
+        )
+    }
+
     /// The live buffer, or nothing while no editable document is open.
     pub fn editor_text(&self) -> Option<String> {
         match &self.document {
@@ -6313,8 +6343,30 @@ fn editable_document_view<'a>(
     {
         widget::scrollable(
             widget::container(
-                markdown::view(&document.markdown_items, cosmic::iced::Theme::Dark)
-                    .map(move |uri| RepositoryAction::MarkdownLink { card, uri }),
+                widget::column::with_children(
+                    document
+                        .markdown_items
+                        .iter()
+                        .enumerate()
+                        .map(|(index, item)| {
+                            let content = markdown::item(
+                                &crate::document_link::PreviewViewer,
+                                markdown::Settings::from(cosmic::iced::Theme::Dark),
+                                item,
+                                index,
+                            )
+                            .map(move |uri| RepositoryAction::MarkdownLink { card, uri });
+                            widget::container(content)
+                                .id(crate::document_link::heading_id(card, index))
+                                .into()
+                        })
+                        .collect::<Vec<_>>(),
+                )
+                .spacing(
+                    markdown::Settings::from(cosmic::iced::Theme::Dark)
+                        .spacing
+                        .0,
+                ),
             )
             .padding(spacing.space_m)
             .max_width(900),

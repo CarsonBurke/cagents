@@ -63,6 +63,7 @@ struct Tab {
     navigation: SidebarState,
     pending_file: Option<PendingFile>,
     pending_diff: Option<bool>,
+    pending_fragment: Option<String>,
     owned_file: Option<PathBuf>,
     next_open: u64,
     files_loaded: bool,
@@ -95,6 +96,7 @@ pub enum Message {
     Choose(bool),
     Chosen(u64, Result<Option<PathBuf>, String>),
     Opened(u64, Result<Opened, String>),
+    DocumentOpened(u64, Option<String>, Result<Opened, String>),
     SessionOpened(u64, Vec<(bool, Result<Opened, String>)>),
     FileResolved(CardId, u64, Result<PathBuf, String>),
     Select(CardId),
@@ -1351,6 +1353,7 @@ impl Editor {
             navigation,
             pending_file,
             pending_diff: None,
+            pending_fragment: None,
             owned_file: None,
             next_open: 1,
             files_loaded: false,
@@ -1587,6 +1590,7 @@ impl Editor {
             return Task::none();
         };
         tab.pending_file = None;
+        tab.pending_fragment = None;
         if RepoPath::parse(&path).is_err() {
             tab.pending_diff = None;
             return Task::none();
@@ -2516,6 +2520,7 @@ impl Application for Editor {
         let navigation_changed = matches!(
             &message,
             Message::Opened(..)
+                | Message::DocumentOpened(..)
                 | Message::SessionOpened(..)
                 | Message::FileResolved(..)
                 | Message::FileOperationFinished(..)
@@ -2622,6 +2627,42 @@ impl Application for Editor {
                     })
                 }
                 Message::Chosen(epoch, Ok(Some(path))) => Self::open(path, epoch),
+                Message::DocumentOpened(epoch, fragment, result) => {
+                    let opened = match result {
+                        Ok(opened) if !self.exiting => opened,
+                        Ok(_) => return Task::none(),
+                        Err(error) => {
+                            self.notice = Some(error);
+                            return Task::none();
+                        }
+                    };
+                    let path = opened.file.as_ref().map(|file| opened.root.join(file));
+                    let task = self.add(opened, epoch == self.selection_epoch);
+                    if epoch != self.selection_epoch {
+                        return task;
+                    }
+                    let owner = path.as_ref().and_then(|path| self.file_owner(path));
+                    let visible = owner == self.active && !self.modal_open();
+                    let navigation =
+                        owner
+                            .and_then(|id| self.tab_mut(id))
+                            .map_or_else(Task::none, |tab| {
+                                tab.pending_fragment = fragment;
+                                if visible && tab.runtime.editor_text().is_some() {
+                                    tab.pending_fragment.take().map_or_else(
+                                        Task::none,
+                                        |fragment| {
+                                            repository_task(
+                                                tab.runtime.preview_fragment(tab.id, &fragment),
+                                            )
+                                        },
+                                    )
+                                } else {
+                                    Task::none()
+                                }
+                            });
+                    Task::batch([task, navigation])
+                }
                 Message::Chosen(_, Ok(None)) => Task::none(),
                 Message::Chosen(_, Err(error)) | Message::Opened(_, Err(error)) => {
                     self.notice = Some(error);
@@ -2672,7 +2713,17 @@ impl Application for Editor {
                 Message::Select(id) => {
                     self.selection_epoch = self.selection_epoch.wrapping_add(1);
                     self.active = Some(id);
-                    Task::none()
+                    self.tab_mut(id).map_or_else(Task::none, |tab| {
+                        if tab.runtime.editor_text().is_some() {
+                            tab.pending_fragment
+                                .take()
+                                .map_or_else(Task::none, |fragment| {
+                                    repository_task(tab.runtime.preview_fragment(id, &fragment))
+                                })
+                        } else {
+                            Task::none()
+                        }
+                    })
                 }
                 Message::CloseTab(id) => self.request_close(id),
                 Message::CloseWindow => {
@@ -2796,14 +2847,48 @@ impl Application for Editor {
                         return self.refresh(id);
                     }
                     if let RepositoryAction::MarkdownLink { uri, .. } = &action {
-                        let uri = uri.to_string();
-                        if !["https://", "http://", "mailto:"]
-                            .iter()
-                            .any(|scheme| uri.starts_with(scheme))
-                        {
-                            self.notice = Some("Only HTTP, HTTPS, and mail links can be opened from document previews.".into());
+                        let Some(source) = self.tab(id).and_then(|tab| {
+                            tab.runtime
+                                .selected_path()
+                                .map(|path| tab.runtime.descriptor.worktree.join(path))
+                        }) else {
                             return Task::none();
-                        }
+                        };
+                        let uri = match cagents::document_link::resolve(&source, uri) {
+                            Ok(cagents::document_link::DocumentLink::External(url)) => {
+                                url.to_string()
+                            }
+                            Ok(cagents::document_link::DocumentLink::Local { path, fragment }) => {
+                                self.selection_epoch = self.selection_epoch.wrapping_add(1);
+                                let epoch = self.selection_epoch;
+                                // Markdown-to-Markdown navigation stays in the preview, including
+                                // fragmentless links. New tabs preserve the source's unsaved edits.
+                                let fragment = Some(fragment.unwrap_or_default());
+                                return cosmic::task::future(async move {
+                                    let result = tokio::task::spawn_blocking(move || {
+                                        let mut opened = Self::resolve_open(path.clone())?;
+                                        if path.is_dir() {
+                                            let directory = path
+                                                .canonicalize()
+                                                .map_err(|error| error.to_string())?;
+                                            if directory != opened.root {
+                                                opened.root = directory;
+                                                opened.snapshot = None;
+                                            }
+                                        }
+                                        Ok(opened)
+                                    })
+                                    .await
+                                    .map_err(|error| error.to_string())
+                                    .and_then(|result| result);
+                                    Message::DocumentOpened(epoch, fragment, result)
+                                });
+                            }
+                            Err(error) => {
+                                self.notice = Some(error);
+                                return Task::none();
+                            }
+                        };
                         return cosmic::task::future(async move {
                             let result = tokio::task::spawn_blocking(move || {
                                 let status =
@@ -2854,6 +2939,12 @@ impl Application for Editor {
                         })
                         .map(cosmic::Action::App);
                     let mut tasks = vec![task];
+                    if focus_loaded
+                        && tab.runtime.editor_text().is_some()
+                        && let Some(fragment) = tab.pending_fragment.take()
+                    {
+                        tasks.push(repository_task(tab.runtime.preview_fragment(id, &fragment)));
+                    }
                     if let Some(staged) = open_diff {
                         let surface = tab.runtime.update(RepositoryAction::ApplySourceSurface {
                             card: id,
@@ -4671,6 +4762,65 @@ mod tests {
         app.settings_open = true;
         drop(app.update(Message::AutoSave(true)));
         assert!(app.settings.editor_auto_save);
+    }
+
+    #[test]
+    fn document_links_deduplicate_tabs_and_keep_the_latest_pending_anchor() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("target.md");
+        std::fs::write(&path, "# First\n\n# Second\n").unwrap();
+        let mut app = configured(&directory);
+        app.selection_epoch = 2;
+        drop(app.update(Message::DocumentOpened(
+            2,
+            Some("second".into()),
+            Editor::resolve_open(path.clone()),
+        )));
+        let id = app.active.unwrap();
+        drop(app.update(Message::DocumentOpened(
+            1,
+            Some("first".into()),
+            Editor::resolve_open(path.clone()),
+        )));
+        assert_eq!(app.tabs.len(), 1);
+        assert_eq!(
+            app.tab(id).unwrap().pending_fragment.as_deref(),
+            Some("second")
+        );
+        drop(
+            app.update(Message::Repository(RepositoryAction::FileLoaded {
+                identity: AsyncIdentity {
+                    card: id,
+                    worktree: directory.path().to_path_buf(),
+                    path: PathBuf::from("target.md"),
+                    generation: 999,
+                },
+                result: cagents::editor::load_file(
+                    directory.path(),
+                    Path::new("target.md"),
+                    cagents::editor::PdfTone::Original,
+                ),
+            })),
+        );
+        assert_eq!(
+            app.tab(id).unwrap().pending_fragment.as_deref(),
+            Some("second")
+        );
+        load_selected(&mut app, id);
+        assert!(app.tab(id).unwrap().pending_fragment.is_none());
+        app.settings_open = true;
+        drop(app.update(Message::DocumentOpened(
+            2,
+            Some("first".into()),
+            Editor::resolve_open(path),
+        )));
+        assert_eq!(
+            app.tab(id).unwrap().pending_fragment.as_deref(),
+            Some("first")
+        );
+        app.settings_open = false;
+        drop(app.update(Message::Select(id)));
+        assert!(app.tab(id).unwrap().pending_fragment.is_none());
     }
 
     #[test]
