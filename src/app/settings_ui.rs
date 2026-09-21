@@ -531,6 +531,20 @@ fn settings_category_controls<'a>(
                     SettingsField::ShortcutCyclePaneWidth,
                     progress,
                 ),
+                setting_input(
+                    "Previous workspace",
+                    "Opens the worktree or channel before this one in the sidebar; may repeat while held.",
+                    &draft.keyboard_shortcuts.previous_workspace,
+                    SettingsField::ShortcutPreviousWorkspace,
+                    progress,
+                ),
+                setting_input(
+                    "Next workspace",
+                    "Opens the worktree or channel after this one in the sidebar; may repeat while held.",
+                    &draft.keyboard_shortcuts.next_workspace,
+                    SettingsField::ShortcutNextWorkspace,
+                    progress,
+                ),
             ],
         )],
     }

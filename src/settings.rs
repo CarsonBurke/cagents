@@ -215,6 +215,8 @@ pub struct KeyboardShortcuts {
     pub previous_column: Vec<String>,
     pub next_column: Vec<String>,
     pub cycle_pane_width: Vec<String>,
+    pub previous_workspace: Vec<String>,
+    pub next_workspace: Vec<String>,
 }
 
 impl Default for KeyboardShortcuts {
@@ -228,6 +230,8 @@ impl Default for KeyboardShortcuts {
             previous_column: vec!["Alt+Q".to_owned(), "Alt+Left".to_owned()],
             next_column: vec!["Alt+W".to_owned(), "Alt+Right".to_owned()],
             cycle_pane_width: vec!["Alt+R".to_owned()],
+            previous_workspace: vec!["Alt+Shift+Tab".to_owned()],
+            next_workspace: vec!["Alt+Tab".to_owned()],
         }
     }
 }
@@ -237,7 +241,7 @@ pub const CHORD_SEPARATOR: &str = ", ";
 
 impl KeyboardShortcuts {
     /// Every action's chord list, in the order the dialog presents them.
-    fn actions(&self) -> [&Vec<String>; 8] {
+    fn actions(&self) -> [&Vec<String>; 10] {
         [
             &self.new_terminal,
             &self.new_channel,
@@ -247,13 +251,15 @@ impl KeyboardShortcuts {
             &self.previous_column,
             &self.next_column,
             &self.cycle_pane_width,
+            &self.previous_workspace,
+            &self.next_workspace,
         ]
     }
 
     fn validate(&self) -> Result<(), SettingsError> {
         let mut parsed = Vec::new();
         for (index, chords) in self.actions().into_iter().enumerate() {
-            if chords.is_empty() && !matches!(index, 1 | 2 | 7) {
+            if chords.is_empty() && !matches!(index, 1 | 2 | 7 | 8 | 9) {
                 // Newly introduced actions may remain unbound so migration
                 // never steals a user's existing custom chord.
                 return Err(SettingsError::InvalidShortcut(
@@ -334,6 +340,7 @@ pub enum ShortcutKey {
     Character(char),
     ArrowLeft,
     ArrowRight,
+    Tab,
 }
 
 pub fn parse_shortcut(raw: &str) -> Result<ShortcutBinding, &'static str> {
@@ -367,13 +374,17 @@ pub fn parse_shortcut(raw: &str) -> Result<ShortcutBinding, &'static str> {
                 Some(ShortcutKey::ArrowLeft)
             } else if token.eq_ignore_ascii_case("right") {
                 Some(ShortcutKey::ArrowRight)
+            } else if token.eq_ignore_ascii_case("tab") {
+                Some(ShortcutKey::Tab)
             } else {
                 let mut characters = token.chars();
                 match (characters.next(), characters.next()) {
                     (Some(character), None) if character.is_ascii_alphanumeric() => {
                         Some(ShortcutKey::Character(character.to_ascii_lowercase()))
                     }
-                    _ => return Err("keyboard shortcut key must be A-Z, 0-9, Left, or Right"),
+                    _ => {
+                        return Err("keyboard shortcut key must be A-Z, 0-9, Left, Right, or Tab");
+                    }
                 }
             };
         }
@@ -792,6 +803,8 @@ where
     preserve_existing_shortcut(&mut shortcuts, "cycle_pane_width", "Alt+R");
     preserve_existing_shortcut(&mut shortcuts, "new_channel", "Alt+G");
     preserve_existing_shortcut(&mut shortcuts, "clone_pane", "Alt+E");
+    preserve_existing_shortcut(&mut shortcuts, "previous_workspace", "Alt+Shift+Tab");
+    preserve_existing_shortcut(&mut shortcuts, "next_workspace", "Alt+Tab");
     toml::Value::Table(shortcuts)
         .try_into()
         .map_err(serde::de::Error::custom)
@@ -811,6 +824,8 @@ where
     preserve_existing_shortcut(&mut shortcuts, "cycle_pane_width", "Alt+R");
     preserve_existing_shortcut(&mut shortcuts, "new_channel", "Alt+G");
     preserve_existing_shortcut(&mut shortcuts, "clone_pane", "Alt+E");
+    preserve_existing_shortcut(&mut shortcuts, "previous_workspace", "Alt+Shift+Tab");
+    preserve_existing_shortcut(&mut shortcuts, "next_workspace", "Alt+Tab");
     toml::Value::Table(shortcuts)
         .try_into()
         .map_err(serde::de::Error::custom)
@@ -1988,6 +2003,18 @@ next_column = ["Alt+W", "Alt+Right"]
             }
         );
         assert!(parse_shortcut("T").is_err());
+        assert_eq!(
+            parse_shortcut("Alt+Shift+Tab").unwrap(),
+            ShortcutBinding {
+                control: false,
+                alt: true,
+                shift: true,
+                logo: false,
+                key: ShortcutKey::Tab,
+            }
+        );
+        // Tab alone still belongs to focus traversal inside a card.
+        assert!(parse_shortcut("Tab").is_err());
         assert!(parse_shortcut("Ctrl+Alt+Left").is_ok());
         assert!(parse_shortcut("Ctrl+NotAKey").is_err());
 

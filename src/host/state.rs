@@ -2077,11 +2077,17 @@ fn record_event_from(
         }
         record.event_sequence = record.event_sequence.saturating_add(1);
         let sequence = record.event_sequence;
-        if let WireTerminalEvent::Exited { exit_code, .. } = &wire_event {
+        if let WireTerminalEvent::Exited {
+            exit_code, signal, ..
+        } = &wire_event
+        {
             record.running = false;
             record.last_exit = Some(TerminalExit {
-                code: i32::try_from(*exit_code).ok(),
-                signal: None,
+                code: signal
+                    .is_none()
+                    .then(|| i32::try_from(*exit_code).ok())
+                    .flatten(),
+                signal: signal.clone(),
                 occurred_at_unix_ms: unix_time_ms(),
             });
         }
