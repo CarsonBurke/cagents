@@ -2295,22 +2295,27 @@ impl RepositoryRuntime {
         };
         // A discarded untracked file or committed deletion can disappear from
         // the list entirely. Keep its buffer, but remove all obsolete Git facts.
+        // The row stays the path that was opened. A link's comparisons follow
+        // the target, which is decided again below from the buffer.
         let file = self.file(&path).cloned().unwrap_or_else(|| RepositoryFile {
             path: path.clone(),
             ..RepositoryFile::default()
         });
-        if !self.file_has_basis(&file, &self.diff_basis) && self.basis_resolution.is_none() {
-            self.diff_basis = if file.unstaged {
+        self.selected = Some(file);
+        let Some(subject) = self.subject_file() else {
+            return Task::none();
+        };
+        if !self.file_has_basis(&subject, &self.diff_basis) && self.basis_resolution.is_none() {
+            self.diff_basis = if subject.unstaged {
                 DiffBasis::IndexToWorktree
             } else {
                 DiffBasis::HeadToIndex
             };
-            if !file.changed() {
+            if !subject.changed() {
                 self.source_surface = SourceSurface::Editor;
             }
             self.reset_diff_viewports();
         }
-        self.selected = Some(file);
         self.ensure_current_diff(card)
     }
 
@@ -2800,6 +2805,47 @@ impl RepositoryRuntime {
         (*source != selected.path).then_some(source.as_path())
     }
 
+    /// The file the open buffer's bytes belong to, when that is not the row.
+    ///
+    /// A refused link stays on the row: its source names the link that failed,
+    /// not a file Git can compare. An editable, image, or document buffer
+    /// names the target the bytes were read from.
+    fn followed_source(&self) -> Option<&Path> {
+        let selected = self.selected.as_ref()?;
+        let source = match &self.document {
+            DocumentState::Editable(document) => &document.source,
+            DocumentState::Image { source, .. } | DocumentState::Pdf { source, .. } => source,
+            _ => return None,
+        };
+        (source != &selected.path).then_some(source.as_path())
+    }
+
+    /// Git's facts for the open buffer.
+    ///
+    /// A link aliases the target's row while it is open, so a diff, a gutter
+    /// baseline, and stage or unstage describe that file. The selected row
+    /// stays the link, which is what a result is matched against. A target
+    /// the list does not name has no index facts, and staging stays hidden.
+    fn subject_file(&self) -> Option<RepositoryFile> {
+        let selected = self.selected.as_ref()?;
+        let Some(source) = self.followed_source() else {
+            return Some(selected.clone());
+        };
+        Some(
+            self.file(source)
+                .cloned()
+                .unwrap_or_else(|| RepositoryFile {
+                    path: source.to_path_buf(),
+                    ..RepositoryFile::default()
+                }),
+        )
+    }
+
+    /// The path a comparison of the open buffer asks Git to read.
+    fn diff_pathspec(&self) -> Option<PathBuf> {
+        self.subject_file().map(|file| file.path)
+    }
+
     /// Whether the open buffer's bytes live in a file other than the selected
     /// row, so that a save changes a row the list has to be asked about.
     fn saves_elsewhere(&self) -> bool {
@@ -2849,7 +2895,7 @@ impl RepositoryRuntime {
         stage: bool,
     ) -> Option<crate::repository::PathSelection> {
         use crate::repository::{PathSelection, RepoPath};
-        let file = self.selected.as_ref()?;
+        let file = self.subject_file()?;
         if self.mutation_refresh_pending
             || self.blocks_navigation()
             || !(if stage { file.unstaged } else { file.staged })
@@ -3232,8 +3278,8 @@ impl RepositoryRuntime {
     fn can_show_diff(&self) -> bool {
         !self.is_saving()
             && !self.directory_only
-            && self.selected.as_ref().is_some_and(|file| {
-                self.file_has_basis(file, &self.diff_basis) || self.basis_resolution.is_some()
+            && self.subject_file().is_some_and(|file| {
+                self.file_has_basis(&file, &self.diff_basis) || self.basis_resolution.is_some()
             })
     }
 
@@ -3251,9 +3297,8 @@ impl RepositoryRuntime {
             && !self.directory_only
             && (!self.mutation_refresh_pending || basis.is_immutable())
             && self
-                .selected
-                .as_ref()
-                .is_some_and(|file| self.file_has_basis(file, basis))
+                .subject_file()
+                .is_some_and(|file| self.file_has_basis(&file, basis))
     }
 
     fn can_select_committed_basis(&self, choice: CommittedChoice) -> bool {
@@ -3369,8 +3414,9 @@ impl RepositoryRuntime {
         };
         let selected = self.selected.is_some();
         let selected_changed = self.selected.as_ref().is_some_and(RepositoryFile::changed);
-        let has_staged = self.selected.as_ref().is_some_and(|file| file.staged);
-        let has_unstaged = self.selected.as_ref().is_some_and(|file| file.unstaged);
+        let subject = self.subject_file();
+        let has_staged = subject.as_ref().is_some_and(|file| file.staged);
+        let has_unstaged = subject.as_ref().is_some_and(|file| file.unstaged);
         let editor = selected && self.source_surface == SourceSurface::Editor;
         let diff = selected && self.source_surface == SourceSurface::Diff;
         let markdown_mode = editor.then_some(match self.markdown_mode {
@@ -3840,7 +3886,19 @@ impl RepositoryRuntime {
                 // to re-render, so the page reconciles with the shell as it is
                 // now. Nothing to reconcile renders nothing.
                 let retone = self.retone_document(identity.card, &cosmic::theme::active());
-                Task::batch([retone, self.restore_visible_scroll()])
+                // The row may already have asked Git about itself, which for a
+                // symbolic link is the link. The buffer is the target, so that
+                // comparison is discarded and read again from the target.
+                let followed = self.followed_source().is_some();
+                if followed {
+                    self.diffs.retain(|(basis, _)| basis.is_immutable());
+                }
+                let reload = if followed {
+                    self.ensure_current_diff(identity.card)
+                } else {
+                    Task::none()
+                };
+                Task::batch([retone, self.restore_visible_scroll(), reload])
             }
             RepositoryAction::PdfTone { card, tone } => {
                 let DocumentState::Pdf {
@@ -4442,7 +4500,10 @@ impl RepositoryRuntime {
                 let Some(selected) = self.selected.as_ref() else {
                     return Task::none();
                 };
-                if !self.file_has_basis(selected, &self.diff_basis) {
+                let Some(subject) = self.subject_file() else {
+                    return Task::none();
+                };
+                if !self.file_has_basis(&subject, &self.diff_basis) {
                     return Task::none();
                 }
                 let previous_path = self.comparison_old_path();
@@ -4589,10 +4650,14 @@ impl RepositoryRuntime {
         let Some(selected) = self.selected.as_ref() else {
             return Task::none();
         };
-        if !self.file_has_basis(selected, &self.diff_basis) {
+        let Some(subject) = self.subject_file() else {
+            return Task::none();
+        };
+        if !self.file_has_basis(&subject, &self.diff_basis) {
             return Task::none();
         }
         let old_path = self.comparison_old_path();
+        // The result is matched to the row. Git reads the file the buffer is.
         let identity = self.current_identity(card, selected.path.clone());
         self.request_diff(identity, self.diff_basis.clone(), old_path)
     }
@@ -4609,6 +4674,9 @@ impl RepositoryRuntime {
         self.next_diff_request = self.next_diff_request.wrapping_add(1).max(1);
         let request = self.next_diff_request;
         let cancellation = CancellationToken::new();
+        let pathspec = self
+            .diff_pathspec()
+            .unwrap_or_else(|| identity.path.clone());
         self.set_diff_state(
             basis.clone(),
             DiffState::Loading {
@@ -4621,6 +4689,7 @@ impl RepositoryRuntime {
             basis,
             request,
             old_path,
+            pathspec,
             self.syntax_theme,
             cancellation,
         )
@@ -4632,7 +4701,7 @@ impl RepositoryRuntime {
         {
             return old_path.clone();
         }
-        self.selected.as_ref()?.previous_path(&self.diff_basis)
+        self.subject_file()?.previous_path(&self.diff_basis)
     }
 
     fn open_committed_file(
@@ -5051,17 +5120,17 @@ fn diff_task(
     basis: DiffBasis,
     request: u64,
     old_path: Option<PathBuf>,
+    pathspec: PathBuf,
     syntax_theme: crate::settings::EditorSyntaxTheme,
     cancellation: CancellationToken,
 ) -> Task<RepositoryAction> {
     let worktree = identity.worktree.clone();
-    let path = identity.path.clone();
     let requested = basis.clone();
     cosmic::task::future(async move {
         let content = tokio::task::spawn_blocking(move || {
             load_repository_diff(
                 &worktree,
-                &path,
+                &pathspec,
                 &requested,
                 old_path.as_deref(),
                 syntax_theme,
@@ -5888,19 +5957,19 @@ pub fn selected_file_toolbar(
             .into(),
         );
     }
+    // Stage and unstage follow the file the buffer is. On a symbolic link
+    // that is the target's row, or nothing when that row has no changes.
+    let subject = runtime.subject_file();
+    let staged = subject.as_ref().is_some_and(|file| file.staged);
+    let unstaged = subject.as_ref().is_some_and(|file| file.unstaged);
     let staging: &[(bool, bool, &str, &str)] = if runtime.reviews_pull_request() {
         &[]
     } else {
         &[
-            (
-                true,
-                selected.unstaged,
-                "list-add-symbolic",
-                "Stage file changes",
-            ),
+            (true, unstaged, "list-add-symbolic", "Stage file changes"),
             (
                 false,
-                selected.staged,
+                staged,
                 "list-remove-symbolic",
                 "Unstage file changes",
             ),
@@ -10477,6 +10546,79 @@ mod tests {
         drop(plain.take_lsp_intents());
     }
 
+    /// The row stays the link. The comparison, its baseline, and staging
+    /// follow the target the buffer was read from.
+    #[test]
+    fn a_linked_buffer_compares_and_stages_the_target() {
+        let card = CardId::new();
+        let (mut runtime, identity) = RepositoryRuntime::selection_fixture(card, "AGENTS.md");
+        runtime.files = FileListState::Ready(vec![
+            RepositoryFile {
+                path: "AGENTS.md".into(),
+                staged: true,
+                status: Some("M ".into()),
+                ..RepositoryFile::default()
+            },
+            RepositoryFile {
+                path: "CLAUDE.md".into(),
+                unstaged: true,
+                unstaged_old_path: Some("notes.md".into()),
+                status: Some(" M".into()),
+                ..RepositoryFile::default()
+            },
+        ]);
+        drop(runtime.update(RepositoryAction::FileLoaded {
+            identity,
+            result: Ok(LoadedFile {
+                source: "CLAUDE.md".into(),
+                content: FileContent::Editable {
+                    text: "new\n".into(),
+                    content_hash: blake3::hash(b"new\n"),
+                    markdown: false,
+                },
+            }),
+        }));
+        assert_eq!(runtime.selected_path(), Some(Path::new("AGENTS.md")));
+        assert_eq!(
+            runtime.diff_pathspec().as_deref(),
+            Some(Path::new("CLAUDE.md")),
+            "Git is asked for the file the buffer is, not the link row"
+        );
+        assert_eq!(
+            runtime.comparison_old_path().as_deref(),
+            Some(Path::new("notes.md")),
+            "the old side is the target's rename, which is the index baseline"
+        );
+        let selection = runtime
+            .selected_staging_selection(true)
+            .expect("the target has unstaged changes to stage");
+        assert_eq!(
+            selection.path.as_path(),
+            Path::new("CLAUDE.md"),
+            "staging names the target"
+        );
+        assert_eq!(
+            selection.old_path.as_ref().map(|path| path.as_path()),
+            Some(Path::new("notes.md"))
+        );
+        assert!(
+            runtime.selected_staging_selection(false).is_none(),
+            "the link's own staged bit must not unstage the link"
+        );
+        assert!(runtime.can_show_diff());
+
+        // A target with nothing to stage hides the command rather than
+        // acting on the link entry.
+        runtime.files = FileListState::Ready(vec![RepositoryFile {
+            path: "AGENTS.md".into(),
+            unstaged: true,
+            status: Some(" M".into()),
+            ..RepositoryFile::default()
+        }]);
+        assert!(runtime.selected_staging_selection(true).is_none());
+        assert!(runtime.selected_staging_selection(false).is_none());
+    }
+
     /// A save through a link changes a row other than the selected one, so
     /// the list is asked again rather than the selected row marked modified.
     #[test]
@@ -12296,6 +12438,51 @@ mod tests {
             resolve_basis(fetched.path(), CommittedChoice::LastCommit),
             Ok(ResolvedBasis::NoCommit)
         );
+    }
+
+    /// Git reports a symlink as the link itself. The buffer behind that link
+    /// is the target's text, and that text is what a comparison has to read
+    /// — including the index side a gutter tint is measured from.
+    #[test]
+    fn a_symlink_comparison_reads_the_target_text() {
+        use std::os::unix::fs::symlink;
+        let root = tempdir().unwrap();
+        git_fixture(root.path());
+        std::fs::write(root.path().join("CLAUDE.md"), "old\n").unwrap();
+        symlink("CLAUDE.md", root.path().join("AGENTS.md")).unwrap();
+        run_git(root.path(), ["add", "CLAUDE.md", "AGENTS.md"]);
+        run_git(root.path(), ["commit", "-qm", "add both"]);
+        std::fs::write(root.path().join("CLAUDE.md"), "new\n").unwrap();
+        let token = CancellationToken::new();
+        let link = load_repository_diff(
+            root.path(),
+            Path::new("AGENTS.md"),
+            &DiffBasis::IndexToWorktree,
+            None,
+            crate::settings::EditorSyntaxTheme::Auto,
+            &token,
+        );
+        assert!(
+            matches!(link, RenderedDiff::NoText(_)),
+            "the link row is not a text diff: {link:?}"
+        );
+        let target = load_repository_diff(
+            root.path(),
+            Path::new("CLAUDE.md"),
+            &DiffBasis::IndexToWorktree,
+            None,
+            crate::settings::EditorSyntaxTheme::Auto,
+            &token,
+        );
+        let RenderedDiff::Text { model, .. } = target else {
+            panic!("the target is a text diff: {target:?}");
+        };
+        assert_eq!(
+            model.before.as_ref(),
+            "old\n",
+            "the baseline is the target's index content"
+        );
+        assert!(model.additions >= 1);
     }
 
     /// An empty repository on a named initial branch, because the branch tests
