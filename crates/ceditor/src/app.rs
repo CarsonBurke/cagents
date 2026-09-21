@@ -1,11 +1,13 @@
 use cagents::settings_widgets::{Setting, field as settings_field, group as settings_group};
 use cagents::{
     design,
+    github::{self, GitHubService},
     lsp::{
         LspCompletionItem, LspDiagnostic, LspDocumentId, LspEvent, LspManager, LspPosition,
         LspStatus,
     },
     model::{CardId, ProjectId, RepositoryView, WorktreeId},
+    pull_request_review::{self, ReviewSource},
     repository::{
         CancellationToken, DiffBasis, MutationOutcome, PathSelection, RepoPath, RepositoryId,
         RepositoryService, RepositorySnapshot, StageRequest, UnstageRequest,
@@ -81,6 +83,35 @@ struct Tab {
     mutation: bool,
     snapshot_loading: bool,
     snapshot_refresh_pending: bool,
+    /// The pull request review behind the sidebar's Pull requests panel. It
+    /// lists the GitHub repository the worktree's remotes name and drives
+    /// `runtime` through the files of whichever pull request is open.
+    review: pull_request_review::State,
+}
+
+/// The GitHub repository a worktree's remotes name, `origin` first, for the
+/// review to list pull requests from.
+fn review_source(root: &Path, snapshot: Option<&RepositorySnapshot>) -> Option<ReviewSource> {
+    review_source_for_remotes(root, &snapshot?.remotes)
+}
+
+fn review_source_for_remotes(
+    root: &Path,
+    remotes: &[cagents::repository::RemoteRecord],
+) -> Option<ReviewSource> {
+    let key = remotes
+        .iter()
+        .filter_map(|remote| github::remote_repository_key(remote.fetch_url.as_deref()?))
+        .collect::<Vec<_>>();
+    let repository = key
+        .iter()
+        .find(|key| github::remote_for_repository(remotes, key).as_deref() == Some("origin"))
+        .or_else(|| key.first())?
+        .clone();
+    Some(ReviewSource {
+        repository,
+        worktree: root.to_path_buf(),
+    })
 }
 
 struct FileOperationDialog {
@@ -120,6 +151,8 @@ pub enum Message {
         basis: DiffBasis,
     },
     Sidebar(SidebarAction),
+    /// One step of a tab's pull request review; see [`Tab::review`].
+    PullRequestReview(CardId, pull_request_review::Action),
     Snapshot(CardId, Result<RepositorySnapshot, String>),
     Mutation(CardId, Result<MutationOutcome, String>),
     FileNameChanged(String),
@@ -211,6 +244,9 @@ pub(crate) enum EditorShortcut {
     FilterFiles,
     QuickOpen,
     ToggleSidebar,
+    ReviewToggleViewed,
+    ReviewNextFile,
+    ReviewPreviousFile,
 }
 impl crate::preferences::EditorShortcuts {
     fn set(&mut self, action: EditorShortcut, value: String) {
@@ -224,6 +260,9 @@ impl crate::preferences::EditorShortcuts {
             EditorShortcut::FilterFiles => self.filter_files = value,
             EditorShortcut::QuickOpen => self.quick_open = value,
             EditorShortcut::ToggleSidebar => self.toggle_sidebar = value,
+            EditorShortcut::ReviewToggleViewed => self.review_toggle_viewed = value,
+            EditorShortcut::ReviewNextFile => self.review_next_file = value,
+            EditorShortcut::ReviewPreviousFile => self.review_previous_file = value,
         }
     }
 
@@ -238,22 +277,33 @@ impl crate::preferences::EditorShortcuts {
             EditorShortcut::FilterFiles => &self.filter_files,
             EditorShortcut::QuickOpen => &self.quick_open,
             EditorShortcut::ToggleSidebar => &self.toggle_sidebar,
+            EditorShortcut::ReviewToggleViewed => &self.review_toggle_viewed,
+            EditorShortcut::ReviewNextFile => &self.review_next_file,
+            EditorShortcut::ReviewPreviousFile => &self.review_previous_file,
         }
     }
 
     fn validate(&self) -> Result<(), String> {
         let mut seen = Vec::new();
-        for value in [
-            &self.new_tab,
-            &self.open_file,
-            &self.open_folder,
-            &self.save_file,
-            &self.close_tab,
-            &self.find_in_file,
-            &self.filter_files,
-            &self.quick_open,
-            &self.toggle_sidebar,
+        for (value, unbindable) in [
+            (&self.new_tab, false),
+            (&self.open_file, false),
+            (&self.open_folder, false),
+            (&self.save_file, false),
+            (&self.close_tab, false),
+            (&self.find_in_file, false),
+            (&self.filter_files, false),
+            (&self.quick_open, false),
+            (&self.toggle_sidebar, false),
+            (&self.review_toggle_viewed, true),
+            (&self.review_next_file, true),
+            (&self.review_previous_file, true),
         ] {
+            // A review action may stay unbound: its default is dropped when
+            // an older table already used the chord for something else.
+            if unbindable && value.trim().is_empty() {
+                continue;
+            }
             let binding = cagents::settings::parse_shortcut(value)
                 .map_err(|error| format!("Invalid shortcut: {error}"))?;
             if seen.contains(&binding) {
@@ -334,6 +384,36 @@ impl Editor {
         }
         if self.shortcut_pressed(EditorShortcut::ToggleSidebar, event) {
             return Some(self.update(Message::ToggleSidebar));
+        }
+        for (shortcut, action) in [
+            (
+                EditorShortcut::ReviewToggleViewed,
+                pull_request_review::Action::ToggleViewedAndAdvance,
+            ),
+            (
+                EditorShortcut::ReviewNextFile,
+                pull_request_review::Action::NextFile,
+            ),
+            (
+                EditorShortcut::ReviewPreviousFile,
+                pull_request_review::Action::PreviousFile,
+            ),
+        ] {
+            if self.shortcut_pressed(shortcut, event) {
+                // The chords mean something only with a review on screen;
+                // otherwise they stay with the editor, where an arrow chord
+                // may be a line move.
+                let reviewing = self.sidebar_open
+                    && self.sidebar_panel == WorktreePanel::PullRequests
+                    && self
+                        .active
+                        .and_then(|card| self.tab(card))
+                        .is_some_and(|tab| tab.git && tab.review.is_open());
+                return reviewing
+                    .then_some(self.active)
+                    .flatten()
+                    .map(|card| self.update(Message::PullRequestReview(card, action)));
+            }
         }
         None
     }
@@ -720,6 +800,28 @@ fn create_new_file(path: &Path, text: &str) -> Result<(), String> {
         let _ = std::fs::File::open(parent).and_then(|directory| directory.sync_all());
     }
     Ok(())
+}
+
+/// The Pull requests panel body: the open pull requests of the reviewed
+/// repository, or the review of the chosen one.
+fn review_panel<'a>(
+    review: &'a pull_request_review::State,
+    modal_open: bool,
+) -> Element<'a, pull_request_review::Action> {
+    if !review.is_open() {
+        return pull_request_review::browser(review.list(), None, modal_open);
+    }
+    let rows = vec![
+        review.header(modal_open),
+        design::horizontal_rule(),
+        review.notice(modal_open),
+        review.file_list(modal_open),
+    ];
+    widget::column::with_children(rows)
+        .spacing(0)
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .into()
 }
 
 fn shortcut_setting<'a>(
@@ -1278,6 +1380,7 @@ impl Editor {
                 .to_string_lossy()
                 .into_owned()
         };
+        let descriptor_root = opened.root.clone();
         let descriptor = RepositoryView {
             project,
             repository: opened.root.clone(),
@@ -1335,6 +1438,14 @@ impl Editor {
             }
         }
         let task = repository_task(runtime.initial_load(id));
+        let mut review = pull_request_review::State::new(
+            Arc::new(GitHubService::system("gh")),
+            RepositoryService::system("git"),
+        );
+        let review_task = review
+            .set_source(review_source(&descriptor_root, opened.snapshot.as_ref()))
+            .map(move |action| Message::PullRequestReview(id, action))
+            .map(cosmic::Action::App);
         self.tabs.push(Tab {
             id,
             title,
@@ -1356,11 +1467,13 @@ impl Editor {
             mutation: false,
             snapshot_loading: false,
             snapshot_refresh_pending: false,
+            review,
         });
         if self.active.is_none() || (focus && !self.modal_open()) {
             self.active = Some(id);
         }
-        task
+        let effects = self.apply_review_effects(id);
+        Task::batch([task, review_task, effects])
     }
 
     // Pending canonical paths reserve ownership too: CLI/picker opens can
@@ -2071,6 +2184,92 @@ impl Editor {
             .and_then(|result| result);
             Message::Snapshot(id, result)
         })
+    }
+
+    /// Hands a link to the desktop's opener. The exit status comes back as a
+    /// notice because the shell has no browser of its own.
+    fn open_external_link(uri: String) -> Task<Message> {
+        cosmic::task::future(async move {
+            let result = tokio::task::spawn_blocking(move || {
+                let status = std::process::Command::new("xdg-open").arg(uri).status()?;
+                if status.success() {
+                    Ok(())
+                } else {
+                    Err(std::io::Error::other(format!(
+                        "Link opener exited with {status}"
+                    )))
+                }
+            })
+            .await;
+            Message::SettingsSaved(
+                result
+                    .map_err(|error| error.to_string())
+                    .and_then(|result| result.map_err(|error| error.to_string())),
+            )
+        })
+    }
+
+    /// Routes one review action to a tab and carries out what the review
+    /// asks of the shell: which committed file the tab's runtime shows, and
+    /// which link to open.
+    fn handle_review(&mut self, id: CardId, action: pull_request_review::Action) -> Task<Message> {
+        if self.modal_open() && !action.allowed_while_modal() {
+            return Task::none();
+        }
+        let Some(tab) = self.tab_mut(id) else {
+            return Task::none();
+        };
+        let action = match action {
+            pull_request_review::Action::Select(number) => match tab.review.listed_target(number) {
+                Some(target) => pull_request_review::Action::Open(target),
+                None => return Task::none(),
+            },
+            action => action,
+        };
+        let updated = tab
+            .review
+            .update(action)
+            .map(move |action| Message::PullRequestReview(id, action))
+            .map(cosmic::Action::App);
+        Task::batch([updated, self.apply_review_effects(id)])
+    }
+
+    /// Carries out what a tab's review asked of the shell since the last
+    /// drain. Every path that drives the review ends here, including the
+    /// re-sourcing a snapshot triggers, so nothing waits in the outbox for
+    /// the next keystroke.
+    fn apply_review_effects(&mut self, id: CardId) -> Task<Message> {
+        let Some(tab) = self.tab_mut(id) else {
+            return Task::none();
+        };
+        let mut tasks = Vec::new();
+        for effect in tab.review.take_effects() {
+            match effect {
+                pull_request_review::Effect::OpenFile {
+                    path,
+                    old_path,
+                    basis,
+                } => tasks.push(repository_task(tab.runtime.update(
+                    RepositoryAction::OpenCommittedFile {
+                        card: id,
+                        path,
+                        old_path,
+                        basis,
+                    },
+                ))),
+                pull_request_review::Effect::CloseFile => tasks.push(repository_task(
+                    tab.runtime
+                        .update(RepositoryAction::BackToFiles { card: id }),
+                )),
+                pull_request_review::Effect::OpenUrl(url) => {
+                    tasks.push(Self::open_external_link(url.to_string()));
+                }
+                // The shell keeps no session state for the review, so the
+                // selection has nothing to update here.
+                pull_request_review::Effect::SelectionChanged(_) => {}
+            }
+        }
+        Task::batch(tasks)
     }
 
     fn focus_active_editor(&self) -> Task<Message> {
@@ -2882,25 +3081,7 @@ impl Application for Editor {
                                 return Task::none();
                             }
                         };
-                        return cosmic::task::future(async move {
-                            let result = tokio::task::spawn_blocking(move || {
-                                let status =
-                                    std::process::Command::new("xdg-open").arg(uri).status()?;
-                                if status.success() {
-                                    Ok(())
-                                } else {
-                                    Err(std::io::Error::other(format!(
-                                        "Link opener exited with {status}"
-                                    )))
-                                }
-                            })
-                            .await;
-                            Message::SettingsSaved(
-                                result
-                                    .map_err(|error| error.to_string())
-                                    .and_then(|result| result.map_err(|error| error.to_string())),
-                            )
-                        });
+                        return Self::open_external_link(uri);
                     }
                     let basis_resolved =
                         matches!(action, RepositoryAction::DiffBasisResolved { .. });
@@ -3187,6 +3368,7 @@ impl Application for Editor {
                     }
                     task
                 }
+                Message::PullRequestReview(id, action) => self.handle_review(id, action),
                 Message::Snapshot(id, result) => {
                     if let Some(tab) = self.tab_mut(id) {
                         if !tab.snapshot_loading {
@@ -3204,6 +3386,15 @@ impl Application for Editor {
                                     tab.sidebar.source_control =
                                         Some(SourceControlModel::ready(key, &snapshot));
                                 }
+                                // A remote added or retargeted since the last
+                                // read changes which repository is reviewed.
+                                let root = tab.runtime.descriptor.worktree.clone();
+                                let sourced = tab
+                                    .review
+                                    .set_source(review_source(&root, Some(&snapshot)))
+                                    .map(move |action| Message::PullRequestReview(id, action))
+                                    .map(cosmic::Action::App);
+                                return Task::batch([sourced, self.apply_review_effects(id)]);
                             }
                             Err(error) => self.notice = Some(error),
                         }
@@ -3991,21 +4182,35 @@ impl Application for Editor {
             let progress = self.sidebar_progress();
             if progress > 0.0 {
                 let width = self.sidebar_width();
-                workspace.push(cagents::interaction::reveal_leading_width(
+                let panel = if tab.git {
+                    self.sidebar_panel
+                } else {
+                    WorktreePanel::Files
+                };
+                let sidebar = if panel == WorktreePanel::PullRequests {
+                    let id = tab.id;
+                    sidebar::worktree_sidebar_with_body(
+                        &tab.sidebar,
+                        &tab.navigation,
+                        width,
+                        self.modal_open(),
+                        panel,
+                        review_panel(&tab.review, self.modal_open())
+                            .map(move |action| Message::PullRequestReview(id, action)),
+                        Message::Sidebar,
+                    )
+                } else {
                     sidebar::worktree_sidebar(
                         &tab.sidebar,
                         &tab.navigation,
                         width,
                         self.modal_open(),
-                        if tab.git {
-                            self.sidebar_panel
-                        } else {
-                            WorktreePanel::Files
-                        },
+                        panel,
                     )
-                    .map(Message::Sidebar),
-                    width,
-                    progress,
+                    .map(Message::Sidebar)
+                };
+                workspace.push(cagents::interaction::reveal_leading_width(
+                    sidebar, width, progress,
                 ));
                 // The files panel carries no trailing rule of its own: the
                 // splitter draws the single sidebar border and the drag
@@ -4392,6 +4597,24 @@ impl Editor {
                             "Show or hide the files sidebar.",
                             EditorShortcut::ToggleSidebar,
                             &self.shortcut_draft.toggle_sidebar,
+                        ),
+                        shortcut_setting(
+                            "Mark reviewed file viewed",
+                            "Toggles the open pull request file's viewed mark and moves to the next file. Leave empty to unbind.",
+                            EditorShortcut::ReviewToggleViewed,
+                            &self.shortcut_draft.review_toggle_viewed,
+                        ),
+                        shortcut_setting(
+                            "Next reviewed file",
+                            "Opens the next changed file of the open pull request.",
+                            EditorShortcut::ReviewNextFile,
+                            &self.shortcut_draft.review_next_file,
+                        ),
+                        shortcut_setting(
+                            "Previous reviewed file",
+                            "Opens the previous changed file of the open pull request.",
+                            EditorShortcut::ReviewPreviousFile,
+                            &self.shortcut_draft.review_previous_file,
                         ),
                         // Fixed, not configurable: the completion request is wired
                         // to the chord directly rather than through the shortcut
@@ -5344,6 +5567,103 @@ mod tests {
             true,
         ));
         app.active.unwrap()
+    }
+
+    /// Alt+Down and its siblings are ordinary editing chords elsewhere, so
+    /// they act on a review only while one is open and on screen.
+    #[test]
+    fn review_chords_stay_with_the_editor_unless_a_review_is_on_screen() {
+        let mut app = editor();
+        let id = add(&mut app, "/workspace", None);
+        app.tab_mut(id).unwrap().git = true;
+        let next = named_key(keyboard::key::Named::ArrowDown, keyboard::Modifiers::ALT);
+        assert!(app.handle_shortcut(&next).is_none(), "no review is open");
+
+        app.sidebar_panel = WorktreePanel::PullRequests;
+        assert!(app.handle_shortcut(&next).is_none(), "still none open");
+
+        let target = pull_request_review::ReviewTarget {
+            repository: github::GitHubRepoKey::new("github.com", None, "o", "r").unwrap(),
+            worktree: "/workspace".into(),
+            pull_request: Arc::new(
+                serde_json::from_value(serde_json::json!({
+                    "number": 1,
+                    "title": "Change",
+                    "state": "OPEN",
+                    "headRefName": "feature",
+                    "baseRefName": "main",
+                    "updatedAt": "2026-01-01T00:00:00Z",
+                    "url": "https://github.com/o/r/pull/1",
+                }))
+                .unwrap(),
+            ),
+        };
+        drop(
+            app.tab_mut(id)
+                .unwrap()
+                .review
+                .update(pull_request_review::Action::Open(target)),
+        );
+        assert!(app.handle_shortcut(&next).is_some(), "review on screen");
+
+        app.sidebar_panel = WorktreePanel::Files;
+        assert!(app.handle_shortcut(&next).is_none(), "review panel hidden");
+        app.sidebar_panel = WorktreePanel::PullRequests;
+        app.sidebar_open = false;
+        assert!(app.handle_shortcut(&next).is_none(), "sidebar closed");
+    }
+
+    #[test]
+    fn the_review_lists_the_origin_repository_before_other_github_remotes() {
+        let remote = |name: &str, url: &str| cagents::repository::RemoteRecord {
+            name: name.into(),
+            fetch_url: Some(url.into()),
+            push_url: None,
+        };
+        let root = Path::new("/repo");
+        let source = review_source_for_remotes(
+            root,
+            &[
+                remote("upstream", "git@github.com:acme/widgets.git"),
+                remote("origin", "https://github.com/someone/widgets.git"),
+            ],
+        )
+        .expect("a GitHub remote names a repository to review");
+        assert_eq!(source.repository.owner, "someone");
+        assert_eq!(source.worktree, root);
+
+        let source = review_source_for_remotes(
+            root,
+            &[remote("upstream", "git@github.com:acme/widgets.git")],
+        )
+        .expect("any GitHub remote will do without origin");
+        assert_eq!(source.repository.owner, "acme");
+
+        assert!(
+            review_source_for_remotes(root, &[remote("origin", "https://example.org/x.git")])
+                .is_none(),
+            "a remote off GitHub has no pull requests to list"
+        );
+        assert!(review_source(root, None).is_none());
+    }
+
+    #[test]
+    fn the_pull_requests_panel_is_a_sidebar_panel() {
+        let mut app = editor();
+        drop(
+            app.update(Message::Sidebar(SidebarAction::SetWorktreePanel {
+                panel: WorktreePanel::PullRequests,
+            })),
+        );
+        assert_eq!(app.sidebar_panel, WorktreePanel::PullRequests);
+        let id = add(&mut app, "/repo", None);
+        // A tab without a repository has no review to select from; the
+        // choice is dropped rather than reaching the runtime.
+        drop(app.update(Message::PullRequestReview(
+            id,
+            pull_request_review::Action::Select(7),
+        )));
+        assert!(app.tab(id).unwrap().review.target().is_none());
     }
 
     fn files_loaded(app: &mut Editor, id: CardId) {

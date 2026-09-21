@@ -70,6 +70,7 @@ use crate::{
         ProjectId, ProjectState, RepositoryView, Residency, RuntimeError, TerminalContinuity,
         TerminalExit, TerminalId, TerminalSession, WorkspaceState, WorktreeState,
     },
+    pull_request_review,
     repository::{
         CancellationToken, CommitOutcome, CommitRequest, CommitSummary, CreateWorktreeRequest,
         DiffBasis, HistoryRequest, HistoryRevision, MutationOutcome, PushOutcome, PushRequest,
@@ -82,7 +83,7 @@ use crate::{
     session::{SessionRuntime, SessionSaveHealth, SessionSaveHealthEvent},
     settings::{
         self, AppSettings, AppTheme, KeyboardShortcuts, LinkOpenDestination, LinkOpenGesture,
-        TerminalCursorStyle,
+        PullRequestOpenTarget, TerminalCursorStyle,
     },
     sidebar::{
         self, ActiveWorktreeKey, MutationKind, PanelSection, SidebarAction, SidebarDataState,
@@ -1869,6 +1870,7 @@ fn user_workspace_message_blocked_while_modal(message: &Message) -> bool {
         Message::ChannelUi(action) => !action.answers_own_dialog(),
         Message::UpdateUi(update_ui::Action::Apply) => true,
         Message::PullRequestUi(action) => !action.allowed_while_modal(),
+        Message::PullRequestReview { action, .. } => !action.allowed_while_modal(),
         Message::Sidebar(action) => !answers_discard_confirmation(action),
         #[cfg(feature = "integrated-browser")]
         Message::BrowserBack(_)
@@ -2080,6 +2082,7 @@ pub enum SettingsField {
     ConfirmTerminalClose,
     FocusFollowsMouse,
     LinkOpenGesture,
+    PullRequestOpenTarget,
     ShortcutNewTerminal,
     ShortcutNewChannel,
     ShortcutClonePane,
@@ -2090,6 +2093,9 @@ pub enum SettingsField {
     ShortcutCyclePaneWidth,
     ShortcutPreviousWorkspace,
     ShortcutNextWorkspace,
+    ShortcutReviewToggleViewed,
+    ShortcutReviewNextFile,
+    ShortcutReviewPreviousFile,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2117,6 +2123,9 @@ struct ShortcutDraft {
     cycle_pane_width: String,
     previous_workspace: String,
     next_workspace: String,
+    review_toggle_viewed: String,
+    review_next_file: String,
+    review_previous_file: String,
 }
 
 impl ShortcutDraft {
@@ -2132,6 +2141,9 @@ impl ShortcutDraft {
             cycle_pane_width: settings::format_chords(&shortcuts.cycle_pane_width),
             previous_workspace: settings::format_chords(&shortcuts.previous_workspace),
             next_workspace: settings::format_chords(&shortcuts.next_workspace),
+            review_toggle_viewed: settings::format_chords(&shortcuts.review_toggle_viewed),
+            review_next_file: settings::format_chords(&shortcuts.review_next_file),
+            review_previous_file: settings::format_chords(&shortcuts.review_previous_file),
         }
     }
 }
@@ -2163,6 +2175,7 @@ struct SettingsDraft {
     focus_follows_mouse: bool,
     link_open_destination: LinkOpenDestination,
     link_open_gesture: LinkOpenGesture,
+    pull_request_open_target: PullRequestOpenTarget,
     keyboard_shortcuts: ShortcutDraft,
 }
 
@@ -2205,6 +2218,7 @@ impl SettingsDraft {
             focus_follows_mouse: settings.focus_follows_mouse,
             link_open_destination: settings.link_open_destination,
             link_open_gesture: settings.link_open_gesture,
+            pull_request_open_target: settings.pull_request_open_target,
             keyboard_shortcuts: ShortcutDraft::from_shortcuts(&settings.keyboard_shortcuts),
         }
     }
@@ -2273,6 +2287,22 @@ impl SettingsDraft {
             }
             SettingsField::ShortcutNextWorkspace => {
                 self.keyboard_shortcuts.next_workspace = value;
+            }
+            SettingsField::PullRequestOpenTarget => {
+                self.pull_request_open_target = if value == PullRequestOpenTarget::Link.as_str() {
+                    PullRequestOpenTarget::Link
+                } else {
+                    PullRequestOpenTarget::Review
+                };
+            }
+            SettingsField::ShortcutReviewToggleViewed => {
+                self.keyboard_shortcuts.review_toggle_viewed = value;
+            }
+            SettingsField::ShortcutReviewNextFile => {
+                self.keyboard_shortcuts.review_next_file = value;
+            }
+            SettingsField::ShortcutReviewPreviousFile => {
+                self.keyboard_shortcuts.review_previous_file = value;
             }
         }
     }
@@ -2481,6 +2511,29 @@ fn settings_update(
         }
         SettingsField::ShortcutNextWorkspace => {
             next.keyboard_shortcuts.next_workspace = settings::parse_chords(value);
+            Ok(())
+        }
+        SettingsField::PullRequestOpenTarget => match value {
+            "review" => {
+                next.pull_request_open_target = PullRequestOpenTarget::Review;
+                Ok(())
+            }
+            "link" => {
+                next.pull_request_open_target = PullRequestOpenTarget::Link;
+                Ok(())
+            }
+            _ => Err("Choose how pull requests should open.".to_owned()),
+        },
+        SettingsField::ShortcutReviewToggleViewed => {
+            next.keyboard_shortcuts.review_toggle_viewed = settings::parse_chords(value);
+            Ok(())
+        }
+        SettingsField::ShortcutReviewNextFile => {
+            next.keyboard_shortcuts.review_next_file = settings::parse_chords(value);
+            Ok(())
+        }
+        SettingsField::ShortcutReviewPreviousFile => {
+            next.keyboard_shortcuts.review_previous_file = settings::parse_chords(value);
             Ok(())
         }
     };
@@ -2748,6 +2801,10 @@ pub enum Message {
     },
     ProjectUi(project_ui::Action),
     PullRequestUi(pull_request_ui::Action),
+    PullRequestReview {
+        card: CardId,
+        action: pull_request_review::Action,
+    },
     NativeWindowAction(cosmic::app::Action),
     ChatUi(chat_ui::Action),
     UpdateUi(update_ui::Action),
@@ -2912,7 +2969,32 @@ enum CardRuntime {
     #[cfg(feature = "integrated-browser")]
     Browser(BrowserRuntime),
     Repository(Box<RepositoryRuntime>),
-    PullRequests(PathBuf),
+    PullRequests(Box<PullRequestPane>),
+}
+
+/// The pull request card: a review beside a standalone repository runtime
+/// that renders whichever file the review selects.
+///
+/// The runtime is never asked for the worktree's files; it only ever shows
+/// committed content from the fetched pull request range, so the working
+/// tree is left alone and the card cannot dirty it.
+struct PullRequestPane {
+    repository: PathBuf,
+    review: pull_request_review::State,
+    runtime: RepositoryRuntime,
+    /// The pull request a restored card was showing, opened once the
+    /// project's GitHub state has loaded enough to name the repository.
+    pending_number: Option<u64>,
+}
+
+impl PullRequestPane {
+    fn project(&self, model: &sidebar::SidebarModel) -> Option<ProjectId> {
+        model
+            .projects
+            .iter()
+            .find(|project| project.repository == self.repository)
+            .map(|project| project.id)
+    }
 }
 
 /// Static chrome strings for a card kind.
@@ -3638,8 +3720,10 @@ impl Cagents {
                         .insert(card.id, CardRuntime::Repository(Box::new(runtime)));
                 }
                 CardKind::PullRequests(view) => {
+                    let pane = self.pull_request_pane(&view);
                     self.cards
-                        .insert(card.id, CardRuntime::PullRequests(view.repository));
+                        .insert(card.id, CardRuntime::PullRequests(Box::new(pane)));
+                    repository_tasks.push(self.open_pending_pull_request(card.id));
                 }
             }
         }
@@ -3929,13 +4013,499 @@ impl Cagents {
                 load
             }
             CardKind::PullRequests(view) => {
+                let pane = self.pull_request_pane(&view);
                 self.cards
-                    .insert(id, CardRuntime::PullRequests(view.repository));
-                Task::none()
+                    .insert(id, CardRuntime::PullRequests(Box::new(pane)));
+                self.open_pending_pull_request(id)
             }
         };
         self.persist();
         Task::batch([start, self.apply_viewport(update, true, false)])
+    }
+
+    fn pull_request_pane(&self, view: &crate::model::PullRequestView) -> PullRequestPane {
+        let project = self
+            .sidebar_model
+            .projects
+            .iter()
+            .find(|project| project.repository == view.repository)
+            .map_or_else(ProjectId::new, |project| project.id);
+        let mut runtime = RepositoryRuntime::new(RepositoryView {
+            project,
+            repository: view.repository.clone(),
+            worktree: view.repository.clone(),
+        });
+        runtime.set_standalone(true);
+        runtime.set_wrap_lines(self.settings.editor_wrap_lines);
+        runtime.set_syntax_theme(self.settings.editor_syntax_theme);
+        PullRequestPane {
+            repository: view.repository.clone(),
+            review: pull_request_review::State::new(
+                Arc::new(GitHubService::system("gh")),
+                RepositoryService::system("git"),
+            ),
+            runtime,
+            pending_number: view.selected_number,
+        }
+    }
+
+    /// The target for a pull request the project's GitHub state lists, or
+    /// `None` until that state has loaded or when the number is not open.
+    fn pull_request_target(
+        &self,
+        project: ProjectId,
+        number: u64,
+    ) -> Option<pull_request_review::ReviewTarget> {
+        let project = self
+            .sidebar_model
+            .projects
+            .iter()
+            .find(|candidate| candidate.id == project)?;
+        let GitHubAvailability::Ready {
+            repository_key,
+            pull_requests,
+            ..
+        } = self.github_availability.get(&project.id)?
+        else {
+            return None;
+        };
+        let (pull_request, _) = pull_requests
+            .iter()
+            .find(|(pull_request, _)| pull_request.number == number)?;
+        Some(pull_request_review::ReviewTarget {
+            repository: repository_key.clone(),
+            // Fetched refs land in the repository's shared object store, so
+            // the main worktree serves every review of the project.
+            worktree: project.repository.clone(),
+            pull_request: Arc::new(pull_request.clone()),
+        })
+    }
+
+    /// Opens the pull request a card was restored with once it can be named.
+    /// Called on creation and again whenever a project's GitHub state lands.
+    fn open_pending_pull_request(&mut self, card: CardId) -> Task<Message> {
+        let Some(CardRuntime::PullRequests(pane)) = self.cards.get(&card) else {
+            return Task::none();
+        };
+        let Some(number) = pane.pending_number else {
+            return Task::none();
+        };
+        let Some(project) = pane.project(&self.sidebar_model) else {
+            return Task::none();
+        };
+        let Some(target) = self.pull_request_target(project, number) else {
+            // A listed project whose GitHub state is settled but does not
+            // carry the number has nothing to restore: the pull request was
+            // merged or closed since, and waiting would never end.
+            if matches!(
+                self.github_availability.get(&project),
+                Some(GitHubAvailability::Ready { .. })
+            ) && let Some(CardRuntime::PullRequests(pane)) = self.cards.get_mut(&card)
+            {
+                pane.pending_number = None;
+            }
+            return Task::none();
+        };
+        if let Some(CardRuntime::PullRequests(pane)) = self.cards.get_mut(&card) {
+            pane.pending_number = None;
+        }
+        self.apply_pull_request_review(card, pull_request_review::Action::Open(target))
+    }
+
+    /// Every restored pull request card still waiting on this project.
+    fn open_pending_pull_requests(&mut self, project: ProjectId) -> Task<Message> {
+        let waiting: Vec<CardId> = self
+            .cards
+            .iter()
+            .filter_map(|(card, runtime)| match runtime {
+                CardRuntime::PullRequests(pane)
+                    if pane.pending_number.is_some()
+                        && pane.project(&self.sidebar_model) == Some(project) =>
+                {
+                    Some(*card)
+                }
+                _ => None,
+            })
+            .collect();
+        Task::batch(
+            waiting
+                .into_iter()
+                .map(|card| self.open_pending_pull_request(card)),
+        )
+    }
+
+    /// Shows a pull request in the review pane for its project: the open
+    /// pull request card for that repository in this workspace, or a new one.
+    fn review_pull_request(&mut self, project: ProjectId, number: u64) -> Task<Message> {
+        let Some(target) = self.pull_request_target(project, number) else {
+            return Task::none();
+        };
+        let repository = target.worktree.clone();
+        self.show_workspace_for_action();
+        let existing = self.durable.cards.iter().find(|card| {
+            card.existence.is_open()
+                && self
+                    .durable
+                    .channels
+                    .iter()
+                    .find(|channel| channel.cards.contains(&card.id))
+                    .map(|channel| channel.id)
+                    == self.durable.active_channel
+                && matches!(&card.kind, CardKind::PullRequests(view) if view.repository == repository)
+        });
+        let (card, created) = match existing {
+            Some(card) => (card.id, Task::none()),
+            None => self.add_pull_requests_card(repository),
+        };
+        let focus = cosmic::task::message(Message::FocusCard(card));
+        let open = self.apply_pull_request_review(card, pull_request_review::Action::Open(target));
+        Task::batch([created, focus, open])
+    }
+
+    /// Drops fetched ranges of pull requests the project's GitHub state no
+    /// longer lists as open, keeping whatever a pane is still reviewing.
+    /// The refs live in the repository's shared store, which two projects
+    /// rooted in worktrees of one clone both reach, so every pane's target
+    /// is kept, not only those of panes on this project's root.
+    fn prune_pull_request_refs(&self, project: ProjectId) -> Task<Message> {
+        let Some(project) = self
+            .sidebar_model
+            .projects
+            .iter()
+            .find(|candidate| candidate.id == project)
+        else {
+            return Task::none();
+        };
+        let Some(GitHubAvailability::Ready { pull_requests, .. }) =
+            self.github_availability.get(&project.id)
+        else {
+            return Task::none();
+        };
+        let mut retain: Vec<u64> = pull_requests
+            .iter()
+            .map(|(pull_request, _)| pull_request.number)
+            .collect();
+        retain.extend(self.cards.values().filter_map(|runtime| {
+            match runtime {
+                CardRuntime::PullRequests(pane) => pane
+                    .review
+                    .target()
+                    .map(|target| target.pull_request.number),
+                _ => None,
+            }
+        }));
+        pull_request_review::prune_fetched_refs(
+            RepositoryService::system("git"),
+            project.repository.clone(),
+            retain,
+            CancellationToken::new(),
+        )
+        .discard()
+    }
+
+    fn add_pull_requests_card(&mut self, repository: PathBuf) -> (CardId, Task<Message>) {
+        let card_id = CardId::new();
+        let view = crate::model::PullRequestView {
+            repository: repository.clone(),
+            selected_number: None,
+        };
+        let title = repository
+            .file_name()
+            .and_then(|name| normalize_card_name(&name.to_string_lossy()))
+            .map_or_else(|| "Pull requests".to_owned(), |name| format!("{name} PRs"));
+        let card = CardState {
+            id: card_id,
+            generation: self.durable.generation,
+            title: title.clone(),
+            width_fraction: self.settings.default_column_fraction,
+            existence: Existence::Open,
+            exposure: Exposure::Visible,
+            residency: Residency::Hot,
+            kind: CardKind::PullRequests(view.clone()),
+        };
+        let durable = Arc::make_mut(&mut self.durable);
+        durable.cards.push(card);
+        durable.focused = Some(card_id);
+        self.register_channel_card(card_id);
+        let pane = self.pull_request_pane(&view);
+        self.cards
+            .insert(card_id, CardRuntime::PullRequests(Box::new(pane)));
+        let index = self.workspace.cards().len();
+        let update = self
+            .workspace
+            .add_card(
+                WorkspaceCard::new(
+                    card_id,
+                    title,
+                    CardWidth::Fraction(self.settings.default_column_fraction),
+                )
+                .expect("pull request card is valid"),
+                index,
+                true,
+            )
+            .unwrap_or_else(|error| {
+                self.status = Some(TransientNotice::error(error.to_string()));
+                ViewportUpdate::unchanged()
+            });
+        self.persist();
+        (card_id, self.apply_viewport(update, true, false))
+    }
+
+    /// Routes one review action to a pull request card and carries out what
+    /// the review asks of the shell: which file its runtime shows, which link
+    /// to open, and which pull request the card remembers.
+    fn handle_pull_request_review(
+        &mut self,
+        card: CardId,
+        action: pull_request_review::Action,
+    ) -> Task<Message> {
+        if self.modal_is_open() && !action.allowed_while_modal() {
+            return Task::none();
+        }
+        self.apply_pull_request_review(card, action)
+    }
+
+    /// Whether the focused card is a pull request pane, which is when the
+    /// review chords are withheld from other cards' processes.
+    fn review_pane_focused(&self) -> bool {
+        self.workspace
+            .focused()
+            .is_some_and(|card| matches!(self.cards.get(&card), Some(CardRuntime::PullRequests(_))))
+    }
+
+    /// [`Self::handle_pull_request_review`] without the modal gate, for
+    /// actions the shell itself originates: restoring a card's pull request
+    /// and opening one from the sidebar are not keystrokes aimed at a dialog.
+    fn apply_pull_request_review(
+        &mut self,
+        card: CardId,
+        action: pull_request_review::Action,
+    ) -> Task<Message> {
+        let action = match action {
+            pull_request_review::Action::Select(number) => {
+                let Some(CardRuntime::PullRequests(pane)) = self.cards.get(&card) else {
+                    return Task::none();
+                };
+                let Some(target) = pane
+                    .project(&self.sidebar_model)
+                    .and_then(|project| self.pull_request_target(project, number))
+                else {
+                    return Task::none();
+                };
+                pull_request_review::Action::Open(target)
+            }
+            action => action,
+        };
+        let Some(CardRuntime::PullRequests(pane)) = self.cards.get_mut(&card) else {
+            return Task::none();
+        };
+        let mut tasks = vec![
+            pane.review
+                .update(action)
+                .map(move |action| Message::PullRequestReview { card, action })
+                .map(cosmic::Action::App),
+        ];
+        let mut selection: Option<Option<u64>> = None;
+        let mut links = Vec::new();
+        for effect in pane.review.take_effects() {
+            match effect {
+                pull_request_review::Effect::OpenFile {
+                    path,
+                    old_path,
+                    basis,
+                } => tasks.push(repository_task(pane.runtime.update(
+                    RepositoryAction::OpenCommittedFile {
+                        card,
+                        path,
+                        old_path,
+                        basis,
+                    },
+                ))),
+                pull_request_review::Effect::CloseFile => tasks.push(repository_task(
+                    pane.runtime.update(RepositoryAction::BackToFiles { card }),
+                )),
+                pull_request_review::Effect::OpenUrl(url) => links.push(url),
+                pull_request_review::Effect::SelectionChanged(number) => {
+                    selection = Some(number);
+                }
+            }
+        }
+        if let Some(number) = selection
+            && let Some(state) = self.card_state_mut(card)
+            && let CardKind::PullRequests(view) = &mut state.kind
+            && view.selected_number != number
+        {
+            view.selected_number = number;
+            self.persist();
+        }
+        for url in links {
+            tasks.push(self.open_clicked_link(url));
+        }
+        Task::batch(tasks)
+    }
+
+    /// The pull request card: the project's open pull requests, or the
+    /// review of the chosen one, beside the file the review selected.
+    fn pull_request_card_view<'a>(
+        &'a self,
+        id: CardId,
+        pane: &'a PullRequestPane,
+    ) -> Element<'a, Message> {
+        let spacing = cosmic::theme::spacing();
+        let modal_open = self.modal_is_open();
+        let review = &pane.review;
+        let mut side: Vec<Element<'a, pull_request_review::Action>> = Vec::new();
+        if review.is_open() {
+            side.push(review.header(modal_open));
+            side.push(design::horizontal_rule());
+            side.push(review.notice(modal_open));
+            side.push(review.file_list(modal_open));
+        } else {
+            let heading = pane.repository.file_name().map_or_else(
+                || "Pull requests".to_owned(),
+                |name| name.to_string_lossy().into_owned(),
+            );
+            side.push(
+                widget::container(
+                    widget::row::with_children(vec![
+                        crate::ui_controls::symbolic_icon("pull-request-symbolic")
+                            .icon()
+                            .size(design::ROW_ICON_SIZE)
+                            .into(),
+                        design::heading(heading)
+                            .wrapping(iced::widget::text::Wrapping::None)
+                            .ellipsize(iced::widget::text::Ellipsize::End(
+                                EllipsizeHeightLimit::Lines(1),
+                            ))
+                            .width(Length::Fill)
+                            .into(),
+                    ])
+                    .spacing(spacing.space_xxs)
+                    .align_y(Alignment::Center),
+                )
+                .height(Length::Fixed(design::HEADER_CONTENT_HEIGHT))
+                .padding([0, spacing.space_xs])
+                .align_y(Alignment::Center)
+                .width(Length::Fill)
+                .into(),
+            );
+            side.push(design::horizontal_rule());
+            let availability = pane
+                .project(&self.sidebar_model)
+                .and_then(|project| self.github_availability.get(&project));
+            let rows: Vec<Element<'a, pull_request_review::Action>> = match availability {
+                Some(GitHubAvailability::Ready { pull_requests, .. })
+                    if pull_requests.is_empty() =>
+                {
+                    vec![
+                        widget::container(design::caption("No open pull requests."))
+                            .padding(Padding::from([spacing.space_xxs, spacing.space_xs]))
+                            .into(),
+                    ]
+                }
+                Some(GitHubAvailability::Ready { pull_requests, .. }) => pull_requests
+                    .iter()
+                    .map(|(pull_request, _)| {
+                        pull_request_review::browser_row(pull_request, false, modal_open)
+                    })
+                    .collect(),
+                Some(availability) => vec![
+                    widget::container(
+                        design::caption(availability.label())
+                            .wrapping(iced::widget::text::Wrapping::Word),
+                    )
+                    .padding(Padding::from([spacing.space_xxs, spacing.space_xs]))
+                    .into(),
+                ],
+                None => vec![
+                    widget::container(
+                        design::caption("This repository is not open as a project.")
+                            .wrapping(iced::widget::text::Wrapping::Word),
+                    )
+                    .padding(Padding::from([spacing.space_xxs, spacing.space_xs]))
+                    .into(),
+                ],
+            };
+            side.push(
+                widget::scrollable(
+                    widget::container(widget::column::with_children(rows).spacing(0))
+                        .padding(design::with_vertical_rail(Padding::from([
+                            spacing.space_xxxs,
+                            spacing.space_xxs,
+                        ])))
+                        .width(Length::Fill),
+                )
+                .class(cosmic::style::iced::Scrollable::Minimal)
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .into(),
+            );
+        }
+        let side: Element<'a, pull_request_review::Action> = widget::container(
+            widget::column::with_children(side)
+                .spacing(0)
+                .height(Length::Fill),
+        )
+        .width(Length::Fixed(design::NAVIGATION_DEFAULT_WIDTH))
+        .height(Length::Fill)
+        .into();
+        let side = side.map(move |action| Message::PullRequestReview { card: id, action });
+
+        let mut main: Vec<Element<'a, Message>> = Vec::new();
+        if let Some(toolbar) = repository_widget::selected_file_toolbar(id, &pane.runtime) {
+            main.push(toolbar.map(Message::Repository));
+            main.push(design::horizontal_rule());
+        }
+        if review.selected().is_some() {
+            main.push(repository_widget::view(id, &pane.runtime).map(Message::Repository));
+        } else {
+            let (title, detail) = if review.is_open() {
+                (
+                    "Choose a file",
+                    "Pick a changed file to read its diff. The shortcuts move between files and mark them viewed.",
+                )
+            } else {
+                (
+                    "Choose a pull request",
+                    "Pick an open pull request to fetch its changes and review them here.",
+                )
+            };
+            main.push(
+                widget::container(
+                    widget::column::with_children(vec![
+                        crate::ui_controls::symbolic_icon("pull-request-symbolic")
+                            .icon()
+                            .size(32)
+                            .into(),
+                        widget::text::title3(title).into(),
+                        design::body(detail)
+                            .class(cosmic::theme::Text::Custom(design::muted_text))
+                            .wrapping(iced::widget::text::Wrapping::Word)
+                            .align_x(Alignment::Center)
+                            .into(),
+                    ])
+                    .align_x(Alignment::Center)
+                    .spacing(spacing.space_xs)
+                    .max_width(420),
+                )
+                .center(Length::Fill)
+                .padding(spacing.space_m)
+                .into(),
+            );
+        }
+        widget::row::with_children(vec![
+            side,
+            design::vertical_rule(),
+            widget::column::with_children(main)
+                .spacing(0)
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .into(),
+        ])
+        .spacing(0)
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .into()
     }
 
     fn add_repository_card(
@@ -4641,9 +5211,10 @@ impl Cagents {
                 task
             }
             CardKind::PullRequests(view) => {
+                let pane = self.pull_request_pane(&view);
                 self.cards
-                    .insert(card, CardRuntime::PullRequests(view.repository));
-                Task::none()
+                    .insert(card, CardRuntime::PullRequests(Box::new(pane)));
+                self.open_pending_pull_request(card)
             }
             CardKind::Chat(session) => {
                 self.start_chat(card, session, crate::chat::Intent::Restore, None, false)
@@ -5548,42 +6119,7 @@ impl Cagents {
             Some(CardRuntime::Repository(runtime)) => {
                 repository_widget::view(id, runtime).map(Message::Repository)
             }
-            Some(CardRuntime::PullRequests(repository)) => widget::container(
-                widget::container(
-                    widget::column::with_children(vec![
-                        crate::ui_controls::symbolic_icon("pull-request-symbolic")
-                            .icon()
-                            .size(32)
-                            .into(),
-                        widget::text::title3("No pull request selected").into(),
-                        widget::text::body(
-                            "Choose a pull request from Projects to open it in a browser column.",
-                        )
-                        .wrapping(cosmic::iced::widget::text::Wrapping::Word)
-                        .into(),
-                        design::caption(repository.to_string_lossy()).into(),
-                        widget::button::standard("Search projects")
-                            // Disabled rather than dead: the pane does not always
-                            // give the search a control to focus.
-                            .on_press_maybe(
-                                sidebar::search_is_reachable(
-                                    &self.sidebar_model,
-                                    SidebarMode::for_width(self.window_width),
-                                )
-                                .then_some(Message::FocusProjectSearch),
-                            )
-                            .into(),
-                    ])
-                    .align_x(Alignment::Center)
-                    .spacing(spacing.space_xs),
-                )
-                .class(cosmic::theme::Container::Card)
-                .max_width(520)
-                .padding(spacing.space_m),
-            )
-            .center(Length::Fill)
-            .padding(spacing.space_m)
-            .into(),
+            Some(CardRuntime::PullRequests(pane)) => self.pull_request_card_view(id, pane),
             Some(CardRuntime::Completed) => {
                 widget::container(design::body(ended_terminal(card).map_or_else(
                     || "Process finished successfully.".to_string(),
@@ -7672,6 +8208,9 @@ impl Cagents {
                         | SettingsField::ShortcutCyclePaneWidth
                         | SettingsField::ShortcutPreviousWorkspace
                         | SettingsField::ShortcutNextWorkspace
+                        | SettingsField::ShortcutReviewToggleViewed
+                        | SettingsField::ShortcutReviewNextFile
+                        | SettingsField::ShortcutReviewPreviousFile
                 ) {
                     self.card_chrome.clear();
                 }
@@ -7701,6 +8240,11 @@ impl Cagents {
                                 CardRuntime::Repository(runtime) => {
                                     runtime.set_wrap_lines(self.settings.editor_wrap_lines);
                                     runtime.set_syntax_theme(self.settings.editor_syntax_theme);
+                                }
+                                CardRuntime::PullRequests(pane) => {
+                                    pane.runtime.set_wrap_lines(self.settings.editor_wrap_lines);
+                                    pane.runtime
+                                        .set_syntax_theme(self.settings.editor_syntax_theme);
                                 }
                                 CardRuntime::Chat(runtime) => {
                                     runtime.set_syntax_theme(self.settings.editor_syntax_theme);
@@ -7745,7 +8289,11 @@ impl Cagents {
                     | SettingsField::ShortcutNextColumn
                     | SettingsField::ShortcutCyclePaneWidth
                     | SettingsField::ShortcutPreviousWorkspace
-                    | SettingsField::ShortcutNextWorkspace => Task::none(),
+                    | SettingsField::ShortcutNextWorkspace
+                    | SettingsField::PullRequestOpenTarget
+                    | SettingsField::ShortcutReviewToggleViewed
+                    | SettingsField::ShortcutReviewNextFile
+                    | SettingsField::ShortcutReviewPreviousFile => Task::none(),
                 };
                 Task::batch([save, effect])
             }
@@ -8621,6 +9169,13 @@ impl Application for Cagents {
                             .apply_project_order(&self.durable.project_order);
                         self.sync_worktree_operation_rows();
                         self.sidebar_model.data_state = SidebarDataState::Ready;
+                        // Restored pull request cards could not name their
+                        // pull request until this project's GitHub state and
+                        // sidebar entry both existed.
+                        let pending = Task::batch([
+                            self.open_pending_pull_requests(project_id),
+                            self.prune_pull_request_refs(project_id),
+                        ]);
                         if open_cards {
                             task = self.select_worktree(worktree, true);
                         } else if let Some(active) = self.active_workspace.clone() {
@@ -8638,6 +9193,7 @@ impl Application for Cagents {
                         self.publish_project_opened(project_id);
                         task = Task::batch([
                             task,
+                            pending,
                             self.project_avatar_task(project_id),
                             self.reconcile_workspace_model(),
                         ]);
@@ -8758,6 +9314,13 @@ impl Application for Cagents {
                             action => Message::Repository(action),
                         })
                         .map(cosmic::Action::App),
+                    // The pane's runtime only ever shows committed content
+                    // from a fetched range, so the working-tree bookkeeping
+                    // below (source-control reloads, dirty closes) has
+                    // nothing to do for it.
+                    Some(CardRuntime::PullRequests(pane)) => {
+                        repository_task(pane.runtime.update(action))
+                    }
                     _ => Task::none(),
                 };
                 // Every buffer transition the action caused is recorded on the
@@ -8835,7 +9398,22 @@ impl Application for Cagents {
                         self.show_workspace_for_action();
                         self.select_worktree(path, true)
                     }
-                    SidebarAction::OpenPullRequest { url, .. } => self.open_clicked_link(url),
+                    SidebarAction::OpenPullRequest {
+                        project_id,
+                        number,
+                        url,
+                    } => match self.settings.pull_request_open_target {
+                        PullRequestOpenTarget::Review
+                            if self.pull_request_target(project_id, number).is_some() =>
+                        {
+                            self.review_pull_request(project_id, number)
+                        }
+                        // A pull request the project's GitHub state no longer
+                        // lists can still be read on GitHub.
+                        PullRequestOpenTarget::Review | PullRequestOpenTarget::Link => {
+                            self.open_clicked_link(url)
+                        }
+                    },
                     SidebarAction::NewWorktree {
                         project_id,
                         repository,
@@ -10181,6 +10759,27 @@ impl Application for Cagents {
                     Some(workspace_widget::GlobalShortcut::CycleWorkspace(direction)) => {
                         self.cycle_workspace(direction)
                     }
+                    Some(
+                        shortcut @ (workspace_widget::GlobalShortcut::ReviewToggleViewed
+                        | workspace_widget::GlobalShortcut::ReviewNextFile
+                        | workspace_widget::GlobalShortcut::ReviewPreviousFile),
+                    ) => {
+                        let Some(card) = self.workspace.focused().filter(|card| {
+                            matches!(self.cards.get(card), Some(CardRuntime::PullRequests(_)))
+                        }) else {
+                            return Task::none();
+                        };
+                        let action = match shortcut {
+                            workspace_widget::GlobalShortcut::ReviewToggleViewed => {
+                                pull_request_review::Action::ToggleViewedAndAdvance
+                            }
+                            workspace_widget::GlobalShortcut::ReviewNextFile => {
+                                pull_request_review::Action::NextFile
+                            }
+                            _ => pull_request_review::Action::PreviousFile,
+                        };
+                        self.handle_pull_request_review(card, action)
+                    }
                     None => Task::none(),
                 }
             }
@@ -10270,6 +10869,9 @@ impl Application for Cagents {
             }
             Message::ProjectUi(action) => self.handle_project_action(action),
             Message::PullRequestUi(action) => self.handle_pull_request_ui(action),
+            Message::PullRequestReview { card, action } => {
+                self.handle_pull_request_review(card, action)
+            }
             Message::CommitUi(action) => self.update_commit_ui(action),
             Message::ChromeUi(action) => self.update_chrome(action),
             Message::ChannelUi(action) => self.handle_channel_ui(action),
@@ -11028,6 +11630,7 @@ impl Application for Cagents {
             workspace_widget::view(
                 &self.workspace,
                 &self.settings.keyboard_shortcuts,
+                self.review_pane_focused(),
                 self.settings.focus_follows_mouse,
                 self.workspace.viewport_width(),
                 self.workspace_scroll_id.clone(),
@@ -16564,5 +17167,228 @@ mod tests {
             "a commit that was not created must keep the message: the text is the user's work"
         );
         assert!(report.is_some());
+    }
+
+    /// An app with one project whose GitHub state lists the given open pull
+    /// requests, so a sidebar row can be resolved to a review target.
+    fn pull_request_test_app(numbers: &[u64]) -> (Cagents, ProjectId) {
+        let mut app = context_inspector_test_app(false);
+        let project = ProjectId::new();
+        app.sidebar_model.projects.push(SidebarProject::new(
+            project,
+            RepositoryId::new(),
+            "project".into(),
+            "/repo".into(),
+            vec![SidebarWorktree::from_durable(
+                WorktreeId::new(),
+                "/repo".into(),
+                Some("main".into()),
+            )],
+            Vec::new(),
+        ));
+        app.github_availability.insert(
+            project,
+            GitHubAvailability::Ready {
+                repository_key: GitHubRepoKey::new("github.com", None, "o", "r").unwrap(),
+                pull_requests: numbers
+                    .iter()
+                    .map(|number| {
+                        (
+                            crate::pull_request_review::tests::pull_request(*number),
+                            Vec::new(),
+                        )
+                    })
+                    .collect(),
+                refreshed_at: 0,
+            },
+        );
+        (app, project)
+    }
+
+    fn pull_request_cards(app: &Cagents) -> Vec<(CardId, Option<u64>)> {
+        app.durable
+            .cards
+            .iter()
+            .filter_map(|card| match &card.kind {
+                CardKind::PullRequests(view) => Some((card.id, view.selected_number)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn reviewed_number(app: &Cagents, card: CardId) -> Option<u64> {
+        match app.cards.get(&card) {
+            Some(CardRuntime::PullRequests(pane)) => pane
+                .review
+                .target()
+                .map(|target| target.pull_request.number),
+            _ => None,
+        }
+    }
+
+    fn open_pull_request(project_id: ProjectId, number: u64) -> Message {
+        Message::Sidebar(SidebarAction::OpenPullRequest {
+            project_id,
+            number,
+            url: Url::parse(&format!("https://github.com/o/r/pull/{number}")).unwrap(),
+        })
+    }
+
+    #[test]
+    fn a_sidebar_pull_request_opens_one_review_pane_per_repository() {
+        let (mut app, project) = pull_request_test_app(&[7, 8]);
+
+        let _ = app.update(open_pull_request(project, 7));
+        let cards = pull_request_cards(&app);
+        assert_eq!(cards.len(), 1, "one pull request card for the repository");
+        let (card, selected) = cards[0];
+        assert_eq!(selected, Some(7), "the card remembers its pull request");
+        assert_eq!(reviewed_number(&app, card), Some(7));
+        assert_eq!(app.workspace.focused(), Some(card));
+
+        let _ = app.update(open_pull_request(project, 8));
+        let cards = pull_request_cards(&app);
+        assert_eq!(cards.len(), 1, "a second pull request reuses the card");
+        assert_eq!(cards[0], (card, Some(8)));
+        assert_eq!(reviewed_number(&app, card), Some(8));
+
+        // A pull request the project's GitHub state does not list cannot be
+        // reviewed here and is left to the browser.
+        let _ = app.update(open_pull_request(project, 9));
+        assert_eq!(pull_request_cards(&app)[0], (card, Some(8)));
+        assert_eq!(reviewed_number(&app, card), Some(8));
+    }
+
+    #[test]
+    fn the_link_setting_keeps_pull_requests_in_the_browser() {
+        let (mut app, project) = pull_request_test_app(&[7]);
+        app.settings.pull_request_open_target = PullRequestOpenTarget::Link;
+
+        let _ = app.update(open_pull_request(project, 7));
+
+        assert!(
+            pull_request_cards(&app).is_empty(),
+            "a link setting opens no review pane"
+        );
+    }
+
+    #[test]
+    fn a_restored_pull_request_card_reopens_its_pull_request_when_github_loads() {
+        let (mut app, project) = pull_request_test_app(&[7]);
+        let (card, _) = app.add_pull_requests_card("/repo".into());
+        if let Some(CardRuntime::PullRequests(pane)) = app.cards.get_mut(&card) {
+            pane.pending_number = Some(7);
+        }
+        assert_eq!(reviewed_number(&app, card), None);
+
+        let _ = app.open_pending_pull_requests(project);
+
+        assert_eq!(reviewed_number(&app, card), Some(7));
+        assert_eq!(pull_request_cards(&app), vec![(card, Some(7))]);
+
+        // A card restored with a pull request that has since been merged or
+        // closed stops waiting: the listing is settled and will not gain it.
+        let (mut app, project) = pull_request_test_app(&[7]);
+        let (card, _) = app.add_pull_requests_card("/repo".into());
+        if let Some(CardRuntime::PullRequests(pane)) = app.cards.get_mut(&card) {
+            pane.pending_number = Some(42);
+        }
+        let _ = app.open_pending_pull_requests(project);
+        assert_eq!(reviewed_number(&app, card), None);
+        match app.cards.get(&card) {
+            Some(CardRuntime::PullRequests(pane)) => assert_eq!(pane.pending_number, None),
+            _ => panic!("the pull request card is missing"),
+        }
+    }
+
+    /// The pane's surfaces each add and remove named controls (the refresh
+    /// spinner, the viewed marks, the file toolbar), which is the condition
+    /// that strands a named node; see the repository surface test above.
+    #[test]
+    fn moving_through_the_pull_request_pane_repaints_the_window() {
+        use crate::pull_request_review::{Action, tests as review};
+        use crate::repository::ChangeKind;
+        use cosmic::iced::advanced::widget::Tree;
+
+        let (mut app, _) = pull_request_test_app(&[7, 8]);
+        let (card, _) = app.add_pull_requests_card("/repo".into());
+        let mut renderer = headless_renderer();
+        let mut tree = Tree::empty();
+        present(&app, &mut renderer, &mut tree);
+        assert_frame_is_faithful(&app, &tree);
+
+        let review_action = |action| Message::PullRequestReview { card, action };
+        let _ = app.update(review_action(Action::Select(7)));
+        present(&app, &mut renderer, &mut tree);
+        assert_frame_is_faithful(&app, &tree);
+
+        if let Some(CardRuntime::PullRequests(pane)) = app.cards.get_mut(&card) {
+            review::finish_load(
+                &mut pane.review,
+                review::loaded(
+                    vec![
+                        review::entry("src/lib.rs", ChangeKind::Modified),
+                        review::entry("src/new.rs", ChangeKind::Added),
+                        review::entry("docs/guide.md", ChangeKind::Deleted),
+                    ],
+                    vec![review::remote_file("src/lib.rs", true)],
+                ),
+            );
+        }
+        for action in [
+            Action::SelectFile(RepoPath::parse("src/new.rs").unwrap()),
+            Action::ToggleViewed(RepoPath::parse("src/new.rs").unwrap()),
+            Action::NextFile,
+            Action::PreviousFile,
+            Action::Refresh,
+            Action::Close,
+            Action::Select(8),
+        ] {
+            let _ = app.update(review_action(action));
+            present(&app, &mut renderer, &mut tree);
+            assert_frame_is_faithful(&app, &tree);
+        }
+    }
+
+    /// Restoring is the shell's doing, not a keystroke aimed at a dialog, so
+    /// a dialog on screen when the project loads must not swallow it.
+    #[test]
+    fn a_restored_pull_request_reopens_even_under_a_dialog() {
+        let (mut app, project) = pull_request_test_app(&[7]);
+        let (card, _) = app.add_pull_requests_card("/repo".into());
+        if let Some(CardRuntime::PullRequests(pane)) = app.cards.get_mut(&card) {
+            pane.pending_number = Some(7);
+        }
+        app.settings_reset_confirm = true;
+        assert!(app.modal_is_open());
+
+        let _ = app.open_pending_pull_requests(project);
+
+        assert_eq!(reviewed_number(&app, card), Some(7));
+    }
+
+    #[test]
+    fn choosing_a_listed_pull_request_in_the_pane_opens_it() {
+        let (mut app, project) = pull_request_test_app(&[7]);
+        let (card, _) = app.add_pull_requests_card("/repo".into());
+
+        let _ = app.update(Message::PullRequestReview {
+            card,
+            action: crate::pull_request_review::Action::Select(7),
+        });
+        assert_eq!(reviewed_number(&app, card), Some(7));
+        assert_eq!(pull_request_cards(&app), vec![(card, Some(7))]);
+
+        let _ = app.update(Message::PullRequestReview {
+            card,
+            action: crate::pull_request_review::Action::Close,
+        });
+        assert_eq!(reviewed_number(&app, card), None);
+        assert_eq!(
+            pull_request_cards(&app),
+            vec![(card, None)],
+            "closing the review forgets the pull request"
+        );
+        let _ = project;
     }
 }

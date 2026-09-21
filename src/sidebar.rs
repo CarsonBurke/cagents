@@ -4925,11 +4925,88 @@ pub fn worktree_sidebar<'a>(
     worktree_panel(model, state, width, modal_open, panel, true, true)
 }
 
+/// [`worktree_sidebar`] for a panel whose body the shell renders itself: the
+/// sidebar keeps the worktree header, its panel switch, and the loading and
+/// error notices, and `body` fills the space beneath them once the worktree
+/// is readable. Every panel the sidebar owns renders as usual.
+pub fn worktree_sidebar_with_body<'a, M: 'a>(
+    model: &'a SidebarModel,
+    state: &'a SidebarState,
+    width: f32,
+    modal_open: bool,
+    panel: WorktreePanel,
+    body: Element<'a, M>,
+    map: impl Fn(SidebarAction) -> M + 'a,
+) -> Element<'a, M> {
+    let ready = bound_source_control(model, state)
+        .filter(|source| matches!(source.data_state, SidebarDataState::Ready));
+    let (Some(source), WorktreePanel::PullRequests) = (ready, panel) else {
+        return worktree_sidebar(model, state, width, modal_open, panel).map(map);
+    };
+    let worktree = bound_worktree(model, source);
+    let header = source_control_header(state, source, worktree, modal_open, panel, true);
+    let notices: Element<'a, SidebarAction> = source_control_notices(source).into();
+    // The body sits between the sidebar's own header and footer, so each of
+    // those maps on its own; the mapper is shared rather than cloned.
+    let map = std::rc::Rc::new(map);
+    let map_header = map.clone();
+    let map_notices = map.clone();
+    let pane = widget::column::with_children(vec![
+        widget::container(worktree_panel_chrome(
+            header.map(move |action| map_header(action)),
+            notices.map(move |action| map_notices(action)),
+            Some(body),
+        ))
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .into(),
+        crate::design::horizontal_rule(),
+        footer(false, modal_open).map(move |action| map(action)),
+    ])
+    .width(Length::Fill)
+    .height(Length::Fill);
+    widget::container(pane)
+        .width(Length::Fixed(sidebar_pane_width(width)))
+        .height(Length::Fill)
+        .into()
+}
+
+/// The pane width the worktree sidebar renders at for a requested `width`.
+fn sidebar_pane_width(width: f32) -> f32 {
+    if width.is_finite() {
+        width.clamp(0.0, design::INSPECTOR_MAX_WIDTH)
+    } else {
+        design::INSPECTOR_DEFAULT_WIDTH
+    }
+}
+
+/// The sidebar row for the worktree a source-control model describes.
+fn bound_worktree<'a>(
+    model: &'a SidebarModel,
+    source: &SourceControlModel,
+) -> Option<&'a SidebarWorktree> {
+    model
+        .projects
+        .iter()
+        .find(|project| project.id == source.key.project_id)
+        .and_then(|project| {
+            project
+                .worktrees
+                .iter()
+                .find(|worktree| worktree.id == source.key.worktree_id)
+        })
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum WorktreePanel {
     #[default]
     Files,
     Changes,
+    /// The shell's pull request review. The sidebar draws this panel's
+    /// header and notices; the shell supplies the body through
+    /// [`worktree_sidebar_with_body`], because the review's actions are not
+    /// sidebar actions.
+    PullRequests,
 }
 
 fn worktree_panel<'a>(
@@ -4941,25 +5018,12 @@ fn worktree_panel<'a>(
     show_panel_switch: bool,
     settings_footer: bool,
 ) -> Element<'a, SidebarAction> {
-    let width = if width.is_finite() {
-        width.clamp(0.0, design::INSPECTOR_MAX_WIDTH)
-    } else {
-        design::INSPECTOR_DEFAULT_WIDTH
-    };
+    let width = sidebar_pane_width(width);
     let content = match bound_source_control(model, state) {
         Some(source) => source_control_panel(
             state,
             source,
-            model
-                .projects
-                .iter()
-                .find(|project| project.id == source.key.project_id)
-                .and_then(|project| {
-                    project
-                        .worktrees
-                        .iter()
-                        .find(|worktree| worktree.id == source.key.worktree_id)
-                }),
+            bound_worktree(model, source),
             &model.external_editors,
             model.file_management && matches!(model.data_state, SidebarDataState::Ready),
             modal_open,
@@ -5026,13 +5090,12 @@ pub(crate) fn bound_source_control<'a>(
         .filter(|source| &source.key == key)
 }
 
-/// Shared worktree identity and loading slots around file or Git navigation.
-fn source_control_panel<'a>(
+/// The worktree title row with the panel switch and the panel's own
+/// controls: the file filter for Files, the tree/flat switch for Changes.
+fn source_control_header<'a>(
     state: &'a SidebarState,
     source: &'a SourceControlModel,
     worktree: Option<&'a SidebarWorktree>,
-    editors: &'a [SidebarEditor],
-    file_management: bool,
     modal_open: bool,
     panel: WorktreePanel,
     show_panel_switch: bool,
@@ -5093,9 +5156,26 @@ fn source_control_panel<'a>(
         } else {
             changes.into()
         };
+        let pull_requests = crate::ui_controls::icon_control(
+            crate::ui_controls::symbolic_icon("pull-request-symbolic"),
+            if git {
+                "Pull requests"
+            } else {
+                "Open a Git repository to review pull requests"
+            },
+            matches!(panel, WorktreePanel::PullRequests),
+            !modal_open && git,
+            gated(
+                SidebarAction::SetWorktreePanel {
+                    panel: WorktreePanel::PullRequests,
+                },
+                modal_open || !git,
+            ),
+        );
         header = header.push(crate::ui_controls::segmented_controls(vec![
             files.into(),
             changes,
+            pull_requests.into(),
         ]));
     }
     if matches!(panel, WorktreePanel::Files) {
@@ -5122,19 +5202,32 @@ fn source_control_panel<'a>(
     if matches!(panel, WorktreePanel::Changes) {
         header = header.push(list_mode_controls(key, state.change_list_mode, modal_open));
     }
-    let header = header
+    header
         .align_y(Alignment::Center)
         .spacing(spacing.space_xxxs)
         .height(design::HEADER_CONTENT_HEIGHT)
-        .width(Length::Fill);
+        .width(Length::Fill)
+        .into()
+}
 
-    // Both notices are permanent slots. The failure arm below this ends in a
-    // named `Try again` button, and iced reconciles a named child at the index
-    // its name held last frame while writing the positionally unmatched
-    // children over those same indices: a notice arriving above the button left
-    // the reconciled child list one entry short, so the button had no tree at
-    // all and disappeared from the one frame that was asking for a press.
-    let mut notices = widget::column::with_capacity(4).spacing(spacing.space_xxxs);
+/// The progress and error slots beneath the header.
+///
+/// Both notices are permanent slots. The failure arm of the panel ends in a
+/// named `Try again` button, and iced reconciles a named child at the index
+/// its name held last frame while writing the positionally unmatched
+/// children over those same indices: a notice arriving above the button left
+/// the reconciled child list one entry short, so the button had no tree at
+/// all and disappeared from the one frame that was asking for a press.
+fn source_control_notices<'a>(
+    source: &'a SourceControlModel,
+) -> cosmic::iced::widget::Column<'a, SidebarAction, cosmic::Theme, cosmic::Renderer> {
+    let spacing = cosmic::theme::spacing();
+    let mut notices: cosmic::iced::widget::Column<
+        'a,
+        SidebarAction,
+        cosmic::Theme,
+        cosmic::Renderer,
+    > = widget::column::with_capacity(4).spacing(spacing.space_xxxs);
     notices = notices.push(slot(source.progress_label().map(|label| {
         widget::row::with_children(vec![
             crate::ui_controls::activity_spinner_tone(14.0, design::warning_color),
@@ -5144,11 +5237,36 @@ fn source_control_panel<'a>(
         .spacing(spacing.space_xxs)
         .into()
     })));
-    notices = notices.push(slot(source.error.as_deref().map(|error| {
+    notices.push(slot(source.error.as_deref().map(|error| {
         design::caption(error)
             .wrapping(cosmic::iced::widget::text::Wrapping::Word)
             .into()
-    })));
+    })))
+}
+
+/// Shared worktree identity and loading slots around file or Git navigation.
+fn source_control_panel<'a>(
+    state: &'a SidebarState,
+    source: &'a SourceControlModel,
+    worktree: Option<&'a SidebarWorktree>,
+    editors: &'a [SidebarEditor],
+    file_management: bool,
+    modal_open: bool,
+    panel: WorktreePanel,
+    show_panel_switch: bool,
+) -> Element<'a, SidebarAction> {
+    let spacing = cosmic::theme::spacing();
+    let chrome = &source.chrome;
+    let key = &source.key;
+    let header = source_control_header(
+        state,
+        source,
+        worktree,
+        modal_open,
+        panel,
+        show_panel_switch,
+    );
+    let mut notices = source_control_notices(source);
 
     match &source.data_state {
         SidebarDataState::Loading => {
@@ -5156,7 +5274,7 @@ fn source_control_panel<'a>(
             // that says "loading" for that long is a flash of text where the
             // files are about to be. The panel stays blank under its header;
             // the header's own busy spinner is what says a read is running.
-            return worktree_panel_chrome(header.into(), notices.into(), None);
+            return worktree_panel_chrome(header, notices.into(), None);
         }
         SidebarDataState::Error(message) => {
             notices = notices
@@ -5172,14 +5290,18 @@ fn source_control_panel<'a>(
                             modal_open,
                         )),
                 );
-            return worktree_panel_chrome(header.into(), notices.into(), None);
+            return worktree_panel_chrome(header, notices.into(), None);
         }
         SidebarDataState::Ready => {}
     }
 
+    // The shell renders this panel's body; see `worktree_sidebar_with_body`.
+    if matches!(panel, WorktreePanel::PullRequests) {
+        return worktree_panel_chrome(header, notices.into(), None);
+    }
     if matches!(panel, WorktreePanel::Files) {
         return worktree_panel_chrome(
-            header.into(),
+            header,
             notices.into(),
             Some(files_section(
                 state,
@@ -5209,7 +5331,7 @@ fn source_control_panel<'a>(
     });
 
     worktree_panel_chrome_with_footer(
-        header.into(),
+        header,
         notices.into(),
         Some(
             widget::column::with_children(vec![
@@ -5293,22 +5415,22 @@ fn changes_tab_controls<'a>(
 /// beneath it. Wrapping both in one inset container left a gap between the
 /// rule and the pane's vertical borders, so the files and Git headers looked
 /// disconnected from the splitter they share with the editor tab strip.
-fn worktree_panel_chrome<'a>(
-    header: Element<'a, SidebarAction>,
-    notices: Element<'a, SidebarAction>,
-    body: Option<Element<'a, SidebarAction>>,
-) -> Element<'a, SidebarAction> {
+fn worktree_panel_chrome<'a, M: 'a>(
+    header: Element<'a, M>,
+    notices: Element<'a, M>,
+    body: Option<Element<'a, M>>,
+) -> Element<'a, M> {
     worktree_panel_chrome_with_footer(header, notices, body, None)
 }
 
 /// The same chrome with a region pinned below the scrolling body, for the
 /// commit box: a terminal action the user must not have to scroll to reach.
-fn worktree_panel_chrome_with_footer<'a>(
-    header: Element<'a, SidebarAction>,
-    notices: Element<'a, SidebarAction>,
-    body: Option<Element<'a, SidebarAction>>,
-    footer: Option<Element<'a, SidebarAction>>,
-) -> Element<'a, SidebarAction> {
+fn worktree_panel_chrome_with_footer<'a, M: 'a>(
+    header: Element<'a, M>,
+    notices: Element<'a, M>,
+    body: Option<Element<'a, M>>,
+    footer: Option<Element<'a, M>>,
+) -> Element<'a, M> {
     let spacing = cosmic::theme::spacing();
     // The divider is the header's bottom edge; spacing would move it below
     // the tab strip's matching rule.

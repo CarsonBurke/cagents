@@ -380,6 +380,17 @@ cagents ui
   nonignored untracked file names.
   Expanded untracked text files show measured additions;
   binary, unsafe, oversized, or budget-limited files retain unknown counts.
+- Clicking a pull request row in Projects opens a **pull request pane** for
+  that repository: the project's open pull requests on the left, and the chosen
+  one's changed files with their GitHub **viewed** marks beneath a header that
+  shows progress and links back to GitHub. Choosing a file shows its diff
+  against the fetched merge base without touching the working tree, so staging
+  and the diff-basis switch are absent there. Marks apply to files or whole
+  directories and are sent to GitHub as you make them; a refused mark reverts
+  and says so. One pane serves each repository, and a restored pane reopens its
+  pull request once GitHub has been read. **Alt+V** marks the open file viewed
+  and moves on, **Alt+Down / Alt+Up** step through files. Settings → Links →
+  **Open pull requests in** switches rows back to plain links.
   The Changes tab highlights local or committed branch changes; committed files
   appear below staged and unstaged files, compared against the known default
   branch's merge base. Switch from **Changes** to **History** to browse commits,
@@ -476,6 +487,13 @@ The choice persists independently of the `language_servers` configuration.
 Service failures appear in the header's **Notices** tray, with readable error
 details and server stderr rather than a log block below the buffer. Closing the
 tray preserves the evidence; **Dismiss notices** clears it.
+
+A Git tab's sidebar has a third **Pull requests** panel beside Files and
+Changes. It lists the open pull requests of the GitHub repository the tab's
+remotes name, `origin` first, through the `gh` CLI; choosing one fetches its
+range and shows its changed files with their GitHub viewed marks, and each file
+opens as a diff in the tab. The same **Alt+V**, **Alt+Down**, and **Alt+Up**
+shortcuts apply and are configurable in Editor settings.
 
 ```sh
 scripts/run-ceditor-development /path/to/project
@@ -769,6 +787,7 @@ default_column_fraction = 0.5
 terminal_scrollback_lines = 10000
 link_open_destination = "integrated_browser"
 link_open_gesture = "control_click"
+pull_request_open_target = "review"
 managed_worktree_directory = "worktrees/"
 editor_auto_save = true
 editor_wrap_lines = false
@@ -782,6 +801,11 @@ search_projects = ["Ctrl+F"]
 previous_column = ["Alt+Q", "Alt+Left"]
 next_column = ["Alt+W", "Alt+Right"]
 cycle_pane_width = ["Alt+R"]
+previous_workspace = ["Alt+Shift+Tab"]
+next_workspace = ["Alt+Tab"]
+review_toggle_viewed = ["Alt+V"]
+review_next_file = ["Alt+Down"]
+review_previous_file = ["Alt+Up"]
 ```
 
 | Key | Type | Default | Accepted values |
@@ -806,10 +830,11 @@ cycle_pane_width = ["Alt+R"]
 | `default_column_fraction` | float | `0.5` | finite values from `0.25` through `1.0`, inclusive |
 | `link_open_destination` | string | `"integrated_browser"` | Default for ordinary application links: `"integrated_browser"` or `"system_default"` |
 | `link_open_gesture` | string | `"control_click"` | Gesture that explicitly opens the system browser: `"control_click"` or `"control_shift_click"`; the other gesture opens in-app |
+| `pull_request_open_target` | string | `"review"` | Where a pull request row in Projects opens: `"review"` for the in-app pull request pane, or `"link"` for the pull request's web page through the link destination above |
 | `managed_worktree_directory` | string | `"worktrees/"` | nonempty path without control characters; absolute or relative to the repository root |
 | `editor_auto_save` | boolean | `true` | `true` or `false`; automatically save edited files after a pause, stopping on conflicts or save errors |
 | `editor_wrap_lines` | boolean | `false` | wrap long native-editor lines instead of keeping a horizontally navigable line |
-| `keyboard_shortcuts.*` | array of strings | shown above | one or more chords, each containing Ctrl, Alt, or Super and one A-Z, 0-9, Left, or Right key; Shift is optional. Every chord in the table must be distinct, and a bound chord is reserved rather than forwarded to the process inside a card. `cycle_pane_width`, `new_channel`, and `clone_pane` may be empty to leave them unbound |
+| `keyboard_shortcuts.*` | array of strings | shown above | one or more chords, each containing Ctrl, Alt, or Super and one A-Z, 0-9, Left, Right, Up, Down, or Tab key; Shift is optional. Every chord in the table must be distinct, and a bound chord is reserved rather than forwarded to the process inside a card. `cycle_pane_width`, `new_channel`, `clone_pane`, the workspace actions, and the three `review_*` actions may be empty to leave them unbound |
 
 Terminal colors include 25 dark and light presets. To create your own, append
 this table to `settings.toml`, restart the app, and select **Custom** in the
@@ -845,7 +870,9 @@ configured. A table that still spells the action `new_thread`, the name it had
 before channels were named, is read under the new key without losing its
 chords. Explicit bindings, including an existing `Ctrl+Shift+T` new-channel
 binding or an empty list, are preserved rather than replaced by the new defaults.
-An explicitly configured conflicting binding is still rejected.
+An explicitly configured conflicting binding is still rejected. The review
+actions arrive the same way: a table without them receives Alt+V, Alt+Down,
+and Alt+Up unless another action already owns one of those chords.
 
 Settings text fields save valid edits after a short pause; closing the dialog
 also applies valid pending edits. Invalid fields and disk-write failures stay

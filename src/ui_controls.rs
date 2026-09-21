@@ -115,6 +115,18 @@ pub fn symbolic_icon(name: &str) -> widget::icon::Handle {
     static CLOSE: LazyLock<widget::icon::Handle> = LazyLock::new(|| {
         widget::icon::from_svg_bytes(br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16"><path d="M4.75 4.75l6.5 6.5M11.25 4.75l-6.5 6.5" fill="none" stroke="black" stroke-width="1.5" stroke-linecap="round"/></svg>"#.as_slice()).symbolic(true)
     });
+    // Review marks: an empty box, a box with a check, and a box with a dash
+    // for a folder whose files are only partly viewed. Drawn here so the
+    // three read as one family whatever icon theme the desktop provides.
+    static CHECKBOX: LazyLock<widget::icon::Handle> = LazyLock::new(|| {
+        widget::icon::from_svg_bytes(br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16"><rect x="2.75" y="2.75" width="10.5" height="10.5" rx="2" fill="none" stroke="black" stroke-width="1.4"/></svg>"#.as_slice()).symbolic(true)
+    });
+    static CHECKBOX_CHECKED: LazyLock<widget::icon::Handle> = LazyLock::new(|| {
+        widget::icon::from_svg_bytes(br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16"><rect x="2.75" y="2.75" width="10.5" height="10.5" rx="2" fill="none" stroke="black" stroke-width="1.4"/><path d="m5.25 8.25 1.9 1.9 3.6-4.1" fill="none" stroke="black" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>"#.as_slice()).symbolic(true)
+    });
+    static CHECKBOX_MIXED: LazyLock<widget::icon::Handle> = LazyLock::new(|| {
+        widget::icon::from_svg_bytes(br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16"><rect x="2.75" y="2.75" width="10.5" height="10.5" rx="2" fill="none" stroke="black" stroke-width="1.4"/><path d="M5.5 8h5" fill="none" stroke="black" stroke-width="1.5" stroke-linecap="round"/></svg>"#.as_slice()).symbolic(true)
+    });
     static MINUS: LazyLock<widget::icon::Handle> = LazyLock::new(|| {
         widget::icon::from_svg_bytes(br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16"><path d="M4 8h8" fill="none" stroke="black" stroke-width="1.5" stroke-linecap="round"/></svg>"#.as_slice()).symbolic(true)
     });
@@ -149,6 +161,9 @@ pub fn symbolic_icon(name: &str) -> widget::icon::Handle {
         "go-next-symbolic" => CHEVRON_RIGHT.clone(),
         "list-add-symbolic" => PLUS.clone(),
         "list-remove-symbolic" => MINUS.clone(),
+        "checkbox-symbolic" => CHECKBOX.clone(),
+        "checkbox-checked-symbolic" => CHECKBOX_CHECKED.clone(),
+        "checkbox-mixed-symbolic" => CHECKBOX_MIXED.clone(),
         "channel-symbolic" => CHANNEL.clone(),
         "channel-add-symbolic" => CHANNEL_ADD.clone(),
         "worktree-add-symbolic" => WORKTREE_ADD.clone(),
