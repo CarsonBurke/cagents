@@ -359,6 +359,52 @@ fn pending_spawn_close_does_not_remove_card_or_reject_future_completion() {
     assert_eq!(app.terminal_close_attempts.len(), 1);
 }
 
+/// The fence exists so one intent cannot submit two concurrent requests, and
+/// so nothing automatic retries a request whose fate is unknown. It is not a
+/// permanent refusal: a card whose close went unanswered used to be
+/// unclosable for the rest of the process, answering every later Close with
+/// "A close was already attempted" beside a Close button that could not be
+/// pressed.
+#[test]
+fn an_unanswered_close_can_be_asked_again_once_its_report_is_dismissed() {
+    let (mut app, card, terminal, _) = live_app();
+    let _ = app.update(Message::CloseCard(card));
+    assert_eq!(app.terminal_close_attempts.len(), 1);
+    report_close(
+        &mut app,
+        terminal_close::CloseOutcome::Unreachable("daemon unreachable".into()),
+    );
+
+    let intent = app.terminal_close.as_ref().expect("the report is retained");
+    assert!(!intent.pending);
+    assert!(
+        intent.detail.is_some(),
+        "an unreachable owner leaves an outcome to report"
+    );
+    assert!(app.card_state(card).unwrap().existence.is_open());
+    assert!(app.terminal_close_dialog().is_some());
+
+    // A report is not a question: confirming it must do nothing at all.
+    let _ = app.update(Message::ConfirmTerminalClose);
+    assert!(app.terminal_close.as_ref().unwrap().detail.is_some());
+    assert!(app.card_state(card).unwrap().existence.is_open());
+
+    let _ = app.update(Message::CancelTerminalClose);
+    assert!(app.terminal_close.is_none());
+    assert!(
+        app.terminal_close_attempts.is_empty(),
+        "dismissing the report ends the attempt it reported on"
+    );
+
+    let _ = app.update(Message::CloseCard(card));
+    assert!(
+        app.terminal_close
+            .as_ref()
+            .is_some_and(|intent| intent.pending && intent.terminal == terminal),
+        "the next explicit close must actually reach the owner, not a refusal"
+    );
+}
+
 #[test]
 fn terminal_confirmation_owns_tab_navigation_and_restores_shell_setting() {
     let (mut app, card, _, _) = live_app();
