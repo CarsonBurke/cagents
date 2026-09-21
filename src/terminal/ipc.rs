@@ -68,7 +68,7 @@ use crate::{
 /// Version 14 distinguishes root process exit from final PTY completion and
 /// publishes semantic conversation titles independently of terminal titles.
 /// Version 15 adds terminal palettes and durable recovery-origin identity.
-pub const PROTOCOL_VERSION: u16 = 15;
+pub const PROTOCOL_VERSION: u16 = 16;
 /// Postcard encodes an 80x24 grid in roughly 20 KiB and a typical single-row
 /// delta in a few hundred bytes, but a full repaint of a very large grid after
 /// a resize still has to fit, so keep generous headroom.
