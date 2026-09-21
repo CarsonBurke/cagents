@@ -5223,6 +5223,16 @@ impl Cagents {
     }
 
     fn begin_terminal_teardown(&mut self, handle: TerminalSurface) {
+        self.retire_terminal_surface(handle, true);
+    }
+
+    /// Drop a terminal surface off the UI thread.
+    ///
+    /// `terminate` sends `ShutdownTerminal`, which kills the PTY child. A live
+    /// Codex switch must not: native chat is attached to that same child, and
+    /// the CLI view is the process still sitting on the PTY. Releasing the
+    /// surface only detaches this client.
+    fn retire_terminal_surface(&mut self, handle: TerminalSurface, terminate: bool) {
         let mut index = 0;
         while index < self.terminal_teardowns.len() {
             if self.terminal_teardowns[index].is_finished() {
@@ -5233,20 +5243,80 @@ impl Cagents {
             }
         }
 
-        let fallback = handle.clone();
+        if terminate {
+            let fallback = handle.clone();
+            match std::thread::Builder::new()
+                .name("cagents-terminal-reaper".into())
+                .spawn(move || {
+                    let _ = handle.shutdown();
+                }) {
+                Ok(join) => self.terminal_teardowns.push(join),
+                Err(error) => {
+                    if let Err(shutdown_error) = fallback.shutdown() {
+                        self.status = Some(TransientNotice::error(format!(
+                            "could not stop terminal after reaper failure ({error}): {shutdown_error}"
+                        )));
+                    }
+                }
+            }
+            return;
+        }
+
+        // Both clones go to the reaper. Dropping one on the UI thread can win
+        // the race and join the client worker there, which stalls the frame.
+        let companion = handle.clone();
         match std::thread::Builder::new()
             .name("cagents-terminal-reaper".into())
             .spawn(move || {
-                let _ = handle.shutdown();
+                handle.release();
+                drop(companion);
             }) {
             Ok(join) => self.terminal_teardowns.push(join),
             Err(error) => {
-                if let Err(shutdown_error) = fallback.shutdown() {
-                    self.status = Some(TransientNotice::error(format!(
-                        "could not stop terminal after reaper failure ({error}): {shutdown_error}"
-                    )));
-                }
+                // Spawn failure drops the closure, and with it both clones.
+                tracing::error!(
+                    %error,
+                    "terminal detach reaper failed; the client detached on the UI thread"
+                );
             }
+        }
+    }
+
+    /// The id of the column title button.
+    ///
+    /// A terminal surface owns `card_focus_id` for as long as it is mounted.
+    /// Chat keeps the title id rather than taking that focus id on the frame
+    /// the surface unmounts. The runtime restores named widget state by id
+    /// before it looks at the widget type, so the title button would draw the
+    /// terminal's state and abort (`Downcast widget state`).
+    fn card_header_widget_id(&self, card: CardId) -> widget::Id {
+        let title = matches!(
+            self.card_state(card).map(|state| &state.kind),
+            Some(CardKind::Terminal(_) | CardKind::Chat(_))
+        );
+        if let Some(chrome) = self.card_chrome.get(&card) {
+            if title {
+                chrome.title_id.clone()
+            } else {
+                chrome.focus_id.clone()
+            }
+        } else if title {
+            card_control_id(card, "title")
+        } else {
+            workspace_widget::card_focus_id(card)
+        }
+    }
+
+    /// Where keyboard focus for `card` lands.
+    fn card_keyboard_focus(&self, card: CardId) -> widget::Id {
+        match self.cards.get(&card) {
+            Some(CardRuntime::Terminal(_)) => self
+                .card_chrome
+                .get(&card)
+                .map(|chrome| chrome.focus_id.clone())
+                .unwrap_or_else(|| workspace_widget::card_focus_id(card)),
+            Some(CardRuntime::Chat(runtime)) => card_control_id(card, runtime.focus_control()),
+            _ => self.card_header_widget_id(card),
         }
     }
 
@@ -5352,7 +5422,10 @@ impl Cagents {
         if let Some(card) = self.workspace.take_widget_focus_request()
             && !self.context_inspector_overlay_active
         {
-            tasks.push(workspace_widget::focus_card(card).map(cosmic::Action::App));
+            tasks.push(
+                iced::widget::operation::focus(self.card_keyboard_focus(card))
+                    .map(cosmic::Action::App),
+            );
         }
         tasks.push(context_overlay_task);
         if reconcile_now {
@@ -7789,7 +7862,7 @@ impl Cagents {
             resolve_restore_card(close.restore_card, self.workspace.focused(), |card| {
                 self.workspace.order().any(|candidate| candidate == card)
             })
-            .map(workspace_widget::card_focus_id)
+            .map(|card| self.card_keyboard_focus(card))
             .unwrap_or_else(|| widget::Id::new(TOOLBAR_FOCUS_ID))
         });
         iced::widget::operation::focus(restore_focus).map(cosmic::Action::App)
@@ -12580,7 +12653,7 @@ mod tests {
     /// Shared rather than written per surface, because every surface that
     /// mounts ids from a list is exposed to the same invariant and a per-test
     /// copy of the walk would drift from the runtime it is modelling.
-    fn duplicate_widget_ids(element: &mut Element<'_, Message>) -> Vec<String> {
+    fn widget_id_counts(element: &mut Element<'_, Message>) -> HashMap<String, usize> {
         use cosmic::iced::advanced::widget::Tree;
         use iced_accessibility::id::Internal;
 
@@ -12595,7 +12668,11 @@ mod tests {
 
         let mut counts = HashMap::new();
         tally(&Tree::new(element.as_widget_mut()), &mut counts);
-        let mut repeated = counts
+        counts
+    }
+
+    fn duplicate_widget_ids(element: &mut Element<'_, Message>) -> Vec<String> {
+        let mut repeated = widget_id_counts(element)
             .into_iter()
             .filter(|(_, count)| *count > 1)
             .map(|(name, _)| name)
@@ -14125,6 +14202,212 @@ mod tests {
             CardKind::Terminal(source)
         );
         assert!(app.chat_start_pending(target));
+    }
+
+    fn live_agent_app(program: &str) -> (Cagents, CardId, tempfile::TempDir) {
+        use crate::model::{BootId, HostIncarnation, HostSessionId};
+
+        let mut app = context_inspector_test_app(false);
+        app.context_inspector_open = false;
+        app.window_width = 1600.0;
+        let mut card = terminal_card_state();
+        let id = card.id;
+        let CardKind::Terminal(terminal) = &mut card.kind else {
+            unreachable!();
+        };
+        terminal.launch.program = program.into();
+        terminal.continuity = TerminalContinuity::Live {
+            host_session_id: HostSessionId::new("host"),
+            boot_id: BootId::new("boot"),
+            host_incarnation: HostIncarnation::new("incarnation"),
+        };
+        let terminal_id = terminal.id;
+        app.durable = Arc::new(WorkspaceState {
+            focused: Some(id),
+            cards: vec![card],
+            ..WorkspaceState::default()
+        });
+        app.workspace = Cagents::rebuild_workspace(&app.durable);
+        app.workspace.resize_viewport(1600.0);
+        let directory = tempfile::tempdir().unwrap();
+        let handle = HostedTerminalHandle::connect_at(
+            directory.path().join("missing.sock"),
+            terminal_id,
+            None,
+            |_| {},
+        )
+        .expect("terminal client starts before the socket accepts");
+        app.cards
+            .insert(id, CardRuntime::Terminal(TerminalSurface::from(handle)));
+        (app, id, directory)
+    }
+
+    fn busy_chat_snapshot() -> crate::chat::Snapshot {
+        use crate::chat::{
+            Capabilities, Choice, Field, Item, ItemContent, Phase, Request, Role, Snapshot,
+            ToolStatus,
+        };
+
+        Snapshot {
+            generation: 2,
+            busy: true,
+            waiting: true,
+            capabilities: Capabilities {
+                steer: true,
+                queue: true,
+                ..Capabilities::default()
+            },
+            items: vec![
+                Item {
+                    id: "user-1".into(),
+                    role: Role::User,
+                    content: ItemContent::Text {
+                        text: "Inspect the switch".into(),
+                        thinking: false,
+                        phase: Phase::Final,
+                    },
+                    at: None,
+                },
+                Item {
+                    id: "tool-1".into(),
+                    role: Role::Assistant,
+                    content: ItemContent::Tool {
+                        name: "shell".into(),
+                        input: "ls".into(),
+                        output: String::new(),
+                        status: ToolStatus::Running,
+                    },
+                    at: None,
+                },
+                Item {
+                    id: "assistant-1".into(),
+                    role: Role::Assistant,
+                    content: ItemContent::Text {
+                        text: "Still working.".into(),
+                        thinking: false,
+                        phase: Phase::Commentary,
+                    },
+                    at: None,
+                },
+            ],
+            requests: vec![Request {
+                id: "request-1".into(),
+                title: "Allow this command?".into(),
+                description: "ls".into(),
+                fields: vec![Field {
+                    id: "note".into(),
+                    label: "Note".into(),
+                    description: String::new(),
+                    choices: Vec::new(),
+                    multiple: false,
+                    secret: false,
+                    initial: String::new(),
+                }],
+                actions: vec![
+                    Choice {
+                        id: "deny".into(),
+                        label: "Deny".into(),
+                        description: String::new(),
+                    },
+                    Choice {
+                        id: "allow".into(),
+                        label: "Allow".into(),
+                        description: String::new(),
+                    },
+                ],
+            }],
+            ..Snapshot::default()
+        }
+    }
+
+    #[test]
+    fn switching_a_live_terminal_to_native_chat_draws_the_swap() {
+        let (mut app, card, _socket) = live_agent_app("codex");
+        let focus_id = workspace_widget::card_focus_id(card).to_string();
+        let composer_id = card_control_id(card, "chat-composer").to_string();
+        assert!(
+            widget_id_counts(&mut app.view()).contains_key(&focus_id),
+            "the terminal surface has to be mounted before the swap, or the crash frame is not drawn"
+        );
+
+        draw_frames(&mut app, 3, |app, frame| match frame {
+            0 => {
+                let _connect = app.update(Message::ChatUi(chat_ui::Action::Switch(card)));
+                let ready = chat_ui::ready_message_for_pending_switch(
+                    app,
+                    card,
+                    crate::chat::Snapshot {
+                        generation: 1,
+                        title: Some("Live thread".into()),
+                        ..crate::chat::Snapshot::default()
+                    },
+                );
+                let _focus = app.update(ready);
+                assert!(
+                    matches!(
+                        app.card_state(card).map(|state| &state.kind),
+                        Some(CardKind::Chat(_))
+                    ),
+                    "a confirmed switch replaces the terminal card with native chat"
+                );
+                assert!(
+                    matches!(app.cards.get(&card), Some(CardRuntime::Chat(_))),
+                    "the chat runtime is what the next frame draws"
+                );
+            }
+            1 => {
+                assert_eq!(
+                    chat_ui::show_chat_snapshot_for_test(app, card, busy_chat_snapshot()),
+                    1,
+                    "the busy frame has to include the in-progress request"
+                );
+            }
+            _ => {}
+        });
+
+        let mounted = widget_id_counts(&mut app.view());
+        assert!(
+            mounted.contains_key(&composer_id),
+            "native chat keeps its composer: {mounted:?}"
+        );
+        assert!(
+            !mounted.contains_key(&focus_id),
+            "chat must not adopt the terminal focus id that still holds terminal widget state"
+        );
+    }
+
+    #[test]
+    fn a_refused_switch_keeps_the_terminal_on_screen() {
+        let (mut app, card, _socket) = live_agent_app("claude");
+        draw_frames(&mut app, 2, |app, frame| {
+            if frame == 0 {
+                let _connect = app.update(Message::ChatUi(chat_ui::Action::Switch(card)));
+                let _ = app.update(chat_ui::refused_switch_message(
+                    app,
+                    card,
+                    "fixture: provider refused the handoff",
+                ));
+            }
+        });
+        assert!(
+            matches!(
+                app.card_state(card).map(|state| &state.kind),
+                Some(CardKind::Terminal(_))
+            ),
+            "a refused handoff leaves the terminal card in place"
+        );
+        assert!(
+            matches!(app.cards.get(&card), Some(CardRuntime::Terminal(_))),
+            "the terminal surface is still what the card draws"
+        );
+        assert!(
+            app.notices
+                .entries
+                .iter()
+                .any(|entry| entry.notice.message.contains("refused the handoff")),
+            "the refusal is recorded as a notice, not a process abort: {:?}",
+            app.notices.entries
+        );
     }
 
     #[test]
