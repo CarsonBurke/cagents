@@ -15,7 +15,7 @@ use std::{
     path::{Path, PathBuf},
     process::{Command, ExitStatus, Stdio},
     sync::{
-        Arc, Condvar, Mutex, MutexGuard,
+        Arc, Condvar, LazyLock, Mutex, MutexGuard,
         atomic::{AtomicBool, AtomicU64, Ordering},
         mpsc,
     },
@@ -1584,6 +1584,81 @@ pub struct BranchComparison {
     pub entries: Vec<DiffEntry>,
 }
 
+/// A pull request's endpoints, fetched into the private ref namespace so the
+/// comparison can be read without checking anything out.
+///
+/// `head` is the commit the caller asked for, proven equal to what the remote
+/// served; `merge_base` is computed locally against `base_tip`, which is the
+/// base branch as the remote had it at fetch time. The two refs are display
+/// handles only: every comparison built from this range names the object ids.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PullRequestRange {
+    pub number: u64,
+    /// The base branch by the name the forge and the user know it, e.g. `main`.
+    pub base_branch: ValidatedBranchName,
+    /// The private mirror of `refs/pull/<number>/head`.
+    pub head_mirror: ValidatedRefName,
+    /// The private mirror of the base branch's remote tip.
+    pub base_mirror: ValidatedRefName,
+    pub head: Oid,
+    pub base_tip: Oid,
+    pub merge_base: Oid,
+}
+
+impl PullRequestRange {
+    /// The comparison this range reviews. Its display ref is the base branch's
+    /// public name, never the private mirror the fetch wrote.
+    pub fn basis(&self) -> DiffBasis {
+        DiffBasis::PullRequest {
+            number: self.number,
+            base_ref: ValidatedRefName::parse(self.base_branch.full_ref())
+                .expect("a validated branch name is a valid ref name"),
+            head: self.head.clone(),
+            merge_base: self.merge_base.clone(),
+        }
+    }
+}
+
+/// The private ref namespace pull request fetches write to. It is outside
+/// `refs/heads`, `refs/remotes` and `refs/tags`, so [`RepositoryService::refs_command`]
+/// never lists it, no branch picker offers it, and a push cannot select it.
+pub const PULL_REQUEST_REF_NAMESPACE: &str = "refs/cagents/pull";
+
+/// The pull request number a private ref names, or `None` for anything that
+/// is not a `<number>/head` or `<number>/base` ref in the namespace.
+fn pull_request_ref_number(name: &str) -> Option<u64> {
+    let rest = name
+        .strip_prefix(PULL_REQUEST_REF_NAMESPACE)?
+        .strip_prefix('/')?;
+    let (number, kind) = rest.split_once('/')?;
+    if !matches!(kind, "head" | "base") || number.starts_with('0') {
+        return None;
+    }
+    number.parse().ok().filter(|number| *number != 0)
+}
+
+/// Whether a refused fetch says the remote has no such ref, as opposed to
+/// a network, authentication, or signal failure that names no ref at all.
+/// Git has reported a missing ref this way since long before anything this
+/// application supports, and the message is not localized.
+fn base_ref_is_missing(failure: &ProcessFailure) -> bool {
+    failure.kind == ProcessFailureKind::Exit
+        && String::from_utf8_lossy(&failure.stderr).contains("couldn't find remote ref")
+}
+
+/// The private refs one pull request's fetch owns.
+pub fn pull_request_refs(
+    number: u64,
+) -> Result<(ValidatedRefName, ValidatedRefName), ValidationError> {
+    if number == 0 {
+        return Err(ValidationError::InvalidBase("pull request 0".into()));
+    }
+    Ok((
+        ValidatedRefName::parse(format!("{PULL_REQUEST_REF_NAMESPACE}/{number}/head"))?,
+        ValidatedRefName::parse(format!("{PULL_REQUEST_REF_NAMESPACE}/{number}/base"))?,
+    ))
+}
+
 /// Independent source-control and file-browser demand. Neither collapsed changes
 /// nor background branch/HEAD checks need an untracked scan.
 #[derive(Debug, Clone, Copy)]
@@ -1910,6 +1985,29 @@ pub enum DiffBasis {
     },
     /// One commit against a chosen parent; `None` for a root commit.
     CommitToParent { oid: Oid, parent: Option<Oid> },
+    /// A pull request's merge base to its head, both fetched into the private
+    /// namespace [`RepositoryService::fetch_pull_request_range`] owns. It is
+    /// immutable like [`Self::MergeBaseToHead`], but its head is not HEAD and
+    /// its chrome names the pull request rather than the checked-out branch.
+    PullRequest {
+        number: u64,
+        base_ref: ValidatedRefName,
+        head: Oid,
+        merge_base: Oid,
+    },
+}
+
+impl DiffBasis {
+    /// Whether the comparison names immutable objects, so a working-tree
+    /// mutation or a background refresh can neither change nor invalidate it.
+    pub fn is_immutable(&self) -> bool {
+        match self {
+            Self::IndexToWorktree | Self::HeadToIndex => false,
+            Self::MergeBaseToHead { .. }
+            | Self::CommitToParent { .. }
+            | Self::PullRequest { .. } => true,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2384,6 +2482,10 @@ struct KeyedLock {
 /// key, while separate repositories never contend.
 #[derive(Debug, Clone, Default)]
 pub struct MutationLocks(Arc<Mutex<BTreeMap<PathBuf, Arc<KeyedLock>>>>);
+
+/// Serializes [`RepositoryService::fetch_pull_request_range`] per repository.
+/// The service is constructed per call, so the registry lives for the process.
+static PULL_REQUEST_FETCH_LOCKS: LazyLock<MutationLocks> = LazyLock::new(MutationLocks::new);
 
 impl MutationLocks {
     pub fn new() -> Self {
@@ -4196,6 +4298,18 @@ pub enum RepositoryError {
     InvalidOutput { field: &'static str, reason: String },
     #[error("{} is a Git directory with no resolvable work tree", .git_dir.display())]
     NoWorkTree { git_dir: PathBuf },
+    /// The remote's pull request head is no longer the commit the caller was
+    /// reviewing. The private ref now names `actual`; nothing else moved.
+    #[error("pull request head moved from {expected} to {actual}")]
+    PullRequestHeadMoved { expected: Oid, actual: Oid },
+    /// The pull request head fetched, but the remote no longer serves its base
+    /// branch — deleted after a merge, or living only on a fork — so there is
+    /// no tip to compute a merge base against.
+    #[error("the remote no longer serves base branch {}: {failure}", base_branch.as_str())]
+    PullRequestBaseUnavailable {
+        base_branch: ValidatedBranchName,
+        failure: Box<ProcessFailure>,
+    },
 }
 
 #[derive(Clone)]
@@ -4760,6 +4874,185 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         })
     }
 
+    /// Fetches one pull request's head and base branch into the private
+    /// [`PULL_REQUEST_REF_NAMESPACE`] and resolves the range to review.
+    ///
+    /// The fetch names exactly two refspecs and forces only the private refs,
+    /// with `--no-tags`, no submodule recursion and no `FETCH_HEAD` write, so
+    /// no branch, tag or remote-tracking ref of the user's can move. Fetches
+    /// for one repository are serialized process-wide: two review panes
+    /// opening at once would otherwise race Git's own ref lock and one of
+    /// them would fail for no reason the user can see.
+    ///
+    /// `expected_head` is the commit the caller read from the forge. When the
+    /// remote now serves a different head, the fetch has still updated the
+    /// private ref, and the caller gets [`RepositoryError::PullRequestHeadMoved`]
+    /// rather than a range whose line numbers no longer match the review
+    /// comments it was about to anchor.
+    pub fn fetch_pull_request_range(
+        &self,
+        worktree: &Path,
+        remote: &str,
+        number: u64,
+        base_branch: &ValidatedBranchName,
+        expected_head: &Oid,
+        cancellation: &CancellationToken,
+    ) -> Result<PullRequestRange, RepositoryError> {
+        validate_remote_name(remote)?;
+        let (head_ref, base_ref) = pull_request_refs(number)?;
+        let output = self.run_checked(
+            &self.git_read(
+                worktree,
+                ["rev-parse", "--path-format=absolute", "--git-common-dir"],
+            ),
+            cancellation,
+        )?;
+        let common_dir = parse_path_line(&output.stdout, "common_dir")?;
+        let _guard = PULL_REQUEST_FETCH_LOCKS.lock(&common_dir);
+        let fetch = |refspec: String| {
+            self.git_mutation(
+                worktree,
+                [
+                    "fetch",
+                    "--quiet",
+                    "--no-tags",
+                    "--no-recurse-submodules",
+                    "--no-write-fetch-head",
+                    "--end-of-options",
+                    remote,
+                    &refspec,
+                ],
+            )
+        };
+        let resolve = |reference: &ValidatedRefName, field: &'static str| {
+            self.resolve_optional_revision(worktree, reference.as_str(), cancellation)?
+                .ok_or_else(|| RepositoryError::InvalidOutput {
+                    field,
+                    reason: format!("{reference} was not written by the fetch"),
+                })
+        };
+        // The head is fetched on its own first: a moved head is settled before
+        // any time is spent on the base, and a base the remote no longer
+        // serves cannot take the head down with it in one refused fetch.
+        self.run_checked(
+            &fetch(format!("+refs/pull/{number}/head:{}", head_ref.as_str())),
+            cancellation,
+        )?;
+        let head = resolve(&head_ref, "pull_request_head")?;
+        if head != *expected_head {
+            return Err(RepositoryError::PullRequestHeadMoved {
+                expected: expected_head.clone(),
+                actual: head,
+            });
+        }
+        let base_refspec = format!("+refs/heads/{}:{}", base_branch.as_str(), base_ref.as_str());
+        match self.run_checked(&fetch(base_refspec), cancellation) {
+            Ok(_) => {}
+            Err(failure) if base_ref_is_missing(&failure) => {
+                return Err(RepositoryError::PullRequestBaseUnavailable {
+                    base_branch: base_branch.clone(),
+                    failure: Box::new(failure),
+                });
+            }
+            Err(failure) => return Err(failure.into()),
+        }
+        let base_tip = resolve(&base_ref, "pull_request_base")?;
+        let command = self
+            .git_read(worktree, ["merge-base", base_tip.as_str(), head.as_str()])
+            .env("GIT_NO_LAZY_FETCH", "1");
+        let output = self.run_checked(&command, cancellation)?;
+        let line = parse_utf8_line(&output.stdout, "merge_base")?;
+        let merge_base =
+            Oid::parse_object(line).map_err(|error| RepositoryError::InvalidOutput {
+                field: "merge_base",
+                reason: error.to_string(),
+            })?;
+        Ok(PullRequestRange {
+            number,
+            base_branch: base_branch.clone(),
+            head_mirror: head_ref,
+            base_mirror: base_ref,
+            head,
+            base_tip,
+            merge_base,
+        })
+    }
+
+    /// Deletes the private pull request refs whose number `retain` rejects,
+    /// returning the numbers it removed.
+    ///
+    /// A fetched pair pins its objects against `gc` for as long as it exists,
+    /// so a caller that knows which pull requests are still worth reviewing —
+    /// typically the open ones — prunes the rest. Refs outside
+    /// [`PULL_REQUEST_REF_NAMESPACE`], and anything in it that is not a
+    /// `<number>/head` or `<number>/base` pair this application writes, are
+    /// never touched.
+    pub fn prune_pull_request_refs(
+        &self,
+        worktree: &Path,
+        retain: impl Fn(u64) -> bool,
+        cancellation: &CancellationToken,
+    ) -> Result<Vec<u64>, RepositoryError> {
+        let output = self.run_checked(
+            &self.git_read(
+                worktree,
+                ["rev-parse", "--path-format=absolute", "--git-common-dir"],
+            ),
+            cancellation,
+        )?;
+        let common_dir = parse_path_line(&output.stdout, "common_dir")?;
+        let _guard = PULL_REQUEST_FETCH_LOCKS.lock(&common_dir);
+        let listing = self.run_checked(
+            &self.git_read(
+                worktree,
+                [
+                    "for-each-ref",
+                    "--format=%(refname)",
+                    &format!("{PULL_REQUEST_REF_NAMESPACE}/"),
+                ],
+            ),
+            cancellation,
+        )?;
+        let listing =
+            String::from_utf8(listing.stdout).map_err(|error| RepositoryError::InvalidOutput {
+                field: "pull_request_refs",
+                reason: error.to_string(),
+            })?;
+        let mut pruned = Vec::new();
+        for name in listing.lines() {
+            let Some(number) = pull_request_ref_number(name) else {
+                continue;
+            };
+            if retain(number) {
+                continue;
+            }
+            let reference = ValidatedRefName::parse(name)?;
+            self.run_checked(
+                &self.git_mutation(
+                    worktree,
+                    ["update-ref", "-d", "--end-of-options", reference.as_str()],
+                ),
+                cancellation,
+            )?;
+            if !pruned.contains(&number) {
+                pruned.push(number);
+            }
+        }
+        Ok(pruned)
+    }
+
+    /// Files that differ between two commits' trees, with rename detection and
+    /// line counts, in the same form the branch and commit listings use.
+    pub fn range_diff_entries(
+        &self,
+        worktree: &Path,
+        old: &Oid,
+        new: &Oid,
+        cancellation: &CancellationToken,
+    ) -> Result<Vec<DiffEntry>, RepositoryError> {
+        self.range_entries(worktree, Some(old), new, cancellation)
+    }
+
     /// Files a commit changed relative to `parent`, or to the empty tree when
     /// `parent` is `None`.
     pub fn commit_diff_entries(
@@ -4893,6 +5186,17 @@ impl<E: ProcessExecutor> RepositoryService<E> {
                     new_label: oid.short().to_owned(),
                 })
             }
+            DiffBasis::PullRequest {
+                number,
+                base_ref,
+                head,
+                merge_base,
+            } => Ok(DiffContent::Comparison {
+                old: self.tree_side(worktree, merge_base, old_path, cancellation)?,
+                new: self.tree_side(worktree, head, &request.path, cancellation)?,
+                old_label: format!("{} ({})", base_ref.short_name(), merge_base.short()),
+                new_label: format!("#{number} ({})", head.short()),
+            }),
         }
     }
 

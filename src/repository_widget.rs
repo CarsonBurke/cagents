@@ -71,7 +71,12 @@ impl RepositoryFile {
         match basis {
             DiffBasis::HeadToIndex => self.staged,
             DiffBasis::IndexToWorktree => self.unstaged,
-            DiffBasis::MergeBaseToHead { .. } | DiffBasis::CommitToParent { .. } => true,
+            // A pull request comparison is installed by a review surface with
+            // a synthetic file, and it must survive every status refresh the
+            // way the other immutable bases do.
+            DiffBasis::MergeBaseToHead { .. }
+            | DiffBasis::CommitToParent { .. }
+            | DiffBasis::PullRequest { .. } => true,
         }
     }
 
@@ -85,7 +90,9 @@ impl RepositoryFile {
         match basis {
             DiffBasis::HeadToIndex => self.staged_old_path.clone(),
             DiffBasis::IndexToWorktree => self.unstaged_old_path.clone(),
-            DiffBasis::MergeBaseToHead { .. } | DiffBasis::CommitToParent { .. } => None,
+            DiffBasis::MergeBaseToHead { .. }
+            | DiffBasis::CommitToParent { .. }
+            | DiffBasis::PullRequest { .. } => None,
         }
     }
 }
@@ -177,6 +184,9 @@ fn basis_label(basis: &DiffBasis) -> String {
         DiffBasis::CommitToParent { oid, parent: None } => {
             format!("Root commit {}", oid.short())
         }
+        DiffBasis::PullRequest {
+            number, base_ref, ..
+        } => format!("#{number} vs {}", base_ref.short_name()),
     }
 }
 
@@ -184,21 +194,32 @@ fn basis_label(basis: &DiffBasis) -> String {
 /// `&'static str` and so cannot carry a ref name or a commit id.
 fn basis_choice_label(basis: &DiffBasis) -> &'static str {
     match basis_choice(basis) {
-        BasisChoice::Staged => "Staged",
-        BasisChoice::Unstaged => "Unstaged",
-        BasisChoice::Committed(choice) => choice.label(),
+        Some(BasisChoice::Staged) => "Staged",
+        Some(BasisChoice::Unstaged) => "Unstaged",
+        Some(BasisChoice::Committed(choice)) => choice.label(),
+        None => "Pull request",
     }
 }
 
 /// Which control choice a basis was made from, so the widget can never show a
-/// choice the runtime has not made.
-fn basis_choice(basis: &DiffBasis) -> BasisChoice {
+/// choice the runtime has not made. A pull request comparison is installed by
+/// a review surface, not chosen here, so no control claims it.
+fn basis_choice(basis: &DiffBasis) -> Option<BasisChoice> {
     match basis {
-        DiffBasis::HeadToIndex => BasisChoice::Staged,
-        DiffBasis::IndexToWorktree => BasisChoice::Unstaged,
-        DiffBasis::MergeBaseToHead { .. } => BasisChoice::Committed(CommittedChoice::Branch),
-        DiffBasis::CommitToParent { .. } => BasisChoice::Committed(CommittedChoice::LastCommit),
+        DiffBasis::HeadToIndex => Some(BasisChoice::Staged),
+        DiffBasis::IndexToWorktree => Some(BasisChoice::Unstaged),
+        DiffBasis::MergeBaseToHead { .. } => Some(BasisChoice::Committed(CommittedChoice::Branch)),
+        DiffBasis::CommitToParent { .. } => {
+            Some(BasisChoice::Committed(CommittedChoice::LastCommit))
+        }
+        DiffBasis::PullRequest { .. } => None,
     }
+}
+
+/// Whether a basis lives in the retained committed-diff cache: everything
+/// immutable, whichever control (if any) made it.
+fn is_committed_choice(basis: &DiffBasis) -> bool {
+    basis.is_immutable()
 }
 
 /// What one side of a comparison is, in one word, for the inspector.
@@ -2232,12 +2253,7 @@ impl RepositoryRuntime {
     pub fn refresh_after_mutation(&mut self, card: CardId) -> Task<RepositoryAction> {
         self.mutation_refresh_pending = true;
         // Resolved branch ranges and commits name immutable objects.
-        self.diffs.retain(|(basis, _)| {
-            matches!(
-                basis,
-                DiffBasis::CommitToParent { .. } | DiffBasis::MergeBaseToHead { .. }
-            )
-        });
+        self.diffs.retain(|(basis, _)| basis.is_immutable());
         self.initial_load(card)
     }
 
@@ -3165,11 +3181,7 @@ impl RepositoryRuntime {
     fn can_select_diff_basis(&self, basis: &DiffBasis) -> bool {
         !self.is_saving()
             && !self.directory_only
-            && (!self.mutation_refresh_pending
-                || matches!(
-                    basis,
-                    DiffBasis::CommitToParent { .. } | DiffBasis::MergeBaseToHead { .. }
-                ))
+            && (!self.mutation_refresh_pending || basis.is_immutable())
             && self
                 .selected
                 .as_ref()
@@ -3642,12 +3654,7 @@ impl RepositoryRuntime {
                 let background_changed =
                     std::mem::take(&mut self.background_file_refresh) && changed;
                 if background_changed {
-                    self.diffs.retain(|(basis, _)| {
-                        matches!(
-                            basis,
-                            DiffBasis::CommitToParent { .. } | DiffBasis::MergeBaseToHead { .. }
-                        )
-                    });
+                    self.diffs.retain(|(basis, _)| basis.is_immutable());
                 }
                 let refresh_selected =
                     (self.mutation_refresh_pending || background_changed) && result.is_ok();
@@ -4451,8 +4458,7 @@ impl RepositoryRuntime {
     /// slot cancels its worker; the completion fence also prevents an already
     /// queued answer from recreating that abandoned slot.
     fn prune_committed_diffs(&mut self) {
-        let committed =
-            |basis: &DiffBasis| matches!(basis_choice(basis), BasisChoice::Committed(_));
+        let committed = is_committed_choice;
         let mut excess = self
             .diffs
             .iter()
@@ -4503,12 +4509,7 @@ impl RepositoryRuntime {
         basis: DiffBasis,
         old_path: Option<PathBuf>,
     ) -> Task<RepositoryAction> {
-        if self.mutation_refresh_pending
-            && !matches!(
-                basis,
-                DiffBasis::CommitToParent { .. } | DiffBasis::MergeBaseToHead { .. }
-            )
-        {
+        if self.mutation_refresh_pending && !basis.is_immutable() {
             return Task::none();
         }
         self.next_diff_request = self.next_diff_request.wrapping_add(1).max(1);
@@ -4547,13 +4548,7 @@ impl RepositoryRuntime {
         old_path: Option<RepoPath>,
         basis: DiffBasis,
     ) -> Task<RepositoryAction> {
-        if self.blocks_navigation()
-            || self.directory_only
-            || !matches!(
-                basis,
-                DiffBasis::MergeBaseToHead { .. } | DiffBasis::CommitToParent { .. }
-            )
-        {
+        if self.blocks_navigation() || self.directory_only || !basis.is_immutable() {
             return Task::none();
         }
         let path = path.as_path().to_path_buf();
@@ -6448,7 +6443,7 @@ fn diff_basis_controls(card: CardId, runtime: &RepositoryRuntime) -> Element<'_,
             Some(BasisChoice::Committed(CommittedChoice::Branch))
         }
         Some(BasisResolution::NoCommits | BasisResolution::Unavailable(_)) => None,
-        None => Some(basis_choice(&runtime.diff_basis)),
+        None => basis_choice(&runtime.diff_basis),
     };
     let unstaged = runtime.can_select_diff_basis(&DiffBasis::IndexToWorktree);
     let staged = runtime.can_select_diff_basis(&DiffBasis::HeadToIndex);
@@ -6608,12 +6603,7 @@ fn diff_review_controls(
 }
 
 fn diff_surface(card: CardId, runtime: &RepositoryRuntime) -> Element<'_, RepositoryAction> {
-    if runtime.mutation_refresh_pending
-        && !matches!(
-            runtime.diff_basis,
-            DiffBasis::CommitToParent { .. } | DiffBasis::MergeBaseToHead { .. }
-        )
-    {
+    if runtime.mutation_refresh_pending && !runtime.diff_basis.is_immutable() {
         return match &runtime.files {
             FileListState::Failed(error) => {
                 information_state("Could not refresh file status", error.clone())
@@ -7812,6 +7802,63 @@ mod tests {
             basis.clone(),
             DiffState::Ready(RenderedDiff::Error("retry".into())),
         );
+        drop(runtime.update(RepositoryAction::RetryDiff { card }));
+        assert!(matches!(
+            runtime.diff_state(&basis),
+            Some(DiffState::Loading { .. })
+        ));
+        assert_eq!(
+            runtime.comparison_old_path(),
+            Some(PathBuf::from("old-name.txt"))
+        );
+    }
+
+    /// A review surface installs a pull request comparison over a working
+    /// file list that knows nothing about it. The comparison is read-only,
+    /// keeps its rename identity, survives the status refresh a background
+    /// change triggers, and can be retried — exactly like the other immutable
+    /// bases, which is what the review surface will depend on.
+    #[test]
+    fn a_pull_request_basis_survives_status_refresh_and_retries() {
+        let card = CardId::new();
+        let (mut runtime, identity) = working_diff_runtime(card, "old\n", "working\n");
+        let basis = DiffBasis::PullRequest {
+            number: 12,
+            base_ref: ValidatedRefName::parse("refs/heads/main").unwrap(),
+            head: fixture_oid(1),
+            merge_base: fixture_oid(2),
+        };
+        drop(runtime.update(RepositoryAction::OpenCommittedFile {
+            card,
+            path: RepoPath::parse("renamed.txt").unwrap(),
+            old_path: Some(RepoPath::parse("old-name.txt").unwrap()),
+            basis: basis.clone(),
+        }));
+        assert!(!runtime.accepts_selected(&identity));
+        assert!(matches!(runtime.document, DocumentState::None));
+        assert!(!runtime.can_save());
+        assert_eq!(runtime.diff_basis, basis);
+        assert_eq!(runtime.source_surface, SourceSurface::Diff);
+        assert!(runtime.can_show_diff());
+        assert_eq!(basis_label(&basis), "#12 vs main");
+        assert_eq!(basis_choice_label(&basis), "Pull request");
+        assert_eq!(basis_choice(&basis), None);
+
+        // The refresh a background working-tree change triggers must not
+        // replace the review with a working comparison.
+        drop(runtime.refresh_selected_status(card));
+        assert_eq!(runtime.diff_basis, basis);
+        assert_eq!(runtime.source_surface, SourceSurface::Diff);
+        assert_eq!(
+            runtime.comparison_old_path(),
+            Some(PathBuf::from("old-name.txt"))
+        );
+
+        runtime.set_diff_state(
+            basis.clone(),
+            DiffState::Ready(RenderedDiff::Error("retry".into())),
+        );
+        assert!(runtime.can_retry_diff());
         drop(runtime.update(RepositoryAction::RetryDiff { card }));
         assert!(matches!(
             runtime.diff_state(&basis),
@@ -11634,7 +11681,7 @@ mod tests {
                 runtime
                     .diffs
                     .iter()
-                    .filter(|(basis, _)| matches!(basis_choice(basis), BasisChoice::Committed(_)))
+                    .filter(|(basis, _)| is_committed_choice(basis))
                     .count()
                     <= MAX_RETAINED_COMMITTED_DIFFS,
                 "the cache exceeded its cap at step {step}"
@@ -11684,12 +11731,19 @@ mod tests {
             head: fixture_oid(1),
             merge_base: fixture_oid(2),
         };
+        let pull_request = DiffBasis::PullRequest {
+            number: 7,
+            base_ref: ValidatedRefName::parse("refs/heads/main").unwrap(),
+            head: fixture_oid(1),
+            merge_base: fixture_oid(2),
+        };
         let labels = [
             &DiffBasis::IndexToWorktree,
             &DiffBasis::HeadToIndex,
             &branch,
             &commit,
             &root_commit,
+            &pull_request,
         ]
         .map(basis_label);
         assert_eq!(
@@ -11700,6 +11754,7 @@ mod tests {
                 "Branch vs origin/main".to_owned(),
                 format!("Commit {}", fixture_oid(1).short()),
                 format!("Root commit {}", fixture_oid(1).short()),
+                "#7 vs main".to_owned(),
             ]
         );
         let mut distinct = labels.to_vec();
@@ -11712,6 +11767,7 @@ mod tests {
         assert_eq!(basis_choice_label(&branch), "Branch");
         assert_eq!(basis_choice_label(&commit), "Commit");
         assert_eq!(basis_choice_label(&root_commit), "Commit");
+        assert_eq!(basis_choice_label(&pull_request), "Pull request");
     }
 
     /// A comparison with no text rows reports what it actually is, including

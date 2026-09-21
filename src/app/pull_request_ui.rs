@@ -1206,19 +1206,31 @@ mod tests {
 
     fn discussion_comment(body: &str) -> crate::github::PullRequestComment {
         crate::github::PullRequestComment {
+            id: None,
             author: None,
             body: body.into(),
             created_at: "2024-01-01T00:00:00Z".into(),
             url: "https://github.com/owner/repo/pull/1".parse().unwrap(),
+            viewer_did_author: false,
+            viewer_can_update: false,
+            viewer_can_delete: false,
+            comment_state: None,
         }
     }
 
     fn review_thread(path: &str, resolved: bool, body: &str) -> PullRequestReviewThread {
         PullRequestReviewThread {
+            id: format!("thread-{path}"),
             path: path.into(),
             line: Some(1),
+            start_line: None,
+            side: crate::github::ReviewDiffSide::Right,
+            start_side: None,
             outdated: false,
             resolved,
+            collapsed: false,
+            viewer_can_resolve: false,
+            viewer_can_unresolve: false,
             comments: vec![discussion_comment(body)],
             truncated: false,
         }

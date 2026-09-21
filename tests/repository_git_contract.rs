@@ -2988,3 +2988,224 @@ fn a_remote_whose_name_contains_a_slash_is_named_the_same_way_by_both_halves() {
 fn canonical(path: &Path) -> PathBuf {
     fs::canonicalize(path).unwrap_or_else(|error| panic!("canonicalize {path:?}: {error}"))
 }
+
+/// A pull request review reads the forge's head without checking it out. The
+/// fetch writes only the private `refs/cagents/pull/N/*` pair, forces only
+/// those, and proves the head it fetched is the one the caller was told about
+/// before anything is compared against it.
+#[test]
+fn a_pull_request_fetch_writes_only_its_private_refs_and_proves_the_head() {
+    let Some(fixture) = Fixture::new() else {
+        return;
+    };
+    fixture.write("a.txt", b"one\n");
+    fixture.git_in_work(&["add", "-A"]);
+    let root = fixture.commit("root");
+    let origin = fixture.origin();
+    let origin_url = origin.to_str().expect("UTF-8 path");
+    fixture.git_in_work(&["remote", "add", "origin", origin_url]);
+    fixture.git_in_work(&["push", "--quiet", "origin", "main"]);
+    fixture.git_in_work(&["fetch", "--quiet", "origin"]);
+    // Base moves on after the branch point, as a real base branch does.
+    fixture.write("b.txt", b"base\n");
+    fixture.git_in_work(&["add", "-A"]);
+    let base_tip = fixture.commit("base moves");
+    fixture.git_in_work(&["push", "--quiet", "origin", "main"]);
+    // The contributor's branch, published the way a forge exposes a pull
+    // request: as `refs/pull/N/head` on the base repository, not as a branch.
+    fixture.git_in_work(&["checkout", "--quiet", "-b", "feature", root.as_str()]);
+    fixture.write("a.txt", b"two\n");
+    fixture.git_in_work(&["add", "-A"]);
+    let feature = fixture.commit("feature");
+    fixture.git_in_work(&["push", "--quiet", "origin", "feature:refs/pull/12/head"]);
+    // Back on a different local state, with a tag the fetch must not touch.
+    fixture.git_in_work(&["checkout", "--quiet", "main"]);
+    fixture.git_in_work(&["tag", "v1", root.as_str()]);
+    fixture.git_in_work(&["branch", "-D", "feature"]);
+    let refs_before = fixture.text(&["for-each-ref"]);
+    let fetch_head = fixture.work().join(".git/FETCH_HEAD");
+    let fetch_head_before = fs::read(&fetch_head).ok();
+
+    let service = fixture.service();
+    let main = ValidatedBranchName::parse("main").unwrap();
+    let range = service
+        .fetch_pull_request_range(
+            &fixture.work(),
+            "origin",
+            12,
+            &main,
+            &feature,
+            &CancellationToken::new(),
+        )
+        .expect("fetch pull request range");
+    assert_eq!(range.number, 12);
+    assert_eq!(range.head, feature);
+    assert_eq!(range.base_tip, base_tip);
+    assert_eq!(range.merge_base, root);
+    assert_eq!(range.base_branch.as_str(), "main");
+    assert_eq!(range.head_mirror.as_str(), "refs/cagents/pull/12/head");
+    assert_eq!(range.base_mirror.as_str(), "refs/cagents/pull/12/base");
+
+    // Exactly the two private refs appeared; every other ref is unchanged.
+    let refs_after = fixture.text(&["for-each-ref"]);
+    let new_lines: Vec<&str> = refs_after
+        .lines()
+        .filter(|line| !refs_before.contains(line))
+        .collect();
+    assert_eq!(new_lines.len(), 2, "{refs_after}");
+    assert!(
+        new_lines
+            .iter()
+            .all(|line| line.contains("refs/cagents/pull/12/"))
+    );
+    for line in refs_before.lines() {
+        assert!(refs_after.contains(line), "{line} moved or vanished");
+    }
+    assert_eq!(
+        fs::read(&fetch_head).ok(),
+        fetch_head_before,
+        "FETCH_HEAD is the user's, not this fetch's"
+    );
+    // The namespace is invisible to the ref listing the branch pickers read.
+    let snapshot = fixture.snapshot();
+    assert!(
+        snapshot
+            .local_refs
+            .iter()
+            .all(|record| !record.name.as_str().starts_with("refs/cagents/"))
+    );
+
+    // The range reads like any other immutable comparison.
+    let entries = service
+        .range_diff_entries(
+            &fixture.work(),
+            &range.merge_base,
+            &range.head,
+            &CancellationToken::new(),
+        )
+        .expect("range entries");
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].path, path("a.txt"));
+    let content = service
+        .diff(
+            &DiffRequest {
+                worktree: fixture.work(),
+                basis: range.basis(),
+                path: path("a.txt"),
+                old_path: None,
+            },
+            &CancellationToken::new(),
+        )
+        .expect("diff");
+    let DiffContent::Comparison {
+        old,
+        new,
+        old_label,
+        new_label,
+    } = content
+    else {
+        panic!("expected a comparison");
+    };
+    assert_eq!(text_side(&old), "one\n");
+    assert_eq!(text_side(&new), "two\n");
+    // The chrome names the base branch the user knows, never the private mirror.
+    assert!(old_label.starts_with("main ("), "{old_label}");
+    assert!(new_label.starts_with("#12 ("), "{new_label}");
+
+    // A head the forge no longer serves is refused rather than reviewed.
+    let moved = service.fetch_pull_request_range(
+        &fixture.work(),
+        "origin",
+        12,
+        &main,
+        &root,
+        &CancellationToken::new(),
+    );
+    assert!(
+        matches!(
+            moved,
+            Err(cagents::repository::RepositoryError::PullRequestHeadMoved { ref expected, ref actual })
+                if *expected == root && *actual == feature
+        ),
+        "{moved:?}"
+    );
+    // The remote name is validated before any process runs: a path-shaped
+    // remote is refused by this application, not merely by Git.
+    let refused = service.fetch_pull_request_range(
+        &fixture.work(),
+        "../evil",
+        12,
+        &main,
+        &feature,
+        &CancellationToken::new(),
+    );
+    assert!(
+        matches!(
+            refused,
+            Err(cagents::repository::RepositoryError::Validation(
+                cagents::repository::ValidationError::InvalidRemote(ref name)
+            )) if name == "../evil"
+        ),
+        "{refused:?}"
+    );
+
+    // A base branch the remote no longer serves is a distinct, actionable
+    // failure, and the head that did fetch stays in place.
+    let missing = service.fetch_pull_request_range(
+        &fixture.work(),
+        "origin",
+        12,
+        &ValidatedBranchName::parse("vanished").unwrap(),
+        &feature,
+        &CancellationToken::new(),
+    );
+    assert!(
+        matches!(
+            missing,
+            Err(cagents::repository::RepositoryError::PullRequestBaseUnavailable { ref base_branch, .. })
+                if base_branch.as_str() == "vanished"
+        ),
+        "{missing:?}"
+    );
+    assert_eq!(
+        fixture.text(&["rev-parse", "refs/cagents/pull/12/head"]),
+        feature.as_str()
+    );
+
+    // Pruning removes only the pairs the caller no longer retains.
+    fixture.git_in_work(&[
+        "push",
+        "--quiet",
+        "origin",
+        &format!("{}:refs/pull/13/head", feature.as_str()),
+    ]);
+    service
+        .fetch_pull_request_range(
+            &fixture.work(),
+            "origin",
+            13,
+            &main,
+            &feature,
+            &CancellationToken::new(),
+        )
+        .expect("fetch second pull request");
+    fixture.git_in_work(&["update-ref", "refs/cagents/pull/notes", feature.as_str()]);
+    let pruned = service
+        .prune_pull_request_refs(
+            &fixture.work(),
+            |number| number == 13,
+            &CancellationToken::new(),
+        )
+        .expect("prune");
+    assert_eq!(pruned, vec![12]);
+    let remaining = fixture.text(&["for-each-ref", "--format=%(refname)", "refs/cagents/"]);
+    assert_eq!(
+        remaining.lines().collect::<Vec<_>>(),
+        vec![
+            "refs/cagents/pull/13/base",
+            "refs/cagents/pull/13/head",
+            "refs/cagents/pull/notes",
+        ],
+        "{remaining}"
+    );
+}
