@@ -1,3 +1,4 @@
+use cagents::settings_widgets::{Setting, field as settings_field, group as settings_group};
 use cagents::{
     design,
     lsp::{
@@ -108,6 +109,7 @@ pub enum Message {
     CancelClose,
     Reaped,
     WindowFocused(window::Id, bool),
+    WindowResized(iced::Size),
     RefreshVisible,
     /// The shell's light or dark mode changed, so a rendered document page no
     /// longer matches the surface it sits on.
@@ -126,6 +128,8 @@ pub enum Message {
     FileOperationFinished(Result<PathBuf, String>),
     Settings,
     SelectSettingsCategory(SettingsCategory),
+    SettingsSearchChanged(String),
+    ResetSettings,
     ShortcutChanged(EditorShortcut, String),
     FindInFile,
     FindQueryChanged(String),
@@ -169,6 +173,7 @@ pub enum Message {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SettingsCategory {
+    General,
     Editing,
     Appearance,
     Keyboard,
@@ -176,7 +181,8 @@ pub(crate) enum SettingsCategory {
 }
 
 impl SettingsCategory {
-    const ALL: [Self; 4] = [
+    const ALL: [Self; 5] = [
+        Self::General,
         Self::Editing,
         Self::Appearance,
         Self::Keyboard,
@@ -185,7 +191,8 @@ impl SettingsCategory {
 
     const fn label(self) -> &'static str {
         match self {
-            Self::Editing => "Editing",
+            Self::General => "General",
+            Self::Editing => "Editor",
             Self::Appearance => "Appearance",
             Self::Keyboard => "Keyboard",
             Self::LanguageServers => "Language servers",
@@ -258,6 +265,29 @@ impl crate::preferences::EditorShortcuts {
     }
 }
 impl Editor {
+    fn set_ui_scale(&mut self, scale: f32) {
+        let ratio = self.settings.ui_scale / scale;
+        self.window_size = iced::Size::new(
+            self.window_size.width * ratio,
+            self.window_size.height * ratio,
+        );
+        self.settings.ui_scale = scale;
+    }
+    fn select_tab(&mut self, id: CardId) -> Task<Message> {
+        self.selection_epoch = self.selection_epoch.wrapping_add(1);
+        self.active = Some(id);
+        self.tab_mut(id).map_or_else(Task::none, |tab| {
+            if tab.runtime.editor_text().is_some() {
+                tab.pending_fragment
+                    .take()
+                    .map_or_else(Task::none, |fragment| {
+                        repository_task(tab.runtime.preview_fragment(id, &fragment))
+                    })
+            } else {
+                Task::none()
+            }
+        })
+    }
     fn shortcut_pressed(&self, action: EditorShortcut, event: &keyboard::Event) -> bool {
         cagents::settings::parse_shortcut(self.shortcuts.value(action))
             .is_ok_and(|binding| workspace_widget::shortcut_event_matches(binding, event))
@@ -318,6 +348,10 @@ pub struct Editor {
     shortcuts: crate::preferences::EditorShortcuts,
     shortcut_draft: crate::preferences::EditorShortcuts,
     settings_category: SettingsCategory,
+    settings_search: String,
+    window_size: iced::Size,
+    tab_history: cagents::tab_history::TabHistory<CardId>,
+    settings_reset_confirm: bool,
     settings_path: PathBuf,
     settings_open: bool,
     settings_writable: bool,
@@ -688,55 +722,12 @@ fn create_new_file(path: &Path, text: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn settings_choice_row(choices: Vec<Element<'_, Message>>) -> Element<'_, Message> {
-    widget::row::with_children(choices)
-        .spacing(design::GRID_UNIT)
-        .align_y(iced::Alignment::Center)
-        .into()
-}
-
-fn settings_field<'a>(
-    title: &'static str,
-    detail: &'static str,
-    control: Element<'a, Message>,
-) -> Element<'a, Message> {
-    widget::column::with_children(vec![
-        widget::text::caption_heading(title).into(),
-        design::caption(detail)
-            .wrapping(iced::widget::text::Wrapping::Word)
-            .width(Length::Fill)
-            .into(),
-        control,
-    ])
-    .spacing(design::GRID_UNIT)
-    .width(Length::Fill)
-    .into()
-}
-
-fn settings_group<'a>(
-    title: &'static str,
-    detail: &'static str,
-    controls: Vec<Element<'a, Message>>,
-) -> Element<'a, Message> {
-    let mut children = vec![
-        widget::text::title4(title).into(),
-        design::caption(detail)
-            .wrapping(iced::widget::text::Wrapping::Word)
-            .width(Length::Fill)
-            .into(),
-    ];
-    children.extend(controls);
-    widget::column::with_children(children)
-        .spacing(12)
-        .width(Length::Fill)
-        .into()
-}
 fn shortcut_setting<'a>(
     title: &'static str,
     detail: &'static str,
     action: EditorShortcut,
     value: &'a str,
-) -> Element<'a, Message> {
+) -> Setting<'a, Message> {
     settings_field(
         title,
         detail,
@@ -769,8 +760,7 @@ fn connected_dialog_surface<'a>(
         widget::container(content)
             .class(cosmic::theme::Container::Dialog(false))
             .width(Length::Fill)
-            .max_width(max_width)
-            .max_height(720),
+            .max_width(max_width),
     )
     .into()
 }
@@ -1986,13 +1976,7 @@ impl Editor {
     }
 
     fn appearance(&mut self) -> Task<Message> {
-        let theme = match self.settings.app_theme {
-            AppTheme::System => {
-                cosmic::Theme::system(Arc::new(self.core.system_theme().cosmic().clone()))
-            }
-            AppTheme::Dark => cosmic::Theme::dark(),
-            AppTheme::Light => cosmic::Theme::light(),
-        };
+        let theme = self.settings.app_theme.resolve(self.core.system_theme());
         let documents = self.retone_documents(&theme);
         Task::batch([
             cosmic::command::set_theme(theme),
@@ -2444,6 +2428,10 @@ impl Application for Editor {
             shortcuts,
             shortcut_draft,
             settings_category: SettingsCategory::Editing,
+            settings_search: String::new(),
+            window_size: iced::Size::new(1200.0, 900.0),
+            tab_history: cagents::tab_history::TabHistory::default(),
+            settings_reset_confirm: false,
             settings_path: flags.settings_path,
             settings_open: false,
             settings_writable,
@@ -2515,6 +2503,7 @@ impl Application for Editor {
     }
 
     fn update(&mut self, message: Message) -> Task<Message> {
+        self.tab_history.observe(self.active);
         let previous_tabs = (self.active, self.tabs.len());
         let was_refresh_visible = self.can_refresh_visible();
         let navigation_changed = matches!(
@@ -2532,6 +2521,17 @@ impl Application for Editor {
                 | Message::SavedAs(..)
         );
         let task = (|| {
+            if self.settings_open
+                && let Message::Key(keyboard::Event::KeyPressed { key, modifiers, .. }) = &message
+                && modifiers.control()
+                && !modifiers.shift()
+                && !modifiers.alt()
+                && !modifiers.logo()
+                && matches!(key, keyboard::Key::Character(value) if value.eq_ignore_ascii_case("f"))
+            {
+                return iced::widget::operation::focus(cagents::settings_widgets::search_id())
+                    .map(cosmic::Action::App);
+            }
             if let Message::Key(keyboard::Event::KeyPressed {
                 key: keyboard::Key::Named(keyboard::key::Named::Escape),
                 ..
@@ -2578,9 +2578,16 @@ impl Application for Editor {
                 return Task::none();
             }
             match message {
+                Message::WindowResized(size) => {
+                    self.window_size = size;
+                    Task::none()
+                }
                 Message::WindowFocused(window, focused) => {
                     if self.core.main_window_id() == Some(window) {
                         self.window_focused = focused;
+                        if !focused {
+                            self.tab_history.finish(self.active);
+                        }
                     }
                     Task::none()
                 }
@@ -2710,21 +2717,7 @@ impl Application for Editor {
                     }
                     self.resume_pending_files()
                 }
-                Message::Select(id) => {
-                    self.selection_epoch = self.selection_epoch.wrapping_add(1);
-                    self.active = Some(id);
-                    self.tab_mut(id).map_or_else(Task::none, |tab| {
-                        if tab.runtime.editor_text().is_some() {
-                            tab.pending_fragment
-                                .take()
-                                .map_or_else(Task::none, |fragment| {
-                                    repository_task(tab.runtime.preview_fragment(id, &fragment))
-                                })
-                        } else {
-                            Task::none()
-                        }
-                    })
-                }
+                Message::Select(id) => self.select_tab(id),
                 Message::CloseTab(id) => self.request_close(id),
                 Message::CloseWindow => {
                     // Shutdown removes runtime tabs to honor dirty-buffer guards;
@@ -3259,8 +3252,42 @@ impl Application for Editor {
                     self.resume_pending_files()
                 }
                 Message::SelectSettingsCategory(category) => {
+                    self.settings_search.clear();
+                    self.settings_reset_confirm = false;
                     self.settings_category = category;
                     Task::none()
+                }
+                Message::SettingsSearchChanged(query) => {
+                    self.settings_search = query;
+                    Task::none()
+                }
+                Message::ResetSettings => {
+                    if !self.settings_writable {
+                        return Task::none();
+                    }
+                    if !self.settings_reset_confirm {
+                        self.settings_reset_confirm = true;
+                        return Task::none();
+                    }
+                    self.settings_reset_confirm = false;
+                    self.set_ui_scale(AppSettings::default().ui_scale);
+                    self.settings = AppSettings::default();
+                    self.shortcuts = crate::preferences::EditorShortcuts::default();
+                    self.shortcut_draft = self.shortcuts.clone();
+                    for tab in &mut self.tabs {
+                        tab.runtime.set_auto_save(self.settings.editor_auto_save);
+                        tab.runtime.set_wrap_lines(self.settings.editor_wrap_lines);
+                        tab.runtime
+                            .set_syntax_theme(self.settings.editor_syntax_theme);
+                    }
+                    let shortcuts =
+                        self.capture_preference(PreferenceWrite::Shortcuts(self.shortcuts.clone()));
+                    Task::batch([
+                        self.set_language_server_assistance(false),
+                        self.appearance(),
+                        self.save_settings(),
+                        preference_task(shortcuts),
+                    ])
                 }
                 Message::ShortcutChanged(action, value) => {
                     self.shortcut_draft.set(action, value);
@@ -3442,7 +3469,7 @@ impl Application for Editor {
                     Task::batch([self.save_settings(), self.appearance()])
                 }
                 Message::Scale(scale) => {
-                    self.settings.ui_scale = scale;
+                    self.set_ui_scale(scale);
                     Task::batch([self.save_settings(), self.appearance()])
                 }
                 Message::SettingsSaved(result) => {
@@ -3572,6 +3599,20 @@ impl Application for Editor {
                     Task::none()
                 }
                 Message::Key(event) => {
+                    if cagents::tab_history::released(&event) {
+                        self.tab_history.finish(self.active);
+                    }
+                    if !self.modal_open()
+                        && let Some(backwards) = cagents::tab_history::step_direction(&event)
+                    {
+                        let available: Vec<_> = self.tabs.iter().map(|tab| tab.id).collect();
+                        if let Some(id) = self.tab_history.step(&available, self.active, backwards)
+                        {
+                            let select = self.select_tab(id);
+                            return Task::batch([select, self.focus_active_editor()]);
+                        }
+                        return Task::none();
+                    }
                     if self.find_open
                         && let Some(task) = self.handle_find_key(&event)
                     {
@@ -3641,6 +3682,7 @@ impl Application for Editor {
             iced::Event::Window(window::Event::Focused) => {
                 Some(Message::WindowFocused(window, true))
             }
+            iced::Event::Window(window::Event::Resized(size)) => Some(Message::WindowResized(size)),
             iced::Event::Window(window::Event::Unfocused) => {
                 Some(Message::WindowFocused(window, false))
             }
@@ -4017,9 +4059,10 @@ impl Application for Editor {
                 .into(),
             );
         }
-        widget::column::with_children(body)
-            .height(Length::Fill)
-            .into()
+        cagents::interaction::reserve_tab_history(
+            widget::column::with_children(body).height(Length::Fill),
+            !self.modal_open(),
+        )
     }
 
     fn dialog(&self) -> Option<Element<'_, Message>> {
@@ -4187,198 +4230,208 @@ impl Application for Editor {
         if !self.settings_open {
             return None;
         }
-        let theme_choices = ["System", "Light", "Dark"]
-            .into_iter()
-            .zip([AppTheme::System, AppTheme::Light, AppTheme::Dark])
-            .map(|(label, theme)| {
-                let selected = self.settings.app_theme == theme;
-                cagents::interaction::hover(
-                    widget::button::custom(design::body(label))
-                        .class(if selected {
-                            cosmic::theme::Button::Suggested
-                        } else {
-                            cosmic::theme::Button::Standard
-                        })
-                        .selected(selected)
-                        .on_press(Message::Theme(theme)),
-                )
-            })
-            .collect();
-        let syntax_choices = settings::EditorSyntaxTheme::ALL
-            .iter()
-            .copied()
-            .map(|theme| {
-                let selected = self.settings.editor_syntax_theme == theme;
-                cagents::interaction::hover(
-                    widget::button::custom(design::body(theme.label()))
-                        .class(if selected {
-                            cosmic::theme::Button::Suggested
-                        } else {
-                            cosmic::theme::Button::Standard
-                        })
-                        .selected(selected)
-                        .on_press(Message::SyntaxTheme(theme)),
-                )
-            })
-            .collect();
-        let controls = match self.settings_category {
-            SettingsCategory::Editing => vec![settings_group(
-                "Editing",
-                "Saving and how the buffer wraps.",
-                vec![
-                    widget::toggler(self.settings.editor_auto_save)
-                        .label("Save files automatically".to_owned())
-                        .on_toggle(Message::AutoSave)
-                        .into(),
-                    design::caption("Saves after a pause. Conflicts still need a decision.")
-                        .wrapping(iced::widget::text::Wrapping::Word)
-                        .into(),
-                    widget::toggler(self.settings.editor_wrap_lines)
-                        .label("Wrap long lines".to_owned())
-                        .on_toggle(Message::WrapLines)
-                        .into(),
-                ],
-            )],
-            SettingsCategory::Appearance => vec![settings_group(
-                "Appearance",
-                "Window colors, syntax colors, and interface scale.",
-                vec![
-                    settings_field(
-                        "Color scheme",
-                        "Follow the desktop, or lock light or dark.",
-                        settings_choice_row(theme_choices),
-                    ),
-                    settings_field(
-                        "Syntax highlighting",
-                        "Match app follows the color scheme. The others keep a fixed highlighter palette.",
-                        settings_choice_row(syntax_choices),
-                    ),
-                    settings_field(
-                        "Interface scale",
-                        "Size of text and controls.",
-                        widget::row::with_children(vec![
-                            icon_control(
-                                symbolic_icon("list-remove-symbolic"),
-                                "Decrease scale",
-                                false,
-                                self.settings.ui_scale > 0.75,
-                                (self.settings.ui_scale > 0.75).then_some(Message::Scale(
-                                    (self.settings.ui_scale - 0.1).max(0.75),
-                                )),
-                            )
-                            .into(),
-                            widget::container(design::body(format!(
-                                "{:.0}%",
-                                self.settings.ui_scale * 100.0
-                            )))
-                            .center_x(64)
-                            .center_y(design::PRIMARY_CONTROL_SIZE)
-                            .into(),
-                            icon_control(
-                                symbolic_icon("list-add-symbolic"),
-                                "Increase scale",
-                                false,
-                                self.settings.ui_scale < 2.0,
-                                (self.settings.ui_scale < 2.0).then_some(Message::Scale(
-                                    (self.settings.ui_scale + 0.1).min(2.0),
-                                )),
-                            )
-                            .into(),
-                        ])
-                        .spacing(design::GRID_UNIT)
-                        .align_y(iced::Alignment::Center)
-                        .into(),
-                    ),
-                ],
-            )],
-            SettingsCategory::Keyboard => vec![settings_group(
-                "Keyboard shortcuts",
-                "Use Ctrl, Alt, or Super plus one key. Changes save immediately when valid.",
-                vec![
-                    shortcut_setting(
-                        "New tab",
-                        "Create an untitled editor tab.",
-                        EditorShortcut::NewTab,
-                        &self.shortcut_draft.new_tab,
-                    ),
-                    shortcut_setting(
-                        "Open file",
-                        "Open a file picker.",
-                        EditorShortcut::OpenFile,
-                        &self.shortcut_draft.open_file,
-                    ),
-                    shortcut_setting(
-                        "Open folder",
-                        "Open a folder picker.",
-                        EditorShortcut::OpenFolder,
-                        &self.shortcut_draft.open_folder,
-                    ),
-                    shortcut_setting(
-                        "Save file",
-                        "Save the active file or open Save as for an untitled note.",
-                        EditorShortcut::SaveFile,
-                        &self.shortcut_draft.save_file,
-                    ),
-                    shortcut_setting(
-                        "Close tab",
-                        "Close the active tab.",
-                        EditorShortcut::CloseTab,
-                        &self.shortcut_draft.close_tab,
-                    ),
-                    shortcut_setting(
-                        "Find in file",
-                        "Search inside the active file.",
-                        EditorShortcut::FindInFile,
-                        &self.shortcut_draft.find_in_file,
-                    ),
-                    shortcut_setting(
-                        "Filter files",
-                        "Focus the sidebar file filter.",
-                        EditorShortcut::FilterFiles,
-                        &self.shortcut_draft.filter_files,
-                    ),
-                    shortcut_setting(
-                        "Quick open",
-                        "Search and open a file from the active worktree.",
-                        EditorShortcut::QuickOpen,
-                        &self.shortcut_draft.quick_open,
-                    ),
-                    shortcut_setting(
-                        "Toggle sidebar",
-                        "Show or hide the files sidebar.",
-                        EditorShortcut::ToggleSidebar,
-                        &self.shortcut_draft.toggle_sidebar,
-                    ),
-                    // Fixed, not configurable: the completion request is wired
-                    // to the chord directly rather than through the shortcut
-                    // table, so list it read-only instead of leaving it
-                    // undiscoverable.
-                    settings_field(
-                        "Request completions",
-                        "Ask the language server for completions at the caret.",
-                        design::body("Ctrl+Space").into(),
-                    ),
-                ],
-            )],
-            SettingsCategory::LanguageServers => vec![settings_group(
-                "Language servers",
-                "Semantic diagnostics, completion, and hover. Off by default.",
-                vec![
-                    widget::toggler(self.language_server_assistance)
-                        .label("Language-server assistance".to_owned())
-                        .on_toggle(Message::LanguageServerAssistance)
-                        .into(),
-                    design::caption(
-                        "Edit language_servers in the preferences file, then restart ceditor.",
-                    )
-                    .wrapping(iced::widget::text::Wrapping::Word)
-                    .into(),
-                    design::caption(self.settings_path.to_string_lossy())
-                        .wrapping(iced::widget::text::Wrapping::WordOrGlyph)
-                        .into(),
-                ],
-            )],
+        Some(self.settings_dialog(self.window_size))
+    }
+}
+
+impl Editor {
+    fn settings_dialog(&self, size: iced::Size) -> Element<'_, Message> {
+        let categories: Vec<_> = if self.settings_search.trim().is_empty() {
+            vec![self.settings_category]
+        } else {
+            SettingsCategory::ALL.to_vec()
         };
+        let mut results = Vec::new();
+        for category in categories {
+            let controls = match category {
+                SettingsCategory::General => vec![settings_group(
+                    "General",
+                    "Preferences for the standalone editor.",
+                    vec![
+                        settings_field(
+                            "Settings file",
+                            "Your editor preferences are independent from workbench settings.",
+                            design::body(self.settings_path.to_string_lossy()).into(),
+                        ),
+                        settings_field(
+                            "Reset all settings",
+                            "Restore default editor preferences and keyboard shortcuts. Open files and saved tabs are preserved.",
+                            widget::button::standard(if self.settings_reset_confirm {
+                                "Confirm reset all settings"
+                            } else {
+                                "Reset all settings"
+                            })
+                            .on_press(Message::ResetSettings)
+                            .into(),
+                        ),
+                    ],
+                )],
+                SettingsCategory::Editing => vec![settings_group(
+                    "Editor",
+                    "Shared native editor and diff preferences.",
+                    cagents::settings_widgets::editor_options(
+                        self.settings.editor_auto_save,
+                        self.settings.editor_wrap_lines,
+                        self.settings.editor_syntax_theme,
+                        Message::AutoSave,
+                        Message::WrapLines,
+                        Message::SyntaxTheme,
+                    ),
+                )],
+                SettingsCategory::Appearance => vec![settings_group(
+                    "Appearance",
+                    "Application colors and interface scale.",
+                    vec![
+                        settings_field(
+                            "App theme",
+                            "Colors for the entire application. Syntax palettes are independent.",
+                            widget::dropdown(
+                                AppTheme::ALL
+                                    .iter()
+                                    .map(|theme| theme.label().to_owned())
+                                    .collect::<Vec<_>>(),
+                                AppTheme::ALL
+                                    .iter()
+                                    .position(|theme| *theme == self.settings.app_theme),
+                                |index| Message::Theme(AppTheme::ALL[index]),
+                            )
+                            .into(),
+                        ),
+                        settings_field(
+                            "Interface scale",
+                            "Size of text and controls.",
+                            widget::row::with_children(vec![
+                                icon_control(
+                                    symbolic_icon("list-remove-symbolic"),
+                                    "Decrease scale",
+                                    false,
+                                    self.settings.ui_scale > 0.75,
+                                    (self.settings.ui_scale > 0.75).then_some(Message::Scale(
+                                        (self.settings.ui_scale - 0.1).max(0.75),
+                                    )),
+                                )
+                                .into(),
+                                widget::container(design::body(format!(
+                                    "{:.0}%",
+                                    self.settings.ui_scale * 100.0
+                                )))
+                                .center_x(64)
+                                .center_y(design::PRIMARY_CONTROL_SIZE)
+                                .into(),
+                                icon_control(
+                                    symbolic_icon("list-add-symbolic"),
+                                    "Increase scale",
+                                    false,
+                                    self.settings.ui_scale < 2.0,
+                                    (self.settings.ui_scale < 2.0).then_some(Message::Scale(
+                                        (self.settings.ui_scale + 0.1).min(2.0),
+                                    )),
+                                )
+                                .into(),
+                            ])
+                            .spacing(design::GRID_UNIT)
+                            .align_y(iced::Alignment::Center)
+                            .into(),
+                        ),
+                    ],
+                )],
+                SettingsCategory::Keyboard => vec![settings_group(
+                    "Keyboard shortcuts",
+                    "Use Ctrl, Alt, or Super plus one key. Changes save immediately when valid.",
+                    vec![
+                        shortcut_setting(
+                            "New tab",
+                            "Create an untitled editor tab.",
+                            EditorShortcut::NewTab,
+                            &self.shortcut_draft.new_tab,
+                        ),
+                        shortcut_setting(
+                            "Open file",
+                            "Open a file picker.",
+                            EditorShortcut::OpenFile,
+                            &self.shortcut_draft.open_file,
+                        ),
+                        shortcut_setting(
+                            "Open folder",
+                            "Open a folder picker.",
+                            EditorShortcut::OpenFolder,
+                            &self.shortcut_draft.open_folder,
+                        ),
+                        shortcut_setting(
+                            "Save file",
+                            "Save the active file or open Save as for an untitled note.",
+                            EditorShortcut::SaveFile,
+                            &self.shortcut_draft.save_file,
+                        ),
+                        shortcut_setting(
+                            "Close tab",
+                            "Close the active tab.",
+                            EditorShortcut::CloseTab,
+                            &self.shortcut_draft.close_tab,
+                        ),
+                        shortcut_setting(
+                            "Find in file",
+                            "Search inside the active file.",
+                            EditorShortcut::FindInFile,
+                            &self.shortcut_draft.find_in_file,
+                        ),
+                        shortcut_setting(
+                            "Filter files",
+                            "Focus the sidebar file filter.",
+                            EditorShortcut::FilterFiles,
+                            &self.shortcut_draft.filter_files,
+                        ),
+                        shortcut_setting(
+                            "Quick open",
+                            "Search and open a file from the active worktree.",
+                            EditorShortcut::QuickOpen,
+                            &self.shortcut_draft.quick_open,
+                        ),
+                        shortcut_setting(
+                            "Toggle sidebar",
+                            "Show or hide the files sidebar.",
+                            EditorShortcut::ToggleSidebar,
+                            &self.shortcut_draft.toggle_sidebar,
+                        ),
+                        // Fixed, not configurable: the completion request is wired
+                        // to the chord directly rather than through the shortcut
+                        // table, so list it read-only instead of leaving it
+                        // undiscoverable.
+                        settings_field(
+                            "Request completions",
+                            "Ask the language server for completions at the caret.",
+                            design::body("Ctrl+Space").into(),
+                        ),
+                    ],
+                )],
+                SettingsCategory::LanguageServers => vec![settings_group(
+                    "Language servers",
+                    "Semantic diagnostics, completion, and hover. Off by default.",
+                    vec![settings_field(
+                        "Language-server assistance",
+                        "Semantic diagnostics, completion, and hover. Configure language_servers in the preferences file, then restart ceditor.",
+                        widget::toggler(self.language_server_assistance)
+                            .label("Enable language servers".to_owned())
+                            .on_toggle(Message::LanguageServerAssistance)
+                            .into(),
+                    )],
+                )],
+            };
+            let query =
+                if cagents::settings_widgets::matches(category.label(), &self.settings_search) {
+                    ""
+                } else {
+                    &self.settings_search
+                };
+            results.extend(
+                controls
+                    .into_iter()
+                    .filter_map(|group| group.view(category.label(), query)),
+            );
+        }
+        if results.is_empty() {
+            results.push(design::body("No matching settings").into());
+        }
         let navigation =
             widget::column::with_children(SettingsCategory::ALL.into_iter().map(|category| {
                 cagents::interaction::hover(
@@ -4396,11 +4449,21 @@ impl Application for Editor {
             .padding([2.0 * design::GRID_UNIT, design::GRID_UNIT])
             .width(180)
             .height(Length::Fill);
+        let navigation = widget::column::with_children(vec![
+            widget::text_input("Search settings…", &self.settings_search)
+                .id(cagents::settings_widgets::search_id())
+                .on_input(Message::SettingsSearchChanged)
+                .into(),
+            navigation.into(),
+        ])
+        .padding(8)
+        .width(200)
+        .height(Length::Fill);
         let body = widget::row::with_children(vec![
             navigation.into(),
             design::vertical_rule().into(),
             widget::scrollable(
-                widget::container(widget::column::with_children(controls).spacing(20))
+                widget::container(widget::column::with_children(results).spacing(20))
                     .padding([4.0 * design::GRID_UNIT, 5.0 * design::GRID_UNIT])
                     .width(Length::Fill)
                     .max_width(620),
@@ -4430,7 +4493,7 @@ impl Application for Editor {
         .padding([2.0 * design::GRID_UNIT, 4.0 * design::GRID_UNIT])
         .align_y(iced::Alignment::Center)
         .height(design::HEADER_HEIGHT);
-        Some(dialog_overlay(
+        dialog_overlay(
             connected_dialog_surface(
                 widget::column::with_children(vec![
                     header.into(),
@@ -4438,11 +4501,11 @@ impl Application for Editor {
                     body.into(),
                 ])
                 .spacing(0)
-                .height(Length::Fill),
+                .height(cagents::settings_widgets::dialog_size(size).height),
                 900.0,
             ),
             Message::Settings,
-        ))
+        )
     }
 }
 
@@ -4461,6 +4524,10 @@ mod tests {
             shortcuts: crate::preferences::EditorShortcuts::default(),
             shortcut_draft: crate::preferences::EditorShortcuts::default(),
             settings_category: SettingsCategory::Editing,
+            settings_search: String::new(),
+            window_size: iced::Size::new(1200.0, 900.0),
+            tab_history: cagents::tab_history::TabHistory::default(),
+            settings_reset_confirm: false,
             settings_path: PathBuf::new(),
             settings_open: false,
             find_open: false,
@@ -4546,6 +4613,39 @@ mod tests {
             app.tab(id).unwrap().runtime.editor_text().is_some(),
             "the buffer for {file} never opened",
         );
+    }
+
+    #[test]
+    fn control_tab_navigates_history_and_focus_loss_commits_it() {
+        let mut app = editor();
+        app.core.set_main_window_id(Some(window::Id::RESERVED));
+        let first = add(&mut app, "/workspace", Some("a.rs"));
+        let second = add(&mut app, "/workspace", Some("b.rs"));
+        let third = add(&mut app, "/workspace", Some("c.rs"));
+        for id in [first, second, third] {
+            drop(app.update(Message::Select(id)));
+        }
+        let next = || {
+            Message::Key(named_key(
+                keyboard::key::Named::Tab,
+                keyboard::Modifiers::CTRL,
+            ))
+        };
+        drop(app.update(next()));
+        assert_eq!(app.active, Some(second));
+        drop(app.update(next()));
+        assert_eq!(app.active, Some(first));
+        drop(app.update(Message::Key(named_key(
+            keyboard::key::Named::Tab,
+            keyboard::Modifiers::CTRL | keyboard::Modifiers::SHIFT,
+        ))));
+        assert_eq!(app.active, Some(second));
+        drop(app.update(Message::WindowFocused(window::Id::RESERVED, false)));
+        drop(app.update(next()));
+        assert_eq!(app.active, Some(third));
+        app.settings_open = true;
+        drop(app.update(next()));
+        assert_eq!(app.active, Some(third));
     }
 
     #[test]

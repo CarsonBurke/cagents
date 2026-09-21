@@ -1594,24 +1594,27 @@ pub enum SettingsCategory {
     General,
     Appearance,
     Terminal,
+    Editor,
     Links,
     Keyboard,
 }
 
 impl SettingsCategory {
-    const ALL: [Self; 5] = [
-        Self::Appearance,
-        Self::Terminal,
+    const ALL: [Self; 6] = [
         Self::General,
+        Self::Appearance,
+        Self::Editor,
+        Self::Terminal,
         Self::Links,
         Self::Keyboard,
     ];
 
     const fn label(self) -> &'static str {
         match self {
-            Self::General => "Performance",
+            Self::General => "General",
             Self::Appearance => "Appearance",
             Self::Terminal => "Terminal",
+            Self::Editor => "Editor",
             Self::Links => "Browser & links",
             Self::Keyboard => "Keyboard",
         }
@@ -1874,6 +1877,7 @@ fn user_message_blocked_during_update(message: &Message) -> bool {
                 | Message::CancelDialog
                 | Message::CloseInspector
                 | Message::SelectSettingsCategory(_)
+                | Message::SettingsSearchChanged(_)
                 | Message::SettingsChanged { .. }
                 | Message::SettingsDraftChanged { .. }
                 | Message::ResetSettings
@@ -2125,12 +2129,7 @@ struct SettingsDraft {
 impl SettingsDraft {
     fn from_settings(settings: &AppSettings) -> Self {
         Self {
-            app_theme: match settings.app_theme {
-                AppTheme::System => "system",
-                AppTheme::Dark => "dark",
-                AppTheme::Light => "light",
-            }
-            .into(),
+            app_theme: settings.app_theme.key().into(),
             ui_scale: settings.ui_scale.to_string(),
             terminal_line_height: settings.terminal_line_height.to_string(),
             terminal_padding: settings.terminal_padding.to_string(),
@@ -2286,21 +2285,9 @@ fn settings_update(
             .parse::<bool>()
             .map(|enabled| next.editor_wrap_lines = enabled)
             .map_err(|_| "Choose whether long editor lines wrap.".to_owned()),
-        SettingsField::AppTheme => match value {
-            "system" => {
-                next.app_theme = AppTheme::System;
-                Ok(())
-            }
-            "dark" => {
-                next.app_theme = AppTheme::Dark;
-                Ok(())
-            }
-            "light" => {
-                next.app_theme = AppTheme::Light;
-                Ok(())
-            }
-            _ => Err("Choose System, Dark, or Light.".into()),
-        },
+        SettingsField::AppTheme => AppTheme::from_key(value)
+            .map(|theme| next.app_theme = theme)
+            .ok_or_else(|| "Choose one of the listed app themes.".to_owned()),
         SettingsField::TerminalCursorStyle => match value {
             "application" => {
                 next.terminal_cursor_style = TerminalCursorStyle::Application;
@@ -2594,7 +2581,7 @@ pub enum Message {
     #[cfg(feature = "integrated-browser")]
     BrowserFactoryReady(Result<BrowserFactoryBinding, String>),
     WindowScaleFactorChanged(f32),
-    WindowResized(f32),
+    WindowResized(f32, f32),
     ActivateUi {
         token: Option<String>,
     },
@@ -2691,6 +2678,7 @@ pub enum Message {
     ContextInspector(InspectorAction),
     CloseInspector,
     SelectSettingsCategory(SettingsCategory),
+    SettingsSearchChanged(String),
     SettingsChanged {
         field: SettingsField,
         value: String,
@@ -3124,6 +3112,7 @@ pub struct Cagents {
     /// are both derived from it and the surface does not report a width until
     /// it has been mapped. `Message::WindowResized` replaces it.
     window_width: f32,
+    window_height: f32,
     core: Core,
     settings_path: Option<PathBuf>,
     settings_write_blocked: bool,
@@ -3197,6 +3186,8 @@ pub struct Cagents {
     context_inspector_overlay_active: bool,
     context_inspector_restore_focus: Option<widget::Id>,
     settings_category: SettingsCategory,
+    settings_search: String,
+    tab_history: crate::tab_history::TabHistory<CardId>,
     keyboard_modifiers: keyboard::Modifiers,
     settings_draft: SettingsDraft,
     settings_feedback: Option<SettingsFeedback>,
@@ -7414,6 +7405,7 @@ impl Cagents {
         // COSMIC applies its scale action asynchronously. Use the previous
         // persisted preference, not Core's possibly not-yet-updated value.
         self.window_width *= previous_scale / self.settings.ui_scale;
+        self.window_height *= previous_scale / self.settings.ui_scale;
         #[cfg(feature = "integrated-browser")]
         for runtime in self.cards.values() {
             if let CardRuntime::Browser(browser) = runtime {
@@ -7423,13 +7415,7 @@ impl Cagents {
                 ));
             }
         }
-        let theme = match self.settings.app_theme {
-            AppTheme::System => {
-                cosmic::Theme::system(Arc::new(self.core.system_theme().cosmic().clone()))
-            }
-            AppTheme::Dark => cosmic::Theme::dark(),
-            AppTheme::Light => cosmic::Theme::light(),
-        };
+        let theme = self.settings.app_theme.resolve(self.core.system_theme());
         let overlay = self.sync_context_overlay_state();
         let documents = self.retone_documents(&theme);
         Task::batch([
@@ -7898,6 +7884,7 @@ impl Application for Cagents {
             browser_parent_lifetime: None,
             window_scale_factor,
             window_width: 1_600.0,
+            window_height: 900.0,
             settings_path,
             settings_write_blocked,
             notices: NoticeLog::default(),
@@ -7963,6 +7950,8 @@ impl Application for Cagents {
             // Keep a valid post-close target ready for that narrow startup.
             context_inspector_restore_focus: Some(context_inspector_toggle_id()),
             settings_category: SettingsCategory::Appearance,
+            settings_search: String::new(),
+            tab_history: crate::tab_history::TabHistory::default(),
             keyboard_modifiers: keyboard::Modifiers::empty(),
             settings_draft,
             settings_feedback: None,
@@ -8089,6 +8078,7 @@ impl Application for Cagents {
     }
 
     fn update(&mut self, message: Message) -> Task<Message> {
+        self.tab_history.observe(self.workspace.focused());
         // Freeze user input, not lifecycle completions. Dropping a completed
         // save/Git/spawn result would strand that operation if another window vetoed.
         if self.update_prepared && user_message_blocked_during_update(&message) {
@@ -9522,7 +9512,10 @@ impl Application for Cagents {
                 }
                 Task::none()
             }
-            Message::WindowResized(width) => {
+            Message::WindowResized(width, height) => {
+                if height.is_finite() && height > 0.0 {
+                    self.window_height = height;
+                }
                 if width.is_finite() && width > 0.0 {
                     self.window_width = width;
                 }
@@ -9912,6 +9905,35 @@ impl Application for Cagents {
                 self.focus_context_overlay_if_exposed()
             }
             Message::KeyEvent { event, captured } => {
+                if crate::tab_history::released(&event) {
+                    self.tab_history.finish(self.workspace.focused());
+                }
+                if !self.workspace_inputs_blocked()
+                    && let Some(backwards) = crate::tab_history::step_direction(&event)
+                {
+                    let available: Vec<_> = self.workspace.order().collect();
+                    if let Some(id) =
+                        self.tab_history
+                            .step(&available, self.workspace.focused(), backwards)
+                        && let Ok(update) = self.workspace.focus(id)
+                    {
+                        return self.apply_viewport(update, true, false);
+                    }
+                    return Task::none();
+                }
+                if self.inspector == Some(Inspector::Settings)
+                    && !self.settings_reset_confirm
+                    && self.update_ui.confirmation.is_none()
+                    && let keyboard::Event::KeyPressed { key, modifiers, .. } = &event
+                    && modifiers.control()
+                    && !modifiers.shift()
+                    && !modifiers.alt()
+                    && !modifiers.logo()
+                    && matches!(key, keyboard::Key::Character(value) if value.eq_ignore_ascii_case("f"))
+                {
+                    return iced::widget::operation::focus(crate::settings_widgets::search_id())
+                        .map(cosmic::Action::App);
+                }
                 if let keyboard::Event::ModifiersChanged(modifiers) = &event {
                     self.keyboard_modifiers = *modifiers;
                 }
@@ -10106,7 +10128,12 @@ impl Application for Cagents {
                 self.flush_settings_drafts()
             }
             Message::SelectSettingsCategory(category) => {
+                self.settings_search.clear();
                 self.settings_category = category;
+                Task::none()
+            }
+            Message::SettingsSearchChanged(query) => {
+                self.settings_search = query;
                 Task::none()
             }
             Message::SettingsChanged { field, value } => self.apply_setting_input(field, value),
@@ -10123,6 +10150,10 @@ impl Application for Cagents {
             Message::ChannelUi(action) => self.handle_channel_ui(action),
             Message::BranchUi(action) => self.update_branch_ui(action),
             Message::RefreshUi(action) => {
+                if matches!(&action, refresh_ui::Action::Focused(id, false) if self.core.main_window_id() == Some(*id))
+                {
+                    self.tab_history.finish(self.workspace.focused());
+                }
                 // A colour-only theme change reaches the hook but not the mode
                 // watch, so the periodic refresh is where that one is caught.
                 Task::batch([self.update_refresh(action), self.flush_document_tone()])
@@ -10385,7 +10416,7 @@ impl Application for Cagents {
                     Some(Message::WindowScaleFactorChanged(scale_factor))
                 }
                 iced::Event::Window(window::Event::Resized(size)) => {
-                    Some(Message::WindowResized(size.width))
+                    Some(Message::WindowResized(size.width, size.height))
                 }
                 iced::Event::Window(window::Event::CloseRequested) => {
                     Some(Message::WindowCloseRequested(event_window))
@@ -10687,8 +10718,9 @@ impl Application for Cagents {
                 Inspector::Settings => settings_dialog(
                     self.settings_category,
                     &self.settings_draft,
+                    &self.settings_search,
                     self.settings_feedback.as_ref(),
-                    self.window_width,
+                    iced::Size::new(self.window_width, self.window_height),
                     progress,
                 ),
             });
@@ -13447,7 +13479,7 @@ mod tests {
 
         // The compositor's first narrow size is the real startup transition.
         app.context_inspector_restore_focus = None;
-        let _focus_close = app.update(Message::WindowResized(design::WIDE_BREAKPOINT - 1.0));
+        let _focus_close = app.update(Message::WindowResized(design::WIDE_BREAKPOINT - 1.0, 900.0));
         assert!(app.context_inspector_is_overlay());
         assert!(app.context_inspector_overlay_active);
         assert!(app.workspace_inputs_blocked());
@@ -13504,11 +13536,11 @@ mod tests {
 
         // Re-entering from a live docked inspector captures afresh instead of
         // depending on the startup value consumed by the first Escape.
-        let _wide = app.update(Message::WindowResized(design::WIDE_BREAKPOINT));
+        let _wide = app.update(Message::WindowResized(design::WIDE_BREAKPOINT, 900.0));
         let _open_docked = app.update(Message::ToggleContextInspector);
         assert!(!app.context_inspector_is_overlay());
         app.context_inspector_restore_focus = None;
-        let _focus_close = app.update(Message::WindowResized(design::WIDE_BREAKPOINT - 1.0));
+        let _focus_close = app.update(Message::WindowResized(design::WIDE_BREAKPOINT - 1.0, 900.0));
         assert!(app.context_inspector_is_overlay());
         assert_eq!(
             app.context_inspector_restore_focus
@@ -13520,7 +13552,7 @@ mod tests {
         // An open inspector remains mounted even before a first card arrives,
         // so its window controls remain reachable on a narrow empty workspace.
         let mut startup = context_inspector_test_app(false);
-        let _narrow = startup.update(Message::WindowResized(design::WIDE_BREAKPOINT - 1.0));
+        let _narrow = startup.update(Message::WindowResized(design::WIDE_BREAKPOINT - 1.0, 900.0));
         assert!(startup.context_inspector_is_overlay());
         assert!(startup.context_inspector_overlay_active);
         assert_eq!(
@@ -14954,6 +14986,7 @@ mod tests {
             browser_parent_lifetime: None,
             window_scale_factor: 1.0,
             window_width: 1_600.0,
+            window_height: 900.0,
             core,
             settings_path: None,
             uncertain_terminal_proofs: HashMap::new(),
@@ -15010,6 +15043,8 @@ mod tests {
             context_inspector_overlay_active: false,
             context_inspector_restore_focus: Some(context_inspector_toggle_id()),
             settings_category: SettingsCategory::Appearance,
+            settings_search: String::new(),
+            tab_history: crate::tab_history::TabHistory::default(),
             keyboard_modifiers: keyboard::Modifiers::empty(),
             settings_feedback: None,
             settings_pending: HashMap::new(),
@@ -15706,6 +15741,52 @@ mod tests {
                     } if *candidate == card
                 ))
         );
+    }
+
+    #[test]
+    fn control_tab_uses_history_and_respects_blocking_surfaces() {
+        let mut app = context_inspector_test_app(false);
+        let cards = vec![
+            terminal_card_state(),
+            terminal_card_state(),
+            terminal_card_state(),
+        ];
+        let ids: Vec<_> = cards.iter().map(|card| card.id).collect();
+        app.durable = Arc::new(WorkspaceState {
+            focused: Some(ids[0]),
+            cards,
+            ..WorkspaceState::default()
+        });
+        app.workspace = Cagents::rebuild_workspace(&app.durable);
+        for id in &ids {
+            drop(app.update(Message::FocusCard(*id)));
+        }
+        let next = || Message::KeyEvent {
+            event: keyboard::Event::KeyPressed {
+                key: keyboard::Key::Named(keyboard::key::Named::Tab),
+                modified_key: keyboard::Key::Named(keyboard::key::Named::Tab),
+                physical_key: keyboard::key::Physical::Code(keyboard::key::Code::Tab),
+                location: keyboard::Location::Standard,
+                modifiers: keyboard::Modifiers::CTRL,
+                text: None,
+                repeat: false,
+            },
+            captured: true,
+        };
+        drop(app.update(next()));
+        assert_eq!(app.workspace.focused(), Some(ids[1]));
+        drop(app.update(next()));
+        assert_eq!(app.workspace.focused(), Some(ids[0]));
+        app.core.set_main_window_id(Some(window::Id::RESERVED));
+        drop(app.update(Message::RefreshUi(refresh_ui::Action::Focused(
+            window::Id::RESERVED,
+            false,
+        ))));
+        drop(app.update(next()));
+        assert_eq!(app.workspace.focused(), Some(ids[2]));
+        app.inspector = Some(Inspector::Settings);
+        drop(app.update(next()));
+        assert_eq!(app.workspace.focused(), Some(ids[2]));
     }
 
     #[test]

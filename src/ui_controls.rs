@@ -212,6 +212,11 @@ pub fn icon_control<'a, Message: Clone + 'a>(
 ) -> IconControl<'a, Message> {
     let label = label.into();
     let content = widget::container(widget::icon(icon).size(crate::design::ROW_ICON_SIZE))
+        // COSMIC's transparent container resets inherited icon color. Keep the
+        // button's semantic status tone through this alignment-only wrapper.
+        .class(cosmic::theme::Container::custom(|_| {
+            iced::widget::container::Style::default()
+        }))
         .center(Length::Fill);
     IconControl {
         button: widget::button::custom(content)
@@ -237,6 +242,9 @@ pub fn compact_icon_control<'a, Message: Clone + 'a>(
 ) -> IconControl<'a, Message> {
     let label = label.into();
     let content = widget::container(widget::icon(icon).size(crate::design::COMPACT_ICON_SIZE))
+        .class(cosmic::theme::Container::custom(|_| {
+            iced::widget::container::Style::default()
+        }))
         .center(Length::Fill);
     IconControl {
         button: widget::button::custom(content)

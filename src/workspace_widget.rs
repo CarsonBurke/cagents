@@ -262,7 +262,8 @@ pub(crate) fn is_global_shortcut_chord(
     modifiers: keyboard::Modifiers,
     shortcuts: &KeyboardShortcuts,
 ) -> bool {
-    global_shortcut_descriptor(key, physical_key, modifiers, shortcuts).is_some()
+    crate::tab_history::is_chord(key, modifiers)
+        || global_shortcut_descriptor(key, physical_key, modifiers, shortcuts).is_some()
 }
 
 fn global_shortcut_descriptor(
