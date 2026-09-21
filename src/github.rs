@@ -25,18 +25,26 @@ use crate::repository::{
 #[cfg(feature = "ui")]
 pub mod avatar;
 
-const PR_LIST_FIELDS: &str = "number,title,state,isDraft,headRefName,headRefOid,baseRefName,author,updatedAt,url,mergeable,mergeStateStatus,reviewDecision,labels,statusCheckRollup";
-const PR_VIEW_FIELDS: &str = "number,title,body,state,isDraft,headRefName,headRefOid,baseRefName,author,createdAt,updatedAt,url,mergeable,mergeStateStatus,reviewDecision,labels,additions,deletions,changedFiles,statusCheckRollup";
+const PR_LIST_FIELDS: &str = "id,number,title,state,isDraft,headRefName,headRefOid,baseRefName,baseRefOid,author,updatedAt,url,mergeable,mergeStateStatus,reviewDecision,labels,statusCheckRollup";
+const PR_VIEW_FIELDS: &str = "id,number,title,body,state,isDraft,headRefName,headRefOid,baseRefName,baseRefOid,author,createdAt,updatedAt,url,mergeable,mergeStateStatus,reviewDecision,labels,additions,deletions,changedFiles,statusCheckRollup";
+/// The fields every review comment carries, whichever query returns it.
+const REVIEW_COMMENT_FIELDS: &str = "id author{login} body createdAt url viewerDidAuthor viewerCanUpdate viewerCanDelete commentState:state";
+/// One review thread with its first page of comments.
+const REVIEW_THREAD_FIELDS: &str = "id path line originalLine startLine originalStartLine diffSide startDiffSide isOutdated isResolved isCollapsed viewerCanResolve viewerCanUnresolve comments(first:50){nodes{id author{login} body createdAt url viewerDidAuthor viewerCanUpdate viewerCanDelete commentState:state} pageInfo{hasNextPage endCursor}}";
+/// How many pages of changed files one listing reads before reporting truncation.
+const FILE_PAGE_LIMIT: usize = 30;
 const PR_CHECK_FIELDS: &str =
     "bucket,completedAt,description,event,link,name,startedAt,state,workflow";
 
-/// How many may be in flight across the whole process.
+/// How many `gh` processes may be in flight across the whole process.
 ///
 /// Refreshes are issued one per project and run concurrently, so the per-refresh
 /// bound alone would still multiply by the project count. This ceiling is above
 /// the one-`gh`-per-project the serial code reached, so it bounds the burst
-/// without making a many-project refresh slower than it used to be.
-const CHECK_PROCESS_CONCURRENCY: usize = 12;
+/// without making a many-project refresh slower than it used to be. Every
+/// invocation takes a permit, not only the checks fetch: a review pane's
+/// file-by-file mutations and the sidebar's refresh share one budget.
+const GH_PROCESS_CONCURRENCY: usize = 12;
 
 /// How long a completed checks result may be reused.
 ///
@@ -55,9 +63,9 @@ static CHECKS_CACHE: LazyLock<Mutex<HashMap<ChecksCacheKey, CachedChecks>>> =
 static CHECKS_FLIGHTS: LazyLock<Mutex<HashMap<ChecksCacheKey, Arc<Mutex<()>>>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
-/// Permits shared by every concurrent refresh; see [`CHECK_PROCESS_CONCURRENCY`].
-static CHECK_PERMITS: LazyLock<CheckPermits> =
-    LazyLock::new(|| CheckPermits::new(CHECK_PROCESS_CONCURRENCY));
+/// Permits shared by every `gh` invocation; see [`GH_PROCESS_CONCURRENCY`].
+static GH_PERMITS: LazyLock<CheckPermits> =
+    LazyLock::new(|| CheckPermits::new(GH_PROCESS_CONCURRENCY));
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct ChecksCacheKey {
@@ -256,6 +264,38 @@ impl PullRequestKey {
 #[serde(transparent)]
 pub struct RemoteValue(pub String);
 
+/// A GraphQL variable, typed so `gh` sends the JSON scalar the schema expects.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GraphQlValue {
+    String(String),
+    Int(i64),
+    Bool(bool),
+}
+
+impl From<&str> for GraphQlValue {
+    fn from(value: &str) -> Self {
+        Self::String(value.to_owned())
+    }
+}
+
+impl From<String> for GraphQlValue {
+    fn from(value: String) -> Self {
+        Self::String(value)
+    }
+}
+
+impl From<u64> for GraphQlValue {
+    fn from(value: u64) -> Self {
+        Self::Int(i64::try_from(value).unwrap_or(i64::MAX))
+    }
+}
+
+impl From<bool> for GraphQlValue {
+    fn from(value: bool) -> Self {
+        Self::Bool(value)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GitHubActor {
     pub login: String,
@@ -277,6 +317,9 @@ pub struct GitHubLabel {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PullRequest {
+    /// The GraphQL node id, which every review mutation addresses.
+    #[serde(default)]
+    pub id: Option<String>,
     pub number: u64,
     pub title: String,
     #[serde(default)]
@@ -288,6 +331,9 @@ pub struct PullRequest {
     #[serde(default)]
     pub head_ref_oid: String,
     pub base_ref_name: String,
+    /// The base branch tip as the forge last computed the pull request against.
+    #[serde(default)]
+    pub base_ref_oid: Option<String>,
     #[serde(default)]
     pub author: Option<GitHubActor>,
     #[serde(default)]
@@ -436,13 +482,34 @@ pub struct PullRequestInspection {
     pub conversation: Result<PullRequestConversation, String>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PullRequestComment {
+    /// Absent only for payloads that did not ask for it.
+    #[serde(default)]
+    pub id: Option<String>,
     pub author: Option<GitHubActor>,
     pub body: String,
     pub created_at: String,
     pub url: Url,
+    #[serde(default)]
+    pub viewer_did_author: bool,
+    #[serde(default)]
+    pub viewer_can_update: bool,
+    #[serde(default)]
+    pub viewer_can_delete: bool,
+    /// `PENDING` while the comment belongs to an unsubmitted review; only the
+    /// viewer's own pending comments are ever returned.
+    #[serde(default)]
+    pub comment_state: Option<RemoteValue>,
+}
+
+impl PullRequestComment {
+    pub fn is_pending(&self) -> bool {
+        self.comment_state
+            .as_ref()
+            .is_some_and(|state| state.0 == "PENDING")
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -452,12 +519,39 @@ pub struct PullRequestReview {
     pub state: RemoteValue,
 }
 
-#[derive(Debug, Clone)]
+/// Which side of a diff a review comment anchors to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum ReviewDiffSide {
+    Left,
+    Right,
+}
+
+impl ReviewDiffSide {
+    fn as_graphql(self) -> &'static str {
+        match self {
+            Self::Left => "LEFT",
+            Self::Right => "RIGHT",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PullRequestReviewThread {
+    pub id: String,
     pub path: String,
+    /// The last line of the anchored range in the current diff, or the
+    /// original line when the thread is outdated.
     pub line: Option<u64>,
+    /// The first line of a multi-line range; `None` for a single line.
+    pub start_line: Option<u64>,
+    pub side: ReviewDiffSide,
+    pub start_side: Option<ReviewDiffSide>,
     pub outdated: bool,
     pub resolved: bool,
+    pub collapsed: bool,
+    pub viewer_can_resolve: bool,
+    pub viewer_can_unresolve: bool,
     pub comments: Vec<PullRequestComment>,
     pub truncated: bool,
 }
@@ -491,9 +585,51 @@ struct ReviewThreadPage {
     path: String,
     line: Option<u64>,
     original_line: Option<u64>,
+    #[serde(default)]
+    start_line: Option<u64>,
+    #[serde(default)]
+    original_start_line: Option<u64>,
+    #[serde(default = "right_side")]
+    diff_side: ReviewDiffSide,
+    #[serde(default)]
+    start_diff_side: Option<ReviewDiffSide>,
     is_outdated: bool,
     is_resolved: bool,
+    #[serde(default)]
+    is_collapsed: bool,
+    #[serde(default)]
+    viewer_can_resolve: bool,
+    #[serde(default)]
+    viewer_can_unresolve: bool,
     comments: Connection<PullRequestComment>,
+}
+
+fn right_side() -> ReviewDiffSide {
+    ReviewDiffSide::Right
+}
+
+impl ReviewThreadPage {
+    fn into_thread(
+        self,
+        comments: Vec<PullRequestComment>,
+        truncated: bool,
+    ) -> PullRequestReviewThread {
+        PullRequestReviewThread {
+            id: self.id,
+            path: self.path,
+            line: self.line.or(self.original_line),
+            start_line: self.start_line.or(self.original_start_line),
+            side: self.diff_side,
+            start_side: self.start_diff_side,
+            outdated: self.is_outdated,
+            resolved: self.is_resolved,
+            collapsed: self.is_collapsed,
+            viewer_can_resolve: self.viewer_can_resolve,
+            viewer_can_unresolve: self.viewer_can_unresolve,
+            comments,
+            truncated,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -609,6 +745,369 @@ pub enum PullRequestCreationOutcome {
     OutcomeUnknown {
         failure: ProcessFailure,
     },
+}
+
+/// The forge's per-viewer record of whether a changed file has been looked at.
+/// `Dismissed` is GitHub's own state for a file that changed after it was
+/// marked viewed; it renders unviewed but is distinct so a client can say why.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum FileViewedState {
+    Viewed,
+    Unviewed,
+    Dismissed,
+    #[serde(other)]
+    Unknown,
+}
+
+impl FileViewedState {
+    pub fn is_viewed(self) -> bool {
+        matches!(self, Self::Viewed)
+    }
+}
+
+fn unviewed() -> FileViewedState {
+    FileViewedState::Unviewed
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PullRequestFile {
+    pub path: String,
+    #[serde(default)]
+    pub additions: u64,
+    #[serde(default)]
+    pub deletions: u64,
+    #[serde(default)]
+    pub change_type: Option<RemoteValue>,
+    #[serde(default = "unviewed")]
+    pub viewer_viewed_state: FileViewedState,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct PullRequestFiles {
+    pub files: Vec<PullRequestFile>,
+    /// More pages existed than [`FILE_PAGE_LIMIT`] reads.
+    pub truncated: bool,
+}
+
+/// The viewer's unsubmitted review, if one exists. GitHub keeps at most one
+/// per viewer per pull request, and only its owner can see it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingReview {
+    pub id: String,
+    pub comment_count: u64,
+}
+
+/// What a review pane needs before its first mutation: the node id every
+/// mutation addresses, the endpoints its diff must match, and whether a
+/// pending review already exists to adopt.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReviewContext {
+    pub pull_request_id: String,
+    pub head_oid: String,
+    pub base_oid: String,
+    pub viewer: String,
+    pub viewer_is_author: bool,
+    pub pending: Option<PendingReview>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReviewEvent {
+    Approve,
+    Comment,
+    RequestChanges,
+}
+
+impl ReviewEvent {
+    fn as_graphql(self) -> &'static str {
+        match self {
+            Self::Approve => "APPROVE",
+            Self::Comment => "COMMENT",
+            Self::RequestChanges => "REQUEST_CHANGES",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Approve => "Approve",
+            Self::Comment => "Comment",
+            Self::RequestChanges => "Request changes",
+        }
+    }
+}
+
+/// A new thread on one line, or on an inclusive `start_line..=line` range, of
+/// the pull request's current diff, attached to a pending review.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AddReviewThreadRequest {
+    pub review_id: String,
+    pub path: String,
+    pub line: u64,
+    pub side: ReviewDiffSide,
+    pub start_line: Option<u64>,
+    pub start_side: Option<ReviewDiffSide>,
+    pub body: String,
+}
+
+impl AddReviewThreadRequest {
+    pub fn validate(&self) -> Result<(), GitHubValidationError> {
+        validate_node_id("review_id", &self.review_id)?;
+        validate_review_path(&self.path)?;
+        validate_comment_body(&self.body)?;
+        if self.line == 0 {
+            return Err(GitHubValidationError::InvalidField {
+                field: "line",
+                reason: "must be at least 1".into(),
+            });
+        }
+        // A one-line range (`start_line == line`) is legal; only an inverted
+        // range is not.
+        if let Some(start) = self.start_line
+            && (start == 0 || start > self.line)
+        {
+            return Err(GitHubValidationError::InvalidField {
+                field: "start_line",
+                reason: "must be at least 1 and not after the last line".into(),
+            });
+        }
+        if self.start_side.is_some() && self.start_line.is_none() {
+            return Err(GitHubValidationError::InvalidField {
+                field: "start_side",
+                reason: "needs a start line".into(),
+            });
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReplyToThreadRequest {
+    pub thread_id: String,
+    /// Attach the reply to a pending review instead of posting it at once.
+    pub review_id: Option<String>,
+    pub body: String,
+}
+
+impl ReplyToThreadRequest {
+    pub fn validate(&self) -> Result<(), GitHubValidationError> {
+        validate_node_id("thread_id", &self.thread_id)?;
+        if let Some(review) = &self.review_id {
+            validate_node_id("review_id", review)?;
+        }
+        validate_comment_body(&self.body)
+    }
+}
+
+/// Submits the pending review `review_id` with `event`, or, when there is no
+/// pending review, creates and submits one in a single mutation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SubmitReviewRequest {
+    pub pull_request_id: String,
+    pub review_id: Option<String>,
+    pub event: ReviewEvent,
+    pub body: String,
+}
+
+impl SubmitReviewRequest {
+    pub fn validate(&self) -> Result<(), GitHubValidationError> {
+        validate_node_id("pull_request_id", &self.pull_request_id)?;
+        if let Some(review) = &self.review_id {
+            validate_node_id("review_id", review)?;
+        }
+        validate_text("body", &self.body)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SubmittedReview {
+    pub id: String,
+    pub state: RemoteValue,
+    pub url: Url,
+}
+
+/// The three things a forge mutation can have done, in the same shape as
+/// [`PullRequestCreationOutcome`]: a caller may retry `NotApplied` freely but
+/// must reconcile `OutcomeUnknown` before retrying, or it risks a duplicate.
+#[derive(Debug, Clone)]
+pub enum ReviewMutationOutcome<T> {
+    Applied(T),
+    NotApplied { failure: ProcessFailure },
+    OutcomeUnknown { failure: ProcessFailure },
+}
+
+impl<T> ReviewMutationOutcome<T> {
+    pub fn map<U>(self, map: impl FnOnce(T) -> U) -> ReviewMutationOutcome<U> {
+        match self {
+            Self::Applied(value) => ReviewMutationOutcome::Applied(map(value)),
+            Self::NotApplied { failure } => ReviewMutationOutcome::NotApplied { failure },
+            Self::OutcomeUnknown { failure } => ReviewMutationOutcome::OutcomeUnknown { failure },
+        }
+    }
+}
+
+fn validate_node_id(field: &'static str, value: &str) -> Result<(), GitHubValidationError> {
+    let valid = !value.is_empty()
+        && value.len() <= 256
+        && value.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'=' | b'+' | b'/' | b':')
+        });
+    if valid {
+        Ok(())
+    } else {
+        Err(GitHubValidationError::InvalidField {
+            field,
+            reason: "must be a GraphQL node id".into(),
+        })
+    }
+}
+
+fn validate_text(field: &'static str, value: &str) -> Result<(), GitHubValidationError> {
+    if value.as_bytes().contains(&0) {
+        Err(GitHubValidationError::InvalidField {
+            field,
+            reason: "must not contain NUL".into(),
+        })
+    } else {
+        Ok(())
+    }
+}
+
+/// GitHub's ceiling for a comment body, in bytes.
+const MAX_COMMENT_BODY_BYTES: usize = 65_536;
+
+fn validate_comment_body(body: &str) -> Result<(), GitHubValidationError> {
+    validate_text("body", body)?;
+    if body.trim().is_empty() {
+        Err(GitHubValidationError::InvalidField {
+            field: "body",
+            reason: "must not be empty".into(),
+        })
+    } else if body.len() > MAX_COMMENT_BODY_BYTES {
+        Err(GitHubValidationError::InvalidField {
+            field: "body",
+            reason: format!("must be at most {MAX_COMMENT_BODY_BYTES} bytes"),
+        })
+    } else {
+        Ok(())
+    }
+}
+
+/// A path as the forge reports it: repository-relative, slash-separated, and
+/// never one Git would refuse to name.
+fn validate_review_path(path: &str) -> Result<(), GitHubValidationError> {
+    let invalid = path.is_empty()
+        || path.starts_with('/')
+        || path.ends_with('/')
+        || path
+            .bytes()
+            .any(|byte| byte == 0 || byte.is_ascii_control())
+        || path
+            .split('/')
+            .any(|segment| segment.is_empty() || segment == "." || segment == "..");
+    if invalid {
+        Err(GitHubValidationError::InvalidField {
+            field: "path",
+            reason: "must be a repository-relative file path".into(),
+        })
+    } else {
+        Ok(())
+    }
+}
+
+/// Everything a review surface asks the forge, behind one object so a shell
+/// can hand its state machine a fake and so a later HTTP transport is a
+/// drop-in. Reads return the forge's answer or a typed error; mutations
+/// return a [`ReviewMutationOutcome`] once their inputs validate.
+pub trait GitHubReviewApi: Send + Sync {
+    fn review_context(
+        &self,
+        key: &PullRequestKey,
+        cancellation: &CancellationToken,
+    ) -> Result<ReviewContext, GitHubError>;
+
+    fn pull_request_files(
+        &self,
+        key: &PullRequestKey,
+        cancellation: &CancellationToken,
+    ) -> Result<PullRequestFiles, GitHubError>;
+
+    fn conversation(
+        &self,
+        key: &PullRequestKey,
+        cancellation: &CancellationToken,
+    ) -> Result<PullRequestConversation, GitHubError>;
+
+    /// Creates the viewer's pending review; fails at the forge if one exists.
+    fn start_review(
+        &self,
+        repository: &GitHubRepoKey,
+        pull_request_id: &str,
+        cancellation: &CancellationToken,
+    ) -> Result<ReviewMutationOutcome<PendingReview>, GitHubError>;
+
+    fn add_review_thread(
+        &self,
+        repository: &GitHubRepoKey,
+        request: &AddReviewThreadRequest,
+        cancellation: &CancellationToken,
+    ) -> Result<ReviewMutationOutcome<PullRequestReviewThread>, GitHubError>;
+
+    fn reply_to_thread(
+        &self,
+        repository: &GitHubRepoKey,
+        request: &ReplyToThreadRequest,
+        cancellation: &CancellationToken,
+    ) -> Result<ReviewMutationOutcome<PullRequestComment>, GitHubError>;
+
+    fn update_comment(
+        &self,
+        repository: &GitHubRepoKey,
+        comment_id: &str,
+        body: &str,
+        cancellation: &CancellationToken,
+    ) -> Result<ReviewMutationOutcome<PullRequestComment>, GitHubError>;
+
+    fn delete_comment(
+        &self,
+        repository: &GitHubRepoKey,
+        comment_id: &str,
+        cancellation: &CancellationToken,
+    ) -> Result<ReviewMutationOutcome<()>, GitHubError>;
+
+    fn submit_review(
+        &self,
+        repository: &GitHubRepoKey,
+        request: &SubmitReviewRequest,
+        cancellation: &CancellationToken,
+    ) -> Result<ReviewMutationOutcome<SubmittedReview>, GitHubError>;
+
+    /// Deletes a pending review and every comment in it.
+    fn discard_review(
+        &self,
+        repository: &GitHubRepoKey,
+        review_id: &str,
+        cancellation: &CancellationToken,
+    ) -> Result<ReviewMutationOutcome<()>, GitHubError>;
+
+    fn set_thread_resolved(
+        &self,
+        repository: &GitHubRepoKey,
+        thread_id: &str,
+        resolved: bool,
+        cancellation: &CancellationToken,
+    ) -> Result<ReviewMutationOutcome<()>, GitHubError>;
+
+    fn set_file_viewed(
+        &self,
+        repository: &GitHubRepoKey,
+        pull_request_id: &str,
+        path: &str,
+        viewed: bool,
+        cancellation: &CancellationToken,
+    ) -> Result<ReviewMutationOutcome<()>, GitHubError>;
 }
 
 #[derive(Debug, Error)]
@@ -750,7 +1249,7 @@ impl<E: ProcessExecutor> GitHubService<E> {
         if keys.is_empty() {
             return Ok(false);
         }
-        let output = self.executor.execute(
+        let output = self.execute(
             &self.gh_command(["auth", "status", "--json", "hosts"]),
             cancellation,
         )?;
@@ -905,7 +1404,7 @@ impl<E: ProcessExecutor> GitHubService<E> {
         cancellation: &CancellationToken,
     ) -> Result<GitHubRepoKey, GitHubError> {
         let command = self.resolve_repository_command(repository);
-        let output = self.executor.execute(&command, cancellation)?;
+        let output = self.execute(&command, cancellation)?;
         if !output.success {
             return Err(output.require_success(&self.gh).unwrap_err().into());
         }
@@ -1048,13 +1547,12 @@ impl<E: ProcessExecutor> GitHubService<E> {
         })
     }
 
-    fn graphql(
+    fn graphql_command(
         &self,
         repository: &GitHubRepoKey,
         query: &str,
-        variables: Vec<(&str, String)>,
-        cancellation: &CancellationToken,
-    ) -> Result<serde_json::Value, GitHubError> {
+        variables: Vec<(&str, GraphQlValue)>,
+    ) -> CommandSpec {
         let mut command = self.gh_command([
             OsString::from("api"),
             "graphql".into(),
@@ -1064,12 +1562,38 @@ impl<E: ProcessExecutor> GitHubService<E> {
             format!("query={query}").into(),
         ]);
         for (name, value) in variables {
+            // `-f` always sends a string; `-F` converts a bare number or
+            // boolean to the JSON scalar GraphQL requires for `Int!`/`Boolean!`.
+            let (flag, value) = match value {
+                GraphQlValue::String(value) => ("-f", value),
+                GraphQlValue::Int(value) => ("-F", value.to_string()),
+                GraphQlValue::Bool(value) => ("-F", value.to_string()),
+            };
             command
                 .arguments
-                .extend([OsString::from("-f"), format!("{name}={value}").into()]);
+                .extend([OsString::from(flag), format!("{name}={value}").into()]);
         }
+        command
+    }
+
+    fn graphql(
+        &self,
+        repository: &GitHubRepoKey,
+        query: &str,
+        variables: Vec<(&str, GraphQlValue)>,
+        cancellation: &CancellationToken,
+    ) -> Result<serde_json::Value, GitHubError> {
+        let command = self.graphql_command(repository, query, variables);
         let output = self.run_checked(&command, repository, cancellation)?;
         attach_process(parse_graphql(&output.stdout), &output)
+    }
+
+    fn pull_request_variables(key: &PullRequestKey) -> Vec<(&'static str, GraphQlValue)> {
+        vec![
+            ("owner", key.repository.owner.as_str().into()),
+            ("name", key.repository.name.as_str().into()),
+            ("number", GraphQlValue::Int(key.number as i64)),
+        ]
     }
 
     pub fn conversation(
@@ -1083,24 +1607,18 @@ impl<E: ProcessExecutor> GitHubService<E> {
         let mut result = PullRequestConversation::default();
         for section in ["reviewThreads", "comments", "reviews"] {
             let fields = match section {
-                "reviewThreads" => {
-                    "id path line originalLine isOutdated isResolved comments(first:50){nodes{author{login} body createdAt url} pageInfo{hasNextPage endCursor}}"
-                }
-                "reviews" => "author{login} body createdAt url state",
-                _ => "author{login} body createdAt url",
+                "reviewThreads" => REVIEW_THREAD_FIELDS,
+                "reviews" => "id author{login} body createdAt url state viewerDidAuthor",
+                _ => "id author{login} body createdAt url viewerDidAuthor",
             };
             let query = format!(
-                "query($owner:String!,$name:String!,$cursor:String){{repository(owner:$owner,name:$name){{pullRequest(number:{}){{{section}(first:50,after:$cursor){{nodes{{{fields}}} pageInfo{{hasNextPage endCursor}}}}}}}}}}",
-                key.number
+                "query($owner:String!,$name:String!,$number:Int!,$cursor:String){{repository(owner:$owner,name:$name){{pullRequest(number:$number){{{section}(first:50,after:$cursor){{nodes{{{fields}}} pageInfo{{hasNextPage endCursor}}}}}}}}}}"
             );
             let mut cursor: Option<String> = None;
             for page in 0..4 {
-                let mut variables = vec![
-                    ("owner", key.repository.owner.clone()),
-                    ("name", key.repository.name.clone()),
-                ];
+                let mut variables = Self::pull_request_variables(key);
                 if let Some(cursor) = &cursor {
-                    variables.push(("cursor", cursor.clone()));
+                    variables.push(("cursor", cursor.as_str().into()));
                 }
                 let data = self.graphql(&key.repository, &query, variables, cancellation)?;
                 let connection = data
@@ -1112,15 +1630,20 @@ impl<E: ProcessExecutor> GitHubService<E> {
                     })?;
                 let info = if section == "reviewThreads" {
                     let connection: Connection<ReviewThreadPage> = decode_value(connection)?;
-                    for thread in connection.nodes {
-                        let mut comments = thread.comments.nodes;
+                    for mut thread in connection.nodes {
+                        let mut comments = std::mem::take(&mut thread.comments.nodes);
                         let mut truncated = thread.comments.page_info.has_next_page;
                         if truncated {
                             let cursor = next_cursor(&thread.comments.page_info, None)?;
                             let data = self.graphql(
                                 &key.repository,
-                                "query($id:ID!,$cursor:String!){node(id:$id){... on PullRequestReviewThread{comments(first:50,after:$cursor){nodes{author{login} body createdAt url} pageInfo{hasNextPage endCursor}}}}}",
-                                vec![("id", thread.id), ("cursor", cursor)],
+                                &format!(
+                                    "query($id:ID!,$cursor:String!){{node(id:$id){{... on PullRequestReviewThread{{comments(first:50,after:$cursor){{nodes{{{REVIEW_COMMENT_FIELDS}}} pageInfo{{hasNextPage endCursor}}}}}}}}}}"
+                                ),
+                                vec![
+                                    ("id", thread.id.as_str().into()),
+                                    ("cursor", cursor.into()),
+                                ],
                                 cancellation,
                             )?;
                             let more: Connection<PullRequestComment> =
@@ -1132,14 +1655,7 @@ impl<E: ProcessExecutor> GitHubService<E> {
                             truncated = more.page_info.has_next_page;
                             comments.extend(more.nodes);
                         }
-                        result.threads.push(PullRequestReviewThread {
-                            path: thread.path,
-                            line: thread.line.or(thread.original_line),
-                            outdated: thread.is_outdated,
-                            resolved: thread.is_resolved,
-                            comments,
-                            truncated,
-                        });
+                        result.threads.push(thread.into_thread(comments, truncated));
                     }
                     connection.page_info
                 } else if section == "reviews" {
@@ -1171,7 +1687,7 @@ impl<E: ProcessExecutor> GitHubService<E> {
     ) -> Result<Vec<PullRequestCheck>, GitHubError> {
         key.validate()?;
         let command = self.checks_command(key);
-        let output = self.executor.execute(&command, cancellation)?;
+        let output = self.execute(&command, cancellation)?;
         match output.exit_code {
             Some(8) => {
                 let checks = attach_process(parse_json(&output.stdout), &output)?;
@@ -1246,7 +1762,6 @@ impl<E: ProcessExecutor> GitHubService<E> {
                 return Ok(entry.checks.clone());
             }
         }
-        let _permit = CHECK_PERMITS.acquire();
         let (checks, ttl) = match self.checks(&key.pull_request, cancellation) {
             Ok(checks) => (checks, CHECKS_CACHE_TTL),
             Err(GitHubError::ChecksPending { checks, .. }) => (checks, Duration::from_secs(2)),
@@ -1271,7 +1786,7 @@ impl<E: ProcessExecutor> GitHubService<E> {
         cancellation: &CancellationToken,
     ) -> Result<PullRequestCreationOutcome, GitHubError> {
         let command = self.create_command(request)?;
-        let output = match self.executor.execute(&command, cancellation) {
+        let output = match self.execute(&command, cancellation) {
             Ok(output) => output,
             Err(failure) if failure.started => {
                 return Ok(PullRequestCreationOutcome::OutcomeUnknown { failure });
@@ -1304,39 +1819,51 @@ impl<E: ProcessExecutor> GitHubService<E> {
         // known successful result.
         let normalization_token = CancellationToken::new();
         let view = self.view_command(&key);
-        let (pull_request, normalization_warning) =
-            match self.executor.execute(&view, &normalization_token) {
-                Ok(output) if output.success => {
-                    match parse_pull_request(&output.stdout, &request.repository) {
-                        Ok(pull_request) if pull_request.number == key.number => {
-                            (Some(pull_request), None)
-                        }
-                        Ok(pull_request) => (
-                            None,
-                            Some(parse_warning(
-                                &self.gh,
-                                output,
-                                format!(
-                                    "gh normalized pull request {}, expected {}",
-                                    pull_request.number, key.number
-                                ),
-                            )),
-                        ),
-                        Err(error) => (
-                            None,
-                            Some(parse_warning(&self.gh, output, error.to_string())),
-                        ),
+        let (pull_request, normalization_warning) = match self.execute(&view, &normalization_token)
+        {
+            Ok(output) if output.success => {
+                match parse_pull_request(&output.stdout, &request.repository) {
+                    Ok(pull_request) if pull_request.number == key.number => {
+                        (Some(pull_request), None)
                     }
+                    Ok(pull_request) => (
+                        None,
+                        Some(parse_warning(
+                            &self.gh,
+                            output,
+                            format!(
+                                "gh normalized pull request {}, expected {}",
+                                pull_request.number, key.number
+                            ),
+                        )),
+                    ),
+                    Err(error) => (
+                        None,
+                        Some(parse_warning(&self.gh, output, error.to_string())),
+                    ),
                 }
-                Ok(output) => (None, Some(output.require_success(&self.gh).unwrap_err())),
-                Err(failure) => (None, Some(failure)),
-            };
+            }
+            Ok(output) => (None, Some(output.require_success(&self.gh).unwrap_err())),
+            Err(failure) => (None, Some(failure)),
+        };
         Ok(PullRequestCreationOutcome::Created {
             key,
             url,
             pull_request: pull_request.map(Box::new),
             normalization_warning: normalization_warning.map(Box::new),
         })
+    }
+
+    /// Every `gh` process goes through here so the concurrency bound holds for
+    /// all of them. A permit is held only for the subprocess, never across a
+    /// second call, so the pool cannot deadlock on nested acquisition.
+    fn execute(
+        &self,
+        command: &CommandSpec,
+        cancellation: &CancellationToken,
+    ) -> Result<ProcessOutput, ProcessFailure> {
+        let _permit = GH_PERMITS.acquire();
+        self.executor.execute(command, cancellation)
     }
 
     fn run_checked(
@@ -1346,7 +1873,7 @@ impl<E: ProcessExecutor> GitHubService<E> {
         cancellation: &CancellationToken,
     ) -> Result<ProcessOutput, GitHubError> {
         repository.validate()?;
-        let output = self.executor.execute(command, cancellation)?;
+        let output = self.execute(command, cancellation)?;
         if output.success {
             Ok(output)
         } else if output.exit_code == Some(4) {
@@ -1373,6 +1900,498 @@ impl<E: ProcessExecutor> GitHubService<E> {
             .env_remove("GH_FORCE_TTY")
             .env_remove("GH_REPO")
             .env_remove("GH_HOST")
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ReviewContextPage {
+    id: String,
+    head_ref_oid: String,
+    base_ref_oid: String,
+    #[serde(default)]
+    viewer_did_author: bool,
+    reviews: Connection<PendingReviewPage>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PendingReviewPage {
+    id: String,
+    author: Option<GitHubActor>,
+    comments: TotalCount,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct TotalCount {
+    total_count: u64,
+}
+
+impl<E: ProcessExecutor> GitHubService<E> {
+    /// Runs one mutation and classifies what the forge did with it.
+    ///
+    /// `payload` is the JSON pointer, under `data`, of the mutation's payload
+    /// object. A payload that arrived is proof the mutation applied even if
+    /// the response also carries errors for some field of it; a response
+    /// with errors and no payload is proof it did not; anything else after
+    /// the process started is unknown, because the request may have reached
+    /// the forge before the failure.
+    fn mutate(
+        &self,
+        repository: &GitHubRepoKey,
+        mutation: &str,
+        variables: Vec<(&str, GraphQlValue)>,
+        payload: &str,
+        cancellation: &CancellationToken,
+    ) -> Result<ReviewMutationOutcome<serde_json::Value>, GitHubError> {
+        repository.validate()?;
+        let command = self.graphql_command(repository, mutation, variables);
+        let output = match self.execute(&command, cancellation) {
+            Ok(output) => output,
+            Err(failure) if failure.started => {
+                return Ok(ReviewMutationOutcome::OutcomeUnknown { failure });
+            }
+            Err(failure) => return Ok(ReviewMutationOutcome::NotApplied { failure }),
+        };
+        if output.exit_code == Some(4) {
+            return Err(GitHubError::AuthenticationRequired {
+                host: repository.host.clone(),
+                failure: Box::new(output.require_success(&self.gh).unwrap_err()),
+            });
+        }
+        let body: Option<serde_json::Value> = serde_json::from_slice(&output.stdout).ok();
+        let applied = body
+            .as_ref()
+            .and_then(|body| body.pointer(&format!("/data{payload}")))
+            .filter(|value| !value.is_null())
+            .cloned();
+        if let Some(value) = applied {
+            return Ok(ReviewMutationOutcome::Applied(value));
+        }
+        let errors: Vec<&serde_json::Value> = body
+            .as_ref()
+            .and_then(|body| body.get("errors"))
+            .and_then(serde_json::Value::as_array)
+            .map(|errors| errors.iter().collect())
+            .unwrap_or_default();
+        if errors.is_empty() {
+            return Ok(if output.success {
+                ReviewMutationOutcome::OutcomeUnknown {
+                    failure: parse_warning(
+                        &self.gh,
+                        output,
+                        "GitHub returned no mutation payload".into(),
+                    ),
+                }
+            } else {
+                ReviewMutationOutcome::OutcomeUnknown {
+                    failure: output.require_success(&self.gh).unwrap_err(),
+                }
+            });
+        }
+        let message = errors
+            .iter()
+            .filter_map(|error| error.get("message").and_then(serde_json::Value::as_str))
+            .collect::<Vec<_>>()
+            .join("; ");
+        // Only evidence proves the write did not happen: a response with no
+        // `data` member never reached execution, and a typed refusal names a
+        // check the forge runs before writing. An untyped error beside a null
+        // payload is how GitHub reports a timeout or an internal failure, and
+        // those can land after the write — retrying them would post twice.
+        let refused = body.as_ref().is_some_and(|body| body.get("data").is_none())
+            || errors.iter().all(|error| {
+                error
+                    .get("type")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(mutation_refusal_type)
+            });
+        Ok(if refused {
+            ReviewMutationOutcome::NotApplied {
+                failure: parse_warning(&self.gh, output, format!("GitHub refused: {message}")),
+            }
+        } else {
+            ReviewMutationOutcome::OutcomeUnknown {
+                failure: parse_warning(
+                    &self.gh,
+                    output,
+                    format!("GitHub did not confirm the change: {message}"),
+                ),
+            }
+        })
+    }
+
+    /// Decodes an applied payload; a payload the forge sent but this build
+    /// cannot read is an unknown outcome, never a failure to apply.
+    fn decode_outcome<T: DeserializeOwned>(
+        &self,
+        outcome: ReviewMutationOutcome<serde_json::Value>,
+    ) -> ReviewMutationOutcome<T> {
+        match outcome {
+            ReviewMutationOutcome::Applied(value) => match decode_value::<T>(&value) {
+                Ok(decoded) => ReviewMutationOutcome::Applied(decoded),
+                Err(error) => ReviewMutationOutcome::OutcomeUnknown {
+                    failure: ProcessFailure {
+                        kind: ProcessFailureKind::Exit,
+                        program: self.gh.clone(),
+                        exit_code: Some(0),
+                        signal: None,
+                        stdout: excerpt(value.to_string().as_bytes()),
+                        stderr: Vec::new(),
+                        message: format!("applied, but the payload was unreadable: {error}"),
+                        started: true,
+                    },
+                },
+            },
+            ReviewMutationOutcome::NotApplied { failure } => {
+                ReviewMutationOutcome::NotApplied { failure }
+            }
+            ReviewMutationOutcome::OutcomeUnknown { failure } => {
+                ReviewMutationOutcome::OutcomeUnknown { failure }
+            }
+        }
+    }
+}
+
+impl<E: ProcessExecutor + Send + Sync> GitHubReviewApi for GitHubService<E> {
+    fn review_context(
+        &self,
+        key: &PullRequestKey,
+        cancellation: &CancellationToken,
+    ) -> Result<ReviewContext, GitHubError> {
+        key.validate()?;
+        let data = self.graphql(
+            &key.repository,
+            "query($owner:String!,$name:String!,$number:Int!){viewer{login} repository(owner:$owner,name:$name){pullRequest(number:$number){id headRefOid baseRefOid viewerDidAuthor reviews(first:10,states:[PENDING]){nodes{id author{login} comments{totalCount}} pageInfo{hasNextPage endCursor}}}}}",
+            Self::pull_request_variables(key),
+            cancellation,
+        )?;
+        let viewer: GitHubActor = decode_value(
+            data.pointer("/viewer")
+                .ok_or_else(|| GitHubError::Inspection("GitHub returned no viewer.".into()))?,
+        )?;
+        let page: ReviewContextPage =
+            decode_value(data.pointer("/repository/pullRequest").ok_or_else(|| {
+                GitHubError::Inspection("GitHub returned no pull request.".into())
+            })?)?;
+        // Only the viewer's own pending reviews are visible, but the author
+        // check costs nothing and keeps a forge quirk from adopting someone
+        // else's draft.
+        let pending = page
+            .reviews
+            .nodes
+            .into_iter()
+            .find(|review| {
+                review
+                    .author
+                    .as_ref()
+                    .is_some_and(|author| author.login == viewer.login)
+            })
+            .map(|review| PendingReview {
+                id: review.id,
+                comment_count: review.comments.total_count,
+            });
+        Ok(ReviewContext {
+            pull_request_id: page.id,
+            head_oid: page.head_ref_oid,
+            base_oid: page.base_ref_oid,
+            viewer: viewer.login,
+            viewer_is_author: page.viewer_did_author,
+            pending,
+        })
+    }
+
+    fn pull_request_files(
+        &self,
+        key: &PullRequestKey,
+        cancellation: &CancellationToken,
+    ) -> Result<PullRequestFiles, GitHubError> {
+        key.validate()?;
+        let mut result = PullRequestFiles::default();
+        let mut cursor: Option<String> = None;
+        for page in 0..FILE_PAGE_LIMIT {
+            let mut variables = Self::pull_request_variables(key);
+            if let Some(cursor) = &cursor {
+                variables.push(("cursor", cursor.as_str().into()));
+            }
+            let data = self.graphql(
+                &key.repository,
+                "query($owner:String!,$name:String!,$number:Int!,$cursor:String){repository(owner:$owner,name:$name){pullRequest(number:$number){files(first:100,after:$cursor){nodes{path additions deletions changeType viewerViewedState} pageInfo{hasNextPage endCursor}}}}}",
+                variables,
+                cancellation,
+            )?;
+            let connection: Connection<PullRequestFile> = decode_value(
+                data.pointer("/repository/pullRequest/files")
+                    .ok_or_else(|| {
+                        GitHubError::Inspection("GitHub returned no changed files.".into())
+                    })?,
+            )?;
+            result.files.extend(connection.nodes);
+            if !connection.page_info.has_next_page {
+                return Ok(result);
+            }
+            if page + 1 == FILE_PAGE_LIMIT {
+                result.truncated = true;
+                return Ok(result);
+            }
+            cursor = Some(next_cursor(&connection.page_info, cursor.as_deref())?);
+        }
+        Ok(result)
+    }
+
+    fn conversation(
+        &self,
+        key: &PullRequestKey,
+        cancellation: &CancellationToken,
+    ) -> Result<PullRequestConversation, GitHubError> {
+        GitHubService::conversation(self, key, cancellation)
+    }
+
+    fn start_review(
+        &self,
+        repository: &GitHubRepoKey,
+        pull_request_id: &str,
+        cancellation: &CancellationToken,
+    ) -> Result<ReviewMutationOutcome<PendingReview>, GitHubError> {
+        validate_node_id("pull_request_id", pull_request_id)?;
+        let outcome = self.mutate(
+            repository,
+            "mutation($pullRequest:ID!){addPullRequestReview(input:{pullRequestId:$pullRequest}){pullRequestReview{id comments{totalCount}}}}",
+            vec![("pullRequest", pull_request_id.into())],
+            "/addPullRequestReview/pullRequestReview",
+            cancellation,
+        )?;
+        Ok(self
+            .decode_outcome::<PendingReviewPage>(outcome)
+            .map(|review| PendingReview {
+                id: review.id,
+                comment_count: review.comments.total_count,
+            }))
+    }
+
+    fn add_review_thread(
+        &self,
+        repository: &GitHubRepoKey,
+        request: &AddReviewThreadRequest,
+        cancellation: &CancellationToken,
+    ) -> Result<ReviewMutationOutcome<PullRequestReviewThread>, GitHubError> {
+        request.validate()?;
+        let mut variables: Vec<(&str, GraphQlValue)> = vec![
+            ("review", request.review_id.as_str().into()),
+            ("path", request.path.as_str().into()),
+            ("line", request.line.into()),
+            ("side", request.side.as_graphql().into()),
+            ("body", request.body.as_str().into()),
+        ];
+        if let Some(start) = request.start_line {
+            variables.push(("startLine", start.into()));
+            variables.push((
+                "startSide",
+                request
+                    .start_side
+                    .unwrap_or(request.side)
+                    .as_graphql()
+                    .into(),
+            ));
+        }
+        let outcome = self.mutate(
+            repository,
+            &format!(
+                "mutation($review:ID!,$path:String!,$line:Int!,$side:DiffSide!,$startLine:Int,$startSide:DiffSide,$body:String!){{addPullRequestReviewThread(input:{{pullRequestReviewId:$review,path:$path,line:$line,side:$side,startLine:$startLine,startSide:$startSide,body:$body}}){{thread{{{REVIEW_THREAD_FIELDS}}}}}}}"
+            ),
+            variables,
+            "/addPullRequestReviewThread/thread",
+            cancellation,
+        )?;
+        Ok(self
+            .decode_outcome::<ReviewThreadPage>(outcome)
+            .map(|mut page| {
+                let truncated = page.comments.page_info.has_next_page;
+                let comments = std::mem::take(&mut page.comments.nodes);
+                page.into_thread(comments, truncated)
+            }))
+    }
+
+    fn reply_to_thread(
+        &self,
+        repository: &GitHubRepoKey,
+        request: &ReplyToThreadRequest,
+        cancellation: &CancellationToken,
+    ) -> Result<ReviewMutationOutcome<PullRequestComment>, GitHubError> {
+        request.validate()?;
+        let mut variables: Vec<(&str, GraphQlValue)> = vec![
+            ("thread", request.thread_id.as_str().into()),
+            ("body", request.body.as_str().into()),
+        ];
+        if let Some(review) = &request.review_id {
+            variables.push(("review", review.as_str().into()));
+        }
+        let outcome = self.mutate(
+            repository,
+            &format!(
+                "mutation($thread:ID!,$body:String!,$review:ID){{addPullRequestReviewThreadReply(input:{{pullRequestReviewThreadId:$thread,body:$body,pullRequestReviewId:$review}}){{comment{{{REVIEW_COMMENT_FIELDS}}}}}}}"
+            ),
+            variables,
+            "/addPullRequestReviewThreadReply/comment",
+            cancellation,
+        )?;
+        Ok(self.decode_outcome(outcome))
+    }
+
+    fn update_comment(
+        &self,
+        repository: &GitHubRepoKey,
+        comment_id: &str,
+        body: &str,
+        cancellation: &CancellationToken,
+    ) -> Result<ReviewMutationOutcome<PullRequestComment>, GitHubError> {
+        validate_node_id("comment_id", comment_id)?;
+        validate_comment_body(body)?;
+        let outcome = self.mutate(
+            repository,
+            &format!(
+                "mutation($comment:ID!,$body:String!){{updatePullRequestReviewComment(input:{{pullRequestReviewCommentId:$comment,body:$body}}){{pullRequestReviewComment{{{REVIEW_COMMENT_FIELDS}}}}}}}"
+            ),
+            vec![("comment", comment_id.into()), ("body", body.into())],
+            "/updatePullRequestReviewComment/pullRequestReviewComment",
+            cancellation,
+        )?;
+        Ok(self.decode_outcome(outcome))
+    }
+
+    fn delete_comment(
+        &self,
+        repository: &GitHubRepoKey,
+        comment_id: &str,
+        cancellation: &CancellationToken,
+    ) -> Result<ReviewMutationOutcome<()>, GitHubError> {
+        validate_node_id("comment_id", comment_id)?;
+        let outcome = self.mutate(
+            repository,
+            "mutation($comment:ID!){deletePullRequestReviewComment(input:{id:$comment}){clientMutationId}}",
+            vec![("comment", comment_id.into())],
+            "/deletePullRequestReviewComment",
+            cancellation,
+        )?;
+        Ok(outcome.map(drop))
+    }
+
+    fn submit_review(
+        &self,
+        repository: &GitHubRepoKey,
+        request: &SubmitReviewRequest,
+        cancellation: &CancellationToken,
+    ) -> Result<ReviewMutationOutcome<SubmittedReview>, GitHubError> {
+        request.validate()?;
+        let mut variables: Vec<(&str, GraphQlValue)> =
+            vec![("event", request.event.as_graphql().into())];
+        if !request.body.trim().is_empty() {
+            variables.push(("body", request.body.as_str().into()));
+        }
+        let outcome = match &request.review_id {
+            Some(review) => {
+                variables.push(("review", review.as_str().into()));
+                self.mutate(
+                    repository,
+                    "mutation($review:ID!,$event:PullRequestReviewEvent!,$body:String){submitPullRequestReview(input:{pullRequestReviewId:$review,event:$event,body:$body}){pullRequestReview{id state url}}}",
+                    variables,
+                    "/submitPullRequestReview/pullRequestReview",
+                    cancellation,
+                )?
+            }
+            None => {
+                variables.push(("pullRequest", request.pull_request_id.as_str().into()));
+                self.mutate(
+                    repository,
+                    "mutation($pullRequest:ID!,$event:PullRequestReviewEvent!,$body:String){addPullRequestReview(input:{pullRequestId:$pullRequest,event:$event,body:$body}){pullRequestReview{id state url}}}",
+                    variables,
+                    "/addPullRequestReview/pullRequestReview",
+                    cancellation,
+                )?
+            }
+        };
+        Ok(self.decode_outcome(outcome))
+    }
+
+    fn discard_review(
+        &self,
+        repository: &GitHubRepoKey,
+        review_id: &str,
+        cancellation: &CancellationToken,
+    ) -> Result<ReviewMutationOutcome<()>, GitHubError> {
+        validate_node_id("review_id", review_id)?;
+        let outcome = self.mutate(
+            repository,
+            "mutation($review:ID!){deletePullRequestReview(input:{pullRequestReviewId:$review}){pullRequestReview{id}}}",
+            vec![("review", review_id.into())],
+            "/deletePullRequestReview",
+            cancellation,
+        )?;
+        Ok(outcome.map(drop))
+    }
+
+    fn set_thread_resolved(
+        &self,
+        repository: &GitHubRepoKey,
+        thread_id: &str,
+        resolved: bool,
+        cancellation: &CancellationToken,
+    ) -> Result<ReviewMutationOutcome<()>, GitHubError> {
+        validate_node_id("thread_id", thread_id)?;
+        let (mutation, payload) = if resolved {
+            (
+                "mutation($thread:ID!){resolveReviewThread(input:{threadId:$thread}){thread{id isResolved}}}",
+                "/resolveReviewThread/thread",
+            )
+        } else {
+            (
+                "mutation($thread:ID!){unresolveReviewThread(input:{threadId:$thread}){thread{id isResolved}}}",
+                "/unresolveReviewThread/thread",
+            )
+        };
+        let outcome = self.mutate(
+            repository,
+            mutation,
+            vec![("thread", thread_id.into())],
+            payload,
+            cancellation,
+        )?;
+        Ok(outcome.map(drop))
+    }
+
+    fn set_file_viewed(
+        &self,
+        repository: &GitHubRepoKey,
+        pull_request_id: &str,
+        path: &str,
+        viewed: bool,
+        cancellation: &CancellationToken,
+    ) -> Result<ReviewMutationOutcome<()>, GitHubError> {
+        validate_node_id("pull_request_id", pull_request_id)?;
+        validate_review_path(path)?;
+        let (mutation, payload) = if viewed {
+            (
+                "mutation($pullRequest:ID!,$path:String!){markFileAsViewed(input:{pullRequestId:$pullRequest,path:$path}){clientMutationId}}",
+                "/markFileAsViewed",
+            )
+        } else {
+            (
+                "mutation($pullRequest:ID!,$path:String!){unmarkFileAsViewed(input:{pullRequestId:$pullRequest,path:$path}){clientMutationId}}",
+                "/unmarkFileAsViewed",
+            )
+        };
+        let outcome = self.mutate(
+            repository,
+            mutation,
+            vec![
+                ("pullRequest", pull_request_id.into()),
+                ("path", path.into()),
+            ],
+            payload,
+            cancellation,
+        )?;
+        Ok(outcome.map(drop))
     }
 }
 
@@ -1587,6 +2606,15 @@ fn attach_process<T>(
 
 fn excerpt(output: &[u8]) -> Vec<u8> {
     output[..output.len().min(1024)].to_vec()
+}
+
+/// GraphQL error types GitHub raises before a mutation writes anything, so a
+/// response carrying only these proves the change was not applied.
+fn mutation_refusal_type(kind: &str) -> bool {
+    matches!(
+        kind,
+        "NOT_FOUND" | "FORBIDDEN" | "UNPROCESSABLE" | "INSUFFICIENT_SCOPES" | "RATE_LIMITED"
+    )
 }
 
 fn parse_warning(program: &Path, output: ProcessOutput, message: String) -> ProcessFailure {
@@ -1999,5 +3027,451 @@ mod tests {
         assert_eq!(conversation.comments[0].body, "Issue comment");
         assert!(!conversation.truncated);
         assert!(!conversation.threads[0].truncated);
+    }
+    fn pull_request_key() -> PullRequestKey {
+        PullRequestKey::new(repository(), 7).unwrap()
+    }
+
+    fn argument_strings(command: &CommandSpec) -> Vec<String> {
+        command
+            .arguments
+            .iter()
+            .map(|argument| argument.to_string_lossy().into_owned())
+            .collect()
+    }
+
+    fn started_failure(kind: ProcessFailureKind, started: bool) -> ProcessFailure {
+        ProcessFailure {
+            kind,
+            program: "gh".into(),
+            exit_code: None,
+            signal: None,
+            stdout: Vec::new(),
+            stderr: b"boom".into(),
+            message: "boom".into(),
+            started,
+        }
+    }
+
+    fn failed(exit_code: i32, stdout: &[u8]) -> Result<ProcessOutput, ProcessFailure> {
+        Ok(ProcessOutput {
+            exit_code: Some(exit_code),
+            signal: None,
+            success: false,
+            stdout: stdout.into(),
+            stderr: Vec::new(),
+        })
+    }
+
+    const THREAD_JSON: &str = r#"{"id":"PRRT_1","path":"src/lib.rs","line":12,"originalLine":12,"startLine":10,"originalStartLine":10,"diffSide":"RIGHT","startDiffSide":"RIGHT","isOutdated":false,"isResolved":false,"isCollapsed":false,"viewerCanResolve":true,"viewerCanUnresolve":false,"comments":{"nodes":[{"id":"PRRC_1","author":{"login":"me"},"body":"Draft","createdAt":"now","url":"https://github.com/owner/repo/pull/7#discussion_r1","viewerDidAuthor":true,"viewerCanUpdate":true,"viewerCanDelete":true,"commentState":"PENDING"}],"pageInfo":{"hasNextPage":false,"endCursor":null}}}"#;
+
+    #[test]
+    fn graphql_sends_integers_typed_and_never_interpolates_the_number() {
+        let fake = Arc::new(FakeExecutor::with_outputs(vec![
+            success(br#"{"data":{"repository":{"pullRequest":{"reviewThreads":{"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":null}}}}}}"#),
+            success(br#"{"data":{"repository":{"pullRequest":{"comments":{"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":null}}}}}}"#),
+            success(br#"{"data":{"repository":{"pullRequest":{"reviews":{"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":null}}}}}}"#),
+        ]));
+        let service = GitHubService::new("gh", fake.clone());
+        service
+            .conversation(&pull_request_key(), &CancellationToken::new())
+            .unwrap();
+        let commands = fake.commands.lock().unwrap();
+        for command in commands.iter() {
+            let arguments = argument_strings(command);
+            let query = arguments
+                .iter()
+                .find_map(|argument| argument.strip_prefix("query="))
+                .expect("query argument");
+            assert!(query.contains("$number:Int!"), "{query}");
+            assert!(!query.contains("number:7"), "{query}");
+            let position = arguments
+                .iter()
+                .position(|argument| argument == "number=7")
+                .expect("number variable");
+            assert_eq!(arguments[position - 1], "-F");
+            let owner = arguments
+                .iter()
+                .position(|argument| argument == "owner=owner")
+                .expect("owner variable");
+            assert_eq!(arguments[owner - 1], "-f");
+        }
+    }
+
+    #[test]
+    fn review_context_adopts_only_the_viewers_pending_review() {
+        let fake = Arc::new(FakeExecutor::with_outputs(vec![
+            success(br#"{"data":{"viewer":{"login":"me"},"repository":{"pullRequest":{"id":"PR_1","headRefOid":"abc","baseRefOid":"def","viewerDidAuthor":false,"reviews":{"nodes":[{"id":"PRR_other","author":{"login":"someone"},"comments":{"totalCount":9}},{"id":"PRR_mine","author":{"login":"me"},"comments":{"totalCount":2}}],"pageInfo":{"hasNextPage":false,"endCursor":null}}}}}}"#),
+            success(br#"{"data":{"viewer":{"login":"me"},"repository":{"pullRequest":{"id":"PR_1","headRefOid":"abc","baseRefOid":"def","viewerDidAuthor":true,"reviews":{"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":null}}}}}}"#),
+        ]));
+        let service = GitHubService::new("gh", fake);
+        let context = service
+            .review_context(&pull_request_key(), &CancellationToken::new())
+            .unwrap();
+        assert_eq!(context.pull_request_id, "PR_1");
+        assert_eq!(context.head_oid, "abc");
+        assert_eq!(context.base_oid, "def");
+        assert_eq!(
+            context.pending,
+            Some(PendingReview {
+                id: "PRR_mine".into(),
+                comment_count: 2
+            })
+        );
+        let context = service
+            .review_context(&pull_request_key(), &CancellationToken::new())
+            .unwrap();
+        assert!(context.viewer_is_author);
+        assert_eq!(context.pending, None);
+    }
+
+    #[test]
+    fn files_paginate_and_keep_the_forges_viewed_states() {
+        let fake = Arc::new(FakeExecutor::with_outputs(vec![
+            success(br#"{"data":{"repository":{"pullRequest":{"files":{"nodes":[{"path":"a.rs","additions":1,"deletions":2,"changeType":"MODIFIED","viewerViewedState":"VIEWED"}],"pageInfo":{"hasNextPage":true,"endCursor":"c1"}}}}}}"#),
+            success(br#"{"data":{"repository":{"pullRequest":{"files":{"nodes":[{"path":"b.rs","additions":3,"deletions":0,"changeType":"ADDED","viewerViewedState":"DISMISSED"},{"path":"c.rs","viewerViewedState":"SOMETHING_NEW"}],"pageInfo":{"hasNextPage":false,"endCursor":null}}}}}}"#),
+        ]));
+        let service = GitHubService::new("gh", fake.clone());
+        let files = service
+            .pull_request_files(&pull_request_key(), &CancellationToken::new())
+            .unwrap();
+        assert!(!files.truncated);
+        assert_eq!(files.files.len(), 3);
+        assert_eq!(files.files[0].viewer_viewed_state, FileViewedState::Viewed);
+        assert!(files.files[0].viewer_viewed_state.is_viewed());
+        assert_eq!(
+            files.files[1].viewer_viewed_state,
+            FileViewedState::Dismissed
+        );
+        assert_eq!(files.files[2].viewer_viewed_state, FileViewedState::Unknown);
+        assert_eq!(files.files[1].additions, 3);
+        let commands = fake.commands.lock().unwrap();
+        assert!(
+            !argument_strings(&commands[0])
+                .iter()
+                .any(|a| a.starts_with("cursor="))
+        );
+        assert!(argument_strings(&commands[1]).contains(&"cursor=c1".to_owned()));
+    }
+
+    #[test]
+    fn a_review_thread_carries_its_range_and_pending_state() {
+        let fake = Arc::new(FakeExecutor::with_outputs(vec![success(
+            format!(r#"{{"data":{{"addPullRequestReviewThread":{{"thread":{THREAD_JSON}}}}}}}"#)
+                .as_bytes(),
+        )]));
+        let service = GitHubService::new("gh", fake.clone());
+        let request = AddReviewThreadRequest {
+            review_id: "PRR_1".into(),
+            path: "src/lib.rs".into(),
+            line: 12,
+            side: ReviewDiffSide::Right,
+            start_line: Some(10),
+            start_side: None,
+            body: "Draft".into(),
+        };
+        let outcome = service
+            .add_review_thread(&repository(), &request, &CancellationToken::new())
+            .unwrap();
+        let ReviewMutationOutcome::Applied(thread) = outcome else {
+            panic!("expected an applied thread");
+        };
+        assert_eq!(thread.id, "PRRT_1");
+        assert_eq!(thread.start_line, Some(10));
+        assert_eq!(thread.line, Some(12));
+        assert_eq!(thread.side, ReviewDiffSide::Right);
+        assert!(thread.viewer_can_resolve);
+        assert!(thread.comments[0].is_pending());
+        assert!(thread.comments[0].viewer_did_author);
+        let arguments = argument_strings(&fake.commands.lock().unwrap()[0]);
+        let line = arguments.iter().position(|a| a == "line=12").unwrap();
+        assert_eq!(arguments[line - 1], "-F");
+        assert!(arguments.contains(&"startLine=10".to_owned()));
+        assert!(arguments.contains(&"startSide=RIGHT".to_owned()));
+        assert!(arguments.contains(&"side=RIGHT".to_owned()));
+
+        let single = AddReviewThreadRequest {
+            start_line: None,
+            ..request.clone()
+        };
+        let fake = Arc::new(FakeExecutor::with_outputs(vec![success(
+            format!(r#"{{"data":{{"addPullRequestReviewThread":{{"thread":{THREAD_JSON}}}}}}}"#)
+                .as_bytes(),
+        )]));
+        let service = GitHubService::new("gh", fake.clone());
+        service
+            .add_review_thread(&repository(), &single, &CancellationToken::new())
+            .unwrap();
+        let arguments = argument_strings(&fake.commands.lock().unwrap()[0]);
+        assert!(!arguments.iter().any(|a| a.starts_with("startLine=")));
+        assert!(!arguments.iter().any(|a| a.starts_with("startSide=")));
+    }
+
+    #[test]
+    fn review_requests_refuse_inputs_the_forge_would_misread() {
+        let service = GitHubService::new("gh", Arc::new(FakeExecutor::default()));
+        let valid = AddReviewThreadRequest {
+            review_id: "PRR_1".into(),
+            path: "src/lib.rs".into(),
+            line: 12,
+            side: ReviewDiffSide::Right,
+            start_line: None,
+            start_side: None,
+            body: "Draft".into(),
+        };
+        let refused = |request: AddReviewThreadRequest| {
+            assert!(
+                service
+                    .add_review_thread(&repository(), &request, &CancellationToken::new())
+                    .is_err()
+            );
+        };
+        refused(AddReviewThreadRequest {
+            line: 0,
+            ..valid.clone()
+        });
+        refused(AddReviewThreadRequest {
+            start_line: Some(13),
+            ..valid.clone()
+        });
+        // A one-line range is legal: the selection was one line.
+        let one_line = AddReviewThreadRequest {
+            start_line: Some(12),
+            ..valid.clone()
+        };
+        assert!(one_line.validate().is_ok());
+        refused(AddReviewThreadRequest {
+            start_side: Some(ReviewDiffSide::Left),
+            ..valid.clone()
+        });
+        refused(AddReviewThreadRequest {
+            path: "../secret".into(),
+            ..valid.clone()
+        });
+        refused(AddReviewThreadRequest {
+            path: "/abs".into(),
+            ..valid.clone()
+        });
+        refused(AddReviewThreadRequest {
+            body: "   ".into(),
+            ..valid.clone()
+        });
+        refused(AddReviewThreadRequest {
+            review_id: "not a node id".into(),
+            ..valid.clone()
+        });
+        assert!(
+            service
+                .set_file_viewed(
+                    &repository(),
+                    "PR_1",
+                    "a/../b",
+                    true,
+                    &CancellationToken::new()
+                )
+                .is_err()
+        );
+        assert!(
+            service
+                .update_comment(&repository(), "PRRC_1", "", &CancellationToken::new())
+                .is_err()
+        );
+        // Nothing reached gh.
+        assert!(service.executor.commands.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_mutation_is_classified_by_what_the_forge_proved() {
+        let repository = repository();
+        let outcomes = |output: Result<ProcessOutput, ProcessFailure>| {
+            let service =
+                GitHubService::new("gh", Arc::new(FakeExecutor::with_outputs(vec![output])));
+            service.set_file_viewed(
+                &repository,
+                "PR_1",
+                "src/lib.rs",
+                true,
+                &CancellationToken::new(),
+            )
+        };
+        assert!(matches!(
+            outcomes(Err(started_failure(ProcessFailureKind::Spawn, false))),
+            Ok(ReviewMutationOutcome::NotApplied { .. })
+        ));
+        assert!(matches!(
+            outcomes(Err(started_failure(ProcessFailureKind::Cancelled, true))),
+            Ok(ReviewMutationOutcome::OutcomeUnknown { .. })
+        ));
+        assert!(matches!(
+            outcomes(success(
+                br#"{"data":{"markFileAsViewed":{"clientMutationId":null}}}"#
+            )),
+            Ok(ReviewMutationOutcome::Applied(()))
+        ));
+        // Errors beside a payload are field errors on an applied mutation.
+        assert!(matches!(
+            outcomes(failed(
+                1,
+                br#"{"data":{"markFileAsViewed":{"clientMutationId":null}},"errors":[{"message":"partial"}]}"#
+            )),
+            Ok(ReviewMutationOutcome::Applied(()))
+        ));
+        // A typed refusal is raised before the write, so it proves non-application.
+        match outcomes(failed(
+            1,
+            br#"{"data":{"markFileAsViewed":null},"errors":[{"type":"NOT_FOUND","message":"Could not resolve to a node"}]}"#,
+        )) {
+            Ok(ReviewMutationOutcome::NotApplied { failure }) => {
+                assert!(failure.message.contains("Could not resolve"), "{failure}");
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+        // So does a response that never reached execution: no `data` at all.
+        assert!(matches!(
+            outcomes(failed(
+                1,
+                br#"{"errors":[{"message":"Variable $path of type String! was provided invalid value"}]}"#
+            )),
+            Ok(ReviewMutationOutcome::NotApplied { .. })
+        ));
+        // An untyped error beside a null payload is how a timeout or internal
+        // failure reports, and those can land after the write.
+        match outcomes(failed(
+            1,
+            br#"{"data":{"markFileAsViewed":null},"errors":[{"message":"Something went wrong while executing your query."}]}"#,
+        )) {
+            Ok(ReviewMutationOutcome::OutcomeUnknown { failure }) => {
+                assert!(failure.message.contains("did not confirm"), "{failure}");
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+        // One typed refusal beside an untyped error does not prove anything.
+        assert!(matches!(
+            outcomes(failed(
+                1,
+                br#"{"data":{"markFileAsViewed":null},"errors":[{"type":"NOT_FOUND","message":"a"},{"message":"b"}]}"#
+            )),
+            Ok(ReviewMutationOutcome::OutcomeUnknown { .. })
+        ));
+        assert!(matches!(
+            outcomes(failed(1, b"error connecting to api.github.com\n")),
+            Ok(ReviewMutationOutcome::OutcomeUnknown { .. })
+        ));
+        assert!(matches!(
+            outcomes(success(b"{}")),
+            Ok(ReviewMutationOutcome::OutcomeUnknown { .. })
+        ));
+        assert!(matches!(
+            outcomes(failed(4, b"")),
+            Err(GitHubError::AuthenticationRequired { .. })
+        ));
+    }
+
+    #[test]
+    fn an_applied_payload_this_build_cannot_read_is_unknown_not_refused() {
+        let fake = Arc::new(FakeExecutor::with_outputs(vec![success(
+            br#"{"data":{"addPullRequestReview":{"pullRequestReview":{"id":42}}}}"#,
+        )]));
+        let service = GitHubService::new("gh", fake);
+        let outcome = service
+            .start_review(&repository(), "PR_1", &CancellationToken::new())
+            .unwrap();
+        match outcome {
+            ReviewMutationOutcome::OutcomeUnknown { failure } => {
+                assert!(failure.started);
+                assert!(failure.message.contains("unreadable"), "{failure}");
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[test]
+    fn submitting_picks_the_mutation_the_pending_state_needs() {
+        let review_payload = br#"{"data":{"submitPullRequestReview":{"pullRequestReview":{"id":"PRR_1","state":"APPROVED","url":"https://github.com/owner/repo/pull/7#pullrequestreview-1"}}}}"#;
+        let fresh_payload = br#"{"data":{"addPullRequestReview":{"pullRequestReview":{"id":"PRR_2","state":"COMMENTED","url":"https://github.com/owner/repo/pull/7#pullrequestreview-2"}}}}"#;
+        let fake = Arc::new(FakeExecutor::with_outputs(vec![
+            success(review_payload),
+            success(fresh_payload),
+        ]));
+        let service = GitHubService::new("gh", fake.clone());
+        let submitted = service
+            .submit_review(
+                &repository(),
+                &SubmitReviewRequest {
+                    pull_request_id: "PR_1".into(),
+                    review_id: Some("PRR_1".into()),
+                    event: ReviewEvent::Approve,
+                    body: "LGTM".into(),
+                },
+                &CancellationToken::new(),
+            )
+            .unwrap();
+        let ReviewMutationOutcome::Applied(review) = submitted else {
+            panic!("expected an applied review");
+        };
+        assert_eq!(review.state.0, "APPROVED");
+        let commented = service
+            .submit_review(
+                &repository(),
+                &SubmitReviewRequest {
+                    pull_request_id: "PR_1".into(),
+                    review_id: None,
+                    event: ReviewEvent::Comment,
+                    body: "  ".into(),
+                },
+                &CancellationToken::new(),
+            )
+            .unwrap();
+        assert!(matches!(commented, ReviewMutationOutcome::Applied(_)));
+        let commands = fake.commands.lock().unwrap();
+        let first = argument_strings(&commands[0]);
+        assert!(first.iter().any(|a| a.contains("submitPullRequestReview")));
+        assert!(first.contains(&"event=APPROVE".to_owned()));
+        assert!(first.contains(&"body=LGTM".to_owned()));
+        assert!(first.contains(&"review=PRR_1".to_owned()));
+        let second = argument_strings(&commands[1]);
+        assert!(second.iter().any(|a| a.contains("addPullRequestReview(")));
+        assert!(second.contains(&"pullRequest=PR_1".to_owned()));
+        assert!(!second.iter().any(|a| a.starts_with("body=")));
+    }
+
+    #[test]
+    fn viewed_and_resolved_toggles_name_the_matching_mutation() {
+        let fake = Arc::new(FakeExecutor::with_outputs(vec![
+            success(br#"{"data":{"markFileAsViewed":{"clientMutationId":null}}}"#),
+            success(br#"{"data":{"unmarkFileAsViewed":{"clientMutationId":null}}}"#),
+            success(br#"{"data":{"resolveReviewThread":{"thread":{"id":"PRRT_1","isResolved":true}}}}"#),
+            success(br#"{"data":{"unresolveReviewThread":{"thread":{"id":"PRRT_1","isResolved":false}}}}"#),
+        ]));
+        let service = GitHubService::new("gh", fake.clone());
+        let token = CancellationToken::new();
+        for viewed in [true, false] {
+            assert!(matches!(
+                service
+                    .set_file_viewed(&repository(), "PR_1", "src/lib.rs", viewed, &token)
+                    .unwrap(),
+                ReviewMutationOutcome::Applied(())
+            ));
+        }
+        for resolved in [true, false] {
+            assert!(matches!(
+                service
+                    .set_thread_resolved(&repository(), "PRRT_1", resolved, &token)
+                    .unwrap(),
+                ReviewMutationOutcome::Applied(())
+            ));
+        }
+        let commands = fake.commands.lock().unwrap();
+        let mutation = |index: usize| {
+            argument_strings(&commands[index])
+                .into_iter()
+                .find(|a| a.starts_with("query="))
+                .unwrap()
+        };
+        assert!(mutation(0).contains("markFileAsViewed"));
+        assert!(mutation(1).contains("unmarkFileAsViewed"));
+        assert!(mutation(2).contains("resolveReviewThread"));
+        assert!(mutation(3).contains("unresolveReviewThread"));
+        assert!(argument_strings(&commands[0]).contains(&"path=src/lib.rs".to_owned()));
     }
 }
