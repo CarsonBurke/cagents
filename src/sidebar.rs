@@ -2649,7 +2649,9 @@ impl SidebarState {
         self.files_filter_open = false;
         self.commit_message.clear();
         self.expanded_directories.clear();
-        self.toggled_sections.remove(&PanelSection::Untracked);
+        // Every section is one worktree's change area now, not a view of the
+        // panel, so none of their disclosures carry to the next worktree.
+        self.toggled_sections.clear();
         self.changes_tab = ChangesTab::default();
         self.publish = None;
         self.discard = None;
@@ -5760,16 +5762,24 @@ fn changes_section<'a>(
             &source.key,
             section,
             source.chrome.section_id(section).clone(),
-            expanded.then(|| RowCount::exact(group.rows().len())),
+            // A count matters most while the rows are not drawn: a bare
+            // "Unstaged" does not say it is folding forty files away.
+            Some(RowCount::exact(group.rows().len())),
             expanded,
             modal_open,
             actions,
             || {
                 if group.is_empty() {
+                    let noun = match group.area {
+                        ChangeArea::Conflict => "conflicted files",
+                        ChangeArea::Staged => "staged changes",
+                        ChangeArea::Unstaged => "unstaged changes",
+                        ChangeArea::Untracked => "untracked files",
+                    };
                     design::caption(if source.reloading {
-                        "Loading untracked files…"
+                        format!("Loading {noun}…")
                     } else {
-                        "No untracked files."
+                        format!("No {noun}.")
                     })
                     .into()
                 } else {
@@ -5777,6 +5787,16 @@ fn changes_section<'a>(
                 }
             },
         ));
+    }
+    // The publish form is several rows tall and grows a wrapping refusal, so
+    // it stays in the scroll region: pinned beside the commit box it could
+    // push its own Cancel and Publish past the bottom of a short panel.
+    if let Some(publish) = state
+        .publish_draft()
+        .filter(|draft| draft.key == source.key)
+    {
+        column = column.push(crate::design::horizontal_rule());
+        column = column.push(publish_picker(source, publish, modal_open));
     }
     column.into()
 }
@@ -6393,9 +6413,6 @@ fn changes_footer<'a>(
         }
     }
     column = column.push(buttons);
-    if let Some(publish) = state.publish_draft().filter(|draft| &draft.key == key) {
-        column = column.push(publish_picker(source, publish, modal_open));
-    }
     column.into()
 }
 
@@ -11526,7 +11543,8 @@ pub(crate) mod tests {
         let mut state = panel_state(&model);
         state.changes_tab = ChangesTab::Changes;
 
-        // The Changes view contains index mutations; History is a separate view.
+        // The Changes view contains index mutations; History and Branch are
+        // separate views with their own commands, and each must stand down.
         let live = frame_enter_presses(&renderer, git_panel(&model, &state, 380.0, false));
         assert!(
             live.iter()
@@ -11542,8 +11560,14 @@ pub(crate) mod tests {
              is up - so a control that still published one would report itself enabled, take the \
              press, and do nothing. It published {gated:?}"
         );
-        state.changes_tab = ChangesTab::History;
-        assert!(frame_enter_presses(&renderer, git_panel(&model, &state, 380.0, true)).is_empty());
+        for tab in ChangesTab::ALL {
+            state.changes_tab = tab;
+            let gated = frame_enter_presses(&renderer, git_panel(&model, &state, 380.0, true));
+            assert!(
+                gated.is_empty(),
+                "{tab:?} published {gated:?} behind a modal"
+            );
+        }
     }
 
     #[test]
