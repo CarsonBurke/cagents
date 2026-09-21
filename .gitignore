@@ -2,3 +2,13 @@
 /worktrees/
 dist/
 node_modules/
+
+# niri-harness leaves these in the checkout it drives.
+session.rc
+session.log
+session.env
+compositor.log
+launch.sh
+nested.kdl
+observed.json
+shots/
