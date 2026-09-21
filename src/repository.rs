@@ -1637,6 +1637,15 @@ fn pull_request_ref_number(name: &str) -> Option<u64> {
     number.parse().ok().filter(|number| *number != 0)
 }
 
+/// Whether a refused fetch says the remote has no such ref, as opposed to
+/// a network, authentication, or signal failure that names no ref at all.
+/// Git has reported a missing ref this way since long before anything this
+/// application supports, and the message is not localized.
+fn base_ref_is_missing(failure: &ProcessFailure) -> bool {
+    failure.kind == ProcessFailureKind::Exit
+        && String::from_utf8_lossy(&failure.stderr).contains("couldn't find remote ref")
+}
+
 /// The private refs one pull request's fetch owns.
 pub fn pull_request_refs(
     number: u64,
@@ -4939,7 +4948,7 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         let base_refspec = format!("+refs/heads/{}:{}", base_branch.as_str(), base_ref.as_str());
         match self.run_checked(&fetch(base_refspec), cancellation) {
             Ok(_) => {}
-            Err(failure) if failure.kind == ProcessFailureKind::Exit => {
+            Err(failure) if base_ref_is_missing(&failure) => {
                 return Err(RepositoryError::PullRequestBaseUnavailable {
                     base_branch: base_branch.clone(),
                     failure: Box::new(failure),

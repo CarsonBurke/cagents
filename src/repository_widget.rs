@@ -71,11 +71,12 @@ impl RepositoryFile {
         match basis {
             DiffBasis::HeadToIndex => self.staged,
             DiffBasis::IndexToWorktree => self.unstaged,
-            DiffBasis::MergeBaseToHead { .. } | DiffBasis::CommitToParent { .. } => true,
-            // A pull request's files come from the forge and its fetched range,
-            // never from this working-tree listing, so no working file is an
-            // answer for it.
-            DiffBasis::PullRequest { .. } => false,
+            // A pull request comparison is installed by a review surface with
+            // a synthetic file, and it must survive every status refresh the
+            // way the other immutable bases do.
+            DiffBasis::MergeBaseToHead { .. }
+            | DiffBasis::CommitToParent { .. }
+            | DiffBasis::PullRequest { .. } => true,
         }
     }
 
@@ -7812,6 +7813,63 @@ mod tests {
         );
     }
 
+    /// A review surface installs a pull request comparison over a working
+    /// file list that knows nothing about it. The comparison is read-only,
+    /// keeps its rename identity, survives the status refresh a background
+    /// change triggers, and can be retried — exactly like the other immutable
+    /// bases, which is what the review surface will depend on.
+    #[test]
+    fn a_pull_request_basis_survives_status_refresh_and_retries() {
+        let card = CardId::new();
+        let (mut runtime, identity) = working_diff_runtime(card, "old\n", "working\n");
+        let basis = DiffBasis::PullRequest {
+            number: 12,
+            base_ref: ValidatedRefName::parse("refs/heads/main").unwrap(),
+            head: fixture_oid(1),
+            merge_base: fixture_oid(2),
+        };
+        drop(runtime.update(RepositoryAction::OpenCommittedFile {
+            card,
+            path: RepoPath::parse("renamed.txt").unwrap(),
+            old_path: Some(RepoPath::parse("old-name.txt").unwrap()),
+            basis: basis.clone(),
+        }));
+        assert!(!runtime.accepts_selected(&identity));
+        assert!(matches!(runtime.document, DocumentState::None));
+        assert!(!runtime.can_save());
+        assert_eq!(runtime.diff_basis, basis);
+        assert_eq!(runtime.source_surface, SourceSurface::Diff);
+        assert!(runtime.can_show_diff());
+        assert_eq!(basis_label(&basis), "#12 vs main");
+        assert_eq!(basis_choice_label(&basis), "Pull request");
+        assert_eq!(basis_choice(&basis), None);
+
+        // The refresh a background working-tree change triggers must not
+        // replace the review with a working comparison.
+        drop(runtime.refresh_selected_status(card));
+        assert_eq!(runtime.diff_basis, basis);
+        assert_eq!(runtime.source_surface, SourceSurface::Diff);
+        assert_eq!(
+            runtime.comparison_old_path(),
+            Some(PathBuf::from("old-name.txt"))
+        );
+
+        runtime.set_diff_state(
+            basis.clone(),
+            DiffState::Ready(RenderedDiff::Error("retry".into())),
+        );
+        assert!(runtime.can_retry_diff());
+        drop(runtime.update(RepositoryAction::RetryDiff { card }));
+        assert!(matches!(
+            runtime.diff_state(&basis),
+            Some(DiffState::Loading { .. })
+        ));
+        assert_eq!(
+            runtime.comparison_old_path(),
+            Some(PathBuf::from("old-name.txt"))
+        );
+    }
+
     #[test]
     fn branch_navigation_cannot_discard_an_unsaved_or_saving_native_buffer() {
         let card = CardId::new();
@@ -11673,12 +11731,19 @@ mod tests {
             head: fixture_oid(1),
             merge_base: fixture_oid(2),
         };
+        let pull_request = DiffBasis::PullRequest {
+            number: 7,
+            base_ref: ValidatedRefName::parse("refs/heads/main").unwrap(),
+            head: fixture_oid(1),
+            merge_base: fixture_oid(2),
+        };
         let labels = [
             &DiffBasis::IndexToWorktree,
             &DiffBasis::HeadToIndex,
             &branch,
             &commit,
             &root_commit,
+            &pull_request,
         ]
         .map(basis_label);
         assert_eq!(
@@ -11689,6 +11754,7 @@ mod tests {
                 "Branch vs origin/main".to_owned(),
                 format!("Commit {}", fixture_oid(1).short()),
                 format!("Root commit {}", fixture_oid(1).short()),
+                "#7 vs main".to_owned(),
             ]
         );
         let mut distinct = labels.to_vec();
@@ -11701,6 +11767,7 @@ mod tests {
         assert_eq!(basis_choice_label(&branch), "Branch");
         assert_eq!(basis_choice_label(&commit), "Commit");
         assert_eq!(basis_choice_label(&root_commit), "Commit");
+        assert_eq!(basis_choice_label(&pull_request), "Pull request");
     }
 
     /// A comparison with no text rows reports what it actually is, including
