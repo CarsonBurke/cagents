@@ -1,4 +1,5 @@
 use super::*;
+use crate::settings_widgets::{Group, Setting, field as setting_field, group as settings_group};
 
 fn settings_input_style(progress: f32) -> cosmic::theme::TextInput {
     use widget::text_input::StyleSheet;
@@ -44,7 +45,7 @@ fn setting_input<'a>(
     value: &'a str,
     field: SettingsField,
     progress: f32,
-) -> Element<'a, Message> {
+) -> Setting<'a, Message> {
     setting_field(
         label,
         detail,
@@ -54,24 +55,6 @@ fn setting_input<'a>(
             .style(settings_input_style(progress))
             .into(),
     )
-}
-
-fn setting_field<'a>(
-    label: &'static str,
-    detail: impl Into<Cow<'a, str>> + 'a,
-    control: Element<'a, Message>,
-) -> Element<'a, Message> {
-    widget::column::with_children(vec![
-        widget::text::caption_heading(label).into(),
-        control,
-        design::caption(detail)
-            .wrapping(iced::widget::text::Wrapping::Word)
-            .width(Length::Fill)
-            .into(),
-    ])
-    .spacing(design::GRID_UNIT)
-    .width(Length::Fill)
-    .into()
 }
 
 fn setting_stepper<'a>(
@@ -84,7 +67,7 @@ fn setting_stepper<'a>(
     step: f32,
     default: f32,
     unit: &'static str,
-) -> Element<'a, Message> {
+) -> Setting<'a, Message> {
     let current = value.parse::<f32>().unwrap_or(default).clamp(min, max);
     let change = |next: f32| Message::SettingsChanged {
         field,
@@ -124,17 +107,7 @@ fn setting_stepper<'a>(
     .align_y(Alignment::Center)
     .width(Length::Shrink)
     .into();
-    widget::column::with_children(vec![
-        widget::text::caption_heading(label).into(),
-        design::caption(detail)
-            .wrapping(iced::widget::text::Wrapping::Word)
-            .width(Length::Fill)
-            .into(),
-        control,
-    ])
-    .spacing(design::GRID_UNIT)
-    .width(Length::Fill)
-    .into()
+    setting_field(label, detail, control)
 }
 
 fn settings_choice<'a>(
@@ -143,7 +116,7 @@ fn settings_choice<'a>(
     field: SettingsField,
     choices: impl IntoIterator<Item = (&'static str, &'static str, bool)>,
     progress: f32,
-) -> Element<'a, Message> {
+) -> Setting<'a, Message> {
     let buttons: Vec<Element<'a, Message>> = choices
         .into_iter()
         .map(|(choice, value, selected)| {
@@ -181,44 +154,24 @@ fn settings_choice<'a>(
     )
 }
 
-fn settings_group<'a>(
-    title: &'static str,
-    description: &'static str,
-    controls: Vec<Element<'a, Message>>,
-) -> Element<'a, Message> {
-    let mut children = Vec::with_capacity(controls.len() + 1);
-    children.push(
-        widget::column::with_children(vec![
-            widget::text::title4(title).into(),
-            design::caption(description)
-                .wrapping(iced::widget::text::Wrapping::Word)
-                .width(Length::Fill)
-                .into(),
-        ])
-        .spacing(design::GRID_UNIT)
-        .into(),
-    );
-    children.extend(controls);
-    widget::container(
-        widget::column::with_children(children)
-            .spacing(4.0 * design::GRID_UNIT)
-            .width(Length::Fill),
-    )
-    .padding([design::GRID_UNIT, 0.0])
-    .width(Length::Fill)
-    .into()
-}
-
 fn settings_category_controls<'a>(
     category: SettingsCategory,
     draft: &'a SettingsDraft,
     progress: f32,
-) -> Vec<Element<'a, Message>> {
+) -> Vec<Group<'a, Message>> {
     match category {
         SettingsCategory::General => vec![settings_group(
             "Runtime",
             "Control how many live columns cagents keeps active and when background work is suspended.",
             vec![
+                setting_field(
+                    "Reset all settings",
+                    "Restore default preferences; saved conversations and tabs are preserved.",
+                    widget::button::standard("Reset all settings")
+                        .id(widget::Id::new("settings.reset"))
+                        .on_press(Message::ResetSettings)
+                        .into(),
+                ),
                 setting_input(
                     "Managed worktree directory",
                     "Absolute path, or relative to the repository root. Defaults to worktrees/. Each new worktree gets its own subdirectory.",
@@ -267,28 +220,6 @@ fn settings_category_controls<'a>(
                     progress,
                 ),
                 setting_field(
-                    "Editor auto-save",
-                    "Save edited files after a pause. Conflicts and save errors still require your attention.",
-                    widget::toggler(draft.editor_auto_save)
-                        .label("Save files automatically".to_owned())
-                        .on_toggle(|enabled| Message::SettingsChanged {
-                            field: SettingsField::EditorAutoSave,
-                            value: enabled.to_string(),
-                        })
-                        .into(),
-                ),
-                setting_field(
-                    "Line wrapping",
-                    "Wrap long lines to the editor width instead of scrolling horizontally.",
-                    widget::toggler(draft.editor_wrap_lines)
-                        .label("Wrap long lines".to_owned())
-                        .on_toggle(|enabled| Message::SettingsChanged {
-                            field: SettingsField::EditorWrapLines,
-                            value: enabled.to_string(),
-                        })
-                        .into(),
-                ),
-                setting_field(
                     "Chat send key",
                     "Enter sends the message and Shift+Enter breaks the line. Turn this off to compose with Enter and send with Ctrl+Enter.",
                     widget::toggler(draft.chat_enter_sends)
@@ -301,21 +232,49 @@ fn settings_category_controls<'a>(
                 ),
             ],
         )],
+        SettingsCategory::Editor => vec![settings_group(
+            "Editor",
+            "Shared native editor and diff preferences.",
+            crate::settings_widgets::editor_options(
+                draft.editor_auto_save,
+                draft.editor_wrap_lines,
+                draft.editor_syntax_theme,
+                |enabled| Message::SettingsChanged {
+                    field: SettingsField::EditorAutoSave,
+                    value: enabled.to_string(),
+                },
+                |enabled| Message::SettingsChanged {
+                    field: SettingsField::EditorWrapLines,
+                    value: enabled.to_string(),
+                },
+                |theme| Message::SettingsChanged {
+                    field: SettingsField::EditorSyntaxTheme,
+                    value: theme.key().into(),
+                },
+            ),
+        )],
         SettingsCategory::Appearance => vec![
             settings_group(
                 "Interface",
                 "Make the workbench comfortable on your display. Changes apply immediately and are saved automatically.",
                 vec![
-                    settings_choice(
-                        "Color scheme",
-                        "System follows your desktop, including later theme changes.",
-                        SettingsField::AppTheme,
-                        [
-                            ("System", "system", draft.app_theme == "system"),
-                            ("Dark", "dark", draft.app_theme == "dark"),
-                            ("Light", "light", draft.app_theme == "light"),
-                        ],
-                        progress,
+                    setting_field(
+                        "App theme",
+                        "Colors for the entire application. Terminal and syntax palettes are independent.",
+                        widget::dropdown(
+                            AppTheme::ALL
+                                .iter()
+                                .map(|theme| theme.label().to_owned())
+                                .collect::<Vec<_>>(),
+                            AppTheme::ALL
+                                .iter()
+                                .position(|theme| theme.key() == draft.app_theme),
+                            |index| Message::SettingsChanged {
+                                field: SettingsField::AppTheme,
+                                value: AppTheme::ALL[index].key().into(),
+                            },
+                        )
+                        .into(),
                     ),
                     setting_stepper(
                         "Interface scale",
@@ -329,23 +288,6 @@ fn settings_category_controls<'a>(
                         "×",
                     ),
                 ],
-            ),
-            settings_group(
-                "Editor",
-                "Syntax colors for native editors and the diff surface. Applies immediately to every open column.",
-                vec![settings_choice(
-                    "Syntax theme",
-                    "Match app follows the interface color scheme, including later theme changes.",
-                    SettingsField::EditorSyntaxTheme,
-                    settings::EditorSyntaxTheme::ALL.iter().map(|theme| {
-                        (
-                            theme.label(),
-                            theme.key(),
-                            draft.editor_syntax_theme == *theme,
-                        )
-                    }),
-                    progress,
-                )],
             ),
             settings_group(
                 "Workspace layout",
@@ -601,6 +543,7 @@ fn category_icon(category: SettingsCategory) -> &'static str {
         SettingsCategory::Terminal => "utilities-terminal-symbolic",
         SettingsCategory::Links => "web-browser-symbolic",
         SettingsCategory::Keyboard => "preferences-desktop-keyboard-symbolic",
+        SettingsCategory::Editor => "accessories-text-editor-symbolic",
     }
 }
 
@@ -638,10 +581,23 @@ fn category_button<'a>(
 pub(super) fn settings_dialog<'a>(
     category: SettingsCategory,
     draft: &'a SettingsDraft,
+    query: &'a str,
     feedback: Option<&'a SettingsFeedback>,
-    window_width: f32,
+    size: iced::Size,
     progress: f32,
 ) -> Element<'a, Message> {
+    settings_dialog_sized(category, draft, query, feedback, size, progress)
+}
+
+fn settings_dialog_sized<'a>(
+    category: SettingsCategory,
+    draft: &'a SettingsDraft,
+    query: &'a str,
+    feedback: Option<&'a SettingsFeedback>,
+    size: iced::Size,
+    progress: f32,
+) -> Element<'a, Message> {
+    let window_width = size.width;
     let narrow = window_width < design::OVERLAY_DOCK_BREAKPOINT;
     let gutter = if narrow { 3.0 } else { 5.0 } * design::GRID_UNIT;
     let navigation: Element<'a, Message> = if narrow {
@@ -695,9 +651,47 @@ pub(super) fn settings_dialog<'a>(
         .into()
     };
 
+    let search = widget::text_input("Search settings…", query)
+        .id(crate::settings_widgets::search_id())
+        .on_input(Message::SettingsSearchChanged);
+    let navigation: Element<'a, Message> = widget::column::with_children(vec![
+        widget::container(search).padding([8, 8]).into(),
+        navigation,
+    ])
+    .width(if narrow {
+        Length::Fill
+    } else {
+        Length::Fixed(200.0)
+    })
+    .height(if narrow { Length::Shrink } else { Length::Fill })
+    .into();
+    let categories: Vec<_> = if query.trim().is_empty() {
+        vec![category]
+    } else {
+        SettingsCategory::ALL.to_vec()
+    };
+    let mut results = Vec::new();
+    for category in categories {
+        let filter = if crate::settings_widgets::matches(category.label(), query) {
+            ""
+        } else {
+            query
+        };
+        results.extend(
+            settings_category_controls(category, draft, progress)
+                .into_iter()
+                .filter_map(|group| group.view(category.label(), filter)),
+        );
+    }
+    if results.is_empty() {
+        results.push(design::body("No matching settings").into());
+    }
+    if let Some(SettingsFeedback::Invalid(message) | SettingsFeedback::Error(message)) = feedback {
+        results.insert(0, design::body(message.as_str()).into());
+    }
     let content: Element<'a, Message> = widget::scrollable(
         widget::container(
-            widget::column::with_children(settings_category_controls(category, draft, progress))
+            widget::column::with_children(results)
                 .spacing(5.0 * design::GRID_UNIT)
                 .width(Length::Fill)
                 .max_width(CONTENT_MAX_WIDTH),
@@ -732,52 +726,6 @@ pub(super) fn settings_dialog<'a>(
         .into()
     };
 
-    let feedback: Element<'a, Message> = if let Some(feedback) = feedback {
-        let (icon, message): (_, Cow<'a, str>) = match feedback {
-            SettingsFeedback::Saved => ("emblem-ok-symbolic", "Saved to settings.toml".into()),
-            SettingsFeedback::Pending => (
-                "document-save-symbolic",
-                "Saving after you pause typing…".into(),
-            ),
-            SettingsFeedback::Invalid(message) => {
-                ("dialog-warning-symbolic", message.as_str().into())
-            }
-            SettingsFeedback::Error(message) => (
-                "dialog-error-symbolic",
-                format!("Could not save settings: {message}").into(),
-            ),
-        };
-        widget::row::with_children(vec![
-            settings_icon(icon, progress).into(),
-            design::caption(message)
-                .wrapping(iced::widget::text::Wrapping::Word)
-                .width(Length::Fill)
-                .into(),
-        ])
-        .align_y(Alignment::Center)
-        .spacing(2.0 * design::GRID_UNIT)
-        .width(Length::Fill)
-        .into()
-    } else {
-        crate::design::caption("Valid changes save automatically after you pause typing.")
-            .wrapping(iced::widget::text::Wrapping::Word)
-            .width(Length::Fill)
-            .into()
-    };
-    // A destructive, irreversible action does not belong behind an unlabelled
-    // 30px glyph whose tooltip needs a 1000ms dwell to appear. This control now
-    // only raises the confirmation, which carries the destructive button.
-    let reset = widget::button::standard("Reset all settings")
-        .id(widget::Id::new("settings.reset"))
-        .name("Reset all settings to defaults")
-        .leading_icon(crate::ui_controls::symbolic_icon("edit-undo-symbolic"))
-        .on_press(Message::ResetSettings)
-        .into();
-    let footer: Element<'a, Message> = widget::row::with_children(vec![feedback, reset])
-        .align_y(Alignment::Center)
-        .spacing(3.0 * design::GRID_UNIT)
-        .width(Length::Fill)
-        .into();
     let header = widget::container(
         widget::row::with_children(vec![
             widget::text::title4("Settings").width(Length::Fill).into(),
@@ -801,11 +749,6 @@ pub(super) fn settings_dialog<'a>(
             header.into(),
             crate::design::horizontal_rule().into(),
             body,
-            crate::design::horizontal_rule().into(),
-            widget::container(footer)
-                .padding([3.0 * design::GRID_UNIT, gutter])
-                .width(Length::Fill)
-                .into(),
         ])
         .width(Length::Fill)
         .height(Length::Fill),
@@ -813,13 +756,12 @@ pub(super) fn settings_dialog<'a>(
     );
     let surface = widget::container(surface)
         .max_width(900.0)
-        .height(Length::Fill)
-        .max_height(760.0);
+        .height(crate::settings_widgets::dialog_size(size).height);
 
     dialog_ui::overlay(surface.into(), Some(Message::CloseInspector), progress)
 }
 
-fn terminal_theme_choice<'a>(selected: &str, has_custom: bool) -> Element<'a, Message> {
+fn terminal_theme_choice<'a>(selected: &str, has_custom: bool) -> Setting<'a, Message> {
     let mut choices: Vec<(&str, &str)> = crate::terminal::TerminalTheme::PRESETS
         .iter()
         .map(|(_, label, id)| (*label, *id))

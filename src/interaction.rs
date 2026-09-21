@@ -20,6 +20,20 @@ mod context_menu;
 const HOVER_DURATION: Duration = Duration::from_millis(120);
 const TOOLTIP_DELAY: Duration = Duration::from_millis(300);
 
+/// Reserve tab-history keys before editor widgets can treat Tab as indentation.
+/// The application's keyboard subscription owns navigation and Control release.
+pub fn reserve_tab_history<'a, Message: 'a>(
+    content: impl Into<Element<'a, Message>>,
+    enabled: bool,
+) -> Element<'a, Message> {
+    Effect {
+        content: content.into(),
+        kind: Kind::TabHistory(enabled),
+        tip: None,
+    }
+    .into()
+}
+
 /// Soft full-bounds hover feedback, including when a child captures the event.
 /// The native animation clock requests frames only until its target is reached.
 pub fn hover<'a, Message: 'a>(content: impl Into<Element<'a, Message>>) -> Element<'a, Message> {
@@ -889,6 +903,7 @@ fn fill_overflow_fade(renderer: &mut Renderer, bounds: Rectangle, from: Color, t
 
 #[derive(Clone, Copy)]
 enum Kind {
+    TabHistory(bool),
     Hover,
     ContextMenu,
     Fade(f32),
@@ -915,6 +930,7 @@ struct Tip<'a, Message> {
 // Distinct tags prevent a positional diff from reusing a tooltip's clock as a
 // hover/fade clock when a conditional wrapper changes kind.
 struct HoverTag;
+struct TabHistoryTag;
 struct FadeTag;
 struct TooltipTag;
 struct AnimationDriverTag;
@@ -965,6 +981,7 @@ impl Default for State {
 impl<Message> Widget<Message, Theme, Renderer> for Effect<'_, Message> {
     fn tag(&self) -> tree::Tag {
         match self.kind {
+            Kind::TabHistory(_) => tree::Tag::of::<TabHistoryTag>(),
             Kind::Hover => tree::Tag::of::<HoverTag>(),
             Kind::Fade(_) => tree::Tag::of::<FadeTag>(),
             Kind::Tooltip => tree::Tag::of::<TooltipTag>(),
@@ -1069,6 +1086,16 @@ impl<Message> Widget<Message, Theme, Renderer> for Effect<'_, Message> {
         shell: &mut Shell<'_, Message>,
         viewport: &Rectangle,
     ) {
+        if let Kind::TabHistory(true) = self.kind
+            && let Event::Keyboard(
+                cosmic::iced::keyboard::Event::KeyPressed { key, modifiers, .. }
+                | cosmic::iced::keyboard::Event::KeyReleased { key, modifiers, .. },
+            ) = event
+            && crate::tab_history::is_chord(key, *modifiers)
+        {
+            shell.capture_event();
+            return;
+        }
         if let Kind::RevealWidth { progress, .. } = self.kind {
             let clipped = layout.bounds().intersection(viewport).unwrap_or_default();
             let cursor = if progress < 1.0 || !cursor.is_over(clipped) {
@@ -1101,6 +1128,9 @@ impl<Message> Widget<Message, Theme, Renderer> for Effect<'_, Message> {
             shell,
             viewport,
         );
+        if matches!(self.kind, Kind::TabHistory(_)) {
+            return;
+        }
         if matches!(self.kind, Kind::ContextMenu) {
             if matches!(
                 event,

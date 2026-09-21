@@ -2213,6 +2213,18 @@ fn encode_key_input(
     encoder.set_options_from_terminal(terminal);
     let mut encoded = Vec::with_capacity(32);
     encoder.encode_to_vec(&event, &mut encoded)?;
+    // Legacy shells cannot distinguish Ctrl+Backspace's BS from Ctrl+H.
+    // Use their conventional backward-kill-word binding, but leave negotiated
+    // CSI-u/modifyOtherKeys encodings and release events intact.
+    if input.key == TerminalKey::Backspace
+        && input.modifiers.control
+        && !input.modifiers.alt
+        && !input.modifiers.shift
+        && !input.modifiers.super_key
+        && matches!(encoded.as_slice(), b"\x08" | b"\x7f")
+    {
+        encoded[0] = 0x17;
+    }
     Ok(encoded)
 }
 
@@ -2871,6 +2883,37 @@ mod tests {
             text: text.map(str::to_owned),
             unshifted_codepoint,
         }
+    }
+
+    #[test]
+    fn control_backspace_kills_words_only_in_legacy_encoding() {
+        let mut terminal = Terminal::new(TerminalOptions {
+            cols: 80,
+            rows: 24,
+            max_scrollback: 100,
+        })
+        .unwrap();
+        let mut encoder = KeyEncoder::new().unwrap();
+        for action in [KeyAction::Press, KeyAction::Repeat, KeyAction::Release] {
+            let mut input = key_input(action, TerminalKey::Backspace, None, None);
+            input.modifiers.control = true;
+            let bytes = encode_key_input(&terminal, &mut encoder, input).unwrap();
+            assert_eq!(
+                bytes,
+                if action == KeyAction::Release {
+                    &b""[..]
+                } else {
+                    &b"\x17"[..]
+                }
+            );
+        }
+        terminal.vt_write(b"\x1b[>1u");
+        let mut input = key_input(KeyAction::Press, TerminalKey::Backspace, None, None);
+        input.modifiers.control = true;
+        assert_eq!(
+            encode_key_input(&terminal, &mut encoder, input).unwrap(),
+            b"\x1b[127;5u"
+        );
     }
 
     #[test]

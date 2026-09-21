@@ -33,6 +33,113 @@ pub enum AppTheme {
     System,
     Dark,
     Light,
+    CatppuccinMocha,
+    CatppuccinLatte,
+    Dracula,
+    Nord,
+    TokyoNight,
+    GruvboxDark,
+    SolarizedLight,
+}
+
+impl AppTheme {
+    pub const ALL: [Self; 10] = [
+        Self::System,
+        Self::Dark,
+        Self::Light,
+        Self::CatppuccinMocha,
+        Self::CatppuccinLatte,
+        Self::Dracula,
+        Self::Nord,
+        Self::TokyoNight,
+        Self::GruvboxDark,
+        Self::SolarizedLight,
+    ];
+    pub fn key(self) -> &'static str {
+        match self {
+            Self::System => "system",
+            Self::Dark => "dark",
+            Self::Light => "light",
+            Self::CatppuccinMocha => "catppuccin_mocha",
+            Self::CatppuccinLatte => "catppuccin_latte",
+            Self::Dracula => "dracula",
+            Self::Nord => "nord",
+            Self::TokyoNight => "tokyo_night",
+            Self::GruvboxDark => "gruvbox_dark",
+            Self::SolarizedLight => "solarized_light",
+        }
+    }
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::System => "System",
+            Self::Dark => "Dark",
+            Self::Light => "Light",
+            Self::CatppuccinMocha => "Catppuccin Mocha",
+            Self::CatppuccinLatte => "Catppuccin Latte",
+            Self::Dracula => "Dracula",
+            Self::Nord => "Nord",
+            Self::TokyoNight => "Tokyo Night",
+            Self::GruvboxDark => "Gruvbox Dark",
+            Self::SolarizedLight => "Solarized Light",
+        }
+    }
+    pub fn from_key(key: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|theme| theme.key() == key)
+    }
+
+    /// App surfaces use their own selection; terminal overrides and syntax
+    /// palettes remain independent. COSMIC derives accessible component states.
+    pub fn resolve(self, system: &cosmic::Theme) -> cosmic::Theme {
+        use crate::terminal::TerminalTheme;
+        use cosmic::cosmic_theme::{
+            ThemeBuilder,
+            palette::{Srgb, Srgba},
+        };
+        let palette = match self {
+            Self::System => {
+                return cosmic::Theme::system(std::sync::Arc::new(system.cosmic().clone()));
+            }
+            Self::Dark => return cosmic::Theme::dark(),
+            Self::Light => return cosmic::Theme::light(),
+            Self::CatppuccinMocha => TerminalTheme::CatppuccinMocha,
+            Self::CatppuccinLatte => TerminalTheme::CatppuccinLatte,
+            Self::Dracula => TerminalTheme::Dracula,
+            Self::Nord => TerminalTheme::Nord,
+            Self::TokyoNight => TerminalTheme::TokyoNight,
+            Self::GruvboxDark => TerminalTheme::GruvboxDark,
+            Self::SolarizedLight => TerminalTheme::SolarizedLight,
+        }
+        .palette();
+        let rgb = |color: crate::terminal::ThemeColor| {
+            let (r, g, b) = color.rgb();
+            Srgb::new(r as f32 / 255.0, g as f32 / 255.0, b as f32 / 255.0)
+        };
+        let surface = |amount: f32| {
+            let bg = rgb(palette.background);
+            let fg = rgb(palette.foreground);
+            Srgba::new(
+                bg.red + (fg.red - bg.red) * amount,
+                bg.green + (fg.green - bg.green) * amount,
+                bg.blue + (fg.blue - bg.blue) * amount,
+                1.0,
+            )
+        };
+        let mut builder = if palette.light {
+            ThemeBuilder::light()
+        } else {
+            ThemeBuilder::dark()
+        };
+        builder.bg_color = Some(surface(0.0));
+        builder.primary_container_bg = Some(surface(0.035));
+        builder.secondary_container_bg = Some(surface(0.07));
+        builder.neutral_tint = Some(rgb(palette.background));
+        builder.text_tint = Some(rgb(palette.foreground));
+        builder.accent = Some(rgb(palette.ansi[4]));
+        builder.success = Some(rgb(palette.ansi[2]));
+        builder.warning = Some(rgb(palette.ansi[3]));
+        builder.destructive = Some(rgb(palette.ansi[1]));
+        cosmic::Theme::custom(std::sync::Arc::new(builder.build()))
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -1358,6 +1465,20 @@ mod tests {
 
     fn path_in(directory: &tempfile::TempDir) -> PathBuf {
         directory.path().join("settings.toml")
+    }
+
+    #[test]
+    fn app_themes_roundtrip_without_changing_editor_or_terminal_palettes() {
+        for app_theme in AppTheme::ALL {
+            let settings = AppSettings {
+                app_theme,
+                ..AppSettings::default()
+            };
+            let restored: AppSettings =
+                toml::from_str(&toml::to_string(&settings).unwrap()).unwrap();
+            assert_eq!(restored, settings);
+            assert_eq!(AppTheme::from_key(app_theme.key()), Some(app_theme));
+        }
     }
 
     #[test]

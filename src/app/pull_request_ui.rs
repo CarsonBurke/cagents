@@ -359,13 +359,30 @@ fn comment_matches(comment: &PullRequestComment, filter: &str) -> bool {
 }
 
 pub fn view(state: &State) -> Element<'_, Action> {
+    let visual = state.preview.as_ref().map(sidebar::pull_request_visual);
     let header = widget::row::with_children(vec![
-        widget::icon::from_name("pull-request-symbolic")
-            .size(design::ROW_ICON_SIZE)
-            .into(),
+        widget::icon(visual.as_ref().map_or_else(
+            || crate::ui_controls::symbolic_icon("pull-request-symbolic"),
+            |(icon, _)| icon.clone(),
+        ))
+        .size(design::ROW_ICON_SIZE)
+        .class(cosmic::theme::Svg::Custom(std::rc::Rc::new(move |theme| {
+            cosmic::iced::widget::svg::Style {
+                color: Some(visual.as_ref().map_or_else(
+                    || theme.current_container().component.on.into(),
+                    |(_, color)| *color,
+                )),
+            }
+        })))
+        .into(),
         design::heading(state.pull_request.as_ref().map_or_else(
-            || "Pull request".to_owned(),
-            |pr| format!("Pull request #{}", pr.number),
+            || {
+                state
+                    .preview
+                    .as_ref()
+                    .map_or_else(|| "Pull request".to_owned(), |pr| pr.title.clone())
+            },
+            |pr| pr.title.clone(),
         ))
         .width(Length::Fill)
         .into(),
