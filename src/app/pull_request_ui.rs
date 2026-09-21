@@ -1,5 +1,8 @@
 use super::*;
-use crate::github::{PullRequest, PullRequestComment, PullRequestInspection};
+use crate::github::{
+    PullRequest, PullRequestComment, PullRequestConversation, PullRequestInspection,
+    PullRequestReviewThread,
+};
 use crate::repository::HeadState;
 use cosmic::widget::markdown;
 
@@ -305,6 +308,113 @@ fn comment<'a>(comment: &'a PullRequestComment, reply: bool) -> Element<'a, Acti
     .into()
 }
 
+/// The tone and wording a pull request's own state carries.
+fn state_badge<'a>(pr: &PullRequest) -> Element<'a, Action> {
+    let (label, tone): (String, fn(&cosmic::Theme) -> iced::Color) = match pr.state.0.as_str() {
+        "OPEN" if pr.is_draft => ("Draft".to_owned(), design::muted_color),
+        "OPEN" => ("Open".to_owned(), design::success_color),
+        "MERGED" => ("Merged".to_owned(), design::accent_color),
+        "CLOSED" => ("Closed".to_owned(), design::destructive_color),
+        // The parser keeps remote states it does not recognise rather than
+        // discarding them, so the badge names whatever it was handed.
+        "" => ("Unknown".to_owned(), design::muted_color),
+        other => (readable_state(other), design::muted_color),
+    };
+    design::badge(label, design::Tone::Themed(tone))
+}
+
+/// The `owner/name` a pull request URL points at, for the rare frame where the
+/// panel holds a pull request but no worktree target to name its repository.
+fn repository_from_url(url: &url::Url) -> String {
+    let segments: Vec<&str> = url
+        .path_segments()
+        .map(|segments| segments.filter(|segment| !segment.is_empty()).collect())
+        .unwrap_or_default();
+    match segments.as_slice() {
+        [owner, name, ..] => format!("{owner}/{name}"),
+        _ => url.to_string(),
+    }
+}
+
+/// Whether a thread survives the panel's filters, as the list below applies them.
+fn thread_shown(thread: &PullRequestReviewThread, filter: &str, hide_resolved: bool) -> bool {
+    if hide_resolved && thread.resolved {
+        return false;
+    }
+    filter.is_empty()
+        || thread.path.to_lowercase().contains(filter)
+        || thread
+            .comments
+            .iter()
+            .any(|comment| comment_matches(comment, filter))
+}
+
+/// How many discussion entries the panel is about to show. The header counts
+/// what the reader can see, so a filter that hides everything reads as zero
+/// rather than contradicting the empty state underneath it.
+fn discussion_count(
+    conversation: &PullRequestConversation,
+    filter: &str,
+    hide_resolved: bool,
+) -> usize {
+    conversation
+        .threads
+        .iter()
+        .filter(|thread| thread_shown(thread, filter, hide_resolved))
+        .count()
+        + conversation
+            .reviews
+            .iter()
+            .filter(|review| comment_matches(&review.comment, filter))
+            .count()
+        + conversation
+            .comments
+            .iter()
+            .filter(|item| comment_matches(item, filter))
+            .count()
+}
+
+/// One label/value pair on the metadata grid.
+///
+/// The labels share a fixed column so the values line up down the panel;
+/// concatenating them into captions left the reader scanning for the colon.
+fn meta_row<'a>(label: &'a str, value: Element<'a, Action>) -> Element<'a, Action> {
+    widget::row::with_children(vec![
+        design::caption(label)
+            .width(Length::Fixed(META_LABEL_WIDTH))
+            .wrapping(iced::widget::text::Wrapping::None)
+            .into(),
+        value,
+    ])
+    .spacing(design::GRID_UNIT * 2.0)
+    .align_y(Alignment::Start)
+    .width(Length::Fill)
+    .into()
+}
+
+/// The width the metadata labels share. Wide enough for "Repository" at
+/// caption size with room to breathe, narrow enough to leave the value column
+/// readable at the inspector's minimum width.
+const META_LABEL_WIDTH: f32 = 80.0;
+
+/// A block of related rows, set on its own surface so the eye reads it as one
+/// thing rather than as more entries in a flat column.
+fn block<'a>(children: Vec<Element<'a, Action>>) -> Element<'a, Action> {
+    widget::container(
+        widget::column::with_children(children)
+            .spacing(design::GRID_UNIT)
+            .width(Length::Fill),
+    )
+    .padding(design::GRID_UNIT * 2.0)
+    .width(Length::Fill)
+    .class(design::surface(
+        Some(design::raised),
+        [design::RADIUS_S; 4],
+        true,
+    ))
+    .into()
+}
+
 fn section_header(
     label: impl Into<String>,
     section: Section,
@@ -399,15 +509,19 @@ pub fn view(state: &State) -> Element<'_, Action> {
     .align_y(Alignment::Center)
     .height(design::HEADER_CONTENT_HEIGHT);
     let mut children: Vec<Element<'_, Action>> = Vec::new();
+    // While a pull request is loaded its metadata grid carries the repository
+    // and branch; this line only orients the reader before that arrives.
     if let Some(target) = &state.target {
-        children.push(
-            crate::design::caption(format!(
-                "{} · {}",
-                target.repository.gh_selector(),
-                target.branch
-            ))
-            .into(),
-        );
+        if state.pull_request.is_none() {
+            children.push(
+                crate::design::caption(format!(
+                    "{} · {}",
+                    target.repository.gh_selector(),
+                    target.branch
+                ))
+                .into(),
+            );
+        }
     } else {
         children.push(
             design::body(
@@ -438,42 +552,147 @@ pub fn view(state: &State) -> Element<'_, Action> {
         children.push(link("Open pull request on GitHub", &pr.url));
     }
     if state.loaded && !state.loading && state.error.is_none() && state.inspection.is_none() {
-        children.push(design::body("No pull request matches this worktree branch.").into());
+        children.push(design::caption("No pull request matches this worktree branch.").into());
     }
     if let Some(pr) = state.pull_request.as_deref() {
-        children.push(design::heading(&pr.title).width(Length::Fill).into());
-        children.push(
-            crate::design::caption(format!(
-                "{}{} · {} → {}",
-                readable_state(&pr.state.0),
-                if pr.is_draft { " · Draft" } else { "" },
-                pr.head_ref_name,
-                pr.base_ref_name
-            ))
+        // The identity block: what this is, what state it is in, and where it
+        // is going. Everything else in the panel is detail about it.
+        let mut identity: Vec<Element<'_, Action>> = vec![
+            widget::row::with_children(vec![
+                state_badge(pr),
+                design::caption(format!("#{}", pr.number))
+                    .width(Length::Fill)
+                    .into(),
+                link("Open on GitHub", &pr.url),
+            ])
+            .spacing(design::GRID_UNIT)
+            .align_y(Alignment::Center)
+            .width(Length::Fill)
             .into(),
-        );
-        children.push(link("Open pull request on GitHub", &pr.url));
-        if state
+            design::heading(&pr.title)
+                .wrapping(iced::widget::text::Wrapping::WordOrGlyph)
+                .width(Length::Fill)
+                .into(),
+            widget::row::with_children(vec![
+                widget::icon(sidebar::worktree_icon())
+                    .size(design::COMPACT_ICON_SIZE)
+                    .into(),
+                design::caption(format!("{} → {}", pr.head_ref_name, pr.base_ref_name))
+                    .width(Length::Fill)
+                    .into(),
+            ])
+            .spacing(design::GRID_UNIT)
+            .align_y(Alignment::Center)
+            .width(Length::Fill)
+            .into(),
+        ];
+        // Only a real disagreement earns a warning. An absent local or remote
+        // OID is not evidence of one, and the local branch is as often ahead
+        // of the pushed head as behind it.
+        let local_head = state
             .target
             .as_ref()
             .and_then(|target| target.head_oid.as_deref())
-            != Some(pr.head_ref_oid.as_str())
+            .filter(|oid| !oid.is_empty());
+        if let Some(local_head) = local_head
+            && !pr.head_ref_oid.is_empty()
+            && local_head != pr.head_ref_oid
         {
-            children.push(design::body("Local HEAD differs from the pull request head. Checks below apply to the remote pull request commit.").into());
+            identity.push(
+                widget::row::with_children(vec![
+                    design::badge("Out of sync", design::Tone::Themed(design::warning_color)),
+                    design::caption(
+                        "Local HEAD differs from the pull request head; checks describe the remote commit.",
+                    )
+                    .wrapping(iced::widget::text::Wrapping::Word)
+                    .width(Length::Fill)
+                    .into(),
+                ])
+                .spacing(design::GRID_UNIT)
+                .align_y(Alignment::Start)
+                .width(Length::Fill)
+                .into(),
+            );
         }
-        children.push(
-            crate::design::caption(format!(
-                "Review decision: {}",
-                readable_state(
-                    pr.review_decision
-                        .as_ref()
-                        .map(|decision| decision.0.as_str())
-                        .filter(|value| !value.is_empty())
-                        .unwrap_or("No decision reported")
-                )
+        children.push(block(identity));
+        let mut metadata: Vec<Element<'_, Action>> = Vec::new();
+        metadata.push(meta_row(
+            "Repository",
+            design::body(state.target.as_ref().map_or_else(
+                // The panel can outlive its target for a frame; the pull
+                // request's own URL still names where it lives.
+                || repository_from_url(&pr.url),
+                |target| target.repository.gh_selector(),
             ))
+            .wrapping(iced::widget::text::Wrapping::WordOrGlyph)
+            .width(Length::Fill)
             .into(),
-        );
+        ));
+        // The identity block names the remote head. Where the checked-out
+        // branch is not that branch, saying so is the whole point of the row.
+        if let Some(target) = &state.target
+            && target.branch != pr.head_ref_name
+        {
+            metadata.push(meta_row(
+                "Branch",
+                design::body(target.branch.clone())
+                    .wrapping(iced::widget::text::Wrapping::WordOrGlyph)
+                    .width(Length::Fill)
+                    .into(),
+            ));
+        }
+        let decision = pr
+            .review_decision
+            .as_ref()
+            .map(|decision| decision.0.as_str())
+            .filter(|value| !value.is_empty());
+        metadata.push(meta_row(
+            "Review",
+            match decision {
+                Some("APPROVED") => {
+                    design::badge("Approved", design::Tone::Themed(design::success_color))
+                }
+                Some("CHANGES_REQUESTED") => design::badge(
+                    "Changes requested",
+                    design::Tone::Themed(design::destructive_color),
+                ),
+                Some(other) => design::badge(
+                    readable_state(other),
+                    design::Tone::Themed(design::muted_color),
+                ),
+                None => design::caption("No decision reported").into(),
+            },
+        ));
+        if let Some(inspection) = &state.inspection
+            && let Ok(checks) = &inspection.checks
+            && !checks.is_empty()
+        {
+            // Classify through the sidebar's own predicates so one pull
+            // request cannot read as failing in the list and passing here.
+            let count = |predicate: fn(&str) -> bool| {
+                checks
+                    .iter()
+                    .filter(|check| predicate(check.bucket.0.as_str()))
+                    .count()
+            };
+            let failing = count(sidebar::is_check_failure);
+            let pending = count(sidebar::is_check_pending);
+            let (summary, tone): (String, fn(&cosmic::Theme) -> iced::Color) = if failing > 0 {
+                (format!("{failing} failing"), design::destructive_color)
+            } else if pending > 0 {
+                (format!("{pending} pending"), design::warning_color)
+            } else {
+                (
+                    format!("{} passing", count(sidebar::is_check_success)),
+                    design::success_color,
+                )
+            };
+            metadata.push(meta_row(
+                "Checks",
+                design::badge(summary, design::Tone::Themed(tone)),
+            ));
+        }
+        children.push(block(metadata));
         children.push(section_header(
             "Description",
             Section::Description,
@@ -516,15 +735,21 @@ pub fn view(state: &State) -> Element<'_, Action> {
         if !state.checks_collapsed {
             match &inspection.checks {
                 Ok(checks) if checks.is_empty() => {
-                    children.push(design::body("No checks reported.").into())
+                    children.push(design::caption("No checks reported.").into())
                 }
                 Ok(checks) => {
                     for check in checks {
                         let (symbol, tone): (_, fn(&cosmic::Theme) -> cosmic::iced::Color) =
                             match check.bucket.0.as_str() {
-                                "pass" => ("emblem-ok-symbolic", design::success_color),
-                                "fail" => ("dialog-error-symbolic", design::destructive_color),
-                                "pending" => ("content-loading-symbolic", design::warning_color),
+                                bucket if sidebar::is_check_failure(bucket) => {
+                                    ("dialog-error-symbolic", design::destructive_color)
+                                }
+                                bucket if sidebar::is_check_pending(bucket) => {
+                                    ("content-loading-symbolic", design::warning_color)
+                                }
+                                bucket if sidebar::is_check_success(bucket) => {
+                                    ("emblem-ok-symbolic", design::success_color)
+                                }
                                 _ => ("dialog-information-symbolic", design::muted_color),
                             };
                         let mut content = widget::column::with_children(vec![
@@ -551,15 +776,26 @@ pub fn view(state: &State) -> Element<'_, Action> {
                         children.push(
                             widget::button::custom(
                                 widget::row::with_children(vec![
-                                    widget::icon::from_name(symbol)
-                                        .size(design::ROW_ICON_SIZE)
-                                        .into(),
+                                    // A fixed column for the status glyph, so
+                                    // every check's name starts at the same x
+                                    // and the run of outcomes reads down the
+                                    // panel as one column.
+                                    widget::container(
+                                        widget::icon::from_name(symbol).size(design::ROW_ICON_SIZE),
+                                    )
+                                    .width(Length::Fixed(design::ROW_ICON_SIZE.into()))
+                                    .align_x(Alignment::Center)
+                                    .into(),
                                     content.into(),
-                                    widget::icon::from_name("external-link-symbolic")
-                                        .size(design::COMPACT_ICON_SIZE)
-                                        .into(),
+                                    widget::container(
+                                        widget::icon::from_name("external-link-symbolic")
+                                            .size(design::COMPACT_ICON_SIZE),
+                                    )
+                                    .width(Length::Fixed(design::COMPACT_ICON_SIZE.into()))
+                                    .align_x(Alignment::Center)
+                                    .into(),
                                 ])
-                                .spacing(8)
+                                .spacing(design::GRID_UNIT * 2.0)
                                 .align_y(Alignment::Center),
                             )
                             .class(crate::ui_controls::control_style(
@@ -574,77 +810,111 @@ pub fn view(state: &State) -> Element<'_, Action> {
                     }
                 }
                 Err(error) => {
-                    children.push(design::body(format!("Checks unavailable: {error}")).into())
+                    children.push(design::caption(format!("Checks unavailable: {error}")).into())
                 }
             }
         }
+        let discussion_label = inspection.conversation.as_ref().map_or_else(
+            |_| "Discussion".to_owned(),
+            |conversation| {
+                format!(
+                    "Discussion ({})",
+                    discussion_count(
+                        conversation,
+                        &state.filter.to_lowercase(),
+                        state.hide_resolved,
+                    )
+                )
+            },
+        );
         children.push(section_header(
-            "Discussion",
+            discussion_label,
             Section::Discussion,
             !state.discussion_collapsed,
         ));
         if !state.discussion_collapsed {
             match &inspection.conversation {
-                Err(error) => {
-                    children.push(design::body(format!("Discussion unavailable: {error}")).into())
-                }
+                Err(error) => children
+                    .push(design::caption(format!("Discussion unavailable: {error}")).into()),
                 Ok(conversation) => {
+                    // The two controls act on one list, so they sit on one
+                    // row rather than stacking as two more full-width entries.
                     children.push(
-                        widget::text_input("Filter by author, text, or file", &state.filter)
-                            .on_input(Action::Filter)
+                        widget::row::with_children(vec![
+                            widget::text_input("Filter author, text, or file", &state.filter)
+                                .on_input(Action::Filter)
+                                .width(Length::Fill)
+                                .into(),
+                            widget::button::custom(design::caption(if state.hide_resolved {
+                                "Show resolved"
+                            } else {
+                                "Hide resolved"
+                            }))
+                            .class(crate::ui_controls::control_style(state.hide_resolved, None))
+                            .height(design::DENSE_ROW_HEIGHT)
+                            .on_press(Action::ToggleResolved)
                             .into(),
-                    );
-                    children.push(
-                        widget::button::custom(design::caption(if state.hide_resolved {
-                            "Show resolved threads"
-                        } else {
-                            "Hide resolved threads"
-                        }))
-                        .class(crate::ui_controls::control_style(state.hide_resolved, None))
-                        .height(design::DENSE_ROW_HEIGHT)
-                        .on_press(Action::ToggleResolved)
+                        ])
+                        .spacing(design::GRID_UNIT)
+                        .align_y(Alignment::Center)
+                        .width(Length::Fill)
                         .into(),
                     );
                     let filter = state.filter.to_lowercase();
                     let mut shown = 0;
                     for thread in &conversation.threads {
-                        if state.hide_resolved && thread.resolved {
-                            continue;
-                        }
-                        if !filter.is_empty()
-                            && !thread.path.to_lowercase().contains(&filter)
-                            && !thread
-                                .comments
-                                .iter()
-                                .any(|comment| comment_matches(comment, &filter))
-                        {
+                        if !thread_shown(thread, &filter, state.hide_resolved) {
                             continue;
                         }
                         shown += 1;
-                        children.push(crate::design::horizontal_rule().into());
                         let location = thread.line.map_or_else(
                             || thread.path.clone(),
                             |line| format!("{}:{line}", thread.path),
                         );
-                        children.push(
-                            design::body(format!(
-                                "{location} · {}{}",
-                                if thread.resolved {
-                                    "Resolved"
+                        // A thread is one conversation about one place in the
+                        // diff. Grouping it on its own surface keeps a reply
+                        // from reading as the start of the next thread, which
+                        // a bare rule between them never made clear.
+                        let mut thread_rows: Vec<Element<'_, Action>> = vec![
+                            widget::row::with_children({
+                                let mut head: Vec<Element<'_, Action>> = vec![
+                                    design::body(location)
+                                        .wrapping(iced::widget::text::Wrapping::Word)
+                                        .width(Length::Fill)
+                                        .into(),
+                                ];
+                                if thread.outdated {
+                                    head.push(design::badge(
+                                        "Outdated",
+                                        design::Tone::Themed(design::muted_color),
+                                    ));
+                                }
+                                head.push(if thread.resolved {
+                                    design::badge(
+                                        "Resolved",
+                                        design::Tone::Themed(design::success_color),
+                                    )
                                 } else {
-                                    "Unresolved"
-                                },
-                                if thread.outdated { " · Outdated" } else { "" }
-                            ))
+                                    design::badge(
+                                        "Unresolved",
+                                        design::Tone::Themed(design::warning_color),
+                                    )
+                                });
+                                head
+                            })
+                            .spacing(design::GRID_UNIT)
+                            .align_y(Alignment::Center)
+                            .width(Length::Fill)
                             .into(),
-                        );
+                        ];
                         // Preserve the whole matching thread so replies retain context.
                         for (index, item) in thread.comments.iter().enumerate() {
-                            children.push(comment(item, index != 0));
+                            thread_rows.push(comment(item, index != 0));
                         }
                         if thread.truncated {
-                            children.push(crate::design::caption("Showing the first 100 comments in this thread. Open its comment link for the full discussion.").into());
+                            thread_rows.push(crate::design::caption("Showing the first 100 comments in this thread. Open its comment link for the full discussion.").into());
                         }
+                        children.push(block(thread_rows));
                     }
                     if !conversation.reviews.is_empty() {
                         children.push(design::heading("Reviews").into());
@@ -652,8 +922,19 @@ pub fn view(state: &State) -> Element<'_, Action> {
                     for review in &conversation.reviews {
                         if comment_matches(&review.comment, &filter) {
                             shown += 1;
-                            children.push(crate::design::caption(&review.state.0).into());
-                            children.push(comment(&review.comment, false));
+                            let tone: fn(&cosmic::Theme) -> iced::Color =
+                                match review.state.0.as_str() {
+                                    "APPROVED" => design::success_color,
+                                    "CHANGES_REQUESTED" => design::destructive_color,
+                                    _ => design::muted_color,
+                                };
+                            children.push(block(vec![
+                                design::badge(
+                                    readable_state(&review.state.0),
+                                    design::Tone::Themed(tone),
+                                ),
+                                comment(&review.comment, false),
+                            ]));
                         }
                     }
                     if !conversation.comments.is_empty() {
@@ -662,12 +943,12 @@ pub fn view(state: &State) -> Element<'_, Action> {
                     for item in &conversation.comments {
                         if comment_matches(item, &filter) {
                             shown += 1;
-                            children.push(comment(item, false));
+                            children.push(block(vec![comment(item, false)]));
                         }
                     }
                     if shown == 0 {
                         children.push(
-                            design::body(if filter.is_empty() && !state.hide_resolved {
+                            design::caption(if filter.is_empty() && !state.hide_resolved {
                                 "No discussion comments reported."
                             } else {
                                 "No comments match these filters."
@@ -921,6 +1202,60 @@ mod tests {
             head_oid: Some("aaa".into()),
             repository: GitHubRepoKey::new("github.com", None, "owner", "repo").unwrap(),
         }
+    }
+
+    fn discussion_comment(body: &str) -> crate::github::PullRequestComment {
+        crate::github::PullRequestComment {
+            author: None,
+            body: body.into(),
+            created_at: "2024-01-01T00:00:00Z".into(),
+            url: "https://github.com/owner/repo/pull/1".parse().unwrap(),
+        }
+    }
+
+    fn review_thread(path: &str, resolved: bool, body: &str) -> PullRequestReviewThread {
+        PullRequestReviewThread {
+            path: path.into(),
+            line: Some(1),
+            outdated: false,
+            resolved,
+            comments: vec![discussion_comment(body)],
+            truncated: false,
+        }
+    }
+
+    #[test]
+    fn the_discussion_header_counts_only_what_the_filters_leave_visible() {
+        let conversation = PullRequestConversation {
+            threads: vec![
+                review_thread("src/app.rs", false, "needs a guard"),
+                review_thread("src/design.rs", true, "settled"),
+            ],
+            comments: vec![discussion_comment("looks good")],
+            reviews: vec![crate::github::PullRequestReview {
+                comment: discussion_comment("approving"),
+                state: crate::github::RemoteValue("APPROVED".into()),
+            }],
+            truncated: false,
+        };
+        assert_eq!(discussion_count(&conversation, "", false), 4);
+        // Hiding resolved threads drops the settled one and nothing else.
+        assert_eq!(discussion_count(&conversation, "", true), 3);
+        // A filter that matches one path leaves exactly that thread.
+        assert_eq!(discussion_count(&conversation, "design.rs", false), 1);
+        assert_eq!(discussion_count(&conversation, "nothing here", false), 0);
+    }
+
+    #[test]
+    fn a_pull_request_url_still_names_its_repository_without_a_target() {
+        assert_eq!(
+            repository_from_url(&"https://github.com/owner/repo/pull/12".parse().unwrap()),
+            "owner/repo"
+        );
+        assert_eq!(
+            repository_from_url(&"https://example.test/".parse().unwrap()),
+            "https://example.test/"
+        );
     }
 
     #[test]
