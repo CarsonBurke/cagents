@@ -13,7 +13,8 @@ use cagents::{
         RepositoryService, RepositorySnapshot, StageRequest, UnstageRequest,
     },
     repository_widget::{
-        self, ClipboardOp, EditorAction, EditorEdit, LspIntent, RepositoryAction, RepositoryRuntime,
+        self, ClipboardOp, EditorAction, EditorEdit, LspIntent, RepositoryAction, RepositoryFile,
+        RepositoryRuntime,
     },
     settings::{self, AppSettings, AppTheme},
     sidebar::{
@@ -65,7 +66,6 @@ struct Tab {
     sidebar: SidebarModel,
     navigation: SidebarState,
     pending_file: Option<PendingFile>,
-    pending_diff: Option<bool>,
     pending_fragment: Option<String>,
     owned_file: Option<PathBuf>,
     next_open: u64,
@@ -1453,7 +1453,6 @@ impl Editor {
             sidebar,
             navigation,
             pending_file,
-            pending_diff: None,
             pending_fragment: None,
             owned_file: None,
             next_open: 1,
@@ -1679,15 +1678,6 @@ impl Editor {
     }
 
     fn request_file(&mut self, id: CardId, path: PathBuf) -> Task<Message> {
-        self.request_file_for_surface(id, path, None)
-    }
-
-    fn request_file_for_surface(
-        &mut self,
-        id: CardId,
-        path: PathBuf,
-        diff_staged: Option<bool>,
-    ) -> Task<Message> {
         self.selection_epoch = self.selection_epoch.wrapping_add(1);
         let Some(tab) = self.tab_mut(id) else {
             return Task::none();
@@ -1695,16 +1685,13 @@ impl Editor {
         tab.pending_file = None;
         tab.pending_fragment = None;
         if RepoPath::parse(&path).is_err() {
-            tab.pending_diff = None;
             return Task::none();
         }
         if tab.runtime.blocks_navigation() {
-            tab.pending_diff = None;
             self.notice =
                 Some("Save or discard the current file before opening another file.".into());
             return Task::none();
         }
-        tab.pending_diff = diff_staged;
         let request = tab.next_open;
         tab.next_open = tab.next_open.wrapping_add(1);
         let absolute = tab.runtime.descriptor.worktree.join(&path);
@@ -1724,6 +1711,70 @@ impl Editor {
             .and_then(|result| result);
             Message::FileResolved(id, request, result)
         })
+    }
+
+    /// Opens the change Git already named, including a path that is no longer
+    /// on disk. Canonicalizing that path fails, and the file never reaches
+    /// the diff.
+    fn open_working_change(
+        &mut self,
+        id: CardId,
+        path: &RepoPath,
+        area: cagents::repository::ChangeArea,
+    ) -> Task<Message> {
+        use cagents::repository::ChangeArea;
+        if self
+            .tab(id)
+            .is_some_and(|tab| tab.runtime.blocks_navigation())
+        {
+            self.notice =
+                Some("Save or discard the current file before opening another file.".into());
+            return Task::none();
+        }
+        let Some(tab) = self.tab_mut(id) else {
+            return Task::none();
+        };
+        let file = {
+            let Some(source) = tab.sidebar.source_control.as_ref() else {
+                return Task::none();
+            };
+            let find = |area| {
+                source
+                    .group(area)
+                    .and_then(|group| group.rows().iter().find(|row| &row.entry.path == path))
+            };
+            if find(area).is_none() {
+                return Task::none();
+            }
+            let staged = find(ChangeArea::Staged);
+            let unstaged = find(ChangeArea::Unstaged)
+                .or_else(|| find(ChangeArea::Untracked))
+                .or_else(|| find(ChangeArea::Conflict));
+            RepositoryFile {
+                path: path.as_path().to_owned(),
+                staged: staged.is_some(),
+                unstaged: unstaged.is_some(),
+                staged_old_path: staged
+                    .and_then(|row| row.entry.old_path.as_ref())
+                    .map(|old| old.as_path().to_owned()),
+                unstaged_old_path: unstaged
+                    .and_then(|row| row.entry.old_path.as_ref())
+                    .map(|old| old.as_path().to_owned()),
+                ..Default::default()
+            }
+        };
+        let basis = if area == ChangeArea::Staged {
+            DiffBasis::HeadToIndex
+        } else {
+            DiffBasis::IndexToWorktree
+        };
+        tab.pending_file = None;
+        tab.pending_fragment = None;
+        repository_task(tab.runtime.update(RepositoryAction::OpenWorkingDiff {
+            card: id,
+            file,
+            basis,
+        }))
     }
 
     fn resume_pending_files(&mut self) -> Task<Message> {
@@ -3099,9 +3150,6 @@ impl Application for Editor {
                         RepositoryAction::FilesLoaded { result: Ok(_), .. }
                             | RepositoryAction::DirectoryListed { result: Ok(_), .. }
                     );
-                    let open_diff = matches!(action, RepositoryAction::FileLoaded { .. })
-                        .then(|| tab.pending_diff.take())
-                        .flatten();
                     let task = tab
                         .runtime
                         .update(action)
@@ -3118,22 +3166,6 @@ impl Application for Editor {
                         && let Some(fragment) = tab.pending_fragment.take()
                     {
                         tasks.push(repository_task(tab.runtime.preview_fragment(id, &fragment)));
-                    }
-                    if let Some(staged) = open_diff {
-                        let surface = tab.runtime.update(RepositoryAction::ApplySourceSurface {
-                            card: id,
-                            diff: true,
-                        });
-                        let basis = staged.then(|| {
-                            tab.runtime.update(RepositoryAction::ApplyDiffBasis {
-                                card: id,
-                                basis: DiffBasis::HeadToIndex,
-                            })
-                        });
-                        tasks[0] = tasks.remove(0).chain(repository_task(surface));
-                        if let Some(basis) = basis {
-                            tasks[0] = tasks.remove(0).chain(repository_task(basis));
-                        }
                     }
                     if listing_changed && !tab.git {
                         if let Some(key) = tab.navigation.active_worktree().cloned() {
@@ -3209,11 +3241,7 @@ impl Application for Editor {
                                 if let Some(tab) = self.tab_mut(id) {
                                     tab.navigation.apply(&action);
                                 }
-                                return self.request_file_for_surface(
-                                    id,
-                                    path.as_path().to_path_buf(),
-                                    Some(*area == cagents::repository::ChangeArea::Staged),
-                                );
+                                return self.open_working_change(id, path, *area);
                             }
                             SidebarAction::Stage { key, selection }
                                 if self.tab(id).is_some_and(|tab| {
@@ -6242,5 +6270,212 @@ mod tests {
         assert!(app.tabs.is_empty());
         assert!(app.exiting);
         assert_eq!(app.session().paths, Vec::<PathBuf>::new());
+    }
+
+    fn changed_path(
+        path: &str,
+        old: Option<&str>,
+        area: cagents::repository::ChangeArea,
+        kind: cagents::repository::ChangeKind,
+    ) -> cagents::repository::ChangedPath {
+        use cagents::repository::{ChangedPath, RepoPath};
+        ChangedPath {
+            path: RepoPath::parse(path).unwrap(),
+            old_path: old.map(|path| RepoPath::parse(path).unwrap()),
+            area,
+            kind,
+            conflict: None,
+            submodule: false,
+            added_lines: Some(1),
+            removed_lines: Some(0),
+        }
+    }
+
+    fn changes_snapshot(
+        entries: Vec<cagents::repository::ChangedPath>,
+    ) -> cagents::repository::RepositorySnapshot {
+        use cagents::repository::{RepositorySnapshot, StatusSnapshot, WorkingFiles};
+        RepositorySnapshot {
+            status: StatusSnapshot {
+                entries,
+                ..StatusSnapshot::default()
+            },
+            files: WorkingFiles::default(),
+            remotes: Vec::new(),
+            local_refs: Vec::new(),
+            remote_refs: Vec::new(),
+            remote_heads: Vec::new(),
+        }
+    }
+
+    fn open_git(
+        app: &mut Editor,
+        root: &Path,
+        file: Option<&str>,
+        entries: Vec<cagents::repository::ChangedPath>,
+    ) -> CardId {
+        drop(app.add(
+            Opened {
+                root: root.to_path_buf(),
+                file: file.map(PathBuf::from),
+                snapshot: Some(changes_snapshot(entries)),
+            },
+            true,
+        ));
+        app.sidebar_panel = WorktreePanel::Changes;
+        app.active.unwrap()
+    }
+
+    fn open_change(
+        app: &mut Editor,
+        id: CardId,
+        path: &str,
+        area: cagents::repository::ChangeArea,
+    ) {
+        let key = app
+            .tab(id)
+            .unwrap()
+            .navigation
+            .active_worktree()
+            .cloned()
+            .unwrap();
+        drop(app.update(Message::Sidebar(SidebarAction::OpenChange {
+            key,
+            path: RepoPath::parse(path).unwrap(),
+            area,
+        })));
+    }
+
+    /// Custom widget ids that name more than one node. A repeated custom id
+    /// aborts the process on the next draw.
+    fn duplicate_custom_ids(element: &mut Element<'_, Message>) -> Vec<String> {
+        use cosmic::iced::advanced::widget::Tree;
+        use cosmic::iced::core::id::Internal;
+        use std::collections::HashMap;
+
+        fn tally(tree: &Tree, out: &mut HashMap<String, usize>) {
+            if let Some(cosmic::iced::core::id::Id(Internal::Custom(_, name))) = &tree.id {
+                *out.entry(name.to_string()).or_default() += 1;
+            }
+            for child in &tree.children {
+                tally(child, out);
+            }
+        }
+
+        let mut counts = HashMap::new();
+        tally(&Tree::new(element.as_widget_mut()), &mut counts);
+        let mut repeated = counts
+            .into_iter()
+            .filter(|(_, count)| *count > 1)
+            .map(|(name, _)| name)
+            .collect::<Vec<_>>();
+        repeated.sort();
+        repeated
+    }
+
+    #[test]
+    fn clicking_a_deleted_change_opens_its_diff() {
+        use cagents::repository::{ChangeArea, ChangeKind};
+        let directory = tempfile::tempdir().unwrap();
+        let mut app = editor();
+        let id = open_git(
+            &mut app,
+            directory.path(),
+            None,
+            vec![changed_path(
+                "gone.txt",
+                None,
+                ChangeArea::Unstaged,
+                ChangeKind::Deleted,
+            )],
+        );
+        open_change(&mut app, id, "gone.txt", ChangeArea::Unstaged);
+        let runtime = &app.tab(id).unwrap().runtime;
+        let context = runtime.inspector_context();
+        assert_eq!(context.surface, "Diff");
+        assert_eq!(
+            context.selected_path.as_deref(),
+            Some(Path::new("gone.txt"))
+        );
+        assert_eq!(context.diff_basis, Some("Unstaged"));
+        assert_eq!(context.diff_state, Some("Loading"));
+        assert!(runtime.comparison_old_path().is_none());
+        assert!(app.tab(id).unwrap().pending_file.is_none());
+        assert!(app.notice.is_none());
+        let repeated = duplicate_custom_ids(&mut app.view());
+        assert!(
+            repeated.is_empty(),
+            "the changes-to-diff frame mounts {repeated:?} more than once"
+        );
+    }
+
+    #[test]
+    fn clicking_a_renamed_change_opens_the_diff_against_its_old_path() {
+        use cagents::repository::{ChangeArea, ChangeKind};
+        let directory = tempfile::tempdir().unwrap();
+        let mut app = editor();
+        let id = open_git(
+            &mut app,
+            directory.path(),
+            None,
+            vec![changed_path(
+                "renamed.txt",
+                Some("original.txt"),
+                ChangeArea::Staged,
+                ChangeKind::Renamed,
+            )],
+        );
+        open_change(&mut app, id, "renamed.txt", ChangeArea::Staged);
+        let runtime = &app.tab(id).unwrap().runtime;
+        let context = runtime.inspector_context();
+        assert_eq!(context.surface, "Diff");
+        assert_eq!(
+            context.selected_path.as_deref(),
+            Some(Path::new("renamed.txt"))
+        );
+        assert_eq!(context.diff_basis, Some("Staged"));
+        assert_eq!(
+            runtime.comparison_old_path().as_deref(),
+            Some(Path::new("original.txt"))
+        );
+        assert!(app.notice.is_none());
+    }
+
+    #[test]
+    fn a_dirty_buffer_refuses_a_change_row_and_stays_up() {
+        use cagents::repository::{ChangeArea, ChangeKind};
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        std::fs::write(root.join("notes.txt"), "alpha\n").unwrap();
+        let mut app = editor();
+        let id = open_git(
+            &mut app,
+            root,
+            Some("notes.txt"),
+            vec![changed_path(
+                "gone.txt",
+                None,
+                ChangeArea::Unstaged,
+                ChangeKind::Deleted,
+            )],
+        );
+        file_loaded(&mut app, id, root, "notes.txt");
+        drop(
+            app.update(Message::Repository(RepositoryAction::EditorAction {
+                card: id,
+                action: widget::text_editor::Action::Edit(widget::text_editor::Edit::Paste(
+                    Arc::new("typed".into()),
+                )),
+            })),
+        );
+        assert!(app.tab(id).unwrap().runtime.blocks_navigation());
+        open_change(&mut app, id, "gone.txt", ChangeArea::Unstaged);
+        let runtime = &app.tab(id).unwrap().runtime;
+        assert_eq!(runtime.selected_path(), Some(Path::new("notes.txt")));
+        assert_eq!(runtime.inspector_context().surface, "Editor");
+        assert_eq!(
+            app.notice.as_deref(),
+            Some("Save or discard the current file before opening another file.")
+        );
     }
 }
