@@ -240,6 +240,15 @@ fn validate_id(id: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// The API message one stream is delivering, keyed by parent tool use. Claude
+/// Code streams only the main thread today, but the wire names the parent.
+struct Stream {
+    message: String,
+    /// Set once the live blocks reach their bound. The message's remaining
+    /// blocks then appear whole with their assistant frames, not streamed.
+    truncated: bool,
+}
+
 #[derive(Default)]
 struct Claude {
     session_id: Option<String>,
@@ -249,7 +258,10 @@ struct Claude {
     pending: HashMap<String, Value>,
     retired: VecDeque<String>,
     controls: HashMap<String, Value>,
-    streams: HashMap<String, String>,
+    streams: HashMap<String, Stream>,
+    /// Blocks of the messages still streaming. Claude emits each block's
+    /// assistant frame before that block stops, so a message's blocks are
+    /// dropped at its `message_stop`, or when its stream starts another message.
     blocks: HashMap<(String, u64), Item>,
     stream_events: VecDeque<String>,
     carrier_offsets: HashMap<String, usize>,
@@ -1581,19 +1593,40 @@ impl Claude {
                     return Err("Too many simultaneous Claude streams".into());
                 }
                 let id = required(&event["message"], "id")?.to_owned();
-                self.streams.insert(parent, id);
+                if self
+                    .streams
+                    .get(&parent)
+                    .is_none_or(|stream| stream.message != id)
+                {
+                    let stream = Stream {
+                        message: id,
+                        truncated: false,
+                    };
+                    // A message interrupted before its `message_stop` is
+                    // abandoned once its stream moves on.
+                    if let Some(abandoned) = self.streams.insert(parent, stream) {
+                        self.settle(&abandoned.message);
+                    }
+                }
                 self.update_usage(&event["message"]["usage"], step);
                 self.status(true, "Claude is working", step);
             }
             "content_block_start" => {
-                let message = self
+                let stream = self
                     .streams
-                    .get(&parent)
-                    .ok_or("Claude block arrived before message_start")?
-                    .clone();
+                    .get_mut(&parent)
+                    .ok_or("Claude block arrived before message_start")?;
+                let message = stream.message.clone();
                 let index = event["index"].as_u64().ok_or("Claude block has no index")?;
                 if self.blocks.len() >= MAX_TOOLS {
-                    return Err("Claude message has too many streaming blocks".into());
+                    if !stream.truncated {
+                        stream.truncated = true;
+                        step.events.push(Event::Error {
+                            message: "Claude message has too many streaming blocks; its remaining blocks appear as each completes".into(),
+                            fatal: false,
+                        });
+                    }
+                    return Ok(());
                 }
                 let block = &event["content_block"];
                 let item = match string(block, "type") {
@@ -1638,17 +1671,19 @@ impl Claude {
                 self.blocks.insert((message, index), item);
             }
             "content_block_delta" => {
-                let message = self
+                let stream = self
                     .streams
                     .get(&parent)
-                    .ok_or("Claude delta arrived before message_start")?
-                    .clone();
+                    .ok_or("Claude delta arrived before message_start")?;
                 let index = event["index"].as_u64().ok_or("Claude delta has no index")?;
                 let delta = &event["delta"];
                 if matches!(string(delta, "type"), "signature_delta" | "citations_delta") {
                     return Ok(());
                 }
-                let Some(item) = self.blocks.get_mut(&(message, index)) else {
+                let Some(item) = self.blocks.get_mut(&(stream.message.clone(), index)) else {
+                    if stream.truncated {
+                        return Ok(());
+                    }
                     return Err("Claude delta arrived without its content block".into());
                 };
                 match (&mut item.content, string(delta, "type")) {
@@ -1688,6 +1723,7 @@ impl Claude {
                     .streams
                     .get(&parent)
                     .ok_or("Claude block stop arrived before message_start")?
+                    .message
                     .clone();
                 let index = event["index"]
                     .as_u64()
@@ -1696,10 +1732,16 @@ impl Claude {
                     if let ItemContent::Tool { name, input, .. } = &item.content {
                         let parsed = if input.is_empty() {
                             Value::Null
+                        } else if let Ok(parsed) = serde_json::from_str::<Value>(input) {
+                            parsed
                         } else {
-                            serde_json::from_str::<Value>(input).map_err(|e| {
-                                format!("Malformed completed Claude tool input: {e}")
-                            })?
+                            // Claude Code closes a block cut off by a retried
+                            // request with a synthetic stop. Its call was
+                            // discarded, never run, so it leaves the transcript.
+                            step.events.push(Event::ItemsRemoved {
+                                ids: vec![item.id.clone()],
+                            });
+                            return Ok(());
                         };
                         // Classifying a tool needs its whole input, which only
                         // exists once the block has stopped, so the fragments
@@ -1715,7 +1757,12 @@ impl Claude {
                 }
             }
             "message_delta" => self.update_usage(&event["usage"], step),
-            "message_stop" | "ping" => {}
+            "message_stop" => {
+                if let Some(stream) = self.streams.remove(&parent) {
+                    self.settle(&stream.message);
+                }
+            }
+            "ping" => {}
             "error" => step.events.push(Event::Error {
                 message: content_text(&event["error"]),
                 fatal: false,
@@ -1726,6 +1773,10 @@ impl Claude {
             }),
         }
         Ok(())
+    }
+    /// Forget a message that will stream no further blocks.
+    fn settle(&mut self, message: &str) {
+        self.blocks.retain(|(id, _), _| id != message);
     }
 
     fn system(&mut self, frame: &Value, step: &mut Step) -> Result<(), String> {
@@ -2784,6 +2835,266 @@ mod tests {
                 duration_ms: None,
                 output: String::new(),
             }]
+        );
+    }
+
+    /// Deliver one API message in the order Claude Code writes it: each
+    /// block's assistant frame precedes that block's `content_block_stop`.
+    fn stream_message(
+        adapter: &mut Claude,
+        parent: Option<&str>,
+        id: &str,
+        blocks: &[Value],
+    ) -> Vec<Event> {
+        let frame = |event: Value| json!({"type":"stream_event", "parent_tool_use_id":parent, "event":event});
+        let mut events = Vec::new();
+        let mut receive = |frame: Value| events.extend(adapter.receive(frame).unwrap().events);
+        receive(frame(json!({"type":"message_start","message":{"id":id}})));
+        for (index, block) in blocks.iter().enumerate() {
+            let (start, delta) = match string(block, "type") {
+                "text" => (
+                    json!({"type":"text","text":""}),
+                    json!({"type":"text_delta","text":block["text"]}),
+                ),
+                "thinking" => (
+                    json!({"type":"thinking","thinking":""}),
+                    json!({"type":"thinking_delta","thinking":block["thinking"]}),
+                ),
+                _ => (
+                    json!({"type":"tool_use","id":block["id"],"name":block["name"]}),
+                    json!({"type":"input_json_delta","partial_json":block["input"].to_string()}),
+                ),
+            };
+            receive(frame(
+                json!({"type":"content_block_start","index":index,"content_block":start}),
+            ));
+            receive(frame(
+                json!({"type":"content_block_delta","index":index,"delta":delta}),
+            ));
+            receive(
+                json!({"type":"assistant","uuid":format!("{id}-{index}"),"parent_tool_use_id":parent,"message":{"id":id,"content":[block]}}),
+            );
+            receive(frame(json!({"type":"content_block_stop","index":index})));
+        }
+        receive(frame(
+            json!({"type":"message_delta","delta":{"stop_reason":"tool_use"},"usage":{"output_tokens":1}}),
+        ));
+        receive(frame(json!({"type":"message_stop"})));
+        events
+    }
+
+    fn errors(events: &[Event]) -> Vec<&str> {
+        events
+            .iter()
+            .filter_map(|event| match event {
+                Event::Error { message, .. } => Some(message.as_str()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// One turn runs one API call per tool round trip, and the turn's
+    /// `result` is the only frame that used to release their blocks, so a
+    /// long agentic turn ended the conversation (#262).
+    #[test]
+    fn a_long_turn_streams_more_blocks_than_one_message_may_hold() {
+        let mut adapter = Claude::default();
+        for call in 0..MAX_TOOLS {
+            let id = format!("msg-{call}");
+            let tool = format!("tool-{call}");
+            let events = stream_message(
+                &mut adapter,
+                None,
+                &id,
+                &[
+                    json!({"type":"thinking","thinking":"Plan"}),
+                    json!({"type":"text","text":"Checking"}),
+                    json!({"type":"tool_use","id":tool,"name":"Bash","input":{"command":"ls"}}),
+                ],
+            );
+            assert_eq!(errors(&events), Vec::<&str>::new());
+            // Each completed assistant frame upserts the item its block streamed.
+            let ids = events
+                .iter()
+                .filter_map(|event| match event {
+                    Event::Item(item) => Some(item.id.clone()),
+                    _ => None,
+                })
+                .collect::<std::collections::BTreeSet<_>>();
+            assert_eq!(
+                ids,
+                [format!("{id}:0"), format!("{id}:1"), tool.clone()].into()
+            );
+            adapter.receive(json!({"type":"user","uuid":format!("result-{call}"),"message":{"id":format!("user-{call}"),"content":[{"type":"tool_result","tool_use_id":tool,"content":"ok"}]}})).unwrap();
+            assert!(adapter.blocks.is_empty());
+        }
+        assert!(adapter.streams.is_empty());
+    }
+
+    /// Streams stay independent per parent tool use, and a stream that has
+    /// stopped no longer counts against the simultaneous-stream bound.
+    /// Claude Code currently streams only the main thread, so this guards
+    /// the adapter's own contract rather than a captured sequence.
+    #[test]
+    fn stopped_parent_streams_leave_an_open_stream_intact() {
+        let mut adapter = Claude::default();
+        adapter
+            .receive(stream(
+                json!({"type":"message_start","message":{"id":"main"}}),
+            ))
+            .unwrap();
+        adapter.receive(stream(json!({"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}))).unwrap();
+        for task in 0..MAX_PENDING * 2 {
+            let events = stream_message(
+                &mut adapter,
+                Some(&format!("task-{task}")),
+                &format!("sub-{task}"),
+                &[json!({"type":"text","text":"Subagent report"})],
+            );
+            assert_eq!(errors(&events), Vec::<&str>::new());
+            assert!(events.iter().any(
+                |e| matches!(e, Event::TextDelta { id, .. } if *id == format!("sub-{task}:0"))
+            ));
+        }
+        assert_eq!(adapter.streams.len(), 1);
+        let delta = adapter.receive(stream(json!({"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Done"}}))).unwrap();
+        assert!(delta.events.iter().any(
+            |e| matches!(e, Event::TextDelta { id, delta, .. } if id == "main:0" && delta == "Done")
+        ));
+    }
+
+    /// Claude Code closes a message it abandons mid-stream, but a message
+    /// that never reaches its `message_stop` is still released once its
+    /// stream starts another.
+    #[test]
+    fn an_unstopped_message_is_released_by_the_next_message_start() {
+        let mut adapter = Claude::default();
+        adapter
+            .receive(stream(
+                json!({"type":"message_start","message":{"id":"msg-1"}}),
+            ))
+            .unwrap();
+        adapter.receive(stream(json!({"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}))).unwrap();
+        adapter.receive(stream(json!({"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Partial"}}))).unwrap();
+        // The aborted partial frame still upserts the block it streamed.
+        let partial = adapter.receive(json!({"type":"assistant","uuid":"a1","message":{"id":"msg-1","content":[{"type":"text","text":"Partial"}]}})).unwrap();
+        assert!(
+            partial
+                .events
+                .iter()
+                .any(|e| matches!(e, Event::Item(i) if i.id == "msg-1:0"))
+        );
+        adapter
+            .receive(stream(
+                json!({"type":"message_start","message":{"id":"msg-2"}}),
+            ))
+            .unwrap();
+        assert!(adapter.blocks.is_empty());
+        let events = stream_message(
+            &mut adapter,
+            None,
+            "msg-2",
+            &[json!({"type":"text","text":"Retried"})],
+        );
+        assert_eq!(errors(&events), Vec::<&str>::new());
+        assert!(adapter.blocks.is_empty() && adapter.streams.is_empty());
+    }
+
+    /// A retried request closes the failed attempt with a synthetic stop for
+    /// its partial block, which never gets an assistant frame. A tool call
+    /// cut off mid-input was discarded, so it leaves the transcript.
+    #[test]
+    fn a_retried_request_closes_its_partial_attempt() {
+        let mut adapter = Claude::default();
+        adapter
+            .receive(stream(
+                json!({"type":"message_start","message":{"id":"msg-1"}}),
+            ))
+            .unwrap();
+        for event in [
+            json!({"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}),
+            json!({"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Done"}}),
+        ] {
+            adapter.receive(stream(event)).unwrap();
+        }
+        adapter.receive(json!({"type":"assistant","uuid":"a0","message":{"id":"msg-1","content":[{"type":"text","text":"Done"}]}})).unwrap();
+        let mut events = Vec::new();
+        for event in [
+            json!({"type":"content_block_stop","index":0}),
+            json!({"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"tool-1","name":"Bash"}}),
+            json!({"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"{\"comm"}}),
+            json!({"type":"content_block_stop","index":1}),
+            json!({"type":"message_stop"}),
+        ] {
+            let step = adapter.receive(stream(event)).unwrap();
+            assert_eq!(errors(&step.events), Vec::<&str>::new());
+            events.extend(step.events);
+        }
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, Event::ItemsRemoved { ids } if *ids == ["tool-1"]))
+        );
+        assert!(adapter.blocks.is_empty() && adapter.streams.is_empty());
+        let events = stream_message(
+            &mut adapter,
+            None,
+            "msg-2",
+            &[json!({"type":"tool_use","id":"tool-2","name":"Bash","input":{"command":"ls"}})],
+        );
+        assert_eq!(errors(&events), Vec::<&str>::new());
+        assert!(adapter.blocks.is_empty());
+    }
+
+    /// A message with more blocks than the bound degrades to whole blocks
+    /// rather than ending the conversation, and the bound still holds.
+    #[test]
+    fn a_runaway_message_stops_streaming_without_ending_the_conversation() {
+        let mut adapter = Claude::default();
+        let mut events = adapter
+            .receive(stream(
+                json!({"type":"message_start","message":{"id":"msg-1"}}),
+            ))
+            .unwrap()
+            .events;
+        for index in 0..MAX_TOOLS + 8 {
+            for event in [
+                json!({"type":"content_block_start","index":index,"content_block":{"type":"text","text":""}}),
+                json!({"type":"content_block_delta","index":index,"delta":{"type":"text_delta","text":"x"}}),
+            ] {
+                events.extend(adapter.receive(stream(event)).unwrap().events);
+            }
+            events.extend(adapter.receive(json!({"type":"assistant","uuid":format!("a{index}"),"message":{"id":"msg-1","content":[{"type":"text","text":"x"}]}})).unwrap().events);
+            events.extend(
+                adapter
+                    .receive(stream(json!({"type":"content_block_stop","index":index})))
+                    .unwrap()
+                    .events,
+            );
+        }
+        assert_eq!(errors(&events).len(), 1);
+        assert_eq!(adapter.blocks.len(), MAX_TOOLS);
+        // The blocks past the bound still arrive whole with their frames.
+        let last = format!("msg-1:{}", MAX_TOOLS + 7);
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, Event::Item(i) if i.id == last))
+        );
+        adapter
+            .receive(stream(json!({"type":"message_stop"})))
+            .unwrap();
+        assert!(adapter.blocks.is_empty());
+        let next = stream_message(
+            &mut adapter,
+            None,
+            "msg-2",
+            &[json!({"type":"text","text":"Streams again"})],
+        );
+        assert_eq!(errors(&next), Vec::<&str>::new());
+        assert!(
+            next.iter()
+                .any(|e| matches!(e, Event::TextDelta { id, .. } if id == "msg-2:0"))
         );
     }
 
