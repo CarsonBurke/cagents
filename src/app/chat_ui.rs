@@ -83,6 +83,16 @@ pub enum CopyPart {
     Change(usize),
 }
 
+/// Why a chat with no daemon handoff did not give its actor up.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReturnRefused {
+    /// The daemon still runs the conversation's CLI, which ends with the
+    /// chat; only reconnecting and taking the daemon's handoff reaches it.
+    SourceLive,
+    /// Giving the actor up could not be confirmed.
+    Unconfirmed(String),
+}
+
 #[derive(Clone)]
 pub enum Action {
     ToolText(Target, String, CopyPart, text_editor::Action),
@@ -94,10 +104,9 @@ pub enum Action {
     /// stopped holding it: a closed card, an abandoned start, or a start that
     /// finished for a card which could no longer hold it.
     Retired(Target, Result<(), String>),
-    /// A chat card with no daemon handoff to take is ready to become a
-    /// terminal: either the Codex CLI the daemon still runs for its thread,
-    /// or, once its actor has been given up, the terminal the card carries.
-    ReturnedLocally(Target, Result<Option<TerminalSession>, String>),
+    /// A chat card with no daemon handoff to take has given up its actor, so
+    /// a terminal can take its place.
+    ReturnedLocally(Target, Result<(), ReturnRefused>),
     Wake(Target, Wake),
     UpdatesAcknowledged(Target, Result<(), String>),
     Reconnect(Target),
@@ -205,7 +214,8 @@ struct Attempt {
 }
 
 struct LocalReturn {
-    terminal: TerminalSession,
+    /// What the terminal that takes the chat's place runs.
+    launch: LaunchRecipe,
     /// Whether the terminal resumes the conversation, and so must not start
     /// beside an actor that may still hold it.
     resumes: bool,
@@ -1562,9 +1572,9 @@ fn retire_conversation(
 /// The CLI the daemon still runs for a Codex thread, if any.
 ///
 /// A Codex chat and its CLI are two views of one thread, and the daemon ends
-/// the CLI together with the chat. Going back to it is therefore an attach:
-/// closing the chat first would kill the very terminal being returned to,
-/// along with any turn it is running.
+/// the CLI together with the chat. Only the daemon's handoff can go back to
+/// it: giving the chat up first would kill the very terminal being returned
+/// to, along with any turn it is running.
 fn live_codex_source(chat: TerminalId) -> Result<Option<TerminalSession>, String> {
     let socket = crate::terminal::ipc::daemon_socket_path().map_err(|error| error.to_string())?;
     let mut client = match crate::control::ControlClient::connect(&socket) {
@@ -1587,12 +1597,21 @@ fn live_codex_source(chat: TerminalId) -> Result<Option<TerminalSession>, String
         .find(|terminal| terminal.id == chat && terminal.continuity.live_proof().is_some()))
 }
 
-/// The terminal a chat card becomes when it has no exact conversation to
-/// return to: a shell in the directory the conversation was working in.
-fn shell_terminal(working_directory: PathBuf) -> Result<TerminalSession, String> {
-    LaunchRecipe::shell(working_directory)
-        .map(fresh_terminal_session)
-        .map_err(|error| format!("Could not open a terminal here: {error}"))
+/// What the terminal replacing a chat runs once its actor is gone.
+///
+/// A conversation the provider named resumes in its CLI, exactly as the
+/// daemon's own return would start it. Anything else becomes a shell in the
+/// directory the conversation was working in, which is the terminal the card
+/// stood in for.
+fn local_return_launch(session: &chat::Session) -> Result<LaunchRecipe, String> {
+    if session.launch.session_id.is_none() {
+        return LaunchRecipe::shell(session.launch.recipe.working_directory.clone())
+            .map_err(|error| format!("Could not open a terminal here: {error}"));
+    }
+    session
+        .launch
+        .terminal_recipe()
+        .ok_or_else(|| "Cannot form a safe exact-session terminal resume command.".to_owned())
 }
 
 fn fresh_chat_session(
@@ -1944,7 +1963,7 @@ impl Cagents {
                 if named {
                     "Return to terminal"
                 } else {
-                    "Open a terminal here"
+                    "Switch to a shell"
                 }
             }
             _ => "Switch to native chat",
@@ -2042,17 +2061,9 @@ impl Cagents {
         };
         // The removal is reserved before anything is given up, so a close the
         // workspace cannot accept changes nothing.
-        let handoff = match self.workspace.pending_close() {
-            Some(handoff) if handoff.unmounting == card => Ok(handoff),
-            _ => self.workspace.request_close(card),
-        };
-        let handoff = match handoff {
-            Ok(handoff) => handoff,
-            Err(error) => {
-                self.status = Some(TransientNotice::error(error.to_string()));
-                return Task::none();
-            }
-        };
+        if self.reserve_chat_removal(card).is_none() {
+            return Task::none();
+        }
         let start = self.chat_ui.attempts.remove(&card);
         let start_in_flight = start.is_some();
         if let Some(attempt) = start {
@@ -2088,9 +2099,7 @@ impl Cagents {
         } else {
             Task::none()
         };
-        self.chat_ui.closed.insert(card);
-        self.observe_agent_activity_for_card(card, None);
-        Task::batch([retire, self.card_removal(handoff)])
+        Task::batch([retire, self.remove_chat_card(card)])
     }
 
     /// Gives up a conversation in the background; see [`retire_conversation`].
@@ -2111,60 +2120,76 @@ impl Cagents {
         })
     }
 
-    /// Replaces a chat card that has no exact conversation to hand back with
-    /// the terminal it can still offer.
+    /// Replaces a chat card that has no daemon handoff to take with a
+    /// terminal in its place.
     ///
-    /// A conversation whose identity is known resumes in its provider's CLI;
-    /// one that never got that far - never prompted, never started, or failed
-    /// before the provider named it - becomes a shell in its directory, which
-    /// is the terminal the card stood in for. Either way the native actor is
-    /// given up first, so the terminal never shares the conversation with it.
+    /// The actor is given up first, so the terminal never shares the
+    /// conversation with it. The terminal is a new card beside the chat's
+    /// rather than the chat card converted: a conversion is only ever an
+    /// exact handoff of one conversation, and a shell is not that.
     fn return_chat_locally(&mut self, card: CardId) -> Task<Message> {
         let Some(session) = self.chat_return_session(card) else {
             return Task::none();
         };
-        let resumes = session.launch.session_id.is_some();
-        let terminal = if resumes {
-            return_terminal(&session)
-        } else {
-            shell_terminal(session.launch.recipe.working_directory.clone())
-        };
-        let terminal = match terminal {
-            Ok(terminal) => terminal,
+        let launch = match local_return_launch(&session) {
+            Ok(launch) => launch,
             Err(error) => {
                 self.status = Some(TransientNotice::error(error));
                 return Task::none();
             }
         };
-        // A terminal that is itself the live CLI of this thread keeps the
-        // actor it is paired with; anything else must not run beside it.
-        let retire = terminal.continuity.live_proof().is_none();
+        let resumes = session.launch.session_id.is_some();
         let handle = match self.cards.get(&card) {
-            Some(CardRuntime::Chat(runtime)) if retire && runtime.connected() => {
-                Some(runtime.handle.clone())
-            }
+            Some(CardRuntime::Chat(runtime)) if runtime.connected() => Some(runtime.handle.clone()),
             _ => None,
         };
-        let shared = retains_source_pty(&session);
-        let chat = session.id;
-        let session = retire.then_some(session);
+        let shared = retains_source_pty(&session) && session.terminal.is_some();
         let target = self.chat_ui.next_target(card);
         self.chat_ui.handoffs.insert(target);
         self.chat_ui
             .local_returns
-            .insert(target, LocalReturn { terminal, resumes });
+            .insert(target, LocalReturn { launch, resumes });
         cosmic::task::future(async move {
             let result = tokio::task::spawn_blocking(move || {
-                if shared && let Some(source) = live_codex_source(chat)? {
-                    return Ok(Some(source));
+                if shared
+                    && live_codex_source(session.id)
+                        .map_err(ReturnRefused::Unconfirmed)?
+                        .is_some()
+                {
+                    return Err(ReturnRefused::SourceLive);
                 }
-                retire_conversation(handle, session).map(|()| None)
+                retire_conversation(handle, Some(session)).map_err(ReturnRefused::Unconfirmed)
             })
             .await
-            .map_err(|error| error.to_string())
+            .map_err(|error| ReturnRefused::Unconfirmed(error.to_string()))
             .and_then(|result| result);
             Message::ChatUi(Action::ReturnedLocally(target, result))
         })
+    }
+
+    /// Reserves the removal of a chat card whose conversation is already
+    /// accounted for, and commits it.
+    fn remove_chat_card(&mut self, card: CardId) -> Task<Message> {
+        let Some(handoff) = self.reserve_chat_removal(card) else {
+            return Task::none();
+        };
+        self.chat_ui.closed.insert(card);
+        self.observe_agent_activity_for_card(card, None);
+        self.card_removal(handoff)
+    }
+
+    /// The workspace's reservation to remove `card`, taken now unless it is
+    /// already held; a refusal is reported.
+    fn reserve_chat_removal(&mut self, card: CardId) -> Option<crate::workspace::FocusHandoff> {
+        let handoff = match self.workspace.pending_close() {
+            Some(handoff) if handoff.unmounting == card => Ok(handoff),
+            _ => self.workspace.request_close(card),
+        };
+        handoff
+            .inspect_err(|error| {
+                self.status = Some(TransientNotice::error(error.to_string()));
+            })
+            .ok()
     }
     /// A panic while connecting is a failed start, not an unwind of the UI thread.
     fn started_chat(
@@ -2693,7 +2718,7 @@ impl Cagents {
                 }
             }
             Action::ReturnedLocally(target, result) => {
-                let Some(LocalReturn { terminal, resumes }) =
+                let Some(LocalReturn { launch, resumes }) =
                     self.chat_ui.local_returns.remove(&target)
                 else {
                     return Task::none();
@@ -2702,39 +2727,55 @@ impl Cagents {
                     return Task::none();
                 }
                 let close = self.chat_ui.close_after_handoff.remove(&target.card);
-                let terminal = match result {
-                    Ok(source) => source.unwrap_or(terminal),
-                    // A resume beside an actor that may still be running would
-                    // be a second writer on one conversation; a new shell
-                    // shares nothing with it, so it only reports the doubt.
-                    Err(error) if resumes => {
-                        self.status = Some(TransientNotice::error(error));
-                        return if close {
-                            self.begin_chat_close(target.card)
-                        } else {
-                            Task::none()
-                        };
-                    }
-                    Err(error) => {
+                // The chat stays whenever its conversation is still running
+                // somewhere a new terminal must not compete with: in the CLI
+                // the daemon keeps, or, for a resume, in an actor that may
+                // still be holding it. A new shell shares nothing with the
+                // actor, so doubt about the actor is only reported.
+                let kept = match result {
+                    Ok(()) => None,
+                    Err(ReturnRefused::SourceLive) => Some(
+                        "This conversation's CLI is still running. Reconnect the chat to return to it."
+                            .to_owned(),
+                    ),
+                    Err(ReturnRefused::Unconfirmed(error)) if resumes => Some(error),
+                    Err(ReturnRefused::Unconfirmed(error)) => {
                         self.status = Some(TransientNotice::warning(format!(
                             "The chat could not be confirmed stopped: {error}"
                         )));
-                        terminal
+                        None
                     }
                 };
-                // Closed while returning: there is no terminal worth starting
-                // only to stop it again, so the card closes as the chat it
-                // still is.
-                if close {
-                    return self.begin_chat_close(target.card);
+                if let Some(error) = kept {
+                    self.status = Some(TransientNotice::error(error));
+                    return if close {
+                        self.begin_chat_close(target.card)
+                    } else {
+                        Task::none()
+                    };
                 }
-                self.chat_forget(target.card);
-                self.chat_ui.fresh_offers.remove(&target.card);
-                self.chat_ui.fresh_threads.remove(&target.card);
-                let Some(visible) = self.convert_card_to_terminal(target.card, &terminal) else {
+                if !self
+                    .card_state(target.card)
+                    .is_some_and(|state| state.existence.is_open())
+                {
                     return Task::none();
-                };
-                return self.start_terminal(target.card, terminal, visible, false);
+                }
+                // Closed while returning: no terminal is started only to be
+                // stopped again.
+                if close {
+                    return self.remove_chat_card(target.card);
+                }
+                // The terminal opens right after the chat, which then leaves.
+                let focus = self
+                    .workspace
+                    .focus(target.card)
+                    .map(|update| self.apply_viewport(update, true, false))
+                    .unwrap_or_else(|_| Task::none());
+                let mut session = fresh_terminal_session(launch);
+                session.resume_hint =
+                    crate::model::agent_recovery::hint_from_launch(&session.launch);
+                let terminal = self.insert_terminal_card(session);
+                return Task::batch([focus, terminal, self.remove_chat_card(target.card)]);
             }
             Action::UpdatesAcknowledged(target, result) => {
                 if let Some(runtime) = self.chat_runtime_mut(target)
@@ -3899,11 +3940,65 @@ mod tests {
         assert!(!app.chat_ui.transition_pending());
     }
 
+    /// The terminal cards open in the current scope.
+    fn terminal_cards(app: &Cagents) -> Vec<CardId> {
+        app.workspace
+            .order()
+            .filter(|id| {
+                matches!(
+                    app.card_state(*id).map(|state| &state.kind),
+                    Some(CardKind::Terminal(_))
+                )
+            })
+            .collect()
+    }
+
+    /// Checks that a returned chat left a new terminal running `launch` in
+    /// its place, and that the chat card itself is on its way out.
+    fn assert_replaced_by_terminal(app: &mut Cagents, card: CardId, launch: &LaunchRecipe) {
+        let terminals = terminal_cards(app);
+        assert_eq!(terminals.len(), 1, "one terminal takes the chat's place");
+        let terminal = terminals[0];
+        let Some(CardKind::Terminal(session)) = app.card_state(terminal).map(|state| &state.kind)
+        else {
+            unreachable!()
+        };
+        assert_eq!(&session.launch, launch);
+        assert_ne!(
+            session.id,
+            match &app.card_state(card).unwrap().kind {
+                CardKind::Chat(chat) => chat.id,
+                _ => panic!("the chat card is never converted in place"),
+            },
+            "a new terminal, not the conversation's identity"
+        );
+        let order = app.workspace.order().collect::<Vec<_>>();
+        let position = |id| order.iter().position(|&other| other == id).unwrap();
+        assert_eq!(position(terminal), position(card) + 1, "right beside it");
+        assert_eq!(
+            app.workspace
+                .pending_close()
+                .map(|handoff| handoff.unmounting),
+            Some(card)
+        );
+        let _ = app.update(Message::CommitClose(card));
+        assert!(!app.workspace.order().any(|id| id == card));
+        assert!(!app.card_state(card).unwrap().existence.is_open());
+        assert!(!app.cards.contains_key(&card));
+        assert!(!app.chat_ui.closed.contains(&card));
+        assert_eq!(app.workspace.focused(), Some(terminal));
+        assert!(matches!(
+            app.cards.get(&terminal),
+            Some(CardRuntime::Loading)
+        ));
+        assert!(!app.chat_ui.transition_pending());
+    }
+
     /// "Return to terminal" refused a conversation the provider had not named
     /// yet, and silently did nothing for one that never started, so a chat
     /// that could not go back had no terminal to offer at all.
     #[test]
-    fn a_chat_with_no_conversation_to_return_to_becomes_a_shell_in_its_directory() {
+    fn a_chat_with_no_conversation_to_return_to_switches_to_a_shell_in_its_directory() {
         for failed in [false, true] {
             let mut app = crate::app::tests::context_inspector_test_app(false);
             let card = if failed {
@@ -3911,36 +4006,26 @@ mod tests {
             } else {
                 live_chat(&mut app, None)
             };
-            assert_eq!(app.chat_switch_label(card), "Open a terminal here");
+            assert_eq!(app.chat_switch_label(card), "Switch to a shell");
             assert!(app.chat_switch_ready(card));
             let _ = app.update(Message::ChatUi(Action::Switch(card)));
             assert!(errors(&app).is_empty(), "{:?}", errors(&app));
             let (&target, plan) = app.chat_ui.local_returns.iter().next().unwrap();
             assert!(!plan.resumes);
-            assert_eq!(
-                plan.terminal.launch,
-                LaunchRecipe::shell(PathBuf::from(FIXTURE_DIRECTORY)).unwrap()
-            );
+            let shell = LaunchRecipe::shell(PathBuf::from(FIXTURE_DIRECTORY)).unwrap();
+            assert_eq!(plan.launch, shell);
             assert!(!app.chat_switch_ready(card), "one return at a time");
 
             // The shell shares nothing with the actor, so doubt about the
             // actor is reported rather than keeping the card a chat.
             let _ = app.update(Message::ChatUi(Action::ReturnedLocally(
                 target,
-                Err("fixture: daemon unreachable".into()),
+                Err(ReturnRefused::Unconfirmed(
+                    "fixture: daemon unreachable".into(),
+                )),
             )));
-            let Some(CardKind::Terminal(session)) = app.card_state(card).map(|state| &state.kind)
-            else {
-                panic!("the card is a terminal now");
-            };
-            assert_eq!(
-                session.launch.working_directory,
-                PathBuf::from(FIXTURE_DIRECTORY)
-            );
-            assert!(matches!(app.cards.get(&card), Some(CardRuntime::Loading)));
-            assert!(app.card_state(card).unwrap().existence.is_open());
-            assert!(!app.chat_start_pending(card));
-            assert!(!app.chat_ui.transition_pending());
+            assert!(errors(&app).is_empty(), "{:?}", errors(&app));
+            assert_replaced_by_terminal(&mut app, card, &shell);
         }
     }
 
@@ -3961,37 +4046,90 @@ mod tests {
                 unreachable!()
             };
             session.launch.session_id = Some(KNOWN_THREAD.into());
+            let resume = session.launch.terminal_recipe().unwrap();
             assert_eq!(app.chat_switch_label(card), "Return to terminal");
             let _ = app.update(Message::ChatUi(Action::Switch(card)));
             assert!(errors(&app).is_empty(), "{:?}", errors(&app));
             let (&target, plan) = app.chat_ui.local_returns.iter().next().unwrap();
             assert!(plan.resumes);
+            assert_eq!(plan.launch, resume, "the CLI the daemon would resume");
             assert!(
-                plan.terminal
-                    .launch
+                resume
                     .arguments
                     .iter()
                     .any(|argument| argument == KNOWN_THREAD),
-                "{:?}",
-                plan.terminal.launch
+                "{resume:?}"
             );
             let _ = app.update(Message::ChatUi(Action::ReturnedLocally(
                 target,
                 if retired {
-                    Ok(None)
+                    Ok(())
                 } else {
-                    Err("fixture: daemon unreachable".into())
+                    Err(ReturnRefused::Unconfirmed(
+                        "fixture: daemon unreachable".into(),
+                    ))
                 },
             )));
-            let kind = &app.card_state(card).unwrap().kind;
             if retired {
-                assert!(matches!(kind, CardKind::Terminal(_)));
+                assert_replaced_by_terminal(&mut app, card, &resume);
             } else {
-                assert!(matches!(kind, CardKind::Chat(_)), "no second writer");
+                assert!(terminal_cards(&app).is_empty(), "no second writer");
+                assert!(matches!(
+                    app.card_state(card).unwrap().kind,
+                    CardKind::Chat(_)
+                ));
+                assert_eq!(app.workspace.pending_close(), None);
                 assert!(!errors(&app).is_empty());
+                assert!(!app.chat_ui.transition_pending());
             }
             assert!(!app.chat_start_pending(card));
         }
+    }
+
+    /// A Codex chat and the CLI the daemon still runs for its thread end
+    /// together, so a chat that cannot take the daemon's handoff keeps its
+    /// card rather than kill that CLI, and a close then closes it as usual.
+    #[test]
+    fn a_codex_chat_whose_cli_still_runs_is_kept_rather_than_killing_it() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let card = failed_chat(&mut app);
+        let _ = app.update(Message::ChatUi(Action::Switch(card)));
+        let target = *app.chat_ui.local_returns.keys().next().unwrap();
+        let _ = app.update(Message::CloseCard(card));
+        let _ = app.update(Message::ChatUi(Action::ReturnedLocally(
+            target,
+            Err(ReturnRefused::SourceLive),
+        )));
+        assert!(terminal_cards(&app).is_empty());
+        assert!(!errors(&app).is_empty(), "the refusal says why");
+        app.notices.entries.clear();
+        // The close asked for meanwhile still happens, and retires the chat.
+        assert_eq!(
+            app.workspace
+                .pending_close()
+                .map(|handoff| handoff.unmounting),
+            Some(card)
+        );
+        let _ = app.update(Message::CommitClose(card));
+        assert!(!app.workspace.order().any(|id| id == card));
+        retired(&mut app, card);
+
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let card = failed_chat(&mut app);
+        let _ = app.update(Message::ChatUi(Action::Switch(card)));
+        let target = *app.chat_ui.local_returns.keys().next().unwrap();
+        let _ = app.update(Message::ChatUi(Action::ReturnedLocally(
+            target,
+            Err(ReturnRefused::SourceLive),
+        )));
+        assert!(terminal_cards(&app).is_empty());
+        assert!(matches!(
+            app.card_state(card).unwrap().kind,
+            CardKind::Chat(_)
+        ));
+        assert_eq!(app.workspace.pending_close(), None);
+        assert!(app.chat_switch_ready(card), "it can be tried again");
+        assert!(!app.chat_ui.transition_pending());
     }
 
     /// A close pressed while the card is on its way back to a terminal waits
@@ -4007,8 +4145,16 @@ mod tests {
         assert!(app.chat_ui.close_after_handoff.contains(&card));
         assert_eq!(app.workspace.pending_close(), None);
         assert!(errors(&app).is_empty(), "{:?}", errors(&app));
-        let _ = app.update(Message::ChatUi(Action::ReturnedLocally(target, Ok(None))));
+        let _ = app.update(Message::ChatUi(Action::ReturnedLocally(target, Ok(()))));
         assert!(app.chat_ui.close_after_handoff.is_empty());
+        assert!(
+            terminal_cards(&app).is_empty(),
+            "no terminal only to stop it"
+        );
+        assert!(
+            app.chat_ui.retiring.is_empty(),
+            "the return already gave the conversation up"
+        );
         assert_eq!(
             app.workspace
                 .pending_close()
@@ -4020,32 +4166,6 @@ mod tests {
         assert!(!app.workspace.order().any(|id| id == card));
         assert!(!app.card_state(card).unwrap().existence.is_open());
         assert!(!app.cards.contains_key(&card));
-    }
-
-    /// A Codex thread whose CLI the daemon still runs goes back to that CLI.
-    /// Closing the chat first would have killed it, and any turn it was in.
-    #[test]
-    fn a_codex_chat_returns_to_the_cli_the_daemon_still_runs() {
-        let mut app = crate::app::tests::context_inspector_test_app(false);
-        let card = failed_chat(&mut app);
-        let Some(CardKind::Chat(session)) = app.card_state(card).map(|state| &state.kind) else {
-            unreachable!()
-        };
-        let chat = session.id;
-        let _ = app.update(Message::ChatUi(Action::Switch(card)));
-        let target = *app.chat_ui.local_returns.keys().next().unwrap();
-        let mut source =
-            fresh_terminal_session(LaunchRecipe::shell(PathBuf::from(FIXTURE_DIRECTORY)).unwrap());
-        source.id = chat;
-        let _ = app.update(Message::ChatUi(Action::ReturnedLocally(
-            target,
-            Ok(Some(source)),
-        )));
-        let Some(CardKind::Terminal(terminal)) = app.card_state(card).map(|state| &state.kind)
-        else {
-            panic!("the card is a terminal now");
-        };
-        assert_eq!(terminal.id, chat, "the thread's own CLI, not a new one");
         assert!(!app.chat_ui.transition_pending());
     }
 

@@ -1256,7 +1256,7 @@ static STARTING_DIRECTORY_CAPTION: LazyLock<String> = LazyLock::new(|| {
 });
 
 /// A terminal that has never run, under a new identity, waiting to launch `launch`.
-fn fresh_terminal_session(launch: LaunchRecipe) -> TerminalSession {
+pub(super) fn fresh_terminal_session(launch: LaunchRecipe) -> TerminalSession {
     let id = TerminalId::new();
     TerminalSession {
         recovery_origin: None,
@@ -3877,9 +3877,23 @@ impl Cagents {
         if self.project_ui.deleting() {
             return Task::none();
         }
-        let working_directory = launch.working_directory.clone();
+        let scope = if self.active_workspace.as_deref() != Some(launch.working_directory.as_path())
+        {
+            self.select_worktree(launch.working_directory.clone(), false)
+        } else {
+            Task::none()
+        };
+        Task::batch([
+            scope,
+            self.insert_terminal_card(fresh_terminal_session(launch)),
+        ])
+    }
+
+    /// Opens the new terminal `session` beside the focused card of the
+    /// current scope.
+    pub(super) fn insert_terminal_card(&mut self, session: TerminalSession) -> Task<Message> {
+        let working_directory = session.launch.working_directory.clone();
         let card_id = CardId::new();
-        let session = fresh_terminal_session(launch);
         let card = CardState {
             id: card_id,
             generation: self.durable.generation,
@@ -3895,11 +3909,6 @@ impl Cagents {
             exposure: Exposure::Visible,
             residency: Residency::Hydrating { epoch: 1 },
             kind: CardKind::Terminal(session.clone()),
-        };
-        let scope = if self.active_workspace.as_deref() != Some(working_directory.as_path()) {
-            self.select_worktree(working_directory.clone(), false)
-        } else {
-            Task::none()
         };
         let (index, durable_index) = self.terminal_insertion_indices();
         let durable = Arc::make_mut(&mut self.durable);
@@ -3931,7 +3940,6 @@ impl Cagents {
         );
         self.persist();
         Task::batch([
-            scope,
             self.start_terminal(card_id, session, true, false),
             self.apply_viewport(update, true, false),
         ])
@@ -4758,31 +4766,13 @@ impl Cagents {
         card: CardId,
         session: TerminalSession,
     ) -> Task<Message> {
-        let Some(visible) = self.convert_card_to_terminal(card, &session) else {
-            return Task::none();
-        };
-        self.pending_terminal_handoffs
-            .insert(session.id, session.clone());
-        let commit = self.commit_terminal_handoffs();
-        let attach = self.start_terminal(card, session, visible, false);
-        Task::batch([commit, attach])
-    }
-
-    /// Turns an open card into the terminal `session`, ready for its start.
-    ///
-    /// The conversion is checkpointed on the writer lane before anything can
-    /// start, so a crash never finds the card naming a conversation it gave
-    /// up. Answers whether the new surface starts visible, or `None` when the
-    /// card is no longer open.
-    fn convert_card_to_terminal(
-        &mut self,
-        card: CardId,
-        session: &TerminalSession,
-    ) -> Option<bool> {
-        let state = self
+        let Some(state) = self
             .card_state(card)
             .filter(|state| state.existence.is_open())
-            .cloned()?;
+            .cloned()
+        else {
+            return Task::none();
+        };
         let residency = Residency::Hydrating {
             epoch: unix_millis().max(1) as u64,
         };
@@ -4798,7 +4788,16 @@ impl Cagents {
         if let Some(writer) = &self.session {
             writer.snapshot_conversion(Arc::clone(&self.durable));
         }
-        Some(state.exposure == Exposure::Visible && self.workspace_surfaces_visible())
+        self.pending_terminal_handoffs
+            .insert(session.id, session.clone());
+        let commit = self.commit_terminal_handoffs();
+        let attach = self.start_terminal(
+            card,
+            session,
+            state.exposure == Exposure::Visible && self.workspace_surfaces_visible(),
+            false,
+        );
+        Task::batch([commit, attach])
     }
 
     /// The flush is ordered after conversion snapshots. Never release daemon
