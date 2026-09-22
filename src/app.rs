@@ -1649,7 +1649,9 @@ impl ContextTab {
     const fn label(self) -> &'static str {
         match self {
             Self::Files => "Files",
-            Self::Changes => "Changes",
+            // The panel holds the Changes, Branch, and History views; naming
+            // it after the first of them said "Changes" twice.
+            Self::Changes => "Source control",
             Self::PullRequest => "Pull request",
             Self::Details => "Details",
         }

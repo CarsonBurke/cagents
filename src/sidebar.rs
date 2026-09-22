@@ -1115,27 +1115,31 @@ impl PanelSection {
     }
 }
 
-/// Which view of the worktree's Git state the Changes tab is showing.
+/// Which view of the worktree's Git state the Git panel is showing.
 ///
 /// Three peers, not a boolean: working-tree changes, this branch's commits,
 /// and the diff against the branch's base are separate questions, and the
-/// panel used to answer the third by stacking it under the first.
+/// panel used to answer the third by stacking it under the first. They are
+/// ordered from nearest to farthest: what is not committed yet, what this
+/// branch changes, then every commit behind it.
+///
+/// Local to the surface and never persisted; see [`SidebarState`].
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum ChangesTab {
     #[default]
     Changes,
-    History,
     Branch,
+    History,
 }
 
 impl ChangesTab {
-    pub const ALL: [Self; 3] = [Self::Changes, Self::History, Self::Branch];
+    pub const ALL: [Self; 3] = [Self::Changes, Self::Branch, Self::History];
 
     fn label(self) -> &'static str {
         match self {
             Self::Changes => "Changes",
-            Self::History => "History",
             Self::Branch => "Branch",
+            Self::History => "History",
         }
     }
 
@@ -1143,18 +1147,17 @@ impl ChangesTab {
     /// cannot fit.
     fn description(self) -> &'static str {
         match self {
-            Self::Changes => "Working tree changes",
+            Self::Changes => "Uncommitted changes in this worktree",
+            Self::Branch => "Everything this branch changed since it left its base",
             Self::History => "Commit history",
-            Self::Branch => "Changes since this branch left its base",
         }
     }
 
-    fn icon(self) -> widget::icon::Handle {
-        match self {
-            Self::Changes => crate::ui_controls::symbolic_icon("document-edit-symbolic"),
-            Self::History => crate::ui_controls::symbolic_icon("document-open-recent-symbolic"),
-            Self::Branch => worktree_icon(),
-        }
+    /// Whether the view is a list of changed files, which is what the
+    /// tree/flat switch arranges. History lists commits and has no such
+    /// choice to offer.
+    fn lists_files(self) -> bool {
+        matches!(self, Self::Changes | Self::Branch)
     }
 }
 
@@ -1550,7 +1553,8 @@ pub struct BranchChangesModel {
     pub merge_base: Oid,
     pub rows: Vec<BranchChangeRow>,
     tree: Vec<FileRow>,
-    title: Box<str>,
+    /// The row count the Branch tab states beside its name.
+    count_label: Box<str>,
     base_label: Box<str>,
 }
 
@@ -1584,7 +1588,7 @@ impl BranchChangesModel {
             .map(|row| row.entry.path.clone())
             .collect();
         Self {
-            title: format!("Branch changes ({})", rows.len()).into_boxed_str(),
+            count_label: rows.len().to_string().into_boxed_str(),
             base_label: format!("Since branching from {}", comparison.base_ref.short_name())
                 .into_boxed_str(),
             base_ref: comparison.base_ref,
@@ -1671,6 +1675,10 @@ pub struct SourceControlModel {
     pub staged_count: usize,
     pub files: Vec<FileRow>,
     groups: Vec<ChangeGroup>,
+    /// How many distinct paths the change groups hold, as the Changes tab
+    /// states it; `None` for a clean worktree. A path both staged and
+    /// unstaged is one changed file, not two.
+    change_count_label: Option<Box<str>>,
     pub branch_changes: BranchChanges,
     pub history: Vec<CommitRow>,
     pub commit_changes: Option<CommitChanges>,
@@ -1811,6 +1819,7 @@ impl SourceControlModel {
             staged_count: 0,
             files: Vec::new(),
             groups: Vec::new(),
+            change_count_label: None,
             branch_changes: BranchChanges::Unavailable("No branch comparison available."),
             history: Vec::new(),
             commit_changes: None,
@@ -1861,6 +1870,13 @@ impl SourceControlModel {
             .iter()
             .find(|group| group.area == ChangeArea::Staged)
             .map_or(0, |group| group.rows.len());
+        let changed_paths = groups
+            .iter()
+            .flat_map(|group| group.rows.iter().map(|row| &row.entry.path))
+            .collect::<BTreeSet<_>>()
+            .len();
+        let change_count_label =
+            (changed_paths > 0).then(|| changed_paths.to_string().into_boxed_str());
         let files = file_rows(&snapshot.files.paths);
 
         // An unborn `HEAD` has no commit and no history to walk; an unreadable
@@ -1890,6 +1906,7 @@ impl SourceControlModel {
             staged_count,
             files,
             groups,
+            change_count_label,
             branch_changes: BranchChanges::Unavailable("No branch comparison available."),
             history: Vec::new(),
             commit_changes: None,
@@ -2154,6 +2171,8 @@ struct SourceControlChrome {
     more_history_id: Id,
     section_ids: [Id; 4],
     changes_tab_ids: [Id; 3],
+    panel_tab_ids: [Id; 3],
+    list_mode_id: Id,
 }
 
 impl SourceControlChrome {
@@ -2194,6 +2213,9 @@ impl SourceControlChrome {
                 .map(|section| entity_id("panel.section", format!("{worktree_id}.{section:?}"))),
             changes_tab_ids: ChangesTab::ALL
                 .map(|tab| entity_id("panel.tab", format!("{worktree_id}.{tab:?}"))),
+            panel_tab_ids: WorktreePanel::ALL
+                .map(|panel| entity_id("panel.view", format!("{worktree_id}.{panel:?}"))),
+            list_mode_id: entity_id("panel.list-mode", worktree_id),
         }
     }
 
@@ -2203,6 +2225,10 @@ impl SourceControlChrome {
 
     fn changes_tab_id(&self, tab: ChangesTab) -> &Id {
         &self.changes_tab_ids[tab as usize]
+    }
+
+    fn panel_tab_id(&self, panel: WorktreePanel) -> &Id {
+        &self.panel_tab_ids[panel as usize]
     }
 }
 
@@ -4889,7 +4915,7 @@ pub fn git_panel<'a>(
         width,
         modal_open,
         WorktreePanel::Changes,
-        false,
+        PanelNavigation::GitViews,
         false,
     )
 }
@@ -4908,13 +4934,13 @@ pub fn file_panel<'a>(
         width,
         modal_open,
         WorktreePanel::Files,
-        false,
+        PanelNavigation::None,
         false,
     )
 }
 
-/// Files or Git changes, with a switch between them. Used by the standalone
-/// editor, which has no context-inspector tab strip.
+/// Files, Git changes, or pull requests, with one tab row between them. Used
+/// by the standalone editor, which has no context-inspector tab strip.
 pub fn worktree_sidebar<'a>(
     model: &'a SidebarModel,
     state: &'a SidebarState,
@@ -4922,7 +4948,15 @@ pub fn worktree_sidebar<'a>(
     modal_open: bool,
     panel: WorktreePanel,
 ) -> Element<'a, SidebarAction> {
-    worktree_panel(model, state, width, modal_open, panel, true, true)
+    worktree_panel(
+        model,
+        state,
+        width,
+        modal_open,
+        panel,
+        PanelNavigation::Panels,
+        true,
+    )
 }
 
 /// [`worktree_sidebar`] for a panel whose body the shell renders itself: the
@@ -4944,16 +4978,26 @@ pub fn worktree_sidebar_with_body<'a, M: 'a>(
         return worktree_sidebar(model, state, width, modal_open, panel).map(map);
     };
     let worktree = bound_worktree(model, source);
-    let header = source_control_header(state, source, worktree, modal_open, panel, true);
+    let view = PanelView::new(panel, PanelNavigation::Panels, state);
+    let header = source_control_header(state, source, worktree, modal_open, view);
+    let navigation = panel_navigation(
+        source,
+        modal_open,
+        view,
+        PanelNavigation::Panels,
+        sidebar_pane_width(width),
+    );
     let notices: Element<'a, SidebarAction> = source_control_notices(source).into();
     // The body sits between the sidebar's own header and footer, so each of
     // those maps on its own; the mapper is shared rather than cloned.
     let map = std::rc::Rc::new(map);
     let map_header = map.clone();
+    let map_navigation = map.clone();
     let map_notices = map.clone();
     let pane = widget::column::with_children(vec![
         widget::container(worktree_panel_chrome(
             header.map(move |action| map_header(action)),
+            navigation.map(|navigation| navigation.map(move |action| map_navigation(action))),
             notices.map(move |action| map_notices(action)),
             Some(body),
         ))
@@ -5009,13 +5053,86 @@ pub enum WorktreePanel {
     PullRequests,
 }
 
+impl WorktreePanel {
+    const ALL: [Self; 3] = [Self::Files, Self::Changes, Self::PullRequests];
+
+    /// The tab label. Pull requests has a short form for a narrow pane,
+    /// where three full words do not fit on one row.
+    fn label(self, narrow: bool) -> &'static str {
+        match self {
+            Self::Files => "Files",
+            Self::Changes => "Changes",
+            Self::PullRequests if narrow => "PRs",
+            Self::PullRequests => "Pull requests",
+        }
+    }
+
+    fn description(self) -> &'static str {
+        match self {
+            Self::Files => "Files in this worktree",
+            Self::Changes => "Uncommitted changes in this worktree",
+            Self::PullRequests => "Pull requests for this repository",
+        }
+    }
+}
+
+/// Below this pane width the panel tabs use their short labels.
+const FULL_PANEL_LABELS_MIN_WIDTH: f32 = 280.0;
+
+/// What the tab row beneath the worktree header switches between.
+///
+/// A pane gets exactly one level of navigation. Where the host's own chrome
+/// already picked the panel, the row switches that panel's views; where the
+/// host has no such chrome, the row switches the panels themselves.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PanelNavigation {
+    /// No row: the host's chrome chose a panel with a single view.
+    None,
+    /// The Git panel's Changes, Branch, and History views, for the cagents
+    /// context inspector, whose own tab strip chose the Git panel.
+    GitViews,
+    /// Files, Changes, and Pull requests, for the standalone editor. It loads
+    /// no history and no base comparison, so its Git panel is Changes alone
+    /// rather than two views that could only ever say "not loaded".
+    Panels,
+}
+
+/// The one view on screen, whichever level of navigation chose it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PanelView {
+    Files,
+    Git(ChangesTab),
+    PullRequests,
+}
+
+impl PanelView {
+    fn new(panel: WorktreePanel, navigation: PanelNavigation, state: &SidebarState) -> Self {
+        match panel {
+            WorktreePanel::Files => Self::Files,
+            WorktreePanel::PullRequests => Self::PullRequests,
+            WorktreePanel::Changes => Self::Git(match navigation {
+                PanelNavigation::GitViews => state.changes_tab,
+                PanelNavigation::None | PanelNavigation::Panels => ChangesTab::Changes,
+            }),
+        }
+    }
+
+    fn panel(self) -> WorktreePanel {
+        match self {
+            Self::Files => WorktreePanel::Files,
+            Self::Git(_) => WorktreePanel::Changes,
+            Self::PullRequests => WorktreePanel::PullRequests,
+        }
+    }
+}
+
 fn worktree_panel<'a>(
     model: &'a SidebarModel,
     state: &'a SidebarState,
     width: f32,
     modal_open: bool,
     panel: WorktreePanel,
-    show_panel_switch: bool,
+    navigation: PanelNavigation,
     settings_footer: bool,
 ) -> Element<'a, SidebarAction> {
     let width = sidebar_pane_width(width);
@@ -5028,7 +5145,8 @@ fn worktree_panel<'a>(
             model.file_management && matches!(model.data_state, SidebarDataState::Ready),
             modal_open,
             panel,
-            show_panel_switch,
+            navigation,
+            width,
         ),
         None => widget::container(
             widget::column::with_children(vec![
@@ -5090,15 +5208,16 @@ pub(crate) fn bound_source_control<'a>(
         .filter(|source| &source.key == key)
 }
 
-/// The worktree title row with the panel switch and the panel's own
-/// controls: the file filter for Files, the tree/flat switch for Changes.
+/// The worktree title row: the worktree's identity, then the options of the
+/// view on screen - the file filter for Files, the tree/flat switch for a
+/// list of changed files - and nothing else. Navigation lives in its own row
+/// beneath, so an option never sits beside a peer it does not belong to.
 fn source_control_header<'a>(
     state: &'a SidebarState,
     source: &'a SourceControlModel,
     worktree: Option<&'a SidebarWorktree>,
     modal_open: bool,
-    panel: WorktreePanel,
-    show_panel_switch: bool,
+    view: PanelView,
 ) -> Element<'a, SidebarAction> {
     let spacing = cosmic::theme::spacing();
     let chrome = &source.chrome;
@@ -5119,88 +5238,38 @@ fn source_control_header<'a>(
         .width(Length::Fill)
         .into(),
     ]);
-    if show_panel_switch {
-        let git = source.offers_changes();
-        let files = crate::ui_controls::icon_control(
-            crate::ui_controls::symbolic_icon("folder-symbolic"),
-            "Files",
-            matches!(panel, WorktreePanel::Files),
-            !modal_open,
-            gated(
-                SidebarAction::SetWorktreePanel {
-                    panel: WorktreePanel::Files,
-                },
+    match view {
+        PanelView::Files => {
+            header = header.push(
+                crate::ui_controls::icon_control(
+                    crate::ui_controls::symbolic_icon("system-search-symbolic"),
+                    if state.files_filter_open {
+                        "Hide file filter"
+                    } else {
+                        "Filter files"
+                    },
+                    state.files_filter_open,
+                    !modal_open,
+                    gated(
+                        SidebarAction::ToggleFilesFilter { key: key.clone() },
+                        modal_open,
+                    ),
+                )
+                .id(chrome.files_filter_id.clone()),
+            );
+        }
+        // File browsing is always a tree, so only a list of changed files
+        // offers the tree/flat switch: the flat list exists for reading
+        // diffs, not for browsing.
+        PanelView::Git(tab) if tab.lists_files() => {
+            header = header.push(list_mode_toggle(
+                key,
+                chrome,
+                state.change_list_mode,
                 modal_open,
-            ),
-        );
-        let changes = crate::ui_controls::icon_control(
-            crate::ui_controls::symbolic_icon("document-edit-symbolic"),
-            if git {
-                "Changes"
-            } else {
-                "Open a Git repository to review changes"
-            },
-            matches!(panel, WorktreePanel::Changes),
-            !modal_open && git,
-            gated(
-                SidebarAction::SetWorktreePanel {
-                    panel: WorktreePanel::Changes,
-                },
-                modal_open || !git,
-            ),
-        );
-        let changes: Element<'_, SidebarAction> = if git && source.has_changes() {
-            changes
-                .icon_tone(design::Tone::Themed(design::warning_color))
-                .into()
-        } else {
-            changes.into()
-        };
-        let pull_requests = crate::ui_controls::icon_control(
-            crate::ui_controls::symbolic_icon("pull-request-symbolic"),
-            if git {
-                "Pull requests"
-            } else {
-                "Open a Git repository to review pull requests"
-            },
-            matches!(panel, WorktreePanel::PullRequests),
-            !modal_open && git,
-            gated(
-                SidebarAction::SetWorktreePanel {
-                    panel: WorktreePanel::PullRequests,
-                },
-                modal_open || !git,
-            ),
-        );
-        header = header.push(crate::ui_controls::segmented_controls(vec![
-            files.into(),
-            changes,
-            pull_requests.into(),
-        ]));
-    }
-    if matches!(panel, WorktreePanel::Files) {
-        header = header.push(
-            crate::ui_controls::icon_control(
-                crate::ui_controls::symbolic_icon("system-search-symbolic"),
-                if state.files_filter_open {
-                    "Hide file filter"
-                } else {
-                    "Filter files"
-                },
-                state.files_filter_open,
-                !modal_open,
-                gated(
-                    SidebarAction::ToggleFilesFilter { key: key.clone() },
-                    modal_open,
-                ),
-            )
-            .id(chrome.files_filter_id.clone()),
-        );
-    }
-    // File browsing is always a tree, so only change review offers the
-    // tree/flat switch: the flat list exists for viewing diffs, not files.
-    if matches!(panel, WorktreePanel::Changes) {
-        header = header.push(list_mode_controls(key, state.change_list_mode, modal_open));
+            ));
+        }
+        PanelView::Git(_) | PanelView::PullRequests => {}
     }
     header
         .align_y(Alignment::Center)
@@ -5253,19 +5322,15 @@ fn source_control_panel<'a>(
     file_management: bool,
     modal_open: bool,
     panel: WorktreePanel,
-    show_panel_switch: bool,
+    navigation: PanelNavigation,
+    width: f32,
 ) -> Element<'a, SidebarAction> {
     let spacing = cosmic::theme::spacing();
     let chrome = &source.chrome;
     let key = &source.key;
-    let header = source_control_header(
-        state,
-        source,
-        worktree,
-        modal_open,
-        panel,
-        show_panel_switch,
-    );
+    let view = PanelView::new(panel, navigation, state);
+    let header = source_control_header(state, source, worktree, modal_open, view);
+    let tabs = panel_navigation(source, modal_open, view, navigation, width);
     let mut notices = source_control_notices(source);
 
     match &source.data_state {
@@ -5274,7 +5339,7 @@ fn source_control_panel<'a>(
             // that says "loading" for that long is a flash of text where the
             // files are about to be. The panel stays blank under its header;
             // the header's own busy spinner is what says a read is running.
-            return worktree_panel_chrome(header, notices.into(), None);
+            return worktree_panel_chrome(header, tabs, notices.into(), None);
         }
         SidebarDataState::Error(message) => {
             notices = notices
@@ -5290,18 +5355,19 @@ fn source_control_panel<'a>(
                             modal_open,
                         )),
                 );
-            return worktree_panel_chrome(header, notices.into(), None);
+            return worktree_panel_chrome(header, tabs, notices.into(), None);
         }
         SidebarDataState::Ready => {}
     }
 
     // The shell renders this panel's body; see `worktree_sidebar_with_body`.
-    if matches!(panel, WorktreePanel::PullRequests) {
-        return worktree_panel_chrome(header, notices.into(), None);
+    if matches!(view, PanelView::PullRequests) {
+        return worktree_panel_chrome(header, tabs, notices.into(), None);
     }
-    if matches!(panel, WorktreePanel::Files) {
+    let PanelView::Git(tab) = view else {
         return worktree_panel_chrome(
             header,
+            tabs,
             notices.into(),
             Some(files_section(
                 state,
@@ -5311,13 +5377,12 @@ fn source_control_panel<'a>(
                 file_management,
             )),
         );
-    }
+    };
 
-    let tab = state.changes_tab;
     let body = match tab {
         ChangesTab::Changes => changes_section(state, source, modal_open),
-        ChangesTab::History => history_section(source, modal_open),
         ChangesTab::Branch => branch_changes_section(state, source, modal_open),
+        ChangesTab::History => history_section(source, modal_open),
     };
     // Committing is the panel's terminal action, so it sits at the panel's
     // bottom edge rather than after however many change rows the scroll
@@ -5332,27 +5397,19 @@ fn source_control_panel<'a>(
 
     worktree_panel_chrome_with_footer(
         header,
+        tabs,
         notices.into(),
         Some(
-            widget::column::with_children(vec![
-                widget::container(changes_tab_controls(key, tab, chrome, modal_open))
-                    .padding(Padding::from([spacing.space_xxxs, spacing.space_xxs]))
-                    .width(Length::Fill)
-                    .into(),
-                widget::scrollable(
-                    widget::container(body)
-                        .padding(design::with_vertical_rail(Padding::from([
-                            0,
-                            spacing.space_xxs,
-                        ])))
-                        .width(Length::Fill),
-                )
-                .direction(sidebar_scroll_direction())
-                .class(cosmic::style::iced::Scrollable::Minimal)
-                .width(Length::Fill)
-                .height(Length::Fill)
-                .into(),
-            ])
+            widget::scrollable(
+                widget::container(body)
+                    .padding(design::with_vertical_rail(Padding::from([
+                        0,
+                        spacing.space_xxs,
+                    ])))
+                    .width(Length::Fill),
+            )
+            .direction(sidebar_scroll_direction())
+            .class(cosmic::style::iced::Scrollable::Minimal)
             .width(Length::Fill)
             .height(Length::Fill)
             .into(),
@@ -5361,58 +5418,93 @@ fn source_control_panel<'a>(
     )
 }
 
-/// The Changes/History/Branch switch.
+/// The pane's one row of navigation, or `None` where there is nothing to
+/// switch between.
 ///
-/// One segmented control of three peers, each an icon over its own label, so
-/// the current view is read from the filled segment rather than from which of
-/// two words happens to look pressed. Each segment keeps a stable id so focus
-/// and the accessibility tree survive a switch.
-fn changes_tab_controls<'a>(
-    key: &ActiveWorktreeKey,
-    selected: ChangesTab,
-    chrome: &SourceControlChrome,
+/// Every tab is a word, never a bare glyph, and each keeps a stable id so
+/// focus and the accessibility tree survive a switch. A view that holds a
+/// countable list states its count beside its name, so what is behind a tab
+/// is readable before it is opened; the working tree's count takes the same
+/// warning tone the shell uses for a dirty worktree.
+fn panel_navigation<'a>(
+    source: &'a SourceControlModel,
     modal_open: bool,
-) -> Element<'a, SidebarAction> {
-    let spacing = cosmic::theme::spacing();
-    crate::ui_controls::segmented_controls(
-        ChangesTab::ALL
+    view: PanelView,
+    navigation: PanelNavigation,
+    width: f32,
+) -> Option<Element<'a, SidebarAction>> {
+    let key = &source.key;
+    let chrome = &source.chrome;
+    let changes_count = || {
+        source
+            .change_count_label
+            .as_deref()
+            .map(|count| (Cow::Borrowed(count), design::warning_text as fn(&_) -> _))
+    };
+    let tabs = match navigation {
+        PanelNavigation::None => return None,
+        PanelNavigation::GitViews => ChangesTab::ALL
             .into_iter()
-            .map(|tab| {
-                let active = tab == selected;
-                let control = button::custom(
-                    widget::container(
-                        widget::row::with_children(vec![
-                            widget::icon(tab.icon()).size(ROW_ICON_SIZE).into(),
-                            design::body(tab.label())
-                                .wrapping(cosmic::iced::widget::text::Wrapping::None)
-                                .into(),
-                        ])
-                        .spacing(spacing.space_xxxs)
-                        .align_y(Alignment::Center),
-                    )
-                    .center(Length::Fill),
-                )
-                .class(crate::ui_controls::control_style(active, None))
-                .id(chrome.changes_tab_id(tab).clone())
-                .name(tab.description())
-                .selected(active)
-                .padding([0, spacing.space_xxs])
-                .height(design::DENSE_ROW_HEIGHT)
-                .width(Length::Fill)
-                .on_press_maybe(gated(
+            .map(|tab| crate::ui_controls::ViewTab {
+                label: Cow::Borrowed(tab.label()),
+                description: Cow::Borrowed(tab.description()),
+                count: match tab {
+                    ChangesTab::Changes => changes_count(),
+                    ChangesTab::Branch => match &source.branch_changes {
+                        BranchChanges::Ready(branch) if !branch.rows.is_empty() => Some((
+                            Cow::Borrowed(&*branch.count_label),
+                            design::muted_text as fn(&_) -> _,
+                        )),
+                        _ => None,
+                    },
+                    ChangesTab::History => None,
+                },
+                selected: view == PanelView::Git(tab),
+                id: Some(chrome.changes_tab_id(tab).clone()),
+                on_press: gated(
                     SidebarAction::SetChangesTab {
                         key: key.clone(),
                         tab,
                     },
-                    modal_open || active,
-                ));
-                crate::interaction::tooltip(crate::interaction::hover(control), tab.description())
+                    modal_open,
+                ),
             })
             .collect(),
+        PanelNavigation::Panels => {
+            // A plain folder has files and nothing else: one tab is not a
+            // choice. The row stays up while the worktree is still being
+            // read, so a repository's tabs do not arrive a frame late.
+            if matches!(source.data_state, SidebarDataState::Ready) && !source.offers_changes() {
+                return None;
+            }
+            let narrow = width < FULL_PANEL_LABELS_MIN_WIDTH;
+            WorktreePanel::ALL
+                .into_iter()
+                .map(|panel| crate::ui_controls::ViewTab {
+                    label: Cow::Borrowed(panel.label(narrow)),
+                    description: Cow::Borrowed(panel.description()),
+                    count: match panel {
+                        WorktreePanel::Changes => changes_count(),
+                        WorktreePanel::Files | WorktreePanel::PullRequests => None,
+                    },
+                    selected: view.panel() == panel,
+                    id: Some(chrome.panel_tab_id(panel).clone()),
+                    on_press: gated(SidebarAction::SetWorktreePanel { panel }, modal_open),
+                })
+                .collect()
+        }
+    };
+    let spacing = cosmic::theme::spacing();
+    Some(
+        widget::container(crate::ui_controls::view_tabs(tabs))
+            .padding(Padding::from([spacing.space_xxxs, spacing.space_xxs]))
+            .width(Length::Fill)
+            .into(),
     )
 }
 
-/// Worktree title, full-width rule, then padded notices and the panel body.
+/// Worktree title, full-width rule, the pane's tab row when it has one, then
+/// padded notices and the panel body.
 ///
 /// The projects sidebar already pads its header without padding the rule
 /// beneath it. Wrapping both in one inset container left a gap between the
@@ -5420,16 +5512,18 @@ fn changes_tab_controls<'a>(
 /// disconnected from the splitter they share with the editor tab strip.
 fn worktree_panel_chrome<'a, M: 'a>(
     header: Element<'a, M>,
+    tabs: Option<Element<'a, M>>,
     notices: Element<'a, M>,
     body: Option<Element<'a, M>>,
 ) -> Element<'a, M> {
-    worktree_panel_chrome_with_footer(header, notices, body, None)
+    worktree_panel_chrome_with_footer(header, tabs, notices, body, None)
 }
 
 /// The same chrome with a region pinned below the scrolling body, for the
 /// commit box: a terminal action the user must not have to scroll to reach.
 fn worktree_panel_chrome_with_footer<'a, M: 'a>(
     header: Element<'a, M>,
+    tabs: Option<Element<'a, M>>,
     notices: Element<'a, M>,
     body: Option<Element<'a, M>>,
     footer: Option<Element<'a, M>>,
@@ -5437,13 +5531,16 @@ fn worktree_panel_chrome_with_footer<'a, M: 'a>(
     let spacing = cosmic::theme::spacing();
     // The divider is the header's bottom edge; spacing would move it below
     // the tab strip's matching rule.
-    let mut chrome = widget::column::with_capacity(3).spacing(0);
+    let mut chrome = widget::column::with_capacity(4).spacing(0);
     chrome = chrome.push(
         widget::container(header)
             .padding([0, spacing.space_xxs])
             .width(Length::Fill),
     );
     chrome = chrome.push(crate::design::horizontal_rule());
+    // Always a child, so the notices below keep their index as the row
+    // comes and goes; see `source_control_notices`.
+    chrome = chrome.push(widget::column::with_children(tabs).width(Length::Fill));
     chrome = chrome.push(
         widget::container(notices)
             .padding([0, spacing.space_xxs])
@@ -5809,37 +5906,38 @@ fn visible_file_rows<'a>(
     (visible, hidden)
 }
 
-fn list_mode_controls<'a>(
+/// The tree/flat switch for a list of changed files, as one action that
+/// names the arrangement it switches to. Two segments for a two-state choice
+/// drew a second selector beside the panel's navigation.
+fn list_mode_toggle<'a>(
     key: &ActiveWorktreeKey,
-    selected: FileListMode,
+    chrome: &SourceControlChrome,
+    current: FileListMode,
     modal_open: bool,
 ) -> Element<'a, SidebarAction> {
-    crate::ui_controls::segmented_controls(
-        [
-            (
-                "Tree file list",
-                "view-list-tree-symbolic",
-                FileListMode::Tree,
-            ),
-            ("Flat file list", "view-list-symbolic", FileListMode::Flat),
-        ]
-        .into_iter()
-        .map(|(label, icon, mode)| {
-            let action = SidebarAction::SetChangeListMode {
+    let (label, icon, mode) = match current {
+        FileListMode::Tree => ("View as list", "view-list-symbolic", FileListMode::Flat),
+        FileListMode::Flat => (
+            "View as tree",
+            "view-list-tree-symbolic",
+            FileListMode::Tree,
+        ),
+    };
+    crate::ui_controls::icon_control(
+        crate::ui_controls::symbolic_icon(icon),
+        label,
+        false,
+        !modal_open,
+        gated(
+            SidebarAction::SetChangeListMode {
                 key: key.clone(),
                 mode,
-            };
-            crate::ui_controls::icon_control(
-                crate::ui_controls::symbolic_icon(icon),
-                label,
-                selected == mode,
-                !modal_open,
-                gated(action, modal_open),
-            )
-            .into()
-        })
-        .collect(),
+            },
+            modal_open,
+        ),
     )
+    .id(chrome.list_mode_id.clone())
+    .into()
 }
 
 fn changes_section<'a>(
@@ -5936,7 +6034,6 @@ fn branch_changes_section<'a>(
     let branch = match &source.branch_changes {
         BranchChanges::Ready(branch) => branch,
         other => {
-            column = column.push(design::heading("Branch changes"));
             return match other {
                 BranchChanges::Unavailable(reason) => column.push(design::caption(*reason)).into(),
                 BranchChanges::Loading(base_ref) => column
@@ -5969,9 +6066,9 @@ fn branch_changes_section<'a>(
             };
         }
     };
-    column = column
-        .push(design::heading(&*branch.title))
-        .push(design::caption(&*branch.base_label));
+    // The tab above already names the view and counts its rows; the body
+    // says only what the rows were measured against.
+    column = column.push(design::caption(&*branch.base_label));
     if branch.rows.is_empty() {
         return column
             .push(design::caption(
@@ -11666,6 +11763,195 @@ pub(crate) mod tests {
                  from {tab:?} it published {offered:?}"
             );
         }
+    }
+
+    /// The standalone editor's sidebar has one row of navigation: the three
+    /// panels. It never also offers the Git views, which that host does not
+    /// load, and a view's option appears only on the view it arranges.
+    #[test]
+    fn the_standalone_sidebar_offers_one_level_of_navigation() {
+        let renderer = headless_renderer();
+        let model = panel_model();
+        let state = panel_state(&model);
+        for panel in WorktreePanel::ALL {
+            let published = frame_enter_presses(
+                &renderer,
+                worktree_sidebar(&model, &state, 380.0, false, panel),
+            );
+            let offered: Vec<WorktreePanel> = published
+                .iter()
+                .filter_map(|action| match action {
+                    SidebarAction::SetWorktreePanel { panel } => Some(*panel),
+                    _ => None,
+                })
+                .collect();
+            let expected: Vec<WorktreePanel> = WorktreePanel::ALL
+                .into_iter()
+                .filter(|it| *it != panel)
+                .collect();
+            assert_eq!(
+                offered, expected,
+                "from {panel:?} it published {published:?}"
+            );
+            assert!(
+                !published
+                    .iter()
+                    .any(|action| matches!(action, SidebarAction::SetChangesTab { .. })),
+                "a second row of Git views is a second level of navigation; {panel:?} \
+                 published {published:?}"
+            );
+            assert_eq!(
+                published
+                    .iter()
+                    .any(|action| matches!(action, SidebarAction::ToggleFilesFilter { .. })),
+                panel == WorktreePanel::Files,
+                "only Files offers the file filter; {panel:?} published {published:?}"
+            );
+            assert_eq!(
+                published
+                    .iter()
+                    .any(|action| matches!(action, SidebarAction::SetChangeListMode { .. })),
+                panel == WorktreePanel::Changes,
+                "only a list of changed files offers tree/list; {panel:?} published \
+                 {published:?}"
+            );
+        }
+    }
+
+    /// A Git view the standalone editor never loads cannot be left selected
+    /// behind its back: its Changes panel is the working tree, whatever the
+    /// shared state last recorded.
+    #[test]
+    fn the_standalone_changes_panel_is_always_the_working_tree() {
+        let renderer = headless_renderer();
+        let model = panel_model();
+        let mut state = panel_state(&model);
+        for tab in ChangesTab::ALL {
+            state.changes_tab = tab;
+            let published = frame_enter_presses(
+                &renderer,
+                worktree_sidebar(&model, &state, 380.0, false, WorktreePanel::Changes),
+            );
+            assert!(
+                published
+                    .iter()
+                    .any(|action| matches!(action, SidebarAction::Stage { .. })),
+                "with {tab:?} recorded the panel must still draw the working tree; it \
+                 published {published:?}"
+            );
+        }
+    }
+
+    /// A plain folder has only files, and one tab is not a choice.
+    #[test]
+    fn a_plain_folder_draws_no_panel_tabs() {
+        let renderer = headless_renderer();
+        let mut model = panel_model();
+        let source = model
+            .source_control
+            .as_mut()
+            .expect("the fixture binds a source");
+        source.branch = None;
+        source.head_oid = None;
+        source.detached = false;
+        source.unborn = false;
+        assert!(!source.offers_changes());
+        let state = panel_state(&model);
+        let published = frame_enter_presses(
+            &renderer,
+            worktree_sidebar(&model, &state, 380.0, false, WorktreePanel::Files),
+        );
+        assert!(
+            !published
+                .iter()
+                .any(|action| matches!(action, SidebarAction::SetWorktreePanel { .. })),
+            "it published {published:?}"
+        );
+    }
+
+    /// The tree/flat choice arranges changed files, so History, a list of
+    /// commits, does not offer it; and the one control names the arrangement
+    /// it switches to.
+    #[test]
+    fn the_list_mode_toggle_follows_the_view_it_arranges() {
+        let renderer = headless_renderer();
+        let model = panel_model();
+        let mut state = panel_state(&model);
+        for tab in ChangesTab::ALL {
+            state.changes_tab = tab;
+            let modes: Vec<FileListMode> =
+                frame_enter_presses(&renderer, git_panel(&model, &state, 380.0, false))
+                    .into_iter()
+                    .filter_map(|action| match action {
+                        SidebarAction::SetChangeListMode { mode, .. } => Some(mode),
+                        _ => None,
+                    })
+                    .collect();
+            let expected = if tab == ChangesTab::History {
+                Vec::new()
+            } else {
+                vec![FileListMode::Flat]
+            };
+            assert_eq!(modes, expected, "{tab:?}");
+        }
+        state.changes_tab = ChangesTab::Changes;
+        state.apply(&SidebarAction::SetChangeListMode {
+            key: main_key(),
+            mode: FileListMode::Flat,
+        });
+        let names = accessible_names(&renderer, git_panel(&model, &state, 380.0, false));
+        assert!(names.iter().any(|name| name == "View as tree"), "{names:?}");
+        assert!(
+            !names.iter().any(|name| name == "View as list"),
+            "{names:?}"
+        );
+    }
+
+    /// Every tab is named in words; none is an unlabeled glyph.
+    #[test]
+    fn every_panel_tab_is_named() {
+        let renderer = headless_renderer();
+        let model = panel_model();
+        let state = panel_state(&model);
+        let names = accessible_names(&renderer, git_panel(&model, &state, 380.0, false));
+        for tab in ChangesTab::ALL {
+            assert!(
+                names.iter().any(|name| name == tab.description()),
+                "{tab:?} is missing from {names:?}"
+            );
+        }
+        let names = accessible_names(
+            &renderer,
+            worktree_sidebar(&model, &state, 380.0, false, WorktreePanel::Files),
+        );
+        for panel in WorktreePanel::ALL {
+            assert!(
+                names.iter().any(|name| name == panel.description()),
+                "{panel:?} is missing from {names:?}"
+            );
+        }
+    }
+
+    /// The Changes tab counts changed files, not group rows: a file with
+    /// both staged and unstaged edits is one change.
+    #[test]
+    fn the_changes_count_is_distinct_paths() {
+        assert_eq!(source_control().change_count_label.as_deref(), Some("4"));
+        let mut snapshot = snapshot();
+        snapshot.status.entries.push(changed(
+            repo_path("src/app.rs"),
+            ChangeArea::Unstaged,
+            ChangeKind::Modified,
+            Some((1, 0)),
+        ));
+        let source = SourceControlModel::ready(main_key(), &snapshot);
+        assert_eq!(source.change_count_label.as_deref(), Some("4"));
+        let mut clean = self::snapshot();
+        clean.status.entries.clear();
+        assert_eq!(
+            SourceControlModel::ready(main_key(), &clean).change_count_label,
+            None
+        );
     }
 
     /// Committing belongs to the working tree, and the working tree is one of

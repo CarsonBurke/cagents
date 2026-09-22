@@ -391,11 +391,13 @@ cagents ui
   pull request once GitHub has been read. **Alt+V** marks the open file viewed
   and moves on, **Alt+Down / Alt+Up** step through files. Settings → Links →
   **Open pull requests in** switches rows back to plain links.
-  The Changes tab highlights local or committed branch changes; committed files
-  appear below staged and unstaged files, compared against the known default
-  branch's merge base. Switch from **Changes** to **History** to browse commits,
-  open a commit's changed files, and inspect their diffs against its first parent
-  (or the empty tree for an initial commit). The Pull request inspector groups
+  The Source control panel has one row of views, each with its count:
+  **Changes** lists uncommitted staged, unstaged, and untracked files;
+  **Branch** lists everything the branch changed since its merge base with the
+  known default branch; **History** browses commits, opens a commit's changed
+  files, and inspects their diffs against its first parent (or the empty tree
+  for an initial commit). The tree/list toggle in the panel header applies to
+  the two file-list views. The Pull request inspector groups
   description, checks, and discussion in collapsible sections.
   Visible repository views refresh automatically while
   the application is focused. File filters open from their search icons.
@@ -488,8 +490,8 @@ Service failures appear in the header's **Notices** tray, with readable error
 details and server stderr rather than a log block below the buffer. Closing the
 tray preserves the evidence; **Dismiss notices** clears it.
 
-A Git tab's sidebar has a third **Pull requests** panel beside Files and
-Changes. It lists the open pull requests of the GitHub repository the tab's
+A Git tab's sidebar switches between **Files**, **Changes**, and **Pull
+requests** in one tab row beneath the worktree name. It lists the open pull requests of the GitHub repository the tab's
 remotes name, `origin` first, through the `gh` CLI; choosing one fetches its
 range and shows its changed files with their GitHub viewed marks, and each file
 opens as a diff in the tab. The same **Alt+V**, **Alt+Down**, and **Alt+Up**
