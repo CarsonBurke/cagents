@@ -1,0 +1,16 @@
+{
+  "type": "rate_limit_event",
+  "rate_limit_info": {
+    "status": "allowed_warning",
+    "resetsAt": 1790186400,
+    "rateLimitType": "seven_day",
+    "utilization": 1.04,
+    "unifiedWindows": {
+      "five_hour": {"utilization": 0.43, "resetsAt": 1790119800},
+      "seven_day": {"utilization": 1.04, "resetsAt": 1790186400}
+    },
+    "isUsingOverage": false
+  },
+  "uuid": "00000000-0000-4000-8000-000000000001",
+  "session_id": "00000000-0000-4000-8000-000000000002"
+}

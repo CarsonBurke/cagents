@@ -72,6 +72,10 @@ pub const SPINNER_ARC_SPAN: f32 = 0.75;
 pub const RADIAL_GAUGE_SIZE: f32 = 16.0;
 pub const RADIAL_GAUGE_STROKE: f32 = 3.0;
 
+/// The height of a linear budget gauge: enough to read as a bar at a glance
+/// without taking a row of its own.
+pub const BUDGET_BAR_HEIGHT: f32 = 4.0;
+
 /// Where a budget stops being a detail and becomes a decision.
 ///
 /// Below the first threshold the figure is background. Above the second the

@@ -112,6 +112,9 @@ pub fn symbolic_icon(name: &str) -> widget::icon::Handle {
     static INFO: LazyLock<widget::icon::Handle> = LazyLock::new(|| {
         widget::icon::from_svg_bytes(br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16"><g fill="none" stroke="black" stroke-width="1.4" stroke-linecap="round"><circle cx="8" cy="8" r="5.5"/><path d="M8 7.2v4.1M8 5.2h0"/></g></svg>"#.as_slice()).symbolic(true)
     });
+    static POP_OUT: LazyLock<widget::icon::Handle> = LazyLock::new(|| {
+        widget::icon::from_svg_bytes(br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16"><g fill="none" stroke="black" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><path d="M13 9v3.5a1 1 0 0 1-1 1H3.5a1 1 0 0 1-1-1V4a1 1 0 0 1 1-1H7M10 2.5h3.5V6M13.5 2.5 8 8"/></g></svg>"#.as_slice()).symbolic(true)
+    });
     static CLOSE: LazyLock<widget::icon::Handle> = LazyLock::new(|| {
         widget::icon::from_svg_bytes(br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16"><path d="M4.75 4.75l6.5 6.5M11.25 4.75l-6.5 6.5" fill="none" stroke="black" stroke-width="1.5" stroke-linecap="round"/></svg>"#.as_slice()).symbolic(true)
     });
@@ -180,6 +183,7 @@ pub fn symbolic_icon(name: &str) -> widget::icon::Handle {
         "document-open-recent-symbolic" => HISTORY.clone(),
         "dialog-information-symbolic" => INFO.clone(),
         "window-close-symbolic" => CLOSE.clone(),
+        "view-pop-out-symbolic" => POP_OUT.clone(),
         _ => widget::icon::from_name(name).handle(),
     }
 }
@@ -895,6 +899,106 @@ impl<Message> cosmic::iced::advanced::Widget<Message, cosmic::Theme, cosmic::Ren
     }
 }
 
+/// The filled width of a linear gauge `width` wide at `fraction`, clamped the
+/// same way as [`radial_sweep`]: past full is full, and a non-finite figure
+/// fills nothing.
+fn bar_fill(width: f32, fraction: f32) -> f32 {
+    let filled = if fraction.is_finite() {
+        fraction.clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    width * filled
+}
+
+/// A thin horizontal gauge the width of its row, for a list of budgets read
+/// against each other.
+///
+/// The ring is right where a budget sits beside a caption; where several
+/// windows are listed one under another, bars of one length let the eye
+/// compare them down the column, which rings of one size cannot.
+pub fn budget_bar<'a, Message: 'a>(
+    fraction: f32,
+    tone: crate::design::Tone,
+) -> Element<'a, Message> {
+    Element::new(BudgetBar { fraction, tone })
+}
+
+struct BudgetBar {
+    fraction: f32,
+    tone: crate::design::Tone,
+}
+
+impl<Message> cosmic::iced::advanced::Widget<Message, cosmic::Theme, cosmic::Renderer>
+    for BudgetBar
+{
+    fn size(&self) -> cosmic::iced::Size<Length> {
+        cosmic::iced::Size {
+            width: Length::Fill,
+            height: Length::Fixed(crate::design::BUDGET_BAR_HEIGHT),
+        }
+    }
+
+    fn layout(
+        &mut self,
+        _tree: &mut cosmic::iced::advanced::widget::Tree,
+        _renderer: &cosmic::Renderer,
+        limits: &cosmic::iced::advanced::layout::Limits,
+    ) -> cosmic::iced::advanced::layout::Node {
+        cosmic::iced::advanced::layout::atomic(
+            limits,
+            Length::Fill,
+            crate::design::BUDGET_BAR_HEIGHT,
+        )
+    }
+
+    fn draw(
+        &self,
+        _tree: &cosmic::iced::advanced::widget::Tree,
+        renderer: &mut cosmic::Renderer,
+        theme: &cosmic::Theme,
+        _style: &cosmic::iced::advanced::renderer::Style,
+        layout: cosmic::iced::advanced::Layout<'_>,
+        _cursor: cosmic::iced::mouse::Cursor,
+        _viewport: &cosmic::iced::Rectangle,
+    ) {
+        use cosmic::iced::advanced::Renderer as _;
+
+        let bounds = layout.bounds();
+        let radius = bounds.height / 2.0;
+        renderer.fill_quad(
+            cosmic::iced::advanced::renderer::Quad {
+                bounds,
+                border: iced::Border {
+                    radius: radius.into(),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            crate::design::track(theme),
+        );
+        let filled = bar_fill(bounds.width, self.fraction);
+        if filled > 0.0 {
+            renderer.fill_quad(
+                cosmic::iced::advanced::renderer::Quad {
+                    bounds: cosmic::iced::Rectangle {
+                        // Never narrower than the bar is tall, so a sliver of
+                        // use still reads as a rounded mark rather than a seam.
+                        width: filled.max(bounds.height).min(bounds.width),
+                        ..bounds
+                    },
+                    border: iced::Border {
+                        radius: radius.into(),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+                self.tone.resolve(theme),
+            );
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1003,6 +1107,15 @@ mod tests {
     /// The ring is the only thing a reader looks at before deciding to
     /// compact, so a full budget has to look full and an empty one has to
     /// draw no sweep at all rather than a stray dot at twelve o'clock.
+    #[test]
+    fn the_bar_fill_is_the_clamped_fraction_of_its_width() {
+        assert_eq!(bar_fill(200.0, 0.25), 50.0);
+        assert_eq!(bar_fill(200.0, 1.7), 200.0);
+        for nothing in [0.0, -1.0, f32::NAN, f32::INFINITY] {
+            assert_eq!(bar_fill(200.0, nothing), 0.0, "{nothing} filled the bar");
+        }
+    }
+
     #[test]
     fn the_radial_sweep_is_the_fraction_of_the_budget_in_use() {
         let quarter = radial_sweep(0.25).expect("a quarter of a budget is a sweep");

@@ -243,6 +243,18 @@ fn settings_category_controls<'a>(
                         1.0,
                         "×",
                     ),
+                    setting_field(
+                        "Status bar",
+                        "A thin bar along the bottom of the window showing how much of each signed-in Claude Code and Codex account's usage limits is left.",
+                        crate::settings_widgets::toggle(
+                            "Show the status bar",
+                            draft.show_status_bar,
+                            |enabled| Message::SettingsChanged {
+                                field: SettingsField::ShowStatusBar,
+                                value: enabled.to_string(),
+                            },
+                        ),
+                    ),
                 ],
             ),
             settings_group(

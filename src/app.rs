@@ -1,3 +1,4 @@
+mod account_ui;
 mod agent_ui;
 mod branch_ui;
 mod channel_ui;
@@ -1302,8 +1303,8 @@ pub(super) fn fresh_terminal_session(launch: LaunchRecipe) -> TerminalSession {
     TerminalSession {
         recovery_origin: None,
         id,
+        transcript_path: transcript_path_for(&launch, id),
         launch: launch.clone(),
-        transcript_path: terminal_transcript_path(id),
         resume_hint: None,
         continuity: TerminalContinuity::RelaunchAvailable {
             recipe: launch,
@@ -1369,10 +1370,20 @@ fn fresh_terminal_relaunch(session: &TerminalSession) -> TerminalSession {
         recovery_origin: Some(session.recovery_origin.unwrap_or(session.id)),
         id,
         launch: recipe.clone(),
-        transcript_path: terminal_transcript_path(id),
+        transcript_path: transcript_path_for(&recipe, id),
         resume_hint,
         continuity: TerminalContinuity::RelaunchAvailable { recipe, last_exit },
     }
+}
+
+/// Where a new, relaunched or cloned terminal records its output: nowhere
+/// for a provider sign-in, whose screen can carry a pasted authorization
+/// code.
+fn transcript_path_for(recipe: &LaunchRecipe, id: TerminalId) -> Option<PathBuf> {
+    if account_ui::is_sign_in(recipe) {
+        return None;
+    }
+    terminal_transcript_path(id)
 }
 
 fn repository_refresh_targets(projects: &[SidebarProject]) -> Vec<(PathBuf, ProjectId)> {
@@ -1961,6 +1972,7 @@ fn user_workspace_message_blocked_while_modal(message: &Message) -> bool {
         Message::ChatUi(action) => !action.allowed_while_modal(),
         Message::ChromeUi(action) => !matches!(action, chrome_ui::Action::Close),
         Message::ChannelUi(action) => !action.answers_own_dialog(),
+        Message::AccountUi(action) => action.blocked_while_modal(),
         Message::UpdateUi(update_ui::Action::Apply) => true,
         Message::PullRequestUi(action) => !action.allowed_while_modal(),
         Message::PullRequestReview { action, .. } => !action.allowed_while_modal(),
@@ -2170,6 +2182,7 @@ pub enum SettingsField {
     EditorAutoSave,
     EditorWrapLines,
     ChatEnterSends,
+    ShowStatusBar,
     EditorSyntaxTheme,
     ConfirmTerminalClose,
     FocusFollowsMouse,
@@ -2264,6 +2277,7 @@ struct SettingsDraft {
     editor_syntax_theme: settings::EditorSyntaxTheme,
     confirm_terminal_close: bool,
     chat_enter_sends: bool,
+    show_status_bar: bool,
     focus_follows_mouse: bool,
     link_open_destination: LinkOpenDestination,
     link_open_gesture: LinkOpenGesture,
@@ -2306,6 +2320,7 @@ impl SettingsDraft {
             editor_wrap_lines: settings.editor_wrap_lines,
             confirm_terminal_close: settings.confirm_terminal_close,
             chat_enter_sends: settings.chat_enter_sends,
+            show_status_bar: settings.show_status_bar,
             editor_syntax_theme: settings.editor_syntax_theme,
             focus_follows_mouse: settings.focus_follows_mouse,
             link_open_destination: settings.link_open_destination,
@@ -2337,6 +2352,7 @@ impl SettingsDraft {
             SettingsField::EditorWrapLines => self.editor_wrap_lines = value == "true",
             SettingsField::ConfirmTerminalClose => self.confirm_terminal_close = value == "true",
             SettingsField::ChatEnterSends => self.chat_enter_sends = value == "true",
+            SettingsField::ShowStatusBar => self.show_status_bar = value == "true",
             SettingsField::EditorSyntaxTheme => {
                 if let Some(theme) = settings::EditorSyntaxTheme::from_key(&value) {
                     self.editor_syntax_theme = theme;
@@ -2427,6 +2443,10 @@ fn settings_update(
             .parse::<bool>()
             .map(|enabled| next.chat_enter_sends = enabled)
             .map_err(|_| "Choose which key sends a chat message.".to_owned()),
+        SettingsField::ShowStatusBar => value
+            .parse::<bool>()
+            .map(|enabled| next.show_status_bar = enabled)
+            .map_err(|_| "Choose whether the status bar is shown.".to_owned()),
         SettingsField::WorktreeSort => match value {
             "newest" => {
                 next.worktree_sort = settings::WorktreeSort::Newest;
@@ -2904,6 +2924,7 @@ pub enum Message {
     BranchUi(branch_ui::Action),
     CommitUi(history_ui::Action),
     RefreshUi(refresh_ui::Action),
+    AccountUi(account_ui::Action),
     /// The shell's light or dark mode changed, so a rendered document page no
     /// longer matches the surface it sits on.
     DocumentToneStale,
@@ -3368,6 +3389,7 @@ pub struct Cagents {
     branch_ui: branch_ui::State,
     history_ui: history_ui::State,
     refresh_ui: refresh_ui::State,
+    account_ui: account_ui::State,
     chrome_ui: chrome_ui::State,
     pull_request_inspector: pull_request_ui::State,
     sidebar_state: SidebarState,
@@ -4061,7 +4083,7 @@ impl Cagents {
                     last_exit: None,
                 };
                 session.resume_hint = None;
-                session.transcript_path = terminal_transcript_path(session.id);
+                session.transcript_path = transcript_path_for(&session.launch, session.id);
             }
             CardKind::Chat(session) => {
                 let Some(recipe) =
@@ -6351,13 +6373,7 @@ impl Cagents {
                 &self.settings_search,
                 self.settings_feedback.as_ref(),
             ),
-            Some(CardRuntime::Accounts) => widget::container(
-                design::caption("Account usage appears here in a later version of cagents.")
-                    .wrapping(cosmic::iced::widget::text::Wrapping::Word),
-            )
-            .center(Length::Fill)
-            .padding(spacing.space_m)
-            .into(),
+            Some(CardRuntime::Accounts) => self.accounts_pane(),
             Some(CardRuntime::Completed) => {
                 widget::container(design::body(ended_terminal(card).map_or_else(
                     || "Process finished successfully.".to_string(),
@@ -8602,6 +8618,7 @@ impl Cagents {
                     SettingsField::AppTheme | SettingsField::UiScale => {
                         self.synchronize_appearance(previous_scale)
                     }
+                    SettingsField::ShowStatusBar => self.accounts_surface_changed(),
                     SettingsField::MaxHotCards => cosmic::task::message(Message::LifecycleSweep),
                     SettingsField::HibernationDelayMs => {
                         // Reconciled here rather than through a queued
@@ -8903,6 +8920,7 @@ impl Application for Cagents {
             branch_ui: branch_ui::State::default(),
             history_ui: history_ui::State::default(),
             refresh_ui: refresh_ui::State::default(),
+            account_ui: account_ui::State::installation(),
             chrome_ui: chrome_ui::State::default(),
             pull_request_inspector: pull_request_ui::State::default(),
             active_workspace: None,
@@ -9056,6 +9074,7 @@ impl Application for Cagents {
             app.initialize_runtimes(),
             app.synchronize_appearance(1.0),
             app.update_update_ui(update_ui::Action::Check),
+            app.load_accounts(),
         ];
         #[cfg(feature = "integrated-browser")]
         tasks.push(cosmic::task::message(Message::InitializeBrowserFactory));
@@ -11022,6 +11041,9 @@ impl Application for Cagents {
                 if let Some(task) = self.chrome_key_event(&event) {
                     return task;
                 }
+                if let Some(task) = self.account_key_event(&event) {
+                    return task;
+                }
                 // A widget that consumed Escape has already answered it - a
                 // focused terminal clearing its selection, for one. Running the
                 // chain anyway would close the inspector behind it in the same
@@ -11257,14 +11279,27 @@ impl Application for Cagents {
             Message::ChromeUi(action) => self.update_chrome(action),
             Message::ChannelUi(action) => self.handle_channel_ui(action),
             Message::BranchUi(action) => self.update_branch_ui(action),
+            Message::AccountUi(action) => self.update_account_ui(action),
             Message::RefreshUi(action) => {
                 if matches!(&action, refresh_ui::Action::Focused(id, false) if self.core.main_window_id() == Some(*id))
                 {
                     self.tab_history.finish(self.workspace.focused());
                 }
+                let account_focus = match action {
+                    refresh_ui::Action::Focused(id, focused)
+                        if self.core.main_window_id() == Some(id) =>
+                    {
+                        Some((focused, focused && !self.refresh_ui.focused))
+                    }
+                    _ => None,
+                };
                 // A colour-only theme change reaches the hook but not the mode
                 // watch, so the periodic refresh is where that one is caught.
-                Task::batch([self.update_refresh(action), self.flush_document_tone()])
+                let refresh = self.update_refresh(action);
+                let accounts = account_focus.map_or_else(Task::none, |(focused, regained)| {
+                    self.accounts_focus_changed(focused, regained)
+                });
+                Task::batch([refresh, self.flush_document_tone(), accounts])
             }
             Message::DocumentToneStale => {
                 self.document_tone_stale = self.settings.app_theme == AppTheme::System;
@@ -11488,6 +11523,7 @@ impl Application for Cagents {
         let mut subscriptions = vec![
             self.chat_subscription(),
             self.refresh_subscription(),
+            self.account_subscription(),
             self.document_tone_subscription(),
             self.terminal_agent_activity_subscription(),
             self.update_subscription(),
@@ -12154,6 +12190,16 @@ impl Application for Cagents {
                 .width(Length::Fill)
                 .into()
         };
+        // The bar comes and goes, but the tree around the workspace must not:
+        // iced matches widget state by position, so wrapping the surface only
+        // while the bar shows would reset every scroll offset and focus in it.
+        let bar = self
+            .status_bar()
+            .unwrap_or_else(|| iced::widget::Space::new().height(Length::Shrink).into());
+        let surface: Element<'_, Message> = widget::column::with_children(vec![surface, bar])
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .into();
         let surface = crate::interaction::drive_animation(
             surface,
             self.workspace.is_animating() || self.context_inspector_transition.is_some(),
@@ -16646,6 +16692,7 @@ mod tests {
             branch_ui: branch_ui::State::default(),
             history_ui: history_ui::State::default(),
             refresh_ui: refresh_ui::State::default(),
+            account_ui: account_ui::State::default(),
             active_workspace: None,
             worktree_focus: HashMap::new(),
             channel_offsets: HashMap::new(),

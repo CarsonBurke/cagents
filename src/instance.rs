@@ -110,7 +110,7 @@ fn slot_socket_name(slot: &str) -> String {
     }
 }
 
-fn owned_lock(path: &Path, operation: i32) -> io::Result<File> {
+pub(crate) fn owned_lock(path: &Path, operation: i32) -> io::Result<File> {
     let lock = OpenOptions::new()
         .create(true)
         .read(true)

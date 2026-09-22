@@ -12,7 +12,7 @@ mod omp;
 pub(crate) mod observe;
 
 // Declaration order is persisted by the binary IPC codec and indexes ADAPTERS.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum Provider {
     Omp,
     Claude,
@@ -108,11 +108,20 @@ impl Provider {
                 launch.arguments.as_slice(),
             )
         };
-        // Shared servers and tool commands do not own the foreground conversation.
+        // Shared servers, tool commands and account management do not own the
+        // foreground conversation: a terminal signing in is not an agent.
         if arguments.first().is_some_and(|arg| {
             matches!(
                 arg.as_str(),
-                "app-server" | "exec" | "review" | "mcp-server" | "proxy" | "agents"
+                "app-server"
+                    | "exec"
+                    | "review"
+                    | "mcp-server"
+                    | "proxy"
+                    | "agents"
+                    | "auth"
+                    | "login"
+                    | "logout"
             ) || arg.starts_with("__omp_")
         }) {
             return None;
@@ -372,6 +381,9 @@ mod tests {
             launch("node", &["/tmp/tool.js", "codex"]),
             launch("omp", &["__omp_worker"]),
             launch("codex", &["exec"]),
+            launch("claude", &["auth", "login"]),
+            launch("codex", &["login"]),
+            launch("/usr/bin/codex", &["logout"]),
         ] {
             assert_eq!(Provider::recognize_launch(&recipe), None);
         }
