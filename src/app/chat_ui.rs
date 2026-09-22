@@ -2036,13 +2036,14 @@ impl Cagents {
     /// the terminal's close never races the actor that owns it.
     pub(super) fn begin_chat_close(&mut self, card: CardId) -> Task<Message> {
         if self.chat_ui.closed.contains(&card) {
-            // The removal is already reserved. Its commit is only resent,
-            // which is what makes a close whose commit was dropped (say,
-            // while an update was being prepared) recoverable by closing again.
-            return match self.workspace.pending_close() {
-                Some(handoff) if handoff.unmounting == card => self.card_removal(handoff),
-                _ => Task::none(),
-            };
+            // The conversation is already given up; only the removal is
+            // left. Its commit is resent, and its reservation retaken if a
+            // rebuilt strip lost it, which is what makes a close whose commit
+            // was dropped (say, while an update was being prepared)
+            // recoverable by closing again.
+            return self
+                .reserve_chat_removal(card)
+                .map_or_else(Task::none, |handoff| self.card_removal(handoff));
         }
         if self
             .chat_ui
@@ -4366,6 +4367,20 @@ mod tests {
             }
             assert!(app.channel_ui.was_deleted(channel));
         }
+    }
+
+    /// A closed chat whose commit was dropped and whose reservation a rebuilt
+    /// strip lost closes again when asked, instead of staying on screen with
+    /// its conversation already given up.
+    #[test]
+    fn a_closed_chat_that_lost_its_reservation_closes_again() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let card = failed_chat(&mut app);
+        let _ = app.update(Message::CloseCard(card));
+        assert!(app.chat_close_approved(card));
+        app.workspace.cancel_close(card).unwrap();
+        assert_eq!(app.workspace.pending_close(), None);
+        close_chat(&mut app, card);
     }
 
     /// Retry between a chat's close and its commit starts nothing, and a start
