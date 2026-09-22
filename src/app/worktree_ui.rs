@@ -322,6 +322,47 @@ impl Cagents {
         selected.map(resolve)
     }
 
+    /// Refresh which worktree rows hold an open pane after state changes,
+    /// never during rendering.
+    ///
+    /// A pane belongs to the worktree `card_worktree` files it under, the path
+    /// attribution agent updates use too, though every card kind counts here
+    /// rather than only agents: any open pane is work in front of the user.
+    /// Global cards (browsers, pull request lists) and channel cards are
+    /// nobody's worktree, so neither counts. A path listed under two projects
+    /// marks both rows.
+    ///
+    /// This runs after every update, terminal output included, so channel
+    /// membership is collected once rather than rescanned per card.
+    pub(super) fn refresh_sidebar_worktree_panes(&mut self) {
+        let channeled = self
+            .durable
+            .channels
+            .iter()
+            .flat_map(|channel| channel.cards.iter().copied())
+            .collect::<HashSet<_>>();
+        let occupied = self
+            .durable
+            .cards
+            .iter()
+            .filter(|card| card.existence.is_open() && !channeled.contains(&card.id))
+            .filter_map(|card| self.unchanneled_card_worktree(card))
+            .collect::<HashSet<_>>();
+        let worktrees = self
+            .sidebar_model
+            .projects
+            .iter()
+            .flat_map(|project| {
+                project
+                    .worktrees
+                    .iter()
+                    .filter(|worktree| occupied.contains(worktree.path.as_path()))
+                    .map(move |worktree| (project.id, worktree.id))
+            })
+            .collect();
+        self.sidebar_state.set_worktrees_with_panes(worktrees);
+    }
+
     pub(super) fn card_worktree<'a>(&'a self, card: &'a CardState) -> Option<&'a Path> {
         if self
             .durable
@@ -331,6 +372,11 @@ impl Cagents {
         {
             return None;
         }
+        self.unchanneled_card_worktree(card)
+    }
+
+    /// `card_worktree` for a card the caller already knows is in no channel.
+    fn unchanneled_card_worktree<'a>(&'a self, card: &'a CardState) -> Option<&'a Path> {
         let directory = card_directory(card)?;
         if let Some(scope) = self
             .worktree_owners
@@ -809,6 +855,96 @@ mod tests {
             },
         });
         card
+    }
+
+    /// The sidebar mutes a worktree row exactly while nothing is open there,
+    /// so the derivation has to follow panes as they open and close, count a
+    /// pane launched deeper inside the worktree, and leave channel cards to
+    /// nobody's worktree.
+    #[test]
+    fn worktree_rows_know_whether_they_hold_an_open_pane() {
+        let mut app = super::super::tests::context_inspector_test_app(false);
+        register_worktrees(&mut app, &["/repo", "/repo/worktree", "/repo/idle"]);
+        let project_id = app.sidebar_model.projects[0].id;
+        let row = |app: &Cagents, path: &str| {
+            app.sidebar_model.projects[0]
+                .worktrees
+                .iter()
+                .find(|worktree| worktree.path == Path::new(path))
+                .expect("registered worktree")
+                .id
+        };
+        let has_panes = |app: &Cagents, path: &str| {
+            app.sidebar_state
+                .worktree_has_panes(project_id, row(app, path))
+        };
+        let root = repository("/repo");
+        let nested = terminal("/repo/worktree/src");
+        let channeled = terminal("/repo/idle");
+        app.durable = Arc::new(WorkspaceState {
+            cards: vec![root.clone(), nested.clone(), channeled.clone()],
+            channels: vec![ProjectChannel {
+                id: ChannelId::new(),
+                project_id,
+                title: "Channel".into(),
+                ordinal: 0,
+                shared: false,
+                cards: vec![channeled.id],
+                focused: Some(channeled.id),
+            }],
+            ..WorkspaceState::default()
+        });
+
+        app.refresh_sidebar_worktree_panes();
+        assert!(has_panes(&app, "/repo"));
+        assert!(has_panes(&app, "/repo/worktree"), "a nested launch counts");
+        assert!(
+            !has_panes(&app, "/repo/idle"),
+            "a channel's card belongs to no worktree"
+        );
+
+        let durable = Arc::make_mut(&mut app.durable);
+        durable.cards[1].existence = super::super::project_ui::removed_existence("closed");
+        durable.cards[0].existence = Existence::Closing {
+            operation_id: crate::model::OperationId::new(),
+        };
+        app.refresh_sidebar_worktree_panes();
+        assert!(!has_panes(&app, "/repo"), "a closing pane is already gone");
+        assert!(!has_panes(&app, "/repo/worktree"));
+
+        Arc::make_mut(&mut app.durable)
+            .cards
+            .push(terminal("/repo/idle"));
+        app.refresh_sidebar_worktree_panes();
+        assert!(has_panes(&app, "/repo/idle"), "a newly opened pane counts");
+    }
+
+    /// The derivation is only as live as the update that runs it: closing a
+    /// pane through the ordinary message path has to mute its row.
+    #[test]
+    fn closing_the_last_pane_through_update_mutes_its_worktree() {
+        let mut app = super::super::tests::context_inspector_test_app(false);
+        register_worktrees(&mut app, &["/repo"]);
+        let project_id = app.sidebar_model.projects[0].id;
+        let worktree = app.sidebar_model.projects[0].worktrees[0].id;
+        let shell = terminal("/repo");
+        let id = shell.id;
+        app.durable = Arc::new(WorkspaceState {
+            cards: vec![shell],
+            ..WorkspaceState::default()
+        });
+        // Any message that reaches the end of `update` derives the rows.
+        let _ = app.update(Message::CancelTerminalClose);
+        assert!(app.sidebar_state.worktree_has_panes(project_id, worktree));
+
+        let _ = app.update(Message::CommitClose(id));
+        assert!(
+            !app.durable
+                .cards
+                .iter()
+                .any(|card| card.id == id && card.existence.is_open())
+        );
+        assert!(!app.sidebar_state.worktree_has_panes(project_id, worktree));
     }
 
     fn register_worktrees(app: &mut Cagents, paths: &[&str]) {

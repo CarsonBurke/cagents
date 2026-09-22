@@ -623,6 +623,7 @@ impl Cagents {
                 let mut activity = None;
                 let mut unread = false;
                 let mut chats = 0;
+                let mut has_panes = false;
                 for id in &channel.cards {
                     let Some(card) = durable
                         .cards
@@ -631,6 +632,7 @@ impl Cagents {
                     else {
                         continue;
                     };
+                    has_panes = true;
                     if matches!(&card.kind, CardKind::Chat(_))
                         || matches!(&card.kind, CardKind::Terminal(session)
                             if crate::agent::Provider::recognize_launch(&session.launch).is_some())
@@ -656,6 +658,7 @@ impl Cagents {
                         && row.activity == activity
                         && row.unread == unread
                         && row.chats == chats
+                        && row.has_panes == has_panes
                         && row.ordinal == channel.ordinal
                 });
                 if !unchanged {
@@ -666,6 +669,7 @@ impl Cagents {
                         activity,
                         unread,
                         chats,
+                        has_panes,
                         channel.ordinal,
                     );
                     if index < project.channels.len() {
@@ -928,6 +932,45 @@ mod tests {
         app.refresh_sidebar_channels();
         assert_eq!(app.sidebar_model.projects[0].channels[0].chats, 1);
         assert_eq!(app.sidebar_model.projects[0].channels[0].id, id);
+    }
+
+    /// Any open card makes a channel somewhere the user has work, a plain
+    /// shell included, even though only conversations count as its chats.
+    /// Once the last one closes the row has nothing open and mutes.
+    #[test]
+    fn a_channel_row_holds_panes_while_any_card_in_it_is_open() {
+        let mut app = super::super::tests::context_inspector_test_app(true);
+        let project = ProjectId::new();
+        let shell = app.durable.cards[0].id;
+        Arc::make_mut(&mut app.durable)
+            .channels
+            .push(ProjectChannel {
+                id: ChannelId::new(),
+                project_id: project,
+                title: "Investigation".into(),
+                ordinal: 0,
+                shared: false,
+                cards: vec![shell],
+                focused: Some(shell),
+            });
+        app.sidebar_model.projects.push(SidebarProject::new(
+            project,
+            RepositoryId::new(),
+            "project".into(),
+            "/repo".into(),
+            Vec::new(),
+            Vec::new(),
+        ));
+
+        app.refresh_sidebar_channels();
+        let row = &app.sidebar_model.projects[0].channels[0];
+        assert_eq!(row.chats, 0, "a shell is not a conversation");
+        assert!(row.has_panes, "but it is an open pane");
+
+        Arc::make_mut(&mut app.durable).cards[0].existence =
+            super::super::project_ui::removed_existence("closed");
+        app.refresh_sidebar_channels();
+        assert!(!app.sidebar_model.projects[0].channels[0].has_panes);
     }
 
     #[test]

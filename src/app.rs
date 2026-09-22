@@ -8841,6 +8841,7 @@ impl Application for Cagents {
             }
         }
         app.refresh_sidebar_channels();
+        app.refresh_sidebar_worktree_panes();
         let mut tasks = vec![
             scope,
             app.commit_terminal_handoffs(),
@@ -9231,11 +9232,16 @@ impl Application for Cagents {
                             self.github_availability.remove(&project_id);
                             self.sync_worktree_operation_rows();
                             self.sidebar_model.data_state = SidebarDataState::Ready;
-                            return if open_cards {
+                            let task = if open_cards {
                                 self.select_worktree(worktree, true)
                             } else {
                                 Task::none()
                             };
+                            // This return skips the derived-row tail below, and
+                            // the new row may already hold the pane just opened.
+                            self.refresh_sidebar_channels();
+                            self.refresh_sidebar_worktree_panes();
+                            return task;
                         }
                         if let Some(session) = &self.session {
                             session.save_project(loaded.project.clone());
@@ -11249,6 +11255,7 @@ impl Application for Cagents {
         let notices = self.reconcile_notice_popup();
         self.synchronize_sidebar_selection();
         self.refresh_sidebar_channels();
+        self.refresh_sidebar_worktree_panes();
         let binding = self.rebind_source_control();
         if let Some(source) = self.sidebar_model.source_control.as_ref() {
             let selected = self
