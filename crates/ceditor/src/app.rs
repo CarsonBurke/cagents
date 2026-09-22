@@ -184,6 +184,7 @@ pub enum Message {
     },
     AutoSave(bool),
     WrapLines(bool),
+    LineHeightChanged(String),
     SyntaxTheme(cagents::settings::EditorSyntaxTheme),
     LanguageServerAssistance(bool),
     Theme(AppTheme),
@@ -429,6 +430,7 @@ pub struct Editor {
     shortcut_draft: crate::preferences::EditorShortcuts,
     settings_category: SettingsCategory,
     settings_search: String,
+    line_height_draft: String,
     window_size: iced::Size,
     tab_history: cagents::tab_history::TabHistory<CardId>,
     settings_reset_confirm: bool,
@@ -1395,6 +1397,7 @@ impl Editor {
         runtime.set_standalone(true);
         runtime.set_auto_save(self.settings.editor_auto_save);
         runtime.set_wrap_lines(self.settings.editor_wrap_lines);
+        runtime.set_line_height(self.settings.terminal_line_height);
         runtime.set_syntax_theme(self.settings.editor_syntax_theme);
         let mut sidebar = SidebarModel::ready(
             SidebarMode::Expanded,
@@ -2629,6 +2632,113 @@ impl Editor {
     }
 }
 
+fn tab_strip(editor: &Editor) -> Element<'_, Message> {
+    let tabs: Vec<Element<'_, Message>> = editor
+        .tabs
+        .iter()
+        .map(|tab| {
+            let selected = editor.active == Some(tab.id);
+            let title = format!(
+                "{}{}",
+                if tab.runtime.is_dirty() { "• " } else { "" },
+                tab.title
+            );
+            let icon = tab
+                .pending_file
+                .as_ref()
+                .map(|pending| pending.canonical.as_ref().unwrap_or(&pending.path))
+                .or(tab.owned_file.as_ref())
+                .map_or_else(
+                    || cagents::file_icon::folder(true),
+                    |path| cagents::file_icon::icon(path),
+                );
+            cagents::interaction::hover(cagents::tab_strip::middle_click_close(
+                widget::container(
+                    widget::row::with_children(vec![
+                        cagents::interaction::tooltip(
+                            widget::button::custom(
+                                widget::row::with_children(vec![
+                                    widget::container(icon).center_y(Length::Fill).into(),
+                                    design::body(title.clone())
+                                        .wrapping(iced::widget::text::Wrapping::None)
+                                        .ellipsize(iced::widget::text::Ellipsize::End(
+                                            iced::advanced::text::EllipsizeHeightLimit::Lines(1),
+                                        ))
+                                        .width(Length::Fill)
+                                        .into(),
+                                ])
+                                .spacing(6)
+                                .align_y(iced::Alignment::Center)
+                                .height(Length::Fill)
+                                .width(Length::Fill),
+                            )
+                            .name(title.clone())
+                            .class(tab_title_style())
+                            .padding([0, 8])
+                            .width(Length::Fill)
+                            .height(Length::Fill)
+                            .on_press(Message::Select(tab.id)),
+                            title,
+                        ),
+                        icon_control(
+                            symbolic_icon("window-close-symbolic"),
+                            "Close tab",
+                            false,
+                            !editor.modal_open(),
+                            Some(Message::CloseTab(tab.id)),
+                        )
+                        .into(),
+                    ])
+                    .align_y(iced::Alignment::Center)
+                    .spacing(2)
+                    .height(Length::Fill),
+                )
+                .width(184)
+                .height(design::PRIMARY_CONTROL_SIZE)
+                .class(cosmic::theme::Container::custom(move |theme| {
+                    iced::widget::container::Style {
+                        background: selected.then(|| {
+                            iced::Background::Color(
+                                theme
+                                    .current_container()
+                                    .component
+                                    .selected_state_color()
+                                    .into(),
+                            )
+                        }),
+                        border: iced::Border {
+                            radius: theme.cosmic().corner_radii.radius_s.into(),
+                            ..Default::default()
+                        },
+                        ..Default::default()
+                    }
+                })),
+                Message::CloseTab(tab.id),
+            ))
+        })
+        .collect();
+    // Keep the tab strip on the same fixed baseline as the app header.
+    let mut tab_row = tabs;
+    tab_row.push(
+        icon_control(
+            symbolic_icon("list-add-symbolic"),
+            "New tab (Ctrl+T)",
+            false,
+            !editor.modal_open(),
+            Some(Message::NewTab),
+        )
+        .id(widget::Id::new("ceditor.tabs.new"))
+        .into(),
+    );
+    cagents::tab_strip::horizontal(
+        widget::Id::new("ceditor.tabs"),
+        tab_row,
+        design::PRIMARY_CONTROL_SIZE,
+        design::HEADER_HEIGHT,
+    )
+    .into()
+}
+
 impl Application for Editor {
     type Executor = cosmic::executor::Default;
     type Flags = Flags;
@@ -2680,6 +2790,7 @@ impl Application for Editor {
             }
         }
         let lsp = LspManager::new(settings.language_servers.clone());
+        let line_height_draft = settings.terminal_line_height.to_string();
         let sidebar_open = saved_session.sidebar_open;
         let mut app = Self {
             core,
@@ -2691,6 +2802,7 @@ impl Application for Editor {
             shortcut_draft,
             settings_category: SettingsCategory::Editing,
             settings_search: String::new(),
+            line_height_draft,
             window_size: iced::Size::new(1200.0, 900.0),
             tab_history: cagents::tab_history::TabHistory::default(),
             settings_reset_confirm: false,
@@ -3509,6 +3621,8 @@ impl Application for Editor {
                         tab.runtime.set_auto_save(self.settings.editor_auto_save);
                         tab.runtime.set_wrap_lines(self.settings.editor_wrap_lines);
                         tab.runtime
+                            .set_line_height(self.settings.terminal_line_height);
+                        tab.runtime
                             .set_syntax_theme(self.settings.editor_syntax_theme);
                     }
                     let shortcuts =
@@ -3682,6 +3796,21 @@ impl Application for Editor {
                     self.settings.editor_wrap_lines = enabled;
                     for tab in &mut self.tabs {
                         tab.runtime.set_wrap_lines(enabled);
+                    }
+                    self.save_settings()
+                }
+                Message::LineHeightChanged(value) => {
+                    self.line_height_draft = value.clone();
+                    let Ok(line_height) = value.parse::<f32>() else {
+                        return Task::none();
+                    };
+                    if !(1.0..=2.0).contains(&line_height) {
+                        return Task::none();
+                    }
+                    self.settings.terminal_line_height = line_height;
+                    self.line_height_draft = line_height.to_string();
+                    for tab in &mut self.tabs {
+                        tab.runtime.set_line_height(line_height);
                     }
                     self.save_settings()
                 }
@@ -3967,125 +4096,23 @@ impl Application for Editor {
     fn header_end(&self) -> Vec<Element<'_, Message>> {
         self.notices_control().into_iter().collect()
     }
+    fn header_center(&self) -> Vec<Element<'_, Message>> {
+        vec![tab_strip(self)]
+    }
     fn view(&self) -> Element<'_, Message> {
-        let tabs: Vec<Element<'_, Message>> =
-            self.tabs
-                .iter()
-                .map(|tab| {
-                    let selected = self.active == Some(tab.id);
-                    let title = format!(
-                        "{}{}",
-                        if tab.runtime.is_dirty() { "• " } else { "" },
-                        tab.title
-                    );
-                    let icon = tab
-                        .pending_file
-                        .as_ref()
-                        .map(|pending| pending.canonical.as_ref().unwrap_or(&pending.path))
-                        .or(tab.owned_file.as_ref())
-                        .map_or_else(
-                            || cagents::file_icon::folder(true),
-                            |path| cagents::file_icon::icon(path),
-                        );
-                    cagents::interaction::hover(cagents::tab_strip::middle_click_close(
-                        widget::container(
-                            widget::row::with_children(vec![
-                                cagents::interaction::tooltip(
-                                    widget::button::custom(
-                                        widget::row::with_children(vec![
-                                    widget::container(icon).center_y(Length::Fill).into(),
-                                    design::body(title.clone())
-                                        .wrapping(iced::widget::text::Wrapping::None)
-                                        .ellipsize(iced::widget::text::Ellipsize::End(
-                                            iced::advanced::text::EllipsizeHeightLimit::Lines(1),
-                                        ))
-                                        .width(Length::Fill)
-                                        .into(),
-                                ])
-                                        .spacing(6)
-                                        .align_y(iced::Alignment::Center)
-                                        .height(Length::Fill)
-                                        .width(Length::Fill),
-                                    )
-                                    .name(title.clone())
-                                    .class(tab_title_style())
-                                    .padding([0, 8])
-                                    .width(Length::Fill)
-                                    .height(Length::Fill)
-                                    .on_press(Message::Select(tab.id)),
-                                    title,
-                                ),
-                                icon_control(
-                                    symbolic_icon("window-close-symbolic"),
-                                    "Close tab",
-                                    false,
-                                    !self.modal_open(),
-                                    Some(Message::CloseTab(tab.id)),
-                                )
-                                .into(),
-                            ])
-                            .align_y(iced::Alignment::Center)
-                            .spacing(2)
-                            .height(Length::Fill),
-                        )
-                        .width(184)
-                        .height(design::PRIMARY_CONTROL_SIZE)
-                        .class(cosmic::theme::Container::custom(move |theme| {
-                            iced::widget::container::Style {
-                                background: selected.then(|| {
-                                    iced::Background::Color(
-                                        theme
-                                            .current_container()
-                                            .component
-                                            .selected_state_color()
-                                            .into(),
-                                    )
-                                }),
-                                border: iced::Border {
-                                    radius: theme.cosmic().corner_radii.radius_s.into(),
-                                    ..Default::default()
-                                },
-                                ..Default::default()
-                            }
-                        })),
-                        Message::CloseTab(tab.id),
-                    ))
-                })
-                .collect();
         let mut body = Vec::new();
         // The COSMIC header above has no separator of its own: always rule
         // off the content below it, tabs or placeholder alike.
         body.push(design::horizontal_rule().into());
-        // Keep the tab strip on the same fixed baseline as the app header.
-        let strip = vec![
-            cagents::tab_strip::horizontal(
-                widget::Id::new("ceditor.tabs"),
-                {
-                    let mut tab_row = tabs;
-                    tab_row.push(
-                        icon_control(
-                            symbolic_icon("list-add-symbolic"),
-                            "New tab (Ctrl+T)",
-                            false,
-                            !self.modal_open(),
-                            Some(Message::NewTab),
-                        )
-                        .id(widget::Id::new("ceditor.tabs.new"))
-                        .into(),
-                    );
-                    tab_row
-                },
-                design::PRIMARY_CONTROL_SIZE,
-                design::HEADER_HEIGHT,
-            ),
-            design::horizontal_rule().into(),
-        ];
         if let Some(tab) = self.current() {
             let mut editor = Vec::new();
-            editor.extend(strip);
             let mut toolbar_controls = Vec::new();
             if let Some(toolbar) = repository_widget::selected_file_toolbar(tab.id, &tab.runtime) {
-                toolbar_controls.push(toolbar.map(Message::Repository));
+                toolbar_controls.push(
+                    widget::container(toolbar.map(Message::Repository))
+                        .width(Length::FillPortion(1))
+                        .into(),
+                );
             } else {
                 toolbar_controls.push(iced::widget::Space::new().width(Length::Fill).into());
             }
@@ -4281,7 +4308,6 @@ impl Application for Editor {
                 self.sidebar_transition.is_some(),
             ));
         } else {
-            body.extend(strip);
             body.push(
                 widget::column::with_children(vec![
                     widget::container(
@@ -4511,18 +4537,28 @@ impl Editor {
                         ),
                     ],
                 )],
-                SettingsCategory::Editing => vec![settings_group(
-                    "Editor",
-                    "Shared native editor and diff preferences.",
-                    cagents::settings_widgets::editor_options(
+                SettingsCategory::Editing => {
+                    let mut controls = cagents::settings_widgets::editor_options(
                         self.settings.editor_auto_save,
                         self.settings.editor_wrap_lines,
                         self.settings.editor_syntax_theme,
                         Message::AutoSave,
                         Message::WrapLines,
                         Message::SyntaxTheme,
-                    ),
-                )],
+                    );
+                    controls.push(settings_field(
+                        "Line height",
+                        "Relative spacing between editor lines. Use a value from 1.0 to 2.0.",
+                        widget::text_input("Line height", &self.line_height_draft)
+                            .on_input(Message::LineHeightChanged)
+                            .into(),
+                    ));
+                    vec![settings_group(
+                        "Editor",
+                        "Shared native editor and diff preferences.",
+                        controls,
+                    )]
+                }
                 SettingsCategory::Appearance => vec![settings_group(
                     "Appearance",
                     "Application colors and interface scale.",
@@ -4713,7 +4749,7 @@ impl Editor {
             .width(180)
             .height(Length::Fill);
         let navigation = widget::column::with_children(vec![
-            widget::text_input("Search settings…", &self.settings_search)
+            widget::text_input("Search", &self.settings_search)
                 .id(cagents::settings_widgets::search_id())
                 .on_input(Message::SettingsSearchChanged)
                 .into(),
@@ -4788,6 +4824,7 @@ mod tests {
             shortcut_draft: crate::preferences::EditorShortcuts::default(),
             settings_category: SettingsCategory::Editing,
             settings_search: String::new(),
+            line_height_draft: AppSettings::default().terminal_line_height.to_string(),
             window_size: iced::Size::new(1200.0, 900.0),
             tab_history: cagents::tab_history::TabHistory::default(),
             settings_reset_confirm: false,
@@ -6419,6 +6456,44 @@ mod tests {
             repeated.is_empty(),
             "the changes-to-diff frame mounts {repeated:?} more than once"
         );
+    }
+
+    #[test]
+    fn open_tabs_mount_once_in_the_header_center() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        std::fs::write(root.join("notes.txt"), "alpha\n").unwrap();
+        let mut app = editor();
+        let id = open_git(&mut app, root, Some("notes.txt"), Vec::new());
+        file_loaded(&mut app, id, root, "notes.txt");
+        assert_eq!(app.tab(id).unwrap().title, "notes.txt");
+        assert_eq!(
+            app.header_center().len(),
+            1,
+            "the open tab strip lives in the header center"
+        );
+        let repeated = duplicate_custom_ids(&mut app.view());
+        assert!(
+            repeated.is_empty(),
+            "the header tab strip mounts {repeated:?} more than once"
+        );
+    }
+
+    #[test]
+    fn line_height_setting_applies_to_open_buffers_within_range() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        std::fs::write(root.join("notes.txt"), "alpha\n").unwrap();
+        let mut app = editor();
+        let id = open_git(&mut app, root, Some("notes.txt"), Vec::new());
+        file_loaded(&mut app, id, root, "notes.txt");
+        drop(app.update(Message::LineHeightChanged("1.8".into())));
+        assert_eq!(app.settings.terminal_line_height, 1.8);
+        assert_eq!(app.line_height_draft, "1.8");
+        drop(app.update(Message::LineHeightChanged("wide".into())));
+        drop(app.update(Message::LineHeightChanged("5.0".into())));
+        assert_eq!(app.settings.terminal_line_height, 1.8);
+        assert_eq!(app.line_height_draft, "5.0");
     }
 
     #[test]
