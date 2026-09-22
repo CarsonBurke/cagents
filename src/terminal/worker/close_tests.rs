@@ -23,7 +23,15 @@ impl CloseSafetyShell {
     fn spawn(program: &Path, arguments: &[&str]) -> Self {
         let home = tempdir().unwrap();
         let config_home = home.path().join(".config");
+        let cache_home = home.path().join(".cache");
+        let data_home = home.path().join(".local/share");
         fs::create_dir_all(config_home.join("fish")).unwrap();
+        // A fresh HOME looks like fish's first run, which starts a detached
+        // man-page completion generator in the shell's session. That job is
+        // real work a checked close must protect, and on a loaded host it
+        // outlives any test deadline. Model an established user instead.
+        fs::create_dir_all(cache_home.join("fish/generated_completions")).unwrap();
+        fs::create_dir_all(&data_home).unwrap();
         fs::write(home.path().join(".inputrc"), "").unwrap();
         fs::write(home.path().join(".bashrc"), "PS1='CLOSE_READY> '\n").unwrap();
         fs::write(
@@ -43,6 +51,14 @@ impl CloseSafetyShell {
                 (
                     "XDG_CONFIG_HOME".into(),
                     config_home.to_string_lossy().into_owned(),
+                ),
+                (
+                    "XDG_CACHE_HOME".into(),
+                    cache_home.to_string_lossy().into_owned(),
+                ),
+                (
+                    "XDG_DATA_HOME".into(),
+                    data_home.to_string_lossy().into_owned(),
                 ),
                 (
                     "INPUTRC".into(),
