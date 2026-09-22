@@ -542,7 +542,15 @@ fn category_button<'a>(item: SettingsCategory, selected: SettingsCategory) -> El
         widget::button::custom(
             widget::row::with_children(vec![
                 settings_icon(category_icon(item)).into(),
-                widget::text::body(item.label()).into(),
+                // One line, cut short in a pane too narrow for the full
+                // label; the button's accessible name keeps all of it.
+                widget::text::body(item.label())
+                    .wrapping(cosmic::iced::widget::text::Wrapping::None)
+                    .ellipsize(cosmic::iced::widget::text::Ellipsize::End(
+                        cosmic::iced::advanced::text::EllipsizeHeightLimit::Lines(1),
+                    ))
+                    .width(Length::Fill)
+                    .into(),
             ])
             .align_y(Alignment::Center)
             .spacing(2.0 * design::GRID_UNIT),

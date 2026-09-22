@@ -1170,6 +1170,32 @@ fn normalize_restored_titles(state: &mut WorkspaceState) {
     }
 }
 
+/// Retires every restored utility pane after the first of its kind.
+///
+/// A window holds one Settings pane and one Accounts pane: opening one again
+/// focuses the existing pane, and their views share fixed widget ids. Only a
+/// damaged or hand-edited snapshot can hold two, and restoring both would
+/// leave the second one unreachable by that path.
+fn retire_duplicate_utility_cards(state: &mut WorkspaceState) {
+    let mut seen = Vec::<CardKind>::new();
+    let mut retired = false;
+    for card in &mut state.cards {
+        if !card.existence.is_open() || !card.kind.is_utility() {
+            continue;
+        }
+        if seen.contains(&card.kind) {
+            card.existence = project_ui::removed_existence("duplicate utility pane");
+            retired = true;
+        } else {
+            seen.push(card.kind.clone());
+        }
+    }
+    if retired {
+        state.normalize_focus();
+        state.normalize_channels();
+    }
+}
+
 fn card_close_name(type_label: &str, title: &str) -> String {
     format!("Close {type_label} column {title}")
 }
@@ -1237,7 +1263,7 @@ fn card_kind_caption(kind: &CardKind) -> Cow<'_, str> {
         CardKind::PullRequests(view) => display_path(&view.repository),
         CardKind::Repository(view) => display_path(&view.worktree),
         // Neither pane belongs to a place: both apply to the whole application.
-        CardKind::Settings | CardKind::Accounts => Cow::Borrowed("Every window"),
+        CardKind::Settings | CardKind::Accounts => Cow::Borrowed("Application-wide"),
     }
 }
 
@@ -3408,6 +3434,9 @@ pub struct Cagents {
     /// Whether the settings pane held focus after the last update, so the
     /// update that moves focus away can flush the drafts typed into it.
     settings_pane_focused: bool,
+    /// A utility pane the user asked for while its only pane was mid-close;
+    /// it opens afresh once that close commits.
+    reopen_utility: Option<CardKind>,
     settings_pending: HashMap<SettingsField, (u64, String)>,
     settings_generation: u64,
     settings_invalid: HashMap<SettingsField, String>,
@@ -3521,6 +3550,7 @@ impl Cagents {
             };
         let mut restored = restored.unwrap_or_default();
         normalize_restored_titles(&mut restored);
+        retire_duplicate_utility_cards(&mut restored);
         Ok(Bootstrap {
             workspace: restored,
             session,
@@ -5489,6 +5519,9 @@ impl Cagents {
         if focus_changed {
             tasks.push(self.reveal_active_tab());
         }
+        // Every focus move lands here, including those whose handlers return
+        // early and so skip the check at the end of `update`.
+        tasks.push(self.flush_settings_on_blur());
         let mut schedule_delayed_sweep = false;
         let mut reconcile_now = false;
         let surfaces_visible = self.workspace_surfaces_visible();
@@ -8092,6 +8125,17 @@ impl Cagents {
         let Some(id) = self.utility_card(&kind) else {
             return self.add_utility_card(kind);
         };
+        // The pane is on its way out and cannot take focus; asking for it
+        // again means the user wants it after all, so it comes back as soon
+        // as the close lands rather than the request being lost.
+        if self
+            .workspace
+            .pending_close()
+            .is_some_and(|handoff| handoff.unmounting == id)
+        {
+            self.reopen_utility = Some(kind);
+            return Task::none();
+        }
         let rehome = if self.workspace.order().any(|card| card == id) {
             Task::none()
         } else {
@@ -8455,6 +8499,22 @@ impl Cagents {
                 .map(|(field, (_, value))| self.apply_setting_input(field, value))
                 .collect::<Vec<_>>(),
         )
+    }
+
+    /// Folds drafts still waiting out their debounce into the settings the
+    /// window is about to save on its way out, without the live effects -
+    /// lifecycle sweeps, theme changes, editor auto-saves - that applying
+    /// them normally triggers, since nothing is left to show them.
+    fn fold_settings_drafts(&mut self) {
+        let mut pending: Vec<_> = self.settings_pending.drain().collect();
+        pending.sort_by_key(|(_, (generation, _))| *generation);
+        for (field, (_, value)) in pending {
+            if let SettingsDecision::Persist(settings) =
+                settings_update(&self.settings, field, &value)
+            {
+                self.settings = settings;
+            }
+        }
     }
 
     fn apply_setting_input(&mut self, field: SettingsField, value: String) -> Task<Message> {
@@ -8900,6 +8960,7 @@ impl Application for Cagents {
             settings_draft,
             settings_feedback: None,
             settings_pane_focused: false,
+            reopen_utility: None,
             settings_pending: HashMap::new(),
             settings_generation: 0,
             settings_invalid: HashMap::new(),
@@ -9985,10 +10046,11 @@ impl Application for Cagents {
                 }
             },
             Message::ResizeCard { card, width } => {
-                if !self
-                    .card_state(card)
-                    .is_some_and(|state| matches!(&state.kind, CardKind::Terminal(_)))
-                {
+                // The settings pane lays itself out against its own width, so
+                // dragging its edge is how the user picks rail or stacked.
+                if !self.card_state(card).is_some_and(|state| {
+                    matches!(&state.kind, CardKind::Terminal(_)) || state.kind.is_utility()
+                }) {
                     return Task::none();
                 }
                 let viewport = self.workspace.viewport_width();
@@ -10398,6 +10460,10 @@ impl Application for Cagents {
                 } else {
                     Task::none()
                 };
+                let utility = self
+                    .card_state(id)
+                    .filter(|card| card.kind.is_utility())
+                    .map(|card| card.kind.clone());
                 if let Some(runtime) = self.cards.remove(&id) {
                     match runtime {
                         CardRuntime::Terminal(_handle) => {
@@ -10446,7 +10512,20 @@ impl Application for Cagents {
                     .into_iter()
                     .filter(|&channel| !self.channel_has_open_card(channel))
                     .collect();
-                Task::batch([closed, replacement, settings, self.delete_channels(emptied)])
+                let reopen = match utility {
+                    Some(kind) if self.reopen_utility.as_ref() == Some(&kind) => {
+                        self.reopen_utility = None;
+                        self.open_utility_card(kind)
+                    }
+                    _ => Task::none(),
+                };
+                Task::batch([
+                    closed,
+                    replacement,
+                    settings,
+                    self.delete_channels(emptied),
+                    reopen,
+                ])
             }
             Message::Viewport { generation, event } => {
                 // Native callbacks already queued by an unmounted worktree
@@ -10937,18 +11016,6 @@ impl Application for Cagents {
                     }
                     return Task::none();
                 }
-                if self.settings_card_focused()
-                    && !self.workspace_inputs_blocked()
-                    && let keyboard::Event::KeyPressed { key, modifiers, .. } = &event
-                    && modifiers.control()
-                    && !modifiers.shift()
-                    && !modifiers.alt()
-                    && !modifiers.logo()
-                    && matches!(key, keyboard::Key::Character(value) if value.eq_ignore_ascii_case("f"))
-                {
-                    return iced::widget::operation::focus(crate::settings_widgets::search_id())
-                        .map(cosmic::Action::App);
-                }
                 if let keyboard::Event::ModifiersChanged(modifiers) = &event {
                     self.keyboard_modifiers = *modifiers;
                 }
@@ -11053,8 +11120,15 @@ impl Application for Cagents {
                     }
                     // A focused editor claims the search chord for its own
                     // buffer, which is what it means in every editor the user
-                    // has. Anywhere else it keeps its existing meaning.
+                    // has, and the settings pane for its own search field.
+                    // Anywhere else it keeps its existing meaning.
                     Some(workspace_widget::GlobalShortcut::FocusProjectSearch) => {
+                        if self.settings_card_focused() {
+                            return iced::widget::operation::focus(
+                                crate::settings_widgets::search_id(),
+                            )
+                            .map(cosmic::Action::App);
+                        }
                         match self.focused_editable_repository_card() {
                             Some(card) => cosmic::task::message(Message::Repository(
                                 RepositoryAction::OpenFind { card },
@@ -11362,6 +11436,9 @@ impl Application for Cagents {
         // notice by assigning it. Draining it here is what makes those notices
         // survive the next assignment instead of silently replacing each other,
         // and it is the one place that can bound the history.
+        // Before the notices drain, so one raised by a committed draft is
+        // recorded with this update rather than the next.
+        let task = Task::batch([task, self.flush_settings_on_blur()]);
         if let Some(notice) = self.status.take() {
             match notice.severity {
                 NoticeSeverity::Error => {
@@ -11377,7 +11454,6 @@ impl Application for Cagents {
         if self.latency_focus != self.workspace.focused() {
             self.latency.abandon_pending();
         }
-        let task = Task::batch([task, self.flush_settings_on_blur()]);
         if camera_only {
             return Task::batch([task, self.release_deferred_navigation_if_unblocked()]);
         }
@@ -12099,9 +12175,7 @@ impl Drop for Cagents {
     fn drop(&mut self) {
         self.latency.abandon_pending();
         self.persist();
-        // Apply drafts still waiting out their debounce, so the save below
-        // writes them; the follow-up tasks are moot once the window is gone.
-        drop(self.flush_settings_drafts());
+        self.fold_settings_drafts();
         if let Err(error) = self.save_settings_now() {
             tracing::error!(%error, "failed to persist settings");
         }
@@ -13438,6 +13512,45 @@ mod tests {
         assert_eq!(app.settings_draft, before);
         assert!(app.settings_search.is_empty());
         assert!(app.settings_pending.is_empty());
+    }
+
+    #[test]
+    fn asking_for_settings_while_its_pane_closes_brings_it_back() {
+        let mut app = context_inspector_test_app(true);
+        app.context_inspector_open = false;
+        let _ = app.update(Message::Sidebar(SidebarAction::OpenSettings));
+        let closing = app.utility_card(&CardKind::Settings).unwrap();
+        let _ = app.request_card_removal(closing);
+        let _ = app.update(Message::Sidebar(SidebarAction::OpenSettings));
+        assert_eq!(open_settings_panes(&app), [closing], "still mid-close");
+        let _ = app.update(Message::CommitClose(closing));
+        let [reopened] = open_settings_panes(&app)[..] else {
+            panic!("the request survives the close");
+        };
+        assert_ne!(reopened, closing);
+        assert_eq!(app.workspace.focused(), Some(reopened));
+        assert!(app.reopen_utility.is_none());
+    }
+
+    #[test]
+    fn a_restored_snapshot_keeps_one_settings_pane() {
+        let panes: Vec<_> = (0..2)
+            .map(|_| {
+                let mut pane = terminal_card_state();
+                pane.kind = CardKind::Settings;
+                pane
+            })
+            .collect();
+        let (first, second) = (panes[0].id, panes[1].id);
+        let mut state = WorkspaceState {
+            focused: Some(second),
+            cards: panes,
+            ..WorkspaceState::default()
+        };
+        retire_duplicate_utility_cards(&mut state);
+        assert!(state.cards[0].existence.is_open());
+        assert!(!state.cards[1].existence.is_open());
+        assert_eq!(state.focused, Some(first));
     }
 
     #[test]
@@ -16573,6 +16686,7 @@ mod tests {
             keyboard_modifiers: keyboard::Modifiers::empty(),
             settings_feedback: None,
             settings_pane_focused: false,
+            reopen_utility: None,
             settings_pending: HashMap::new(),
             settings_generation: 0,
             settings_invalid: HashMap::new(),

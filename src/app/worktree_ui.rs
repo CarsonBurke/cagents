@@ -1018,6 +1018,34 @@ mod tests {
             Some(channeled.id),
             "the channel keeps a focus it still holds"
         );
+
+        // Opened in a channel holding nothing else and closed again, it
+        // leaves the channel as it found it rather than deleting it.
+        let empty = ChannelId::new();
+        Arc::make_mut(&mut app.durable)
+            .channels
+            .push(ProjectChannel {
+                id: empty,
+                project_id: app.sidebar_model.projects[0].id,
+                title: "Empty".into(),
+                ordinal: 1,
+                shared: true,
+                cards: Vec::new(),
+                focused: None,
+            });
+        let _ = app.select_channel(empty);
+        let _ = app.update(Message::Sidebar(SidebarAction::OpenSettings));
+        assert_eq!(order(&app), [pane]);
+        let _ = app.request_card_removal(pane);
+        let _ = app.update(Message::CommitClose(pane));
+        assert!(app.utility_card(&CardKind::Settings).is_none());
+        assert!(
+            app.durable
+                .channels
+                .iter()
+                .any(|channel| channel.id == empty)
+        );
+        assert_eq!(app.durable.active_channel, Some(empty));
     }
 
     fn register_worktrees(app: &mut Cagents, paths: &[&str]) {

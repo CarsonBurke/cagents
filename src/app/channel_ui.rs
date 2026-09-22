@@ -351,14 +351,26 @@ impl Cagents {
     /// Channel membership is pruned of closed cards whenever the scope is
     /// persisted, so this must be read before the retirement is persisted;
     /// afterwards the channel no longer records that it held these cards.
+    ///
+    /// Only the channel's own content counts. A utility pane such as Settings
+    /// belongs to the window and merely follows the user into whichever
+    /// channel they are viewing, so closing it never empties a channel - the
+    /// channel is shared with every window, whose conversations it would end
+    /// - and it does not keep an otherwise empty channel alive either.
     pub(super) fn channels_emptied_by(&self, retired: &[CardId]) -> Vec<ChannelId> {
         self.durable
             .channels
             .iter()
-            .filter(|channel| channel.cards.iter().any(|card| retired.contains(card)))
+            .filter(|channel| {
+                channel
+                    .cards
+                    .iter()
+                    .any(|&card| retired.contains(&card) && self.is_channel_content(card))
+            })
             .filter(|channel| {
                 !channel.cards.iter().any(|&card| {
                     !retired.contains(&card)
+                        && self.is_channel_content(card)
                         && self
                             .card_state(card)
                             .is_some_and(|state| state.existence.is_open())
@@ -376,9 +388,16 @@ impl Cagents {
             .is_some_and(|channel| {
                 channel.cards.iter().any(|&card| {
                     self.card_state(card)
-                        .is_some_and(|state| state.existence.is_open())
+                        .is_some_and(|state| state.existence.is_open() && !state.kind.is_utility())
                 })
             })
+    }
+
+    /// Whether `card` is part of what a channel holds, rather than a window
+    /// utility pane that is only passing through it.
+    fn is_channel_content(&self, card: CardId) -> bool {
+        self.card_state(card)
+            .is_none_or(|state| !state.kind.is_utility())
     }
 
     pub(super) fn delete_channels(&mut self, ids: Vec<ChannelId>) -> Task<Message> {
@@ -477,6 +496,12 @@ impl Cagents {
         self.publish_model_edit(ModelEdit::DeleteChannel { id });
         self.channel_ui.deleted.insert(id);
         for card in channel.cards {
+            // A utility pane outlives the channel it was visiting: it leaves
+            // with no channel, which every worktree strip shows, and opening
+            // it again from a channel brings it there.
+            if !self.is_channel_content(card) {
+                continue;
+            }
             self.retire_lsp_card(card);
             self.sidebar_state.clear_agent_activity(card);
             self.sidebar_state.acknowledge_agent_update(card);
@@ -1110,5 +1135,52 @@ mod tests {
             app.durable.active_worktree, app.active_workspace,
             "the deletion persisted the workspace it left behind"
         );
+    }
+
+    #[test]
+    fn a_visiting_settings_pane_is_not_what_a_channel_holds() {
+        let mut app = super::super::tests::context_inspector_test_app(true);
+        let channel = ChannelId::new();
+        let conversation = CardId::new();
+        let settings = CardId::new();
+        let durable = Arc::make_mut(&mut app.durable);
+        let mut chat = durable.cards[0].clone();
+        chat.id = conversation;
+        chat.kind = CardKind::Chat(chat_session());
+        let mut pane = durable.cards[0].clone();
+        pane.id = settings;
+        pane.kind = CardKind::Settings;
+        pane.title = "Settings".into();
+        durable.cards.extend([chat, pane]);
+        durable.channels.push(ProjectChannel {
+            id: channel,
+            project_id: ProjectId::new(),
+            title: "Investigation".into(),
+            ordinal: 0,
+            shared: true,
+            cards: vec![conversation, settings],
+            focused: Some(settings),
+        });
+        app.cards.insert(settings, CardRuntime::Settings);
+
+        // Closing the window's settings pane must not delete a channel that
+        // every window shares, and with it their conversations.
+        assert!(app.channels_emptied_by(&[settings]).is_empty());
+        // Nor does it keep a channel whose conversations are all gone.
+        assert_eq!(app.channels_emptied_by(&[conversation]), [channel]);
+        assert!(app.channel_has_open_card(channel));
+        Arc::make_mut(&mut app.durable).cards[1].existence =
+            super::super::project_ui::removed_existence("closed fixture");
+        assert!(!app.channel_has_open_card(channel));
+
+        // When the channel goes, the pane outlives it rather than vanishing
+        // from under the user; it is simply nobody's channel any more.
+        let _ = app.handle_channel_ui(Action::Delete(channel));
+        assert!(!app.durable.channels.iter().any(|row| row.id == channel));
+        assert!(app.card_state(settings).unwrap().existence.is_open());
+        assert!(matches!(
+            app.cards.get(&settings),
+            Some(CardRuntime::Settings)
+        ));
     }
 }
