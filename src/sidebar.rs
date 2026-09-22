@@ -372,6 +372,8 @@ pub struct SidebarProject {
 ///
 /// A channel is a container: `chats` counts the conversations open inside it,
 /// which is what keeps the row distinguishable from a single conversation.
+/// `has_panes` is wider: any open card counts, a plain shell included, because
+/// what it decides is whether the row is somewhere the user has work open.
 /// [`ChannelId`] names the container, while each chat inside it is a card with
 /// its own `CardId`, so the two levels cannot be mistaken for one another.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -382,6 +384,7 @@ pub struct SidebarChannel {
     pub activity: Option<crate::agent::ActivityState>,
     pub unread: bool,
     pub chats: usize,
+    pub has_panes: bool,
     /// The creation rank the shared registry assigned. Carried on the row
     /// because the row is what gets ordered, and the registry's rank is the
     /// only order two windows can agree on.
@@ -393,6 +396,7 @@ pub struct SidebarChannel {
 }
 
 impl SidebarChannel {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         id: ChannelId,
         title: String,
@@ -400,6 +404,7 @@ impl SidebarChannel {
         activity: Option<crate::agent::ActivityState>,
         unread: bool,
         chats: usize,
+        has_panes: bool,
         ordinal: u32,
     ) -> Self {
         let contents = match chats {
@@ -412,11 +417,13 @@ impl SidebarChannel {
             activity,
             unread,
             chats,
+            has_panes,
             ordinal,
             folded_title: fold(&title),
             open_id: entity_id("channel.open", id),
             accessible_name: format!(
-                "Open channel {title}, {contents}{}",
+                "Open channel {title}, {contents}{}{}",
+                if has_panes { "" } else { ", no open panes" },
                 if unread { ", unread agent update" } else { "" }
             )
             .into_boxed_str(),
@@ -582,16 +589,17 @@ impl SidebarWorktree {
         let label = worktree_display_name(&path, branch.as_deref(), detached);
         let path_label = path.display().to_string();
         let status = status_summary(detached, locked, dirty.as_ref(), false, ahead, behind);
+        let accessible_name = format!(
+            "Open worktree {label}, {}, {status}",
+            branch.as_deref().unwrap_or(&path_label)
+        );
         let chrome = WorktreeChrome {
             folded_label: fold(&label),
             folded_branch: branch.as_deref().map(fold),
             folded_path: fold(&path.to_string_lossy()),
             open_id: entity_id("worktree.open", id),
-            accessible_name: format!(
-                "Open worktree {label}, {}, {status}",
-                branch.as_deref().unwrap_or(&path_label)
-            )
-            .into_boxed_str(),
+            paneless_accessible_name: paneless_name(&accessible_name),
+            accessible_name: accessible_name.into_boxed_str(),
             tooltip: format!(
                 "{label} — {} — {path_label} — {status}",
                 branch.as_deref().unwrap_or("Detached HEAD")
@@ -750,8 +758,9 @@ impl SidebarWorktree {
             );
         }
         let branch = self.branch.as_deref().unwrap_or("Detached HEAD");
-        self.chrome.accessible_name =
-            format!("Open worktree {}, {branch}, {status}", self.chrome.label).into_boxed_str();
+        let accessible_name = format!("Open worktree {}, {branch}, {status}", self.chrome.label);
+        self.chrome.paneless_accessible_name = paneless_name(&accessible_name);
+        self.chrome.accessible_name = accessible_name.into_boxed_str();
         self.chrome.tooltip = format!(
             "{} — {branch} — {} — {status}",
             self.chrome.label,
@@ -759,6 +768,10 @@ impl SidebarWorktree {
         )
         .into_boxed_str();
     }
+}
+
+fn paneless_name(accessible_name: &str) -> Box<str> {
+    format!("{accessible_name}, no open panes").into_boxed_str()
 }
 
 pub(crate) fn worktree_display_name(path: &Path, branch: Option<&str>, detached: bool) -> String {
@@ -800,6 +813,9 @@ struct WorktreeChrome {
     open_id: Id,
     label: Box<str>,
     accessible_name: Box<str>,
+    /// `accessible_name` for the row with nothing open, which is most rows in
+    /// a long list, built once so naming them allocates nothing per frame.
+    paneless_accessible_name: Box<str>,
     tooltip: Box<str>,
     dirty_badge: Option<Box<str>>,
     pull_request: Option<SidebarPullRequest>,
@@ -2433,6 +2449,10 @@ pub struct SidebarState {
     worktree_sort: crate::settings::WorktreeSort,
     agent_updates: BTreeMap<CardId, Option<(ProjectId, WorktreeId)>>,
     agent_activity: BTreeMap<CardId, PaneActivity>,
+    /// Worktrees holding at least one open pane. Derived by the application
+    /// after its updates, never while drawing, so each row's read is one
+    /// lookup however many cards are open.
+    worktrees_with_panes: BTreeSet<(ProjectId, WorktreeId)>,
     commit_message: String,
     /// File-tree folders the user opened. Everything else renders collapsed,
     /// so a fresh worktree shows its top level and loading a whole project
@@ -2515,6 +2535,15 @@ impl SidebarState {
         self.agent_updates
             .values()
             .any(|owner| *owner == Some((project, worktree)))
+    }
+
+    /// Replaces the worktrees that hold an open pane.
+    pub fn set_worktrees_with_panes(&mut self, worktrees: BTreeSet<(ProjectId, WorktreeId)>) {
+        self.worktrees_with_panes = worktrees;
+    }
+
+    pub fn worktree_has_panes(&self, project: ProjectId, worktree: WorktreeId) -> bool {
+        self.worktrees_with_panes.contains(&(project, worktree))
     }
 
     pub fn card_activity(&self, card: CardId) -> Option<crate::agent::Activity> {
@@ -4230,6 +4259,7 @@ fn project_view<'a>(
                 project.editors,
                 project.state.has_agent_update(project_id, worktree.id),
                 project.state.agent_activity(project_id, worktree.id),
+                project.state.worktree_has_panes(project_id, worktree.id),
                 false,
             ));
         }
@@ -4293,6 +4323,7 @@ fn compact_project<'a>(
             project.editors,
             project.state.has_agent_update(entity.id, worktree.id),
             project.state.agent_activity(entity.id, worktree.id),
+            project.state.worktree_has_panes(entity.id, worktree.id),
             true,
         ));
     }
@@ -4329,6 +4360,105 @@ fn compact_project<'a>(
     .into()
 }
 
+/// How strongly a navigation row draws where no state color claims it.
+///
+/// A worktree or channel with an open pane is somewhere the user has work in
+/// front of them, so it keeps full strength; one with nothing open recedes,
+/// which is what lets the rows that deserve focus stand out in a long list.
+/// Unread news keeps a row at full strength too: it is a reason to go back
+/// even when nothing is open there. The glyph and the label follow the same
+/// rule, so a row reads as one strength rather than two.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RowInk {
+    Full,
+    Muted,
+}
+
+impl RowInk {
+    fn of(has_panes: bool, unread: bool) -> Self {
+        if has_panes || unread {
+            Self::Full
+        } else {
+            Self::Muted
+        }
+    }
+
+    fn icon_color(self, theme: &cosmic::Theme) -> cosmic::iced::Color {
+        match self {
+            Self::Full => theme.current_container().on.into(),
+            Self::Muted => design::muted_icon_color(theme),
+        }
+    }
+
+    fn text_class(self) -> theme::Text {
+        match self {
+            Self::Full => theme::Text::default(),
+            Self::Muted => theme::Text::Custom(design::muted_text),
+        }
+    }
+}
+
+/// The color a navigation row's leading glyph takes.
+///
+/// A state color always wins over the row's ink: it is news about the row,
+/// and muting it because nothing is open there would hide exactly what the
+/// user needs to see. Small and `Copy` so the style closure can carry it and
+/// resolve the color against the theme it draws with.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GlyphTone {
+    Ink(RowInk),
+    /// A draft pull request. Its cue is being quieter than its neighbours,
+    /// which no fixed color can say beside rows that are themselves either
+    /// full or muted, so it stays one step below whatever the row's ink is.
+    Draft(RowInk),
+    Danger,
+    Warning,
+    PullRequest(PullRequestTone),
+}
+
+impl GlyphTone {
+    fn color(self, theme: &cosmic::Theme) -> cosmic::iced::Color {
+        match self {
+            Self::Ink(ink) => ink.icon_color(theme),
+            Self::Draft(RowInk::Full) => design::muted_icon_color(theme),
+            Self::Draft(RowInk::Muted) => PullRequestTone::Draft.color(theme),
+            Self::Danger => theme.cosmic().destructive.base.into(),
+            Self::Warning => theme.cosmic().warning.base.into(),
+            Self::PullRequest(tone) => tone.color(theme),
+        }
+    }
+}
+
+fn channel_ink(channel: &SidebarChannel) -> RowInk {
+    RowInk::of(channel.has_panes, channel.unread)
+}
+
+fn channel_glyph_tone(channel: &SidebarChannel) -> GlyphTone {
+    if channel.unread {
+        GlyphTone::Danger
+    } else if channel.activity == Some(crate::agent::ActivityState::Working) {
+        GlyphTone::Warning
+    } else {
+        GlyphTone::Ink(channel_ink(channel))
+    }
+}
+
+/// A neutral pull request carries no news, so its glyph follows the row's ink
+/// like the plain worktree glyph it stands in for; a draft follows it one step
+/// quieter.
+fn worktree_glyph_tone(
+    pull_request: Option<PullRequestTone>,
+    update: bool,
+    has_panes: bool,
+) -> GlyphTone {
+    let ink = RowInk::of(has_panes, update);
+    match pull_request {
+        None | Some(PullRequestTone::Neutral) => GlyphTone::Ink(ink),
+        Some(PullRequestTone::Draft) => GlyphTone::Draft(ink),
+        Some(tone) => GlyphTone::PullRequest(tone),
+    }
+}
+
 /// The one live indicator a channel row shows in its reserved slot.
 ///
 /// Attention outranks the chat count: a channel whose agent is working or
@@ -4362,25 +4492,19 @@ fn channel_view(
     compact: bool,
 ) -> Element<'_, SidebarAction> {
     let grid = RowGrid::child(compact);
-    let activity = channel.activity;
-    let unread = channel.unread;
+    let tone = channel_glyph_tone(channel);
     let glyph = widget::container(
         widget::icon(crate::ui_controls::symbolic_icon("channel-symbolic")).size(ROW_ICON_SIZE),
     )
     .class(theme::Container::custom(move |theme| {
         cosmic::iced::widget::container::Style {
-            icon_color: Some(if unread {
-                theme.cosmic().destructive.base.into()
-            } else if activity == Some(crate::agent::ActivityState::Working) {
-                theme.cosmic().warning.base.into()
-            } else {
-                design::muted_icon_color(theme)
-            }),
+            icon_color: Some(tone.color(theme)),
             ..Default::default()
         }
     }));
     let label = (!compact).then(|| {
         design::body(&channel.title)
+            .class(channel_ink(channel).text_class())
             .wrapping(cosmic::iced::widget::text::Wrapping::None)
             .ellipsize(cosmic::iced::widget::text::Ellipsize::End(
                 EllipsizeHeightLimit::Lines(1),
@@ -4449,8 +4573,13 @@ fn worktree_accessible_name(
     worktree: &SidebarWorktree,
     unread: bool,
     activity: Option<crate::agent::ActivityState>,
+    has_panes: bool,
 ) -> Cow<'_, str> {
-    let mut name = Cow::Borrowed(&*worktree.chrome.accessible_name);
+    let mut name = Cow::Borrowed(if has_panes {
+        &*worktree.chrome.accessible_name
+    } else {
+        &*worktree.chrome.paneless_accessible_name
+    });
     if unread {
         name.to_mut().push_str(", unread agent update");
     }
@@ -4539,17 +4668,14 @@ fn worktree_view<'a>(
     editors: &'a [SidebarEditor],
     agent_update: bool,
     activity: Option<crate::agent::ActivityState>,
+    has_panes: bool,
     compact: bool,
 ) -> Element<'a, SidebarAction> {
     let chrome = &worktree.chrome;
     let grid = RowGrid::child(compact);
     let label = (!compact).then(|| {
         design::body(&*chrome.label)
-            .class(if !agent_update {
-                theme::Text::Custom(design::muted_text)
-            } else {
-                theme::Text::default()
-            })
+            .class(RowInk::of(has_panes, agent_update).text_class())
             .wrapping(cosmic::iced::widget::text::Wrapping::None)
             .ellipsize(cosmic::iced::widget::text::Ellipsize::End(
                 EllipsizeHeightLimit::Lines(1),
@@ -4558,7 +4684,7 @@ fn worktree_view<'a>(
             .into()
     });
     let mut content = grid.content(
-        worktree_status_icon(worktree, agent_update),
+        worktree_status_icon(worktree, agent_update, has_panes),
         label,
         worktree_indicator(worktree, agent_update, activity, compact),
     );
@@ -4608,7 +4734,12 @@ fn worktree_view<'a>(
     let action = grid
         .control(content, selected)
         .id(chrome.open_id.clone())
-        .name(worktree_accessible_name(worktree, agent_update, activity))
+        .name(worktree_accessible_name(
+            worktree,
+            agent_update,
+            activity,
+            has_panes,
+        ))
         .on_press_maybe(gated(
             SidebarAction::OpenWorktree {
                 project_id,
@@ -4846,29 +4977,25 @@ fn editor_icon(editor: &SidebarEditor) -> icon::Handle {
     }
 }
 
-fn worktree_status_icon(worktree: &SidebarWorktree, update: bool) -> Element<'_, SidebarAction> {
-    let (handle, tone) = worktree
+fn worktree_status_icon(
+    worktree: &SidebarWorktree,
+    update: bool,
+    has_panes: bool,
+) -> Element<'_, SidebarAction> {
+    let (handle, pull_request) = worktree
         .chrome
         .pull_request
         .as_ref()
         .map(|pr| (pull_request_icon(pr), Some(pull_request_tone(pr))))
         .unwrap_or_else(|| (worktree_icon(), None));
+    let tone = worktree_glyph_tone(pull_request, update, has_panes);
     let glyph = widget::container(widget::icon(handle).size(ROW_ICON_SIZE)).class(
         theme::Container::custom(move |theme| cosmic::iced::widget::container::Style {
             // Resolved here, against the theme this frame is drawing with: this
             // builder runs once per visible worktree row, and reaching for
             // `cosmic::theme::active()` locked the process-global theme and
             // cloned it that many times per frame.
-            icon_color: Some(tone.map_or_else(
-                || {
-                    if !update {
-                        design::muted_icon_color(theme)
-                    } else {
-                        theme.current_container().on.into()
-                    }
-                },
-                |tone| tone.color(theme),
-            )),
+            icon_color: Some(tone.color(theme)),
             ..Default::default()
         }),
     );
@@ -8575,8 +8702,8 @@ pub(crate) mod tests {
         let first = ChannelId::new();
         let second = ChannelId::new();
         entry.channels = vec![
-            SidebarChannel::new(first, "First".into(), false, None, false, 1, 1),
-            SidebarChannel::new(second, "Second".into(), false, None, false, 1, 2),
+            SidebarChannel::new(first, "First".into(), false, None, false, 1, true, 1),
+            SidebarChannel::new(second, "Second".into(), false, None, false, 1, true, 2),
         ];
         let model = SidebarModel::ready(SidebarMode::Expanded, vec![entry]);
         let mut state = SidebarState::default();
@@ -8759,6 +8886,7 @@ pub(crate) mod tests {
             Some(crate::agent::ActivityState::Waiting),
             true,
             2,
+            true,
             1,
         ));
         let mut model = SidebarModel::ready(SidebarMode::Expanded, vec![entry]);
@@ -8814,6 +8942,7 @@ pub(crate) mod tests {
             None,
             false,
             1,
+            true,
             1,
         ));
         SidebarModel::ready(SidebarMode::Expanded, vec![entry])
@@ -8990,6 +9119,125 @@ pub(crate) mod tests {
         );
     }
 
+    /// Rows with open panes keep full strength and the rest recede, but a
+    /// state color always wins: muting news because nothing is open there
+    /// would hide exactly what the user needs to see.
+    #[test]
+    fn rows_without_panes_mute_unless_a_state_color_claims_the_glyph() {
+        use crate::agent::ActivityState;
+        assert_eq!(RowInk::of(true, false), RowInk::Full);
+        assert_eq!(RowInk::of(false, true), RowInk::Full);
+        assert_eq!(RowInk::of(false, false), RowInk::Muted);
+
+        let channel = |activity, unread, has_panes| {
+            SidebarChannel::new(
+                ChannelId::from_uuid(Uuid::from_u128(20)),
+                "Investigate login".into(),
+                false,
+                activity,
+                unread,
+                0,
+                has_panes,
+                1,
+            )
+        };
+        assert_eq!(
+            channel_glyph_tone(&channel(None, false, true)),
+            GlyphTone::Ink(RowInk::Full)
+        );
+        assert_eq!(
+            channel_glyph_tone(&channel(None, false, false)),
+            GlyphTone::Ink(RowInk::Muted)
+        );
+        assert_eq!(
+            channel_glyph_tone(&channel(Some(ActivityState::Waiting), false, true)),
+            GlyphTone::Ink(RowInk::Full),
+            "waiting is shown by the indicator, not the glyph"
+        );
+        assert_eq!(
+            channel_glyph_tone(&channel(Some(ActivityState::Working), false, true)),
+            GlyphTone::Warning
+        );
+        assert_eq!(
+            channel_glyph_tone(&channel(None, true, false)),
+            GlyphTone::Danger
+        );
+        assert!(
+            channel(None, false, false)
+                .accessible_name
+                .contains("no open panes")
+        );
+        assert!(
+            !channel(None, false, true)
+                .accessible_name
+                .contains("no open panes")
+        );
+
+        assert_eq!(
+            worktree_glyph_tone(None, false, true),
+            GlyphTone::Ink(RowInk::Full)
+        );
+        assert_eq!(
+            worktree_glyph_tone(None, false, false),
+            GlyphTone::Ink(RowInk::Muted)
+        );
+        assert_eq!(
+            worktree_glyph_tone(None, true, false),
+            GlyphTone::Ink(RowInk::Full),
+            "an unread update keeps a paneless worktree at full strength"
+        );
+        assert_eq!(
+            worktree_glyph_tone(Some(PullRequestTone::Neutral), false, false),
+            GlyphTone::Ink(RowInk::Muted),
+            "a neutral pull request carries no news"
+        );
+        assert_eq!(
+            worktree_glyph_tone(Some(PullRequestTone::Draft), false, true),
+            GlyphTone::Draft(RowInk::Full),
+            "a draft stays a step quieter than its row, whichever the row is"
+        );
+        assert_eq!(
+            worktree_glyph_tone(Some(PullRequestTone::Draft), false, false),
+            GlyphTone::Draft(RowInk::Muted)
+        );
+        for tone in [
+            PullRequestTone::Merged,
+            PullRequestTone::Danger,
+            PullRequestTone::Pending,
+            PullRequestTone::Passing,
+        ] {
+            assert_eq!(
+                worktree_glyph_tone(Some(tone), false, false),
+                GlyphTone::PullRequest(tone)
+            );
+        }
+    }
+
+    #[test]
+    fn worktree_pane_occupancy_is_keyed_by_project_and_worktree() {
+        let project = ProjectId::from_uuid(Uuid::from_u128(1));
+        let other_project = ProjectId::from_uuid(Uuid::from_u128(2));
+        let worktree = WorktreeId::from_uuid(Uuid::from_u128(3));
+        let other = WorktreeId::from_uuid(Uuid::from_u128(4));
+        let mut state = SidebarState::default();
+        assert!(!state.worktree_has_panes(project, worktree));
+
+        state.set_worktrees_with_panes(BTreeSet::from([(project, worktree)]));
+        assert!(state.worktree_has_panes(project, worktree));
+        assert!(!state.worktree_has_panes(project, other));
+        assert!(!state.worktree_has_panes(other_project, worktree));
+
+        state.set_worktrees_with_panes(BTreeSet::new());
+        assert!(!state.worktree_has_panes(project, worktree));
+    }
+
+    #[test]
+    fn a_paneless_worktree_says_so_to_assistive_technology() {
+        let row = worktree(1, "feature", false);
+        assert!(worktree_accessible_name(&row, false, None, false).ends_with(", no open panes"));
+        assert!(!worktree_accessible_name(&row, false, None, true).contains("no open panes"));
+    }
+
     #[test]
     fn row_indicators_share_one_reserved_slot() {
         let renderer = headless_renderer();
@@ -9001,6 +9249,7 @@ pub(crate) mod tests {
                 activity,
                 unread,
                 chats,
+                chats > 0,
                 1,
             )
         };
@@ -9542,6 +9791,7 @@ pub(crate) mod tests {
                 None,
                 false,
                 1,
+                true,
                 1,
             ));
             sidebar
@@ -10392,6 +10642,7 @@ pub(crate) mod tests {
             None,
             true,
             1,
+            true,
             1,
         ));
         entry.unreachable = Some("fatal: not a git repository".into());
