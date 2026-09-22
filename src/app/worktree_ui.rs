@@ -29,7 +29,10 @@ fn card_directory(card: &CardState) -> Option<&Path> {
         CardKind::Terminal(session) => Some(&session.launch.working_directory),
         CardKind::Chat(session) => Some(&session.launch.recipe.working_directory),
         CardKind::Repository(view) => Some(&view.worktree),
-        CardKind::Browser(_) | CardKind::PullRequests(_) => None,
+        CardKind::Browser(_)
+        | CardKind::PullRequests(_)
+        | CardKind::Settings
+        | CardKind::Accounts => None,
     }
 }
 
@@ -945,6 +948,76 @@ mod tests {
                 .any(|card| card.id == id && card.existence.is_open())
         );
         assert!(!app.sidebar_state.worktree_has_panes(project_id, worktree));
+    }
+
+    #[test]
+    fn the_settings_pane_follows_the_user_between_worktrees_and_channels() {
+        let mut app = super::super::tests::context_inspector_test_app(false);
+        app.context_inspector_open = false;
+        register_worktrees(&mut app, &["/repo", "/repo/worktree"]);
+        let main = terminal("/repo");
+        let nested = terminal("/repo/worktree");
+        let channeled = terminal("/home/user");
+        let channel = ChannelId::new();
+        app.durable = Arc::new(WorkspaceState {
+            cards: vec![main.clone(), nested.clone(), channeled.clone()],
+            active_worktree: Some("/repo".into()),
+            channels: vec![ProjectChannel {
+                id: channel,
+                project_id: app.sidebar_model.projects[0].id,
+                title: "Channel".into(),
+                ordinal: 0,
+                shared: false,
+                cards: vec![channeled.id],
+                focused: Some(channeled.id),
+            }],
+            ..WorkspaceState::default()
+        });
+        let _ = app.restore_worktree_scope();
+        let order = |app: &Cagents| app.workspace.order().collect::<Vec<_>>();
+        let in_channel =
+            |app: &Cagents, card: CardId| app.durable.channels[0].cards.contains(&card);
+
+        // Opened from a worktree, it is nobody's worktree, like a browser.
+        let _ = app.update(Message::Sidebar(SidebarAction::OpenSettings));
+        let pane = app.utility_card(&CardKind::Settings).unwrap();
+        assert_eq!(order(&app), [main.id, pane]);
+        // It was filed beside the pane focused when it opened, which puts it
+        // ahead of the nested worktree's panes in the shared order.
+        let _ = app.select_worktree("/repo/worktree".into(), false);
+        assert_eq!(order(&app), [pane, nested.id]);
+
+        // A channel shows only its own cards, so asking for settings there
+        // brings the one pane in rather than leaving the channel.
+        let _ = app.select_channel(channel);
+        assert_eq!(order(&app), [channeled.id]);
+        let _ = app.update(Message::Sidebar(SidebarAction::OpenSettings));
+        assert_eq!(app.durable.active_channel, Some(channel));
+        assert_eq!(order(&app), [channeled.id, pane]);
+        assert_eq!(app.workspace.focused(), Some(pane));
+        assert!(in_channel(&app, pane));
+        let _ = app.select_worktree("/repo".into(), false);
+        assert_eq!(order(&app), [main.id]);
+
+        // And back out again, still the same single pane.
+        let _ = app.update(Message::Sidebar(SidebarAction::OpenSettings));
+        assert_eq!(order(&app), [main.id, pane]);
+        assert!(!in_channel(&app, pane));
+        assert_eq!(
+            app.durable
+                .cards
+                .iter()
+                .filter(|card| card.kind == CardKind::Settings)
+                .count(),
+            1
+        );
+        let _ = app.select_channel(channel);
+        assert_eq!(order(&app), [channeled.id]);
+        assert_eq!(
+            app.durable.channels[0].focused,
+            Some(channeled.id),
+            "the channel keeps a focus it still holds"
+        );
     }
 
     fn register_worktrees(app: &mut Cagents, paths: &[&str]) {

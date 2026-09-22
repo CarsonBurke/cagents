@@ -278,16 +278,12 @@ impl Cagents {
                     });
                 self.publish_channel_creation(id, project_id);
                 self.sidebar_state.reveal_project(project_id);
-                self.show_workspace_for_action();
                 let scope = self.select_channel(id);
                 let chat = self.new_native_thread();
                 self.persist();
                 Task::batch([scope, chat])
             }
-            Action::Open(id) => {
-                self.show_workspace_for_action();
-                self.select_channel(id)
-            }
+            Action::Open(id) => self.select_channel(id),
             Action::Delete(id) => {
                 let Some(channel) = self
                     .durable

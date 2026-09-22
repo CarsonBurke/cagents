@@ -176,7 +176,7 @@ pub fn shortcut_keys(action: GlobalShortcut, shortcuts: &KeyboardShortcuts) -> &
     }
 }
 
-/// The chords bound to `action`, in the one-line form the settings dialog
+/// The chords bound to `action`, in the one-line form the settings pane
 /// reads back.
 pub fn shortcut_chords(action: GlobalShortcut, shortcuts: &KeyboardShortcuts) -> String {
     format_chords(shortcut_keys(action, shortcuts))

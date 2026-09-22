@@ -207,6 +207,21 @@ pub enum CardKind {
     Browser(BrowserSession),
     PullRequests(PullRequestView),
     Repository(RepositoryView),
+    /// The window's settings pane. Its content is the application's global
+    /// settings, so the card itself carries no payload.
+    Settings,
+    /// The window's account usage pane. Like settings it shows global state
+    /// and carries no payload.
+    Accounts,
+}
+
+impl CardKind {
+    /// Whether the card is one of the window's singleton utility panes, which
+    /// show application state rather than a session, file or page, so a
+    /// window holds at most one of each and they never hibernate.
+    pub fn is_utility(&self) -> bool {
+        matches!(self, Self::Settings | Self::Accounts)
+    }
 }
 
 /// An argv-based launch recipe. `program` is never interpreted by a shell and

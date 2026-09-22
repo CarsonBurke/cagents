@@ -146,13 +146,6 @@ pub fn search_id() -> widget::Id {
     widget::Id::new("settings.search")
 }
 
-pub fn dialog_size(available: iced::Size) -> iced::Size {
-    iced::Size::new(
-        900.0_f32.min((available.width - 32.0).max(0.0)),
-        available.height * 0.87,
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -189,14 +182,5 @@ mod tests {
                 .view("Editor", "editor terminal")
                 .is_none()
         );
-    }
-    #[test]
-    fn dialog_uses_available_vertical_space_at_every_window_size() {
-        for height in [480.0, 900.0, 1600.0] {
-            assert_eq!(
-                dialog_size(iced::Size::new(1280.0, height)).height,
-                height * 0.87
-            );
-        }
     }
 }

@@ -1,50 +1,11 @@
 use super::*;
 use crate::settings_widgets::{Group, Setting, field as setting_field, group as settings_group};
 
-fn settings_input_style(progress: f32) -> cosmic::theme::TextInput {
-    use widget::text_input::StyleSheet;
-
-    let progress = progress.clamp(0.0, 1.0);
-    if progress == 1.0 {
-        return cosmic::theme::TextInput::Default;
-    }
-    cosmic::theme::TextInput::Custom {
-        active: Box::new(move |theme| {
-            fade_input_appearance(theme.active(&cosmic::theme::TextInput::Default), progress)
-        }),
-        error: Box::new(move |theme| {
-            fade_input_appearance(theme.error(&cosmic::theme::TextInput::Default), progress)
-        }),
-        hovered: Box::new(move |theme| {
-            fade_input_appearance(theme.hovered(&cosmic::theme::TextInput::Default), progress)
-        }),
-        focused: Box::new(move |theme| {
-            fade_input_appearance(theme.focused(&cosmic::theme::TextInput::Default), progress)
-        }),
-        disabled: Box::new(move |theme| {
-            fade_input_appearance(theme.disabled(&cosmic::theme::TextInput::Default), progress)
-        }),
-    }
-}
-
-fn fade_input_appearance(
-    mut appearance: widget::text_input::Appearance,
-    progress: f32,
-) -> widget::text_input::Appearance {
-    // The outer fade already scales semantic text, selection, and border colors.
-    // Pinned COSMIC replaces background alpha with 0.25 and blends placeholder
-    // RGB into an opaque color, so only these final primitives need correction.
-    appearance.background = appearance.background.scale_alpha(progress);
-    appearance.placeholder_color.a *= progress;
-    appearance
-}
-
 fn setting_input<'a>(
     label: &'static str,
     detail: impl Into<Cow<'a, str>> + 'a,
     value: &'a str,
     field: SettingsField,
-    progress: f32,
 ) -> Setting<'a, Message> {
     setting_field(
         label,
@@ -52,7 +13,6 @@ fn setting_input<'a>(
         widget::text_input(label, value)
             .on_input(move |value| Message::SettingsDraftChanged { field, value })
             .width(Length::Fill)
-            .style(settings_input_style(progress))
             .into(),
     )
 }
@@ -115,13 +75,12 @@ fn settings_choice<'a>(
     detail: &'static str,
     field: SettingsField,
     choices: impl IntoIterator<Item = (&'static str, &'static str, bool)>,
-    progress: f32,
 ) -> Setting<'a, Message> {
     let buttons: Vec<Element<'a, Message>> = choices
         .into_iter()
         .map(|(choice, value, selected)| {
             let marker: Element<'a, Message> = if selected {
-                settings_icon("object-select-symbolic", progress).into()
+                settings_icon("object-select-symbolic").into()
             } else {
                 iced::widget::Space::new().width(16).height(16).into()
             };
@@ -157,7 +116,6 @@ fn settings_choice<'a>(
 fn settings_category_controls<'a>(
     category: SettingsCategory,
     draft: &'a SettingsDraft,
-    progress: f32,
 ) -> Vec<Group<'a, Message>> {
     match category {
         SettingsCategory::General => vec![settings_group(
@@ -177,7 +135,6 @@ fn settings_category_controls<'a>(
                     "Absolute path, or relative to the repository root. Defaults to worktrees/. Each new worktree gets its own subdirectory.",
                     &draft.managed_worktree_directory,
                     SettingsField::ManagedWorktreeDirectory,
-                    progress,
                 ),
                 settings_choice(
                     "Worktree order",
@@ -192,7 +149,6 @@ fn settings_category_controls<'a>(
                             draft.worktree_sort == "alphabetical",
                         ),
                     ],
-                    progress,
                 ),
                 setting_field(
                     "Pane activation",
@@ -210,14 +166,12 @@ fn settings_category_controls<'a>(
                     "Applies immediately; extra background columns may hibernate.",
                     &draft.max_hot_cards,
                     SettingsField::MaxHotCards,
-                    progress,
                 ),
                 setting_input(
                     "Hibernation delay (ms)",
                     "Applies immediately to background columns.",
                     &draft.hibernation_delay_ms,
                     SettingsField::HibernationDelayMs,
-                    progress,
                 ),
                 setting_field(
                     "Chat send key",
@@ -326,7 +280,6 @@ fn settings_category_controls<'a>(
                         "Leave empty for system monospace. Use an installed fixed-pitch family, including a Nerd Font for Powerline glyphs. Saves after you pause typing.",
                         &draft.terminal_font_family,
                         SettingsField::TerminalFontFamily,
-                        progress,
                     ),
                     settings_choice(
                         "Font preset",
@@ -337,7 +290,6 @@ fn settings_category_controls<'a>(
                             "",
                             draft.terminal_font_family.is_empty(),
                         )],
-                        progress,
                     ),
                     setting_stepper(
                         "Line height",
@@ -366,7 +318,6 @@ fn settings_category_controls<'a>(
                         "Base lines moved per mouse-wheel notch. Use scroll speed for high-resolution wheel or trackpad input.",
                         &draft.terminal_scroll_size,
                         SettingsField::TerminalScrollSize,
-                        progress,
                     ),
                     setting_stepper(
                         "Scroll speed",
@@ -398,7 +349,6 @@ fn settings_category_controls<'a>(
                                 draft.terminal_cursor_style == "underline",
                             ),
                         ],
-                        progress,
                     ),
                 ],
             ),
@@ -410,7 +360,6 @@ fn settings_category_controls<'a>(
                     "0–1,000,000 lines per newly started terminal. Existing history is preserved.",
                     &draft.terminal_scrollback_lines,
                     SettingsField::TerminalScrollbackLines,
-                    progress,
                 )],
             ),
             settings_group(
@@ -449,7 +398,6 @@ fn settings_category_controls<'a>(
                             draft.link_open_destination == LinkOpenDestination::SystemDefault,
                         ),
                     ],
-                    progress,
                 ),
                 settings_choice(
                     "System browser gesture",
@@ -467,7 +415,6 @@ fn settings_category_controls<'a>(
                             draft.link_open_gesture == LinkOpenGesture::ControlShiftClick,
                         ),
                     ],
-                    progress,
                 ),
                 settings_choice(
                     "Open pull requests in",
@@ -485,7 +432,6 @@ fn settings_category_controls<'a>(
                             draft.pull_request_open_target == PullRequestOpenTarget::Link,
                         ),
                     ],
-                    progress,
                 ),
             ],
         )],
@@ -498,91 +444,78 @@ fn settings_category_controls<'a>(
                     "Creates a terminal column.",
                     &draft.keyboard_shortcuts.new_terminal,
                     SettingsField::ShortcutNewTerminal,
-                    progress,
                 ),
                 setting_input(
                     "New channel",
                     "Creates an independent native conversation in the project's main worktree. Leave blank to unbind.",
                     &draft.keyboard_shortcuts.new_channel,
                     SettingsField::ShortcutNewChannel,
-                    progress,
                 ),
                 setting_input(
                     "Clone focused pane",
                     "Opens an independent terminal or conversation, or the same browser or repository location. Leave blank to unbind.",
                     &draft.keyboard_shortcuts.clone_pane,
                     SettingsField::ShortcutClonePane,
-                    progress,
                 ),
                 setting_input(
                     "Close focused column",
                     "Closes the active workspace column.",
                     &draft.keyboard_shortcuts.close_focused_column,
                     SettingsField::ShortcutCloseFocusedColumn,
-                    progress,
                 ),
                 setting_input(
                     "Search projects",
                     "Moves keyboard focus to project search.",
                     &draft.keyboard_shortcuts.search_projects,
                     SettingsField::ShortcutSearchProjects,
-                    progress,
                 ),
                 setting_input(
                     "Previous column",
                     "Moves focus left and may repeat while held.",
                     &draft.keyboard_shortcuts.previous_column,
                     SettingsField::ShortcutPreviousColumn,
-                    progress,
                 ),
                 setting_input(
                     "Next column",
                     "Moves focus right and may repeat while held.",
                     &draft.keyboard_shortcuts.next_column,
                     SettingsField::ShortcutNextColumn,
-                    progress,
                 ),
                 setting_input(
                     "Cycle pane width",
                     "Cycles the active pane through 1/3, 2/3, 1/2, and full viewport width; may repeat while held.",
                     &draft.keyboard_shortcuts.cycle_pane_width,
                     SettingsField::ShortcutCyclePaneWidth,
-                    progress,
                 ),
                 setting_input(
                     "Previous workspace",
                     "Opens the worktree or channel before this one in the sidebar; may repeat while held.",
                     &draft.keyboard_shortcuts.previous_workspace,
                     SettingsField::ShortcutPreviousWorkspace,
-                    progress,
                 ),
                 setting_input(
                     "Next workspace",
                     "Opens the worktree or channel after this one in the sidebar; may repeat while held.",
                     &draft.keyboard_shortcuts.next_workspace,
                     SettingsField::ShortcutNextWorkspace,
-                    progress,
                 ),
                 setting_input(
                     "Mark reviewed file viewed",
                     "Toggles the reviewed file's viewed mark in the focused pull request pane and moves to the next file.",
                     &draft.keyboard_shortcuts.review_toggle_viewed,
                     SettingsField::ShortcutReviewToggleViewed,
-                    progress,
                 ),
                 setting_input(
                     "Next reviewed file",
                     "Opens the next changed file in the focused pull request pane; may repeat while held.",
                     &draft.keyboard_shortcuts.review_next_file,
                     SettingsField::ShortcutReviewNextFile,
-                    progress,
                 ),
                 setting_input(
                     "Previous reviewed file",
                     "Opens the previous changed file in the focused pull request pane; may repeat while held.",
                     &draft.keyboard_shortcuts.review_previous_file,
                     SettingsField::ShortcutReviewPreviousFile,
-                    progress,
                 ),
             ],
         )],
@@ -600,22 +533,15 @@ fn category_icon(category: SettingsCategory) -> &'static str {
     }
 }
 
-fn settings_icon(name: &'static str, progress: f32) -> widget::icon::Icon {
-    crate::ui_controls::symbolic_icon(name)
-        .icon()
-        .size(16)
-        .opacity(progress.clamp(0.0, 1.0))
+fn settings_icon(name: &'static str) -> widget::icon::Icon {
+    crate::ui_controls::symbolic_icon(name).icon().size(16)
 }
 
-fn category_button<'a>(
-    item: SettingsCategory,
-    selected: SettingsCategory,
-    progress: f32,
-) -> Element<'a, Message> {
+fn category_button<'a>(item: SettingsCategory, selected: SettingsCategory) -> Element<'a, Message> {
     crate::interaction::hover(
         widget::button::custom(
             widget::row::with_children(vec![
-                settings_icon(category_icon(item), progress).into(),
+                settings_icon(category_icon(item)).into(),
                 widget::text::body(item.label()).into(),
             ])
             .align_y(Alignment::Center)
@@ -631,36 +557,54 @@ fn category_button<'a>(
     )
 }
 
-pub(super) fn settings_dialog<'a>(
+/// Card width below which the category rail folds above the settings. The
+/// rail needs its own width plus a readable column beside it.
+const RAIL_BREAKPOINT: f32 = 560.0;
+const RAIL_WIDTH: f32 = 42.0 * design::GRID_UNIT;
+
+/// The settings pane's body. Its layout follows the card's width, which the
+/// user sets per card, not the window's.
+pub(super) fn settings_pane<'a>(
     category: SettingsCategory,
     draft: &'a SettingsDraft,
     query: &'a str,
     feedback: Option<&'a SettingsFeedback>,
-    size: iced::Size,
-    progress: f32,
 ) -> Element<'a, Message> {
-    settings_dialog_sized(category, draft, query, feedback, size, progress)
+    iced::widget::responsive(move |size| {
+        settings_layout(category, draft, query, feedback, size.width)
+    })
+    .into()
 }
 
-fn settings_dialog_sized<'a>(
+fn settings_layout<'a>(
     category: SettingsCategory,
     draft: &'a SettingsDraft,
     query: &'a str,
     feedback: Option<&'a SettingsFeedback>,
-    size: iced::Size,
-    progress: f32,
+    width: f32,
 ) -> Element<'a, Message> {
-    let window_width = size.width;
-    let narrow = window_width < design::OVERLAY_DOCK_BREAKPOINT;
+    let narrow = width < RAIL_BREAKPOINT;
+    let searching = !query.trim().is_empty();
     let gutter = if narrow { 3.0 } else { 5.0 } * design::GRID_UNIT;
+
+    let mut search = widget::text_input::search_input("Search settings", query)
+        .id(crate::settings_widgets::search_id())
+        .on_input(Message::SettingsSearchChanged)
+        .width(Length::Fill);
+    if !query.is_empty() {
+        search = search.on_clear(Message::SettingsSearchChanged(String::new()));
+    }
     let navigation: Element<'a, Message> = if narrow {
-        // Two columns keep every category readable without an overflowing tab strip.
-        let rows: Vec<Element<'a, Message>> = SettingsCategory::ALL
-            .chunks(2)
-            .map(|items| {
+        let mut rows: Vec<Element<'a, Message>> = vec![search.into()];
+        // Search results span every category, so the picker gives its room
+        // to them while a query is active.
+        if !searching {
+            // Two columns keep every category readable without an
+            // overflowing tab strip.
+            rows.extend(SettingsCategory::ALL.chunks(2).map(|items| {
                 let mut buttons: Vec<_> = items
                     .iter()
-                    .map(|item| category_button(*item, category, progress))
+                    .map(|item| category_button(*item, category))
                     .collect();
                 if items.len() == 1 {
                     buttons.push(iced::widget::Space::new().width(Length::Fill).into());
@@ -669,8 +613,8 @@ fn settings_dialog_sized<'a>(
                     .spacing(design::GRID_UNIT)
                     .width(Length::Fill)
                     .into()
-            })
-            .collect();
+            }));
+        }
         widget::container(
             widget::column::with_children(rows)
                 .spacing(design::GRID_UNIT)
@@ -680,18 +624,18 @@ fn settings_dialog_sized<'a>(
         .width(Length::Fill)
         .into()
     } else {
-        widget::scrollable(
+        let categories = widget::scrollable(
             widget::container(
                 widget::column::with_children(
                     SettingsCategory::ALL
                         .into_iter()
-                        .map(|item| category_button(item, category, progress)),
+                        .map(|item| category_button(item, category)),
                 )
                 .spacing(design::GRID_UNIT)
                 .width(Length::Fill),
             )
             .padding(design::with_vertical_rail(
-                [3.0 * design::GRID_UNIT, 2.0 * design::GRID_UNIT].into(),
+                [design::GRID_UNIT, 2.0 * design::GRID_UNIT].into(),
             ))
             .width(Length::Fill),
         )
@@ -699,32 +643,29 @@ fn settings_dialog_sized<'a>(
             crate::design::scrollbar(),
         ))
         .class(cosmic::style::iced::Scrollable::Minimal)
-        .width(Length::Fixed(42.0 * design::GRID_UNIT))
+        .width(Length::Fill)
+        .height(Length::Fill);
+        widget::column::with_children(vec![
+            widget::container(search)
+                .padding(iced::Padding {
+                    top: 3.0 * design::GRID_UNIT,
+                    right: 2.0 * design::GRID_UNIT,
+                    bottom: 0.0,
+                    left: 2.0 * design::GRID_UNIT,
+                })
+                .into(),
+            categories.into(),
+        ])
+        .spacing(design::GRID_UNIT)
+        .width(Length::Fixed(RAIL_WIDTH))
         .height(Length::Fill)
         .into()
     };
 
-    let search = widget::text_input("Search", query)
-        .id(crate::settings_widgets::search_id())
-        .on_input(Message::SettingsSearchChanged);
-    let navigation: Element<'a, Message> = widget::column::with_children(vec![
-        widget::container(search).padding([8, 8]).into(),
-        navigation,
-    ])
-    .width(if narrow {
-        Length::Fill
-    } else {
-        // Keep the search field and category list on the same rail width.
-        // The list itself is sized to this width; constraining the wrapper to
-        // 200px caused its wider child to clip and overlap the content pane.
-        Length::Fixed(42.0 * design::GRID_UNIT)
-    })
-    .height(if narrow { Length::Shrink } else { Length::Fill })
-    .into();
-    let categories: Vec<_> = if query.trim().is_empty() {
-        vec![category]
-    } else {
+    let categories: Vec<_> = if searching {
         SettingsCategory::ALL.to_vec()
+    } else {
+        vec![category]
     };
     let mut results = Vec::new();
     for category in categories {
@@ -734,7 +675,7 @@ fn settings_dialog_sized<'a>(
             query
         };
         results.extend(
-            settings_category_controls(category, draft, progress)
+            settings_category_controls(category, draft)
                 .into_iter()
                 .filter_map(|group| group.view(category.label(), filter)),
         );
@@ -762,7 +703,7 @@ fn settings_dialog_sized<'a>(
     .width(Length::Fill)
     .height(Length::Fill)
     .into();
-    let body: Element<'a, Message> = if narrow {
+    if narrow {
         widget::column::with_children(vec![
             navigation,
             crate::design::horizontal_rule().into(),
@@ -780,41 +721,7 @@ fn settings_dialog_sized<'a>(
         .width(Length::Fill)
         .height(Length::Fill)
         .into()
-    };
-
-    let header = widget::container(
-        widget::row::with_children(vec![
-            widget::text::title4("Settings").width(Length::Fill).into(),
-            crate::ui_controls::icon_control(
-                crate::ui_controls::symbolic_icon("window-close-symbolic"),
-                "Close settings",
-                false,
-                true,
-                Some(Message::CloseInspector),
-            )
-            .id(settings_close_id())
-            .into(),
-        ])
-        .align_y(Alignment::Center)
-        .height(design::HEADER_HEIGHT),
-    )
-    .padding([2.0 * design::GRID_UNIT, gutter])
-    .width(Length::Fill);
-    let surface = dialog_ui::connected_surface(
-        widget::column::with_children(vec![
-            header.into(),
-            crate::design::horizontal_rule().into(),
-            body,
-        ])
-        .width(Length::Fill)
-        .height(Length::Fill),
-        900.0,
-    );
-    let surface = widget::container(surface)
-        .max_width(900.0)
-        .height(crate::settings_widgets::dialog_size(size).height);
-
-    dialog_ui::overlay(surface.into(), Some(Message::CloseInspector), progress)
+    }
 }
 
 fn terminal_theme_choice<'a>(selected: &str, has_custom: bool) -> Setting<'a, Message> {

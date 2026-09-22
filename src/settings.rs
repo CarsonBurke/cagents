@@ -263,7 +263,7 @@ impl Default for KeyboardShortcuts {
     }
 }
 
-/// Separates chords in the one-line form the settings dialog edits.
+/// Separates chords in the one-line form the settings pane edits.
 pub const CHORD_SEPARATOR: &str = ", ";
 
 impl KeyboardShortcuts {
@@ -338,7 +338,7 @@ fn withheld_from_the_card(binding: ShortcutBinding) -> Option<&'static str> {
     }
 }
 
-/// Renders a chord list as the single line the settings dialog edits.
+/// Renders a chord list as the single line the settings pane edits.
 pub fn format_chords(chords: &[String]) -> String {
     chords.join(CHORD_SEPARATOR)
 }

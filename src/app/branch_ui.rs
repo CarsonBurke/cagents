@@ -342,7 +342,6 @@ impl Cagents {
         key: ActiveWorktreeKey,
         open: impl FnOnce(CardId) -> RepositoryAction,
     ) -> Task<Message> {
-        self.show_workspace_for_action();
         let overlay = if self.context_inspector_is_overlay() {
             self.set_context_inspector_open(false)
         } else {

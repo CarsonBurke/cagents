@@ -510,6 +510,8 @@ pub fn model_for_card(
         CardKind::Browser(_) => ("Browser", "internet-web-browser-symbolic"),
         CardKind::PullRequests(_) => ("Pull requests", "vcs-merge-request-symbolic"),
         CardKind::Repository(_) => ("Repository", "folder-symbolic"),
+        CardKind::Settings => ("Settings", "emblem-system-symbolic"),
+        CardKind::Accounts => ("Accounts", "avatar-default-symbolic"),
     };
     let mut sections = Vec::with_capacity(4);
     let mut actions = Vec::new();
@@ -843,6 +845,9 @@ pub fn model_for_card(
                 .primary(),
             );
         }
+        // Utility panes show application state, which the pane itself lays
+        // out; the inspector has nothing to add beyond its status.
+        CardKind::Settings | CardKind::Accounts => {}
     }
 
     sections.push(Section::new(
@@ -1364,6 +1369,7 @@ fn repository_context<'a>(
                     .first()
                     .map(|worktree| (project, worktree))
             }),
+        CardKind::Settings | CardKind::Accounts => None,
     }
 }
 

@@ -257,7 +257,6 @@ impl Cagents {
                     }
                     ProjectCommand::NewTerminal => {
                         self.project_ui.dialog = None;
-                        self.show_workspace_for_action();
                         let select = self.select_worktree(target.path.clone(), false);
                         let terminal = self.add_terminal(target.path);
                         return Task::batch([select, terminal]);
