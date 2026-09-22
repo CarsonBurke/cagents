@@ -4,17 +4,10 @@ use crate::model::{ChannelId, ProjectChannel};
 use crate::sidebar::SidebarChannel;
 use crate::workspace_model::ModelEdit;
 
-fn close_channel_sessions(sessions: Vec<CardKind>) -> Result<(), String> {
-    close_sessions(sessions, true)
-}
-
 /// Closes the daemon's live sessions behind `sessions`, by the identities the
-/// daemon itself reports rather than the saved descriptors.
-///
-/// `paired` also closes the source terminal a converted chat keeps running,
-/// which is right whenever the chat's card goes away and wrong when the card
-/// is about to show that very terminal.
-pub(super) fn close_sessions(sessions: Vec<CardKind>, paired: bool) -> Result<(), String> {
+/// daemon itself reports rather than the saved descriptors, together with the
+/// source terminal a converted chat keeps running.
+pub(super) fn close_sessions(sessions: Vec<CardKind>) -> Result<(), String> {
     if !sessions
         .iter()
         .any(|kind| matches!(kind, CardKind::Terminal(_) | CardKind::Chat(_)))
@@ -41,18 +34,7 @@ pub(super) fn close_sessions(sessions: Vec<CardKind>, paired: bool) -> Result<()
     // Query live identities: a saved descriptor can predate an upgrade or handoff.
     let terminals = client.list().map_err(|error| error.to_string())?;
     let chats = client.list_chats().map_err(|error| error.to_string())?;
-    let terminal_ids = if paired {
-        channel_terminal_ids(&sessions, &chats)
-    } else {
-        channel_terminal_ids(
-            &sessions
-                .iter()
-                .filter(|kind| matches!(kind, CardKind::Terminal(_)))
-                .cloned()
-                .collect::<Vec<_>>(),
-            &chats,
-        )
-    };
+    let terminal_ids = channel_terminal_ids(&sessions, &chats);
     for kind in &sessions {
         if let CardKind::Chat(session) = kind
             && let Some(live) = chats.iter().find(|live| live.id == session.id)
@@ -437,7 +419,7 @@ impl Cagents {
             return self.finish_delete_channel(id);
         }
         cosmic::task::future(async move {
-            let result = tokio::task::spawn_blocking(move || close_channel_sessions(sessions))
+            let result = tokio::task::spawn_blocking(move || close_sessions(sessions))
                 .await
                 .map_err(|error| error.to_string())
                 .and_then(|result| result);
