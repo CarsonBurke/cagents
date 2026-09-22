@@ -3885,13 +3885,20 @@ impl Cagents {
         };
         Task::batch([
             scope,
-            self.insert_terminal_card(fresh_terminal_session(launch)),
+            self.insert_terminal_card(fresh_terminal_session(launch), None),
         ])
     }
 
-    /// Opens the new terminal `session` beside the focused card of the
-    /// current scope.
-    pub(super) fn insert_terminal_card(&mut self, session: TerminalSession) -> Task<Message> {
+    /// Opens the new terminal `session` in the current scope: at `slot`, as
+    /// strip and saved-order indices, or else beside the focused card.
+    pub(super) fn insert_terminal_card(
+        &mut self,
+        session: TerminalSession,
+        slot: Option<(usize, usize)>,
+    ) -> Task<Message> {
+        if self.project_ui.deleting() {
+            return Task::none();
+        }
         let working_directory = session.launch.working_directory.clone();
         let card_id = CardId::new();
         let card = CardState {
@@ -3910,7 +3917,7 @@ impl Cagents {
             residency: Residency::Hydrating { epoch: 1 },
             kind: CardKind::Terminal(session.clone()),
         };
-        let (index, durable_index) = self.terminal_insertion_indices();
+        let (index, durable_index) = slot.unwrap_or_else(|| self.terminal_insertion_indices());
         let durable = Arc::make_mut(&mut self.durable);
         durable.cards.insert(durable_index, card.clone());
         durable.focused = Some(card_id);
@@ -10231,6 +10238,8 @@ impl Application for Cagents {
                 // Read before anything persists the scope, which prunes the
                 // closed card from its channel's membership.
                 let emptied = self.channels_emptied_by(&[id]);
+                // Taken while the chat still has its slot.
+                let replacement = self.take_chat_replacement(id);
                 self.retire_lsp_card(id);
                 self.sidebar_state.clear_agent_activity(id);
                 self.sidebar_state.acknowledge_agent_update(id);
@@ -10270,7 +10279,12 @@ impl Application for Cagents {
                         Task::none()
                     }
                 };
-                Task::batch([closed, self.delete_channels(emptied)])
+                // A chat returned to a terminal is replaced only now that it
+                // is closed, so no state ever holds both.
+                let replacement = replacement
+                    .map(|(launch, slot)| self.open_chat_replacement(launch, slot))
+                    .unwrap_or_else(Task::none);
+                Task::batch([closed, replacement, self.delete_channels(emptied)])
             }
             Message::Viewport { generation, event } => {
                 // Native callbacks already queued by an unmounted worktree

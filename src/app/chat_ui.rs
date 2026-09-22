@@ -214,6 +214,8 @@ struct Attempt {
 }
 
 struct LocalReturn {
+    /// The conversation being given up.
+    session: chat::Session,
     /// What the terminal that takes the chat's place runs.
     launch: LaunchRecipe,
     /// Whether the terminal resumes the conversation, and so must not start
@@ -248,6 +250,12 @@ pub(super) struct State {
     /// The terminal each card without an exact conversation to hand back
     /// becomes once its chat actor is given up, keyed like `handoffs`.
     local_returns: HashMap<Target, LocalReturn>,
+    /// The terminal each returned chat card is replaced with once its removal
+    /// commits.
+    ///
+    /// The chat leaves first so that no saved state, however it is cut short,
+    /// holds the chat open beside a terminal resuming the same conversation.
+    replacements: HashMap<CardId, LaunchRecipe>,
     /// Unsent composer text belonging to a card whose chat runtime has been
     /// dropped.
     ///
@@ -285,6 +293,7 @@ impl Default for State {
             abandoned: HashMap::new(),
             retiring: HashSet::new(),
             local_returns: HashMap::new(),
+            replacements: HashMap::new(),
             drafts: HashMap::new(),
             parked: HashMap::new(),
             fresh_offers: HashSet::new(),
@@ -1910,6 +1919,7 @@ impl Cagents {
         self.chat_ui.fresh_threads.remove(&card);
         self.chat_ui.closed.remove(&card);
         self.chat_ui.close_after_handoff.remove(&card);
+        self.chat_ui.replacements.remove(&card);
     }
     pub(super) fn chat_start_pending(&self, card: CardId) -> bool {
         self.chat_ui.attempts.contains_key(&card)
@@ -2143,12 +2153,20 @@ impl Cagents {
             Some(CardRuntime::Chat(runtime)) if runtime.connected() => Some(runtime.handle.clone()),
             _ => None,
         };
-        let shared = retains_source_pty(&session) && session.terminal.is_some();
+        // The daemon may run a CLI for a Codex thread that this card never
+        // heard about, when the answer to an earlier return was lost; only
+        // the daemon can say.
+        let shared = retains_source_pty(&session);
         let target = self.chat_ui.next_target(card);
         self.chat_ui.handoffs.insert(target);
-        self.chat_ui
-            .local_returns
-            .insert(target, LocalReturn { launch, resumes });
+        self.chat_ui.local_returns.insert(
+            target,
+            LocalReturn {
+                session: session.clone(),
+                launch,
+                resumes,
+            },
+        );
         cosmic::task::future(async move {
             let result = tokio::task::spawn_blocking(move || {
                 if shared
@@ -2176,6 +2194,33 @@ impl Cagents {
         self.chat_ui.closed.insert(card);
         self.observe_agent_activity_for_card(card, None);
         self.card_removal(handoff)
+    }
+
+    /// The terminal that takes a returned chat's place, with the slot it
+    /// takes: where the chat stands now, in the strip and in saved order.
+    pub(super) fn take_chat_replacement(
+        &mut self,
+        card: CardId,
+    ) -> Option<(LaunchRecipe, (usize, usize))> {
+        let launch = self.chat_ui.replacements.remove(&card)?;
+        let index = self.workspace.order().position(|id| id == card)?;
+        let durable = self
+            .durable
+            .cards
+            .iter()
+            .position(|state| state.id == card)?;
+        Some((launch, (index, durable + 1)))
+    }
+
+    /// Opens the terminal that replaces a chat whose removal has committed.
+    pub(super) fn open_chat_replacement(
+        &mut self,
+        launch: LaunchRecipe,
+        slot: (usize, usize),
+    ) -> Task<Message> {
+        let mut session = fresh_terminal_session(launch);
+        session.resume_hint = crate::model::agent_recovery::hint_from_launch(&session.launch);
+        self.insert_terminal_card(session, Some(slot))
     }
 
     /// The workspace's reservation to remove `card`, taken now unless it is
@@ -2718,64 +2763,72 @@ impl Cagents {
                 }
             }
             Action::ReturnedLocally(target, result) => {
-                let Some(LocalReturn { launch, resumes }) =
-                    self.chat_ui.local_returns.remove(&target)
+                let Some(LocalReturn {
+                    session,
+                    launch,
+                    resumes,
+                }) = self.chat_ui.local_returns.remove(&target)
                 else {
                     return Task::none();
                 };
                 if !self.chat_ui.handoffs.remove(&target) {
                     return Task::none();
                 }
-                let close = self.chat_ui.close_after_handoff.remove(&target.card);
+                let card = target.card;
+                let close = self.chat_ui.close_after_handoff.remove(&card);
                 // The chat stays whenever its conversation is still running
                 // somewhere a new terminal must not compete with: in the CLI
                 // the daemon keeps, or, for a resume, in an actor that may
                 // still be holding it. A new shell shares nothing with the
-                // actor, so doubt about the actor is only reported.
-                let kept = match result {
-                    Ok(()) => None,
-                    Err(ReturnRefused::SourceLive) => Some(
-                        "This conversation's CLI is still running. Reconnect the chat to return to it."
-                            .to_owned(),
+                // actor, so it goes ahead while the actor is given up again,
+                // which reports if it still cannot be confirmed.
+                let (kept, retry) = match result {
+                    Ok(()) => (None, Task::none()),
+                    Err(ReturnRefused::SourceLive) => (
+                        Some(
+                            "This conversation's CLI is still running. Reconnect the chat to return to it."
+                                .to_owned(),
+                        ),
+                        Task::none(),
                     ),
-                    Err(ReturnRefused::Unconfirmed(error)) if resumes => Some(error),
-                    Err(ReturnRefused::Unconfirmed(error)) => {
-                        self.status = Some(TransientNotice::warning(format!(
-                            "The chat could not be confirmed stopped: {error}"
-                        )));
-                        None
+                    Err(ReturnRefused::Unconfirmed(error)) if resumes => (Some(error), Task::none()),
+                    Err(ReturnRefused::Unconfirmed(_)) => {
+                        (None, self.retire_chat(card, None, Some(session)))
                     }
                 };
                 if let Some(error) = kept {
                     self.status = Some(TransientNotice::error(error));
                     return if close {
-                        self.begin_chat_close(target.card)
+                        self.begin_chat_close(card)
                     } else {
                         Task::none()
                     };
                 }
                 if !self
-                    .card_state(target.card)
+                    .card_state(card)
                     .is_some_and(|state| state.existence.is_open())
                 {
-                    return Task::none();
+                    return retry;
                 }
                 // Closed while returning: no terminal is started only to be
                 // stopped again.
                 if close {
-                    return self.remove_chat_card(target.card);
+                    return Task::batch([retry, self.remove_chat_card(card)]);
                 }
-                // The terminal opens right after the chat, which then leaves.
-                let focus = self
-                    .workspace
-                    .focus(target.card)
-                    .map(|update| self.apply_viewport(update, true, false))
-                    .unwrap_or_else(|_| Task::none());
-                let mut session = fresh_terminal_session(launch);
-                session.resume_hint =
-                    crate::model::agent_recovery::hint_from_launch(&session.launch);
-                let terminal = self.insert_terminal_card(session);
-                return Task::batch([focus, terminal, self.remove_chat_card(target.card)]);
+                // The terminal takes the chat's place in its strip, so it can
+                // only be placed while that strip is the one on screen.
+                if !self.workspace.order().any(|id| id == card) {
+                    self.status = Some(TransientNotice::warning(
+                        "The chat has stopped. Return to it and switch again to open its terminal.",
+                    ));
+                    return retry;
+                }
+                self.chat_ui.replacements.insert(card, launch);
+                let removal = self.remove_chat_card(card);
+                if !self.chat_ui.closed.contains(&card) {
+                    self.chat_ui.replacements.remove(&card);
+                }
+                return Task::batch([retry, removal]);
             }
             Action::UpdatesAcknowledged(target, result) => {
                 if let Some(runtime) = self.chat_runtime_mut(target)
@@ -3953,9 +4006,30 @@ mod tests {
             .collect()
     }
 
-    /// Checks that a returned chat left a new terminal running `launch` in
-    /// its place, and that the chat card itself is on its way out.
+    /// Checks that a returned chat leaves, and that a new terminal running
+    /// `launch` takes its place only once it has.
     fn assert_replaced_by_terminal(app: &mut Cagents, card: CardId, launch: &LaunchRecipe) {
+        let chat = match &app.card_state(card).unwrap().kind {
+            CardKind::Chat(chat) => chat.id,
+            _ => panic!("the chat card is never converted in place"),
+        };
+        assert!(
+            terminal_cards(app).is_empty(),
+            "no state holds the chat beside its replacement"
+        );
+        assert_eq!(
+            app.workspace
+                .pending_close()
+                .map(|handoff| handoff.unmounting),
+            Some(card)
+        );
+        let before = app.workspace.order().collect::<Vec<_>>();
+        let slot = before.iter().position(|&id| id == card).unwrap();
+        let _ = app.update(Message::CommitClose(card));
+        assert!(!app.card_state(card).unwrap().existence.is_open());
+        assert!(!app.cards.contains_key(&card));
+        assert!(!app.chat_ui.closed.contains(&card));
+        assert!(app.chat_ui.replacements.is_empty());
         let terminals = terminal_cards(app);
         assert_eq!(terminals.len(), 1, "one terminal takes the chat's place");
         let terminal = terminals[0];
@@ -3965,27 +4039,15 @@ mod tests {
         };
         assert_eq!(&session.launch, launch);
         assert_ne!(
-            session.id,
-            match &app.card_state(card).unwrap().kind {
-                CardKind::Chat(chat) => chat.id,
-                _ => panic!("the chat card is never converted in place"),
-            },
+            session.id, chat,
             "a new terminal, not the conversation's identity"
         );
         let order = app.workspace.order().collect::<Vec<_>>();
-        let position = |id| order.iter().position(|&other| other == id).unwrap();
-        assert_eq!(position(terminal), position(card) + 1, "right beside it");
-        assert_eq!(
-            app.workspace
-                .pending_close()
-                .map(|handoff| handoff.unmounting),
-            Some(card)
-        );
-        let _ = app.update(Message::CommitClose(card));
-        assert!(!app.workspace.order().any(|id| id == card));
-        assert!(!app.card_state(card).unwrap().existence.is_open());
-        assert!(!app.cards.contains_key(&card));
-        assert!(!app.chat_ui.closed.contains(&card));
+        assert!(!order.contains(&card));
+        assert_eq!(order.len(), before.len());
+        assert_eq!(order[slot], terminal, "in the chat's own slot");
+        let saved = |id| app.durable.cards.iter().position(|state| state.id == id);
+        assert_eq!(saved(terminal), saved(card).map(|index| index + 1));
         assert_eq!(app.workspace.focused(), Some(terminal));
         assert!(matches!(
             app.cards.get(&terminal),
@@ -4017,7 +4079,8 @@ mod tests {
             assert!(!app.chat_switch_ready(card), "one return at a time");
 
             // The shell shares nothing with the actor, so doubt about the
-            // actor is reported rather than keeping the card a chat.
+            // actor does not keep the card a chat; the actor is given up
+            // again, and that retirement reports whether it succeeded.
             let _ = app.update(Message::ChatUi(Action::ReturnedLocally(
                 target,
                 Err(ReturnRefused::Unconfirmed(
@@ -4025,6 +4088,8 @@ mod tests {
                 )),
             )));
             assert!(errors(&app).is_empty(), "{:?}", errors(&app));
+            let retry = retired(&mut app, card);
+            let _ = app.update(Message::ChatUi(Action::Retired(retry, Ok(()))));
             assert_replaced_by_terminal(&mut app, card, &shell);
         }
     }
@@ -4137,36 +4202,85 @@ mod tests {
     /// terminal only to stop it.
     #[test]
     fn a_chat_closed_during_its_return_closes_once_the_return_lands() {
-        let mut app = crate::app::tests::context_inspector_test_app(false);
-        let card = live_chat(&mut app, None);
-        let _ = app.update(Message::ChatUi(Action::Switch(card)));
-        let target = *app.chat_ui.local_returns.keys().next().unwrap();
-        let _ = app.update(Message::CloseCard(card));
-        assert!(app.chat_ui.close_after_handoff.contains(&card));
-        assert_eq!(app.workspace.pending_close(), None);
-        assert!(errors(&app).is_empty(), "{:?}", errors(&app));
-        let _ = app.update(Message::ChatUi(Action::ReturnedLocally(target, Ok(()))));
-        assert!(app.chat_ui.close_after_handoff.is_empty());
-        assert!(
-            terminal_cards(&app).is_empty(),
-            "no terminal only to stop it"
-        );
-        assert!(
-            app.chat_ui.retiring.is_empty(),
-            "the return already gave the conversation up"
-        );
-        assert_eq!(
-            app.workspace
-                .pending_close()
-                .map(|handoff| handoff.unmounting),
-            Some(card),
-            "the close the user asked for goes ahead"
-        );
-        let _ = app.update(Message::CommitClose(card));
-        assert!(!app.workspace.order().any(|id| id == card));
-        assert!(!app.card_state(card).unwrap().existence.is_open());
-        assert!(!app.cards.contains_key(&card));
-        assert!(!app.chat_ui.transition_pending());
+        for confirmed in [true, false] {
+            let mut app = crate::app::tests::context_inspector_test_app(false);
+            let card = live_chat(&mut app, None);
+            let _ = app.update(Message::ChatUi(Action::Switch(card)));
+            let target = *app.chat_ui.local_returns.keys().next().unwrap();
+            let _ = app.update(Message::CloseCard(card));
+            assert!(app.chat_ui.close_after_handoff.contains(&card));
+            assert_eq!(app.workspace.pending_close(), None);
+            assert!(errors(&app).is_empty(), "{:?}", errors(&app));
+            let result = if confirmed {
+                Ok(())
+            } else {
+                Err(ReturnRefused::Unconfirmed(
+                    "fixture: daemon unreachable".into(),
+                ))
+            };
+            let _ = app.update(Message::ChatUi(Action::ReturnedLocally(target, result)));
+            assert!(app.chat_ui.close_after_handoff.is_empty());
+            assert!(app.chat_ui.replacements.is_empty());
+            assert_eq!(
+                app.chat_ui.retiring.is_empty(),
+                confirmed,
+                "a conversation not confirmed stopped is given up again"
+            );
+            assert_eq!(
+                app.workspace
+                    .pending_close()
+                    .map(|handoff| handoff.unmounting),
+                Some(card),
+                "the close the user asked for goes ahead"
+            );
+            let _ = app.update(Message::CommitClose(card));
+            assert!(
+                terminal_cards(&app).is_empty(),
+                "no terminal only to stop it"
+            );
+            assert!(!app.workspace.order().any(|id| id == card));
+            assert!(!app.card_state(card).unwrap().existence.is_open());
+            assert!(!app.cards.contains_key(&card));
+            if !confirmed {
+                let retry = retired(&mut app, card);
+                let _ = app.update(Message::ChatUi(Action::Retired(retry, Ok(()))));
+            }
+            assert!(!app.chat_ui.transition_pending());
+        }
+    }
+
+    /// A return that lands once its chat is no longer on screen, or once its
+    /// removal cannot be reserved, keeps the chat rather than opening a
+    /// terminal in a strip the chat is not in, or beside a chat that stays.
+    #[test]
+    fn a_return_that_cannot_take_the_chats_place_keeps_the_chat() {
+        for away in [true, false] {
+            let mut app = crate::app::tests::context_inspector_test_app(false);
+            let other = failed_chat(&mut app);
+            let card = failed_chat(&mut app);
+            let _ = app.update(Message::ChatUi(Action::Switch(card)));
+            let target = *app.chat_ui.local_returns.keys().next().unwrap();
+            if away {
+                // The user has moved to another strip meanwhile.
+                app.workspace =
+                    crate::workspace::Workspace::new(crate::workspace::WorkspaceConfig::default())
+                        .unwrap();
+            } else {
+                // Another card's close is waiting for its commit.
+                app.workspace.request_close(other).unwrap();
+            }
+            let _ = app.update(Message::ChatUi(Action::ReturnedLocally(target, Ok(()))));
+            assert!(terminal_cards(&app).is_empty());
+            assert!(app.chat_ui.replacements.is_empty());
+            assert!(!app.chat_ui.closed.contains(&card));
+            assert!(app.card_state(card).unwrap().existence.is_open());
+            assert!(matches!(
+                app.card_state(card).unwrap().kind,
+                CardKind::Chat(_)
+            ));
+            assert!(app.chat_switch_ready(card), "it can be tried again");
+            assert!(!app.chat_ui.transition_pending());
+        }
     }
 
     /// A close pressed after the removal was reserved never starts a new
