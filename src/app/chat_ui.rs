@@ -1912,6 +1912,13 @@ impl Cagents {
     /// stashing its unsent text would pin the string for the lifetime of the
     /// process with nothing able to read it back.
     pub(super) fn chat_discard(&mut self, card: CardId) {
+        // A start still in flight is not dropped with the card: whatever it
+        // leaves in the daemon is given up when it answers, as for a close.
+        if let Some(attempt) = self.chat_ui.attempts.remove(&card) {
+            self.chat_ui
+                .abandoned
+                .insert(attempt.target, attempt.session);
+        }
         self.chat_forget(card);
         self.chat_ui.drafts.remove(&card);
         self.chat_ui.parked.remove(&card);
@@ -4359,6 +4366,34 @@ mod tests {
             }
             assert!(app.channel_ui.was_deleted(channel));
         }
+    }
+
+    /// Retry between a chat's close and its commit starts nothing, and a start
+    /// still in flight when a card is discarded is given up when it answers
+    /// rather than leaving a daemon actor no card can reach.
+    #[test]
+    fn a_discarded_card_never_strands_a_start() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let card = failed_chat(&mut app);
+        let _ = app.update(Message::CloseCard(card));
+        let _ = app.update(Message::RetryCard(card));
+        assert!(
+            !app.chat_start_pending(card),
+            "retry after close starts nothing"
+        );
+
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let (card, target) = starting_chat(&mut app);
+        let handle = fixture_handle(&app, card, None);
+        app.chat_discard(card);
+        assert!(
+            app.chat_ui.transition_pending(),
+            "the start is still owed an answer"
+        );
+        answer_start(&mut app, target, Ok(handle));
+        let retry = retired(&mut app, card);
+        let _ = app.update(Message::ChatUi(Action::Retired(retry, Ok(()))));
+        assert!(!app.chat_ui.transition_pending());
     }
 
     /// A close pressed while a live Codex chat returns to its CLI lands on a

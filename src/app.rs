@@ -5168,6 +5168,10 @@ impl Cagents {
     }
 
     fn retry_card(&mut self, card: CardId) -> Task<Message> {
+        // A card whose close is already accepted never starts anything again.
+        if self.chat_close_approved(card) {
+            return Task::none();
+        }
         if self.completed_terminal_has_native_owner(card) {
             return self.handle_chat_ui(chat_ui::Action::Switch(card));
         }
