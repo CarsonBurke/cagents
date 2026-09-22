@@ -471,6 +471,10 @@ const fn default_chat_enter_sends() -> bool {
     true
 }
 
+const fn default_show_status_bar() -> bool {
+    true
+}
+
 /// Main stays first; imported worktrees without creation evidence sort by path.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -596,6 +600,12 @@ pub struct AppSettings {
     /// moves sending to Ctrl+Enter, which suits composing long prompts.
     #[serde(default = "default_chat_enter_sends")]
     pub chat_enter_sends: bool,
+    /// Whether the window keeps a status bar along its bottom edge, which
+    /// reports how much of each signed-in provider account's usage limits
+    /// is left. Hiding it also stops the account probes that feed it while
+    /// no Accounts pane is open.
+    #[serde(default = "default_show_status_bar")]
+    pub show_status_bar: bool,
     /// External language servers, in declaration order. The first server whose
     /// language claims a file extension handles that file. An empty list
     /// disables LSP entirely.
@@ -643,6 +653,7 @@ impl Default for AppSettings {
             editor_syntax_theme: EditorSyntaxTheme::default(),
             confirm_terminal_close: default_confirm_terminal_close(),
             chat_enter_sends: default_chat_enter_sends(),
+            show_status_bar: default_show_status_bar(),
             language_servers: default_language_servers(),
             keyboard_shortcuts: KeyboardShortcuts::default(),
         }

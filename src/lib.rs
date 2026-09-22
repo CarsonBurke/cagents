@@ -5,6 +5,7 @@
 /// itself to a person or a log.
 pub const VERSION: &str = env!("CAGENTS_VERSION");
 
+pub mod account;
 pub mod agent;
 #[cfg(feature = "ui")]
 pub mod app;
