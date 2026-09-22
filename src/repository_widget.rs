@@ -4626,7 +4626,8 @@ impl RepositoryRuntime {
         )
     }
 
-    fn comparison_old_path(&self) -> Option<PathBuf> {
+    /// The rename or copy source the old side of the visible comparison reads.
+    pub fn comparison_old_path(&self) -> Option<PathBuf> {
         if let Some((basis, old_path)) = &self.committed_selection
             && *basis == self.diff_basis
         {
