@@ -5380,14 +5380,17 @@ fn changes_tab_controls<'a>(
             .map(|tab| {
                 let active = tab == selected;
                 let control = button::custom(
-                    widget::row::with_children(vec![
-                        widget::icon(tab.icon()).size(ROW_ICON_SIZE).into(),
-                        design::body(tab.label())
-                            .wrapping(cosmic::iced::widget::text::Wrapping::None)
-                            .into(),
-                    ])
-                    .spacing(spacing.space_xxxs)
-                    .align_y(Alignment::Center),
+                    widget::container(
+                        widget::row::with_children(vec![
+                            widget::icon(tab.icon()).size(ROW_ICON_SIZE).into(),
+                            design::body(tab.label())
+                                .wrapping(cosmic::iced::widget::text::Wrapping::None)
+                                .into(),
+                        ])
+                        .spacing(spacing.space_xxxs)
+                        .align_y(Alignment::Center),
+                    )
+                    .center(Length::Fill),
                 )
                 .class(crate::ui_controls::control_style(active, None))
                 .id(chrome.changes_tab_id(tab).clone())

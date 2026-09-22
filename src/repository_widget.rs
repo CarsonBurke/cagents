@@ -1555,6 +1555,7 @@ pub struct RepositoryRuntime {
     basis_resolution: Option<BasisResolution>,
     auto_save: bool,
     wrap_lines: bool,
+    line_height: f32,
     syntax_theme: crate::settings::EditorSyntaxTheme,
     listed_directories: BTreeSet<PathBuf>,
     file_search_generation: u64,
@@ -1690,6 +1691,7 @@ impl RepositoryRuntime {
             basis_resolution: None,
             auto_save: true,
             wrap_lines: false,
+            line_height: 1.5,
             syntax_theme: crate::settings::EditorSyntaxTheme::Auto,
             listed_directories: BTreeSet::new(),
             file_search_generation: 0,
@@ -1732,6 +1734,13 @@ impl RepositoryRuntime {
     /// Changes presentation without replacing the open buffer or its edit history.
     pub fn set_wrap_lines(&mut self, wrap_lines: bool) {
         self.wrap_lines = wrap_lines;
+    }
+
+    /// Changes the editor's relative line height without replacing the buffer.
+    pub fn set_line_height(&mut self, line_height: f32) {
+        if line_height.is_finite() {
+            self.line_height = line_height.clamp(1.0, 2.0);
+        }
     }
 
     /// Installs the syntax palette and drops every comparison coloured with
@@ -6600,6 +6609,9 @@ fn editable_document_view<'a>(
             )
             .font(Font::MONOSPACE)
             .size(14.0)
+            .line_height(iced::widget::text::LineHeight::Relative(
+                runtime.line_height,
+            ))
             .added_lines(if runtime.working_annotations_current() {
                 &runtime.working_diff.additions
             } else {

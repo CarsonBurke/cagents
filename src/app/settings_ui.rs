@@ -704,7 +704,7 @@ fn settings_dialog_sized<'a>(
         .into()
     };
 
-    let search = widget::text_input("Search settings…", query)
+    let search = widget::text_input("Search", query)
         .id(crate::settings_widgets::search_id())
         .on_input(Message::SettingsSearchChanged);
     let navigation: Element<'a, Message> = widget::column::with_children(vec![
@@ -714,7 +714,10 @@ fn settings_dialog_sized<'a>(
     .width(if narrow {
         Length::Fill
     } else {
-        Length::Fixed(200.0)
+        // Keep the search field and category list on the same rail width.
+        // The list itself is sized to this width; constraining the wrapper to
+        // 200px caused its wider child to clip and overlap the content pane.
+        Length::Fixed(42.0 * design::GRID_UNIT)
     })
     .height(if narrow { Length::Shrink } else { Length::Fill })
     .into();

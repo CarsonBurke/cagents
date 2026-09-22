@@ -244,7 +244,18 @@ pub struct StripGeometry {
 impl StripGeometry {
     pub fn build(cards: &[WorkspaceCard], viewport_width: f32, config: WorkspaceConfig) -> Self {
         let viewport_width = finite_nonnegative(viewport_width);
-        let mut cursor = config.leading_padding;
+        let leading = if cards.len() == 1 {
+            let width = cards[0].width.resolve(viewport_width, config.width_limits);
+            let available = viewport_width - config.leading_padding - config.trailing_padding;
+            if width < available {
+                config.leading_padding + (available - width) / 2.0
+            } else {
+                config.leading_padding
+            }
+        } else {
+            config.leading_padding
+        };
+        let mut cursor = leading;
         let mut geometry = Vec::with_capacity(cards.len());
         let mut prefix_ends = Vec::with_capacity(cards.len());
 
@@ -270,9 +281,9 @@ impl StripGeometry {
         } else {
             cursor + config.trailing_padding
         };
-        // An underfilled strip stays anchored to navigation. Centering the
-        // entire strip introduces a dead leading band and moves existing
-        // columns whenever another column is inserted or the viewport grows.
+        // Multi-pane strips stay anchored to navigation. A lone underfilled
+        // pane is centered, while centering the entire strip would introduce
+        // a dead leading band and move existing columns on insertion.
         let total_width = total_width.max(viewport_width);
 
         Self {
@@ -1839,14 +1850,15 @@ mod tests {
     }
 
     #[test]
-    fn underfilled_strip_stays_leading_aligned_through_resize_and_insertion() {
+    fn lone_underfilled_pane_is_centered_but_multi_pane_strips_stay_leading_aligned() {
         let mut workspace = workspace_with_widths(&[CardWidth::Fraction(0.35)], 1_000.0);
         let first = workspace.focused().unwrap();
         for width in [1_000.0, 1_440.0, 800.0] {
             workspace.resize_viewport(width);
             let geometry = workspace.geometry();
             let card = geometry.card(first).unwrap();
-            assert_eq!(card.start, workspace.config.leading_padding);
+            let expected = (width - card.width()) / 2.0;
+            assert!((card.start - expected).abs() < f32::EPSILON);
             assert_eq!(geometry.max_offset(width), 0.0);
             assert_eq!(workspace.projection(width).mounted[0].start, card.start);
         }

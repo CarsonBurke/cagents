@@ -6023,7 +6023,12 @@ impl Cagents {
         Task::batch(tasks)
     }
 
-    fn card_view<'a>(&'a self, id: CardId, focused: bool) -> Element<'a, Message> {
+    fn card_view<'a>(
+        &'a self,
+        id: CardId,
+        focused: bool,
+        show_resize_splitter: bool,
+    ) -> Element<'a, Message> {
         let spacing = cosmic::theme::spacing();
         let card = self.card_state(id);
         let attention = self.sidebar_state.has_card_update(id) && !focused;
@@ -6391,32 +6396,36 @@ impl Cagents {
         .height(Length::Fill)
         .into();
         let edge: Element<'a, Message> = if card.is_some() {
-            let limits = self.workspace.fractional_width_limits();
-            let width = self
-                .workspace
-                .geometry()
-                .card(id)
-                .map_or(limits.minimum, |card| card.width());
-            let maximum = limits.maximum;
-            let minimum = limits.minimum;
-            Splitter::new(
-                chrome.map_or_else(
-                    || card_control_id(id, "resize"),
-                    |chrome| chrome.resize_id.clone(),
-                ),
-                chrome.map_or_else(
-                    || card.map_or("Resize terminal column", |state| state.title.as_str()),
-                    |chrome| chrome.resize_name.as_str(),
-                ),
-                width,
-                minimum,
-                maximum,
-                SplitterEdge::Trailing,
-                self.modal_is_open(),
-                move |width| Message::ResizeCard { card: id, width },
-                move || Message::ResizeCardFinished(id),
-            )
-            .into()
+            if show_resize_splitter {
+                let limits = self.workspace.fractional_width_limits();
+                let width = self
+                    .workspace
+                    .geometry()
+                    .card(id)
+                    .map_or(limits.minimum, |card| card.width());
+                let maximum = limits.maximum;
+                let minimum = limits.minimum;
+                Splitter::new(
+                    chrome.map_or_else(
+                        || card_control_id(id, "resize"),
+                        |chrome| chrome.resize_id.clone(),
+                    ),
+                    chrome.map_or_else(
+                        || card.map_or("Resize terminal column", |state| state.title.as_str()),
+                        |chrome| chrome.resize_name.as_str(),
+                    ),
+                    width,
+                    minimum,
+                    maximum,
+                    SplitterEdge::Trailing,
+                    self.modal_is_open(),
+                    move |width| Message::ResizeCard { card: id, width },
+                    move || Message::ResizeCardFinished(id),
+                )
+                .into()
+            } else {
+                iced::widget::Space::new().into()
+            }
         } else {
             widget::container(crate::design::vertical_rule())
                 .center_x(Length::Fixed(crate::splitter::WIDTH))
@@ -11696,6 +11705,11 @@ impl Application for Cagents {
         // The focused card's own name and path are the card header's job, and
         // the window's header bar already carries the name; see
         // `sync_window_title`.
+        let docked_context_inspector = self.context_inspector_visible()
+            && matches!(
+                inspector::mount_for_width(window_width, true, true),
+                Some(InspectorLayout::Docked)
+            );
 
         let workspace: Element<'_, Message> = if self.workspace.cards().is_empty() {
             let action_buttons = || {
@@ -11772,7 +11786,9 @@ impl Application for Cagents {
                 self.settings.focus_follows_mouse,
                 self.workspace.viewport_width(),
                 self.workspace_scroll_id.clone(),
-                |context| self.card_view(context.id, context.focused),
+                move |context| {
+                    self.card_view(context.id, context.focused, !docked_context_inspector)
+                },
                 // `sync_chrome` keeps an entry for every durable card, so
                 // the fallback is only reachable for a card the workspace holds
                 // but the durable model does not.
