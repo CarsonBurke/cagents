@@ -1046,6 +1046,21 @@ mod tests {
                 .any(|channel| channel.id == empty)
         );
         assert_eq!(app.durable.active_channel, Some(empty));
+
+        // Visiting a channel that is deleted while the user is elsewhere, it
+        // returns to the worktree strip on screen at once.
+        let _ = app.update(Message::Sidebar(SidebarAction::OpenSettings));
+        let pane = app.utility_card(&CardKind::Settings).unwrap();
+        let _ = app.select_worktree("/repo".into(), false);
+        assert_eq!(order(&app), [main.id]);
+        let _ = app.handle_channel_ui(super::super::channel_ui::Action::Delete(empty));
+        assert!(
+            !app.durable
+                .channels
+                .iter()
+                .any(|channel| channel.id == empty)
+        );
+        assert!(order(&app).contains(&pane));
     }
 
     fn register_worktrees(app: &mut Cagents, paths: &[&str]) {

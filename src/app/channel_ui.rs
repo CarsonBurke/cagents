@@ -495,11 +495,13 @@ impl Cagents {
         // identically whoever asked.
         self.publish_model_edit(ModelEdit::DeleteChannel { id });
         self.channel_ui.deleted.insert(id);
+        let mut freed_utility = false;
         for card in channel.cards {
             // A utility pane outlives the channel it was visiting: it leaves
             // with no channel, which every worktree strip shows, and opening
             // it again from a channel brings it there.
             if !self.is_channel_content(card) {
+                freed_utility = true;
                 continue;
             }
             self.retire_lsp_card(card);
@@ -525,6 +527,13 @@ impl Cagents {
                     }
                 },
             }
+        } else if freed_utility
+            && self.durable.active_channel.is_none()
+            && let Some(path) = self.active_workspace.clone()
+        {
+            // The freed pane now belongs in the worktree strip on screen,
+            // which was built without it.
+            self.select_worktree(path, false)
         } else {
             Task::none()
         };
@@ -646,11 +655,10 @@ impl Cagents {
                 let mut chats = 0;
                 let mut has_panes = false;
                 for id in &channel.cards {
-                    let Some(card) = durable
-                        .cards
-                        .iter()
-                        .find(|card| card.id == *id && card.existence.is_open())
-                    else {
+                    // A visiting utility pane is not what the channel holds.
+                    let Some(card) = durable.cards.iter().find(|card| {
+                        card.id == *id && card.existence.is_open() && !card.kind.is_utility()
+                    }) else {
                         continue;
                     };
                     has_panes = true;
@@ -1169,6 +1177,22 @@ mod tests {
         // Nor does it keep a channel whose conversations are all gone.
         assert_eq!(app.channels_emptied_by(&[conversation]), [channel]);
         assert!(app.channel_has_open_card(channel));
+        Arc::make_mut(&mut app.durable).cards[1].existence =
+            super::super::project_ui::removed_existence("closed fixture");
+        app.sidebar_model.projects.push(SidebarProject::new(
+            ProjectId::new(),
+            RepositoryId::new(),
+            "project".into(),
+            "/repo".into(),
+            Vec::new(),
+            Vec::new(),
+        ));
+        Arc::make_mut(&mut app.durable).channels[0].project_id = app.sidebar_model.projects[0].id;
+        app.refresh_sidebar_channels();
+        assert!(
+            !app.sidebar_model.projects[0].channels[0].has_panes,
+            "the sidebar mutes a channel only settings is visiting"
+        );
         Arc::make_mut(&mut app.durable).cards[1].existence =
             super::super::project_ui::removed_existence("closed fixture");
         assert!(!app.channel_has_open_card(channel));
