@@ -153,13 +153,14 @@ fn settings_category_controls<'a>(
                 setting_field(
                     "Pane activation",
                     "Activate the pane under the pointer without scrolling the workspace or pane contents.",
-                    widget::toggler(draft.focus_follows_mouse)
-                        .label("Activate panes on hover".to_owned())
-                        .on_toggle(|enabled| Message::SettingsChanged {
+                    crate::settings_widgets::toggle(
+                        "Activate panes on hover",
+                        draft.focus_follows_mouse,
+                        |enabled| Message::SettingsChanged {
                             field: SettingsField::FocusFollowsMouse,
                             value: enabled.to_string(),
-                        })
-                        .into(),
+                        },
+                    ),
                 ),
                 setting_input(
                     "Maximum hot columns",
@@ -176,13 +177,14 @@ fn settings_category_controls<'a>(
                 setting_field(
                     "Chat send key",
                     "Enter sends the message and Shift+Enter breaks the line. Turn this off to compose with Enter and send with Ctrl+Enter.",
-                    widget::toggler(draft.chat_enter_sends)
-                        .label("Enter sends a chat message".to_owned())
-                        .on_toggle(|enabled| Message::SettingsChanged {
+                    crate::settings_widgets::toggle(
+                        "Enter sends a chat message",
+                        draft.chat_enter_sends,
+                        |enabled| Message::SettingsChanged {
                             field: SettingsField::ChatEnterSends,
                             value: enabled.to_string(),
-                        })
-                        .into(),
+                        },
+                    ),
                 ),
             ],
         )],
@@ -368,13 +370,14 @@ fn settings_category_controls<'a>(
                 vec![setting_field(
                     "Active processes",
                     "Ask before closing a terminal with a foreground program or background jobs.",
-                    widget::toggler(draft.confirm_terminal_close)
-                        .label("Confirm closing active processes".to_owned())
-                        .on_toggle(|enabled| Message::SettingsChanged {
+                    crate::settings_widgets::toggle(
+                        "Confirm closing active processes",
+                        draft.confirm_terminal_close,
+                        |enabled| Message::SettingsChanged {
                             field: SettingsField::ConfirmTerminalClose,
                             value: enabled.to_string(),
-                        })
-                        .into(),
+                        },
+                    ),
                 )],
             ),
         ],
@@ -568,6 +571,9 @@ fn category_button<'a>(item: SettingsCategory, selected: SettingsCategory) -> El
 /// Card width below which the category rail folds above the settings. The
 /// rail needs its own width plus a readable column beside it.
 const RAIL_BREAKPOINT: f32 = 560.0;
+/// Card width below which two category columns no longer fit their labels,
+/// so the picker collapses to a single dropdown under the search field.
+const GRID_BREAKPOINT: f32 = 340.0;
 const RAIL_WIDTH: f32 = 42.0 * design::GRID_UNIT;
 
 /// The settings pane's body. Its layout follows the card's width, which the
@@ -606,7 +612,22 @@ fn settings_layout<'a>(
         let mut rows: Vec<Element<'a, Message>> = vec![search.into()];
         // Search results span every category, so the picker gives its room
         // to them while a query is active.
-        if !searching {
+        if !searching && width < GRID_BREAKPOINT {
+            let labels: Vec<String> = SettingsCategory::ALL
+                .iter()
+                .map(|item| item.label().to_owned())
+                .collect();
+            let selected = SettingsCategory::ALL
+                .iter()
+                .position(|item| *item == category);
+            rows.push(
+                widget::dropdown(labels, selected, |index| {
+                    Message::SelectSettingsCategory(SettingsCategory::ALL[index])
+                })
+                .width(Length::Fill)
+                .into(),
+            );
+        } else if !searching {
             // Two columns keep every category readable without an
             // overflowing tab strip.
             rows.extend(SettingsCategory::ALL.chunks(2).map(|items| {
