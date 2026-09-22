@@ -419,6 +419,131 @@ pub fn segmented_controls<'a, Message: 'a>(
     .into()
 }
 
+/// One entry of a [`view_tabs`] bar.
+pub struct ViewTab<'a, Message> {
+    /// The short visible name.
+    pub label: Cow<'a, str>,
+    /// The accessible name and tooltip, which say what the label cannot fit.
+    pub description: Cow<'a, str>,
+    /// A quiet trailing figure, such as how many rows the view holds, and the
+    /// text style it draws in, e.g. [`crate::design::muted_text`].
+    pub count: Option<(
+        Cow<'a, str>,
+        fn(&cosmic::Theme) -> iced::widget::text::Style,
+    )>,
+    pub selected: bool,
+    pub id: Option<widget::Id>,
+    /// What choosing the tab raises. The selected tab publishes nothing:
+    /// choosing the view already on screen is not an intent.
+    pub on_press: Option<Message>,
+}
+
+/// A pane's single row of text tabs.
+///
+/// Views of one pane are peers, so they are words on one baseline rather than
+/// unlabeled glyphs in a boxed selector: the selected view reads from its
+/// filled surface and full-strength label, the others stay quiet until
+/// hovered. Nothing else belongs in the row; a view's own options live in the
+/// pane's header, beside the identity they act on.
+///
+/// `compact` tightens each tab's inset for a narrow pane. The row clips
+/// rather than spilling past the pane if its words still do not fit.
+pub fn view_tabs<'a, Message: Clone + 'a>(
+    tabs: Vec<ViewTab<'a, Message>>,
+    compact: bool,
+) -> Element<'a, Message> {
+    let spacing = cosmic::theme::spacing();
+    let inset = if compact {
+        spacing.space_xxs
+    } else {
+        spacing.space_xs
+    };
+    let row = widget::row::with_children(
+        tabs.into_iter()
+            .map(|tab| {
+                let ViewTab {
+                    label,
+                    description,
+                    count,
+                    selected,
+                    id,
+                    on_press,
+                } = tab;
+                let mut content = widget::row::with_capacity(2)
+                    .spacing(spacing.space_xxs)
+                    .align_y(iced::Alignment::Center)
+                    .push(crate::design::body(label).wrapping(iced::widget::text::Wrapping::None));
+                // The count is drawn, so it is spoken too: a name that left it
+                // out would describe a different tab than the one on screen.
+                let name: Cow<'a, str> = match &count {
+                    Some((count, _)) => format!("{description}: {count}").into(),
+                    None => description,
+                };
+                if let Some((count, style)) = count {
+                    content = content.push(
+                        crate::design::caption(count)
+                            .wrapping(iced::widget::text::Wrapping::None)
+                            .class(cosmic::theme::Text::Custom(style)),
+                    );
+                }
+                let mut button =
+                    widget::button::custom(widget::container(content).center_y(Length::Fill))
+                        .class(view_tab_style(selected))
+                        .name(name.clone())
+                        .selected(selected)
+                        .padding([0, inset])
+                        .height(crate::design::DENSE_ROW_HEIGHT)
+                        .on_press_maybe(if selected { None } else { on_press });
+                if let Some(id) = id {
+                    button = button.id(id);
+                }
+                tooltip(crate::interaction::hover(button), name)
+            })
+            .collect::<Vec<_>>(),
+    )
+    .spacing(spacing.space_xxxs)
+    .align_y(iced::Alignment::Center);
+    widget::container(row).width(Length::Fill).clip(true).into()
+}
+
+/// [`control_style`]'s surface with a label tone: the selected tab keeps its
+/// fill and full-strength label even though it publishes nothing, and the
+/// rest read as quieter peers rather than as disabled controls.
+fn view_tab_style(selected: bool) -> cosmic::theme::Button {
+    let appearance = move |focused: bool, theme: &cosmic::Theme| {
+        let component = &theme.current_container().component;
+        widget::button::Style {
+            background: (selected || focused)
+                .then(|| iced::Background::Color(component.selected_state_color().into())),
+            border_radius: theme.cosmic().corner_radii.radius_s.into(),
+            border_width: 0.0,
+            text_color: Some(if selected {
+                component.on.into()
+            } else {
+                crate::design::muted_color(theme)
+            }),
+            ..widget::button::Style::new()
+        }
+    };
+    cosmic::theme::Button::Custom {
+        active: Box::new(appearance),
+        disabled: Box::new(move |theme| appearance(false, theme)),
+        hovered: Box::new(move |focused, theme| widget::button::Style {
+            background: Some(iced::Background::Color(
+                theme.current_container().component.hover.into(),
+            )),
+            text_color: Some(theme.current_container().component.on.into()),
+            ..appearance(focused, theme)
+        }),
+        pressed: Box::new(move |focused, theme| widget::button::Style {
+            background: Some(iced::Background::Color(
+                theme.current_container().component.pressed.into(),
+            )),
+            ..appearance(focused, theme)
+        }),
+    }
+}
+
 /// The shell's flat control surface: no border, no fill until hovered.
 ///
 /// Exposed so a surface that composes its own row - a transcript step, a
