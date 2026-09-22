@@ -90,6 +90,7 @@ impl Cagents {
             Ok(handoff) => workspace_widget::focus_handoff_then(
                 handoff,
                 widget::Id::new(TOOLBAR_FOCUS_ID),
+                |next| self.card_keyboard_focus(next),
                 Message::CommitClose(card),
             )
             .map(cosmic::Action::App),
@@ -131,7 +132,7 @@ impl Cagents {
             let _ = self.workspace.focus(card);
         }
         iced::widget::operation::focus(
-            card.map(workspace_widget::card_focus_id)
+            card.map(|card| self.card_keyboard_focus(card))
                 .unwrap_or_else(|| widget::Id::new(TOOLBAR_FOCUS_ID)),
         )
         .map(cosmic::Action::App)

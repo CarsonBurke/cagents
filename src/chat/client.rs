@@ -254,6 +254,61 @@ fn restore(
     })
 }
 impl ClientHandle {
+    /// A handle whose snapshot the UI can render without a daemon.
+    ///
+    /// The peer sockets are kept open for the process lifetime so dropping the
+    /// handle does not look like a protocol failure to a test that only draws.
+    #[cfg(test)]
+    pub(crate) fn fixture(session: Session, snapshot: Snapshot) -> Self {
+        let (stream, peer) = UnixStream::pair().expect("socket pair");
+        let (cancel, cancel_peer) = UnixStream::pair().expect("socket pair");
+        let (visibility_tx, visibility_rx) = crossbeam_channel::bounded(1);
+        std::mem::forget(peer);
+        std::mem::forget(cancel_peer);
+        std::mem::forget(visibility_rx);
+        let proof = HostSessionProof {
+            host_session_id: crate::model::HostSessionId::new("fixture-host"),
+            boot_id: crate::model::BootId::new("fixture-boot"),
+            host_incarnation: crate::model::HostIncarnation::new("fixture-incarnation"),
+        };
+        Self {
+            inner: Arc::new(Inner {
+                id: session.id,
+                session,
+                proof,
+                wire: Arc::new(Mutex::new(Wire {
+                    stream,
+                    codec: FrameCodec::new(ipc::MAX_FRAME_BYTES),
+                })),
+                cancel,
+                snapshot: Arc::new(Mutex::new(Arc::new(snapshot))),
+                activity: Arc::new(Mutex::new(ActivityObservation {
+                    generation: 0,
+                    state: ActivityState::Idle,
+                    pending: false,
+                })),
+                observed: Arc::new(Mutex::new(OutputObservation::default())),
+                next: Arc::new(AtomicU64::new(1)),
+                alive: Arc::new(AtomicBool::new(true)),
+                visible: Arc::new(AtomicBool::new(true)),
+                wake: Arc::new(|_| {}),
+                reader: Mutex::new(None),
+                pending: Arc::new(Mutex::new(BTreeMap::new())),
+                visibility_tx,
+                visibility_worker: Mutex::new(None),
+            }),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn replace_snapshot_for_test(&self, snapshot: Snapshot) {
+        *self
+            .inner
+            .snapshot
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Arc::new(snapshot);
+    }
+
     /// Read-only metadata lookup. Does not subscribe, resume, or write a turn.
     pub fn preview(
         session: Session,

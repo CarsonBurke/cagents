@@ -311,7 +311,7 @@ impl Cagents {
                 let focus = self.nested_modal_focus_target().unwrap_or_else(|| {
                     self.workspace
                         .focused()
-                        .map(workspace_widget::card_focus_id)
+                        .map(|card| self.card_keyboard_focus(card))
                         .unwrap_or_else(|| widget::Id::new(TOOLBAR_FOCUS_ID))
                 });
                 iced::widget::operation::focus(focus).map(cosmic::Action::App)

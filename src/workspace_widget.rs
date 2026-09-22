@@ -278,26 +278,33 @@ pub fn focus_card<Message: 'static>(id: CardId) -> Task<Message> {
     widget::operation::focus(card_focus_id(id))
 }
 
-pub fn focus_handoff<Message: 'static>(
+pub fn focus_handoff<Message, F>(
     handoff: FocusHandoff,
     toolbar_focus_id: widget::Id,
-) -> Task<Message> {
+    card_focus: F,
+) -> Task<Message>
+where
+    Message: Send + 'static,
+    F: FnOnce(CardId) -> widget::Id,
+{
     match handoff.target {
-        FocusTarget::Card(id) => focus_card(id),
+        FocusTarget::Card(id) => widget::operation::focus(card_focus(id)),
         FocusTarget::WorkspaceToolbar => widget::operation::focus(toolbar_focus_id),
         FocusTarget::Unchanged => Task::none(),
     }
 }
 
-pub fn focus_handoff_then<Message>(
+pub fn focus_handoff_then<Message, F>(
     handoff: FocusHandoff,
     toolbar_focus_id: widget::Id,
+    card_focus: F,
     after_focus: Message,
 ) -> Task<Message>
 where
     Message: Send + 'static,
+    F: FnOnce(CardId) -> widget::Id,
 {
-    focus_handoff(handoff, toolbar_focus_id).chain(Task::done(after_focus))
+    focus_handoff(handoff, toolbar_focus_id, card_focus).chain(Task::done(after_focus))
 }
 
 pub fn global_shortcut(

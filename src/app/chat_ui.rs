@@ -1268,6 +1268,15 @@ impl Runtime {
         }
     }
 
+    /// The named control that should receive the keyboard for this card.
+    pub(super) fn focus_control(&self) -> &'static str {
+        if self.model_picker.is_some() {
+            "chat-model-search"
+        } else {
+            "chat-composer"
+        }
+    }
+
     fn can_choose_provider(&self) -> bool {
         self.session.terminal.is_none()
             && !self.snapshot.busy
@@ -1390,6 +1399,18 @@ fn observed_launch(session: &TerminalSession) -> Option<LaunchRecipe> {
         .as_deref()
         .and_then(crate::model::agent_recovery::observed_launch_from_hint)
         .or_else(|| Provider::from_program(&session.launch.program).map(|_| session.launch.clone()))
+}
+
+/// Whether switching this chat to the native view must leave its source PTY running.
+///
+/// Codex native chat is the same thread as the CLI, including while a turn is
+/// in progress. `ShutdownTerminal` kills that child. The session returned by
+/// attach copies the daemon's stored terminal, whose continuity stays
+/// `RelaunchAvailable` even while the process is live, so the decision cannot
+/// consult `live_proof`. Claude and OMP stop the CLI before native resume, and
+/// their source PTY is torn down with the surface.
+pub(super) fn retains_source_pty(session: &chat::Session) -> bool {
+    session.launch.provider == Provider::Codex
 }
 
 pub(super) fn conversion(session: &TerminalSession) -> Result<chat::Session, String> {
@@ -1837,6 +1858,32 @@ impl Cagents {
             Message::ChatUi(Action::CloseFinished(target, result))
         })
     }
+    /// A panic while connecting is a failed start, not an unwind of the UI thread.
+    fn started_chat(
+        caught: Result<
+            Result<Arc<ClientHandle>, chat::StartFailure>,
+            Box<dyn std::any::Any + Send>,
+        >,
+    ) -> Result<Arc<ClientHandle>, chat::StartFailure> {
+        match caught {
+            Ok(result) => result,
+            Err(payload) => {
+                let detail = payload
+                    .downcast_ref::<&str>()
+                    .copied()
+                    .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
+                    .unwrap_or("the native chat connection panicked");
+                Err(chat::StartFailure::retry(format!(
+                    "Native chat failed to start: {detail}"
+                )))
+            }
+        }
+    }
+
+    fn retire_switched_terminal(&mut self, terminal: TerminalSurface, session: &chat::Session) {
+        self.retire_terminal_surface(terminal, !retains_source_pty(session));
+    }
+
     pub(super) fn start_chat(
         &mut self,
         card: CardId,
@@ -1861,17 +1908,24 @@ impl Cagents {
         let sender = self.chat_ui.sender.clone();
         cosmic::task::future(async move {
             let result = tokio::task::spawn_blocking(move || {
-                ClientHandle::connect(
-                    session,
-                    intent,
-                    source,
-                    terminate_source,
-                    selection,
-                    move |wake| {
-                        let _ = sender.try_send((target, wake));
+                // A panic in the provider handshake has to come back as a
+                // failed start. Unwinding here fails the blocking task; the
+                // UI thread then only sees a join error and can still draw.
+                Self::started_chat(std::panic::catch_unwind(std::panic::AssertUnwindSafe(
+                    || {
+                        ClientHandle::connect(
+                            session,
+                            intent,
+                            source,
+                            terminate_source,
+                            selection,
+                            move |wake| {
+                                let _ = sender.try_send((target, wake));
+                            },
+                        )
+                        .map(Arc::new)
                     },
-                )
-                .map(Arc::new)
+                )))
             })
             .await
             .map_err(|error| chat::StartFailure::retry(error.to_string()))
@@ -2047,7 +2101,7 @@ impl Cagents {
                     if let Some(CardRuntime::Terminal(terminal)) =
                         self.cards.insert(card, CardRuntime::Chat(runtime))
                     {
-                        self.begin_terminal_teardown(terminal);
+                        self.retire_switched_terminal(terminal, &session);
                     }
                     self.commit_chat_session(card, session);
                     return Task::none();
@@ -2248,7 +2302,7 @@ impl Cagents {
                                 .cards
                                 .insert(target.card, CardRuntime::Chat(Box::new(runtime)))
                             {
-                                self.begin_terminal_teardown(terminal);
+                                self.retire_switched_terminal(terminal, &session);
                             }
                         }
                         if let Some(CardRuntime::Chat(runtime)) = self.cards.get(&target.card) {
@@ -2264,11 +2318,9 @@ impl Cagents {
                             self.name_channel_from_prompt(target.card, &name);
                         }
                         self.observe_agent_activity_for_card(target.card, Some(activity));
-                        let control = if matches!(self.cards.get(&target.card), Some(CardRuntime::Chat(runtime)) if runtime.model_picker.is_some())
-                        {
-                            "chat-model-search"
-                        } else {
-                            "chat-composer"
+                        let control = match self.cards.get(&target.card) {
+                            Some(CardRuntime::Chat(runtime)) => runtime.focus_control(),
+                            _ => "chat-composer",
                         };
                         return iced::widget::operation::focus(card_control_id(
                             target.card,
@@ -3045,6 +3097,63 @@ impl Cagents {
 }
 
 #[cfg(test)]
+pub(super) fn refused_switch_message(app: &Cagents, card: CardId, message: &str) -> Message {
+    Message::ChatUi(Action::Ready(
+        pending_switch_target(app, card),
+        Ready(Arc::new(Mutex::new(Some(Err(chat::StartFailure::retry(
+            message,
+        )))))),
+    ))
+}
+
+#[cfg(test)]
+pub(super) fn pending_switch_target(app: &Cagents, card: CardId) -> Target {
+    app.chat_ui
+        .attempts
+        .get(&card)
+        .expect("switch staged an attempt")
+        .target
+}
+
+#[cfg(test)]
+pub(super) fn ready_message_for_pending_switch(
+    app: &Cagents,
+    card: CardId,
+    snapshot: chat::Snapshot,
+) -> Message {
+    let attempt = app
+        .chat_ui
+        .attempts
+        .get(&card)
+        .expect("switch staged an attempt");
+    let handle = Arc::new(ClientHandle::fixture(attempt.session.clone(), snapshot));
+    Message::ChatUi(Action::Ready(
+        attempt.target,
+        Ready(Arc::new(Mutex::new(Some(Ok(handle))))),
+    ))
+}
+
+#[cfg(test)]
+pub(super) fn show_chat_snapshot_for_test(
+    app: &mut Cagents,
+    card: CardId,
+    snapshot: chat::Snapshot,
+) -> usize {
+    let requests = snapshot.requests.len();
+    let Some(CardRuntime::Chat(runtime)) = app.cards.get_mut(&card) else {
+        panic!("chat snapshot requires a chat runtime");
+    };
+    runtime.handle.replace_snapshot_for_test(snapshot);
+    runtime.show(true);
+    assert_eq!(
+        runtime.snapshot.requests.len(),
+        requests,
+        "the drawn transcript has to be the snapshot just installed"
+    );
+    requests
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -3206,6 +3315,55 @@ mod tests {
         assert!(!app.chat_start_pending(card));
         assert!(
             matches!(&app.card_state(card).unwrap().kind, CardKind::Chat(session) if session.launch.provider == Provider::Codex)
+        );
+    }
+
+    #[test]
+    fn a_panic_while_starting_native_chat_is_a_failed_start() {
+        let caught =
+            std::panic::catch_unwind(|| -> Result<Arc<ClientHandle>, chat::StartFailure> {
+                panic!("attach exploded");
+            });
+        let Err(failure) = Cagents::started_chat(caught) else {
+            panic!("a panic is a start failure");
+        };
+        assert!(
+            failure.message.contains("attach exploded"),
+            "the panic payload has to reach the card: {}",
+            failure.message
+        );
+        assert_eq!(failure.recovery, chat::Recovery::Retry);
+    }
+
+    #[test]
+    fn codex_keeps_its_source_pty_even_when_the_daemon_record_is_not_marked_live() {
+        use crate::model::{BootId, HostIncarnation, HostSessionId};
+
+        let mut card = crate::app::tests::terminal_card_state();
+        let CardKind::Terminal(terminal) = &mut card.kind else {
+            unreachable!();
+        };
+        terminal.continuity = TerminalContinuity::Live {
+            host_session_id: HostSessionId::new("host"),
+            boot_id: BootId::new("boot"),
+            host_incarnation: HostIncarnation::new("incarnation"),
+        };
+        terminal.launch.program = "claude".into();
+        let claude = conversion(terminal).expect("claude converts");
+        assert!(!retains_source_pty(&claude));
+
+        // Attach copies the daemon's stored terminal. That record keeps the
+        // spawn continuity, which is not Live, while the child is still the
+        // native writer's process.
+        terminal.launch.program = "codex".into();
+        terminal.continuity = TerminalContinuity::RelaunchAvailable {
+            recipe: terminal.launch.clone(),
+            last_exit: None,
+        };
+        let attached = conversion(terminal).expect("codex converts");
+        assert!(
+            retains_source_pty(&attached),
+            "a Codex attach must not ShutdownTerminal just because the stored continuity is not Live"
         );
     }
 

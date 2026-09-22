@@ -116,6 +116,15 @@ impl TerminalSurface {
     pub fn shutdown(&self) -> Result<(), TerminalSendError> {
         self.0.shutdown()
     }
+
+    /// Drop this client's attachment without stopping the daemon-owned PTY.
+    ///
+    /// [`shutdown`](Self::shutdown) asks the worker to kill its child. A Codex
+    /// thread stays alive in that child while native chat is attached, so the
+    /// UI has to leave the process hosted and only disconnect itself.
+    pub fn release(self) {
+        drop(self);
+    }
 }
 
 impl From<HostedTerminalHandle> for TerminalSurface {

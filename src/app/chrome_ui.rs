@@ -79,6 +79,73 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn chat_column_title_does_not_adopt_the_terminal_focus_id() {
+        use cosmic::iced::advanced::{Layout, Shell, clipboard, layout, mouse, widget::Tree};
+        use cosmic::iced::{Event, Rectangle, Size};
+
+        let mut app = super::super::tests::context_inspector_test_app(true);
+        let card = app.workspace.focused().unwrap();
+        let state = Arc::make_mut(&mut app.durable)
+            .cards
+            .iter_mut()
+            .find(|state| state.id == card)
+            .unwrap();
+        let CardKind::Terminal(terminal) = &mut state.kind else {
+            unreachable!();
+        };
+        terminal.launch.program = "codex".into();
+        let session = chat_ui::conversion(terminal).expect("codex terminal converts");
+        state.kind = CardKind::Chat(session);
+
+        let renderer = super::super::tests::headless_renderer();
+        for (target, title_activated) in [
+            (workspace_widget::card_focus_id(card), false),
+            (card_control_id(card, "title"), true),
+        ] {
+            let mut header = app.column_header(card, true, 320.0);
+            let mut tree = Tree::new(header.as_widget());
+            let viewport = Rectangle::with_size(Size::new(320.0, 40.0));
+            let node = header.as_widget_mut().layout(
+                &mut tree,
+                &renderer,
+                &layout::Limits::new(Size::ZERO, viewport.size()),
+            );
+            header.as_widget_mut().operate(
+                &mut tree,
+                Layout::new(&node),
+                &renderer,
+                &mut iced::advanced::widget::operation::focusable::focus::<()>(target.clone()),
+            );
+            let event = Event::Keyboard(keyboard::Event::KeyPressed {
+                key: keyboard::Key::Named(keyboard::key::Named::Enter),
+                modified_key: keyboard::Key::Named(keyboard::key::Named::Enter),
+                physical_key: keyboard::key::Physical::Code(keyboard::key::Code::Enter),
+                location: keyboard::Location::Standard,
+                modifiers: keyboard::Modifiers::empty(),
+                text: None,
+                repeat: false,
+            });
+            let mut messages = Vec::new();
+            let mut shell = Shell::new(&mut messages);
+            header.as_widget_mut().update(
+                &mut tree,
+                &event,
+                Layout::new(&node),
+                mouse::Cursor::Unavailable,
+                &renderer,
+                &mut clipboard::Null,
+                &mut shell,
+                &viewport,
+            );
+            assert_eq!(
+                shell.is_event_captured(),
+                title_activated,
+                "focus target {target:?} should activate the title: {title_activated}"
+            );
+        }
+    }
 }
 
 impl State {
@@ -781,17 +848,7 @@ impl Cagents {
         let title = card.map_or("Column", |card| card.title.as_str());
         let labels = card_kind_labels(card.map(|card| &card.kind));
         let chrome = self.card_chrome.get(&id);
-        let focus_id = if card.is_some_and(|card| matches!(card.kind, CardKind::Terminal(_))) {
-            chrome.map_or_else(
-                || card_control_id(id, "title"),
-                |chrome| chrome.title_id.clone(),
-            )
-        } else {
-            chrome.map_or_else(
-                || workspace_widget::card_focus_id(id),
-                |chrome| chrome.focus_id.clone(),
-            )
-        };
+        let focus_id = self.card_header_widget_id(id);
         let caption = card.map(|card| card_kind_caption(&card.kind));
         let icon: Element<'_, Message> = match card.map(|card| &card.kind) {
             Some(CardKind::Browser(_)) => browser_icon().icon().size(16).into(),
