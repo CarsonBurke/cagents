@@ -372,6 +372,19 @@ impl Cagents {
             .collect()
     }
 
+    pub(super) fn channel_has_open_card(&self, id: ChannelId) -> bool {
+        self.durable
+            .channels
+            .iter()
+            .find(|channel| channel.id == id)
+            .is_some_and(|channel| {
+                channel.cards.iter().any(|&card| {
+                    self.card_state(card)
+                        .is_some_and(|state| state.existence.is_open())
+                })
+            })
+    }
+
     pub(super) fn delete_channels(&mut self, ids: Vec<ChannelId>) -> Task<Message> {
         Task::batch(ids.into_iter().map(|id| self.delete_channel(id)))
     }

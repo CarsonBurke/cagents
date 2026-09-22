@@ -4354,6 +4354,47 @@ mod tests {
         }
     }
 
+    /// A chat that switches to a shell leaves its channel only for the shell
+    /// that takes its place; the channel is not empty, so it stays.
+    #[test]
+    fn a_chat_replaced_by_a_shell_keeps_its_channel() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let channel = crate::model::ChannelId::new();
+        let durable = Arc::make_mut(&mut app.durable);
+        durable.channels.push(crate::model::ProjectChannel {
+            id: channel,
+            project_id: crate::model::ProjectId::new(),
+            title: String::new(),
+            ordinal: 0,
+            shared: false,
+            cards: Vec::new(),
+            focused: None,
+        });
+        durable.active_channel = Some(channel);
+        app.active_workspace = Some(PathBuf::from(FIXTURE_DIRECTORY));
+        let card = failed_chat(&mut app);
+        let members = |app: &Cagents| {
+            app.durable
+                .channels
+                .iter()
+                .find(|candidate| candidate.id == channel)
+                .map(|channel| channel.cards.clone())
+        };
+        assert_eq!(members(&app), Some(vec![card]), "the chat's only pane");
+        let _ = app.update(Message::ChatUi(Action::Switch(card)));
+        let target = *app.chat_ui.local_returns.keys().next().unwrap();
+        let _ = app.update(Message::ChatUi(Action::ReturnedLocally(target, Ok(()))));
+        let shell = LaunchRecipe::shell(PathBuf::from(FIXTURE_DIRECTORY)).unwrap();
+        assert_replaced_by_terminal(&mut app, card, &shell);
+        let terminal = terminal_cards(&app)[0];
+        assert!(
+            !app.channel_ui.is_deleting(channel) && !app.channel_ui.was_deleted(channel),
+            "the channel still holds the shell"
+        );
+        assert_eq!(members(&app), Some(vec![terminal]));
+        assert!(app.card_state(terminal).unwrap().existence.is_open());
+    }
+
     #[test]
     fn a_failed_new_thread_can_choose_another_provider_in_the_same_card() {
         let mut app = crate::app::tests::context_inspector_test_app(false);

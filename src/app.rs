@@ -10284,6 +10284,12 @@ impl Application for Cagents {
                 let replacement = replacement
                     .map(|(launch, slot)| self.open_chat_replacement(launch, slot))
                     .unwrap_or_else(Task::none);
+                // The replacement joins the chat's channel, which is then not
+                // empty after all.
+                let emptied = emptied
+                    .into_iter()
+                    .filter(|&channel| !self.channel_has_open_card(channel))
+                    .collect();
                 Task::batch([closed, replacement, self.delete_channels(emptied)])
             }
             Message::Viewport { generation, event } => {
