@@ -156,11 +156,15 @@ struct Engine {
     /// engine thread that unwinds then gets the same ordering `run` applies by
     /// hand on its way out.
     cards: Vec<Card>,
-    /// One runtime for every card. `servo::Servo` is `!Send`/`!Sync` - it is
-    /// `Rc<ServoInner>` over `Rc`/`RefCell` state - so it is created on and
-    /// confined to this thread. Every `WebView` holds an owning clone, so this
-    /// handle only actually shuts the constellation down once the last card has
-    /// released its webview, which is exactly when it should.
+    /// One runtime for every card, kept for the life of this thread.
+    ///
+    /// `servo::Servo` is `!Send`/`!Sync` — it is `Rc<ServoInner>` over
+    /// `Rc`/`RefCell` state — so it is created on and confined to this thread.
+    /// It also initializes process-global options exactly once:
+    /// `opts::initialize_options` panics with "Already initialized" on a second
+    /// `Servo::new`, including on a fresh thread. Dropping the runtime when the
+    /// last webview closes would make the next card's engine unwind there and
+    /// report [`ENGINE_PANIC_REASON`]. A closed webview is not runtime shutdown.
     servo: Option<servo::Servo>,
     /// `None` once the registry has released this engine's channel.
     registrations: Option<Receiver<Registration>>,
@@ -216,10 +220,19 @@ impl Engine {
             wake_queued: Arc::new(AtomicBool::new(false)),
         };
         engine.event_loop();
-        // Cards go first: dropping every webview is what lets the shared
-        // runtime's own Drop finish shutting the constellation down.
+        // Cards go first. The runtime drops only because this thread is
+        // leaving, which is not the last-card path: that one parks with the
+        // runtime still installed. Shutdown can panic inside Servo; catching
+        // it keeps Drop from turning a finished thread into a second fault.
         engine.cards.clear();
-        engine.servo = None;
+        let runtime = engine.servo.take();
+        let _recovered = crate::instance::recovered_panic_scope();
+        if let Err(payload) = std::panic::catch_unwind(AssertUnwindSafe(|| drop(runtime))) {
+            tracing::error!(
+                "browser runtime shutdown panicked: {}",
+                panic_detail(payload.as_ref())
+            );
+        }
     }
 
     fn event_loop(&mut self) {
@@ -258,12 +271,12 @@ impl Engine {
 
             self.reap();
             self.drain_wayland();
-            if self.cards.is_empty() {
-                match &self.registrations {
-                    None => break,
-                    Some(registrations) if retire(self.generation, registrations) => break,
-                    Some(_) => {}
-                }
+            // An empty card list is not a reason to leave. The runtime cannot
+            // be constructed again, so this thread stays registered and the
+            // next card joins it. The thread ends only once its registration
+            // channel is gone, which is a replacement, not a closed tab.
+            if self.cards.is_empty() && self.registrations.is_none() {
+                break;
             }
         }
     }
@@ -284,6 +297,14 @@ impl Engine {
                 Ok(registration) => self.register(registration),
                 Err(TryRecvError::Empty) => return,
                 Err(TryRecvError::Disconnected) => {
+                    // Nothing is buffered: `try_recv` only reports disconnection
+                    // once the channel is empty. Clear the slot if this
+                    // generation still owns it, then drop the receiver.
+                    if let Some(registrations) = self.registrations.as_ref()
+                        && !retire(self.generation, registrations)
+                    {
+                        return;
+                    }
                     self.registrations = None;
                     return;
                 }
@@ -337,23 +358,48 @@ impl Engine {
         };
         // `Servo` is an `Rc` handle; this clone exists only to keep the engine
         // borrow away from the card borrow.
-        let servo = self.servo_runtime().clone();
+        let servo = match self.servo_runtime() {
+            Ok(servo) => servo,
+            Err(error) => {
+                self.cards[index].fail_initialization(error);
+                return;
+            }
+        };
         self.cards[index].adopt_session(rendering, &servo);
     }
 
-    fn servo_runtime(&mut self) -> &servo::Servo {
-        if self.servo.is_none() {
-            let servo = servo::ServoBuilder::default()
-                .event_loop_waker(Box::new(BrowserWaker {
-                    wake_tx: self.wake_tx.clone(),
-                    wake_queued: self.wake_queued.clone(),
-                }))
-                .build();
-            // The UI owns the process-wide log bridge; Servo's setup_logging
-            // installs a second global logger and panics after UI startup.
-            self.servo = Some(servo);
+    /// The shared runtime, created on the first card that actually gets a surface.
+    ///
+    /// A second `Servo::new` panics process-wide. That panic used to unwind this
+    /// thread and land on the new card as [`ENGINE_PANIC_REASON`]. Building is
+    /// caught so a failed start faults the card and leaves the thread parked.
+    fn servo_runtime(&mut self) -> Result<servo::Servo, BrowserError> {
+        if let Some(servo) = self.servo.clone() {
+            return Ok(servo);
         }
-        self.servo.as_ref().expect("engine runtime created")
+        let wake_tx = self.wake_tx.clone();
+        let wake_queued = self.wake_queued.clone();
+        let _recovered = crate::instance::recovered_panic_scope();
+        let built = std::panic::catch_unwind(AssertUnwindSafe(|| {
+            servo::ServoBuilder::default()
+                .event_loop_waker(Box::new(BrowserWaker {
+                    wake_tx,
+                    wake_queued,
+                }))
+                .build()
+        }));
+        // The UI owns the process-wide log bridge; Servo's setup_logging
+        // installs a second global logger and panics after UI startup.
+        match built {
+            Ok(servo) => {
+                self.servo = Some(servo.clone());
+                Ok(servo)
+            }
+            Err(payload) => Err(BrowserError::Servo(format!(
+                "could not start the browser runtime: {}",
+                panic_detail(payload.as_ref())
+            ))),
+        }
     }
 
     fn dispatch_command(&mut self, index: usize) {
@@ -377,17 +423,37 @@ impl Engine {
     /// constellation traffic, while `paint` is per webview and per surface, so
     /// N cards cost one pump instead of N.
     fn tick(&mut self) {
-        let Some(servo) = self.servo.as_ref() else {
-            return;
+        let spun = {
+            let Some(servo) = self.servo.as_ref() else {
+                return;
+            };
+            // Servo calls back into our delegates from this spin, and those are
+            // already caught. A panic below that boundary used to unwind the
+            // thread and fault every card, including one that had only just
+            // registered. The cards that have a session are the ones it served.
+            let _recovered = crate::instance::recovered_panic_scope();
+            std::panic::catch_unwind(AssertUnwindSafe(|| {
+                servo.spin_event_loop();
+            }))
         };
-        servo.spin_event_loop();
+        if let Err(payload) = spun {
+            let detail = panic_detail(payload.as_ref());
+            tracing::error!("the browser engine panicked while spinning: {detail}");
+            for card in &mut self.cards {
+                if card.session.is_some() {
+                    card.fault(format!(
+                        "the browser engine panicked while spinning: {detail}"
+                    ));
+                }
+            }
+            return;
+        }
         for card in &mut self.cards {
             card.after_spin();
         }
     }
 
-    /// Retires finished cards and, once none is left holding a webview, the
-    /// shared runtime with them.
+    /// Drops finished cards. The shared runtime stays for the life of the thread.
     fn reap(&mut self) {
         for card in &mut self.cards {
             // Our own delegate dispatch panicked for this webview. It was
@@ -409,15 +475,10 @@ impl Engine {
                 card.close();
             }
         }
-        // Every webview keeps an owning clone of the runtime alive, so dropping
-        // the engine's handle only means anything - and is the whole point -
-        // once no card holds one. Hibernating one of six cards now costs that
-        // card's webview and surface instead of a whole engine.
-        if self.servo.is_some() && !self.cards.iter().any(|card| card.session.is_some()) {
-            self.servo = None;
-        }
-        // The final card's teardown barrier also covers the shared engine.
-        // Releasing it before Servo drops lets application exit race JS shutdown.
+        // The runtime stays installed after the last webview is gone. Shutting
+        // it down here is what made the next card construct a second `Servo`
+        // and paint [`ENGINE_PANIC_REASON`]. Hibernating a card still drops
+        // that card's webview and surface; the constellation behind it remains.
         self.cards.retain(|card| !card.closed);
     }
 
@@ -1072,9 +1133,9 @@ impl BrowserDelegate {
 /// our dispatch would unwind through Servo's internals and take down the single
 /// engine thread every card shares. Catching it here contains the blast radius
 /// to the card whose callback failed: `Engine::reap` sees the flag, closes that
-/// webview, and leaves every sibling running. Servo's own internal panics are
-/// raised below this boundary and are still fatal to the thread, which is out
-/// of our hands.
+/// webview, and leaves every sibling running. A panic raised below this
+/// boundary, inside Servo, is caught around `spin_event_loop` so it faults the
+/// cards that have a session instead of unwinding the thread.
 ///
 /// The catch deliberately wraps a whole callback body, so no `RefCell` borrow is
 /// live when it fires - unwinding releases every borrow guard on the way out.
@@ -1686,14 +1747,32 @@ mod tests {
         assert_eq!(resize_request(&requested, degenerate), None);
     }
 
+    /// Both registry tests share the process-wide engine slot.
+    fn engine_test_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        LOCK.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn engine_generation() -> Option<u64> {
+        lock_registry().as_ref().map(|(generation, _)| *generation)
+    }
+
+    fn crash_reasons(events: &EventBus) -> Vec<String> {
+        std::iter::from_fn(|| events.try_recv().ok())
+            .filter_map(|event| match event {
+                BrowserEvent::Crashed { reason, .. } => Some(reason),
+                _ => None,
+            })
+            .collect()
+    }
+
     /// `retire` never runs on the panic path, so the registry keeps pointing at
     /// the engine that unwound. The next card must notice that channel is dead
     /// and start a fresh engine rather than register onto a corpse and hang.
-    ///
-    /// This is the only test that touches the process-wide registry; it is also
-    /// the only test that calls `register`.
     #[test]
     fn a_card_registered_after_an_engine_panic_starts_a_fresh_engine() {
+        let _registry = engine_test_lock();
         // Exactly the state an unwound engine leaves behind: the registry's
         // sender is live, but the receiver went with the thread.
         let (dead_sender, dead_receiver) = crossbeam_channel::unbounded();
@@ -1733,6 +1812,73 @@ mod tests {
                 .as_ref()
                 .is_none_or(|(live, _)| *live != dead_generation),
             "the dead generation must not survive in the registry"
+        );
+    }
+
+    /// Closing the last card must not retire the runtime. Servo can be
+    /// constructed once per process, so a replacement thread's `Servo::new`
+    /// panics ("Already initialized") and that unwind is what the next card
+    /// renders as [`ENGINE_PANIC_REASON`].
+    #[test]
+    fn closing_the_last_card_reuses_the_engine_for_the_next_one() {
+        let _registry = engine_test_lock();
+        let open = |events: Arc<EventBus>| {
+            let (teardown, teardown_done) = crossbeam_channel::bounded(0);
+            register(Registration {
+                mailbox: CommandMailbox::new(),
+                events,
+                restore: restore_state(),
+                visible: true,
+                fallback_factory: None,
+                teardown,
+            })
+            .expect("registration reaches a live engine");
+            assert!(
+                matches!(
+                    teardown_done.recv_timeout(Duration::from_secs(10)),
+                    Err(crossbeam_channel::RecvTimeoutError::Disconnected)
+                ),
+                "the card was not released"
+            );
+        };
+
+        let first = EventBus::new();
+        open(first.clone());
+        let generation =
+            engine_generation().expect("the engine stays registered after the last card");
+        let first_reasons = crash_reasons(&first);
+        assert!(
+            first_reasons
+                .iter()
+                .all(|reason| reason != ENGINE_PANIC_REASON),
+            "closing the last card faulted the engine: {first_reasons:?}"
+        );
+        assert!(
+            first_reasons
+                .iter()
+                .any(|reason| reason.contains("initialization failed")),
+            "the card should fail for lack of a surface, not vanish: {first_reasons:?}"
+        );
+
+        let second = EventBus::new();
+        open(second.clone());
+        assert_eq!(
+            engine_generation(),
+            Some(generation),
+            "the next card must join the parked engine instead of constructing another Servo"
+        );
+        let second_reasons = crash_reasons(&second);
+        assert!(
+            second_reasons
+                .iter()
+                .all(|reason| reason != ENGINE_PANIC_REASON),
+            "the card opened after close rendered the engine panic: {second_reasons:?}"
+        );
+        assert!(
+            second_reasons
+                .iter()
+                .any(|reason| reason.contains("initialization failed")),
+            "the second card was not served by the parked engine: {second_reasons:?}"
         );
     }
 
