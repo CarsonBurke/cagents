@@ -4262,6 +4262,7 @@ impl Application for Editor {
                         width,
                         self.modal_open(),
                         panel,
+                        tab.git,
                         review_panel(&tab.review, self.modal_open())
                             .map(move |action| Message::PullRequestReview(id, action)),
                         Message::Sidebar,
@@ -4273,6 +4274,7 @@ impl Application for Editor {
                         width,
                         self.modal_open(),
                         panel,
+                        tab.git,
                     )
                     .map(Message::Sidebar)
                 };

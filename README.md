@@ -391,7 +391,8 @@ cagents ui
   pull request once GitHub has been read. **Alt+V** marks the open file viewed
   and moves on, **Alt+Down / Alt+Up** step through files. Settings → Links →
   **Open pull requests in** switches rows back to plain links.
-  The Source control panel has one row of views, each with its count:
+  The Source control panel has one row of views; Changes and Branch show
+  their file counts:
   **Changes** lists uncommitted staged, unstaged, and untracked files;
   **Branch** lists everything the branch changed since its merge base with the
   known default branch; **History** browses commits, opens a commit's changed

@@ -445,9 +445,20 @@ pub struct ViewTab<'a, Message> {
 /// filled surface and full-strength label, the others stay quiet until
 /// hovered. Nothing else belongs in the row; a view's own options live in the
 /// pane's header, beside the identity they act on.
-pub fn view_tabs<'a, Message: Clone + 'a>(tabs: Vec<ViewTab<'a, Message>>) -> Element<'a, Message> {
+///
+/// `compact` tightens each tab's inset for a narrow pane. The row clips
+/// rather than spilling past the pane if its words still do not fit.
+pub fn view_tabs<'a, Message: Clone + 'a>(
+    tabs: Vec<ViewTab<'a, Message>>,
+    compact: bool,
+) -> Element<'a, Message> {
     let spacing = cosmic::theme::spacing();
-    widget::row::with_children(
+    let inset = if compact {
+        spacing.space_xxs
+    } else {
+        spacing.space_xs
+    };
+    let row = widget::row::with_children(
         tabs.into_iter()
             .map(|tab| {
                 let ViewTab {
@@ -462,6 +473,12 @@ pub fn view_tabs<'a, Message: Clone + 'a>(tabs: Vec<ViewTab<'a, Message>>) -> El
                     .spacing(spacing.space_xxs)
                     .align_y(iced::Alignment::Center)
                     .push(crate::design::body(label).wrapping(iced::widget::text::Wrapping::None));
+                // The count is drawn, so it is spoken too: a name that left it
+                // out would describe a different tab than the one on screen.
+                let name: Cow<'a, str> = match &count {
+                    Some((count, _)) => format!("{description}: {count}").into(),
+                    None => description,
+                };
                 if let Some((count, style)) = count {
                     content = content.push(
                         crate::design::caption(count)
@@ -472,21 +489,21 @@ pub fn view_tabs<'a, Message: Clone + 'a>(tabs: Vec<ViewTab<'a, Message>>) -> El
                 let mut button =
                     widget::button::custom(widget::container(content).center_y(Length::Fill))
                         .class(view_tab_style(selected))
-                        .name(description.clone())
+                        .name(name.clone())
                         .selected(selected)
-                        .padding([0, spacing.space_xs])
+                        .padding([0, inset])
                         .height(crate::design::DENSE_ROW_HEIGHT)
                         .on_press_maybe(if selected { None } else { on_press });
                 if let Some(id) = id {
                     button = button.id(id);
                 }
-                tooltip(crate::interaction::hover(button), description)
+                tooltip(crate::interaction::hover(button), name)
             })
             .collect::<Vec<_>>(),
     )
     .spacing(spacing.space_xxxs)
-    .align_y(iced::Alignment::Center)
-    .into()
+    .align_y(iced::Alignment::Center);
+    widget::container(row).width(Length::Fill).clip(true).into()
 }
 
 /// [`control_style`]'s surface with a label tone: the selected tab keeps its

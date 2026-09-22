@@ -1588,7 +1588,7 @@ impl BranchChangesModel {
             .map(|row| row.entry.path.clone())
             .collect();
         Self {
-            count_label: rows.len().to_string().into_boxed_str(),
+            count_label: tab_count_label(rows.len()),
             base_label: format!("Since branching from {}", comparison.base_ref.short_name())
                 .into_boxed_str(),
             base_ref: comparison.base_ref,
@@ -1875,8 +1875,7 @@ impl SourceControlModel {
             .flat_map(|group| group.rows.iter().map(|row| &row.entry.path))
             .collect::<BTreeSet<_>>()
             .len();
-        let change_count_label =
-            (changed_paths > 0).then(|| changed_paths.to_string().into_boxed_str());
+        let change_count_label = (changed_paths > 0).then(|| tab_count_label(changed_paths));
         let files = file_rows(&snapshot.files.paths);
 
         // An unborn `HEAD` has no commit and no history to walk; an unreadable
@@ -4941,22 +4940,31 @@ pub fn file_panel<'a>(
 
 /// Files, Git changes, or pull requests, with one tab row between them. Used
 /// by the standalone editor, which has no context-inspector tab strip.
+///
+/// `git` is the host's own knowledge that the folder is a Git worktree. It
+/// decides the tab row up front rather than from a snapshot that is still
+/// loading: a plain folder has only Files, and one tab is not a choice, so it
+/// draws no row at all instead of one that vanishes when the read lands.
 pub fn worktree_sidebar<'a>(
     model: &'a SidebarModel,
     state: &'a SidebarState,
     width: f32,
     modal_open: bool,
     panel: WorktreePanel,
+    git: bool,
 ) -> Element<'a, SidebarAction> {
-    worktree_panel(
-        model,
-        state,
-        width,
-        modal_open,
-        panel,
-        PanelNavigation::Panels,
-        true,
-    )
+    let (panel, navigation) = standalone_navigation(panel, git);
+    worktree_panel(model, state, width, modal_open, panel, navigation, true)
+}
+
+/// The panel and tab row the standalone sidebar shows for a folder that is,
+/// or is not, a Git worktree.
+fn standalone_navigation(panel: WorktreePanel, git: bool) -> (WorktreePanel, PanelNavigation) {
+    if git {
+        (panel, PanelNavigation::Panels)
+    } else {
+        (WorktreePanel::Files, PanelNavigation::None)
+    }
 }
 
 /// [`worktree_sidebar`] for a panel whose body the shell renders itself: the
@@ -4969,22 +4977,24 @@ pub fn worktree_sidebar_with_body<'a, M: 'a>(
     width: f32,
     modal_open: bool,
     panel: WorktreePanel,
+    git: bool,
     body: Element<'a, M>,
     map: impl Fn(SidebarAction) -> M + 'a,
 ) -> Element<'a, M> {
     let ready = bound_source_control(model, state)
         .filter(|source| matches!(source.data_state, SidebarDataState::Ready));
+    let (panel, navigation) = standalone_navigation(panel, git);
     let (Some(source), WorktreePanel::PullRequests) = (ready, panel) else {
-        return worktree_sidebar(model, state, width, modal_open, panel).map(map);
+        return worktree_sidebar(model, state, width, modal_open, panel, git).map(map);
     };
     let worktree = bound_worktree(model, source);
-    let view = PanelView::new(panel, PanelNavigation::Panels, state);
+    let view = PanelView::new(panel, navigation, state);
     let header = source_control_header(state, source, worktree, modal_open, view);
     let navigation = panel_navigation(
         source,
         modal_open,
         view,
-        PanelNavigation::Panels,
+        navigation,
         sidebar_pane_width(width),
     );
     let notices: Element<'a, SidebarAction> = source_control_notices(source).into();
@@ -5076,8 +5086,21 @@ impl WorktreePanel {
     }
 }
 
-/// Below this pane width the panel tabs use their short labels.
-const FULL_PANEL_LABELS_MIN_WIDTH: f32 = 280.0;
+/// A count as a tab states it. Past three digits the exact figure stops
+/// telling the reader anything the section headers do not, and a wider figure
+/// would push the tab row past a narrow pane.
+fn tab_count_label(count: usize) -> Box<str> {
+    if count > 999 {
+        "999+".into()
+    } else {
+        count.to_string().into_boxed_str()
+    }
+}
+
+/// Below this pane width the panel tabs use their short labels and compact
+/// insets. At it, "Files", "Changes 999+", and "Pull requests" fit with their
+/// full insets; below it, the short forms fit down to the narrowest sidebar.
+const FULL_PANEL_LABELS_MIN_WIDTH: f32 = 320.0;
 
 /// What the tab row beneath the worktree header switches between.
 ///
@@ -5470,13 +5493,8 @@ fn panel_navigation<'a>(
                 ),
             })
             .collect(),
+        // The host said this is a Git worktree; see `worktree_sidebar`.
         PanelNavigation::Panels => {
-            // A plain folder has files and nothing else: one tab is not a
-            // choice. The row stays up while the worktree is still being
-            // read, so a repository's tabs do not arrive a frame late.
-            if matches!(source.data_state, SidebarDataState::Ready) && !source.offers_changes() {
-                return None;
-            }
             let narrow = width < FULL_PANEL_LABELS_MIN_WIDTH;
             WorktreePanel::ALL
                 .into_iter()
@@ -5496,10 +5514,13 @@ fn panel_navigation<'a>(
     };
     let spacing = cosmic::theme::spacing();
     Some(
-        widget::container(crate::ui_controls::view_tabs(tabs))
-            .padding(Padding::from([spacing.space_xxxs, spacing.space_xxs]))
-            .width(Length::Fill)
-            .into(),
+        widget::container(crate::ui_controls::view_tabs(
+            tabs,
+            width < FULL_PANEL_LABELS_MIN_WIDTH,
+        ))
+        .padding(Padding::from([spacing.space_xxxs, spacing.space_xxs]))
+        .width(Length::Fill)
+        .into(),
     )
 }
 
@@ -11776,7 +11797,7 @@ pub(crate) mod tests {
         for panel in WorktreePanel::ALL {
             let published = frame_enter_presses(
                 &renderer,
-                worktree_sidebar(&model, &state, 380.0, false, panel),
+                worktree_sidebar(&model, &state, 380.0, false, panel, true),
             );
             let offered: Vec<WorktreePanel> = published
                 .iter()
@@ -11830,7 +11851,7 @@ pub(crate) mod tests {
             state.changes_tab = tab;
             let published = frame_enter_presses(
                 &renderer,
-                worktree_sidebar(&model, &state, 380.0, false, WorktreePanel::Changes),
+                worktree_sidebar(&model, &state, 380.0, false, WorktreePanel::Changes, true),
             );
             assert!(
                 published
@@ -11842,31 +11863,32 @@ pub(crate) mod tests {
         }
     }
 
-    /// A plain folder has only files, and one tab is not a choice.
+    /// A plain folder has only files, and one tab is not a choice. The host
+    /// says so up front, so the row never depends on whether the read has
+    /// landed yet, and a panel remembered from a Git tab falls back to Files.
     #[test]
     fn a_plain_folder_draws_no_panel_tabs() {
         let renderer = headless_renderer();
-        let mut model = panel_model();
-        let source = model
-            .source_control
-            .as_mut()
-            .expect("the fixture binds a source");
-        source.branch = None;
-        source.head_oid = None;
-        source.detached = false;
-        source.unborn = false;
-        assert!(!source.offers_changes());
+        let model = panel_model();
         let state = panel_state(&model);
-        let published = frame_enter_presses(
-            &renderer,
-            worktree_sidebar(&model, &state, 380.0, false, WorktreePanel::Files),
-        );
-        assert!(
-            !published
-                .iter()
-                .any(|action| matches!(action, SidebarAction::SetWorktreePanel { .. })),
-            "it published {published:?}"
-        );
+        for panel in WorktreePanel::ALL {
+            let published = frame_enter_presses(
+                &renderer,
+                worktree_sidebar(&model, &state, 380.0, false, panel, false),
+            );
+            assert!(
+                !published
+                    .iter()
+                    .any(|action| matches!(action, SidebarAction::SetWorktreePanel { .. })),
+                "{panel:?} published {published:?}"
+            );
+            assert!(
+                published
+                    .iter()
+                    .any(|action| matches!(action, SidebarAction::ToggleFilesFilter { .. })),
+                "{panel:?} must fall back to Files; it published {published:?}"
+            );
+        }
     }
 
     /// The tree/flat choice arranges changed files, so History, a list of
@@ -11916,20 +11938,36 @@ pub(crate) mod tests {
         let names = accessible_names(&renderer, git_panel(&model, &state, 380.0, false));
         for tab in ChangesTab::ALL {
             assert!(
-                names.iter().any(|name| name == tab.description()),
+                names.iter().any(|name| name.starts_with(tab.description())),
                 "{tab:?} is missing from {names:?}"
             );
         }
+        // The count the tab draws is part of what it is called.
+        assert!(
+            names
+                .iter()
+                .any(|name| name == "Uncommitted changes in this worktree: 4"),
+            "{names:?}"
+        );
         let names = accessible_names(
             &renderer,
-            worktree_sidebar(&model, &state, 380.0, false, WorktreePanel::Files),
+            worktree_sidebar(&model, &state, 380.0, false, WorktreePanel::Files, true),
         );
         for panel in WorktreePanel::ALL {
             assert!(
-                names.iter().any(|name| name == panel.description()),
+                names
+                    .iter()
+                    .any(|name| name.starts_with(panel.description())),
                 "{panel:?} is missing from {names:?}"
             );
         }
+    }
+
+    #[test]
+    fn tab_counts_stop_growing_past_three_digits() {
+        assert_eq!(&*tab_count_label(7), "7");
+        assert_eq!(&*tab_count_label(999), "999");
+        assert_eq!(&*tab_count_label(1_000), "999+");
     }
 
     /// The Changes tab counts changed files, not group rows: a file with
