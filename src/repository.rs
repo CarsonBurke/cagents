@@ -6353,14 +6353,13 @@ impl<E: ProcessExecutor> RepositoryService<E> {
                 ))?);
             }
         }
-        for name in ["main", "master"] {
-            if refs
-                .local
-                .iter()
-                .any(|local| local.name.as_str() == format!("refs/heads/{name}"))
-            {
-                return Ok(BaseRevision::LocalBranch(ValidatedBranchName::parse(name)?));
-            }
+        // The checked-out branch is a proven ref. A repository whose default
+        // is not `main` must not be silently based on a local branch of that
+        // name, and a missing symbolic remote HEAD is not a reason to guess.
+        if let Some(current) = refs.local.iter().find(|record| record.head) {
+            return Ok(BaseRevision::LocalBranch(ValidatedBranchName::parse(
+                current.name.short_name(),
+            )?));
         }
         if let Some(head) = self.resolve_head(repository, cancellation)? {
             return Ok(BaseRevision::object_id(head.to_string())?);
@@ -11718,6 +11717,29 @@ mod worktree_journal_tests {
         assert_eq!(
             fs::read_to_string(fixture.request.destination.join("tracked.txt")).unwrap(),
             fs::read_to_string(fixture.request.repository.join("tracked.txt")).unwrap(),
+        );
+    }
+
+    #[test]
+    fn a_new_worktree_uses_the_checked_out_branch_when_nothing_advertises_a_default() {
+        let mut fixture = Fixture::new();
+        fixture.git(&["switch", "-c", "develop"]);
+        fixture.resolve(fixture.input("feature/from-develop"));
+        assert!(
+            matches!(
+                &fixture.request.base,
+                BaseRevision::LocalBranch(branch) if branch.as_str() == "develop"
+            ),
+            "a local branch named main must not win over the checked-out branch: {:?}",
+            fixture.request.base
+        );
+
+        fixture.git(&["switch", "--detach"]);
+        fixture.resolve(fixture.input("feature/from-detached"));
+        assert!(
+            matches!(&fixture.request.base, BaseRevision::ObjectId(_)),
+            "a detached HEAD must not fall back to a guessed branch name: {:?}",
+            fixture.request.base
         );
     }
 

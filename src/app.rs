@@ -1437,11 +1437,41 @@ fn pull_request_head(
                 .iter()
                 .find(|worktree| worktree.path == path)
                 .and_then(|worktree| worktree.branch.clone()),
-            None => project
-                .worktrees
-                .iter()
-                .find_map(|worktree| worktree.branch.clone()),
+            // A project-level create has no worktree to bind to. The first
+            // row's branch is not a choice the reader made.
+            None => None,
         })
+        .unwrap_or_default()
+}
+
+/// The GitHub base branch a comparison has already proved, or empty.
+///
+/// A remote-tracking ref is reduced with the remote names this worktree
+/// actually configured, so `refs/remotes/origin/trunk` becomes `trunk` and a
+/// remote whose name contains a slash is not split at the first one. Nothing
+/// here invents `main`.
+fn proven_pull_request_base(changes: &sidebar::BranchChanges, remotes: &[String]) -> String {
+    let base = match changes {
+        sidebar::BranchChanges::Ready(model) => &model.base_ref,
+        sidebar::BranchChanges::Loading(base)
+        | sidebar::BranchChanges::Error { base_ref: base, .. } => base,
+        sidebar::BranchChanges::Unavailable(_) => return String::new(),
+    };
+    let name = base.as_str();
+    if let Some(branch) = name.strip_prefix("refs/heads/") {
+        return branch.to_owned();
+    }
+    let Some(rest) = name.strip_prefix("refs/remotes/") else {
+        return String::new();
+    };
+    remotes
+        .iter()
+        .filter(|remote| {
+            rest.strip_prefix(remote.as_str())
+                .is_some_and(|tail| tail.starts_with('/'))
+        })
+        .max_by_key(|remote| remote.len())
+        .map(|remote| rest[remote.len() + 1..].to_owned())
         .unwrap_or_default()
 }
 
@@ -1493,6 +1523,8 @@ struct WorktreeDialog {
 pub struct PullRequestDialog {
     repository: GitHubRepoKey,
     project_id: ProjectId,
+    /// The worktree this draft was opened against, when it was opened from one.
+    worktree: Option<PathBuf>,
     base: String,
     head: String,
     title: String,
@@ -9461,12 +9493,30 @@ impl Application for Cagents {
                             project_id,
                             worktree.as_deref(),
                         );
+                        let base = self
+                            .sidebar_model
+                            .source_control
+                            .as_ref()
+                            .filter(|source| {
+                                source.key.project_id == project_id
+                                    && worktree.as_ref().is_none_or(|path| {
+                                        source.key.canonical_path == *path
+                                    })
+                            })
+                            .map(|source| {
+                                proven_pull_request_base(
+                                    &source.branch_changes,
+                                    &source.remotes,
+                                )
+                            })
+                            .unwrap_or_default();
                         self.pull_request_dialog_generation =
                             self.pull_request_dialog_generation.wrapping_add(1);
                         self.pull_request_dialog = Some(PullRequestDialog {
                             project_id,
                             repository,
-                            base: "main".into(),
+                            worktree,
+                            base,
                             head,
                             title: String::new(),
                             body: String::new(),
@@ -11454,9 +11504,21 @@ impl Application for Cagents {
         }
 
         let dialog = self.pull_request_dialog.as_ref()?;
+        let head = dialog.head.trim();
+        let base = dialog.base.trim();
+        let draft = if dialog.draft { ", draft" } else { "" };
+        let route = if head.is_empty() || base.is_empty() {
+            "Choose a head and a base".to_owned()
+        } else {
+            format!("{head} → {base}{draft}")
+        };
+        let context = match &dialog.worktree {
+            Some(path) => format!("{} · {route}", path.display()),
+            None => route,
+        };
         let mut rows: Vec<Element<'_, Message>> = vec![
             widget::text::title3("Create pull request").into(),
-            design::caption(dialog.repository.gh_selector()).into(),
+            design::caption(format!("{} · {context}", dialog.repository.gh_selector())).into(),
             widget::column::with_children(vec![
                 design::caption("Title").into(),
                 widget::text_input("Title", &dialog.title)
@@ -11519,7 +11581,10 @@ impl Application for Cagents {
                     .into(),
                 widget::button::suggested("Create")
                     .on_press_maybe(
-                        (dialog.retry_confirmation != Some(false)
+                        (!head.is_empty()
+                            && !base.is_empty()
+                            && !dialog.title.trim().is_empty()
+                            && dialog.retry_confirmation != Some(false)
                             && self
                                 .github_availability
                                 .get(&dialog.project_id)
@@ -12212,7 +12277,8 @@ mod tests {
 
         assert_eq!(
             pull_request_head(&[project.clone()], project_id, None),
-            "first"
+            "",
+            "a project-level create must not adopt the first worktree's branch"
         );
         assert_eq!(
             pull_request_head(&[project.clone()], project_id, Some(&selected)),
@@ -12222,6 +12288,86 @@ mod tests {
             pull_request_head(&[project], project_id, Some(Path::new("/repo/missing"))),
             ""
         );
+    }
+
+    #[test]
+    fn a_proven_remote_default_is_the_branch_github_would_merge_into() {
+        let base = crate::repository::ValidatedRefName::parse("refs/remotes/te/am/trunk").unwrap();
+        assert_eq!(
+            proven_pull_request_base(
+                &sidebar::BranchChanges::Loading(base),
+                &["te".into(), "te/am".into()],
+            ),
+            "trunk"
+        );
+        assert_eq!(
+            proven_pull_request_base(&sidebar::BranchChanges::Unavailable("no base"), &[]),
+            ""
+        );
+    }
+
+    #[test]
+    fn opening_a_pull_request_does_not_guess_main_or_the_first_branch() {
+        let mut app = context_inspector_test_app(false);
+        let project_id = ProjectId::new();
+        let repository = GitHubRepoKey::new("github.com", None, "owner", "repo").unwrap();
+        app.github_availability.insert(
+            project_id,
+            GitHubAvailability::Ready {
+                repository_key: repository,
+                pull_requests: Vec::new(),
+                refreshed_at: 1,
+            },
+        );
+        let selected = PathBuf::from("/repo/selected");
+        app.sidebar_model.projects = vec![SidebarProject::new(
+            project_id,
+            crate::repository::RepositoryId::new(),
+            "repo".into(),
+            PathBuf::from("/repo"),
+            vec![
+                SidebarWorktree::new(
+                    WorktreeId::new(),
+                    PathBuf::from("/repo/first"),
+                    Some("first".into()),
+                    false,
+                    false,
+                    None,
+                    None,
+                    None,
+                ),
+                SidebarWorktree::new(
+                    WorktreeId::new(),
+                    selected.clone(),
+                    Some("selected".into()),
+                    false,
+                    false,
+                    None,
+                    None,
+                    None,
+                ),
+            ],
+            Vec::new(),
+        )];
+
+        let _ = app.update(Message::Sidebar(SidebarAction::CreatePullRequest {
+            project_id,
+            worktree: None,
+        }));
+        let dialog = app.pull_request_dialog.as_ref().unwrap();
+        assert_eq!(dialog.head, "");
+        assert_eq!(dialog.base, "");
+        assert!(dialog.worktree.is_none());
+
+        let _ = app.update(Message::CancelDialog);
+        let _ = app.update(Message::Sidebar(SidebarAction::CreatePullRequest {
+            project_id,
+            worktree: Some(selected.clone()),
+        }));
+        let dialog = app.pull_request_dialog.as_ref().unwrap();
+        assert_eq!(dialog.head, "selected");
+        assert_eq!(dialog.base, "");
+        assert_eq!(dialog.worktree.as_deref(), Some(selected.as_path()));
     }
 
     fn health_event(
@@ -13703,6 +13849,7 @@ mod tests {
         PullRequestDialog {
             project_id: ProjectId::new(),
             repository: GitHubRepoKey::new("github.com", None, "owner", "repo").unwrap(),
+            worktree: None,
             base: "release".into(),
             head: "topic/authored-change".into(),
             title: "Keep the authored title".into(),
@@ -13855,6 +14002,7 @@ mod tests {
         }));
         let _ = app.update(Message::PullRequestTitleChanged("Newer PR".into()));
         let _ = app.update(Message::PullRequestHeadChanged("new-topic".into()));
+        let _ = app.update(Message::PullRequestBaseChanged("trunk".into()));
         let _ = app.update(Message::PullRequestBodyChanged("Newer description".into()));
         let newer = app.pull_request_dialog.clone().unwrap();
         let failure = Message::PullRequestCreated {
@@ -14157,6 +14305,7 @@ mod tests {
         app.pull_request_dialog = Some(PullRequestDialog {
             project_id: ProjectId::new(),
             repository: GitHubRepoKey::new("github.com", None, "owner", "repo").unwrap(),
+            worktree: None,
             base: "main".into(),
             head: "topic".into(),
             title: String::new(),

@@ -177,6 +177,7 @@ fn open_draft(app: &mut Cagents, project: ProjectId) {
         .as_mut()
         .expect("a confirmed repository authorizes a draft");
     dialog.head = "topic".into();
+    dialog.base = "trunk".into();
     dialog.title = "Authored title".into();
 }
 
