@@ -613,10 +613,7 @@ fn settings_layout<'a>(
         // Search results span every category, so the picker gives its room
         // to them while a query is active.
         if !searching && width < GRID_BREAKPOINT {
-            let labels: Vec<String> = SettingsCategory::ALL
-                .iter()
-                .map(|item| item.label().to_owned())
-                .collect();
+            let labels = SettingsCategory::ALL.map(SettingsCategory::label).to_vec();
             let selected = SettingsCategory::ALL
                 .iter()
                 .position(|item| *item == category);
