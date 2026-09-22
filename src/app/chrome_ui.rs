@@ -577,7 +577,10 @@ impl Cagents {
                 + design::PRIMARY_CONTROL_SIZE
                 + 12.0
         };
-        let update = if self.has_update_control() {
+        // The docked inspector owns both the alerts control and the update
+        // control. Reserving the update here as well pushed it onto the
+        // workspace header, on the far side of the bar from the alerts.
+        let update = if !self.context_inspector_visible() && self.has_update_control() {
             design::PRIMARY_CONTROL_SIZE + 4.0
         } else {
             0.0
@@ -730,30 +733,39 @@ impl Cagents {
                 )),
             ));
         }
-        // The inspector panel's own header mounts the notice control and the
-        // inspector toggle as well, and the two headers must never mount the
-        // same one at once: a custom `widget::Id` may name only one node in a
-        // frame. The pinned runtime lifts every named node's state into one
-        // thread-local map keyed by that name before diffing, hands it to the
-        // first widget that asks for the name, and leaves any later claimant
-        // holding the `State::None` the lift left behind - which the next
-        // draw downcasts, aborting the process.
+        // The inspector panel's own header mounts the notice control, the update
+        // control and the inspector toggle, and the two headers must never
+        // mount the same one at once: a custom `widget::Id` may name only one
+        // node in a frame. The pinned runtime lifts every named node's state
+        // into one thread-local map keyed by that name before diffing, hands
+        // it to the first widget that asks for the name, and leaves any later
+        // claimant holding the `State::None` the lift left behind - which the
+        // next draw downcasts, aborting the process.
         //
         // Ownership therefore changes hands when the panel mounts and
         // unmounts, not when it is asked to open or close. Those differ for
         // the whole of the collapse animation: `context_inspector_open` goes
         // false at the click, while the panel stays mounted and keeps drawing
         // its header until the transition ends.
+        //
+        // The update control sits immediately to the right of the alerts.
+        // Leaving it on the workspace header while the panel held the alerts
+        // put the two icons on opposite ends of the window.
         let panel_owns_shared_controls = self.context_inspector_visible();
         vec![
             widget::row::with_children(actions)
                 .spacing(2)
                 .align_y(Alignment::Center)
                 .into(),
-            widget::row::with_children(self.update_control()).into(),
             widget::row::with_children(
                 (!panel_owns_shared_controls)
                     .then(|| self.notice_control())
+                    .flatten(),
+            )
+            .into(),
+            widget::row::with_children(
+                (!panel_owns_shared_controls)
+                    .then(|| self.update_control())
                     .flatten(),
             )
             .into(),
@@ -1029,14 +1041,13 @@ impl Cagents {
         .spacing(2)
         .align_y(Alignment::Center);
         // Keep named controls in fixed slots as notices and updates come and go.
+        // Alerts, then the update icon on their right, then the sidebar toggle.
+        // This header is the one mounted while the panel owns those controls,
+        // including a docked inspector: the workspace header must not also
+        // show the update or the icon stays on the far side of the window.
         let end = widget::row::with_children(vec![
-            widget::row::with_children(
-                self.context_inspector_is_overlay()
-                    .then(|| self.update_control())
-                    .flatten(),
-            )
-            .into(),
             widget::row::with_children(self.notice_control()).into(),
+            widget::row::with_children(self.update_control()).into(),
             self.sidebar_toggle(),
         ])
         .spacing(2)
