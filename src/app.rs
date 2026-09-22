@@ -1255,6 +1255,22 @@ static STARTING_DIRECTORY_CAPTION: LazyLock<String> = LazyLock::new(|| {
     format!("Starting directory: {}", display_path(&directory))
 });
 
+/// A terminal that has never run, under a new identity, waiting to launch `launch`.
+pub(super) fn fresh_terminal_session(launch: LaunchRecipe) -> TerminalSession {
+    let id = TerminalId::new();
+    TerminalSession {
+        recovery_origin: None,
+        id,
+        launch: launch.clone(),
+        transcript_path: terminal_transcript_path(id),
+        resume_hint: None,
+        continuity: TerminalContinuity::RelaunchAvailable {
+            recipe: launch,
+            last_exit: None,
+        },
+    }
+}
+
 fn terminal_transcript_path(id: TerminalId) -> Option<PathBuf> {
     instance::project_dirs().map(|dirs| {
         dirs.data_dir()
@@ -3861,21 +3877,30 @@ impl Cagents {
         if self.project_ui.deleting() {
             return Task::none();
         }
-        let working_directory = launch.working_directory.clone();
-        let card_id = CardId::new();
-        let terminal_id = TerminalId::new();
-        let transcript_path = terminal_transcript_path(terminal_id);
-        let session = TerminalSession {
-            recovery_origin: None,
-            id: terminal_id,
-            launch: launch.clone(),
-            transcript_path,
-            resume_hint: None,
-            continuity: TerminalContinuity::RelaunchAvailable {
-                recipe: launch,
-                last_exit: None,
-            },
+        let scope = if self.active_workspace.as_deref() != Some(launch.working_directory.as_path())
+        {
+            self.select_worktree(launch.working_directory.clone(), false)
+        } else {
+            Task::none()
         };
+        Task::batch([
+            scope,
+            self.insert_terminal_card(fresh_terminal_session(launch), None),
+        ])
+    }
+
+    /// Opens the new terminal `session` in the current scope: at `slot`, as
+    /// strip and saved-order indices, or else beside the focused card.
+    pub(super) fn insert_terminal_card(
+        &mut self,
+        session: TerminalSession,
+        slot: Option<(usize, usize)>,
+    ) -> Task<Message> {
+        if self.project_ui.deleting() {
+            return Task::none();
+        }
+        let working_directory = session.launch.working_directory.clone();
+        let card_id = CardId::new();
         let card = CardState {
             id: card_id,
             generation: self.durable.generation,
@@ -3892,12 +3917,7 @@ impl Cagents {
             residency: Residency::Hydrating { epoch: 1 },
             kind: CardKind::Terminal(session.clone()),
         };
-        let scope = if self.active_workspace.as_deref() != Some(working_directory.as_path()) {
-            self.select_worktree(working_directory.clone(), false)
-        } else {
-            Task::none()
-        };
-        let (index, durable_index) = self.terminal_insertion_indices();
+        let (index, durable_index) = slot.unwrap_or_else(|| self.terminal_insertion_indices());
         let durable = Arc::make_mut(&mut self.durable);
         durable.cards.insert(durable_index, card.clone());
         durable.focused = Some(card_id);
@@ -3927,7 +3947,6 @@ impl Cagents {
         );
         self.persist();
         Task::batch([
-            scope,
             self.start_terminal(card_id, session, true, false),
             self.apply_viewport(update, true, false),
         ])
@@ -5149,6 +5168,10 @@ impl Cagents {
     }
 
     fn retry_card(&mut self, card: CardId) -> Task<Message> {
+        // A card whose close is already accepted never starts anything again.
+        if self.chat_close_approved(card) {
+            return Task::none();
+        }
         if self.completed_terminal_has_native_owner(card) {
             return self.handle_chat_ui(chat_ui::Action::Switch(card));
         }
@@ -10216,6 +10239,11 @@ impl Application for Cagents {
                 {
                     return self.begin_card_close(id);
                 }
+                // Read before anything persists the scope, which prunes the
+                // closed card from its channel's membership.
+                let emptied = self.channels_emptied_by(&[id]);
+                // Taken while the chat still has its slot.
+                let replacement = self.take_chat_replacement(id);
                 self.retire_lsp_card(id);
                 self.sidebar_state.clear_agent_activity(id);
                 self.sidebar_state.acknowledge_agent_update(id);
@@ -10255,7 +10283,18 @@ impl Application for Cagents {
                         Task::none()
                     }
                 };
-                Task::batch([closed, self.close_emptied_channels(&[id])])
+                // A chat returned to a terminal is replaced only now that it
+                // is closed, so no state ever holds both.
+                let replacement = replacement
+                    .map(|(launch, slot)| self.open_chat_replacement(launch, slot))
+                    .unwrap_or_else(Task::none);
+                // The replacement joins the chat's channel, which is then not
+                // empty after all.
+                let emptied = emptied
+                    .into_iter()
+                    .filter(|&channel| !self.channel_has_open_card(channel))
+                    .collect();
+                Task::batch([closed, replacement, self.delete_channels(emptied)])
             }
             Message::Viewport { generation, event } => {
                 // Native callbacks already queued by an unmounted worktree

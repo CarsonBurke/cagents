@@ -2231,7 +2231,7 @@ fn validate_card_conversion(
                 || id != source.id.to_string()
                 || from_json::<crate::model::LaunchRecipe>("terminal recipe", &recipe)?
                     != source.launch
-                || !source_chat_launch_matches(source, session)
+                || !(source_chat_launch_matches(source, session) || codex_cli_view(session, source))
                 || exact_chat_resume(session).is_none()
             {
                 return Err(invalid());
@@ -2244,13 +2244,17 @@ fn validate_card_conversion(
                 |row| row.get(0),
             )?;
             let session: crate::chat::Session = from_json("chat card", &content)?;
+            let proof = terminal.continuity.live_proof();
             let reattach = session.launch.provider == crate::agent::Provider::Codex
-                && session.terminal.as_ref().is_some_and(|source| {
-                    terminal.id == source.id
-                        && terminal.launch == source.launch
-                        && terminal.continuity.live_proof().is_some()
-                        && terminal.continuity.live_proof() == source.continuity.live_proof()
-                });
+                && proof.is_some()
+                && match &session.terminal {
+                    Some(source) => {
+                        terminal.id == source.id
+                            && terminal.launch == source.launch
+                            && proof == source.continuity.live_proof()
+                    }
+                    None => codex_cli_view(&session, terminal),
+                };
             if !reattach
                 && (terminal.id == session.id
                     || exact_chat_resume(&session).as_ref() != Some(&terminal.launch))
@@ -2312,6 +2316,22 @@ fn exact_chat_resume(session: &crate::chat::Session) -> Option<crate::model::Lau
     session.launch.terminal_recipe()
 }
 
+/// Whether `view` is the CLI the daemon opened for a native Codex thread.
+///
+/// A native thread has no CLI until its return asks for one, and the daemon
+/// then opens it under the chat's own identity, running the chat's exact
+/// resume, in the host session the chat was proven live in. That view is
+/// the one source a chat may gain after it was saved, and the card may move
+/// between the two like any chat and the CLI it came from.
+fn codex_cli_view(session: &crate::chat::Session, view: &TerminalSession) -> bool {
+    let proof = view.continuity.live_proof();
+    session.launch.provider == crate::agent::Provider::Codex
+        && view.id == session.id
+        && exact_chat_resume(session).as_ref() == Some(&view.launch)
+        && proof.is_some()
+        && proof == session.proof
+}
+
 fn validate_chat_identity(
     transaction: &Transaction<'_>,
     card: CardId,
@@ -2337,7 +2357,12 @@ fn validate_chat_identity(
         if stored.id != session.id
             || stored.launch.provider != session.launch.provider
             || stored.launch.recipe != session.launch.recipe
-            || stored.terminal != session.terminal
+            || (stored.terminal != session.terminal
+                && !(stored.terminal.is_none()
+                    && session
+                        .terminal
+                        .as_ref()
+                        .is_some_and(|view| codex_cli_view(session, view))))
             || (stored
                 .launch
                 .session_id
@@ -3760,6 +3785,90 @@ mod tests {
                 .kind,
             CardKind::Terminal(terminal)
         );
+    }
+
+    /// A native Codex thread returns through a CLI view the daemon opens
+    /// under the chat's own identity; refusing it left every later save of
+    /// the window failing with "saved state is invalid".
+    #[test]
+    fn a_native_codex_thread_converts_to_the_cli_view_the_daemon_opened_for_it() {
+        // The app records the view as the chat's source before it converts
+        // the card, but the writer may coalesce the two into one write.
+        for paired_first in [true, false] {
+            let directory = tempdir().unwrap();
+            let store =
+                StateStore::open(directory.path().join("chat.sqlite3"), boot("chat-boot")).unwrap();
+            let (mut workspace, paired) = agent_workspace(crate::agent::Provider::Codex);
+            let source = paired.terminal.unwrap();
+            let proof = source.continuity.live_proof().unwrap();
+            let mut native = crate::chat::Session {
+                id: TerminalId::new(),
+                launch: paired.launch,
+                proof: Some(proof.clone()),
+                terminal: None,
+            };
+            native.launch.recipe.arguments = vec!["--remote".into(), "unix://".into()];
+            workspace.cards[0].kind = CardKind::Chat(native.clone());
+            let mut lane = SaveLane::default();
+            lane.save(&store, &workspace).unwrap();
+
+            let view = TerminalSession {
+                recovery_origin: None,
+                id: native.id,
+                launch: native.launch.terminal_recipe().unwrap(),
+                transcript_path: None,
+                resume_hint: None,
+                continuity: source.continuity.clone(),
+            };
+            let mut other_host = view.clone();
+            other_host.continuity = TerminalContinuity::DetachedSameBoot {
+                host_session_id: "another-host".into(),
+                boot_id: proof.boot_id.clone(),
+                host_incarnation: proof.host_incarnation.clone(),
+            };
+            let mut other_command = view.clone();
+            other_command.launch.arguments.push("--yolo".into());
+            let mut unproven = view.clone();
+            unproven.continuity = TerminalContinuity::RelaunchAvailable {
+                recipe: view.launch.clone(),
+                last_exit: None,
+            };
+            for wrong in [other_host, other_command, unproven] {
+                workspace.cards[0].kind = CardKind::Terminal(wrong.clone());
+                assert!(matches!(
+                    lane.save(&store, &workspace),
+                    Err(StoreError::InvalidState(_))
+                ));
+                let mut paired = native.clone();
+                paired.terminal = Some(wrong);
+                workspace.cards[0].kind = CardKind::Chat(paired);
+                assert!(matches!(
+                    lane.save(&store, &workspace),
+                    Err(StoreError::InvalidState(_))
+                ));
+            }
+            if paired_first {
+                let mut paired = native.clone();
+                paired.terminal = Some(view.clone());
+                workspace.cards[0].kind = CardKind::Chat(paired);
+                lane.save(&store, &workspace).unwrap();
+            }
+            workspace.cards[0].kind = CardKind::Terminal(view.clone());
+            lane.save(&store, &workspace).unwrap();
+            assert_eq!(
+                store
+                    .load_card(workspace.cards[0].id, Some(&proof))
+                    .unwrap()
+                    .unwrap()
+                    .kind,
+                CardKind::Terminal(view.clone())
+            );
+            // And the CLI switches back to the chat it came from.
+            let mut paired = native.clone();
+            paired.terminal = Some(view);
+            workspace.cards[0].kind = CardKind::Chat(paired);
+            lane.save(&store, &workspace).unwrap();
+        }
     }
 
     #[test]

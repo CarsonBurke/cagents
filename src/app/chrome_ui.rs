@@ -969,7 +969,8 @@ impl Cagents {
                 },
                 self.chat_switch_label(id),
                 card_control_id(id, "chat"),
-                (!self.modal_is_open()).then_some(Message::ChatUi(chat_ui::Action::Switch(id))),
+                (!self.modal_is_open() && self.chat_switch_ready(id))
+                    .then_some(Message::ChatUi(chat_ui::Action::Switch(id))),
             ));
         }
         children.push(command(

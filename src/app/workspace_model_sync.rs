@@ -339,7 +339,7 @@ impl Cagents {
             }
         }
         for shared in &model.channels {
-            if self.channel_ui.is_deleting(shared.id) {
+            if self.channel_ui.is_deleting(shared.id) || self.channel_ui.was_deleted(shared.id) {
                 continue;
             }
             match self
@@ -903,6 +903,37 @@ mod tests {
             !card.existence.is_open(),
             "a conversation that lived only in the channel goes with it"
         );
+    }
+
+    /// A window is not sent the echo of its own deletion, so its cached model
+    /// still names the channel afterwards, and the next reconciliation - any
+    /// other window's edit, a repository finishing loading, or a read taken
+    /// before the registry applied the deletion - adopted it straight back as
+    /// an empty channel.
+    #[test]
+    fn a_channel_this_window_deleted_is_never_adopted_back() {
+        let (mut app, project, repository) = app_with_project();
+        let id = ChannelId::new();
+        let mut channel = local(id, project, "doomed", 4);
+        channel.shared = true;
+        Arc::make_mut(&mut app.durable).channels.push(channel);
+        let model = registry(vec![shared(id, &repository, "doomed", 4)]);
+        app.workspace_model = model.clone();
+        let published = intercept_publishes(&mut app);
+
+        let _ = app.delete_channel(id);
+        assert!(!app.durable.channels.iter().any(|channel| channel.id == id));
+        assert!(drain(&published).iter().any(
+            |edit| matches!(edit, ModelEdit::DeleteChannel { id: deleted } if *deleted == id)
+        ));
+
+        let _ = app.reconcile_workspace_model();
+        let _ = app.apply_workspace_model_update(ModelUpdate::Read(model));
+        assert!(
+            !app.durable.channels.iter().any(|channel| channel.id == id),
+            "a model that predates the deletion does not revive the channel"
+        );
+        assert!(drain(&published).is_empty());
     }
 
     /// Before a window has shared a channel, the registry's silence about that

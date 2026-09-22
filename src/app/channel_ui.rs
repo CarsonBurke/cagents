@@ -4,7 +4,10 @@ use crate::model::{ChannelId, ProjectChannel};
 use crate::sidebar::SidebarChannel;
 use crate::workspace_model::ModelEdit;
 
-fn close_channel_sessions(sessions: Vec<CardKind>) -> Result<(), String> {
+/// Closes the daemon's live sessions behind `sessions`, by the identities the
+/// daemon itself reports rather than the saved descriptors, together with the
+/// source terminal a converted chat keeps running.
+pub(super) fn close_sessions(sessions: Vec<CardKind>) -> Result<(), String> {
     if !sessions
         .iter()
         .any(|kind| matches!(kind, CardKind::Terminal(_) | CardKind::Chat(_)))
@@ -22,7 +25,11 @@ fn close_channel_sessions(sessions: Vec<CardKind>) -> Result<(), String> {
         {
             return Ok(());
         }
-        Err(error) => return Err(format!("Cannot close the channel's sessions: {error}")),
+        Err(error) => {
+            return Err(format!(
+                "Cannot reach the daemon to close sessions: {error}"
+            ));
+        }
     };
     // Query live identities: a saved descriptor can predate an upgrade or handoff.
     let terminals = client.list().map_err(|error| error.to_string())?;
@@ -142,6 +149,14 @@ impl Action {
 pub struct State {
     dialog: Option<Deletion>,
     deleting: HashSet<ChannelId>,
+    /// Channels this window has deleted.
+    ///
+    /// A window is not sent the echo of its own edits, so its cached copy of
+    /// the shared model keeps naming a channel it deleted until the next full
+    /// read, and a read can be older than the deletion. Either would adopt the
+    /// channel straight back. An identity is never reused, so remembering it
+    /// for the life of the window is exact.
+    deleted: HashSet<ChannelId>,
 }
 
 #[derive(Debug, Clone)]
@@ -159,6 +174,10 @@ impl State {
 
     pub(super) fn is_deleting(&self, id: ChannelId) -> bool {
         self.deleting.contains(&id)
+    }
+
+    pub(super) fn was_deleted(&self, id: ChannelId) -> bool {
+        self.deleted.contains(&id)
     }
 
     pub(super) fn focus_target() -> widget::Id {
@@ -327,8 +346,17 @@ impl Cagents {
     /// these cards belonged to are considered: a channel that has just been
     /// created is empty too, and is waiting for its first card.
     pub(super) fn close_emptied_channels(&mut self, retired: &[CardId]) -> Task<Message> {
-        let emptied: Vec<ChannelId> = self
-            .durable
+        let emptied = self.channels_emptied_by(retired);
+        self.delete_channels(emptied)
+    }
+
+    /// The channels `retired` would leave without an open card.
+    ///
+    /// Channel membership is pruned of closed cards whenever the scope is
+    /// persisted, so this must be read before the retirement is persisted;
+    /// afterwards the channel no longer records that it held these cards.
+    pub(super) fn channels_emptied_by(&self, retired: &[CardId]) -> Vec<ChannelId> {
+        self.durable
             .channels
             .iter()
             .filter(|channel| channel.cards.iter().any(|card| retired.contains(card)))
@@ -341,8 +369,24 @@ impl Cagents {
                 })
             })
             .map(|channel| channel.id)
-            .collect();
-        Task::batch(emptied.into_iter().map(|id| self.delete_channel(id)))
+            .collect()
+    }
+
+    pub(super) fn channel_has_open_card(&self, id: ChannelId) -> bool {
+        self.durable
+            .channels
+            .iter()
+            .find(|channel| channel.id == id)
+            .is_some_and(|channel| {
+                channel.cards.iter().any(|&card| {
+                    self.card_state(card)
+                        .is_some_and(|state| state.existence.is_open())
+                })
+            })
+    }
+
+    pub(super) fn delete_channels(&mut self, ids: Vec<ChannelId>) -> Task<Message> {
+        Task::batch(ids.into_iter().map(|id| self.delete_channel(id)))
     }
 
     /// Removes a channel along with everything that existed only inside it.
@@ -388,7 +432,7 @@ impl Cagents {
             return self.finish_delete_channel(id);
         }
         cosmic::task::future(async move {
-            let result = tokio::task::spawn_blocking(move || close_channel_sessions(sessions))
+            let result = tokio::task::spawn_blocking(move || close_sessions(sessions))
                 .await
                 .map_err(|error| error.to_string())
                 .and_then(|result| result);
@@ -435,6 +479,7 @@ impl Cagents {
         // threading an origin flag through the one path that must behave
         // identically whoever asked.
         self.publish_model_edit(ModelEdit::DeleteChannel { id });
+        self.channel_ui.deleted.insert(id);
         for card in channel.cards {
             self.retire_lsp_card(card);
             self.sidebar_state.clear_agent_activity(card);
